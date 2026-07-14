@@ -1,11 +1,11 @@
-"""Trusted committed-capture to admitted-calibration artifact spine."""
+"""User-visible durability contract for readout calibration artifacts."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import multiprocessing
+import os
 from pathlib import Path
-import pickle
-import shutil
 import threading
 import time
 
@@ -13,79 +13,67 @@ import numpy as np
 import pytest
 
 from Zou_lab_control.neutral_atom.devices.registry import DeviceSet
-from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualTrapArray
+from Zou_lab_control.neutral_atom.devices.virtual import (
+    VirtualCamera,
+    VirtualSequencer,
+    VirtualTrapArray,
+)
+from Zou_lab_control.neutral_atom.ports import PortCatalog, PortSpec
 from zlc_data import (
-    READOUT_EVENT,
-    REPEAT,
-    SCAN_POINT,
-    AxisId,
-    AxisSpec,
-    BlockId,
-    PointLayout,
+    READOUT_EVENT, REPEAT, SCAN_POINT, AxisId, AxisSpec, BlockId, PointLayout,
 )
 from zlc_neutral_atom.acquisition import CameraAcquisitionMode
-from zlc_neutral_atom.artifacts import (
-    AdmittedCapture,
-    CaptureArtifactRef,
-    CaptureRepository,
-    compile_capture_artifact_pipeline,
-)
+from zlc_neutral_atom.artifacts.capture import CaptureRepository, compile_capture_artifact_pipeline
+from zlc_neutral_atom.capture_reference import CaptureArtifactRef
 from zlc_neutral_atom.readout.analysis import (
-    BoxAnalysisConfig,
-    CalibrationAnalysisResult,
-    CalibrationAnalysisPlanningAssumption,
-    CalibrationAnalysisRequest,
-    CalibrationBracketSamplingAssumption,
-    PsfAnalysisConfig,
-    ReferenceClassOrientation,
-    ReferenceLabelSource,
-    build_calibration_work_plan,
+    CalibrationAnalysisRequest, CalibrationAnalysisResult, CalibrationComputation,
+    analyze_calibration,
+    estimate_calibration_analysis_peak_bytes,
 )
 from zlc_neutral_atom.readout.calibration import (
-    BackgroundMode,
-    BoxReducer,
-    CalibrationResourceExceeded,
-    CalibrationResourcePolicy,
-    CalibrationParameter,
-    ReadoutModelKind,
+    BackgroundMode, BoxReducer, ReadoutModelKind, ResolvedCalibration,
 )
-from zlc_neutral_atom.readout.contracts import CalibrationCaptureLayout
-import zlc_neutral_atom.readout.analysis as analysis_impl
-import zlc_neutral_atom.readout.calibration_repository as repository_impl
-import zlc_storage.content_store as content_store_impl
+from zlc_neutral_atom.readout.calibration_codec import (
+    calibration_report_blob_refs,
+    decode_calibration_artifact,
+    decode_calibration_report,
+    decode_calibration_report_arrays,
+    encode_calibration_artifact,
+    encode_calibration_reference_average,
+    encode_calibration_reference_average_validity,
+    encode_calibration_report_metadata,
+)
 from zlc_neutral_atom.readout.calibration_reference import (
-    CALIBRATION_ARTIFACT_NAMESPACE,
-    CalibrationArtifactRef,
+    CALIBRATION_ARTIFACT_NAMESPACE, CalibrationArtifactRef,
 )
 from zlc_neutral_atom.readout.calibration_repository import (
-    AdmittedCalibration,
-    CALIBRATION_MANIFEST_SCHEMA,
-    CalibrationRepository,
+    CALIBRATION_MANIFEST_FORMAT, CalibrationRepository,
     compile_calibration_artifact_plan,
 )
+import zlc_neutral_atom.readout.calibration_repository as repository_impl
+import zlc_neutral_atom.readout.analysis as analysis_impl
+from zlc_neutral_atom.readout.contracts import CalibrationCaptureLayout
 from zlc_neutral_atom.runtime import (
-    CancelOutcome,
-    DatasetCellAddress,
-    DatasetMaterializerSpec,
-    MinimalPipelineSpec,
-    PipelineMemoryProfile,
-    RunCancelled,
-    RunFailed,
+    CancelOutcome, DatasetCellAddress, DatasetMaterializerSpec,
+    MemoryQuarantineJournal, MinimalPipelineSpec, PipelineMemoryProfile,
+    ResourceArbiter, RunCancelled, RunController, RunFailed,
 )
-from zlc_neutral_atom.runtime.commit import (
-    CommitIntent,
-    CommitKind,
-    CommitTarget,
-    PersistentCommitJournal,
+from zlc_neutral_atom.timing.capture import TriggeredCaptureSpec
+from zlc_neutral_atom.timing.capture_plan import compile_capture_cell_plan
+from zlc_neutral_atom.timing.pulse import FinitePulseExecutionRequest
+from zlc_pulse import (
+    FIELD_DURATION,
+    FrozenScanTable,
+    PulseExecutionForm,
+    PulseFieldRef,
+    RepeatRegion,
+    ScanParameter,
+    compile_pulse_artifact,
+    load_pulse_document,
 )
 from zlc_storage import (
-    ContentAddressedStore,
-    ContentRef,
-    FramedJournal,
-    RepositoryRootBusy,
-    decode,
-    encode,
-    sha256_digest,
+    ContentRef, ContentSizeLimitError, ContentStoreAuthority, content_ref_to_tree,
+    decode, encode, sha256_digest,
 )
 from zlc_workbench.camera_capture import CameraCaptureBindingRequest
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
@@ -96,54 +84,77 @@ _SPOT = np.array(
     ((0.42, 0.60, 0.42), (0.60, 1.00, 0.60), (0.42, 0.60, 0.42)),
     dtype=np.float64,
 )
+_ROOT = Path(__file__).parents[1]
+
+
+def _pulse_catalog(document) -> PortCatalog:
+    return PortCatalog(
+        document.target.raw_lanes,
+        tuple(
+            PortSpec(
+                port.key,
+                port.kind,
+                port.lanes,
+                port.label,
+                port.bus_index,
+                port.width,
+                port.encoding,
+                port.safe_value,
+                port.latch_clock,
+            )
+            for port in document.target.ports
+        ),
+    )
 
 
 def _axis(name: str, role, size: int) -> AxisSpec:
     return AxisSpec(AxisId(name), name, role, size, tuple(range(size)))
 
 
-def _request(**changes) -> CalibrationAnalysisRequest:
-    base = CalibrationAnalysisRequest(
-        CalibrationCaptureLayout(AxisId("readout-event"), (0, 2), 1),
-        (2, 2),
-        ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY,
-        ReferenceClassOrientation.ABOVE_IS_OCCUPIED,
-        CalibrationBracketSamplingAssumption.INDEPENDENT_STATIONARY_BRACKETS,
-        CalibrationAnalysisPlanningAssumption.PRECOMMITTED_BEFORE_SOURCE_INSPECTION,
-        box=BoxAnalysisConfig(1, BoxReducer.SUM),
+def _request() -> CalibrationAnalysisRequest:
+    return CalibrationAnalysisRequest(
+        layout=CalibrationCaptureLayout(AxisId("readout-event"), (0, 2), 1),
+        grid_shape_yx=(2, 2),
+        box_radius=1,
+        box_reducer=BoxReducer.SUM,
+        psf_half_width=1,
+        psf_background=BackgroundMode.NONE,
+        psf_background_padding=2,
         model_kinds=(
-            ReadoutModelKind.UNIFORM_PSF,
             ReadoutModelKind.BOX,
             ReadoutModelKind.PER_SITE_PSF,
+            ReadoutModelKind.UNIFORM_PSF,
         ),
         default_model_kind=ReadoutModelKind.BOX,
-        psf=PsfAnalysisConfig(1, BackgroundMode.NONE, 0),
-        train_fraction=0.35,
-        minimum_train_samples_per_class=1,
-        minimum_test_samples_per_class=1,
-        minimum_held_out_class_accuracy_lower_bound=0.0,
+        train_fraction=0.5,
+        split_seed=7,
+        histogram_bins=32,
+        max_drop=2,
+        detector_min_distance=8,
+        detector_threshold_rel=0.2,
+        detector_refine_half=1,
+        expected_centers_xy=np.asarray(_CENTERS, dtype="<f8"),
+        maximum_site_residual_px=2.0,
     )
-    return replace(base, **changes)
 
 
 def _frame(repeat: int, event: int, context: int) -> np.ndarray:
     image = np.zeros((32, 32), dtype=np.uint16)
     for site, (x, y) in enumerate(_CENTERS):
         occupied = (repeat + context + site) % 2 == 0
-        if event in (0, 2):
-            level = 2000.0 if occupied else 200.0
-        else:
-            level = 1000.0 if occupied else 100.0
-        image[y - 1 : y + 2, x - 1 : x + 2] = np.rint(level * _SPOT).astype(
-            np.uint16
+        level = (2200.0 if occupied else 180.0) if event in (0, 2) else (
+            1050.0 if occupied else 90.0
         )
+        image[y - 1 : y + 2, x - 1 : x + 2] = np.rint(
+            level * _SPOT
+        ).astype(np.uint16)
     return image
 
 
 def _deliver_when_armed(camera: VirtualCamera, images: list[np.ndarray]):
     failures: list[BaseException] = []
 
-    def source() -> None:
+    def deliver() -> None:
         try:
             deadline = time.monotonic() + 5.0
             state = camera._recent_state()
@@ -154,51 +165,81 @@ def _deliver_when_armed(camera: VirtualCamera, images: list[np.ndarray]):
                         raise TimeoutError("camera was not armed")
                     state["cond"].wait(remaining)
             camera._deliver(images)
-        except BaseException as exc:
-            failures.append(exc)
+        except BaseException as error:
+            failures.append(error)
 
-    thread = threading.Thread(target=source, daemon=False)
+    thread = threading.Thread(target=deliver, daemon=False)
     thread.start()
     return thread, failures
 
 
 @dataclass
-class _CommittedFixture:
-    root: object
-    runtime: LegacyNeutralAtomRuntime
-    capture_repository: CaptureRepository
-    capture_ref: CaptureArtifactRef
+class _CaptureFixture:
+    root: Path
+    repository_id: str
+    repository: CaptureRepository
+    reference: CaptureArtifactRef
     request: CalibrationAnalysisRequest
-    calibration_repository: CalibrationRepository
-    calibration_ref: CalibrationArtifactRef
+    result: CalibrationAnalysisResult
 
 
 @pytest.fixture(scope="module")
-def committed(tmp_path_factory):
-    root = tmp_path_factory.mktemp("trusted-calibration")
+def capture_fixture(tmp_path_factory) -> _CaptureFixture:
+    root = tmp_path_factory.mktemp("compact-calibration-capture")
+    document = load_pulse_document(_ROOT / "pulses" / "imaging_template.json")
+    document = replace(
+        document,
+        repeat=RepeatRegion(
+            document.periods[0].period_id,
+            document.periods[-1].period_id,
+            12,
+        ),
+        scan_parameters=(
+            ScanParameter(
+                "fixture_point_duration",
+                PulseFieldRef(
+                    FIELD_DURATION,
+                    document.periods[0].period_id,
+                    None,
+                ),
+                "fixture point duration",
+                "s",
+            ),
+        ),
+        scan_table=FrozenScanTable(
+            ("fixture_point_duration",),
+            ((document.periods[0].duration,),) * 2,
+        ),
+    )
+    sequencer = VirtualSequencer(
+        sleep_scale=0,
+        port_catalog=_pulse_catalog(document),
+    )
     camera = VirtualCamera(
         VirtualTrapArray(grid_shape=(2, 2), image_shape=(32, 32), seed=11),
         exposure=1e-3,
+        capture_trigger_channels=("ch11",),
     )
-    # This fixture deliberately injects the entire finite hardware burst at
-    # once.  Its concrete driver-retention proof must therefore cover that
-    # burst; production adapters derive the same bound from hardware facts.
-    camera.recent_capacity = 256
+    camera.recent_capacity = 128
     runtime = LegacyNeutralAtomRuntime(
         DeviceSet(
-            {"readout": camera},
-            {"readout": {"type": "VirtualCamera", "params": {}}},
+            {"readout": camera, "sequencer": sequencer},
+            {
+                "readout": {"type": "VirtualCamera", "params": {}},
+                "sequencer": {"type": "VirtualSequencer", "params": {}},
+            },
         )
     )
     description = runtime.describe_camera("readout")
-    repeat_axis = _axis("repeat", REPEAT, 32)
+    repeat_axis = _axis("repeat", REPEAT, 12)
     event_axis = _axis("readout-event", READOUT_EVENT, 3)
     context_axis = _axis("context", SCAN_POINT, 2)
     layout = PointLayout.rect_c((3, 2))
     cells = tuple(
-        DatasetCellAddress(repeat, point)
+        DatasetCellAddress(repeat, layout.storage_index((event, context)))
+        for context in range(context_axis.size)
         for repeat in range(repeat_axis.size)
-        for point in range(layout.storage_size)
+        for event in range(event_axis.size)
     )
     measurement = runtime.bind_camera_measurement(
         CameraCaptureBindingRequest(
@@ -213,1353 +254,866 @@ def committed(tmp_path_factory):
             tuple(description.event_setting(index) for index in range(3)),
         )
     )
-    spec = MinimalPipelineSpec(
-        "trusted calibration raw capture",
+    capture = MinimalPipelineSpec(
+        "compact calibration source",
         measurement,
         DatasetMaterializerSpec(
-            BlockId("trusted-calibration-source"),
-            PipelineMemoryProfile(128 << 20),
+            BlockId("compact-calibration-source"),
+            PipelineMemoryProfile(96 << 20),
         ),
     )
-    images = []
-    for cell in cells:
-        event, context = layout.multi_index(cell.point_storage_index)
-        images.append(_frame(cell.repeat_index, event, context))
-    capture_repository = CaptureRepository(root / "captures", repository_id="captures")
-    source_thread, source_failures = _deliver_when_armed(camera, images)
+    pulse_artifact = compile_pulse_artifact(
+        document,
+        clock_hz=sequencer.clock_hz,
+        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
+        trigger_channels=("ch11",),
+        live_target=document.target,
+    )
+    cell_plan = compile_capture_cell_plan(
+        pulse_artifact,
+        "ch11",
+        measurement.capture_contract.dataset_schema,
+        readout_event_axis_id=event_axis.axis_id,
+        scan_point_layout=PointLayout.rect_c((context_axis.size,)),
+        within_point_grouping=tuple(
+            (repeat, event)
+            for repeat in range(repeat_axis.size)
+            for event in range(event_axis.size)
+        ),
+    )
+    spec = TriggeredCaptureSpec(
+        capture,
+        runtime.bind_sequencer_port(),
+        FinitePulseExecutionRequest(document, pulse_artifact),
+        "ch11",
+        cell_plan,
+    )
+    images = [
+        _frame(cell.repeat_index, *layout.multi_index(cell.point_storage_index))
+        for cell in cells
+    ]
+    repository_id = "calibration-test-captures"
+    repository = CaptureRepository(root, repository_id=repository_id)
+    thread, failures = _deliver_when_armed(camera, images)
     try:
-        capture_handle = runtime.controller.start(
-            compile_capture_artifact_pipeline(spec, capture_repository)
-        )
-        capture_ref = capture_handle.result(15.0)
-        source_thread.join(5.0)
-        assert not source_thread.is_alive()
-        assert source_failures == []
-        request = _request()
-        calibration_repository = CalibrationRepository(
-            root / "calibrations",
-            repository_id="calibrations",
-        )
-        calibration_handle = runtime.controller.start(
-            compile_calibration_artifact_plan(
-                capture_ref,
-                capture_repository,
-                calibration_repository,
-                request,
-            )
-        )
-        calibration_ref = calibration_handle.result(20.0)
-        assert calibration_handle.snapshot().final_committed
-        yield _CommittedFixture(
-            root,
-            runtime,
-            capture_repository,
-            capture_ref,
-            request,
-            calibration_repository,
-            calibration_ref,
-        )
+        reference = runtime.controller.start(
+            compile_capture_artifact_pipeline(spec, repository)
+        ).result(20.0)
+        thread.join(5.0)
+        assert not thread.is_alive() and failures == []
     finally:
-        if source_thread.is_alive():
+        if thread.is_alive():
             camera.finish_record_capture()
-            source_thread.join(2.0)
-        shutdown_ok = runtime.shutdown(timeout=3.0)
-        if "calibration_repository" in locals():
-            calibration_repository.close()
-        capture_repository.close()
-        assert shutdown_ok
-
-
-def _manifest_root(repository: CalibrationRepository):
-    return (
-        repository.root
-        / "content"
-        / "manifests"
-        / CALIBRATION_ARTIFACT_NAMESPACE
-    )
-
-
-def _assert_no_manifest(repository: CalibrationRepository) -> None:
-    root = _manifest_root(repository)
-    assert not root.exists() or tuple(root.iterdir()) == ()
-
-
-def _assert_no_content_blobs(repository: CalibrationRepository) -> None:
-    root = repository.root / "content" / "blobs"
-    assert not root.exists() or tuple(path for path in root.rglob("*") if path.is_file()) == ()
-
-
-def test_calibration_reference_owns_its_typed_target_namespace():
-    reference = CalibrationArtifactRef("calibrations", "a" * 64)
-    assert CALIBRATION_ARTIFACT_NAMESPACE == "calibration"
-    assert reference.target_ref == (
-        f"{CALIBRATION_ARTIFACT_NAMESPACE}/{reference.manifest_digest}"
-    )
-
-
-def _copy_calibration_repository(
-    source: CalibrationRepository,
-    destination,
-    *,
-    include_journal: bool,
-) -> None:
-    """Copy durable evidence without copying a live root's locked lease file."""
-
-    shutil.copytree(source.root / "content", destination / "content")
-    if include_journal:
-        shutil.copy2(
-            source.root / "calibration-commit.journal",
-            destination / "calibration-commit.journal",
-        )
-
-
-def _append_pending_intent(root, intent: CommitIntent) -> None:
-    """Inject the exact crash-state record below the sealed journal API."""
-
-    FramedJournal(root / "calibration-commit.journal").append(
-        f"intent:{intent.commit_id}",
-        {
-            "kind": "INTENT",
-            "operation_kind": intent.kind.value,
-            "commit_id": intent.commit_id,
-            "run_id": intent.run_id,
-            "safety_bundle_id": intent.safety_bundle_id,
-            "target": {
-                "repository_id": intent.target.repository_id,
-                "artifact_kind": intent.target.artifact_kind,
-                "artifact_format": intent.target.artifact_format,
-                "target_ref": intent.target.target_ref,
-                "expected_manifest_digest": (
-                    intent.target.expected_manifest_digest
-                ),
-            },
-            "created_at": intent.created_at,
-        },
-    )
-
-
-def test_flat_run_commits_reopens_and_admits_only_after_exact_source_reload(
-    committed,
-    tmp_path,
-):
-    repository = committed.calibration_repository
-    reference = committed.calibration_ref
-    artifact = repository.load(reference)
-    analysis_result = repository.load_analysis_result(reference)
-    assert analysis_result.artifact.fingerprint == artifact.fingerprint
-    assert analysis_result.diagnostics.bracket_count == (
-        artifact.source_binding.bracket_count
-    )
-    assert artifact.source_binding.source_capture_ref == committed.capture_ref
-    assert not isinstance(artifact, AdmittedCalibration)
-
-    admitted = repository.admit(reference, committed.capture_repository)
-    assert admitted.reference == reference
-    assert admitted.artifact.fingerprint == artifact.fingerprint
-    assert admitted.artifact_fingerprint == artifact.fingerprint
-    assert admitted.source_capture_ref == committed.capture_ref
-    assert admitted.commit_kind is CommitKind.FINAL
-    assert admitted.commit_id.startswith("calibration-final-")
-    assert len(admitted.evidence_digest) == 64
-    with pytest.raises(TypeError, match="process-local"):
-        pickle.dumps(admitted)
-    with pytest.raises(PermissionError, match="only be minted"):
-        AdmittedCalibration(
-            None,
-            repository_token=None,
-            reference=reference,
-            artifact=artifact,
-            commit_kind=CommitKind.FINAL,
-            commit_id=admitted.commit_id,
-            evidence_digest=admitted.evidence_digest,
-        )
-    with pytest.raises(AttributeError, match="immutable"):
-        admitted._commit_id = "forged"
-    with pytest.raises(TypeError, match="final"):
-        class _ForgedAdmission(AdmittedCalibration):
-            pass
-
-    forged = object.__new__(AdmittedCalibration)
-    for slot in AdmittedCalibration.__slots__:
-        if slot == "__weakref__":
-            continue
-        object.__setattr__(forged, slot, object.__getattribute__(admitted, slot))
-    object.__setattr__(
-        forged,
-        "_reference",
-        CalibrationArtifactRef(reference.repository_id, "0" * 64),
-    )
-    with pytest.raises(PermissionError, match="authority is invalid"):
-        forged.artifact
-
-    copied_root = tmp_path / "reopened-calibrations"
-    _copy_calibration_repository(repository, copied_root, include_journal=True)
-    reopened = CalibrationRepository(
-        copied_root,
-        repository_id=repository.repository_id,
+            thread.join(2.0)
+        assert runtime.shutdown(timeout=3.0)
+    request = _request()
+    result = analyze_calibration(repository.admit(reference), request)
+    fixture = _CaptureFixture(
+        root,
+        repository_id,
+        repository,
+        reference,
+        request,
+        result,
     )
     try:
-        assert reopened.startup_reconciliations == ()
-        assert reopened.load(reference).fingerprint == artifact.fingerprint
-        reopened_admission = reopened.admit(
-            reference,
-            committed.capture_repository,
-        )
-        assert reopened_admission.reference == reference
-        assert reopened_admission.commit_id == admitted.commit_id
-        assert reopened_admission.evidence_digest == admitted.evidence_digest
+        yield fixture
     finally:
-        reopened.close()
+        fixture.repository.close()
 
 
-def test_visible_calibration_without_final_intent_is_inspectable_not_admitted(
-    committed,
-    tmp_path,
+def _controller() -> RunController:
+    return RunController(ResourceArbiter(MemoryQuarantineJournal()))
+
+
+def _repository(tmp_path: Path, name: str) -> CalibrationRepository:
+    return CalibrationRepository(tmp_path / name, repository_id=f"{name}-calibrations")
+
+
+def _plan(fixture: _CaptureFixture, repository: CalibrationRepository):
+    return compile_calibration_artifact_plan(
+        fixture.reference,
+        fixture.repository,
+        repository,
+        fixture.request,
+        memory_limit_bytes=512 << 20,
+    )
+
+
+def _encoded_record(
+    repository_id: str,
+    result: CalibrationAnalysisResult,
+) -> tuple[bytes, bytes, bytes, bytes, bytes]:
+    artifact_payload = encode_calibration_artifact(result.artifact)
+    average_payload = encode_calibration_reference_average(
+        result.report.reference_average
+    )
+    validity_payload = encode_calibration_reference_average_validity(
+        result.report.reference_average_validity
+    )
+    artifact_ref = ContentRef(sha256_digest(artifact_payload), len(artifact_payload))
+    average_ref = ContentRef(sha256_digest(average_payload), len(average_payload))
+    validity_ref = ContentRef(sha256_digest(validity_payload), len(validity_payload))
+    report_payload = encode_calibration_report_metadata(
+        result.report,
+        reference_average_blob=average_ref,
+        reference_average_validity_blob=validity_ref,
+    )
+    report_ref = ContentRef(sha256_digest(report_payload), len(report_payload))
+    manifest = encode(
+        {
+            "format": CALIBRATION_MANIFEST_FORMAT,
+            "repository_id": repository_id,
+            "artifact_blob": content_ref_to_tree(artifact_ref),
+            "report_blob": content_ref_to_tree(report_ref),
+        }
+    )
+    return artifact_payload, average_payload, validity_payload, report_payload, manifest
+
+
+def _expected_reference(
+    repository_id: str,
+    result: CalibrationAnalysisResult,
+) -> CalibrationArtifactRef:
+    return CalibrationArtifactRef(
+        repository_id,
+        sha256_digest(_encoded_record(repository_id, result)[-1]),
+    )
+
+
+def _commit(
+    fixture: _CaptureFixture,
+    repository: CalibrationRepository,
 ):
-    copied_root = tmp_path / "visible-uncommitted-calibration"
-    _copy_calibration_repository(
-        committed.calibration_repository,
-        copied_root,
-        include_journal=False,
+    handle = _controller().start(_plan(fixture, repository))
+    return handle, handle.result(30.0)
+
+
+def test_real_analysis_artifact_and_report_codec_roundtrip(capture_fixture):
+    result = capture_fixture.result
+    artifact_payload = encode_calibration_artifact(result.artifact)
+    average_payload = encode_calibration_reference_average(
+        result.report.reference_average
     )
-    repository = CalibrationRepository(
-        copied_root,
-        repository_id=committed.calibration_repository.repository_id,
+    validity_payload = encode_calibration_reference_average_validity(
+        result.report.reference_average_validity
     )
-    try:
-        assert (
-            repository.load(committed.calibration_ref).fingerprint
-            == committed.calibration_repository.load(
-                committed.calibration_ref
-            ).fingerprint
+    average_ref = ContentRef(sha256_digest(average_payload), len(average_payload))
+    validity_ref = ContentRef(sha256_digest(validity_payload), len(validity_payload))
+    report_payload = encode_calibration_report_metadata(
+        result.report,
+        reference_average_blob=average_ref,
+        reference_average_validity_blob=validity_ref,
+    )
+    artifact = decode_calibration_artifact(artifact_payload)
+    average, validity = decode_calibration_report_arrays(
+        average_payload,
+        validity_payload,
+        image_shape=result.artifact.frame_contract.frame_schema.data_shape,
+    )
+    report = decode_calibration_report(
+        report_payload,
+        reference_average=average,
+        reference_average_validity=validity,
+    )
+    assert encode_calibration_artifact(artifact) == artifact_payload
+    assert encode_calibration_report_metadata(
+        report,
+        reference_average_blob=average_ref,
+        reference_average_validity_blob=validity_ref,
+    ) == report_payload
+    assert calibration_report_blob_refs(report_payload) == (average_ref, validity_ref)
+    assert artifact.source_binding.source_capture_ref == capture_fixture.reference
+    assert tuple(model.kind for model in artifact.models) == (
+        ReadoutModelKind.BOX,
+        ReadoutModelKind.PER_SITE_PSF,
+        ReadoutModelKind.UNIFORM_PSF,
+    )
+    assert report.reference_box_signals.shape == (24, 2, 4)
+
+
+def test_runcontroller_commit_load_report_and_admit(capture_fixture, tmp_path):
+    repository = _repository(tmp_path, "committed")
+    handle, reference = _commit(capture_fixture, repository)
+    assert handle.snapshot().final_committed
+    artifact = repository.load(reference)
+    report = repository.load_report(reference)
+    admitted = repository.admit(reference, capture_fixture.repository)
+    assert isinstance(admitted, ResolvedCalibration)
+    assert admitted.reference == reference and admitted.artifact is not None
+    with pytest.raises(TypeError, match="cannot be assembled by callers"):
+        ResolvedCalibration(
+            CalibrationArtifactRef("another-calibration-repository", "f" * 64),
+            admitted.artifact,
         )
-        with pytest.raises(PermissionError, match="no committed FINAL authority"):
-            repository.admit(
-                committed.calibration_ref,
-                committed.capture_repository,
-            )
-        assert not hasattr(repository, "put")
+    assert artifact.source_binding.source_capture_ref == capture_fixture.reference
+    assert report.request == capture_fixture.request
+    try:
+        assert repository.load(reference).source_binding == artifact.source_binding
+        assert repository.load_report(reference).request == report.request
     finally:
         repository.close()
 
 
-def test_passive_numeric_lineage_notes_are_not_required_for_admission(
-    committed,
+def test_runtime_load_and_admit_never_read_report_blobs(
+    capture_fixture,
     tmp_path,
     monkeypatch,
 ):
-    real_analyze = repository_impl.analyze_calibration
+    repository = _repository(tmp_path, "artifact-only-load")
+    _handle, reference = _commit(capture_fixture, repository)
+    _repository_id, artifact_ref, report_ref = repository_impl._decode_manifest(
+        repository._read_manifest(reference)
+    )
+    report_payload = repository._store_authority.read_blob(report_ref)
+    average_ref, validity_ref = calibration_report_blob_refs(report_payload)
+    forbidden = {report_ref, average_ref, validity_ref}
+    real_read_blob = ContentStoreAuthority.read_blob
+    real_read_manifest = ContentStoreAuthority.read_manifest
+    blob_limits, manifest_limits = [], []
 
-    def analyze_without_notes(*args, **kwargs):
-        result = real_analyze(*args, **kwargs)
-        artifact = replace(
-            result.artifact,
-            parameters=tuple(
-                item
-                for item in result.artifact.parameters
-                if item.name not in {"numpy-version", "scipy-version"}
-            ),
+    def artifact_only(self, content, *, max_bytes=None):
+        if content in forbidden:
+            raise AssertionError("runtime artifact path read calibration diagnostics")
+        blob_limits.append((content, max_bytes))
+        return real_read_blob(self, content, max_bytes=max_bytes)
+
+    def bounded_manifest(self, namespace, digest, *, max_bytes=None):
+        manifest_limits.append((namespace, max_bytes))
+        return real_read_manifest(self, namespace, digest, max_bytes=max_bytes)
+
+    monkeypatch.setattr(ContentStoreAuthority, "read_blob", artifact_only)
+    monkeypatch.setattr(ContentStoreAuthority, "read_manifest", bounded_manifest)
+    try:
+        assert repository.load(reference).source_binding.source_capture_ref == (
+            capture_fixture.reference
         )
-        return CalibrationAnalysisResult(artifact, result.diagnostics)
+        assert repository.admit(reference, capture_fixture.repository).reference == reference
+        with pytest.raises(AssertionError, match="diagnostics"):
+            repository.load_report(reference)
+        calibration_limits = [
+            limit
+            for namespace, limit in manifest_limits
+            if namespace == CALIBRATION_ARTIFACT_NAMESPACE
+        ]
+        assert calibration_limits and set(calibration_limits) == {
+            repository_impl._MAX_MANIFEST_BYTES
+        }
+        artifact_limits = [limit for content, limit in blob_limits if content == artifact_ref]
+        assert artifact_limits and set(artifact_limits) == {repository_impl._MAX_ARTIFACT_BYTES}
+    finally:
+        repository.close()
+
+
+def test_report_blob_io_does_not_block_runtime_admission(
+    capture_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    repository = _repository(tmp_path, "report-io-lock-scope")
+    _handle, reference = _commit(capture_fixture, repository)
+    _repository_id, _artifact_ref, report_ref = repository_impl._decode_manifest(
+        repository._read_manifest(reference)
+    )
+    average_ref, _validity_ref = calibration_report_blob_refs(
+        repository._store_authority.read_blob(report_ref)
+    )
+    report_reading, release_report, admit_done = (
+        threading.Event(), threading.Event(), threading.Event()
+    )
+    report_errors, admit_errors = [], []
+    real_read_blob = ContentStoreAuthority.read_blob
+
+    def block_average(self, content, *, max_bytes=None):
+        if content == average_ref:
+            report_reading.set()
+            if not release_report.wait(5.0):
+                raise TimeoutError("test did not release report blob read")
+        return real_read_blob(self, content, max_bytes=max_bytes)
+
+    def load_report():
+        try:
+            repository.load_report(reference)
+        except BaseException as exc:
+            report_errors.append(exc)
+
+    def admit_runtime():
+        try:
+            repository.admit(reference, capture_fixture.repository)
+        except BaseException as exc:
+            admit_errors.append(exc)
+        finally:
+            admit_done.set()
+
+    monkeypatch.setattr(ContentStoreAuthority, "read_blob", block_average)
+    report_thread = threading.Thread(target=load_report)
+    admit_thread = threading.Thread(target=admit_runtime)
+    admission_was_independent = False
+    try:
+        report_thread.start()
+        assert report_reading.wait(2.0)
+        admit_thread.start()
+        admission_was_independent = admit_done.wait(2.0)
+    finally:
+        release_report.set()
+        report_thread.join(5.0)
+        admit_thread.join(5.0)
+        repository.close()
+    assert admission_was_independent
+    assert not report_thread.is_alive() and not admit_thread.is_alive()
+    assert report_errors == [] and admit_errors == []
+
+
+def test_report_metadata_refs_raw_images_without_canonical_base64(
+    capture_fixture,
+    tmp_path,
+):
+    repository = _repository(tmp_path, "binary-diagnostics")
+    _handle, reference = _commit(capture_fixture, repository)
+    try:
+        _repository_id, _artifact_ref, report_ref = repository_impl._decode_manifest(
+            repository._read_manifest(reference)
+        )
+        report_payload = repository._store_authority.read_blob(report_ref)
+        tree = decode(report_payload)
+        average_ref, validity_ref = calibration_report_blob_refs(report_payload)
+        assert "reference_average" not in tree
+        assert "reference_average_validity" not in tree
+        assert average_ref.size == capture_fixture.result.report.reference_average.nbytes
+        assert validity_ref.size == (
+            capture_fixture.result.report.reference_average_validity.nbytes
+        )
+        assert repository._store_authority.read_blob(average_ref) == (
+            encode_calibration_reference_average(
+                capture_fixture.result.report.reference_average
+            )
+        )
+    finally:
+        repository.close()
+
+
+def test_report_limits_do_not_block_artifact_runtime_load(capture_fixture, tmp_path):
+    root = tmp_path / "diagnostic-limits"
+    repository_id = "diagnostic-limit-calibrations"
+    repository = CalibrationRepository(root, repository_id=repository_id)
+    _handle, reference = _commit(capture_fixture, repository)
+    repository.close()
+
+    memory_limited = CalibrationRepository(
+        root,
+        repository_id=repository_id,
+        diagnostic_memory_limit_bytes=1,
+    )
+    try:
+        assert memory_limited.load(reference).source_binding.source_capture_ref == (
+            capture_fixture.reference
+        )
+        with pytest.raises(MemoryError, match="diagnostics require"):
+            memory_limited.load_report(reference)
+    finally:
+        memory_limited.close()
+
+    metadata_limited = CalibrationRepository(
+        root,
+        repository_id=repository_id,
+        max_report_metadata_bytes=1,
+    )
+    try:
+        assert metadata_limited.load(reference).source_binding.source_capture_ref == (
+            capture_fixture.reference
+        )
+        with pytest.raises(ContentSizeLimitError):
+            metadata_limited.load_report(reference)
+    finally:
+        metadata_limited.close()
+
+
+def test_stage_rejects_diagnostic_memory_before_copying_or_writing_images(
+    capture_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    repository = CalibrationRepository(
+        tmp_path / "stage-diagnostic-preflight",
+        repository_id="stage-diagnostic-preflight",
+        diagnostic_memory_limit_bytes=1,
+    )
+
+    def forbidden_image_copy(_value):
+        raise AssertionError("large diagnostic image was encoded before admission")
 
     monkeypatch.setattr(
         repository_impl,
-        "analyze_calibration",
-        analyze_without_notes,
+        "encode_calibration_reference_average",
+        forbidden_image_copy,
     )
-    repository = CalibrationRepository(
-        tmp_path / "calibrations-without-numeric-notes",
-        repository_id="calibrations-without-numeric-notes",
+    monkeypatch.setattr(
+        repository_impl,
+        "encode_calibration_reference_average_validity",
+        forbidden_image_copy,
     )
     try:
-        handle = committed.runtime.controller.start(
-            compile_calibration_artifact_plan(
-                committed.capture_ref,
-                committed.capture_repository,
-                repository,
-                committed.request,
-            )
+        with pytest.raises(MemoryError, match="diagnostics require"):
+            repository._stage_result(capture_fixture.result)
+        blob_root = repository.root / "content" / "blobs"
+        assert not blob_root.exists() or not any(
+            path.is_file() for path in blob_root.rglob("*")
         )
-        reference = handle.result(20.0)
-        artifact = repository.load(reference)
-        assert not {
-            "numpy-version",
-            "scipy-version",
-        } & {item.name for item in artifact.parameters}
-        assert repository.admit(
-            reference,
-            committed.capture_repository,
-        ).reference == reference
     finally:
         repository.close()
 
 
-def test_load_and_admission_never_probe_the_current_numeric_environment(
-    committed,
+def test_stage_rejects_payloads_its_own_loaders_cannot_read(
+    capture_fixture,
+    tmp_path,
     monkeypatch,
 ):
-    def forbidden():
-        pytest.fail("persistent calibration access probed the numeric environment")
+    repository = _repository(tmp_path, "self-readable-stage")
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(repository_impl, "_MAX_ARTIFACT_BYTES", 1)
+            with pytest.raises(MemoryError, match="calibration artifact requires"):
+                repository._stage_result(capture_fixture.result)
 
-    monkeypatch.setattr(analysis_impl, "_numeric_lineage_notes", forbidden)
-    artifact = committed.calibration_repository.load(committed.calibration_ref)
-    result = committed.calibration_repository.load_analysis_result(
-        committed.calibration_ref
-    )
-    admitted = committed.calibration_repository.admit(
-        committed.calibration_ref,
-        committed.capture_repository,
-    )
-    assert result.artifact.fingerprint == artifact.fingerprint
-    assert admitted.artifact.fingerprint == artifact.fingerprint
+        with monkeypatch.context() as patch:
+            def reject_report(*_args, **_kwargs):
+                raise ValueError("report decoder rejected staged bytes")
 
-
-def test_repository_root_has_one_live_owner_and_close_is_terminal(tmp_path):
-    root = tmp_path / "exclusive-calibrations"
-    repository = CalibrationRepository(root, repository_id="exclusive-calibrations")
-    with pytest.raises(RepositoryRootBusy, match="live owner"):
-        CalibrationRepository(root, repository_id="exclusive-calibrations")
-    repository.close()
-    with pytest.raises(RuntimeError, match="lease owner is closed"):
-        repository.has(CalibrationArtifactRef(repository.repository_id, "0" * 64))
-
-    reopened = CalibrationRepository(root, repository_id="exclusive-calibrations")
-    reopened.close()
+            patch.setattr(
+                repository_impl,
+                "decode_calibration_report",
+                reject_report,
+            )
+            with pytest.raises(ValueError, match="decoder rejected"):
+                repository._stage_result(capture_fixture.result)
+    finally:
+        repository.close()
 
 
-def test_preflight_loaded_capture_is_the_same_object_analyzed_and_request_is_snapshotted(
-    committed,
-    monkeypatch,
+def test_committed_artifact_remains_loadable_if_diagnostic_blob_is_lost(
+    capture_fixture,
+    tmp_path,
 ):
-    capture_repository = committed.capture_repository
-    calibration_repository = CalibrationRepository(
-        committed.root / "same-object-calibrations",
-        repository_id="same-object-calibrations",
+    repository = _repository(tmp_path, "lost-diagnostic")
+    _handle, reference = _commit(capture_fixture, repository)
+    _repository_id, _artifact_ref, report_ref = repository_impl._decode_manifest(
+        repository._read_manifest(reference)
     )
-    request = replace(
-        committed.request,
-        minimum_reference_cluster_separation_rss=2.5,
+    average_ref, _validity_ref = calibration_report_blob_refs(
+        repository._store_authority.read_blob(report_ref)
     )
-    frozen_fingerprint = request.fingerprint
-    plan = compile_calibration_artifact_plan(
-        committed.capture_ref,
-        capture_repository,
-        calibration_repository,
-        request,
-    )
-    object.__setattr__(request, "minimum_reference_cluster_separation_rss", 3.0)
-    assert request.fingerprint != frozen_fingerprint
+    repository._store._blob_path_for_digest(average_ref.digest).unlink()
+    try:
+        assert repository.load(reference).source_binding.source_capture_ref == (
+            capture_fixture.reference
+        )
+        assert repository.admit(reference, capture_fixture.repository).reference == reference
+        with pytest.raises(FileNotFoundError):
+            repository.load_report(reference)
+    finally:
+        repository.close()
 
-    admitted_artifact_ids: list[int] = []
-    analyzed_ids: list[int] = []
-    analyzed_request_fingerprints: list[str] = []
-    real_admit = CaptureRepository.admit
+
+def test_cancel_and_execute_failure_never_publish(capture_fixture, tmp_path, monkeypatch):
     real_analyze = repository_impl.analyze_calibration
 
-    def tracked_admit(self, reference):
-        value = real_admit(self, reference)
-        if self is capture_repository:
-            admitted_artifact_ids.append(id(value.artifact))
-        return value
-
-    def tracked_analyze(capture, frozen_request):
-        analyzed_ids.append(id(capture))
-        analyzed_request_fingerprints.append(frozen_request.fingerprint)
-        return real_analyze(capture, frozen_request)
-
-    monkeypatch.setattr(CaptureRepository, "admit", tracked_admit)
-    monkeypatch.setattr(repository_impl, "analyze_calibration", tracked_analyze)
-    reference = committed.runtime.controller.start(plan).result(20.0)
-    assert calibration_repository.has(reference)
-    assert admitted_artifact_ids == analyzed_ids
-    assert analyzed_request_fingerprints == [frozen_fingerprint]
-
-
-def test_cancel_and_analysis_failure_publish_no_calibration_manifest(
-    committed,
-    monkeypatch,
-):
-    cancelled_repository = CalibrationRepository(
-        committed.root / "cancelled-calibrations",
-        repository_id="cancelled-calibrations",
-    )
-    entered = threading.Event()
+    cancel_repository = _repository(tmp_path, "cancelled")
+    started = threading.Event()
     release = threading.Event()
-    real_analyze = repository_impl.analyze_calibration
+    cancelled_result: list[CalibrationAnalysisResult] = []
 
     def paused(capture, request):
-        entered.set()
+        result = real_analyze(capture, request)
+        cancelled_result.append(result)
+        started.set()
         assert release.wait(10.0)
-        return real_analyze(capture, request)
+        return result
 
     monkeypatch.setattr(repository_impl, "analyze_calibration", paused)
-    handle = committed.runtime.controller.start(
-        compile_calibration_artifact_plan(
-            committed.capture_ref,
-            committed.capture_repository,
-            cancelled_repository,
-            committed.request,
-        )
-    )
-    assert entered.wait(5.0)
-    assert handle.cancel() is CancelOutcome.REQUESTED
+    handle = _controller().start(_plan(capture_fixture, cancel_repository))
+    assert started.wait(20.0)
+    assert handle.cancel("test cancellation") is CancelOutcome.REQUESTED
     release.set()
     with pytest.raises(RunCancelled):
         handle.result(20.0)
-    _assert_no_manifest(cancelled_repository)
-
-    monkeypatch.setattr(repository_impl, "analyze_calibration", real_analyze)
-    failed_repository = CalibrationRepository(
-        committed.root / "failed-calibrations",
-        repository_id="failed-calibrations",
+    cancelled_ref = _expected_reference(
+        cancel_repository.repository_id,
+        cancelled_result[0],
     )
-    impossible = replace(committed.request, grid_shape_yx=(3, 3))
-    with pytest.raises(RunFailed):
-        committed.runtime.controller.start(
-            compile_calibration_artifact_plan(
-                committed.capture_ref,
-                committed.capture_repository,
-                failed_repository,
-                impossible,
-            )
-    ).result(20.0)
-    _assert_no_manifest(failed_repository)
-    assert committed.capture_repository.load(committed.capture_ref).ref == (
-        committed.capture_ref
+    assert not handle.snapshot().final_committed
+    assert not cancel_repository.has(cancelled_ref)
+    cancel_repository.close()
+
+    failed_repository = _repository(tmp_path, "failed")
+    failed_result: list[CalibrationAnalysisResult] = []
+
+    def failed(capture, request):
+        result = real_analyze(capture, request)
+        failed_result.append(result)
+        raise RuntimeError("injected analysis failure")
+
+    monkeypatch.setattr(repository_impl, "analyze_calibration", failed)
+    failed_handle = _controller().start(_plan(capture_fixture, failed_repository))
+    with pytest.raises(RunFailed, match="injected analysis failure"):
+        failed_handle.result(20.0)
+    failed_ref = _expected_reference(
+        failed_repository.repository_id,
+        failed_result[0],
     )
+    assert not failed_handle.snapshot().final_committed
+    assert not failed_repository.has(failed_ref)
+    failed_repository.close()
 
 
-def test_target_repository_budgets_reject_in_preflight_without_analysis_or_blobs(
-    committed,
+def test_analysis_memory_budget_rejects_before_scientific_execute(
+    capture_fixture,
+    tmp_path,
     monkeypatch,
 ):
-    capture = committed.capture_repository.admit(committed.capture_ref).artifact
-    work_plan = build_calibration_work_plan(capture, committed.request)
-    base = CalibrationResourcePolicy()
-    cases = (
-        ("sites", replace(base, max_sites=3)),
-        ("models", replace(base, max_models=2)),
-        (
-            "kernels",
-            replace(base, max_kernel_elements=work_plan.planned_kernel_elements - 1),
-        ),
-        (
-            "per-model-samples",
-            replace(
-                base,
-                max_sampled_pixels_per_model=(
-                    work_plan.maximum_model_sampled_pixels - 1
-                ),
-            ),
-        ),
-        (
-            "total-samples",
-            replace(
-                base,
-                max_total_sampled_pixels_all_models=(
-                    work_plan.total_model_sampled_pixels - 1
-                ),
-            ),
-        ),
-        (
-            "artifact-wire",
-            replace(
-                base,
-                max_artifact_blob_bytes=(
-                    work_plan.artifact_encoding_upper_bound_bytes - 1
-                ),
-            ),
-        ),
-        (
-            "derivation-wire",
-            replace(
-                base,
-                max_artifact_blob_bytes=(
-                    work_plan.artifact_encoding_upper_bound_bytes + 1
-                ),
-            ),
-        ),
-        ("manifest-wire", replace(base, max_manifest_bytes=128)),
+    repository = _repository(tmp_path, "analysis-memory-limit")
+    source = capture_fixture.repository.admit(capture_fixture.reference).artifact.frame_source
+    required = estimate_calibration_analysis_peak_bytes(
+        source.schema,
+        capture_fixture.request,
+        source_read_scratch_bytes=source.max_read_scratch_bytes,
     )
-    analyze_calls = 0
+    called = False
 
     def forbidden_analysis(*_args, **_kwargs):
-        nonlocal analyze_calls
-        analyze_calls += 1
-        pytest.fail("target policy reached numerical calibration analysis")
+        nonlocal called
+        called = True
+        raise AssertionError("analysis ran after memory admission failed")
 
     monkeypatch.setattr(repository_impl, "analyze_calibration", forbidden_analysis)
-    for label, policy in cases:
-        repository = CalibrationRepository(
-            committed.root / f"preflight-{label}",
-            repository_id=f"preflight-{label}",
-            resource_policy=policy,
-        )
-        try:
-            handle = committed.runtime.controller.start(
-                compile_calibration_artifact_plan(
-                    committed.capture_ref,
-                    committed.capture_repository,
-                    repository,
-                    committed.request,
-                )
-            )
-            with pytest.raises(RunFailed, match="target repository policy"):
-                handle.result(20.0)
-            _assert_no_manifest(repository)
-            _assert_no_content_blobs(repository)
-        finally:
-            repository.close()
-    assert analyze_calls == 0
-
-
-def test_manifest_staging_failure_leaves_only_safe_orphan_blobs(
-    committed,
-    monkeypatch,
-):
-    repository = CalibrationRepository(
-        committed.root / "orphaned-calibration-blobs",
-        repository_id="orphaned-calibration-blobs",
+    plan = compile_calibration_artifact_plan(
+        capture_fixture.reference,
+        capture_fixture.repository,
+        repository,
+        capture_fixture.request,
+        memory_limit_bytes=required - 1,
     )
-    monkeypatch.setattr(
-        repository_impl,
-        "_manifest_payload",
-        lambda **_kwargs: b"x"
-        * (repository.resource_policy.max_manifest_bytes + 1),
-    )
+    handle = _controller().start(plan)
     try:
-        handle = committed.runtime.controller.start(
-            compile_calibration_artifact_plan(
-                committed.capture_ref,
-                committed.capture_repository,
-                repository,
-                committed.request,
-            )
-        )
-        with pytest.raises(RunFailed, match="manifest exceeds"):
+        with pytest.raises(RunFailed) as failure:
             handle.result(20.0)
-        _assert_no_manifest(repository)
-        blob_root = repository.root / "content" / "blobs"
-        orphan_blobs = tuple(
-            path for path in blob_root.rglob("*") if path.is_file()
-        )
-        assert len(orphan_blobs) == 2
+        assert failure.value.primary is not None
+        assert failure.value.primary.original_type == "MemoryError"
+        assert not called
+        assert repository.startup_reconciliations == ()
     finally:
         repository.close()
 
 
-def test_dishonest_analysis_request_parameters_are_rejected_before_staging(
-    committed,
-    monkeypatch,
-):
-    repository = CalibrationRepository(
-        committed.root / "dishonest-analysis",
-        repository_id="dishonest-analysis",
-    )
-    real_analyze = repository_impl.analyze_calibration
-
-    def dishonest(capture, request):
-        result = real_analyze(capture, request)
-        parameters = tuple(
-            CalibrationParameter(
-                item.name,
-                0.25
-                if item.name == "reference-valley-familywise-error-rate"
-                else item.value,
-            )
-            for item in result.artifact.parameters
-        )
-        artifact = replace(result.artifact, parameters=parameters)
-        return CalibrationAnalysisResult(artifact, result.diagnostics)
-
-    monkeypatch.setattr(repository_impl, "analyze_calibration", dishonest)
-    try:
-        handle = committed.runtime.controller.start(
-            compile_calibration_artifact_plan(
-                committed.capture_ref,
-                committed.capture_repository,
-                repository,
-                committed.request,
-            )
-        )
-        with pytest.raises(RunFailed, match="parameters differ"):
-            handle.result(20.0)
-        _assert_no_manifest(repository)
-        _assert_no_content_blobs(repository)
-    finally:
-        repository.close()
-
-
-def test_commit_encodes_diagnostics_once_and_load_or_admit_replays_result_once(
-    committed,
-    monkeypatch,
-):
-    repository = CalibrationRepository(
-        committed.root / "single-encode-replay",
-        repository_id="single-encode-replay",
-    )
-    real_encode = repository_impl.encode_calibration_analysis_diagnostics
-    encode_calls = 0
-
-    def counted_encode(*args, **kwargs):
-        nonlocal encode_calls
-        encode_calls += 1
-        return real_encode(*args, **kwargs)
-
-    monkeypatch.setattr(
-        repository_impl,
-        "encode_calibration_analysis_diagnostics",
-        counted_encode,
-    )
-    try:
-        reference = committed.runtime.controller.start(
-            compile_calibration_artifact_plan(
-                committed.capture_ref,
-                committed.capture_repository,
-                repository,
-                committed.request,
-            )
-        ).result(20.0)
-        assert encode_calls == 1
-
-        real_result = repository_impl.CalibrationAnalysisResult
-        result_calls = 0
-
-        def counted_result(*args, **kwargs):
-            nonlocal result_calls
-            result_calls += 1
-            return real_result(*args, **kwargs)
-
-        monkeypatch.setattr(repository_impl, "CalibrationAnalysisResult", counted_result)
-        assert repository.load_analysis_result(reference).artifact.fingerprint
-        assert result_calls == 1
-        result_calls = 0
-        assert repository.admit(reference, committed.capture_repository).reference == reference
-        assert result_calls == 1
-    finally:
-        repository.close()
-
-
-def test_manifest_and_derivation_tampering_are_rejected_current_only(committed):
-    repository = committed.calibration_repository
-    manifest = decode(
-        repository._store.read_manifest(
-            "calibration",
-            committed.calibration_ref.manifest_digest,
-        )
-    )
-
-    unsupported_manifest = decode(encode(manifest))
-    unsupported_manifest["schema"] = "unsupported-calibration-manifest"
-    stored = repository._store.publish_manifest(
-        "calibration",
-        encode(unsupported_manifest),
-    )
-    with pytest.raises(ValueError, match="unsupported.*manifest schema"):
-        repository.load(
-            CalibrationArtifactRef(repository.repository_id, stored.content.digest)
-        )
-
-    obsolete_manifest = decode(encode(manifest))
-    obsolete_manifest["algorithm_id"] = "retired-duplicate-identity"
-    obsolete_manifest["algorithm_version"] = "7"
-    stored = repository._store.publish_manifest(
-        "calibration",
-        encode(obsolete_manifest),
-    )
-    with pytest.raises(ValueError, match="unknown field set"):
-        repository.load(
-            CalibrationArtifactRef(repository.repository_id, stored.content.digest)
-        )
-
-    forged_manifest = decode(encode(manifest))
-    forged_manifest["resource_summary"]["site_count"] += 1
-    stored = repository._store.publish_manifest("calibration", encode(forged_manifest))
-    with pytest.raises(ValueError, match="summary differs"):
-        repository.load(
-            CalibrationArtifactRef(repository.repository_id, stored.content.digest)
-        )
-
-    forged_manifest = decode(encode(manifest))
-    forged_manifest["request_fingerprint"] = "0" * 64
-    stored = repository._store.publish_manifest("calibration", encode(forged_manifest))
-    with pytest.raises(ValueError, match="request_fingerprint differs"):
-        repository.load(CalibrationArtifactRef(repository.repository_id, stored.content.digest))
-
-    forged_manifest = decode(encode(manifest))
-    forged_manifest["source_capture_evidence_digest"] = "0" * 64
-    stored = repository._store.publish_manifest("calibration", encode(forged_manifest))
-    with pytest.raises(ValueError, match="source_capture_evidence_digest differs"):
-        repository.load(
-            CalibrationArtifactRef(repository.repository_id, stored.content.digest)
-        )
-
-    derivation_ref = ContentRef(
-        manifest["derivation_blob"]["digest"],
-        manifest["derivation_blob"]["size"],
-    )
-    derivation = decode(repository._store.read_blob(derivation_ref))
-    obsolete_derivation = decode(encode(derivation))
-    obsolete_derivation["algorithm_id"] = "retired-duplicate-identity"
-    obsolete_derivation["algorithm_version"] = "7"
-    obsolete_derivation_blob = repository._store.put_blob(
-        encode(obsolete_derivation)
-    )
-    obsolete_derivation_manifest = decode(encode(manifest))
-    obsolete_derivation_manifest["derivation_blob"] = {
-        "digest": obsolete_derivation_blob.digest,
-        "size": obsolete_derivation_blob.size,
-    }
-    obsolete_derivation_manifest["evidence_digest"] = (
-        obsolete_derivation_blob.digest
-    )
-    stored = repository._store.publish_manifest(
-        "calibration",
-        encode(obsolete_derivation_manifest),
-    )
-    with pytest.raises(ValueError, match="unknown field set"):
-        repository.load(
-            CalibrationArtifactRef(repository.repository_id, stored.content.digest)
-        )
-
-    derivation["analysis_run_id"] = "forged-analysis-run"
-    forged_derivation = repository._store.put_blob(encode(derivation))
-    derivation_only = decode(encode(manifest))
-    derivation_only["derivation_blob"] = {
-        "digest": forged_derivation.digest,
-        "size": forged_derivation.size,
-    }
-    derivation_only["evidence_digest"] = forged_derivation.digest
-    stored = repository._store.publish_manifest("calibration", encode(derivation_only))
-    with pytest.raises(ValueError, match="analysis_run_id differs"):
-        repository.load(CalibrationArtifactRef(repository.repository_id, stored.content.digest))
-
-def test_admission_requires_the_concrete_exact_source_repository(
-    committed,
+def test_physical_manifest_without_final_commit_is_not_public(
+    capture_fixture,
     tmp_path,
 ):
-    with pytest.raises(TypeError, match="final"):
-        class LyingCaptureRepository(CaptureRepository):
-            pass
-
-    wrong = CaptureRepository(tmp_path / "wrong-captures", repository_id="wrong-captures")
-    with pytest.raises(ValueError, match="another repository"):
-        committed.calibration_repository.admit(committed.calibration_ref, wrong)
-    with pytest.raises(TypeError, match="CaptureRepository"):
-        committed.calibration_repository.admit(
-            committed.calibration_ref,
-            lambda _reference: committed.capture_repository.load(committed.capture_ref),
-        )
-    uncommitted_root = tmp_path / "visible-uncommitted-captures"
-    shutil.copytree(
-        committed.capture_repository.root / "content",
-        uncommitted_root / "content",
-    )
-    uncommitted = CaptureRepository(
-        uncommitted_root,
-        repository_id=committed.capture_repository.repository_id,
-    )
-    assert uncommitted.load(committed.capture_ref).ref == committed.capture_ref
-    with pytest.raises(PermissionError, match="no committed journal authority"):
-        uncommitted.admit(committed.capture_ref)
-    with pytest.raises(PermissionError, match="no committed journal authority"):
-        committed.calibration_repository.admit(
-            committed.calibration_ref,
-            uncommitted,
-        )
-
-    target = CalibrationRepository(
-        tmp_path / "laundering-target-calibrations",
-        repository_id="laundering-target-calibrations",
-    )
-    with pytest.raises(RunFailed, match="no committed journal authority"):
-        committed.runtime.controller.start(
-            compile_calibration_artifact_plan(
-                committed.capture_ref,
-                uncommitted,
-                target,
-                committed.request,
-            )
-        ).result(10.0)
-    _assert_no_manifest(target)
-
-
-def test_admission_rechecks_capture_commit_evidence(committed, monkeypatch):
-    real_admit = CaptureRepository.admit
-
-    def drifted_admit(self, reference):
-        admission = real_admit(self, reference)
-        if self is not committed.capture_repository:
-            return admission
-        forged = object.__new__(AdmittedCapture)
-        for slot in AdmittedCapture.__slots__:
-            object.__setattr__(forged, slot, getattr(admission, slot))
-        object.__setattr__(forged, "_evidence_digest", "0" * 64)
-        return forged
-
-    monkeypatch.setattr(CaptureRepository, "admit", drifted_admit)
-    with pytest.raises(ValueError, match="admission evidence differs"):
-        committed.calibration_repository.admit(
-            committed.calibration_ref,
-            committed.capture_repository,
-        )
-
-
-def test_restart_reconciles_visible_manifest_without_rerunning_analysis(
-    committed,
-    tmp_path,
-    monkeypatch,
-):
-    root = tmp_path / "restart-visible-calibrations"
-    _copy_calibration_repository(
-        committed.calibration_repository,
-        root,
-        include_journal=False,
-    )
-    repository = CalibrationRepository(
-        root,
-        repository_id=committed.calibration_repository.repository_id,
-    )
-    loaded = repository._load_record(committed.calibration_ref)
-    target = CommitTarget(
+    repository = _repository(tmp_path, "ghost")
+    result = capture_fixture.result
+    (
+        artifact_payload,
+        average_payload,
+        validity_payload,
+        report_payload,
+        _predicted_manifest,
+    ) = _encoded_record(
         repository.repository_id,
-        "calibration",
-        CALIBRATION_MANIFEST_SCHEMA,
-        committed.calibration_ref.target_ref,
-        committed.calibration_ref.manifest_digest,
+        result,
     )
-    intent = CommitIntent(
-        CommitKind.FINAL,
-        (
-            f"calibration-final-{loaded.derivation.analysis_run_id}-"
-            f"{committed.calibration_ref.manifest_digest}"
-        ),
-        loaded.derivation.analysis_run_id,
-        loaded.derivation.analysis_safety_bundle_id,
-        target,
-        time.time(),
+    artifact_ref = repository._store_authority.put_blob(artifact_payload)
+    repository._store_authority.put_blob(average_payload)
+    repository._store_authority.put_blob(validity_payload)
+    report_ref = repository._store_authority.put_blob(report_payload)
+    # Rebuild from the exact CAS-owned references; their values match the
+    # predicted references above, but the storage owner remains authoritative.
+    payload = repository_impl._manifest_payload(
+        repository.repository_id,
+        artifact_ref,
+        report_ref,
     )
-    with pytest.raises(ValueError, match="not a CalibrationArtifact target"):
-        repository._recover(
-            replace(
-                intent,
-                kind=CommitKind.CHECKPOINT,
-                commit_id="checkpoint-is-not-calibration-final",
-            )
+    digest = sha256_digest(payload)
+    repository._store_authority.publish_manifest(
+        CALIBRATION_ARTIFACT_NAMESPACE,
+        payload,
+        expected_digest=digest,
+    )
+    reference = CalibrationArtifactRef(repository.repository_id, digest)
+    try:
+        assert not repository.has(reference)
+        with pytest.raises(PermissionError, match="FINAL commit"):
+            repository.load(reference)
+    finally:
+        repository.close()
+
+
+def test_unknown_manifest_format_is_rejected_after_final_commit(
+    capture_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    repository = _repository(tmp_path, "unknown-format")
+
+    def unknown_manifest(repository_id, artifact_blob, report_blob):
+        return encode(
+            {
+                "format": "unknown-calibration-manifest",
+                "repository_id": repository_id,
+                "artifact_blob": content_ref_to_tree(artifact_blob),
+                "report_blob": content_ref_to_tree(report_blob),
+            }
         )
-    mismatches = (
-        (
-            replace(
-                target,
-                target_ref=f"legacy-calibration/{target.expected_manifest_digest}",
-            ),
-            "target ref and digest differ",
-        ),
-        (
-            replace(target, expected_manifest_digest="0" * 64),
-            "target ref and digest differ",
-        ),
-        (
-            replace(target, artifact_kind="other-artifact"),
-            "not a CalibrationArtifact target",
+
+    monkeypatch.setattr(repository_impl, "_manifest_payload", unknown_manifest)
+    _handle, reference = _commit(capture_fixture, repository)
+    try:
+        assert repository.has(reference)
+        with pytest.raises(ValueError, match="expected format"):
+            repository.load(reference)
+    finally:
+        repository.close()
+
+
+def test_source_capture_frame_contract_is_rechecked_before_publication(
+    capture_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    repository = _repository(tmp_path, "source-mismatch")
+    original = capture_fixture.result
+    contract = original.artifact.frame_contract
+    mismatched_contract = replace(
+        contract,
+        exposure_seconds=contract.exposure_seconds * 2.0,
+    )
+    mismatched_artifact = replace(
+        original.artifact,
+        frame_contract=mismatched_contract,
+        readout_physical_context=replace(
+            original.artifact.readout_physical_context,
+            integration_seconds=mismatched_contract.exposure_seconds,
         ),
     )
-    for mismatched_target, message in mismatches:
-        with pytest.raises(ValueError, match=message):
-            repository._recover(replace(intent, target=mismatched_target))
+    mismatched = CalibrationComputation(
+        mismatched_artifact,
+        original.report,
+    )
+    monkeypatch.setattr(
+        analysis_impl,
+        "compute_calibration",
+        lambda _capture, _request: mismatched,
+    )
+    handle = _controller().start(_plan(capture_fixture, repository))
+    with pytest.raises(RunFailed) as failure:
+        handle.result(20.0)
+    assert failure.value.primary is not None
+    assert failure.value.primary.original_type == "ValueError"
+    assert "FrameContract" in str(failure.value.primary)
+    assert not repository.has(_expected_reference(repository.repository_id, mismatched))
     repository.close()
-    _append_pending_intent(root, intent)
+
+
+def test_source_capture_pulse_context_is_rederived_before_publication(
+    capture_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    repository = _repository(tmp_path, "pulse-context-mismatch")
+    original = capture_fixture.result
+    context = original.artifact.readout_physical_context
+    mismatched_artifact = replace(
+        original.artifact,
+        readout_physical_context=replace(
+            context,
+            integration_start_offset_seconds=(
+                context.integration_start_offset_seconds + 1e-9
+            ),
+        ),
+    )
+    mismatched = CalibrationComputation(mismatched_artifact, original.report)
+    monkeypatch.setattr(
+        analysis_impl,
+        "compute_calibration",
+        lambda _capture, _request: mismatched,
+    )
+
+    handle = _controller().start(_plan(capture_fixture, repository))
+    with pytest.raises(RunFailed) as failure:
+        handle.result(20.0)
+
+    assert failure.value.primary is not None
+    assert failure.value.primary.original_type == "ValueError"
+    assert "readout physical context differs" in str(failure.value.primary)
+    assert not repository.has(_expected_reference(repository.repository_id, mismatched))
+    repository.close()
+
+
+def test_pure_calibration_computation_cannot_enter_final_commit(
+    capture_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    repository = _repository(tmp_path, "pure-computation")
+    pure = CalibrationComputation(
+        capture_fixture.result.artifact,
+        capture_fixture.result.report,
+    )
     monkeypatch.setattr(
         repository_impl,
         "analyze_calibration",
-        lambda *_args, **_kwargs: pytest.fail("recovery reran calibration analysis"),
+        lambda _source, _request: pure,
     )
-    reopened = CalibrationRepository(
-        root,
-        repository_id=repository.repository_id,
-    )
-    assert len(reopened.startup_reconciliations) == 1
-    reconciliation = reopened.startup_reconciliations[0]
-    assert reconciliation.intent == intent
-    assert reconciliation.recovery.committed
-    assert reconciliation.recovery.result.result == committed.calibration_ref
 
-
-def test_online_commit_recovers_plain_error_after_manifest_became_visible(
-    committed,
-    monkeypatch,
-):
-    repository = CalibrationRepository(
-        committed.root / "lost-ack-calibrations",
-        repository_id="lost-ack-calibrations",
-    )
-    real_publish = ContentAddressedStore._publish_manifest
-    publish_calls = 0
-
-    def publish_then_lose_ack(self, *args, **kwargs):
-        nonlocal publish_calls
-        stored = real_publish(self, *args, **kwargs)
-        if self is not repository._store:
-            return stored
-        publish_calls += 1
-        raise OSError("directory fsync acknowledgement was lost")
-
-    monkeypatch.setattr(
-        ContentAddressedStore,
-        "_publish_manifest",
-        publish_then_lose_ack,
-    )
-    handle = committed.runtime.controller.start(
-        compile_calibration_artifact_plan(
-            committed.capture_ref,
-            committed.capture_repository,
-            repository,
-            committed.request,
-        )
-    )
-    reference = handle.result(20.0)
-    assert publish_calls == 1
-    assert handle.snapshot().final_committed
-    assert "publication acknowledgement" in (
-        handle.snapshot().commit_recovery_warning or ""
-    )
-    assert repository.load(reference).fingerprint
-    assert repository._journal.pending() == ()
-
-
-def test_close_refuses_inflight_commit_without_poisoning_owner(
-    committed,
-    monkeypatch,
-):
-    repository = CalibrationRepository(
-        committed.root / "close-inflight-calibrations",
-        repository_id="close-inflight-calibrations",
-    )
-    entered_publish = threading.Event()
-    release_publish = threading.Event()
-    real_publish = ContentAddressedStore._publish_manifest
-
-    def paused_publish(store, *args, **kwargs):
-        if store is repository._store:
-            entered_publish.set()
-            if not release_publish.wait(10.0):
-                raise TimeoutError("test did not release calibration publication")
-        return real_publish(store, *args, **kwargs)
-
-    monkeypatch.setattr(
-        ContentAddressedStore,
-        "_publish_manifest",
-        paused_publish,
-    )
-    handle = committed.runtime.controller.start(
-        compile_calibration_artifact_plan(
-            committed.capture_ref,
-            committed.capture_repository,
-            repository,
-            committed.request,
-        )
-    )
+    handle = _controller().start(_plan(capture_fixture, repository))
     try:
-        assert entered_publish.wait(5.0)
-        with pytest.raises(RuntimeError, match="outstanding commit authorities"):
-            repository.close()
-        assert repository._root_lease.active
-        assert repository.startup_reconciliations == ()
-        release_publish.set()
-        reference = handle.result(20.0)
-        assert repository.load(reference).fingerprint
+        with pytest.raises(RunFailed) as failure:
+            handle.result(20.0)
+        assert failure.value.primary is not None
+        assert failure.value.primary.original_type == "TypeError"
+        assert "CalibrationAnalysisResult" in str(failure.value.primary)
+        manifest_root = repository.root / "content" / "manifests" / "calibration"
+        assert not manifest_root.exists() or tuple(manifest_root.iterdir()) == ()
     finally:
-        release_publish.set()
-    repository.close()
-    assert not repository._root_lease.active
+        repository.close()
 
 
-def test_finalize_exception_abandons_prepared_calibration_authority(
-    committed,
-    monkeypatch,
-):
-    repository = CalibrationRepository(
-        committed.root / "abandoned-calibration-authority",
-        repository_id="abandoned-calibration-authority",
-    )
-    real_final_commit = CalibrationRepository.final_commit
-
-    def mint_then_fail(self, context, executed):
-        operation = real_final_commit(self, context, executed)
-        if self is repository:
-            assert operation.commit_id.startswith("calibration-final-")
-            raise RuntimeError("analysis failed after preparing calibration commit")
-        return operation
-
-    monkeypatch.setattr(
-        CalibrationRepository,
-        "final_commit",
-        mint_then_fail,
-    )
-    handle = committed.runtime.controller.start(
-        compile_calibration_artifact_plan(
-            committed.capture_ref,
-            committed.capture_repository,
-            repository,
-            committed.request,
-        )
-    )
-    with pytest.raises(RunFailed, match="failed after preparing calibration"):
-        handle.result(20.0)
-    assert repository._coordinator._authorities == {}
-    repository.close()
-
-    reopened = CalibrationRepository(
-        repository.root,
-        repository_id=repository.repository_id,
-    )
-    reopened.close()
-
-
-def test_startup_recovery_bounds_visible_manifest_before_decoding(tmp_path):
-    root = tmp_path / "oversized-recovery"
-    repository = CalibrationRepository(root, repository_id="bounded-recovery")
-    payload = b"x" * (repository.resource_policy.max_manifest_bytes + 1)
-    digest = sha256_digest(payload)
-    path = repository._store._manifest_path("calibration", digest)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
-    oversized_ref = CalibrationArtifactRef(repository.repository_id, digest)
-    with pytest.raises(CalibrationResourceExceeded, match="manifest exceeds"):
-        repository.has(oversized_ref)
-    target = CommitTarget(
-        repository.repository_id,
-        "calibration",
-        CALIBRATION_MANIFEST_SCHEMA,
-        f"calibration/{digest}",
-        digest,
-    )
-    intent = CommitIntent(
-        CommitKind.FINAL,
-        f"calibration-final-oversized-recovery-run-{digest}",
-        "oversized-recovery-run",
-        None,
-        target,
-        time.time(),
-    )
-    repository.close()
-    _append_pending_intent(root, intent)
-    with pytest.raises(CalibrationResourceExceeded, match="manifest exceeds"):
-        CalibrationRepository(root, repository_id=repository.repository_id)
-
-
-def test_recovery_requires_existing_target_directory_durability(
-    committed,
+def test_group_contexts_are_rejoined_to_the_admitted_capture_before_publish(
+    capture_fixture,
     tmp_path,
     monkeypatch,
 ):
-    root = tmp_path / "recovery-directory-durability"
-    _copy_calibration_repository(
-        committed.calibration_repository,
-        root,
-        include_journal=False,
+    repository = _repository(tmp_path, "context-mismatch")
+    original = capture_fixture.result
+    mismatched_report = replace(
+        original.report,
+        group_contexts=tuple(reversed(original.report.group_contexts)),
     )
-    repository = CalibrationRepository(
-        root,
-        repository_id=committed.calibration_repository.repository_id,
+    mismatched = CalibrationComputation(
+        original.artifact,
+        mismatched_report,
     )
-    loaded = repository._load_record(committed.calibration_ref)
-    intent = CommitIntent(
-        CommitKind.FINAL,
-        (
-            f"calibration-final-{loaded.derivation.analysis_run_id}-"
-            f"{committed.calibration_ref.manifest_digest}"
-        ),
-        loaded.derivation.analysis_run_id,
-        loaded.derivation.analysis_safety_bundle_id,
-        CommitTarget(
-            repository.repository_id,
-            "calibration",
-            CALIBRATION_MANIFEST_SCHEMA,
-            committed.calibration_ref.target_ref,
-            committed.calibration_ref.manifest_digest,
-        ),
-        time.time(),
-    )
-    repository.close()
-    _append_pending_intent(root, intent)
-
-    manifest_directory = (
-        root / "content" / "manifests" / "calibration"
-    ).resolve()
-    real_flush = content_store_impl.durability.flush_directory
-    failed_flushes = 0
-
-    def lose_manifest_directory_flush(directory):
-        nonlocal failed_flushes
-        if Path(directory).resolve() == manifest_directory:
-            failed_flushes += 1
-            raise OSError("manifest directory flush acknowledgement lost")
-        return real_flush(directory)
-
     monkeypatch.setattr(
-        content_store_impl.durability,
-        "flush_directory",
-        lose_manifest_directory_flush,
+        analysis_impl,
+        "compute_calibration",
+        lambda _capture, _request: mismatched,
     )
-    with pytest.raises(OSError, match="flush acknowledgement lost"):
-        CalibrationRepository(root, repository_id=repository.repository_id)
-    assert failed_flushes == 1
-    assert intent in PersistentCommitJournal(
-        root / "calibration-commit.journal",
-        repository.repository_id,
-    ).pending()
-
-    monkeypatch.setattr(
-        content_store_impl.durability,
-        "flush_directory",
-        real_flush,
-    )
-    reopened = CalibrationRepository(
-        root,
-        repository_id=repository.repository_id,
-    )
+    handle = _controller().start(_plan(capture_fixture, repository))
     try:
-        assert len(reopened.startup_reconciliations) == 1
-        assert reopened.startup_reconciliations[0].recovery.committed
-        assert reopened._journal.pending() == ()
+        with pytest.raises(RunFailed) as failure:
+            handle.result(20.0)
+        assert failure.value.primary is not None
+        assert failure.value.primary.original_type == "ValueError"
+        assert "group contexts" in str(failure.value.primary)
+        assert not handle.snapshot().final_committed
     finally:
-        reopened.close()
+        repository.close()
 
 
-def test_recovery_never_recreates_target_removed_after_validation(
-    committed,
-    tmp_path,
-    monkeypatch,
-):
-    root = tmp_path / "recovery-target-disappears"
-    _copy_calibration_repository(
-        committed.calibration_repository,
-        root,
-        include_journal=False,
+def _crash_after_calibration_manifest_publish(
+    capture_root: str,
+    capture_repository_id: str,
+    capture_digest: str,
+    calibration_root: str,
+    calibration_repository_id: str,
+    digest_sidecar: str,
+) -> None:
+    capture_repository = CaptureRepository(
+        capture_root,
+        repository_id=capture_repository_id,
     )
-    repository = CalibrationRepository(
-        root,
-        repository_id=committed.calibration_repository.repository_id,
+    calibration_repository = CalibrationRepository(
+        calibration_root,
+        repository_id=calibration_repository_id,
     )
-    loaded = repository._load_record(committed.calibration_ref)
-    intent = CommitIntent(
-        CommitKind.FINAL,
-        (
-            f"calibration-final-{loaded.derivation.analysis_run_id}-"
-            f"{committed.calibration_ref.manifest_digest}"
-        ),
-        loaded.derivation.analysis_run_id,
-        loaded.derivation.analysis_safety_bundle_id,
-        CommitTarget(
-            repository.repository_id,
-            "calibration",
-            CALIBRATION_MANIFEST_SCHEMA,
-            committed.calibration_ref.target_ref,
-            committed.calibration_ref.manifest_digest,
-        ),
-        time.time(),
-    )
-    manifest_path = repository._store._manifest_path(
-        "calibration",
-        committed.calibration_ref.manifest_digest,
-    )
-    repository.close()
-    _append_pending_intent(root, intent)
+    original_publish = ContentStoreAuthority.publish_manifest
 
-    real_confirm = ContentAddressedStore._confirm_manifest_durable
-
-    def remove_before_confirmation(store, namespace, digest, **kwargs):
-        if store.root == (root / "content").resolve():
-            ContentAddressedStore._manifest_path(
-                store,
+    def crash_publish(self, namespace, payload, *, expected_digest=None):
+        if namespace != CALIBRATION_ARTIFACT_NAMESPACE:
+            return original_publish(
+                self,
                 namespace,
-                digest,
-            ).unlink()
-        return real_confirm(store, namespace, digest, **kwargs)
-
-    monkeypatch.setattr(
-        ContentAddressedStore,
-        "_confirm_manifest_durable",
-        remove_before_confirmation,
-    )
-    with pytest.raises(FileNotFoundError):
-        CalibrationRepository(root, repository_id=repository.repository_id)
-    assert not manifest_path.exists()
-    assert intent in PersistentCommitJournal(
-        root / "calibration-commit.journal",
-        repository.repository_id,
-    ).pending()
-
-
-def test_visible_manifest_with_missing_blob_remains_pending(committed, tmp_path):
-    root = tmp_path / "missing-blob-recovery"
-    _copy_calibration_repository(
-        committed.calibration_repository,
-        root,
-        include_journal=False,
-    )
-    repository = CalibrationRepository(
-        root,
-        repository_id=committed.calibration_repository.repository_id,
-    )
-    manifest = decode(
-        repository._store.read_manifest(
-            "calibration",
-            committed.calibration_ref.manifest_digest,
+                payload,
+                expected_digest=expected_digest,
+            )
+        Path(digest_sidecar).write_text(sha256_digest(payload), encoding="ascii")
+        original_publish(
+            self,
+            namespace,
+            payload,
+            expected_digest=expected_digest,
         )
-    )
-    derivation_ref = ContentRef(
-        manifest["derivation_blob"]["digest"],
-        manifest["derivation_blob"]["size"],
-    )
-    repository._store._blob_path(derivation_ref.digest).unlink()
-    target = CommitTarget(
-        repository.repository_id,
-        "calibration",
-        CALIBRATION_MANIFEST_SCHEMA,
-        committed.calibration_ref.target_ref,
-        committed.calibration_ref.manifest_digest,
-    )
-    intent = CommitIntent(
-        CommitKind.FINAL,
-        (
-            f"calibration-final-{manifest['analysis_run_id']}-"
-            f"{committed.calibration_ref.manifest_digest}"
-        ),
-        manifest["analysis_run_id"],
-        manifest["analysis_safety_bundle_id"],
-        target,
-        time.time(),
-    )
-    repository.close()
-    _append_pending_intent(root, intent)
-    with pytest.raises(FileNotFoundError):
-        CalibrationRepository(root, repository_id=repository.repository_id)
-    replayed = PersistentCommitJournal(
-        root / "calibration-commit.journal",
-        repository.repository_id,
-    )
-    assert intent in replayed.pending()
+        os._exit(97)
 
-
-def test_repository_snapshots_policy_and_rejects_nested_authority_drift(tmp_path):
-    caller_policy = CalibrationResourcePolicy(max_manifest_bytes=96 * 1024)
-    repository = CalibrationRepository(
-        tmp_path / "policy-authority",
-        repository_id="policy-authority",
-        resource_policy=caller_policy,
-    )
-    object.__setattr__(caller_policy, "max_manifest_bytes", 1)
-    assert repository.resource_policy.max_manifest_bytes == 96 * 1024
-
-    object.__setattr__(repository.resource_policy, "max_manifest_bytes", 1)
-    with pytest.raises(RuntimeError, match="durability authority changed"):
-        repository.has(
-            CalibrationArtifactRef(repository.repository_id, "0" * 64)
+    ContentStoreAuthority.publish_manifest = crash_publish
+    reference = CaptureArtifactRef(capture_repository_id, capture_digest)
+    _controller().start(
+        compile_calibration_artifact_plan(
+            reference,
+            capture_repository,
+            calibration_repository,
+            _request(),
+            memory_limit_bytes=512 << 20,
         )
-
-    clean = CalibrationRepository(
-        tmp_path / "store-shadow-authority",
-        repository_id="store-shadow-authority",
-    )
-    with pytest.raises(AttributeError, match="immutable"):
-        clean._store.read_manifest = lambda *_args, **_kwargs: b"forged"
+    ).result(30.0)
+    os._exit(98)
 
 
-def test_repository_identity_drift_fails_before_analysis_or_publication(committed):
-    repository = CalibrationRepository(
-        committed.root / "identity-drift-calibrations",
-        repository_id="identity-drift-calibrations",
-    )
-    plan = compile_calibration_artifact_plan(
-        committed.capture_ref,
-        committed.capture_repository,
-        repository,
-        committed.request,
-    )
-    original = committed.capture_repository.repository_id
-    object.__setattr__(
-        committed.capture_repository,
-        "repository_id",
-        "drifted-captures",
-    )
-    try:
-        with pytest.raises(RunFailed, match="identity changed"):
-            committed.runtime.controller.start(plan).result(10.0)
-    finally:
-        object.__setattr__(
-            committed.capture_repository,
-            "repository_id",
-            original,
-        )
-    _assert_no_manifest(repository)
-
-    plan = compile_calibration_artifact_plan(
-        committed.capture_ref,
-        committed.capture_repository,
-        repository,
-        committed.request,
-    )
-    object.__setattr__(repository, "repository_id", "drifted-calibrations")
-    try:
-        with pytest.raises(RunFailed, match="identity changed"):
-            committed.runtime.controller.start(plan).result(10.0)
-    finally:
-        object.__setattr__(
-            repository,
-            "repository_id",
-            "identity-drift-calibrations",
-        )
-    _assert_no_manifest(repository)
-
-    plan = compile_calibration_artifact_plan(
-        committed.capture_ref,
-        committed.capture_repository,
-        repository,
-        committed.request,
-    )
-    original_store = repository._store
-    other = CalibrationRepository(
-        committed.root / "identity-drift-other",
-        repository_id=repository.repository_id,
-    )
-    object.__setattr__(repository, "_store", other._store)
-    try:
-        with pytest.raises(RunFailed, match="durability authority changed"):
-            committed.runtime.controller.start(plan).result(10.0)
-    finally:
-        object.__setattr__(repository, "_store", original_store)
-    _assert_no_manifest(repository)
-
-
-def test_executed_candidate_cannot_be_committed_by_same_id_other_root(
-    committed,
+def test_restart_recovers_manifest_visible_before_commit_ack(
+    capture_fixture,
+    tmp_path,
     monkeypatch,
 ):
-    repository_a = CalibrationRepository(
-        committed.root / "authority-a",
-        repository_id="shared-authority-id",
+    calibration_root = tmp_path / "crash-recovery"
+    calibration_repository_id = "recovered-calibrations"
+    sidecar = tmp_path / "published-digest.txt"
+    capture_fixture.repository.close()
+    process = multiprocessing.get_context("spawn").Process(
+        target=_crash_after_calibration_manifest_publish,
+        args=(
+            str(capture_fixture.root),
+            capture_fixture.repository_id,
+            capture_fixture.reference.manifest_digest,
+            str(calibration_root),
+            calibration_repository_id,
+            str(sidecar),
+        ),
     )
-    repository_b = CalibrationRepository(
-        committed.root / "authority-b",
-        repository_id="shared-authority-id",
+    try:
+        process.start()
+        process.join(60.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(5.0)
+            pytest.fail("crash-recovery child did not terminate")
+        assert process.exitcode == 97
+    finally:
+        capture_fixture.repository = CaptureRepository(
+            capture_fixture.root,
+            repository_id=capture_fixture.repository_id,
+        )
+    reference = CalibrationArtifactRef(
+        calibration_repository_id,
+        sidecar.read_text(encoding="ascii"),
     )
-    plan = compile_calibration_artifact_plan(
-        committed.capture_ref,
-        committed.capture_repository,
-        repository_a,
-        committed.request,
-    )
-    real_final_commit = CalibrationRepository.final_commit
+    verified: list[ContentRef] = []
+    real_verify_blob = ContentStoreAuthority.verify_blob
 
-    def redirect(self, context, executed):
-        if self is repository_a:
-            return real_final_commit(repository_b, context, executed)
-        return real_final_commit(self, context, executed)
+    def observe_verify(self, content, *, max_bytes=None):
+        verified.append(content)
+        return real_verify_blob(self, content, max_bytes=max_bytes)
 
-    monkeypatch.setattr(CalibrationRepository, "final_commit", redirect)
-    with pytest.raises(RunFailed, match="another durability authority"):
-        committed.runtime.controller.start(plan).result(20.0)
-    _assert_no_manifest(repository_a)
-    _assert_no_manifest(repository_b)
+    monkeypatch.setattr(ContentStoreAuthority, "verify_blob", observe_verify)
+    recovered = CalibrationRepository(
+        calibration_root,
+        repository_id=calibration_repository_id,
+    )
+    try:
+        reconciliations = recovered.startup_reconciliations
+        assert len(reconciliations) == 1
+        assert reconciliations[0].recovery.committed
+        assert sorted(item.size for item in verified) == [32 * 32, 32 * 32 * 8]
+        assert recovered.load(reference).source_binding.source_capture_ref == (
+            capture_fixture.reference
+        )
+        assert recovered.admit(reference, capture_fixture.repository).reference == reference
+    finally:
+        recovered.close()

@@ -1073,7 +1073,7 @@ RUNNING -> CANCELLING -> CANCELLED | FAILED
 
 waiting resource、arming、capturing、fitting、saving、finalizing、commit-reconciliation-blocked 是 phase，不是通用工作流状态。
 
-最终 artifact 的可见提交与 cancellation 使用同一个短原子 gate。`finalize` 可以在 gate 外构造和校验临时 artifact；`commit_final(FinalCommit)`只能使用owner Repository的`RepositoryCommitCoordinator`在startup reconciliation成功后铸造的opaque、不可变、单次 `CommitAuthority`。公开authority是无副作用handle：除冻结CommitTarget外不暴露`publish()`、journal、recover或callback；真正的`target/journal/publish/recover`快照只存在coordinator私有registry。普通plan只能携带handle，RunController通过内部consumer token原子pop签发快照；同一authority跨run/commit_id复用直接拒绝。lost-ack重试使用RunController已经持有的快照与稳定commit_id做reconciliation，不重新开放publish capability。随后在该Repository同一durability域持久化`CommitIntent(commit_id, run_id, safety_disposition_set_digest, CommitTarget)`。`CommitTarget`至少冻结repository_id、artifact_kind、artifact_format、target_ref与expected_manifest_digest，使重启后无需内存closure即可路由到唯一owner并验证目标内容。repository publish必须返回typed `PublishedManifest(target_ref, manifest_digest, result)`，owner快照逐字段匹配CommitTarget后才允许写COMMITTED，正常成功路径也不能跳过digest验证。返回类型错误、target/digest不符及其它确定性合同违例直接写ABORTED并失败，绝不能调用recover“洗白”；只有Repository明确抛出`PublishVisibilityUnknown`，表示atomic replace后可见性确实无法判定，才进入inspection-only recovery。intent fsync期间cancellation仍可受理。intent完成后在短内存gate内做最后一次CancellationToken checkpoint并关闭cancel gate，随后才允许manifest/rename publish：cancel先取得gate，则把intent幂等标为`ABORTED`、publish调用次数必须为0，run不能产生成功artifact；publish先取得gate，则之后的cancel明确返回`TOO_LATE_ALREADY_COMMITTED`（若run已terminal则为`ALREADY_TERMINAL`），不得把已经可见的成功artifact报成CANCELLED。长时间序列化、blob写入和intent fsync不在不可取消gate内；gate只保护最终可见发布及其结果判定。
+由 `RunController.requires_final_commit` 管理的最终 artifact，其可见提交与 cancellation 使用同一个短原子 gate。`finalize` 可以在 gate 外构造和校验临时 artifact；`commit_final(FinalCommit)`只能使用owner Repository的`RepositoryCommitCoordinator`在startup reconciliation成功后铸造的opaque、不可变、单次 `CommitAuthority`。公开authority是无副作用handle：除冻结CommitTarget外不暴露`publish()`、journal、recover或callback；真正的`target/journal/publish/recover`快照只存在coordinator私有registry。普通plan只能携带handle，RunController通过内部consumer token原子pop签发快照；同一authority跨run/commit_id复用直接拒绝。lost-ack重试使用RunController已经持有的快照与稳定commit_id做reconciliation，不重新开放publish capability。随后在该Repository同一durability域持久化`CommitIntent(commit_id, run_id, safety_disposition_set_digest, CommitTarget)`。`CommitTarget`至少冻结repository_id、artifact_kind、artifact_format、target_ref与expected_manifest_digest，使重启后无需内存closure即可路由到唯一owner并验证目标内容。repository publish必须返回typed `PublishedManifest(target_ref, manifest_digest, result)`，owner快照逐字段匹配CommitTarget后才允许写COMMITTED，正常成功路径也不能跳过digest验证。返回类型错误、target/digest不符及其它确定性合同违例直接写ABORTED并失败，绝不能调用recover“洗白”；只有Repository明确抛出`PublishVisibilityUnknown`，表示atomic replace后可见性确实无法判定，才进入inspection-only recovery。intent fsync期间cancellation仍可受理。intent完成后在短内存gate内做最后一次CancellationToken checkpoint并关闭cancel gate，随后才允许manifest/rename publish：cancel先取得gate，则把intent幂等标为`ABORTED`、publish调用次数必须为0，run不能产生成功artifact；publish先取得gate，则之后的cancel明确返回`TOO_LATE_ALREADY_COMMITTED`（若run已terminal则为`ALREADY_TERMINAL`），不得把已经可见的成功artifact报成CANCELLED。长时间序列化、blob写入和intent fsync不在不可取消gate内；gate只保护最终可见发布及其结果判定。当前 `CaptureFitResultRepository.save()` 是 notebook/direct CAS 保存面，不携带 Run final-commit authority；publish acknowledgement 丢失时不返回成功 ref，可见但未被调用者引用的 manifest 只算 content-addressed orphan。它尚未纳入上述 lost-ack coordinator，不能被本轮 raw Capture/Calibration repository 的闭合结论代称为“全部 capture artifact 已闭合”。
 
 `CommitTarget` journal 的字段名切换是 current-only durable protocol cutover：部署新软件前必须完成 startup reconciliation 并确认没有 pending 旧 intent；本项目不保留双 reader，也不建立在线 upgrade fallback。若现场仍存在 pending intent，先用旧 release 完成或明确终止该提交，再部署新 release。
 
@@ -1670,7 +1670,7 @@ WorkbenchFitRequest 是 workbench Command DTO，可持 app-local LiveDataBlockRe
 
 batch cell 独立执行；预先列举的数值初始化/solver/evaluation-limit/timeout/浮点或线性代数失败只使该格产生 typed status，某格失败或收敛后被拒绝时仍保留其它格结果。输入整体 schema/model 不兼容、transform 无效、cancellation，以及 AssertionError/TypeError/MemoryError 等未知实现或资源异常必须中止整个 Fit Analysis，不能被 broad `except Exception` 伪装成单格 solver failure。FitResultBatch 不包含 runtime EventRef、LiveDataBlockRef 或 ArtifactRef；formal Analysis/figure repository adapter 在外层附加 input lineage。它不拆成多个 scalar signal，overlay 从同一个 result 与外层 lineage 派生。
 
-FitResultBatch 是 compact solver-issued report，不是把原始坐标、observation、Jacobian 重复塞进去的 proof-carrying result。构造器/strict codec 验证状态机、静态 domain/constraint、计数、RSS、R²、covariance 的有限性/对称/PSD/fixed-row与 canonical zero；RMSE、effective schema fingerprint、coordinate source、parameter schema/unit、initializer/solver identity 都由已保存的 FitSpec/AxisSpec/catalog 唯一派生，不在 payload 再存第二份真相。动态 geometry/Jacobian/alias acceptance 由执行时的可信 solver path 唯一拥有。raw codec decode 只能得到 untrusted report；public formal 保存只接受 `CaptureFitResultRepository.execute()` 铸造的 process-local `FitExecution`，load 返回 capture-specific `AdmittedCaptureFitResult`。outer manifest 只含 current format、repository id、owner-encoded source CaptureArtifactRef 与 owner-encoded result ContentRef：result blob digest 就是 result digest，DatasetRevisionRef/FitSpec/solver contract 只在 FitResultBatch 内各存一次。load 时重新 admit source capture、由 block+generation 重建 OwnedSnapshot，并调用 zlc_data 的唯一 binding validator 交叉验证 source/spec/axes/layout/counts；它明确**不重跑 solver，也不从 parameters 反推证明一次历史数值执行**。这里的 admission 信任边界是由 OS/process root lease 排他的本地 repository writer 加 CAS 内容完整性：正常 public API 不能把任意 decoded FitResultBatch 升为 formal artifact；若外部主体能绕过 API 直接改写 repository filesystem，则没有密钥/签名的本地 artifact 都不具备 producer attestation，必须按 untrusted repository 处理，不能增添一个自报 producer digest 或伪 journal 冒充证明。若 manifest/source revision 无法验证，则只能显示诊断或从源 revision 重算。
+FitResultBatch 是 compact solver-issued report，不是把原始坐标、observation、Jacobian 重复塞进去的 proof-carrying result。构造器/strict codec 验证状态机、静态 domain/constraint、计数、RSS、R²、covariance 的有限性/对称/PSD/fixed-row与 canonical zero；RMSE、effective schema fingerprint、coordinate source、parameter schema/unit、initializer/solver identity 都由已保存的 FitSpec/AxisSpec/catalog 唯一派生，不在 payload 再存第二份真相。动态 geometry/Jacobian/alias acceptance 由执行时的可信 solver path 唯一拥有。raw codec decode 只能得到 untrusted report；public direct 保存只接受 `CaptureFitResultRepository.execute()` 铸造的 process-local `FitExecution`，load 返回 capture-specific `AdmittedCaptureFitResult`。outer manifest 只含 current format、repository id、owner-encoded source CaptureArtifactRef 与 owner-encoded result ContentRef：result blob digest 就是 result digest，DatasetRevisionRef/FitSpec/solver contract 只在 FitResultBatch 内各存一次。load 时重新 admit source capture、由 block+generation 重建 OwnedSnapshot，并调用 zlc_data 的唯一 binding validator 交叉验证 source/spec/axes/layout/counts；它明确**不重跑 solver，也不从 parameters 反推证明一次历史数值执行**。这里的 admission 信任边界是由 OS/process root lease 排他的本地 repository writer 加 CAS 内容完整性：正常 public API 不能把任意 decoded FitResultBatch 升为 durable direct artifact；若外部主体能绕过 API 直接改写 repository filesystem，则没有密钥/签名的本地 artifact 都不具备 producer attestation，必须按 untrusted repository 处理，不能增添一个自报 producer digest 或伪 journal 冒充证明。当前 direct save 不是 RunController final commit，不能把一次 publish lost-ack 宣称成 SUCCEEDED；若 manifest/source revision 无法验证，则只能显示诊断或从源 revision 重算。
 
 FitResultBatch 是当前一等需求，不延后：gridplot、site grid 和任何保留 site/component axis 的 fit 都要求“一组共享 model/parameter schema + 按具名 batch axes 排列的每格结果”。`BatchLayout` 复用 PointLayout 的 RECT_C/RECT_F/EXPLICIT 映射思想；稀疏 batch 只保存实际 B 个 cell，missing coordinate 与 fit failure 是不同状态，不能强行 densify 后混成 NaN。grid 的 cell label/coordinate 由 batch_axis_specs + BatchLayout/axis coordinates 派生，不能用 list index 充当永久 identity。ComponentValidity 在 build_fit_problem 时按 batch cell 切片；某个 site 无效只使对应 per_batch_status 失败，不污染其它 cell，也不允许先对 site 轴平均成一个 FitResult。`build_fit_problem` 是 fit densify/packing 的唯一 owner；若某 solver 只接受 dense layout，它必须显式 materialize mapping+validity或在 bind 时拒绝，不由 renderer/collector 猜 reshape。
 
@@ -1922,30 +1922,44 @@ Calibration 是 `neutral_atom.readout.calibration` 的内建 feature，不使用
 ### 13.1 Artifact
 
 ```text
+ReadoutFeature =
+    BoxFeature
+  | PerSitePsfFeature
+  | UniformPsfFeature
+
+ReadoutModel:
+  feature: ReadoutFeature
+  thresholds: ndarray[site]
+  usable_sites: ComponentValidity[site]
+
 CalibrationArtifact:
-  source_binding
+  source_binding: (CaptureArtifactRef, CalibrationCaptureLayout)
   frame_contract
   site_map
   models: tuple[ReadoutModel, ...]  # non-empty, kind unique, canonical order
-  default_model_kind: ReadoutModelKind | None
-  parameters
-  fingerprint  # derived from current canonical content
+  default_model_kind: ReadoutModelKind
 
-ReadoutModel =
-    BoxReadoutModel
-  | PerSitePsfReadoutModel
-  | UniformPsfReadoutModel
+CalibrationReport:
+  request
+  software_lineage  # passive numpy/scipy text only
+  group_contexts    # 每组完整的 (AxisId, logical index)，不匿名 flatten
+  reference_average + reference_average_validity
+  reference_box_signals
+  labels + split + per-model short_signals/short_validity
+  thresholds/polarity/fidelity/ablation + PSF diagnostics
+
+CalibrationAnalysisRequest spatial intent:
+  expected_centers_xy: optional ndarray[site, xy]  # preview 可省略，正式提交必需
+  maximum_site_residual_px: optional positive float # 与 expected_centers_xy 成对
 ```
 
-一次 calibration 可产生共享 artifact 中的多种 model，但正式 `CalibrationArtifact` 只表示一次完整、原子成功的校准：`models` 必须非空，每种 `ReadoutModelKind` 最多一个，并按 kind 排成 canonical 顺序。site-map-only 是完整 `SiteMap` 结果（将来若有持久化用例则定义独立 `SiteMapArtifact`），不能用半完成 `CalibrationArtifact`、stage 或 capability flags 冒充成功校准。Analysis request 中的 `model_kinds` 属于冻结请求/derivation；repository 验证实际 model kinds 与请求一致，不把同一集合再复制进 artifact。
+一次 calibration 可产生共享 `SiteMap` 的多种 model。feature 表示训练前已经确定、且训练/运行共同执行的信号提取数学；model 只再绑定阈值和可用 site。这个两层结构有两个真实消费者，不能合并：analysis 必须先提取 short signal 才能学习 threshold，runtime 必须执行同一 feature；但不存在再镜像一遍 feature 字段的 `ReadoutFeatureSpec`。`models` 必须非空、kind 唯一并按 `ReadoutModelKind` 声明顺序排列，`default_model_kind` 必须命中已有 model，不保留 optional/default-policy 包装或 tuple-first 猜测。
 
-Readout model 的唯一选择身份是 `CalibrationArtifactRef + ReadoutModelKind`。每个 concrete model 的 union kind、阈值、方向、boxes/kernels/background、参数和 quality evidence 已被 artifact content fingerprint 覆盖，因此不再保存与 kind 一一映射的 `model_id/model_version`，也不为同一事实建立 `DefaultModelPolicy` 包装。Occupancy request 可显式给 kind；未给时只允许使用 artifact 的 `default_model_kind`，或在 artifact 恰有一个 model 时选择该唯一 model；多 model 且无 default 必须在 request 构造时明确报歧义，永不按 tuple 第一项猜。若以后真实出现同一 artifact 中多个同-kind model 的第二个生产用例，再引入有业务含义的 selector 或 individual-model content digest，不能恢复数字改稿版本。
+所有 ndarray 在领域值构造边界复制为 C-contiguous read-only owner。`CalibrationArtifact` 不保存 fingerprint、FrameContract/SiteMap fingerprint 镜像、model header、quality evidence、generic parameter bag 或资源证明；内容身份只由 durable codec bytes 和 CAS `ContentRef` 拥有。Repository 的 typed decode 构造领域值一次，之后信任 immutable type，不为防 `object.__setattr__`、pickle 或反射攻击在 getter/worker 中反复重编码、重哈希或 replay 科学算法。
 
-`ReadoutFeatureSpec` 与 `CalibrationArtifact` 在构造边界把所有 ndarray 复制/归一化为 bytes-backed immutable owner，并从 owner codec 的 canonical tree 计算一次 fingerprint；后续 lineage 读取只返回该冻结 digest，不重复投影/编码整件大数组。Repository load/admit 仍在 bytes/CAS/typed codec 边界验证内容与 ref，worker mint 仍核对 admitted artifact ref、FrameContract、SiteMap/model applicability。恶意 `object.__setattr__` 反射替换 frozen 字段不属于 Python 进程内安全模型，不能以它为理由让每个 getter 重哈希整件 calibration。
+quality、阈值诊断、PSF fit、train/test split 和 drop-worst ablation 只住在 `CalibrationReport`，不复制进 runtime model。report 必须保留 short signal 的 component validity，坏 component 不能在图、histogram 或统计中被当成零。NumPy/SciPy 版本只作为 report 中两条被动文本 lineage 随 blob 保存；读取端不与当前环境比较，它不参与准入、重放、格式选择或模型适用性。不存在 backend schema、定宽版本字段、模拟升级测试或 WorkPlan binding。
 
-`ReadoutModelQuality` 只表示已经通过准入的完整 per-site evidence，因此不保存调用方可随意写成 `True` 的 `gate_passed`；失败证据属于 `CalibrationAnalysisDiagnostics`，不能进入正式 artifact。描述 exact-binomial/IUT/Holm 等统计语义的 `quality_gate_id`、`reference-valley-gate-id` 与 `reference-ambiguity-gate-id` 必须保留；纯改稿数字 `*_version` 必须删除。artifact、analysis result、derivation 与 manifest 也不复制单一 producer 的 `algorithm_id/version`：request/work-plan/partition/diagnostics/source evidence、artifact fingerprint 与 plan binding 已构成 repository authority，SiteDetectionLineage 直接覆盖这些事实。
-
-NumPy/SciPy 的版本只作为 `CalibrationArtifact.parameters` 顶层的有界、只读 producer lineage 备注。当前 producer 尽力写入两条备注；读取端允许备注缺失或为 `unknown`，不能因此拒绝 load/admit。它们不进入 WorkPlan、模型参数、SiteMap/detection lineage、derivation、manifest 专属字段、科学兼容性判断或 replay，也不与当前进程环境比较。artifact 的 CAS/fingerprint 仍像覆盖其它持久字节一样覆盖这些备注；这是内容完整性，不是数值后端准入权威。资源计划对两条备注使用固定宽度上界，因此环境版本字符串不能改变 WorkPlan 或 plan binding。
+Readout model 的选择身份只有 `CalibrationArtifactRef + ReadoutModelKind`。运行时 fluorescence 物理不变量固定为 `occupied = signal > threshold`，不持久化 per-site polarity；short calibration 若拟合出 `bright_above=False`，该 site 在 `usable_sites` 中明确无效，绝不能把 `< threshold` 变成另一种 runtime 模式。feature/site/model 的 `ComponentValidity` 逐层取交集；无效 signal 与 occupied 使用规范 filler，但消费者必须读取 validity，不能把 `False` 解读为 dark atom。
 
 ```text
 FrameContract:
@@ -1959,14 +1973,41 @@ FrameContract:
 SiteMap:
   stable site AxisSpec
   site coordinates in the same coordinate frame
-  detection/selection lineage
+  component validity
 ```
 
 Camera geometry、ROI/binning 整除、output shape、spatial axis 与 real-count dtype 的纯规则只由 `zlc_neutral_atom.readout.contracts` 拥有；`CameraCaptureDescriptor`、`FrameContract` 与 runtime `CameraPhysicalFacts` 各自仍验证本对象的完整合同，但必须委托同一组规则，不能复制第二套物理公式。
 
-所有会改变数值解释的采集设置都进入 FrameContract fingerprint。CalibrationAnalysisRequest 明确列出所需 `model_kinds`；所有请求 model 成功并产生完整质量证据后才原子提交 CalibrationArtifact，不能把部分失败 artifact 当成功。每个 model 保存自己的参数、适用 FrameContract/SiteMap fingerprint 与全部 per-site 质量证据；正式 artifact 的实际 kind 集合必须和持久 request 相同。
+所有会改变数值解释的采集设置都进入 `FrameContract`；artifact 构造时一次验证 SiteMap coordinate frame、site coordinates、feature boxes 和 model axes 与该合同一致。公共 notebook/API application 必须提交 `CalibrationArtifact + 当前 FrameContract + frame`，因此相同 shape 但 exposure、ROI origin、optical path 或 camera identity 不同的 frame 也会拒绝；裸 `ReadoutModel + frame` operator 是 package 内部的已绑定 hot path，不是 public API。Occupancy bind 再把完整 capture `FrameContract` 与 artifact 比较一次，因为这是“当前物理输入适用性”而不是重复验证 artifact 内部结构；绑定后 hot path 信任该事实，不再逐帧复制 frame/site/model digest 或 FrameContract 检查。
 
-### 13.2 输入
+`FrameContract` 只回答 camera 如何解释一帧，不能单独证明该帧曝光时原子装置经历了同样的 pulse 条件。因此权威 calibration 还必须保存由 **CaptureArtifact 中已经冻结的 camera physical facts 与 pulse lineage** 派生的 `ReadoutPhysicalContext`；调用者不能提交一个自报 context/digest 来给自己作证。context 绑定 pulse-owned `target_abi_fingerprint`，使 raw lane、logical port 到 lane 的映射、DAC bus index/width/encoding/safe value 与 latch clock 任一改变都会拒绝旧 calibration；它不是 whole-artifact fingerprint，也不把无关 pulse 编译细节误当成适用性。
+
+每个 readout event 先把已经包含 channel delay 的物理 trigger 上升沿作为时间锚，再用 camera-qualified integration-start offset 和实际 exposure 得到严格半开窗口 `[start, end)`。当前实现只有 nullable scalar offset，**尚不存在**名为 `CommonFrameAperture` 的类型级证明；该名字只描述 Q0 以后才能发布的能力。开放 scalar 权威路径前，E0/Q0 必须对具体 sensor mode、applied global-exposure mode、ROI 与 readout speed 证明全部输出像素共享同一个 integration aperture，并由届时的 typed capability 承载；只读取到一个 global-exposure 枚举值或非空 scalar 不构成证明。若 qCMOS 实际是 rolling/per-row aperture，当前 scalar capability 必须继续为 `None`/NO-GO；必须先引入与 spatial-y/component axis 对齐的 typed aperture model并逐 component 派生适用性，禁止拿平均行、首行或一个经验 offset 代表整帧。
+
+EDGE trigger 下 trigger 只负责锚定，trigger high width/下降沿不作为被测物理条件；context 收集窗口起点的完整状态以及窗口内所有其它 logical digital output 和 decoded DAC value transition。窗口起点 transition 进入初态，恰在 `end` 的 transition 不进入本帧。有限 pulse 在 DONE 时的真实 bus safe 行为同样属于物理 waveform：RTL 在 DONE 边界清除 undelayed bus，registered 输出从下一 tick 可见 safe；每个物理 bus 再按其冻结 delay 后移，因此 safe transition 位于 `DONE + 1 + bus_delay`。若它落入曝光窗就必须写入 context，不能只展开用户编程的 DAC segment。compact repeated DAC 或 live ramp 若无法从当前 TargetIR 无歧义展开则 fail closed，绝不猜中间值。
+
+同一 calibration capture 的全部 repeat/point/event 必须派生完全相同的 `ReadoutPhysicalContext`，否则不能把帧混成同一个训练总体。source re-admit 会从持久 pulse lineage 重新派生并比较；triggered occupancy 在任何 camera arm/FPGA FIRE 之前从当前 camera capability、当前 compiled pulse/cell plan 重新派生并与 artifact 比较。裸 `apply_calibration(artifact, Value)` 只保留为明确的非权威纯数值函数：它验证结构/schema，但没有物理 lineage，不能产生或冒充正式 occupancy artifact。qCMOS 当前尚未资格化 edge-to-integration offset，adapter 必须发布 `None`；因此它可以做诊断 capture，但权威 calibration/triggered occupancy 会明确拒绝，不能默认猜 `0`。VirtualCamera 的已声明 offset 为 `0`，可用于离线/E2E 验证。
+
+Calibration 的计算事实与提交权威是两个不同类型。`CalibrationComputation(artifact, report)` 只表示纯计算已经通过 artifact/report 绑定校验；该构造边界也是“detector centers 符合 request 中可选 spatial intent”的唯一 owner，后续边界信任这个不可变类型，不重复计算 residual。公共 `compute_calibration(CaptureArtifact, request)` 和 package-private 的 raw-frame oracle 都只返回该非可提交类型。只有 `analyze_calibration(AdmittedCapture, request)` 会在计算前要求 request 含独立 spatial intent，并从 repository 已承认的原始 capture 铸造 closed `CalibrationAnalysisResult`；这个结果类型携带“意图存在且已由 CalibrationComputation 绑定验证”和同一次 process-local repository/journal admission。`final_commit` 只重新核对它自己拥有的 source ref、FrameContract/layout、逐组 context 与精确 admission，不再重验 site residual。加载已有 report 时可以复用 `CalibrationComputation` 的纯绑定验证，但不能借 decode 把它升级成提交权威。这个类型级边界消除了 SiteMap/feature/threshold 与另一份 report 错绑后被提交的路径；producer 内部仍直接核对 source layout、grid、frame shape、site count、model kinds/default、逐 model threshold、由 held-out evidence 推导的 usable mask，以及 request 声明的 feature 类型/box/PSF geometry，作为实现自检；不恢复 artifact fingerprint 或 proof graph。
+
+Repository 将 runtime `CalibrationArtifact` 与 diagnostic `CalibrationReport` 分成两条读取面：manifest 只配对一个小型 typed artifact blob 和一个 report-metadata blob；全分辨率 `reference_average(<f8)` 与 validity 使用两个 raw CAS blob，由 metadata 的 owner-encoded `ContentRef` 引用。`load()/admit()` 只读取 manifest+artifact，绝不为 occupancy 拉入 report、平均图、validity 或 SciPy；只有显式 `load_report()` 才按内存预算 materialize diagnostics。写入端在编码或复制全分辨率诊断前先按已知 shape/dtype 做峰值 admission，metadata 产生后再做精确第二次检查；在发布 manifest 前还必须用读取端同一个 size/structure/typed decoder 做 round-trip，不能生成自己无法读取的 FINAL。pending recovery 对 raw arrays 使用有界流式 hash，不 materialize 大图，也不重跑 detector、fit 或 threshold。Repository 锁只保护 open/commit 状态与 coordinator 线性化点，CAS read/write、report decode 和大数组复制全部在锁外；因此 GUI 打开 report 不能阻塞并发 runtime admission。
+
+### 13.2 算法权威与明确偏离
+
+Calibration/readout 的唯一物理算法权威是 `main@6c337d49c7086fa0ff21f879cd159bdf0e753f51` 的实际代码；任何旁路归档、旧迁移样本或本设计文档都不能反向定义 production 合同。当前实现逐项继承：全部 reference frame 平均、Gaussian smooth/local maxima/5×5 subpixel refine、separable lattice repair、四种 grid order、3×3 BOX mean 默认及 mean/sum/median/max、7×7 empirical PSF 与 annulus-median、uniform PSF、96-bin quick Otsu、pooled per-site bimodal strict consensus、per-site/per-class 90/10 seed-0 split、120-bin common edges、empirical balanced threshold、held-out/model/global fidelity 与 drop-worst ablation。训练和 runtime 共同调用唯一 feature extractor。
+
+对旁支 commit `a82c29a5bc34c5df669d5e26e1e5b311f4787a08` 的机械对账确认：它不是当前分支 ancestor，其中的 SiteTopology/SiteRegistration、anchor/Hungarian assignment 与四组外部 fixture 均不进入本设计。它揭示的有效不变量是 main strongest-N detector 在“真实 site 变暗，同时出现更亮伪峰”时可能产出另一个自洽但物理错误的规则格；仅凭同一张图的 peak count、lattice residual 或规则性在信息上无法区分真格与假格。因此 exact-main detector 一行不改，但正式 authority 增加独立空间意图 gate：`expected_centers_xy` 必须按当前 ordering/FrameContract 给出粗略逐 site 位置，`maximum_site_residual_px` 给出显式容差；detector 结果不吸附、不重排、不替换，只要任一 site 超限就拒绝。无该意图的 `compute_calibration` 仍可生成非权威 preview；`analyze_calibration` 在昂贵计算前拒绝缺失意图的请求，成功返回的 closed `CalibrationAnalysisResult` 则成为后续提交边界信任的类型证明，不在 authority mint/final commit 重做同一 residual 校验。Workbench 可以显示 detector 建议并让用户明确核对，也可以从先前已 admit 的同物理 FrameContract calibration 预填；不能把同一次 detector 输出无提示地自动回填成自己的权威证据。
+
+只保留四个有明确错误依据的偏离，并分别使用同帧/物理不变量测试：
+
+- non-finite/invalid reference observation 不得因为 boolean filler 变成 dark；缺少 required PSF pixel 时整 site invalid，不 renormalize kernel 改变信号尺度；训练 annulus 只消费有效 pixel，uniform kernel 只平均有效 site，invalid placeholder 不得污染其它 site；BOX finite-only reducer 仅在至少有一个有效 pixel 时有效，BOX-only request 不执行或受 PSF geometry 约束；
+- short signal 出现反 fluorescence polarity 时 site invalid，runtime 仍只执行 `>`；
+- 完全无判别力的 site 即使产生有限 threshold，也只有 chance-level `0.5` held-out balanced fidelity，不能进入 runtime；request 只增加一个显式 `minimum_site_fidelity`（默认 `0.5`，usable 必须严格大于），不恢复 Holm/Clopper/valley 等无 main 依据的统计 gate，也不因单 site 低质量拒绝整件 artifact；
+- 模型适用性使用完整 `FrameContract` 和 component validity，不再只按 array shape 猜相机/ROI/setting。
+
+冻结的 `tests/fixtures/main_readout_oracle.npz` 只含 raw synthetic camera frames和由上述 exact main commit 产生的 expected arrays；测试不在运行时 import 另一棵工作树或任何其它算法实现，也不用新实现同款公式生成期望。它完整覆盖 detector、三种 feature、labels/split、quick/formal threshold、fidelity/ablation、PSF diagnostics、runtime occupancy 和 `(R,P,site)` 保形；单独的 intentional-difference tests 才覆盖上述四处纠错。真实 CaptureArtifact E2E 另外锁定相机 `ValidityContract` 接缝：VALUE 只能生成整帧 VALID/INVALID，局部坏像素保守使整帧 invalid；只有 schema 已声明 COMPONENTS 时才沿声明轴保留 component mask，不能伪造 y/x validity。
+
+### 13.3 输入
 
 ```text
 CalibrationInput =
@@ -1976,25 +2017,41 @@ CalibrationInput =
 
 neutral domain/runtime 不接受“执行时读取 session current calibration”、裸 filesystem fallback 或 legacy path search。Notebook facade 构造 Occupancy/Detection/Scan request 时必须显式接收并 load/admit `CalibrationArtifactRef`，验证 readout binding，解析显式/default/唯一 model，并把具体 ReadoutBindingKey、CalibrationArtifactRef 与最终 `ReadoutModelKind` 冻结进 request。若 ref 缺失、binding/FrameContract/model 不适用或选择歧义，request 构造/preflight 失败；运行中不存在可切换的 facade current pointer。Workbench 同样在用户点击 Run 时冻结用户明确选择的 ref，而不是让 processor 回查 mutable session或按 repository 最近文件猜。
 
-### 13.3 执行
+### 13.4 执行
 
 ```text
 CalibrationTask:
   LiveCalibrationInput:
     CaptureSession -> CaptureRepository.atomic_put -> CaptureArtifactRef
   CaptureArtifactInput:
-    validate/load CaptureArtifactRef
-  -> bind CalibrationAnalysisStep(capture_artifact, parameters)
-  -> 同一个 calibrate(capture_artifact, parameters)
-  -> CalibrationRepository.atomic_put
+    CaptureRepository.admit(CaptureArtifactRef) -> AdmittedCapture
+  -> analyze_calibration(admitted_capture, explicit request)
+       -> compute_calibration(admitted_capture.artifact, explicit request)
+       -> CalibrationComputation(artifact, report)          # internal pure stage
+  -> CalibrationAnalysisResult(computation + exact source admission)
+  -> CalibrationRepository.final_commit(runtime artifact + diagnostic metadata/raw arrays + manifest)
   -> CalibrationArtifactRef
 ```
 
-live 路径先提交原始 CaptureArtifact，再与 offline 路径汇合；算法或模型质量 gate 失败时不产生 CalibrationArtifact，但原始 capture 仍可用于诊断和重跑。virtual/real 只在 CaptureSession adapter 不同，提交后的校准代码完全相同。
+live 路径先提交原始 CaptureArtifact，再与 offline 路径汇合；detector/feature/model 无法构造完整请求结果时不发布 CalibrationArtifact，但原始 capture 仍可诊断和重跑。低 fidelity 本身是 report evidence，不由没有 main 依据的 Holm/Clopper/valley gate 擅自拒绝整个校准；具体坏 site 通过 `usable_sites` fail-closed。virtual/real 只在 CaptureSession adapter 不同，提交后的 calibration 代码完全相同。
 
-不需要 CalibrationService、child Measurement Run、calibration StreamProcessor 或 reducer 包装。普通批量校准就是 neutral-owned `CalibrationAnalysisDefinition` 绑定出的 AnalysisStep，在该 Task 的 run-owner/必要时 disposable compute process 中运行，不占用 view/Fit executor，并受同一 RunHandle cancellation/revision 管理。只有出现一个必须在采集完成前产生控制反馈、且不能保存原始样本后批处理的真实用例，才另行设计领域 StreamReducer；baseline 不为 calibration 预留它。
+当前 qCMOS 真机 calibration 还有必须由 E0 硬件事实关闭的 gate，但软件侧不能继续把本可读取的事实留成猜测。adapter 已在完整配置事务结束后一次读取并冻结实际 `EXPOSURETIME`、`TIMING_MINTRIGGERINTERVAL`、readout speed、sensor mode、trigger-global-exposure 以及 trigger source/active/polarity；qCMOS 的 minimum interval 必须严格为有限正数，trigger trio 必须仍是 external/edge/positive，无法读取、后续 ROI 操作改变 trigger mode或配置中途失败都会清除旧 working-point proof。ROI 写入按 `SUBARRAY OFF -> zero positions -> sizes -> final positions -> SUBARRAY ON/readback` 完成。所有 public configure 路径在取得 acquisition lock 前后都检查 arming/armed，关闭同线程 RLock 重入与跨线程 B→A 的 ABA；`cap_start` 后还重新从硬件读取完整 working point，任何 drift 都先 stop/release/disarm并失败，因此 camera endpoint 在 FPGA FIRE 前比较的是 arm 后真实 readback fingerprint，不是配置期缓存。
 
-Occupancy request 携带 CalibrationArtifactRef 和已解析的 `ReadoutModelKind`；RunPlan 在绑定 `OccupancyStreamProcessor` 前解析并 admit immutable CalibrationArtifact，验证 artifact fingerprint/evidence/commit、输入 sample/capture 的 FrameContract、SiteMap/coordinate frame、model kind 与 applicability。任何 mismatch 明确失败，不按相同 shape 猜“应该兼容”。
+compiled binder 现在会用上述冻结 working point 对**同一 artifact 内相邻 trigger**做 fail-before-arm 的最小间距检查；这不等于已经证明 arm-ready 到第一沿、最后一沿到 drain/下一 run 第一沿的跨边界余量，后两者仍必须由 Q0/E0 qualification 给出。更根本的实验 gate 也仍存在：adapter 配置 `TRIGGERACTIVE.EDGE`，一次 arm 只有一个 hardware `EXPOSURETIME`；checked-in calibration pulse 的 20 ms/5 ms/20 ms 只是 FPGA period/probe-window 时长，不能被软件宣称为三种相机曝光。E0 必须证明 edge-to-integration offset、所选 trigger mode 的曝光语义、每沿一帧/顺序/不漏、arm/first-edge 与 run-boundary margin；若相机只支持 per-arm 固定曝光，bracket 必须改成物理可实现且算法语义正确的协议，不能把 pulse width 冒充 camera exposure。virtual 帧通过、计数最终相等或 GUI 上看见三帧都不能替代该证明；这些事实资格化前 qCMOS 正式 calibration 用户路径仍为 NO-GO。该 gate 优先使用相机与现有 FPGA 的硬件时序，不自动授权 RTL/bitstream 变更。
+
+CaptureArtifact 的大帧面只有一个公共 owner：`frame_source: CaptureFrameSource`。它保存完整 `DatasetSchema`、block/revision、精确 cell schedule、event-order metadata 与固定大小 raw frame chunks；不再并列暴露 `.block`、`.event_metadata`、`.source_cell_schedule` alias，也不保留旧 whole-DataBlock blob reader。chunk 以约 64 MiB 为目标并受 repository policy 上限约束；普通 `load/admit` 只验证 manifest/index及 chunk refs，实际 `read/iter_cells` 首次用到某 chunk 时核验其 size+SHA，pending-commit recovery 才逐块流式全验。这里的 admission 证明 commit/journal authority 与索引可解析，不等于全介质健康扫描；未读取 chunk 的损坏会在第一次读取/计算时以内容损坏明确拒绝。显式 `materialize(memory_limit_bytes=...)` 是唯一 whole-dataset 入口，预算同时包含最终 block、构造 copy、validity 与最大单 chunk scratch。index 写入和读取共用同一个 size、canonical-node/container、typed reconstruction 和 re-encode owner；任何 writer 自己读不回的 index 在 manifest 可见前拒绝。compiled capture plan 在任何 camera arm/FPGA fire 前取得 repository root borrow；close 若先赢则 run 在硬件前拒绝，run 若先赢则 borrow 阻止 repository 在 finalize/cleanup 前关闭，不能完成硬件后才发现保存根已经失效。
+
+frame bytes 的 invalid/component-invalid/NaN 规范化只由 `zlc_data.canonical_value_array` 拥有：普通 C-contiguous uint16 VALID frame 返回原 view，不为 hash/持久化前检查复制整帧；Capture repository 仅在真正写 CAS 的边界转为 bytes。schema-level INVALID 沿用既有 `canonical-invalid-values` event digest，component-invalid 则以相同 mask 与零 filler 产生相同 identity，不能让两条路径漂移。float/complex NaN payload canonicalization 需要的临时 mask 是独立 admitted scratch，不能因为结果最终仍是一块 frame bytes 就漏算峰值。
+
+analysis 按 bracket/context 从 `CaptureFrameSource` 流式消费；不 `np.stack` 原始 frame、不为每帧构造第二份 owned image，也不生成 `(groups, shots, H, W)` 临时栈。reference 阶段允许为“平均图”和“按最终 site feature 提取”各走一次可重复源遍历；short 阶段对每帧只准备一次并同时填入全部 model 的小型 `(model, groups, sites)` signal/validity 数组，禁止每个 model 重读整套 qCMOS frame。reference average 使用一个 float64 image accumulator和按真实 shot 数选择的最小无符号 count image，最终原位除法；空间复杂度是 `O(HW + groups*shots*sites + models*groups*sites)`，不是 `O(groups*shots*HW)`。cell 地址用可重复惰性 generator，不提前构造完整对象元组；report 逐组保存原来的 `(AxisId, logical index)` context，repeat、多条 point axis和二维 data axes各自保留语义，绝不能变成匿名 `data_points/data_dim`。
+
+`CalibrationAnalysisRequest.max_drop` 省略时取 `min(5, site_count)`，显式值不得超过 site count：更大的值只会重复“全部 site 已排除”的同一报告，不是新证据。preflight estimator 与 analysis 数值实现同属一个 owner，显式计入 source 最大读 scratch、72 bytes/pixel 的实测保守图像工作集、全部 model short arrays、histogram、PSF 与每个 ablation point 的 mask+Python object overhead。2304×2304 qCMOS 下，64 MiB chunk 产生约 81 MiB（VALUE/cell validity）至 91 MiB（full component validity）的读取 scratch，72 bytes/pixel 图像项约 364.5 MiB；紧凑 site 项另计，因此 512 MiB baseline 仍有明确余量，任何双 chunk、全帧 float64 copy 或未计费 ablation 都是回归。
+
+runtime feature extractor 保留 camera 原 dtype，只把当前 site 的 BOX/PSF 小窗口转换成 float64；float reducer/weighted sum仍与 main 数值路径一致。2304×2304 uint16 针对性 profile 中，旧整图转换每帧额外 `40.50 MiB`、约 `11.91 ms`，当前四个 3×3 ROI 路径峰值增量约 `0.04 MiB`、约 `0.028 ms`。`readout_runtime_scratch_nbytes` 与 numeric operator 同属 calibration owner并保守覆盖 annulus 全图 median fallback；pipeline 只调用该 estimator，不能复制公式或恢复 `bound.operator_scratch_nbytes` 镜像。
+
+不需要 CalibrationService、child Measurement Run、calibration StreamProcessor、recursive execution plan、WorkPlan 或 reducer 包装。当前 `compile_calibration_artifact_plan` 只是一个同步 flat `RunPlan` adapter：preflight admit raw capture，execute 调同一个 `analyze_calibration`，finalize 重新 admit source 后准备 FINAL commit；cancel/execute failure 不发布 manifest。长计算可由现有 RunController 的普通 worker hosting 执行，不因此发明 calibration 专用 async engine。只有出现一个必须在采集完成前反馈、且不能保存原始样本后批处理的真实用例，才另行设计领域 StreamReducer。
+
+Occupancy request 携带 `ResolvedCalibration(reference, artifact)` 和已解析的 `ReadoutModelKind`；repository `admit` 负责 FINAL/source 验证，但返回值不冒充不可伪造的 authority token。该轻量领域值归 `calibration.py` 所有，因此导入 occupancy runtime 不加载 calibration repository、report codec、analysis 或 SciPy；fresh-process import ratchet机械锁定此边界。processor bind 再比较当前 capture 的完整 FrameContract、SiteMap/model kind 与 axis。任何 mismatch 明确失败，不按相同 shape 猜“应该兼容”；hot path 每帧只执行共享 feature extractor 和 `>` classifier，原子发布 counts、occupied、metadata 和相同 component validity。
 
 ## 14. PulseScan
 
@@ -2491,7 +2548,7 @@ canonical tree 到 bytes、UTF-8、map key order、整数/float/NaN 表示、nda
 
 同一条 canonical primitive 约束也只有这里一个实现：canonical/non-empty text、lowercase SHA-256 text、finite real、integer lower bound 与 exact mapping/discriminator admission 由 `zlc_storage.canonical` 提供；领域 constructor 只保留物理/语义约束，codec 只声明字段集合并委托 owner。领域包不得复制 `_text/_sha256/_positive_int/_exact_map` 一类 helper；架构 AST ratchet 机械禁止重新引入。面向用户输入的 UI label normalizer 可以在 presentation/composition 层 strip 文本，但它必须用不同语义、不得承担 persisted canonical value 的权威校验。
 
-无领域语义的 `ContentRef{digest,size}` 及其 schema-free current tree 只由 `zlc_storage.content_store` 拥有；Capture/Calibration 等 manifest 必须调用 owner codec，不能各抄一份 `{digest,size}` parser。领域 typed Ref 仍分别拥有自己的 repository namespace 与 `target_ref` 文法；recovery 从冻结的 expected manifest digest 构造 typed Ref 后比较完整 `target_ref`，不得手工切 prefix/slice。真实 CAS 地址只能由 `put_blob()` 根据最终 bytes 铸造，领域 repository 使用它返回的 ref 构造 manifest，不能在 storage 外重复 `sha256(payload)+len(payload)` 后再自证相等。manifest 发布前遗留的不可达 blob 是安全 orphan、不是可见 artifact；它不构成重新引入预计算地址或自动 GC 的理由。
+无领域语义的 `ContentRef{digest,size}` 及其 schema-free current tree 只由 `zlc_storage.content_store` 拥有；Capture/Calibration 等 manifest 必须调用 owner codec，不能各抄一份 `{digest,size}` parser。领域 typed Ref 仍分别拥有自己的 repository namespace 与 `target_ref` 文法；recovery 从冻结的 expected manifest digest 构造 typed Ref 后比较完整 `target_ref`，不得手工切 prefix/slice。storage owner 的 `identify_blob(payload)` 可以在发布前计算 canonical 内容身份，供 metadata 引用与内存 admission 使用；它不发布、不证明 durability，也不能被领域包用手写 `sha256(payload)+len(payload)` 替代。只有 `put_blob()` 才把 payload staging 到 CAS、核验并确认该 `ContentRef` 已可见。对 writable `bytearray/memoryview`，store 必须写入自己拥有的临时文件并按预计算 ref 重新校验后才能 atomic replace；若 replace 后的验证失败，必须删除目标并 flush parent，使读取保持 fail-closed，而不是留下 digest 与 bytes 不一致的可见对象。manifest 发布前遗留的不可达 blob 是安全 orphan、不是可见 artifact；它不构成自动 GC 或领域自算地址的理由。
 
 F0 第一日即建立 cross-package golden/property contract：同一 primitive tree 在四个 owner 包中产生 byte-identical encoding/digest；嵌入 owner value object 时 outer manifest 使用 owner bytes/digest；字段重排、float edge、NaN、unicode、ndarray order/endianness 与版本变化均有向量。golden 不是允许四份实现漂移的补救，而是守卫唯一 encoder 和 owner codec delegation。
 
@@ -2988,6 +3045,15 @@ S0.6完成不等于旧DeviceSet实现已物理删除；它可以继续作为封�
 
 2026-07 追溯审查确认了一处已经发生的迁移排序错误：tracked `pulses/*.json` 已全部是 `zlc_pulse.PulseDocument`，但 legacy `CalibrateReadout`、部分 Camera/Task/PulseScan 测试与 `resolve_fireable_template` 路径仍调用 `PulseTableState.load()` 读取这些同名资产；开发机 ignored 的 `T.json/pulse_test.json` 又曾使测试输入集合随工作区变化，掩盖了断口。该状态不是需要兼容的双格式需求，而是未闭合的 consumer cut：禁止恢复旧 tracked 资产、在 `PulseTableState` 中增加 `PulseDocument` 猜测/转换器，或让测试继续依赖 ignored 文件。H1/S3 必须把每个仍需保留的 calibration、camera、PulseScan 与 GUI consumer 直接迁到 current document/compiler/endpoint owner，并在同一 dependency-closed 切片删除相应 legacy reader；完成前这些具体 legacy 用户路径明确 NO-GO，不能靠只测新栈宣称系统全绿。
 
+本轮 clean cut 已先停止广告两个已知破损入口：legacy TaskConsole catalog 不再注册
+`Task: Calibrate readout` 或 `Processor: Judge occupancy`，也删除了零消费者的
+`ParamDecl(kind="pulse_param")`、对应 widget/form special path 与
+`enumerate_pulse_params`。语义明确的 `pulse_slots` 保留。这里没有加入
+`PulseDocument ↔ PulseTableState` converter；`CalibrateReadoutTask` 与
+`OccupancyProcessor` 核心类只因仍有直接算法/API consumer 暂留，不能据此重新暴露 GUI
+入口。S3 完成 current calibration/occupancy controller 之前，TaskConsole 的正式标定与占据
+GUI 路径保持 NO-GO；用户文档不得继续给出点击这两个旧入口的步骤。
+
 H1完成现有`image.build_fingerprint`/几何/ABI握手、PreparedProgramRef软件guard、repeat轴展开的finite autonomous table与camera-trigger schedule digest、当前UART/AXI/JTAG容量/错误行为，以及raw STATUS/CURSOR的组合读序、logical终态值和双读稳定规则的contract kit。H1同时根据当前RTL delay scheduler语义与CompiledPulseArtifact的冻结channel delay/最后edge推导`max_physical_output_tail_after_logical_done`，用golden/xsim/真机观测验证正常与safe/abort变体并给出保守margin；raw DONE/CURSOR本身不算tail-idle证据。高层`scan_progress()`镜像只供UI，不进入Formal proof。Formal compiler明确强制`repeat_forever=False, scan_repeats=0`并拒绝host wrap-stop；`AUTONOMOUS_RESIDENT`形成近期装载方式基线。超过resident window默认明确拒绝；只有单一I/O owner、保守refill硬上界以及覆盖每个潜在seam的硬件时间观测/完整schedule residual均由contract kit证明，才发布`AUTONOMOUS_REFILLED`条件execution capability。只测试现有RTL实际提供的能力，不增加ProgramToken/CellFireToken、ROM attestation、CRC verifier、PHYSICAL_DONE或telemetry。preview通过S0.5 workbench projector使用frontend FigureDocument，不制造frontend -> pulse反向边。
 
 H1同时建立当前endpoint的installation-owned `ProgrammedImageDeploymentRecordRef`，把冻结`.bit` content digest、release/timing records、现有fingerprint和owner批准对应起来；这一步只登记并复核现有部署，不调用Vivado、不program硬件。autonomous table与API segment分别发布各自H1 terminal read recipe；后者明确只用PreparedProgramRef+compiled segment schedule+stable raw DONE/STATUS，CURSOR=N/A。
@@ -3201,13 +3267,13 @@ apps/
 
 ### 22.1 追溯整改范围与当前 gate
 
-规则 1–7 的审查集合必须每次由 Git 机械产生，不能靠上下文记忆或“我记得写过哪些提交”。整改启动时的固定证据是 `git rev-list --count main..HEAD = 113`、`git diff --name-only main...HEAD = 315`；在纠正误删并完成 tracked-fixture 整改的 checkpoint `12f3414`，分支已变为 139 个领先提交、323 个 changed files。后续数字会随整改提交增长，因此报告必须同时写 checkpoint commit，不能把 113/315 或 139/323 当永久常量。
+规则 1–7 的审查集合必须每次由 Git 机械产生，不能靠上下文记忆或“我记得写过哪些提交”。整改启动时的固定证据是 `git rev-list --count main..HEAD = 113`、`git diff --name-only main...HEAD = 315`；在纠正误删并完成 tracked-fixture 整改的 checkpoint `12f3414`，分支变为 139/323；清除错误 calibration 历史并把唯一 oracle 重新冻结到 exact main 后，checkpoint `455ff97` 为 160 个领先提交、330 个 changed files；当前已提交 checkpoint `e31cb9407ae8` 为 161/330。其后的 Rule 1–7 工作树整改尚未提交，不能混进该 checkpoint 数字。后续数字会随整改提交增长，因此报告必须同时写 checkpoint commit，不能把任一组历史数字当永久常量。
 
 `12f3414` 的 323 文件第一集合按顶层 owner 分布为：tests 142、旧树 `Zou_lab_control` 48、`zlc_neutral_atom` 42、`zlc_pulse` 23、`zlc_data` 20、`zlc_workbench` 10、`zlc_frontend` 8、FPGA host/config 8、tracked pulse assets 6、`zlc_storage` 6、tutorials 5、docs 2、root/config 3；文件类型为 Python 298、JSON 9、Markdown 7、notebook 5，其余 TOML/gitignore/TeX body/batch 各 1。每个文件必须分配一个 primary owner/slice，测试跟随被测 owner审查；跨域文件还要记录 secondary seam，不能因“另一路 agent 看过相邻包”漏掉。
 
 机械覆盖至少包含：完整 changed-file set；Python AST 的 class/dataclass/enum/function/import/call-site 清点；重复 validator/digest/codec/版本常量的符号与语义搜索；production + 已排期 target consumer 图；测试 oracle/fixture 来源；main 等价物的 NCLOC/class/dataclass 比；以及对大帧 digest/copy、fit/calibration、journal、pulse compile/pack 的针对性 profile。每条规则的完成报告必须给出覆盖 checkpoint、发现总数（包含点名样本之外的新发现）、净行数变化、涉及 owner、独立验证和未来 ratchet。只给抽样或只说测试通过，不算完成。
 
-当前 gate 是 **NO-GO：迁移继续冻结**。已有整改提交覆盖了一部分 canonical owner、payload digest、格式身份、edit counter、content ref、camera primitive 和 checkout-independent tests，但规则 1–7 尚未全仓闭合；尤其 calibration 物理同帧 golden、monitor/rolling 最小职责、occupancy 原子多字段物化、剩余重复 terminal/deployment validation、镜像 oracle 和各切片海拔压缩仍未完成。
+当前 gate 仍是 **NO-GO：迁移继续冻结**。Calibration/readout/occupancy/raw CaptureArtifact 子切片的 main 同帧 oracle、流式内存、多轴物理 context、exact triggered consumer、typed codec、Calibration 与 raw CaptureArtifact 的 coordinator-backed 持久提交及本轮 Rule-6 重复 owner 已闭合；direct-CAS `CaptureFitResultRepository` 不在这项持久提交结论内。qCMOS Formal 仍受 E0/Q0 common-aperture、first-edge/run-boundary 与 ordered-trigger 真机资格化约束。更重要的是，规则 1–7 尚未对完整 changed-file set 全局完成，剩余 owner/版本戳/镜像 oracle/海拔与 profile 清点仍必须按文件账本推进；不能因为一个纵切变绿就提前恢复新迁移。
 
 规则 1 的 storage journal 整改以“扫描边界一次解码”为唯一 owner：`FramedJournal._scan()` 在校验 frame 长度、digest 与 canonical record 后同时保留原始 payload 和已解码 value；原始 bytes 继续负责同 id 冲突/幂等判定，`records()` 与 `append_checked()` 只消费已验证 value，不得再次 decode 已有记录。新 append 的候选仍须经过 canonical `encode -> decode` 规范化，torn-tail repair、跨进程锁、fsync 与 corruption fail-closed 语义不变。调用计数测试必须锁定 N 条已有记录每次扫描恰好 N 次 decode，避免以后以 wrapper 或 getter 的形式恢复重复工作。
 
@@ -3219,7 +3285,15 @@ Workbench 内本地 sequencer、远端 sequencer 与 camera endpoint 共享的 `
 
 Finite exact 的“event ordinal 到每个 dataset cell 的完整唯一排列”由 `FrozenDatasetEdge` 在 defensive copy 后验证一次；同一结果派生 schedule、key-sequence 与 consumer-contract digest，并缓存 key-domain fingerprint。Workbench 的 `CameraCaptureBindingRequest` 只冻结 declarative sequence，`CaptureStreamContract` 直接消费 edge，processor worker 在确认同一个 edge/key-contract owner 与 reservation cardinality 后信任该 immutable schedule，不得再次逐 key 扫描。CompiledCaptureCellPlan 对 pulse trigger/scan/repeat/event 物理关联的验证仍保留，因为那是比 generic dataset permutation 更强的不同不变量；reservation state、generation、consumer ownership、cursor 与锁内 TOCTOU 检查也不属于静态 schedule，不能删除。`expected_cells=None` 的 monitor/rolling 分支保持独立 bounded preview 语义，不因 exact owner 收敛而删除或退化。
 
-规则 4 的唯一物理与算法权威是 `main` 当前提交 `6c337d49` 上实际使用、已经过真机验证的 calibration/readout 实现；`references/`、历史归档或外部分析脚本不得反向定义 production 合同。第一条同帧 golden 只把一张真实 qCMOS frame 的 13×22 crop 当输入，期望值来自该 `main` 提交的 `roi_counts`、`psf_signals` 与 `TrapCalibration.detect`：比较 BOX mean/sum、per-site PSF（无背景与 annulus-median）、site order/validity 及 fluorescence `bright_above=True`。输入帧的来源不具有算法权威，也不能据此引入 `main` 没有的 topology、feature、threshold 或 quality 机制。这个 golden 只证明给定 centers/boxes/kernels/thresholds 时的 feature/application 等价；detector、PSF 拟合、strict-consensus reference labels、120-bin empirical balanced-fidelity threshold、artifact 与端到端 task 仍需分别以 `main` 同帧输出补齐，因此 Rule 4 继续保持 PARTIAL/NO-GO。
+Calibration/readout 的规则 4 子切片以 `main@6c337d49` 为唯一物理与算法权威并已完成逐项同帧核对。tracked oracle 从 synthetic raw camera frames冻结 main 的 detector、四种 site order、BOX mean/sum/median/max、per-site/uniform PSF与annulus、strict-consensus labels、seed-0 split、96-bin Otsu、120-bin empirical threshold、per-site/global fidelity、ablation和runtime occupancy；当前实现不在测试时加载第二套算法。四处明确偏离只有 invalid/nonfinite传播、反 polarity runtime拒绝、chance-level site禁用和完整 FrameContract applicability，均有独立 intentional-difference tests。当前证据集合 `test_zlc_readout_main_oracle.py + test_zlc_readout_validity.py + test_zlc_calibration_commit.py + test_zlc_calibration_stream_contracts.py` 由 `pytest --collect-only` 得到 51 个测试函数、60 个pytest items，覆盖 main physical golden、四类纠错、真实多轴/borrowed-frame/codec、真实CAS commit/recovery；fingerprint/version/WorkPlan、无消费者quality gate、resource-policy镜像和反射伪造测试随对应机制一起删除，不能按旧测试数量补镜像。规则 4 对 calibration/readout 已 COMPLETE，但全分支其它物理切片尚未逐一完成，因此全局规则 4 仍为 PARTIAL。
+
+Calibration/readout Rule-6 清点使用 physical line、nonblank line、AST class/dataclass/enum/function 五种计数。当前 `calibration.py + analysis.py` 数值/领域 core 为 `3338 / 3058 / 25 / 20 / 4 / 99`，对 main 物理算法五文件 `1765 / 1556 / 6 / 6 / 0 / 64` 是 `1.89x / 1.97x` 行数；额外的 pulse/camera `physical_context.py` 为 `382 / 349 / 3 / 3 / 0 / 9`，main 没有同职责能力，禁止伪造一个倍率。六个 calibration primary-owner 文件（上述 core/context 加 `calibration_codec.py`、`calibration_repository.py`、`calibration_reference.py`）为 `5530 / 4998 / 30 / 24 / 4 / 205`，对 main 含 readout facade/task 的合理包络 `2791 / 2464 / 9 / 6 / 0 / 106` 是 `1.98x / 2.03x` 行数；这不是 dependency-closed 总和，共享的 `readout/contracts.py` 与 `readout/codec.py` 分别归通用 readout contract/codec 切片，若把依赖也纳入则必须单列，不能把 `5530/4998` 称为整个依赖闭包。class/dataclass 倍率较高，但无单成员 enum；4个 enum 均有多个真实分支，3种 feature 有训练/runtime 两端 dispatch，computation/analysis-result/resolved-calibration 分别承担非权威计算、source-admitted commit capability 与 runtime admission，不能按字段相似合并。
+
+Occupancy operator 当前为 `687 PLOC / 596 nonblank / 8 classes`，对 main operator `750 / 687 / 2` 是 `0.92x / 0.87x`；加入 finite exact pipeline 为 `1105 / 963 / 12`，再加入 autonomous triggered coordinator 为 `1350 / 1183 / 15`。后者对 main 单独 operator 是 `1.80x / 1.72x`，但对 main 含 subsystem convenience 的完整 occupancy 包络 `1653 / 1484 / 5` 只有 `0.82x / 0.80x`；必须同时报告两种分母，不能选有利倍率。Capture lazy frame/repository 当前为 `2439 / 2270 / 8`；main 没有 chunked CAS、crash-safe manifest、lazy bounded reader 与 admitted-source 同职责实现，因此只报告绝对值和能力增量，不拿 camera measurement 几百行伪装成等价分母。共享 exact coordination + pulse binding/lineage 当前为 `286 / 243 / 3 classes / 2 dataclasses / 0 enum / 15 functions`，已经有 triggered capture 与 triggered occupancy 两个真实生产消费者；新增 binding 的存在理由是消除 spec/result/artifact 对同一 pulse/schedule/edge association 的重复复合验证。
+
+本轮复杂度对抗审查没有用“都可辩护”结案，而是又删除/收敛四个会漂移的 owner：`CalibrationRepository` 与 raw `CaptureRepository` 的 manifest publish visibility 裁决委托一个 cycle-free runtime leaf（不包含仍走 direct CAS save 的 `CaptureFitResultRepository`）；frame validity/record/chunk geometry 由一个私有纯函数和私有 frozen value供 scratch admission、stager、reader 共用；analysis 删除第二套 annulus median/background fallback并委托 calibration 数值 owner；cycle-free `timing.lineage` 中的 `PulseCaptureBinding` 唯一验证 compiled artifact、trigger schedule digest/cardinality及每个 edge 到 plan 的关联，spec 保存该不可变 binding，`PulseCaptureLineage` 只再绑定 terminal receipt/count，两种 result、durable CaptureArtifact 与 `derive_readout_physical_context` 信任 pulse 侧类型并只校验各自新引入的 dataset/capture/window join，禁止 physical-context API 再接受 raw artifact+plan 绕过 schedule digest。没有 repository 基类、generic workflow engine 或新版本机制。两个零生产消费者的一层 accessor 已删除；`BoundOccupancyStreamProcessor.evaluate` 保留，因为没有它，纯数值/validity unit test 只能绕过 bound contract 或启动完整线程链。Calibration/Capture 两种 ArtifactRef 继续是语义不同的 newtype；目前只有两个用例，暂不为机械相似性建立跨领域 common helper，出现第三个真实同构 consumer时再抽 codec mechanics。后续若任何类型退化成单成员 enum、单实例 wrapper、只转发字段或重复同一安全/物理公式，ratchet必须拒绝而不是用“类型安全”辩护。
+
+`zlc_neutral_atom.timing` 包根与 `readout` 一样保持空边界；capture artifact、Workbench、notebook和测试都从 `timing.capture`、`timing.capture_plan`、`timing.lineage`、`timing.pulse` leaf owner导入。普通 calibration/capture import 不再因为包根聚合而加载 triggered occupancy；禁止恢复宽 re-export 或 lazy compatibility表，import-DAG测试机械搜索 package-root consumer。
 
 Calibration partition 的 deterministic hash split 只保留描述性 identity `fixed-hash-order`；`ALGORITHM_FIXED_HASH_ORDER_V1` 是尚无历史 consumer 的软件改稿编号，不是可协商格式或物理算法版本。删除编号不改变 split、digest 字段集合之外的算法、训练样本或任何 artifact capability。
 
@@ -3249,7 +3323,7 @@ Pipeline memory admission有真实故障依据：历史2.3MP live路径曾因多
 | `zlc_frontend` Figure/View/selector | S0.5/S2/S5 Workbench 与 notebook render | 审查 target DAG、最小入口与性能，不以旧 GUI 尚未迁入为由删除 | 新 frontend 设计被正式替换且所有目标用户面有闭环 |
 | legacy PulseTableState readers | 尚未迁完的 CalibrateReadout/PulseScan/PulseGUI 岛 | 先迁每个保留 consumer 到 current PulseDocument/compiler | 最后 consumer 迁走的 H1/S3 dependency-closed commit |
 
-规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`；只有 `COMPLETE` 才能恢复新迁移。目前：规则 1 PARTIAL，规则 2 PARTIAL（已纠正“零当前消费者即删除”的错误判据），规则 3 PARTIAL，规则 4 NOT COMPLETE，规则 5 PARTIAL，规则 6 NOT COMPLETE，规则 7 PARTIAL。最终还需独立对抗审查证明没有 P0/P1 correctness、边界或可实现性漏洞。
+规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`；只有七条全局规则全部 `COMPLETE` 才能恢复新迁移。目前：规则 1 PARTIAL，规则 2 PARTIAL（已纠正“零当前消费者即删除”的错误判据），规则 3 PARTIAL，规则 4 PARTIAL（calibration/readout/occupancy/capture 子切片 COMPLETE），规则 5 PARTIAL，规则 6 PARTIAL（同一子切片 COMPLETE，但全仓 runtime aggregate 与其它 owner 尚未），规则 7 PARTIAL。最终还需对完整分支做独立对抗审查，证明没有 P0/P1 correctness、边界或可实现性漏洞；子切片 GO 不能被改写成全局 GO。
 
 ### 22.2 终态验收清单
 
@@ -3320,7 +3394,7 @@ Artifact/Calibration：
 - live/offline calibration 在 CaptureArtifactRef 后走同一算法路径；
 - FrameContract/SiteMap/model applicability 不匹配明确失败。
 - calibration 默认按 ReadoutBindingKey 与声明的 model policy选择，site-map-only/完整 model capability 不混淆。
-- NumPy/SciPy 版本只在顶层 artifact 作为可选被动备注；版本改变不改变 WorkPlan、SiteMap、模型或诊断，load/admit 不探测当前数值环境。
+- NumPy/SciPy 版本只在 CalibrationReport 作为被动 lineage；版本改变不改变 request、SiteMap、模型或准入，load/admit 不探测当前数值环境。
 
 Pulse/FPGA：
 

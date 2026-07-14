@@ -1,4046 +1,2093 @@
-"""Leakage-free, bounded, headless readout-calibration analysis.
+"""Calibration analysis derived from the validated ``main`` readout physics.
 
-The only durable input is a raw CaptureArtifact-shaped value plus an explicit
-CalibrationCaptureLayout.  A bracket partition is frozen before any learned
-quantity.  Training brackets propose site geometry, reference thresholds, PSF
-kernels, and short-readout thresholds; an independent reference-evidence
-partition tests the frozen statistical valleys; held-out reference frames then
-produce explicitly unsupervised pseudo-labels used only to score frozen
-short-readout models.  No reference observation is called a physical oracle.
+The module has two layers only: pure image/statistics functions, and one adapter
+that reads a raw CaptureArtifact through ``CalibrationCaptureLayout``.  Training
+and runtime call the same feature extractor from :mod:`.calibration`; display
+diagnostics never become runtime authority.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from enum import Enum
-import hashlib
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field, fields
 import math
-from numbers import Integral, Real
-from typing import Protocol
+from typing import Sequence
 
 import numpy as np
 import scipy
-from scipy.ndimage import (
-    gaussian_filter,
-    label,
-    maximum_filter,
-    minimum_filter,
-)
-from scipy.optimize import linear_sum_assignment
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import minimum_spanning_tree
-from scipy.spatial import cKDTree
-from scipy.stats import beta as beta_distribution, binomtest
+from scipy import ndimage
+from scipy.optimize import curve_fit, minimize_scalar
+from scipy.special import erf
 
 from zlc_data import (
     SITE,
     AxisId,
     AxisSpec,
     ComponentValidity,
-    DataBlock,
-    expand_dataset_validity,
+    DatasetSchema,
+    ValidityMode,
+    expand_value_validity,
 )
+from zlc_neutral_atom.artifacts.capture_frames import CaptureFrameSource
+from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 from zlc_storage import (
-    canonical_digest,
-    finite_real as _finite_real,
+    finite_real as _finite_float,
     nonnegative_integer as _nonnegative_integer,
     positive_integer as _positive_integer,
 )
 
 from .calibration import (
     BackgroundMode,
-    BoxReadoutModel,
+    BoxFeature,
     BoxReducer,
     CalibrationArtifact,
-    CalibrationParameter,
-    CalibrationResourceExceeded,
-    CalibrationResourcePolicy,
     CalibrationSourceBinding,
-    DEFAULT_CALIBRATION_RESOURCE_POLICY,
-    PerSitePsfReadoutModel,
-    ReadoutFeatureSpec,
+    GridOrder,
+    PerSitePsfFeature,
+    ReadoutFeature,
     ReadoutModel,
-    ReadoutModelHeader,
     ReadoutModelKind,
-    ReadoutModelQuality,
     SiteMap,
-    UniformPsfReadoutModel,
-    _derive_calibration_source_binding_with_resolved_brackets,
-    _extract_readout_features_arrays,
-    _is_bytes_backed_read_only,
-    _readout_background_from_arrays,
-    validate_calibration_artifact_resources,
+    UniformPsfFeature,
+    _annulus_background,
+    _extract_readout_arrays,
+    _immutable_array,
+    derive_calibration_source_binding,
+    derive_calibration_readout_physical_context,
 )
-from .contracts import CalibrationCaptureBracket, CalibrationCaptureLayout, FrameContract
-
-
-# The partition is an algorithm decision, not a post-capture tuning knob.  A
-# public seed would let callers repeatedly repartition one observed capture
-# until a nominal familywise gate happened to pass.
-_PARTITION_SEED = 3817
-_MAX_AFFINE_ASSIGNMENT_ITERATIONS = 8
-_ASSIGNMENT_WORK_FACTOR = _MAX_AFFINE_ASSIGNMENT_ITERATIONS + 2
-_ASSIGNMENT_SCRATCH_BYTES_PER_PAIR = 64
-# Conservative phase peak for normalized smoothing, local-extrema labels,
-# four vectorized 8-neighbour edge families, their concatenated COO/CSR
-# materialization, the sparse spanning forest, sort order, and the reused
-# union-find arrays.  The prominence and catchment Kruskal passes are
-# sequential and reuse those arrays; they are not concurrent phase peaks.
-_DETECTOR_WORKING_BYTES_PER_PIXEL = 384
-_TOPOGRAPHIC_EDGE_COUNT_PER_PIXEL = 4
-_QUALITY_GATE_ID = (
-    "precommitted-frozen-bracket-adverse-missingness-exact-binomial-"
-    "iut-artifact-model-site-holm"
-)
-_REFERENCE_VALLEY_GATE_ID = (
-    "independent-stationary-complete-three-bin-exact-binomial-iut-holm"
-)
-_REFERENCE_AMBIGUITY_GATE_ID = "one-level-nested-valley-screen-holm"
-_REFERENCE_EVIDENCE_ASSUMPTION = (
-    "INDEPENDENT_STATIONARY_BRACKETS_COMPLETE_REFERENCE_FEATURES"
-)
-_NUMERIC_LINEAGE_NOTE_MAX_CHARS = 64
-_NUMERIC_LINEAGE_PARAMETER_NAMES = ("numpy-version", "scipy-version")
+from .contracts import CalibrationCaptureLayout, FrameContract
+from .physical_context import ReadoutPhysicalContext
 
 
 class CalibrationAnalysisError(ValueError):
-    """A validly encoded source cannot produce an admitted calibration."""
+    pass
 
 
-class GridOrder(str, Enum):
-    ROW_MAJOR = "ROW_MAJOR"
-    COLUMN_MAJOR = "COLUMN_MAJOR"
+_ADMITTED_ANALYSIS_TOKEN = object()
 
 
-class UsableSiteAcceptance(str, Enum):
-    ALL = "ALL"
-    MINIMUM_FRACTION = "MINIMUM_FRACTION"
-
-
-class ReferenceLabelSource(str, Enum):
-    """The physical authority available for calibration labels.
-
-    The current protocol observes the same unknown state twice; it can admit a
-    reproducible dominant binary valley under the declared screens, but it
-    cannot turn that statistical evidence into a known physical preparation
-    or prove that exactly two physical populations exist.  Its exact-binomial
-    claim requires independently prepared, gate-stationary brackets as
-    statistical units.  Invalid or non-finite reference features are never
-    dropped: they are persisted separately as adverse evidence, and any such
-    training/evidence observation prevents that site from acquiring
-    reference-label authority.
-    """
-
-    UNSUPERVISED_REFERENCE_VALLEY = "UNSUPERVISED_REFERENCE_VALLEY"
-
-
-class ReferenceClassOrientation(str, Enum):
-    """Explicit physical interpretation supplied by the experiment protocol.
-
-    Valley analysis can distinguish a lower and an upper statistical class;
-    it cannot infer which class physically means an occupied atom.  Requiring
-    this closed value prevents a convenience default from silently upgrading
-    unsupervised evidence into an occupancy claim.
-    """
-
-    ABOVE_IS_OCCUPIED = "ABOVE_IS_OCCUPIED"
-    BELOW_IS_OCCUPIED = "BELOW_IS_OCCUPIED"
-
-
-class CalibrationBracketSamplingAssumption(str, Enum):
-    """Protocol authority required by both finite-sample exact gates.
-
-    Independence and stationarity are properties of how experimental brackets
-    are prepared; neither can be proven by re-examining one captured value
-    sequence.  For every pooled exact gate, the corresponding Bernoulli
-    indicator must have one common, predeclared generating probability across
-    the frozen bracket population.  Context-dependent level shifts may not be
-    pooled under this assertion.  Exchangeability alone is intentionally not
-    offered because correlated blocks invalidate the binomial and
-    Clopper--Pearson guarantees.
-    """
-
-    INDEPENDENT_STATIONARY_BRACKETS = "INDEPENDENT_STATIONARY_BRACKETS"
-
-
-class CalibrationAnalysisPlanningAssumption(str, Enum):
-    """Protocol authority required for nominal post-selection guarantees.
-
-    The analysis request must be frozen before inspecting the source capture.
-    Repeatedly changing partitions, geometry, models, or quality gates on one
-    observed capture until a calibration passes invalidates the declared
-    familywise error rate.  Software persists and replays this assertion but
-    cannot infer a caller's pre-inspection intent from the captured values.
-    """
-
-    PRECOMMITTED_BEFORE_SOURCE_INSPECTION = (
-        "PRECOMMITTED_BEFORE_SOURCE_INSPECTION"
-    )
-
-
-def _same_typed_scalar(actual: object, expected: object) -> bool:
-    return type(actual) is type(expected) and actual == expected
-
-
-def _typed_parameter_maps_equal(
-    actual: dict[str, object],
-    expected: dict[str, object],
-) -> bool:
-    return set(actual) == set(expected) and all(
-        _same_typed_scalar(actual[name], value)
-        for name, value in expected.items()
-    )
-
-
-@dataclass(frozen=True)
-class BoxAnalysisConfig:
-    half_width: int = 2
-    reducer: BoxReducer = BoxReducer.SUM
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "half_width",
-            _nonnegative_integer(self.half_width, "box half_width"),
-        )
-        if not isinstance(self.reducer, BoxReducer):
-            raise TypeError("box reducer must be BoxReducer")
-
-
-@dataclass(frozen=True)
-class PsfAnalysisConfig:
-    half_width: int = 3
-    background: BackgroundMode = BackgroundMode.ANNULUS_MEDIAN
-    background_padding: int = 3
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "half_width",
-            _nonnegative_integer(self.half_width, "PSF half_width"),
-        )
-        if not isinstance(self.background, BackgroundMode):
-            raise TypeError("PSF background must be BackgroundMode")
-        padding = _nonnegative_integer(
-            self.background_padding,
-            "PSF background_padding",
-        )
-        if self.background is BackgroundMode.ANNULUS_MEDIAN and padding == 0:
-            raise ValueError("ANNULUS_MEDIAN requires positive background padding")
-        if self.background is BackgroundMode.NONE and padding != 0:
-            raise ValueError("NONE background requires canonical zero padding")
-        object.__setattr__(self, "background_padding", padding)
-
-
-@dataclass(frozen=True)
-class SiteDetectionPolicy:
-    smoothing_sigma_pixels: float = 0.75
-    minimum_prominence_fraction: float = 0.10
-    minimum_peak_separation_pixels: float = 2.0
-    minimum_half_prominence_basin_area_pixels: int = 4
-    reject_touching_half_prominence_basins: bool = True
-    maximum_lattice_rms_residual_pixels: float = 0.75
-    minimum_lattice_step_pixels: float = 2.0
-    minimum_band_separation_pixels: float = 0.5
-    minimum_affine_sin_angle: float = 0.20
-    maximum_affine_condition_number: float = 10.0
-    minimum_assignment_cost_gap_pixels_squared: float = 4.0
-
-    def __post_init__(self) -> None:
-        sigma = _finite_real(self.smoothing_sigma_pixels, "smoothing_sigma_pixels")
-        if sigma < 0.0:
-            raise ValueError("smoothing_sigma_pixels must be non-negative")
-        object.__setattr__(self, "smoothing_sigma_pixels", sigma)
-        prominence = _finite_real(
-            self.minimum_prominence_fraction,
-            "minimum_prominence_fraction",
-        )
-        if not 0.0 < prominence <= 1.0:
-            raise ValueError("minimum_prominence_fraction must lie in (0, 1]")
-        object.__setattr__(self, "minimum_prominence_fraction", prominence)
-        basin_area = _positive_integer(
-            self.minimum_half_prominence_basin_area_pixels,
-            "minimum_half_prominence_basin_area_pixels",
-        )
-        object.__setattr__(
-            self,
-            "minimum_half_prominence_basin_area_pixels",
-            basin_area,
-        )
-        if not isinstance(self.reject_touching_half_prominence_basins, bool):
-            raise TypeError("reject_touching_half_prominence_basins must be bool")
-        for name in (
-            "minimum_peak_separation_pixels",
-            "maximum_lattice_rms_residual_pixels",
-            "minimum_lattice_step_pixels",
-            "minimum_band_separation_pixels",
-            "minimum_affine_sin_angle",
-            "maximum_affine_condition_number",
-            "minimum_assignment_cost_gap_pixels_squared",
-        ):
-            value = _finite_real(getattr(self, name), name)
-            if value <= 0.0:
-                raise ValueError(f"{name} must be positive")
-            object.__setattr__(self, name, value)
-        if self.minimum_affine_sin_angle > 1.0:
-            raise ValueError("minimum_affine_sin_angle must not exceed one")
-        if self.maximum_affine_condition_number < 1.0:
-            raise ValueError("maximum_affine_condition_number must be at least one")
-
-
-@dataclass(frozen=True)
-class CalibrationAnalysisResourcePolicy:
-    artifact_policy: CalibrationResourcePolicy = DEFAULT_CALIBRATION_RESOURCE_POLICY
-    max_source_cells: int = 2_000_000
-    max_brackets: int = 200_000
-    max_reference_frames: int = 1_000_000
-    max_image_pixels: int = 20_000_000
-    max_signal_evaluations: int = 100_000_000
-    max_modality_test_work_units: int = 20_000_000_000
-    max_reference_valley_diagnostics: int = 100_000
-    max_sampled_pixel_operations: int = 5_000_000_000
-    max_working_bytes: int = 2_000_000_000
-    max_lattice_sites: int = 2_048
-    max_detector_graph_work_units: int = 2_000_000_000
-    max_dense_assignment_work_units: int = 20_000_000_000
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.artifact_policy, CalibrationResourcePolicy):
-            raise TypeError("artifact_policy must be CalibrationResourcePolicy")
-        for name in (
-            "max_source_cells",
-            "max_brackets",
-            "max_reference_frames",
-            "max_image_pixels",
-            "max_signal_evaluations",
-            "max_modality_test_work_units",
-            "max_reference_valley_diagnostics",
-            "max_sampled_pixel_operations",
-            "max_working_bytes",
-            "max_lattice_sites",
-            "max_detector_graph_work_units",
-            "max_dense_assignment_work_units",
-        ):
-            object.__setattr__(self, name, _positive_integer(getattr(self, name), name))
-
-
-@dataclass(frozen=True)
-class CalibrationWorkPlan:
-    source_cell_count: int
-    bracket_upper_bound: int
-    train_bracket_upper_bound: int
-    reference_evidence_bracket_upper_bound: int
-    reference_frame_upper_bound: int
-    image_pixel_count: int
-    full_frame_read_count: int
-    feature_pixel_operations: int
-    signal_evaluations: int
-    modality_test_work_units: int
-    reference_valley_diagnostic_count: int
-    diagnostics_encoding_upper_bound_bytes: int
-    planned_kernel_elements: int
-    maximum_model_sampled_pixels: int
-    total_model_sampled_pixels: int
-    artifact_metadata_encoding_upper_bound_bytes: int
-    artifact_encoding_upper_bound_bytes: int
-    layout_working_bytes: int
-    detector_working_bytes: int
-    assignment_scratch_bytes: int
-    feature_working_bytes: int
-    psf_working_bytes: int
-    artifact_array_bytes: int
-    canonical_encoding_scratch_bytes: int
-    working_peak_bytes: int
-    detector_graph_work_units: int
-    dense_assignment_work_units: int
-
-    def __post_init__(self) -> None:
-        for name in self.__dataclass_fields__:
-            value = _nonnegative_integer(getattr(self, name), name)
-            object.__setattr__(self, name, value)
-        if self.source_cell_count == 0 or self.image_pixel_count == 0:
-            raise ValueError("calibration work plan requires non-empty source geometry")
-        from .analysis_codec import (
-            calibration_analysis_diagnostics_encoding_working_upper_bound,
-        )
-        from .calibration_codec import (
-            calibration_artifact_encoding_working_upper_bound,
-        )
-
-        required_canonical_scratch = max(
-            calibration_analysis_diagnostics_encoding_working_upper_bound(
-                self.diagnostics_encoding_upper_bound_bytes
-            ),
-            calibration_artifact_encoding_working_upper_bound(
-                self.artifact_array_bytes,
-                self.artifact_metadata_encoding_upper_bound_bytes,
-            ),
-        )
-        if self.canonical_encoding_scratch_bytes < required_canonical_scratch:
-            raise ValueError(
-                "canonical scratch is lower than an owner encoding working bound"
-            )
-        if (
-            self.canonical_encoding_scratch_bytes
-            < self.diagnostics_encoding_upper_bound_bytes
-        ):
-            raise ValueError(
-                "canonical scratch is lower than diagnostics encoding bound"
-            )
-        if self.total_model_sampled_pixels < self.maximum_model_sampled_pixels:
-            raise ValueError(
-                "total model sampled pixels are lower than the per-model maximum"
-            )
-        if (
-            self.canonical_encoding_scratch_bytes
-            < self.artifact_encoding_upper_bound_bytes
-        ):
-            raise ValueError(
-                "canonical scratch is lower than artifact encoding bound"
-            )
-        if self.working_peak_bytes < max(
-            self.layout_working_bytes,
-            self.detector_working_bytes + self.assignment_scratch_bytes,
-            self.assignment_scratch_bytes,
-            self.artifact_array_bytes + self.feature_working_bytes,
-            self.artifact_array_bytes
-            + self.psf_working_bytes
-            + self.feature_working_bytes,
-            self.artifact_array_bytes + self.canonical_encoding_scratch_bytes,
-        ):
-            raise ValueError("working_peak_bytes is lower than a declared phase peak")
-
-    @property
-    def fingerprint(self) -> str:
-        from .analysis_codec import calibration_work_plan_to_tree
-
-        return canonical_digest(calibration_work_plan_to_tree(self))
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CalibrationAnalysisRequest:
+    """Physical and statistical choices for one reference/readout capture.
+
+    ``expected_centers_xy``, when present, follows ``ordering`` exactly and is
+    independent spatial admission evidence.  It constrains authority; it never
+    changes the centers returned by the main detector.
+    """
+
     layout: CalibrationCaptureLayout
     grid_shape_yx: tuple[int, int]
-    reference_label_source: ReferenceLabelSource
-    reference_class_orientation: ReferenceClassOrientation
-    bracket_sampling_assumption: CalibrationBracketSamplingAssumption
-    analysis_planning_assumption: CalibrationAnalysisPlanningAssumption
-    grid_order: GridOrder = GridOrder.ROW_MAJOR
-    box: BoxAnalysisConfig = BoxAnalysisConfig()
-    model_kinds: tuple[ReadoutModelKind, ...] = (ReadoutModelKind.BOX,)
-    default_model_kind: ReadoutModelKind | None = ReadoutModelKind.BOX
-    psf: PsfAnalysisConfig | None = None
-    detection: SiteDetectionPolicy = SiteDetectionPolicy()
-    train_fraction: float = 0.35
-    reference_evidence_fraction: float = 0.35
-    minimum_train_samples_per_class: int = 4
-    minimum_test_samples_per_class: int = 4
-    minimum_reference_cluster_separation_rss: float = 2.0
-    reference_valley_familywise_error_rate: float = 0.01
-    held_out_confidence_level: float = 0.95
-    minimum_held_out_class_accuracy_lower_bound: float = 0.60
-    usable_site_acceptance: UsableSiteAcceptance = UsableSiteAcceptance.ALL
-    minimum_usable_site_fraction: float = 1.0
-    resource_policy: CalibrationAnalysisResourcePolicy = CalibrationAnalysisResourcePolicy()
+    ordering: GridOrder = GridOrder.ROW_MAJOR
+    box_radius: int = 1
+    box_reducer: BoxReducer = BoxReducer.MEAN
+    psf_half_width: int = 3
+    psf_background: BackgroundMode = BackgroundMode.ANNULUS_MEDIAN
+    psf_background_padding: int = 3
+    model_kinds: tuple[ReadoutModelKind, ...] = (
+        ReadoutModelKind.BOX,
+        ReadoutModelKind.PER_SITE_PSF,
+        ReadoutModelKind.UNIFORM_PSF,
+    )
+    default_model_kind: ReadoutModelKind = ReadoutModelKind.BOX
+    train_fraction: float = 0.9
+    split_seed: int = 0
+    histogram_bins: int = 120
+    minimum_site_fidelity: float = 0.5
+    max_drop: int | None = None
+    detector_min_distance: int | None = None
+    detector_threshold_rel: float = 0.35
+    detector_refine_half: int = 2
+    expected_centers_xy: np.ndarray | None = None
+    maximum_site_residual_px: float | None = None
+
+    __hash__ = None
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, CalibrationAnalysisRequest):
+            return NotImplemented
+        for item in fields(self):
+            if item.name == "expected_centers_xy":
+                continue
+            if getattr(self, item.name) != getattr(other, item.name):
+                return False
+        if self.expected_centers_xy is None or other.expected_centers_xy is None:
+            return self.expected_centers_xy is other.expected_centers_xy
+        return bool(np.array_equal(self.expected_centers_xy, other.expected_centers_xy))
 
     def __post_init__(self) -> None:
         if not isinstance(self.layout, CalibrationCaptureLayout):
             raise TypeError("layout must be CalibrationCaptureLayout")
-        shape = tuple(self.grid_shape_yx)
-        if len(shape) != 2:
-            raise ValueError("grid_shape_yx must have two entries")
-        shape = tuple(_positive_integer(value, "grid_shape_yx entry") for value in shape)
-        object.__setattr__(self, "grid_shape_yx", shape)
-        if not isinstance(self.reference_label_source, ReferenceLabelSource):
-            raise TypeError("reference_label_source must be ReferenceLabelSource")
-        if not isinstance(self.reference_class_orientation, ReferenceClassOrientation):
-            raise TypeError(
-                "reference_class_orientation must be ReferenceClassOrientation"
-            )
-        if not isinstance(
-            self.bracket_sampling_assumption,
-            CalibrationBracketSamplingAssumption,
-        ):
-            raise TypeError(
-                "bracket_sampling_assumption must be "
-                "CalibrationBracketSamplingAssumption"
-            )
-        if not isinstance(
-            self.analysis_planning_assumption,
-            CalibrationAnalysisPlanningAssumption,
-        ):
-            raise TypeError(
-                "analysis_planning_assumption must be "
-                "CalibrationAnalysisPlanningAssumption"
-            )
-        if not isinstance(self.grid_order, GridOrder):
-            raise TypeError("grid_order must be GridOrder")
-        if not isinstance(self.box, BoxAnalysisConfig):
-            raise TypeError("box must be BoxAnalysisConfig")
+        try:
+            raw_grid = tuple(self.grid_shape_yx)
+        except TypeError as exc:
+            raise ValueError("grid_shape_yx must contain two positive integers") from exc
+        if len(raw_grid) != 2:
+            raise ValueError("grid_shape_yx must contain two positive integers")
+        grid = (
+            _positive_integer(raw_grid[0], "grid_shape_yx[0]"),
+            _positive_integer(raw_grid[1], "grid_shape_yx[1]"),
+        )
+        if not isinstance(self.ordering, GridOrder):
+            raise TypeError("ordering must be GridOrder")
+        radius = _nonnegative_integer(self.box_radius, "box_radius")
+        if not isinstance(self.box_reducer, BoxReducer):
+            raise TypeError("box_reducer must be BoxReducer")
+        psf_half = _nonnegative_integer(self.psf_half_width, "psf_half_width")
+        if not isinstance(self.psf_background, BackgroundMode):
+            raise TypeError("psf_background must be BackgroundMode")
+        padding = _positive_integer(
+            self.psf_background_padding,
+            "psf_background_padding",
+        )
         kinds = tuple(self.model_kinds)
         if not kinds or any(not isinstance(kind, ReadoutModelKind) for kind in kinds):
-            raise ValueError("model_kinds must contain closed ReadoutModelKind values")
+            raise TypeError("model_kinds must contain ReadoutModelKind values")
         if len(set(kinds)) != len(kinds):
             raise ValueError("model_kinds must be unique")
-        kinds = tuple(sorted(kinds, key=lambda kind: kind.value))
-        object.__setattr__(self, "model_kinds", kinds)
-        if self.default_model_kind is not None:
-            if not isinstance(self.default_model_kind, ReadoutModelKind):
-                raise TypeError("default_model_kind must be ReadoutModelKind or None")
-            if self.default_model_kind not in kinds:
-                raise ValueError("default_model_kind must be one of model_kinds")
-        needs_psf = any(kind is not ReadoutModelKind.BOX for kind in kinds)
-        if needs_psf and not isinstance(self.psf, PsfAnalysisConfig):
-            raise ValueError("requested PSF models require a PsfAnalysisConfig")
-        if not needs_psf and self.psf is not None:
-            raise ValueError("BOX-only request requires canonical absent PSF config")
-        if not isinstance(self.detection, SiteDetectionPolicy):
-            raise TypeError("detection must be SiteDetectionPolicy")
-        fraction = _finite_real(self.train_fraction, "train_fraction")
+        kinds = tuple(kind for kind in ReadoutModelKind if kind in kinds)
+        if not isinstance(self.default_model_kind, ReadoutModelKind):
+            raise TypeError("default_model_kind must be ReadoutModelKind")
+        if self.default_model_kind not in kinds:
+            raise ValueError("default_model_kind must be present in model_kinds")
+        fraction = _finite_float(self.train_fraction, "train_fraction")
         if not 0.0 < fraction < 1.0:
-            raise ValueError("train_fraction must lie strictly between zero and one")
+            raise ValueError("train_fraction must be in (0, 1)")
+        seed = _nonnegative_integer(self.split_seed, "split_seed")
+        bins = _positive_integer(self.histogram_bins, "histogram_bins")
+        if bins < 2:
+            raise ValueError("histogram_bins must be at least two")
+        minimum_site_fidelity = _finite_float(
+            self.minimum_site_fidelity,
+            "minimum_site_fidelity",
+        )
+        if not 0.5 <= minimum_site_fidelity <= 1.0:
+            raise ValueError("minimum_site_fidelity must be in [0.5, 1.0]")
+        site_count = grid[0] * grid[1]
+        max_drop = (
+            min(5, site_count)
+            if self.max_drop is None
+            else _nonnegative_integer(self.max_drop, "max_drop")
+        )
+        if max_drop > site_count:
+            raise ValueError(
+                f"max_drop must not exceed the {site_count} declared sites"
+            )
+        min_distance = self.detector_min_distance
+        if min_distance is not None:
+            min_distance = _positive_integer(min_distance, "detector_min_distance")
+        threshold_rel = _finite_float(
+            self.detector_threshold_rel,
+            "detector_threshold_rel",
+        )
+        if not 0.0 <= threshold_rel <= 1.0:
+            raise ValueError("detector_threshold_rel must be in [0, 1]")
+        refine_half = _nonnegative_integer(
+            self.detector_refine_half,
+            "detector_refine_half",
+        )
+        expected_centers = self.expected_centers_xy
+        maximum_residual = self.maximum_site_residual_px
+        if (expected_centers is None) != (maximum_residual is None):
+            raise ValueError(
+                "expected_centers_xy and maximum_site_residual_px must be "
+                "provided together"
+            )
+        if expected_centers is not None:
+            expected_centers = _immutable_array(
+                expected_centers,
+                dtype="<f8",
+                shape=(site_count, 2),
+                field_name="expected_centers_xy",
+            )
+            if not np.all(np.isfinite(expected_centers)):
+                raise ValueError("expected_centers_xy must be finite")
+            maximum_residual = _finite_float(
+                maximum_residual,
+                "maximum_site_residual_px",
+            )
+            if maximum_residual <= 0.0:
+                raise ValueError("maximum_site_residual_px must be positive")
+        object.__setattr__(self, "grid_shape_yx", grid)
+        object.__setattr__(self, "box_radius", radius)
+        object.__setattr__(self, "psf_half_width", psf_half)
+        object.__setattr__(self, "psf_background_padding", padding)
+        object.__setattr__(self, "model_kinds", kinds)
         object.__setattr__(self, "train_fraction", fraction)
-        evidence_fraction = _finite_real(
-            self.reference_evidence_fraction,
-            "reference_evidence_fraction",
-        )
-        if not 0.0 < evidence_fraction < 1.0:
-            raise ValueError(
-                "reference_evidence_fraction must lie strictly between zero and one"
-            )
-        if fraction + evidence_fraction >= 1.0:
-            raise ValueError(
-                "train_fraction plus reference_evidence_fraction must be below one"
-            )
+        object.__setattr__(self, "split_seed", seed)
+        object.__setattr__(self, "histogram_bins", bins)
         object.__setattr__(
             self,
-            "reference_evidence_fraction",
-            evidence_fraction,
+            "minimum_site_fidelity",
+            minimum_site_fidelity,
         )
-        for name in (
-            "minimum_train_samples_per_class",
-            "minimum_test_samples_per_class",
-        ):
-            object.__setattr__(
-                self,
-                name,
-                _positive_integer(getattr(self, name), name),
-            )
-        reference_separation = _finite_real(
-            self.minimum_reference_cluster_separation_rss,
-            "minimum_reference_cluster_separation_rss",
-        )
-        if reference_separation <= 0.0:
-            raise ValueError(
-                "minimum_reference_cluster_separation_rss must be positive"
-            )
-        object.__setattr__(
-            self,
-            "minimum_reference_cluster_separation_rss",
-            reference_separation,
-        )
-        familywise_error_rate = _finite_real(
-            self.reference_valley_familywise_error_rate,
-            "reference_valley_familywise_error_rate",
-        )
-        if not 0.0 < familywise_error_rate < 1.0:
-            raise ValueError(
-                "reference_valley_familywise_error_rate must lie inside (0, 1)"
-            )
-        object.__setattr__(
-            self,
-            "reference_valley_familywise_error_rate",
-            familywise_error_rate,
-        )
-        confidence = _finite_real(
-            self.held_out_confidence_level,
-            "held_out_confidence_level",
-        )
-        if not 0.0 < confidence < 1.0:
-            raise ValueError("held_out_confidence_level must lie strictly inside (0, 1)")
-        object.__setattr__(self, "held_out_confidence_level", confidence)
-        lower_bound = _finite_real(
-            self.minimum_held_out_class_accuracy_lower_bound,
-            "minimum_held_out_class_accuracy_lower_bound",
-        )
-        if not 0.0 <= lower_bound <= 1.0:
-            raise ValueError(
-                "minimum_held_out_class_accuracy_lower_bound must lie in [0, 1]"
-            )
-        object.__setattr__(
-            self,
-            "minimum_held_out_class_accuracy_lower_bound",
-            lower_bound,
-        )
-        if not isinstance(self.usable_site_acceptance, UsableSiteAcceptance):
-            raise TypeError("usable_site_acceptance must be UsableSiteAcceptance")
-        usable_fraction = _finite_real(
-            self.minimum_usable_site_fraction,
-            "minimum_usable_site_fraction",
-        )
-        if not 0.0 < usable_fraction <= 1.0:
-            raise ValueError("minimum_usable_site_fraction must lie in (0, 1]")
-        if (
-            self.usable_site_acceptance is UsableSiteAcceptance.ALL
-            and usable_fraction != 1.0
-        ):
-            raise ValueError("ALL usable-site acceptance requires canonical fraction 1.0")
-        object.__setattr__(self, "minimum_usable_site_fraction", usable_fraction)
-        if not isinstance(self.resource_policy, CalibrationAnalysisResourcePolicy):
-            raise TypeError("resource_policy must be CalibrationAnalysisResourcePolicy")
-        if self.site_count > self.resource_policy.artifact_policy.max_sites:
-            raise CalibrationResourceExceeded("requested grid exceeds site resource policy")
-        if self.site_count > self.resource_policy.max_lattice_sites:
-            raise CalibrationResourceExceeded("requested grid exceeds lattice site budget")
-        if len(kinds) > self.resource_policy.artifact_policy.max_models:
-            raise CalibrationResourceExceeded("requested models exceed resource policy")
+        object.__setattr__(self, "max_drop", max_drop)
+        object.__setattr__(self, "detector_min_distance", min_distance)
+        object.__setattr__(self, "detector_threshold_rel", threshold_rel)
+        object.__setattr__(self, "detector_refine_half", refine_half)
+        object.__setattr__(self, "expected_centers_xy", expected_centers)
+        object.__setattr__(self, "maximum_site_residual_px", maximum_residual)
 
     @property
     def site_count(self) -> int:
-        return math.prod(self.grid_shape_yx)
+        return self.grid_shape_yx[0] * self.grid_shape_yx[1]
 
-    @property
-    def fingerprint(self) -> str:
-        from .analysis_codec import calibration_analysis_request_to_tree
 
-        return canonical_digest(calibration_analysis_request_to_tree(self))
+def _validate_site_center_admission(
+    centers_xy: np.ndarray,
+    request: CalibrationAnalysisRequest,
+) -> None:
+    """Admit exact-main detector output against independent spatial intent.
+
+    The detector's returned coordinates are never snapped, reordered, or
+    replaced here.  A request without spatial intent remains valid for a pure
+    preview computation; only authority minting requires the paired fields.
+    """
+
+    if not isinstance(request, CalibrationAnalysisRequest):
+        raise TypeError("request must be CalibrationAnalysisRequest")
+    expected = request.expected_centers_xy
+    if expected is None:
+        return
+    observed = np.asarray(centers_xy)
+    if observed.shape != expected.shape:
+        raise CalibrationAnalysisError(
+            "detector centers do not match the declared ordered site geometry"
+        )
+    limit = request.maximum_site_residual_px
+    assert limit is not None  # paired by CalibrationAnalysisRequest
+    for site, (actual, intended) in enumerate(zip(observed, expected, strict=True)):
+        if not math.isfinite(float(actual[0])) or not math.isfinite(float(actual[1])):
+            raise CalibrationAnalysisError(
+                f"detected site {site} contains non-finite coordinates"
+            )
+        residual = math.hypot(
+            float(actual[0]) - float(intended[0]),
+            float(actual[1]) - float(intended[1]),
+        )
+        if residual > limit:
+            raise CalibrationAnalysisError(
+                f"detected site {site} differs from expected_centers_xy by "
+                f"{residual:.6g} px; maximum_site_residual_px is {limit:.6g}"
+            )
+
+
+def estimate_calibration_analysis_peak_bytes(
+    schema: DatasetSchema,
+    request: CalibrationAnalysisRequest,
+    *,
+    source_read_scratch_bytes: int = 0,
+) -> int:
+    """Conservatively admit the observed calibration allocation pattern.
+
+    A 2304x2304 qCMOS profile peaked at 146.82 MiB (about 29 bytes per
+    pixel).  The 72-byte pixel allowance below covers the accumulator/count,
+    validity, detector-filter temporaries, immutable report copy, and the
+    worst dense local-maximum coordinate workspace.  Compact site/statistics
+    arrays and the capture owner's bounded read scratch are added separately.
+    This is deliberately a pure deterministic bound, not an OS-memory probe or
+    a second resource scheduler.
+    """
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(request, CalibrationAnalysisRequest):
+        raise TypeError("request must be CalibrationAnalysisRequest")
+    read_scratch = _nonnegative_integer(
+        source_read_scratch_bytes,
+        "source_read_scratch_bytes",
+    )
+    request.layout.validate_schema(schema)
+    if len(schema.cell_schema.data_shape) != 2:
+        raise CalibrationAnalysisError("calibration source cells must be 2D frames")
+    group_count = len(request.layout.brackets(schema))
+    reference_shots = len(request.layout.reference_event_indices)
+    pixels = math.prod(schema.cell_schema.data_shape)
+    sites = request.site_count
+    model_count = len(request.model_kinds)
+    reference_samples = group_count * reference_shots * sites
+    short_samples = group_count * sites
+    psf_extent = 2 * request.psf_half_width + 1
+
+    frame_working_set = pixels * 72
+    reference_working_set = reference_samples * 24
+    # The one-pass extractor holds all model signal/validity arrays while each
+    # immutable report copies those arrays and adds predictions/statistical
+    # masks.  32 bytes per model/group/site covers both representations and
+    # their concurrently live boolean workspaces.
+    short_working_set = short_samples * 32 * model_count
+    histogram_working_set = (
+        model_count * sites * (request.histogram_bins + 1) * 8
+    )
+    # Each retained ablation point owns a site-sized boolean mask plus Python
+    # objects for the ndarray, frozen result, scalar fields, and tuple slot.
+    # 1024 bytes is deliberately conservative for that object graph; the mask
+    # payload remains explicit so larger site arrays scale correctly.
+    ablation_working_set = (
+        model_count * (request.max_drop + 1) * (sites + 1024)
+    )
+    psf_working_set = sites * psf_extent * psf_extent * 24
+    site_admission_working_set = (
+        0
+        if request.expected_centers_xy is None
+        else request.expected_centers_xy.nbytes
+    )
+    return int(
+        read_scratch
+        + frame_working_set
+        + reference_working_set
+        + short_working_set
+        + histogram_working_set
+        + ablation_working_set
+        + psf_working_set
+        + site_admission_working_set
+    )
 
 
 @dataclass(frozen=True)
-class SiteDetectionDiagnostic:
-    candidate_count: int
-    minimum_peak_to_saddle_prominence: float
-    minimum_half_prominence_basin_area_pixels: int
-    lattice_rms_residual_pixels: float
-    minimum_band_separation_pixels: float | None
-    affine_sin_angle: float | None
-    affine_condition_number: float | None
-    assignment_cost_gap_pixels_squared: float | None
+class BimodalFit:
+    threshold: float
+    fidelity: float
+    dark_mean: float
+    dark_sigma: float
+    bright_mean: float
+    bright_sigma: float
+    bright_fraction: float
+    dark_fidelity: float
+    bright_fidelity: float
+    bright_above: bool
+    ok: bool
+
+
+@dataclass(frozen=True, eq=False)
+class ReferenceLabels:
+    occupied: np.ndarray
+    dark: np.ndarray
+    valid: np.ndarray
+    fits: tuple[BimodalFit, ...]
+    n_reference_shots: int
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "candidate_count",
-            _positive_integer(self.candidate_count, "candidate_count"),
+        occupied = _immutable_array(
+            self.occupied,
+            dtype="bool",
+            field_name="occupied",
         )
-        object.__setattr__(
-            self,
-            "minimum_half_prominence_basin_area_pixels",
-            _positive_integer(
-                self.minimum_half_prominence_basin_area_pixels,
-                "minimum_half_prominence_basin_area_pixels",
-            ),
+        if occupied.ndim != 2:
+            raise ValueError("reference labels must have shape (groups, sites)")
+        dark = _immutable_array(
+            self.dark,
+            dtype="bool",
+            shape=occupied.shape,
+            field_name="dark",
         )
-        for name in (
-            "minimum_peak_to_saddle_prominence",
-            "lattice_rms_residual_pixels",
+        valid = _immutable_array(
+            self.valid,
+            dtype="bool",
+            shape=occupied.shape,
+            field_name="valid",
+        )
+        fits = tuple(self.fits)
+        if len(fits) != occupied.shape[1] or any(
+            not isinstance(fit, BimodalFit) for fit in fits
         ):
-            value = _finite_real(getattr(self, name), name)
-            if value < 0.0:
-                raise ValueError(f"{name} must be non-negative")
-            object.__setattr__(self, name, value)
-        for name in (
-            "minimum_band_separation_pixels",
-            "affine_sin_angle",
-            "affine_condition_number",
-            "assignment_cost_gap_pixels_squared",
-        ):
-            value = getattr(self, name)
-            if value is None:
-                continue
-            value = _finite_real(value, name)
-            if value < 0.0:
-                raise ValueError(f"{name} must be non-negative")
-            object.__setattr__(self, name, value)
-        if self.affine_sin_angle is not None and self.affine_sin_angle > 1.0:
-            raise ValueError("affine_sin_angle must not exceed one")
-        if (
-            self.affine_condition_number is not None
-            and self.affine_condition_number < 1.0
-        ):
-            raise ValueError("affine_condition_number must be at least one")
+            raise ValueError("fits must contain one BimodalFit per site")
+        shots = _positive_integer(self.n_reference_shots, "n_reference_shots")
+        if np.any(occupied & dark) or np.any((occupied | dark) & ~valid):
+            raise ValueError("reference labels are internally inconsistent")
+        object.__setattr__(self, "occupied", occupied)
+        object.__setattr__(self, "dark", dark)
+        object.__setattr__(self, "valid", valid)
+        object.__setattr__(self, "fits", fits)
+        object.__setattr__(self, "n_reference_shots", shots)
+
+    @property
+    def n_groups(self) -> int:
+        return int(self.occupied.shape[0])
+
+    @property
+    def n_sites(self) -> int:
+        return int(self.occupied.shape[1])
+
+
+@dataclass(frozen=True, eq=False)
+class TrainTestSplit:
+    train: np.ndarray
+    test: np.ndarray
+    seed: int
+    train_fraction: float
+
+    def __post_init__(self) -> None:
+        train = _immutable_array(self.train, dtype="bool", field_name="train")
+        if train.ndim != 2:
+            raise ValueError("train must have shape (groups, sites)")
+        test = _immutable_array(
+            self.test,
+            dtype="bool",
+            shape=train.shape,
+            field_name="test",
+        )
+        if np.any(train & test):
+            raise ValueError("train and test masks must be disjoint")
+        seed = _nonnegative_integer(self.seed, "seed")
+        fraction = _finite_float(self.train_fraction, "train_fraction")
+        if not 0.0 < fraction < 1.0:
+            raise ValueError("train_fraction must be in (0, 1)")
+        object.__setattr__(self, "train", train)
+        object.__setattr__(self, "test", test)
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "train_fraction", fraction)
 
 
 @dataclass(frozen=True)
-class ModelAnalysisDiagnostic:
+class SiteFidelity:
+    site: int
+    threshold: float
+    bright_above: bool
+    fidelity: float
+    fidelity_dark: float
+    fidelity_bright: float
+    model_fidelity: float
+    dark_mean: float
+    dark_sigma: float
+    bright_mean: float
+    bright_sigma: float
+    n_test: int
+    n_train_dark: int
+    n_train_bright: int
+
+
+@dataclass(frozen=True, eq=False)
+class AblationPoint:
+    drop_worst_k: int
+    excluded_sites: np.ndarray
+    fidelity: float
+    errors: int
+    n_valid: int
+
+    def __post_init__(self) -> None:
+        excluded = _immutable_array(
+            self.excluded_sites,
+            dtype="bool",
+            field_name="excluded_sites",
+        )
+        if excluded.ndim != 1:
+            raise ValueError("excluded_sites must have shape (sites,)")
+        object.__setattr__(
+            self,
+            "drop_worst_k",
+            _nonnegative_integer(self.drop_worst_k, "drop_worst_k"),
+        )
+        object.__setattr__(self, "excluded_sites", excluded)
+        object.__setattr__(self, "errors", _nonnegative_integer(self.errors, "errors"))
+        object.__setattr__(self, "n_valid", _nonnegative_integer(self.n_valid, "n_valid"))
+
+
+@dataclass(frozen=True, eq=False)
+class ModelCalibrationReport:
     kind: ReadoutModelKind
-    usable_site_count: int
-    rejected_site_count: int
-    minimum_fidelity: float
-    mean_fidelity: float
-    minimum_class_accuracy_lower_bound: float
-    mean_class_accuracy_lower_bound: float
+    quick_thresholds: np.ndarray
+    short_signals: np.ndarray
+    short_validity: np.ndarray
+    bin_edges: np.ndarray
+    predictions: np.ndarray
+    site_fidelity: tuple[SiteFidelity, ...]
+    aggregate_fidelity: float
+    global_threshold: float
+    global_bright_above: bool
+    global_fidelity: float
+    ablation: tuple[AblationPoint, ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ReadoutModelKind):
             raise TypeError("kind must be ReadoutModelKind")
-        for name in ("usable_site_count", "rejected_site_count"):
-            object.__setattr__(
-                self,
-                name,
-                _nonnegative_integer(getattr(self, name), name),
-            )
-        if self.usable_site_count == 0:
-            raise ValueError("model diagnostic requires at least one usable site")
-        for minimum_name, mean_name in (
-            ("minimum_fidelity", "mean_fidelity"),
-            (
-                "minimum_class_accuracy_lower_bound",
-                "mean_class_accuracy_lower_bound",
-            ),
+        short = _immutable_array(
+            self.short_signals,
+            dtype="<f8",
+            field_name="short_signals",
+        )
+        if short.ndim != 2:
+            raise ValueError("short_signals must have shape (groups, sites)")
+        quick = _immutable_array(
+            self.quick_thresholds,
+            dtype="<f8",
+            shape=(short.shape[1],),
+            field_name="quick_thresholds",
+        )
+        short_validity = _immutable_array(
+            self.short_validity,
+            dtype="bool",
+            shape=short.shape,
+            field_name="short_validity",
+        )
+        edges = _immutable_array(self.bin_edges, dtype="<f8", field_name="bin_edges")
+        if edges.ndim != 1 or edges.size < 3 or not np.all(np.diff(edges) > 0):
+            raise ValueError("bin_edges must be a strictly increasing 1D array")
+        predictions = _immutable_array(
+            self.predictions,
+            dtype="bool",
+            shape=short.shape,
+            field_name="predictions",
+        )
+        site_fidelity = tuple(self.site_fidelity)
+        if len(site_fidelity) != short.shape[1] or any(
+            not isinstance(item, SiteFidelity) for item in site_fidelity
         ):
-            minimum = _finite_real(getattr(self, minimum_name), minimum_name)
-            mean = _finite_real(getattr(self, mean_name), mean_name)
-            if not 0.0 <= minimum <= mean <= 1.0:
-                raise ValueError(f"{minimum_name}/{mean_name} must satisfy 0 <= min <= mean <= 1")
-            object.__setattr__(self, minimum_name, minimum)
-            object.__setattr__(self, mean_name, mean)
+            raise ValueError("site_fidelity must contain one item per site")
+        if tuple(item.site for item in site_fidelity) != tuple(range(short.shape[1])):
+            raise ValueError("site_fidelity must follow the canonical site order")
+        if type(self.global_bright_above) is not bool:
+            raise TypeError("global_bright_above must be bool")
+        ablation = tuple(self.ablation)
+        if any(not isinstance(item, AblationPoint) for item in ablation):
+            raise TypeError("ablation must contain AblationPoint values")
+        if any(item.excluded_sites.shape != (short.shape[1],) for item in ablation):
+            raise ValueError("ablation masks must follow the report site axis")
+        object.__setattr__(self, "quick_thresholds", quick)
+        object.__setattr__(self, "short_signals", short)
+        object.__setattr__(self, "short_validity", short_validity)
+        object.__setattr__(self, "bin_edges", edges)
+        object.__setattr__(self, "predictions", predictions)
+        object.__setattr__(self, "site_fidelity", site_fidelity)
+        object.__setattr__(self, "ablation", ablation)
+
+    @property
+    def thresholds(self) -> np.ndarray:
+        values = np.asarray([item.threshold for item in self.site_fidelity], dtype="<f8")
+        values.setflags(write=False)
+        return values
 
 
 @dataclass(frozen=True)
-class ReferenceValleyEvidence:
-    """Finite-sample exact evidence for one frozen three-bin valley."""
-
-    sample_count: int
-    left_count: int
-    middle_count: int
-    right_count: int
-    outside_count: int
-    invalid_count: int
-
-    def __post_init__(self) -> None:
-        for name in (
-            "sample_count",
-            "left_count",
-            "middle_count",
-            "right_count",
-            "outside_count",
-            "invalid_count",
-        ):
-            object.__setattr__(
-                self,
-                name,
-                _nonnegative_integer(getattr(self, name), name),
-            )
-        if (
-            self.left_count
-            + self.middle_count
-            + self.right_count
-            + self.outside_count
-            + self.invalid_count
-            != self.sample_count
-        ):
-            raise ValueError("reference-valley bin counts must cover all evidence")
+class PsfFitDiagnostic:
+    site: int
+    center_xy: tuple[float, float]
+    sigma_xy: tuple[float, float]
+    fit_ok: bool
 
 
-    def _outer_vs_adverse_pvalue(self, outer_count: int) -> float:
-        # Every valid evidence sample participates.  Values outside the three
-        # frozen bins are adverse evidence, not silently renormalized away.
-        adverse_count = (
-            self.middle_count + self.outside_count + self.invalid_count
-        )
-        pair_count = outer_count + adverse_count
-        if pair_count == 0:
-            return 1.0
-        return float(
-            binomtest(
-                outer_count,
-                pair_count,
-                0.5,
-                alternative="greater",
-            ).pvalue
-        )
-
-    @property
-    def left_vs_adverse_pvalue(self) -> float:
-        return self._outer_vs_adverse_pvalue(self.left_count)
-
-    @property
-    def right_vs_adverse_pvalue(self) -> float:
-        return self._outer_vs_adverse_pvalue(self.right_count)
-
-    @property
-    def valley_pvalue(self) -> float:
-        return max(
-            self.left_vs_adverse_pvalue,
-            self.right_vs_adverse_pvalue,
-        )
-
-
-@dataclass(frozen=True)
-class ReferenceValleyDiagnostic:
-    """Auditable evidence for one reference-event/site label proposal.
-
-    ``site_accepted`` means only that the independently proposed statistical
-    valley passed the declared familywise gates.  It does not assert that the
-    two populations are physically prepared empty/occupied states.
-    """
-
-    reference_index: int
-    site_index: int
-    proposal_threshold: float | None
-    proposal_lower_sample_count: int
-    proposal_upper_sample_count: int
-    cluster_separation_rss: float | None
-    evidence: ReferenceValleyEvidence
-    lower_cluster_evidence: ReferenceValleyEvidence | None
-    upper_cluster_evidence: ReferenceValleyEvidence | None
-    site_accepted: bool
+@dataclass(frozen=True, eq=False)
+class CalibrationReport:
+    request: CalibrationAnalysisRequest
+    software_lineage: tuple[tuple[str, str], ...]
+    group_contexts: tuple[tuple[tuple[AxisId, int], ...], ...]
+    reference_average: np.ndarray
+    reference_average_validity: np.ndarray
+    reference_box_signals: np.ndarray
+    labels: ReferenceLabels
+    split: TrainTestSplit
+    psf_fits: tuple[PsfFitDiagnostic, ...]
+    models: tuple[ModelCalibrationReport, ...]
 
     def __post_init__(self) -> None:
-        for name in (
-            "reference_index",
-            "site_index",
-            "proposal_lower_sample_count",
-            "proposal_upper_sample_count",
-        ):
-            object.__setattr__(
-                self,
-                name,
-                _nonnegative_integer(getattr(self, name), name),
-            )
-        threshold = self.proposal_threshold
-        separation = self.cluster_separation_rss
-        if threshold is None:
-            if (
-                self.proposal_lower_sample_count != 0
-                or self.proposal_upper_sample_count != 0
-                or separation is not None
-            ):
-                raise ValueError("missing proposal must not carry proposal evidence")
-        else:
-            threshold = _finite_real(threshold, "proposal_threshold")
-            if (
-                self.proposal_lower_sample_count == 0
-                or self.proposal_upper_sample_count == 0
-            ):
-                raise ValueError("proposal requires samples in both classes")
-            if (
-                separation is None
-                or isinstance(separation, bool)
-                or not isinstance(separation, Real)
-            ):
-                raise ValueError(
-                    "present proposal requires cluster_separation_rss"
-                )
-            separation = float(separation)
-            if math.isnan(separation) or separation <= 0.0:
-                raise ValueError("cluster_separation_rss must be positive")
-        object.__setattr__(self, "proposal_threshold", threshold)
-        object.__setattr__(self, "cluster_separation_rss", separation)
-        if not isinstance(self.evidence, ReferenceValleyEvidence):
-            raise TypeError("evidence must be ReferenceValleyEvidence")
-        for name in ("lower_cluster_evidence", "upper_cluster_evidence"):
-            value = getattr(self, name)
-            if value is not None and not isinstance(value, ReferenceValleyEvidence):
-                raise TypeError(f"{name} must be ReferenceValleyEvidence or None")
-        if not isinstance(self.site_accepted, bool):
-            raise TypeError("site_accepted must be bool")
-
-
-@dataclass(frozen=True)
-class CalibrationAnalysisDiagnostics:
-    bracket_count: int
-    train_bracket_count: int
-    reference_evidence_bracket_count: int
-    test_bracket_count: int
-    partition_digest: str
-    reference_frame_count: int
-    valid_training_reference_pixel_fraction: float
-    consensus_dark_counts: tuple[int, ...]
-    consensus_bright_counts: tuple[int, ...]
-    reference_valleys: tuple[ReferenceValleyDiagnostic, ...]
-    detection: SiteDetectionDiagnostic
-    models: tuple[ModelAnalysisDiagnostic, ...]
-
-    def __post_init__(self) -> None:
-        for name in (
-            "bracket_count",
-            "train_bracket_count",
-            "reference_evidence_bracket_count",
-            "test_bracket_count",
-            "reference_frame_count",
-        ):
-            object.__setattr__(
-                self,
-                name,
-                _nonnegative_integer(getattr(self, name), name),
-            )
-        if self.bracket_count == 0:
-            raise ValueError("bracket_count must be positive")
-        if self.reference_frame_count == 0:
-            raise ValueError("reference_frame_count must be positive")
-        if (
-            self.train_bracket_count == 0
-            or self.reference_evidence_bracket_count == 0
-            or self.test_bracket_count == 0
-        ):
-            raise ValueError(
-                "diagnostics require non-empty train, reference-evidence, and test partitions"
-            )
-        if (
-            self.train_bracket_count
-            + self.reference_evidence_bracket_count
-            + self.test_bracket_count
-            != self.bracket_count
-        ):
-            raise ValueError("diagnostic partition counts must sum to bracket_count")
-        if (
-            not isinstance(self.partition_digest, str)
-            or len(self.partition_digest) != 64
-            or any(c not in "0123456789abcdef" for c in self.partition_digest)
-        ):
-            raise ValueError("partition_digest must be a lowercase SHA-256 digest")
-        fraction = _finite_real(
-            self.valid_training_reference_pixel_fraction,
-            "valid_training_reference_pixel_fraction",
-        )
-        if not 0.0 <= fraction <= 1.0:
-            raise ValueError("valid training reference fraction must lie in [0, 1]")
-        object.__setattr__(
-            self,
-            "valid_training_reference_pixel_fraction",
-            fraction,
-        )
-        dark = tuple(
-            _nonnegative_integer(value, "consensus_dark_counts entry")
-            for value in self.consensus_dark_counts
-        )
-        bright = tuple(
-            _nonnegative_integer(value, "consensus_bright_counts entry")
-            for value in self.consensus_bright_counts
-        )
-        if not dark or len(dark) != len(bright):
-            raise ValueError("consensus count vectors must be non-empty and equal length")
-        valleys = tuple(self.reference_valleys)
-        if self.reference_frame_count % self.bracket_count != 0:
-            raise ValueError("reference-frame count is not divisible by bracket count")
-        reference_count = self.reference_frame_count // self.bracket_count
-        expected_valley_count = reference_count * len(dark)
-        if len(valleys) != expected_valley_count or any(
-            not isinstance(item, ReferenceValleyDiagnostic) for item in valleys
-        ):
-            raise ValueError(
-                "reference_valleys must contain one diagnostic per reference and site"
-            )
-        for reference in range(reference_count):
-            for site in range(len(dark)):
-                item = valleys[reference * len(dark) + site]
-                if item.reference_index != reference or item.site_index != site:
-                    raise ValueError("reference-valley diagnostic order is not canonical")
-                if (
-                    item.proposal_lower_sample_count
-                    + item.proposal_upper_sample_count
-                    > self.train_bracket_count
-                ):
-                    raise ValueError("reference proposal exceeds training partition")
-                if item.evidence.sample_count != self.reference_evidence_bracket_count:
-                    raise ValueError(
-                        "reference evidence must cover every scheduled evidence bracket"
-                    )
-                for nested in (
-                    item.lower_cluster_evidence,
-                    item.upper_cluster_evidence,
-                ):
-                    if (
-                        nested is not None
-                        and nested.sample_count
-                        > self.reference_evidence_bracket_count
-                    ):
-                        raise ValueError("nested evidence exceeds evidence partition")
-                if item.proposal_threshold is None and (
-                    item.evidence.left_count != 0
-                    or item.evidence.middle_count != 0
-                    or item.evidence.right_count != 0
-                    or (
-                        item.evidence.outside_count
-                        + item.evidence.invalid_count
-                        != item.evidence.sample_count
-                    )
-                    or item.evidence.valley_pvalue != 1.0
-                    or item.lower_cluster_evidence is not None
-                    or item.upper_cluster_evidence is not None
-                    or item.site_accepted
-                ):
-                    raise ValueError("missing proposal cannot carry valley authority")
-        for site in range(len(dark)):
-            site_items = valleys[site::len(dark)]
-            accepted = site_items[0].site_accepted
-            if any(
-                item.site_accepted is not accepted
-                for item in site_items
-            ):
-                raise ValueError("reference-valley site decisions are inconsistent")
-            if dark[site] + bright[site] > self.bracket_count:
-                raise ValueError(
-                    "consensus class counts exceed the bracket population"
-                )
-        if not isinstance(self.detection, SiteDetectionDiagnostic):
-            raise TypeError("detection must be SiteDetectionDiagnostic")
-        if self.detection.candidate_count != len(dark):
-            raise ValueError("site-detection diagnostic count differs from site vectors")
-        models = tuple(self.models)
-        if not models or any(not isinstance(item, ModelAnalysisDiagnostic) for item in models):
-            raise ValueError("models must contain ModelAnalysisDiagnostic values")
-        if len({item.kind for item in models}) != len(models):
-            raise ValueError("diagnostic model kinds must be unique")
-        if tuple(item.kind for item in models) != tuple(
-            sorted((item.kind for item in models), key=lambda kind: kind.value)
-        ):
-            raise ValueError("diagnostic model kinds must use canonical order")
+        if not isinstance(self.request, CalibrationAnalysisRequest):
+            raise TypeError("request must be CalibrationAnalysisRequest")
+        lineage = tuple(tuple(item) for item in self.software_lineage)
         if any(
-            item.usable_site_count + item.rejected_site_count != len(dark)
-            for item in models
+            len(item) != 2
+            or not all(isinstance(value, str) and value for value in item)
+            for item in lineage
         ):
-            raise ValueError("diagnostic model site counts differ from site vectors")
-        object.__setattr__(self, "consensus_dark_counts", dark)
-        object.__setattr__(self, "consensus_bright_counts", bright)
-        object.__setattr__(self, "reference_valleys", valleys)
+            raise ValueError("software_lineage must contain non-empty text pairs")
+        if len({name for name, _version in lineage}) != len(lineage):
+            raise ValueError("software_lineage names must be unique")
+        lineage = tuple(sorted(lineage))
+        contexts = tuple(
+            tuple((axis_id, _nonnegative_integer(index, "group context index")) for axis_id, index in context)
+            for context in self.group_contexts
+        )
+        if len(contexts) != self.labels.n_groups or len(set(contexts)) != len(contexts):
+            raise ValueError("group_contexts must uniquely identify every calibration group")
+        context_axis_ids = tuple(axis_id for axis_id, _index in contexts[0])
+        for context in contexts:
+            if any(not isinstance(axis_id, AxisId) for axis_id, _index in context):
+                raise TypeError("group context keys must use AxisId")
+            if len({axis_id for axis_id, _index in context}) != len(context):
+                raise ValueError("group context axes must be unique")
+            if tuple(axis_id for axis_id, _index in context) != context_axis_ids:
+                raise ValueError(
+                    "every calibration group context must use the same ordered AxisIds"
+                )
+        average = _immutable_array(
+            self.reference_average,
+            dtype="<f8",
+            field_name="reference_average",
+        )
+        if average.ndim != 2:
+            raise ValueError("reference_average must be a 2D image")
+        if not np.all(np.isfinite(average)):
+            raise ValueError("reference_average must be finite")
+        average_validity = _immutable_array(
+            self.reference_average_validity,
+            dtype="bool",
+            shape=average.shape,
+            field_name="reference_average_validity",
+        )
+        signals = _immutable_array(
+            self.reference_box_signals,
+            dtype="<f8",
+            field_name="reference_box_signals",
+        )
+        expected = (
+            self.labels.n_groups,
+            self.labels.n_reference_shots,
+            self.labels.n_sites,
+        )
+        if signals.shape != expected:
+            raise ValueError(
+                f"reference_box_signals must have shape {expected}, got {signals.shape}"
+            )
+        psf_fits = tuple(self.psf_fits)
+        expected_psf_fits = (
+            self.labels.n_sites
+            if any(kind is not ReadoutModelKind.BOX for kind in self.request.model_kinds)
+            else 0
+        )
+        if len(psf_fits) != expected_psf_fits or any(
+            not isinstance(item, PsfFitDiagnostic) for item in psf_fits
+        ):
+            raise ValueError("psf_fits has the wrong size for the requested models")
+        if tuple(item.site for item in psf_fits) != tuple(range(expected_psf_fits)):
+            raise ValueError("psf_fits must follow the canonical site order")
+        models = tuple(self.models)
+        if not models or any(not isinstance(item, ModelCalibrationReport) for item in models):
+            raise TypeError("models must contain ModelCalibrationReport values")
+        if tuple(item.kind for item in models) != self.request.model_kinds:
+            raise ValueError("report models must match the request model set and order")
+        if self.labels.n_sites != self.request.site_count:
+            raise ValueError("report labels and request contain different site counts")
+        if any(item.short_signals.shape != self.labels.valid.shape for item in models):
+            raise ValueError("model reports and reference labels have different shapes")
+        if self.split.train.shape != self.labels.valid.shape:
+            raise ValueError("split and reference labels have different shapes")
+        object.__setattr__(self, "software_lineage", lineage)
+        object.__setattr__(self, "group_contexts", contexts)
+        object.__setattr__(self, "reference_average", average)
+        object.__setattr__(self, "reference_average_validity", average_validity)
+        object.__setattr__(self, "reference_box_signals", signals)
+        object.__setattr__(self, "psf_fits", psf_fits)
         object.__setattr__(self, "models", models)
 
-
-@dataclass(frozen=True)
-class CalibrationAnalysisResult:
-    artifact: CalibrationArtifact
-    diagnostics: CalibrationAnalysisDiagnostics
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.artifact, CalibrationArtifact):
-            raise TypeError("artifact must be CalibrationArtifact")
-        if not isinstance(self.diagnostics, CalibrationAnalysisDiagnostics):
-            raise TypeError("diagnostics must be CalibrationAnalysisDiagnostics")
-        site_count = self.artifact.site_map.site_axis.size
-        if len(self.diagnostics.consensus_dark_counts) != site_count:
-            raise ValueError("diagnostic consensus vectors differ from artifact site count")
-        if self.diagnostics.bracket_count != self.artifact.source_binding.bracket_count:
-            raise ValueError("diagnostic bracket count differs from source binding")
-        expected_reference_frames = self.diagnostics.bracket_count * len(
-            self.artifact.source_binding.layout.reference_event_indices
-        )
-        if self.diagnostics.reference_frame_count != expected_reference_frames:
-            raise ValueError("diagnostic reference-frame count differs from source layout")
-        if self.diagnostics.detection.candidate_count != site_count:
-            raise ValueError("site-detection diagnostic differs from artifact site count")
-        model_kinds = tuple(model.kind for model in self.artifact.models)
-        diagnostic_kinds = tuple(item.kind for item in self.diagnostics.models)
-        if diagnostic_kinds != model_kinds:
-            raise ValueError("diagnostic model order differs from artifact")
-
-        artifact_parameters = {
-            item.name: item.value for item in self.artifact.parameters
-        }
-        if artifact_parameters.get("bracket-partition-digest") != (
-            self.diagnostics.partition_digest
-        ):
-            raise ValueError("artifact partition lineage differs from diagnostics")
-        for name in (
-            "analysis-request-fingerprint",
-            "analysis-work-plan-fingerprint",
-        ):
-            value = artifact_parameters.get(name)
-            if (
-                not isinstance(value, str)
-                or len(value) != 64
-                or any(character not in "0123456789abcdef" for character in value)
-            ):
-                raise ValueError(f"artifact omits canonical {name}")
-        expected_analysis_parameters = {
-            "analysis-planning-assumption": (
-                CalibrationAnalysisPlanningAssumption
-                .PRECOMMITTED_BEFORE_SOURCE_INSPECTION.value
-            ),
-            "held-out-family-scope": "ARTIFACT_MODEL_SITE",
-            "held-out-family-model-count": len(self.artifact.models),
-            "held-out-family-hypothesis-count": (
-                len(self.artifact.models) * site_count
-            ),
-        }
-        for name, expected in expected_analysis_parameters.items():
-            if not _same_typed_scalar(artifact_parameters.get(name), expected):
-                raise ValueError(f"artifact analysis parameter {name} differs")
-        expected_reference_parameters = {
-            "bracket-sampling-assumption": (
-                CalibrationBracketSamplingAssumption.INDEPENDENT_STATIONARY_BRACKETS.value
-            ),
-            "reference-label-source": (
-                ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY.value
-            ),
-            "reference-valley-gate-id": (
-                _REFERENCE_VALLEY_GATE_ID
-            ),
-            "reference-ambiguity-gate-id": _REFERENCE_AMBIGUITY_GATE_ID,
-            "reference-statistical-unit": "BRACKET",
-            "reference-evidence-assumption": (
-                _REFERENCE_EVIDENCE_ASSUMPTION
-            ),
-            "train-bracket-count": self.diagnostics.train_bracket_count,
-            "reference-evidence-bracket-count": (
-                self.diagnostics.reference_evidence_bracket_count
-            ),
-            "test-bracket-count": self.diagnostics.test_bracket_count,
-        }
-        for name, expected in expected_reference_parameters.items():
-            if not _same_typed_scalar(artifact_parameters.get(name), expected):
-                raise ValueError(f"artifact reference-label parameter {name} differs")
-        familywise_error_rate = artifact_parameters.get(
-            "reference-valley-familywise-error-rate"
-        )
-        if (
-            isinstance(familywise_error_rate, bool)
-            or not isinstance(familywise_error_rate, Real)
-            or not math.isfinite(float(familywise_error_rate))
-            or not 0.0 < float(familywise_error_rate) < 1.0
-        ):
-            raise ValueError("artifact omits reference-valley familywise error rate")
-        familywise_error_rate = float(familywise_error_rate)
-        separation_gate = artifact_parameters.get(
-            "minimum-reference-cluster-separation-rss"
-        )
-        if (
-            isinstance(separation_gate, bool)
-            or not isinstance(separation_gate, Real)
-            or not math.isfinite(float(separation_gate))
-            or float(separation_gate) <= 0.0
-        ):
-            raise ValueError("artifact omits positive reference separation gate")
-        separation_gate = float(separation_gate)
-        minimum_reference_samples = artifact_parameters.get(
-            "minimum-reference-proposal-samples-per-class"
-        )
-        if (
-            isinstance(minimum_reference_samples, bool)
-            or not isinstance(minimum_reference_samples, Integral)
-            or minimum_reference_samples <= 0
-        ):
-            raise ValueError("artifact omits reference proposal sample gate")
-        orientation = artifact_parameters.get("reference-class-orientation")
-        if orientation not in {"ABOVE_IS_OCCUPIED", "BELOW_IS_OCCUPIED"}:
-            raise ValueError("artifact omits reference class orientation")
-        for item in self.diagnostics.reference_valleys:
-            if item.proposal_threshold is None:
-                continue
-            if (
-                item.proposal_lower_sample_count < minimum_reference_samples
-                or item.proposal_upper_sample_count < minimum_reference_samples
-            ):
-                raise ValueError("reference proposal violates minimum sample gate")
-            if (
-                item.cluster_separation_rss is not None
-                and item.cluster_separation_rss < separation_gate
-            ):
-                raise ValueError("reference proposal violates separation gate")
-
-        reference_count = len(
-            self.artifact.source_binding.layout.reference_event_indices
-        )
-        valley_matrix = np.asarray(
-            [
-                item.evidence.valley_pvalue
-                for item in self.diagnostics.reference_valleys
-            ],
-            dtype=np.float64,
-        ).reshape(reference_count, site_count)
-        expected_primary = _holm_rejections(
-            np.max(valley_matrix, axis=0),
-            familywise_error_rate,
-        )
-        nested_matrix = np.asarray(
-            [
-                1.0 if value is None else value
-                for item in self.diagnostics.reference_valleys
-                for evidence in (
-                    item.lower_cluster_evidence,
-                    item.upper_cluster_evidence,
-                )
-                for value in (
-                    None if evidence is None else evidence.valley_pvalue,
-                )
-            ],
-            dtype=np.float64,
-        ).reshape(reference_count, site_count, 2)
-        expected_ambiguous = np.any(
-            _holm_rejections(
-                nested_matrix.reshape(-1),
-                familywise_error_rate,
-            ).reshape(nested_matrix.shape),
-            axis=(0, 2),
-        )
-        complete_reference_sites = np.ones(site_count, dtype=bool)
-        for site in range(site_count):
-            for reference in range(reference_count):
-                item = self.diagnostics.reference_valleys[
-                    reference * site_count + site
-                ]
-                if (
-                    item.proposal_lower_sample_count
-                    + item.proposal_upper_sample_count
-                    != self.diagnostics.train_bracket_count
-                    or item.evidence.invalid_count != 0
-                    or any(
-                        nested is not None and nested.invalid_count != 0
-                        for nested in (
-                            item.lower_cluster_evidence,
-                            item.upper_cluster_evidence,
-                        )
-                    )
-                ):
-                    complete_reference_sites[site] = False
-                    break
-        expected_reference_sites = (
-            expected_primary
-            & ~expected_ambiguous
-            & complete_reference_sites
-        )
-        reported_reference_sites = np.asarray(
-            [
-                self.diagnostics.reference_valleys[site].site_accepted
-                for site in range(site_count)
-            ],
-            dtype=bool,
-        )
-        if not np.array_equal(expected_reference_sites, reported_reference_sites):
-            raise ValueError("reference-valley decision differs from persisted evidence")
-        declared_gate_policy: tuple[int, int, float, float, str, float] | None = None
-        held_out_records: list[_HeldOutReplayRecord] = []
-        for model, diagnostic in zip(
-            self.artifact.models,
-            self.diagnostics.models,
-            strict=True,
-        ):
-            model_parameters = {
-                item.name: item.value for item in model.header.parameters
-            }
-            if model_parameters.get("bracket-partition-digest") != (
-                self.diagnostics.partition_digest
-            ):
-                raise ValueError("model partition lineage differs from diagnostics")
-            for name in (
-                "analysis-request-fingerprint",
-                "analysis-work-plan-fingerprint",
-                "bracket-sampling-assumption",
-                "analysis-planning-assumption",
-                "held-out-family-scope",
-                "held-out-family-model-count",
-                "held-out-family-hypothesis-count",
-            ):
-                if not _same_typed_scalar(
-                    model_parameters.get(name),
-                    artifact_parameters.get(name),
-                ):
-                    raise ValueError(f"model {name} differs from artifact")
-            if (
-                model_parameters.get("train-bracket-count")
-                != self.diagnostics.train_bracket_count
-                or model_parameters.get("reference-evidence-bracket-count")
-                != self.diagnostics.reference_evidence_bracket_count
-                or model_parameters.get("test-bracket-count")
-                != self.diagnostics.test_bracket_count
-            ):
-                raise ValueError("model partition counts differ from diagnostics")
-            quality = model.header.quality
-            if quality.quality_gate_id != _QUALITY_GATE_ID:
-                raise ValueError("model quality gate differs from analysis contract")
-            usable = quality.usable_sites.mask
-            if any(
-                int(dark_count) + int(bright_count)
-                > self.diagnostics.train_bracket_count
-                for dark_count, bright_count in zip(
-                    quality.dark_training_sample_counts,
-                    quality.bright_training_sample_counts,
-                    strict=True,
-                )
-            ):
-                raise ValueError("model training evidence exceeds train partition")
-            evidence_sites = quality.held_out_validity.mask
-            for site in np.flatnonzero(evidence_sites):
-                dark_unknown = int(
-                    quality.held_out_dark_total_counts[site]
-                    - quality.held_out_dark_labeled_counts[site]
-                )
-                bright_unknown = int(
-                    quality.held_out_bright_total_counts[site]
-                    - quality.held_out_bright_labeled_counts[site]
-                )
-                if dark_unknown != bright_unknown or (
-                    int(quality.held_out_dark_labeled_counts[site])
-                    + int(quality.held_out_bright_labeled_counts[site])
-                    + dark_unknown
-                    != self.diagnostics.test_bracket_count
-                ):
-                    raise ValueError(
-                        "model held-out evidence does not cover the test partition"
-                    )
-            if np.any(usable & ~expected_reference_sites):
-                raise ValueError("model uses a site rejected by reference-label evidence")
-
-            def positive_integer_parameter(name: str) -> int:
-                value = model_parameters.get(name)
-                if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
-                    raise ValueError(f"model omits positive {name}")
-                return int(value)
-
-            minimum_train = positive_integer_parameter(
-                "minimum-train-samples-per-class"
-            )
-            minimum_test = positive_integer_parameter(
-                "minimum-test-samples-per-class"
-            )
-            confidence = model_parameters.get("held-out-confidence-level")
-            if (
-                isinstance(confidence, bool)
-                or not isinstance(confidence, Real)
-                or not math.isfinite(float(confidence))
-                or not 0.0 < float(confidence) < 1.0
-            ):
-                raise ValueError("model omits held-out confidence level")
-            confidence = float(confidence)
-            lower_gate = model_parameters.get(
-                "minimum-held-out-class-accuracy-lower-bound"
-            )
-            if (
-                isinstance(lower_gate, bool)
-                or not isinstance(lower_gate, Real)
-                or not math.isfinite(float(lower_gate))
-                or not 0.0 <= float(lower_gate) <= 1.0
-            ):
-                raise ValueError("model omits held-out class lower-bound gate")
-            lower_gate = float(lower_gate)
-            evidence = quality.held_out_validity.mask
-            expected_dark_lower = np.zeros(site_count, dtype=np.float64)
-            expected_bright_lower = np.zeros(site_count, dtype=np.float64)
-            for site in np.flatnonzero(evidence):
-                expected_dark_lower[site] = _one_sided_clopper_pearson_lower_bound(
-                    int(quality.held_out_dark_success_counts[site]),
-                    int(quality.held_out_dark_total_counts[site]),
-                    confidence,
-                )
-                expected_bright_lower[site] = _one_sided_clopper_pearson_lower_bound(
-                    int(quality.held_out_bright_success_counts[site]),
-                    int(quality.held_out_bright_total_counts[site]),
-                    confidence,
-                )
-            if not np.allclose(
-                quality.held_out_dark_accuracy_lower_bounds,
-                expected_dark_lower,
-                rtol=1e-12,
-                atol=1e-15,
-            ) or not np.allclose(
-                quality.held_out_bright_accuracy_lower_bounds,
-                expected_bright_lower,
-                rtol=1e-12,
-                atol=1e-15,
-            ):
-                raise ValueError(
-                    "model Clopper-Pearson evidence differs from success/total counts"
-                )
-            site_pvalues = np.ones(site_count, dtype=np.float64)
-            for site in np.flatnonzero(evidence):
-                site_pvalues[site] = max(
-                    _one_sided_binomial_superiority_pvalue(
-                        int(quality.held_out_dark_success_counts[site]),
-                        int(quality.held_out_dark_total_counts[site]),
-                        lower_gate,
-                    ),
-                    _one_sided_binomial_superiority_pvalue(
-                        int(quality.held_out_bright_success_counts[site]),
-                        int(quality.held_out_bright_total_counts[site]),
-                        lower_gate,
-                    ),
-                )
-            candidate_sites = (
-                expected_reference_sites
-                & evidence
-                & (
-                    quality.dark_training_sample_counts
-                    >= minimum_train
-                )
-                & (
-                    quality.bright_training_sample_counts
-                    >= minimum_train
-                )
-                & (
-                    quality.held_out_dark_labeled_counts
-                    >= minimum_test
-                )
-                & (
-                    quality.held_out_bright_labeled_counts
-                    >= minimum_test
-                )
-                & (
-                    quality.held_out_dark_accuracy_lower_bounds
-                    >= lower_gate - 1e-12
-                )
-                & (
-                    quality.held_out_bright_accuracy_lower_bounds
-                    >= lower_gate - 1e-12
-                )
-            )
-            acceptance = model_parameters.get("usable-site-acceptance")
-            fraction = model_parameters.get("minimum-usable-site-fraction")
-            if acceptance == UsableSiteAcceptance.ALL.value:
-                required_usable = site_count
-                if fraction != 1.0:
-                    raise ValueError("ALL acceptance requires canonical fraction one")
-                fraction = 1.0
-            elif acceptance == UsableSiteAcceptance.MINIMUM_FRACTION.value:
-                if (
-                    isinstance(fraction, bool)
-                    or not isinstance(fraction, Real)
-                    or not 0.0 < float(fraction) <= 1.0
-                ):
-                    raise ValueError("model omits usable-site fraction")
-                fraction = float(fraction)
-                required_usable = math.ceil(fraction * site_count)
-            else:
-                raise ValueError("model omits usable-site acceptance policy")
-            gate_policy = (
-                minimum_train,
-                minimum_test,
-                confidence,
-                lower_gate,
-                acceptance,
-                fraction,
-            )
-            if declared_gate_policy is None:
-                declared_gate_policy = gate_policy
-            elif gate_policy != declared_gate_policy:
-                raise ValueError("models declare inconsistent calibration gate policies")
-            held_out_records.append(
-                _HeldOutReplayRecord(
-                    diagnostic=diagnostic,
-                    quality=quality,
-                    usable=usable,
-                    candidate_sites=candidate_sites,
-                    site_pvalues=site_pvalues,
-                    minimum_train=minimum_train,
-                    minimum_test=minimum_test,
-                    lower_gate=lower_gate,
-                    required_usable=required_usable,
-                )
-            )
-
-        if declared_gate_policy is None or not held_out_records:
-            raise ValueError("calibration result omits held-out model evidence")
-        confidence = declared_gate_policy[2]
-        joint_certified = _artifact_wide_held_out_rejections(
-            np.stack([item.site_pvalues for item in held_out_records], axis=0),
-            1.0 - confidence,
-        )
-        for record, model_certified in zip(
-            held_out_records,
-            joint_certified,
-            strict=True,
-        ):
-            quality = record.quality
-            usable = record.usable
-            expected_usable = record.candidate_sites & model_certified
-            if not np.array_equal(usable, expected_usable):
-                raise ValueError(
-                    "model usable sites differ from replayed artifact-wide "
-                    "familywise evidence"
-                )
-            usable_count = int(np.count_nonzero(usable))
-            diagnostic = record.diagnostic
-            if diagnostic.usable_site_count != usable_count or (
-                diagnostic.rejected_site_count != site_count - usable_count
-            ):
-                raise ValueError("model site-count diagnostic differs from quality")
-            if np.any(
-                quality.dark_training_sample_counts[usable] < record.minimum_train
-            ) or np.any(
-                quality.bright_training_sample_counts[usable] < record.minimum_train
-            ):
-                raise ValueError("usable site violates minimum training evidence")
-            if np.any(
-                quality.held_out_dark_labeled_counts[usable] < record.minimum_test
-            ) or np.any(
-                quality.held_out_bright_labeled_counts[usable] < record.minimum_test
-            ):
-                raise ValueError("usable site violates minimum held-out evidence")
-            if np.any(
-                quality.held_out_dark_accuracy_lower_bounds[usable]
-                < record.lower_gate - 1e-12
-            ) or np.any(
-                quality.held_out_bright_accuracy_lower_bounds[usable]
-                < record.lower_gate - 1e-12
-            ):
-                raise ValueError("usable site violates class confidence gate")
-            if usable_count < record.required_usable:
-                raise ValueError("model quality violates usable-site acceptance")
-            fidelity = quality.held_out_fidelity[usable]
-            class_lower = np.minimum(
-                quality.held_out_dark_accuracy_lower_bounds[usable],
-                quality.held_out_bright_accuracy_lower_bounds[usable],
-            )
-            expected = (
-                float(np.min(fidelity)),
-                float(np.mean(fidelity)),
-                float(np.min(class_lower)),
-                float(np.mean(class_lower)),
-            )
-            observed = (
-                diagnostic.minimum_fidelity,
-                diagnostic.mean_fidelity,
-                diagnostic.minimum_class_accuracy_lower_bound,
-                diagnostic.mean_class_accuracy_lower_bound,
-            )
-            if not np.allclose(observed, expected, rtol=1e-12, atol=1e-12):
-                raise ValueError("model evidence diagnostic differs from quality")
+    def model(self, kind: ReadoutModelKind) -> ModelCalibrationReport:
+        for report in self.models:
+            if report.kind is kind:
+                return report
+        raise KeyError(kind)
 
 
-@dataclass(frozen=True)
-class _BracketPartition:
-    train_indices: tuple[int, ...]
-    reference_evidence_indices: tuple[int, ...]
-    test_indices: tuple[int, ...]
-    digest: str
+def _main_reference_thresholds_available(
+    reports: Sequence[ModelCalibrationReport],
+) -> bool:
+    """Mirror main's all-method gate for committing labelled thresholds."""
 
-
-@dataclass(frozen=True)
-class _CalibrationWorkPreparation:
-    plan: CalibrationWorkPlan
-    brackets: tuple[CalibrationCaptureBracket, ...]
-    source_binding: CalibrationSourceBinding
-    frame_contract: FrameContract
-    partition: _BracketPartition
-
-
-@dataclass(frozen=True)
-class _ReferenceThresholdProposal:
-    threshold: float
-    left_center: float
-    center_spacing: float
-    lower_sample_count: int
-    upper_sample_count: int
-    cluster_separation_rss: float
-
-
-@dataclass(frozen=True)
-class _LatticeResult:
-    coordinates_xy: np.ndarray
-    diagnostic: SiteDetectionDiagnostic
-
-
-@dataclass(frozen=True)
-class _PeakCandidates:
-    coordinates_xy: np.ndarray
-    prominences: np.ndarray
-    half_prominence_basin_areas: np.ndarray
-
-
-@dataclass(frozen=True)
-class _TrainingResult:
-    thresholds: np.ndarray
-    occupied_above: np.ndarray
-    usable: np.ndarray
-    candidate_sites: np.ndarray
-    site_pvalues: np.ndarray
-    dark_training_counts: np.ndarray
-    bright_training_counts: np.ndarray
-    held_out_dark_success_counts: np.ndarray
-    held_out_dark_total_counts: np.ndarray
-    held_out_dark_labeled_counts: np.ndarray
-    held_out_bright_success_counts: np.ndarray
-    held_out_bright_total_counts: np.ndarray
-    held_out_bright_labeled_counts: np.ndarray
-    held_out_dark_lower_bounds: np.ndarray
-    held_out_bright_lower_bounds: np.ndarray
-    held_out_validity: np.ndarray
-    held_out_fidelity: np.ndarray
-
-
-@dataclass(frozen=True)
-class _HeldOutReplayRecord:
-    diagnostic: ModelAnalysisDiagnostic
-    quality: ReadoutModelQuality
-    usable: np.ndarray
-    candidate_sites: np.ndarray
-    site_pvalues: np.ndarray
-    minimum_train: int
-    minimum_test: int
-    lower_gate: float
-    required_usable: int
-
-
-class _RawCapture(Protocol):
-    block: DataBlock
-    source_cell_schedule: tuple[object, ...]
-
-
-def _bounded_numeric_version(value: object) -> str:
-    """Return a small passive lineage note, never an admission identity."""
-
-    try:
-        text = str(value).strip()
-    except Exception:
-        return "unknown"
-    if not text:
-        return "unknown"
-    # Package versions are normally PEP-440 ASCII.  Restricting the note keeps
-    # its encoded upper bound independent of the executing environment.
-    safe = "".join(
-        character
-        if character.isascii()
-        and (character.isalnum() or character in ".+-_")
-        else "_"
-        for character in text
+    ordered = tuple(reports)
+    return bool(ordered) and all(
+        any(math.isfinite(item.model_fidelity) for item in report.site_fidelity)
+        for report in ordered
     )
-    return safe[:_NUMERIC_LINEAGE_NOTE_MAX_CHARS] or "unknown"
 
 
-def _numeric_lineage_notes() -> dict[str, str]:
-    return {
-        "numpy-version": _bounded_numeric_version(
-            getattr(np, "__version__", "unknown")
-        ),
-        "scipy-version": _bounded_numeric_version(
-            getattr(scipy, "__version__", "unknown")
-        ),
-    }
-
-
-def _validate_partition_capacity(
-    train_count: int,
-    evidence_count: int,
-    test_count: int,
+def _runtime_model_values(
+    feature: ReadoutFeature,
+    report: ModelCalibrationReport,
     request: CalibrationAnalysisRequest,
     *,
-    label: str,
-) -> None:
-    if train_count < 1 or evidence_count < 1 or test_count < 1:
-        raise CalibrationResourceExceeded(
-            f"{label} cannot populate train, reference-evidence, and test partitions"
-        )
-    if train_count < 2 * request.minimum_train_samples_per_class:
-        raise CalibrationResourceExceeded(
-            f"{label} cannot satisfy minimum train samples per class"
-        )
-    if test_count < 2 * request.minimum_test_samples_per_class:
-        raise CalibrationResourceExceeded(
-            f"{label} cannot satisfy minimum test samples per class"
-        )
-    minimum_outer_evidence = math.ceil(
-        math.log2(request.site_count / request.reference_valley_familywise_error_rate)
-    )
-    if evidence_count // 2 < minimum_outer_evidence:
-        raise CalibrationResourceExceeded(
-            f"{label} cannot possibly pass the declared familywise "
-            "exact-binomial gate"
-        )
-    minimum_accuracy = request.minimum_held_out_class_accuracy_lower_bound
-    smallest_balanced_class = test_count // 2
-    held_out_alpha = 1.0 - request.held_out_confidence_level
-    held_out_family_size = request.site_count * len(request.model_kinds)
-    if minimum_accuracy == 1.0 or (
-        minimum_accuracy > 0.0
-        and smallest_balanced_class * math.log(minimum_accuracy)
-        > math.log(held_out_alpha / held_out_family_size)
-    ):
-        raise CalibrationResourceExceeded(
-            f"{label} cannot possibly pass the held-out familywise "
-            "exact-binomial gate"
-        )
-
-
-def _planned_model_resources(
-    request: CalibrationAnalysisRequest,
-) -> tuple[int, int, int]:
-    """Return per-model samples, total samples, and persisted kernel elements."""
-
-    box_area = (2 * request.box.half_width + 1) ** 2
-    maximum_sampled = 0
-    total_sampled = 0
-    kernel_elements = 0
-    for kind in request.model_kinds:
-        if kind is ReadoutModelKind.BOX:
-            sample_area = box_area
-        else:
-            assert request.psf is not None
-            sample_extent = 2 * request.psf.half_width + 1
-            if request.psf.background is BackgroundMode.ANNULUS_MEDIAN:
-                sample_extent += 2 * request.psf.background_padding
-            sample_area = sample_extent**2
-            kernel_extent = 2 * request.psf.half_width + 1
-            kernel_elements += (
-                request.site_count * kernel_extent**2
-                if kind is ReadoutModelKind.PER_SITE_PSF
-                else kernel_extent**2
-            )
-        sampled = request.site_count * sample_area
-        maximum_sampled = max(maximum_sampled, sampled)
-        total_sampled += sampled
-    return maximum_sampled, total_sampled, kernel_elements
-
-
-def _prepare_calibration_work(
-    capture: _RawCapture,
-    request: CalibrationAnalysisRequest,
-) -> _CalibrationWorkPreparation:
-    """Freeze source-specific work and resource bounds."""
-
-    if not isinstance(request, CalibrationAnalysisRequest):
-        raise TypeError("request must be CalibrationAnalysisRequest")
-    try:
-        block = capture.block
-    except AttributeError as exc:
-        raise TypeError("capture must expose a DataBlock") from exc
-    if not isinstance(block, DataBlock):
-        raise TypeError("capture.block must be DataBlock")
-    schema = block.schema
-    policy = request.resource_policy
-    source_cells = schema.repeat_axis.size * schema.point_layout.storage_size
-    if source_cells > policy.max_source_cells:
-        raise CalibrationResourceExceeded("source cells exceed analysis budget")
-    if len(schema.cell_schema.data_shape) != 2:
-        raise CalibrationAnalysisError("calibration source cell must be exactly named Y,X")
-    image_pixels = math.prod(schema.cell_schema.data_shape)
-    if image_pixels > policy.max_image_pixels:
-        raise CalibrationResourceExceeded("frame pixels exceed analysis budget")
-    # Every bracket consumes one row for every selected reference plus one
-    # readout row.  This remains cheap and safe for sparse arbitrary layouts.
-    selected_rows_per_bracket = len(request.layout.reference_event_indices) + 1
-    bracket_upper = source_cells // selected_rows_per_bracket
-    if bracket_upper > policy.max_brackets:
-        raise CalibrationResourceExceeded("bracket upper bound exceeds analysis budget")
-    reference_count = len(request.layout.reference_event_indices)
-    reference_upper = bracket_upper * reference_count
-    if reference_upper > policy.max_reference_frames:
-        raise CalibrationResourceExceeded("reference-frame upper bound exceeds budget")
-    if bracket_upper >= 3:
-        train_upper = int(math.floor(bracket_upper * request.train_fraction))
-        evidence_upper = int(
-            math.floor(bracket_upper * request.reference_evidence_fraction)
-        )
-    else:
-        train_upper = bracket_upper
-        evidence_upper = 0
-    test_upper = bracket_upper - train_upper - evidence_upper
-    _validate_partition_capacity(
-        train_upper,
-        evidence_upper,
-        test_upper,
-        request,
-        label="bracket upper bound",
-    )
-    modality_work = request.site_count * reference_count * (
-        2 * train_upper * max(1, train_upper.bit_length())
-        + 3 * evidence_upper
-    )
-    modality_work += request.site_count * max(1, request.site_count.bit_length())
-    nested_test_count = 2 * request.site_count * reference_count
-    modality_work += nested_test_count * max(1, nested_test_count.bit_length())
-    model_statistical_work = len(request.model_kinds) * request.site_count * (
-        2 * train_upper * max(1, train_upper.bit_length())
-        + test_upper
-        + 256
-    )
-    held_out_hypothesis_count = len(request.model_kinds) * request.site_count
-    model_statistical_work += held_out_hypothesis_count * max(
-        1,
-        held_out_hypothesis_count.bit_length(),
-    )
-    modality_work += model_statistical_work
-    if modality_work > policy.max_modality_test_work_units:
-        raise CalibrationResourceExceeded("reference-modality work exceeds budget")
-    reference_valley_diagnostic_count = request.site_count * reference_count
-    from .analysis_codec import (
-        MAX_ANALYSIS_DIAGNOSTICS_BYTES,
-        MAX_DIAGNOSTIC_VECTOR_ENTRIES,
-        calibration_analysis_diagnostics_encoding_upper_bound,
-        calibration_analysis_diagnostics_encoding_working_upper_bound,
-    )
-    from .calibration_codec import (
-        calibration_artifact_metadata_encoding_upper_bound,
-        calibration_artifact_encoding_upper_bound,
-        calibration_artifact_encoding_working_upper_bound,
-    )
-
-    if (
-        reference_valley_diagnostic_count
-        > min(
-            policy.max_reference_valley_diagnostics,
-            MAX_DIAGNOSTIC_VECTOR_ENTRIES,
-        )
-    ):
-        raise CalibrationResourceExceeded(
-            "reference-valley diagnostics exceed analysis budget"
-        )
-    diagnostics_encoding_upper_bound = (
-        calibration_analysis_diagnostics_encoding_upper_bound(
-            site_count=request.site_count,
-            reference_count=reference_count,
-            bracket_upper_bound=bracket_upper,
-            train_bracket_upper_bound=train_upper,
-            reference_evidence_bracket_upper_bound=evidence_upper,
-            model_count=len(request.model_kinds),
-        )
-    )
-    if diagnostics_encoding_upper_bound > min(
-        MAX_ANALYSIS_DIAGNOSTICS_BYTES,
-        policy.artifact_policy.max_artifact_blob_bytes,
-    ):
-        raise CalibrationResourceExceeded(
-            "calibration diagnostics canonical encoding exceeds persistence budget"
-        )
-    signal_evaluations = request.site_count * (
-        train_upper * reference_count
-        + evidence_upper * reference_count
-        + bracket_upper * reference_count
-        + bracket_upper * len(request.model_kinds)
-    )
-    if signal_evaluations > policy.max_signal_evaluations:
-        raise CalibrationResourceExceeded("signal-evaluation upper bound exceeds budget")
-    box_area = (2 * request.box.half_width + 1) ** 2
-    full_frame_reads = (
-        train_upper * reference_count
-        + train_upper * reference_count
-        + evidence_upper * reference_count
-        + bracket_upper * reference_count
-        + bracket_upper * len(request.model_kinds)
-    )
-    sampled = train_upper * reference_count * image_pixels
-    sampled += (
-        train_upper + evidence_upper + bracket_upper
-    ) * reference_count * request.site_count * box_area
-    psf_sample_area = 0
-    if request.psf is not None:
-        extent = 2 * request.psf.half_width + 1
-        if request.psf.background is BackgroundMode.ANNULUS_MEDIAN:
-            extent += 2 * request.psf.background_padding
-        psf_sample_area = extent**2
-        sampled += request.site_count * psf_sample_area
-    (
-        max_model_sampled,
-        total_model_sampled,
-        planned_kernel_elements,
-    ) = _planned_model_resources(request)
-    for kind in request.model_kinds:
-        if kind is ReadoutModelKind.BOX:
-            area = box_area
-        else:
-            assert request.psf is not None
-            extent = 2 * request.psf.half_width + 1
-            if request.psf.background is BackgroundMode.ANNULUS_MEDIAN:
-                extent += 2 * request.psf.background_padding
-            area = extent**2
-        model_sampled = request.site_count * area
-        sampled += bracket_upper * model_sampled
-    if sampled > policy.max_sampled_pixel_operations:
-        raise CalibrationResourceExceeded("sampled-pixel upper bound exceeds budget")
-    artifact_policy = policy.artifact_policy
-    if max_model_sampled > artifact_policy.max_sampled_pixels_per_model:
-        raise CalibrationResourceExceeded(
-            "planned model sampled pixels exceed artifact resource policy"
-        )
-    if total_model_sampled > artifact_policy.max_total_sampled_pixels_all_models:
-        raise CalibrationResourceExceeded(
-            "planned total sampled pixels exceed artifact resource policy"
-        )
-    psf_extent = 0 if request.psf is None else 2 * request.psf.half_width + 1
-    psf_elements = psf_extent**2
-    if planned_kernel_elements > artifact_policy.max_kernel_elements:
-        raise CalibrationResourceExceeded(
-            "planned calibration kernels exceed artifact resource policy"
-        )
-    dense_work = _ASSIGNMENT_WORK_FACTOR * request.site_count**3
-    # E <= 4V for the undirected 8-neighbour graph.  This E log(V) envelope
-    # covers sparse MST construction plus the N log(N) forest-edge ordering;
-    # both subsequent Kruskal passes are linear and share that order.
-    detector_graph_work = (
-        _TOPOGRAPHIC_EDGE_COUNT_PER_PIXEL
-        * image_pixels
-        * max(1, image_pixels.bit_length())
-    )
-    if detector_graph_work > policy.max_detector_graph_work_units:
-        raise CalibrationResourceExceeded("topographic detector work exceeds budget")
-    if dense_work > policy.max_dense_assignment_work_units:
-        raise CalibrationResourceExceeded("dense lattice-assignment work exceeds budget")
-    assignment_scratch = (
-        _ASSIGNMENT_SCRATCH_BYTES_PER_PAIR * request.site_count**2
-    )
-    detector_bytes = _DETECTOR_WORKING_BYTES_PER_PIXEL * image_pixels
-    layout_bytes = source_cells + bracket_upper * 768
-    if max(
-        layout_bytes,
-        detector_bytes + assignment_scratch,
-    ) > policy.max_working_bytes:
-        raise CalibrationResourceExceeded("working-byte lower bound exceeds budget")
-
-    # Only after every schema/count/algorithmic bound passes may the planner
-    # resolve the bounded layout and measure source-owned metadata.  A schema-
-    # only plan cannot truthfully bound arbitrary canonical camera/source text.
-    brackets = request.layout.brackets(schema)
-    if len(brackets) > bracket_upper:
-        raise CalibrationAnalysisError(
-            "resolved brackets exceed frozen work-plan bound"
-        )
-    source_binding, frame_contract = (
-        _derive_calibration_source_binding_with_resolved_brackets(
-            capture,
-            request.layout,
-            resolved_brackets=brackets,
-        )
-    )
-    partition = _freeze_partition(brackets, request)
-    _validate_partition_capacity(
-        len(partition.train_indices),
-        len(partition.reference_evidence_indices),
-        len(partition.test_indices),
-        request,
-        label="resolved bracket partition",
-    )
-    placeholder_digest = "f" * 64
-    artifact_parameters = _artifact_parameters_for_resource_plan(
-        _artifact_parameter_values(
-            request,
-            partition_digest=partition.digest,
-            train_count=len(partition.train_indices),
-            reference_evidence_count=len(partition.reference_evidence_indices),
-            test_count=len(partition.test_indices),
-            work_plan_digest=placeholder_digest,
-        )
-    )
-    model_parameters = tuple(
-        CalibrationParameter(name, value)
-        for name, value in _model_parameter_values(
-            request,
-            partition_digest=partition.digest,
-            train_count=len(partition.train_indices),
-            reference_evidence_count=len(partition.reference_evidence_indices),
-            test_count=len(partition.test_indices),
-            work_plan_digest=placeholder_digest,
-        ).items()
-    )
-    artifact_metadata_encoding_upper_bound = (
-        calibration_artifact_metadata_encoding_upper_bound(
-            source_binding=source_binding,
-            frame_contract=frame_contract,
-            artifact_parameters=artifact_parameters,
-            model_parameters=tuple(
-                model_parameters for _kind in request.model_kinds
-            ),
-            model_kinds=request.model_kinds,
-            default_model_kind=request.default_model_kind,
-        )
-    )
-    artifact_encoding_upper_bound = calibration_artifact_encoding_upper_bound(
-        site_count=request.site_count,
-        model_count=len(request.model_kinds),
-        kernel_elements=planned_kernel_elements,
-        metadata_encoding_upper_bound_bytes=(
-            artifact_metadata_encoding_upper_bound
-        ),
-    )
-    if artifact_encoding_upper_bound > artifact_policy.max_artifact_blob_bytes:
-        raise CalibrationResourceExceeded(
-            "calibration artifact canonical encoding exceeds persistence budget"
-        )
-    reference_feature_bytes = (
-        (train_upper + evidence_upper)
-        * reference_count
-        * request.site_count
-        * 9
-    )
-    reference_gate_state_bytes = (
-        reference_count * request.site_count * 1536
-    )
-    reference_sort_scratch_bytes = max(train_upper, evidence_upper) * 128
-    feature_bytes = max(
-        reference_feature_bytes
-        + reference_gate_state_bytes
-        + reference_sort_scratch_bytes,
-        bracket_upper * request.site_count * 20,
-    )
-    psf_bytes = 4 * planned_kernel_elements * 8 + 8 * psf_elements * 4
-    artifact_array_bytes = (
-        request.site_count * 24
-        + len(request.model_kinds) * request.site_count * 160
-        + reference_valley_diagnostic_count * 1024
-        + planned_kernel_elements * 8
-        + 64 * 1024
-    )
-    canonical_scratch = max(
-        calibration_artifact_encoding_working_upper_bound(
-            artifact_array_bytes,
-            artifact_metadata_encoding_upper_bound,
-        ),
-        calibration_analysis_diagnostics_encoding_working_upper_bound(
-            diagnostics_encoding_upper_bound
-        ),
-    )
-    working_peak = max(
-        layout_bytes,
-        detector_bytes + assignment_scratch,
-        artifact_array_bytes + feature_bytes,
-        artifact_array_bytes + psf_bytes + feature_bytes,
-        artifact_array_bytes + canonical_scratch,
-    )
-    plan = CalibrationWorkPlan(
-        source_cell_count=source_cells,
-        bracket_upper_bound=bracket_upper,
-        train_bracket_upper_bound=train_upper,
-        reference_evidence_bracket_upper_bound=evidence_upper,
-        reference_frame_upper_bound=reference_upper,
-        image_pixel_count=image_pixels,
-        full_frame_read_count=full_frame_reads,
-        feature_pixel_operations=sampled,
-        signal_evaluations=signal_evaluations,
-        modality_test_work_units=modality_work,
-        reference_valley_diagnostic_count=reference_valley_diagnostic_count,
-        diagnostics_encoding_upper_bound_bytes=diagnostics_encoding_upper_bound,
-        planned_kernel_elements=planned_kernel_elements,
-        maximum_model_sampled_pixels=max_model_sampled,
-        total_model_sampled_pixels=total_model_sampled,
-        artifact_metadata_encoding_upper_bound_bytes=(
-            artifact_metadata_encoding_upper_bound
-        ),
-        artifact_encoding_upper_bound_bytes=artifact_encoding_upper_bound,
-        layout_working_bytes=layout_bytes,
-        detector_working_bytes=detector_bytes,
-        assignment_scratch_bytes=assignment_scratch,
-        feature_working_bytes=feature_bytes,
-        psf_working_bytes=psf_bytes,
-        artifact_array_bytes=artifact_array_bytes,
-        canonical_encoding_scratch_bytes=canonical_scratch,
-        working_peak_bytes=working_peak,
-        detector_graph_work_units=detector_graph_work,
-        dense_assignment_work_units=dense_work,
-    )
-    if plan.working_peak_bytes > policy.max_working_bytes:
-        raise CalibrationResourceExceeded("working-byte upper bound exceeds budget")
-    return _CalibrationWorkPreparation(
-        plan=plan,
-        brackets=brackets,
-        source_binding=source_binding,
-        frame_contract=frame_contract,
-        partition=partition,
-    )
-
-
-def build_calibration_work_plan(
-    capture: _RawCapture,
-    request: CalibrationAnalysisRequest,
-) -> CalibrationWorkPlan:
-    """Derive the complete source-specific pre-allocation work contract."""
-
-    return _prepare_calibration_work(capture, request).plan
-
-
-def _validate_source_schedule(capture: _RawCapture) -> None:
-    """Validate exact coverage with a bounded bitset, never a second giant set."""
-
-    try:
-        schedule = capture.source_cell_schedule
-    except AttributeError as exc:
-        raise TypeError("capture must expose source_cell_schedule") from exc
-    if not isinstance(schedule, tuple):
-        raise TypeError("source_cell_schedule must be an already bounded tuple")
-    from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
-
-    schema = capture.block.schema
-    repeats = schema.repeat_axis.size
-    points = schema.point_layout.storage_size
-    total = repeats * points
-    if len(schedule) != total:
-        raise CalibrationAnalysisError("source_cell_schedule cardinality differs from dataset")
-    seen = np.zeros(total, dtype=bool)
-    for address in schedule:
-        if not isinstance(address, DatasetCellAddress):
-            raise TypeError("source_cell_schedule must contain DatasetCellAddress values")
-        if address.repeat_index >= repeats or address.point_storage_index >= points:
-            raise CalibrationAnalysisError("source_cell_schedule address is out of bounds")
-        flat = address.repeat_index * points + address.point_storage_index
-        if seen[flat]:
-            raise CalibrationAnalysisError("source_cell_schedule contains a duplicate address")
-        seen[flat] = True
-    if not np.all(seen):
-        raise CalibrationAnalysisError("source_cell_schedule omits a raw dataset cell")
-
-
-class _FrameAccessor:
-    """Borrow one immutable DataBlock frame at a time without a Value snapshot."""
-
-    def __init__(self, block: DataBlock) -> None:
-        if not isinstance(block, DataBlock):
-            raise TypeError("block must be DataBlock")
-        if len(block.schema.cell_schema.data_shape) != 2:
-            raise CalibrationAnalysisError("calibration frames must be exactly named Y,X")
-        if (
-            block.values.flags.writeable
-            or not block.values.flags.c_contiguous
-            or not _is_bytes_backed_read_only(block.values)
-        ):
-            raise CalibrationAnalysisError(
-                "analysis requires an immutable bytes-backed contiguous DataBlock"
-            )
-        self.block = block
-        self._validity = expand_dataset_validity(block.validity, block.schema)
-        self._repeat_axis_id = block.schema.repeat_axis.axis_id
-
-    def arrays(
-        self,
-        bracket: CalibrationCaptureBracket,
-        storage_row: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        context = dict(bracket.context_key)
-        if self._repeat_axis_id not in context:
-            raise CalibrationAnalysisError("calibration bracket omits repeat AxisId")
-        repeat = context[self._repeat_axis_id]
-        values = self.block.values[repeat, storage_row]
-        mask = np.asarray(self._validity[repeat, storage_row])
-        if (
-            values.flags.writeable
-            or not values.flags.c_contiguous
-            or not np.shares_memory(values, self.block.values)
-        ):
-            raise CalibrationAnalysisError("DataBlock frame borrow lost immutable ownership")
-        if mask.dtype != np.dtype(bool) or mask.shape != values.shape:
-            raise CalibrationAnalysisError("dataset validity cannot align to borrowed frame")
-        return values, mask
-
-
-def _context_tree(context: tuple[tuple[AxisId, int], ...]) -> list[list[object]]:
-    return [[axis_id.value, index] for axis_id, index in context]
-
-
-def _freeze_partition(
-    brackets: tuple[CalibrationCaptureBracket, ...],
-    request: CalibrationAnalysisRequest,
-) -> _BracketPartition:
-    if len(brackets) < 3:
-        raise CalibrationAnalysisError(
-            "calibration requires distinct train, reference-evidence, and test brackets"
-        )
-
-    def key(index: int) -> bytes:
-        context = ";".join(
-            f"{axis_id.value}={value}" for axis_id, value in brackets[index].context_key
-        )
-        return hashlib.sha256(f"{_PARTITION_SEED}|{context}".encode("utf-8")).digest()
-
-    ordered = tuple(sorted(range(len(brackets)), key=key))
-    train_count = int(math.floor(len(ordered) * request.train_fraction))
-    evidence_count = int(
-        math.floor(len(ordered) * request.reference_evidence_fraction)
-    )
-    if train_count < 1 or evidence_count < 1:
-        raise CalibrationAnalysisError(
-            "partition policy leaves train or reference-evidence empty"
-        )
-    test_start = train_count + evidence_count
-    if test_start >= len(ordered):
-        raise CalibrationAnalysisError("partition policy leaves held-out test empty")
-    train = tuple(sorted(ordered[:train_count]))
-    reference_evidence = tuple(sorted(ordered[train_count:test_start]))
-    test = tuple(sorted(ordered[test_start:]))
-    digest = canonical_digest(
-        {
-            "schema": "zlc_neutral_atom.CalibrationBracketPartition",
-            "source_schema": request.layout.readout_event_axis_id.value,
-            "partition_policy": "fixed-hash-order",
-            "train": [_context_tree(brackets[index].context_key) for index in train],
-            "reference_evidence": [
-                _context_tree(brackets[index].context_key)
-                for index in reference_evidence
-            ],
-            "test": [_context_tree(brackets[index].context_key) for index in test],
-        }
-    )
-    return _BracketPartition(train, reference_evidence, test, digest)
-
-
-def _training_reference_template(
-    accessor: _FrameAccessor,
-    brackets: tuple[CalibrationCaptureBracket, ...],
-    train_indices: tuple[int, ...],
-) -> tuple[np.ndarray, np.ndarray, float]:
-    shape = accessor.block.schema.cell_schema.data_shape
-    total = np.zeros(shape, dtype=np.float64)
-    count = np.zeros(shape, dtype=np.uint64)
-    for bracket_index in train_indices:
-        bracket = brackets[bracket_index]
-        for _event, row in bracket.reference_point_storage_rows:
-            image, pixel_validity = accessor.arrays(bracket, row)
-            valid = pixel_validity & np.isfinite(image)
-            total[valid] += image[valid]
-            count[valid] += 1
-    valid = count > 0
-    if not np.any(valid):
-        raise CalibrationAnalysisError("training reference frames contain no valid pixels")
-    average = np.zeros(shape, dtype=np.float64)
-    average[valid] = total[valid] / count[valid]
-    return average, valid, float(np.mean(valid))
-
-
-def _topographic_prominences(
-    smooth: np.ndarray,
-    validity: np.ndarray,
-    seed_indices: np.ndarray,
-    peak_heights: np.ndarray,
-    peak_component_floors: np.ndarray,
-    validity_component_count: int,
+    use_reference_thresholds: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Exact 8-neighbour maximin saddles from a maximum-spanning forest."""
+    """Derive runtime thresholds and usable sites from diagnostic evidence.
 
-    if smooth.ndim != 2 or validity.shape != smooth.shape:
-        raise ValueError("topographic image and validity must share one 2D shape")
-    if validity.dtype != np.dtype(bool) or not np.any(validity):
-        raise ValueError("topographic validity must contain bool valid pixels")
-    seeds = np.asarray(seed_indices)
-    if seeds.dtype.kind not in "iu" or seeds.ndim != 1 or len(seeds) < 2:
-        raise ValueError("topographic seeds must be one integral candidate vector")
-    seeds = seeds.astype(np.int64, copy=False)
-    heights = np.asarray(peak_heights, dtype=np.float64)
-    floors = np.asarray(peak_component_floors, dtype=np.float64)
-    if heights.shape != seeds.shape or floors.shape != seeds.shape:
-        raise ValueError("topographic peak metadata must align with seeds")
-    if (
-        np.any(seeds[1:] < 0)
-        or np.any(seeds[1:] >= smooth.size)
-        or len(np.unique(seeds[1:])) != len(seeds) - 1
-    ):
-        raise ValueError("topographic peak seeds must be unique in-bounds pixels")
-    flat_smooth = smooth.ravel()
-    flat_validity = validity.ravel()
-    if np.any(~flat_validity[seeds[1:]]):
-        raise ValueError("topographic peak seed lies outside validity")
-    if np.any(~np.isfinite(heights[1:])) or np.any(~np.isfinite(floors[1:])):
-        raise ValueError("topographic peak heights and floors must be finite")
-    if not np.array_equal(flat_smooth[seeds[1:]], heights[1:]):
-        raise ValueError("topographic peak height differs from its seed pixel")
-    component_count = _positive_integer(
-        validity_component_count,
-        "validity_component_count",
-    )
+    ``main`` first calibrated every method with a quick Otsu threshold.  It
+    replaced those thresholds with bracket-labelled thresholds only when every
+    requested method produced held-out model evidence; a missing per-site
+    labelled threshold then fell back to that site's quick threshold.  Keep
+    that physical rule here while applying the migration's explicit safety
+    corrections only to sites that actually use a labelled fit.
+    """
 
-    pixel_ids = np.arange(smooth.size, dtype=np.int64).reshape(smooth.shape)
-    edge_rows: list[np.ndarray] = []
-    edge_columns: list[np.ndarray] = []
-    edge_costs: list[np.ndarray] = []
-    high = float(np.max(smooth[validity]))
-    low = float(np.min(smooth[validity]))
-    span = high - low
-    offset = float(np.spacing(span))
-    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
-        if dx >= 0:
-            left_x = slice(0, smooth.shape[1] - dx or None)
-            right_x = slice(dx, None)
-        else:
-            left_x = slice(-dx, None)
-            right_x = slice(0, dx)
-        top_y = slice(0, smooth.shape[0] - dy or None)
-        bottom_y = slice(dy, None)
-        pair_valid = (
-            validity[top_y, left_x]
-            & validity[bottom_y, right_x]
-        )
-        if not np.any(pair_valid):
-            continue
-        edge_rows.append(pixel_ids[top_y, left_x][pair_valid])
-        edge_columns.append(pixel_ids[bottom_y, right_x][pair_valid])
-        saddle = np.minimum(
-            smooth[top_y, left_x][pair_valid],
-            smooth[bottom_y, right_x][pair_valid],
-        )
-        edge_costs.append((high - saddle) + offset)
-
-    if edge_rows:
-        rows = np.concatenate(edge_rows)
-        columns = np.concatenate(edge_columns)
-        costs = np.concatenate(edge_costs)
-        del edge_rows, edge_columns, edge_costs
-        graph = coo_matrix(
-            (costs, (rows, columns)),
-            shape=(smooth.size, smooth.size),
-        ).tocsr()
-        del rows, columns, costs
-        tree = minimum_spanning_tree(graph, overwrite=True).tocoo(copy=False)
-        del graph
+    formal = report.thresholds
+    quick = report.quick_thresholds
+    has_labelled_threshold = np.isfinite(formal)
+    if use_reference_thresholds:
+        thresholds = np.where(has_labelled_threshold, formal, quick)
     else:
-        tree = coo_matrix((smooth.size, smooth.size), dtype=np.float64)
-    expected_tree_edges = int(np.count_nonzero(validity)) - component_count
-    if tree.nnz != expected_tree_edges:
-        raise CalibrationAnalysisError(
-            "topographic maximum-spanning forest lost valid connectivity"
-        )
-    tree_rows = np.asarray(tree.row, dtype=np.int64)
-    tree_columns = np.asarray(tree.col, dtype=np.int64)
-    tree_saddles = np.minimum(
-        flat_smooth[tree_rows],
-        flat_smooth[tree_columns],
+        thresholds = np.array(quick, copy=True)
+
+    labelled_quality = np.asarray(
+        [
+            item.bright_above
+            and math.isfinite(item.threshold)
+            and math.isfinite(item.fidelity)
+            and item.fidelity > request.minimum_site_fidelity
+            for item in report.site_fidelity
+        ],
+        dtype=bool,
     )
-    del tree
-    edge_order = np.argsort(-tree_saddles, kind="stable")
+    usable = (
+        feature.valid_sites.mask
+        & np.isfinite(thresholds)
+        # Threshold selection follows main's all-method commit gate, but an
+        # unrelated method's failure must never erase this site's explicit
+        # reversed-polarity or chance-level labelled evidence.  Only a site
+        # with no finite labelled threshold gets the unconditional quick
+        # fallback.
+        & (~has_labelled_threshold | labelled_quality)
+    )
+    return thresholds, usable
 
-    parent = np.arange(smooth.size, dtype=np.int64)
-    rank = np.zeros(smooth.size, dtype=np.uint8)
-    owner = np.zeros(smooth.size, dtype=np.int32)
-    owner[seeds[1:]] = np.arange(1, len(seeds), dtype=np.int32)
-    prominences = np.full(len(seeds), np.nan, dtype=np.float64)
 
-    def find(index: int) -> int:
-        root = index
-        while parent[root] != root:
-            root = int(parent[root])
-        while parent[index] != index:
-            next_index = int(parent[index])
-            parent[index] = root
-            index = next_index
-        return root
+def _validate_calibration_binding(
+    artifact: CalibrationArtifact,
+    report: CalibrationReport,
+) -> None:
+    """Validate the pure artifact/report relationship without minting authority."""
 
-    for edge_index in edge_order:
-        left_root = find(int(tree_rows[edge_index]))
-        right_root = find(int(tree_columns[edge_index]))
-        if left_root == right_root:
-            continue
-        left_owner = int(owner[left_root])
-        right_owner = int(owner[right_root])
-        merged_owner = left_owner or right_owner
-        if left_owner and right_owner:
-            if (
-                heights[left_owner] > heights[right_owner]
-                or (
-                    heights[left_owner] == heights[right_owner]
-                    and left_owner < right_owner
-                )
+    if not isinstance(artifact, CalibrationArtifact):
+        raise TypeError("artifact must be CalibrationArtifact")
+    if not isinstance(report, CalibrationReport):
+        raise TypeError("report must be CalibrationReport")
+    request = report.request
+    if artifact.source_binding.layout != request.layout:
+        raise ValueError("artifact and report name different capture layouts")
+    if artifact.site_map.grid_shape_yx != request.grid_shape_yx:
+        raise ValueError("artifact and report name different site grids")
+    if artifact.site_map.ordering is not request.ordering:
+        raise ValueError("artifact and report name different site ordering")
+    _validate_site_center_admission(
+        artifact.site_map.coordinates_xy,
+        request,
+    )
+    if report.reference_average.shape != artifact.frame_contract.frame_schema.data_shape:
+        raise ValueError("report reference image differs from the artifact FrameContract")
+    if report.labels.n_sites != artifact.site_map.site_axis.size:
+        raise ValueError("artifact and report contain different site counts")
+    artifact_kinds = tuple(model.kind for model in artifact.models)
+    if artifact_kinds != request.model_kinds:
+        raise ValueError("artifact and report contain different model sets")
+    if artifact.default_model_kind is not request.default_model_kind:
+        raise ValueError("artifact and report name different default models")
+    expected_box_boxes = _boxes_for_centers(
+        artifact.site_map.coordinates_xy,
+        report.reference_average.shape,
+        request.box_radius,
+    )
+    expected_psf_boxes = np.asarray(
+        [
+            _crop_psf_box(
+                report.reference_average.shape,
+                float(x),
+                float(y),
+                request.psf_half_width,
+            )
+            for x, y in artifact.site_map.coordinates_xy
+        ],
+        dtype="<i8",
+    )
+    report_by_kind = {item.kind: item for item in report.models}
+    use_reference_thresholds = _main_reference_thresholds_available(report.models)
+    for model in artifact.models:
+        model_report = report_by_kind[model.kind]
+        expected_thresholds, expected_usable = _runtime_model_values(
+            model.feature,
+            model_report,
+            request,
+            use_reference_thresholds=use_reference_thresholds,
+        )
+        if not np.array_equal(
+            model.thresholds,
+            expected_thresholds,
+            equal_nan=True,
+        ):
+            raise ValueError("artifact thresholds differ from the calibration report")
+        if not np.array_equal(model.usable_sites.mask, expected_usable):
+            raise ValueError("artifact usable sites differ from report evidence")
+        feature = model.feature
+        if isinstance(feature, BoxFeature):
+            if feature.reducer is not request.box_reducer or not np.array_equal(
+                feature.boxes_xywh,
+                expected_box_boxes,
             ):
-                winner, loser = left_owner, right_owner
-            else:
-                winner, loser = right_owner, left_owner
-            saddle = float(tree_saddles[edge_index])
-            prominence = float(heights[loser] - saddle)
-            tolerance = 128.0 * np.finfo(np.float64).eps * max(
-                1.0,
-                abs(float(heights[loser])),
-                abs(saddle),
+                raise ValueError("BOX feature differs from the calibration request")
+        elif isinstance(feature, (PerSitePsfFeature, UniformPsfFeature)):
+            expected_extent = 2 * request.psf_half_width + 1
+            kernel_shape = (
+                feature.kernels.shape[-2:]
+                if isinstance(feature, PerSitePsfFeature)
+                else feature.kernel.shape
             )
-            if prominence < -tolerance:
-                raise CalibrationAnalysisError(
-                    "topographic saddle lies above its regional maximum"
-                )
-            prominences[loser] = 0.0 if prominence <= tolerance else prominence
-            merged_owner = winner
-        if rank[left_root] < rank[right_root]:
-            left_root, right_root = right_root, left_root
-        parent[right_root] = left_root
-        if rank[left_root] == rank[right_root]:
-            rank[left_root] += 1
-        owner[left_root] = merged_owner
-
-    for peak in range(1, len(seeds)):
-        if np.isnan(prominences[peak]):
-            root = find(int(seeds[peak]))
-            if int(owner[root]) != peak:
-                raise CalibrationAnalysisError(
-                    "topographic peak lost without a recorded saddle"
-                )
-            prominences[peak] = max(0.0, float(heights[peak] - floors[peak]))
-    if np.any(~np.isfinite(prominences[1:])):
-        raise CalibrationAnalysisError("topographic prominence graph is incomplete")
-
-    # A second Kruskal pass cuts, rather than merges, every edge that would
-    # join two peak-owned components.  This produces disjoint maximin
-    # catchments from the same physical forest used for the saddle evidence;
-    # no IFT label-order or synthetic background marker can split a saddle.
-    parent = np.arange(smooth.size, dtype=np.int64)
-    rank.fill(0)
-    owner.fill(0)
-    owner[seeds[1:]] = np.arange(1, len(seeds), dtype=np.int32)
-    for edge_index in edge_order:
-        left_root = find(int(tree_rows[edge_index]))
-        right_root = find(int(tree_columns[edge_index]))
-        if left_root == right_root:
-            continue
-        left_owner = int(owner[left_root])
-        right_owner = int(owner[right_root])
-        if left_owner and right_owner and left_owner != right_owner:
-            continue
-        merged_owner = left_owner or right_owner
-        if rank[left_root] < rank[right_root]:
-            left_root, right_root = right_root, left_root
-        parent[right_root] = left_root
-        if rank[left_root] == rank[right_root]:
-            rank[left_root] += 1
-        owner[left_root] = merged_owner
-
-    while True:
-        compressed = parent[parent]
-        if np.array_equal(compressed, parent):
-            break
-        parent = compressed
-    basins_flat = owner[parent]
-    basins_flat[~flat_validity] = 0
-    if not np.array_equal(basins_flat[seeds[1:]], np.arange(1, len(seeds))):
-        raise CalibrationAnalysisError("topographic catchment lost a peak seed")
-    return prominences, basins_flat.reshape(smooth.shape)
+            if (
+                feature.background is not request.psf_background
+                or feature.background_padding != request.psf_background_padding
+                or kernel_shape != (expected_extent, expected_extent)
+                or not np.array_equal(feature.boxes_xywh, expected_psf_boxes)
+            ):
+                raise ValueError("PSF feature differs from the calibration request")
 
 
-def _collapse_prominent_maxima(
-    average: np.ndarray,
-    validity: np.ndarray,
-    policy: SiteDetectionPolicy,
-) -> _PeakCandidates:
-    weights = gaussian_filter(validity.astype(np.float64), policy.smoothing_sigma_pixels)
-    numerator = gaussian_filter(
-        np.where(validity, average, 0.0),
-        policy.smoothing_sigma_pixels,
-    )
-    smooth = np.zeros_like(numerator)
-    usable = weights > 1e-12
-    smooth[usable] = numerator[usable] / weights[usable]
-    finite = smooth[validity]
-    low, high = float(np.min(finite)), float(np.max(finite))
-    span = high - low
-    if not math.isfinite(span) or span <= max(1e-12, abs(high) * 1e-12):
-        raise CalibrationAnalysisError("training reference template has no site contrast")
-    validity_components, validity_component_count = label(
-        validity,
-        structure=np.ones((3, 3), dtype=int),
-    )
-    flat_validity_components = validity_components.ravel()
-    valid_indices = np.flatnonzero(flat_validity_components)
-    valid_component_labels = flat_validity_components[valid_indices]
-    component_floors = np.full(
-        validity_component_count + 1,
-        np.inf,
-        dtype=np.float64,
-    )
-    np.minimum.at(
-        component_floors,
-        valid_component_labels,
-        smooth.ravel()[valid_indices],
-    )
-    local_maximum = maximum_filter(
-        np.where(validity, smooth, -np.inf),
-        size=3,
-        mode="constant",
-        cval=-np.inf,
-    )
-    local_minimum = minimum_filter(
-        np.where(validity, smooth, np.inf),
-        size=3,
-        mode="constant",
-        cval=np.inf,
-    )
-    maxima = validity & (smooth == local_maximum) & (smooth > local_minimum)
-    components, component_count = label(maxima, structure=np.ones((3, 3), dtype=int))
-    if component_count == 0:
-        raise CalibrationAnalysisError("training reference template has no regional maximum")
-    flat_components = components.ravel()
-    member_indices = np.flatnonzero(flat_components)
-    member_labels = flat_components[member_indices]
-    peak_heights = np.full(component_count + 1, -np.inf, dtype=np.float64)
-    np.maximum.at(peak_heights, member_labels, smooth.ravel()[member_indices])
-    seed_indices = np.full(component_count + 1, smooth.size, dtype=np.int64)
-    np.minimum.at(seed_indices, member_labels, member_indices)
+@dataclass(frozen=True)
+class CalibrationComputation:
+    """Pure, validated calibration output with no durable commit authority."""
 
-    required_prominence = policy.minimum_prominence_fraction * span
-    peak_component_ids_by_label = flat_validity_components[seed_indices[1:]]
-    candidate_component_floors = component_floors[peak_component_ids_by_label]
-    # No topographic prominence can exceed peak_height minus the floor of its
-    # own 8-connected valid component.  Never let an isolated valid island
-    # borrow a lower floor from an unrelated component.
-    capable_labels = np.flatnonzero(
-        peak_heights[1:] - candidate_component_floors >= required_prominence
-    ) + 1
-    if capable_labels.size == 0:
-        return _PeakCandidates(
-            np.empty((0, 2), dtype=np.float64),
-            np.empty(0, dtype=np.float64),
-            np.empty(0, dtype=np.int64),
+    artifact: CalibrationArtifact
+    report: CalibrationReport
+
+    def __post_init__(self) -> None:
+        _validate_calibration_binding(self.artifact, self.report)
+
+
+@dataclass(frozen=True, init=False)
+class CalibrationAnalysisResult:
+    """Authority-bearing result produced only from an AdmittedCapture."""
+
+    artifact: CalibrationArtifact
+    report: CalibrationReport
+    _source_admission: object = field(repr=False, compare=False)
+
+    def __init_subclass__(cls, **_kwargs) -> None:
+        raise TypeError("CalibrationAnalysisResult is final and cannot be subclassed")
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        raise TypeError(
+            "CalibrationAnalysisResult is returned by analyze_calibration"
         )
-    peak_component_ids = peak_component_ids_by_label[capable_labels - 1]
-    peak_component_floors = np.concatenate(
-        ([-np.inf], component_floors[peak_component_ids])
-    )
-    peak_heights = np.concatenate(([-np.inf], peak_heights[capable_labels]))
-    seed_indices = np.concatenate(([smooth.size], seed_indices[capable_labels]))
-    component_count = int(capable_labels.size)
 
-    # Prominence and catchment ownership must come from the same maximin
-    # topology.  In particular, do not seed per-component floors as negative
-    # watershed markers: a synthetic floor marker is a barrier that can split
-    # a positive basin and manufacture a much deeper saddle.  A component
-    # floor is evidence only for the one surviving maximum in that connected
-    # component.  Components with no prominence-capable maximum remain basin
-    # zero and therefore cannot contribute an admitted area or centroid.
-    prominences, basins = _topographic_prominences(
-        smooth,
-        validity,
-        seed_indices,
-        peak_heights,
-        peak_component_floors,
-        validity_component_count,
-    )
-    thresholds = peak_heights - 0.5 * prominences
-    thresholds[0] = np.inf
-    basin_thresholds = thresholds[np.maximum(basins, 0)]
-    half_mask = validity & (basins > 0) & (smooth >= basin_thresholds)
-    areas = np.bincount(
-        basins[half_mask],
-        minlength=component_count + 1,
-    ).astype(np.int64, copy=False)
-    touching = np.zeros(component_count + 1, dtype=bool)
-    if policy.reject_touching_half_prominence_basins:
-        for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
-            if dx >= 0:
-                first_x = slice(0, basins.shape[1] - dx or None)
-                second_x = slice(dx, None)
-            else:
-                first_x = slice(-dx, None)
-                second_x = slice(0, dx)
-            first_y = slice(0, basins.shape[0] - dy or None)
-            second_y = slice(dy, None)
-            first_labels = basins[first_y, first_x]
-            second_labels = basins[second_y, second_x]
-            boundary = (
-                half_mask[first_y, first_x]
-                & half_mask[second_y, second_x]
-                & (first_labels != second_labels)
+    @classmethod
+    def _from_admitted_analysis(
+        cls,
+        token: object,
+        computation: CalibrationComputation,
+        source: object,
+    ) -> "CalibrationAnalysisResult":
+        from zlc_neutral_atom.artifacts.capture import AdmittedCapture
+
+        if token is not _ADMITTED_ANALYSIS_TOKEN:
+            raise PermissionError(
+                "admitted calibration results are minted by analyze_calibration"
             )
-            if np.any(boundary):
-                touching[first_labels[boundary]] = True
-                touching[second_labels[boundary]] = True
-    qualified = (
-        (prominences >= required_prominence)
-        & (areas >= policy.minimum_half_prominence_basin_area_pixels)
-        & ~touching
-    )
-    qualified[0] = False
-    labels_flat = basins.ravel()
-    half_flat = half_mask.ravel()
-    half_labels = labels_flat[half_flat]
-    half_thresholds = thresholds[half_labels]
-    weights_for_centroid = np.maximum(
-        smooth.ravel()[half_flat] - half_thresholds,
-        np.finfo(np.float64).eps,
-    )
-    yy, xx = np.indices(smooth.shape, dtype=np.float64)
-    weight_sums = np.bincount(
-        half_labels,
-        weights=weights_for_centroid,
-        minlength=component_count + 1,
-    )
-    x_sums = np.bincount(
-        half_labels,
-        weights=weights_for_centroid * xx.ravel()[half_flat],
-        minlength=component_count + 1,
-    )
-    y_sums = np.bincount(
-        half_labels,
-        weights=weights_for_centroid * yy.ravel()[half_flat],
-        minlength=component_count + 1,
-    )
-    admitted_labels = np.flatnonzero(qualified)
-    points = np.column_stack(
-        (
-            x_sums[admitted_labels] / weight_sums[admitted_labels],
-            y_sums[admitted_labels] / weight_sums[admitted_labels],
+        if not isinstance(computation, CalibrationComputation):
+            raise TypeError("computation must be CalibrationComputation")
+        if type(source) is not AdmittedCapture:
+            raise TypeError("source must be an exact AdmittedCapture")
+        if computation.artifact.source_binding.source_capture_ref != source.reference:
+            raise ValueError("calibration result names another admitted capture")
+        result = object.__new__(cls)
+        object.__setattr__(result, "artifact", computation.artifact)
+        object.__setattr__(result, "report", computation.report)
+        object.__setattr__(result, "_source_admission", source)
+        return result
+
+    def _require_source_admission(self, source: object) -> None:
+        """Require the exact capture repository/journal authority used in analysis."""
+
+        from zlc_neutral_atom.artifacts.capture import AdmittedCapture
+
+        if type(source) is not AdmittedCapture:
+            raise TypeError("source must be an exact AdmittedCapture")
+        if not self._source_admission._matches_admission(source):
+            raise PermissionError(
+                "calibration result belongs to another source admission"
+            )
+
+def _gaussian_2d(coords, offset, amplitude, x0, y0, sigma_x, sigma_y):
+    x, y = coords
+    return (
+        offset
+        + amplitude
+        * np.exp(
+            -0.5
+            * (((x - x0) / sigma_x) ** 2 + ((y - y0) / sigma_y) ** 2)
         )
-    )
-    admitted_prominences = prominences[admitted_labels]
-    admitted_areas = areas[admitted_labels]
-    order = np.lexsort((points[:, 0], points[:, 1], -admitted_prominences))
-    points = points[order]
-    admitted_prominences = admitted_prominences[order]
-    admitted_areas = admitted_areas[order]
-    if len(points) > 1:
-        nearest = cKDTree(points).query(points, k=2)[0][:, 1]
-        if float(np.min(nearest)) < policy.minimum_peak_separation_pixels:
-            raise CalibrationAnalysisError("prominent site candidates violate minimum separation")
-    return _PeakCandidates(points, admitted_prominences, admitted_areas)
+    ).ravel()
 
 
-def _fit_affine(ideal: np.ndarray, observed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    design = np.column_stack((np.ones(len(ideal)), ideal[:, 0], ideal[:, 1]))
-    coefficients, _residuals, _rank, _singular = np.linalg.lstsq(
-        design,
-        observed,
-        rcond=None,
-    )
-    predicted = design @ coefficients
-    return coefficients, predicted
-
-
-def _second_best_assignment_cost_delta(
-    cost: np.ndarray,
-    rows: np.ndarray,
-    cols: np.ndarray,
-) -> tuple[float, float | None]:
-    source = np.asarray(cost)
-    if source.dtype.kind not in "iuf" or source.dtype.kind == "b":
-        raise TypeError("assignment cost must have a real numeric dtype")
-    matrix = np.asarray(source, dtype=np.float64)
-    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[0] != matrix.shape[1]:
-        raise ValueError("assignment cost must be one non-empty square matrix")
-    if not np.all(np.isfinite(matrix)) or np.any(matrix < 0.0):
-        raise ValueError("assignment cost must contain finite non-negative values")
-    count = matrix.shape[0]
-
-    def permutation(values: np.ndarray, name: str) -> np.ndarray:
-        source_values = np.asarray(values)
-        if source_values.ndim != 1 or source_values.shape != (count,):
-            raise ValueError(f"{name} must have shape ({count},)")
-        if source_values.dtype.kind not in "iu" or source_values.dtype.kind == "b":
-            raise TypeError(f"{name} must have an integral dtype")
-        normalized = source_values.astype(np.int64, copy=False)
-        if not np.array_equal(np.sort(normalized), np.arange(count, dtype=np.int64)):
-            raise ValueError(f"{name} must be a permutation of assignment indices")
-        return normalized
-
-    row_order = permutation(rows, "rows")
-    columns = permutation(cols, "cols")
-    assigned = np.empty(count, dtype=np.int64)
-    assigned[row_order] = columns
-    base_edges = matrix[np.arange(count), assigned]
-    best = math.fsum(float(value) for value in base_edges)
-    if count == 1:
-        return best, None
-    weights = matrix[:, assigned] - base_edges[:, None]
-    np.fill_diagonal(weights, np.inf)
-    distances = weights.copy()
-    np.fill_diagonal(distances, 0.0)
-    for pivot in range(count):
-        via = distances[:, pivot, None] + distances[None, pivot, :]
-        np.minimum(distances, via, out=distances)
-    finite_weights = weights[np.isfinite(weights)]
-    scale = max(1.0, float(np.max(matrix)))
-    weight_scale = max(1.0, float(np.max(np.abs(finite_weights))))
-    tolerance = 128.0 * np.finfo(np.float64).eps * (
-        scale + count * weight_scale
-    )
-    if float(np.min(np.diag(distances))) < -tolerance:
-        raise CalibrationAnalysisError(
-            "assignment optimum has a negative alternating cycle"
+def _fit_gaussian_spot_2d(
+    data: np.ndarray,
+    yy: np.ndarray,
+    xx: np.ndarray,
+    *,
+    x0: float,
+    y0: float,
+    offset0: float,
+    amplitude: float,
+    sigma0: float = 0.9,
+) -> tuple[float, float, float, float, bool]:
+    amplitude = float(amplitude)
+    try:
+        initial = [
+            float(offset0),
+            max(amplitude, 1e-6),
+            float(x0),
+            float(y0),
+            sigma0,
+            sigma0,
+        ]
+        lower = [
+            float(np.nanmin(data)) - abs(amplitude) - 1,
+            0.0,
+            float(xx.min()) - 0.5,
+            float(yy.min()) - 0.5,
+            0.2,
+            0.2,
+        ]
+        upper = [
+            float(np.nanmax(data)) + abs(amplitude) + 1,
+            max(amplitude * 5, 1.0),
+            float(xx.max()) + 0.5,
+            float(yy.max()) + 0.5,
+            4.0,
+            4.0,
+        ]
+        fitted, _ = curve_fit(
+            _gaussian_2d,
+            (xx.ravel(), yy.ravel()),
+            data.ravel(),
+            p0=initial,
+            bounds=(lower, upper),
+            maxfev=5000,
         )
-    closed_walks = weights + distances.T
-    delta_raw = float(np.min(closed_walks))
-    if not math.isfinite(delta_raw):
-        raise CalibrationAnalysisError("assignment has no finite distinct alternative")
-    if delta_raw < -tolerance:
-        raise CalibrationAnalysisError(
-            "assignment second-best delta is materially negative"
+        _offset, _amplitude, x_fit, y_fit, sigma_x, sigma_y = fitted
+        return (
+            float(x_fit),
+            float(y_fit),
+            float(abs(sigma_x)),
+            float(abs(sigma_y)),
+            True,
         )
-    delta = 0.0 if delta_raw <= tolerance else delta_raw
-    return best, delta
-
-
-def _band_separation(
-    assigned: np.ndarray,
-    rows: int,
-    columns: int,
-) -> float | None:
-    grid = assigned.reshape(rows, columns, 2)
-    separations: list[float] = []
-    for row in range(rows - 1):
-        upper = grid[row, :, 1]
-        lower = grid[row + 1, :, 1]
-        separations.append(float(np.min(lower) - np.max(upper)))
-    for column in range(columns - 1):
-        left = grid[:, column, 0]
-        right = grid[:, column + 1, 0]
-        separations.append(float(np.min(right) - np.max(left)))
-    return min(separations) if separations else None
-
-
-def _assign_unique_affine_lattice(
-    peaks: _PeakCandidates,
-    request: CalibrationAnalysisRequest,
-) -> _LatticeResult:
-    candidates_xy = peaks.coordinates_xy
-    rows, columns = request.grid_shape_yx
-    expected = rows * columns
-    if candidates_xy.shape != (expected, 2):
-        raise CalibrationAnalysisError(
-            f"prominence produced {len(candidates_xy)} candidates; grid requires {expected}"
+    except Exception:
+        values = np.clip(data - np.nanpercentile(data, 20), 0, None)
+        total = float(np.sum(values))
+        if total <= 0:
+            return float(x0), float(y0), float(sigma0), float(sigma0), False
+        return (
+            float(np.sum(xx * values) / total),
+            float(np.sum(yy * values) / total),
+            float(sigma0),
+            float(sigma0),
+            False,
         )
-    # Initial row bands are defined in the declared ROI-local X/Y frame.  This
-    # fixes reflections/90-degree symmetries before the affine refinement.
-    by_y = np.lexsort((candidates_xy[:, 0], candidates_xy[:, 1]))
-    initial_indices: list[int] = []
-    for row in range(rows):
-        band = by_y[row * columns : (row + 1) * columns]
-        initial_indices.extend(
-            int(index) for index in band[np.argsort(candidates_xy[band, 0], kind="stable")]
-        )
-    ideal = np.asarray(
-        [(column, row) for row in range(rows) for column in range(columns)],
-        dtype=np.float64,
+
+
+def _refine_center_subpixel(
+    image: np.ndarray,
+    x: float,
+    y: float,
+    half: int = 2,
+) -> tuple[float, float]:
+    height, width = image.shape
+    x_int, y_int = int(round(x)), int(round(y))
+    x0, x1 = max(0, x_int - half), min(width, x_int + half + 1)
+    y0, y1 = max(0, y_int - half), min(height, y_int + half + 1)
+    cut = image[y0:y1, x0:x1]
+    if cut.size < 9 or not np.isfinite(cut).any():
+        return float(x), float(y)
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    background = float(np.nanmedian(cut))
+    amplitude = float(np.nanmax(cut) - background)
+    x_fit, y_fit, _sx, _sy, _ok = _fit_gaussian_spot_2d(
+        cut,
+        yy,
+        xx,
+        x0=float(x),
+        y0=float(y),
+        offset0=background,
+        amplitude=amplitude,
     )
-    assignment_cols = np.asarray(initial_indices, dtype=np.int64)
-    assigned = candidates_xy[assignment_cols]
-    coefficients, predicted = _fit_affine(ideal, assigned)
-    final_cost: np.ndarray | None = None
-    assignment_rows = np.arange(expected, dtype=np.int64)
-    for _iteration in range(_MAX_AFFINE_ASSIGNMENT_ITERATIONS):
-        differences = predicted[:, None, :] - candidates_xy[None, :, :]
-        cost = np.einsum("ijk,ijk->ij", differences, differences)
-        next_rows, next_cols = linear_sum_assignment(cost)
-        next_rows = next_rows.astype(np.int64, copy=False)
-        next_cols = next_cols.astype(np.int64, copy=False)
-        if not np.array_equal(next_rows, assignment_rows):
-            raise CalibrationAnalysisError("lattice assignment omitted an ideal grid cell")
-        if np.array_equal(next_cols, assignment_cols):
-            final_cost = cost
-            break
-        assignment_cols = next_cols
-        assigned = candidates_xy[assignment_cols]
-        coefficients, predicted = _fit_affine(ideal, assigned)
-    if final_cost is None:
-        raise CalibrationAnalysisError("affine lattice assignment did not converge")
-    assigned = candidates_xy[assignment_cols]
-    coefficients, predicted = _fit_affine(ideal, assigned)
-    verification_differences = predicted[:, None, :] - candidates_xy[None, :, :]
-    verification_cost = np.einsum(
-        "ijk,ijk->ij",
-        verification_differences,
-        verification_differences,
-    )
-    verification_rows, verification_cols = linear_sum_assignment(verification_cost)
-    if not np.array_equal(verification_rows, assignment_rows) or not np.array_equal(
-        verification_cols,
-        assignment_cols,
+    return x_fit, y_fit
+
+
+def _sort_centers_grid(
+    centers: np.ndarray,
+    grid_shape_yx: tuple[int, int],
+    ordering: GridOrder,
+) -> np.ndarray:
+    centers = np.asarray(centers, dtype=float)
+    rows, columns = grid_shape_yx
+    if centers.shape != (rows * columns, 2):
+        raise ValueError("center count does not match grid_shape_yx")
+    if ordering in (GridOrder.ROW_MAJOR, GridOrder.SERPENTINE):
+        output = []
+        for row_index, chunk in enumerate(
+            np.array_split(centers[np.argsort(centers[:, 1])], rows)
+        ):
+            row = chunk[np.argsort(chunk[:, 0])]
+            if ordering is GridOrder.SERPENTINE and row_index % 2:
+                row = row[::-1]
+            output.append(row)
+        return np.vstack(output)
+    output = []
+    for column_index, chunk in enumerate(
+        np.array_split(centers[np.argsort(centers[:, 0])], columns)
     ):
-        raise CalibrationAnalysisError("affine lattice assignment changed after final refit")
-    final_cost = verification_cost
-    residual = float(np.sqrt(np.mean(np.sum((assigned - predicted) ** 2, axis=1))))
-    policy = request.detection
-    if residual > policy.maximum_lattice_rms_residual_pixels:
-        raise CalibrationAnalysisError("site candidates exceed affine lattice residual gate")
-    column_step = coefficients[1]
-    row_step = coefficients[2]
-    active_steps = []
-    if columns > 1:
-        active_steps.append(float(np.linalg.norm(column_step)))
+        column = chunk[np.argsort(chunk[:, 1])]
+        if ordering is GridOrder.COLUMN_SERPENTINE and column_index % 2:
+            column = column[::-1]
+        output.append(column)
+    return np.vstack(output)
+
+
+def _robust_axis_lattice(anchors: np.ndarray, count: int) -> np.ndarray:
+    anchors = np.asarray(anchors, dtype=float)
+    if count <= 1:
+        return anchors.copy()
+    indices = np.arange(count, dtype=float)
+    slopes = [
+        (anchors[j] - anchors[i]) / (j - i)
+        for i in range(count)
+        for j in range(i + 1, count)
+    ]
+    pitch = float(np.median(slopes)) if slopes else 0.0
+    origin = float(np.median(anchors - pitch * indices))
+    return origin + pitch * indices
+
+
+def _regularize_grid(
+    row_major_centers: np.ndarray,
+    grid_shape_yx: tuple[int, int],
+    image_shape_yx: tuple[int, int],
+) -> np.ndarray:
+    rows, columns = grid_shape_yx
+    grid = np.asarray(row_major_centers, dtype=float).reshape(rows, columns, 2)
+    height, width = image_shape_yx
+    row_y = _robust_axis_lattice(np.median(grid[:, :, 1], axis=1), rows)
+    column_x = _robust_axis_lattice(np.median(grid[:, :, 0], axis=0), columns)
+    pitches = []
     if rows > 1:
-        active_steps.append(float(np.linalg.norm(row_step)))
-    if active_steps and min(active_steps) < policy.minimum_lattice_step_pixels:
-        raise CalibrationAnalysisError("affine lattice step is below the declared minimum")
-    # Declared row/column identity is top-to-bottom and left-to-right in the
-    # ROI-local frame.  A reflected or axis-swapped solution is not equivalent.
-    if (columns > 1 and column_step[0] <= 0.0) or (
-        rows > 1 and row_step[1] <= 0.0
-    ):
-        raise CalibrationAnalysisError(
-            "affine lattice orientation is inconsistent with grid order"
-        )
-    sin_angle: float | None = None
-    condition_number: float | None = None
-    if columns > 1 and rows > 1:
-        column_norm = float(np.linalg.norm(column_step))
-        row_norm = float(np.linalg.norm(row_step))
-        basis = np.column_stack((column_step, row_step))
-        sin_angle = min(
-            1.0,
-            abs(float(np.linalg.det(basis))) / (column_norm * row_norm),
-        )
-        condition_number = float(np.linalg.cond(basis))
-        if (
-            not math.isfinite(sin_angle)
-            or sin_angle < policy.minimum_affine_sin_angle
-        ):
-            raise CalibrationAnalysisError("affine lattice basis is nearly collinear")
-        if (
-            not math.isfinite(condition_number)
-            or condition_number > policy.maximum_affine_condition_number
-        ):
-            raise CalibrationAnalysisError("affine lattice basis is ill-conditioned")
-    separation = _band_separation(assigned, rows, columns)
-    if separation is not None and separation < policy.minimum_band_separation_pixels:
-        raise CalibrationAnalysisError("row/column lattice bands are not uniquely separated")
-    _best_cost, assignment_gap = _second_best_assignment_cost_delta(
-        final_cost,
-        assignment_rows,
-        assignment_cols,
+        pitches.append(abs(float(row_y[1] - row_y[0])))
+    if columns > 1:
+        pitches.append(abs(float(column_x[1] - column_x[0])))
+    pitches = [value for value in pitches if math.isfinite(value) and value > 0]
+    pitch = float(min(pitches)) if pitches else float(min(height, width))
+    lattice_x = np.broadcast_to(column_x[None, :], (rows, columns))
+    lattice_y = np.broadcast_to(row_y[:, None], (rows, columns))
+    off_node = (
+        np.hypot(grid[:, :, 0] - lattice_x, grid[:, :, 1] - lattice_y)
+        > 0.5 * pitch
     )
-    if (
-        assignment_gap is not None
-        and assignment_gap < policy.minimum_assignment_cost_gap_pixels_squared
-    ):
-        raise CalibrationAnalysisError("affine lattice has an ambiguous second-best assignment")
-    row_major = candidates_xy[assignment_cols]
-    if request.grid_order is GridOrder.ROW_MAJOR:
-        ordered = row_major
-    else:
-        indices = [row * columns + column for column in range(columns) for row in range(rows)]
-        ordered = row_major[indices]
-    immutable = np.frombuffer(
-        np.ascontiguousarray(ordered, dtype="<f8").tobytes(),
-        dtype="<f8",
-    ).reshape(expected, 2)
-    immutable.setflags(write=False)
-    return _LatticeResult(
-        immutable,
-        SiteDetectionDiagnostic(
-            expected,
-            float(np.min(peaks.prominences)),
-            int(np.min(peaks.half_prominence_basin_areas)),
-            residual,
-            separation,
-            sin_angle,
-            condition_number,
-            assignment_gap,
-        ),
+    grid[off_node, 0] = lattice_x[off_node]
+    grid[off_node, 1] = lattice_y[off_node]
+    margin = max(1.0, 0.25 * pitch)
+    grid[:, :, 0] = np.clip(
+        grid[:, :, 0],
+        margin,
+        max(margin, width - 1 - margin),
     )
+    grid[:, :, 1] = np.clip(
+        grid[:, :, 1],
+        margin,
+        max(margin, height - 1 - margin),
+    )
+    return grid.reshape(rows * columns, 2)
 
 
-def _detect_sites(
-    average: np.ndarray,
-    validity: np.ndarray,
-    request: CalibrationAnalysisRequest,
-) -> _LatticeResult:
-    candidates = _collapse_prominent_maxima(average, validity, request.detection)
-    return _assign_unique_affine_lattice(candidates, request)
+def find_site_centers(
+    image: np.ndarray,
+    grid_shape_yx: tuple[int, int],
+    *,
+    min_distance: int | None = None,
+    threshold_rel: float = 0.35,
+    ordering: GridOrder = GridOrder.ROW_MAJOR,
+    refine_half: int = 2,
+) -> np.ndarray:
+    """Main-authority Gaussian/local-maximum detector with lattice repair."""
+
+    image = np.asarray(image, dtype=float)
+    if image.ndim != 2 or 0 in image.shape or not np.isfinite(image).any():
+        raise ValueError("image must be a non-empty finite 2D array")
+    rows, columns = grid_shape_yx
+    needed = rows * columns
+    if min_distance is None:
+        min_distance = max(3, int(min(image.shape) / max(rows, columns, 1) / 2))
+    min_distance = _positive_integer(min_distance, "min_distance")
+    smooth = ndimage.gaussian_filter(image, sigma=1.0)
+    cutoff = float(
+        np.nanmin(smooth)
+        + threshold_rel * (np.nanmax(smooth) - np.nanmin(smooth))
+    )
+    local_max = ndimage.maximum_filter(smooth, size=min_distance)
+    is_peak = smooth == local_max
+    candidates_yx = np.argwhere(is_peak & (smooth >= cutoff))
+    if len(candidates_yx) < needed:
+        peaks_yx = np.argwhere(is_peak)
+        if len(peaks_yx) < needed:
+            raise CalibrationAnalysisError(
+                f"only {len(peaks_yx)} local maxima for a {rows}x{columns} grid"
+            )
+        weights = smooth[peaks_yx[:, 0], peaks_yx[:, 1]]
+        candidates_yx = peaks_yx[np.argsort(weights)[::-1][:needed]]
+    weights = smooth[candidates_yx[:, 0], candidates_yx[:, 1]]
+    selected = candidates_yx[np.argsort(weights)[::-1]][:needed]
+    centers = np.asarray(
+        [
+            _refine_center_subpixel(
+                image,
+                float(column),
+                float(row),
+                half=refine_half,
+            )
+            for row, column in selected
+        ],
+        dtype=float,
+    )
+    row_major = _sort_centers_grid(centers, grid_shape_yx, GridOrder.ROW_MAJOR)
+    repaired = _regularize_grid(row_major, grid_shape_yx, image.shape)
+    return _sort_centers_grid(repaired, grid_shape_yx, ordering)
 
 
 def _boxes_for_centers(
     centers_xy: np.ndarray,
-    *,
-    half_width: int,
     image_shape_yx: tuple[int, int],
+    radius: int,
 ) -> np.ndarray:
     height, width = image_shape_yx
-    extent = 2 * half_width + 1
-    boxes = np.empty((len(centers_xy), 4), dtype="<i8")
-    for index, (x, y) in enumerate(centers_xy):
+    boxes = []
+    for x, y in centers_xy:
         center_x, center_y = int(round(float(x))), int(round(float(y)))
-        x0, y0 = center_x - half_width, center_y - half_width
-        if x0 < 0 or y0 < 0 or x0 + extent > width or y0 + extent > height:
-            raise CalibrationAnalysisError(
-                f"site {index} is too close to the frame edge for width {extent}"
-            )
-        boxes[index] = (x0, y0, extent, extent)
-    return boxes
+        if not (0 <= center_x < width and 0 <= center_y < height):
+            raise CalibrationAnalysisError("detected center is outside the image")
+        x0, x1 = max(0, center_x - radius), min(width, center_x + radius + 1)
+        y0, y1 = max(0, center_y - radius), min(height, center_y + radius + 1)
+        boxes.append((x0, y0, x1 - x0, y1 - y0))
+    return np.asarray(boxes, dtype="<i8")
 
 
-def _psf_kernels(
-    average: np.ndarray,
+def _crop_psf_box(
+    image_shape_yx: tuple[int, int],
+    x: float,
+    y: float,
+    half_width: int,
+) -> tuple[int, int, int, int]:
+    height, width = image_shape_yx
+    x_int, y_int = int(round(float(x))), int(round(float(y)))
+    x0, x1 = max(0, x_int - half_width), min(width, x_int + half_width + 1)
+    y0, y1 = max(0, y_int - half_width), min(height, y_int + half_width + 1)
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def _gaussian_psf(
+    shape: tuple[int, int],
+    x0: float,
+    y0: float,
+    sigma_x: float,
+    sigma_y: float,
+) -> np.ndarray:
+    yy, xx = np.mgrid[0 : shape[0], 0 : shape[1]]
+    gaussian = np.exp(
+        -0.5
+        * (
+            ((xx - x0) / max(sigma_x, 1e-6)) ** 2
+            + ((yy - y0) / max(sigma_y, 1e-6)) ** 2
+        )
+    )
+    gaussian = np.clip(gaussian, 0, None)
+    total = float(np.sum(gaussian))
+    return (
+        gaussian / total
+        if total > 0
+        else np.ones(shape, dtype=float) / float(np.prod(shape))
+    )
+
+
+def _fit_psf_features(
+    reference_average: np.ndarray,
     average_validity: np.ndarray,
-    boxes: np.ndarray,
-    config: PsfAnalysisConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    extent = 2 * config.half_width + 1
-    kernels = np.zeros((len(boxes), extent, extent), dtype=np.float64)
-    geometry_valid = np.ones(len(boxes), dtype=bool)
-    for site, box in enumerate(boxes):
-        x0, y0, width, height = (int(value) for value in box)
-        cut = average[y0 : y0 + height, x0 : x0 + width]
-        cut_valid = average_validity[y0 : y0 + height, x0 : x0 + width]
-        if cut.shape != (extent, extent) or not np.all(cut_valid):
+    centers_xy: np.ndarray,
+    site_axis: AxisSpec,
+    request: CalibrationAnalysisRequest,
+) -> tuple[PerSitePsfFeature, UniformPsfFeature, tuple[PsfFitDiagnostic, ...]]:
+    box_extent = 2 * request.psf_half_width + 1
+    boxes = []
+    kernels = []
+    geometry_valid = np.ones(site_axis.size, dtype=bool)
+    diagnostics = []
+    for site, (x, y) in enumerate(centers_xy):
+        box = _crop_psf_box(
+            reference_average.shape,
+            float(x),
+            float(y),
+            request.psf_half_width,
+        )
+        box_x, box_y, width, height = box
+        if (width, height) != (box_extent, box_extent):
+            raise CalibrationAnalysisError(
+                f"site {site} is too close to the image edge for a "
+                f"{box_extent}x{box_extent} PSF"
+            )
+        boxes.append(box)
+        cut = reference_average[box_y : box_y + height, box_x : box_x + width]
+        cut_valid = average_validity[box_y : box_y + height, box_x : box_x + width]
+        if not np.all(cut_valid & np.isfinite(cut)):
             geometry_valid[site] = False
+            kernel = np.ones((height, width), dtype=float) / float(height * width)
+            kernels.append(kernel)
+            diagnostics.append(
+                PsfFitDiagnostic(site, (float(x), float(y)), (0.9, 0.9), False)
+            )
             continue
-        background = _readout_background_from_arrays(
-            average,
+        background = _annulus_background(
+            reference_average,
             average_validity,
             box,
-            mode=config.background,
-            padding=config.background_padding,
+            request.psf_background_padding,
         )
-        if background is None:
-            geometry_valid[site] = False
-            continue
-        positive = gaussian_filter(np.maximum(cut - background, 0.0), 0.35)
-        total = float(np.sum(positive, dtype=np.float64))
-        if not math.isfinite(total) or total <= 0.0:
-            geometry_valid[site] = False
-            continue
-        kernels[site] = positive / total
-    impulse = np.zeros((extent, extent), dtype=np.float64)
-    impulse[0, 0] = 1.0
-    kernels[~geometry_valid] = impulse
-    if not np.any(geometry_valid):
-        raise CalibrationAnalysisError("no site has a valid training-only PSF template")
-    uniform = np.mean(kernels[geometry_valid], axis=0, dtype=np.float64)
-    uniform = np.maximum(uniform, 0.0)
-    uniform /= np.sum(uniform, dtype=np.float64)
-    return kernels, uniform, geometry_valid
-
-
-def _feature_spec(
-    kind: ReadoutModelKind,
-    *,
-    site_axis_id: AxisId,
-    boxes: np.ndarray,
-    geometry_validity: np.ndarray,
-    request: CalibrationAnalysisRequest,
-    per_site_kernels: np.ndarray | None = None,
-    uniform_kernel: np.ndarray | None = None,
-) -> ReadoutFeatureSpec:
-    validity = ComponentValidity((site_axis_id,), geometry_validity)
-    if kind is ReadoutModelKind.BOX:
-        return ReadoutFeatureSpec(
-            kind,
-            site_axis_id,
-            boxes,
-            validity,
-            box_reducer=request.box.reducer,
+        subtracted = cut - background
+        yy, xx = np.mgrid[box_y : box_y + height, box_x : box_x + width]
+        amplitude = float(np.nanmax(subtracted)) if np.isfinite(subtracted).any() else 0.0
+        x_fit, y_fit, sigma_x, sigma_y, fit_ok = _fit_gaussian_spot_2d(
+            subtracted,
+            yy,
+            xx,
+            x0=float(x),
+            y0=float(y),
+            offset0=0.0,
+            amplitude=amplitude,
         )
-    assert request.psf is not None
-    return ReadoutFeatureSpec(
-        kind,
-        site_axis_id,
-        boxes,
+        positive = np.clip(subtracted, 0, None)
+        positive = ndimage.gaussian_filter(positive, 0.35)
+        total = float(np.sum(positive))
+        kernel = (
+            positive / total
+            if total > 0
+            else _gaussian_psf(
+                (height, width),
+                x_fit - box_x,
+                y_fit - box_y,
+                sigma_x,
+                sigma_y,
+            )
+        )
+        kernels.append(np.ascontiguousarray(kernel, dtype=float))
+        diagnostics.append(
+            PsfFitDiagnostic(
+                site,
+                (x_fit, y_fit),
+                (sigma_x, sigma_y),
+                fit_ok,
+            )
+        )
+    boxes_array = np.asarray(boxes, dtype="<i8")
+    kernels_array = np.stack(kernels, axis=0)
+    validity = ComponentValidity((site_axis.axis_id,), geometry_valid)
+    per_site = PerSitePsfFeature(
+        site_axis,
+        boxes_array,
+        kernels_array,
+        request.psf_background,
+        request.psf_background_padding,
         validity,
-        per_site_kernels=(
-            per_site_kernels if kind is ReadoutModelKind.PER_SITE_PSF else None
-        ),
-        uniform_kernel=(
-            uniform_kernel if kind is ReadoutModelKind.UNIFORM_PSF else None
-        ),
-        background=request.psf.background,
-        background_padding=request.psf.background_padding,
     )
+    shared = (
+        np.mean(kernels_array[geometry_valid], axis=0)
+        if np.any(geometry_valid)
+        else np.ones(kernels_array.shape[1:], dtype=float)
+    )
+    shared_total = float(np.sum(shared))
+    shared = (
+        shared / shared_total
+        if shared_total > 0
+        else np.ones_like(shared) / float(shared.size)
+    )
+    uniform = UniformPsfFeature(
+        site_axis,
+        boxes_array,
+        shared,
+        request.psf_background,
+        request.psf_background_padding,
+        validity,
+    )
+    return per_site, uniform, tuple(diagnostics)
 
 
-def _reference_threshold_proposal(
-    values: np.ndarray,
-    minimum_samples_per_class: int,
-    minimum_separation_rss: float,
-) -> _ReferenceThresholdProposal | None:
-    ordered = np.sort(np.asarray(values, dtype=np.float64))
-    ordered = ordered[np.isfinite(ordered)]
-    minimum_samples_per_class = _positive_integer(
-        minimum_samples_per_class,
-        "minimum_samples_per_class",
+def otsu_threshold(values: object, *, bins: int = 96) -> float:
+    samples = np.asarray(values, dtype=float).reshape(-1)
+    samples = samples[np.isfinite(samples)]
+    if not samples.size:
+        return float("nan")
+    if float(np.min(samples)) == float(np.max(samples)):
+        return float(samples[0])
+    histogram, edges = np.histogram(samples, bins=bins)
+    centers = (edges[:-1] + edges[1:]) / 2
+    weights = histogram.astype(float)
+    probability = weights / weights.sum()
+    omega = np.cumsum(probability)
+    mu = np.cumsum(probability * centers)
+    denominator = omega * (1.0 - omega)
+    score = np.full_like(centers, -np.inf, dtype=float)
+    valid = denominator > 0
+    score[valid] = (
+        (mu[-1] * omega[valid] - mu[valid]) ** 2 / denominator[valid]
     )
-    minimum_separation_rss = _finite_real(
-        minimum_separation_rss,
-        "minimum_separation_rss",
+    best = float(np.max(score[valid]))
+    plateau = np.flatnonzero(
+        valid & (score >= best - 1e-9 * (abs(best) + 1.0))
     )
-    if minimum_separation_rss <= 0.0:
-        raise ValueError("minimum_separation_rss must be positive")
-    if (
-        ordered.size < 2 * minimum_samples_per_class
-        or ordered[0] == ordered[-1]
-    ):
-        return None
-    normalized = (ordered - ordered[0]) / (ordered[-1] - ordered[0])
-    cumulative = np.cumsum(normalized, dtype=np.float64)
-    left_count = np.arange(1, ordered.size, dtype=np.float64)
-    right_count = ordered.size - left_count
-    distinct = ordered[:-1] < ordered[1:]
-    score = left_count * right_count * (
-        (cumulative[-1] - cumulative[:-1]) / right_count
-        - cumulative[:-1] / left_count
-    ) ** 2
-    score[~distinct] = -np.inf
+    return float(np.mean(centers[plateau]))
+
+
+def _normal_cdf(x, mean: float, sigma: float):
+    sigma = max(abs(float(sigma)), 1e-12)
+    result = 0.5 * (
+        1.0
+        + erf((np.asarray(x, dtype=float) - mean) / (sigma * math.sqrt(2.0)))
+    )
+    return float(result) if result.ndim == 0 else result
+
+
+def _exact_otsu_threshold(values: np.ndarray, min_fraction: float = 0.02) -> float:
+    samples = np.sort(np.asarray(values, dtype=float)[np.isfinite(values)])
+    count = int(samples.size)
+    if count < 4:
+        return float("nan")
+    minimum = max(2, int(math.ceil(min_fraction * count)))
+    if count < 2 * minimum + 1:
+        minimum = max(1, count // 4)
+    positions = np.arange(1, count, dtype=float)
+    cumulative = np.cumsum(samples)
+    total = float(cumulative[-1])
+    left_count = positions
+    right_count = float(count) - positions
+    valid = (
+        (left_count >= minimum)
+        & (right_count >= minimum)
+        & (samples[:-1] < samples[1:])
+    )
+    if not np.any(valid):
+        return float(np.median(samples))
+    left_mean = cumulative[:-1] / left_count
+    right_mean = (total - cumulative[:-1]) / right_count
+    score = left_count * right_count * (right_mean - left_mean) ** 2
+    score[~valid] = -np.inf
     index = int(np.argmax(score))
     if not np.isfinite(score[index]):
-        return None
-    left, right = ordered[: index + 1], ordered[index + 1 :]
-    if (
-        len(left) < minimum_samples_per_class
-        or len(right) < minimum_samples_per_class
-    ):
-        return None
-    left_median, right_median = float(np.median(left)), float(np.median(right))
-    left_scatter = 1.4826 * float(np.median(np.abs(left - left_median)))
-    right_scatter = 1.4826 * float(np.median(np.abs(right - right_median)))
-    combined_scatter = math.hypot(left_scatter, right_scatter)
-    separation = (
-        math.inf
-        if combined_scatter == 0.0
-        else (right_median - left_median) / combined_scatter
+        return float(np.median(samples))
+    return float(0.5 * (samples[index] + samples[index + 1]))
+
+
+def _one_sided_core_stats(
+    samples: np.ndarray,
+    side: str,
+    sigma_floor: float,
+) -> tuple[float, float, bool]:
+    samples = np.asarray(samples, dtype=float).reshape(-1)
+    samples = samples[np.isfinite(samples)]
+    if samples.size < 4:
+        return float("nan"), float("nan"), False
+    q16, q50, q84 = np.percentile(
+        samples,
+        [15.865525393145708, 50.0, 84.1344746068543],
     )
-    if separation < minimum_separation_rss:
-        return None
-    center_spacing = 0.5 * (right_median - left_median)
-    threshold = float(
-        ordered[index] + 0.5 * (ordered[index + 1] - ordered[index])
-    )
+    sigma = float(q50 - q16) if side == "low" else float(q84 - q50)
+    alternative = float(0.5 * (q84 - q16))
+    if not math.isfinite(sigma) or sigma <= 0:
+        sigma = alternative
+    if not math.isfinite(sigma) or sigma <= 0:
+        median = float(np.median(samples))
+        sigma = 1.482602218505602 * float(np.median(np.abs(samples - median)))
+    return float(q50), max(float(sigma), sigma_floor, 1e-12), True
+
+
+def _optimal_gaussian_threshold(
+    dark_mean: float,
+    dark_sigma: float,
+    bright_mean: float,
+    bright_sigma: float,
+) -> tuple[float, bool]:
+    bright_above = bool(bright_mean >= dark_mean)
+    lower, upper = min(dark_mean, bright_mean), max(dark_mean, bright_mean)
     if (
-        not math.isfinite(center_spacing)
-        or center_spacing <= 0.0
-        or not math.isfinite(threshold)
+        not np.isfinite([lower, upper, dark_sigma, bright_sigma]).all()
+        or upper <= lower
     ):
-        return None
-    return _ReferenceThresholdProposal(
+        return float(0.5 * (dark_mean + bright_mean)), bright_above
+
+    def error(threshold: float) -> float:
+        if bright_above:
+            dark_error = 1.0 - float(_normal_cdf(threshold, dark_mean, dark_sigma))
+            bright_error = float(_normal_cdf(threshold, bright_mean, bright_sigma))
+        else:
+            dark_error = float(_normal_cdf(threshold, dark_mean, dark_sigma))
+            bright_error = 1.0 - float(
+                _normal_cdf(threshold, bright_mean, bright_sigma)
+            )
+        return 0.5 * (dark_error + bright_error)
+
+    result = minimize_scalar(error, bounds=(lower, upper), method="bounded")
+    threshold = result.x if result.success else 0.5 * (lower + upper)
+    return float(threshold), bright_above
+
+
+def _gaussian_fidelity(
+    dark_mean: float,
+    dark_sigma: float,
+    bright_mean: float,
+    bright_sigma: float,
+    threshold: float,
+    bright_above: bool,
+) -> tuple[float, float, float]:
+    if not np.isfinite(
+        [dark_mean, dark_sigma, bright_mean, bright_sigma, threshold]
+    ).all():
+        return float("nan"), float("nan"), float("nan")
+    if bright_above:
+        dark = float(_normal_cdf(threshold, dark_mean, dark_sigma))
+        bright = 1.0 - float(_normal_cdf(threshold, bright_mean, bright_sigma))
+    else:
+        dark = 1.0 - float(_normal_cdf(threshold, dark_mean, dark_sigma))
+        bright = float(_normal_cdf(threshold, bright_mean, bright_sigma))
+    return dark, bright, 0.5 * (dark + bright)
+
+
+def fit_bimodal(values: object, *, min_component_fraction: float = 0.01) -> BimodalFit:
+    samples = np.asarray(values, dtype=float).reshape(-1)
+    samples = samples[np.isfinite(samples)]
+    split = _exact_otsu_threshold(samples)
+    if samples.size < 8 or not math.isfinite(split):
+        return BimodalFit(
+            split,
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            True,
+            False,
+        )
+    low = samples[samples <= split]
+    high = samples[samples > split]
+    minimum = max(4, int(math.ceil(min_component_fraction * samples.size)))
+    if low.size < minimum or high.size < minimum:
+        return BimodalFit(
+            split,
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float(high.size / samples.size),
+            float("nan"),
+            float("nan"),
+            True,
+            False,
+        )
+    full_sigma = float(np.std(samples)) if samples.size > 1 else 1.0
+    floor = max(1e-6 * full_sigma, 1e-12)
+    dark_mean, dark_sigma, dark_ok = _one_sided_core_stats(low, "low", floor)
+    bright_mean, bright_sigma, bright_ok = _one_sided_core_stats(high, "high", floor)
+    bright_fraction = float(high.size / samples.size)
+    if (
+        not (dark_ok and bright_ok)
+        or not np.isfinite(
+            [dark_mean, dark_sigma, bright_mean, bright_sigma]
+        ).all()
+        or bright_mean <= dark_mean
+    ):
+        return BimodalFit(
+            split,
+            float("nan"),
+            dark_mean,
+            dark_sigma,
+            bright_mean,
+            bright_sigma,
+            bright_fraction,
+            float("nan"),
+            float("nan"),
+            True,
+            False,
+        )
+    threshold, bright_above = _optimal_gaussian_threshold(
+        dark_mean,
+        dark_sigma,
+        bright_mean,
+        bright_sigma,
+    )
+    dark_fidelity, bright_fidelity, fidelity = _gaussian_fidelity(
+        dark_mean,
+        dark_sigma,
+        bright_mean,
+        bright_sigma,
         threshold,
-        left_median,
-        center_spacing,
-        len(left),
-        len(right),
-        separation,
+        bright_above,
+    )
+    separation = (bright_mean - dark_mean) / max(dark_sigma + bright_sigma, 1e-12)
+    return BimodalFit(
+        threshold,
+        fidelity,
+        dark_mean,
+        dark_sigma,
+        bright_mean,
+        bright_sigma,
+        bright_fraction,
+        dark_fidelity,
+        bright_fidelity,
+        bright_above,
+        bool(separation > 0.5),
     )
 
 
-def _reference_valley_evidence(
-    values: np.ndarray,
-    proposal: _ReferenceThresholdProposal,
-    validity: np.ndarray | None = None,
-) -> ReferenceValleyEvidence:
-    observed = np.asarray(values, dtype=np.float64)
-    if observed.ndim != 1:
-        raise ValueError("reference evidence must be one-dimensional")
-    if validity is None:
-        valid = np.ones(observed.shape, dtype=bool)
-    else:
-        valid = np.asarray(validity)
-        if valid.dtype != np.dtype(bool) or valid.shape != observed.shape:
-            raise ValueError("reference evidence validity must align to values")
-    finite_valid = valid & np.isfinite(observed)
-    selected = observed[finite_valid]
-    normalized = (selected - proposal.left_center) / proposal.center_spacing
-    # One boundary vector and a single (a, b] convention prevent overlaps,
-    # gaps, and double-counting when an observation lands on a boundary.
-    boundaries = np.asarray((-0.5, 0.5, 1.5, 2.5), dtype=np.float64)
-    counts = tuple(
-        int(np.count_nonzero((normalized > lower) & (normalized <= upper)))
-        for lower, upper in zip(boundaries[:-1], boundaries[1:], strict=True)
-    )
-    left_count, middle_count, right_count = counts
-    outside_count = int(selected.size) - sum(counts)
-    invalid_count = int(observed.size - selected.size)
+def reference_labels(
+    reference_signals: np.ndarray,
+    reference_validity: np.ndarray | None = None,
+) -> ReferenceLabels:
+    """Strict all-bright/all-dark consensus, with invalid data never called dark."""
 
-    return ReferenceValleyEvidence(
-        int(observed.size),
-        left_count,
-        middle_count,
-        right_count,
-        outside_count,
-        invalid_count,
-    )
-
-
-def _holm_rejections(pvalues: np.ndarray, familywise_error_rate: float) -> np.ndarray:
-    values = np.asarray(pvalues, dtype=np.float64)
-    if values.ndim != 1 or values.size == 0:
-        raise ValueError("Holm pvalues must be a non-empty vector")
-    if np.any(~np.isfinite(values)) or np.any((values < 0.0) | (values > 1.0)):
-        raise ValueError("Holm pvalues must be finite probabilities")
-    alpha = _finite_real(familywise_error_rate, "familywise_error_rate")
-    if not 0.0 < alpha < 1.0:
-        raise ValueError("familywise_error_rate must lie inside (0, 1)")
-    indices = np.arange(values.size, dtype=np.int64)
-    order = np.lexsort((indices, values))
-    rejected = np.zeros(values.size, dtype=bool)
-    for rank, index in enumerate(order):
-        if values[index] > alpha / (values.size - rank):
-            break
-        rejected[index] = True
-    return rejected
-
-
-def _artifact_wide_held_out_rejections(
-    pvalues: np.ndarray,
-    familywise_error_rate: float,
-) -> np.ndarray:
-    """Certify the single persisted model-by-site hypothesis family."""
-
-    values = np.asarray(pvalues, dtype=np.float64)
-    if values.ndim != 2 or 0 in values.shape:
+    signals = np.asarray(reference_signals, dtype=float)
+    if signals.ndim != 3:
         raise ValueError(
-            "artifact-wide held-out pvalues must be a non-empty model-by-site matrix"
+            "reference_signals must have shape (groups, reference_shots, sites)"
         )
-    return _holm_rejections(
-        values.reshape(-1),
-        familywise_error_rate,
-    ).reshape(values.shape)
-
-
-def _reference_feature_values(
-    accessor: _FrameAccessor,
-    brackets: tuple[CalibrationCaptureBracket, ...],
-    indices: tuple[int, ...],
-    spec: ReadoutFeatureSpec,
-) -> tuple[np.ndarray, np.ndarray]:
-    reference_count = len(brackets[0].reference_point_storage_rows)
-    site_count = spec.boxes_xywh.shape[0]
-    values = np.zeros((len(indices), reference_count, site_count))
-    validity = np.zeros(values.shape, dtype=bool)
-    for position, bracket_index in enumerate(indices):
-        bracket = brackets[bracket_index]
-        for reference_position, (_event, row) in enumerate(
-            bracket.reference_point_storage_rows
-        ):
-            image, pixel_validity = accessor.arrays(bracket, row)
-            features = _extract_readout_features_arrays(
-                spec,
-                image,
-                pixel_validity,
-            )
-            values[position, reference_position] = features.values
-            validity[position, reference_position] = features.validity.mask
-    return values, validity
-
-
-def _learn_reference_thresholds(
-    accessor: _FrameAccessor,
-    brackets: tuple[CalibrationCaptureBracket, ...],
-    partition: _BracketPartition,
-    spec: ReadoutFeatureSpec,
-    minimum_samples_per_class: int,
-    minimum_separation_rss: float,
-    familywise_error_rate: float,
-) -> tuple[np.ndarray, np.ndarray, tuple[ReferenceValleyDiagnostic, ...]]:
-    reference_count = len(brackets[0].reference_point_storage_rows)
-    site_count = spec.boxes_xywh.shape[0]
-    train_values, train_validity = _reference_feature_values(
-        accessor,
-        brackets,
-        partition.train_indices,
-        spec,
+    valid_input = (
+        np.ones(signals.shape, dtype=bool)
+        if reference_validity is None
+        else np.asarray(reference_validity, dtype=bool)
     )
-    evidence_values, evidence_validity = _reference_feature_values(
-        accessor,
-        brackets,
-        partition.reference_evidence_indices,
-        spec,
+    if valid_input.shape != signals.shape:
+        raise ValueError("reference_validity shape differs from reference_signals")
+    valid_input = valid_input & np.isfinite(signals)
+    groups, shots, sites = signals.shape
+    bright = np.zeros((groups, shots, sites), dtype=bool)
+    fit_ok = np.zeros(sites, dtype=bool)
+    fits = []
+    for site in range(sites):
+        fit = fit_bimodal(signals[:, :, site][valid_input[:, :, site]])
+        fits.append(fit)
+        # Fluorescence physics is fixed: an occupied atom is brighter.  A
+        # reversed fit is diagnostic evidence of a bad site, never a runtime mode.
+        if fit.ok and fit.bright_above and math.isfinite(fit.threshold):
+            bright[:, :, site] = signals[:, :, site] > fit.threshold
+            fit_ok[site] = True
+    every_reference_valid = np.all(valid_input, axis=1)
+    all_bright = np.all(bright, axis=1)
+    all_dark = np.all(~bright, axis=1)
+    valid = (
+        every_reference_valid
+        & (all_bright | all_dark)
+        & fit_ok[np.newaxis, :]
     )
-    complete_reference_sites = np.all(
-        train_validity & np.isfinite(train_values),
-        axis=(0, 1),
-    ) & np.all(
-        evidence_validity & np.isfinite(evidence_values),
-        axis=(0, 1),
+    return ReferenceLabels(
+        all_bright & valid,
+        all_dark & valid,
+        valid,
+        tuple(fits),
+        shots,
     )
-    thresholds = np.zeros((reference_count, site_count), dtype=np.float64)
-    threshold_validity = np.zeros((reference_count, site_count), dtype=bool)
-    proposals: list[list[_ReferenceThresholdProposal | None]] = [
-        [None] * site_count for _reference in range(reference_count)
-    ]
-    evidences: list[list[ReferenceValleyEvidence]] = [
-        [
-            ReferenceValleyEvidence(0, 0, 0, 0, 0, 0)
-            for _site in range(site_count)
-        ]
-        for _reference in range(reference_count)
-    ]
-    pvalues = np.ones((reference_count, site_count), dtype=np.float64)
-    for reference in range(reference_count):
-        for site in range(site_count):
-            selected = train_values[:, reference, site][
-                train_validity[:, reference, site]
-            ]
-            proposal = _reference_threshold_proposal(
-                selected,
-                minimum_samples_per_class,
-                minimum_separation_rss,
-            )
-            proposals[reference][site] = proposal
-            evidence = evidence_values[:, reference, site]
-            evidence_mask = evidence_validity[:, reference, site]
-            if proposal is None:
-                finite_valid_count = int(
-                    np.count_nonzero(evidence_mask & np.isfinite(evidence))
-                )
-                evidences[reference][site] = ReferenceValleyEvidence(
-                    int(evidence.size),
-                    0,
-                    0,
-                    0,
-                    finite_valid_count,
-                    int(evidence.size) - finite_valid_count,
-                )
-                continue
-            valley = _reference_valley_evidence(
-                evidence,
-                proposal,
-                evidence_mask,
-            )
-            evidences[reference][site] = valley
-            pvalues[reference, site] = valley.valley_pvalue
-    # A site may supply a frozen binary pseudo-label only when every reference
-    # event independently shows the dominant valley.  max(p_ref) is the IUT
-    # p-value under arbitrary reference correlation; Holm then controls the
-    # family of site decisions without assuming site independence.
-    site_pvalues = np.max(pvalues, axis=0)
-    primary_sites = _holm_rejections(
-        site_pvalues,
-        familywise_error_rate,
-    )
-    # A third physical population can also manufacture a very strong binary
-    # Otsu split.  For sites that passed the primary gate, independently freeze
-    # one nested proposal inside each outer training cluster and test it on the
-    # same untouched evidence partition.  These tests only remove sites, never
-    # create authority; Holm therefore makes the availability loss controlled
-    # without weakening the primary familywise false-admission guarantee.
-    nested_pvalues = np.ones(
-        (reference_count, site_count, 2),
-        dtype=np.float64,
-    )
-    nested_evidences: list[list[list[ReferenceValleyEvidence | None]]] = [
-        [[None, None] for _site in range(site_count)]
-        for _reference in range(reference_count)
-    ]
-    for reference in range(reference_count):
-        for site in np.flatnonzero(primary_sites):
-            site = int(site)
-            proposal = proposals[reference][site]
-            if proposal is None:
-                continue
-            training = train_values[:, reference, site][
-                train_validity[:, reference, site]
-            ]
-            evidence = evidence_values[:, reference, site]
-            evidence_valid = (
-                evidence_validity[:, reference, site]
-                & np.isfinite(evidence)
-            )
-            evidence_invalid = ~evidence_valid
-            for cluster, (training_mask, evidence_member) in enumerate(
-                (
-                    (
-                        training <= proposal.threshold,
-                        evidence_valid & (evidence <= proposal.threshold),
-                    ),
-                    (
-                        training > proposal.threshold,
-                        evidence_valid & (evidence > proposal.threshold),
-                    ),
-                )
-            ):
-                nested = _reference_threshold_proposal(
-                    training[training_mask],
-                    minimum_samples_per_class,
-                    minimum_separation_rss,
-                )
-                if nested is None:
-                    continue
-                # An invalid evidence bracket has unknown parent-cluster
-                # membership.  It therefore contributes adverse evidence to
-                # both nested screens; double accounting here can only make
-                # this reject-only ambiguity screen more conservative.
-                nested_members = evidence_member | evidence_invalid
-                nested_evidence = _reference_valley_evidence(
-                    evidence[nested_members],
-                    nested,
-                    evidence_validity[:, reference, site][nested_members],
-                )
-                nested_evidences[reference][site][cluster] = nested_evidence
-                nested_pvalues[reference, site, cluster] = (
-                    nested_evidence.valley_pvalue
-                )
-    nested_rejections = _holm_rejections(
-        nested_pvalues.reshape(-1),
-        familywise_error_rate,
-    ).reshape(nested_pvalues.shape)
-    ambiguous_sites = np.any(nested_rejections, axis=(0, 2))
-    accepted_sites = (
-        primary_sites & ~ambiguous_sites & complete_reference_sites
-    )
-    for reference in range(reference_count):
-        for site in np.flatnonzero(accepted_sites):
-            proposal = proposals[reference][int(site)]
-            if proposal is None:
-                continue
-            thresholds[reference, site] = proposal.threshold
-            threshold_validity[reference, site] = True
-    diagnostics: list[ReferenceValleyDiagnostic] = []
-    for reference in range(reference_count):
-        for site in range(site_count):
-            proposal = proposals[reference][site]
-            evidence = evidences[reference][site]
-            diagnostics.append(
-                ReferenceValleyDiagnostic(
-                    reference,
-                    site,
-                    None if proposal is None else proposal.threshold,
-                    0 if proposal is None else proposal.lower_sample_count,
-                    0 if proposal is None else proposal.upper_sample_count,
-                    (
-                        None
-                        if proposal is None
-                        else proposal.cluster_separation_rss
-                    ),
-                    evidence,
-                    nested_evidences[reference][site][0],
-                    nested_evidences[reference][site][1],
-                    bool(accepted_sites[site]),
-                )
-            )
-    return thresholds, threshold_validity, tuple(diagnostics)
 
 
-def _reference_labels(
-    accessor: _FrameAccessor,
-    brackets: tuple[CalibrationCaptureBracket, ...],
-    spec: ReadoutFeatureSpec,
-    thresholds: np.ndarray,
-    threshold_validity: np.ndarray,
-    request: CalibrationAnalysisRequest,
-) -> tuple[np.ndarray, np.ndarray]:
-    site_count = spec.boxes_xywh.shape[0]
-    labels = np.zeros((len(brackets), site_count), dtype=bool)
-    validity = np.zeros(labels.shape, dtype=bool)
-    for bracket_index, bracket in enumerate(brackets):
-        decisions = np.zeros((len(bracket.reference_point_storage_rows), site_count), dtype=bool)
-        valid = threshold_validity.copy()
-        for reference, (_event, row) in enumerate(bracket.reference_point_storage_rows):
-            image, pixel_validity = accessor.arrays(bracket, row)
-            features = _extract_readout_features_arrays(
-                spec,
-                image,
-                pixel_validity,
-            )
-            valid[reference] &= features.validity.mask
-            decisions[reference] = (
-                features.values > thresholds[reference]
-                if request.reference_class_orientation
-                is ReferenceClassOrientation.ABOVE_IS_OCCUPIED
-                else features.values < thresholds[reference]
-            )
-        all_valid = np.all(valid, axis=0)
-        consensus = np.all(decisions == decisions[:1], axis=0)
-        selected = all_valid & consensus
-        validity[bracket_index] = selected
-        labels[bracket_index, selected] = decisions[0, selected]
-    return labels, validity
-
-
-def _extract_short_features(
-    accessor: _FrameAccessor,
-    brackets: tuple[CalibrationCaptureBracket, ...],
-    spec: ReadoutFeatureSpec,
-) -> tuple[np.ndarray, np.ndarray]:
-    site_count = spec.boxes_xywh.shape[0]
-    values = np.zeros((len(brackets), site_count), dtype=np.float64)
-    validity = np.zeros(values.shape, dtype=bool)
-    for index, bracket in enumerate(brackets):
-        image, pixel_validity = accessor.arrays(
-            bracket,
-            bracket.readout_point_storage_row,
-        )
-        features = _extract_readout_features_arrays(
-            spec,
-            image,
-            pixel_validity,
-        )
-        values[index] = features.values
-        validity[index] = features.validity.mask
-    return values, validity
-
-
-def _train_and_score_thresholds(
+def train_test_split(
+    labels: ReferenceLabels,
     *,
+    train_fraction: float = 0.9,
+    seed: int = 0,
+) -> TrainTestSplit:
+    fraction = float(train_fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("train_fraction must be in (0, 1)")
+    rng = np.random.default_rng(int(seed))
+    train = np.zeros_like(labels.valid)
+    test = np.zeros_like(labels.valid)
+    for site in range(labels.n_sites):
+        for state in (False, True):
+            indices = np.where(
+                labels.valid[:, site] & (labels.occupied[:, site] == state)
+            )[0]
+            if not indices.size:
+                continue
+            permutation = rng.permutation(indices)
+            train_count = int(round(fraction * indices.size))
+            train_count = (
+                min(max(train_count, 1), indices.size - 1)
+                if indices.size >= 2
+                else 1
+            )
+            train[permutation[:train_count], site] = True
+            if train_count < indices.size:
+                test[permutation[train_count:], site] = True
+    return TrainTestSplit(train, test, int(seed), fraction)
+
+
+def _common_bin_edges(
     values: np.ndarray,
-    feature_validity: np.ndarray,
-    labels: np.ndarray,
-    label_validity: np.ndarray,
-    partition: _BracketPartition,
-    geometry_validity: np.ndarray,
-    request: CalibrationAnalysisRequest,
-) -> _TrainingResult:
-    site_count = values.shape[1]
-    thresholds = np.zeros(site_count, dtype=np.float64)
-    occupied_above = np.zeros(site_count, dtype=bool)
-    usable = np.zeros(site_count, dtype=bool)
-    candidate = np.zeros(site_count, dtype=bool)
-    site_pvalues = np.ones(site_count, dtype=np.float64)
-    dark_counts = np.zeros(site_count, dtype="<u8")
-    bright_counts = np.zeros(site_count, dtype="<u8")
-    dark_success_counts = np.zeros(site_count, dtype="<u8")
-    dark_total_counts = np.zeros(site_count, dtype="<u8")
-    dark_labeled_counts = np.zeros(site_count, dtype="<u8")
-    bright_success_counts = np.zeros(site_count, dtype="<u8")
-    bright_total_counts = np.zeros(site_count, dtype="<u8")
-    bright_labeled_counts = np.zeros(site_count, dtype="<u8")
-    dark_lower_bounds = np.zeros(site_count, dtype=np.float64)
-    bright_lower_bounds = np.zeros(site_count, dtype=np.float64)
-    held_out_validity = np.zeros(site_count, dtype=bool)
-    fidelity = np.zeros(site_count, dtype=np.float64)
-    train = np.asarray(partition.train_indices, dtype=int)
-    test = np.asarray(partition.test_indices, dtype=int)
-    for site in range(site_count):
-        if not geometry_validity[site]:
-            continue
-        train_feature_valid = (
-            feature_validity[train, site]
-            & np.isfinite(values[train, site])
-        )
-        train_valid = label_validity[train, site] & train_feature_valid
-        train_dark = train[train_valid & ~labels[train, site]]
-        train_bright = train[train_valid & labels[train, site]]
-        dark_counts[site] = len(train_dark)
-        bright_counts[site] = len(train_bright)
-        if (
-            len(train_dark) < request.minimum_train_samples_per_class
-            or len(train_bright) < request.minimum_train_samples_per_class
-        ):
-            continue
-        dark_median = float(np.median(values[train_dark, site]))
-        bright_median = float(np.median(values[train_bright, site]))
-        if not math.isfinite(dark_median + bright_median) or dark_median == bright_median:
-            continue
-        above = bright_median > dark_median
-        threshold = 0.5 * (dark_median + bright_median)
-        test_label_valid = label_validity[test, site]
-        test_feature_valid = (
-            feature_validity[test, site]
-            & np.isfinite(values[test, site])
-        )
-        known_dark_mask = test_label_valid & ~labels[test, site]
-        known_bright_mask = test_label_valid & labels[test, site]
-        unknown_count = int(np.count_nonzero(~test_label_valid))
-        dark_labeled = int(np.count_nonzero(known_dark_mask))
-        bright_labeled = int(np.count_nonzero(known_bright_mask))
-        if dark_labeled == 0 or bright_labeled == 0:
-            continue
-        dark_labeled_counts[site] = dark_labeled
-        bright_labeled_counts[site] = bright_labeled
-        dark_total = dark_labeled + unknown_count
-        bright_total = bright_labeled + unknown_count
-        dark_evaluable = known_dark_mask & test_feature_valid
-        bright_evaluable = known_bright_mask & test_feature_valid
-        if above:
-            dark_correct = dark_evaluable & (values[test, site] <= threshold)
-            bright_correct = bright_evaluable & (values[test, site] > threshold)
-        else:
-            dark_correct = dark_evaluable & (values[test, site] >= threshold)
-            bright_correct = bright_evaluable & (values[test, site] < threshold)
-        dark_success = int(np.count_nonzero(dark_correct))
-        bright_success = int(np.count_nonzero(bright_correct))
-        # Known-label invalid/non-finite features are class failures.  An
-        # invalid or disagreeing reference label is unknown and therefore a
-        # failure in both class denominators.  Selective missingness can only
-        # reduce admission evidence; it can never hide a misclassification.
-        held_out = 0.5 * (
-            dark_success / dark_total + bright_success / bright_total
-        )
-        if not math.isfinite(held_out):
-            continue
-        dark_lower = _one_sided_clopper_pearson_lower_bound(
-            dark_success,
-            dark_total,
-            request.held_out_confidence_level,
-        )
-        bright_lower = _one_sided_clopper_pearson_lower_bound(
-            bright_success,
-            bright_total,
-            request.held_out_confidence_level,
-        )
-        dark_success_counts[site] = dark_success
-        dark_total_counts[site] = dark_total
-        bright_success_counts[site] = bright_success
-        bright_total_counts[site] = bright_total
-        dark_lower_bounds[site] = dark_lower
-        bright_lower_bounds[site] = bright_lower
-        held_out_validity[site] = True
-        fidelity[site] = held_out
-        site_pvalues[site] = max(
-            _one_sided_binomial_superiority_pvalue(
-                dark_success,
-                dark_total,
-                request.minimum_held_out_class_accuracy_lower_bound,
-            ),
-            _one_sided_binomial_superiority_pvalue(
-                bright_success,
-                bright_total,
-                request.minimum_held_out_class_accuracy_lower_bound,
-            ),
-        )
-        if (
-            dark_labeled < request.minimum_test_samples_per_class
-            or bright_labeled < request.minimum_test_samples_per_class
-            or dark_lower < request.minimum_held_out_class_accuracy_lower_bound
-            or bright_lower < request.minimum_held_out_class_accuracy_lower_bound
-        ):
-            continue
-        candidate[site] = True
-        thresholds[site] = threshold
-        occupied_above[site] = above
-    return _TrainingResult(
-        thresholds=thresholds,
-        occupied_above=occupied_above,
-        usable=usable,
-        candidate_sites=candidate,
-        site_pvalues=site_pvalues,
-        dark_training_counts=dark_counts,
-        bright_training_counts=bright_counts,
-        held_out_dark_success_counts=dark_success_counts,
-        held_out_dark_total_counts=dark_total_counts,
-        held_out_dark_labeled_counts=dark_labeled_counts,
-        held_out_bright_success_counts=bright_success_counts,
-        held_out_bright_total_counts=bright_total_counts,
-        held_out_bright_labeled_counts=bright_labeled_counts,
-        held_out_dark_lower_bounds=dark_lower_bounds,
-        held_out_bright_lower_bounds=bright_lower_bounds,
-        held_out_validity=held_out_validity,
-        held_out_fidelity=fidelity,
-    )
-
-
-def _certify_artifact_wide_training_results(
-    results: tuple[_TrainingResult, ...],
+    mask: np.ndarray,
     *,
-    familywise_error_rate: float,
-) -> tuple[_TrainingResult, ...]:
-    if not results:
-        raise ValueError("artifact-wide certification requires model evidence")
-    site_count = results[0].site_pvalues.size
-    if any(
-        item.site_pvalues.shape != (site_count,)
-        or item.candidate_sites.shape != (site_count,)
-        for item in results
-    ):
-        raise ValueError("model evidence has inconsistent site geometry")
-    certified = _artifact_wide_held_out_rejections(
-        np.stack([item.site_pvalues for item in results], axis=0),
-        familywise_error_rate,
-    )
-    admitted: list[_TrainingResult] = []
-    for item, model_certified in zip(results, certified, strict=True):
-        usable = item.candidate_sites & model_certified
-        thresholds = item.thresholds.copy()
-        occupied_above = item.occupied_above.copy()
-        thresholds[~usable] = 0.0
-        occupied_above[~usable] = False
-        admitted.append(
-            replace(
-                item,
-                thresholds=thresholds,
-                occupied_above=occupied_above,
-                usable=usable,
-            )
-        )
-    return tuple(admitted)
+    bins: int,
+) -> np.ndarray:
+    samples = np.asarray(values, dtype=float)[np.asarray(mask, dtype=bool)]
+    samples = samples[np.isfinite(samples)]
+    if samples.size < 2:
+        return np.linspace(-1.0, 1.0, bins + 1)
+    lower, upper = np.quantile(samples, (0.001, 0.999))
+    if not np.isfinite([lower, upper]).all() or upper <= lower:
+        lower, upper = float(np.min(samples)), float(np.max(samples))
+    span = max(float(upper - lower), 1.0)
+    return np.linspace(lower - 0.04 * span, upper + 0.04 * span, bins + 1)
 
 
-def _one_sided_clopper_pearson_lower_bound(
-    successes: int,
-    total: int,
-    confidence_level: float,
+def _empirical_threshold(
+    dark: np.ndarray,
+    bright: np.ndarray,
+    edges: np.ndarray,
+    *,
+    bright_above: bool,
+    tie_target: float,
 ) -> float:
-    """Exact one-sided binomial lower confidence bound."""
-
-    successes = _nonnegative_integer(successes, "successes")
-    total = _positive_integer(total, "total")
-    if successes > total:
-        raise ValueError("successes cannot exceed total")
-    confidence = _finite_real(confidence_level, "confidence_level")
-    if not 0.0 < confidence < 1.0:
-        raise ValueError("confidence_level must lie strictly inside (0, 1)")
-    if successes == 0:
-        return 0.0
-    alpha = 1.0 - confidence
-    result = float(
-        beta_distribution.ppf(
-            alpha,
-            successes,
-            total - successes + 1,
-        )
-    )
-    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
-        raise CalibrationAnalysisError("binomial confidence bound is not finite")
-    return 0.0 if result == 0.0 else result
-
-
-def _one_sided_binomial_superiority_pvalue(
-    successes: int,
-    total: int,
-    null_probability: float,
-) -> float:
-    """Exact p-value for H0: success probability <= declared minimum."""
-
-    successes = _nonnegative_integer(successes, "successes")
-    total = _positive_integer(total, "total")
-    if successes > total:
-        raise ValueError("successes cannot exceed total")
-    probability = _finite_real(null_probability, "null_probability")
-    if not 0.0 <= probability <= 1.0:
-        raise ValueError("null_probability must lie in [0, 1]")
-    return float(
-        binomtest(
-            successes,
-            total,
-            probability,
-            alternative="greater",
-        ).pvalue
-    )
-
-
-def _model_parameter_values(
-    request: CalibrationAnalysisRequest,
-    *,
-    partition_digest: str,
-    train_count: int,
-    reference_evidence_count: int,
-    test_count: int,
-    work_plan_digest: str,
-) -> dict[str, bool | int | float | str]:
-    return {
-        "analysis-request-fingerprint": request.fingerprint,
-        "bracket-partition-digest": partition_digest,
-        "analysis-work-plan-fingerprint": work_plan_digest,
-        "bracket-sampling-assumption": request.bracket_sampling_assumption.value,
-        "analysis-planning-assumption": (
-            request.analysis_planning_assumption.value
-        ),
-        "held-out-family-scope": "ARTIFACT_MODEL_SITE",
-        "held-out-family-model-count": len(request.model_kinds),
-        "held-out-family-hypothesis-count": (
-            len(request.model_kinds) * request.site_count
-        ),
-        "train-bracket-count": train_count,
-        "reference-evidence-bracket-count": reference_evidence_count,
-        "test-bracket-count": test_count,
-        "minimum-train-samples-per-class": (
-            request.minimum_train_samples_per_class
-        ),
-        "minimum-test-samples-per-class": request.minimum_test_samples_per_class,
-        "held-out-confidence-level": request.held_out_confidence_level,
-        "minimum-held-out-class-accuracy-lower-bound": (
-            request.minimum_held_out_class_accuracy_lower_bound
-        ),
-        "usable-site-acceptance": request.usable_site_acceptance.value,
-        "minimum-usable-site-fraction": request.minimum_usable_site_fraction,
-    }
-
-
-def _artifact_parameter_values(
-    request: CalibrationAnalysisRequest,
-    *,
-    partition_digest: str,
-    train_count: int,
-    reference_evidence_count: int,
-    test_count: int,
-    work_plan_digest: str,
-) -> dict[str, bool | int | float | str]:
-    return {
-        "analysis-request-fingerprint": request.fingerprint,
-        "bracket-partition-digest": partition_digest,
-        "analysis-work-plan-fingerprint": work_plan_digest,
-        "grid-rows": request.grid_shape_yx[0],
-        "grid-columns": request.grid_shape_yx[1],
-        "grid-order": request.grid_order.value,
-        "strict-reference-consensus": True,
-        "bracket-sampling-assumption": request.bracket_sampling_assumption.value,
-        "analysis-planning-assumption": (
-            request.analysis_planning_assumption.value
-        ),
-        "held-out-family-scope": "ARTIFACT_MODEL_SITE",
-        "held-out-family-model-count": len(request.model_kinds),
-        "held-out-family-hypothesis-count": (
-            len(request.model_kinds) * request.site_count
-        ),
-        "reference-label-source": request.reference_label_source.value,
-        "reference-class-orientation": request.reference_class_orientation.value,
-        "reference-valley-gate-id": _REFERENCE_VALLEY_GATE_ID,
-        "reference-statistical-unit": "BRACKET",
-        "reference-evidence-assumption": _REFERENCE_EVIDENCE_ASSUMPTION,
-        "reference-ambiguity-gate-id": _REFERENCE_AMBIGUITY_GATE_ID,
-        "train-bracket-count": train_count,
-        "reference-evidence-bracket-count": reference_evidence_count,
-        "test-bracket-count": test_count,
-        "minimum-reference-cluster-separation-rss": (
-            request.minimum_reference_cluster_separation_rss
-        ),
-        "minimum-reference-proposal-samples-per-class": (
-            request.minimum_train_samples_per_class
-        ),
-        "reference-valley-familywise-error-rate": (
-            request.reference_valley_familywise_error_rate
-        ),
-    }
-
-
-def _artifact_parameters_for_resource_plan(
-    authoritative_values: dict[str, bool | int | float | str],
-) -> tuple[CalibrationParameter, ...]:
-    """Use fixed-width placeholders so package versions cannot alter a plan."""
-
-    values = {
-        **authoritative_values,
-        **{
-            name: "x" * _NUMERIC_LINEAGE_NOTE_MAX_CHARS
-            for name in _NUMERIC_LINEAGE_PARAMETER_NAMES
-        },
-    }
-    return tuple(
-        CalibrationParameter(name, value) for name, value in values.items()
-    )
-
-
-def _model_header(
-    kind: ReadoutModelKind,
-    *,
-    training: _TrainingResult,
-    frame_contract: FrameContract,
-    site_map: SiteMap,
-    request: CalibrationAnalysisRequest,
-    partition: _BracketPartition,
-    work_plan_digest: str,
-) -> ReadoutModelHeader:
-    usable_count = int(np.count_nonzero(training.usable))
-    if request.usable_site_acceptance is UsableSiteAcceptance.ALL:
-        required_usable = request.site_count
+    dark = np.asarray(dark, dtype=float)
+    bright = np.asarray(bright, dtype=float)
+    dark = dark[np.isfinite(dark)]
+    bright = bright[np.isfinite(bright)]
+    if not dark.size or not bright.size:
+        return float("nan")
+    dark_histogram, _ = np.histogram(dark, bins=edges)
+    bright_histogram, _ = np.histogram(bright, bins=edges)
+    dark_cumulative = np.concatenate([[0], np.cumsum(dark_histogram)])
+    bright_cumulative = np.concatenate([[0], np.cumsum(bright_histogram)])
+    if bright_above:
+        dark_fidelity = dark_cumulative / dark.size
+        bright_fidelity = (bright.size - bright_cumulative) / bright.size
     else:
-        required_usable = math.ceil(
-            request.minimum_usable_site_fraction * request.site_count
-        )
-    if usable_count < required_usable:
-        raise CalibrationAnalysisError(
-            f"{kind.value} admitted {usable_count}/{request.site_count} sites; "
-            f"quality policy requires at least {required_usable}"
-        )
-    axis_id = site_map.site_axis.axis_id
-    quality = ReadoutModelQuality(
-        axis_id,
-        ComponentValidity((axis_id,), training.usable),
-        training.dark_training_counts,
-        training.bright_training_counts,
-        training.held_out_dark_success_counts,
-        training.held_out_dark_total_counts,
-        training.held_out_dark_labeled_counts,
-        training.held_out_bright_success_counts,
-        training.held_out_bright_total_counts,
-        training.held_out_bright_labeled_counts,
-        training.held_out_dark_lower_bounds,
-        training.held_out_bright_lower_bounds,
-        training.held_out_fidelity,
-        ComponentValidity((axis_id,), training.held_out_validity),
-        _QUALITY_GATE_ID,
+        dark_fidelity = (dark.size - dark_cumulative) / dark.size
+        bright_fidelity = bright_cumulative / bright.size
+    fidelity = 0.5 * (dark_fidelity + bright_fidelity)
+    best_value = float(np.nanmax(fidelity))
+    best = np.flatnonzero(np.isclose(fidelity, best_value, rtol=0, atol=1e-12))
+    index = (
+        int(best[np.argmin(np.abs(edges[best] - tie_target))])
+        if best.size > 1
+        else int(best[0])
     )
-    return ReadoutModelHeader(
-        frame_contract.fingerprint,
-        site_map.fingerprint,
-        axis_id,
-        training.thresholds,
-        training.occupied_above,
-        quality,
-        tuple(
-            CalibrationParameter(name, value)
-            for name, value in _model_parameter_values(
-                request,
-                partition_digest=partition.digest,
-                train_count=len(partition.train_indices),
-                reference_evidence_count=len(
-                    partition.reference_evidence_indices
-                ),
-                test_count=len(partition.test_indices),
-                work_plan_digest=work_plan_digest,
-            ).items()
-        ),
-    )
+    return float(edges[index])
 
 
-def _canonical_boxes(boxes: np.ndarray, usable: np.ndarray, *, psf: bool) -> np.ndarray:
-    result = np.asarray(boxes, dtype="<i8").copy()
-    if psf:
-        width, height = int(result[0, 2]), int(result[0, 3])
-        result[~usable] = (0, 0, width, height)
-    else:
-        result[~usable] = (0, 0, 1, 1)
-    return result
-
-
-def validate_calibration_analysis_contract(
-    result: CalibrationAnalysisResult,
-    request: CalibrationAnalysisRequest,
-    work_plan: CalibrationWorkPlan,
-    *,
-    source_brackets: tuple[CalibrationCaptureBracket, ...] | None = None,
-) -> CalibrationAnalysisResult:
-    """Replay every request-owned declaration at a repository trust boundary."""
-
-    if not isinstance(result, CalibrationAnalysisResult):
-        raise TypeError("result must be CalibrationAnalysisResult")
-    if not isinstance(request, CalibrationAnalysisRequest):
-        raise TypeError("request must be CalibrationAnalysisRequest")
-    if not isinstance(work_plan, CalibrationWorkPlan):
-        raise TypeError("work_plan must be CalibrationWorkPlan")
-    artifact = result.artifact
-    diagnostics = result.diagnostics
-    if artifact.source_binding.layout != request.layout:
-        raise ValueError("artifact capture layout differs from analysis request")
-    site_count = request.site_count
-    reference_count = len(request.layout.reference_event_indices)
-    if artifact.site_map.site_axis.size != site_count:
-        raise ValueError("artifact site count differs from requested grid")
-    if diagnostics.bracket_count != artifact.source_binding.bracket_count:
-        raise ValueError("diagnostic bracket count differs from source binding")
-
-    train_count = int(math.floor(diagnostics.bracket_count * request.train_fraction))
-    evidence_count = int(
-        math.floor(
-            diagnostics.bracket_count * request.reference_evidence_fraction
-        )
-    )
-    test_count = diagnostics.bracket_count - train_count - evidence_count
-    _validate_partition_capacity(
-        train_count,
-        evidence_count,
-        test_count,
-        request,
-        label="persisted bracket population",
-    )
-    if (
-        diagnostics.train_bracket_count != train_count
-        or diagnostics.reference_evidence_bracket_count != evidence_count
-        or diagnostics.test_bracket_count != test_count
-    ):
-        raise ValueError("diagnostic partition counts differ from request policy")
-    if source_brackets is not None:
-        validate_calibration_partition_against_source(
-            diagnostics,
-            request,
-            source_brackets,
-        )
-
-    if work_plan.reference_valley_diagnostic_count != site_count * reference_count:
-        raise ValueError("work plan reference diagnostic count differs from request")
-    from .analysis_codec import (
-        calibration_analysis_diagnostics_encoding_upper_bound,
-    )
-
-    expected_diagnostics_bound = (
-        calibration_analysis_diagnostics_encoding_upper_bound(
-            site_count=site_count,
-            reference_count=reference_count,
-            bracket_upper_bound=work_plan.bracket_upper_bound,
-            train_bracket_upper_bound=work_plan.train_bracket_upper_bound,
-            reference_evidence_bracket_upper_bound=(
-                work_plan.reference_evidence_bracket_upper_bound
-            ),
-            model_count=len(request.model_kinds),
-        )
-    )
-    if work_plan.diagnostics_encoding_upper_bound_bytes != (
-        expected_diagnostics_bound
-    ):
-        raise ValueError("work plan diagnostics encoding bound is not canonical")
-    (
-        expected_maximum_sampled,
-        expected_total_sampled,
-        expected_kernel_elements,
-    ) = _planned_model_resources(request)
-    if work_plan.maximum_model_sampled_pixels != expected_maximum_sampled:
-        raise ValueError("work plan per-model sampled pixels are not canonical")
-    if work_plan.total_model_sampled_pixels != expected_total_sampled:
-        raise ValueError("work plan total sampled pixels are not canonical")
-    if work_plan.planned_kernel_elements != expected_kernel_elements:
-        raise ValueError("work plan kernel elements are not canonical")
-    artifact_values = {item.name: item.value for item in artifact.parameters}
-    for name in _NUMERIC_LINEAGE_PARAMETER_NAMES:
-        note = artifact_values.pop(name, None)
-        if note is not None and (
-            type(note) is not str or note != _bounded_numeric_version(note)
-        ):
-            raise ValueError(f"artifact {name} lineage note is not bounded text")
-    expected_artifact_values = _artifact_parameter_values(
-        request,
-        partition_digest=diagnostics.partition_digest,
-        train_count=train_count,
-        reference_evidence_count=evidence_count,
-        test_count=test_count,
-        work_plan_digest=work_plan.fingerprint,
-    )
-    if not _typed_parameter_maps_equal(artifact_values, expected_artifact_values):
-        raise ValueError("artifact parameters differ from frozen analysis request")
-
-    if tuple(model.kind for model in artifact.models) != request.model_kinds:
-        raise ValueError("artifact model kinds differ from request")
-    if artifact.default_model_kind is not request.default_model_kind:
-        raise ValueError("artifact default model kind differs from request")
-
-    box_geometry = _boxes_for_centers(
-        artifact.site_map.coordinates_xy,
-        half_width=request.box.half_width,
-        image_shape_yx=artifact.frame_contract.frame_schema.data_shape,
-    )
-    psf_geometry = None
-    if request.psf is not None:
-        psf_geometry = _boxes_for_centers(
-            artifact.site_map.coordinates_xy,
-            half_width=request.psf.half_width,
-            image_shape_yx=artifact.frame_contract.frame_schema.data_shape,
-        )
-    expected_model_values = _model_parameter_values(
-        request,
-        partition_digest=diagnostics.partition_digest,
-        train_count=train_count,
-        reference_evidence_count=evidence_count,
-        test_count=test_count,
-        work_plan_digest=work_plan.fingerprint,
-    )
-    from .calibration_codec import (
-        calibration_artifact_encoding_upper_bound,
-        calibration_artifact_metadata_encoding_upper_bound,
-    )
-
-    expected_metadata_bound = calibration_artifact_metadata_encoding_upper_bound(
-        source_binding=artifact.source_binding,
-        frame_contract=artifact.frame_contract,
-        artifact_parameters=_artifact_parameters_for_resource_plan(
-            expected_artifact_values
-        ),
-        model_parameters=tuple(
-            tuple(
-                CalibrationParameter(name, value)
-                for name, value in expected_model_values.items()
-            )
-            for _kind in request.model_kinds
-        ),
-        model_kinds=request.model_kinds,
-        default_model_kind=request.default_model_kind,
-    )
-    if work_plan.artifact_metadata_encoding_upper_bound_bytes != (
-        expected_metadata_bound
-    ):
-        raise ValueError("work plan artifact metadata bound is not canonical")
-    expected_artifact_bound = calibration_artifact_encoding_upper_bound(
-        site_count=site_count,
-        model_count=len(request.model_kinds),
-        kernel_elements=expected_kernel_elements,
-        metadata_encoding_upper_bound_bytes=expected_metadata_bound,
-    )
-    if work_plan.artifact_encoding_upper_bound_bytes != expected_artifact_bound:
-        raise ValueError("work plan artifact encoding bound is not canonical")
-    for model in artifact.models:
-        model_values = {
-            item.name: item.value for item in model.header.parameters
+def _fit_site_threshold(
+    dark: np.ndarray,
+    bright: np.ndarray,
+    edges: np.ndarray,
+) -> dict[str, float | bool | int]:
+    dark = np.asarray(dark, dtype=float)
+    bright = np.asarray(bright, dtype=float)
+    dark = dark[np.isfinite(dark)]
+    bright = bright[np.isfinite(bright)]
+    if dark.size < 2 or bright.size < 2:
+        return {
+            "threshold": float("nan"),
+            "bright_above": True,
+            "dark_mean": float("nan"),
+            "dark_sigma": float("nan"),
+            "bright_mean": float("nan"),
+            "bright_sigma": float("nan"),
+            "model_fidelity": float("nan"),
+            "n_train_dark": int(dark.size),
+            "n_train_bright": int(bright.size),
         }
-        if not _typed_parameter_maps_equal(model_values, expected_model_values):
-            raise ValueError("model parameters differ from frozen analysis request")
-        usable = model.header.quality.usable_sites.mask
-        if isinstance(model, BoxReadoutModel):
-            if model.reducer is not request.box.reducer:
-                raise ValueError("BOX reducer differs from analysis request")
-            expected_boxes = _canonical_boxes(box_geometry, usable, psf=False)
-        else:
-            if request.psf is None or psf_geometry is None:
-                raise ValueError("PSF model exists without requested PSF configuration")
-            if (
-                model.background is not request.psf.background
-                or model.background_padding != request.psf.background_padding
-            ):
-                raise ValueError("PSF background differs from analysis request")
-            expected_boxes = _canonical_boxes(psf_geometry, usable, psf=True)
-            extent = 2 * request.psf.half_width + 1
-            if isinstance(model, PerSitePsfReadoutModel):
-                if model.kernels.shape[1:] != (extent, extent):
-                    raise ValueError("per-site PSF kernel shape differs from request")
-            elif isinstance(model, UniformPsfReadoutModel):
-                if model.kernel.shape != (extent, extent):
-                    raise ValueError("uniform PSF kernel shape differs from request")
-            else:  # pragma: no cover - CalibrationArtifact already closes the union
-                raise TypeError("artifact contains an unknown readout model")
-        if not np.array_equal(model.boxes_xywh, expected_boxes):
-            raise ValueError("model extraction geometry differs from analysis request")
-    return result
+    dark_mean, bright_mean = float(np.mean(dark)), float(np.mean(bright))
+    dark_sigma = max(float(np.std(dark, ddof=1)), 1e-12)
+    bright_sigma = max(float(np.std(bright, ddof=1)), 1e-12)
+    gaussian_threshold, bright_above = _optimal_gaussian_threshold(
+        dark_mean,
+        dark_sigma,
+        bright_mean,
+        bright_sigma,
+    )
+    threshold = _empirical_threshold(
+        dark,
+        bright,
+        edges,
+        bright_above=bright_above,
+        tie_target=gaussian_threshold,
+    )
+    if not math.isfinite(threshold):
+        threshold = gaussian_threshold
+    _dark_fidelity, _bright_fidelity, model_fidelity = _gaussian_fidelity(
+        dark_mean,
+        dark_sigma,
+        bright_mean,
+        bright_sigma,
+        threshold,
+        bright_above,
+    )
+    return {
+        "threshold": threshold,
+        "bright_above": bright_above,
+        "dark_mean": dark_mean,
+        "dark_sigma": dark_sigma,
+        "bright_mean": bright_mean,
+        "bright_sigma": bright_sigma,
+        "model_fidelity": model_fidelity,
+        "n_train_dark": int(dark.size),
+        "n_train_bright": int(bright.size),
+    }
 
 
-def validate_calibration_partition_against_source(
-    diagnostics: CalibrationAnalysisDiagnostics,
-    request: CalibrationAnalysisRequest,
-    source_brackets: tuple[CalibrationCaptureBracket, ...],
-) -> None:
-    """Rejoin persisted partition lineage to one resolved source capture.
+def _confusion(
+    prediction: np.ndarray,
+    occupied: np.ndarray,
+    valid: np.ndarray,
+) -> dict[str, float | int]:
+    prediction = np.asarray(prediction, dtype=bool)[np.asarray(valid, dtype=bool)]
+    occupied = np.asarray(occupied, dtype=bool)[np.asarray(valid, dtype=bool)]
+    true_positive = int(np.sum(prediction & occupied))
+    true_negative = int(np.sum(~prediction & ~occupied))
+    false_positive = int(np.sum(prediction & ~occupied))
+    false_negative = int(np.sum(~prediction & occupied))
+    bright_count = int(np.sum(occupied))
+    dark_count = int(np.sum(~occupied))
+    dark_fidelity = true_negative / dark_count if dark_count else float("nan")
+    bright_fidelity = true_positive / bright_count if bright_count else float("nan")
+    fidelity = (
+        0.5 * (dark_fidelity + bright_fidelity)
+        if np.isfinite([dark_fidelity, bright_fidelity]).all()
+        else float("nan")
+    )
+    return {
+        "fidelity": fidelity,
+        "dark_fidelity": dark_fidelity,
+        "bright_fidelity": bright_fidelity,
+        "n_valid": int(occupied.size),
+        "errors": false_positive + false_negative,
+    }
 
-    Scientific replay belongs to :func:`validate_calibration_analysis_contract`.
-    Admission has already performed that replay while loading persistent
-    evidence, so its source join needs only this bounded partition witness.
-    """
 
-    if not isinstance(diagnostics, CalibrationAnalysisDiagnostics):
-        raise TypeError("diagnostics must be CalibrationAnalysisDiagnostics")
-    if not isinstance(request, CalibrationAnalysisRequest):
-        raise TypeError("request must be CalibrationAnalysisRequest")
-    if not isinstance(source_brackets, tuple) or any(
-        not isinstance(item, CalibrationCaptureBracket) for item in source_brackets
-    ):
-        raise TypeError("source_brackets must be a tuple of CalibrationCaptureBracket")
-    if len(source_brackets) != diagnostics.bracket_count:
-        raise ValueError("source bracket population differs from diagnostics")
-    if _freeze_partition(source_brackets, request).digest != diagnostics.partition_digest:
-        raise ValueError("persisted partition differs from source brackets")
-
-
-def _build_model(
+def characterize_readout(
     kind: ReadoutModelKind,
+    short_signals: np.ndarray,
+    short_validity: np.ndarray,
+    labels: ReferenceLabels,
+    split: TrainTestSplit,
     *,
-    feature_spec: ReadoutFeatureSpec,
-    training: _TrainingResult,
-    frame_contract: FrameContract,
-    site_map: SiteMap,
-    request: CalibrationAnalysisRequest,
-    partition: _BracketPartition,
-    work_plan_digest: str,
-) -> tuple[ReadoutModel, ModelAnalysisDiagnostic]:
-    header = _model_header(
-        kind,
-        training=training,
-        frame_contract=frame_contract,
-        site_map=site_map,
-        request=request,
-        partition=partition,
-        work_plan_digest=work_plan_digest,
+    bins: int,
+    max_drop: int,
+) -> ModelCalibrationReport:
+    short = np.asarray(short_signals, dtype=float)
+    short_validity = np.asarray(short_validity, dtype=bool) & np.isfinite(short)
+    if short.shape != labels.occupied.shape or short_validity.shape != short.shape:
+        raise ValueError("short signals/validity must match reference label shape")
+    combined_validity = labels.valid & short_validity
+    edges = _common_bin_edges(short, combined_validity, bins=bins)
+    quick = np.asarray(
+        [
+            otsu_threshold(short[:, site][short_validity[:, site]])
+            for site in range(labels.n_sites)
+        ],
+        dtype=float,
     )
-    boxes = _canonical_boxes(
-        feature_spec.boxes_xywh,
-        training.usable,
-        psf=kind is not ReadoutModelKind.BOX,
+    metrics = []
+    prediction = np.zeros_like(labels.occupied, dtype=bool)
+    for site in range(labels.n_sites):
+        finite = short_validity[:, site]
+        train_mask = split.train[:, site] & labels.valid[:, site] & finite
+        test_mask = split.test[:, site] & labels.valid[:, site] & finite
+        fit = _fit_site_threshold(
+            short[train_mask & ~labels.occupied[:, site], site],
+            short[train_mask & labels.occupied[:, site], site],
+            edges,
+        )
+        threshold = float(fit["threshold"])
+        bright_above = bool(fit["bright_above"])
+        if math.isfinite(threshold):
+            prediction[:, site] = (
+                short[:, site] > threshold
+                if bright_above
+                else short[:, site] < threshold
+            )
+        confusion = _confusion(
+            prediction[:, site],
+            labels.occupied[:, site],
+            test_mask,
+        )
+        metrics.append(
+            SiteFidelity(
+                site,
+                threshold,
+                bright_above,
+                float(confusion["fidelity"]),
+                float(confusion["dark_fidelity"]),
+                float(confusion["bright_fidelity"]),
+                float(fit["model_fidelity"]),
+                float(fit["dark_mean"]),
+                float(fit["dark_sigma"]),
+                float(fit["bright_mean"]),
+                float(fit["bright_sigma"]),
+                int(confusion["n_valid"]),
+                int(fit["n_train_dark"]),
+                int(fit["n_train_bright"]),
+            )
+        )
+    aggregate = _confusion(
+        prediction,
+        labels.occupied,
+        split.test & combined_validity,
+    )["fidelity"]
+    train_all = split.train & combined_validity
+    global_fit = _fit_site_threshold(
+        short[train_all & ~labels.occupied],
+        short[train_all & labels.occupied],
+        edges,
     )
-    if kind is ReadoutModelKind.BOX:
-        model: ReadoutModel = BoxReadoutModel(header, boxes, request.box.reducer)
-    elif kind is ReadoutModelKind.PER_SITE_PSF:
-        assert request.psf is not None and feature_spec.per_site_kernels is not None
-        kernels = feature_spec.per_site_kernels.copy()
-        impulse = np.zeros(kernels.shape[1:], dtype="<f8")
-        impulse[0, 0] = 1.0
-        kernels[~training.usable] = impulse
-        model = PerSitePsfReadoutModel(
-            header,
-            boxes,
-            kernels,
-            request.psf.background,
-            request.psf.background_padding,
+    global_threshold = float(global_fit["threshold"])
+    global_bright_above = bool(global_fit["bright_above"])
+    if math.isfinite(global_threshold):
+        global_prediction = (
+            short > global_threshold
+            if bool(global_fit["bright_above"])
+            else short < global_threshold
         )
     else:
-        assert request.psf is not None and feature_spec.uniform_kernel is not None
-        model = UniformPsfReadoutModel(
-            header,
-            boxes,
-            feature_spec.uniform_kernel,
-            request.psf.background,
-            request.psf.background_padding,
+        global_prediction = np.zeros_like(labels.occupied, dtype=bool)
+    # Label validity gates calibration statistics, not whether the same frame
+    # can be classified at runtime.  Canonicalize only invalid measured
+    # signals; every valid signal must reproduce the runtime decision.
+    prediction[~short_validity] = False
+    global_fidelity = _confusion(
+        global_prediction,
+        labels.occupied,
+        split.test & combined_validity,
+    )["fidelity"]
+    order = list(
+        np.argsort(
+            [
+                item.fidelity if math.isfinite(item.fidelity) else -np.inf
+                for item in metrics
+            ]
         )
-    admitted = training.held_out_fidelity[training.usable]
-    admitted_lower = np.minimum(
-        training.held_out_dark_lower_bounds[training.usable],
-        training.held_out_bright_lower_bounds[training.usable],
     )
-    return model, ModelAnalysisDiagnostic(
+    ablation = []
+    for drop_count in range(max_drop + 1):
+        excluded = np.zeros(labels.n_sites, dtype=bool)
+        for index in order[: min(drop_count, len(order))]:
+            excluded[int(index)] = True
+        confusion = _confusion(
+            prediction,
+            labels.occupied,
+            split.test & combined_validity & ~excluded[np.newaxis, :],
+        )
+        ablation.append(
+            AblationPoint(
+                drop_count,
+                excluded,
+                float(confusion["fidelity"]),
+                int(confusion["errors"]),
+                int(confusion["n_valid"]),
+            )
+        )
+    return ModelCalibrationReport(
         kind,
-        int(np.count_nonzero(training.usable)),
-        int(request.site_count - np.count_nonzero(training.usable)),
-        float(np.min(admitted)),
-        float(np.mean(admitted)),
-        float(np.min(admitted_lower)),
-        float(np.mean(admitted_lower)),
+        quick,
+        short,
+        short_validity,
+        edges,
+        prediction,
+        tuple(metrics),
+        float(aggregate),
+        global_threshold,
+        global_bright_above,
+        float(global_fidelity),
+        tuple(ablation),
     )
 
 
-def analyze_calibration(
-    capture: _RawCapture,
+def _normalize_frame_stack_validity(
+    validity: np.ndarray,
+    frame_contract: FrameContract,
+) -> np.ndarray:
+    """Conservatively express pixel observations in the declared frame contract."""
+
+    schema = frame_contract.frame_schema
+    mask = np.asarray(validity, dtype=bool)
+    data_rank = len(schema.data_axes)
+    if data_rank != 2 or mask.shape[-data_rank:] != schema.data_shape:
+        raise ValueError("frame validity does not match the FrameContract")
+    leading_rank = mask.ndim - data_rank
+    contract = schema.validity_contract
+    if contract.mode is ValidityMode.VALUE:
+        reduced = np.all(
+            mask,
+            axis=tuple(range(leading_rank, mask.ndim)),
+            keepdims=True,
+        )
+        return np.broadcast_to(reduced, mask.shape)
+    declared = set(contract.component_axis_ids)
+    omitted = tuple(
+        leading_rank + index
+        for index, axis in enumerate(schema.data_axes)
+        if axis.axis_id not in declared
+    )
+    reduced = np.all(mask, axis=omitted, keepdims=True) if omitted else mask
+    return np.broadcast_to(reduced, mask.shape)
+
+
+def _prepare_frame(
+    values: np.ndarray,
+    validity: np.ndarray,
+    frame_contract: FrameContract,
+) -> tuple[np.ndarray, np.ndarray]:
+    frame = np.asarray(values)
+    mask = np.asarray(validity, dtype=bool)
+    expected = frame_contract.frame_schema.data_shape
+    if frame.shape != expected or mask.shape != expected:
+        raise ValueError("frame and validity do not match the FrameContract")
+    if np.issubdtype(frame.dtype, np.inexact):
+        mask = mask & np.isfinite(frame)
+    return frame, _normalize_frame_stack_validity(mask, frame_contract)
+
+
+def _extract_source_stack(
+    feature: ReadoutFeature,
+    leading_shape: tuple[int, ...],
+    frame_sequence: Callable[
+        [],
+        Iterator[tuple[np.ndarray, np.ndarray]],
+    ],
+    frame_contract: FrameContract,
+) -> tuple[np.ndarray, np.ndarray]:
+    values = np.empty((*leading_shape, feature.site_axis.size), dtype=float)
+    output_validity = np.empty(values.shape, dtype=bool)
+    frames = _exact_frame_sequence(
+        frame_sequence,
+        math.prod(leading_shape),
+        "feature frame sequence",
+    )
+    for index, raw_frame in zip(np.ndindex(leading_shape), frames, strict=True):
+        frame, validity = _prepare_frame(*raw_frame, frame_contract)
+        extracted, extracted_validity = _extract_readout_arrays(
+            feature,
+            frame,
+            validity,
+        )
+        values[index] = extracted
+        output_validity[index] = extracted_validity
+    return values, output_validity
+
+
+def _extract_source_feature_stacks(
+    features: Sequence[ReadoutFeature],
+    leading_shape: tuple[int, ...],
+    frame_sequence: Callable[
+        [],
+        Iterator[tuple[np.ndarray, np.ndarray]],
+    ],
+    frame_contract: FrameContract,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract every model feature while traversing the frame source once."""
+
+    ordered = tuple(features)
+    if not ordered:
+        raise ValueError("features must contain at least one ReadoutFeature")
+    site_axis = ordered[0].site_axis
+    site_count = site_axis.size
+    if any(
+        feature.site_axis.axis_id != site_axis.axis_id
+        or feature.site_axis.size != site_count
+        for feature in ordered
+    ):
+        raise ValueError("all readout features must use the same site axis")
+    values = np.empty(
+        (len(ordered), *leading_shape, site_count),
+        dtype=float,
+    )
+    output_validity = np.empty(values.shape, dtype=bool)
+    frames = _exact_frame_sequence(
+        frame_sequence,
+        math.prod(leading_shape),
+        "feature frame sequence",
+    )
+    for index, raw_frame in zip(np.ndindex(leading_shape), frames, strict=True):
+        frame, validity = _prepare_frame(*raw_frame, frame_contract)
+        for model_index, feature in enumerate(ordered):
+            extracted, extracted_validity = _extract_readout_arrays(
+                feature,
+                frame,
+                validity,
+            )
+            output_index = (model_index, *index)
+            values[output_index] = extracted
+            output_validity[output_index] = extracted_validity
+    return values, output_validity
+
+
+def _exact_frame_sequence(
+    factory: Callable[[], Iterator[tuple[np.ndarray, np.ndarray]]],
+    expected_count: int,
+    field_name: str,
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    iterator = iter(factory())
+    for _index in range(expected_count):
+        try:
+            yield next(iterator)
+        except StopIteration as exc:
+            raise CalibrationAnalysisError(
+                f"{field_name} ended before {expected_count} frames"
+            ) from exc
+    sentinel = object()
+    if next(iterator, sentinel) is not sentinel:
+        raise CalibrationAnalysisError(
+            f"{field_name} contains more than {expected_count} frames"
+        )
+
+
+def _calibrate_readout_source(
+    *,
+    group_count: int,
+    reference_shot_count: int,
+    reference_frames: Callable[
+        [],
+        Iterator[tuple[np.ndarray, np.ndarray]],
+    ],
+    short_frames: Callable[
+        [],
+        Iterator[tuple[np.ndarray, np.ndarray]],
+    ],
+    group_contexts: tuple[tuple[tuple[AxisId, int], ...], ...],
+    source_binding: CalibrationSourceBinding,
+    frame_contract: FrameContract,
+    readout_physical_context: ReadoutPhysicalContext,
     request: CalibrationAnalysisRequest,
-) -> CalibrationAnalysisResult:
-    if not isinstance(request, CalibrationAnalysisRequest):
-        raise TypeError("request must be CalibrationAnalysisRequest")
-    try:
-        block = capture.block
-    except AttributeError as exc:
-        raise TypeError("capture must be a resolved raw CaptureArtifact") from exc
-    if not isinstance(block, DataBlock):
-        raise TypeError("capture.block must be DataBlock")
-
-    # Preparation performs every cheap schema/count bound before resolving the
-    # bounded layout or measuring source-owned metadata.
-    preparation = _prepare_calibration_work(capture, request)
-    work_plan = preparation.plan
-    brackets = preparation.brackets
-    _validate_source_schedule(capture)
-    source_binding = preparation.source_binding
-    frame_contract = preparation.frame_contract
-    partition = preparation.partition
-    accessor = _FrameAccessor(block)
-    average, average_validity, valid_fraction = _training_reference_template(
-        accessor,
-        brackets,
-        partition.train_indices,
+) -> CalibrationComputation:
+    if group_count <= 0:
+        raise ValueError("calibration requires at least one frame group")
+    if reference_shot_count != len(request.layout.reference_event_indices):
+        raise ValueError("reference shot count differs from the capture layout")
+    if len(group_contexts) != group_count or len(set(group_contexts)) != group_count:
+        raise ValueError("calibration group contexts must be complete and unique")
+    context_axis_ids = tuple(axis_id for axis_id, _index in group_contexts[0])
+    if any(
+        tuple(axis_id for axis_id, _index in context) != context_axis_ids
+        for context in group_contexts
+    ):
+        raise ValueError(
+            "calibration group contexts must share the same ordered AxisIds"
+        )
+    image_shape = frame_contract.frame_schema.data_shape
+    total = np.zeros(image_shape, dtype=float)
+    count_dtype = np.min_scalar_type(group_count * reference_shot_count)
+    count = np.zeros(image_shape, dtype=count_dtype)
+    for raw_frame in _exact_frame_sequence(
+        reference_frames,
+        group_count * reference_shot_count,
+        "reference frame sequence",
+    ):
+        frame, valid = _prepare_frame(*raw_frame, frame_contract)
+        np.add(total, frame, out=total, where=valid, casting="unsafe")
+        np.add(count, valid, out=count, casting="unsafe")
+    average_validity = count > 0
+    if not np.any(average_validity):
+        raise CalibrationAnalysisError("reference frames contain no valid pixels")
+    # Reuse the float64 accumulator for the average.  Calibration needs memory
+    # proportional to one frame, not another frame-sized temporary per shot.
+    average = total
+    np.divide(total, count, out=average, where=average_validity)
+    if np.all(average_validity):
+        detector_image = average
+    else:
+        detector_image = np.array(average, copy=True)
+        detector_image[~average_validity] = float(
+            np.median(average[average_validity])
+        )
+    centers = find_site_centers(
+        detector_image,
+        request.grid_shape_yx,
+        min_distance=request.detector_min_distance,
+        threshold_rel=request.detector_threshold_rel,
+        ordering=request.ordering,
+        refine_half=request.detector_refine_half,
     )
-    lattice = _detect_sites(average, average_validity, request)
-    centers = lattice.coordinates_xy
     site_axis = AxisSpec(
         AxisId("readout-site"),
         "readout site",
@@ -4048,212 +2095,346 @@ def analyze_calibration(
         request.site_count,
         coordinates=tuple(range(request.site_count)),
     )
-    template_hasher = hashlib.sha256()
-    template_hasher.update(np.ascontiguousarray(average, dtype="<f8").tobytes())
-    template_hasher.update(
-        np.ascontiguousarray(average_validity, dtype=np.uint8).tobytes()
-    )
-    detection_lineage = canonical_digest(
-        {
-            "schema": "zlc_neutral_atom.SiteDetectionLineage",
-            "source_binding": source_binding.bracket_witness_digest,
-            "partition": partition.digest,
-            "request": request.fingerprint,
-            "template_digest": template_hasher.hexdigest(),
-            "work_plan": work_plan.fingerprint,
-        }
+    all_sites = ComponentValidity(
+        (site_axis.axis_id,),
+        np.ones(site_axis.size, dtype=bool),
     )
     site_map = SiteMap(
         site_axis,
         centers,
+        request.grid_shape_yx,
+        request.ordering,
         frame_contract.coordinate_frame,
-        ComponentValidity((site_axis.axis_id,), np.ones(request.site_count, dtype=bool)),
-        detection_lineage,
+        all_sites,
     )
-    box_boxes = _boxes_for_centers(
-        centers,
-        half_width=request.box.half_width,
-        image_shape_yx=frame_contract.frame_schema.data_shape,
+    box_feature = BoxFeature(
+        site_axis,
+        _boxes_for_centers(centers, average.shape, request.box_radius),
+        request.box_reducer,
+        all_sites,
     )
-    all_sites = np.ones(request.site_count, dtype=bool)
-    reference_spec = _feature_spec(
-        ReadoutModelKind.BOX,
-        site_axis_id=site_axis.axis_id,
-        boxes=box_boxes,
-        geometry_validity=all_sites,
-        request=request,
+    reference_box_signals, reference_box_validity = _extract_source_stack(
+        box_feature,
+        (group_count, reference_shot_count),
+        reference_frames,
+        frame_contract,
     )
-    (
-        reference_thresholds,
-        reference_threshold_validity,
-        reference_valley_diagnostics,
-    ) = _learn_reference_thresholds(
-        accessor,
-        brackets,
-        partition,
-        reference_spec,
-        request.minimum_train_samples_per_class,
-        request.minimum_reference_cluster_separation_rss,
-        request.reference_valley_familywise_error_rate,
+    labels = reference_labels(reference_box_signals, reference_box_validity)
+    split = train_test_split(
+        labels,
+        train_fraction=request.train_fraction,
+        seed=request.split_seed,
     )
-    labels, label_validity = _reference_labels(
-        accessor,
-        brackets,
-        reference_spec,
-        reference_thresholds,
-        reference_threshold_validity,
-        request,
-    )
-
-    psf_boxes: np.ndarray | None = None
-    per_site_kernels: np.ndarray | None = None
-    uniform_kernel: np.ndarray | None = None
-    psf_geometry: np.ndarray | None = None
-    if request.psf is not None:
-        psf_boxes = _boxes_for_centers(
-            centers,
-            half_width=request.psf.half_width,
-            image_shape_yx=frame_contract.frame_schema.data_shape,
-        )
-        per_site_kernels, uniform_kernel, psf_geometry = _psf_kernels(
+    features: dict[ReadoutModelKind, ReadoutFeature] = {
+        ReadoutModelKind.BOX: box_feature,
+    }
+    psf_fits: tuple[PsfFitDiagnostic, ...] = ()
+    if any(kind is not ReadoutModelKind.BOX for kind in request.model_kinds):
+        per_site_psf, uniform_psf, psf_fits = _fit_psf_features(
             average,
             average_validity,
-            psf_boxes,
-            request.psf,
+            centers,
+            site_axis,
+            request,
         )
-
-    prepared_models: list[
-        tuple[ReadoutModelKind, ReadoutFeatureSpec, _TrainingResult]
-    ] = []
-    for kind in request.model_kinds:
-        if kind is ReadoutModelKind.BOX:
-            spec = reference_spec
-        else:
-            assert (
-                psf_boxes is not None
-                and per_site_kernels is not None
-                and uniform_kernel is not None
-                and psf_geometry is not None
-            )
-            spec = _feature_spec(
-                kind,
-                site_axis_id=site_axis.axis_id,
-                boxes=psf_boxes,
-                geometry_validity=psf_geometry,
-                request=request,
-                per_site_kernels=per_site_kernels,
-                uniform_kernel=uniform_kernel,
-            )
-        values, validity = _extract_short_features(accessor, brackets, spec)
-        training = _train_and_score_thresholds(
-            values=values,
-            feature_validity=validity,
-            labels=labels,
-            label_validity=label_validity,
-            partition=partition,
-            geometry_validity=spec.site_validity.mask,
-            request=request,
-        )
-        prepared_models.append((kind, spec, training))
-
-    admitted_training = _certify_artifact_wide_training_results(
-        tuple(item[2] for item in prepared_models),
-        familywise_error_rate=1.0 - request.held_out_confidence_level,
+        features[ReadoutModelKind.PER_SITE_PSF] = per_site_psf
+        features[ReadoutModelKind.UNIFORM_PSF] = uniform_psf
+    ordered_features = tuple(features[kind] for kind in request.model_kinds)
+    short_signal_stacks, short_validity_stacks = _extract_source_feature_stacks(
+        ordered_features,
+        (group_count,),
+        short_frames,
+        frame_contract,
     )
-    models: list[ReadoutModel] = []
-    diagnostics: list[ModelAnalysisDiagnostic] = []
-    for (kind, spec, _evidence), training in zip(
-        prepared_models,
-        admitted_training,
-        strict=True,
+    reports = []
+    for model_index, (kind, feature) in enumerate(
+        zip(request.model_kinds, ordered_features, strict=True)
     ):
-        model, diagnostic = _build_model(
+        signals = short_signal_stacks[model_index]
+        signal_validity = short_validity_stacks[model_index]
+        report = characterize_readout(
             kind,
-            feature_spec=spec,
-            training=training,
-            frame_contract=frame_contract,
-            site_map=site_map,
-            request=request,
-            partition=partition,
-            work_plan_digest=work_plan.fingerprint,
+            signals,
+            signal_validity,
+            labels,
+            split,
+            bins=request.histogram_bins,
+            max_drop=request.max_drop,
         )
-        models.append(model)
-        diagnostics.append(diagnostic)
+        reports.append(report)
 
+    use_reference_thresholds = _main_reference_thresholds_available(reports)
+    models = []
+    for feature, report in zip(ordered_features, reports, strict=True):
+        thresholds, usable = _runtime_model_values(
+            feature,
+            report,
+            request,
+            use_reference_thresholds=use_reference_thresholds,
+        )
+        models.append(
+            ReadoutModel(
+                feature,
+                thresholds,
+                ComponentValidity((site_axis.axis_id,), usable),
+            )
+        )
     artifact = CalibrationArtifact(
         source_binding,
         frame_contract,
+        readout_physical_context,
         site_map,
         tuple(models),
         request.default_model_kind,
-        tuple(
-            CalibrationParameter(name, value)
-            for name, value in {
-                **_artifact_parameter_values(
-                    request,
-                    partition_digest=partition.digest,
-                    train_count=len(partition.train_indices),
-                    reference_evidence_count=len(
-                        partition.reference_evidence_indices
-                    ),
-                    test_count=len(partition.test_indices),
-                    work_plan_digest=work_plan.fingerprint,
+    )
+    report = CalibrationReport(
+        request,
+        (("numpy", np.__version__), ("scipy", scipy.__version__)),
+        group_contexts,
+        average,
+        average_validity,
+        reference_box_signals,
+        labels,
+        split,
+        psf_fits,
+        tuple(reports),
+    )
+    return CalibrationComputation(artifact, report)
+
+
+def _calibrate_readout_frames(
+    reference_frames: np.ndarray,
+    short_frames: np.ndarray,
+    *,
+    source_binding: CalibrationSourceBinding,
+    frame_contract: FrameContract,
+    readout_physical_context: ReadoutPhysicalContext,
+    request: CalibrationAnalysisRequest,
+    reference_validity: np.ndarray | None = None,
+    short_validity: np.ndarray | None = None,
+) -> CalibrationComputation:
+    """Compute a non-submittable array oracle from ``(G,K,H,W)`` and ``(G,H,W)``.
+
+    This path is for deterministic physics tests and offline diagnostics.  A
+    durable calibration must be recomputed from an ``AdmittedCapture`` through
+    :func:`analyze_calibration`; caller-supplied lineage never becomes commit
+    authority.
+    """
+
+    if not isinstance(source_binding, CalibrationSourceBinding):
+        raise TypeError("source_binding must be CalibrationSourceBinding")
+    if not isinstance(frame_contract, FrameContract):
+        raise TypeError("frame_contract must be FrameContract")
+    if not isinstance(readout_physical_context, ReadoutPhysicalContext):
+        raise TypeError(
+            "readout_physical_context must be ReadoutPhysicalContext"
+        )
+    if not isinstance(request, CalibrationAnalysisRequest):
+        raise TypeError("request must be CalibrationAnalysisRequest")
+    if source_binding.layout != request.layout:
+        raise ValueError("source binding and request use different capture layouts")
+    references = np.asarray(reference_frames)
+    short = np.asarray(short_frames)
+    if references.ndim != 4 or short.ndim != 3:
+        raise ValueError(
+            "reference_frames must be (groups, shots, y, x) and short_frames (groups, y, x)"
+        )
+    if references.shape[0] != short.shape[0] or references.shape[-2:] != short.shape[-2:]:
+        raise ValueError("reference and short frames must share groups and image shape")
+    if references.shape[-2:] != frame_contract.frame_schema.data_shape:
+        raise ValueError("calibration images differ from the FrameContract")
+    reference_valid = (
+        np.broadcast_to(True, references.shape)
+        if reference_validity is None
+        else np.asarray(reference_validity, dtype=bool)
+    )
+    short_valid = (
+        np.broadcast_to(True, short.shape)
+        if short_validity is None
+        else np.asarray(short_validity, dtype=bool)
+    )
+    if reference_valid.shape != references.shape or short_valid.shape != short.shape:
+        raise ValueError("calibration validity masks have the wrong shape")
+    group_axis = AxisId("calibration-group")
+    contexts = tuple(
+        ((group_axis, group),)
+        for group in range(references.shape[0])
+    )
+    def reference_sequence() -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        for group, shot in np.ndindex(references.shape[:2]):
+            yield references[group, shot], reference_valid[group, shot]
+
+    def short_sequence() -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        for group in range(short.shape[0]):
+            yield short[group], short_valid[group]
+
+    return _calibrate_readout_source(
+        group_count=references.shape[0],
+        reference_shot_count=references.shape[1],
+        reference_frames=reference_sequence,
+        short_frames=short_sequence,
+        group_contexts=contexts,
+        source_binding=source_binding,
+        frame_contract=frame_contract,
+        readout_physical_context=readout_physical_context,
+        request=request,
+    )
+
+
+def _capture_frame_source(
+    source: CaptureFrameSource,
+    layout: CalibrationCaptureLayout,
+) -> tuple[
+    int,
+    Callable[[], Iterator[tuple[np.ndarray, np.ndarray]]],
+    Callable[[], Iterator[tuple[np.ndarray, np.ndarray]]],
+    tuple[tuple[tuple[AxisId, int], ...], ...],
+]:
+    if not isinstance(source, CaptureFrameSource):
+        raise TypeError("source must be CaptureFrameSource")
+    if len(source.schema.cell_schema.data_shape) != 2:
+        raise CalibrationAnalysisError("calibration source cells must be 2D frames")
+    brackets = layout.brackets(source.schema)
+    repeat_axis_id = source.schema.repeat_axis.axis_id
+    normalized = []
+    for bracket in brackets:
+        context = dict(bracket.context_key)
+        if repeat_axis_id not in context:
+            raise CalibrationAnalysisError("calibration bracket omits repeat AxisId")
+        normalized.append((bracket, context[repeat_axis_id]))
+    frozen = tuple(normalized)
+
+    def frame_sequence(
+        cell_sequence: Callable[[], Iterator[DatasetCellAddress]],
+    ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        for expected, (cell, sample) in zip(
+            cell_sequence(),
+            source.iter_cells(cell_sequence()),
+            strict=True,
+        ):
+            if cell != expected:
+                raise CalibrationAnalysisError(
+                    "capture frame source changed the requested cell order"
+                )
+            yield (
+                sample.image.values,
+                expand_value_validity(
+                    sample.image.validity,
+                    source.schema.cell_schema,
                 ),
-                **_numeric_lineage_notes(),
-            }.items()
-        ),
+            )
+
+    def reference_cells() -> Iterator[DatasetCellAddress]:
+        for bracket, repeat in frozen:
+            for _event, row in bracket.reference_point_storage_rows:
+                yield DatasetCellAddress(repeat, row)
+
+    def short_cells() -> Iterator[DatasetCellAddress]:
+        for bracket, repeat in frozen:
+            yield DatasetCellAddress(
+                repeat,
+                bracket.readout_point_storage_row,
+            )
+
+    def reference_sequence() -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        return frame_sequence(reference_cells)
+
+    def short_sequence() -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        return frame_sequence(short_cells)
+
+    contexts = tuple(tuple(bracket.context_key) for bracket, _repeat in frozen)
+    return len(frozen), reference_sequence, short_sequence, contexts
+
+
+def compute_calibration(
+    capture: object,
+    request: CalibrationAnalysisRequest,
+) -> CalibrationComputation:
+    """Compute a non-submittable result from one resolved raw CaptureArtifact."""
+
+    if not isinstance(request, CalibrationAnalysisRequest):
+        raise TypeError("request must be CalibrationAnalysisRequest")
+    from zlc_neutral_atom.artifacts.capture import CaptureArtifact
+
+    if not isinstance(capture, CaptureArtifact):
+        raise TypeError("capture must be a resolved raw CaptureArtifact")
+    try:
+        source = capture.frame_source  # type: ignore[attr-defined]
+    except AttributeError as exc:
+        raise TypeError("capture must be a resolved raw CaptureArtifact") from exc
+    if not isinstance(source, CaptureFrameSource):
+        raise TypeError("capture.frame_source must be CaptureFrameSource")
+    source_binding, frame_contract = derive_calibration_source_binding(
+        capture,
+        request.layout,
     )
-    validate_calibration_artifact_resources(
-        artifact,
-        request.resource_policy.artifact_policy,
+    readout_physical_context = derive_calibration_readout_physical_context(
+        capture,
+        request.layout,
+        frame_contract,
     )
-    dark_counts = tuple(
-        int(np.count_nonzero(label_validity[:, site] & ~labels[:, site]))
-        for site in range(request.site_count)
+    group_count, reference_frames, short_frames, contexts = _capture_frame_source(
+        source,
+        request.layout,
     )
-    bright_counts = tuple(
-        int(np.count_nonzero(label_validity[:, site] & labels[:, site]))
-        for site in range(request.site_count)
+    return _calibrate_readout_source(
+        group_count=group_count,
+        reference_shot_count=len(request.layout.reference_event_indices),
+        reference_frames=reference_frames,
+        short_frames=short_frames,
+        group_contexts=contexts,
+        source_binding=source_binding,
+        frame_contract=frame_contract,
+        readout_physical_context=readout_physical_context,
+        request=request,
     )
-    result_diagnostics = CalibrationAnalysisDiagnostics(
-        len(brackets),
-        len(partition.train_indices),
-        len(partition.reference_evidence_indices),
-        len(partition.test_indices),
-        partition.digest,
-        len(brackets) * len(request.layout.reference_event_indices),
-        valid_fraction,
-        dark_counts,
-        bright_counts,
-        reference_valley_diagnostics,
-        lattice.diagnostic,
-        tuple(diagnostics),
+
+
+def analyze_calibration(
+    source: object,
+    request: CalibrationAnalysisRequest,
+) -> CalibrationAnalysisResult:
+    """Analyze one repository-admitted capture into a submittable result."""
+
+    from zlc_neutral_atom.artifacts.capture import AdmittedCapture
+
+    if type(source) is not AdmittedCapture:
+        raise TypeError("calibration analysis requires an exact AdmittedCapture")
+    if not isinstance(request, CalibrationAnalysisRequest):
+        raise TypeError("request must be CalibrationAnalysisRequest")
+    if request.expected_centers_xy is None:
+        raise CalibrationAnalysisError(
+            "authoritative calibration requires expected_centers_xy and "
+            "maximum_site_residual_px"
+        )
+    computation = compute_calibration(source.artifact, request)
+    return CalibrationAnalysisResult._from_admitted_analysis(
+        _ADMITTED_ANALYSIS_TOKEN,
+        computation,
+        source,
     )
-    return CalibrationAnalysisResult(artifact, result_diagnostics)
 
 
 __all__ = [
-    "BoxAnalysisConfig",
-    "CalibrationAnalysisDiagnostics",
+    "AblationPoint",
+    "BimodalFit",
     "CalibrationAnalysisError",
     "CalibrationAnalysisRequest",
-    "CalibrationAnalysisPlanningAssumption",
-    "CalibrationAnalysisResourcePolicy",
     "CalibrationAnalysisResult",
-    "CalibrationBracketSamplingAssumption",
-    "CalibrationWorkPlan",
-    "GridOrder",
-    "ModelAnalysisDiagnostic",
-    "PsfAnalysisConfig",
-    "ReferenceClassOrientation",
-    "ReferenceLabelSource",
-    "ReferenceValleyDiagnostic",
-    "ReferenceValleyEvidence",
-    "SiteDetectionDiagnostic",
-    "SiteDetectionPolicy",
-    "UsableSiteAcceptance",
+    "CalibrationComputation",
+    "CalibrationReport",
+    "ModelCalibrationReport",
+    "PsfFitDiagnostic",
+    "ReferenceLabels",
+    "SiteFidelity",
+    "TrainTestSplit",
     "analyze_calibration",
-    "build_calibration_work_plan",
-    "validate_calibration_analysis_contract",
-    "validate_calibration_partition_against_source",
+    "characterize_readout",
+    "compute_calibration",
+    "estimate_calibration_analysis_peak_bytes",
+    "find_site_centers",
+    "fit_bimodal",
+    "otsu_threshold",
+    "reference_labels",
+    "train_test_split",
 ]

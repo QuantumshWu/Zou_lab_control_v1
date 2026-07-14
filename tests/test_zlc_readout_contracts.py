@@ -186,6 +186,8 @@ def _physical_facts() -> CameraPhysicalFacts:
         dtype=descriptor.dtype,
         count_unit=descriptor.count_unit,
         exposure_seconds=setting.exposure_seconds,
+        required_external_trigger_interval_seconds=0.0,
+        external_trigger_integration_start_offset_seconds=0.0,
         gain=setting.gain,
         readout_mode=setting.readout_mode,
         opaque_frame_settings_fingerprint="f" * 64,

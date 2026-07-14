@@ -36,7 +36,7 @@ from zlc_neutral_atom.artifacts import (
     FitExecution,
     compile_capture_artifact_pipeline,
 )
-from zlc_neutral_atom.readout.calibration import CalibrationArtifact
+from zlc_neutral_atom.readout.calibration import ResolvedCalibration
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
 from zlc_neutral_atom.readout.calibration_repository import CalibrationRepository
 from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
@@ -47,9 +47,7 @@ from zlc_neutral_atom.runtime import (
     RunHandle,
     estimate_pipeline_peak_bytes,
 )
-from zlc_neutral_atom.timing import (
-    TriggeredCaptureSpec,
-)
+from zlc_neutral_atom.timing.capture import TriggeredCaptureSpec
 from zlc_pulse import (
     PulseDocument,
     PulseExecutionForm,
@@ -350,8 +348,12 @@ class ReadoutFacade:
     def load_calibration(
         self,
         reference: CalibrationArtifactRef,
-    ) -> CalibrationArtifact:
-        return _services(self._token).calibration_repository.load(reference)
+    ) -> ResolvedCalibration:
+        services = _services(self._token)
+        return services.calibration_repository.admit(
+            reference,
+            services.capture_repository,
+        )
 
 
 class Experiment:
@@ -406,7 +408,7 @@ class Experiment:
         if spec is None:
             assert model is not None
             spec = fit_spec_for(
-                admitted.artifact.block.schema,
+                admitted.artifact.frame_source.schema,
                 model,
                 committed_transform=committed_transform,
                 fit_axis_ids=fit_axis_ids,

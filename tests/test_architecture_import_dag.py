@@ -49,7 +49,6 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
     {
         (Path("zlc_pulse/document.py"), "ScanRecipeProvenance.__post_init__"),
         (Path("zlc_pulse/transport/axi.py"), "VivadoAxiRegisterTransport._parse_read"),
-        (Path("zlc_neutral_atom/readout/analysis.py"), "_bounded_numeric_version"),
         (Path("zlc_workbench/camera_capture.py"), "_camera_dtype"),
         (Path("zlc_workbench/legacy_neutral_atom.py"), "_qcmos_identity_probe.probe"),
         (Path("zlc_workbench/legacy_neutral_atom.py"), "_pylon_live_identity"),
@@ -104,6 +103,33 @@ if loaded:
     raise SystemExit('storage backends loaded through zlc_data: ' + ', '.join(loaded))
 if 'zlc_storage.canonical' not in sys.modules:
     raise SystemExit('zlc_data did not load its only permitted storage primitive module')
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_occupancy_runtime_does_not_import_calibration_analysis_or_repository():
+    code = """
+import sys
+import zlc_neutral_atom.readout.occupancy
+
+forbidden = (
+    'scipy',
+    'zlc_neutral_atom.readout.analysis',
+    'zlc_neutral_atom.readout.calibration_codec',
+    'zlc_neutral_atom.readout.calibration_repository',
+)
+loaded = tuple(
+    name for name in forbidden
+    if name in sys.modules or any(item.startswith(name + '.') for item in sys.modules)
+)
+if loaded:
+    raise SystemExit('occupancy imported offline calibration machinery: ' + ', '.join(loaded))
 """
     completed = subprocess.run(
         [sys.executable, "-c", code],
@@ -303,7 +329,7 @@ def test_readout_artifacts_do_not_restore_edit_counter_metadata():
                 violations.append(f"{relative}:{node.lineno} restores {candidate}")
     assert not violations, (
         "readout identity is CalibrationArtifactRef + ReadoutModelKind; descriptive "
-        "gate ids and content fingerprints replace edit-counter metadata:\n"
+        "durable format names and CAS bytes replace edit-counter metadata:\n"
         + "\n".join(violations)
     )
 
@@ -502,26 +528,17 @@ def test_calibration_numeric_versions_are_not_admission_authority():
             if token in text:
                 violations.append(f"{path.relative_to(ROOT)} contains {token}")
     assert not violations, (
-        "numeric package versions are passive CalibrationArtifact notes; they "
+        "numeric package versions are passive CalibrationReport notes; they "
         "must not regain a digest, replay, model, manifest, or admission role:\n"
         + "\n".join(violations)
     )
 
     analysis_path = ROOT / "zlc_neutral_atom" / "readout" / "analysis.py"
-    tree = ast.parse(
-        analysis_path.read_text(encoding="utf-8"),
-        filename=str(analysis_path),
-    )
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_numeric_lineage_notes"
-    ]
-    assert len(calls) == 1, (
-        "numeric version notes must be sampled once, only when constructing "
-        "the top-level CalibrationArtifact"
+    source = analysis_path.read_text(encoding="utf-8")
+    assert source.count("np.__version__") == 1
+    assert source.count("scipy.__version__") == 1, (
+        "numeric version notes must be sampled once into CalibrationReport, "
+        "never copied into runtime artifact or admission evidence"
     )
 
 
@@ -566,6 +583,10 @@ def test_current_format_names_do_not_encode_edit_counters():
         relative = Path(item)
         path = ROOT / relative
         if relative == ratchet_path:
+            continue
+        # A worktree deletion is already absent from the architecture under
+        # review even though ``git ls-files`` retains it until the next commit.
+        if not path.is_file():
             continue
         if path.name != ".gitignore" and path.suffix not in {
             ".py",

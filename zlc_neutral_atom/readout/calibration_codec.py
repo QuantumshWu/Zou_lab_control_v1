@@ -1,44 +1,59 @@
-"""Strict current-format codecs for neutral-atom calibration values."""
+"""Canonical durable formats for readout calibration artifacts and reports.
+
+Only the two repository values cross this boundary.  Nested values remain
+private implementation details and delegate foreign values to their owner
+serializers.  Scientific validation belongs to the domain constructors; this
+module enforces exact field sets, scalar types, and canonical bytes.
+"""
 
 from __future__ import annotations
 
-from typing import Any, Callable, TypeVar
+from numbers import Integral, Real
+from typing import Any
 
 import numpy as np
 
-from zlc_data import AxisId, ComponentValidity, CoordinateFrameId
+from zlc_data import AxisId, AxisSpec, ComponentValidity, CoordinateFrameId
 from zlc_data.codec import axis_from_tree, axis_to_tree, validity_from_tree, validity_to_tree
-from zlc_storage import (
-    CanonicalArrayEvent,
-    CanonicalListEvent,
-    canonical_text as _text,
-    decode,
-    encode,
-    exact_mapping as _exact_map,
-)
 from zlc_neutral_atom.capture_reference import (
     capture_artifact_ref_from_tree,
     capture_artifact_ref_to_tree,
 )
+from zlc_storage import (
+    CanonicalDecodeLimits,
+    ContentRef,
+    canonical_text as _text,
+    content_ref_from_tree,
+    content_ref_to_tree,
+    decode,
+    encode,
+    exact_mapping as _exact_map,
+)
 
+from .analysis import (
+    AblationPoint,
+    BimodalFit,
+    CalibrationAnalysisRequest,
+    CalibrationReport,
+    ModelCalibrationReport,
+    PsfFitDiagnostic,
+    ReferenceLabels,
+    SiteFidelity,
+    TrainTestSplit,
+)
 from .calibration import (
     BackgroundMode,
-    BoxReadoutModel,
+    BoxFeature,
     BoxReducer,
     CalibrationArtifact,
-    CalibrationParameter,
-    CalibrationResourceExceeded,
-    CalibrationResourcePolicy,
     CalibrationSourceBinding,
-    DEFAULT_CALIBRATION_RESOURCE_POLICY,
-    PerSitePsfReadoutModel,
+    GridOrder,
+    PerSitePsfFeature,
+    ReadoutFeature,
     ReadoutModel,
-    ReadoutModelHeader,
     ReadoutModelKind,
-    ReadoutModelQuality,
     SiteMap,
-    UniformPsfReadoutModel,
-    validate_calibration_artifact_resources,
+    UniformPsfFeature,
 )
 from .codec import (
     calibration_capture_layout_from_tree,
@@ -46,818 +61,931 @@ from .codec import (
     frame_contract_from_tree,
     frame_contract_to_tree,
 )
-from .contracts import FrameContract
+from .physical_context import (
+    readout_physical_context_from_tree,
+    readout_physical_context_to_tree,
+)
 
 
-CALIBRATION_SOURCE_BINDING_SCHEMA = "zlc_neutral_atom.calibration-source-binding"
-SITE_MAP_SCHEMA = "zlc_neutral_atom.site-map"
-READOUT_MODEL_QUALITY_SCHEMA = "zlc_neutral_atom.readout-model-quality"
-READOUT_MODEL_HEADER_SCHEMA = "zlc_neutral_atom.readout-model-header"
-READOUT_MODEL_SCHEMA = "zlc_neutral_atom.readout-model"
-CALIBRATION_ARTIFACT_SCHEMA = "zlc_neutral_atom.calibration-artifact"
+CALIBRATION_ARTIFACT_FORMAT = "zlc_neutral_atom.calibration-artifact"
+CALIBRATION_REPORT_FORMAT = "zlc_neutral_atom.calibration-report"
+
+_REPORT_DECODE_LIMITS = CanonicalDecodeLimits(
+    max_depth=64,
+    max_nodes=500_000,
+    max_container_entries=250_000,
+    max_arrays=4_096,
+    max_total_array_bytes=256 * 1024 * 1024,
+)
 
 
-class CalibrationCodecError(ValueError):
-    """A payload does not have one canonical current calibration meaning."""
+def _fields(tree: Any, fields: set[str], name: str) -> dict[str, Any]:
+    return _exact_map(tree, fields, name, discriminator=None)
 
 
-T = TypeVar("T")
+def _outer_fields(tree: Any, fields: set[str], format_name: str) -> dict[str, Any]:
+    return _exact_map(tree, fields, format_name, discriminator="format")
 
 
-def _list(value: Any, field_name: str) -> list[Any]:
+def _list(value: Any, field: str) -> list[Any]:
     if not isinstance(value, list):
-        raise ValueError(f"{field_name} must be a list")
+        raise ValueError(f"{field} must be a list")
     return value
 
 
-def _enum(enum_type, value: Any, field_name: str):
-    try:
-        return enum_type(_text(value, field_name))
-    except ValueError as exc:
-        raise ValueError(f"{field_name} has an unknown value {value!r}") from exc
-
-
-def _ndarray(value: Any, field_name: str) -> np.ndarray:
+def _array(value: Any, field: str) -> np.ndarray:
     if not isinstance(value, np.ndarray):
-        raise ValueError(f"{field_name} must be a canonical ndarray")
+        raise ValueError(f"{field} must be a canonical ndarray")
     return value
 
 
-def _canonical_tree(original: Any, projected: Any, schema: str) -> None:
-    if encode(original) != encode(projected):
-        raise CalibrationCodecError(f"{schema} tree is typed but non-canonical")
+def _bool(value: Any, field: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{field} must be a boolean")
+    return value
 
 
-def _encode_typed(value: T, projector: Callable[[T], dict[str, Any]]) -> bytes:
-    return encode(projector(value))
+def _int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{field} must be an integer")
+    return int(value)
 
 
-def _decode_typed(
-    payload: bytes | bytearray | memoryview,
-    parser: Callable[[Any], T],
-    projector: Callable[[T], dict[str, Any]],
-    schema: str,
-    *,
-    admit_structure=None,
-) -> T:
+def _optional_int(value: Any, field: str) -> int | None:
+    return None if value is None else _int(value, field)
+
+
+def _real(value: Any, field: str) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{field} must be a real number")
+    return float(value)
+
+
+def _optional_real(value: Any, field: str) -> float | None:
+    return None if value is None else _real(value, field)
+
+
+def _enum(enum_type, value: Any, field: str):
+    try:
+        return enum_type(_text(value, field))
+    except ValueError as exc:
+        raise ValueError(f"{field} has an unknown value {value!r}") from exc
+
+
+def _integer_pair(value: Any, field: str) -> tuple[int, int]:
+    items = _list(value, field)
+    if len(items) != 2:
+        raise ValueError(f"{field} must contain two integers")
+    return _int(items[0], f"{field}[0]"), _int(items[1], f"{field}[1]")
+
+
+def _real_pair(value: Any, field: str) -> tuple[float, float]:
+    items = _list(value, field)
+    if len(items) != 2:
+        raise ValueError(f"{field} must contain two real numbers")
+    return _real(items[0], f"{field}[0]"), _real(items[1], f"{field}[1]")
+
+
+def _component_validity(tree: Any, field: str) -> ComponentValidity:
+    value = validity_from_tree(tree)
+    if not isinstance(value, ComponentValidity):
+        raise ValueError(f"{field} must be ComponentValidity")
+    return value
+
+
+def _decode_typed(payload: bytes | bytearray | memoryview, parser, projector, name: str):
     if not isinstance(payload, (bytes, bytearray, memoryview)):
-        raise TypeError("typed calibration payload must be bytes-like")
+        raise TypeError(f"{name} payload must be bytes-like")
     raw = bytes(payload)
-    value = parser(decode(raw, admit_structure=admit_structure))
+    value = parser(decode(raw))
     if encode(projector(value)) != raw:
-        raise CalibrationCodecError(
-            f"{schema} payload uses a non-canonical typed representation"
-        )
+        raise ValueError(f"{name} payload is typed but non-canonical")
     return value
 
 
-def calibration_source_binding_to_tree(
-    value: CalibrationSourceBinding,
-) -> dict[str, Any]:
+def _source_to_tree(value: CalibrationSourceBinding) -> dict[str, Any]:
     if not isinstance(value, CalibrationSourceBinding):
         raise TypeError("value must be CalibrationSourceBinding")
     return {
-        "schema": CALIBRATION_SOURCE_BINDING_SCHEMA,
-        "source_capture_ref": capture_artifact_ref_to_tree(
-            value.source_capture_ref
-        ),
+        "source_capture_ref": capture_artifact_ref_to_tree(value.source_capture_ref),
         "layout": calibration_capture_layout_to_tree(value.layout),
-        "source_schema_fingerprint": value.source_schema_fingerprint,
-        "frame_contract_fingerprint": value.frame_contract_fingerprint,
-        "bracket_count": value.bracket_count,
-        "bracket_witness_digest": value.bracket_witness_digest,
     }
 
 
-def calibration_source_binding_from_tree(tree: Any) -> CalibrationSourceBinding:
-    data = _exact_map(
-        tree,
-        {
-            "schema",
-            "source_capture_ref",
-            "layout",
-            "source_schema_fingerprint",
-            "frame_contract_fingerprint",
-            "bracket_count",
-            "bracket_witness_digest",
-        },
-        CALIBRATION_SOURCE_BINDING_SCHEMA,
+def _source_from_tree(tree: Any) -> CalibrationSourceBinding:
+    data = _fields(tree, {"source_capture_ref", "layout"}, "source binding")
+    return CalibrationSourceBinding(
+        source_capture_ref=capture_artifact_ref_from_tree(data["source_capture_ref"]),
+        layout=calibration_capture_layout_from_tree(data["layout"]),
     )
-    if type(data["bracket_count"]) is not int:
-        raise ValueError("bracket_count must be a canonical integer")
-    value = CalibrationSourceBinding(
-        capture_artifact_ref_from_tree(data["source_capture_ref"]),
-        calibration_capture_layout_from_tree(data["layout"]),
-        _text(data["source_schema_fingerprint"], "source_schema_fingerprint"),
-        _text(data["frame_contract_fingerprint"], "frame_contract_fingerprint"),
-        data["bracket_count"],
-        _text(data["bracket_witness_digest"], "bracket_witness_digest"),
-    )
-    _canonical_tree(
-        tree,
-        calibration_source_binding_to_tree(value),
-        CALIBRATION_SOURCE_BINDING_SCHEMA,
-    )
-    return value
 
 
-def site_map_to_tree(value: SiteMap) -> dict[str, Any]:
+def _site_map_to_tree(value: SiteMap) -> dict[str, Any]:
     if not isinstance(value, SiteMap):
         raise TypeError("value must be SiteMap")
     return {
-        "schema": SITE_MAP_SCHEMA,
         "site_axis": axis_to_tree(value.site_axis),
         "coordinates_xy": value.coordinates_xy,
+        "grid_shape_yx": list(value.grid_shape_yx),
+        "ordering": value.ordering.value,
         "coordinate_frame": value.coordinate_frame.value,
         "validity": validity_to_tree(value.validity),
-        "detection_lineage_digest": value.detection_lineage_digest,
     }
 
 
-def site_map_from_tree(tree: Any) -> SiteMap:
-    data = _exact_map(
+def _site_map_from_tree(tree: Any) -> SiteMap:
+    data = _fields(
         tree,
         {
-            "schema",
             "site_axis",
             "coordinates_xy",
+            "grid_shape_yx",
+            "ordering",
             "coordinate_frame",
             "validity",
-            "detection_lineage_digest",
         },
-        SITE_MAP_SCHEMA,
+        "site map",
     )
-    validity = validity_from_tree(data["validity"])
-    if not isinstance(validity, ComponentValidity):
-        raise ValueError("SiteMap validity must decode as ComponentValidity")
-    value = SiteMap(
-        axis_from_tree(data["site_axis"]),
-        _ndarray(data["coordinates_xy"], "coordinates_xy"),
-        CoordinateFrameId(_text(data["coordinate_frame"], "coordinate_frame")),
-        validity,
-        _text(data["detection_lineage_digest"], "detection_lineage_digest"),
-    )
-    _canonical_tree(tree, site_map_to_tree(value), SITE_MAP_SCHEMA)
-    return value
-
-
-def _parameter_to_tree(value: CalibrationParameter) -> dict[str, Any]:
-    if not isinstance(value, CalibrationParameter):
-        raise TypeError("value must be CalibrationParameter")
-    scalar = value.value
-    tag = (
-        "bool"
-        if isinstance(scalar, bool)
-        else "int"
-        if isinstance(scalar, int)
-        else "float"
-        if isinstance(scalar, float)
-        else "text"
-    )
-    return {"name": value.name, "type": tag, "value": scalar}
-
-
-def _parameter_from_tree(tree: Any) -> CalibrationParameter:
-    if not isinstance(tree, dict) or set(tree) != {"name", "type", "value"}:
-        raise ValueError("CalibrationParameter has an unknown field set")
-    tag = _text(tree["type"], "parameter type")
-    value = tree["value"]
-    expected = {
-        "bool": bool,
-        "int": int,
-        "float": float,
-        "text": str,
-    }.get(tag)
-    if expected is None or type(value) is not expected:
-        raise ValueError("CalibrationParameter value differs from its scalar type tag")
-    result = CalibrationParameter(_text(tree["name"], "parameter name"), value)
-    _canonical_tree(tree, _parameter_to_tree(result), "CalibrationParameter")
-    return result
-
-
-def _component_validity(tree: Any, field_name: str) -> ComponentValidity:
-    value = validity_from_tree(tree)
-    if not isinstance(value, ComponentValidity):
-        raise ValueError(f"{field_name} must decode as ComponentValidity")
-    return value
-
-
-def readout_model_quality_to_tree(value: ReadoutModelQuality) -> dict[str, Any]:
-    if not isinstance(value, ReadoutModelQuality):
-        raise TypeError("value must be ReadoutModelQuality")
-    return {
-        "schema": READOUT_MODEL_QUALITY_SCHEMA,
-        "site_axis_id": value.site_axis_id.value,
-        "usable_sites": validity_to_tree(value.usable_sites),
-        "dark_training_sample_counts": value.dark_training_sample_counts,
-        "bright_training_sample_counts": value.bright_training_sample_counts,
-        "held_out_dark_success_counts": value.held_out_dark_success_counts,
-        "held_out_dark_total_counts": value.held_out_dark_total_counts,
-        "held_out_dark_labeled_counts": value.held_out_dark_labeled_counts,
-        "held_out_bright_success_counts": value.held_out_bright_success_counts,
-        "held_out_bright_total_counts": value.held_out_bright_total_counts,
-        "held_out_bright_labeled_counts": value.held_out_bright_labeled_counts,
-        "held_out_dark_accuracy_lower_bounds": (
-            value.held_out_dark_accuracy_lower_bounds
+    axis = axis_from_tree(data["site_axis"])
+    if not isinstance(axis, AxisSpec):
+        raise ValueError("site_axis must decode to AxisSpec")
+    return SiteMap(
+        site_axis=axis,
+        coordinates_xy=_array(data["coordinates_xy"], "coordinates_xy"),
+        grid_shape_yx=_integer_pair(data["grid_shape_yx"], "grid_shape_yx"),
+        ordering=_enum(GridOrder, data["ordering"], "ordering"),
+        coordinate_frame=CoordinateFrameId(
+            _text(data["coordinate_frame"], "coordinate_frame")
         ),
-        "held_out_bright_accuracy_lower_bounds": (
-            value.held_out_bright_accuracy_lower_bounds
-        ),
-        "held_out_fidelity": value.held_out_fidelity,
-        "held_out_validity": validity_to_tree(value.held_out_validity),
-        "quality_gate_id": value.quality_gate_id,
-    }
-
-
-def readout_model_quality_from_tree(tree: Any) -> ReadoutModelQuality:
-    data = _exact_map(
-        tree,
-        {
-            "schema",
-            "site_axis_id",
-            "usable_sites",
-            "dark_training_sample_counts",
-            "bright_training_sample_counts",
-            "held_out_dark_success_counts",
-            "held_out_dark_total_counts",
-            "held_out_dark_labeled_counts",
-            "held_out_bright_success_counts",
-            "held_out_bright_total_counts",
-            "held_out_bright_labeled_counts",
-            "held_out_dark_accuracy_lower_bounds",
-            "held_out_bright_accuracy_lower_bounds",
-            "held_out_fidelity",
-            "held_out_validity",
-            "quality_gate_id",
-        },
-        READOUT_MODEL_QUALITY_SCHEMA,
+        validity=_component_validity(data["validity"], "validity"),
     )
-    value = ReadoutModelQuality(
-        AxisId(_text(data["site_axis_id"], "site_axis_id")),
-        _component_validity(data["usable_sites"], "usable_sites"),
-        _ndarray(data["dark_training_sample_counts"], "dark_training_sample_counts"),
-        _ndarray(data["bright_training_sample_counts"], "bright_training_sample_counts"),
-        _ndarray(data["held_out_dark_success_counts"], "held_out_dark_success_counts"),
-        _ndarray(data["held_out_dark_total_counts"], "held_out_dark_total_counts"),
-        _ndarray(data["held_out_dark_labeled_counts"], "held_out_dark_labeled_counts"),
-        _ndarray(data["held_out_bright_success_counts"], "held_out_bright_success_counts"),
-        _ndarray(data["held_out_bright_total_counts"], "held_out_bright_total_counts"),
-        _ndarray(
-            data["held_out_bright_labeled_counts"],
-            "held_out_bright_labeled_counts",
-        ),
-        _ndarray(
-            data["held_out_dark_accuracy_lower_bounds"],
-            "held_out_dark_accuracy_lower_bounds",
-        ),
-        _ndarray(
-            data["held_out_bright_accuracy_lower_bounds"],
-            "held_out_bright_accuracy_lower_bounds",
-        ),
-        _ndarray(data["held_out_fidelity"], "held_out_fidelity"),
-        _component_validity(data["held_out_validity"], "held_out_validity"),
-        _text(data["quality_gate_id"], "quality_gate_id"),
-    )
-    _canonical_tree(
-        tree,
-        readout_model_quality_to_tree(value),
-        READOUT_MODEL_QUALITY_SCHEMA,
-    )
-    return value
 
 
-def readout_model_header_to_tree(value: ReadoutModelHeader) -> dict[str, Any]:
-    if not isinstance(value, ReadoutModelHeader):
-        raise TypeError("value must be ReadoutModelHeader")
-    return {
-        "schema": READOUT_MODEL_HEADER_SCHEMA,
-        "frame_contract_fingerprint": value.frame_contract_fingerprint,
-        "site_map_fingerprint": value.site_map_fingerprint,
-        "site_axis_id": value.site_axis_id.value,
-        "thresholds": value.thresholds,
-        "occupied_above_thresholds": value.occupied_above_thresholds,
-        "quality": readout_model_quality_to_tree(value.quality),
-        "parameters": [_parameter_to_tree(item) for item in value.parameters],
-    }
-
-
-def readout_model_header_from_tree(tree: Any) -> ReadoutModelHeader:
-    data = _exact_map(
-        tree,
-        {
-            "schema",
-            "frame_contract_fingerprint",
-            "site_map_fingerprint",
-            "site_axis_id",
-            "thresholds",
-            "occupied_above_thresholds",
-            "quality",
-            "parameters",
-        },
-        READOUT_MODEL_HEADER_SCHEMA,
-    )
-    value = ReadoutModelHeader(
-        _text(data["frame_contract_fingerprint"], "frame_contract_fingerprint"),
-        _text(data["site_map_fingerprint"], "site_map_fingerprint"),
-        AxisId(_text(data["site_axis_id"], "site_axis_id")),
-        _ndarray(data["thresholds"], "thresholds"),
-        _ndarray(data["occupied_above_thresholds"], "occupied_above_thresholds"),
-        readout_model_quality_from_tree(data["quality"]),
-        tuple(
-            _parameter_from_tree(item)
-            for item in _list(data["parameters"], "parameters")
-        ),
-    )
-    _canonical_tree(
-        tree,
-        readout_model_header_to_tree(value),
-        READOUT_MODEL_HEADER_SCHEMA,
-    )
-    return value
-
-
-def readout_model_to_tree(value: ReadoutModel) -> dict[str, Any]:
-    common = {
-        "schema": READOUT_MODEL_SCHEMA,
-        "kind": value.kind.value,
-        "header": readout_model_header_to_tree(value.header),
-        "boxes_xywh": value.boxes_xywh,
-    }
-    if isinstance(value, BoxReadoutModel):
-        return {**common, "reducer": value.reducer.value}
-    if isinstance(value, PerSitePsfReadoutModel):
+def _feature_to_tree(value: ReadoutFeature) -> dict[str, Any]:
+    if isinstance(value, BoxFeature):
         return {
-            **common,
+            "kind": value.kind.value,
+            "boxes_xywh": value.boxes_xywh,
+            "reducer": value.reducer.value,
+            "valid_sites": validity_to_tree(value.valid_sites),
+        }
+    if isinstance(value, PerSitePsfFeature):
+        return {
+            "kind": value.kind.value,
+            "boxes_xywh": value.boxes_xywh,
             "kernels": value.kernels,
             "background": value.background.value,
             "background_padding": value.background_padding,
+            "valid_sites": validity_to_tree(value.valid_sites),
         }
-    if isinstance(value, UniformPsfReadoutModel):
+    if isinstance(value, UniformPsfFeature):
         return {
-            **common,
+            "kind": value.kind.value,
+            "boxes_xywh": value.boxes_xywh,
             "kernel": value.kernel,
             "background": value.background.value,
             "background_padding": value.background_padding,
+            "valid_sites": validity_to_tree(value.valid_sites),
         }
-    raise TypeError("value must be a closed ReadoutModel")
+    raise TypeError("value must be a closed ReadoutFeature")
 
 
-def readout_model_from_tree(tree: Any) -> ReadoutModel:
-    if not isinstance(tree, dict):
-        raise ValueError("ReadoutModel must be a mapping")
-    kind = _enum(ReadoutModelKind, tree.get("kind"), "model kind")
-    common = {"schema", "kind", "header", "boxes_xywh"}
+def _feature_from_tree(tree: Any, site_axis: AxisSpec) -> ReadoutFeature:
+    if not isinstance(tree, dict) or "kind" not in tree:
+        raise ValueError("readout feature must be a tagged mapping")
+    kind = _enum(ReadoutModelKind, tree["kind"], "feature.kind")
     if kind is ReadoutModelKind.BOX:
-        data = _exact_map(tree, common | {"reducer"}, READOUT_MODEL_SCHEMA)
-        value: ReadoutModel = BoxReadoutModel(
-            readout_model_header_from_tree(data["header"]),
-            _ndarray(data["boxes_xywh"], "boxes_xywh"),
-            _enum(BoxReducer, data["reducer"], "reducer"),
-        )
-    elif kind is ReadoutModelKind.PER_SITE_PSF:
-        data = _exact_map(
+        data = _fields(
             tree,
-            common | {"kernels", "background", "background_padding"},
-            READOUT_MODEL_SCHEMA,
+            {"kind", "boxes_xywh", "reducer", "valid_sites"},
+            "box feature",
         )
-        value = PerSitePsfReadoutModel(
-            readout_model_header_from_tree(data["header"]),
-            _ndarray(data["boxes_xywh"], "boxes_xywh"),
-            _ndarray(data["kernels"], "kernels"),
-            _enum(BackgroundMode, data["background"], "background"),
-            data["background_padding"],
+        return BoxFeature(
+            site_axis=site_axis,
+            boxes_xywh=_array(data["boxes_xywh"], "boxes_xywh"),
+            reducer=_enum(BoxReducer, data["reducer"], "reducer"),
+            valid_sites=_component_validity(data["valid_sites"], "valid_sites"),
         )
-    else:
-        data = _exact_map(
-            tree,
-            common | {"kernel", "background", "background_padding"},
-            READOUT_MODEL_SCHEMA,
+    common = {
+        "kind",
+        "boxes_xywh",
+        "background",
+        "background_padding",
+        "valid_sites",
+    }
+    if kind is ReadoutModelKind.PER_SITE_PSF:
+        data = _fields(tree, common | {"kernels"}, "per-site PSF feature")
+        return PerSitePsfFeature(
+            site_axis=site_axis,
+            boxes_xywh=_array(data["boxes_xywh"], "boxes_xywh"),
+            kernels=_array(data["kernels"], "kernels"),
+            background=_enum(BackgroundMode, data["background"], "background"),
+            background_padding=_int(data["background_padding"], "background_padding"),
+            valid_sites=_component_validity(data["valid_sites"], "valid_sites"),
         )
-        value = UniformPsfReadoutModel(
-            readout_model_header_from_tree(data["header"]),
-            _ndarray(data["boxes_xywh"], "boxes_xywh"),
-            _ndarray(data["kernel"], "kernel"),
-            _enum(BackgroundMode, data["background"], "background"),
-            data["background_padding"],
-        )
-    _canonical_tree(tree, readout_model_to_tree(value), READOUT_MODEL_SCHEMA)
-    return value
+    data = _fields(tree, common | {"kernel"}, "uniform PSF feature")
+    return UniformPsfFeature(
+        site_axis=site_axis,
+        boxes_xywh=_array(data["boxes_xywh"], "boxes_xywh"),
+        kernel=_array(data["kernel"], "kernel"),
+        background=_enum(BackgroundMode, data["background"], "background"),
+        background_padding=_int(data["background_padding"], "background_padding"),
+        valid_sites=_component_validity(data["valid_sites"], "valid_sites"),
+    )
 
 
-def calibration_artifact_to_tree(value: CalibrationArtifact) -> dict[str, Any]:
+def _model_to_tree(value: ReadoutModel) -> dict[str, Any]:
+    if not isinstance(value, ReadoutModel):
+        raise TypeError("value must be ReadoutModel")
+    return {
+        "feature": _feature_to_tree(value.feature),
+        "thresholds": value.thresholds,
+        "usable_sites": validity_to_tree(value.usable_sites),
+    }
+
+
+def _model_from_tree(tree: Any, site_axis: AxisSpec) -> ReadoutModel:
+    data = _fields(tree, {"feature", "thresholds", "usable_sites"}, "readout model")
+    return ReadoutModel(
+        feature=_feature_from_tree(data["feature"], site_axis),
+        thresholds=_array(data["thresholds"], "thresholds"),
+        usable_sites=_component_validity(data["usable_sites"], "usable_sites"),
+    )
+
+
+def _artifact_to_tree(value: CalibrationArtifact) -> dict[str, Any]:
     if not isinstance(value, CalibrationArtifact):
         raise TypeError("value must be CalibrationArtifact")
     return {
-        "schema": CALIBRATION_ARTIFACT_SCHEMA,
-        "source_binding": calibration_source_binding_to_tree(value.source_binding),
+        "format": CALIBRATION_ARTIFACT_FORMAT,
+        "source": _source_to_tree(value.source_binding),
         "frame_contract": frame_contract_to_tree(value.frame_contract),
-        "site_map": site_map_to_tree(value.site_map),
-        "models": [readout_model_to_tree(model) for model in value.models],
-        "default_model_kind": (
-            None
-            if value.default_model_kind is None
-            else value.default_model_kind.value
+        "readout_physical_context": readout_physical_context_to_tree(
+            value.readout_physical_context
         ),
-        "parameters": [_parameter_to_tree(item) for item in value.parameters],
+        "site_map": _site_map_to_tree(value.site_map),
+        "models": [_model_to_tree(model) for model in value.models],
+        "default_model_kind": value.default_model_kind.value,
     }
 
 
-def calibration_artifact_from_tree(tree: Any) -> CalibrationArtifact:
-    data = _exact_map(
+def _artifact_from_tree(tree: Any) -> CalibrationArtifact:
+    data = _outer_fields(
         tree,
         {
-            "schema",
-            "source_binding",
+            "format",
+            "source",
             "frame_contract",
+            "readout_physical_context",
             "site_map",
             "models",
             "default_model_kind",
-            "parameters",
         },
-        CALIBRATION_ARTIFACT_SCHEMA,
+        CALIBRATION_ARTIFACT_FORMAT,
     )
-    value = CalibrationArtifact(
-        calibration_source_binding_from_tree(data["source_binding"]),
-        frame_contract_from_tree(data["frame_contract"]),
-        site_map_from_tree(data["site_map"]),
-        tuple(readout_model_from_tree(item) for item in _list(data["models"], "models")),
-        (
+    site_map = _site_map_from_tree(data["site_map"])
+    return CalibrationArtifact(
+        source_binding=_source_from_tree(data["source"]),
+        frame_contract=frame_contract_from_tree(data["frame_contract"]),
+        readout_physical_context=readout_physical_context_from_tree(
+            data["readout_physical_context"]
+        ),
+        site_map=site_map,
+        models=tuple(
+            _model_from_tree(item, site_map.site_axis)
+            for item in _list(data["models"], "models")
+        ),
+        default_model_kind=_enum(
+            ReadoutModelKind,
+            data["default_model_kind"],
+            "default_model_kind",
+        ),
+    )
+
+
+def _request_to_tree(value: CalibrationAnalysisRequest) -> dict[str, Any]:
+    if not isinstance(value, CalibrationAnalysisRequest):
+        raise TypeError("value must be CalibrationAnalysisRequest")
+    return {
+        "layout": calibration_capture_layout_to_tree(value.layout),
+        "grid_shape_yx": list(value.grid_shape_yx),
+        "ordering": value.ordering.value,
+        "box_radius": value.box_radius,
+        "box_reducer": value.box_reducer.value,
+        "psf_half_width": value.psf_half_width,
+        "psf_background": value.psf_background.value,
+        "psf_background_padding": value.psf_background_padding,
+        "model_kinds": [kind.value for kind in value.model_kinds],
+        "default_model_kind": value.default_model_kind.value,
+        "train_fraction": value.train_fraction,
+        "split_seed": value.split_seed,
+        "histogram_bins": value.histogram_bins,
+        "minimum_site_fidelity": value.minimum_site_fidelity,
+        "max_drop": value.max_drop,
+        "detector_min_distance": value.detector_min_distance,
+        "detector_threshold_rel": value.detector_threshold_rel,
+        "detector_refine_half": value.detector_refine_half,
+        "expected_centers_xy": value.expected_centers_xy,
+        "maximum_site_residual_px": value.maximum_site_residual_px,
+    }
+
+
+def _request_from_tree(tree: Any) -> CalibrationAnalysisRequest:
+    fields = {
+        "layout",
+        "grid_shape_yx",
+        "ordering",
+        "box_radius",
+        "box_reducer",
+        "psf_half_width",
+        "psf_background",
+        "psf_background_padding",
+        "model_kinds",
+        "default_model_kind",
+        "train_fraction",
+        "split_seed",
+        "histogram_bins",
+        "minimum_site_fidelity",
+        "max_drop",
+        "detector_min_distance",
+        "detector_threshold_rel",
+        "detector_refine_half",
+        "expected_centers_xy",
+        "maximum_site_residual_px",
+    }
+    data = _fields(tree, fields, "calibration analysis request")
+    return CalibrationAnalysisRequest(
+        layout=calibration_capture_layout_from_tree(data["layout"]),
+        grid_shape_yx=_integer_pair(data["grid_shape_yx"], "grid_shape_yx"),
+        ordering=_enum(GridOrder, data["ordering"], "ordering"),
+        box_radius=_int(data["box_radius"], "box_radius"),
+        box_reducer=_enum(BoxReducer, data["box_reducer"], "box_reducer"),
+        psf_half_width=_int(data["psf_half_width"], "psf_half_width"),
+        psf_background=_enum(
+            BackgroundMode,
+            data["psf_background"],
+            "psf_background",
+        ),
+        psf_background_padding=_int(
+            data["psf_background_padding"],
+            "psf_background_padding",
+        ),
+        model_kinds=tuple(
+            _enum(ReadoutModelKind, item, "model_kinds entry")
+            for item in _list(data["model_kinds"], "model_kinds")
+        ),
+        default_model_kind=_enum(
+            ReadoutModelKind,
+            data["default_model_kind"],
+            "default_model_kind",
+        ),
+        train_fraction=_real(data["train_fraction"], "train_fraction"),
+        split_seed=_int(data["split_seed"], "split_seed"),
+        histogram_bins=_int(data["histogram_bins"], "histogram_bins"),
+        minimum_site_fidelity=_real(
+            data["minimum_site_fidelity"],
+            "minimum_site_fidelity",
+        ),
+        max_drop=_int(data["max_drop"], "max_drop"),
+        detector_min_distance=_optional_int(
+            data["detector_min_distance"],
+            "detector_min_distance",
+        ),
+        detector_threshold_rel=_real(
+            data["detector_threshold_rel"],
+            "detector_threshold_rel",
+        ),
+        detector_refine_half=_int(
+            data["detector_refine_half"],
+            "detector_refine_half",
+        ),
+        expected_centers_xy=(
             None
-            if data["default_model_kind"] is None
-            else _enum(
-                ReadoutModelKind,
-                data["default_model_kind"],
-                "default_model_kind",
-            )
+            if data["expected_centers_xy"] is None
+            else _array(data["expected_centers_xy"], "expected_centers_xy")
         ),
-        tuple(
-            _parameter_from_tree(item)
-            for item in _list(data["parameters"], "parameters")
+        maximum_site_residual_px=_optional_real(
+            data["maximum_site_residual_px"],
+            "maximum_site_residual_px",
         ),
     )
-    _canonical_tree(
+
+
+_BIMODAL_FLOATS = (
+    "threshold",
+    "fidelity",
+    "dark_mean",
+    "dark_sigma",
+    "bright_mean",
+    "bright_sigma",
+    "bright_fraction",
+    "dark_fidelity",
+    "bright_fidelity",
+)
+
+
+def _bimodal_to_tree(value: BimodalFit) -> dict[str, Any]:
+    if not isinstance(value, BimodalFit):
+        raise TypeError("value must be BimodalFit")
+    tree = {field: _real(getattr(value, field), field) for field in _BIMODAL_FLOATS}
+    tree.update(
+        {
+            "bright_above": _bool(value.bright_above, "bright_above"),
+            "ok": _bool(value.ok, "ok"),
+        }
+    )
+    return tree
+
+
+def _bimodal_from_tree(tree: Any) -> BimodalFit:
+    data = _fields(
         tree,
-        calibration_artifact_to_tree(value),
-        CALIBRATION_ARTIFACT_SCHEMA,
+        set(_BIMODAL_FLOATS) | {"bright_above", "ok"},
+        "bimodal fit",
     )
-    return value
-
-
-def encode_site_map(value: SiteMap) -> bytes:
-    return _encode_typed(value, site_map_to_tree)
-
-
-def encode_calibration_source_binding(value: CalibrationSourceBinding) -> bytes:
-    return _encode_typed(value, calibration_source_binding_to_tree)
-
-
-def decode_calibration_source_binding(
-    payload: bytes | bytearray | memoryview,
-) -> CalibrationSourceBinding:
-    return _decode_typed(
-        payload,
-        calibration_source_binding_from_tree,
-        calibration_source_binding_to_tree,
-        CALIBRATION_SOURCE_BINDING_SCHEMA,
+    values = {field: _real(data[field], field) for field in _BIMODAL_FLOATS}
+    return BimodalFit(
+        **values,
+        bright_above=_bool(data["bright_above"], "bright_above"),
+        ok=_bool(data["ok"], "ok"),
     )
 
 
-def _checked_payload(
-    payload: bytes | bytearray | memoryview,
-    resource_policy: CalibrationResourcePolicy,
-) -> bytes:
-    if not isinstance(resource_policy, CalibrationResourcePolicy):
-        raise TypeError("resource_policy must be CalibrationResourcePolicy")
-    if not isinstance(payload, (bytes, bytearray, memoryview)):
-        raise TypeError("calibration payload must be bytes-like")
-    size = payload.nbytes if isinstance(payload, memoryview) else len(payload)
-    if size > resource_policy.max_artifact_blob_bytes:
-        raise CalibrationResourceExceeded("calibration payload exceeds resource policy")
-    return bytes(payload)
+def _labels_to_tree(value: ReferenceLabels) -> dict[str, Any]:
+    if not isinstance(value, ReferenceLabels):
+        raise TypeError("value must be ReferenceLabels")
+    return {
+        "occupied": value.occupied,
+        "dark": value.dark,
+        "valid": value.valid,
+        "fits": [_bimodal_to_tree(item) for item in value.fits],
+        "n_reference_shots": value.n_reference_shots,
+    }
 
 
-def _resource_admission(resource_policy: CalibrationResourcePolicy):
-    """Return a canonical-structure admission hook with no wire-parser knowledge."""
+def _labels_from_tree(tree: Any) -> ReferenceLabels:
+    data = _fields(
+        tree,
+        {"occupied", "dark", "valid", "fits", "n_reference_shots"},
+        "reference labels",
+    )
+    return ReferenceLabels(
+        occupied=_array(data["occupied"], "occupied"),
+        dark=_array(data["dark"], "dark"),
+        valid=_array(data["valid"], "valid"),
+        fits=tuple(_bimodal_from_tree(item) for item in _list(data["fits"], "fits")),
+        n_reference_shots=_int(data["n_reference_shots"], "n_reference_shots"),
+    )
 
-    def admit(events) -> None:
-        model_count = next(
+
+def _split_to_tree(value: TrainTestSplit) -> dict[str, Any]:
+    if not isinstance(value, TrainTestSplit):
+        raise TypeError("value must be TrainTestSplit")
+    return {
+        "train": value.train,
+        "test": value.test,
+        "seed": value.seed,
+        "train_fraction": value.train_fraction,
+    }
+
+
+def _split_from_tree(tree: Any) -> TrainTestSplit:
+    data = _fields(tree, {"train", "test", "seed", "train_fraction"}, "train/test split")
+    return TrainTestSplit(
+        train=_array(data["train"], "train"),
+        test=_array(data["test"], "test"),
+        seed=_int(data["seed"], "seed"),
+        train_fraction=_real(data["train_fraction"], "train_fraction"),
+    )
+
+
+_SITE_FIDELITY_FLOATS = (
+    "threshold",
+    "fidelity",
+    "fidelity_dark",
+    "fidelity_bright",
+    "model_fidelity",
+    "dark_mean",
+    "dark_sigma",
+    "bright_mean",
+    "bright_sigma",
+)
+_SITE_FIDELITY_INTS = ("site", "n_test", "n_train_dark", "n_train_bright")
+
+
+def _site_fidelity_to_tree(value: SiteFidelity) -> dict[str, Any]:
+    if not isinstance(value, SiteFidelity):
+        raise TypeError("value must be SiteFidelity")
+    tree = {field: _real(getattr(value, field), field) for field in _SITE_FIDELITY_FLOATS}
+    tree.update({field: _int(getattr(value, field), field) for field in _SITE_FIDELITY_INTS})
+    tree["bright_above"] = _bool(value.bright_above, "bright_above")
+    return tree
+
+
+def _site_fidelity_from_tree(tree: Any) -> SiteFidelity:
+    fields = set(_SITE_FIDELITY_FLOATS) | set(_SITE_FIDELITY_INTS) | {"bright_above"}
+    data = _fields(tree, fields, "site fidelity")
+    values = {field: _real(data[field], field) for field in _SITE_FIDELITY_FLOATS}
+    values.update({field: _int(data[field], field) for field in _SITE_FIDELITY_INTS})
+    return SiteFidelity(
+        **values,
+        bright_above=_bool(data["bright_above"], "bright_above"),
+    )
+
+
+def _ablation_to_tree(value: AblationPoint) -> dict[str, Any]:
+    if not isinstance(value, AblationPoint):
+        raise TypeError("value must be AblationPoint")
+    return {
+        "drop_worst_k": value.drop_worst_k,
+        "excluded_sites": value.excluded_sites,
+        "fidelity": _real(value.fidelity, "fidelity"),
+        "errors": value.errors,
+        "n_valid": value.n_valid,
+    }
+
+
+def _ablation_from_tree(tree: Any) -> AblationPoint:
+    data = _fields(
+        tree,
+        {"drop_worst_k", "excluded_sites", "fidelity", "errors", "n_valid"},
+        "ablation point",
+    )
+    return AblationPoint(
+        drop_worst_k=_int(data["drop_worst_k"], "drop_worst_k"),
+        excluded_sites=_array(data["excluded_sites"], "excluded_sites"),
+        fidelity=_real(data["fidelity"], "fidelity"),
+        errors=_int(data["errors"], "errors"),
+        n_valid=_int(data["n_valid"], "n_valid"),
+    )
+
+
+def _model_report_to_tree(value: ModelCalibrationReport) -> dict[str, Any]:
+    if not isinstance(value, ModelCalibrationReport):
+        raise TypeError("value must be ModelCalibrationReport")
+    return {
+        "kind": value.kind.value,
+        "quick_thresholds": value.quick_thresholds,
+        "short_signals": value.short_signals,
+        "short_validity": value.short_validity,
+        "bin_edges": value.bin_edges,
+        "predictions": value.predictions,
+        "site_fidelity": [_site_fidelity_to_tree(item) for item in value.site_fidelity],
+        "aggregate_fidelity": _real(value.aggregate_fidelity, "aggregate_fidelity"),
+        "global_threshold": _real(value.global_threshold, "global_threshold"),
+        "global_bright_above": _bool(
+            value.global_bright_above,
+            "global_bright_above",
+        ),
+        "global_fidelity": _real(value.global_fidelity, "global_fidelity"),
+        "ablation": [_ablation_to_tree(item) for item in value.ablation],
+    }
+
+
+def _model_report_from_tree(tree: Any) -> ModelCalibrationReport:
+    fields = {
+        "kind",
+        "quick_thresholds",
+        "short_signals",
+        "short_validity",
+        "bin_edges",
+        "predictions",
+        "site_fidelity",
+        "aggregate_fidelity",
+        "global_threshold",
+        "global_bright_above",
+        "global_fidelity",
+        "ablation",
+    }
+    data = _fields(tree, fields, "model calibration report")
+    return ModelCalibrationReport(
+        kind=_enum(ReadoutModelKind, data["kind"], "kind"),
+        quick_thresholds=_array(data["quick_thresholds"], "quick_thresholds"),
+        short_signals=_array(data["short_signals"], "short_signals"),
+        short_validity=_array(data["short_validity"], "short_validity"),
+        bin_edges=_array(data["bin_edges"], "bin_edges"),
+        predictions=_array(data["predictions"], "predictions"),
+        site_fidelity=tuple(
+            _site_fidelity_from_tree(item)
+            for item in _list(data["site_fidelity"], "site_fidelity")
+        ),
+        aggregate_fidelity=_real(data["aggregate_fidelity"], "aggregate_fidelity"),
+        global_threshold=_real(data["global_threshold"], "global_threshold"),
+        global_bright_above=_bool(
+            data["global_bright_above"],
+            "global_bright_above",
+        ),
+        global_fidelity=_real(data["global_fidelity"], "global_fidelity"),
+        ablation=tuple(
+            _ablation_from_tree(item) for item in _list(data["ablation"], "ablation")
+        ),
+    )
+
+
+def _psf_fit_to_tree(value: PsfFitDiagnostic) -> dict[str, Any]:
+    if not isinstance(value, PsfFitDiagnostic):
+        raise TypeError("value must be PsfFitDiagnostic")
+    return {
+        "site": _int(value.site, "site"),
+        "center_xy": [_real(item, "center_xy entry") for item in value.center_xy],
+        "sigma_xy": [_real(item, "sigma_xy entry") for item in value.sigma_xy],
+        "fit_ok": _bool(value.fit_ok, "fit_ok"),
+    }
+
+
+def _psf_fit_from_tree(tree: Any) -> PsfFitDiagnostic:
+    data = _fields(tree, {"site", "center_xy", "sigma_xy", "fit_ok"}, "PSF fit diagnostic")
+    return PsfFitDiagnostic(
+        site=_int(data["site"], "site"),
+        center_xy=_real_pair(data["center_xy"], "center_xy"),
+        sigma_xy=_real_pair(data["sigma_xy"], "sigma_xy"),
+        fit_ok=_bool(data["fit_ok"], "fit_ok"),
+    )
+
+
+def _lineage_to_tree(value: tuple[tuple[str, str], ...]) -> list[list[str]]:
+    return [
+        [_text(name, "software lineage name"), _text(version, "software lineage version")]
+        for name, version in value
+    ]
+
+
+def _lineage_from_tree(tree: Any) -> tuple[tuple[str, str], ...]:
+    pairs = []
+    for index, item in enumerate(_list(tree, "software_lineage")):
+        values = _list(item, f"software_lineage[{index}]")
+        if len(values) != 2:
+            raise ValueError(f"software_lineage[{index}] must contain name and version")
+        pairs.append(
             (
-                event.length
-                for event in events
-                if isinstance(event, CanonicalListEvent) and event.path == ("models",)
-            ),
-            None,
+                _text(values[0], f"software_lineage[{index}].name"),
+                _text(values[1], f"software_lineage[{index}].version"),
+            )
         )
-        if model_count is not None and model_count > resource_policy.max_models:
-            raise CalibrationResourceExceeded(
-                "calibration model count exceeds resource policy"
-            )
-        kernel_elements = 0
-        site_array_suffixes = (
-            "coordinates_xy",
-            "thresholds",
-            "occupied_above_thresholds",
-            "dark_training_sample_counts",
-            "bright_training_sample_counts",
-            "held_out_dark_success_counts",
-            "held_out_dark_total_counts",
-            "held_out_dark_labeled_counts",
-            "held_out_bright_success_counts",
-            "held_out_bright_total_counts",
-            "held_out_bright_labeled_counts",
-            "held_out_dark_accuracy_lower_bounds",
-            "held_out_bright_accuracy_lower_bounds",
-            "held_out_fidelity",
-            "boxes_xywh",
-            "kernels",
-            "mask",
-        )
-        arrays = tuple(
-            event for event in events if isinstance(event, CanonicalArrayEvent)
-        )
-        # A closed calibration model has a small fixed number of arrays.  This
-        # generic upper bound prevents unknown-field arrays from amplifying a
-        # compact wire payload into thousands of NumPy objects before the typed
-        # exact-field decoder rejects them.
-        if len(arrays) > 16 + 16 * resource_policy.max_models:
-            raise CalibrationResourceExceeded(
-                "calibration ndarray count exceeds resource policy"
-            )
-        if sum(event.nbytes for event in arrays) > resource_policy.max_artifact_blob_bytes:
-            raise CalibrationResourceExceeded(
-                "calibration ndarray bytes exceed resource policy"
-            )
-        for event in arrays:
-            field_name = event.path[-1] if event.path else None
-            if event.shape and field_name in site_array_suffixes:
-                if event.shape[0] > resource_policy.max_sites:
-                    raise CalibrationResourceExceeded(
-                        "calibration site count exceeds resource policy"
-                    )
-            if field_name in ("kernels", "kernel"):
-                kernel_elements += event.nbytes // np.dtype(event.dtype).itemsize
-        if kernel_elements > resource_policy.max_kernel_elements:
-            raise CalibrationResourceExceeded(
-                "calibration kernel elements exceed resource policy"
-            )
-
-    return admit
+    return tuple(pairs)
 
 
-def decode_site_map(
-    payload: bytes | bytearray | memoryview,
+def _group_contexts_to_tree(
+    contexts: tuple[tuple[tuple[AxisId, int], ...], ...],
+) -> list[list[list[Any]]]:
+    return [
+        [[axis_id.value, index] for axis_id, index in context]
+        for context in contexts
+    ]
+
+
+def _group_contexts_from_tree(
+    tree: Any,
+) -> tuple[tuple[tuple[AxisId, int], ...], ...]:
+    contexts = []
+    for group, raw_context in enumerate(_list(tree, "group_contexts")):
+        context = []
+        for item_index, raw_item in enumerate(
+            _list(raw_context, f"group_contexts[{group}]")
+        ):
+            item = _list(raw_item, f"group_contexts[{group}][{item_index}]")
+            if len(item) != 2:
+                raise ValueError("group context entries must contain axis id and index")
+            context.append(
+                (
+                    AxisId(_text(item[0], "group context axis id")),
+                    _int(item[1], "group context index"),
+                )
+            )
+        contexts.append(tuple(context))
+    return tuple(contexts)
+
+
+_REPORT_FIELDS = {
+    "format",
+    "request",
+    "software_lineage",
+    "group_contexts",
+    "reference_average_blob",
+    "reference_average_validity_blob",
+    "reference_box_signals",
+    "labels",
+    "split",
+    "psf_fits",
+    "models",
+}
+
+
+def _report_to_tree(
+    value: CalibrationReport,
+    reference_average_blob: ContentRef,
+    reference_average_validity_blob: ContentRef,
+) -> dict[str, Any]:
+    if not isinstance(value, CalibrationReport):
+        raise TypeError("value must be CalibrationReport")
+    if not isinstance(reference_average_blob, ContentRef):
+        raise TypeError("reference_average_blob must be ContentRef")
+    if not isinstance(reference_average_validity_blob, ContentRef):
+        raise TypeError("reference_average_validity_blob must be ContentRef")
+    if reference_average_blob.size != value.reference_average.nbytes:
+        raise ValueError("reference_average_blob size differs from the report image")
+    if reference_average_validity_blob.size != value.reference_average_validity.nbytes:
+        raise ValueError(
+            "reference_average_validity_blob size differs from the report mask"
+        )
+    return {
+        "format": CALIBRATION_REPORT_FORMAT,
+        "request": _request_to_tree(value.request),
+        "software_lineage": _lineage_to_tree(value.software_lineage),
+        "group_contexts": _group_contexts_to_tree(value.group_contexts),
+        "reference_average_blob": content_ref_to_tree(reference_average_blob),
+        "reference_average_validity_blob": content_ref_to_tree(
+            reference_average_validity_blob
+        ),
+        "reference_box_signals": value.reference_box_signals,
+        "labels": _labels_to_tree(value.labels),
+        "split": _split_to_tree(value.split),
+        "psf_fits": [_psf_fit_to_tree(item) for item in value.psf_fits],
+        "models": [_model_report_to_tree(item) for item in value.models],
+    }
+
+
+def _report_data(tree: Any) -> dict[str, Any]:
+    return _outer_fields(tree, _REPORT_FIELDS, CALIBRATION_REPORT_FORMAT)
+
+
+def _report_from_tree(
+    tree: Any,
     *,
-    resource_policy: CalibrationResourcePolicy = DEFAULT_CALIBRATION_RESOURCE_POLICY,
-) -> SiteMap:
-    raw = _checked_payload(payload, resource_policy)
-    value = _decode_typed(
-        raw,
-        site_map_from_tree,
-        site_map_to_tree,
-        SITE_MAP_SCHEMA,
-        admit_structure=_resource_admission(resource_policy),
+    reference_average: np.ndarray,
+    reference_average_validity: np.ndarray,
+) -> CalibrationReport:
+    data = _report_data(tree)
+    content_ref_from_tree(data["reference_average_blob"])
+    content_ref_from_tree(data["reference_average_validity_blob"])
+    return CalibrationReport(
+        request=_request_from_tree(data["request"]),
+        software_lineage=_lineage_from_tree(data["software_lineage"]),
+        group_contexts=_group_contexts_from_tree(data["group_contexts"]),
+        reference_average=reference_average,
+        reference_average_validity=reference_average_validity,
+        reference_box_signals=_array(
+            data["reference_box_signals"],
+            "reference_box_signals",
+        ),
+        labels=_labels_from_tree(data["labels"]),
+        split=_split_from_tree(data["split"]),
+        psf_fits=tuple(
+            _psf_fit_from_tree(item) for item in _list(data["psf_fits"], "psf_fits")
+        ),
+        models=tuple(
+            _model_report_from_tree(item) for item in _list(data["models"], "models")
+        ),
     )
-    if value.site_axis.size > resource_policy.max_sites:
-        raise CalibrationResourceExceeded("SiteMap site count exceeds resource policy")
-    return value
-
-
-def encode_readout_model(value: ReadoutModel) -> bytes:
-    return _encode_typed(value, readout_model_to_tree)
-
-
-def decode_readout_model(
-    payload: bytes | bytearray | memoryview,
-    *,
-    resource_policy: CalibrationResourcePolicy = DEFAULT_CALIBRATION_RESOURCE_POLICY,
-) -> ReadoutModel:
-    raw = _checked_payload(payload, resource_policy)
-    value = _decode_typed(
-        raw,
-        readout_model_from_tree,
-        readout_model_to_tree,
-        READOUT_MODEL_SCHEMA,
-        admit_structure=_resource_admission(resource_policy),
-    )
-    if value.header.site_count > resource_policy.max_sites:
-        raise CalibrationResourceExceeded("readout model site count exceeds resource policy")
-    kernel_elements = (
-        int(value.kernels.size)
-        if isinstance(value, PerSitePsfReadoutModel)
-        else int(value.kernel.size)
-        if isinstance(value, UniformPsfReadoutModel)
-        else 0
-    )
-    if kernel_elements > resource_policy.max_kernel_elements:
-        raise CalibrationResourceExceeded("readout model kernels exceed resource policy")
-    return value
 
 
 def encode_calibration_artifact(value: CalibrationArtifact) -> bytes:
-    return _encode_typed(value, calibration_artifact_to_tree)
-
-
-def calibration_artifact_metadata_encoding_upper_bound(
-    *,
-    source_binding: CalibrationSourceBinding,
-    frame_contract: FrameContract,
-    artifact_parameters: tuple[CalibrationParameter, ...],
-    model_parameters: tuple[tuple[CalibrationParameter, ...], ...],
-    model_kinds: tuple[ReadoutModelKind, ...],
-    default_model_kind: ReadoutModelKind | None,
-) -> int:
-    """Bound every non-array artifact byte from its frozen owner values.
-
-    External camera/schema/source text is deliberately measured from the
-    owner projections instead of hidden behind a fixed allowance.  The small
-    fixed envelopes cover only codec-owned field names, schemas, model kinds,
-    quality-gate identifiers, and scalar wrappers.
-    """
-
-    if not isinstance(source_binding, CalibrationSourceBinding):
-        raise TypeError("source_binding must be CalibrationSourceBinding")
-    if not isinstance(frame_contract, FrameContract):
-        raise TypeError("frame_contract must be FrameContract")
-    if default_model_kind is not None and not isinstance(
-        default_model_kind,
-        ReadoutModelKind,
-    ):
-        raise TypeError("default_model_kind must be ReadoutModelKind or None")
-    artifact_parameters = tuple(artifact_parameters)
-    model_parameters = tuple(tuple(items) for items in model_parameters)
-    model_kinds = tuple(model_kinds)
-    if any(not isinstance(item, CalibrationParameter) for item in artifact_parameters):
-        raise TypeError("artifact_parameters must contain CalibrationParameter")
-    if not model_kinds or any(
-        not isinstance(item, ReadoutModelKind) for item in model_kinds
-    ):
-        raise TypeError("model_kinds must contain ReadoutModelKind")
-    if len(set(model_kinds)) != len(model_kinds):
-        raise ValueError("model_kinds must be unique")
-    if default_model_kind is not None and default_model_kind not in model_kinds:
-        raise ValueError("default_model_kind must name one supplied model kind")
-    if len(model_parameters) != len(model_kinds) or any(
-        any(not isinstance(item, CalibrationParameter) for item in items)
-        for items in model_parameters
-    ):
-        raise TypeError(
-            "model_parameters must contain one CalibrationParameter tuple per model"
-        )
-    projected = {
-        "source_binding": calibration_source_binding_to_tree(source_binding),
-        "frame_contract": frame_contract_to_tree(frame_contract),
-        "site_coordinate_frame": frame_contract.coordinate_frame.value,
-        "artifact_parameters": [
-            _parameter_to_tree(item) for item in artifact_parameters
-        ],
-        "models": [
-            {
-                "kind": kind.value,
-                "parameters": [
-                    _parameter_to_tree(item) for item in parameters
-                ],
-            }
-            for kind, parameters in zip(
-                model_kinds,
-                model_parameters,
-                strict=True,
-            )
-        ],
-        "default_model_kind": (
-            None
-            if default_model_kind is None
-            else default_model_kind.value
-        ),
-    }
-    return len(encode(projected)) + 12 * 1024 + 6 * 1024 * len(model_kinds)
-
-
-def calibration_artifact_encoding_upper_bound(
-    *,
-    site_count: int,
-    model_count: int,
-    kernel_elements: int,
-    metadata_encoding_upper_bound_bytes: int,
-) -> int:
-    """Conservatively bound the current artifact wire representation.
-
-    The calibration codec owns this estimate because it owns both the closed
-    artifact tree and its canonical encoding.  The raw-array term includes the
-    SiteMap, every per-site model/quality vector, extraction boxes, and all PSF
-    kernels.  Two wire bytes per raw byte cover base64 expansion plus canonical
-    array framing.
-    The fixed and per-model envelopes cover axes, parameters, schemas, and
-    scalar metadata.  Boundary tests compare real encodings with
-    this estimate so schema growth cannot silently outrun repository preflight.
-    """
-
-    values = {
-        "site_count": site_count,
-        "model_count": model_count,
-        "kernel_elements": kernel_elements,
-        "metadata_encoding_upper_bound_bytes": (
-            metadata_encoding_upper_bound_bytes
-        ),
-    }
-    for name, value in values.items():
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f"{name} must be an integer")
-        if value < 0:
-            raise ValueError(f"{name} must be non-negative")
-    # SiteMap coordinates+validity: 17 bytes/site.  Each model carries
-    # thresholds, direction, eight uint64 evidence vectors, three float64
-    # quality vectors, two validity masks, and four int64 box coordinates:
-    # 131 bytes/site/model.  Kernels are canonical little-endian float64.
-    raw_array_bytes = (
-        17 * site_count
-        + 131 * site_count * model_count
-        + 8 * kernel_elements
-    )
-    return metadata_encoding_upper_bound_bytes + 2 * raw_array_bytes
-
-
-def calibration_artifact_encoding_working_upper_bound(
-    retained_array_bytes: int,
-    metadata_encoding_upper_bound_bytes: int,
-) -> int:
-    """Bound transient canonical-encoding memory above retained artifact arrays.
-
-    Canonical ndarray encoding can simultaneously hold a normalized byte copy,
-    base64 text, the tagged JSON tree, its rendered string, and final UTF-8
-    bytes.  Profiling across power-of-two float64 kernels measures roughly
-    4.67x raw transient memory.  Six times retained bytes plus a fixed envelope
-    is the current fail-closed owner contract.
-    """
-
-    if isinstance(retained_array_bytes, bool) or not isinstance(
-        retained_array_bytes,
-        int,
-    ):
-        raise TypeError("retained_array_bytes must be an integer")
-    if retained_array_bytes < 0:
-        raise ValueError("retained_array_bytes must be non-negative")
-    if isinstance(metadata_encoding_upper_bound_bytes, bool) or not isinstance(
-        metadata_encoding_upper_bound_bytes,
-        int,
-    ):
-        raise TypeError("metadata_encoding_upper_bound_bytes must be an integer")
-    if metadata_encoding_upper_bound_bytes < 0:
-        raise ValueError(
-            "metadata_encoding_upper_bound_bytes must be non-negative"
-        )
-    return (
-        6 * retained_array_bytes
-        + 12 * metadata_encoding_upper_bound_bytes
-        + 1024 * 1024
-    )
+    return encode(_artifact_to_tree(value))
 
 
 def decode_calibration_artifact(
     payload: bytes | bytearray | memoryview,
-    *,
-    resource_policy: CalibrationResourcePolicy = DEFAULT_CALIBRATION_RESOURCE_POLICY,
 ) -> CalibrationArtifact:
-    raw = _checked_payload(payload, resource_policy)
-    value = _decode_typed(
-        raw,
-        calibration_artifact_from_tree,
-        calibration_artifact_to_tree,
-        CALIBRATION_ARTIFACT_SCHEMA,
-        admit_structure=_resource_admission(resource_policy),
+    return _decode_typed(
+        payload,
+        _artifact_from_tree,
+        _artifact_to_tree,
+        CALIBRATION_ARTIFACT_FORMAT,
     )
-    validate_calibration_artifact_resources(value, resource_policy)
-    return value
+
+
+def encode_calibration_report_metadata(
+    value: CalibrationReport,
+    *,
+    reference_average_blob: ContentRef,
+    reference_average_validity_blob: ContentRef,
+) -> bytes:
+    return encode(
+        _report_to_tree(
+            value,
+            reference_average_blob,
+            reference_average_validity_blob,
+        )
+    )
+
+
+def calibration_report_blob_refs(
+    payload: bytes | bytearray | memoryview,
+) -> tuple[ContentRef, ContentRef]:
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise TypeError("calibration report payload must be bytes-like")
+    data = _report_data(decode(payload, limits=_REPORT_DECODE_LIMITS))
+    return (
+        content_ref_from_tree(data["reference_average_blob"]),
+        content_ref_from_tree(data["reference_average_validity_blob"]),
+    )
+
+
+def _report_image_bytes(
+    value: np.ndarray,
+    dtype: str,
+    field: str,
+    finite: bool,
+) -> bytes:
+    array = np.asarray(value)
+    if (
+        array.dtype != np.dtype(dtype)
+        or array.ndim != 2
+        or not array.flags.c_contiguous
+        or (finite and not np.all(np.isfinite(array)))
+    ):
+        qualifier = "finite " if finite else ""
+        raise ValueError(f"{field} must be a {qualifier}C-contiguous {dtype} image")
+    return array.tobytes(order="C")
+
+
+def encode_calibration_reference_average(value: np.ndarray) -> bytes:
+    return _report_image_bytes(value, "<f8", "reference_average", True)
+
+
+def encode_calibration_reference_average_validity(value: np.ndarray) -> bytes:
+    return _report_image_bytes(value, "bool", "reference_average_validity", False)
+
+
+def decode_calibration_report_arrays(
+    reference_average_payload: bytes | bytearray | memoryview,
+    reference_average_validity_payload: bytes | bytearray | memoryview,
+    *,
+    image_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    if (
+        not isinstance(reference_average_payload, (bytes, bytearray, memoryview))
+        or not isinstance(
+            reference_average_validity_payload,
+            (bytes, bytearray, memoryview),
+        )
+    ):
+        raise TypeError("calibration report array payloads must be bytes-like")
+    try:
+        raw_shape = tuple(image_shape)
+    except TypeError as exc:
+        raise ValueError("image_shape must contain two positive integers") from exc
+    if len(raw_shape) != 2 or any(
+        isinstance(size, bool) or not isinstance(size, Integral) or size <= 0
+        for size in raw_shape
+    ):
+        raise ValueError("image_shape must contain two positive integers")
+    shape = tuple(int(size) for size in raw_shape)
+    pixel_count = shape[0] * shape[1]
+    average_payload = bytes(reference_average_payload)
+    validity_payload = bytes(reference_average_validity_payload)
+    if len(average_payload) != pixel_count * np.dtype("<f8").itemsize:
+        raise ValueError("reference_average payload size differs from image_shape")
+    if len(validity_payload) != pixel_count:
+        raise ValueError(
+            "reference_average_validity payload size differs from image_shape"
+        )
+    average = np.frombuffer(average_payload, dtype="<f8").reshape(shape)
+    validity_bytes = np.frombuffer(validity_payload, dtype="uint8")
+    if np.any(validity_bytes > 1):
+        raise ValueError("reference_average_validity payload is not canonical boolean")
+    validity = validity_bytes.view("bool").reshape(shape)
+    if not np.all(np.isfinite(average)):
+        raise ValueError("reference_average payload contains non-finite values")
+    average.setflags(write=False)
+    validity.setflags(write=False)
+    return average, validity
+
+
+def decode_calibration_report(
+    payload: bytes | bytearray | memoryview,
+    *,
+    reference_average: np.ndarray,
+    reference_average_validity: np.ndarray,
+) -> CalibrationReport:
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise TypeError("calibration report payload must be bytes-like")
+    raw = bytes(payload)
+    tree = decode(raw, limits=_REPORT_DECODE_LIMITS)
+    data = _report_data(tree)
+    average_blob = content_ref_from_tree(data["reference_average_blob"])
+    validity_blob = content_ref_from_tree(data["reference_average_validity_blob"])
+    report = _report_from_tree(
+        tree,
+        reference_average=reference_average,
+        reference_average_validity=reference_average_validity,
+    )
+    if encode(
+        _report_to_tree(report, average_blob, validity_blob)
+    ) != raw:
+        raise ValueError("calibration report payload is typed but non-canonical")
+    return report
 
 
 __all__ = [
-    "CALIBRATION_ARTIFACT_SCHEMA",
-    "CALIBRATION_SOURCE_BINDING_SCHEMA",
-    "READOUT_MODEL_HEADER_SCHEMA",
-    "READOUT_MODEL_QUALITY_SCHEMA",
-    "READOUT_MODEL_SCHEMA",
-    "SITE_MAP_SCHEMA",
-    "CalibrationCodecError",
-    "calibration_artifact_from_tree",
-    "calibration_artifact_metadata_encoding_upper_bound",
-    "calibration_artifact_encoding_upper_bound",
-    "calibration_artifact_encoding_working_upper_bound",
-    "calibration_artifact_to_tree",
-    "calibration_source_binding_from_tree",
-    "calibration_source_binding_to_tree",
+    "CALIBRATION_ARTIFACT_FORMAT",
+    "CALIBRATION_REPORT_FORMAT",
     "decode_calibration_artifact",
-    "decode_calibration_source_binding",
-    "decode_readout_model",
-    "decode_site_map",
+    "decode_calibration_report",
+    "decode_calibration_report_arrays",
     "encode_calibration_artifact",
-    "encode_calibration_source_binding",
-    "encode_readout_model",
-    "encode_site_map",
-    "readout_model_from_tree",
-    "readout_model_header_from_tree",
-    "readout_model_header_to_tree",
-    "readout_model_quality_from_tree",
-    "readout_model_quality_to_tree",
-    "readout_model_to_tree",
-    "site_map_from_tree",
-    "site_map_to_tree",
+    "encode_calibration_reference_average",
+    "encode_calibration_reference_average_validity",
+    "encode_calibration_report_metadata",
+    "calibration_report_blob_refs",
 ]

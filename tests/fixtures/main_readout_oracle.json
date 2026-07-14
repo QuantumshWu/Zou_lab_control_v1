@@ -32,6 +32,13 @@
     "max_drop": 5,
     "readout_exposure_seconds": 0.005
   },
+  "box_reducer_oracle": {
+    "source": "input_reference_frames[0,0] with box_boxes_xywh",
+    "mean": [23.908570721459004, 24.51158215529408, 25.856227433349773, 10.415658528387665, 27.453251103183568, 27.798303845894115],
+    "sum": [215.17713649313103, 220.6042393976467, 232.70604690014795, 93.74092675548899, 247.0792599286521, 250.18473461304703],
+    "median": [22.79770188144567, 17.800009284218998, 22.04449664870946, 10.422826109399063, 23.92282443069747, 23.0658519544236],
+    "max": [44.01657081631366, 41.71000709133889, 49.80572786297182, 11.117498601594095, 53.71101604192, 52.18471173016414]
+  },
   "scope": "Detector, three feature models, quick thresholds, strict-consensus labels, split, empirical thresholds, held-out/model fidelity, drop-worst, threshold writeback, and runtime occupancy.",
-  "excluded_from_equivalence": "Known main defects involving non-finite validity and reversed fluorescence polarity are tested separately as intentional corrections."
+  "excluded_from_equivalence": "Four intentional corrections are tested separately: invalid/non-finite propagation, reversed fluorescence polarity rejection, chance-level site disabling, and complete FrameContract applicability."
 }

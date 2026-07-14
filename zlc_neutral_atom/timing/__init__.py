@@ -1,79 +1,8 @@
-"""Neutral-atom pulse execution contracts."""
+"""Neutral-atom timing domain.
 
-from .capture import (
-    compile_triggered_pipeline,
-    TriggeredCaptureSpec,
-    TriggeredPipelineResult,
-)
-from .occupancy import (
-    compile_triggered_occupancy_pipeline,
-    TriggeredOccupancyPipelineResult,
-    TriggeredOccupancySpec,
-)
-from .capture_plan import (
-    COMPILED_CAPTURE_CELL_PLAN_SCHEMA,
-    CaptureCellAssignment,
-    CompiledCaptureCellPlan,
-    compile_capture_cell_plan,
-    compiled_capture_cell_plan_from_tree,
-    compiled_capture_cell_plan_to_tree,
-    decode_compiled_capture_cell_plan,
-    encode_compiled_capture_cell_plan,
-    repeat_major_capture_grouping,
-)
-from .pulse import (
-    BoundPulsePort,
-    CompletePulseCommand,
-    FinitePulseExecutionRequest,
-    FirePulseCommand,
-    PreparePulseCommand,
-    PulseFiredAck,
-    PulsePreparedAck,
-    PULSE_TERMINAL_ACK_SCHEMA,
-    PulseSession,
-    PulseSessionState,
-    PulseTerminalAck,
-    PulseTerminalEvidenceKind,
-    PulseTerminalReceipt,
-    SimulatedPulseReceipt,
-    pulse_terminal_ack_from_tree,
-    pulse_terminal_ack_to_tree,
-    validate_pulse_terminal_for_artifact,
-    SequencerCapabilitySnapshot,
-)
+Import values from their owning leaf module.  Keeping this package boundary
+empty prevents an ordinary capture or pulse import from loading triggered
+occupancy and its readout pipeline as an unrelated side effect.
+"""
 
-__all__ = [
-    "BoundPulsePort",
-    "COMPILED_CAPTURE_CELL_PLAN_SCHEMA",
-    "CaptureCellAssignment",
-    "CompiledCaptureCellPlan",
-    "CompletePulseCommand",
-    "FinitePulseExecutionRequest",
-    "FirePulseCommand",
-    "PreparePulseCommand",
-    "PulseFiredAck",
-    "PulsePreparedAck",
-    "PULSE_TERMINAL_ACK_SCHEMA",
-    "PulseSession",
-    "PulseSessionState",
-    "PulseTerminalAck",
-    "PulseTerminalEvidenceKind",
-    "PulseTerminalReceipt",
-    "pulse_terminal_ack_from_tree",
-    "pulse_terminal_ack_to_tree",
-    "validate_pulse_terminal_for_artifact",
-    "SequencerCapabilitySnapshot",
-    "SimulatedPulseReceipt",
-    "compile_triggered_pipeline",
-    "compile_capture_cell_plan",
-    "compiled_capture_cell_plan_from_tree",
-    "compiled_capture_cell_plan_to_tree",
-    "decode_compiled_capture_cell_plan",
-    "encode_compiled_capture_cell_plan",
-    "repeat_major_capture_grouping",
-    "TriggeredCaptureSpec",
-    "TriggeredPipelineResult",
-    "compile_triggered_occupancy_pipeline",
-    "TriggeredOccupancyPipelineResult",
-    "TriggeredOccupancySpec",
-]
+__all__: tuple[str, ...] = ()
