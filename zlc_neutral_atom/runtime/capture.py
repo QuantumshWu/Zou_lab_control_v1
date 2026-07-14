@@ -88,6 +88,12 @@ class CameraPhysicalFacts:
     snapshot.  A later binding may name event indices, but it cannot change the
     physical trigger wiring, exposure, gain, readout mode, geometry, identity,
     dtype, or unit attested by this capability.
+
+    ``required_external_trigger_interval_seconds == 0`` means the adapter has
+    no additional measured lower bound to assert.  It is not a claim that the
+    physical camera has unlimited trigger bandwidth.  A ``None`` integration
+    start offset is likewise an explicit unqualified fact; consumers must not
+    reinterpret it as zero.
     """
 
     camera_identity: str
@@ -104,6 +110,8 @@ class CameraPhysicalFacts:
     dtype: np.dtype
     count_unit: str
     exposure_seconds: float
+    required_external_trigger_interval_seconds: float
+    external_trigger_integration_start_offset_seconds: float | None
     gain: float
     readout_mode: str
     opaque_frame_settings_fingerprint: str
@@ -152,6 +160,40 @@ class CameraPhysicalFacts:
             self,
             "exposure_seconds",
             _positive_finite(self.exposure_seconds, "exposure_seconds"),
+        )
+        interval = self.required_external_trigger_interval_seconds
+        if (
+            isinstance(interval, bool)
+            or not isinstance(interval, (int, float))
+            or not math.isfinite(float(interval))
+            or float(interval) < 0
+        ):
+            raise ValueError(
+                "required_external_trigger_interval_seconds must be finite "
+                "and non-negative"
+            )
+        object.__setattr__(
+            self,
+            "required_external_trigger_interval_seconds",
+            float(interval),
+        )
+        integration_offset = self.external_trigger_integration_start_offset_seconds
+        if integration_offset is not None:
+            if (
+                isinstance(integration_offset, bool)
+                or not isinstance(integration_offset, (int, float))
+                or not math.isfinite(float(integration_offset))
+                or float(integration_offset) < 0
+            ):
+                raise ValueError(
+                    "external_trigger_integration_start_offset_seconds must be "
+                    "finite, non-negative, or None"
+                )
+            integration_offset = float(integration_offset)
+        object.__setattr__(
+            self,
+            "external_trigger_integration_start_offset_seconds",
+            integration_offset,
         )
         if (
             isinstance(self.gain, bool)
@@ -261,6 +303,12 @@ def camera_physical_facts_to_tree(value: CameraPhysicalFacts) -> dict[str, objec
         "dtype": value.dtype.str,
         "count_unit": value.count_unit,
         "exposure_seconds": value.exposure_seconds,
+        "required_external_trigger_interval_seconds": (
+            value.required_external_trigger_interval_seconds
+        ),
+        "external_trigger_integration_start_offset_seconds": (
+            value.external_trigger_integration_start_offset_seconds
+        ),
         "gain": value.gain,
         "readout_mode": value.readout_mode,
         "opaque_frame_settings_fingerprint": (
@@ -286,6 +334,8 @@ def camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:
         "dtype",
         "count_unit",
         "exposure_seconds",
+        "required_external_trigger_interval_seconds",
+        "external_trigger_integration_start_offset_seconds",
         "gain",
         "readout_mode",
         "opaque_frame_settings_fingerprint",
@@ -306,6 +356,12 @@ def camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:
         dtype=np.dtype(data["dtype"]),
         count_unit=data["count_unit"],
         exposure_seconds=data["exposure_seconds"],
+        required_external_trigger_interval_seconds=data[
+            "required_external_trigger_interval_seconds"
+        ],
+        external_trigger_integration_start_offset_seconds=data[
+            "external_trigger_integration_start_offset_seconds"
+        ],
         gain=data["gain"],
         readout_mode=data["readout_mode"],
         opaque_frame_settings_fingerprint=data[

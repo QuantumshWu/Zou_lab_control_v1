@@ -141,11 +141,47 @@ def _settings_tree(camera: CameraDevice) -> dict[str, object]:
         }
     )
     if type(camera) is QCMOSCamera:
+        applied_exposure = snapshot.get("applied_exposure_seconds")
+        minimum_interval = snapshot.get(
+            "required_external_trigger_interval_seconds"
+        )
+        applied_readout_speed = snapshot.pop("applied_readout_speed", None)
+        applied_sensor_mode = snapshot.pop("applied_sensor_mode", None)
+        applied_trigger_global_exposure = snapshot.pop(
+            "applied_trigger_global_exposure",
+            None,
+        )
+        if (
+            applied_exposure is None
+            or minimum_interval is None
+            or applied_readout_speed is None
+            or applied_sensor_mode is None
+            or applied_trigger_global_exposure is None
+        ):
+            raise RuntimeError(
+                "qCMOS physical working-point readback is unavailable"
+            )
         snapshot.update(
             {
-                "sensor_mode": camera.config.sensor_mode,
-                "trigger_global_exposure": camera.config.trigger_global_exposure,
+                "readout_speed": int(applied_readout_speed),
+                "sensor_mode": int(applied_sensor_mode),
+                "trigger_global_exposure": int(
+                    applied_trigger_global_exposure
+                ),
+                # E0 has not qualified the edge-to-integration latency for the
+                # deployed qCMOS mode.  A DCAM timing-rate readback is not proof
+                # of this separate physical fact.
+                "external_trigger_integration_start_offset_seconds": None,
             }
+        )
+    else:
+        # These adapters currently expose no independently measured trigger-rate
+        # lower bound.  Zero means exactly that -- no additional known lower
+        # bound -- rather than claiming unlimited physical trigger bandwidth.
+        snapshot["applied_exposure_seconds"] = float(snapshot["exposure"])
+        snapshot["required_external_trigger_interval_seconds"] = 0.0
+        snapshot["external_trigger_integration_start_offset_seconds"] = (
+            0.0 if type(camera) is VirtualCamera else None
         )
     return snapshot
 
@@ -207,7 +243,13 @@ def _physical_facts(
         coordinate_frame=y_axis.coordinate_frame,
         dtype=payload_contract.value_schema.dtype,
         count_unit=payload_contract.value_schema.value_unit,
-        exposure_seconds=float(settings_tree["exposure"]),
+        exposure_seconds=float(settings_tree["applied_exposure_seconds"]),
+        required_external_trigger_interval_seconds=float(
+            settings_tree["required_external_trigger_interval_seconds"]
+        ),
+        external_trigger_integration_start_offset_seconds=settings_tree[
+            "external_trigger_integration_start_offset_seconds"
+        ],
         # These adapters expose no independent gain control; unity is their
         # explicit digital-count gain policy, frozen into the same snapshot.
         gain=gain,
@@ -652,9 +694,29 @@ class CameraCaptureEndpoint:
             max_inflight_frames=min(expected, self._max_inflight_frames),
             timeout=command.timeout_seconds,
         )
-        with self._lock:
-            session = self._active_session(binding, command.session_id)
-            session.started = True
+        try:
+            with self._lock:
+                session = self._active_session(binding, command.session_id)
+                if (
+                    canonical_digest(_settings_tree(self._camera))
+                    != self._settings_fingerprint
+                ):
+                    raise RuntimeError(
+                        "camera settings changed between prepare and armed start"
+                    )
+                session.started = True
+        except BaseException as primary:
+            try:
+                self._camera.finish_record_capture()
+            except BaseException as secondary:
+                try:
+                    primary.add_note(
+                        "camera disarm after armed-start validation also failed: "
+                        f"{type(secondary).__name__}: {secondary}"
+                    )
+                except BaseException:
+                    pass
+            raise
         return CaptureStartedAck(
             command.session_id,
             binding.binding_id,

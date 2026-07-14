@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualTrapArray
+from Zou_lab_control.neutral_atom.devices.pylon import PylonCamera
 from Zou_lab_control.neutral_atom.devices.registry import DeviceSet
 from zlc_data import (
     AxisId,
@@ -43,6 +44,7 @@ from zlc_neutral_atom.runtime import (
     RunFailed,
     SafeStateAck,
     SafetyOperation,
+    StartCaptureCommand,
     compile_pipeline,
 )
 from zlc_neutral_atom.runtime.capture import (
@@ -56,6 +58,7 @@ from zlc_workbench.camera_capture import (
     CameraCaptureBindingRequest,
     CameraCaptureDescription,
     CameraCaptureEndpoint,
+    _settings_tree,
     bind_camera_measurement,
 )
 from zlc_workbench.legacy_runtime import (
@@ -118,6 +121,14 @@ def _bound_endpoint(camera: VirtualCamera):
     assert description.physical_facts.camera_identity == binding.stable_device_identity
     assert description.physical_facts.output_shape_yx == camera.frame_shape
     assert description.physical_facts.exposure_seconds == camera.exposure
+    assert (
+        description.physical_facts.required_external_trigger_interval_seconds
+        == 0.0
+    )
+    assert (
+        description.physical_facts.external_trigger_integration_start_offset_seconds
+        == 0.0
+    )
     with pytest.raises(PermissionError):
         CameraCaptureDescription(
             object(),
@@ -241,6 +252,32 @@ def test_camera_endpoint_rejects_settings_drift_before_hardware_arm():
     assert broker.current_binding(binding.key) is binding
 
 
+def test_camera_endpoint_revalidates_after_arm_and_disarms_before_fire():
+    camera = _camera()
+    broker, _registry, endpoint, binding, attestation, description = _bound_endpoint(
+        camera
+    )
+    target = endpoint.target_endpoint
+    prepare = _one_frame_prepare_command(attestation.snapshot, description)
+    target.execute_command(binding, prepare)
+    original_arm = camera.arm
+
+    def arm_then_drift(*args, **kwargs):
+        original_arm(*args, **kwargs)
+        camera.configure(exposure=2e-3)
+
+    camera.arm = arm_then_drift
+    start = StartCaptureCommand(prepare.session_id, 1.0)
+    with pytest.raises(RuntimeError, match="between prepare and armed start"):
+        target.execute_command(binding, start)
+
+    state = camera._recent_state()
+    with state["cond"]:
+        assert state["armed"] is False
+        assert state["arming"] is False
+    assert broker.current_binding(binding.key) is binding
+
+
 def test_camera_endpoint_rejects_physical_trigger_wiring_drift_before_arm():
     camera = _camera()
     broker, _registry, endpoint, binding, attestation, description = _bound_endpoint(
@@ -295,6 +332,27 @@ def test_capability_physical_facts_use_applied_roi_and_payload_geometry():
     assert evidence.source_id == "readout"
 
 
+def test_unqualified_pylon_integration_offset_is_not_coerced_to_zero():
+    class _IntegerNode:
+        def __init__(self, value):
+            self._value = value
+
+        def GetValue(self):
+            return self._value
+
+    camera = PylonCamera(trigger_source="Line1")
+    camera._camera = types.SimpleNamespace(
+        HeightMax=_IntegerNode(6),
+        WidthMax=_IntegerNode(8),
+    )
+    try:
+        settings = _settings_tree(camera)
+        assert settings["external_trigger_integration_start_offset_seconds"] is None
+        assert settings["required_external_trigger_interval_seconds"] == 0.0
+    finally:
+        camera._camera = None
+
+
 def test_trigger_wiring_has_one_physical_owner_and_current_canonical_round_trip():
     camera = _camera()
     camera.capture_trigger_channels = ("ch11", "ch12")
@@ -317,6 +375,8 @@ def test_trigger_wiring_has_one_physical_owner_and_current_canonical_round_trip(
     facts_tree = camera_physical_facts_to_tree(facts)
     assert facts_tree["schema"] == "zlc_neutral_atom.CameraPhysicalFacts"
     assert facts_tree["capture_trigger_channels"] == ["ch11", "ch12"]
+    assert facts_tree["required_external_trigger_interval_seconds"] == 0.0
+    assert facts_tree["external_trigger_integration_start_offset_seconds"] == 0.0
     assert camera_physical_facts_from_tree(facts_tree) == facts
     single_tree = dict(facts_tree)
     single_tree["capture_trigger_channels"] = ["ch11"]

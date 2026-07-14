@@ -188,6 +188,7 @@ def _fake_dcam_module():
         EXPOSURETIME=1, TRIGGERSOURCE=2, TRIGGERACTIVE=3, TRIGGERPOLARITY=4,
         READOUTSPEED=5, SENSORMODE=6, TRIGGER_GLOBALEXPOSURE=7,
         SUBARRAYMODE=8, SUBARRAYHSIZE=9, SUBARRAYHPOS=10, SUBARRAYVSIZE=11, SUBARRAYVPOS=12,
+        TIMING_MINTRIGGERINTERVAL=13,
     )
     DCAMPROP = ns(
         TRIGGERSOURCE=ns(EXTERNAL=2), TRIGGERACTIVE=ns(EDGE=1),
@@ -197,12 +198,33 @@ def _fake_dcam_module():
 
 
 class _FakeDcam:
-    def __init__(self, reject=None, clamp=None):
+    def __init__(
+        self,
+        reject=None,
+        clamp=None,
+        *,
+        minimum_trigger_interval=0.004,
+        applied_exposure=None,
+        applied_readout_speed=None,
+        applied_sensor_mode=1,
+        applied_trigger_global_exposure=1,
+    ):
         self._reject = reject          # idprop value that prop_setvalue rejects
         self._clamp = clamp            # idprop whose read-back differs
-        self._vals = {}
+        mod = _fake_dcam_module()
+        self._vals = {
+            mod.DCAM_IDPROP.SENSORMODE: applied_sensor_mode,
+            mod.DCAM_IDPROP.TRIGGER_GLOBALEXPOSURE: (
+                applied_trigger_global_exposure
+            ),
+        }
+        self._minimum_trigger_interval = float(minimum_trigger_interval)
+        self._applied_exposure = applied_exposure
+        self._applied_readout_speed = applied_readout_speed
+        self.operations = []
 
     def prop_setvalue(self, idprop, value):
+        self.operations.append(("set", idprop, value))
         if idprop == self._reject:
             return False
         self._vals[idprop] = value
@@ -211,6 +233,18 @@ class _FakeDcam:
     def prop_getvalue(self, idprop):
         if idprop == self._clamp:
             return self._vals.get(idprop, 0) + 1   # substituted/clamped value
+        if (
+            idprop == _fake_dcam_module().DCAM_IDPROP.EXPOSURETIME
+            and self._applied_exposure is not None
+        ):
+            return float(self._applied_exposure)
+        if idprop == _fake_dcam_module().DCAM_IDPROP.TIMING_MINTRIGGERINTERVAL:
+            return self._minimum_trigger_interval
+        if (
+            idprop == _fake_dcam_module().DCAM_IDPROP.READOUTSPEED
+            and self._applied_readout_speed is not None
+        ):
+            return self._applied_readout_speed
         return self._vals.get(idprop, 0)
 
     def prop_getattr(self, idprop):
@@ -218,13 +252,47 @@ class _FakeDcam:
         return types.SimpleNamespace(valuemin=0.0, valuemax=2304.0, valuestep=4.0)
 
     def prop_setgetvalue(self, idprop, value, option=0):
+        mod = _fake_dcam_module()
+        subarray_fields = {
+            mod.DCAM_IDPROP.SUBARRAYHPOS,
+            mod.DCAM_IDPROP.SUBARRAYHSIZE,
+            mod.DCAM_IDPROP.SUBARRAYVPOS,
+            mod.DCAM_IDPROP.SUBARRAYVSIZE,
+        }
+        self.operations.append(("setget", idprop, value))
         if idprop == self._reject:
+            return False
+        if (
+            idprop in subarray_fields
+            and self._vals.get(mod.DCAM_IDPROP.SUBARRAYMODE) == mod.DCAMPROP.MODE.ON
+        ):
             return False
         self._vals[idprop] = value      # already snapped by the adapter; echo it back
         return float(value)
 
     def lasterr(self):
         return "DCAMERR_FAKE"
+
+    def cap_transferinfo(self):
+        return types.SimpleNamespace(nFrameCount=0)
+
+
+class _ArmableFakeDcam(_FakeDcam):
+    on_start = None
+
+    def buf_alloc(self, _frames):
+        return True
+
+    def cap_start(self, *, bSequence=True):
+        if self.on_start is not None:
+            self.on_start()
+        return bSequence is True
+
+    def cap_stop(self):
+        return True
+
+    def buf_release(self):
+        return True
 
 
 def _camera_with(fake):
@@ -253,9 +321,325 @@ def test_qcmos_write_settings_raises_on_clamped_trigger():
         cam._write_settings()
 
 
+def test_qcmos_final_working_point_rechecks_trigger_after_subarray_transaction():
+    """A later DCAM setting must not invalidate an earlier trigger readback."""
+
+    mod = _fake_dcam_module()
+
+    class _SubarrayEnableResetsTriggerSource(_FakeDcam):
+        def prop_setvalue(self, idprop, value):
+            accepted = super().prop_setvalue(idprop, value)
+            if (
+                accepted
+                and idprop == mod.DCAM_IDPROP.SUBARRAYMODE
+                and value == mod.DCAMPROP.MODE.ON
+            ):
+                self._vals[mod.DCAM_IDPROP.TRIGGERSOURCE] = 1
+            return accepted
+
+    cam = _camera_with(_SubarrayEnableResetsTriggerSource())
+    cam.config.roi = (100, 32, 200, 16)
+
+    with pytest.raises(RuntimeError, match="applied trigger source read back"):
+        cam._write_settings()
+
+    snapshot = cam.snapshot()
+    assert snapshot["applied_exposure_seconds"] is None
+    assert snapshot["applied_trigger_source"] is None
+    assert snapshot["roi"] == cam.config.roi
+
+
+def test_qcmos_arm_refresh_rejects_trigger_drift_from_cap_start():
+    """Armed-start validation must observe hardware after cap_start, not its cache."""
+
+    mod = _fake_dcam_module()
+    fake = _ArmableFakeDcam()
+    cam = _camera_with(fake)
+    cam._write_settings()
+
+    def drift_trigger_source():
+        fake._vals[mod.DCAM_IDPROP.TRIGGERSOURCE] = 1
+
+    fake.on_start = drift_trigger_source
+    with pytest.raises(RuntimeError, match="applied trigger source read back"):
+        cam.arm(1)
+
+    state = cam._recent_state()
+    with state["cond"]:
+        assert state["armed"] is False
+        assert state["arming"] is False
+    snapshot = cam.snapshot()
+    assert snapshot["applied_exposure_seconds"] is None
+    assert snapshot["applied_trigger_source"] is None
+
+
 def test_qcmos_write_settings_ok_when_accepted():
-    cam = _camera_with(_FakeDcam())
+    from zlc_storage import canonical_digest
+    from zlc_workbench.camera_capture import _settings_tree
+
+    cam = _camera_with(
+        _FakeDcam(
+            minimum_trigger_interval=0.00625,
+            applied_exposure=0.0195,
+        )
+    )
     cam._write_settings()   # no raise: all writes accepted + read back equal
+    snapshot = cam.snapshot()
+    assert snapshot["applied_exposure_seconds"] == 0.0195
+    assert snapshot["required_external_trigger_interval_seconds"] == 0.00625
+    assert snapshot["applied_readout_speed"] == 1
+    assert snapshot["applied_sensor_mode"] == 1
+    assert snapshot["applied_trigger_global_exposure"] == 1
+    first_settings = _settings_tree(cam)
+    assert first_settings["external_trigger_integration_start_offset_seconds"] is None
+
+    changed = _camera_with(_FakeDcam(minimum_trigger_interval=0.0075))
+    changed._write_settings()
+    second_settings = _settings_tree(changed)
+    assert canonical_digest(first_settings) != canonical_digest(second_settings)
+
+
+def test_qcmos_subarray_is_written_while_off_and_enabled_only_afterward():
+    mod = _fake_dcam_module()
+    fake = _FakeDcam()
+    cam = _camera_with(fake)
+    cam.config.roi = (100, 32, 200, 16)
+
+    cam._write_settings()
+
+    subarray_fields = {
+        mod.DCAM_IDPROP.SUBARRAYMODE,
+        mod.DCAM_IDPROP.SUBARRAYHPOS,
+        mod.DCAM_IDPROP.SUBARRAYHSIZE,
+        mod.DCAM_IDPROP.SUBARRAYVPOS,
+        mod.DCAM_IDPROP.SUBARRAYVSIZE,
+    }
+    assert [
+        operation
+        for operation in fake.operations
+        if operation[1] in subarray_fields
+    ] == [
+        ("set", mod.DCAM_IDPROP.SUBARRAYMODE, mod.DCAMPROP.MODE.OFF),
+        ("setget", mod.DCAM_IDPROP.SUBARRAYHPOS, 0),
+        ("setget", mod.DCAM_IDPROP.SUBARRAYVPOS, 0),
+        ("setget", mod.DCAM_IDPROP.SUBARRAYHSIZE, 32),
+        ("setget", mod.DCAM_IDPROP.SUBARRAYVSIZE, 16),
+        ("setget", mod.DCAM_IDPROP.SUBARRAYHPOS, 100),
+        ("setget", mod.DCAM_IDPROP.SUBARRAYVPOS, 200),
+        ("set", mod.DCAM_IDPROP.SUBARRAYMODE, mod.DCAMPROP.MODE.ON),
+    ]
+    assert fake._vals[mod.DCAM_IDPROP.SUBARRAYMODE] == mod.DCAMPROP.MODE.ON
+    assert cam.roi == (100, 32, 200, 16)
+    operations_after_apply = tuple(fake.operations)
+    assert cam.sensor_shape == (2304, 2304)
+    assert tuple(fake.operations) == operations_after_apply
+
+
+def test_qcmos_final_subarray_enable_is_read_back():
+    mod = _fake_dcam_module()
+
+    class _RejectFinalEnableReadback(_FakeDcam):
+        def prop_getvalue(self, idprop):
+            if (
+                idprop == mod.DCAM_IDPROP.SUBARRAYMODE
+                and self._vals.get(idprop) == mod.DCAMPROP.MODE.ON
+            ):
+                return mod.DCAMPROP.MODE.OFF
+            return super().prop_getvalue(idprop)
+
+    cam = _camera_with(_RejectFinalEnableReadback())
+    cam.config.roi = (100, 32, 200, 16)
+    with pytest.raises(RuntimeError, match="subarray_mode read back"):
+        cam._write_settings()
+
+
+@pytest.mark.parametrize("minimum_interval", [0.0, -0.001, float("nan"), float("inf")])
+def test_qcmos_rejects_unusable_minimum_trigger_interval_readback(minimum_interval):
+    cam = _camera_with(_FakeDcam(minimum_trigger_interval=minimum_interval))
+    with pytest.raises(RuntimeError, match="minimum external trigger interval"):
+        cam._write_settings()
+    snapshot = cam.snapshot()
+    assert snapshot["applied_exposure_seconds"] is None
+    assert snapshot["required_external_trigger_interval_seconds"] is None
+    assert snapshot["applied_readout_speed"] is None
+
+
+def test_qcmos_freezes_applied_readout_speed_instead_of_requested_value():
+    from zlc_workbench.camera_capture import _readout_mode_from_settings, _settings_tree
+
+    mod = _fake_dcam_module()
+    cam = _camera_with(_FakeDcam(clamp=mod.DCAM_IDPROP.READOUTSPEED))
+    cam._write_settings()
+
+    settings = _settings_tree(cam)
+    assert cam.config.readout_speed == 1
+    assert cam.snapshot()["applied_readout_speed"] == 2
+    assert settings["readout_speed"] == 2
+    assert "readout-speed=2" in _readout_mode_from_settings(cam, settings)
+
+
+def test_qcmos_rejects_zero_requested_or_applied_modes():
+    from Zou_lab_control.neutral_atom.devices.qcmos import QCMOSConfig
+
+    for field in ("readout_speed", "sensor_mode", "trigger_global_exposure"):
+        with pytest.raises(ValueError, match=field):
+            QCMOSConfig(**{field: 0})
+
+    invalid_readout = _camera_with(_FakeDcam(applied_readout_speed=0))
+    with pytest.raises(RuntimeError, match="non-positive applied readout speed"):
+        invalid_readout._write_settings()
+    invalid_sensor = _camera_with(_FakeDcam(applied_sensor_mode=0))
+    with pytest.raises(RuntimeError, match="non-positive applied sensor mode"):
+        invalid_sensor._write_settings()
+    invalid_global = _camera_with(_FakeDcam(applied_trigger_global_exposure=0))
+    with pytest.raises(
+        RuntimeError,
+        match="non-positive applied trigger global exposure",
+    ):
+        invalid_global._write_settings()
+
+
+def test_qcmos_unpinned_modes_freeze_actual_power_on_readbacks():
+    from zlc_storage import canonical_digest
+    from zlc_workbench.camera_capture import _settings_tree
+
+    first = _camera_with(
+        _FakeDcam(applied_sensor_mode=1, applied_trigger_global_exposure=1)
+    )
+    second = _camera_with(
+        _FakeDcam(applied_sensor_mode=3, applied_trigger_global_exposure=2)
+    )
+    first._write_settings()
+    second._write_settings()
+
+    first_settings = _settings_tree(first)
+    second_settings = _settings_tree(second)
+    assert first.config.sensor_mode is first.config.trigger_global_exposure is None
+    assert second.config.sensor_mode is second.config.trigger_global_exposure is None
+    assert (first_settings["sensor_mode"], first_settings["trigger_global_exposure"]) == (1, 1)
+    assert (second_settings["sensor_mode"], second_settings["trigger_global_exposure"]) == (3, 2)
+    assert canonical_digest(first_settings) != canonical_digest(second_settings)
+
+
+@pytest.mark.parametrize(
+    ("fake_kwargs", "mode_name"),
+    [
+        ({"applied_sensor_mode": False}, "applied sensor mode"),
+        (
+            {"applied_trigger_global_exposure": False},
+            "applied trigger global exposure",
+        ),
+    ],
+)
+def test_qcmos_unpinned_mode_readback_unavailable_fails_closed(
+    fake_kwargs,
+    mode_name,
+):
+    cam = _camera_with(_FakeDcam(**fake_kwargs))
+    with pytest.raises(RuntimeError, match=mode_name):
+        cam._write_settings()
+    assert cam.snapshot()["applied_sensor_mode"] is None
+    assert cam.snapshot()["applied_trigger_global_exposure"] is None
+
+
+def test_qcmos_failed_reconfiguration_clears_all_previous_working_point_proof():
+    from zlc_workbench.camera_capture import _settings_tree
+
+    mod = _fake_dcam_module()
+    fake = _FakeDcam(minimum_trigger_interval=0.006)
+    cam = _camera_with(fake)
+    cam._write_settings()
+    assert cam.snapshot()["applied_readout_speed"] == 1
+
+    fake._reject = mod.DCAM_IDPROP.TRIGGERSOURCE
+    with pytest.raises(RuntimeError, match="trigger_source"):
+        cam.configure(exposure=0.03)
+
+    snapshot = cam.snapshot()
+    assert snapshot["applied_exposure_seconds"] is None
+    assert snapshot["required_external_trigger_interval_seconds"] is None
+    assert snapshot["applied_readout_speed"] is None
+    assert snapshot["applied_sensor_mode"] is None
+    assert snapshot["applied_trigger_global_exposure"] is None
+    with pytest.raises(RuntimeError, match="unavailable"):
+        _settings_tree(cam)
+
+
+def test_qcmos_same_thread_cannot_reconfigure_an_armed_epoch():
+    fake = _ArmableFakeDcam()
+    cam = _camera_with(fake)
+    cam._write_settings()
+    settings_before = cam.snapshot()
+    operations_before = tuple(fake.operations)
+
+    cam.arm(1)
+    try:
+        assert cam.open() is cam
+        with pytest.raises(RuntimeError, match="armed acquisition epoch"):
+            cam.configure(exposure=0.03)
+        assert cam.snapshot() == settings_before
+        assert tuple(fake.operations) == operations_before
+    finally:
+        cam.disarm()
+
+
+def test_qcmos_same_thread_cannot_reconfigure_while_hardware_is_arming():
+    fake = _ArmableFakeDcam()
+    cam = _camera_with(fake)
+    cam._write_settings()
+    settings_before = cam.snapshot()
+    operations_before = tuple(fake.operations)
+    reentrant_errors: list[BaseException] = []
+
+    def mutate_during_cap_start():
+        try:
+            cam.configure(exposure=0.03)
+        except BaseException as error:
+            reentrant_errors.append(error)
+
+    fake.on_start = mutate_during_cap_start
+    cam.arm(1)
+    try:
+        assert len(reentrant_errors) == 1
+        assert isinstance(reentrant_errors[0], RuntimeError)
+        assert "armed acquisition epoch" in str(reentrant_errors[0])
+        assert cam.snapshot() == settings_before
+        assert tuple(fake.operations) == operations_before
+    finally:
+        cam.disarm()
+
+
+def test_qcmos_other_thread_cannot_perform_b_to_a_settings_aba_while_armed():
+    fake = _ArmableFakeDcam()
+    cam = _camera_with(fake)
+    cam._write_settings()
+    settings_before = cam.snapshot()
+    operations_before = tuple(fake.operations)
+    errors: list[BaseException] = []
+
+    def mutate_b_then_a():
+        for exposure in (0.03, settings_before["exposure"]):
+            try:
+                cam.configure(exposure=exposure)
+            except BaseException as error:
+                errors.append(error)
+
+    cam.arm(1)
+    try:
+        worker = threading.Thread(target=mutate_b_then_a, daemon=False)
+        worker.start()
+        worker.join(1.0)
+        assert not worker.is_alive()
+        assert len(errors) == 2
+        assert all(
+            isinstance(error, RuntimeError)
+            and "armed acquisition epoch" in str(error)
+            for error in errors
+        )
+        assert cam.snapshot() == settings_before
+        assert tuple(fake.operations) == operations_before
+    finally:
+        cam.disarm()
 
 
 # --------------------------------------------------------------------------- M5
@@ -280,6 +664,7 @@ def test_qcmos_acquire_cancels_promptly_on_stop():
             return True
 
     cam = _camera_with(_WedgedDcam())
+    cam._write_settings()
     stop = threading.Event()
     stop.set()
     with pytest.raises(AcquisitionCancelled):
@@ -304,14 +689,14 @@ def test_qcmos_acquire_times_out_without_stop():
             return True
 
     cam = _camera_with(_WedgedDcam())
+    cam._write_settings()
     with pytest.raises(TimeoutError):
         cam.acquire(1, timeout=0.01)
 
 
 # --------------------------------------------------------------------------- M8
-def test_remote_sequencer_abort_reconnects():
-    """abort() runs on the error/safing path; it must reconnect like the other
-    RPC calls, not silently no-op on a dropped link and leave outputs running."""
+def test_remote_sequencer_abort_requires_an_authorized_live_connection():
+    """A safety command must not create an unauthorised replacement session."""
     from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
 
     seq = RemoteSequencer(host="127.0.0.1", port=18861)
@@ -330,9 +715,31 @@ def test_remote_sequencer_abort_reconnects():
         return seq
 
     seq.open = fake_open
+    with pytest.raises(RuntimeError, match="ConnectionEstablishmentClaim/RecoveryClaim"):
+        seq.abort()
+
+    assert opened["n"] == 0
+    assert seq._conn is None
+
+
+def test_remote_sequencer_abort_uses_the_established_connection():
+    from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
+
+    class _Root:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
+    root = _Root()
+    seq = RemoteSequencer(host="127.0.0.1", port=18861)
+    seq._conn = types.SimpleNamespace(root=root, closed=False)
+    seq.port_catalog = object()
+    seq.clock_hz = 1.0
+
     seq.abort()
-    assert opened["n"] == 1                 # abort routed through open()
-    assert seq._conn.root.aborted is True
+
+    assert root.aborted is True
 
 
 # --------------------------------------------------------------------------- B1 (re-audit)

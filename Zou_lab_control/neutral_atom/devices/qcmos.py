@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 import importlib
+import math
 import threading
 import time
 from typing import Any, Sequence
@@ -114,15 +115,18 @@ class QCMOSConfig:
         self.capture_trigger_channels = tuple(str(c) for c in self.capture_trigger_channels)
         # The ONE exposure validation every camera write path shares (devices.base).
         self.exposure = CameraDevice._validated_exposure(self.exposure)
-        self.readout_speed = nonnegative_int(self.readout_speed, "readout_speed")
+        self.readout_speed = positive_int(self.readout_speed, "readout_speed")
         self.device_index = nonnegative_int(self.device_index, "device_index")
         self.timeout_ms = positive_int(self.timeout_ms, "timeout_ms")
         if self.roi is not None:
             self.roi = normalize_roi(self.roi)
         if self.sensor_mode is not None:
-            self.sensor_mode = nonnegative_int(self.sensor_mode, "sensor_mode")
+            self.sensor_mode = positive_int(self.sensor_mode, "sensor_mode")
         if self.trigger_global_exposure is not None:
-            self.trigger_global_exposure = nonnegative_int(self.trigger_global_exposure, "trigger_global_exposure")
+            self.trigger_global_exposure = positive_int(
+                self.trigger_global_exposure,
+                "trigger_global_exposure",
+            )
 
 
 DEFAULT_DCAM_MODULE = "Zou_lab_control.neutral_atom.devices.drivers.dcam.dcam"
@@ -151,6 +155,23 @@ class QCMOSCamera(CameraDevice):
         # -- so a consumer (the Edit 'now:' reference, the 2D panel's axes) reflects
         # the region truly being imaged.
         self._applied_roi: tuple[int, int, int, int] | None = None
+        # Full sensor geometry is queried while SUBARRAYMODE is deliberately
+        # OFF during the settings transaction, then cached.  Merely observing
+        # sensor_shape later must never change the live ROI.
+        self._sensor_shape_yx: tuple[int, int] | None = None
+        # Physical timing read back after every complete settings write.  The
+        # requested config value is not evidence that DCAM accepted that exact
+        # exposure, and TIMING_MINTRIGGERINTERVAL depends on the applied
+        # exposure/ROI/readout working point.  Capability probes consume these
+        # readbacks; None honestly means no live hardware snapshot exists yet.
+        self._applied_exposure_seconds: float | None = None
+        self._required_external_trigger_interval_seconds: float | None = None
+        self._applied_readout_speed: int | None = None
+        self._applied_sensor_mode: int | None = None
+        self._applied_trigger_global_exposure: int | None = None
+        self._applied_trigger_source: int | None = None
+        self._applied_trigger_active: int | None = None
+        self._applied_trigger_polarity: int | None = None
         # Armed-session bookkeeping for the acquisition hooks (_arm/_grab/_disarm):
         # the DCAM buffer depth of the current session + the next frame index to transfer.
         self._buf_alloc = 0
@@ -265,31 +286,49 @@ class QCMOSCamera(CameraDevice):
         # honest "unknown until opened" the base default also returns).
         if self._dcam is None:
             return None
-        try:
-            _step, max_w, max_h = self._subarray_grid()
-        except Exception:
-            return None
-        return (int(max_h), int(max_w)) if max_w and max_h else None
+        return self._sensor_shape_yx
 
-    def configure(self, *, exposure: float | None = None, readout_speed: int | None = None, roi: Sequence[int] | None | object = None, **kwargs) -> None:
+    def _require_configuration_epoch(self) -> None:
+        state = self._recent_state()
+        with state["cond"]:
+            if state["arming"] or state["armed"]:
+                raise RuntimeError(
+                    "qCMOS settings cannot change during an armed acquisition epoch"
+                )
+
+    def configure(
+        self,
+        *,
+        exposure: float | None = None,
+        readout_speed: int | None = None,
+        roi: Sequence[int] | None | object = None,
+        **kwargs,
+    ) -> None:
         self._reject_unknown_configure_keys({"exposure", "readout_speed", "roi"}, kwargs)
-        if exposure is not None:
-            self.config.exposure = self._validated_exposure(exposure)
-        if readout_speed is not None:
-            self.config.readout_speed = nonnegative_int(readout_speed, "readout_speed")
-        if roi is not None:
-            # FULL_FRAME (and its blank-box equivalents) clears back to the full sensor -- the
-            # ONE sentinel set in devices.base (roi is None means "leave unchanged"), so
-            # configure(roi=...) is backend-agnostic.
-            self.config.roi = None if roi in ROI_CLEAR_SENTINELS else normalize_roi(roi)
-        if self._dcam is not None:
-            self._write_settings()
+        # The first check makes a same-thread call fail despite the acquisition
+        # RLock being re-entrant.  The second check, after taking that lock,
+        # closes the race with arm(): either configuration linearizes first or
+        # it cannot mutate the device until the acquisition epoch is terminal.
+        self._require_configuration_epoch()
+        with self._acquire_lock():
+            self._require_configuration_epoch()
+            if exposure is not None:
+                self.config.exposure = self._validated_exposure(exposure)
+            if readout_speed is not None:
+                self.config.readout_speed = positive_int(readout_speed, "readout_speed")
+            if roi is not None:
+                # FULL_FRAME (and its blank-box equivalents) clears back to the full sensor -- the
+                # ONE sentinel set in devices.base (roi is None means "leave unchanged"), so
+                # configure(roi=...) is backend-agnostic.
+                self.config.roi = None if roi in ROI_CLEAR_SENTINELS else normalize_roi(roi)
+            if self._dcam is not None:
+                self._write_settings()
 
     def runtime_controls(self):
         """The qCMOS live controls: the shared camera set (exposure / ROI / geometry) PLUS the WRITABLE
         ``readout_speed`` (this backend's extra live knob) -- a backend that has more knobs than the
         contract extends ``super().runtime_controls()`` here.  The write routes through the ONE
-        ``configure(readout_speed=...)`` (validated by ``nonnegative_int``, pushed to open hardware via
+        ``configure(readout_speed=...)`` (validated by ``positive_int``, pushed to open hardware via
         ``_write_settings``), so the GUI never re-implements the device's own validation."""
         from .base import RuntimeControl
         from ..core.params import ParamDecl
@@ -303,6 +342,18 @@ class QCMOSCamera(CameraDevice):
         )
 
     def open(self) -> "QCMOSCamera":
+        # Preserve BaseDevice.open's idempotence even inside an acquisition
+        # epoch.  An already-live handle needs no configuration transaction.
+        if self._dcam is not None:
+            return self
+        self._require_configuration_epoch()
+        with self._acquire_lock():
+            self._require_configuration_epoch()
+            return self._open_locked()
+
+    def _open_locked(self) -> "QCMOSCamera":
+        """Open and configure while the caller owns the acquisition lock."""
+
         if self._dcam is not None:
             return self
         mod = importlib.import_module(self.dcam_module_name)
@@ -376,14 +427,45 @@ class QCMOSCamera(CameraDevice):
         )
         if dcam.buf_alloc(alloc) is False:
             raise RuntimeError(f"qCMOS buf_alloc({alloc}) failed: {dcam.lasterr()}")
+        started = False
+        self._clear_applied_working_point()
         try:
             if dcam.cap_start(bSequence=True) is False:
                 raise RuntimeError(f"qCMOS cap_start failed: {dcam.lasterr()}")
-        except BaseException:
+            started = True
+            # cap_start is part of the physical arm boundary.  Refresh every
+            # hardware-applied acquisition fact after it returns so the endpoint's
+            # armed-start fingerprint compares real readback, not the cache minted
+            # by the earlier configuration transaction.
+            self._read_applied_working_point()
+        except BaseException as primary:
+            if started:
+                try:
+                    if dcam.cap_stop() is False:
+                        raise RuntimeError(
+                            f"qCMOS cap_stop after failed arm validation: {dcam.lasterr()}"
+                        )
+                except BaseException as cleanup_error:
+                    try:
+                        primary.add_note(
+                            "qCMOS cap_stop after failed arm validation also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    except BaseException:
+                        pass
             try:
-                dcam.buf_release()
-            except Exception:
-                pass
+                if dcam.buf_release() is False:
+                    raise RuntimeError(
+                        f"qCMOS buf_release after failed arm validation: {dcam.lasterr()}"
+                    )
+            except BaseException as cleanup_error:
+                try:
+                    primary.add_note(
+                        "qCMOS buf_release after failed arm validation also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
             raise
         self._buf_alloc = alloc
         self._next_frame = 0
@@ -557,8 +639,26 @@ class QCMOSCamera(CameraDevice):
                 raise RuntimeError(f"qCMOS {name} read back {read!r}, expected {value!r} "
                                    "(property clamped/substituted by the camera).")
 
+    def _clear_applied_working_point(self) -> None:
+        """Invalidate the one cached hardware working-point observation."""
+
+        self._applied_roi = None
+        self._applied_exposure_seconds = None
+        self._required_external_trigger_interval_seconds = None
+        self._applied_readout_speed = None
+        self._applied_sensor_mode = None
+        self._applied_trigger_global_exposure = None
+        self._applied_trigger_source = None
+        self._applied_trigger_active = None
+        self._applied_trigger_polarity = None
+
     def _write_settings(self) -> None:
         mod = self._module
+        # Invalidate the previous proof before touching any setting.  A failed
+        # partial reconfiguration must not leave a stale working-point timing
+        # snapshot available to a later capability probe.
+        self._clear_applied_working_point()
+        self._sensor_shape_yx = None
         self._set_prop(mod.DCAM_IDPROP.EXPOSURETIME, self.config.exposure, "exposure")
         # External rising-edge trigger is the imaging scheme -- verify the camera
         # actually accepted it (these are the writes that fail silently on a
@@ -571,15 +671,180 @@ class QCMOSCamera(CameraDevice):
             self._set_prop(mod.DCAM_IDPROP.SENSORMODE, self.config.sensor_mode, "sensor_mode", verify=True)
         if self.config.trigger_global_exposure is not None:
             self._set_prop(mod.DCAM_IDPROP.TRIGGER_GLOBALEXPOSURE, self.config.trigger_global_exposure, "trigger_global_exposure", verify=True)
-        self._apply_subarray()
+        subarray_grid = self._subarray_grid()
+        _step, max_w, max_h = subarray_grid
+        if max_w > 0 and max_h > 0:
+            self._sensor_shape_yx = (int(max_h), int(max_w))
+        self._apply_subarray(subarray_grid)
+        try:
+            self._read_applied_working_point()
+        except BaseException:
+            # `_apply_subarray` records its immediate set/get result for UI use,
+            # but no part of a failed final working-point observation is valid
+            # capability evidence.
+            self._clear_applied_working_point()
+            raise
 
-    def _subarray_grid(self) -> tuple[int, int, int, int]:
+    def _read_applied_working_point(self) -> None:
+        """Freeze one atomic readback of the fully applied DCAM working point."""
+
+        mod, dcam = self._module, self._dcam
+        values: dict[str, float] = {}
+        for name, idprop in (
+            ("applied exposure", mod.DCAM_IDPROP.EXPOSURETIME),
+            (
+                "minimum external trigger interval",
+                mod.DCAM_IDPROP.TIMING_MINTRIGGERINTERVAL,
+            ),
+            ("applied readout speed", mod.DCAM_IDPROP.READOUTSPEED),
+            ("applied sensor mode", mod.DCAM_IDPROP.SENSORMODE),
+            (
+                "applied trigger global exposure",
+                mod.DCAM_IDPROP.TRIGGER_GLOBALEXPOSURE,
+            ),
+            ("applied trigger source", mod.DCAM_IDPROP.TRIGGERSOURCE),
+            ("applied trigger active", mod.DCAM_IDPROP.TRIGGERACTIVE),
+            ("applied trigger polarity", mod.DCAM_IDPROP.TRIGGERPOLARITY),
+        ):
+            raw = dcam.prop_getvalue(idprop)
+            if raw is False:
+                raise RuntimeError(f"qCMOS could not read back {name}: {dcam.lasterr()}")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"qCMOS returned a non-numeric {name}: {raw!r}") from exc
+            if not math.isfinite(value) or value < 0:
+                raise RuntimeError(f"qCMOS returned an invalid {name}: {raw!r}")
+            values[name] = value
+        if values["applied exposure"] <= 0:
+            raise RuntimeError("qCMOS returned a non-positive applied exposure")
+        if values["minimum external trigger interval"] <= 0:
+            raise RuntimeError(
+                "qCMOS returned a non-positive minimum external trigger interval"
+            )
+        applied_modes = {}
+        for name in (
+            "applied readout speed",
+            "applied sensor mode",
+            "applied trigger global exposure",
+        ):
+            value = values[name]
+            if value <= 0:
+                raise RuntimeError(f"qCMOS returned a non-positive {name}")
+            if not value.is_integer():
+                raise RuntimeError(
+                    f"qCMOS returned a non-integral {name}: {value!r}"
+                )
+            applied_modes[name] = int(value)
+
+        expected_trigger_modes = {
+            "applied trigger source": mod.DCAMPROP.TRIGGERSOURCE.EXTERNAL,
+            "applied trigger active": mod.DCAMPROP.TRIGGERACTIVE.EDGE,
+            "applied trigger polarity": mod.DCAMPROP.TRIGGERPOLARITY.POSITIVE,
+        }
+        applied_trigger_modes: dict[str, int] = {}
+        for name, expected in expected_trigger_modes.items():
+            value = values[name]
+            if not value.is_integer():
+                raise RuntimeError(f"qCMOS returned a non-integral {name}: {value!r}")
+            applied = int(value)
+            if applied != int(expected):
+                raise RuntimeError(
+                    f"qCMOS {name} read back {applied!r}, expected {int(expected)!r}"
+                )
+            applied_trigger_modes[name] = applied
+
+        subarray_mode_raw = dcam.prop_getvalue(mod.DCAM_IDPROP.SUBARRAYMODE)
+        if subarray_mode_raw is False:
+            raise RuntimeError(
+                f"qCMOS could not read back applied subarray mode: {dcam.lasterr()}"
+            )
+        try:
+            subarray_mode_value = float(subarray_mode_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"qCMOS returned a non-numeric applied subarray mode: {subarray_mode_raw!r}"
+            ) from exc
+        if not math.isfinite(subarray_mode_value) or not subarray_mode_value.is_integer():
+            raise RuntimeError(
+                f"qCMOS returned an invalid applied subarray mode: {subarray_mode_raw!r}"
+            )
+        subarray_mode = int(subarray_mode_value)
+        if subarray_mode == int(mod.DCAMPROP.MODE.OFF):
+            applied_roi = None
+        elif subarray_mode == int(mod.DCAMPROP.MODE.ON):
+            roi_values: dict[str, int] = {}
+            for name, idprop in (
+                ("subarray_hpos", mod.DCAM_IDPROP.SUBARRAYHPOS),
+                ("subarray_hsize", mod.DCAM_IDPROP.SUBARRAYHSIZE),
+                ("subarray_vpos", mod.DCAM_IDPROP.SUBARRAYVPOS),
+                ("subarray_vsize", mod.DCAM_IDPROP.SUBARRAYVSIZE),
+            ):
+                raw = dcam.prop_getvalue(idprop)
+                if raw is False:
+                    raise RuntimeError(f"qCMOS could not read back {name}: {dcam.lasterr()}")
+                try:
+                    numeric = float(raw)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"qCMOS returned a non-numeric {name}: {raw!r}"
+                    ) from exc
+                if not math.isfinite(numeric) or numeric < 0 or not numeric.is_integer():
+                    raise RuntimeError(f"qCMOS returned an invalid {name}: {raw!r}")
+                roi_values[name] = int(numeric)
+            applied_roi = (
+                roi_values["subarray_hpos"],
+                roi_values["subarray_hsize"],
+                roi_values["subarray_vpos"],
+                roi_values["subarray_vsize"],
+            )
+            if applied_roi[1] <= 0 or applied_roi[3] <= 0:
+                raise RuntimeError("qCMOS returned a non-positive applied subarray size")
+            sensor_shape = self._sensor_shape_yx
+            if sensor_shape is None:
+                raise RuntimeError("qCMOS sensor geometry is unavailable during ROI readback")
+            if (
+                applied_roi[0] + applied_roi[1] > sensor_shape[1]
+                or applied_roi[2] + applied_roi[3] > sensor_shape[0]
+            ):
+                raise RuntimeError("qCMOS applied subarray lies outside the sensor")
+        else:
+            raise RuntimeError(
+                f"qCMOS applied subarray mode {subarray_mode!r} is neither OFF nor ON"
+            )
+
+        self._applied_exposure_seconds = values["applied exposure"]
+        self._required_external_trigger_interval_seconds = values[
+            "minimum external trigger interval"
+        ]
+        self._applied_readout_speed = applied_modes["applied readout speed"]
+        self._applied_sensor_mode = applied_modes["applied sensor mode"]
+        self._applied_trigger_global_exposure = applied_modes[
+            "applied trigger global exposure"
+        ]
+        self._applied_trigger_source = applied_trigger_modes[
+            "applied trigger source"
+        ]
+        self._applied_trigger_active = applied_trigger_modes[
+            "applied trigger active"
+        ]
+        self._applied_trigger_polarity = applied_trigger_modes[
+            "applied trigger polarity"
+        ]
+        self._applied_roi = applied_roi
+
+    def _subarray_grid(self) -> tuple[int, int, int]:
         """The camera's valid sub-array grid (step, max_w, max_h) queried with
         SUBARRAYMODE OFF, where HSIZE/VSIZE max report the FULL sensor.  Falls back
         to a step of 4 (the qCMOS hardware requirement) if the attribute query
         is unavailable, so a request is always snapped to a legal window."""
         mod, dcam = self._module, self._dcam
-        self._set_prop(mod.DCAM_IDPROP.SUBARRAYMODE, mod.DCAMPROP.MODE.OFF, "subarray_mode")
+        self._set_prop(
+            mod.DCAM_IDPROP.SUBARRAYMODE,
+            mod.DCAMPROP.MODE.OFF,
+            "subarray_mode",
+            verify=True,
+        )
 
         def _attr(idprop, field, default):
             attr = dcam.prop_getattr(idprop)
@@ -603,7 +868,10 @@ class QCMOSCamera(CameraDevice):
             raise RuntimeError(f"qCMOS rejected {name} = {value}: {self._dcam.lasterr()}")
         return int(round(float(actual)))
 
-    def _apply_subarray(self) -> None:
+    def _apply_subarray(
+        self,
+        grid: tuple[int, int, int] | None = None,
+    ) -> None:
         """Apply the requested ROI as a valid sub-array and record what the camera
         actually reads out.  The plot/acquisition layer hands a window in raw
         sensor-pixel coordinates; here it is SNAPPED to the camera's grid
@@ -613,22 +881,32 @@ class QCMOSCamera(CameraDevice):
         the final say; the read-back tuple becomes ``self._applied_roi``."""
         mod = self._module
         if self.config.roi is None:
-            self._set_prop(mod.DCAM_IDPROP.SUBARRAYMODE, mod.DCAMPROP.MODE.OFF, "subarray_mode")
+            self._set_prop(
+                mod.DCAM_IDPROP.SUBARRAYMODE,
+                mod.DCAMPROP.MODE.OFF,
+                "subarray_mode",
+                verify=True,
+            )
             self._applied_roi = None
             return
-        step, max_w, max_h = self._subarray_grid()
+        step, max_w, max_h = self._subarray_grid() if grid is None else grid
         x, width, y, height = snap_subarray(
             self.config.roi, step=step,
             max_w=max_w or self.config.roi[0] + self.config.roi[1],
             max_h=max_h or self.config.roi[2] + self.config.roi[3],
         )
-        self._set_prop(mod.DCAM_IDPROP.SUBARRAYMODE, mod.DCAMPROP.MODE.ON, "subarray_mode")
         self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYHPOS, 0, "subarray_hpos")
         self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYVPOS, 0, "subarray_vpos")
         applied_w = self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYHSIZE, width, "subarray_hsize")
         applied_h = self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYVSIZE, height, "subarray_vsize")
         applied_x = self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYHPOS, x, "subarray_hpos")
         applied_y = self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYVPOS, y, "subarray_vpos")
+        self._set_prop(
+            mod.DCAM_IDPROP.SUBARRAYMODE,
+            mod.DCAMPROP.MODE.ON,
+            "subarray_mode",
+            verify=True,
+        )
         self._applied_roi = (applied_x, applied_w, applied_y, applied_h)
 
     def close(self) -> None:
@@ -637,6 +915,8 @@ class QCMOSCamera(CameraDevice):
                 self._dcam.dev_close()
             finally:
                 self._dcam = None
+                self._sensor_shape_yx = None
+                self._clear_applied_working_point()
         if self._api is not None:
             # Drop THIS camera's reference; the runtime is uninited only once the LAST holder
             # closes -- so closing one of two qCMOS cameras leaves the other's DCAM handle live.
@@ -657,6 +937,18 @@ class QCMOSCamera(CameraDevice):
         out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
         out.update({
             "exposure": self.config.exposure,
+            "applied_exposure_seconds": self._applied_exposure_seconds,
+            "required_external_trigger_interval_seconds": (
+                self._required_external_trigger_interval_seconds
+            ),
+            "applied_readout_speed": self._applied_readout_speed,
+            "applied_sensor_mode": self._applied_sensor_mode,
+            "applied_trigger_global_exposure": (
+                self._applied_trigger_global_exposure
+            ),
+            "applied_trigger_source": self._applied_trigger_source,
+            "applied_trigger_active": self._applied_trigger_active,
+            "applied_trigger_polarity": self._applied_trigger_polarity,
             "readout_speed": self.config.readout_speed,
             "roi": self.roi,          # the region truly being imaged (hardware-snapped when open)
             "device_index": self.config.device_index,
