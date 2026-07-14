@@ -609,3 +609,49 @@ def test_current_format_names_do_not_encode_edit_counters():
         "edit counters are forbidden:\n"
         + "\n".join(violations)
     )
+
+
+def test_pulse_software_formats_have_no_upgrade_or_edit_counter():
+    """The remaining legacy island is current-only until its final H1 cut.
+
+    Its three persisted software values may retain a plain schema name, but
+    must not regrow a numeric revision field or a historical parser. Hardware
+    ABI and the deployed runtime wire version are intentionally out of scope.
+    """
+
+    timing_root = ROOT / "Zou_lab_control" / "neutral_atom" / "timing"
+    upgrader = timing_root / "legacy_pulse_upgrade.py"
+    assert not upgrader.exists(), "historical pulse upgrade code must stay deleted"
+
+    owners = (
+        (ROOT / "Zou_lab_control" / "neutral_atom" / "ports.py", "PortCatalog"),
+        (timing_root / "sequence.py", "PulseSequence"),
+        (timing_root / "pulse_table.py", "PulseTableState"),
+    )
+    violations = []
+    for path, class_name in owners:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        owner = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        for node in ast.walk(owner):
+            if isinstance(node, ast.Constant) and node.value == "version":
+                violations.append(
+                    f"{path.relative_to(ROOT)}:{node.lineno} persists a version field"
+                )
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+                if any(isinstance(target, ast.Name) and target.id == "version" for target in targets):
+                    violations.append(
+                        f"{path.relative_to(ROOT)}:{node.lineno} defines a version attribute"
+                    )
+
+    for path in (ROOT / "Zou_lab_control").rglob("*.py"):
+        if "legacy_pulse_upgrade" in path.read_text(encoding="utf-8"):
+            violations.append(f"{path.relative_to(ROOT)} imports the deleted upgrader")
+
+    assert not violations, (
+        "legacy pulse software formats are current-only; use their plain schema "
+        "name and reject every other shape:\n" + "\n".join(violations)
+    )

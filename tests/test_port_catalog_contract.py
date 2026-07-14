@@ -66,12 +66,9 @@ def test_pulse_document_persists_one_topology_contract():
     [
         ("schema", None, r"missing=.*schema"),
         ("schema", "old.PortCatalog", "port-catalog schema"),
-        ("version", None, r"missing=.*version"),
-        ("version", 0, "port-catalog version"),
-        ("version", 2, "port-catalog version"),
     ],
 )
-def test_port_catalog_rejects_missing_or_unknown_contract_identity(field, value, message):
+def test_port_catalog_rejects_missing_or_unknown_format_name(field, value, message):
     payload = _dac_catalog().to_dict()
     if value is None:
         payload.pop(field)
@@ -97,14 +94,14 @@ def test_port_catalog_rejects_unknown_top_level_fields():
         PortCatalog.from_dict(payload)
 
 
-def test_pulse_table_requires_exact_current_version_shape():
+def test_pulse_table_requires_exact_current_format_shape():
     payload = _dac_state(_dac_catalog()).to_dict()
     payload.pop("delay_units")
     with pytest.raises(ValueError, match=r"missing=.*delay_units"):
         PulseTableState.from_dict(payload)
 
 
-def test_pulse_sequence_requires_exact_current_version_shape_and_types():
+def test_pulse_sequence_requires_exact_current_format_shape_and_types():
     payload = PulseSequence(
         [Pulse("ttl", 0.0, 1e-6)], name="shot", repeat_forever=False,
     ).to_dict()
@@ -118,8 +115,6 @@ def test_pulse_sequence_requires_exact_current_version_shape_and_types():
 
     with pytest.raises(ValueError, match=r"unexpected=.*legacy_repeat"):
         PulseSequence.from_dict({**payload, "legacy_repeat": 1})
-    with pytest.raises(ValueError, match="PulseSequence version"):
-        PulseSequence.from_dict({**payload, "version": payload["version"] + 1})
     with pytest.raises(ValueError, match="repeat_forever must be a boolean"):
         PulseSequence.from_dict({**payload, "repeat_forever": "false"})
 
@@ -193,7 +188,7 @@ def test_pulse_nested_records_require_their_complete_shape(factory, payload, fie
         "encoding", "safe_value", "latch_clock",
     ],
 )
-def test_port_spec_requires_the_complete_versioned_catalog_shape(field):
+def test_port_spec_requires_the_complete_catalog_shape(field):
     payload = _dac_catalog().to_dict()
     payload["ports"][0].pop(field)
 
@@ -201,7 +196,7 @@ def test_port_spec_requires_the_complete_versioned_catalog_shape(field):
         PortCatalog.from_dict(payload)
 
 
-def test_port_spec_rejects_unknown_fields_inside_current_catalog_version():
+def test_port_spec_rejects_unknown_fields_inside_current_catalog():
     payload = _dac_catalog().to_dict()
     payload["ports"][0]["old_channel_alias"] = "x0"
 

@@ -143,7 +143,6 @@ class PortCatalog:
     ports: tuple[PortSpec, ...]
 
     schema = "Zou_lab_control.neutral_atom.PortCatalog"
-    version = 1
 
     def __post_init__(self) -> None:
         raw = tuple(str(item).strip() for item in self.raw_lanes)
@@ -291,7 +290,6 @@ class PortCatalog:
     def to_dict(self, *, include_fingerprint: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
             "schema": self.schema,
-            "version": self.version,
             "raw_lanes": list(self.raw_lanes),
             "ports": [port.to_dict() for port in self.ports],
         }
@@ -301,19 +299,15 @@ class PortCatalog:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "PortCatalog":
-        fields = {"schema", "version", "raw_lanes", "ports", "fingerprint"}
+        fields = {"schema", "raw_lanes", "ports", "fingerprint"}
         require_exact_fields(payload, fields, what="sequencer port catalog")
         if payload["schema"] != cls.schema:
             raise ValueError(
                 f"unsupported sequencer port-catalog schema {payload['schema']!r}; "
                 f"expected {cls.schema!r}")
-        if payload["version"] != cls.version:
-            raise ValueError(
-                f"unsupported sequencer port-catalog version {payload['version']!r}; "
-                f"expected {cls.version}")
         raw_lanes = require_array(payload["raw_lanes"], what="PortCatalog.raw_lanes")
         ports = require_array(payload["ports"], what="PortCatalog.ports")
-        # Reconstruct + STRUCTURALLY validate (``__post_init__``) + version-check only.  The stored
+        # Reconstruct and structurally validate in ``__post_init__``.  The stored
         # ``fingerprint`` is NOT a load-time gate: it is the host↔bitstream ABI hash, checked at
         # connect / prepare against the LIVE device catalog (sequencer.py).  Gating deserialization on
         # it made merely OPENING a pulse for editing fail whenever the file predated a topology/label

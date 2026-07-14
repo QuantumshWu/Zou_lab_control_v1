@@ -72,12 +72,10 @@ class Pulse:
 class PulseSequence:
     """Physical-time pulse table with simple per-channel delay support."""
 
-    # The JSON payload identity, single-sourced as class attributes (the same shape the
-    # sister ``PulseTableState`` carries): every writer (``to_dict``), reader
-    # (``from_dict``) and payload dispatcher (subsystems / devices) references THESE --
-    # the schema string is an on-disk persistence contract, never a retyped literal.
+    # The current JSON payload identity. Every writer, reader and payload dispatcher
+    # references this one plain format name; there is no edit-counter version or
+    # historical upgrade path.
     schema = "Zou_lab_control.neutral_atom.PulseSequence"
-    version = 2
 
     def __init__(
         self,
@@ -276,7 +274,6 @@ class PulseSequence:
     def to_dict(self) -> dict[str, object]:
         return {
             "schema": self.schema,
-            "version": self.version,
             "name": self.name,
             "delays": dict(self.delays),
             "repeat_count": self.repeat_count,
@@ -289,17 +286,13 @@ class PulseSequence:
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "PulseSequence":
         fields = {
-            "schema", "version", "name", "delays", "repeat_count",
+            "schema", "name", "delays", "repeat_count",
             "repeat_period", "repeat_forever", "pulses", "source_table",
         }
         require_exact_fields(payload, fields, what="PulseSequence")
         if payload["schema"] != cls.schema:
             raise ValueError(
                 f"unsupported PulseSequence schema {payload['schema']!r}; expected {cls.schema!r}.")
-        if payload["version"] != cls.version:
-            raise ValueError(
-                f"unsupported PulseSequence version {payload['version']!r}; "
-                f"expected {cls.version}.")
         pulses = require_array(payload["pulses"], what="PulseSequence.pulses")
         delays = require_object(payload["delays"], what="PulseSequence.delays")
         source = payload["source_table"]

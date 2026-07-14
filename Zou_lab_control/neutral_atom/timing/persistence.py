@@ -28,8 +28,7 @@ def load_pulse_payload(pulse: PulseSequence | PulseTableState | str | Path) -> P
     # BOTH payload kinds dispatch on their class-owned ``schema`` attribute (the single
     # source each class also writes in ``to_dict``) -- never a retyped literal here.
     if schema == PulseTableState.schema:
-        from .legacy_pulse_upgrade import upgrade   # REMOVE-ME(legacy-pulse-upgrade)
-        return PulseTableState.from_dict(upgrade(payload))
+        return PulseTableState.from_dict(payload)
     if schema == PulseSequence.schema:
         return PulseSequence.from_dict(payload)
     raise ValueError(f"unsupported pulse JSON schema in {path}: {schema!r}")

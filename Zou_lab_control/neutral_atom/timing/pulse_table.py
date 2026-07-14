@@ -375,7 +375,6 @@ class PulseTableState:
     """Editable period table that compiles into a ``PulseSequence``."""
 
     schema = "Zou_lab_control.neutral_atom.PulseTableState"
-    version = 4
 
     def __init__(
         self,
@@ -410,7 +409,7 @@ class PulseTableState:
         self.time_step_ns = positive_time_step_ns(time_step_ns)
         # Programmatic construction may use keyword mappings with the dataclass's documented optional
         # fields.  Serialized documents do not pass this seam: ``from_dict`` validates their complete
-        # versioned shape first and supplies typed ScanSlot objects.
+        # current exact shape first and supplies typed ScanSlot objects.
         self.scan_slots = [
             slot if isinstance(slot, ScanSlot) else ScanSlot(**dict(slot))
             for slot in (scan_slots or [])
@@ -1946,7 +1945,6 @@ class PulseTableState:
     def to_dict(self) -> dict[str, object]:
         return {
             "schema": self.schema,
-            "version": self.version,
             "name": self.name,
             "port_catalog": self.port_catalog.to_dict(),
             "scan_slots": [slot.to_dict() for slot in self.scan_slots],
@@ -2011,7 +2009,7 @@ class PulseTableState:
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "PulseTableState":
         fields = {
-            "schema", "version", "name", "port_catalog", "scan_slots", "scan_table",
+            "schema", "name", "port_catalog", "scan_slots", "scan_table",
             "scan_code", "api_slots", "time_step_ns", "periods", "visible_ports",
             "analog_bus_modes", "delays", "delay_units", "repeat_start", "repeat_end",
             "repeat_count", "repeat_forever", "scan_repeats",
@@ -2020,10 +2018,6 @@ class PulseTableState:
         if payload["schema"] != cls.schema:
             raise ValueError(
                 f"unsupported pulse table schema {payload['schema']!r}; expected {cls.schema!r}.")
-        if type(payload["version"]) is not int or payload["version"] != cls.version:
-            raise ValueError(
-                f"unsupported pulse table version {payload['version']!r}; "
-                f"expected {cls.version}.")
         catalog_payload = payload["port_catalog"]
         if not isinstance(catalog_payload, Mapping):
             raise ValueError("pulse table requires an embedded PortCatalog.")
@@ -2078,8 +2072,7 @@ class PulseTableState:
 
     @classmethod
     def load(cls, path: str | Path) -> "PulseTableState":
-        from .legacy_pulse_upgrade import upgrade   # REMOVE-ME(legacy-pulse-upgrade)
-        return cls.from_dict(upgrade(json.loads(Path(path).read_text(encoding="utf-8"))))
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
     @classmethod
     def from_sequence(

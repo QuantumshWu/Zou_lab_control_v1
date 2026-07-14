@@ -100,18 +100,18 @@ def test_tick_tie_rounding_is_one_rule_on_both_snap_paths():
 
 # ------------------------------------------------------------------ PulseSequence schema
 def test_pulse_sequence_schema_identity_lives_on_the_class(tmp_path):
-    """``PulseSequence`` carries ``schema`` / ``version`` as class attributes (same shape as
-    its sister ``PulseTableState``); writer, reader and the timing-layer payload loader all
-    read THEM -- the on-disk schema string is a persistence contract with one home."""
+    """The plain schema name is the one persisted format identity.
+
+    Writer, reader and the timing-layer payload loader all read the class-owned
+    name; there is no numeric edit counter or upgrade path.
+    """
     from Zou_lab_control.neutral_atom.timing import (
         PulseSequence, PulseTableState, load_pulse_payload, single_imaging_template)
 
     assert isinstance(PulseSequence.schema, str) and PulseSequence.schema
-    assert isinstance(PulseSequence.version, int)
     seq = PulseSequence([], name="probe")
     payload = seq.to_dict()
     assert payload["schema"] == PulseSequence.schema
-    assert payload["version"] == PulseSequence.version
     assert PulseSequence.from_dict(payload).name == "probe"
     with pytest.raises(ValueError):
         PulseSequence.from_dict({**payload, "schema": "nope"})
