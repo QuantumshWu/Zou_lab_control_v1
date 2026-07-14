@@ -80,6 +80,7 @@ from zlc_storage import (
     sha256_text as _sha256,
 )
 
+from ._endpoint_binding import require_current_endpoint_binding as _require_binding
 from .legacy_runtime import LegacyDeviceRegistry, TargetDeviceEndpoint
 
 
@@ -841,16 +842,7 @@ class CameraCaptureEndpoint:
         )
 
     def _validate_binding(self, binding: BoundDevice) -> None:
-        if not isinstance(binding, BoundDevice):
-            raise TypeError("camera endpoint requires BoundDevice")
-        if self._binding_id is None:
-            # The first capability probe establishes the private callback binding.
-            return
-        if (
-            binding.binding_id != self._binding_id
-            or binding.connection_generation != self._generation
-        ):
-            raise RuntimeError("camera endpoint binding generation changed")
+        _require_binding(binding, "camera", self._binding_id, self._generation)
 
     def _active_session(
         self,

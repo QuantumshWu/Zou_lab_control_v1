@@ -36,6 +36,7 @@ from zlc_pulse import (
 )
 from zlc_storage import canonical_digest, canonical_text as _text
 
+from ._endpoint_binding import require_current_endpoint_binding as _require_binding
 from .legacy_runtime import LegacyDeviceRegistry, TargetDeviceEndpoint
 
 
@@ -381,15 +382,7 @@ class VirtualSequencerExecutionEndpoint:
         return canonical_digest({"operation": "SAFE_STATE", "state": "safe"})
 
     def _validate_binding(self, binding: BoundDevice) -> None:
-        if not isinstance(binding, BoundDevice):
-            raise TypeError("sequencer endpoint requires BoundDevice")
-        if self._binding_id is None:
-            return
-        if (
-            binding.binding_id != self._binding_id
-            or binding.connection_generation != self._generation
-        ):
-            raise RuntimeError("sequencer endpoint binding generation changed")
+        _require_binding(binding, "sequencer", self._binding_id, self._generation)
 
     def _active_session(self, binding: BoundDevice, session_id: str) -> _EndpointSession:
         self._validate_binding(binding)
@@ -661,12 +654,7 @@ class RemotePulseExecutionEndpoint:
         )
 
     def _validate_binding(self, binding: BoundDevice) -> None:
-        if not isinstance(binding, BoundDevice):
-            raise TypeError("sequencer endpoint requires BoundDevice")
-        if self._binding_id is None:
-            return
-        if binding.binding_id != self._binding_id or binding.connection_generation != self._generation:
-            raise RuntimeError("sequencer endpoint binding generation changed")
+        _require_binding(binding, "sequencer", self._binding_id, self._generation)
 
     def _validate_remote_generation(self):
         snapshot = self._client.snapshot()

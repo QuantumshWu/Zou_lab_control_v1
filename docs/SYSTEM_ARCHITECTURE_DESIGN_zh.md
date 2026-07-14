@@ -3215,6 +3215,8 @@ Pulse RPC 的 artifact message 不是第二个 wire owner：`encode_artifact_mes
 
 PulseTarget ABI、TargetIR、PulseWireImage、CompiledPulseArtifact 与已经通过构造验证的 terminal/tail evidence 都是 immutable value；其 canonical identity 在成功 `__post_init__`/root decode 的末尾计算一次，getter 只返回缓存，不为检测 `object.__setattr__` 反射而反复重建全树。Wire image 的 digest payload 与公开 tree 必须共用同一个不含 digest 的 private projection，禁止维护两份字段表。Raw STATUS/CURSOR/tail observation 的 u32、recipe、sample-count、稳定性与 artifact binding 仍在对应硬件证据 owner 边界验证，缓存不能提前到 raw observation，也不能替代 completion admission。golden digest 向量和“构造后 monkeypatch `canonical_digest`”结构测试共同锁定值不变与只计算一次。
 
+Workbench 内本地 sequencer、远端 sequencer 与 camera endpoint 共享的 `BoundDevice + binding_id + connection_generation` 当前性检查由一个 private function 拥有；首次 capability probe 前只要求真实 `BoundDevice`，probe 后同时严格匹配 binding id 与 generation。远端 server generation、capability 及各设备自己的 live readback 是不同不变量，继续留在对应 endpoint，不得因抽取公共函数而合并或削弱。该收敛只去除三份相同实现，不改变 camera/sequencer 入口、GUI 计划 consumer 或设备能力。
+
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 
 | 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |
