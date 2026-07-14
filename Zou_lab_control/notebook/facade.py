@@ -17,11 +17,23 @@ from Zou_lab_control.neutral_atom.devices import (
     load_devices,
     resolve_connect_config,
 )
-from zlc_data import AxisId, BlockId
+from zlc_data import (
+    AxisId,
+    BlockId,
+    CommittedTransform,
+    FitNumericPolicy,
+    FitParameterConstraint,
+    FitResultArtifactRef,
+    FitSpec,
+    fit_spec_for,
+)
 from zlc_neutral_atom.artifacts import (
+    AdmittedCaptureFitResult,
     CaptureArtifact,
     CaptureArtifactRef,
+    CaptureFitResultRepository,
     CaptureRepository,
+    FitExecution,
     compile_capture_artifact_pipeline,
 )
 from zlc_neutral_atom.readout import (
@@ -205,33 +217,14 @@ class PlanDescriptor:
 
 @dataclass
 class _ExperimentServices:
-    name: str
     runtime: LegacyNeutralAtomRuntime
     devices: object
     capture_repository: CaptureRepository
     calibration_repository: CalibrationRepository
+    fit_repository: CaptureFitResultRepository
     catalog: DeviceCatalogView
     operation_lock: threading.RLock
-    composite_lock: threading.RLock
-    current_calibrations: dict[ReadoutBindingKey, "_CurrentCalibrationEntry"]
     closed: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class _CurrentCalibrationEntry:
-    revision: int
-    reference: CalibrationArtifactRef | None
-
-    def __post_init__(self) -> None:
-        if isinstance(self.revision, bool) or not isinstance(self.revision, int):
-            raise TypeError("current calibration revision must be int")
-        if self.revision < 0:
-            raise ValueError("current calibration revision cannot be negative")
-        if self.reference is not None and not isinstance(
-            self.reference,
-            CalibrationArtifactRef,
-        ):
-            raise TypeError("current calibration reference must be typed")
 
 
 _AUTHORITY_LOCK = threading.RLock()
@@ -285,22 +278,6 @@ class ReadoutFacade:
             raise TypeError("binding must be ReadoutBindingKey or None")
         self._binding = binding
 
-    def _binding_key(self) -> ReadoutBindingKey:
-        services = _services(self._token)
-        if self._binding is not None:
-            info = services.catalog.require(self._binding.value)
-            if info.domain != "camera":
-                raise ValueError(
-                    f"readout binding {self._binding.value!r} is not a camera"
-                )
-            return self._binding
-        roles = services.catalog.roles("camera")
-        if len(roles) != 1:
-            raise ValueError(
-                f"installation has {len(roles)} readout bindings; use for_binding()"
-            )
-        return ReadoutBindingKey(roles[0])
-
     def for_binding(
         self,
         binding: ReadoutBindingKey | str,
@@ -317,42 +294,6 @@ class ReadoutFacade:
         if info.domain != "camera":
             raise ValueError(f"readout binding {key.value!r} is not a camera")
         return ReadoutFacade(self._token, key)
-
-    @property
-    def current_calibration_ref(self) -> CalibrationArtifactRef | None:
-        services = _services(self._token)
-        binding = self._binding_key()
-        with services.operation_lock:
-            entry = services.current_calibrations.get(binding)
-            return None if entry is None else entry.reference
-
-    @current_calibration_ref.setter
-    def current_calibration_ref(
-        self,
-        value: CalibrationArtifactRef | None,
-    ) -> None:
-        services = _services(self._token)
-        binding = self._binding_key()
-        if value is not None and not isinstance(value, CalibrationArtifactRef):
-            raise TypeError(
-                "current_calibration_ref must be CalibrationArtifactRef or None"
-            )
-        with services.operation_lock:
-            if value is not None:
-                admitted = services.calibration_repository.admit(
-                    value,
-                    services.capture_repository,
-                )
-                if admitted.artifact.frame_contract.binding != binding:
-                    raise ValueError(
-                        "calibration artifact belongs to another readout binding"
-                    )
-            previous = services.current_calibrations.get(binding)
-            revision = 1 if previous is None else previous.revision + 1
-            services.current_calibrations[binding] = _CurrentCalibrationEntry(
-                revision,
-                value,
-            )
 
     def capture_request(
         self,
@@ -445,13 +386,69 @@ class Experiment:
         _plan, descriptor = _compile(self._authority_token, request)
         return descriptor
 
+    def fit(
+        self,
+        source: CaptureArtifactRef,
+        spec: FitSpec | None = None,
+        *,
+        model: str | None = None,
+        committed_transform: CommittedTransform | None = None,
+        fit_axis_ids: tuple[AxisId, ...] | None = None,
+        constraints: tuple[FitParameterConstraint, ...] = (),
+        numeric_policy: FitNumericPolicy | None = None,
+    ) -> FitExecution:
+        """Fit one committed capture without hiding any axis reduction."""
+
+        if not isinstance(source, CaptureArtifactRef):
+            raise TypeError("source must be CaptureArtifactRef")
+        if (spec is None) == (model is None):
+            raise ValueError("provide exactly one of spec or model")
+        services = _services(self._authority_token)
+        admitted = services.capture_repository.admit(source)
+        if spec is None:
+            assert model is not None
+            spec = fit_spec_for(
+                admitted.artifact.block.schema,
+                model,
+                committed_transform=committed_transform,
+                fit_axis_ids=fit_axis_ids,
+                constraints=constraints,
+                numeric_policy=(
+                    FitNumericPolicy()
+                    if numeric_policy is None
+                    else numeric_policy
+                ),
+            )
+        elif any(
+            value is not None
+            for value in (
+                committed_transform,
+                fit_axis_ids,
+                numeric_policy,
+            )
+        ) or constraints:
+            raise ValueError(
+                "spec cannot be combined with model convenience arguments"
+            )
+        return services.fit_repository.execute(admitted, spec)
+
+    def load_fit(
+        self,
+        reference: FitResultArtifactRef,
+    ) -> AdmittedCaptureFitResult:
+        services = _services(self._authority_token)
+        return services.fit_repository.load(
+            reference,
+            services.capture_repository,
+        )
+
     def close(self) -> None:
         with _AUTHORITY_LOCK:
             services = _AUTHORITIES.get(self._authority_token)
         if services is None or services.closed:
             return
         failures: list[Exception] = []
-        with services.composite_lock, services.operation_lock:
+        with services.operation_lock:
             if services.closed:
                 return
             shutdown = services.runtime.shutdown(timeout=2.0)
@@ -462,6 +459,7 @@ class Experiment:
             failures.extend(
                 _cleanup_failures(
                     services.devices.close,
+                    services.fit_repository.close,
                     services.calibration_repository.close,
                     services.capture_repository.close,
                 )
@@ -598,23 +596,17 @@ def connect(
     if not isinstance(repository, (str, Path)):
         raise TypeError("repository must be an explicit experiment workspace root")
     repository_root = Path(repository).expanduser().resolve()
-    capture_repository = CaptureRepository(repository_root / "captures")
+    capture_repository = None
     calibration_repository = None
+    fit_repository = None
     devices = None
     runtime = None
     try:
+        capture_repository = CaptureRepository(repository_root / "captures")
         calibration_repository = CalibrationRepository(
             repository_root / "calibrations"
         )
-    except BaseException as error:
-        failures = _cleanup_failures(capture_repository.close)
-        if failures and isinstance(error, Exception):
-            raise _ResourceCleanupError(
-                "calibration repository creation cleanup failed",
-                tuple(failures),
-            ) from error
-        raise
-    try:
+        fit_repository = CaptureFitResultRepository(repository_root / "fits")
         device_config, device_overrides, _defaults = resolve_connect_config(
             config,
             trap_array=trap_array,
@@ -644,15 +636,13 @@ def connect(
             revision=1,
         )
         services = _ExperimentServices(
-            _text(name, "experiment name"),
             runtime,
             devices,
             capture_repository,
             calibration_repository,
+            fit_repository,
             catalog,
             threading.RLock(),
-            threading.RLock(),
-            {},
         )
         token = _register(services)
         return Experiment(token, name=name, device_catalog=catalog)
@@ -664,8 +654,9 @@ def connect(
                 else lambda: _require_runtime_shutdown(runtime, timeout=2.0)
             ),
             None if devices is None else devices.close,
-            calibration_repository.close,
-            capture_repository.close,
+            None if fit_repository is None else fit_repository.close,
+            None if calibration_repository is None else calibration_repository.close,
+            None if capture_repository is None else capture_repository.close,
         )
         if failures and isinstance(error, Exception):
             raise _ResourceCleanupError(
@@ -676,9 +667,11 @@ def connect(
 
 
 __all__ = [
+    "AdmittedCaptureFitResult",
     "CaptureRequest",
     "connect",
     "Experiment",
+    "FitExecution",
     "PlanDescriptor",
     "ReadoutFacade",
     "TimingFacade",

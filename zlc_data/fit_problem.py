@@ -13,6 +13,7 @@ from .fit_contract import (
     BoundFit,
     FitCoordinateSource,
     FitProblem,
+    FitResultBatch,
     FitSpec,
     _coordinate_source_for_axis,
 )
@@ -261,6 +262,46 @@ def build_fit_problem(
         valid_observation_counts=np.asarray(valid_counts, dtype=np.dtype("<i8")),
         used_observation_counts=np.asarray(used_counts, dtype=np.dtype("<i8")),
     )
+
+
+def validate_fit_result_binding(
+    result: FitResultBatch,
+    snapshot: OwnedSnapshot,
+) -> None:
+    """Replay the packing contract that binds a persisted result to its source.
+
+    This does not rerun the solver or judge its numeric output.  It delegates
+    dataset packing to :func:`build_fit_problem`, then verifies only the source,
+    axis, layout, unit, and observation-count facts derived by that owner.
+    """
+
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("result must be FitResultBatch")
+    if not isinstance(snapshot, OwnedSnapshot):
+        raise TypeError("snapshot must be OwnedSnapshot")
+    problem = build_fit_problem(
+        bind_fit(result.spec, snapshot.block.schema),
+        snapshot,
+    )
+    if result.source_ref != problem.source_ref:
+        raise ValueError("fit result source reference differs from source snapshot")
+    if result.fit_axis_specs != problem.fit_axis_specs:
+        raise ValueError("fit result axis specifications differ from source packing")
+    if result.batch_axis_specs != problem.batch_axis_specs:
+        raise ValueError("fit result batch axes differ from source packing")
+    if result.batch_layout != problem.batch_layout:
+        raise ValueError("fit result batch layout differs from source packing")
+    if result.value_unit != problem.value_unit:
+        raise ValueError("fit result value unit differs from source packing")
+    for field in (
+        "present_observation_counts",
+        "valid_observation_counts",
+        "used_observation_counts",
+    ):
+        if not np.array_equal(getattr(result, field), getattr(problem, field)):
+            raise ValueError(
+                f"fit result {field} differs from source packing"
+            )
 
 
 def _batch_layout_from_mapping(
@@ -686,4 +727,4 @@ def _check_abort(abort_check: Callable[[], None] | None) -> None:
         abort_check()
 
 
-__all__ = ["bind_fit", "build_fit_problem"]
+__all__ = ["bind_fit", "build_fit_problem", "validate_fit_result_binding"]

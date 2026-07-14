@@ -288,6 +288,28 @@ def test_readout_artifacts_do_not_restore_edit_counter_metadata():
     )
 
 
+def test_notebook_facade_has_no_implicit_current_calibration_state():
+    source = (ROOT / "Zou_lab_control/notebook/facade.py").read_text(
+        encoding="utf-8"
+    )
+    assert "current_calibration" not in source, (
+        "calibration-dependent notebook requests must receive an explicit typed ref; "
+        "do not restore a session current/revision map"
+    )
+
+
+def test_headless_notebook_import_does_not_load_frontend_renderer():
+    code = (
+        "import sys; import Zou_lab_control.notebook; "
+        "assert 'zlc_frontend.render' not in sys.modules; "
+        "assert not any(name == 'matplotlib' or name.startswith('matplotlib.') "
+        "or name == 'PyQt5' or name.startswith('PyQt5.') "
+        "or name == 'PySide6' or name.startswith('PySide6.') "
+        "for name in sys.modules)"
+    )
+    subprocess.run([sys.executable, "-c", code], cwd=ROOT, check=True)
+
+
 def test_content_ref_codec_and_cas_address_have_one_storage_owner():
     violations = []
     package_roots = (

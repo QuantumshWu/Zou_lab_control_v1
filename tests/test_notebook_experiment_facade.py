@@ -13,7 +13,12 @@ import Zou_lab_control.notebook.facade as facade_impl
 from Zou_lab_control.neutral_atom.devices.base import BaseDevice
 from Zou_lab_control.neutral_atom.devices.registry import DeviceSet
 from Zou_lab_control.neutral_atom.device_catalog import DeviceRef
-from zlc_neutral_atom.artifacts import CaptureArtifactRef, CaptureRepository
+from zlc_data import FitNumericPolicy, FitResultArtifactRef, SPATIAL_X, SPATIAL_Y
+from zlc_neutral_atom.artifacts import (
+    CaptureArtifactRef,
+    CaptureFitResultRepository,
+    CaptureRepository,
+)
 from zlc_neutral_atom.readout import CalibrationRepository, ReadoutBindingKey
 from zlc_storage import RepositoryRootBusy
 from zlc_neutral_atom.runtime import BoundDevice, RunPlan
@@ -64,6 +69,41 @@ def test_readout_capture_convenience_uses_the_same_authoritative_path(tmp_path):
             ROOT / "pulses" / "imaging_template.json"
         )
         assert exp.readout.load_capture(reference).pulse_lineage is not None
+
+
+def test_capture_fit_save_load_is_short_headless_and_preserves_named_batch_axes(
+    tmp_path,
+):
+    with zlc.connect("virtual", repository=tmp_path / "workspace") as exp:
+        capture_ref = exp.readout.capture(
+            ROOT / "pulses" / "imaging_template.json"
+        )
+        execution = exp.fit(
+            capture_ref,
+            model="radial_gaussian_center",
+            numeric_policy=FitNumericPolicy(
+                max_evaluations=500,
+                max_seconds_per_batch=1.0,
+                max_total_seconds=5.0,
+                sample_budget_per_batch=512,
+                max_packed_observations=4_096,
+            ),
+        )
+        assert tuple(axis.role for axis in execution.result.fit_axis_specs) == (
+            SPATIAL_X,
+            SPATIAL_Y,
+        )
+        assert execution.result.spec.batch_axis_ids == tuple(
+            axis.axis_id for axis in execution.result.batch_axis_specs
+        )
+        assert len(execution.result.batch_axis_specs) == 2
+
+        fit_ref = execution.save()
+        assert isinstance(fit_ref, FitResultArtifactRef)
+        admitted = exp.load_fit(fit_ref)
+        assert admitted.reference == fit_ref
+        assert admitted.source_capture_ref == capture_ref
+        assert admitted.result.digest == execution.result.digest
 
 
 def test_public_experiment_graph_contains_no_drive_capability(tmp_path):
@@ -140,14 +180,17 @@ def test_experiment_owns_typed_sibling_repositories_until_close(tmp_path):
             CaptureRepository(root / "captures")
         with pytest.raises(RepositoryRootBusy, match="live owner"):
             CalibrationRepository(root / "calibrations")
+        with pytest.raises(RepositoryRootBusy, match="live owner"):
+            CaptureFitResultRepository(root / "fits")
     finally:
         exp.close()
 
     CaptureRepository(root / "captures").close()
     CalibrationRepository(root / "calibrations").close()
+    CaptureFitResultRepository(root / "fits").close()
 
 
-def test_failed_composition_releases_both_repository_roots(tmp_path):
+def test_failed_composition_releases_all_repository_roots(tmp_path):
     root = tmp_path / "failed-workspace"
     with pytest.raises(TypeError, match="string indices"):
         zlc.connect(
@@ -156,6 +199,7 @@ def test_failed_composition_releases_both_repository_roots(tmp_path):
         )
     CaptureRepository(root / "captures").close()
     CalibrationRepository(root / "calibrations").close()
+    CaptureFitResultRepository(root / "fits").close()
 
 
 def test_failed_composition_reports_runtime_that_did_not_shutdown(
@@ -187,15 +231,12 @@ def test_failed_composition_reports_runtime_that_did_not_shutdown(
     assert isinstance(caught.value.__cause__, ValueError)
     CaptureRepository(root / "captures").close()
     CalibrationRepository(root / "calibrations").close()
+    CaptureFitResultRepository(root / "fits").close()
 
 
-def test_readout_binding_view_is_typed_and_current_reference_starts_empty(tmp_path):
+def test_readout_binding_view_is_typed_without_session_calibration_state(tmp_path):
     with zlc.connect("virtual", repository=tmp_path / "workspace") as exp:
-        with pytest.raises(ValueError, match="2 readout bindings"):
-            _ = exp.readout.current_calibration_ref
         bound = exp.readout.for_binding(ReadoutBindingKey("camera"))
-        assert bound.current_calibration_ref is None
-        bound.current_calibration_ref = None
-        assert bound.current_calibration_ref is None
+        assert not hasattr(bound, "current_calibration_ref")
         with pytest.raises(ValueError, match="cannot switch"):
             bound.for_binding("sequencer")

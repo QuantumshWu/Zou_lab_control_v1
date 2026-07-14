@@ -12,6 +12,12 @@ from .capture import (
     compile_capture_artifact_pipeline,
     PulseCaptureLineage,
 )
+from .capture_fit import (
+    AdmittedCaptureFitResult,
+    CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA,
+    CaptureFitResultRepository,
+    FitExecution,
+)
 
 __all__ = [
     "AdmittedCapture",
@@ -24,4 +30,8 @@ __all__ = [
     "DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY",
     "compile_capture_artifact_pipeline",
     "PulseCaptureLineage",
+    "AdmittedCaptureFitResult",
+    "CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA",
+    "CaptureFitResultRepository",
+    "FitExecution",
 ]

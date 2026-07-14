@@ -1,9 +1,11 @@
 """Notebook-first public API."""
 
 from .facade import (
+    AdmittedCaptureFitResult,
     CaptureRequest,
     connect,
     Experiment,
+    FitExecution,
     PlanDescriptor,
     ReadoutFacade,
     TimingFacade,
@@ -11,9 +13,11 @@ from .facade import (
 )
 
 __all__ = [
+    "AdmittedCaptureFitResult",
     "CaptureRequest",
     "connect",
     "Experiment",
+    "FitExecution",
     "PlanDescriptor",
     "ReadoutFacade",
     "TimingFacade",

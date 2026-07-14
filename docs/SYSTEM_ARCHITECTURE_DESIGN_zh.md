@@ -234,7 +234,7 @@ Zou_lab_control.notebook  notebook composition 与薄 Experiment 门面
 
 `zlc_data` 不是新的 `common/utils`：它只容纳领域中立、headless、可序列化的数据语义和值上的纯算法。它拥有 Value/DataBlock、Axis/Validity/PointLayout、Selection/CommittedTransform、Reduction、FitSpec/FitProblem/FitResultBatch、model/solver adapter 与 `fit_analysis`。它不知道 Hub、Run、Device、neutral artifact、Figure、Qt 或 Matplotlib。
 
-headless fit 保存的 typed identity 也由数据语义 owner 定义：`zlc_data.FitResultArtifactRef` 与 FitResultBatch canonical codec 属于 zlc_data；实际 Repository I/O 由 notebook/neutral/workbench composition adapter 委托 zlc_storage 完成。`fit.save()` 保存 FitResultBatch 与 input/FitSpec lineage，不要求 frontend，也不把通用 fit 伪装成 neutral 领域 Analysis。Figure 保存仍使用 frontend-owned FigureArtifactRef；二者是不同 artifact kind。
+headless fit 保存的 typed identity 也由数据语义 owner 定义：`zlc_data.FitResultArtifactRef` 与 FitResultBatch canonical codec 属于 zlc_data。当前唯一可验证的 durable fit 输入是 neutral-owned committed `CaptureArtifact`，因此唯一 I/O adapter 是 `zlc_neutral_atom.artifacts.CaptureFitResultRepository`：它只绑定 admitted capture lineage、data-owned result payload 与 `zlc_storage`，不定义 Fit 算法、Processor 或通用 Analysis repository；出现第二种非 Capture source 后才提取共同 adapter。`fit.save()` 不要求 frontend，也不把通用 fit 伪装成 neutral 领域 Analysis。Figure 保存仍使用 frontend-owned FigureArtifactRef；二者是不同 artifact kind。
 
 “selector”必须拆开看：`Selection` 是可保存、可供 fit/processor 共同消费的数据语义，属于 zlc_data；鼠标手势、RectangleSelector、handle、overlay 和 interaction state 属于 frontend。`DataFigure` 明确属于 frontend，因为它是 render/public presentation facade。fit editor/overlay 属于 frontend，但它们调用 zlc_data 的唯一 fit 实现，不复制模型和结果 schema。
 
@@ -334,7 +334,7 @@ UnavailableInstallationState
   no raw graph / binding registry / drive facade / partial binding
 ```
 
-`private raw adapter graph` 只在 composition/runtime owner lane 内可达；它不是 `InstallationState` 的公共字段，也不能通过 debug property、generic resolver、callback closure 或 frontend ViewModel 泄漏。这里的typed facades是generation-pinned、immutable installation binding surface/descriptor，不包含用户可变的calibration convenience pointer或UI state。public `Experiment`只发布`device_catalog`与稳定的领域convenience facade；每个facade操作在一个composition临界区恰好snapshot一次current InstallationState、据此构造并冻结request/binding generation，不能分别读取descriptor和runtime指针。`current_calibration_ref`等application convenience state独立存在，但在request构造时与同一binding key/generation显式冻结。headless domain session本身不是普通用户的硬件service locator。
+`private raw adapter graph` 只在 composition/runtime owner lane 内可达；它不是 `InstallationState` 的公共字段，也不能通过 debug property、generic resolver、callback closure 或 frontend ViewModel 泄漏。这里的typed facades是generation-pinned、immutable installation binding surface/descriptor，不包含用户可变的calibration convenience pointer或UI state。public `Experiment`只发布`device_catalog`与稳定的领域convenience facade；每个facade操作在一个composition临界区恰好snapshot一次current InstallationState、据此构造并冻结request/binding generation，不能分别读取descriptor和runtime指针。所有依赖标定的请求都显式接收 `CalibrationArtifactRef` 并在构造时与 binding/model 一起冻结；headless domain session本身不是普通用户的硬件service locator。
 
 InstallationState的“immutable”指字段、binding membership、generation与registry快照结构不可改；其中引用的live adapter/connection当然会在owner lane内部改变物理/driver状态，但这些对象不向state读者开放，且不能被替换为另一binding。任何binding membership或connection identity变化都必须生成新state/generation，不能原地改registry后沿用旧catalog。
 
@@ -446,11 +446,11 @@ Experiment                         # notebook/application facade，不含领域�
   .trap.geometry                   # typed immutable domain descriptor
   .timing.target                   # clock/port/target descriptor，不是 raw sequencer
   .readout.camera_descriptor(...)  # frame/trigger/config capability descriptor
-  .readout.current_calibration_ref(binding?)
-                                      # 按 ReadoutBindingKey 保存的可见默认 Ref
   .run(request)                       # public只收declarative Request
   .start(request) -> RunHandle        # RunHandle不暴露plan/Port
   .inspect(request) -> PlanDescriptor # 纯摘要，不含capability
+  .fit(capture_ref, spec|model=...) -> FitExecution
+  .load_fit(FitResultArtifactRef) -> AdmittedCaptureFitResult
   .figure_document(result_or_ref)   # headless projector
   .figure(result_or_ref)            # 需要 zlc_frontend[render]
   .task_console() / .pulse_gui()    # 懒加载 notebook[workbench]，否则入口不存在/给安装提示
@@ -460,7 +460,7 @@ neutral domain Result
   no FigureDocument/DataFigure/Qt/Matplotlib object
 ```
 
-`Experiment` 只做参数便利、typed request 构造、结果解包和composition delegation；它不调用raw adapter，不复制 calibration/fit/scan 算法，也不让 domain object lazy 回查全局 session。唯一允许的便利状态是 `Experiment.readout` 内用户可见、可读取/赋值/清空的 `ReadoutBindingKey -> CalibrationArtifactRef` 映射：ref 只是 immutable 指针，不是 calibration 数据或第二份权威状态。单一默认 readout 时 `.current_calibration_ref` 可保持短属性；存在多个 camera/readout binding 时必须通过 `for_binding(binding)` 或显式 `calibration=` 选择，不能把 camera A 的 ref 猜给 camera B。`sitemap()` 成功可按公开契约只更新本次 binding 的默认 ref；任何依赖 calibration 的 convenience request 在**构造 request 时**把该 ref 解析为显式字段并立即冻结，运行时不再回查 facade。结果、internal RunPlan 与 artifact lineage 始终记录实际使用的 binding/ref/digest，因此短 notebook 路径不以隐藏物理输入换便利。
+`Experiment` 只做参数便利、typed request 构造、结果解包和composition delegation；它不调用raw adapter，不复制 calibration/fit/scan 算法，也不让 domain object lazy 回查全局 session。notebook baseline 不保存 `current_calibration` 指针、revision 或“最近一次”映射：这些状态在当前实现没有业务消费者，还会让短 API 的物理输入变成隐式。所有依赖 calibration 的 convenience request 必须显式接收 `calibration=CalibrationArtifactRef`，在请求构造时 load/admit 并与具体 `ReadoutBindingKey`、model 一起冻结；多 camera 不能猜 ref，运行时也不回查 facade。结果、internal RunPlan 与 artifact lineage 始终记录实际使用的 binding/ref/digest，因此短 notebook 路径不以隐藏物理输入换便利。
 
 `Experiment`、TaskConsole、PulseGUI 与 standalone launcher 都不得公开 raw `CameraDevice`、`SequencerDevice`、DeviceSet、SDK handle、BoundDevice/drive-capable Port、含BoundDependencies的RunPlan，或可直接执行 `configure/arm/acquire/prepare/fire/abort/safe` 的 adapter。普通实验硬件动作必须转换为 declarative typed request/窄command facade，经同一个 installation authority、RunController、ResourceArbiter、DeviceControlLease 与 owner I/O lane 执行；连接建立与故障恢复分别只能走§9的ConnectionEstablishmentClaim/RecoveryClaim维护入口，composition/workbench只编排这些入口，不取得第三种raw adapter capability。`.pulse_gui()` 得到的是 workbench-owned pulse command facade，而不是 `session.sequencer`；`.readout` 得到的是领域 convenience facade，而不是 `session.camera`；`.device_catalog` 返回 immutable 值，而不是 `session.devices` 的兼容代理。若某 standalone 入口无法加入同一 installation authority，real mode 启动即失败，只可显式运行 virtual/offline 模式，不能以“独立窗口”为由绕过 quarantine、generation 或 active claim。
 
@@ -472,11 +472,10 @@ neutral domain Result
 
 ```python
 exp = zlc.connect("virtual", repository=repo)
-cal = exp.readout.sitemap(frames=12)
-# 单 readout 时 exp.readout.current_calibration_ref == cal.ref；多 readout 按 binding 保存
-scan = exp.readout.detection_time(times).run()
-fit = scan.fit(model="decay")
+capture_ref = exp.readout.capture("imaging_template.json")
+fit = exp.fit(capture_ref, model="radial_gaussian_center")
 fit_ref = fit.save()  # headless zlc_data FitResultArtifactRef，不要求 renderer
+saved = exp.load_fit(fit_ref)
 ```
 
 同一组代码换成 real adapter 只改 `connect` 参数。契约 E2E 固定“connect virtual -> capture -> 1D fit -> save”和“sitemap -> calibration ref -> detect”均为少量 notebook 语句；不得要求用户手工 bind Port、构造 PipelineSpec、解析 PipelineResult 或 resolve artifact ref。门面在最早 vertical slice 与 RunController/Repository 一起交付，不能拖到剩余 helper 收尾阶段。
@@ -1602,6 +1601,7 @@ commit_transform(schema, authoritative_spec, revision, origin)
 - CURVE：detuning 作为 x；height/width 不能自动平均。没有 ROI 时返回 `NEEDS_INPUT`，同时继续显示 image 让用户框 ROI；定义 ROI count 后曲线建议成为 `REVIEW_REQUIRED` 或 `RESOLVED`。
 - HISTOGRAM：repeat 作为独立样本 pool；site/spatial 维默认 batch/facet，不把 repeat 先平均，也不默认把所有 site 混成一个分布。
 - Fit authority draft：`suggest_fit_draft` 令 detuning 成为 fit axis；repeat 默认 preserve 为 batch，或预填用户已提交的 repeat reduction；剩余 site/spatial axis 继续成为 batch。每个 batch cell 产生一个 FitResult，组成 FitResultBatch，绝不对剩余轴 `nanmean`。该步骤不是 ViewIntent。
+- headless/notebook 的 `fit_spec_for` 使用同一条 role-driven 规则：显式 axes 原样采用；省略时只有 model 声明的 axis role 存在**唯一完整 matching**才生成权威 FitSpec。只要存在第二组物理上合法的 matching（即使 role 不同，例如 scan 与 spectral），就要求用户明确 `fit_axis_ids`；稳定优先级只允许用于 frontend 的显示/草稿建议，不能直接提交成权威 fit。它绝不按 rank/shape/singleton 猜轴，也不自动 Select/Reduce/flatten；repeat、point、site、component 与所有未选中的多维 data axes 逐根保留为具名 batch axes。
 - METER：没有已声明 ROI/integral 时为 `NEEDS_INPUT`，不能显示像素 `(0,0)` 冒充物理 signal。
 
 ### 11.7 Fit contract
@@ -1666,7 +1666,7 @@ WorkbenchFitRequest 是 workbench Command DTO，可持 app-local LiveDataBlockRe
 
 batch cell 独立执行；预先列举的数值初始化/solver/evaluation-limit/timeout/浮点或线性代数失败只使该格产生 typed status，某格失败或收敛后被拒绝时仍保留其它格结果。输入整体 schema/model 不兼容、transform 无效、cancellation，以及 AssertionError/TypeError/MemoryError 等未知实现或资源异常必须中止整个 Fit Analysis，不能被 broad `except Exception` 伪装成单格 solver failure。FitResultBatch 不包含 runtime EventRef、LiveDataBlockRef 或 ArtifactRef；formal Analysis/figure repository adapter 在外层附加 input lineage。它不拆成多个 scalar signal，overlay 从同一个 result 与外层 lineage 派生。
 
-FitResultBatch 是 compact solver-issued report，不是把原始坐标、observation、Jacobian 重复塞进去的 proof-carrying result。构造器/strict codec 验证状态机、静态 domain/constraint、计数、RSS、R²、covariance 的有限性/对称/PSD/fixed-row与 canonical zero；RMSE、effective schema fingerprint、coordinate source、parameter schema/unit、initializer/solver identity 都由已保存的 FitSpec/AxisSpec/catalog 唯一派生，不在 payload 再存第二份真相。动态 geometry/Jacobian/alias acceptance 由可信 solver path 唯一拥有，单凭一段自称 `ACCEPTED` 的任意 bytes 不能获得权威性。raw codec decode 只能得到 untrusted report；formal 保存必须经 composition-owned fit executor 把 result digest、source_ref、FitSpec digest 与 producer contract 写入 repository manifest，formal consumer 只接受 repository 验证后返回的 authoritative artifact view，不能直接接收 FitResultBatch/任意 bytes。若 manifest/producer/source revision 无法验证，则只能显示诊断或从源 revision 重算。
+FitResultBatch 是 compact solver-issued report，不是把原始坐标、observation、Jacobian 重复塞进去的 proof-carrying result。构造器/strict codec 验证状态机、静态 domain/constraint、计数、RSS、R²、covariance 的有限性/对称/PSD/fixed-row与 canonical zero；RMSE、effective schema fingerprint、coordinate source、parameter schema/unit、initializer/solver identity 都由已保存的 FitSpec/AxisSpec/catalog 唯一派生，不在 payload 再存第二份真相。动态 geometry/Jacobian/alias acceptance 由执行时的可信 solver path 唯一拥有。raw codec decode 只能得到 untrusted report；public formal 保存只接受 `CaptureFitResultRepository.execute()` 铸造的 process-local `FitExecution`，load 返回 capture-specific `AdmittedCaptureFitResult`。outer manifest 只含 current format、repository id、owner-encoded source CaptureArtifactRef 与 owner-encoded result ContentRef：result blob digest 就是 result digest，DatasetRevisionRef/FitSpec/solver contract 只在 FitResultBatch 内各存一次。load 时重新 admit source capture、由 block+generation 重建 OwnedSnapshot，并调用 zlc_data 的唯一 binding validator 交叉验证 source/spec/axes/layout/counts；它明确**不重跑 solver，也不从 parameters 反推证明一次历史数值执行**。这里的 admission 信任边界是由 OS/process root lease 排他的本地 repository writer 加 CAS 内容完整性：正常 public API 不能把任意 decoded FitResultBatch 升为 formal artifact；若外部主体能绕过 API 直接改写 repository filesystem，则没有密钥/签名的本地 artifact 都不具备 producer attestation，必须按 untrusted repository 处理，不能增添一个自报 producer digest 或伪 journal 冒充证明。若 manifest/source revision 无法验证，则只能显示诊断或从源 revision 重算。
 
 FitResultBatch 是当前一等需求，不延后：gridplot、site grid 和任何保留 site/component axis 的 fit 都要求“一组共享 model/parameter schema + 按具名 batch axes 排列的每格结果”。`BatchLayout` 复用 PointLayout 的 RECT_C/RECT_F/EXPLICIT 映射思想；稀疏 batch 只保存实际 B 个 cell，missing coordinate 与 fit failure 是不同状态，不能强行 densify 后混成 NaN。grid 的 cell label/coordinate 由 batch_axis_specs + BatchLayout/axis coordinates 派生，不能用 list index 充当永久 identity。ComponentValidity 在 build_fit_problem 时按 batch cell 切片；某个 site 无效只使对应 per_batch_status 失败，不污染其它 cell，也不允许先对 site 轴平均成一个 FitResult。`build_fit_problem` 是 fit densify/packing 的唯一 owner；若某 solver 只接受 dense layout，它必须显式 materialize mapping+validity或在 bind 时拒绝，不由 renderer/collector 猜 reshape。
 
@@ -1968,7 +1968,7 @@ CalibrationInput =
   | CaptureArtifactInput(CaptureArtifactRef)
 ```
 
-neutral domain/runtime 不接受“执行时读取 session current calibration”、裸 filesystem fallback 或 legacy path search。Notebook `Experiment.readout` 的 binding-keyed calibration ref 只是 composition facade 的可见默认：facade 构造 Occupancy/Detection/Scan request 时必须 load/admit 当前 ref，验证 readout binding，解析显式/default/唯一 model，并把具体 ReadoutBindingKey、CalibrationArtifactRef 与最终 `ReadoutModelKind` 冻结进 request。若 ref 为空、binding/FrameContract/model 不适用或选择歧义，request 构造/preflight 失败；运行中不能因为 facade 的 current ref/default 后来改变而换 calibration。Workbench 同样在用户点击 Run 时冻结当前选择，而不是让 processor 回查 mutable session或按 repository 最近文件猜。
+neutral domain/runtime 不接受“执行时读取 session current calibration”、裸 filesystem fallback 或 legacy path search。Notebook facade 构造 Occupancy/Detection/Scan request 时必须显式接收并 load/admit `CalibrationArtifactRef`，验证 readout binding，解析显式/default/唯一 model，并把具体 ReadoutBindingKey、CalibrationArtifactRef 与最终 `ReadoutModelKind` 冻结进 request。若 ref 缺失、binding/FrameContract/model 不适用或选择歧义，request 构造/preflight 失败；运行中不存在可切换的 facade current pointer。Workbench 同样在用户点击 Run 时冻结用户明确选择的 ref，而不是让 processor 回查 mutable session或按 repository 最近文件猜。
 
 ### 13.3 执行
 
@@ -2462,7 +2462,7 @@ pulse:         CompiledPulseRef
 neutral_atom:  CaptureArtifactRef、CalibrationArtifactRef、ScanArtifactRef
 ```
 
-每种 typed Ref 至少包含 kind、plain artifact format、artifact content digest 和 repository namespace；它不是任意 filesystem path，也不直接嵌入 mutable Python object。各 owner context 拥有自己的 Repository/codec 与 canonical manifest。Workbench 通过本地 ArtifactDescriptor adapters 聚合展示，不把 descriptor 反向泄漏给 owner。
+每种 typed Ref 至少包含 kind、plain artifact format、artifact content digest 和 repository namespace；它不是任意 filesystem path，也不直接嵌入 mutable Python object。typed Ref 与领域 payload codec 始终由值语义 owner 拥有；若正式 lineage 必须同时验证更高层 source authority，outer manifest/repository 位于能够单向依赖两侧的最窄 adapter（当前实例是 neutral 的 CaptureFitResultRepository），但不得复制 payload schema 或反向夺走算法所有权。Workbench 通过本地 ArtifactDescriptor adapters 聚合展示，不把 descriptor 反向泄漏给 owner。
 
 repository namespace 在 composition root 由 ExperimentWorkspace 显式绑定到用户可见的 RepositoryRoot；不读 current working directory、session 最近文件或隐式搜索路径。virtual/real 运行使用同一个 Repository API 和目录布局，测试只把 RepositoryRoot 换成临时目录。UI/日志始终能显示 artifact 实际写入的 root/ref，offline 流程要求用户选择 typed Ref 而不是“猜最近文件”。
 
@@ -2790,7 +2790,7 @@ Thread/UI：
 - Definition.bind/pipeline validation/pulse compile 不在 GUI thread 且不持有 hardware claim；
 - notebook Experiment facade 的 virtual connect -> capture -> 1D fit -> save 保持少量语句，headless 无 render extra 仍可完整运行；
 - headless fit.save 返回 zlc_data FitResultArtifactRef且不加载 frontend.render；figure_document 只需 frontend.figure，只有 figure()/GUI 需要 render/workbench extra；
-- Experiment.readout 的 ReadoutBindingKey -> CalibrationArtifactRef 可见可设；多 camera 不串 ref，convenience request 在构造时冻结 binding/ref/model，运行时清空/切换 facade pointer 不改变已启动 Run；
+- Experiment.readout 不保存 current calibration；依赖标定的 convenience request 必须显式接收 ref，并在构造时冻结 binding/ref/model，多 camera 不允许猜测或串用；
 - panel 的视图摘要与实际 render 的 ViewSpec/EvaluatedFigureData 一致，权威操作摘要与执行的 CommittedTransform/FitProblem/ScanOutputContract 一致；
 - 一次 Fit/Run 点击冻结 revision，后续 selector 变化不污染进行中的结果；
 - EditorSession base revision 冲突拒绝 last-write-wins；
@@ -2946,7 +2946,7 @@ F0 只有 contract/unit tests，不作为长期“基础设施里程碑”单独
 3. 建立 `LegacyPanelHost/CatalogRouter`、`LegacyRuntimeFence` 与 `SerializedLegacyAggBridge` 三个窄桥；旧 panel 可逐项隐藏/替换，旧 LogicNode 的所有 start/stop 先登记`LegacyRunFootprint(claims, reference_keys)`，Figure handoff timeout fail-closed。`claims`只描述本run真实host-side控制/读取语义并交给ResourceArbiter；`reference_keys`描述raw connection、接线或generation/lifecycle依赖，只供installation swap/close查找并等待相关handle terminal，绝不自动升级成OBSERVE/EXCLUSIVE claim。VirtualCamera读取其虚拟trigger wire是adapter内部接线事实，不等于CameraMeasurement对sequencer申请OBSERVE。全部referenced devices都必须出现在reference_keys，任何真实读写仍必须出现在claims；缺任一集合或无法证明时，同一ResourceKey的legacy/new mode保守互斥。这样“只引用”不会跨generation悬挂raw adapter，也不会因虚拟接线错误阻塞另一个合法EXCLUSIVE run。迁移期 PulseGUI 的prepare/fire/abort/safe、notebook/session的camera/sequencer drive verb也必须经同一个LegacyRuntimeFence/installation authority，不能继续持有raw device旁路；无法机械约束的真实入口在迁走前禁用。
    config/device swap先由LegacyRuntimeFence/installation authority关闭admission、等待这些handle真实terminal并完成safety/journal，再发送immutable `SwapStateChanged`；TaskConsole/PulseGUI只在Qt owner thread queued reconcile界面，QWidget hook、panel registry和GUI teardown既不执行硬件stop/close，也不能确认或veto swap。GUI未启动、已销毁或事件循环卡住不得改变硬件安全结果。跨过旧connection close后的`SwapRecoveryContext`即使swap commit失败、session公开状态变为UNAVAILABLE，也必须由稳定InstallationSupervisor持续拥有old/new binding/raw-graph lifecycle state、既有authority-domain refs、journal lock、gates和intent并提供确定性reconcile/shutdown；不得创建replacement local authority。
 
-   当前若存在`Zou_lab_control.neutral_atom._gui -> zlc_workbench` launcher反向import，只允许作为import-ratchet中的这一条S0.5临时shim；notebook/workbench composition入口接管launcher后，必须在**S0.5完成前**删除该反向边和allowlist。`LegacyRuntimeFence`本体可按最后legacy consumer保留到S5/Z0，但neutral到workbench的import不能随它存活。
+   当前若存在`Zou_lab_control.neutral_atom._gui -> zlc_workbench` launcher反向import，只允许作为import-ratchet中的这一条S0.5临时shim；notebook facade 当前直接使用的 `_triggered_camera/LegacyNeutralAtomRuntime` 等硬件 composition submodule 也必须迁到两种应用面共同依赖的非 GUI composition owner，不能把 `notebook -> zlc_workbench` 变成永久边。迁移完成前 `zlc_workbench.__init__` 必须保持 lazy，确保 headless notebook import 不连带加载 `zlc_frontend`/renderer；这只是隔离，不是最终所有权。notebook/workbench composition入口接管launcher后，必须在**S0.5完成前**删除上述反向/错误方向边和allowlist。`LegacyRuntimeFence`本体可按最后legacy consumer保留到S5/Z0，但 neutral/notebook 到 workbench 的 import 不能随它存活。
 4. 后续每个 dependency-closed 纵向切片以新 panel/controller/runtime 替换对应旧岛；已迁 use case 立即删除自己的旧路径，但共享 producer/algorithm 只在最后一个旧 consumer 迁走时删除。三个 bridge 都有删除期限，不是 public API，Z0 必须为 0。
 
 S0.5 解决的是“新切片住在哪里”，不是预先重写 9000 行 UI；Setting/Edit/catalog 的完整迁移仍随实际 panel/use case 发生。
