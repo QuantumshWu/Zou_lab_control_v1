@@ -3219,6 +3219,8 @@ Workbench 内本地 sequencer、远端 sequencer 与 camera endpoint 共享的 `
 
 Finite exact 的“event ordinal 到每个 dataset cell 的完整唯一排列”由 `FrozenDatasetEdge` 在 defensive copy 后验证一次；同一结果派生 schedule、key-sequence 与 consumer-contract digest，并缓存 key-domain fingerprint。Workbench 的 `CameraCaptureBindingRequest` 只冻结 declarative sequence，`CaptureStreamContract` 直接消费 edge，processor worker 在确认同一个 edge/key-contract owner 与 reservation cardinality 后信任该 immutable schedule，不得再次逐 key 扫描。CompiledCaptureCellPlan 对 pulse trigger/scan/repeat/event 物理关联的验证仍保留，因为那是比 generic dataset permutation 更强的不同不变量；reservation state、generation、consumer ownership、cursor 与锁内 TOCTOU 检查也不属于静态 schedule，不能删除。`expected_cells=None` 的 monitor/rolling 分支保持独立 bounded preview 语义，不因 exact owner 收敛而删除或退化。
 
+规则 4 的第一条物理 golden 使用 archived `Rb87_readout_2ms_2ms_2000_Image1` 的同一真实 qCMOS frame crop 和相邻两个 site，固定 legacy commit `6c337d49`、原始 frame/analysis 文件 SHA-256、frame/site/crop 坐标、boxes、PSF kernels 与旧 `roi_counts`/`psf_signals` 输出。测试独立比较 migrated BOX mean/sum、per-site PSF（无背景与 annulus-median）、site validity/order 及 bright-above occupancy，fixture 只有 13×22 crop，不依赖 ignored 的 32 MB archive。它证明的是“给定 legacy site/PSF 几何与阈值时，核心 feature/application 物理等价”；**不证明**当前 5×7 detector、35-site lattice、训练/阈值/quality gate 或四套 archive 的 end-to-end calibration 等价，因此规则 4 仍是 PARTIAL，必须继续建立真实 35-site detection/training golden，不能用这两个 site 宣称完成。
+
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 
 | 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |
