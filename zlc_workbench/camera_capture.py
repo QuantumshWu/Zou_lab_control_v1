@@ -387,19 +387,9 @@ class CameraCaptureBindingRequest:
             raise TypeError("point_layout must be PointLayout")
         if self.point_layout.logical_shape != tuple(axis.size for axis in points):
             raise ValueError("point_layout shape differs from point axes")
-        cells = tuple(self.expected_cells)
-        expected_domain = {
-            DatasetCellAddress(repeat, point)
-            for repeat in range(self.repeat_axis.size)
-            for point in range(self.point_layout.storage_size)
-        }
-        if len(cells) != len(expected_domain):
-            raise ValueError("expected_cells length differs from the dataset domain")
-        if any(not isinstance(cell, DatasetCellAddress) for cell in cells):
-            raise TypeError("expected_cells must contain DatasetCellAddress values")
-        if set(cells) != expected_domain:
-            raise ValueError("expected_cells must be a complete unique dataset permutation")
-        object.__setattr__(self, "expected_cells", cells)
+        # The runtime FrozenDatasetEdge is the sole complete-permutation owner.
+        # This request only snapshots the caller's declarative sequence.
+        object.__setattr__(self, "expected_cells", tuple(self.expected_cells))
         if not isinstance(self.mode, CameraAcquisitionMode):
             raise TypeError("mode must be CameraAcquisitionMode")
         lag = self.required_consumer_lag_events

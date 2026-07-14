@@ -501,6 +501,22 @@ def dataset_cell_permutation_fingerprint(
     )
 
 
+def _dataset_key_sequence_digest_from_rows(
+    key_contract_fingerprint: str,
+    cells: tuple[DatasetCellAddress, ...],
+) -> str:
+    return canonical_digest(
+        {
+            "contract": "zlc_neutral_atom.DatasetKeySequence",
+            "key_contract_fingerprint": key_contract_fingerprint,
+            "cells": [
+                [cell.repeat_index, cell.point_storage_index]
+                for cell in cells
+            ],
+        }
+    )
+
+
 def dataset_key_sequence_digest(
     schema: DatasetSchema,
     cells: tuple[DatasetCellAddress, ...],
@@ -508,17 +524,28 @@ def dataset_key_sequence_digest(
     """Identity of ordinal keys independent of the per-cell ValueSchema."""
 
     ordered = tuple(cells)
-    # Reuse the complete-permutation validation, then deliberately bind only
-    # the key domain and address order.
     dataset_cell_permutation_digest(schema, ordered)
+    return _dataset_key_sequence_digest_from_rows(
+        dataset_cell_key_fingerprint(schema),
+        ordered,
+    )
+
+
+def _dataset_consumer_contract_digest_from_schedule(
+    dataset_schema_fingerprint: str,
+    schedule_digest: str,
+    metadata_contract_fingerprint: str,
+    event_adapter_operator_fingerprint: str,
+) -> str:
     return canonical_digest(
         {
-            "contract": "zlc_neutral_atom.DatasetKeySequence",
-            "key_contract_fingerprint": dataset_cell_key_fingerprint(schema),
-            "cells": [
-                [cell.repeat_index, cell.point_storage_index]
-                for cell in ordered
-            ],
+            "contract": "zlc_neutral_atom.DatasetConsumerContract",
+            "dataset_schema_fingerprint": dataset_schema_fingerprint,
+            "join_plan_digest": schedule_digest,
+            "metadata_contract_fingerprint": metadata_contract_fingerprint,
+            "event_adapter_operator_fingerprint": (
+                event_adapter_operator_fingerprint
+            ),
         }
     )
 
@@ -538,16 +565,12 @@ def dataset_consumer_contract_digest(
         event_adapter_operator_fingerprint,
         "event adapter operator fingerprint",
     )
-    return canonical_digest(
-        {
-            "contract": "zlc_neutral_atom.DatasetConsumerContract",
-            "dataset_schema_fingerprint": schema.fingerprint,
-            "join_plan_digest": dataset_cell_permutation_digest(schema, cells),
-            "metadata_contract_fingerprint": metadata_contract_fingerprint,
-            "event_adapter_operator_fingerprint": (
-                event_adapter_operator_fingerprint
-            ),
-        }
+    schedule_digest = dataset_cell_permutation_digest(schema, cells)
+    return _dataset_consumer_contract_digest_from_schedule(
+        schema.fingerprint,
+        schedule_digest,
+        metadata_contract_fingerprint,
+        event_adapter_operator_fingerprint,
     )
 
 
@@ -616,6 +639,11 @@ class FrozenDatasetEdge(Generic[PayloadT]):
     )
     _value_schema: ValueSchema = field(init=False, repr=False, compare=False)
     _operator_fingerprint: str = field(init=False, repr=False, compare=False)
+    _key_contract_fingerprint: str = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _value_operator: Callable[[PayloadT], Value] = field(
         init=False,
         repr=False,
@@ -741,6 +769,12 @@ class FrozenDatasetEdge(Generic[PayloadT]):
         object.__setattr__(self, "_value_schema", value_schema)
         object.__setattr__(self, "_operator_fingerprint", operator_fingerprint)
         object.__setattr__(self, "_value_operator", value_operator)
+        key_contract_fingerprint = dataset_cell_key_fingerprint(schema)
+        object.__setattr__(
+            self,
+            "_key_contract_fingerprint",
+            key_contract_fingerprint,
+        )
 
         cells = self.expected_cells
         if cells is None:
@@ -772,13 +806,16 @@ class FrozenDatasetEdge(Generic[PayloadT]):
                 for cell in cells
             )
             schedule_digest = dataset_cell_permutation_digest(schema, cells)
-            consumer_digest = dataset_consumer_contract_digest(
-                schema,
-                cells,
+            consumer_digest = _dataset_consumer_contract_digest_from_schedule(
+                schema.fingerprint,
+                schedule_digest,
                 metadata_fingerprint,
                 operator_fingerprint,
             )
-            key_sequence_digest = dataset_key_sequence_digest(schema, cells)
+            key_sequence_digest = _dataset_key_sequence_digest_from_rows(
+                key_contract_fingerprint,
+                cells,
+            )
             object.__setattr__(self, "expected_cells", cells)
         object.__setattr__(self, "schedule_digest", schedule_digest)
         object.__setattr__(self, "key_sequence_digest", key_sequence_digest)
@@ -857,7 +894,7 @@ class FrozenDatasetEdge(Generic[PayloadT]):
 
     @property
     def key_contract_fingerprint(self) -> str:
-        return dataset_cell_key_fingerprint(self.schema)
+        return self._key_contract_fingerprint
 
     @property
     def exact_key_sequence_digest(self) -> str:

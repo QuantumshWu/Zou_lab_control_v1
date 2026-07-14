@@ -16,7 +16,6 @@ from zlc_neutral_atom.runtime._failure import (
 from zlc_neutral_atom.runtime.cancellation import CancellationRequested, CancellationToken
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
-    DatasetCellAddress,
     DatasetCellKeyContract,
     DatasetMode,
     FrozenDatasetEdge,
@@ -255,14 +254,6 @@ class ExactStreamProcessorWorker:
         total = input_reservation.end_sequence - input_reservation.start_sequence
         if len(keys) != total:
             raise ValueError("expected_keys length differs from exact reservation")
-        if any(not isinstance(key, DatasetCellAddress) for key in keys):
-            raise TypeError("expected_keys must contain DatasetCellAddress values")
-        for key in keys:
-            input_key_contract.validate(key)
-            try:
-                hash(key)
-            except TypeError as error:
-                raise TypeError("expected keys must be frozen and hashable") from error
         if not isinstance(output_producer, AcquisitionProducer):
             raise TypeError("output_producer must be AcquisitionProducer")
         output_stream = output_producer._stream

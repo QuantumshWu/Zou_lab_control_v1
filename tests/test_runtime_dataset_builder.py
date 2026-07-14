@@ -199,6 +199,56 @@ def test_frozen_edge_owner_copies_exact_schedule_addresses():
     assert edge.schedule_digest == frozen_digest
 
 
+def test_frozen_edge_validates_and_projects_one_exact_schedule_once(monkeypatch):
+    schema = dataset_schema(repeats=2, points=3)
+    stream, _producer = source(schema, events=6)
+    validate_calls = 0
+    real_validate = runtime_dataset.dataset_cell_permutation_digest
+
+    def counted_validate(*args, **kwargs):
+        nonlocal validate_calls
+        validate_calls += 1
+        return real_validate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        runtime_dataset,
+        "dataset_cell_permutation_digest",
+        counted_validate,
+    )
+
+    edge = FrozenDatasetEdge(schema, event_adapter(stream), cell_schedule(schema))
+
+    assert validate_calls == 1
+    assert edge.schedule_digest == (
+        "f7e14715db33ff71419d1e9b3925d78d5f1f289ba4d32cddd0147a119026d1d2"
+    )
+    assert edge.key_sequence_digest == (
+        "35e3dc24b8941846b0d1daf1057893fce860d9699e882eef7428dfae9147936b"
+    )
+    assert edge.consumer_contract_digest == (
+        "fe061889cfb9e19eaab1e01ef261db9b5760930902af26847be585bc7e7a250d"
+    )
+
+
+@pytest.mark.parametrize(
+    ("schedule", "error"),
+    (
+        ((DatasetCellAddress(0, 0),), ValueError),
+        ((DatasetCellAddress(0, 0), DatasetCellAddress(0, 0)), ValueError),
+        ((DatasetCellAddress(0, 0), DatasetCellAddress(0, 2)), ValueError),
+        ((DatasetCellAddress(0, 0), object()), TypeError),
+    ),
+)
+def test_frozen_edge_rejects_incomplete_duplicate_and_foreign_schedules(
+    schedule,
+    error,
+):
+    schema = dataset_schema(points=2)
+    stream, _producer = source(schema, events=2)
+    with pytest.raises(error):
+        FrozenDatasetEdge(schema, event_adapter(stream), schedule)
+
+
 def test_cell_domain_fingerprint_is_cached_for_large_explicit_layout(monkeypatch):
     size = 2000
     source = dataset_schema(points=size)

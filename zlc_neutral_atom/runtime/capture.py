@@ -697,15 +697,11 @@ class CaptureStreamContract:
             raise TypeError("capability must be CaptureCapabilitySnapshot")
         if not isinstance(self.runtime_profile, CaptureRuntimeProfile):
             raise TypeError("runtime_profile must be CaptureRuntimeProfile")
-        cells = tuple(self.expected_cells)
-        domain = {
-            DatasetCellAddress(repeat, point)
-            for repeat in range(self.dataset_schema.repeat_axis.size)
-            for point in range(self.dataset_schema.point_layout.storage_size)
-        }
-        if len(cells) != len(domain) or set(cells) != domain:
-            raise ValueError("expected_cells must be a complete unique dataset permutation")
-        edge = FrozenDatasetEdge(self.dataset_schema, self.event_adapter, cells)
+        edge = FrozenDatasetEdge(
+            self.dataset_schema,
+            self.event_adapter,
+            tuple(self.expected_cells),
+        )
         object.__setattr__(self, "expected_cells", edge.expected_cells)
         object.__setattr__(self, "dataset_edge", edge)
         object.__setattr__(self, "event_adapter", edge.event_adapter)
