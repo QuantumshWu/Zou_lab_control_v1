@@ -204,7 +204,6 @@ def build_server_runtime(
 ) -> PulseServerRuntime:
     geometry = params or default_params()
     clock = float(default_clock_hz() if clock_hz is None else clock_hz)
-    validate_deployed_target(target, geometry)
     session = open_deployed_session(
         backend,
         target=target,

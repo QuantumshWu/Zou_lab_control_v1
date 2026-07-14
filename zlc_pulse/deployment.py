@@ -85,11 +85,27 @@ def validate_artifact_for_deployment(
     params: StreamerParams,
     clock_hz: float,
 ) -> None:
-    """Prove a compiled artifact against the bound topology before any I/O."""
+    """Prove a target and compiled artifact at a standalone deployment boundary."""
+
+    validate_deployed_target(target, params)
+    _validate_artifact_against_bound_deployment(
+        artifact,
+        target,
+        params,
+        clock_hz,
+    )
+
+
+def _validate_artifact_against_bound_deployment(
+    artifact: CompiledPulseArtifact,
+    target: PulseTarget,
+    params: StreamerParams,
+    clock_hz: float,
+) -> None:
+    """Validate one artifact after the session constructor bound target geometry."""
 
     if not isinstance(artifact, CompiledPulseArtifact):
         raise TypeError("artifact must be CompiledPulseArtifact")
-    validate_deployed_target(target, params)
     if artifact.target_ir.clock_hz != float(clock_hz):
         raise ValueError("compiled artifact clock differs from deployed hardware clock")
     validate_resident_scan_capacity(artifact, params)

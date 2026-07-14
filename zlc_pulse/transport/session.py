@@ -23,7 +23,10 @@ from fpga.pulse_streamer.host.image import (
 )
 
 from ..artifact import CompiledPulseArtifact, PulseExecutionForm
-from ..deployment import validate_artifact_for_deployment, validate_deployed_target
+from ..deployment import (
+    _validate_artifact_against_bound_deployment,
+    validate_deployed_target,
+)
 from ..evidence import (
     AUTONOMOUS_TABLE_READ_RECIPE,
     POST_TERMINAL_TAIL_WAIT_RECIPE,
@@ -312,7 +315,7 @@ class DeployedStreamerSession:
             operation_epoch = self._operation_epoch
             self._operation_stop = threading.Event()
             operation_stop = self._operation_stop
-        validate_artifact_for_deployment(
+        _validate_artifact_against_bound_deployment(
             artifact,
             self.deployed_target,
             self.params,

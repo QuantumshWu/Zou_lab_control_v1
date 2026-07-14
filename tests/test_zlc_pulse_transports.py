@@ -265,7 +265,7 @@ def test_safe_during_deployment_validation_cannot_revive_prepared_state(monkeypa
         assert release.wait(1.0)
 
     monkeypatch.setattr(
-        "zlc_pulse.transport.session.validate_artifact_for_deployment",
+        "zlc_pulse.transport.session._validate_artifact_against_bound_deployment",
         blocked_validation,
     )
     errors = []

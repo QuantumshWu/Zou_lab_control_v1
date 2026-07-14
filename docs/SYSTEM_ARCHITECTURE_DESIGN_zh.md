@@ -3225,6 +3225,8 @@ Finite exact 的“event ordinal 到每个 dataset cell 的完整唯一排列”
 
 Content store 的 raw manifest `(namespace, digest)` 在每个公开 read/has/durability API 入口各验证一次，随后 path builder 和同一次 verified read 信任已规范化字符串；`has_manifest` 直接使用同一个 path 做内容校验，不再回调公开 reader 重验。`ContentRef` 在构造/root decode 后是 typed immutable blob identity，`read_blob` 信任其 digest/size，不重新跑文本 validator，但仍从同一 open handle 执行实际 size 与 SHA-256 内容核验。Store wrapper 获取 process-local authority 不作一次空的预检再由 operation 重检；真正 filesystem operation 仍恰好执行一次 authority/store/root/path/lock identity 检查。路径逃逸、内容损坏、size budget、fsync 与 manifest 可见性边界全部保留。
 
+Pulse deployment 的静态 target/geometry/ABI 拓扑由 `DeployedStreamerSession` 构造边界验证并绑定一次；随后每次 `prepare` 只验证新 artifact 的 clock、resident capacity、IR-to-target 关系与 deterministic wire packing，不再次扫描不变拓扑。独立使用的 public `validate_artifact_for_deployment` 仍先组合静态 target admission 再调用同一个 bound-artifact validator；`build_service_for_session` 面向 generic/fake session 的 composition boundary 仍需验证 target、session geometry 与 clock，而 `build_server_runtime` 不在这些 owner 外预演第三次相同校验。该收敛只减少 host 端重复工作，不改变 prepare-before-I/O、冻结 bitstream、wire bytes、hardware layout readback 或任何 pulse consumer。
+
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 
 | 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |

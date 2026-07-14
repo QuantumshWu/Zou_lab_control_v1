@@ -218,6 +218,26 @@ def test_current_session_rejects_clock_mismatch_before_hardware_access(tmp_path)
     assert hardware.words == {}
 
 
+def test_prepare_trusts_the_topology_bound_by_the_session_constructor(
+    monkeypatch,
+    tmp_path,
+):
+    params = StreamerParams()
+    document, artifact = _artifact(params)
+    hardware = CurrentStreamerHardware(params)
+    session = _axi_session(tmp_path, document.target, params, hardware)
+
+    def forbidden_static_revalidation(*args, **kwargs):
+        raise AssertionError("prepare must trust the constructor-bound deployment")
+
+    monkeypatch.setattr(
+        "zlc_pulse.deployment.validate_deployed_target",
+        forbidden_static_revalidation,
+    )
+    session.prepare(artifact)
+    assert session.snapshot()["prepared_artifact_digest"] == artifact.fingerprint
+
+
 def test_current_artifact_uses_the_same_contract_over_uart(tmp_path):
     params = StreamerParams()
     document, artifact = _artifact(params)
@@ -311,7 +331,7 @@ def test_fire_and_await_are_constant_time_identity_checks_after_prepare(
         raise AssertionError("FIRE/await must not repack after prepare")
 
     monkeypatch.setattr(
-        "zlc_pulse.transport.session.validate_artifact_for_deployment",
+        "zlc_pulse.transport.session._validate_artifact_against_bound_deployment",
         forbidden_revalidation,
     )
     session.fire(artifact)

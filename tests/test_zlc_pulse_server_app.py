@@ -164,6 +164,17 @@ def test_server_runtime_composes_only_the_current_service(monkeypatch, tmp_path)
     params = StreamerParams()
     session = AppSession(params)
     calls: list[tuple[str, object]] = []
+    target_validation_count = 0
+
+    def count_target_validation(target, geometry):
+        nonlocal target_validation_count
+        target_validation_count += 1
+        validate_deployed_target(target, geometry)
+
+    monkeypatch.setattr(
+        "zlc_pulse.server_app.validate_deployed_target",
+        count_target_validation,
+    )
 
     monkeypatch.setattr(
         "zlc_pulse.server_app.open_deployed_session",
@@ -191,6 +202,7 @@ def test_server_runtime_composes_only_the_current_service(monkeypatch, tmp_path)
 
     assert calls[0][0] == "serve"
     assert calls[0][1][1:] == ("127.0.0.1", 18862, False)
+    assert target_validation_count == 1
     assert runtime.service.snapshot()["backend"]["transport"] == "test"
     runtime.close()
     assert calls[-1] == ("close", None)
