@@ -4,9 +4,8 @@ Put the files that change **per board / per wiring / per machine** here. They ar
 intentionally separate from the RTL and the host code so you can reconfigure for a
 different FPGA board or cabling without touching anything else.
 
-This is the **default** location the toolchain reads from. (The old
-`references/source_archives/address_switch/...` copy is deprecated and no longer read —
-don't edit it.)
+This is the sole in-repository default. `ZLC_PS_XDC` may explicitly override it
+with an external board file.
 
 ## What goes in here
 

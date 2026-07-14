@@ -11,9 +11,7 @@ WITHOUT being able to break the visual design: geometry/dpi/typography/scale and
 the art-bearing fluent widgets are OWNED here, never passed in or re-exported;
 every public parameter is classified DATA (allowed) vs ART/geometry (internal).
 
-The authoritative, numbered statement of those rules -- plus the failure history
-that motivates each -- lives in ``frontend/AGENTS.md`` (single source; do not
-re-list the rule text here, it drifts).  This module is their implementation.
+This module owns and implements that public surface.
 ============================================================================
 """
 

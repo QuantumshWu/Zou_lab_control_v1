@@ -718,11 +718,9 @@ def test_repo_batch_files_use_crlf_line_endings():
     actual working-tree bytes so a stray LF rewrite can't silently reintroduce it."""
 
     root = Path(__file__).resolve().parents[1]
-    # Police only our own entrypoints, not archived/third-party material under
-    # references/ or generated build artifacts.
+    # Police only our own entrypoints, not generated build artifacts.
     skip_parts = {
         ".git", "build", "__pycache__", "node_modules", ".venv", "site-packages",
-        "references",
     }
     bats = [
         p for p in root.rglob("*.bat")
@@ -751,8 +749,7 @@ def test_docs_delay_is_api_only_and_templates_use_repo_xdc():
     only, never bound to a scan slot (single source: ``FIELD_KINDS`` in
     ``timing/pulse_table.py``; ``bind_field("delay", ...)`` raises).  The docs must not
     re-claim the old "duration/delay/DAC all scan" contract, and the notebook templates
-    must point at the in-repo default XDC (``fpga/board_config/board.xdc``), never the
-    archived ``references/source_archives`` copy."""
+    must point at the in-repo default XDC (``fpga/board_config/board.xdc``)."""
 
     from Zou_lab_control.neutral_atom.timing.pulse_table import FIELD_KINDS
 
@@ -790,14 +787,7 @@ def test_docs_delay_is_api_only_and_templates_use_repo_xdc():
     # ... and the corrected contract is stated where the scan workflow is taught.
     assert "never scanned" in docs["pulses/README.md"]
 
-    # Notebook templates must reference the shipped board XDC, not the archived copy.
-    templates_dir = root / "Zou_lab_control" / "frontend" / "content" / "notebook_templates"
-    offenders = [
-        path.name
-        for path in sorted(templates_dir.glob("*.cells.md"))
-        if "source_archives" in path.read_text(encoding="utf-8")
-    ]
-    assert offenders == [], f"notebook templates still reference the archived XDC: {offenders}"
+    # Notebook templates must reference the one shipped board XDC.
     assert "board_config" in docs["neutral_atom_fpga_server notebook"]
 
 
@@ -806,12 +796,12 @@ def _user_facing_markdown_files(root):
 
     The docs were reorganized into a single root README, one consolidated
     maintainer note, and trimmed subsystem pointers. Rather than hard-code a
-    stale list, glob for ``*.md`` and drop the non-user-facing ones: historical
-    source archives, tool caches, and the notebook-cell source templates
+    stale list, glob for ``*.md`` and drop the non-user-facing ones: tool caches
+    and the notebook-cell source templates
     (``*.cells.md``) that are not standalone documents.
     """
 
-    skip_parts = {"references", ".git", ".pytest_cache", "__pycache__", "build"}
+    skip_parts = {".git", ".pytest_cache", "__pycache__", "build"}
     markdown_files = []
     for path in sorted(root.rglob("*.md")):
         if any(part in skip_parts for part in path.relative_to(root).parts):
@@ -839,7 +829,6 @@ def test_user_facing_markdown_local_links_exist():
         "fpga/pulse_streamer/README.md",
         "pulses/README.md",
         "Zou_lab_control/frontend/README.md",
-        "Zou_lab_control/frontend/AGENTS.md",
         "tests/README.md",
     }
     assert expected_present.issubset(discovered), expected_present - discovered
@@ -900,7 +889,7 @@ def test_repo_tree_has_no_generated_fpga_or_latex_work_products():
             return False
 
     # Walk with pruning: a git-ignored subtree (e.g. fpga/build from a local Vivado
-    # run, or references/) is never committed, so it cannot pollute the repo -- skip
+    # run) is never committed, so it cannot pollute the repo -- skip
     # it entirely.  Only NON-ignored generated artifacts are real problems.
     found: list[str] = []
     for dirpath, dirnames, filenames in os.walk(str(root)):
@@ -925,7 +914,7 @@ def test_repo_bat_entrypoints_are_minimal_and_grouped_by_submodule():
     # harness's transient tooling state (skills/hooks + agent worktree copies of the whole repo) -- it
     # is gitignored, not part of the project entrypoints, and a leftover agent worktree would otherwise
     # smuggle a duplicate copy of every .bat into this audit.
-    ignored_roots = {".git", ".claude", "references", "reference", "build"}
+    ignored_roots = {".git", ".claude", "build"}
     bat_files = sorted(path.relative_to(root).as_posix() for path in root.rglob("*.bat") if not (set(path.relative_to(root).parts) & ignored_roots))
 
     assert bat_files == [
@@ -1557,8 +1546,7 @@ def test_top_has_per_channel_clk_mux():
 def test_build_input_files_are_utf8():
     """The build-input HDL/constraint/tcl/config files must be valid UTF-8 -- a GBK-encoded
     file (Chinese comments) shows up as mojibake in git/editors/non-CJK-locale tools and is a
-    recurring papercut (board.xdc was GBK).  Guards the active fpga/ build inputs (NOT the
-    references/source_archives snapshots, which may legitimately keep their original bytes)."""
+    recurring papercut (board.xdc was GBK).  Guards the active FPGA build inputs."""
 
     root = Path(__file__).resolve().parents[1]
     roots = [root / "fpga" / "board_config", root / "fpga" / "pulse_streamer"]
@@ -1568,7 +1556,7 @@ def test_build_input_files_are_utf8():
         for p in base.rglob("*"):
             if not p.is_file() or p.suffix.lower() not in exts:
                 continue
-            if "build" in p.parts or "references" in p.parts:   # generated / archived
+            if "build" in p.parts:   # generated output
                 continue
             try:
                 p.read_bytes().decode("utf-8")

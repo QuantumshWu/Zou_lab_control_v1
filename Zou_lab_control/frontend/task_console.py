@@ -1296,7 +1296,7 @@ GRID_UNIT = 8
 # the HORIZONTAL inter-card gap the user likes: two cards on adjacent base-columns pitched by
 # ``_cell_size()[0] + GAP`` sit exactly GAP px apart (and a multi-column card's internal columns are
 # joined by the SAME GAP, see ``_card_size``).  Reusing this one existing spacing constant (no new
-# public art/geom knob, per frontend/AGENTS.md F2/F3); change this one number to retune all board
+# public art/geom knob); change this one number to retune all board
 # spacing.
 GAP = GRID_UNIT
 

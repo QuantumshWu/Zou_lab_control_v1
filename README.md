@@ -52,7 +52,6 @@ pulses/           checked-in PulseTableState presets
 tutorials/        generated Jupyter notebooks
 docs/             reference manuals, maintainer notes, bring-up checklist, generated PDFs
 tests/            targeted verification matrix and tests
-references/       historical source archives (ignored by git)
 ```
 
 ## Documentation

@@ -55,13 +55,6 @@ tutorials/_executed_check/
 _shots/
 **/_shots/
 
-# Root-level source archives kept locally outside git history
-/*.zip
-
-# Historical reference code kept locally outside git history
-/references/
-/reference/
-
 # Logs and temporary files
 *.log
 *.tmp

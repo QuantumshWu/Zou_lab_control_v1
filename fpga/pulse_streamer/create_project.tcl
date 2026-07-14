@@ -61,8 +61,8 @@ proc zlc_safe_project_dir {project_dir script_dir project_name} {
 }
 
 # Board pin constraints: default to fpga/board_config/board.xdc (the in-repo,
-# platform-config copy -- see fpga/board_config/README.md).  Override per board with
-# the ZLC_PS_XDC env var.  (The old references/ copy is deprecated and no longer read.)
+# platform configuration -- see fpga/board_config/README.md).  Override per board with
+# the ZLC_PS_XDC env var.
 set xdc_path [env_or ZLC_PS_XDC [file join $script_dir .. board_config board.xdc]]
 if {![file exists $xdc_path]} { error "board XDC not found: $xdc_path. Put your board pin map at fpga/board_config/board.xdc or set ZLC_PS_XDC." }
 set xdc_file [open $xdc_path r]; set xdc_text [read $xdc_file]; close $xdc_file
