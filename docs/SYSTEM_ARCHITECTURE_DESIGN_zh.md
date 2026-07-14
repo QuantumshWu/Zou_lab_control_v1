@@ -1913,39 +1913,35 @@ reject new commands
 
 Calibration 是 `neutral_atom.readout.calibration` 的内建 feature，不使用 plugin、entry point、包扫描或动态 registry 覆盖。
 
-**当前实现状态（2026-07 追溯整改）**：S3 尚未交付，不能把目标模型当作现有能力。此前实现只有一个 notebook `load_calibration(ref)` 入口和一套 `CalibrationRepository/CalibrationArtifactRef`，仓内没有 production producer、calibrate/commit 调用或可到达的 occupancy consumer；它只能读取一类本系统从未能正式产生的 artifact。本轮删除这条 producerless load-only 路径，并删除同样零 production consumer 的 CalibrationArtifact/ReadoutModel/codec 值图。未来只有在同一个 dependency-closed 纵向切片同时交付“真实 capture -> 校准 -> 保存 -> load/admit -> readout consumer”时，才重新引入这些类型；repository 必须复用 zlc_storage/Capture 已有 canonical、CAS、commit authority，不能提前建立空壳。旧 `neutral_atom/session.py` 的文件路径式 TrapCalibration 是尚待 S3 迁走的 legacy island，不是新领域 API，也不为新格式建立兼容 reader。
-
-同一轮还删除了没有 package-external production caller 的 `analysis.py/analysis_codec.py`，把 calibration 明确退回“物理算法尚未迁移”。原因不是测试数量不足，而是其约 4.3k LOC 实现已经改变实验算法，却没有按同一批真机 frame 对 main 做独立 golden：
-
-- main 的 site path 是 Gaussian blur -> top-N local maxima -> 2D Gaussian subpixel refinement -> 可修补缺失暗 site 的 axis-aligned lattice，并支持四种 ordering；被删实现改成 topographic-prominence forest、half-prominence centroid、strict affine/Hungarian/second-best assignment，只接受精确 candidate 数和 row/column ordering。常见暗 site 从“由格点插值得到可用 site”变成“整次 calibration 拒绝”。
-- PSF 路径虽有相似卷积结构，但 smoothing、Gaussian refinement 与边界处理没有逐帧等价证据。
-- main 的 label/threshold 路径使用 pooled bimodal/Otsu、strict reference consensus，并以 histogram balanced-fidelity optimum 为短阈值、Gaussian 为 tie/fallback；被删实现改为 independent train/evidence/test、reference valley + Holm、最终 median midpoint 与 Clopper-Pearson/Holm admission。这是新的统计实验，不是等价重构。
-- main 的 fidelity 提供 per-site/global/drop-worst 与分布报告；被删实现改变 evidence/report 语义，且其内部 validator/codec/result 多次重放同一推导，测试主要证明实现自洽，不能证明物理正确。
-
-该实现的 strict assignment 还通过 Floyd-Warshall 搜索 second-best，复杂度 O(N^3)；本机审计仅该步骤实测 512/768/1024/1152 sites 约为 0.406/1.212/3.012/4.825 s，尚未包含检测、Hungarian 和统计。未来 S3 默认逐字继承 main 已验证物理算法；每个偏离必须先指出 main 的可复现错误，再用同一真实 frame 的旧结果、独立参考实现或实验 ground truth 证明差异正是预期。不得用新实现自身生成 expected、私有字段断言或 codec round-trip 代替 oracle，也不得在无第二生产消费者前恢复 analysis work-plan/resource-policy/diagnostics object graph。
-
 `zlc_neutral_atom.readout` 包根不重导出 contracts、codec、analysis、repository 的宽 API；调用方必须从语义 owner 子模块导入。追溯整改实测旧包根的 122 个 eager re-export 会让单独导入 `readout.contracts` 也加载 SciPy，冷导入约 0.86 s、tracemalloc 峰值约 51.8 MiB。删除包根聚合后，同一探针不再加载 SciPy（当前机器约 0.35 s、10 MiB，主要为 NumPy/zlc_data 基础值）。这不是 lazy `__getattr__` 兼容表：本项目没有需要维护的旧公共格式，重复出口清单只会形成第二个 owner；稳定公共用户面由 notebook/workbench facade 组合，领域实现直接依赖 leaf owner。
 
 ### 13.1 Artifact
 
 ```text
 CalibrationArtifact:
-  source_capture_ref
+  source_binding
   frame_contract
   site_map
-  model                  # first vertical slice: exactly one verified model
-  calibration_parameters # only parameters actually consumed by the algorithm
-  quality_evidence       # only established admission/report evidence
-  producer_provenance
+  models: tuple[ReadoutModel, ...]  # non-empty, kind unique, canonical order
+  default_model_kind: ReadoutModelKind | None
+  parameters
+  fingerprint  # derived from current canonical content
+
+ReadoutModel =
+    BoxReadoutModel
+  | PerSitePsfReadoutModel
+  | UniformPsfReadoutModel
 ```
 
-第一条 S3 纵切只实现 main 当前实际使用且通过同帧 golden 的一个 readout model，不预建三成员 union、default-model policy 或 model selector。正式 `CalibrationArtifact` 只表示一次完整、原子成功的校准；site-map-only 结果不能用半完成 artifact、stage 或 capability flags 冒充成功。若真实工作流随后要求同一 source 同时保存第二种模型，先保留两个完整 artifact；只有第二个 production consumer 证明原子多模型 artifact 能消除实际不一致后，才引入 `models + explicit/default selection`，不得因为旧草案已经写过就恢复。
+一次 calibration 可产生共享 artifact 中的多种 model，但正式 `CalibrationArtifact` 只表示一次完整、原子成功的校准：`models` 必须非空，每种 `ReadoutModelKind` 最多一个，并按 kind 排成 canonical 顺序。site-map-only 是完整 `SiteMap` 结果（将来若有持久化用例则定义独立 `SiteMapArtifact`），不能用半完成 `CalibrationArtifact`、stage 或 capability flags 冒充成功校准。Analysis request 中的 `model_kinds` 属于冻结请求/derivation；repository 验证实际 model kinds 与请求一致，不把同一集合再复制进 artifact。
 
-artifact 的唯一持久身份是 repository 根据 canonical payload 铸造的 typed content ref；payload 内不再保存第二个 `fingerprint`、`model_id/model_version` 或改稿计数。构造器负责本对象的局部语义，repository 在 commit/load 边界验证 owner codec 与 CAS；runtime 消费已冻结值，不通过反射威胁模型重放全套科学推导。真正的 crash/tamper 边界由 zlc_storage 的 bytes/digest/atomic commit 覆盖，而不是 WeakKeyDictionary、进程内 token 或多层 seal。
+Readout model 的唯一选择身份是 `CalibrationArtifactRef + ReadoutModelKind`。每个 concrete model 的 union kind、阈值、方向、boxes/kernels/background、参数和 quality evidence 已被 artifact content fingerprint 覆盖，因此不再保存与 kind 一一映射的 `model_id/model_version`，也不为同一事实建立 `DefaultModelPolicy` 包装。Occupancy request 可显式给 kind；未给时只允许使用 artifact 的 `default_model_kind`，或在 artifact 恰有一个 model 时选择该唯一 model；多 model 且无 default 必须在 request 构造时明确报歧义，永不按 tuple 第一项猜。若以后真实出现同一 artifact 中多个同-kind model 的第二个生产用例，再引入有业务含义的 selector 或 individual-model content digest，不能恢复数字改稿版本。
 
-`quality_evidence` 先逐项继承 main 已用于用户判断和 admission 的 per-site/global fidelity、threshold 和必要分布；不预置 exact-binomial/IUT/Holm、reference-valley 或 ambiguity gate。若实验数据证明旧准入会接受错误 calibration，再以该失败数据作为独立 oracle 增加最小 gate。失败诊断属于本次 calibration result/report，不复制进成功 artifact 的多个 derivation/diagnostics/manifest 图。
+`CalibrationArtifact.fingerprint` 由 artifact owner 根据当前 canonical 内容重算并与构造时 seal 比较；它不能只返回缓存值。`AdmittedCalibration` 的每次 artifact 权威访问都消费这次验证过的 digest 并与 repository admission binding 对照，因此即使有人绕过 frozen dataclass、反射替换嵌套 model/threshold，也只能 fail closed，不能让 occupancy 执行新数值却保留旧 provenance。
 
-NumPy/SciPy 版本至多是 run provenance 的被动诊断文本，不能改变校准计划、model、load/admit 或科学兼容性；更不能为了环境版本建立 backend digest、replay authority 或 format version。
+`ReadoutModelQuality` 只表示已经通过准入的完整 per-site evidence，因此不保存调用方可随意写成 `True` 的 `gate_passed`；失败证据属于 `CalibrationAnalysisDiagnostics`，不能进入正式 artifact。描述 exact-binomial/IUT/Holm 等统计语义的 `quality_gate_id`、`reference-valley-gate-id` 与 `reference-ambiguity-gate-id` 必须保留；纯改稿数字 `*_version` 必须删除。artifact、analysis result、derivation 与 manifest 也不复制单一 producer 的 `algorithm_id/version`：request/work-plan/partition/diagnostics/source evidence、artifact fingerprint 与 plan binding 已构成 repository authority，SiteDetectionLineage 直接覆盖这些事实。
+
+NumPy/SciPy 的版本只作为 `CalibrationArtifact.parameters` 顶层的有界、只读 producer lineage 备注。当前 producer 尽力写入两条备注；读取端允许备注缺失或为 `unknown`，不能因此拒绝 load/admit。它们不进入 WorkPlan、模型参数、SiteMap/detection lineage、derivation、manifest 专属字段、科学兼容性判断或 replay，也不与当前进程环境比较。artifact 的 CAS/fingerprint 仍像覆盖其它持久字节一样覆盖这些备注；这是内容完整性，不是数值后端准入权威。资源计划对两条备注使用固定宽度上界，因此环境版本字符串不能改变 WorkPlan 或 plan binding。
 
 ```text
 FrameContract:
@@ -1964,7 +1960,7 @@ SiteMap:
 
 Camera geometry、ROI/binning 整除、output shape、spatial axis 与 real-count dtype 的纯规则只由 `zlc_neutral_atom.readout.contracts` 拥有；`CameraCaptureDescriptor`、`FrameContract` 与 runtime `CameraPhysicalFacts` 各自仍验证本对象的完整合同，但必须委托同一组规则，不能复制第二套物理公式。
 
-所有会改变数值解释的采集设置都进入 FrameContract canonical 内容。site map、model、参数和质量证据全部成功并满足同一个冻结 request 后才原子提交 CalibrationArtifact，不能把部分失败 artifact 当成功；同一事实不再同时保存为 nested fingerprint、manifest derivation 和 result seal。
+所有会改变数值解释的采集设置都进入 FrameContract fingerprint。CalibrationAnalysisRequest 明确列出所需 `model_kinds`；所有请求 model 成功并产生完整质量证据后才原子提交 CalibrationArtifact，不能把部分失败 artifact 当成功。每个 model 保存自己的参数、适用 FrameContract/SiteMap fingerprint 与全部 per-site 质量证据；正式 artifact 的实际 kind 集合必须和持久 request 相同。
 
 ### 13.2 输入
 
@@ -1990,19 +1986,11 @@ CalibrationTask:
   -> CalibrationArtifactRef
 ```
 
-上图是 S3 的**目标纵切**，不是当前已实现流程。typed artifact、codec、repository 与 notebook/workbench 入口必须随第一个真实 producer 和 consumer 一起出现；单独实现 value graph、load-only repository、analysis wrapper 或只验证内部私有结构的测试，都不计为进度。
-
 live 路径先提交原始 CaptureArtifact，再与 offline 路径汇合；算法或模型质量 gate 失败时不产生 CalibrationArtifact，但原始 capture 仍可用于诊断和重跑。virtual/real 只在 CaptureSession adapter 不同，提交后的校准代码完全相同。
 
 不需要 CalibrationService、child Measurement Run、calibration StreamProcessor 或 reducer 包装。普通批量校准就是 neutral-owned `CalibrationAnalysisDefinition` 绑定出的 AnalysisStep，在该 Task 的 run-owner/必要时 disposable compute process 中运行，不占用 view/Fit executor，并受同一 RunHandle cancellation/revision 管理。只有出现一个必须在采集完成前产生控制反馈、且不能保存原始样本后批处理的真实用例，才另行设计领域 StreamReducer；baseline 不为 calibration 预留它。
 
 Occupancy request 携带 CalibrationArtifactRef 和已解析的 `ReadoutModelKind`；RunPlan 在绑定 `OccupancyStreamProcessor` 前解析并 admit immutable CalibrationArtifact，验证 artifact fingerprint/evidence/commit、输入 sample/capture 的 FrameContract、SiteMap/coordinate frame、model kind 与 applicability。任何 mismatch 明确失败，不按相同 shape 猜“应该兼容”。
-
-整改后的实现顺序以真实消费者为门，而不是先造通用执行框架。第一条可交付路径是“已提交 CaptureArtifact + 已 admit CalibrationArtifact -> 纯 `apply_readout_model` -> immutable counts/occupied/ComponentValidity/provenance”；硬件 arm/fire/exact reservation/cleanup 仍由既有 Capture/Pulse owner 持有。只有这个离线路径与旧真机算法的同帧 golden 一致后，才为 live monitor 建立一个 concrete `BoundReadoutProcessor`。在出现第二个具有相同生命周期和 backpressure 语义的领域 processor 前，不建立 generic `processing.stream` worker、额外 execution guard、anti-rebadge token、occupancy 专用 transaction/result wrapper，也不把 occupied 偷塞进 metadata 后再重建第二个 dataset。counts 与 occupied 若同时落盘，必须是同一原子 typed record 的两个字段，并共享同一个 ComponentValidity 与 source cell provenance。
-
-2026-07 的追溯整改发现，已提交的 `occupancy.py + occupancy_pipeline.py + timing/occupancy.py` 共约 2.7k production LOC，却没有 composition-root 或 notebook production caller；其唯一“大量使用者”是约 2.3k LOC 的实现镜像测试。该实现因此在本轮整改中删除，不能计为 S3 已完成能力。同一审计还删除了没有 producer/commit caller 的 `CalibrationRepository/CalibrationArtifactRef`、notebook load-only API，以及零 production consumer 的 analysis/artifact/model/codec 图。当前只保留已经有真实消费者或数据正确性依据的 FrameContract/context join、ComponentValidity、Capture exact reservation 与硬件 cleanup。S3 恢复时必须先建立上述最短公共纵切和独立 oracle，再按真实第二消费者决定是否抽象。
-
-occupancy 删除后，`zlc_neutral_atom.processing.stream` 的 1,651 production LOC、`CaptureProcessorInputBinding` 防伪 authority 和 1,915 LOC worker 测试也变成零 production consumer；本轮一并物理删除。CaptureSession 继续直接铸造唯一 exact reservation，DatasetBuilder 直接消费它；未来 concrete readout processor 若出现，先在该真实纵切内组合现有 reservation/cursor，不预建 Definition -> Bound -> Guard -> Readiness -> Worker -> StageOutput 通用层。只有第二个 production processor 证明生命周期、背压和 terminal 语义相同后才提取共享 worker。
 
 ## 14. PulseScan
 
@@ -3029,10 +3017,10 @@ H2默认不排期。只有以下任一证据成立才可创建提案：
 
 ### S3：StreamProcessor、Calibration 与 Occupancy/readout
 
-1. 先以 main 中真机验证过的 site/PSF/threshold/fidelity 算法为默认基线，建立同一批 frame 的 golden 对照；每个偏离都必须写明旧实现具体错误并证明差异正是预期结果。完成 CaptureArtifact -> CalibrationAnalysis -> CalibrationArtifact 的 live/offline 同路纯函数，以及最小 FrameContract/SiteMap/ReadoutModel。
-2. 先交付离线 `CaptureArtifactRef + CalibrationArtifactRef/model -> counts/occupied/validity/provenance`，由同一个 `apply_readout_model` 同时服务 notebook、GUI 与未来 live processor；不建立 0 resource/0 hazard/0 device 的伪硬件 RunPlan。
-3. 真实 live consumer 接通时只建立一个 concrete `BoundReadoutProcessor`，输出单个原子 typed record；它消费 CaptureSession 已有的 exact cursor/reservation，不再叠一套 guard/token/transaction authority。只有第二个生产 processor 证明相同抽象确有复用价值后，才提取 generic StreamProcessor worker。
-4. DatasetBuilder 把该 typed record 物化为一个具有 counts/occupied 两字段和共同 ComponentValidity 的 dataset；frontend Figure 与 zlc_data Fit 直接消费该冻结 dataset，证明四平面边界贯通。禁止 values/metadata 双真相。
+1. 在已工作的 camera event 上加入最小 `StreamProcessorWorker`、typed record、join/cardinality/budget 和 exact propagation；不让 StreamProcessor 读取累计 DataBlock。
+2. 完成 CaptureArtifact -> CalibrationAnalysis -> CalibrationArtifact 的 live/offline 同路算法，以及 FrameContract/SiteMap/ReadoutModel。
+3. 迁 `OccupancyStreamProcessor`，输出单个 `OccupancySample(occupied, counts, metadata)` typed record，并显式绑定 CalibrationArtifactRef/model。
+4. DatasetBuilder 把 occupancy events 物化为 dataset；frontend Figure 与 zlc_data Fit 直接消费该冻结 dataset，证明四平面边界贯通。
 5. integration 通过后删除旧 camera frame producer/LogicNode 与最后一个 Occupancy/ROI/readout reactive consumer组成的完整旧链，同时删除 `read_frames()/acquire()` 等 array-only acquisition reader及其专用测试，不在adapter_sdk保留无metadata便利入口。并删除 runtime/session calibration 回查 fallback、filesystem fallback、legacy search、拆散 scalar signals 和会碰硬件的旧 Processor；保留的只有 notebook/workbench composition 在 request 构造时按 ReadoutBindingKey 冻结显式 CalibrationArtifactRef/model 的可见 convenience pointer。
 
 ### S4：近期 Formal PulseScan（AUTONOMOUS_STREAMED）

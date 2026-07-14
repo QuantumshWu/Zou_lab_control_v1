@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import pickle
 import threading
 import time
 import weakref
@@ -31,6 +32,7 @@ from zlc_neutral_atom.runtime.capture import (
     BoundCapturePort,
     CaptureCapabilitySnapshot,
     CapturePreparedAck,
+    CaptureProcessorInputBinding,
     CaptureRuntimeProfile,
     CaptureSessionState,
     CaptureStartedAck,
@@ -98,6 +100,12 @@ from zlc_neutral_atom.runtime.streams import (
     ReservationState,
 )
 from zlc_neutral_atom.catalog import DefinitionCatalog, DefinitionKey
+from zlc_neutral_atom.processing.stream import (
+    BoundStreamProcessor,
+    ExactStreamProcessorWorker,
+    StreamProcessorDefinition,
+    StreamProcessorError,
+)
 
 
 SHA_A = "a" * 64
@@ -119,6 +127,23 @@ def schema(points: int = 2) -> DatasetSchema:
         PointLayout.rect_c((points,)),
         ValueSchema((y, x), ValidityContract.value(), np.dtype("<u2"), "count"),
     )
+
+
+def identity_camera_payload(payload: object, config: object) -> object:
+    assert config is None
+    return payload
+
+
+CAPTURE_PROCESSOR_ENTERED = threading.Event()
+CAPTURE_PROCESSOR_RELEASE = threading.Event()
+
+
+def blocking_camera_payload(payload: object, config: object) -> object:
+    assert config is None
+    CAPTURE_PROCESSOR_ENTERED.set()
+    if not CAPTURE_PROCESSOR_RELEASE.wait(1.0):
+        raise TimeoutError("test did not release camera processor")
+    return payload
 
 
 @dataclass(frozen=True)
@@ -623,6 +648,302 @@ def harness(points: int = 2) -> CaptureHarness:
     )
 
 
+@dataclass
+class ProcessorCaptureHarness:
+    session: object
+    reservation: object
+    worker: ExactStreamProcessorWorker
+    builder: DatasetBuilder
+
+
+def processor_capture_harness(
+    item: CaptureHarness,
+    *,
+    operator=identity_camera_payload,
+    run_id: str = "processor-capture-run",
+    output_metadata_contract: FrameMetadataContract | None = None,
+) -> ProcessorCaptureHarness:
+    trace = TraceBinding(run_id, item.contract.source_id)
+    session = item.port.open_session(item.contract, trace, item.spec)
+    reservation = session.reserve_exact()
+    input_cursor = reservation.activate()
+    processor_input = session.processor_input_binding
+    key_contract = processor_input.join_key_contract
+    output_edge = item.contract.dataset_edge
+    if output_metadata_contract is not None:
+        output_edge = FrozenDatasetEdge(
+            item.contract.dataset_schema,
+            CameraEventAdapter(
+                item.contract.payload_contract,
+                output_metadata_contract,
+                "f" * 64,
+            ),
+            item.contract.expected_cells,
+        )
+    output_payload_contract = output_edge.payload_contract
+    output_stream, output_producer = AcquisitionStream.create(
+        StreamId("camera.processed"),
+        output_payload_contract,
+        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
+        retention_events=item.contract.total_events,
+        retention_bytes=(
+            item.contract.total_events
+            * output_payload_contract.max_retained_nbytes
+        ),
+        join_key_contract=key_contract,
+    )
+    output_reservation = output_stream.reserve(
+        total_events=item.contract.total_events,
+        max_inflight_events=item.contract.total_events,
+        max_inflight_bytes=(
+            item.contract.total_events
+            * output_payload_contract.max_retained_nbytes
+        ),
+        trace_binding=TraceBinding(run_id, "camera-processor"),
+    )
+    output_cursor = output_reservation.activate()
+    builder = DatasetBuilder(
+        BlockId("processed-camera"),
+        output_reservation,
+        output_edge,
+        DatasetMode.FINITE_EXACT,
+    )
+    definition = StreamProcessorDefinition(
+        DefinitionKey("tests", "identity-camera"),
+        "Identity camera",
+        "tests.identity-camera",
+        item.contract.payload_contract.fingerprint,
+        output_payload_contract.fingerprint,
+        dataset_cell_key_fingerprint(item.contract.dataset_schema),
+    )
+    bound = BoundStreamProcessor(
+        definition,
+        None,
+        item.contract.payload_contract,
+        output_payload_contract,
+        key_contract,
+        output_stream.stream_id,
+        "camera-processor",
+        operator,
+    )
+    worker = ExactStreamProcessorWorker(
+        bound,
+        reservation,
+        input_cursor,
+        input_edge=item.contract.dataset_edge,
+        output_producer=output_producer,
+        output_cursor=output_cursor,
+        output_builder=builder,
+        deadline_monotonic=time.monotonic() + 2.0,
+    )
+    return ProcessorCaptureHarness(session, reservation, worker, builder)
+
+
+def test_capture_session_exposes_one_atomic_processor_input_binding():
+    item = harness(points=1)
+    session = item.port.open_session(
+        item.contract,
+        TraceBinding("processor-input-binding", item.contract.source_id),
+        item.spec,
+    )
+
+    binding = session.processor_input_binding
+
+    assert session.processor_input_binding is binding
+    assert binding.capture_contract is item.contract
+    assert binding.stream is session.stream
+    assert binding.payload_contract is item.contract.payload_contract
+    assert binding.input_edge is item.contract.dataset_edge
+    assert (
+        binding.join_key_contract.fingerprint
+        == item.contract.dataset_edge.key_contract_fingerprint
+    )
+    assert (
+        binding.stream.payload_contract_fingerprint
+        == binding.input_edge.payload_contract_fingerprint
+        == binding.payload_contract.fingerprint
+    )
+    binding.input_edge.validate_stream(binding.stream)
+    reservation = session.reserve_exact()
+    reservation.activate()
+    assert session.state is CaptureSessionState.NEW
+    assert session.processor_input_binding is binding
+    assert binding.require_reservation(reservation) is None
+    reservation.abort(cancelled=True)
+    reservation.release()
+    with pytest.raises(RuntimeError, match="no longer registered"):
+        binding.require_reservation(reservation)
+
+    import zlc_neutral_atom.runtime as runtime_api
+
+    assert runtime_api.CaptureProcessorInputBinding is CaptureProcessorInputBinding
+
+
+def test_capture_session_stops_dispensing_processor_input_after_prepare():
+    item = harness(points=1)
+    plan = item.plan(consume=False)
+    original_execute = plan.execute
+
+    def execute(context: RunContext, prepared):
+        session, _cursor, _builder = prepared
+        assert session.state is CaptureSessionState.PREPARED
+        with pytest.raises(RuntimeError, match="only available.*NEW"):
+            session.processor_input_binding
+        return original_execute(context, prepared)
+
+    guarded_plan = RunPlan(**{**plan.__dict__, "execute": execute})
+    RunController(ResourceArbiter(MemoryQuarantineJournal())).start(
+        guarded_plan
+    ).result(2.0)
+
+
+def test_processor_input_binding_rejects_clone_stream_reservation():
+    item = harness(points=1)
+    session = item.port.open_session(
+        item.contract,
+        TraceBinding("processor-input-clone", item.contract.source_id),
+        item.spec,
+    )
+    binding = session.processor_input_binding
+    clone_stream, _clone_producer = AcquisitionStream.create(
+        binding.stream.stream_id,
+        binding.payload_contract,
+        flow_control=binding.stream.flow_control,
+        retention_events=binding.stream.retention_events,
+        retention_bytes=binding.stream.retention_bytes,
+        join_key_contract=binding.join_key_contract,
+    )
+    clone_reservation = clone_stream.reserve(
+        total_events=item.contract.total_events,
+        max_inflight_events=item.contract.max_inflight_events,
+        max_inflight_bytes=item.contract.max_inflight_bytes,
+        trace_binding=TraceBinding(
+            "processor-input-clone",
+            item.contract.source_id,
+        ),
+    )
+
+    assert clone_stream is not binding.stream
+    assert clone_stream.stream_id == binding.stream.stream_id
+    assert (
+        clone_stream.payload_contract_fingerprint
+        == binding.stream.payload_contract_fingerprint
+    )
+    binding.input_edge.validate_stream(clone_stream)
+    with pytest.raises(PermissionError, match="not minted by this CaptureSession"):
+        binding.require_reservation(clone_reservation)
+
+    clone_reservation.abort(cancelled=True)
+    clone_reservation.release()
+
+
+def test_processor_input_rejects_caller_reserved_interval_on_the_same_stream():
+    item = harness(points=1)
+    session = item.port.open_session(
+        item.contract,
+        TraceBinding("processor-input-rogue-reservation", item.contract.source_id),
+        item.spec,
+    )
+    binding = session.processor_input_binding
+    rogue = binding.stream.reserve(
+        total_events=item.contract.total_events,
+        max_inflight_events=item.contract.max_inflight_events,
+        max_inflight_bytes=item.contract.max_inflight_bytes,
+        trace_binding=TraceBinding(
+            "processor-input-rogue-reservation",
+            item.contract.source_id,
+        ),
+    )
+    rogue.activate()
+
+    with pytest.raises(PermissionError, match="not minted by this CaptureSession"):
+        binding.require_reservation(rogue)
+    with pytest.raises(AttributeError):
+        object.__setattr__(binding, "_session_reservation", rogue)
+
+    rogue.abort(cancelled=True)
+    rogue.release()
+
+
+def test_processor_input_binding_rejects_a_copied_clone_generation():
+    item = harness(points=1)
+    session = item.port.open_session(
+        item.contract,
+        TraceBinding("processor-input-forged-clone", item.contract.source_id),
+        item.spec,
+    )
+    binding = session.processor_input_binding
+    reservation = session.reserve_exact()
+    reservation.activate()
+    clone_stream, _clone_producer = AcquisitionStream.create(
+        binding.stream.stream_id,
+        binding.payload_contract,
+        flow_control=binding.stream.flow_control,
+        retention_events=binding.stream.retention_events,
+        retention_bytes=binding.stream.retention_bytes,
+        join_key_contract=binding.join_key_contract,
+    )
+    forged = object.__new__(CaptureProcessorInputBinding)
+    for slot in CaptureProcessorInputBinding.__slots__:
+        if slot == "__weakref__":
+            continue
+        object.__setattr__(forged, slot, object.__getattribute__(binding, slot))
+    object.__setattr__(forged, "_stream", clone_stream)
+
+    with pytest.raises(PermissionError, match="not registered"):
+        forged.require_reservation(reservation)
+
+    reservation.abort(cancelled=True)
+    reservation.release()
+
+
+def test_capture_processor_input_binding_is_sealed_immutable_and_process_local():
+    item = harness(points=1)
+    session = item.port.open_session(
+        item.contract,
+        TraceBinding("sealed-processor-input", item.contract.source_id),
+        item.spec,
+    )
+    binding = session.processor_input_binding
+
+    with pytest.raises(TypeError, match="exact ExactReservation"):
+        binding.require_reservation(object())
+    with pytest.raises(PermissionError, match="only be minted by CaptureSession"):
+        CaptureProcessorInputBinding(
+            object(),
+            capture_contract=item.contract,
+            stream=session.stream,
+        )
+    with pytest.raises(PermissionError, match="not minted by CaptureSession"):
+        object.__new__(CaptureProcessorInputBinding).stream
+    with pytest.raises(TypeError, match="sealed"):
+        type(
+            "ForgedCaptureProcessorInputBinding",
+            (CaptureProcessorInputBinding,),
+            {},
+        )
+    with pytest.raises(AttributeError, match="immutable"):
+        binding.stream = session.stream
+    with pytest.raises(TypeError, match="process-local"):
+        pickle.dumps(binding)
+
+
+def emit_processor_capture_source(
+    processor: ProcessorCaptureHarness,
+    item: CaptureHarness,
+) -> None:
+    for payload, cell in zip(item.camera.payloads, item.contract.expected_cells):
+        processor.session._producer.emit(
+            payload,
+            captured_at=payload.captured_at,
+            trace=TraceContext(
+                processor.session._trace_binding.run_id,
+                item.contract.source_id,
+                payload.correlation_id,
+            ),
+            join_key=cell,
+        )
+
 
 def run(harness_value: CaptureHarness, **plan_options):
     controller = RunController(ResourceArbiter(MemoryQuarantineJournal()))
@@ -737,6 +1058,78 @@ def test_prepare_revalidates_stale_readiness_before_hardware_command(invalidatio
     assert not item.camera.close_attempted
     assert not item.camera.started
     item.holder["builder"].close()
+
+
+def test_processor_readiness_requires_started_live_worker_before_capture_binding():
+    item = harness(points=1)
+    processor = processor_capture_harness(item)
+    with pytest.raises(StreamProcessorError, match="has not started"):
+        processor.worker.exact_readiness()
+    assert item.camera.session_id == ""
+    processor.worker.start()
+    readiness = processor.worker.exact_readiness()
+    processor.session.bind_exact_consumer(readiness)
+    processor.session._validate_readiness(readiness, processor.reservation)
+    assert item.camera.session_id == ""
+    assert not item.camera.close_attempted
+    processor.worker.close(2.0)
+
+
+@pytest.mark.parametrize("terminal_state", ["failed", "done"])
+def test_dead_processor_readiness_is_rejected_before_any_hardware_command(terminal_state):
+    item = harness(points=1)
+    processor = processor_capture_harness(item)
+    processor.worker.start()
+    readiness = processor.worker.exact_readiness()
+    processor.session.bind_exact_consumer(readiness)
+    if terminal_state == "failed":
+        processor.worker.cancel("processor failed before capture prepare")
+    else:
+        emit_processor_capture_source(processor, item)
+        processor.session._producer.finish()
+    processor.worker.wait(2.0)
+    with pytest.raises(Exception):
+        processor.session._validate_readiness(readiness, processor.reservation)
+    with pytest.raises(StreamProcessorError, match="not live"):
+        processor.worker.exact_readiness()
+    assert item.camera.session_id == ""
+    assert not item.camera.close_attempted
+
+
+def test_closing_processor_readiness_is_rejected_before_any_hardware_command():
+    CAPTURE_PROCESSOR_ENTERED.clear()
+    CAPTURE_PROCESSOR_RELEASE.clear()
+    item = harness(points=1)
+    processor = processor_capture_harness(item, operator=blocking_camera_payload)
+    processor.worker.start()
+    readiness = processor.worker.exact_readiness()
+    processor.session.bind_exact_consumer(readiness)
+    emit_processor_capture_source(processor, item)
+    assert CAPTURE_PROCESSOR_ENTERED.wait(1.0)
+    close_errors: list[BaseException] = []
+
+    def close_worker():
+        try:
+            processor.worker.close(2.0)
+        except BaseException as error:
+            close_errors.append(error)
+
+    closer = threading.Thread(target=close_worker)
+    closer.start()
+    deadline = time.monotonic() + 1.0
+    while not processor.worker._closing and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert processor.worker._closing
+    with pytest.raises(Exception):
+        processor.session._validate_readiness(readiness, processor.reservation)
+    with pytest.raises(StreamProcessorError, match="not live"):
+        readiness._validate_terminal_sink()
+    assert item.camera.session_id == ""
+    assert not item.camera.close_attempted
+    CAPTURE_PROCESSOR_RELEASE.set()
+    closer.join(2.0)
+    assert not closer.is_alive()
+    assert close_errors == []
 
 
 @pytest.mark.parametrize("mismatch", ["schedule", "adapter"])
@@ -1046,6 +1439,110 @@ def test_minimal_pipeline_compiles_to_one_flat_run_and_returns_typed_result():
             object(),
             result._memory_admission,
         )
+
+
+def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
+    from zlc_neutral_atom.runtime.pipeline import _PIPELINE_RESULT_TOKEN
+
+    item = harness(points=2)
+    holder = {}
+    base = item.plan()
+
+    def preflight(context: RunContext):
+        processor = processor_capture_harness(
+            item,
+            run_id=context.run_id.value,
+            output_metadata_contract=DerivedFrameMetadataContract(),
+        )
+        processor.worker.start()
+        readiness = processor.worker.exact_readiness()
+        processor.session.bind_exact_consumer(readiness)
+        holder["memory_admission"] = admit_pipeline_memory(
+            aggregate_peak_bytes=1,
+            memory_profile=PipelineMemoryProfile.for_current_runtime(1024),
+            chain_contract_digest=readiness.chain_contract_digest,
+        )
+        return processor
+
+    def execute(context: RunContext, processor: ProcessorCaptureHarness):
+        try:
+            processor.session.prepare(context)
+            processor.session.start(context)
+            for _ in item.contract.expected_cells:
+                processor.session.capture_next(context)
+            completion = processor.session.complete(context)
+            dataset = processor.worker.finish(completion.eos, 2.0)
+            derivation = dataset.provenance.derivation
+            assert derivation is not None
+            wrong_digest = (
+                "0" * 64
+                if derivation.root_input_span.ordered_digest != "0" * 64
+                else "1" * 64
+            )
+            readiness = processor.session._exact_consumer_readiness
+            assert readiness is not None
+            forged_dataset = dataset._with_derivation(
+                readiness,
+                replace(derivation.root_input_span, ordered_digest=wrong_digest),
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="derivation differs from capture readiness chain",
+            ):
+                PipelineResult(
+                    _PIPELINE_RESULT_TOKEN,
+                    forged_dataset,
+                    completion,
+                    holder["memory_admission"],
+                )
+            result = finalize_pipeline_result(
+                dataset=dataset,
+                capture_completion=completion,
+                memory_admission=holder["memory_admission"],
+            )
+            with pytest.raises(RuntimeError, match="already consumed"):
+                PipelineResult(
+                    _PIPELINE_RESULT_TOKEN,
+                    dataset,
+                    completion,
+                    holder["memory_admission"],
+                )
+            return result
+        except BaseException as error:
+            processor.session.fail(error)
+            raise
+
+    def cleanup(context: RunContext, processor, _primary):
+        if processor is None:
+            return item.port.verify_idle(context)
+        processor.worker.close(2.0)
+        return processor.session.cleanup(context)
+
+    plan = RunPlan(
+        **{
+            **base.__dict__,
+            "preflight": preflight,
+            "execute": execute,
+            "cleanup": cleanup,
+            "finalize": lambda _context, result: result,
+        }
+    )
+    result = RunController(ResourceArbiter(MemoryQuarantineJournal())).start(plan).result(2.0)
+    assert not result.is_direct_raw_capture
+    derivation = result.dataset.provenance.derivation
+    assert derivation is not None
+    assert derivation.chain_contract_digest == result.chain_contract_digest
+    assert derivation.root_input_span == result.source_event_span
+    assert derivation.root_input_span.count == item.contract.total_events
+    assert len(derivation.stages) == 1
+    assert (
+        result.capture_terminal.ordered_metadata_digest
+        != result.dataset.provenance.ordered_metadata_digest
+    )
+
+    assert result.processor_stages == derivation.stages
+    assert not hasattr(result, "_capture_completion")
+    assert result.dataset._terminal_reservation is None
 
 
 def test_pipeline_budget_rejects_before_run_or_hardware_prepare():

@@ -282,8 +282,8 @@ def test_readout_artifacts_do_not_restore_edit_counter_metadata():
             if candidate in forbidden:
                 violations.append(f"{relative}:{node.lineno} restores {candidate}")
     assert not violations, (
-        "future readout identity must be content-addressed plus a semantic model kind; "
-        "descriptive gate ids and content fingerprints replace edit-counter metadata:\n"
+        "readout identity is CalibrationArtifactRef + ReadoutModelKind; descriptive "
+        "gate ids and content fingerprints replace edit-counter metadata:\n"
         + "\n".join(violations)
     )
 
@@ -411,6 +411,7 @@ def test_content_ref_codec_and_cas_address_have_one_storage_owner():
 
     for relative in (
         Path("zlc_neutral_atom/artifacts/capture.py"),
+        Path("zlc_neutral_atom/readout/calibration_repository.py"),
     ):
         tree = ast.parse(
             (ROOT / relative).read_text(encoding="utf-8"),
@@ -444,7 +445,10 @@ def test_content_ref_codec_and_cas_address_have_one_storage_owner():
 
 def test_artifact_finalizers_do_not_replay_published_payload_digests():
     violations = []
-    for relative in (Path("zlc_neutral_atom/artifacts/capture.py"),):
+    for relative in (
+        Path("zlc_neutral_atom/artifacts/capture.py"),
+        Path("zlc_neutral_atom/readout/occupancy_pipeline.py"),
+    ):
         path = ROOT / relative
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
@@ -461,7 +465,7 @@ def test_artifact_finalizers_do_not_replay_published_payload_digests():
     )
 
 
-def test_calibration_numeric_versions_do_not_regain_authority():
+def test_calibration_numeric_versions_are_not_admission_authority():
     forbidden = (
         "CalibrationNumericBackend",
         "numeric-backend-digest",
@@ -478,9 +482,26 @@ def test_calibration_numeric_versions_do_not_regain_authority():
             if token in text:
                 violations.append(f"{path.relative_to(ROOT)} contains {token}")
     assert not violations, (
-        "numeric package versions must not regain a digest, replay, model, "
-        "manifest, or admission role in future calibration work:\n"
+        "numeric package versions are passive CalibrationArtifact notes; they "
+        "must not regain a digest, replay, model, manifest, or admission role:\n"
         + "\n".join(violations)
+    )
+
+    analysis_path = ROOT / "zlc_neutral_atom" / "readout" / "analysis.py"
+    tree = ast.parse(
+        analysis_path.read_text(encoding="utf-8"),
+        filename=str(analysis_path),
+    )
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_numeric_lineage_notes"
+    ]
+    assert len(calls) == 1, (
+        "numeric version notes must be sampled once, only when constructing "
+        "the top-level CalibrationArtifact"
     )
 
 
