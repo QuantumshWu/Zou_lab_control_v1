@@ -8,7 +8,7 @@ import time
 import uuid
 import weakref
 from collections import deque
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from typing import Callable, Generic, Protocol, TypeVar
 
@@ -32,7 +32,6 @@ _DELIVERY_TOKEN = object()
 _CURSOR_TOKEN = object()
 _RESERVATION_TOKEN = object()
 _MONITOR_TOKEN = object()
-_MONITOR_UPDATE_TOKEN = object()
 _STREAM_TOKEN = object()
 _PRODUCER_TOKEN = object()
 _READINESS_TOKEN = object()
@@ -57,11 +56,11 @@ class PayloadContract(Protocol[PayloadT]):
 
 
 class JoinKeyContract(Protocol):
+    """Generation owner whose snapshot validates and freezes one join key."""
+
     fingerprint: str
 
     def snapshot(self, key: object) -> object: ...
-
-    def validate(self, key: object) -> None: ...
 
 
 def _contains_materialization(value: object, seen: set[int] | None = None) -> bool:
@@ -1231,37 +1230,17 @@ class AcquisitionCursor(Generic[PayloadT]):
             self._inflight = None
 
 
+@dataclass(frozen=True, slots=True)
 class MonitorUpdate(Generic[PayloadT]):
-    """Opaque update issued by one concrete monitor tap."""
+    """One atomic delivery from a concrete tap, including local overwrite loss."""
 
-    __slots__ = ("_tap", "_envelope", "_missed")
+    envelope: Envelope[PayloadT]
+    missed: int
 
-    def __init__(
-        self,
-        authority: object,
-        *,
-        tap: "MonitorTap[PayloadT]",
-        envelope: Envelope[PayloadT],
-        missed: int,
-    ) -> None:
-        if authority is not _MONITOR_UPDATE_TOKEN:
-            raise PermissionError("MonitorUpdate can only be minted by MonitorTap")
-        if not isinstance(envelope, Envelope):
+    def __post_init__(self) -> None:
+        if not isinstance(self.envelope, Envelope):
             raise TypeError("envelope must be Envelope")
-        object.__setattr__(self, "_tap", tap)
-        object.__setattr__(self, "_envelope", envelope)
-        object.__setattr__(self, "_missed", _nonnegative_int(missed, "missed"))
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("MonitorUpdate is immutable")
-
-    @property
-    def envelope(self) -> Envelope[PayloadT]:
-        return self._envelope
-
-    @property
-    def missed(self) -> int:
-        return self._missed
+        object.__setattr__(self, "missed", _nonnegative_int(self.missed, "missed"))
 
 
 class MonitorTap(Generic[PayloadT]):
@@ -1289,6 +1268,7 @@ class MonitorTap(Generic[PayloadT]):
         self._closed = False
         self._source_finished = False
         self._terminal_error: StreamError | None = None
+        self._consumer_owner: object | None = None
 
     @property
     def retained_bytes(self) -> int:
@@ -1310,16 +1290,50 @@ class MonitorTap(Generic[PayloadT]):
             self._retained_bytes += stored.payload_bytes
             self._condition.notify_all()
 
-    def next(self, timeout: float | None = None) -> MonitorUpdate[PayloadT]:
+    def _claim_consumer(self, owner: object) -> None:
+        if owner is None:
+            raise TypeError("monitor consumer owner cannot be None")
+        # Match the stream -> tap lock order used by publication and terminal
+        # delivery. Ownership and the first publication then have one
+        # linearization point.
+        with self._stream._condition:
+            if self._stream._next_sequence != 0:
+                raise ReservationStateError(
+                    "monitor consumer must bind before the first publication"
+                )
+            with self._condition:
+                if self._closed or self._source_finished:
+                    raise StreamEndedEarly("cannot bind a terminal monitor tap")
+                if self._consumer_owner is not None:
+                    raise PermissionError("monitor tap already belongs to another consumer")
+                self._consumer_owner = owner
+                # A raw reader may already be asleep in next(). Wake it so it
+                # rechecks authority rather than stealing the owner's first event.
+                self._condition.notify_all()
+
+    def _raise_terminal_if_empty_locked(self) -> None:
+        if self._closed:
+            raise StreamEndedEarly("monitor tap is closed")
+        if self._source_finished:
+            if self._terminal_error is not None:
+                raise self._terminal_error
+            raise StreamEndedEarly("monitor source reached end-of-stream")
+
+    def _take(
+        self,
+        owner: object | None,
+        *,
+        latest: bool,
+        timeout: float | None = None,
+    ) -> MonitorUpdate[PayloadT]:
         deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
         with self._condition:
             while not self._queue:
-                if self._closed:
-                    raise StreamEndedEarly("monitor tap is closed")
-                if self._source_finished:
-                    if self._terminal_error is not None:
-                        raise self._terminal_error
-                    raise StreamEndedEarly("monitor source reached end-of-stream")
+                self._raise_terminal_if_empty_locked()
+                if self._consumer_owner is not owner:
+                    raise PermissionError("monitor tap belongs to another consumer")
+                if latest:
+                    raise LookupError("monitor tap has no retained event")
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -1327,40 +1341,33 @@ class MonitorTap(Generic[PayloadT]):
                     self._condition.wait(remaining)
                 else:
                     self._condition.wait()
+            if self._consumer_owner is not owner:
+                raise PermissionError("monitor tap belongs to another consumer")
+            if latest:
+                while len(self._queue) > 1:
+                    removed = self._queue.popleft()
+                    self._retained_bytes -= removed.payload_bytes
+                    self._missed += 1
             stored = self._queue.popleft()
             self._retained_bytes -= stored.payload_bytes
             missed, self._missed = self._missed, 0
-            return MonitorUpdate(
-                _MONITOR_UPDATE_TOKEN,
-                tap=self,
-                envelope=stored.envelope,
-                missed=missed,
-            )
+            return MonitorUpdate(stored.envelope, missed)
+
+    def next(self, timeout: float | None = None) -> MonitorUpdate[PayloadT]:
+        return self._take(None, latest=False, timeout=timeout)
+
+    def _next_for(
+        self,
+        owner: object,
+        timeout: float | None = None,
+    ) -> MonitorUpdate[PayloadT]:
+        return self._take(owner, latest=False, timeout=timeout)
 
     def latest(self) -> MonitorUpdate[PayloadT]:
-        with self._condition:
-            if not self._queue:
-                if self._source_finished:
-                    if self._terminal_error is not None:
-                        raise self._terminal_error
-                    raise StreamEndedEarly("monitor source reached end-of-stream")
-                raise LookupError("monitor tap has no retained event")
-            while len(self._queue) > 1:
-                removed = self._queue.popleft()
-                self._retained_bytes -= removed.payload_bytes
-                self._missed += 1
-            stored = self._queue.popleft()
-            self._retained_bytes -= stored.payload_bytes
-            missed, self._missed = self._missed, 0
-            return MonitorUpdate(
-                _MONITOR_UPDATE_TOKEN,
-                tap=self,
-                envelope=stored.envelope,
-                missed=missed,
-            )
+        return self._take(None, latest=True)
 
-    def _owns_update(self, update: MonitorUpdate[PayloadT]) -> bool:
-        return isinstance(update, MonitorUpdate) and update._tap is self
+    def _latest_for(self, owner: object) -> MonitorUpdate[PayloadT]:
+        return self._take(owner, latest=True)
 
     def _source_ended(self, error: StreamError | None) -> None:
         with self._condition:
@@ -1375,6 +1382,7 @@ class MonitorTap(Generic[PayloadT]):
         self._stream._remove_monitor(self)
         with self._condition:
             self._closed = True
+            self._consumer_owner = None
             self._queue.clear()
             self._retained_bytes = 0
             self._condition.notify_all()
@@ -1458,9 +1466,8 @@ class AcquisitionStream(Generic[PayloadT]):
                 raise TypeError(f"payload_contract.{method} must be callable")
         if join_key_contract is not None:
             _digest(join_key_contract.fingerprint, "join key contract fingerprint")
-            for method in ("snapshot", "validate"):
-                if not callable(getattr(join_key_contract, method, None)):
-                    raise TypeError(f"join_key_contract.{method} must be callable")
+            if not callable(getattr(join_key_contract, "snapshot", None)):
+                raise TypeError("join_key_contract.snapshot must be callable")
         self._payload_contract = payload_contract
         self._join_key_contract = join_key_contract
         self._condition = threading.Condition(threading.RLock())
@@ -1606,6 +1613,10 @@ class AcquisitionStream(Generic[PayloadT]):
         with self._condition:
             if self._closed:
                 raise StreamEndedEarly("cannot monitor a closed stream")
+            if self._next_sequence != 0:
+                raise ReservationStateError(
+                    "monitor topology must be admitted before the first publication"
+                )
             self._monitors.add(tap)
         return tap
 
@@ -1634,7 +1645,6 @@ class AcquisitionStream(Generic[PayloadT]):
             join_key_schema_fingerprint = None
         else:
             join_key = self._join_key_contract.snapshot(join_key)
-            self._join_key_contract.validate(join_key)
             join_key_schema_fingerprint = self._join_key_contract.fingerprint
         with self._condition:
             if self._closed:
@@ -1761,7 +1771,9 @@ class AcquisitionStream(Generic[PayloadT]):
         """Publish one terminal state to every monitor while the stream lock is held."""
 
         self._closed = True
-        for monitor in tuple(self._monitors):
+        monitors = tuple(self._monitors)
+        self._monitors.clear()
+        for monitor in monitors:
             monitor._source_ended(error)
         self._condition.notify_all()
 

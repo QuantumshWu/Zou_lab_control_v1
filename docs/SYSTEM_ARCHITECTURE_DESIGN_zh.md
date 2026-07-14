@@ -491,7 +491,7 @@ saved = exp.load_fit(fit_ref)
   -> Measurement
   -> [sample/event plane: Envelope<Value | typed domain record>]
   -> StreamProcessor（可选、逐 event 或明确 key group）
-  -> DatasetBuilder
+  -> DatasetBuilder（finite exact）| MonitorDataset（live preview）
   -> [dataset plane: immutable DataBlock revision / typed ArtifactRef]
   -> Analysis（zlc_data 通用分析或 neutral 领域分析）
   -> [result plane: typed result / immutable artifact]
@@ -504,7 +504,7 @@ saved = exp.load_fit(fit_ref)
 三个边界各自只有一个 owner：
 
 1. `Measurement -> event` 由 acquisition runtime 赋 envelope、key、generation 和 provenance；设备 adapter 不发布 Hub event。
-2. `event -> dataset` 只由 `DatasetBuilder` 完成；它用显式 repeat/point key 写入 `(R,P,*data_shape)`，因此 StreamProcessor 永远不会把累计 DataBlock 当“最新 signal”。
+2. `event -> dataset` 只由一个预先绑定的 materializer 完成：finite exact 由 `DatasetBuilder` 按冻结 repeat/point schedule 写入，live 由 `MonitorDataset` 按物理 cycle 或 event sequence 写入；二者都保持 `(R,P,*data_shape)`，StreamProcessor 永远不会把累计 DataBlock 当“最新 signal”。
 3. `dataset/result -> presentation` 只由 frontend 完成；ViewSpec 是可重算显示意图，zlc_data FitSpec/CommittedTransform 与 neutral 领域 AnalysisSpec 是独立权威意图，二者没有可隐式升级的继承关系。
 
 这四个平面不是四套框架：它们共享 zlc_data 的 Value/DataBlock/axis/validity 值对象和统一 lineage，但不共享生命周期、背压或失败语义。sample plane 处理实时性与 exact reservation；dataset plane 处理完整性与 revision；result plane 处理算法合同与 artifact commit；presentation plane 只优化交互延迟。这样既避免“所有东西都是 Processor”，也避免为了统一表面形式引入递归工作流引擎。
@@ -606,7 +606,7 @@ DatasetSchema:
   cell_schema: ValueSchema
 ```
 
-`ValueSchema` 描述一次 Measurement/StreamProcessor event 携带的值，例如一帧 `(H,W)` image、一个 `(site,)` occupancy vector 或一个真正标量。它没有伪造的 R/P leading axes。`DatasetSchema` 描述 DatasetBuilder 把带 key 的事件放入哪些 repeat/point cell 后形成的完整数据集。DataBlock 永远符合 DatasetSchema，AcquisitionStream/MonitorStream 的普通 event 永远不携带累计 DataBlock 或 DataPatch。
+`ValueSchema` 描述一次 Measurement/StreamProcessor event 携带的值，例如一帧 `(H,W)` image、一个 `(site,)` occupancy vector 或一个真正标量。它没有伪造的 R/P leading axes。`DatasetSchema` 描述 materializer 把事件放入哪些 repeat/point cell 后形成的完整数据集。DataBlock 永远符合 DatasetSchema，AcquisitionStream/MonitorTap 的普通 event 永远不携带累计 DataBlock 或 DataPatch。
 
 一个 domain event 可以是 frozen typed record，例如 `CameraSample(image: Value, frame_metadata)` 或 `OccupancySample(occupied: Value, counts: Value, source_metadata)`；它仍作为一个 Envelope payload 原子发布。record 中每个数值字段使用 zlc_data 的 Value/ValueSchema，record 类型和领域 metadata 由 producer package 拥有。
 
@@ -623,7 +623,7 @@ AxisId 由 producer Definition 的稳定字段语义派生，在相同 semantic 
 
 UnitConversion/CoordinateTransform 都是 serializable value，只引用 zlc_data 的封闭实现；不携带 callable/FQCN。需要相机畸变标定、物理模型等领域映射时使用带 CalibrationArtifactRef 的 neutral StreamProcessor 或 Analysis，不能把领域 calibration 藏进通用坐标转换。出现第二个确需组合量纲或坐标代数的生产用例后，才评估引入更强模型。
 
-`role: AxisRoleId` 是 producer 声明的 stable、可序列化语义，例如 repeat、scan-point、spatial-x、spatial-y、spectral、site 或 component。built-in role 由 zlc_data 单源定义；领域扩展使用 namespaced id，不注册可变全局对象。不认识的 role 仍能 round-trip，但默认 preserve/select。role 不能从 rank、长度、singleton 或数值内容反推。
+`role: AxisRoleId` 是 producer 声明的 stable、可序列化语义，例如 repeat、scan-point、monitor-history、spatial-x、spatial-y、spectral、site 或 component。built-in role 由 zlc_data 单源定义；领域扩展使用 namespaced id，不注册可变全局对象。不认识的 role 仍能 round-trip，但默认 preserve/select。role 不能从 rank、长度、singleton 或数值内容反推。`MONITOR_HISTORY` 只表示 live snapshot 内 newest-first 的可见 slot，不是物理 scan point、readout setting 或可直接进入权威 Fit 的自变量。
 
 ValidityContract 是 ValueSchema 的一部分并进入 fingerprint：VALUE 表示整个 event value 同生同灭；COMPONENTS(axis_ids) 声明 mask 可细化到哪些具名 data axes。producer 不能首帧发 VALUE validity、遇到坏 site 后再未经 generation migration 改成未声明的 component mask。StreamProcessorDefinition 在 bind/preflight 中根据输入 validity contract 声明输出 contract 与传播规则，无法证明时不能进入 formal exact pipeline。
 
@@ -714,15 +714,15 @@ Value.validity 与 DataBlock.validity 必须符合 cell_schema.validity_contract
 
 ReductionSpec 必须声明 `validity_policy`（例如 `ALL_REQUIRED`、`ANY_VALID`、`MIN_COUNT(n)` 或所选 reducer 合同自己的规则）。reducer 只在 mask 为真的 component 上运算，并产生新的具名 validity；不能把 NaN 当通用 validity，也不能用 `nanmean` 在未声明策略时悄悄吞掉坏 site。FitProblem 逐 batch cell 过滤无效 observation，并记录有效样本数；不足模型最小点数时只使该 batch result 失败。Histogram 丢弃无效 sample 但记录 dropped count；Meter 在目标 component 无效时显示 invalid，不回退其它 component。
 
-发布后的 DataBlock 是 immutable materialized dataset snapshot：不仅 consumer 不能写，**snapshot 的 bytes 在其整个可见生命周期内也不得因 DatasetBuilder 后续 ingest 而变化**。累计采集由单 owner 的 `DatasetBuilder` 持有不外泄的 mutable preallocated/chunked storage；它根据 typed key + DatasetLayout 定位 cell并原子更新 values+validity。**每个 sample 只产生轻量 `DatasetProgress(block_id, revision, dirty_cells, coverage)`，不得发布/复制完整累计 DataBlock。** `DatasetProgress.ref` 只是“当时 current revision”的通知，不承诺 builder 永久保留每个中间 revision；内存 baseline 只保留 current mutable dataset，旧 ref 请求必须返回 `SnapshotExpired`，绝不能回 latest。需要跨刷新周期保留某一版时，Live binding 以 `DatasetRevisionRef + SliceSpec` 显式请求并持有 owner-copy 的 `DatasetPreviewSnapshot`，或交给 SnapshotStore/Repository 明确冻结；禁止每个 event 自动 materialize full dataset。这样 exact builder 不再同时常驻 full base + full current + 每 cell image patch，单点 ingest 摊销 O(1)，总复制近似 O(final bytes)。
+发布后的 DataBlock 是 immutable materialized dataset snapshot：不仅 consumer 不能写，**snapshot 的 bytes 在其整个可见生命周期内也不得因 materializer 后续 ingest 而变化**。finite exact 的 `DatasetBuilder` 持有不外泄的 mutable preallocated/chunked storage，根据冻结 schedule 原子写 values+validity，并只返回轻量 `DatasetProgress(block_id, revision, dirty_cells, coverage)`；旧 ref 请求必须返回 `SnapshotExpired`，绝不能回 latest。live 的 `MonitorDataset` 也只保留 current mutable window，但 ingest 通知只用于 coalesce；controller 必须从同一把锁冻结的 `MonitorDatasetSnapshot(OwnedSnapshot, aligned EventRefs, head, coverage)`读取当前值与 current selection，禁止把旧 progress 的 dirty/head 与后来 snapshot 拼接。任何 owned snapshot 都按刷新预算显式取得，不能每个 event 自动 fan-out 完整 DataBlock。
 
-`DatasetBuilder.materialize(current_ref)` 只产生 **provisional** `DatasetPreviewSnapshot`；它可供带状态徽标的 UI/诊断计算使用，却不能作为正式 Repository/权威 Analysis 输入。只有绑定的 exact reservation 全部 ack、冻结的 `sequence -> DatasetCellAddress` 计划逐项匹配、TraceBinding 一致、source-owner EndOfStream 与 reserved end 相同、coverage 完整时，builder 才能 mint 不可伪造的 `SealedDatasetArtifact`。该 capability 证明的是软件 stream/join/EOS 完整性，不自动证明物理 trigger↔frame 真实性；PulseScan 仍必须再由 §14.5 `EpochValidationRecord` 包装为 VALID，才能形成 ScanArtifact。ROLLING_MONITOR 永远只能产生 preview，不能 seal。发布快照必须是 owned copy、immutable sealed chunk 或 copy-on-write；禁止把 mutable ndarray view 仅设 `writeable=False` 后冒充 revision。
+`DatasetBuilder.materialize(current_ref)` 只产生 **provisional** `DatasetPreviewSnapshot`；只有绑定的 exact reservation 全部 ack、冻结的 `sequence -> DatasetCellAddress` 计划逐项匹配、TraceBinding 一致、source-owner EndOfStream 与 reserved end 相同、coverage 完整时，它才能 mint `SealedDatasetArtifact`。`MonitorDataset` 在类型上没有 `seal()`，只产生 `MonitorDatasetSnapshot`；交互冻结必须另建带 coverage/EventRef 的 finite diagnostic input，不能把 live window 冒充 formal capture。软件 seal 不自动证明物理 trigger↔frame 真实性；PulseScan 仍须由 §14.5 `EpochValidationRecord` 包装为 VALID。发布快照必须是 owned copy、immutable sealed chunk 或 copy-on-write；禁止把 mutable ndarray view 仅设 `writeable=False` 后冒充 revision。
 
 DatasetRevisionRef故意不携带Formal runtime provenance，避免zlc_data反向依赖neutral。Formal scan由§14.5的neutral-owned `EpochBoundDatasetRef`把普通DatasetRevisionRef与epoch integrity绑定；Workbench/Repository adapter必须保留这个外层wrapper，不能只抽出裸DatasetRevisionRef后绕过authority gate。
 
-Measurement/StreamProcessor 不创建 DataBlock/DataPatch，也不读“当前累计 block”来决定下一条输出。它们只处理当前 Envelope payload 或声明的完整 key group。DatasetBuilder 是 sample stream -> dataset 的唯一边界；interactive/display Analysis 可显式消费 DatasetPreviewSnapshot 并保留 provisional provenance，权威 Fit/Calibration/Repository 只消费 SealedDatasetArtifact 或更强的 VALID EpochBoundDatasetRef。DatasetProgress 是状态通知，不是数据输入，consumer 不能从它重建权威值。
+Measurement/StreamProcessor 不创建 DataBlock/DataPatch，也不读“当前累计 block”来决定下一条输出。它们只处理当前 Envelope payload 或声明的完整 key group。`DatasetBuilder` 与 `MonitorDataset` 是互斥的两种 sample -> dataset 边界；interactive/display Analysis 可显式消费 provisional snapshot，权威 Fit/Calibration/Repository 只消费 SealedDatasetArtifact 或更强的 VALID EpochBoundDatasetRef。DatasetProgress/RevisionRef 是状态通知，不是数据输入，consumer 不能从它重建权威值。
 
-DatasetBuilder 不假设 stream payload 必须是裸 Value；它绑定一个与同一 PayloadContract、同一 ValueSchema owner 对齐的 immutable `DatasetEventAdapter[T]`。adapter 从一次 frozen payload 中投影 `Value`，metadata 则由独立但同属该 adapter 的 `DatasetMetadataContract(snapshot/validate/retained_nbytes/max/fingerprint/digest)` 单源冻结；builder 机械拒绝 dict/list/可变 dataclass 等浅别名，把 metadata bytes 纳入 payload budget，并在同一 Delivery/ack 事务中写 cell、保存 ordered manifest 与 metadata digest。`CameraSample(image, metadata)` 因此不需要第二个 exact consumer、side-channel metadata stream 或 TraceContext 私有字段；seal 同时冻结 DataBlock 与不可变 ordered frame metadata。普通 Value stream 使用 `ValueDatasetEventAdapter + NoDatasetMetadataContract`。adapter 不能改变 key、sequence、TraceBinding 或 cell schedule。
+两种 materializer 共用一个与 generation-owned PayloadContract、同一 ValueSchema owner 对齐的 frozen `DatasetEventAdapter[T]`，但不复制/反射重建整张 adapter graph。adapter 从一次 frozen payload 投影 `Value`，metadata 由其 `DatasetMetadataContract(snapshot/retained_nbytes/max/fingerprint/digest)` owner 冻结；runtime 只拒绝真实可变 metadata alias，不把同进程 `object.__setattr__` 当安全边界。exact 路径在 Delivery/ack 事务中保存 ordered metadata digest；live 路径只保存显示所需 metadata 与 EventRef，不在热路径计算无人消费的第二份 digest。`CameraSample(image, metadata)` 因此不需要 side-channel metadata stream；adapter 不能改变 key、sequence、TraceBinding 或 exact cell schedule。
 
 所有 AxisId 在一个 DatasetSchema 内唯一；coordinates 长度与 size 相等；`repeat_axis.size == R`；`values.shape[1] == point_layout.storage_size`；cell_schema.data_axes 顺序与 trailing ndarray 顺序完全一致。任何 public consumer 若要从 P 恢复多维 point index，必须调用 PointLayout，不能自行 `reshape` 猜 order。
 
@@ -752,9 +752,9 @@ DataPatch:
   schema_fingerprint
 ```
 
-values 与 cell/component validity 原子更新。Patch 只能应用到匹配 block_id/base_revision/schema_fingerprint 的 DatasetBuilder，不能改变 schema 或 validity axis contract；result_revision 必须严格递增。target_cells 在 patch 内唯一，shape/dtype/mask axes 必须与 schema 一致。runtime 另在 Envelope/cursor 层校验 stream_generation，zlc_data DataPatch 不引用 stream lifecycle。正式 exact capture 重复写已 valid component 是 duplicate fatal；只有非权威 rolling monitor builder 才能覆盖。实现必须先完整验证 validity/shape/address 再一次提交 values+written+validity，任何验证或 ack 失败不得留下可 seal 的 revision。
+values 与 cell/component validity 必须原子更新。`DataPatch` 是 snapshot store/持久化 delta 可选使用的 zlc_data 值对象，只能应用到匹配 block_id/base_revision/schema_fingerprint 的 owner，不能改变 schema 或 validity axis contract；result_revision 严格递增，target_cells 唯一。内存 `DatasetBuilder` 与 `MonitorDataset` 不为单 cell 临时构造再丢弃 DataPatch：它们先完成 payload、validity、exact schedule/cycle key 验证，再在一把锁内直接提交 values+written+validity+metadata+EventRef。任何验证或 ack 失败不得留下可 seal 的 revision。
 
-DataPatch 只在 DatasetBuilder 内部、snapshot store 与持久化 materializer 的受控边界传播，不是 sample stream/StreamProcessor edge 或普通 UI queue 的 payload。内存 builder 可把单-cell patch 当作事务 staging，提交后立即丢弃；不能为大 image 的每个 cell 同时常驻 full current、full base 和全历史 patch。Live binding 正常只接 DatasetProgress，再按刷新预算请求 current slice/owned preview；不得每个 event 把 full DataPatch 或 full snapshot fan-out 给所有 panel。若持久化 materializer选择 journal delta，其 revision 与 commit 点一致：consumer 要么看到 patch 前完整状态，要么看到 patch 后完整状态，不能看到 values 已更新但 validity 尚未更新的中间态。
+DataPatch 不是 sample stream/StreamProcessor edge 或普通 UI queue 的 payload；baseline 没有 DataPatch journal consumer，也不为未来可能性预建 patch history。若 SnapshotStore/持久化 materializer 将来以真实 profile 证明需要 journal delta，它的 revision 必须与 commit 点一致：consumer 要么看到 patch 前完整状态，要么看到 patch 后完整状态。Live binding 只接 coalesced revision 通知并按刷新预算请求 current slice/owned snapshot；不得把 full patch 或 full snapshot 逐 event fan-out 给所有 panel。
 
 ### 6.6 Axis transform
 
@@ -810,7 +810,7 @@ CausationRef =
 
 数值/领域数据 Envelope 额外包含 payload contract fingerprint 与 captured timestamp。payload 的 snapshot/validate/retained-bytes/max-bytes 必须由一个 generation-owned `PayloadContract` 单源提供，不能让三个 lambda 分别估计并漂移；`ValuePayloadContract` 还要求所有 event 共享同一个 ValueSchema 对象，并把 ComponentValidity mask 的 owned bytes 纳入预算，禁止每帧夹带未计费的重复 schema/coordinates。普通 stream payload 是 Value 或包含 Value 字段的 frozen domain record；DataBlock/DataPatch 只属于 DatasetBuilder/materialization 边界，不能作为“当前累计 signal”反复发布。Provenance 是 causation graph、payload fingerprint 和 TransformRecords 的派生视图，不是另一套含义模糊字段。
 
-JoinKey 是 frozen、可序列化的领域值（例如 TriggerKey/ScanCellKey/ShotKey），不是字符串拼接或 payload 私有字段。type、snapshot、validate 与 fingerprint 同样由一个 generation-owned `JoinKeyContract` 提供；Envelope 保存 owner snapshot，不能只检查“可 hash”后保留可变对象别名。DatasetBuilder 另绑定由编译计划独立产生的完整 `sequence -> DatasetCellAddress` schedule，event 自报 key 必须逐项相等；仅有合法 key 类型并不足以证明 row 没有对调。`EXACT_KEY`/`LATEST_COMPLETE_KEY_MONITOR` 只接受相同 contract fingerprint；key 缺失或不合法在配置/preflight/consume 阶段失败。TraceContext.correlation_id 只用于追踪，不能代替数据关联 key。
+JoinKey 是 frozen、可序列化的领域值（例如 TriggerKey/ScanCellKey/ShotKey），不是字符串拼接或 payload 私有字段。generation-owned `JoinKeyContract.snapshot(key)` 是唯一 admission owner：它同时验证并返回 owned frozen key，stream 不在下一行重复 validate；fingerprint 绑定其语义。exact DatasetBuilder 另绑定由编译计划独立产生的完整 `sequence -> DatasetCellAddress` schedule，event key 必须逐项相等；仅有合法 key 类型并不足以证明 row 没有对调。keyed live cycle 同样验证物理 schedule；append history 则故意不把 producer join key 当 panel slot，slot 只由 consumer sequence 决定。TraceContext.correlation_id 只用于追踪，不能代替数据关联 key。
 
 `stream_generation` 只能由 broker/factory mint 的不可复用 incarnation identity 产生，调用方不能用可复用字符串为两个 live source 指定同一 generation；否则不同内容可能得到相等 DatasetRevisionRef。`sequence` 在 `(stream_id, generation)` 内从 0 严格单调且不复用，event_id 由 generation+sequence 派生，不维护随 monitor 寿命无界增长的去重集合。StreamProcessor 输出创建新 event_id，不能沿用某个输入 id 冒充同一事件。少量 join 使用 EventRef；StreamReducer/DatasetBuilder 的长连续输入使用 EventSpanRef，ordered_digest 覆盖按 sequence 排列的 event_id/payload digest。禁止在每个累计结果里复制全部历史 event_id，避免 provenance 退化为 O(N²)。
 
@@ -819,7 +819,7 @@ JoinKey 是 frozen、可序列化的领域值（例如 TriggerKey/ScanCellKey/Sh
 | 原语 | 语义 | 用途 |
 |---|---|---|
 | AcquisitionStream | ordered、exact、cursor、gap-fatal | 正式 scan/capture |
-| MonitorStream | bounded、latest/coherent-latest、missed count | live UI |
+| MonitorTap + MonitorDataset | bounded backlog、latest/ordered、missed + sequence-owned window | live UI |
 | ControlTopic[T] | typed、revisioned、ack | ROI、threshold、run command |
 | EventStream[T] | progress/transition notification | UI/headless status |
 
@@ -866,7 +866,7 @@ max_inflight_events/bytes        # 未 ack retention admission
 max_source_burst + backpressure capability
 ```
 
-RunController 根据 source 最大 burst/速率、最慢 required consumer、ack 边界和是否可 backpressure，证明一个保守最大 backlog；reservation 只 pin 未 ack 区间，ack 后立即释放。不能因为 run 有 N 点就无条件在 RAM 保留 N 个大帧，也不能在不可 backpressure 的相机上假设 consumer 平均够快。若无法证明 max inflight，必须为最坏 total 分配、选择流式 artifact sink/更慢触发，或 preflight 拒绝。连续 Measurement 在 baseline 中只使用 MonitorStream，不建立 infinite reservation、continuous-exact epoch 或 durable spool。未来只有出现必须连续、不可丢且无法切成普通有限 Run 的第二个生产用例，才单独设计持久 spool/epoch 协议；不能先让所有运行背负该状态机。
+RunController 根据 source 最大 burst/速率、最慢 required consumer、ack 边界和是否可 backpressure，证明一个保守最大 backlog；reservation 只 pin 未 ack 区间，ack 后立即释放。不能因为 run 有 N 点就无条件在 RAM 保留 N 个大帧，也不能在不可 backpressure 的相机上假设 consumer 平均够快。若无法证明 max inflight，必须为最坏 total 分配、选择流式 artifact sink/更慢触发，或 preflight 拒绝。连续 Measurement 在 baseline 中只使用 admitted `MonitorTap -> MonitorDataset`，不建立 infinite reservation、continuous-exact epoch 或 durable spool。未来只有出现必须连续、不可丢且无法切成普通有限 Run 的第二个生产用例，才单独设计持久 spool/epoch 协议；不能先让所有运行背负该状态机。
 
 source contract 必须声明 `BACKPRESSURE_CAPABLE` 或 `NON_BACKPRESSURE_CAPTURED`。前者的 publish 可在零状态变化后返回 `StreamBackpressure` 并由真实 producer 稍后重试；后者表示调用 publish 时物理帧已经不可撤回，第一次 event/byte retention miss 必须在同一临界区把 generation、reservation 与所有 formal consumer 永久置为 `RetentionOverrun/FAILED`，后续 frame 绝不能占用失败帧原本的 sequence，emit/finish/seal 全部拒绝。qCMOS 属于后者。retention 之外任何发生在物理 capture **之后**的 decode/copy/schema/metadata/key/publish 异常也必须由 CaptureSession 统一转成 `producer.fail(SourceFailed)` 并继续做硬件安全 drain；禁止 catch 后继续 formal collection。
 
@@ -888,7 +888,7 @@ record 构造时就必须取得图像 bytes 的 ownership 并冻结 metadata；d
 
 arm 时冻结 pending retention capacity：finite capture 以声明的 frame budget 为硬上限，continuous capture 以 adapter/profile 证明的 max-inflight 为上限。adapter pending queue 在两种模式下都不 overwrite 尚未被唯一 capture owner 排空的物理帧；monitor 的 overwrite/missed 只发生在 owner 已将 record 转交给 broker 之后的 bounded monitor tap。容量不足、ordinal 不连续或超过 arm budget 返回 typed `CameraBufferOverrun`，formal CaptureSession 将其上升为 `SourceFailed/RetentionOverrun`；monitor run 也必须明确停止/重建 capture session 并报错，不能在 adapter queue 内悄悄丢帧后只增加 UI missed count。迁移期的 `read_frames()` 只能解包同一 record queue 的 `image`，不得维持第二份排队、ordinal 或 metadata 真相源；array-only reader 只在**最后一个 legacy camera consumer 所在的 dependency-closed 切片**删除，不能把时点写死为 S3。当前 consumer matrix 仍包含 ROI、monitor、temperature 与剩余 legacy measurement/UI，预计随 S5 收口。终态 adapter contract 只交付 record。CaptureSession 在 owner lane 把 record 一次转换为neutral-owned `CameraSample(Value, metadata)`；`CameraFrameRecord` 不穿过 bounded-context 边界进入 zlc_data、processor、UI 或持久 artifact。
 
-stream_generation/payload contract fingerprint 改变时，旧 exact cursor 终止为 typed SchemaChanged。schema-affecting reconfigure 不是“原地改参数”，而是 generation migration：owner 在 transaction boundary 终止旧 generation、对所有 pending Control revision 发 terminal ack，为每个绑定的 DatasetBuilder 创建新 block_id/DatasetSchema/generation，再允许 Monitor 显式 rebind。旧 pending view/fit 结果 stale，CommittedTransform 因 DatasetSchema fingerprint 改变一律失效，不能按 index 偷迁移。稳定 AxisId 只帮助迁移 workspace preference 的候选匹配，仍须完整 schema/coordinate/validity 校验。正式 finite Run 默认拒绝 schema-affecting reconfigure；value-only 且 schema 不变的参数才可按运行合同在边界 APPLIED。
+stream_generation/payload contract fingerprint 改变时，旧 exact cursor 终止为 typed SchemaChanged。schema-affecting reconfigure 不是“原地改参数”，而是 generation migration：owner 在 transaction boundary 终止旧 generation、对所有 pending Control revision 发 terminal ack，为每个绑定的 exact DatasetBuilder 或 live MonitorDataset 创建新 block_id/DatasetSchema/generation，再在新 generation 首次 publication 前完成 tap/materializer rebind。旧 pending view/fit 结果 stale，CommittedTransform 因 DatasetSchema fingerprint 改变一律失效，不能按 index 偷迁移。稳定 AxisId 只帮助迁移 workspace preference 的候选匹配，仍须完整 schema/coordinate/validity 校验。正式 finite Run 默认拒绝 schema-affecting reconfigure；value-only 且 schema 不变的参数才可按运行合同在边界 APPLIED。
 
 一个 StreamProcessor invocation 只原子发布一个 typed payload；同 shot 多字段装进同一 frozen record，成功 enqueue 后才 ack 输入。baseline 不支持把一次 invocation 拆成多个 exact stream 再实现跨 stream transaction；确有不同 cardinality/key 的结果应拆成独立节点。DatasetBuilder 在 Value 已按 frozen schedule 原子写入 values+validity 后 ack；storage 与权威 processor 只接受 SealedDatasetArtifact 或 VALID EpochBoundDatasetRef，不能退回接受裸 DataBlock/OwnedSnapshot/DatasetPreviewSnapshot。Repository sink 的 ack 点是临时 blob fsync/校验完成且 manifest 原子提交之后，不是刚开始写文件。
 
@@ -924,26 +924,30 @@ broker 只分发 immutable payload/ref；driver 会复用 DMA/frame buffer 时�
 
 ### 7.6 Buffer sizing
 
-Measurement output contract 声明 `max_payload_bytes`、`max_burst_events`、finite run 的 expected/max total events、生产速率/停顿边界与是否能 backpressure；StreamProcessorDefinition 声明 cardinality、record/Value 输出尺寸上界、最大并发处理与 ack 点；DatasetBuilder/sink 声明 ingest backlog、chunk/flush 策略和最终 DataBlock bytes。RunController 从这些合同派生每条 edge 的 `max_inflight_events/bytes`，而不是把 total events 直接当 history depth。它们是 preflight 预算输入，不是节点自行分配私有 list 的权限。
+Measurement output contract 声明 `max_payload_bytes`、`max_burst_events`、finite run 的 expected/max total events、生产速率/停顿边界与是否能 backpressure；StreamProcessorDefinition 声明 cardinality、输出尺寸上界、最大并发处理与 ack 点；DatasetBuilder/sink 声明 exact backlog、chunk/flush 与最终 DataBlock bytes；`LiveDatasetSlotSpec` 单独声明可见 window capacity。RunController 从这些合同派生 exact edge budget、MonitorTap 暂时来不及 ingest 的 backlog budget，以及 MonitorDataset 已 ingest 可见历史 budget；三者不能用一个 “buffer size” 冒充。
 
-Monitor subscriber 可以请求小容量（例如 image latest/history=8），其合同就是允许 overwrite 并报告 missed。正式采集不能靠“把 history 设成 full size”保证完整：RunController 必须沿整个 source -> processor -> sink exact chain 汇总每条 edge 的 event/byte budget，并在 fire 前对共享 retention backend 原子 reservation。一个节点的 full-size buffer 不能替代上游/下游 edge reservation，也不能保证变长 payload、多 subscriber 或 processor fan-out 不溢出。
+MonitorTap 可以请求小 backlog（例如 image 2–8 帧），其合同就是允许 overwrite 并报告 missed；可见 rolling history 长度由下游 MonitorDataset 决定，LiveDatasetSlot 只共享 handle/revision 并 coalesce 通知，绝不能再持第二份 window/buffer。同一 source 的多个 panel默认共享一个 admitted slot，再用 ViewSpec 取 `<= capacity` 的窗口，而不是各自动态 attach 大帧 ring。正式采集不能靠“把 history 设成 full size”保证完整：RunController 必须沿 source -> processor -> sink exact chain 汇总 event/byte budget并在 fire 前 reservation。MonitorTap 与其唯一 materializer 都必须在首次 publication 前绑定；这个本地时序门禁仍不等于全拓扑 byte admission，在 S5 composition factory 汇总 tap backlog、materializer window、snapshot/front-buffer 并冻结 topology 以前，禁止把当前构造器接入真实 Workbench。execute 中或 panel 打开时不得新增 raw tap/window。
 
 ### 7.7 Finite dataset 与 rolling monitor
 
-同一个 DatasetBuilder/materializer contract 明确区分两种模式，不允许 implementation 自行发明无界 live buffer：
+三个 owner 明确分责，不允许一个双模式 builder 同时背 exact seal、broker backlog 与 GUI rolling：
 
 ```text
-FINITE_EXACT
-  固定/有界 key coverage，duplicate fatal，EOS 冻结
-  revision 在 retention 合同内可重取，可进入 formal Analysis/artifact
+AcquisitionStream -> MonitorTap
+  bounded event/byte backlog；overwrite/missed；不参与 exact retention/backpressure
 
-ROLLING_MONITOR
-  固定 byte/cell capacity，overwrite + missed/expired count
-  每个可见 revision 仍是内容稳定的 OwnedSnapshot
-  默认不可成为完整 CaptureArtifact 或 Formal Analysis 输入
+ExactReservation -> DatasetBuilder
+  完整 sequence -> DatasetCellAddress 排列；ack/EOS/seal；只能 finite exact
+
+MonitorTap -> MonitorDataset
+  keyed_cycle: 物理 cycle offset 0 或 sequence gap 时先原子清空旧值/validity/metadata
+  append_window: materializer 按 event sequence 分配 ring slot，snapshot 统一 newest-first
+  两者都只产生 MonitorDatasetSnapshot，绝不 seal
 ```
 
-交互 Fit/Save 若要使用 rolling 数据，必须先冻结一个仍可解析的 DatasetRevisionRef/窗口为新的 owned finite input并记录 missed/coverage；不能把“当前 rolling window”冒充从运行开始至今的完整 dataset。monitor progress、dirty cells 与 pending snapshot request 都必须有界/coalesce，Python 引用不能绕过 retention budget让旧大帧无限存活。
+`MonitorDatasetSnapshot` 在同一临界区冻结 DataBlock、cell-aligned EventRefs、head 与 `MonitorCoverage`；controller 的 current selection 只来自该 snapshot，不拼接可能过期的 progress。append history 的目标 shape 必须是 `(R=1,P=history,*data_shape)`，且 P 只能是一条 `MONITOR_HISTORY`、dense `RECT_C`、坐标严格为 `0..capacity-1` 的 newest-first slot 轴；slot 0 表示本次 snapshot 中最新的 retained event，遇到 gap 时 slot n 不等于物理上的“n shots ago”，真实 source sequence 只能读取 aligned EventRef。任意二维/多维 `data_shape` 原样保留，绝不能借用 SCAN_POINT/READOUT_EVENT、塞进匿名 `(repeat,data_points,data_dim)` 三项容器或 `reshape(...)[0]`。正常 ring eviction 不计为 loss；`MonitorCoverage.missed_events` 是 lifetime telemetry，`current_gap` 只描述当前可见窗口，gap 滚出后 coverage 可以恢复 complete。formal `DatasetCoverage` 只保存 written/total；exact loss 已由 reservation sequence、cursor ack、完整 schedule 与 owner EOS fail-closed 证明，不保留一个生产中永远为 0 的旧 monitor 字段。keyed cycle 的 complete 只描述当前 sweep，绝不混入上一 sweep 的仍 valid cell。
+
+交互 Fit/Save 若要使用 live 数据，必须把一个原子 snapshot 冻结为新的 owned finite diagnostic input并记录 event range、head、missed/coverage；不能把“当前 window”冒充从运行开始至今的完整 dataset。pending snapshot request 必须有界/coalesce，Python 引用不能绕过 retention budget让旧大帧无限存活。
 
 ## 8. 同步执行与线程托管
 
@@ -1264,7 +1268,7 @@ Task 是 one-shot use case，可以同步组合 CaptureSession、纯 operator �
 
 Task 不一定产生 artifact；普通控制/查询 Task 可返回 immutable result，需要持久化时返回本包 typed ref。
 
-Task 的中途数值/图像显示不重新建立 `TaskOutput`。需要 live frame、3D map 或优化轨迹的 Task，必须在同一 RunPlan 中声明并复用正式 DatasetBuilder 或 ROLLING_MONITOR materializer；RunHandle 只暴露 typed `LiveDatasetSlot -> DatasetRevisionRef`，Workbench panel 通过 SnapshotStore 读取。阶段/progress/warning 仍走 EventStream。这样中途 UI、最终 Analysis 与 artifact 使用同一 builder/revision 真相源，Task 不发布第二份 mutable signal，也不会因删除 `__task_frame__` 丢失现有用户功能。
+Task 的中途数值/图像显示不重新建立 `TaskOutput`。需要 live frame、3D map 或优化轨迹的 Task，必须在同一 RunPlan 中声明 finite exact DatasetBuilder 或 admitted `MonitorTap -> MonitorDataset -> LiveDatasetSlot`；RunHandle 只暴露 slot 的 coalesced revision 通知，Workbench 从 slot 取得原子 MonitorDatasetSnapshot。阶段/progress/warning 仍走 EventStream。这样中途 UI、最终 Analysis 与 artifact 使用同一 materializer/revision 真相源，Task 不发布第二份 mutable signal，也不会因删除 `__task_frame__` 丢失现有用户功能。
 
 ### 10.3 Measurement
 
@@ -1469,7 +1473,7 @@ auto slice、latest、repeat mean 和鼠标刚画出的 ROI 都是 display state
 
 `suggest_view` 返回轻量 `ViewSuggestion` 供 UI 显示。算法优先把信息轴放入 ViewContract 允许的 display/facet/batch，其余轴给有坐标标签的 slider/select；batch/facet 联合容量由一个有界、确定性的局部规划器求解，不能按 dataset tuple 顺序贪心。Selection 只限定允许的 index/coordinate 集合，本身不表示 mean、sum、integrate 或 count；除 repeat 的 ViewContract policy 外，suggestion 不从“框了一个范围”发明 reducer。仍需压掉有物理信息的轴而没有唯一规则时返回 `NEEDS_INPUT`。baseline 因而只有一个可保存 ViewSpec、一个权威 CommittedTransform、一个瞬时 suggestion 和一个 renderer DTO；没有可互相转换的五层 projection 状态机。
 
-`LatestNonempty` 只表示“显式 display selection 内最大的非空**逻辑 repeat index**”，不表示最后发布事件、硬件时序或 provenance current cell；它只能绑定 repeat AxisId。若剩余多个 cell 的最大 valid repeat 不同，ViewContract 也不能做 per-cell latest gather 后拼出一条伪装成同一次 shot 的曲线。ROLLING_MONITOR 可按同一 cell address 覆盖，事件顺序甚至可能是 `point 0 -> 1 -> 0` 或 `repeat 0 -> 1 -> 0`，所以 Workbench rolling controller 必须从 MonitorUpdate/EventRef/DatasetProgress 的当前事实生成覆盖 repeat 与全部 point axes 的完整显式 Selection；figure 层禁止从 axis role、最大 nonempty index 或 PointLayout 猜“最后发布”。
+`LatestNonempty` 只表示“显式 display selection 内最大的非空**逻辑 repeat index**”，不表示最后发布事件、硬件时序或 provenance current cell；它只能绑定 repeat AxisId。若剩余多个 cell 的最大 valid repeat 不同，ViewContract 也不能做 per-cell latest gather 后拼出一条伪装成同一次 shot 的曲线。Workbench live current 必须读取同一个 `MonitorDatasetSnapshot.head + event_refs + block` 后生成覆盖 repeat 与全部 point axes 的完整显式 Selection；figure 层禁止从 axis role、最大 nonempty index、过期 DatasetProgress 或 PointLayout 猜“最后发布”。
 
 ### 11.2 三层 Projection 语义
 
@@ -2679,7 +2683,7 @@ display decimation/downsampling 只能作为带标签的 render policy，不能�
 Data：
 
 - Value event 只携带 `(*data_shape)` 与 ValueSchema；DataBlock 只携带 `(R,P,*data_shape)` 与 DatasetSchema，普通 stream edge 拒绝 DataBlock/DataPatch；
-- DatasetBuilder 是唯一 event -> dataset 边界：TriggerKey/ScanCellKey 到 `(R,P)` 映射、duplicate/missing key、ValueSchema mismatch、values+validity journal 原子更新均有合同测试；
+- 每条 edge 恰有一个 event -> dataset owner：finite exact DatasetBuilder 验证完整 TriggerKey/ScanCellKey schedule、missing/key mismatch、ValueSchema 与原子写；live MonitorDataset 验证 keyed cycle 或按 sequence 管理 append window，二者不共享 mode/state machine；
 - StreamProcessor 每次 invocation 返回一个 frozen typed record；同一 record 的字段共享 key/provenance，字段不同 cardinality/key/lifecycle 时静态拒绝并要求拆节点；
 - 任意 point/data axes；
 - scalar 与长度一 axis；
@@ -2697,7 +2701,7 @@ Data：
 - 发布 DataBlock/array write-protected，driver buffer reuse 不改变已发布 snapshot；
 - DataPatch block/base/result revision、schema fingerprint、重复 target、exact 重写 valid cell 与 values/validity 原子性；
 - DataPatch/snapshot 近线性且无每点全 block copy；
-- 每 sample 只发 DatasetProgress/dirty coverage，不把完整 DataBlock/DataPatch fan-out；snapshot 按请求 revision/slice 解析，EOS final freeze 总复制近似 O(final bytes)；
+- finite exact 每 sample 只发 DatasetProgress/dirty coverage；live 只发可 coalesce 的 revision 通知并按需取得同一原子 MonitorDatasetSnapshot；两者都不把完整 DataBlock/DataPatch fan-out，EOS final freeze 总复制近似 O(final bytes)；
 - 非法隐式 reduce/anonymous flatten 失败；
 - DataTransformSpec 不包含显示 binding，ViewSpec 不可传入 neutral runtime；
 - 同一 schema + ViewIntent + Selection 得到确定性 ViewSuggestion/ViewSpec；只改变等语义 data-axis tuple 排列不改变 AxisId→binding 决策；合同有可行 batch/facet 分配时不能因贪心次序误拒；
@@ -2764,8 +2768,8 @@ Stream：
 - stale DeviceCapabilitySnapshot/output schema mismatch 在 arm/fire 前拒绝；
 - StreamProcessor cardinality/byte-bound 无法证明或 formal path 含未解释 filter 时 preflight 拒绝；
 - StreamProcessor output contract 依赖首帧数值或运行中改变 record fields/axis 时不能编入 formal pipeline；
-- continuous Measurement 只能使用 MonitorStream；exact request 必须有限且可完整 reservation；
-- ROLLING_MONITOR 固定容量、报告 overwrite/missed/expired，只产生 provisional preview；若要成为 formal input，必须启动新的 finite exact capture，不能给 rolling snapshot 改名；
+- continuous Measurement 只能使用 admitted MonitorTap/MonitorDataset；exact request 必须有限且可完整 reservation；
+- MonitorTap backlog 与 MonitorDataset window 固定容量、报告 lifetime missed 与 current gap，只产生 provisional atomic snapshot；若要成为 formal input，必须显式冻结新的 finite diagnostic input或启动 finite exact capture，不能给 live snapshot 改名；
 - 单个 typed output record 的 ack 只在 publish 与所有 required downstream 接收成功后；不同 cardinality/key/lifecycle 的结果必须建独立节点，不能伪装为一次多-output transaction；
 - exact/monitor 同源 event_id；
 - EventSpanRef digest/count 等价于显式 ordered events，lineage 不随累计输出 O(N²) 增长；
@@ -2955,7 +2959,7 @@ producer/adapter
 
 同一个 use case 不允许双写、双读或自动 fallback；尚未迁移的其它 use case 可以暂时停留在旧实现，但不能通过 bridge 污染新合同。S0.5 只允许 host/catalog/render/resource containment，不允许把旧 Hub/LogicNode/metadata vocabulary 适配成新 event/data/runtime 类型；这叫迁移隔离，不是领域兼容层。旧 panel 可由 LegacyPanelHost 逐项托管，旧 hardware workflow 必须经过 LegacyRuntimeFence 使用同一 ResourceArbiter/DeviceControlLease。共享 primitive 只在首个消费它的切片中建立最小正式版本；后续若无第二用例，不提前泛化。
 
-追溯审查判断“是否保留”时必须看终态职责和已排期 consumer，不能把中间提交的 production reachability 当成唯一标准。`MonitorTap/ROLLING_MONITOR` 的未来 GUI live/rolling consumer、calibration/occupancy 的 S3 consumer、FitResultBatch 的 gridplot consumer 都是明确需求；它们可以因职责混杂、重复 owner 或过度包装而重构、压缩或替换，但不能仅因当前 composition 尚未接线就整簇删除。只有目标职责已有更小的唯一 owner、全部当前与已排期 consumer 都完成迁移，并有 dependency-closed 删除证据时才物理删除。
+追溯审查判断“是否保留”时必须看终态职责和已排期 consumer，不能把中间提交的 production reachability 当成唯一标准。`MonitorTap -> MonitorDataset -> LiveDatasetSlot` 的未来 GUI live/rolling consumer、calibration/occupancy 的 S3 consumer、FitResultBatch 的 gridplot consumer 都是明确需求；它们可以因职责混杂、重复 owner 或过度包装而重构、压缩或替换，但不能仅因当前 composition 尚未接线就整簇删除。只有目标职责已有更小的唯一 owner、全部当前与已排期 consumer 都完成迁移，并有 dependency-closed 删除证据时才物理删除。
 
 依赖关系是：
 
@@ -2999,7 +3003,7 @@ E0a报告是S1/H1设计、Q0测试矩阵、preflight margin候选与PerformanceB
 1. safety spine：RunController/RunHandle、ResourceArbiter、跨入口 DeviceControlLease、BoundDevice/owner I/O lane、真实 termination acknowledgement 与 machine/device级 write-ahead quarantine journal；先用阻塞 fake/virtual camera证明HAZARD_ACTIVE durable前cancel不调用硬件、interrupt/join未完成不发布terminal或释放claim，并用per-authority幂等SafetyDispositionBundle + RunSafetyDispositionSet覆盖safe、mixed unsafe、跨domain partial success、restart、retry及bundle-set/artifact/terminal crash reconciliation；真实bootstrap缺少persistent journal必须拒绝启动。
 2. zlc_data：AxisId/AxisSpec、ValueSchema/DatasetSchema、Value/DataBlock、Validity、PointLayout、DataPatch、ValuePayloadContract 和 canonical codec；它是这些通用数据类型、数值 snapshot/byte-accounting 合同的唯一 owner。
 3. zlc_storage：canonical primitive encoder/digest、BlobStore/ManifestCommitter/atomic probe；各 owner 保留 typed Repository/schema codec，并从第一天用 cross-package golden/property test 锁定 canonical bytes。
-4. neutral stream：broker-minted generation、AcquisitionProducer/read-side stream、Payload/JoinKey contracts、opaque Delivery/EOS、single-formal reservation/ack、TraceBinding、BACKPRESSURE_CAPABLE/NON_BACKPRESSURE_CAPTURED、RetentionOverrun poison，以及 DatasetBuilder/DatasetProgress/DatasetPreviewSnapshot/SealedDatasetArtifact；不发布累计 DataBlock。
+4. neutral stream：broker-minted generation、AcquisitionProducer/read-side stream、Payload/JoinKey contracts、opaque Delivery/EOS、single-formal reservation/ack、TraceBinding、BACKPRESSURE_CAPABLE/NON_BACKPRESSURE_CAPTURED、RetentionOverrun poison，以及 exact `DatasetBuilder/DatasetProgress/DatasetPreviewSnapshot/SealedDatasetArtifact` 与 bounded `MonitorTap/MonitorDataset/MonitorDatasetSnapshot`；不发布累计 DataBlock，live owner 在 S5 aggregate admission 完成前不接真实 Workbench。
 5. explicit DefinitionCatalog、PipelineSpec -> flat RunPlan compiler；此时只支持 S1 所需的 Measurement、DatasetBuilder 与 sink，不预建递归 plan 或通用 workflow DSL。
 6. camera exact queue 改为 O(1)，明确 driver buffer ownership。
 
@@ -3282,7 +3286,7 @@ PulseTarget ABI、TargetIR、PulseWireImage、CompiledPulseArtifact 与已经通
 
 Workbench 内本地 sequencer、远端 sequencer 与 camera endpoint 共享的 `BoundDevice + binding_id + connection_generation` 当前性检查由一个 private function 拥有；首次 capability probe 前只要求真实 `BoundDevice`，probe 后同时严格匹配 binding id 与 generation。远端 server generation、capability 及各设备自己的 live readback 是不同不变量，继续留在对应 endpoint，不得因抽取公共函数而合并或削弱。该收敛只去除三份相同实现，不改变 camera/sequencer 入口、GUI 计划 consumer 或设备能力。
 
-Finite exact 的“event ordinal 到每个 dataset cell 的完整唯一排列”由 `FrozenDatasetEdge` 在 defensive copy 后验证一次；同一结果派生 schedule、key-sequence 与 consumer-contract digest，并缓存 key-domain fingerprint。Workbench 的 `CameraCaptureBindingRequest` 只冻结 declarative sequence，`CaptureStreamContract` 直接消费 edge，processor worker 在确认同一个 edge/key-contract owner 与 reservation cardinality 后信任该 immutable schedule，不得再次逐 key 扫描。CompiledCaptureCellPlan 对 pulse trigger/scan/repeat/event 物理关联的验证仍保留，因为那是比 generic dataset permutation 更强的不同不变量；reservation state、generation、consumer ownership、cursor 与锁内 TOCTOU 检查也不属于静态 schedule，不能删除。`expected_cells=None` 的 monitor/rolling 分支保持独立 bounded preview 语义，不因 exact owner 收敛而删除或退化。
+Finite exact 的“event ordinal 到每个 dataset cell 的完整唯一排列”由 `FrozenDatasetEdge` 对 address 值作 defensive copy 后验证一次；同一结果派生 schedule、key-sequence 与 consumer-contract digest，并缓存 key-domain fingerprint。adapter/contract 是 composition-owned frozen generation owner，不为抵御同进程 `object.__setattr__` 再递归复制整张 graph。Workbench 的 `CameraCaptureBindingRequest` 只冻结 declarative sequence，`CaptureStreamContract` 直接消费 edge，processor worker 在确认同一个 edge/key-contract owner 与 reservation cardinality 后信任该 immutable schedule，不得再次逐 key 扫描。CompiledCaptureCellPlan 对 pulse trigger/scan/repeat/event 物理关联的验证仍保留，因为那是更强的不同不变量；reservation state、generation、consumer ownership、cursor 与锁内 TOCTOU 也不能删除。schedule-free edge 只复用 payload-to-cell projection；live 的 keyed cycle/append window 语义归独立 `MonitorDataset`，不再是 DatasetBuilder 的 `expected_cells=None` 分支。
 
 Calibration/readout 的规则 4 子切片以 `main@6c337d49` 为唯一物理与算法权威并已完成逐项同帧核对。tracked oracle 从 synthetic raw camera frames冻结 main 的 detector、四种 site order、BOX mean/sum/median/max、per-site/uniform PSF与annulus、strict-consensus labels、seed-0 split、96-bin Otsu、120-bin empirical threshold、per-site/global fidelity、ablation和runtime occupancy；当前实现不在测试时加载第二套算法。四处明确偏离只有 invalid/nonfinite传播、反 polarity runtime拒绝、chance-level site禁用和完整 FrameContract applicability，均有独立 intentional-difference tests。当前证据集合 `test_zlc_readout_main_oracle.py + test_zlc_readout_validity.py + test_zlc_calibration_commit.py + test_zlc_calibration_stream_contracts.py` 由 `pytest --collect-only` 得到 51 个测试函数、60 个pytest items，覆盖 main physical golden、四类纠错、真实多轴/borrowed-frame/codec、真实CAS commit/recovery；fingerprint/version/WorkPlan、无消费者quality gate、resource-policy镜像和反射伪造测试随对应机制一起删除，不能按旧测试数量补镜像。规则 4 对 calibration/readout 已 COMPLETE，但全分支其它物理切片尚未逐一完成，因此全局规则 4 仍为 PARTIAL。
 
@@ -3306,7 +3310,15 @@ TaskConsole current-layout 的 Rule-3 清点以 parent checkpoint `5c54184` 的1
 
 至此，Rule-3 的完整changed-file AST/字符串账本已收敛：所有普通software format/algorithm改稿号及upgrade chain均已删除，跨会话文件只保留plain current format name并对其它shape fail-closed；允许项只剩真实部署双端消费的FPGA layout、迁移期`RuntimeSequenceProgram` wire、`zlc_pulse.PulseTargetABI/v1` hash domain，以及不属于格式版本的内容revision/runtime generation。`ZLC-CANONICAL-1`是获批ABI所依赖的冻结字节原语而非可协商edit counter。Rule 3状态改为COMPLETE；其它规则仍保持各自PARTIAL，迁移继续冻结。
 
-`MonitorTap`/rolling live capability 是终态 GUI consumer 所需能力，不因当前 composition 尚未接线而删除。订阅时 `max_bytes` 必须至少覆盖 stream contract 的一个 `max_payload_bytes`；不足立即拒绝且不注册 tap，不能接受订阅后对每个合法 full-frame 都静默 drop、让 `next()` 永久等待。合法 monitor 仍使用 bounded overwrite、`missed` 计数和 latest/ordered update，且从不参与 finite exact retention 或 backpressure。
+`MonitorTap`/rolling live capability 是终态 GUI consumer 所需能力，不因当前 composition 尚未接线而删除。tap 只拥有 broker backlog：订阅时 `max_bytes` 必须至少覆盖一个 `max_payload_bytes`，不足立即拒绝；tap 与唯一 materializer 都只允许首次 publication 前由 preflight bind，claim 会唤醒更早 blocked 的 raw reader并令其重验 owner；bounded overwrite、`missed`、latest/ordered update 不参与 finite exact retention 或 backpressure。可见历史、cycle reset、head EventRef 与 atomic snapshot 已移到独立 `MonitorDataset`；关闭 materializer 必须关闭 tap、清空保留字节并唤醒 blocked reader。当前本地门禁不冒充 S5 aggregate memory admission，真实 Workbench 接线仍被冻结。
+
+Monitor/rolling 的 Rules 1–7 回顾以 parent checkpoint `b648ba9` 的 182 个领先提交、386 个 changed files为机械范围，完整 owner 闭包覆盖 `runtime/streams.py`、`runtime/dataset.py`、package export、finite capture/processor call sites、data/frontend 的 history-role seam、两个直接测试与本设计账本，并以 main 的 `core/signals.py + core/signal_tensor.py + LiveLive.roll/ScanNode._fill_point` 为独立行为来源。首轮三路只读对抗确认一个 P0：旧 `point0 -> point1 -> point0` 会保留上一 sweep 的 point1 且仍宣称 complete；现测试曾把 `[3,2]` 错误行为钉成契约。继续反例审查又确认九个 P1：producer join key 被误当 panel history slot；lifetime missed 与 current-window gap 混为一字段；rolling builder 不释放 tap；旧 progress ref/head 与后来 snapshot 可错配；claim 前已 blocked 的 raw reader 可在 owner 接管后偷走首帧；`DatasetCellKeyContract.snapshot()` 返回 caller 原对象；hashable mutable adapter 可让投影变化而 digest 不变；metadata contract 的 `validate()` 被漏掉；公开构造器的第二份 `cycle_cells` 可推翻 edge schedule，且 append 借用 SCAN_POINT 会把物理坐标静默重标为历史。
+
+整改删除双模式 `DatasetMode`、不可达 duplicate exception、schedule-free rolling 假 digest、exact-only rolling state、单-cell DataPatch staging、死的 MonitorUpdate tap 引用，以及约 150 行防 `object.__setattr__` 修改 frozen contract graph 的未观测 copy machinery；keyed monitor 仍有意复用 edge 的真实完整 cycle schedule/digests，append edge 才明确无 schedule/digest。exact DatasetBuilder 只管 reservation/schedule/ack/EOS/seal，MonitorTap 只管有界 backlog，MonitorDataset 只管从 edge 唯一派生的 keyed cycle 或 sequence-owned append window。claim 与 first publication 在 stream→tap 同锁序上线性化并唤醒旧 waiter 重验 owner；join-key snapshot defensive-copy；adapter/contract 在 bind 时复用现有一次性 intrinsically-immutable 检查，metadata snapshot 在 commit 前由 owner validate。keyed cycle 新 sweep/任意 offset gap 原子清 values、validity、metadata、EventRef；append window 只接受 MONITOR_HISTORY，newest-first且 gap 滚出后 current coverage 恢复，lifetime missed 仍保留。`(R,P,*data_shape)` 与 ComponentValidity 全轴不变。
+
+本回顾 Rule-6 使用 physical/nonblank/AST 计数：整改前 stream+dataset 为 `3982 / 3553 / 57 classes / 21 dataclasses / 3 enums`，当前为 `4061 / 3603 / 58 / 24 / 2`；相对 main `1672 / 1438 / 15 / 8` 为 `2.43x / 2.51x` 行数、`3.87x` classes。净增 79 physical/50 nonblank 是把原先错误且无时间顺序的 rolling branch替换为 keyed-cycle 与 append 两个真实 GUI consumer语义，并加入可证明的 ownership/immutability 边界；data role export、四种 frontend ViewContract policy 与 processor snapshot-only seam 合计只净增 7 行且不增加 class/enum。运行时净增的 1 个 class 对应 live/formal coverage 类型防火墙；formal DatasetCoverage/codec 的旧 missed 字段、死 MonitorUpdate tap 引用和 single-member mode enum均已物理删除，MonitorUpdate 改为 slotted dataclass，atomic snapshot另有一个值对象。直接测试从 `2042 / 1759 / 20 classes / 15 dataclasses` 变为 `2194 / 1879 / 15 / 9`；新增七条互不等价的 nonzero-gap、blocked-reader handoff、late-bind、join-key alias、metadata-admission、second-cycle-source 与 history-role oracle，并把既有 mutable-adapter/list 例子加强为正常 hashable mutable alias；synthetic reflection fixtures 的 class/dataclass 数反而分别减少 5/6。修后真实 `2304×2304 uint16` public path 以 1 次 warmup + 5 次中位数重测：emit `2.708 ms`、ingest `1.239 ms`、owned materialize `3.272 ms`，materialize `tracemalloc` 峰值 `10.128 MiB`；scalar capacity 300 的 10,000 次 payload-build+emit+ingest 为 `35.8 µs/event`，最终 `[9999,9998,9997]`。74个直接 oracle、18个 capture/processor/occupancy/frontend seam oracle、17个 capture artifact current-codec oracle与22个 import-DAG ratchet通过。该 owner切片局部 GO，但真实 Workbench `LiveDatasetSlot -> PanelController -> Figure` E2E、board coalescing与 aggregate memory admission仍在 S5；故全局 Rules 1/4/5/6/7保持 PARTIAL，迁移继续冻结。
+
+独立全局探针仍有一个与本切片无关但不能隐藏的 blocker：`test_measurement_fidelity.py::test_fidelity_template_scan_rises_with_readout_duration` 因默认 imaging template 仍是旧 pulse JSON 字段、current reader 按 current-only exact schema 拒绝而失败。本 monitor/rolling 提交不修改或放宽该边界；在 owner 切片解决并建立 main 物理 oracle 前，全局 Step 1 不能宣称完成，也不得继续迁移。
 
 `zlc_frontend.figure` 全幅 IMAGE 的 Rules 1/4/5/6/7 子切片以 parent checkpoint `8285e43` 的177个领先提交、386个changed files为范围，覆盖共享 ndarray ownership、figure model/contract/evaluator及其两个直接测试文件。共定位7类同源问题：默认400万元素上限会拒绝真实`2304×2304` qCMOS；单个整数 repeat 的显示均值违背 main 当前`reduce_repeat`的 native-dtype快速路径并把`uint16`膨胀为`float64`；evaluator DTO只翻转writeable flag、消费者可重新开启写权限；IMAGE/CURVE validity会把整数、非零小数和NaN静默强转为真；complex IMAGE/CURVE/HISTOGRAM在没有显式real/imag/magnitude/phase transform时仍被宣称可显示；连续选择与`(X,Y)->(Y,X)`方向变换制造不必要整帧副本；旧resource测试只拿错误的`1920×1200`尺寸镜像私有估算函数，既没有调用公开evaluator，也没有约束真实峰值。整改由`zlc_data.immutable_array`唯一拥有bytes-backed不可重新启写的数组冻结；选择器对连续区间返回view、只对真正非连续轴按最窄比例依次gather，运行时与admission共用同一个AxisId顺序；IMAGE的Y/X仅由声明轴决定，`(R,P,component,Y,X)`中的component只能显式facet/select/reduce，绝不靠rank、singleton或`reshape(...)[0]`猜掉；只有声明为REPEAT且实际最多一个contributor的整数/布尔显示降维才保持native dtype，多repeat MEAN仍为canonical float并保留小数，complex非METER在contract边界fail-closed。`max_materialized_nbytes`改为描述真实语义的current-only `max_live_nbytes`，没有历史alias；每层先检查“此前retained DTO + 本层峰值”再分配，输入OwnedSnapshot仍明确属于调用方而不重复计入。
 
@@ -3330,7 +3342,7 @@ Pulse deployment 的静态 target/geometry/ABI 拓扑由 `DeployedStreamerSessio
 
 Runtime Rule-6 海拔清点在 checkpoint `675c62f` 由 `git show HEAD:path/main:path`、Python tokenize 与 AST 独立计数：stream、dataset、capture、processor、Workbench camera/sequencer 直接切片合计 current `9836 PLOC / 8926 NCLOC / 98 classes / 49 dataclasses`，main 非重叠同职责等价物为 `2104 / 1699 / 16 / 5`，即 `4.67x / 5.25x`；把 installation/composition authority 纳入双方包络后为 current `11356 / 10254` 对 main `3176 / 2608`，即 `3.58x / 3.93x`。高倍率不能直接推出删除：main 不具备 exact reservation/cursor、publication identity、processor lineage、physical terminal/safety，且 MonitorTap/rolling/live 有明确 scheduled GUI/notebook consumer。近期压缩只允许 dependency-closed 地收敛重复 owner/wrapper；不以 current reachability 砍能力。已识别的安全候选是 stream terminal/live-binding helper 去重；projection/capture/processor wrapper、completion mirror、endpoint state machine 与 triggered-camera binding 需先有 Rule-4 digest/authority/lifecycle golden，再决定是否压缩。
 
-9 MiB frame 的针对性 profile 将必要成本与重复防御分开：构造 immutable `Value` bytes 约 `1.957 ms`，一次 payload content digest 约 `2.412 ms`，两者必须保留；generic dataclass materialization walk 约 `0.542 ms/次`，而把已构造的精确 `Value` 视为 owner-validated leaf 后约 `0.00336 ms`。因此 stream publication 仍只生成一个 snapshot、一个 digest、一个 byte count和一个 `_Stored(Envelope, payload_bytes)`供 exact/MonitorTap/rolling 共用；`Envelope.__post_init__` 是拒绝 `DataBlock/DataPatch`（包括嵌套）的唯一 generic admission owner，`_emit` 不预扫第二次。Dataset metadata immutability walker同样信任精确 `Value` 构造不变量；`FrozenDatasetEdge` 在构造时复制并冻结 adapter、缓存 contract/schema/operator，hot getter/project 不为防 `object.__setattr__` 反射而重读整张 adapter graph。实际 stream owner/fingerprint/key-domain绑定、reservation/generation/cursor、锁内 Delivery TOCTOU、metadata semantic digest与 occupancy 原子关系全部保留；不引入 `PreparedPayload`、tuple-returning contract或第二套 unchecked API。
+9 MiB frame 的针对性 profile 将必要成本与重复防御分开：构造 immutable `Value` bytes 约 `1.957 ms`，一次 payload content digest 约 `2.412 ms`，两者必须保留；generic dataclass materialization walk 约 `0.542 ms/次`，而把已构造的精确 `Value` 视为 owner-validated leaf 后约 `0.00336 ms`。因此 stream publication 仍只生成一个 snapshot、一个 digest、一个 byte count和一个 `_Stored(Envelope, payload_bytes)`供 exact/MonitorTap 共用；`Envelope.__post_init__` 是拒绝 `DataBlock/DataPatch`（包括嵌套）的唯一 generic admission owner，`_emit` 不预扫第二次。Dataset 的一次性 immutable-snapshot 检查同时用于 adapter/contract bind 与 metadata snapshot，信任精确 `Value` 构造不变量并拒绝正常 hashable mutable alias；`FrozenDatasetEdge` 只缓存 composition-owned frozen adapter/contract/schema/operator 与 defensive-copied exact address schedule，不为防显式 `object.__setattr__` 复制或反复重读整张 graph。实际 stream owner/fingerprint/key-domain绑定、reservation/generation/cursor、锁内 Delivery TOCTOU、metadata semantic validate/digest与 occupancy 原子关系全部保留；不引入 `PreparedPayload`、tuple-returning contract或第二套 unchecked API。
 
 Stream state machine 的代码去重只能围绕完全相同的事实：readiness source 的“已注册、同一 consumer、ACTIVE、source 未终止”由一个 lock-held helper供 bind/source/emitter 三处复用；exact delivery/completion/abort共同的“已注册且 consumer identity 相同”由 stream 内一个 helper拥有，各操作自己的 allowed-state/EOS/ack/commit语义仍留在调用点。generation terminal 的“关闭 admission、把同一 terminal error/EOS通知所有 MonitorTap、唤醒等待者”也只有一个 helper，finish/fail/supersede/non-backpressure overrun只负责各自独有的终态构造与 reservation 处置。不得把这些 helper扩成 generic state-machine framework，也不得把 exact acknowledgement/backpressure与 bounded monitor overwrite合并。
 
@@ -3354,7 +3366,7 @@ Fit / capture-fit 的 Rule-6 回顾以 parent checkpoint `f0f13d2` 加当前候�
 
 | 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |
 |---|---|---|---|
-| `MonitorTap` 与 bounded live/rolling | Workbench live image、rolling curve、histogram、board coherent present | 保留 broker fan-out 语义；审查 window ownership、sequence/EventRef、copy 与 missed/expiry | 同等 GUI capability 已由更小唯一 owner 交付并迁完全部 panel |
+| `MonitorTap -> MonitorDataset` bounded live | Workbench live image、rolling curve、histogram、board coherent present | tap 只拥有 admitted backlog；materializer 拥有 keyed cycle/append window、head/EventRef 与 atomic snapshot | 同等 GUI capability 已由更小唯一 owner 交付并迁完全部 panel |
 | finite exact DatasetBuilder | capture、scan、processor、artifact | 保留 exact schedule/cursor/gap-fatal；与 display window 分责并收敛重复 patch/materialize | 不删除；只替换内部实现且 exact oracle 等价 |
 | StreamProcessor/occupancy | S3 readout、未来 analysis processor | 保留 task/measurement/processor 语义；合并 anti-forgery wrapper、重复 guard 和不可达 policy | 真实 replacement 同时交付 offline/live consumer、E2E 与 lifecycle oracle |
 | calibration/readout | notebook、Workbench、occupancy、site-map/gridplot | 默认继承 main 真机数学；压缩 artifact/codec/evidence 图并建立同帧 golden | 不因未接 composition 删除；只有产品明确取消该实验能力才可删除 |
@@ -3386,11 +3398,11 @@ Fit / capture-fit 的 Rule-6 回顾以 parent checkpoint `f0f13d2` 加当前候�
 数据与 Signal：
 
 - 任意 trailing axes 不丢；
-- sample stream 只传 Value/typed record，不传累计 DataBlock/DataPatch；DatasetBuilder 是唯一 event -> dataset materializer；
+- sample stream 只传 Value/typed record，不传累计 DataBlock/DataPatch；finite exact DatasetBuilder 与 live MonitorDataset 各自是互斥的单一 event -> dataset materializer；
 - 多维 point axes 只经 PointLayout 映射 P，不退化为匿名 data_points/data_dim；
 - cell/component partial validity 沿 reduce/fit/histogram/meter/figure 正确传播；
 - scalar 语义明确；
-- 已 materialize 的 owned DataBlock 内容稳定 immutable，builder 后续 ingest 不改变该 snapshot；未显式冻结的旧 progress ref 返回 SnapshotExpired，不回 latest；patch revision/duplicate 规则正确；
+- 已 materialize 的 owned DataBlock 内容稳定 immutable，materializer 后续 ingest 不改变该 snapshot；未显式冻结的旧 ref 返回 SnapshotExpired，不回 latest；live head/EventRefs/coverage 与 block 在同一 snapshot 原子冻结；
 - exact source/reservation/Delivery/EOS authority、single materializer、TraceBinding、frozen cell schedule、pin/ack、broker-minted generation 与真实 byte budget 正确；
 - CaptureCapability由broker endpoint probe attestation绑定device generation；FrozenCaptureSpec只含owner canonical bytes/digest且prepare无替换/codec回调入口；CaptureSession所有device operation保持同一owner I/O lane；
 - BACKPRESSURE_CAPABLE 可零副作用拒绝后重试；NON_BACKPRESSURE_CAPTURED 首次 overrun 或 capture 后处理失败永久 poison epoch，后续 frame 不得补占旧 sequence；
@@ -3398,7 +3410,7 @@ Fit / capture-fit 的 Rule-6 回顾以 parent checkpoint `f0f13d2` 加当前候�
 - formal epoch的PROVISIONAL/VALID/INVALID由独立immutable validation record解析；PROVISIONAL只可带徽标显示，不能经普通Figure/Fit/derived save逃逸为成功权威artifact；
 - repeat轴已展开进finite single-pass table，Formal路径不存在`scan_repeats>0` host wrap-stop；
 - coherent monitor 不混 shot；
-- rolling monitor bounded且只产生 DatasetPreviewSnapshot；storage/权威 processor 类型上只接受 SealedDatasetArtifact 或 VALID epoch wrapper；
+- MonitorTap backlog 与 MonitorDataset window 都有独立 byte/cell budget；keyed cycle 不混 sweep，append window newest-first且不丢 trailing data axes；live 只产生 MonitorDatasetSnapshot，storage/权威 processor 类型上只接受 SealedDatasetArtifact 或 VALID epoch wrapper；
 - artifact/result 原子提交；
 - 自动视图只按 axis metadata + ViewIntent 决策，不读 values 猜语义；
 - 显示投影始终可见、可改、可复现，且不修改原始 DataBlock；

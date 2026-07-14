@@ -15,6 +15,7 @@ import pytest
 
 from zlc_data import (
     COMPONENT,
+    MONITOR_HISTORY,
     READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
@@ -38,6 +39,7 @@ from zlc_data import (
     VALID,
     ValidityContract,
     ValueSchema,
+    fit_spec_for,
 )
 from zlc_frontend.figure import (
     AxisViewRole,
@@ -174,6 +176,44 @@ def test_suggest_curve_is_axis_total_role_driven_and_deterministic():
         site.axis_id: AxisViewRole.BATCH,
     }
     validate_view_spec(block.schema, first.spec)
+
+
+def test_monitor_history_is_display_only_curve_x_or_newest_image_slider():
+    repeat = axis("history-repeat", REPEAT, 1)
+    history = axis("monitor.history", MONITOR_HISTORY, 4)
+    curve = make_block(
+        np.arange(4, dtype=np.float64).reshape(1, 4),
+        repeat_axis=repeat,
+        point_axes=(history,),
+        point_layout=PointLayout.rect_c((4,)),
+    )
+    curve_view = suggest_view(curve.schema, ViewIntent.CURVE)
+    assert curve_view.status is SuggestionStatus.RESOLVED
+    assert curve_view.spec.binding(history.axis_id).role is AxisViewRole.X
+
+    y = axis("camera.y", SPATIAL_Y, 2)
+    x = axis("camera.x", SPATIAL_X, 3)
+    image = make_block(
+        np.zeros((1, 4, 2, 3), dtype=np.uint16),
+        repeat_axis=repeat,
+        point_axes=(history,),
+        point_layout=PointLayout.rect_c((4,)),
+        data_axes=(y, x),
+    )
+    image_view = suggest_view(image.schema, ViewIntent.IMAGE)
+    assert image_view.status is SuggestionStatus.RESOLVED
+    history_binding = image_view.spec.binding(history.axis_id)
+    assert history_binding.role is AxisViewRole.SLIDER
+    assert history_binding.selector == FixedIndex(0)
+
+    with pytest.raises(ValueError, match="declared-role axis"):
+        fit_spec_for(curve.schema, "gaussian_offset")
+    with pytest.raises(ValueError):
+        fit_spec_for(
+            curve.schema,
+            "gaussian_offset",
+            fit_axis_ids=(history.axis_id,),
+        )
 
 
 def test_ambiguous_axis_and_stale_selection_fail_without_tuple_order_guessing():

@@ -496,9 +496,8 @@ class BoundStreamProcessor:
             != self.definition.join_key_contract_fingerprint
         ):
             raise ValueError("join_key_contract fingerprint differs from definition")
-        for member in ("snapshot", "validate"):
-            if not callable(getattr(self.join_key_contract, member, None)):
-                raise TypeError(f"join_key_contract.{member} must be callable")
+        if not callable(getattr(self.join_key_contract, "snapshot", None)):
+            raise TypeError("join_key_contract.snapshot must be callable")
         if not isinstance(self.artifact_inputs, tuple):
             raise TypeError("artifact_inputs must be an immutable tuple")
         inputs = tuple(item for item in self.artifact_inputs)

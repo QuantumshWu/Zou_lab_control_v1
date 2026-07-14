@@ -21,7 +21,6 @@ from zlc_neutral_atom.runtime.capture import CaptureSession, CaptureSessionState
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
     DatasetCellAddress,
-    DatasetMode,
     OrderedDatasetMetadataHasher,
 )
 from zlc_neutral_atom.runtime.pipeline import (
@@ -304,7 +303,7 @@ def open_exact_occupancy(spec: OccupancyPipelineSpec, context: RunContext) -> Ex
             trace_binding=TraceBinding(context.run_id.value, bound.output_source_id),
         )
         output_cursor = output_reservation.activate()
-        builder = DatasetBuilder(spec.counts_block_id, output_reservation, bound.output_edge, DatasetMode.FINITE_EXACT)
+        builder = DatasetBuilder(spec.counts_block_id, output_reservation, bound.output_edge)
         _remaining_seconds(context)
         assert context.deadline is not None
         worker = bound.create_exact_worker(

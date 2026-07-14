@@ -7,6 +7,7 @@ from typing import Sequence
 
 from zlc_data import (
     COMPONENT,
+    MONITOR_HISTORY,
     READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
@@ -46,6 +47,7 @@ IMAGE_CONTRACT = ViewContract(
         AxisRolePolicy(SCAN_POINT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(SPECTRAL, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(READOUT_EVENT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(SITE, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
         AxisRolePolicy(COMPONENT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
         AxisRolePolicy(SPATIAL_X, ()),
@@ -61,11 +63,12 @@ IMAGE_CONTRACT = ViewContract(
 
 CURVE_CONTRACT = ViewContract(
     ViewIntent.CURVE,
-    (DisplaySlot(AxisViewRole.X, (SPECTRAL, SCAN_POINT)),),
+    (DisplaySlot(AxisViewRole.X, (SPECTRAL, SCAN_POINT, MONITOR_HISTORY)),),
     (
         AxisRolePolicy(SCAN_POINT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
         AxisRolePolicy(SPECTRAL, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
         AxisRolePolicy(READOUT_EVENT, (AxisViewRole.BATCH, AxisViewRole.FACET)),
+        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
         AxisRolePolicy(SITE, (AxisViewRole.BATCH, AxisViewRole.FACET)),
         AxisRolePolicy(COMPONENT, (AxisViewRole.BATCH, AxisViewRole.FACET)),
         # A spatial curve requires an explicit pixel/ROI selection.  It is
@@ -91,6 +94,7 @@ HISTOGRAM_CONTRACT = ViewContract(
     (),
     (
         AxisRolePolicy(READOUT_EVENT, (AxisViewRole.SAMPLE,)),
+        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SAMPLE,)),
         AxisRolePolicy(SITE, (AxisViewRole.FACET, AxisViewRole.BATCH)),
         AxisRolePolicy(COMPONENT, (AxisViewRole.FACET, AxisViewRole.BATCH)),
         AxisRolePolicy(SCAN_POINT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
@@ -119,6 +123,7 @@ METER_CONTRACT = ViewContract(
         AxisRolePolicy(SCAN_POINT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(SPECTRAL, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(READOUT_EVENT, (AxisViewRole.FACET,)),
+        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(SITE, (AxisViewRole.FACET,)),
         AxisRolePolicy(COMPONENT, (AxisViewRole.FACET,)),
         AxisRolePolicy(SPATIAL_X, ()),

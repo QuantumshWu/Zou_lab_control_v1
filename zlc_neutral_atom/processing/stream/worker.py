@@ -17,7 +17,6 @@ from zlc_neutral_atom.runtime.cancellation import CancellationRequested, Cancell
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
     DatasetCellKeyContract,
-    DatasetMode,
     FrozenDatasetEdge,
     SealedDatasetArtifact,
 )
@@ -285,8 +284,6 @@ class ExactStreamProcessorWorker:
                 raise TypeError("output_cursor must be AcquisitionCursor")
             if not isinstance(output_builder, DatasetBuilder):
                 raise TypeError("output_builder must be DatasetBuilder")
-            if output_builder.mode is not DatasetMode.FINITE_EXACT:
-                raise ValueError("processor output requires a FINITE_EXACT DatasetBuilder")
             if output_cursor._stream is not output_stream:
                 raise ValueError(
                     "output_cursor and output_producer belong to different streams"

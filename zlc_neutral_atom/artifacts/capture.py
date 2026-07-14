@@ -1512,7 +1512,6 @@ def _coverage_to_tree(coverage: DatasetCoverage) -> dict[str, object]:
     return {
         "written_cells": coverage.written_cells,
         "total_cells": coverage.total_cells,
-        "missed_events": coverage.missed_events,
     }
 
 
@@ -1520,7 +1519,6 @@ def _coverage_from_tree(tree: object) -> DatasetCoverage:
     if not isinstance(tree, dict) or set(tree) != {
         "written_cells",
         "total_cells",
-        "missed_events",
     }:
         raise ValueError("dataset coverage has an unknown field set")
     return DatasetCoverage(**tree)

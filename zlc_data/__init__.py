@@ -4,6 +4,7 @@ from ._arrays import immutable_array
 from .axis import (
     COMPONENT,
     HISTOGRAM_BIN,
+    MONITOR_HISTORY,
     READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
@@ -172,6 +173,7 @@ __all__ = [
     "FitSpec",
     "INVALID",
     "HISTOGRAM_BIN",
+    "MONITOR_HISTORY",
     "Invalid",
     "RowComponentValidity",
     "IndexRangeSelection",

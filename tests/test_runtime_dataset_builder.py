@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 from enum import Enum
-from types import MappingProxyType
+import threading
 
 import numpy as np
 import pytest
@@ -17,6 +17,7 @@ from zlc_data import (
     BlockId,
     ComponentValidity,
     DatasetSchema,
+    MONITOR_HISTORY,
     PointLayout,
     REPEAT,
     SCAN_POINT,
@@ -34,11 +35,12 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetCellAddress,
     DatasetCellDomain,
     DatasetCellKeyContract,
-    DatasetMode,
+    DatasetCoverage,
     DatasetPreviewSnapshot,
-    DuplicateDatasetCell,
     FrozenDatasetEdge,
     MissingDatasetCells,
+    MonitorCoverage,
+    MonitorDataset,
     OrderedDatasetEventHasher,
     OrderedDatasetMetadataHasher,
     SnapshotExpired,
@@ -52,6 +54,7 @@ from zlc_neutral_atom.runtime.streams import (
     EventId,
     EventRef,
     ReservationCapacityExceeded,
+    ReservationStateError,
     StreamEndedEarly,
     StreamId,
     TraceContext,
@@ -62,6 +65,13 @@ from zlc_neutral_atom.runtime.streams import (
 
 FINGERPRINT = "3" * 64
 TRACE_BINDING = TraceBinding("run", "camera")
+
+
+def test_formal_and_monitor_coverage_have_distinct_loss_semantics():
+    assert DatasetCoverage(1, 1).complete
+    assert not hasattr(DatasetCoverage(1, 1), "missed_events")
+    assert MonitorCoverage(1, 1, 1, current_gap=False).complete
+    assert not MonitorCoverage(1, 1, 1, current_gap=True).complete
 
 
 def test_ordered_metadata_hasher_matches_frozen_golden_and_preserves_order():
@@ -150,12 +160,29 @@ def image_value_schema(*, component_validity: bool = False) -> ValueSchema:
     return ValueSchema((y, x), validity, np.dtype("<u2"), value_unit="count")
 
 
-def dataset_schema(*, repeats: int = 1, points: int = 3, component_validity: bool = False):
+def dataset_schema(
+    *,
+    repeats: int = 1,
+    points: int = 3,
+    component_validity: bool = False,
+    cell_schema: ValueSchema | None = None,
+):
     return DatasetSchema(
         axis("repeat", REPEAT, repeats),
         (axis("detuning", SCAN_POINT, points),),
         PointLayout.rect_c((points,)),
-        image_value_schema(component_validity=component_validity),
+        cell_schema
+        if cell_schema is not None
+        else image_value_schema(component_validity=component_validity),
+    )
+
+
+def monitor_history_schema(source_schema: DatasetSchema, capacity: int) -> DatasetSchema:
+    return DatasetSchema(
+        axis("repeat", REPEAT, 1),
+        (axis("monitor.history", MONITOR_HISTORY, capacity),),
+        PointLayout.rect_c((capacity,)),
+        source_schema.cell_schema,
     )
 
 
@@ -251,6 +278,85 @@ def test_frozen_edge_owner_copies_exact_schedule_addresses():
 
     assert edge.expected_cells[0] == DatasetCellAddress(0, 0)
     assert edge.schedule_digest == frozen_digest
+
+
+def test_dataset_cell_key_snapshot_detaches_the_published_envelope():
+    schema = dataset_schema(points=1)
+    stream, producer = source(schema, events=1)
+    address = DatasetCellAddress(0, 0)
+
+    envelope = emit(producer, value(1), address, 0)
+    object.__setattr__(address, "point_storage_index", 7)
+
+    assert envelope.join_key is not address
+    assert envelope.join_key == DatasetCellAddress(0, 0)
+
+
+def test_frozen_edge_rejects_normally_mutable_adapter_configuration():
+    schema = dataset_schema(points=1)
+    stream, _producer = source(schema, events=1)
+
+    class HashableMutableScale:
+        __hash__ = object.__hash__
+
+        def __init__(self, factor: int) -> None:
+            self.factor = factor
+
+    @dataclass(frozen=True)
+    class MutableAdapter:
+        payload_contract: ValuePayloadContract
+        scale: HashableMutableScale
+        metadata_contract: object = ValueDatasetEventAdapter(
+            ValuePayloadContract(image_value_schema())
+        ).metadata_contract
+        operator_fingerprint: str = "e" * 64
+
+        @property
+        def value_schema(self):
+            return self.payload_contract.schema
+
+        def value(self, payload):
+            return Value(
+                payload.values * self.scale.factor,
+                payload.validity,
+                payload.schema,
+            )
+
+    with pytest.raises(TypeError, match="intrinsically immutable"):
+        FrozenDatasetEdge(
+            schema,
+            MutableAdapter(stream._payload_contract, HashableMutableScale(1)),
+            cell_schedule(schema),
+        )
+
+
+def test_metadata_contract_validation_precedes_exact_commit(monkeypatch):
+    schema = dataset_schema(points=1)
+    stream, producer = source(schema, events=1)
+    edge = dataset_edge(stream, schema)
+
+    def reject(_metadata):
+        raise ValueError("semantic metadata rejection")
+
+    monkeypatch.setattr(type(edge.metadata_contract), "validate", staticmethod(reject))
+    reservation = stream.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=12,
+        trace_binding=TRACE_BINDING,
+    )
+    cursor = reservation.activate()
+    builder = DatasetBuilder(BlockId("metadata-validation"), reservation, edge)
+    emit(producer, value(1), DatasetCellAddress(0, 0), 0)
+    delivery = cursor.next()
+
+    with pytest.raises(ValueError, match="semantic metadata rejection"):
+        builder.consume(delivery)
+
+    assert not delivery.acknowledged
+    assert builder.revision.value == 0
+    builder.abort()
+    reservation.release()
 
 
 def test_frozen_edge_validates_and_projects_one_exact_schedule_once(monkeypatch):
@@ -350,7 +456,6 @@ def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
         BlockId("capture"),
         reservation,
         dataset_edge(stream, schema),
-        DatasetMode.FINITE_EXACT,
     )
 
     emit(producer, value(10), DatasetCellAddress(0, 0), 0)
@@ -392,7 +497,6 @@ def test_bound_builder_owns_reservation_completion():
         BlockId("completion-owner"),
         reservation,
         dataset_edge(stream, schema),
-        DatasetMode.FINITE_EXACT,
     )
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
     delivery = cursor.next()
@@ -420,7 +524,6 @@ def test_builder_context_preserves_body_error_and_releases_zero_event_preflight(
             BlockId("context-owner"),
             reservation,
             dataset_edge(stream, schema),
-            DatasetMode.FINITE_EXACT,
         ):
             raise RuntimeError("body failure")
     replacement = stream.reserve(
@@ -433,7 +536,7 @@ def test_builder_context_preserves_body_error_and_releases_zero_event_preflight(
     replacement.release()
 
 
-def test_exact_duplicate_and_missing_cells_fail_without_acknowledging_delivery():
+def test_exact_wrong_key_and_missing_cells_fail_without_acknowledging_delivery():
     schema = dataset_schema(points=2)
     stream, producer = source(schema, events=2)
     reservation = stream.reserve(
@@ -447,12 +550,11 @@ def test_exact_duplicate_and_missing_cells_fail_without_acknowledging_delivery()
         BlockId("duplicate"),
         reservation,
         dataset_edge(stream, schema),
-        DatasetMode.FINITE_EXACT,
     )
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
     builder.consume(cursor.next())
     emit(producer, value(2), DatasetCellAddress(0, 0), 1)
-    with pytest.raises(DuplicateDatasetCell):
+    with pytest.raises(Exception, match="frozen plan key"):
         builder.consume(cursor.next())
     assert cursor.next_sequence == 1
     builder.abort()
@@ -470,7 +572,6 @@ def test_exact_duplicate_and_missing_cells_fail_without_acknowledging_delivery()
         BlockId("missing"),
         missing_reservation,
         dataset_edge(missing_stream, schema),
-        DatasetMode.FINITE_EXACT,
     )
     emit(missing_producer, value(1), DatasetCellAddress(0, 0), 0)
     missing_builder.consume(missing_cursor.next())
@@ -499,7 +600,6 @@ def test_component_validity_is_aligned_by_axis_id_not_trailing_shape_guess():
         BlockId("component-validity"),
         reservation,
         dataset_edge(stream, schema),
-        DatasetMode.FINITE_EXACT,
     )
     emit(producer, value(7, component_validity=component), DatasetCellAddress(0, 0), 0)
     builder.consume(cursor.next())
@@ -513,31 +613,194 @@ def test_component_validity_is_aligned_by_axis_id_not_trailing_shape_guess():
     reservation.release()
 
 
-def test_rolling_monitor_overwrite_expires_old_revision_without_formal_seal():
+def test_keyed_monitor_cycle_clears_the_previous_sweep_before_point_zero():
     schema = dataset_schema(points=2)
     stream, producer = source(schema, events=4)
-    tap = stream.monitor(max_events=1, max_bytes=12)
-    builder = DatasetBuilder(
+    tap = stream.monitor(max_events=4, max_bytes=48)
+    builder = MonitorDataset.keyed_cycle(
         BlockId("rolling"),
         tap,
-        dataset_edge(stream, schema, exact=False),
-        DatasetMode.ROLLING_MONITOR,
+        dataset_edge(stream, schema),
     )
 
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
-    first = builder.ingest_monitor(tap.next()).ref
+    first = builder.ingest_next()
     emit(producer, value(2), DatasetCellAddress(0, 1), 1)
-    builder.ingest_monitor(tap.next())
+    builder.ingest_next()
     emit(producer, value(3), DatasetCellAddress(0, 0), 2)
-    builder.ingest_monitor(tap.next())
+    builder.ingest_next()
 
     with pytest.raises(SnapshotExpired):
         builder.materialize(first)
     current = builder.materialize()
     assert current.block.values[0, 0, 0, 0] == 3
-    assert current.block.values[0, 1, 0, 0] == 2
-    with pytest.raises(Exception, match="cannot become formal"):
-        builder.seal(producer.finish())
+    assert np.count_nonzero(current.block.values[0, 1]) == 0
+    assert current.block.validity.mask.tolist() == [[True, False]]
+    assert not current.coverage.complete
+    assert current.head.sequence == 2
+    assert current.event_refs[0] == current.head
+    assert current.event_refs[1] is None
+    builder.close()
+
+
+def test_keyed_monitor_gap_at_nonzero_offset_clears_every_stale_cell():
+    schema = dataset_schema(points=3)
+    stream, producer = source(schema, events=6)
+    tap = stream.monitor(max_events=1, max_bytes=12)
+    builder = MonitorDataset.keyed_cycle(
+        BlockId("gap-cycle"),
+        tap,
+        dataset_edge(stream, schema),
+    )
+
+    for sequence in range(3):
+        emit(
+            producer,
+            value(sequence + 1),
+            DatasetCellAddress(0, sequence),
+            sequence,
+        )
+        builder.ingest_next()
+    assert builder.materialize().coverage.complete
+
+    emit(producer, value(4), DatasetCellAddress(0, 0), 3)
+    emit(producer, value(5), DatasetCellAddress(0, 1), 4)
+    builder.ingest_latest()
+
+    current = builder.materialize()
+    assert current.block.values[0, :, 0, 0].tolist() == [0, 5, 0]
+    assert current.block.validity.mask.tolist() == [[False, True, False]]
+    assert current.event_refs[0] is None
+    assert current.event_refs[1] == current.head
+    assert current.event_refs[2] is None
+    assert current.cell_metadata == (None, None, None)
+    assert current.coverage.missed_events == 1
+    assert not current.coverage.complete
+    builder.close()
+
+
+def test_append_window_owns_newest_first_order_not_producer_join_keys():
+    source_schema = dataset_schema(points=2)
+    window_schema = monitor_history_schema(source_schema, 3)
+    stream, producer = source(source_schema, events=8)
+    tap = stream.monitor(max_events=4, max_bytes=48)
+    window = MonitorDataset.append_window(
+        BlockId("history"),
+        tap,
+        dataset_edge(stream, window_schema, exact=False),
+    )
+
+    for sequence, number in enumerate((1, 2, 3, 4)):
+        emit(
+            producer,
+            value(number),
+            DatasetCellAddress(0, sequence % 2),
+            sequence,
+        )
+        window.ingest_next()
+
+    snapshot = window.materialize()
+    assert snapshot.block.values.shape == (1, 3, 2, 3)
+    assert snapshot.block.values[0, :, 0, 0].tolist() == [4, 3, 2]
+    assert [reference.sequence for reference in snapshot.event_refs] == [3, 2, 1]
+    assert snapshot.head == snapshot.event_refs[0]
+    assert snapshot.coverage.complete
+    assert snapshot.coverage.missed_events == 0
+    window.close()
+
+
+def test_append_window_gap_recovers_after_loss_rolls_out_of_visible_history():
+    source_schema = dataset_schema(points=2)
+    window_schema = monitor_history_schema(source_schema, 3)
+    stream, producer = source(source_schema, events=8)
+    tap = stream.monitor(max_events=1, max_bytes=12)
+    window = MonitorDataset.append_window(
+        BlockId("gap-recovery"),
+        tap,
+        dataset_edge(stream, window_schema, exact=False),
+    )
+
+    emit(producer, value(1), DatasetCellAddress(0, 0), 0)
+    window.ingest_next()
+    emit(producer, value(2), DatasetCellAddress(0, 1), 1)
+    emit(producer, value(3), DatasetCellAddress(0, 0), 2)
+    window.ingest_latest()
+    with_gap = window.materialize()
+    assert with_gap.coverage.missed_events == 1
+    assert with_gap.coverage.current_gap
+    assert not with_gap.coverage.complete
+
+    for sequence, number in enumerate((4, 5, 6), start=3):
+        emit(
+            producer,
+            value(number),
+            DatasetCellAddress(0, sequence % 2),
+            sequence,
+        )
+        window.ingest_next()
+    recovered = window.materialize()
+    assert recovered.block.values[0, :, 0, 0].tolist() == [6, 5, 4]
+    assert recovered.coverage.complete
+    assert not recovered.coverage.current_gap
+    assert recovered.coverage.missed_events == 1
+    window.close()
+
+
+def test_append_window_preserves_every_data_axis_and_component_validity():
+    source_schema = dataset_schema(points=1, component_validity=True)
+    window_schema = monitor_history_schema(source_schema, 2)
+    stream, producer = source(source_schema, events=3)
+    tap = stream.monitor(max_events=3, max_bytes=39)
+    window = MonitorDataset.append_window(
+        BlockId("multidimensional-history"),
+        tap,
+        dataset_edge(stream, window_schema, exact=False),
+    )
+    x_axis = source_schema.cell_schema.data_axes[1]
+    masks = (
+        ComponentValidity((x_axis.axis_id,), np.array([True, False, True])),
+        ComponentValidity((x_axis.axis_id,), np.array([False, True, True])),
+        ComponentValidity((x_axis.axis_id,), np.array([True, True, False])),
+    )
+    for sequence, mask in enumerate(masks):
+        emit(
+            producer,
+            value(sequence + 1, component_validity=mask),
+            DatasetCellAddress(0, 0),
+            sequence,
+        )
+        window.ingest_next()
+
+    snapshot = window.materialize()
+    assert snapshot.block.values.shape == (1, 2, 2, 3)
+    assert snapshot.block.values[0, :, 0, 0].tolist() == [3, 2]
+    assert snapshot.block.validity.axis_ids == tuple(
+        axis.axis_id for axis in source_schema.cell_schema.data_axes
+    )
+    assert snapshot.block.validity.mask.shape == (1, 2, 2, 3)
+    np.testing.assert_array_equal(
+        snapshot.block.validity.mask[0, 0],
+        np.broadcast_to(masks[2].mask, (2, 3)),
+    )
+    np.testing.assert_array_equal(
+        snapshot.block.validity.mask[0, 1],
+        np.broadcast_to(masks[1].mask, (2, 3)),
+    )
+    window.close()
+
+
+def test_append_window_rejects_scan_axes_relabelled_as_history():
+    schema = dataset_schema(points=2)
+    stream, _producer = source(schema, events=2)
+    tap = stream.monitor(max_events=1, max_bytes=12)
+
+    with pytest.raises(Exception, match="MONITOR_HISTORY"):
+        MonitorDataset.append_window(
+            BlockId("not-history"),
+            tap,
+            dataset_edge(stream, schema, exact=False),
+        )
+
     tap.close()
 
 
@@ -563,13 +826,11 @@ def test_exact_delivery_cannot_cross_source_authority_even_when_ids_match():
         BlockId("authority"),
         reservation_a,
         dataset_edge(stream_a, schema),
-        DatasetMode.FINITE_EXACT,
     )
     builder_b = DatasetBuilder(
         BlockId("authority-b"),
         reservation_b,
         dataset_edge(stream_b, schema),
-        DatasetMode.FINITE_EXACT,
     )
     emit(producer_a, value(1), DatasetCellAddress(0, 0), 0)
     emit(producer_b, value(999), DatasetCellAddress(0, 0), 0)
@@ -598,7 +859,6 @@ def test_exact_join_key_must_match_the_frozen_plan_schedule():
         BlockId("schedule"),
         reservation,
         dataset_edge(stream, schema),
-        DatasetMode.FINITE_EXACT,
     )
     emit(producer, value(10), DatasetCellAddress(0, 1), 0)
     delivery = cursor.next()
@@ -624,7 +884,6 @@ def test_exact_reservation_rejects_cross_run_trace_mixing():
         BlockId("trace-binding"),
         reservation,
         dataset_edge(stream, schema),
-        DatasetMode.FINITE_EXACT,
     )
     payload = Value(value(7).values, VALID, schema.cell_schema)
     with pytest.raises(Exception, match="reserved formal run/source"):
@@ -640,24 +899,98 @@ def test_exact_reservation_rejects_cross_run_trace_mixing():
     reservation.release()
 
 
-def test_monitor_update_cannot_cross_tap_or_source_authority():
+def test_monitor_materializer_is_the_tap_consumer_and_releases_it_on_close():
     schema = dataset_schema(points=1)
-    stream_a, _producer_a = source(schema, events=1)
-    stream_b, producer_b = source(schema, events=1)
-    tap_a = stream_a.monitor(max_events=1, max_bytes=12)
-    tap_b = stream_b.monitor(max_events=1, max_bytes=12)
-    builder = DatasetBuilder(
+    stream, producer = source(schema, events=1)
+    tap = stream.monitor(max_events=1, max_bytes=12)
+    builder = MonitorDataset.keyed_cycle(
         BlockId("monitor-authority"),
-        tap_a,
-        dataset_edge(stream_a, schema, exact=False),
-        DatasetMode.ROLLING_MONITOR,
+        tap,
+        dataset_edge(stream, schema),
     )
-    emit(producer_b, value(9), DatasetCellAddress(0, 0), 0)
-    with pytest.raises(PermissionError, match="another monitor"):
-        builder.ingest_monitor(tap_b.next())
-    assert builder.revision.value == 0
-    tap_a.close()
-    tap_b.close()
+    with pytest.raises(PermissionError, match="another consumer"):
+        MonitorDataset.keyed_cycle(BlockId("duplicate-owner"), tap, dataset_edge(stream, schema))
+    emit(producer, value(9), DatasetCellAddress(0, 0), 0)
+    with pytest.raises(PermissionError, match="another consumer"):
+        tap.next()
+    builder.ingest_next()
+    builder.close()
+    assert tap.retained_bytes == 0
+    with pytest.raises(StreamEndedEarly, match="closed"):
+        tap.latest()
+
+
+def test_monitor_constructor_cannot_override_the_edge_cycle_schedule():
+    schema = dataset_schema(points=2)
+    stream, _producer = source(schema, events=2)
+    tap = stream.monitor(max_events=1, max_bytes=12)
+    edge = dataset_edge(stream, schema)
+
+    with pytest.raises(TypeError, match="cycle_cells"):
+        MonitorDataset(
+            BlockId("no-second-cycle"),
+            tap,
+            edge,
+            cycle_cells=tuple(reversed(edge.expected_cells)),
+        )
+
+    tap.close()
+
+
+def test_monitor_claim_wakes_and_revokes_an_already_blocked_raw_reader(monkeypatch):
+    schema = dataset_schema(points=1)
+    stream, producer = source(schema, events=1)
+    tap = stream.monitor(max_events=1, max_bytes=12)
+    entered_wait = threading.Event()
+    failures: list[BaseException] = []
+    real_wait = tap._condition.wait
+
+    def announced_wait(timeout=None):
+        entered_wait.set()
+        return real_wait(timeout)
+
+    monkeypatch.setattr(tap._condition, "wait", announced_wait)
+
+    def raw_read() -> None:
+        try:
+            tap.next(timeout=1.0)
+        except BaseException as error:
+            failures.append(error)
+
+    reader = threading.Thread(target=raw_read)
+    reader.start()
+    assert entered_wait.wait(timeout=1.0)
+    builder = MonitorDataset.keyed_cycle(
+        BlockId("claimed-after-wait"),
+        tap,
+        dataset_edge(stream, schema),
+    )
+    reader.join(timeout=1.0)
+
+    assert not reader.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], PermissionError)
+    emit(producer, value(9), DatasetCellAddress(0, 0), 0)
+    builder.ingest_next(timeout=1.0)
+    assert builder.materialize().block.values[0, 0, 0, 0] == 9
+    builder.close()
+
+
+def test_monitor_materializer_must_bind_before_first_publication():
+    schema = dataset_schema(points=1)
+    stream, producer = source(schema, events=1)
+    tap = stream.monitor(max_events=1, max_bytes=12)
+    emit(producer, value(3), DatasetCellAddress(0, 0), 0)
+
+    with pytest.raises(ReservationStateError, match="before the first publication"):
+        MonitorDataset.keyed_cycle(
+            BlockId("late-monitor-owner"),
+            tap,
+            dataset_edge(stream, schema),
+        )
+
+    assert tap.next().envelope.sequence == 0
+    tap.close()
 
 
 def test_value_payload_contract_counts_component_validity_bytes():
@@ -707,7 +1040,6 @@ def test_minted_generation_prevents_revision_ref_collision_across_sources():
             BlockId("same-block-label"),
             reservation,
             dataset_edge(stream, schema),
-            DatasetMode.FINITE_EXACT,
         )
         emit(producer, value(number), DatasetCellAddress(0, 0), 0)
         builder.consume(cursor.next())
@@ -829,7 +1161,6 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
             schema,
             adapter=CameraSampleAdapter(contract),
         ),
-        DatasetMode.FINITE_EXACT,
     )
     metadata = FrameMetadata(physical_ordinal=0, frame_stamp=101)
     sample = CameraSample(Value(value(5).values, VALID, schema.cell_schema), metadata)
@@ -848,264 +1179,14 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
     reservation.release()
 
 
-def test_metadata_contract_cannot_seal_a_mutable_alias():
-    schema = dataset_schema(points=1)
-    stream, _producer = source(schema, events=1)
-
-    @dataclass(frozen=True)
-    class MutableMetadataContract:
-        shared: object
-        fingerprint: str = "6" * 64
-        max_retained_nbytes: int = 0
-
-        def snapshot(self, _payload):
-            return self.shared
-
-        @staticmethod
-        def validate(_metadata):
-            return None
-
-        @staticmethod
-        def retained_nbytes(_metadata):
-            return 0
-
-        @staticmethod
-        def digest(_metadata):
-            return "7" * 64
-
-    @dataclass(frozen=True)
-    class MutableMetadataAdapter:
-        payload_contract: ValuePayloadContract
-        metadata_contract: MutableMetadataContract
-        operator_fingerprint: str = "b" * 64
-
-        @property
-        def value_schema(self):
-            return self.payload_contract.schema
-
-        def value(self, payload):
-            self.payload_contract.validate(payload)
-            return payload
-
-    for mutable in (
-        [1],
-        {"scale": 1},
-        {1},
-        MappingProxyType({"scale": 1}),
-        np.asarray([1], dtype=np.int64),
-    ):
-        with pytest.raises(TypeError, match="intrinsically immutable"):
-            dataset_edge(
-                stream,
-                schema,
-                adapter=MutableMetadataAdapter(
-                    stream._payload_contract,
-                    MutableMetadataContract(mutable),
-                ),
-            )
-
-    cyclic = MutableMetadataContract(None)
-    object.__setattr__(cyclic, "shared", cyclic)
-    with pytest.raises(TypeError, match="intrinsically immutable"):
-        dataset_edge(
-            stream,
-            schema,
-            adapter=MutableMetadataAdapter(stream._payload_contract, cyclic),
-        )
+@pytest.mark.parametrize(
+    "metadata",
+    ([1], {"scale": 1}, {1}, np.asarray([1], dtype=np.int64)),
+)
+def test_runtime_metadata_rejects_mutable_aliases(metadata):
+    assert not runtime_dataset._is_deeply_immutable(metadata)
 
 
-def test_frozen_edge_rejects_mutable_adapter_state_before_digest_can_freeze():
-    schema = dataset_schema(points=1)
-    stream, _producer = source(schema, events=1)
-
-    @dataclass(frozen=True)
-    class ScalingAdapter:
-        payload_contract: ValuePayloadContract
-        scale: list[int]
-        metadata_contract: object = ValueDatasetEventAdapter(
-            ValuePayloadContract(image_value_schema())
-        ).metadata_contract
-        operator_fingerprint: str = "e" * 64
-
-        @property
-        def value_schema(self):
-            return self.payload_contract.schema
-
-        def value(self, payload):
-            self.payload_contract.validate(payload)
-            return Value(
-                payload.values * self.scale[0],
-                payload.validity,
-                payload.schema,
-            )
-
-    scale = [1]
-    adapter = ScalingAdapter(stream._payload_contract, scale)
-    with pytest.raises(TypeError, match="intrinsically immutable"):
-        dataset_edge(stream, schema, adapter=adapter)
-    scale[0] = 7
-    with pytest.raises(TypeError, match="intrinsically immutable"):
-        dataset_edge(stream, schema, adapter=adapter)
-
-
-def test_frozen_edge_owner_copies_projection_adapter_before_binding_operator():
-    schema = dataset_schema(points=1)
-    stream, _producer = source(schema, events=1)
-
-    @dataclass(frozen=True)
-    class ScalingAdapter:
-        payload_contract: ValuePayloadContract
-        scale: tuple[int, ...]
-        metadata_contract: object = ValueDatasetEventAdapter(
-            ValuePayloadContract(image_value_schema())
-        ).metadata_contract
-        operator_fingerprint: str = "e" * 64
-
-        @property
-        def value_schema(self):
-            return self.payload_contract.schema
-
-        def value(self, payload):
-            self.payload_contract.validate(payload)
-            return Value(
-                payload.values * self.scale[0],
-                payload.validity,
-                payload.schema,
-            )
-
-    adapter = ScalingAdapter(stream._payload_contract, (2,))
-    edge = dataset_edge(stream, schema, adapter=adapter)
-    assert edge.event_adapter is not adapter
-    assert edge.payload_contract is not stream._payload_contract
-    frozen_operator = edge.operator_fingerprint
-
-    # A frozen caller value is still reflectively writable.  The bound method
-    # must target the edge-owned reconstruction, not this retained instance.
-    object.__setattr__(adapter, "scale", (7,))
-    object.__setattr__(adapter, "operator_fingerprint", "f" * 64)
-    payload = Value(
-        np.ones((2, 3), dtype=np.uint16),
-        VALID,
-        schema.cell_schema,
-    )
-    projected = edge.project_value(payload)
-    np.testing.assert_array_equal(projected.values, np.full((2, 3), 2))
-    assert edge.operator_fingerprint == frozen_operator == "e" * 64
-
-def test_builder_freezes_one_metadata_contract_identity_for_the_generation():
-    schema = dataset_schema(points=2)
-
-    @dataclass(frozen=True)
-    class BudgetedValueContract:
-        schema: ValueSchema
-        fingerprint: str = "8" * 64
-        max_retained_nbytes: int = 20
-
-        def snapshot(self, payload):
-            self.validate(payload)
-            return payload
-
-        def validate(self, payload):
-            if not isinstance(payload, Value) or payload.schema is not self.schema:
-                raise TypeError("invalid Value")
-
-        def retained_nbytes(self, payload):
-            self.validate(payload)
-            return payload.values.nbytes + 8
-
-        def digest(self, payload):
-            self.validate(payload)
-            return ValuePayloadContract(self.schema).digest(payload)
-
-    @dataclass(frozen=True)
-    class SwitchingMetadataContract:
-        fingerprint: str
-        as_text: bool
-        max_retained_nbytes: int = 8
-
-        def snapshot(self, payload):
-            number = int(payload.values[0, 0])
-            return str(number) if self.as_text else number
-
-        @staticmethod
-        def validate(metadata):
-            if type(metadata) not in (int, str):
-                raise TypeError("metadata must be canonical int or text")
-
-        @staticmethod
-        def retained_nbytes(_metadata):
-            return 8
-
-        @staticmethod
-        def digest(metadata):
-            return hashlib.sha256(str(metadata).encode("ascii")).hexdigest()
-
-    @dataclass(frozen=True)
-    class SwitchingAdapter:
-        payload_contract: BudgetedValueContract
-        metadata_contract: SwitchingMetadataContract
-        operator_fingerprint: str = "c" * 64
-
-        @property
-        def value_schema(self):
-            return self.payload_contract.schema
-
-        def value(self, payload):
-            self.payload_contract.validate(payload)
-            return payload
-
-    payload_contract = BudgetedValueContract(schema.cell_schema)
-    first_contract = SwitchingMetadataContract("9" * 64, False)
-    adapter = SwitchingAdapter(payload_contract, first_contract)
-    stream, producer = AcquisitionStream.create(
-        StreamId("metadata-contract-identity"),
-        payload_contract,
-        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-        retention_events=2,
-        retention_bytes=40,
-        join_key_contract=DatasetCellKeyContract(schema),
-    )
-    reservation = stream.reserve(
-        total_events=2,
-        max_inflight_events=2,
-        max_inflight_bytes=40,
-        trace_binding=TRACE_BINDING,
-    )
-    cursor = reservation.activate()
-    edge = dataset_edge(stream, schema, adapter=adapter)
-    assert edge.event_adapter is not adapter
-    assert edge.payload_contract is not payload_contract
-    assert edge.metadata_contract is not first_contract
-    object.__setattr__(first_contract, "as_text", True)
-    object.__setattr__(payload_contract, "fingerprint", "a" * 64)
-    object.__setattr__(
-        adapter,
-        "metadata_contract",
-        SwitchingMetadataContract("a" * 64, True),
-    )
-    builder = DatasetBuilder(
-        BlockId("metadata-contract-identity"),
-        reservation,
-        edge,
-        DatasetMode.FINITE_EXACT,
-    )
-    for point, number in enumerate((1, 2)):
-        payload = Value(
-            np.full((2, 3), number, dtype=np.uint16),
-            VALID,
-            schema.cell_schema,
-        )
-        producer.emit(
-            payload,
-            captured_at=float(point),
-            trace=TraceContext("run", "camera", f"capture-{point}"),
-            join_key=DatasetCellAddress(0, point),
-        )
-        builder.consume(cursor.next())
-    artifact = builder.seal(producer.finish())
-    assert artifact.event_metadata == (1, 2)
-    assert artifact.provenance.metadata_contract_fingerprint == "9" * 64
-    reservation.release()
 
 
 def test_metadata_rejects_enum_with_mutable_value():
@@ -1166,7 +1247,6 @@ def test_metadata_rejects_enum_with_mutable_value():
             schema,
             adapter=EnumMetadataAdapter(stream._payload_contract),
         ),
-        DatasetMode.FINITE_EXACT,
     )
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
     with pytest.raises(TypeError, match="deeply immutable"):
@@ -1196,7 +1276,7 @@ def test_runtime_metadata_accepts_owned_value_as_a_validated_leaf(monkeypatch):
         return dataclass_fields(value)
 
     monkeypatch.setattr(runtime_dataset, "fields", tracked_fields)
-    assert runtime_dataset._deeply_immutable_metadata(
+    assert runtime_dataset._is_deeply_immutable(
         OccupancyLikeMetadata(safe_value, ("occupied", "empty"))
     )
     assert traversed_types == [OccupancyLikeMetadata]
@@ -1204,12 +1284,12 @@ def test_runtime_metadata_accepts_owned_value_as_a_validated_leaf(monkeypatch):
         np.arange(6, dtype=np.int64).tobytes(),
         dtype=np.dtype("<i8"),
     )
-    assert runtime_dataset._deeply_immutable_metadata(bytes_backed)
+    assert runtime_dataset._is_deeply_immutable(bytes_backed)
 
     owning = np.arange(6, dtype=np.int64)
     owning.setflags(write=False)
-    assert not runtime_dataset._deeply_immutable_metadata(owning)
+    assert not runtime_dataset._is_deeply_immutable(owning)
     mutable_owner = np.arange(6, dtype=np.int64)
     readonly_alias = mutable_owner.view()
     readonly_alias.setflags(write=False)
-    assert not runtime_dataset._deeply_immutable_metadata(readonly_alias)
+    assert not runtime_dataset._is_deeply_immutable(readonly_alias)

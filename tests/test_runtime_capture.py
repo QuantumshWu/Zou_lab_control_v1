@@ -48,7 +48,6 @@ from zlc_neutral_atom.runtime.capture import (
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
     DatasetCellAddress,
-    DatasetMode,
     FrozenDatasetEdge,
     OrderedDatasetMetadataHasher,
     SealedDatasetArtifact,
@@ -500,7 +499,6 @@ class CaptureHarness:
                     BlockId("capture"),
                     reservation,
                     materializer_edge,
-                    DatasetMode.FINITE_EXACT,
                 )
                 self.holder["builder"] = builder
                 session.bind_exact_consumer(builder.exact_readiness())
@@ -706,7 +704,6 @@ def processor_capture_harness(
         BlockId("processed-camera"),
         output_reservation,
         output_edge,
-        DatasetMode.FINITE_EXACT,
     )
     definition = StreamProcessorDefinition(
         DefinitionKey("tests", "identity-camera"),
@@ -1039,7 +1036,6 @@ def test_prepare_revalidates_stale_readiness_before_hardware_command(invalidatio
             BlockId("stale-readiness"),
             reservation,
             item.contract.dataset_edge,
-            DatasetMode.FINITE_EXACT,
         )
         item.holder["builder"] = builder
         session.bind_exact_consumer(builder.exact_readiness())

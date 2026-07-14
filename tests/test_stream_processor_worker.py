@@ -42,7 +42,6 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
     DatasetCellAddress,
     DatasetCellKeyContract,
-    DatasetMode,
     FrozenDatasetEdge,
     ValueDatasetEventAdapter,
     dataset_cell_key_fingerprint,
@@ -423,7 +422,6 @@ def two_stage_chain(
         BlockId("synthetic-chain-output"),
         output_reservation,
         dataset_edge,
-        DatasetMode.FINITE_EXACT,
     )
 
     second = ExactStreamProcessorWorker(
@@ -590,7 +588,6 @@ def chain(
         BlockId("synthetic-output"),
         output_reservation,
         output_edge,
-        DatasetMode.FINITE_EXACT,
     )
     definition = StreamProcessorDefinition(
         DefinitionKey("test", "scale"),
@@ -1842,7 +1839,6 @@ def test_stale_downstream_readiness_cannot_bind_an_upstream_worker():
         BlockId("synthetic-stale-output"),
         output_reservation,
         dataset_edge,
-        DatasetMode.FINITE_EXACT,
     )
     second = ExactStreamProcessorWorker(
         _processor_binding(

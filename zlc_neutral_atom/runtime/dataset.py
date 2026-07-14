@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import threading
-from dataclasses import dataclass, field, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from numbers import Integral
 from typing import Callable, Generic, Protocol, TypeVar
@@ -15,16 +15,17 @@ from zlc_storage import canonical_digest, encode, sha256_text as _sha256_digest
 
 from zlc_data import (
     BlockId,
+    AxisLayoutMode,
     AxisSpec,
     CellValidity,
     ComponentValidity,
     DataBlock,
-    DataPatch,
     DatasetRevision,
     DatasetRevisionRef,
     DatasetSchema,
     Invalid,
     OwnedSnapshot,
+    MONITOR_HISTORY,
     StreamGenerationId,
     PointLayout,
     REPEAT,
@@ -133,16 +134,7 @@ class ValueDatasetEventAdapter:
 
 
 
-class DatasetMode(str, Enum):
-    FINITE_EXACT = "FINITE_EXACT"
-    ROLLING_MONITOR = "ROLLING_MONITOR"
-
-
 class DatasetError(RuntimeError):
-    pass
-
-
-class DuplicateDatasetCell(DatasetError):
     pass
 
 
@@ -182,7 +174,7 @@ def _intrinsically_bytes_backed_array(value: object) -> bool:
     )
 
 
-def _deeply_immutable_metadata(
+def _is_deeply_immutable(
     value: object,
     active: set[int] | None = None,
     validated: set[int] | None = None,
@@ -208,15 +200,15 @@ def _deeply_immutable_metadata(
         return True
     active.add(identity)
     if isinstance(value, Enum):
-        result = _deeply_immutable_metadata(value.value, active, validated)
+        result = _is_deeply_immutable(value.value, active, validated)
     elif isinstance(value, (tuple, frozenset)):
         result = all(
-            _deeply_immutable_metadata(item, active, validated) for item in value
+            _is_deeply_immutable(item, active, validated) for item in value
         )
     elif is_dataclass(value) and not isinstance(value, type):
         parameters = getattr(type(value), "__dataclass_params__", None)
         result = bool(parameters and parameters.frozen) and all(
-            _deeply_immutable_metadata(
+            _is_deeply_immutable(
                 getattr(value, field.name),
                 active,
                 validated,
@@ -228,159 +220,6 @@ def _deeply_immutable_metadata(
     active.remove(identity)
     if result:
         validated.add(identity)
-    return result
-
-
-def _intrinsically_immutable_contract_value(
-    value: object,
-    *,
-    active: set[int] | None = None,
-    validated: set[int] | None = None,
-    budget: list[int] | None = None,
-    depth: int = 0,
-) -> bool:
-    """Validate retained contract definitions, not runtime metadata values.
-
-    Contract owners may contain only immutable declarative structure.  In
-    particular, mapping proxies and read-only arrays are still aliases to an
-    external owner and are intentionally rejected here.  Shared immutable
-    subgraphs are accepted once, while an active-path identity is a cycle.
-    """
-
-    if value is None or type(value) in (bool, int, str, bytes):
-        return True
-    if type(value) is float:
-        return math.isfinite(value)
-    if isinstance(value, np.dtype):
-        return True
-    if depth > 64:
-        return False
-    identity = id(value)
-    active = set() if active is None else active
-    validated = set() if validated is None else validated
-    budget = [0] if budget is None else budget
-    if identity in active:
-        return False
-    if identity in validated:
-        return True
-    budget[0] += 1
-    if budget[0] > 262_144:
-        return False
-    active.add(identity)
-    if isinstance(value, Enum):
-        result = _intrinsically_immutable_contract_value(
-            value.value,
-            active=active,
-            validated=validated,
-            budget=budget,
-            depth=depth + 1,
-        )
-    elif isinstance(value, (tuple, frozenset)):
-        result = all(
-            _intrinsically_immutable_contract_value(
-                item,
-                active=active,
-                validated=validated,
-                budget=budget,
-                depth=depth + 1,
-            )
-            for item in value
-        )
-    elif is_dataclass(value) and not isinstance(value, type):
-        parameters = getattr(type(value), "__dataclass_params__", None)
-        result = bool(parameters and parameters.frozen) and all(
-            _intrinsically_immutable_contract_value(
-                getattr(value, item.name),
-                active=active,
-                validated=validated,
-                budget=budget,
-                depth=depth + 1,
-            )
-            for item in fields(value)
-        )
-    else:
-        result = False
-    active.remove(identity)
-    if result:
-        validated.add(identity)
-    return result
-
-
-def _snapshot_intrinsically_immutable_contract_value(
-    value: object,
-    *,
-    preserve: dict[int, object] | None = None,
-    memo: dict[int, object] | None = None,
-    active: set[int] | None = None,
-) -> object:
-    """Rebuild an immutable owner graph so reflective caller mutation cannot drift it."""
-
-    preserve = {} if preserve is None else preserve
-    memo = {} if memo is None else memo
-    active = set() if active is None else active
-    identity = id(value)
-    if identity in preserve:
-        return preserve[identity]
-    if value is None or type(value) in (bool, int, float, str, bytes):
-        return value
-    if isinstance(value, (np.dtype, Enum)):
-        return value
-    if identity in active:
-        raise TypeError("contract owner graph contains a recursive cycle")
-    if identity in memo:
-        return memo[identity]
-    active.add(identity)
-    if isinstance(value, tuple):
-        result = tuple(
-            _snapshot_intrinsically_immutable_contract_value(
-                item,
-                preserve=preserve,
-                memo=memo,
-                active=active,
-            )
-            for item in value
-        )
-    elif isinstance(value, frozenset):
-        result = frozenset(
-            _snapshot_intrinsically_immutable_contract_value(
-                item,
-                preserve=preserve,
-                memo=memo,
-                active=active,
-            )
-            for item in value
-        )
-    elif is_dataclass(value) and not isinstance(value, type):
-        parameters = getattr(type(value), "__dataclass_params__", None)
-        if not parameters or not parameters.frozen:
-            active.remove(identity)
-            raise TypeError("contract owner must be a frozen dataclass value")
-        updates = {
-            item.name: _snapshot_intrinsically_immutable_contract_value(
-                getattr(value, item.name),
-                preserve=preserve,
-                memo=memo,
-                active=active,
-            )
-            for item in fields(value)
-            if item.init
-        }
-        try:
-            result = replace(value, **updates)
-        except (TypeError, ValueError) as error:
-            active.remove(identity)
-            raise TypeError(
-                f"cannot reconstruct immutable contract owner {type(value).__name__}"
-            ) from error
-    else:
-        active.remove(identity)
-        raise TypeError(
-            f"unsupported immutable contract owner value {type(value).__name__}"
-        )
-    active.remove(identity)
-    memo[identity] = result
-    if not _intrinsically_immutable_contract_value(result):
-        raise TypeError("reconstructed contract owner is not intrinsically immutable")
     return result
 
 
@@ -593,16 +432,13 @@ class DatasetCellKeyContract:
         return self.domain.fingerprint
 
     def snapshot(self, key: object) -> DatasetCellAddress:
-        self.validate(key)
-        return key
-
-    def validate(self, key: object) -> None:
         if not isinstance(key, DatasetCellAddress):
             raise TypeError("join key must be DatasetCellAddress")
         if key.repeat_index >= self.domain.repeat_axis.size:
             raise IndexError("join key repeat index is outside DatasetSchema")
         if key.point_storage_index >= self.domain.point_layout.storage_size:
             raise IndexError("join key point index is outside PointLayout")
+        return DatasetCellAddress(key.repeat_index, key.point_storage_index)
 
 
 @dataclass(frozen=True)
@@ -617,10 +453,9 @@ class FrozenDatasetEdge(Generic[PayloadT]):
     schema: DatasetSchema
     event_adapter: DatasetEventAdapter[PayloadT]
     expected_cells: tuple[DatasetCellAddress, ...] | None = None
-    schedule_digest: str = field(init=False)
+    schedule_digest: str | None = field(init=False)
     key_sequence_digest: str | None = field(init=False)
-    consumer_contract_digest: str = field(init=False)
-    _source_payload_contract: object = field(init=False, repr=False, compare=False)
+    consumer_contract_digest: str | None = field(init=False)
     _payload_contract: object = field(init=False, repr=False, compare=False)
     _payload_contract_fingerprint: str = field(init=False, repr=False, compare=False)
     _payload_max_retained_nbytes: int = field(init=False, repr=False, compare=False)
@@ -660,21 +495,6 @@ class FrozenDatasetEdge(Generic[PayloadT]):
         parameters = getattr(type(adapter), "__dataclass_params__", None)
         if not is_dataclass(adapter) or not parameters or not parameters.frozen:
             raise TypeError("DatasetEventAdapter must be a frozen dataclass value")
-        if not _intrinsically_immutable_contract_value(adapter):
-            raise TypeError(
-                "DatasetEventAdapter fields must be recursively intrinsically immutable"
-            )
-        try:
-            source_payload_contract = adapter.payload_contract
-        except AttributeError as error:
-            raise TypeError(
-                "event_adapter does not implement DatasetEventAdapter"
-            ) from error
-        adapter = _snapshot_intrinsically_immutable_contract_value(
-            adapter,
-            preserve={id(schema.cell_schema): schema.cell_schema},
-        )
-        object.__setattr__(self, "event_adapter", adapter)
         try:
             payload_contract = adapter.payload_contract
             value_schema = adapter.value_schema
@@ -689,6 +509,10 @@ class FrozenDatasetEdge(Generic[PayloadT]):
             raise TypeError("event_adapter.value must be callable")
         if value_schema is not schema.cell_schema:
             raise DatasetError("DatasetEventAdapter must share DatasetSchema.cell_schema")
+        if not _is_deeply_immutable(adapter):
+            raise TypeError(
+                "DatasetEventAdapter fields must contain only intrinsically immutable values"
+            )
         for name, owner in (
             ("payload contract", payload_contract),
             ("metadata contract", metadata),
@@ -698,11 +522,11 @@ class FrozenDatasetEdge(Generic[PayloadT]):
                 not is_dataclass(owner)
                 or not owner_parameters
                 or not owner_parameters.frozen
-                or not _intrinsically_immutable_contract_value(owner)
             ):
+                raise TypeError(f"{name} must be a frozen dataclass value")
+            if not _is_deeply_immutable(owner):
                 raise TypeError(
-                    f"{name} must be a recursively intrinsically immutable "
-                    "frozen dataclass value"
+                    f"{name} fields must contain only intrinsically immutable values"
                 )
         payload_fingerprint = _sha256_digest(
             payload_contract.fingerprint,
@@ -748,11 +572,6 @@ class FrozenDatasetEdge(Generic[PayloadT]):
         object.__setattr__(self, "_payload_contract", payload_contract)
         object.__setattr__(
             self,
-            "_source_payload_contract",
-            source_payload_contract,
-        )
-        object.__setattr__(
-            self,
             "_payload_contract_fingerprint",
             payload_fingerprint,
         )
@@ -780,20 +599,8 @@ class FrozenDatasetEdge(Generic[PayloadT]):
 
         cells = self.expected_cells
         if cells is None:
-            schedule_digest = canonical_digest(
-                {
-                    "contract": "zlc_neutral_atom.RollingDatasetJoin",
-                    "dataset_schema_fingerprint": schema.fingerprint,
-                }
-            )
-            consumer_digest = canonical_digest(
-                {
-                    "contract": "zlc_neutral_atom.RollingDatasetConsumer",
-                    "dataset_schema_fingerprint": schema.fingerprint,
-                    "metadata_contract_fingerprint": metadata_fingerprint,
-                    "event_adapter_operator_fingerprint": operator_fingerprint,
-                }
-            )
+            schedule_digest = None
+            consumer_digest = None
             key_sequence_digest = None
         else:
             if not isinstance(cells, tuple):
@@ -829,7 +636,7 @@ class FrozenDatasetEdge(Generic[PayloadT]):
 
     @property
     def source_payload_contract(self) -> object:
-        return self._source_payload_contract
+        return self._payload_contract
 
     @property
     def payload_contract_fingerprint(self) -> str:
@@ -872,18 +679,18 @@ class FrozenDatasetEdge(Generic[PayloadT]):
             raise DatasetError("rolling dataset edge has no exact key sequence")
         return self.key_sequence_digest
 
-    def validate_stream(self, stream: AcquisitionStream[PayloadT]) -> None:
+    def validate_payload_stream(self, stream: AcquisitionStream[PayloadT]) -> None:
         if not isinstance(stream, AcquisitionStream):
             raise TypeError("stream must be AcquisitionStream")
-        if (
-            stream._payload_contract is not self.source_payload_contract
-            and stream._payload_contract is not self.payload_contract
-        ):
+        if stream._payload_contract is not self.payload_contract:
             raise DatasetError("dataset edge must share the stream PayloadContract owner")
         if stream.payload_contract_fingerprint != self.payload_contract_fingerprint:
             raise DatasetError("dataset edge payload fingerprint differs from stream")
         if stream.max_payload_bytes != self.payload_max_retained_nbytes:
             raise DatasetError("dataset edge payload byte bound differs from stream")
+
+    def validate_stream(self, stream: AcquisitionStream[PayloadT]) -> None:
+        self.validate_payload_stream(stream)
         key_contract = stream._join_key_contract
         if not isinstance(key_contract, DatasetCellKeyContract):
             raise DatasetError("dataset source must declare DatasetCellKeyContract")
@@ -895,20 +702,49 @@ class FrozenDatasetEdge(Generic[PayloadT]):
 class DatasetCoverage:
     written_cells: int
     total_cells: int
-    missed_events: int
 
     def __post_init__(self) -> None:
-        for field in ("written_cells", "total_cells", "missed_events"):
-            value = getattr(self, field)
-            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-                raise ValueError(f"{field} must be a non-negative integer")
-            object.__setattr__(self, field, int(value))
-        if self.written_cells > self.total_cells:
-            raise ValueError("written_cells cannot exceed total_cells")
+        _validate_cell_counts(self)
 
     @property
     def complete(self) -> bool:
-        return self.written_cells == self.total_cells and self.missed_events == 0
+        return self.written_cells == self.total_cells
+
+
+@dataclass(frozen=True)
+class MonitorCoverage:
+    """Visible-window completeness plus lifetime monitor loss telemetry."""
+
+    written_cells: int
+    total_cells: int
+    missed_events: int
+    current_gap: bool
+
+    def __post_init__(self) -> None:
+        _validate_cell_counts(self)
+        if (
+            isinstance(self.missed_events, bool)
+            or not isinstance(self.missed_events, Integral)
+            or self.missed_events < 0
+        ):
+            raise ValueError("missed_events must be a non-negative integer")
+        object.__setattr__(self, "missed_events", int(self.missed_events))
+        if not isinstance(self.current_gap, bool):
+            raise TypeError("current_gap must be bool")
+
+    @property
+    def complete(self) -> bool:
+        return self.written_cells == self.total_cells and not self.current_gap
+
+
+def _validate_cell_counts(coverage: DatasetCoverage | MonitorCoverage) -> None:
+    for name in ("written_cells", "total_cells"):
+        value = getattr(coverage, name)
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+        object.__setattr__(coverage, name, int(value))
+    if coverage.written_cells > coverage.total_cells:
+        raise ValueError("written_cells cannot exceed total_cells")
 
 
 @dataclass(frozen=True)
@@ -934,8 +770,52 @@ class DatasetPreviewSnapshot:
 
     snapshot: OwnedSnapshot
     coverage: DatasetCoverage
-    mode: DatasetMode
     cell_metadata: tuple[object | None, ...]
+
+    @property
+    def ref(self) -> DatasetRevisionRef:
+        return self.snapshot.ref
+
+    @property
+    def block(self) -> DataBlock:
+        return self.snapshot.block
+
+
+@dataclass(frozen=True)
+class MonitorDatasetSnapshot:
+    """One atomically frozen live view with its aligned event identities."""
+
+    snapshot: OwnedSnapshot
+    coverage: MonitorCoverage
+    cell_metadata: tuple[object | None, ...]
+    event_refs: tuple[EventRef | None, ...]
+    head: EventRef | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.snapshot, OwnedSnapshot):
+            raise TypeError("snapshot must be OwnedSnapshot")
+        if not isinstance(self.coverage, MonitorCoverage):
+            raise TypeError("coverage must be MonitorCoverage")
+        total = (
+            self.snapshot.block.schema.repeat_axis.size
+            * self.snapshot.block.schema.point_layout.storage_size
+        )
+        metadata = tuple(self.cell_metadata)
+        references = tuple(self.event_refs)
+        if len(metadata) != total or len(references) != total:
+            raise ValueError("monitor metadata and event refs must align to dataset cells")
+        if any(
+            reference is not None and not isinstance(reference, EventRef)
+            for reference in references
+        ):
+            raise TypeError("event_refs must contain EventRef or None")
+        if self.head is not None:
+            if not isinstance(self.head, EventRef):
+                raise TypeError("head must be EventRef or None")
+            if self.head not in references:
+                raise ValueError("head must be present in the aligned event refs")
+        object.__setattr__(self, "cell_metadata", metadata)
+        object.__setattr__(self, "event_refs", references)
 
     @property
     def ref(self) -> DatasetRevisionRef:
@@ -1223,213 +1103,213 @@ class OrderedDatasetMetadataHasher:
         return self._hasher.copy().hexdigest()
 
 
+def _new_validity_storage(schema: DatasetSchema) -> np.ndarray:
+    contract = schema.cell_schema.validity_contract
+    if contract.mode is ValidityMode.VALUE:
+        return np.zeros(schema.physical_shape[:2], dtype=bool)
+    axes = tuple(schema.cell_schema.axis(axis_id) for axis_id in contract.component_axis_ids)
+    return np.zeros(
+        (*schema.physical_shape[:2], *(axis.size for axis in axes)),
+        dtype=bool,
+    )
+
+
+def _value_validity_mask(schema: DatasetSchema, validity: object) -> np.ndarray | bool:
+    contract = schema.cell_schema.validity_contract
+    if contract.mode is ValidityMode.VALUE:
+        if isinstance(validity, Valid):
+            return True
+        if isinstance(validity, Invalid):
+            return False
+        raise ValueError("component validity cannot enter a VALUE dataset contract")
+    return expand_component_validity(validity, schema.cell_schema)
+
+
+def _materialized_validity(schema: DatasetSchema, validity: np.ndarray):
+    contract = schema.cell_schema.validity_contract
+    if contract.mode is ValidityMode.VALUE:
+        return CellValidity(validity)
+    return ComponentValidity(contract.component_axis_ids, validity)
+
+
+def _project_payload(
+    edge: FrozenDatasetEdge[PayloadT],
+    payload: PayloadT,
+    *,
+    include_metadata_digest: bool,
+) -> tuple[Value, object | None, str | None]:
+    value = edge.project_value(payload)
+    if not isinstance(value, Value):
+        raise TypeError("DatasetEventAdapter.value must return Value")
+    if value.schema is not edge.schema.cell_schema:
+        raise DatasetError("event ValueSchema differs from DatasetSchema cell contract")
+    contract = edge.metadata_contract
+    metadata = contract.snapshot(payload)
+    contract.validate(metadata)
+    if not _is_deeply_immutable(metadata):
+        raise TypeError("metadata contract must return a deeply immutable snapshot")
+    retained = contract.retained_nbytes(metadata)
+    if (
+        isinstance(retained, bool)
+        or not isinstance(retained, Integral)
+        or retained < 0
+        or retained > edge.metadata_max_retained_nbytes
+    ):
+        raise ValueError("metadata retained bytes exceed the declared metadata bound")
+    digest = (
+        _sha256_digest(contract.digest(metadata), "metadata digest")
+        if include_metadata_digest
+        else None
+    )
+    return value, metadata, digest
+
+
+def _write_cell(
+    cell: tuple[int, int],
+    value: Value,
+    validity_mask: np.ndarray | bool,
+    values: np.ndarray,
+    written: np.ndarray,
+    validity: np.ndarray,
+) -> None:
+    values[cell] = value.values
+    written[cell] = True
+    validity[cell] = validity_mask
+
+
 class DatasetBuilder(Generic[PayloadT]):
-    """Private mutable materializer; public reads are immutable owned snapshots."""
+    """Finite exact event-to-dataset materializer and formal seal owner."""
 
     def __init__(
         self,
         block_id: BlockId,
-        source: ExactReservation[PayloadT] | MonitorTap[PayloadT],
+        source: ExactReservation[PayloadT],
         edge: FrozenDatasetEdge[PayloadT],
-        mode: DatasetMode,
     ) -> None:
         if not isinstance(block_id, BlockId):
             raise TypeError("block_id must be BlockId")
+        if not isinstance(source, ExactReservation):
+            raise TypeError("DatasetBuilder must bind an ExactReservation")
         if not isinstance(edge, FrozenDatasetEdge):
             raise TypeError("edge must be FrozenDatasetEdge")
-        if not isinstance(mode, DatasetMode):
-            raise TypeError("mode must be DatasetMode")
-        if mode is DatasetMode.FINITE_EXACT and not isinstance(source, ExactReservation):
-            raise TypeError("FINITE_EXACT DatasetBuilder must bind an ExactReservation")
-        if mode is DatasetMode.ROLLING_MONITOR and not isinstance(source, MonitorTap):
-            raise TypeError("ROLLING_MONITOR DatasetBuilder must bind a MonitorTap")
-        if mode is DatasetMode.FINITE_EXACT and edge.expected_cells is None:
-            raise DatasetError("FINITE_EXACT DatasetBuilder requires an exact edge schedule")
-        if mode is DatasetMode.ROLLING_MONITOR and edge.expected_cells is not None:
-            raise DatasetError("ROLLING_MONITOR DatasetBuilder requires a schedule-free edge")
+        if edge.expected_cells is None:
+            raise DatasetError("DatasetBuilder requires a frozen exact cell schedule")
+        if edge.schedule_digest is None or edge.consumer_contract_digest is None:
+            raise DatasetError("exact dataset edge is missing its formal digests")
         self.block_id = block_id
-        self._reservation = source if isinstance(source, ExactReservation) else None
-        self._monitor = source if isinstance(source, MonitorTap) else None
+        self._reservation = source
         self._source: AcquisitionStream[PayloadT] = source._stream
         edge.validate_stream(self._source)
         self.stream_id = self._source.stream_id
         self.generation = self._source.generation
         self.edge = edge
         self.schema = edge.schema
-        self.mode = mode
-        metadata_contract = edge.metadata_contract
-        self._metadata_contract = metadata_contract
-        self._metadata_contract_fingerprint = edge.metadata_contract_fingerprint
-        self._metadata_max_retained_nbytes = edge.metadata_max_retained_nbytes
-        schema = edge.schema
-        expected_cells = edge.expected_cells
-        total_cells = schema.repeat_axis.size * schema.point_layout.storage_size
-        if self._reservation is not None:
-            reserved_events = self._reservation.end_sequence - self._reservation.start_sequence
-            if reserved_events != total_cells:
-                raise DatasetError("exact reservation length must equal DatasetSchema cell count")
-        self._expected_cells = expected_cells
+        self._expected_cells = edge.expected_cells
         self._join_plan_digest = edge.schedule_digest
-        self._ordered_event_hasher = (
-            OrderedDatasetEventHasher(
-                self.stream_id,
-                self.generation,
-                self._reservation.start_sequence,
-            )
-            if self._reservation is not None
-            else None
+        self._metadata_contract_fingerprint = edge.metadata_contract_fingerprint
+        total_cells = self.schema.repeat_axis.size * self.schema.point_layout.storage_size
+        reserved_events = source.end_sequence - source.start_sequence
+        if reserved_events != total_cells:
+            raise DatasetError("exact reservation length must equal DatasetSchema cell count")
+        self._ordered_event_hasher = OrderedDatasetEventHasher(
+            self.stream_id,
+            self.generation,
+            source.start_sequence,
         )
         self._ordered_metadata_hasher = OrderedDatasetMetadataHasher(
             self._metadata_contract_fingerprint
         )
         self._lock = threading.RLock()
-        self._values = np.zeros(schema.physical_shape, dtype=schema.cell_schema.dtype)
-        self._written = np.zeros(schema.physical_shape[:2], dtype=bool)
-        self._written_count = 0
-        self._validity = self._new_validity_storage()
-        self._revision = 0
-        self._expected_sequence = (
-            self._reservation.start_sequence if self._reservation is not None else 0
+        self._values = np.zeros(
+            self.schema.physical_shape,
+            dtype=self.schema.cell_schema.dtype,
         )
-        self._last_monitor_sequence: int | None = None
-        self._missed_events = 0
+        self._written = np.zeros(self.schema.physical_shape[:2], dtype=bool)
+        self._written_count = 0
+        self._validity = _new_validity_storage(self.schema)
+        self._revision = 0
+        self._expected_sequence = source.start_sequence
         self._cell_metadata: list[object | None] = [None] * total_cells
         self._ordered_event_metadata: list[object | None] = [None] * total_cells
         self._sealed = False
         self._aborted = False
-        self._exact_readiness: ExactConsumerReadiness | None = None
-        if self._reservation is not None:
-            self._exact_readiness = self._source._claim_consumer(
-                self._reservation,
-                self,
-                source_contract_digest=edge.consumer_contract_digest,
-                source_schedule_digest=self._join_plan_digest,
-                source_key_sequence_digest=edge.exact_key_sequence_digest,
-                chain_contract_digest=edge.consumer_contract_digest,
-                terminal=True,
-            )
+        self._exact_readiness = self._source._claim_consumer(
+            source,
+            self,
+            source_contract_digest=edge.consumer_contract_digest,
+            source_schedule_digest=edge.schedule_digest,
+            source_key_sequence_digest=edge.exact_key_sequence_digest,
+            chain_contract_digest=edge.consumer_contract_digest,
+            terminal=True,
+        )
 
     @property
     def revision(self) -> DatasetRevision:
         with self._lock:
             return DatasetRevision(self._revision)
 
-    @property
-    def retained_patch_count(self) -> int:
-        return 0
-
     def current_ref(self) -> DatasetRevisionRef:
         with self._lock:
             return self._ref_locked(self._revision)
 
-    def consume(
-        self,
-        delivery: Delivery[PayloadT],
-    ) -> DatasetProgress:
-        if self.mode is not DatasetMode.FINITE_EXACT:
-            raise DatasetError("exact cursor consumption requires FINITE_EXACT mode")
+    def consume(self, delivery: Delivery[PayloadT]) -> DatasetProgress:
         if not isinstance(delivery, Delivery) or not delivery.is_exact:
-            raise TypeError("FINITE_EXACT DatasetBuilder requires an exact Delivery capability")
+            raise TypeError("DatasetBuilder requires an exact Delivery capability")
         if delivery.acknowledged:
             raise DatasetError("delivery was already acknowledged")
-        if self._reservation is None:
-            raise DatasetError("exact DatasetBuilder has no bound reservation")
-        projected = self._project_payload(delivery.envelope.payload)
+        projected = _project_payload(
+            self.edge,
+            delivery.envelope.payload,
+            include_metadata_digest=True,
+        )
         return self._source._consume_exact(
             self._reservation,
             delivery,
             self,
-            lambda envelope: self._ingest(
-                envelope,
-                projected=projected,
-                additional_missed=0,
-            ),
-        )
-
-    def ingest_monitor(
-        self,
-        update: MonitorUpdate[PayloadT],
-    ) -> DatasetProgress:
-        if self.mode is not DatasetMode.ROLLING_MONITOR:
-            raise DatasetError("monitor updates require ROLLING_MONITOR mode")
-        if not isinstance(update, MonitorUpdate):
-            raise TypeError("update must be MonitorUpdate")
-        if self._monitor is None or not self._monitor._owns_update(update):
-            raise PermissionError("MonitorUpdate belongs to another monitor authority")
-        projected = self._project_payload(update.envelope.payload)
-        return self._ingest(
-            update.envelope,
-            projected=projected,
-            additional_missed=update.missed,
+            lambda envelope: self._ingest(envelope, projected),
         )
 
     def _ingest(
         self,
         envelope: Envelope[PayloadT],
-        *,
-        projected: tuple[Value, object | None, str],
-        additional_missed: int,
+        projected: tuple[Value, object | None, str | None],
     ) -> DatasetProgress:
-        if not isinstance(envelope, Envelope):
-            raise TypeError("envelope must be Envelope")
         address = envelope.join_key
         if not isinstance(address, DatasetCellAddress):
             raise DatasetError("dataset event is missing its typed DatasetCellAddress")
+        value, metadata, metadata_digest = projected
+        assert metadata_digest is not None
+        validity_mask = _value_validity_mask(self.schema, value.validity)
         with self._lock:
             self._ensure_writable_locked()
             self._validate_envelope_identity_locked(envelope)
-            value, metadata, metadata_digest = projected
-            self._validate_address_locked(address)
+            if envelope.sequence != self._expected_sequence:
+                raise DatasetError(
+                    f"exact dataset expected sequence {self._expected_sequence}, "
+                    f"got {envelope.sequence}"
+                )
+            schedule_index = envelope.sequence - self._reservation.start_sequence
+            expected_address = self._expected_cells[schedule_index]
+            if address != expected_address:
+                raise DatasetError(
+                    f"event join key {address} differs from frozen plan key "
+                    f"{expected_address} at sequence {envelope.sequence}"
+                )
             cell = (address.repeat_index, address.point_storage_index)
-            was_written = bool(self._written[cell])
-            if self.mode is DatasetMode.FINITE_EXACT and was_written:
-                raise DuplicateDatasetCell(f"dataset cell {cell} was already written")
-            if self.mode is DatasetMode.FINITE_EXACT:
-                if envelope.sequence != self._expected_sequence:
-                    raise DatasetError(
-                        f"exact dataset expected sequence {self._expected_sequence}, "
-                        f"got {envelope.sequence}"
-                    )
-                assert self._expected_cells is not None
-                schedule_index = envelope.sequence - self._reservation.start_sequence
-                expected_address = self._expected_cells[schedule_index]
-                if address != expected_address:
-                    raise DatasetError(
-                        f"event join key {address} differs from frozen plan key "
-                        f"{expected_address} at sequence {envelope.sequence}"
-                    )
-            elif self._last_monitor_sequence is not None and envelope.sequence <= self._last_monitor_sequence:
-                raise DatasetError("monitor dataset events must remain strictly ordered")
-
-            base = DatasetRevision(self._revision)
-            result = DatasetRevision(self._revision + 1)
-            patch = DataPatch(
-                block_id=self.block_id,
-                base_revision=base,
-                result_revision=result,
-                target_cells=(cell,),
-                values=value.values.reshape((1, *self.schema.cell_schema.data_shape)),
-                validity_patch=(value.validity,),
-                schema_fingerprint=self.schema.fingerprint,
-            )
-            self._apply_patch_locked(
-                patch,
+            _write_cell(
+                cell,
+                value,
+                validity_mask,
                 self._values,
                 self._written,
                 self._validity,
             )
             self._revision += 1
-            if not was_written:
-                self._written_count += 1
-            self._missed_events += additional_missed
-            if self.mode is DatasetMode.FINITE_EXACT:
-                self._expected_sequence += 1
-                self._ordered_event_metadata[schedule_index] = metadata
-                self._ordered_metadata_hasher.update(metadata_digest)
-                assert self._ordered_event_hasher is not None
-                self._ordered_event_hasher.update(envelope.ref, metadata_digest)
-            else:
-                self._last_monitor_sequence = envelope.sequence
+            self._written_count += 1
+            self._expected_sequence += 1
+            self._ordered_event_metadata[schedule_index] = metadata
+            self._ordered_metadata_hasher.update(metadata_digest)
+            self._ordered_event_hasher.update(envelope.ref, metadata_digest)
             flat_cell = (
                 address.repeat_index * self.schema.point_layout.storage_size
                 + address.point_storage_index
@@ -1443,36 +1323,23 @@ class DatasetBuilder(Generic[PayloadT]):
 
     def materialize(self, ref: DatasetRevisionRef | None = None) -> DatasetPreviewSnapshot:
         with self._lock:
-            selected = self._ref_locked(self._revision) if ref is None else ref
-            self._validate_ref_locked(selected)
-            target_revision = selected.revision.value
-            if target_revision > self._revision:
-                raise KeyError(f"dataset revision {target_revision} has not been committed")
-            if target_revision != self._revision:
-                raise SnapshotExpired(
-                    "DatasetBuilder retains only the current revision; "
-                    "callers retain OwnedSnapshot values, not mutable history"
-                )
+            selected = self._select_current_ref_locked(ref)
             block = DataBlock(
                 block_id=self.block_id,
-                revision=DatasetRevision(target_revision),
+                revision=selected.revision,
                 values=self._values,
-                validity=self._materialized_validity(self._validity),
+                validity=_materialized_validity(self.schema, self._validity),
                 schema=self.schema,
             )
             return DatasetPreviewSnapshot(
                 snapshot=OwnedSnapshot(selected, block),
                 coverage=self._coverage_locked(),
-                mode=self.mode,
                 cell_metadata=tuple(self._cell_metadata),
             )
 
     def seal(self, eos: EndOfStream) -> SealedDatasetArtifact:
-        if self.mode is not DatasetMode.FINITE_EXACT or self._reservation is None:
-            raise DatasetError("rolling monitor datasets cannot become formal sealed datasets")
         self._source._complete_consumer(self._reservation, eos, self, self._seal_locked)
         preview = self.materialize()
-        assert self._ordered_event_hasher is not None
         return SealedDatasetArtifact(
             _SEALED_TOKEN,
             snapshot=preview.snapshot,
@@ -1506,34 +1373,22 @@ class DatasetBuilder(Generic[PayloadT]):
             self._sealed = True
 
     def abort(self) -> None:
-        if self._reservation is not None:
-            self._source._abort_consumer(
-                self._reservation,
-                self,
-                self._mark_aborted_locked,
-            )
-            return
-        self._mark_aborted_locked()
+        self._source._abort_consumer(
+            self._reservation,
+            self,
+            self._mark_aborted_locked,
+        )
 
     def exact_readiness(self) -> ExactConsumerReadiness:
-        if self.mode is not DatasetMode.FINITE_EXACT or self._reservation is None:
-            raise DatasetError("only a finite exact DatasetBuilder can authorize capture")
         with self._lock:
             self._ensure_writable_locked()
             readiness = self._exact_readiness
-        if readiness is None:
-            raise DatasetError("finite exact DatasetBuilder lost its readiness proof")
         readiness._validate_terminal_sink()
         return readiness
 
     def close(self) -> None:
         """Idempotently abort if needed and release the exact reservation."""
 
-        if self._reservation is None:
-            with self._lock:
-                if not self._sealed and not self._aborted:
-                    self._mark_aborted_locked()
-            return
         if self._reservation.state is ReservationState.RELEASED:
             return
         with self._lock:
@@ -1551,21 +1406,7 @@ class DatasetBuilder(Generic[PayloadT]):
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        if self._reservation is None:
-            return False
-        cleanup_error: BaseException | None = None
-        try:
-            self.close()
-        except BaseException as error:
-            cleanup_error = error
-        if cleanup_error is not None:
-            if exc is None:
-                raise cleanup_error
-            record_secondary_failure(
-                exc,
-                "DatasetBuilder teardown also failed",
-                cleanup_error,
-            )
+        _close_preserving_body_error(self.close, exc, "DatasetBuilder teardown also failed")
         return False
 
     def _mark_aborted_locked(self) -> None:
@@ -1574,102 +1415,20 @@ class DatasetBuilder(Generic[PayloadT]):
                 raise DatasetError("sealed dataset cannot be aborted")
             self._aborted = True
 
-    def _new_validity_storage(self) -> np.ndarray:
-        contract = self.schema.cell_schema.validity_contract
-        if contract.mode is ValidityMode.VALUE:
-            return np.zeros(self.schema.physical_shape[:2], dtype=bool)
-        axes = tuple(self.schema.cell_schema.axis(axis_id) for axis_id in contract.component_axis_ids)
-        return np.zeros(
-            (*self.schema.physical_shape[:2], *(axis.size for axis in axes)),
-            dtype=bool,
-        )
-
     def _ensure_writable_locked(self) -> None:
         if self._sealed:
             raise DatasetError("dataset is sealed")
         if self._aborted:
             raise DatasetError("dataset is aborted")
 
-    def _validate_envelope_identity_locked(
-        self,
-        envelope: Envelope[PayloadT],
-    ) -> None:
+    def _validate_envelope_identity_locked(self, envelope: Envelope[PayloadT]) -> None:
         if envelope.stream_generation != self.generation:
             raise DatasetError("envelope stream generation differs from DatasetBuilder")
         if envelope.stream_id != self.stream_id:
             raise DatasetError("envelope stream id differs from DatasetBuilder")
 
-    def _project_payload(
-        self,
-        payload: PayloadT,
-    ) -> tuple[Value, object | None, str]:
-        value = self.edge.project_value(payload)
-        if not isinstance(value, Value):
-            raise TypeError("DatasetEventAdapter.value must return Value")
-        if value.schema is not self.schema.cell_schema:
-            raise DatasetError("event ValueSchema differs from DatasetSchema cell contract")
-        contract = self._metadata_contract
-        metadata = contract.snapshot(payload)
-        contract.validate(metadata)
-        if not _deeply_immutable_metadata(metadata):
-            raise TypeError("metadata contract must return a deeply immutable snapshot")
-        retained = contract.retained_nbytes(metadata)
-        if (
-            isinstance(retained, bool)
-            or not isinstance(retained, Integral)
-            or retained < 0
-            or retained > self._metadata_max_retained_nbytes
-        ):
-            raise ValueError("metadata retained bytes exceed the declared metadata bound")
-        digest = _sha256_digest(contract.digest(metadata), "metadata digest")
-        return value, metadata, digest
-
-    def _validate_address_locked(self, address: DatasetCellAddress) -> None:
-        if address.repeat_index >= self.schema.repeat_axis.size:
-            raise IndexError("repeat index is outside DatasetSchema")
-        if address.point_storage_index >= self.schema.point_layout.storage_size:
-            raise IndexError("point storage index is outside PointLayout")
-
-    def _value_validity_mask(self, validity) -> np.ndarray | bool:
-        contract = self.schema.cell_schema.validity_contract
-        if contract.mode is ValidityMode.VALUE:
-            if isinstance(validity, Valid):
-                return True
-            if isinstance(validity, Invalid):
-                return False
-            raise ValueError("component validity cannot enter a VALUE dataset contract")
-        return expand_component_validity(validity, self.schema.cell_schema)
-
-    def _apply_patch_locked(
-        self,
-        patch: DataPatch,
-        values: np.ndarray,
-        written: np.ndarray,
-        validity: np.ndarray,
-    ) -> None:
-        if patch.block_id != self.block_id or patch.schema_fingerprint != self.schema.fingerprint:
-            raise DatasetError("DataPatch targets another dataset contract")
-        prepared = tuple(
-            (cell, patch.values[index], self._value_validity_mask(patch.validity_patch[index]))
-            for index, cell in enumerate(patch.target_cells)
-        )
-        for cell, cell_values, validity_mask in prepared:
-            values[cell] = cell_values
-            written[cell] = True
-            validity[cell] = validity_mask
-
-    def _materialized_validity(self, validity: np.ndarray):
-        contract = self.schema.cell_schema.validity_contract
-        if contract.mode is ValidityMode.VALUE:
-            return CellValidity(validity)
-        return ComponentValidity(contract.component_axis_ids, validity)
-
     def _coverage_locked(self) -> DatasetCoverage:
-        return DatasetCoverage(
-            written_cells=self._written_count,
-            total_cells=int(self._written.size),
-            missed_events=self._missed_events,
-        )
+        return DatasetCoverage(self._written_count, int(self._written.size))
 
     def _ref_locked(self, revision: int) -> DatasetRevisionRef:
         return DatasetRevisionRef(
@@ -1679,15 +1438,322 @@ class DatasetBuilder(Generic[PayloadT]):
             revision=DatasetRevision(revision),
         )
 
-    def _validate_ref_locked(self, ref: DatasetRevisionRef) -> None:
-        if not isinstance(ref, DatasetRevisionRef):
-            raise TypeError("ref must be DatasetRevisionRef")
-        if ref.block_id != self.block_id:
-            raise ValueError("snapshot ref belongs to another block")
-        if ref.stream_generation != self.generation:
-            raise ValueError("snapshot ref belongs to another stream generation")
-        if ref.schema_fingerprint != self.schema.fingerprint:
-            raise ValueError("snapshot ref schema fingerprint differs")
+    def _select_current_ref_locked(
+        self,
+        ref: DatasetRevisionRef | None,
+    ) -> DatasetRevisionRef:
+        selected = self._ref_locked(self._revision) if ref is None else ref
+        _validate_dataset_ref(selected, self.block_id, self.generation, self.schema)
+        target_revision = selected.revision.value
+        if target_revision > self._revision:
+            raise KeyError(f"dataset revision {target_revision} has not been committed")
+        if target_revision != self._revision:
+            raise SnapshotExpired(
+                "materializers retain only the current revision; callers retain snapshots"
+            )
+        return selected
+
+
+class MonitorDataset(Generic[PayloadT]):
+    """Sequence-owned live materializer; never a formal artifact authority."""
+
+    @classmethod
+    def keyed_cycle(
+        cls,
+        block_id: BlockId,
+        source: MonitorTap[PayloadT],
+        edge: FrozenDatasetEdge[PayloadT],
+    ) -> "MonitorDataset[PayloadT]":
+        if edge.expected_cells is None:
+            raise DatasetError("keyed_cycle requires a frozen complete cell schedule")
+        return cls(block_id, source, edge)
+
+    @classmethod
+    def append_window(
+        cls,
+        block_id: BlockId,
+        source: MonitorTap[PayloadT],
+        edge: FrozenDatasetEdge[PayloadT],
+    ) -> "MonitorDataset[PayloadT]":
+        if edge.expected_cells is not None:
+            raise DatasetError("append_window requires a schedule-free dataset edge")
+        return cls(block_id, source, edge)
+
+    def __init__(
+        self,
+        block_id: BlockId,
+        source: MonitorTap[PayloadT],
+        edge: FrozenDatasetEdge[PayloadT],
+    ) -> None:
+        if not isinstance(block_id, BlockId):
+            raise TypeError("block_id must be BlockId")
+        if not isinstance(source, MonitorTap):
+            raise TypeError("MonitorDataset must bind a MonitorTap")
+        if not isinstance(edge, FrozenDatasetEdge):
+            raise TypeError("edge must be FrozenDatasetEdge")
+        self.block_id = block_id
+        self._monitor = source
+        self._source: AcquisitionStream[PayloadT] = source._stream
+        self.edge = edge
+        self.schema = edge.schema
+        self._cycle_cells = edge.expected_cells
+        if self._cycle_cells is None:
+            edge.validate_payload_stream(self._source)
+            if self.schema.repeat_axis.size != 1:
+                raise DatasetError("append_window requires a single repeat storage row")
+            if (
+                len(self.schema.point_axes) != 1
+                or self.schema.point_axes[0].role != MONITOR_HISTORY
+                or self.schema.point_layout.mode is not AxisLayoutMode.RECT_C
+                or self.schema.point_axes[0].coordinates
+                != tuple(range(self.schema.point_axes[0].size))
+            ):
+                raise DatasetError(
+                    "append_window requires one dense MONITOR_HISTORY axis with "
+                    "newest-first slot coordinates 0..history-1"
+                )
+        else:
+            edge.validate_stream(self._source)
+        self.stream_id = self._source.stream_id
+        self.generation = self._source.generation
+        total_cells = self.schema.repeat_axis.size * self.schema.point_layout.storage_size
+        source._claim_consumer(self)
+        try:
+            self._lock = threading.RLock()
+            self._consume_lock = threading.Lock()
+            self._values = np.zeros(
+                self.schema.physical_shape,
+                dtype=self.schema.cell_schema.dtype,
+            )
+            self._written = np.zeros(self.schema.physical_shape[:2], dtype=bool)
+            self._validity = _new_validity_storage(self.schema)
+            self._cell_metadata: list[object | None] = [None] * total_cells
+            self._event_refs: list[EventRef | None] = [None] * total_cells
+            self._revision = 0
+            self._last_sequence: int | None = None
+            self._missed_events = 0
+            self._head: EventRef | None = None
+            self._next_slot = 0
+            self._count = 0
+            self._aborted = False
+        except BaseException:
+            source.close()
+            raise
+
+    @property
+    def revision(self) -> DatasetRevision:
+        with self._lock:
+            return DatasetRevision(self._revision)
+
+    def current_ref(self) -> DatasetRevisionRef:
+        with self._lock:
+            return self._ref_locked(self._revision)
+
+    def ingest_next(self, timeout: float | None = None) -> DatasetRevisionRef:
+        with self._consume_lock:
+            update = self._monitor._next_for(self, timeout)
+            return self._ingest(update)
+
+    def ingest_latest(self) -> DatasetRevisionRef:
+        with self._consume_lock:
+            update = self._monitor._latest_for(self)
+            return self._ingest(update)
+
+    def _ingest(self, update: MonitorUpdate[PayloadT]) -> DatasetRevisionRef:
+        envelope = update.envelope
+        value, metadata, _digest = _project_payload(
+            self.edge,
+            envelope.payload,
+            include_metadata_digest=False,
+        )
+        validity_mask = _value_validity_mask(self.schema, value.validity)
+        with self._lock:
+            self._ensure_writable_locked()
+            self._validate_envelope_identity_locked(envelope)
+            expected_sequence = 0 if self._last_sequence is None else self._last_sequence + 1
+            if envelope.sequence < expected_sequence:
+                raise DatasetError("monitor dataset events must remain strictly ordered")
+            sequence_gap = envelope.sequence - expected_sequence
+            self._missed_events += max(update.missed, sequence_gap)
+            if self._cycle_cells is None:
+                cell = (0, self._next_slot)
+            else:
+                offset = envelope.sequence % len(self._cycle_cells)
+                expected_address = self._cycle_cells[offset]
+                if envelope.join_key != expected_address:
+                    raise DatasetError(
+                        f"monitor cycle key {envelope.join_key!r} differs from "
+                        f"frozen key {expected_address!r} at sequence {envelope.sequence}"
+                    )
+                if offset == 0 or sequence_gap > 0 or update.missed > 0:
+                    self._clear_locked()
+                cell = (
+                    expected_address.repeat_index,
+                    expected_address.point_storage_index,
+                )
+            _write_cell(
+                cell,
+                value,
+                validity_mask,
+                self._values,
+                self._written,
+                self._validity,
+            )
+            flat_cell = cell[0] * self.schema.point_layout.storage_size + cell[1]
+            self._cell_metadata[flat_cell] = metadata
+            self._event_refs[flat_cell] = envelope.ref
+            if self._cycle_cells is None:
+                capacity = self.schema.point_layout.storage_size
+                self._next_slot = (self._next_slot + 1) % capacity
+                self._count = min(self._count + 1, capacity)
+            self._last_sequence = envelope.sequence
+            self._head = envelope.ref
+            self._revision += 1
+            return self._ref_locked(self._revision)
+
+    def materialize(
+        self,
+        ref: DatasetRevisionRef | None = None,
+    ) -> MonitorDatasetSnapshot:
+        with self._lock:
+            selected = self._select_current_ref_locked(ref)
+            if self._cycle_cells is None:
+                order = self._append_order_locked()
+                values = self._values[:, order, ...]
+                written = self._written[:, order]
+                validity = self._validity[:, order, ...]
+                metadata = tuple(self._cell_metadata[index] for index in order)
+                event_refs = tuple(self._event_refs[index] for index in order)
+            else:
+                values = self._values
+                written = self._written
+                validity = self._validity
+                metadata = tuple(self._cell_metadata)
+                event_refs = tuple(self._event_refs)
+            block = DataBlock(
+                block_id=self.block_id,
+                revision=selected.revision,
+                values=values,
+                validity=_materialized_validity(self.schema, validity),
+                schema=self.schema,
+            )
+            return MonitorDatasetSnapshot(
+                snapshot=OwnedSnapshot(selected, block),
+                coverage=self._coverage_locked(written, event_refs),
+                cell_metadata=metadata,
+                event_refs=event_refs,
+                head=self._head,
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            self._aborted = True
+        self._monitor.close()
+
+    def __enter__(self) -> "MonitorDataset":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        _close_preserving_body_error(
+            self.close,
+            exc,
+            "MonitorDataset teardown also failed",
+        )
+        return False
+
+    def _append_order_locked(self) -> tuple[int, ...]:
+        capacity = self.schema.point_layout.storage_size
+        used = tuple((self._next_slot - 1 - age) % capacity for age in range(self._count))
+        used_set = set(used)
+        return used + tuple(slot for slot in range(capacity) if slot not in used_set)
+
+    def _clear_locked(self) -> None:
+        self._values.fill(0)
+        self._written.fill(False)
+        self._validity.fill(False)
+        self._cell_metadata[:] = [None] * len(self._cell_metadata)
+        self._event_refs[:] = [None] * len(self._event_refs)
+
+    def _coverage_locked(
+        self,
+        written: np.ndarray,
+        event_refs: tuple[EventRef | None, ...],
+    ) -> MonitorCoverage:
+        current_gap = False
+        if self._cycle_cells is None:
+            retained = tuple(reference for reference in event_refs if reference is not None)
+            current_gap = any(
+                newer.sequence != older.sequence + 1
+                for newer, older in zip(retained, retained[1:])
+            )
+        return MonitorCoverage(
+            written_cells=int(np.count_nonzero(written)),
+            total_cells=int(written.size),
+            missed_events=self._missed_events,
+            current_gap=current_gap,
+        )
+
+    def _ensure_writable_locked(self) -> None:
+        if self._aborted:
+            raise DatasetError("monitor dataset is closed")
+
+    def _validate_envelope_identity_locked(self, envelope: Envelope[PayloadT]) -> None:
+        if envelope.stream_generation != self.generation:
+            raise DatasetError("envelope stream generation differs from MonitorDataset")
+        if envelope.stream_id != self.stream_id:
+            raise DatasetError("envelope stream id differs from MonitorDataset")
+
+    def _ref_locked(self, revision: int) -> DatasetRevisionRef:
+        return DatasetRevisionRef(
+            block_id=self.block_id,
+            stream_generation=self.generation,
+            schema_fingerprint=self.schema.fingerprint,
+            revision=DatasetRevision(revision),
+        )
+
+    def _select_current_ref_locked(
+        self,
+        ref: DatasetRevisionRef | None,
+    ) -> DatasetRevisionRef:
+        selected = self._ref_locked(self._revision) if ref is None else ref
+        _validate_dataset_ref(selected, self.block_id, self.generation, self.schema)
+        target_revision = selected.revision.value
+        if target_revision > self._revision:
+            raise KeyError(f"dataset revision {target_revision} has not been committed")
+        if target_revision != self._revision:
+            raise SnapshotExpired(
+                "materializers retain only the current revision; callers retain snapshots"
+            )
+        return selected
+
+
+def _validate_dataset_ref(
+    ref: DatasetRevisionRef,
+    block_id: BlockId,
+    generation: StreamGenerationId,
+    schema: DatasetSchema,
+) -> None:
+    if not isinstance(ref, DatasetRevisionRef):
+        raise TypeError("ref must be DatasetRevisionRef")
+    if ref.block_id != block_id:
+        raise ValueError("snapshot ref belongs to another block")
+    if ref.stream_generation != generation:
+        raise ValueError("snapshot ref belongs to another stream generation")
+    if ref.schema_fingerprint != schema.fingerprint:
+        raise ValueError("snapshot ref schema fingerprint differs")
+
+
+def _close_preserving_body_error(
+    close: Callable[[], None],
+    body_error: BaseException | None,
+    message: str,
+) -> None:
+    try:
+        close()
+    except BaseException as cleanup_error:
+        if body_error is None:
+            raise
+        record_secondary_failure(body_error, message, cleanup_error)
 
 
 __all__ = [
@@ -1700,13 +1766,14 @@ __all__ = [
     "DatasetEventAdapter",
     "DatasetMetadataContract",
     "DatasetError",
-    "DatasetMode",
     "DatasetProgress",
     "DatasetPreviewSnapshot",
     "DatasetSealProvenance",
-    "DuplicateDatasetCell",
     "FrozenDatasetEdge",
     "MissingDatasetCells",
+    "MonitorCoverage",
+    "MonitorDataset",
+    "MonitorDatasetSnapshot",
     "NoDatasetMetadataContract",
     "OrderedDatasetEventHasher",
     "OrderedDatasetMetadataHasher",

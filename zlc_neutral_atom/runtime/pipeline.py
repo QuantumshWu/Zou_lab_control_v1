@@ -31,7 +31,6 @@ from .capture import (
 from .dataset import (
     DatasetBuilder,
     DatasetCellAddress,
-    DatasetMode,
     SealedDatasetArtifact,
 )
 from .run import CleanupReport, RunContext, RunMode, RunPlan
@@ -642,7 +641,6 @@ def open_exact_capture(
             spec.materializer.block_id,
             reservation,
             contract.dataset_edge,
-            DatasetMode.FINITE_EXACT,
         )
         readiness = builder.exact_readiness()
         memory_admission = admit_pipeline_memory(

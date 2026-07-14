@@ -118,12 +118,9 @@ class TupleJoinContract:
 
     @staticmethod
     def snapshot(key):
-        return tuple(key) if isinstance(key, tuple) else key
-
-    @staticmethod
-    def validate(key):
         if not isinstance(key, tuple):
             raise TypeError("join key must be tuple")
+        return tuple(key)
 
 
 def trace() -> TraceContext:
@@ -286,11 +283,86 @@ def test_exact_backlog_fails_before_overwrite_and_monitor_still_overwrites():
     monitor.close()
 
 
+def test_monitor_loss_accounting_never_changes_exact_order_or_retention():
+    total = 100
+    source, producer = stream(events=total)
+    reservation = source.reserve(
+        total_events=total,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    cursor = reservation.activate()
+    owner = bind_terminal_consumer(source, reservation)
+    monitor = source.monitor(max_events=7, max_bytes=56)
+    exact_sequences = []
+    updates = []
+
+    for sequence in range(total):
+        emit(producer, float(sequence))
+        delivery = cursor.next()
+        exact_sequences.append(delivery.envelope.sequence)
+        acknowledge(source, reservation, delivery, owner)
+        if sequence % 17 == 16:
+            updates.append(monitor.latest())
+    updates.append(monitor.latest())
+
+    assert exact_sequences == list(range(total))
+    assert [update.envelope.sequence for update in updates] == sorted(
+        update.envelope.sequence for update in updates
+    )
+    assert len(updates) + sum(update.missed for update in updates) == total
+    eos = producer.finish()
+    source._complete_consumer(reservation, eos, owner, lambda: None)
+    reservation.release()
+    monitor.close()
+
+
 def test_monitor_budget_must_retain_one_contract_payload():
     source, _producer = stream(events=2)
     with pytest.raises(ValueError, match="retain one maximum payload"):
         source.monitor(max_events=2, max_bytes=source.max_payload_bytes - 1)
     assert not source._monitors
+
+
+def test_monitor_topology_cannot_expand_after_publication_begins():
+    source, producer = stream(events=2)
+    emit(producer, 0.0)
+    with pytest.raises(ReservationStateError, match="before the first publication"):
+        source.monitor(max_events=1, max_bytes=8)
+
+
+def test_monitor_close_is_terminal_for_polling_and_wakes_blocked_reader(monkeypatch):
+    source, _producer = stream(events=2)
+    monitor = source.monitor(max_events=1, max_bytes=8)
+    failures: list[BaseException] = []
+    entered_wait = threading.Event()
+    real_wait = monitor._condition.wait
+
+    def announced_wait(timeout=None):
+        entered_wait.set()
+        return real_wait(timeout)
+
+    monkeypatch.setattr(monitor._condition, "wait", announced_wait)
+
+    def read() -> None:
+        try:
+            monitor.next()
+        except BaseException as error:
+            failures.append(error)
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    assert entered_wait.wait(timeout=1.0)
+    monitor.close()
+    reader.join(timeout=1.0)
+    assert not reader.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], StreamEndedEarly)
+    with pytest.raises(StreamEndedEarly, match="closed"):
+        monitor.next()
+    with pytest.raises(StreamEndedEarly, match="closed"):
+        monitor.latest()
 
 
 def test_reservation_admission_is_atomic_over_event_and_byte_capacity():
