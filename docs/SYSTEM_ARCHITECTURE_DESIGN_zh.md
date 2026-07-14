@@ -3231,6 +3231,8 @@ Runtime Rule-6 海拔清点在 checkpoint `675c62f` 由 `git show HEAD:path/main
 
 9 MiB frame 的针对性 profile 将必要成本与重复防御分开：构造 immutable `Value` bytes 约 `1.957 ms`，一次 payload content digest 约 `2.412 ms`，两者必须保留；generic dataclass materialization walk 约 `0.542 ms/次`，而把已构造的精确 `Value` 视为 owner-validated leaf 后约 `0.00336 ms`。因此 stream publication 仍只生成一个 snapshot、一个 digest、一个 byte count和一个 `_Stored(Envelope, payload_bytes)`供 exact/MonitorTap/rolling 共用；`Envelope.__post_init__` 是拒绝 `DataBlock/DataPatch`（包括嵌套）的唯一 generic admission owner，`_emit` 不预扫第二次。Dataset metadata immutability walker同样信任精确 `Value` 构造不变量；`FrozenDatasetEdge` 在构造时复制并冻结 adapter、缓存 contract/schema/operator，hot getter/project 不为防 `object.__setattr__` 反射而重读整张 adapter graph。实际 stream owner/fingerprint/key-domain绑定、reservation/generation/cursor、锁内 Delivery TOCTOU、metadata semantic digest与 occupancy 原子关系全部保留；不引入 `PreparedPayload`、tuple-returning contract或第二套 unchecked API。
 
+Stream state machine 的代码去重只能围绕完全相同的事实：readiness source 的“已注册、同一 consumer、ACTIVE、source 未终止”由一个 lock-held helper供 bind/source/emitter 三处复用；exact delivery/completion/abort共同的“已注册且 consumer identity 相同”由 stream 内一个 helper拥有，各操作自己的 allowed-state/EOS/ack/commit语义仍留在调用点。generation terminal 的“关闭 admission、把同一 terminal error/EOS通知所有 MonitorTap、唤醒等待者”也只有一个 helper，finish/fail/supersede/non-backpressure overrun只负责各自独有的终态构造与 reservation 处置。不得把这些 helper扩成 generic state-machine framework，也不得把 exact acknowledgement/backpressure与 bounded monitor overwrite合并。
+
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 
 | 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |

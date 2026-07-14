@@ -896,6 +896,23 @@ class ExactConsumerReadiness:
     def _resolved_owner_liveness(self) -> tuple[Callable[[], None], ...]:
         return tuple(reference.resolve() for reference in self._owner_liveness)
 
+    def _require_live_source_locked(
+        self,
+        reservation: ExactReservation,
+        context: str,
+    ) -> None:
+        """Validate the shared live source invariant while its stream lock is held."""
+
+        stream = reservation._stream
+        if stream._reservations.get(reservation._token) is not reservation:
+            raise ReservationStateError(f"{context} reservation is not registered")
+        if not self._source_consumer.matches(reservation._consumer_owner):
+            raise ReservationStateError(f"{context} lost its source consumer")
+        if reservation._state is not ReservationState.ACTIVE:
+            raise ReservationStateError(f"{context} source is not ACTIVE")
+        if stream._terminal_error is not None or stream._closed:
+            raise ReservationStateError(f"{context} source is no longer live")
+
     def _claim_binding(self, owner: object) -> None:
         """Consume this process-local proof for exactly one enclosing owner."""
 
@@ -904,14 +921,7 @@ class ExactConsumerReadiness:
             if self._binding_owner is not None:
                 raise ReservationStateError("exact readiness was already bound")
             reservation = self._source_reservation
-            if stream._reservations.get(reservation._token) is not reservation:
-                raise ReservationStateError("exact readiness source is not registered")
-            if not self._source_consumer.matches(reservation._consumer_owner):
-                raise ReservationStateError("exact readiness lost its source consumer")
-            if reservation._state is not ReservationState.ACTIVE:
-                raise ReservationStateError("exact readiness source is not ACTIVE")
-            if stream._terminal_error is not None or stream._closed:
-                raise ReservationStateError("exact readiness source is no longer live")
+            self._require_live_source_locked(reservation, "exact readiness")
             self._validate_terminal_sink()
             object.__setattr__(self, "_binding_owner", _ObjectReference(owner))
 
@@ -939,14 +949,7 @@ class ExactConsumerReadiness:
         expected_total = _positive_int(total_events, "total_events")
         stream = reservation._stream
         with stream._condition:
-            if stream._reservations.get(reservation._token) is not reservation:
-                raise ReservationStateError("exact readiness reservation is not registered")
-            if not self._source_consumer.matches(reservation._consumer_owner):
-                raise ReservationStateError("exact readiness lost its source consumer")
-            if reservation._state is not ReservationState.ACTIVE:
-                raise ReservationStateError("exact readiness source is not ACTIVE")
-            if stream._terminal_error is not None or stream._closed:
-                raise ReservationStateError("exact readiness source is no longer live")
+            self._require_live_source_locked(reservation, "exact readiness")
             if reservation.trace_binding != trace_binding:
                 raise ReservationStateError("exact readiness trace binding differs")
             if reservation.end_sequence - reservation.start_sequence != expected_total:
@@ -1004,22 +1007,7 @@ class ExactConsumerReadiness:
                 "downstream readiness belongs to another output stream"
             )
         with stream._condition:
-            if stream._reservations.get(reservation._token) is not reservation:
-                raise ReservationStateError(
-                    "downstream readiness reservation is not registered"
-                )
-            if not self._source_consumer.matches(reservation._consumer_owner):
-                raise ReservationStateError(
-                    "downstream readiness lost its immediate source consumer"
-                )
-            if reservation._state is not ReservationState.ACTIVE:
-                raise ReservationStateError(
-                    "downstream readiness source is not ACTIVE"
-                )
-            if stream._terminal_error is not None or stream._closed:
-                raise ReservationStateError(
-                    "downstream readiness source is no longer live"
-                )
+            self._require_live_source_locked(reservation, "downstream readiness")
             if reservation.trace_binding != trace_binding:
                 raise ReservationStateError(
                     "downstream readiness trace binding differs from output producer"
@@ -1741,7 +1729,6 @@ class AcquisitionStream(Generic[PayloadT]):
                     "the generation is permanently invalid"
                 )
                 self._terminal_error = overrun
-                self._closed = True
                 for reservation in self._reservations.values():
                     if reservation._state in (
                         ReservationState.RESERVED,
@@ -1749,9 +1736,7 @@ class AcquisitionStream(Generic[PayloadT]):
                         ReservationState.DRAINING,
                     ):
                         reservation._state = ReservationState.FAILED
-                for monitor in tuple(self._monitors):
-                    monitor._source_ended(overrun)
-                self._condition.notify_all()
+                self._close_generation_locked(overrun)
                 raise overrun from error
             stored = _Stored(envelope, size)
             self._records[sequence] = stored
@@ -1771,6 +1756,14 @@ class AcquisitionStream(Generic[PayloadT]):
                 monitor._offer(stored)
             self._condition.notify_all()
         return envelope
+
+    def _close_generation_locked(self, error: StreamError | None) -> None:
+        """Publish one terminal state to every monitor while the stream lock is held."""
+
+        self._closed = True
+        for monitor in tuple(self._monitors):
+            monitor._source_ended(error)
+        self._condition.notify_all()
 
     def _finish(self, producer: AcquisitionProducer[PayloadT]) -> EndOfStream:
         with self._condition:
@@ -1801,10 +1794,7 @@ class AcquisitionStream(Generic[PayloadT]):
                 owner=self,
                 nonce=nonce,
             )
-            self._closed = True
-            for monitor in tuple(self._monitors):
-                monitor._source_ended(None)
-            self._condition.notify_all()
+            self._close_generation_locked(None)
             return self._eos
 
     def _supersede(
@@ -1828,10 +1818,7 @@ class AcquisitionStream(Generic[PayloadT]):
             if self._terminal_error is not None:
                 raise StreamEndedEarly("stream already has a terminal failure")
             self._terminal_error = SchemaChanged(self.generation, replacement)
-            self._closed = True
-            for monitor in tuple(self._monitors):
-                monitor._source_ended(self._terminal_error)
-            self._condition.notify_all()
+            self._close_generation_locked(self._terminal_error)
 
     def _fail(
         self,
@@ -1850,10 +1837,7 @@ class AcquisitionStream(Generic[PayloadT]):
                     return
                 raise StreamEndedEarly("stream already has a terminal failure")
             self._terminal_error = error
-            self._closed = True
-            for monitor in tuple(self._monitors):
-                monitor._source_ended(error)
-            self._condition.notify_all()
+            self._close_generation_locked(error)
 
     def _owns_eos(self, eos: EndOfStream) -> bool:
         with self._condition:
@@ -1915,11 +1899,7 @@ class AcquisitionStream(Generic[PayloadT]):
         delivery: Delivery[PayloadT],
         consumer: object,
     ) -> AcquisitionCursor[PayloadT]:
-        registered = self._reservations.get(reservation._token)
-        if registered is not reservation:
-            raise ReservationStateError("exact consumer reservation is not registered")
-        if reservation._consumer_owner is not consumer:
-            raise PermissionError("reservation belongs to another exact consumer")
+        self._require_consumer_locked(reservation, consumer)
         if reservation._state not in (ReservationState.ACTIVE, ReservationState.DRAINING):
             raise ReservationStateError("exact consumer reservation is not active")
         cursor = reservation._cursor
@@ -1986,10 +1966,7 @@ class AcquisitionStream(Generic[PayloadT]):
         eos: EndOfStream,
         consumer: object,
     ) -> None:
-        if self._reservations.get(reservation._token) is not reservation:
-            raise ReservationStateError("exact consumer reservation is not registered")
-        if reservation._consumer_owner is not consumer:
-            raise PermissionError("reservation belongs to another exact consumer")
+        self._require_consumer_locked(reservation, consumer)
         if reservation._state not in (ReservationState.ACTIVE, ReservationState.DRAINING):
             raise ReservationStateError("exact consumer reservation cannot be completed")
         if not self._owns_eos(eos):
@@ -2117,10 +2094,7 @@ class AcquisitionStream(Generic[PayloadT]):
         cancelled: bool = False,
     ) -> None:
         with self._condition:
-            if self._reservations.get(reservation._token) is not reservation:
-                raise ReservationStateError("exact consumer reservation is not registered")
-            if reservation._consumer_owner is not consumer:
-                raise PermissionError("reservation belongs to another exact consumer")
+            self._require_consumer_locked(reservation, consumer)
             if reservation._state is ReservationState.COMPLETED:
                 raise ReservationStateError("completed reservation cannot be aborted")
             commit()
@@ -2133,6 +2107,18 @@ class AcquisitionStream(Generic[PayloadT]):
                 )
             self._trim_locked()
             self._condition.notify_all()
+
+    def _require_consumer_locked(
+        self,
+        reservation: ExactReservation[PayloadT],
+        consumer: object,
+    ) -> None:
+        """Validate the shared registered-consumer invariant under the stream lock."""
+
+        if self._reservations.get(reservation._token) is not reservation:
+            raise ReservationStateError("exact consumer reservation is not registered")
+        if reservation._consumer_owner is not consumer:
+            raise PermissionError("reservation belongs to another exact consumer")
 
     def _ack(self, token: object, sequence: int) -> None:
         try:
