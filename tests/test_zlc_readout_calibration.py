@@ -411,7 +411,7 @@ def test_site_map_and_models_are_intrinsically_immutable_and_uniform_stores_one_
     assert uniform_spec.uniform_kernel is uniform.kernel
 
 
-def test_feature_spec_fingerprint_is_canonical_and_rejects_another_models_math():
+def test_feature_spec_fingerprint_is_canonical_and_distinguishes_model_math():
     contract, site_map, quality, boxes = _contracts()
     selected_model = _models(contract, site_map, quality, boxes)[0]
     bound_spec = bind_readout_feature_spec(selected_model, site_map)
@@ -438,9 +438,8 @@ def test_feature_spec_fingerprint_is_canonical_and_rejects_another_models_math()
     with pytest.raises(ValueError, match="does not match the selected model"):
         validate_readout_feature_spec_model(replacement_spec, selected_model)
 
-    object.__setattr__(constructed_spec, "box_reducer", BoxReducer.MEAN)
-    with pytest.raises(ValueError, match="changed after construction"):
-        _ = constructed_spec.fingerprint
+    with pytest.raises(AttributeError):
+        constructed_spec.box_reducer = BoxReducer.MEAN
 
 
 def test_box_application_propagates_site_and_nonfinite_validity_without_dark_coercion():
@@ -1297,15 +1296,21 @@ def test_direct_decode_site_budget_rejects_before_ndarray_materialization(
     assert materializations == 0
 
 
-def test_artifact_is_unhashable_and_fingerprint_rechecks_current_content():
+def test_artifact_is_unhashable_and_fingerprint_is_bound_once(monkeypatch):
     artifact = _artifact()
     fingerprint = artifact.fingerprint
     with pytest.raises(TypeError):
         hash(artifact)
+
+    import zlc_neutral_atom.readout.calibration as calibration
+
+    def unexpected_digest(_value):
+        raise AssertionError("fingerprint access recalculated canonical content")
+
+    monkeypatch.setattr(calibration, "canonical_digest", unexpected_digest)
     assert artifact.fingerprint == fingerprint
-    object.__setattr__(artifact, "default_model_kind", None)
-    with pytest.raises(ValueError, match="changed after construction"):
-        _ = artifact.fingerprint
+    with pytest.raises(AttributeError):
+        artifact.default_model_kind = None
 
 
 def test_all_persistent_values_have_strict_current_canonical_codecs():

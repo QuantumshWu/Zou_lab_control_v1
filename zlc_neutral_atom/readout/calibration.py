@@ -919,10 +919,7 @@ class ReadoutFeatureSpec:
     def fingerprint(self) -> str:
         """Canonical identity of every field that changes extracted signals."""
 
-        current = canonical_digest(_readout_feature_spec_to_tree(self))
-        if current != self._fingerprint:
-            raise ValueError("readout feature spec changed after construction")
-        return current
+        return self._fingerprint
 
 
 def _readout_feature_spec_to_tree(spec: ReadoutFeatureSpec) -> dict[str, object]:
@@ -1229,12 +1226,7 @@ class CalibrationArtifact:
 
     @property
     def fingerprint(self) -> str:
-        from .calibration_codec import calibration_artifact_to_tree
-
-        current = canonical_digest(calibration_artifact_to_tree(self))
-        if current != self._fingerprint:
-            raise ValueError("CalibrationArtifact changed after construction")
-        return current
+        return self._fingerprint
 
     def select_model(
         self,

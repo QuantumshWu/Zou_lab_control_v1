@@ -658,39 +658,21 @@ def test_bind_requires_admitted_calibration_and_freezes_default_model(trusted_ca
         )
 
 
-def test_admitted_calibration_rejects_nested_model_mutation(trusted_calibration):
+def test_admitted_calibration_model_arrays_are_intrinsically_immutable(
+    trusted_calibration,
+):
     admission = trusted_calibration.calibration_repository.admit(
         trusted_calibration.calibration_ref,
         trusted_calibration.capture_repository,
     )
     artifact = admission.artifact
-    original_models = artifact.models
     model = artifact.select_model(kind=ReadoutModelKind.BOX)
-    thresholds = model.header.thresholds.copy()
-    thresholds[0] += 1.0
-    forged_model = replace(
-        model,
-        header=replace(model.header, thresholds=thresholds),
-    )
-    object.__setattr__(
-        artifact,
-        "models",
-        tuple(
-            forged_model if item.kind is ReadoutModelKind.BOX else item
-            for item in original_models
-        ),
-    )
-
-    with pytest.raises(ValueError, match="changed after construction"):
-        _ = artifact.fingerprint
-    with pytest.raises(PermissionError, match="authority is invalid"):
-        OccupancyStreamProcessorSpec(
-            calibration=admission,
-            readout_binding=ReadoutBindingKey("readout"),
-            model_kind=ReadoutModelKind.BOX,
-            output_stream_id=StreamId("tampered-calibration"),
-            output_source_id="tampered-calibration",
-        )
+    thresholds = model.header.thresholds
+    with pytest.raises(ValueError):
+        thresholds.setflags(write=True)
+    with pytest.raises(ValueError):
+        thresholds[0] += 1.0
+    assert admission.artifact_fingerprint == artifact.fingerprint
 
 
 def test_calibration_memory_owner_counts_every_unique_array(trusted_calibration):
