@@ -205,10 +205,43 @@ def display_axis_indices(
     return tuple(indices)
 
 
-def _display_axis_cardinality(axis, selections) -> int:
-    """Return the visible cardinality after one optional display selection."""
+def _first_visible_point_tuple(
+    schema: DatasetSchema,
+    allowed_indices,
+    fixed_indices=None,
+) -> tuple[int, ...] | None:
+    """Return one physically present point tuple inside the visible selections."""
 
-    return len(display_axis_indices(axis, selections))
+    fixed_indices = {} if fixed_indices is None else fixed_indices
+    point_axes = schema.point_axes
+    if not point_axes:
+        return ()
+    allowed_membership = {}
+    for axis in point_axes:
+        indices = allowed_indices[axis.axis_id]
+        allowed_membership[axis.axis_id] = (
+            indices if isinstance(indices, range) else frozenset(indices)
+        )
+    layout = schema.point_layout
+    if layout.storage_to_multi is None:
+        candidate = tuple(
+            fixed_indices.get(axis.axis_id, allowed_indices[axis.axis_id][0])
+            for axis in point_axes
+        )
+        if all(
+            index in allowed_membership[axis.axis_id]
+            for axis, index in zip(point_axes, candidate)
+        ):
+            return candidate
+        return None
+    for candidate in layout.storage_to_multi:
+        if all(
+            index in allowed_membership[axis.axis_id]
+            and fixed_indices.get(axis.axis_id, index) == index
+            for axis, index in zip(point_axes, candidate)
+        ):
+            return candidate
+    return None
 
 
 def _repeat_mode_for_binding(binding) -> RepeatViewMode:
@@ -283,6 +316,20 @@ def validate_view_spec(
         axis.axis_id: display_axis_indices(axis, spec.display_selections)
         for axis in axes
     }
+    fixed_indices = {
+        binding.axis_id: binding.selector.index
+        for binding in spec.axis_bindings
+        if isinstance(binding.selector, FixedIndex)
+    }
+    for axis_id, index in fixed_indices.items():
+        if index not in allowed_indices[axis_id]:
+            raise IndexError(
+                f"selector index is outside the display selection on axis {axis_id}"
+            )
+    if _first_visible_point_tuple(schema, allowed_indices, fixed_indices) is None:
+        raise ValueError(
+            "point selections and fixed selectors do not identify a physical point"
+        )
     effective_cardinality = {
         axis_id: len(indices) for axis_id, indices in allowed_indices.items()
     }
@@ -305,7 +352,6 @@ def validate_view_spec(
     if spec.intent is not ViewIntent.HISTOGRAM and AxisViewRole.SAMPLE in roles:
         raise ValueError("SAMPLE axes are valid only for HISTOGRAM")
 
-    latest_count = 0
     batch_size = 1
     facet_size = 1
     for binding in spec.axis_bindings:
@@ -317,13 +363,11 @@ def validate_view_spec(
                 raise ValueError(
                     f"repeat mode {repeat_mode.value} is not allowed by this ViewContract"
                 )
-        if isinstance(binding.selector, FixedIndex):
-            if binding.selector.index not in allowed_indices[axis.axis_id]:
-                raise IndexError(
-                    f"selector index is outside the display selection on axis {axis.axis_id}"
-                )
         if isinstance(binding.selector, LatestNonempty):
-            latest_count += 1
+            if axis.axis_id != schema.repeat_axis.axis_id:
+                raise ValueError(
+                    "LatestNonempty is valid only for the logical repeat axis"
+                )
         if binding.role is AxisViewRole.REDUCED:
             assert binding.reduction is not None
             if axis.role not in contract.reducible_axis_roles:
@@ -361,8 +405,6 @@ def validate_view_spec(
     }
     if len(reduction_methods) > 1:
         raise ValueError("joint display reductions must use one common method")
-    if latest_count > 1:
-        raise ValueError("baseline ViewSpec permits only one global LatestNonempty selector")
     if batch_size > contract.maximum_batch_series:
         raise ValueError(
             f"batch product {batch_size} exceeds contract limit {contract.maximum_batch_series}"

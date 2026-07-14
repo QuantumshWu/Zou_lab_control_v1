@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 import importlib
+from itertools import permutations, product
 from pathlib import Path
 import time
 import tracemalloc
@@ -14,11 +15,13 @@ import pytest
 
 from zlc_data import (
     COMPONENT,
+    READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
     SITE,
     SPATIAL_X,
     SPATIAL_Y,
+    SPECTRAL,
     AxisId,
     AxisSpec,
     BlockId,
@@ -198,41 +201,296 @@ def test_ambiguous_axis_and_stale_selection_fail_without_tuple_order_guessing():
     assert stale.reasons[0].code == "STALE_SELECTION_AXIS"
 
 
+def test_scalar_selection_resolves_display_axis_ambiguity():
+    repeat = axis("selected-repeat", REPEAT, 1)
+    first = axis("selected-a", SCAN_POINT, 2)
+    second = axis("selected-b", SCAN_POINT, 3)
+    schema = make_block(
+        np.zeros((1, 6)),
+        repeat_axis=repeat,
+        point_axes=(first, second),
+        point_layout=PointLayout.rect_c((2, 3)),
+    ).schema
+    suggestion = suggest_view(
+        schema,
+        ViewIntent.CURVE,
+        Selection.index(first.axis_id, 0),
+    )
+    assert suggestion.status is SuggestionStatus.RESOLVED
+    assert suggestion.spec.binding(first.axis_id).role is AxisViewRole.SELECTED
+    assert suggestion.spec.binding(second.axis_id).role is AxisViewRole.X
+    validate_view_spec(schema, suggestion.spec)
+
+
+def test_automatic_layout_matches_independent_capacity_oracle_and_axis_permutations():
+    repeat = axis("planner-repeat", REPEAT, 1)
+    point = axis("planner-point", SCAN_POINT, 2)
+    layout = PointLayout.rect_c((2,))
+    cardinalities = (2, 3, 8, 17)
+    role_defs = (
+        ("planner-event", READOUT_EVENT),
+        ("planner-site", SITE),
+        ("planner-component", COMPONENT),
+    )
+
+    for sizes in product(cardinalities, repeat=3):
+        feasible = False
+        for assignment in product(("batch", "facet"), repeat=3):
+            batch_product = 1
+            facet_product = 1
+            for size, bucket in zip(sizes, assignment):
+                if bucket == "batch":
+                    batch_product *= size
+                else:
+                    facet_product *= size
+            if batch_product <= 32 and facet_product <= 36:
+                feasible = True
+                break
+
+        expected_mapping = None
+        defined_axes = tuple(
+            axis(name, role, size)
+            for (name, role), size in zip(role_defs, sizes)
+        )
+        for ordered_axes in permutations(defined_axes):
+            schema = DatasetSchema(
+                repeat,
+                (point,),
+                layout,
+                ValueSchema(
+                    tuple(ordered_axes),
+                    ValidityContract.value(),
+                    np.dtype("float64"),
+                ),
+            )
+            suggestion = suggest_view(schema, ViewIntent.CURVE)
+            assert (suggestion.spec is not None) is feasible
+            if not feasible:
+                continue
+            mapping = tuple(
+                sorted(
+                    (
+                        axis_spec.axis_id.value,
+                        suggestion.spec.binding(axis_spec.axis_id).role.value,
+                    )
+                    for axis_spec in defined_axes
+                )
+            )
+            if expected_mapping is None:
+                expected_mapping = mapping
+            else:
+                assert mapping == expected_mapping
+
+    site_a = axis("planner-site-a", SITE, 16)
+    site_b = axis("planner-site-b", SITE, 3)
+    same_role_mappings = set()
+    for ordered_axes in permutations((site_a, site_b)):
+        schema = DatasetSchema(
+            repeat,
+            (point,),
+            layout,
+            ValueSchema(
+                tuple(ordered_axes),
+                ValidityContract.value(),
+                np.dtype("float64"),
+            ),
+        )
+        suggestion = suggest_view(schema, ViewIntent.CURVE)
+        assert suggestion.status is SuggestionStatus.RESOLVED
+        same_role_mappings.add(
+            tuple(
+                (axis_id.value, suggestion.spec.binding(axis_id).role.value)
+                for axis_id in (site_a.axis_id, site_b.axis_id)
+            )
+        )
+    assert len(same_role_mappings) == 1
+
+    repeat_batch = axis("planner-repeat-batch", REPEAT, 16)
+    site = axis("planner-batch-site", SITE, 4)
+    batch_schema = DatasetSchema(
+        repeat_batch,
+        (point,),
+        layout,
+        ValueSchema((site,), ValidityContract.value(), np.dtype("float64")),
+    )
+    batch_suggestion = suggest_view(
+        batch_schema,
+        ViewIntent.CURVE,
+        preferences=ViewPreferences(repeat_mode=RepeatViewMode.BATCH),
+    )
+    assert batch_suggestion.status is SuggestionStatus.RESOLVED
+    assert batch_suggestion.spec.binding(repeat_batch.axis_id).role is AxisViewRole.BATCH
+    assert batch_suggestion.spec.binding(site.axis_id).role is AxisViewRole.FACET
+
+
+def test_slider_bindings_preserve_contract_order_and_repeat_latest():
+    repeat = axis("slider-repeat", REPEAT, 1)
+    point = axis("slider-point", SCAN_POINT, 2)
+    spectral = axis("slider-spectral", SPECTRAL, 3)
+    site = axis("slider-site", SITE, 50)
+    component = axis("slider-component", COMPONENT, 40)
+    y = axis("slider-y", SPATIAL_Y, 2)
+    x = axis("slider-x", SPATIAL_X, 3)
+    image_schema = DatasetSchema(
+        repeat,
+        (point,),
+        PointLayout.rect_c((2,)),
+        ValueSchema(
+            (spectral, site, component, y, x),
+            ValidityContract.value(),
+            np.dtype("uint16"),
+        ),
+    )
+    image_suggestion = suggest_view(
+        image_schema,
+        ViewIntent.IMAGE,
+        Selection.index_range(site.axis_id, 5, 45),
+    )
+    assert image_suggestion.status is SuggestionStatus.RESOLVED
+    for axis_id, expected_index in (
+        (point.axis_id, 0),
+        (spectral.axis_id, 0),
+        (site.axis_id, 5),
+        (component.axis_id, 0),
+    ):
+        binding = image_suggestion.spec.binding(axis_id)
+        assert binding.role is AxisViewRole.SLIDER
+        assert binding.selector == FixedIndex(expected_index)
+
+    rolling_point = axis("rolling-meter-point", SCAN_POINT, 40)
+    meter_schema = DatasetSchema(
+        repeat,
+        (rolling_point,),
+        PointLayout.rect_c((40,)),
+        ValueSchema((), ValidityContract.value(), np.dtype("float64")),
+    )
+    meter_suggestion = suggest_view(meter_schema, ViewIntent.METER)
+    assert meter_suggestion.status is SuggestionStatus.RESOLVED
+    assert meter_suggestion.spec.binding(repeat.axis_id).selector == FixedIndex(0)
+    assert meter_suggestion.spec.binding(rolling_point.axis_id).selector == FixedIndex(0)
+
+    repeated_point = axis(
+        "repeated-meter-point",
+        SCAN_POINT,
+        2,
+        coordinates=(10.0, 20.0),
+    )
+    repeated = axis("repeated-meter-repeat", REPEAT, 2)
+    repeated_block = make_block(
+        np.array([[1.0, 2.0], [3.0, 4.0]]),
+        repeat_axis=repeated,
+        point_axes=(repeated_point,),
+        point_layout=PointLayout.rect_c((2,)),
+    )
+    repeated_suggestion = suggest_view(repeated_block.schema, ViewIntent.METER)
+    assert repeated_suggestion.status is SuggestionStatus.RESOLVED
+    assert isinstance(
+        repeated_suggestion.spec.binding(repeated.axis_id).selector,
+        LatestNonempty,
+    )
+    point_binding = repeated_suggestion.spec.binding(repeated_point.axis_id)
+    assert point_binding.role is AxisViewRole.SLIDER
+    assert point_binding.selector == FixedIndex(0)
+    evaluated = evaluated_data(repeated_block, repeated_suggestion.spec)
+    resolutions = {item.axis_id: item for item in evaluated.layers[0].resolutions}
+    assert resolutions[repeated_point.axis_id].selector == "FIXED_INDEX"
+    assert resolutions[repeated_point.axis_id].index == 0
+    assert resolutions[repeated_point.axis_id].coordinate == 10.0
+    assert resolutions[repeated.axis_id].selector == "LATEST_NONEMPTY"
+    assert resolutions[repeated.axis_id].index == 1
+
+    invalid_latest = replace(
+        repeated_suggestion.spec,
+        axis_bindings=tuple(
+            replace(binding, selector=LatestNonempty())
+            if binding.axis_id == repeated_point.axis_id
+            else binding
+            for binding in repeated_suggestion.spec.axis_bindings
+        ),
+    )
+    with pytest.raises(ValueError, match="logical repeat axis"):
+        validate_view_spec(repeated_block.schema, invalid_latest)
+
+
+def test_sparse_point_sliders_use_one_physical_layout_tuple():
+    repeat = axis("sparse-slider-repeat", REPEAT, 1)
+    scan = axis("sparse-slider-scan", SCAN_POINT, 2)
+    spectral = axis("sparse-slider-spectral", SPECTRAL, 2)
+    y = axis("sparse-slider-y", SPATIAL_Y, 1)
+    x = axis("sparse-slider-x", SPATIAL_X, 1)
+    block = make_block(
+        np.array([[[[7.0]]]]),
+        repeat_axis=repeat,
+        point_axes=(scan, spectral),
+        point_layout=PointLayout.explicit((2, 2), ((0, 1),)),
+        data_axes=(y, x),
+    )
+    suggestion = suggest_view(block.schema, ViewIntent.IMAGE)
+    assert suggestion.status is SuggestionStatus.RESOLVED
+    assert suggestion.spec.binding(scan.axis_id).selector == FixedIndex(0)
+    assert suggestion.spec.binding(spectral.axis_id).selector == FixedIndex(1)
+    evaluated = evaluated_data(block, suggestion.spec)
+    np.testing.assert_array_equal(only_series(evaluated).data.values, [[7.0]])
+    resolutions = {item.axis_id: item for item in evaluated.layers[0].resolutions}
+    assert resolutions[scan.axis_id].index == 0
+    assert resolutions[spectral.axis_id].index == 1
+
+    hole = replace(
+        suggestion.spec,
+        axis_bindings=tuple(
+            replace(binding, selector=FixedIndex(0))
+            if binding.axis_id == spectral.axis_id
+            else binding
+            for binding in suggestion.spec.axis_bindings
+        ),
+    )
+    with pytest.raises(ValueError, match="do not identify a physical point"):
+        validate_view_spec(block.schema, hole)
+
+    empty = suggest_view(
+        block.schema,
+        ViewIntent.IMAGE,
+        Selection.index(spectral.axis_id, 0),
+    )
+    assert empty.status is SuggestionStatus.NEEDS_INPUT
+    assert empty.reasons[0].code == "EMPTY_POINT_SELECTION"
+
+
 def test_view_and_document_codec_are_strict_canonical_and_owner_delegating(
     monkeypatch,
 ):
     fingerprint = "0" * 64
     point_id = AxisId("point")
     repeat_id = AxisId("repeat")
+    roi_id = AxisId("roi-x")
     shot_id = AxisId("shot")
-    site_id = AxisId("site")
-    selection = Selection.index(site_id, 2)
+    selection = Selection.index(roi_id, 2)
     view = ViewSpec(
         fingerprint,
         ViewIntent.CURVE,
         (
             AxisViewBinding(
-                site_id,
-                AxisViewRole.SELECTED,
-                selector=FixedIndex(2),
+                roi_id,
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
             ),
             AxisViewBinding(point_id, AxisViewRole.X),
             AxisViewBinding(
                 shot_id,
                 AxisViewRole.SLIDER,
-                selector=LatestNonempty(),
+                selector=FixedIndex(1),
             ),
             AxisViewBinding(
                 repeat_id,
-                AxisViewRole.REDUCED,
-                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+                AxisViewRole.SELECTED,
+                selector=LatestNonempty(),
             ),
         ),
         (selection,),
     )
     owner_selection_tree = {
         "schema": "zlc_data.Selection",
-        "terms": [{"kind": "INDEX", "axis_id": "site", "index": 2}],
+        "terms": [{"kind": "INDEX", "axis_id": "roi-x", "index": 2}],
     }
     expected_view_tree = {
         "schema": "zlc_frontend.ViewSpec",
@@ -242,6 +500,12 @@ def test_view_and_document_codec_are_strict_canonical_and_owner_delegating(
             {"axis_id": "point", "role": "X", "selector": None, "reduction": None},
             {
                 "axis_id": "repeat",
+                "role": "SELECTED",
+                "selector": {"kind": "LATEST_NONEMPTY"},
+                "reduction": None,
+            },
+            {
+                "axis_id": "roi-x",
                 "role": "REDUCED",
                 "selector": None,
                 "reduction": {"method": "MEAN"},
@@ -249,13 +513,7 @@ def test_view_and_document_codec_are_strict_canonical_and_owner_delegating(
             {
                 "axis_id": "shot",
                 "role": "SLIDER",
-                "selector": {"kind": "LATEST_NONEMPTY"},
-                "reduction": None,
-            },
-            {
-                "axis_id": "site",
-                "role": "SELECTED",
-                "selector": {"kind": "FIXED_INDEX", "index": 2},
+                "selector": {"kind": "FIXED_INDEX", "index": 1},
                 "reduction": None,
             },
         ],
@@ -277,7 +535,7 @@ def test_view_and_document_codec_are_strict_canonical_and_owner_delegating(
             FigureLayer("layer-z", dataset_z, view),
             FigureLayer("layer-a", dataset_a, view),
         ),
-        (FigureSelection("site-choice", dataset_z, selection),),
+        (FigureSelection("roi-choice", dataset_z, selection),),
     )
     expected_document_tree = {
         "schema": "zlc_frontend.FigureDocument",
@@ -301,7 +559,7 @@ def test_view_and_document_codec_are_strict_canonical_and_owner_delegating(
         ],
         "selections": [
             {
-                "selection_id": "site-choice",
+                "selection_id": "roi-choice",
                 "dataset_id": "dataset-z",
                 "selection": owner_selection_tree,
             }
@@ -399,7 +657,7 @@ def test_explicit_sparse_image_preserves_hole_as_invalid():
     np.testing.assert_array_equal(image.validity, [[True, True], [True, False]])
 
 
-def test_roi_selection_precedes_joint_repeat_and_spatial_reduction():
+def test_roi_selection_does_not_invent_a_reducer_but_explicit_reduction_evaluates():
     frame = CoordinateFrameId("camera")
     repeat = axis("repeat", REPEAT, 2)
     point = axis("detuning", SCAN_POINT, 3)
@@ -427,12 +685,33 @@ def test_roi_selection_precedes_joint_repeat_and_spatial_reduction():
         coordinate_frame=frame,
     )
     suggestion = suggest_view(block.schema, ViewIntent.CURVE, roi)
-    assert suggestion.status is SuggestionStatus.REVIEW_REQUIRED
-    assert suggestion.spec.display_selections == (roi,)
-    roles = {binding.axis_id: binding.role for binding in suggestion.spec.axis_bindings}
-    assert roles[x.axis_id] is AxisViewRole.REDUCED
-    assert roles[y.axis_id] is AxisViewRole.REDUCED
-    series = only_series(evaluated_data(block, suggestion.spec))
+    assert suggestion.status is SuggestionStatus.NEEDS_INPUT
+    assert suggestion.reasons[0].code == "UNRESOLVED_INFORMATION_AXIS"
+    explicit_view = ViewSpec(
+        block.schema.fingerprint,
+        ViewIntent.CURVE,
+        (
+            AxisViewBinding(point.axis_id, AxisViewRole.X),
+            AxisViewBinding(
+                repeat.axis_id,
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+            ),
+            AxisViewBinding(
+                x.axis_id,
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+            ),
+            AxisViewBinding(
+                y.axis_id,
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+            ),
+        ),
+        (roi,),
+    )
+    validate_view_spec(block.schema, explicit_view)
+    series = only_series(evaluated_data(block, explicit_view))
     assert isinstance(series.data, EvaluatedCurve)
     expected = []
     for p in range(3):
@@ -582,9 +861,32 @@ def test_validate_rejects_mixed_joint_reducers_and_outside_fixed_selection():
         ViewPreferences(repeat_mode=RepeatViewMode.SUM),
     )
     assert mixed_suggestion.status is SuggestionStatus.NEEDS_INPUT
-    assert mixed_suggestion.reasons[0].code == "CONTRACT_REJECTED"
+    assert mixed_suggestion.reasons[0].code == "UNRESOLVED_INFORMATION_AXIS"
 
-    mean_spec = suggest_view(block.schema, ViewIntent.CURVE, roi).spec
+    mean_spec = ViewSpec(
+        block.schema.fingerprint,
+        ViewIntent.CURVE,
+        (
+            AxisViewBinding(point.axis_id, AxisViewRole.X),
+            AxisViewBinding(
+                repeat.axis_id,
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+            ),
+            AxisViewBinding(
+                x.axis_id,
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+            ),
+            AxisViewBinding(
+                y.axis_id,
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+            ),
+        ),
+        (roi,),
+    )
+    validate_view_spec(block.schema, mean_spec)
     mixed_spec = replace(
         mean_spec,
         axis_bindings=tuple(
@@ -938,7 +1240,7 @@ def test_multi_repeat_integer_mean_remains_canonical_and_fractional():
     assert series.reductions[0].maximum_contributors == 2
 
 
-def test_latest_point_admission_counts_visible_frame_not_rolling_history():
+def test_explicit_current_point_admission_counts_visible_frame_not_rolling_history():
     repeat = axis("rolling-repeat", REPEAT, 1)
     point = axis("rolling-point", SCAN_POINT, 8)
     y = axis("rolling-y", SPATIAL_Y, 64)
@@ -953,13 +1255,18 @@ def test_latest_point_admission_counts_visible_frame_not_rolling_history():
         point_layout=PointLayout.rect_c((point.size,)),
         data_axes=(y, x),
     )
-    view = suggest_view(block.schema, ViewIntent.IMAGE).spec
+    view = suggest_view(
+        block.schema,
+        ViewIntent.IMAGE,
+        Selection.index(point.axis_id, 7),
+    ).spec
     doc, datasets = document(block, view)
     evaluated = FigureEvaluator(
         FigureEvaluationPolicy(max_reduction_contributions=4_100)
     ).evaluate(doc, datasets)
     layer = evaluated.layers[0]
     assert layer.resolutions[0].axis_id == point.axis_id
+    assert layer.resolutions[0].selector == "FIXED_INDEX"
     assert layer.resolutions[0].index == 7
     np.testing.assert_array_equal(only_series(evaluated).data.values, 7.0)
 
@@ -1057,7 +1364,27 @@ def test_ragged_explicit_reduction_never_pads_to_groups_times_max(monkeypatch):
     )
     selection = Selection.index_range(reduced.axis_id, 0, reduced.size)
     suggestion = suggest_view(block.schema, ViewIntent.CURVE, selection)
-    assert suggestion.status is SuggestionStatus.REVIEW_REQUIRED
+    assert suggestion.status is SuggestionStatus.NEEDS_INPUT
+    assert suggestion.reasons[0].code == "UNRESOLVED_INFORMATION_AXIS"
+    explicit_view = ViewSpec(
+        block.schema.fingerprint,
+        ViewIntent.CURVE,
+        (
+            AxisViewBinding(x.axis_id, AxisViewRole.X),
+            AxisViewBinding(
+                repeat.axis_id,
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+            ),
+            AxisViewBinding(
+                reduced.axis_id,
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+            ),
+        ),
+        (selection,),
+    )
+    validate_view_spec(block.schema, explicit_view)
     evaluator_module = importlib.import_module("zlc_frontend.figure.evaluate")
     original_zeros = evaluator_module.np.zeros
 
@@ -1068,7 +1395,7 @@ def test_ragged_explicit_reduction_never_pads_to_groups_times_max(monkeypatch):
         return original_zeros(shape, *args, **kwargs)
 
     monkeypatch.setattr(evaluator_module.np, "zeros", guarded_zeros)
-    curve = only_series(evaluated_data(block, suggestion.spec)).data
+    curve = only_series(evaluated_data(block, explicit_view)).data
     assert curve.values[0] == pytest.approx(np.arange(4096).mean())
     np.testing.assert_array_equal(curve.values[1:], np.arange(1, 257) + 10_000)
     np.testing.assert_array_equal(curve.validity, np.ones(257, dtype=bool))
@@ -1119,7 +1446,7 @@ def test_evaluated_meter_rejects_non_numeric_public_values():
         EvaluatedMeter([1.25], True)
 
 
-def test_meter_latest_with_point_facets_yields_typed_scalars():
+def test_meter_latest_with_explicit_point_facets_yields_typed_scalars():
     repeat = axis("repeat", REPEAT, 2)
     point = axis("point", SCAN_POINT, 2)
     block = make_block(
@@ -1128,7 +1455,11 @@ def test_meter_latest_with_point_facets_yields_typed_scalars():
         point_axes=(point,),
         point_layout=PointLayout.rect_c((2,)),
     )
-    suggestion = suggest_view(block.schema, ViewIntent.METER)
+    suggestion = suggest_view(
+        block.schema,
+        ViewIntent.METER,
+        preferences=ViewPreferences(facet_axis_ids=(point.axis_id,)),
+    )
     assert suggestion.status is SuggestionStatus.RESOLVED
     evaluated = evaluated_data(block, suggestion.spec)
     assert len(evaluated.layers[0].cells) == 2

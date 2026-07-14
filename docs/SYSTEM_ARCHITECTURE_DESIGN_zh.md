@@ -1461,13 +1461,13 @@ EvaluatedFigureData:               # evaluator 的 immutable transient DTO，不
 
 `zlc_data` 对外只有 `DataTransformSpec` 与 `CommittedTransform` 两种 transform 合同；不拥有 x/image/sample/facet、latest/navigation 等呈现语义，也不提供无上下文的 `default_projection(schema)`。同一个 schema 在 image、curve、histogram、meter 和 fit 中需要不同处理；把自动决策放进 data kernel 会让权威路径误用显示启发式。neutral_atom 只依赖 zlc_data，因此既不能调用显示层 auto policy，也不会看到 ViewSpec。
 
-ViewSpec 是 figure 唯一持久 presentation 类型；它不保存 authority seed、CommittedTransform、FitSpec 或 ScanOutputContract。FigureEvaluator 根据当前 immutable DataBlock revision/validity 和 Selection snapshot，把 ViewSpec 直接求值为 `EvaluatedFigureData`。latest/navigation 每次解析都有明确 input revision/coordinate record；renderer DTO 不能进入 zlc_data authority path。`ViewSuggestion` 只是 ViewSpec 是否能被安全构造的解释性返回，不复制 axis bucket，不成为第四层 projection，也不进入 artifact。
+ViewSpec 是 figure 唯一持久 presentation 类型；它不保存 authority seed、CommittedTransform、FitSpec 或 ScanOutputContract。FigureEvaluator 根据当前 immutable DataBlock revision/validity 和 Selection snapshot，把 ViewSpec 直接求值为 `EvaluatedFigureData`。每个 `FixedIndex` 与 `LatestNonempty` navigation 都必须在结果中留下 AxisId、实际 index、coordinate 和 input revision resolution record；renderer 不得只看 ViewSpec 猜“当前切片”。renderer DTO 不能进入 zlc_data authority path。`ViewSuggestion` 只是 ViewSpec 是否能被安全构造的解释性返回，不复制 axis bucket，不成为第四层 projection，也不进入 artifact。
 
 auto slice、latest、repeat mean 和鼠标刚画出的 ROI 都是 display state/candidate。用户从 Fit/Scan 动作接受某个候选时，Workbench 根据当前 Selection snapshot 在对应 FitSpec/ScanOutputContract draft 中重新构造 DataTransformSpec，再交给 commit_transform；不存在把 ViewSpec 的 axis binding/display operation cast、unwrap 或复制成权威 transform 的通用函数。已保存的权威复用项是独立 AnalysisPreset/FitSpec/ScanOutputContract，不藏在 workspace ViewSpec 中。
 
-`suggest_view` 返回轻量 `ViewSuggestion` 供 UI 显示。算法只做三件事：优先把信息轴放入 ViewContract 允许的 display/facet/batch；其余轴给有坐标标签的 slider/select；只有 ViewContract 明确允许的 display reduction 才自动加入并始终显示标签。仍需压掉有物理信息的轴而没有唯一规则时返回 `NEEDS_INPUT`。baseline 因而只有一个可保存 ViewSpec、一个权威 CommittedTransform、一个瞬时 suggestion 和一个 renderer DTO；没有可互相转换的五层 projection 状态机。
+`suggest_view` 返回轻量 `ViewSuggestion` 供 UI 显示。算法优先把信息轴放入 ViewContract 允许的 display/facet/batch，其余轴给有坐标标签的 slider/select；batch/facet 联合容量由一个有界、确定性的局部规划器求解，不能按 dataset tuple 顺序贪心。Selection 只限定允许的 index/coordinate 集合，本身不表示 mean、sum、integrate 或 count；除 repeat 的 ViewContract policy 外，suggestion 不从“框了一个范围”发明 reducer。仍需压掉有物理信息的轴而没有唯一规则时返回 `NEEDS_INPUT`。baseline 因而只有一个可保存 ViewSpec、一个权威 CommittedTransform、一个瞬时 suggestion 和一个 renderer DTO；没有可互相转换的五层 projection 状态机。
 
-LatestValid 必须在应用显式 display selection 后解析为唯一、可记录的 axis index。若剩余多个 cell 的“最新 valid repeat”不同，ViewContract 必须明确声明 per-cell gather 及其输出 schema/标签；否则返回 NEEDS_INPUT 或改用声明过的 reduction，不能拼出每点来自不同 repeat 的曲线却标成同一次 shot。
+`LatestNonempty` 只表示“显式 display selection 内最大的非空**逻辑 repeat index**”，不表示最后发布事件、硬件时序或 provenance current cell；它只能绑定 repeat AxisId。若剩余多个 cell 的最大 valid repeat 不同，ViewContract 也不能做 per-cell latest gather 后拼出一条伪装成同一次 shot 的曲线。ROLLING_MONITOR 可按同一 cell address 覆盖，事件顺序甚至可能是 `point 0 -> 1 -> 0` 或 `repeat 0 -> 1 -> 0`，所以 Workbench rolling controller 必须从 MonitorUpdate/EventRef/DatasetProgress 的当前事实生成覆盖 repeat 与全部 point axes 的完整显式 Selection；figure 层禁止从 axis role、最大 nonempty index 或 PointLayout 猜“最后发布”。
 
 ### 11.2 三层 Projection 语义
 
@@ -1522,23 +1522,22 @@ ViewSuggestion:
   alternatives
 ```
 
-- `RESOLVED`：由 ViewContract 和 axis role 唯一决定，所有有损步骤都有唯一、明确的显示语义；
-- `REVIEW_REQUIRED`：可以安全预览，但包含需要用户看到并接受的临时 select/reduce；
+- `RESOLVED`：由 ViewContract、axis role 与明确 Selection 唯一决定；可包含始终显示实际 coordinate、可编辑且永不进入权威路径的 presentation-only slider；
+- `REVIEW_REQUIRED`：可以安全预览，但包含用户明确提出、必须持续突出显示的临时有损 reducer/sample policy；普通可见 FixedIndex navigation 本身不触发弹窗；
 - `NEEDS_INPUT`：无法在不压掉有物理信息的 axis 时满足该 ViewIntent，此时 `spec=None`。它可以显示占位说明或另一种无损视图，但不能进入权威路径。
 
-每个输入 AxisId 必须恰好出现在 ViewSpec 的一条 AxisViewBinding 中；UI 没有同时画出的轴也必须是 slider/facet/batch/selected/reduced 之一，不能靠独立 `hidden_axes` 字段成为丢轴通道。summary、displayed/reduced axes 和 lossy steps 全部从 ViewSpec 派生，ViewSuggestion 不保存第二份。若同一优先级有多个同 role axis 且合同不能同时容纳，返回 alternatives/`NEEDS_INPUT`，不能按 tuple 顺序选第一个。
+每个输入 AxisId 必须恰好出现在 ViewSpec 的一条 AxisViewBinding 中；UI 没有同时画出的轴也必须是 slider/facet/batch/selected/reduced 之一，不能靠独立 `hidden_axes` 字段成为丢轴通道。summary、displayed/reduced axes 和 lossy steps 全部从 ViewSpec 派生，ViewSuggestion 不保存第二份。选择 x/image display axis 是物理语义决定：同一优先级有多个同 role 候选且 Selection 未消歧时必须返回 alternatives/`NEEDS_INPUT`。而把其余轴放入 batch/facet/slider 是不丢轴的布局问题，可按 ViewContract role priority + AxisId 稳定求一个满足容量的方案；AxisId 只作相同语义方案的确定性 tie-break，绝不推断物理角色。对 point axes，所有自动 FixedIndex 必须来自同一条实际存在且满足 Selection 的 PointLayout storage row；逐轴拿第一个 index 拼出 EXPLICIT layout 中不存在的 tuple，或 Selection 覆盖不到任何物理 row，都必须 fail closed。
 
 自动选择使用稳定优先级：
 
-1. 把 axis 保留为该视图的 display axis；
-2. 保留为 batch axis；
-3. 在 ViewContract 容量内 facet；
-4. 使用已有、带坐标标签的 Selection；
-5. 使用 ViewContract 明确允许的 display-only reduction；
-6. 仅为预览建立可见的 slider/current-slice；
-7. 返回 `NEEDS_INPUT`。
+1. 规范化 Selection，一次解析每根轴的 allowed indices，并确认 point-axis 限制至少覆盖一条真实 PointLayout row；Selection 不产生 reducer；
+2. 选择该视图的 display axis；真实 display-axis 歧义要求最小用户输入，显式 scalar Selection 可消除相应候选；
+3. 按 ViewContract 绑定 repeat policy，再冻结用户显式 batch/facet/sample preference；
+4. 对剩余信息轴按合同声明的 automatic-role 顺序求满足 batch/facet product 上限的方案；排序只用 role priority + AxisId，不用 ndarray/data-axis tuple 顺序；
+5. SLIDER 在 display 层可初始化为 allowed set 中一个带标签的 FixedIndex；point-axis FixedIndex 必须共同取自第 1 步同一条物理 row；
+6. 无合法布局或仍需未声明 reduction 时返回 `NEEDS_INPUT`。
 
-禁止以 `index=0`、flatten、全局 `nanmean` 作为兜底。临时 current-slice 必须显示实际坐标和“仅预览”，也不能被静默升级为 committed input。
+禁止在权威路径或无标签显示中以 `index=0`、flatten、全局 `nanmean` 作为降维兜底。presentation-only slider 可以从**第一个 allowed index**初始化（Selection 后不一定是原始 index 0），但 panel 必须显示 axis name、实际 coordinate 与“仅预览”，允许立即编辑，evaluator 必须输出对应 resolution record，并且它不能被静默升级为 committed input。rolling 的 current cell 不是这种初始化值，必须由 runtime provenance 驱动的完整显式 Selection 给出。
 
 ### 11.4 role 与 ViewIntent 的组合规则
 
@@ -1546,10 +1545,10 @@ role 只说明 axis 是什么；ViewIntent 说明用户现在想怎么看。两�
 
 | axis role | IMAGE | CURVE | HISTOGRAM | METER |
 |---|---|---|---|---|
-| repeat | mean 或 latest，由 image contract 声明并标注 | mean/error-band 或 batch，由 curve contract 声明 | pool 为样本，绝不先 mean | latest 或声明的统计量 |
-| scan-point | slider/current point 或 facet | 优先作为 x | batch/facet | 不能静默 reduce |
+| repeat | mean 或最大非空逻辑 repeat，由 image contract 声明并标注 | mean/error-band 或 batch，由 curve contract 声明 | pool 为样本，绝不先 mean | 最大非空逻辑 repeat 或声明的统计量；不代表最后发布事件 |
+| scan-point | 带实际坐标的 fixed slider 或 facet；rolling current 由显式完整 cell Selection 驱动 | 优先作为 x | batch/facet | 带标签 fixed/显式 current Selection；不能静默 reduce |
 | spatial-x/y | 显示轴 | 需要 ROI/Selection，不自动平均 | batch/facet，除非明确 pool sites | 需要 ROI 或物理积分 |
-| spectral | curve x/facet | 优先作为 x | batch/facet | 需要显式 band/integral |
+| spectral | curve x/facet/fixed slider；不能把最大波长索引叫 latest | 优先作为 x | batch/facet | 带标签 fixed；band/integral 必须显式 |
 | site/component | facet/batch/select | facet/batch/select | 默认逐 site；pool 必须显式 | select |
 
 `mean`、`sum`、`integrate` 是不同物理 reduction，不能编码成一个含义模糊的 reducer。通用 `mean/sum` 使用 zlc_data 中封闭、版本化的 reducer 合同，并由用户/analysis spec 显式选择；ROI photon count、相机畸变校正等带设备/物理含义的操作由 neutral 领域 StreamProcessor/Analysis 定义，不能因输入恰好是 image 就由 frontend 自动提出。普通 image 默认只能显示、选择或保留 spatial axes。
@@ -1601,7 +1600,7 @@ commit_transform(schema, authoritative_spec, revision, origin)
 (repeat=32, detuning=21, height=40, width=20)
 ```
 
-- IMAGE：height/width 为显示轴；detuning 是带坐标标签的 slider/current point；repeat 按 IMAGE ViewContract 选择 `mean/32` 或 latest，panel 明示。底层四个 axis 完整保留。
+- IMAGE：height/width 为显示轴；detuning 是带坐标标签的 fixed slider，rolling controller 有 provenance 时可用完整显式 Selection 改到 current cell；repeat 按 IMAGE ViewContract 选择 `mean/32` 或最大非空逻辑 repeat，panel 明示。底层四个 axis 完整保留。
 - CURVE：detuning 作为 x；height/width 不能自动平均。没有 ROI 时返回 `NEEDS_INPUT`，同时继续显示 image 让用户框 ROI；定义 ROI count 后曲线建议成为 `REVIEW_REQUIRED` 或 `RESOLVED`。
 - HISTOGRAM：repeat 作为独立样本 pool；site/spatial 维默认 batch/facet，不把 repeat 先平均，也不默认把所有 site 混成一个分布。
 - Fit authority draft：`suggest_fit_draft` 令 detuning 成为 fit axis；repeat 默认 preserve 为 batch，或预填用户已提交的 repeat reduction；剩余 site/spatial axis 继续成为 batch。每个 batch cell 产生一个 FitResult，组成 FitResultBatch，绝不对剩余轴 `nanmean`。该步骤不是 ViewIntent。
@@ -2597,7 +2596,7 @@ ArtifactDataRef:
 
 LiveDataBlockRef 只在进程内有效，由 neutral runtime broker/snapshot store 持有明确 lifetime，不能被 frontend codec 序列化，也不能出现在 FigureDocument。Workbench LiveFigureBinding 用本地 LiveDatasetBinding 将它映射到 frontend DatasetId；render 时解析为只读 DataBlock snapshot。执行 Save 时必须把用户看到的确切 block revision materialize 到 frontend Figure Repository 的 immutable blob，再让保存后的 FigureArtifact dataset descriptor 指向 frontend-owned ArtifactDataRef。保存期间 live revision 继续变化不影响已冻结 snapshot，也不能偷偷保存“最新”revision；FigureArtifact 不直接嵌入 CaptureArtifactRef/ScanArtifactRef 等 neutral 类型。
 
-FigureArtifact 保存 ViewSpec、当次 EvaluatedFigureData 的 input revision/resolution records、Selection snapshot、layer/model/fit lineage 和所引用 dataset digests；重开默认复现保存时的 concrete selection，用户明确切回 dynamic latest policy 后才重新解析，不进行新的 axis auto 推断。若用户只保存 workspace layout 而不 materialize live data，文件必须明确标为 session-only workspace，并在数据 lifetime 结束后显示 missing binding，不能假装是自包含 FigureArtifact。
+FigureArtifact 保存 ViewSpec、当次 EvaluatedFigureData 的 input revision/resolution records、Selection snapshot、layer/model/fit lineage 和所引用 dataset digests；重开默认复现保存时的 concrete selection。用户明确切回 repeat 的 `LatestNonempty` display policy 后，才重新解析最大非空逻辑 repeat；这仍不等于恢复最后发布事件，也不进行新的 axis auto 推断。若用户只保存 workspace layout 而不 materialize live data，文件必须明确标为 session-only workspace，并在数据 lifetime 结束后显示 missing binding，不能假装是自包含 FigureArtifact。
 
 ### 16.4 当前格式名与重跑策略
 
@@ -2700,10 +2699,12 @@ Data：
 - 每 sample 只发 DatasetProgress/dirty coverage，不把完整 DataBlock/DataPatch fan-out；snapshot 按请求 revision/slice 解析，EOS final freeze 总复制近似 O(final bytes)；
 - 非法隐式 reduce/anonymous flatten 失败；
 - DataTransformSpec 不包含显示 binding，ViewSpec 不可传入 neutral runtime；
-- 同一 schema + ViewIntent + Selection 得到确定性 ViewSuggestion/ViewSpec；
-- suggestion 不读取 values，不按 rank/singleton/axis 顺序猜 role；
+- 同一 schema + ViewIntent + Selection 得到确定性 ViewSuggestion/ViewSpec；只改变等语义 data-axis tuple 排列不改变 AxisId→binding 决策；合同有可行 batch/facet 分配时不能因贪心次序误拒；
+- suggestion 不读取 values，不按 rank/singleton/axis 顺序猜 role；Selection range 不自动变成 reducer；
+- 多 point-axis 的自动 FixedIndex 来自同一个真实 PointLayout storage row；EXPLICIT hole、Selection 后无物理 row、手写/解码得到的不存在 fixed tuple 均失败；
 - suggestion 不修改 DataBlock，所有有损 binding/operation 均可从 ViewSpec 派生并出现在 panel 摘要；
-- latest/navigation binding 每个 input revision 解析为带 coordinate record 的 EvaluatedFigureData，display navigation 不能进入 CommittedTransform；
+- FixedIndex/LatestNonempty navigation 每个 input revision 都解析为带 coordinate record 的 EvaluatedFigureData；LatestNonempty 只允许 repeat 且只表示最大非空逻辑 index；display navigation 不能进入 CommittedTransform；
+- rolling overwrite/wrap 的 current cell 由 EventRef/progress 驱动、覆盖 repeat 与全部 point axes 的显式 Selection 给出；最高 nonempty axis index 不得冒充最后发布事件；
 - `NEEDS_INPUT` 不能转换为 CommittedTransform；
 - CommittedTransform 在 schema fingerprint 变化时失效；
 - ViewSpec display mean/latest 不能被 commit；Fit/Scan draft 不读取任何 ViewSpec 权威字段，并从各自 spec/policy 重派生 reduction/batch/output axes；
@@ -3315,6 +3316,12 @@ TaskConsole current-layout 的 Rule-3 清点以 parent checkpoint `5c54184` 的1
 Figure current codec 的 Rules 1/2/3/5/6 子切片以 parent checkpoint `b8682ed` 的178个领先提交、386个changed files为范围，沿 `ViewSpec/FigureDocument -> primitive tree -> zlc_storage canonical bytes` 及嵌入的 zlc_data Selection owner逐层核对。格式只保留 plain current schema `zlc_frontend.ViewSpec` 与 `zlc_frontend.FigureDocument`；`FigureDocument.revision`是内容revision，不是软件格式改稿号；不存在version、upgrade、legacy reader、alias或compatibility fallback。发现的两类问题是：codec 自建 `_exact`，7个调用点重复`zlc_storage.canonical.exact_mapping`，并在领域值构造器前用13次text和2次integer预校验重复同一leaf invariant；唯一codec测试虽名为owner-delegating，实际 ViewSpec/Document 均没有Selection，只做同一writer/reader round-trip和一个extra-field拒绝，writer/reader同步改字段或绕过Selection owner仍会全绿。整改令codec只拥有wire structure、tag/list dispatch及decode后的typed canonical re-encode检查；map shape/discriminator委托storage owner，AxisId/DatasetId、enum、digest/text/revision/index原值直接交给各自领域构造器，Selection tree双向委托zlc_data owner。re-encode检查保留，因为它拒绝binding/dataset等集合经领域排序规范化前的非canonical typed representation，不是leaf重复验证。
 
 Rule-5 ratchet 改为手写rich primitive-tree oracle：固定两种frontend schema及完整字段，覆盖X/REDUCED/SLIDER/SELECTED、MEAN、FixedIndex、LatestNonempty、display Selection、FigureSelection、两dataset排序和layer顺序；Selection非空路径对owner函数双向各观测4次。测试另独立扰动顶层/嵌套extra field、两种unknown schema、selector tag、binding顺序和dataset顺序，不能由production常量或字段集合生成expected；canonical framed bytes不在frontend重复冻结，因为`zlc_storage.canonical`已有独立literal byte golden。独立审查的21种畸形payload全部fail-closed。`codec.py`从`273 PLOC / 239 nonblank / 13 functions`变为`276 / 244 / 12`，`figure/__init__.py`保持`93 / 90 / 0`，没有class、enum、dataclass或wrapper增长；main没有同职责renderer-free codec，旧GUI persistence block只作方向参考而不冒充等价分母。当前四个bytes入口仍只有测试和两层public re-export，但它们有明确Workbench/notebook终态consumer，不能按当前reachability删除。本codec owner可局部判GO；全局Rules 1/5/6仍为PARTIAL，迁移门禁不变。
+
+Figure auto-view 的 Rules 1/4/5/6/7 子切片以 parent checkpoint `17c06c2` 的179个领先提交、386个changed files为范围，覆盖 `ViewContract/ViewSpec -> suggest_view -> FigureEvaluator`、Selection、PointLayout 与唯一直接测试。首轮独立审查找到4类P1：按dataset tuple顺序贪心会让同一AxisId集合因排列不同而误拒，并漏算已绑定repeat BATCH；range Selection被擅自解释成spatial mean；所有SLIDER被误写成LatestNonempty，使site/component/spectral按“最高valid index”漂移且singleton repeat浪费动态名额；显式scalar Selection发生在display-axis选择之后，不能消除同role歧义。后续对抗又关闭5类同源边界：自动FixedIndex逐point axis取首项会在EXPLICIT PointLayout拼出不存在的tuple；rolling monitor允许同一cell address覆盖，`0 -> 1 -> 0`证明最大nonempty repeat/point index都不是最后发布事件；FixedIndex没有resolution record会让renderer无法显示实际coordinate；EXPLICIT非连续allowed tuple逐项membership为O(P²)；singleton fixed cell axis被memory admission误算成整行gather并拒绝本可安全显示的稀疏图。
+
+整改后的唯一语义是：Selection只裁剪allowed indices，不生成reducer；display-axis物理歧义仍需输入，其余不丢轴布局由contract role priority + AxisId tie-break的有界`(batch_product, facet_product)`规划器求解，repeat BATCH从既有binding计入。自动SLIDER仅用带标签FixedIndex；全部point-axis fixed值共同取自一条真实PointLayout storage row，validator对saved/manual ViewSpec再次拒绝EXPLICIT hole。LatestNonempty只允许repeat且明文表示“最大允许非空逻辑repeat index、非发布时间”；rolling current必须由controller根据EventRef/progress生成覆盖repeat和全部point axes的完整显式Selection。evaluator为FixedIndex与LatestNonempty都生成AxisResolution；singleton physical row不再被预算成gather。非连续point selection仅在helper入口转frozenset一次，100k-row EXPLICIT公开suggest约0.05–0.08秒，不再二次增长。
+
+Rule-5采用独立容量/排列与物理layout oracle：6,859个三信息轴容量组合和961个repeat-BATCH组合为0误接收、0误拒绝、0无效spec；独立复审扩为41,154个排列与5,000个随机RECT_C/RECT_F/EXPLICIT四intent schema，0 permutation drift、0轴遗漏、0非repeat自动reduce/Latest、0非物理point tuple。相关storage/data/figure集合为82 passed、1个既有条件skip；figure自身32 passed。Rule-6按物理行/nonblank/AST计数：四个production owner从`2987 / 2691 / 38 functions / 46 classes`变为`3128 / 2829 / 38 / 46`，即`1.047x / 1.051x`；没有新增class、dataclass、enum、function、single-member wrapper或通用solver。直接测试从`1146 / 1053`变为`1477 / 1367`，增长来自独立数学oracle、sparse hole、rolling语义与resolution行为，不复制production DP。main没有同职责的renderer-free typed planner，故不拿legacy `coerce_panel_value`的shape猜测伪装等价分母。本owner经两路独立对抗审查判GO；两个非阻塞P2如实保留：S2 rolling controller接线时仍须增加真实wrap→完整cell Selection集成测试，最终validator异常仍统一显示`CONTRACT_REJECTED`而诊断较粗。全局Rules 1/4/5/6/7仍为PARTIAL，迁移继续冻结。
 
 Content store 的 raw manifest `(namespace, digest)` 在每个公开 read/has/durability API 入口各验证一次，随后 path builder 和同一次 verified read 信任已规范化字符串；`has_manifest` 直接使用同一个 path 做内容校验，不再回调公开 reader 重验。`ContentRef` 在构造/root decode 后是 typed immutable blob identity，`read_blob` 信任其 digest/size，不重新跑文本 validator，但仍从同一 open handle 执行实际 size 与 SHA-256 内容核验。Store wrapper 获取 process-local authority 不作一次空的预检再由 operation 重检；真正 filesystem operation 仍恰好执行一次 authority/store/root/path/lock identity 检查。路径逃逸、内容损坏、size budget、fsync 与 manifest 可见性边界全部保留。
 

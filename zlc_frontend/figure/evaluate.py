@@ -639,7 +639,7 @@ def _layer_resource_upper_bound(
     )
     cell_axes = (block.schema.repeat_axis, *block.schema.point_axes)
     row_gather = any(
-        axis.axis_id in fixed_indices
+        (axis.axis_id in fixed_indices and axis.size > 1)
         or not _is_full_selection(allowed[axis.axis_id], axis.size)
         for axis in cell_axes
     )
@@ -1282,15 +1282,19 @@ class FigureEvaluator:
         axes = dataset_axes(block.schema)
         axis_by_id = {axis.axis_id: axis for axis in axes}
         allowed = _selection_index_sets(block, view)
-        fixed: dict[AxisId, int] = {}
-        dynamic = []
-        for binding in view.axis_bindings:
-            if isinstance(binding.selector, FixedIndex):
-                fixed[binding.axis_id] = binding.selector.index
-            elif isinstance(binding.selector, LatestNonempty):
-                dynamic.append(binding)
-        if len(dynamic) > 1:
-            raise FigureEvaluationError("only one global LatestNonempty selector is supported")
+        fixed = {
+            binding.axis_id: binding.selector.index
+            for binding in view.axis_bindings
+            if isinstance(binding.selector, FixedIndex)
+        }
+        dynamic = next(
+            (
+                binding
+                for binding in view.axis_bindings
+                if isinstance(binding.selector, LatestNonempty)
+            ),
+            None,
+        )
         cells, series_count, output_elements, histogram_samples = _layer_budget(
             view, allowed
         )
@@ -1313,9 +1317,17 @@ class FigureEvaluator:
         guard.check()
         working_base = _extract(block, fixed, allowed)
         guard.check()
-        resolutions = []
-        if dynamic:
-            binding = dynamic[0]
+        resolutions = [
+            AxisResolution(
+                axis_id,
+                "FIXED_INDEX",
+                index,
+                _axis_coordinate(axis_by_id[axis_id], index),
+            )
+            for axis_id, index in fixed.items()
+        ]
+        if dynamic is not None:
+            binding = dynamic
             axis = axis_by_id[binding.axis_id]
             resolved = None
             resolved_working = None
@@ -1400,7 +1412,7 @@ class FigureEvaluator:
             layer.layer_id,
             layer.dataset_id,
             tuple(cells),
-            tuple(resolutions),
+            tuple(sorted(resolutions, key=lambda item: item.axis_id.value)),
         )
 
 

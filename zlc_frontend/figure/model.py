@@ -92,7 +92,7 @@ class FixedIndex:
 
 @dataclass(frozen=True)
 class LatestNonempty:
-    """Resolve one global latest non-empty index for the complete layer."""
+    """Resolve the greatest allowed non-empty logical index, not publication time."""
 
 
 DisplaySelector = FixedIndex | LatestNonempty
