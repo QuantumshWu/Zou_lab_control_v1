@@ -154,7 +154,7 @@ def _runtime(
         measurement,
         DatasetMaterializerSpec(
             BlockId("triggered-capture"),
-            PipelineMemoryProfile.for_current_runtime(8 << 20),
+            PipelineMemoryProfile(8 << 20),
         ),
         timeout_seconds=3.0,
     )

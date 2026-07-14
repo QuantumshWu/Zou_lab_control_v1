@@ -354,7 +354,6 @@ class CaptureArtifact:
     provenance: DatasetSealProvenance
     terminal: CaptureTerminalAck
     aggregate_peak_bytes: int
-    memory_profile_fingerprint: str
     camera_provenance: CameraCaptureProvenance
     camera_capability_evidence: CameraCapabilityEvidence
     camera_arm_spec: FrozenCaptureSpec
@@ -387,7 +386,6 @@ class CaptureArtifact:
         if peak == 0:
             raise ValueError("aggregate_peak_bytes must be positive")
         object.__setattr__(self, "aggregate_peak_bytes", peak)
-        _sha256(self.memory_profile_fingerprint, "memory_profile_fingerprint")
         if not isinstance(self.camera_provenance, CameraCaptureProvenance):
             raise TypeError("camera_provenance must be CameraCaptureProvenance")
         self.camera_provenance.validate_schema(self.block.schema)
@@ -880,7 +878,6 @@ class CaptureRepository:
                 "provenance",
                 "terminal",
                 "aggregate_peak_bytes",
-                "memory_profile_fingerprint",
                 "camera_provenance",
                 "camera_capability_evidence",
                 "camera_arm_spec",
@@ -1027,7 +1024,6 @@ class CaptureRepository:
             provenance=_provenance_from_tree(data["provenance"]),
             terminal=_terminal_from_tree(data["terminal"]),
             aggregate_peak_bytes=data["aggregate_peak_bytes"],
-            memory_profile_fingerprint=data["memory_profile_fingerprint"],
             camera_provenance=_camera_provenance_from_tree(
                 data["camera_provenance"]
             ),
@@ -1380,7 +1376,6 @@ class CaptureRepository:
             provenance=base.dataset.provenance,
             terminal=base.capture_terminal,
             aggregate_peak_bytes=base.aggregate_peak_bytes,
-            memory_profile_fingerprint=base.memory_profile_fingerprint,
             camera_provenance=base.camera_provenance,
             camera_capability_evidence=base.camera_capability_evidence,
             camera_arm_spec=base.camera_arm_spec,
@@ -1575,7 +1570,6 @@ def _manifest_payload(
             "provenance": _provenance_to_tree(artifact.provenance),
             "terminal": _terminal_to_tree(artifact.terminal),
             "aggregate_peak_bytes": artifact.aggregate_peak_bytes,
-            "memory_profile_fingerprint": artifact.memory_profile_fingerprint,
             "camera_provenance": _camera_provenance_to_tree(
                 artifact.camera_provenance
             ),

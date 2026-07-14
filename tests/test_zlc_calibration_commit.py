@@ -218,7 +218,7 @@ def committed(tmp_path_factory):
         measurement,
         DatasetMaterializerSpec(
             BlockId("trusted-calibration-source"),
-            PipelineMemoryProfile.for_current_runtime(128 << 20),
+            PipelineMemoryProfile(128 << 20),
         ),
     )
     images = []

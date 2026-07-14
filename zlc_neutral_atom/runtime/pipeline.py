@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import math
-import hashlib
-import struct
-import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from zlc_data import BlockId, DatasetSchema, ValidityMode
 from zlc_storage import (
@@ -127,64 +124,20 @@ def resolve_measurement_definition(
     return definition
 
 
-_MEMORY_PROFILE_TOKEN = object()
-
-
+@dataclass(frozen=True, slots=True)
 class PipelineMemoryProfile:
-    """Runtime-owned conservative Python object/allocator overhead policy."""
+    """User memory limit plus runtime-owned conservative Python overhead."""
 
-    __slots__ = (
-        "_memory_limit_bytes",
-        "_overhead_profile_fingerprint",
-        "_fixed_runtime_overhead_bytes",
-        "_per_event_reference_overhead_bytes",
-    )
+    memory_limit_bytes: int
+    fixed_runtime_overhead_bytes: int = field(init=False, default=1 << 20)
+    per_event_reference_overhead_bytes: int = field(init=False, default=2048)
 
-    def __init__(self, authority: object, memory_limit_bytes: int) -> None:
-        if authority is not _MEMORY_PROFILE_TOKEN:
-            raise PermissionError(
-                "PipelineMemoryProfile must be minted for the current runtime"
-            )
-        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
-        pointer_bytes = struct.calcsize("P")
-        fixed = 1 << 20
-        per_event = max(2048, 128 * pointer_bytes)
-        identity = (
-            f"zlc.pipeline-memory-overhead|{sys.implementation.name}|"
-            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|"
-            f"ptr={pointer_bytes}|fixed={fixed}|per_event={per_event}"
-        )
-        object.__setattr__(self, "_memory_limit_bytes", limit)
+    def __post_init__(self) -> None:
         object.__setattr__(
             self,
-            "_overhead_profile_fingerprint",
-            hashlib.sha256(identity.encode("ascii")).hexdigest(),
+            "memory_limit_bytes",
+            _positive_int(self.memory_limit_bytes, "memory_limit_bytes"),
         )
-        object.__setattr__(self, "_fixed_runtime_overhead_bytes", fixed)
-        object.__setattr__(self, "_per_event_reference_overhead_bytes", per_event)
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("PipelineMemoryProfile is immutable")
-
-    @classmethod
-    def for_current_runtime(cls, memory_limit_bytes: int) -> "PipelineMemoryProfile":
-        return cls(_MEMORY_PROFILE_TOKEN, memory_limit_bytes)
-
-    @property
-    def memory_limit_bytes(self) -> int:
-        return self._memory_limit_bytes
-
-    @property
-    def overhead_profile_fingerprint(self) -> str:
-        return self._overhead_profile_fingerprint
-
-    @property
-    def fixed_runtime_overhead_bytes(self) -> int:
-        return self._fixed_runtime_overhead_bytes
-
-    @property
-    def per_event_reference_overhead_bytes(self) -> int:
-        return self._per_event_reference_overhead_bytes
 
 
 _MEMORY_ADMISSION_TOKEN = object()
@@ -195,7 +148,6 @@ class PipelineMemoryAdmission:
 
     __slots__ = (
         "_aggregate_peak_bytes",
-        "_memory_profile_fingerprint",
         "_chain_contract_digest",
     )
 
@@ -221,11 +173,6 @@ class PipelineMemoryAdmission:
             )
         sha256_text(chain_contract_digest, "chain_contract_digest")
         object.__setattr__(self, "_aggregate_peak_bytes", peak)
-        object.__setattr__(
-            self,
-            "_memory_profile_fingerprint",
-            memory_profile.overhead_profile_fingerprint,
-        )
         object.__setattr__(self, "_chain_contract_digest", chain_contract_digest)
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -240,10 +187,6 @@ class PipelineMemoryAdmission:
     @property
     def aggregate_peak_bytes(self) -> int:
         return self._aggregate_peak_bytes
-
-    @property
-    def memory_profile_fingerprint(self) -> str:
-        return self._memory_profile_fingerprint
 
     @property
     def chain_contract_digest(self) -> str:
@@ -304,7 +247,6 @@ class PipelineResult:
         "_capture_terminal",
         "_memory_admission",
         "_aggregate_peak_bytes",
-        "_memory_profile_fingerprint",
         "_run_id",
         "_source_dataset_schema",
         "_camera_provenance",
@@ -396,11 +338,6 @@ class PipelineResult:
             self,
             "_aggregate_peak_bytes",
             memory_admission.aggregate_peak_bytes,
-        )
-        object.__setattr__(
-            self,
-            "_memory_profile_fingerprint",
-            memory_admission.memory_profile_fingerprint,
         )
         object.__setattr__(self, "_run_id", capture_completion.trace_binding.run_id)
         object.__setattr__(
@@ -513,11 +450,6 @@ class PipelineResult:
     @property
     def aggregate_peak_bytes(self) -> int:
         return self._aggregate_peak_bytes
-
-    @property
-    def memory_profile_fingerprint(self) -> str:
-        return self._memory_profile_fingerprint
-
 
 def dataset_storage_nbytes(schema: DatasetSchema) -> int:
     """Return exact value-plus-validity bytes for one materialized DataBlock."""

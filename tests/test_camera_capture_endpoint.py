@@ -155,7 +155,7 @@ def _pipeline(camera: VirtualCamera):
         measurement,
         DatasetMaterializerSpec(
             BlockId("camera-endpoint"),
-            PipelineMemoryProfile.for_current_runtime(8 << 20),
+            PipelineMemoryProfile(8 << 20),
         ),
     )
     return broker, endpoint, binding, compile_pipeline(spec)

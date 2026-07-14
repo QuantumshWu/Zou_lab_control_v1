@@ -289,7 +289,7 @@ def trusted_calibration(tmp_path_factory):
         measurement,
         DatasetMaterializerSpec(
             BlockId("occupancy-calibration-source"),
-            PipelineMemoryProfile.for_current_runtime(128 << 20),
+            PipelineMemoryProfile(128 << 20),
         ),
     )
     images = [
@@ -468,7 +468,7 @@ def _occupancy_pipeline_spec(
         materializer=OccupancyDatasetMaterializerSpec(
             BlockId("occupancy-counts"),
             BlockId("occupancy-occupied"),
-            PipelineMemoryProfile.for_current_runtime(memory_limit),
+            PipelineMemoryProfile(memory_limit),
         ),
         timeout_seconds=12.0,
     )

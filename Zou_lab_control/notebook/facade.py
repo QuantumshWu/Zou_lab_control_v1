@@ -531,7 +531,7 @@ def _compile(token: object, request: CaptureRequest):
             binding.measurement,
             DatasetMaterializerSpec(
                 BlockId(f"capture-{binding.compiled_artifact.fingerprint[:20]}"),
-                PipelineMemoryProfile.for_current_runtime(
+                PipelineMemoryProfile(
                     request.pipeline_memory_limit_bytes
                 ),
             ),

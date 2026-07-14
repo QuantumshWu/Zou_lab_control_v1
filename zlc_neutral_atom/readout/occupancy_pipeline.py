@@ -265,7 +265,6 @@ class OccupancyPipelineResult:
         "_camera_arm_spec",
         "_chain_contract_digest",
         "_aggregate_peak_bytes",
-        "_memory_profile_fingerprint",
         "_terminal_provenance",
         "_model_kind",
         "_calibration_reference",
@@ -341,11 +340,6 @@ class OccupancyPipelineResult:
         )
         object.__setattr__(
             self,
-            "_memory_profile_fingerprint",
-            pipeline.memory_profile_fingerprint,
-        )
-        object.__setattr__(
-            self,
             "_terminal_provenance",
             pipeline.dataset.provenance,
         )
@@ -415,10 +409,6 @@ class OccupancyPipelineResult:
     @property
     def aggregate_peak_bytes(self) -> int:
         return self._aggregate_peak_bytes
-
-    @property
-    def memory_profile_fingerprint(self) -> str:
-        return self._memory_profile_fingerprint
 
     @property
     def terminal_provenance(self) -> DatasetSealProvenance:

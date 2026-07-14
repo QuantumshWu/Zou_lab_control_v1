@@ -98,7 +98,7 @@ def _runtime_and_spec(
         measurement,
         DatasetMaterializerSpec(
             BlockId("capture-artifact-test"),
-            PipelineMemoryProfile.for_current_runtime(8 << 20),
+            PipelineMemoryProfile(8 << 20),
         ),
     )
     return camera, runtime, spec
@@ -168,7 +168,7 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
             DatasetCellAddress(0, 1),
         )
         assert len(artifact.chain_contract_digest) == 64
-        assert artifact.chain_contract_digest != artifact.memory_profile_fingerprint
+        assert artifact.aggregate_peak_bytes > artifact.block.values.nbytes
         assert not hasattr(artifact, "camera")
         assert not hasattr(reference, "repository")
 

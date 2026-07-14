@@ -970,7 +970,7 @@ def minimal_pipeline(item: CaptureHarness, *, memory_limit: int = 4 << 20):
         bound,
         DatasetMaterializerSpec(
             BlockId("pipeline-capture"),
-            PipelineMemoryProfile.for_current_runtime(memory_limit),
+            PipelineMemoryProfile(memory_limit),
         ),
     )
 
@@ -1430,7 +1430,7 @@ def test_minimal_pipeline_compiles_to_one_flat_run_and_returns_typed_result():
     assert np.all(result.dataset.block.values[0, 0] == 1)
     assert np.all(result.dataset.block.values[0, 1] == 2)
     assert result.capture_terminal.joined
-    assert len(result.memory_profile_fingerprint) == 64
+    assert result.aggregate_peak_bytes > result.dataset.block.values.nbytes
     assert item.camera.closed
     with pytest.raises(PermissionError):
         PipelineResult(
@@ -1459,7 +1459,7 @@ def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
         processor.session.bind_exact_consumer(readiness)
         holder["memory_admission"] = admit_pipeline_memory(
             aggregate_peak_bytes=1,
-            memory_profile=PipelineMemoryProfile.for_current_runtime(1024),
+            memory_profile=PipelineMemoryProfile(1024),
             chain_contract_digest=readiness.chain_contract_digest,
         )
         return processor
@@ -1547,8 +1547,6 @@ def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
 
 def test_pipeline_budget_rejects_before_run_or_hardware_prepare():
     item = harness(points=1)
-    with pytest.raises(PermissionError):
-        PipelineMemoryProfile(object(), 1024)
     with pytest.raises(MemoryError):
         compile_pipeline(minimal_pipeline(item, memory_limit=1))
     assert item.camera.session_id == ""
