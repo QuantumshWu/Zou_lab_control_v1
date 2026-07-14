@@ -46,6 +46,8 @@ _LAZY_EXPORTS = {
     "ContentSizeLimitError": ("content_store", "ContentSizeLimitError"),
     "ContentRef": ("content_store", "ContentRef"),
     "StoredManifest": ("content_store", "StoredManifest"),
+    "content_ref_from_tree": ("content_store", "content_ref_from_tree"),
+    "content_ref_to_tree": ("content_store", "content_ref_to_tree"),
 }
 
 
@@ -77,6 +79,8 @@ __all__ = [
     "ContentCorruptionError",
     "ContentSizeLimitError",
     "ContentRef",
+    "content_ref_from_tree",
+    "content_ref_to_tree",
     "canonical_text",
     "canonical_digest",
     "FramedJournal",

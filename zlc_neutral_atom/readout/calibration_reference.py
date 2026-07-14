@@ -14,7 +14,7 @@ from zlc_storage import (
 
 
 CALIBRATION_ARTIFACT_REF_SCHEMA = "zlc_neutral_atom.calibration-artifact-ref"
-_CALIBRATION_NAMESPACE = "calibration"
+CALIBRATION_ARTIFACT_NAMESPACE = "calibration"
 
 
 @dataclass(frozen=True, order=True)
@@ -28,7 +28,7 @@ class CalibrationArtifactRef:
 
     @property
     def target_ref(self) -> str:
-        return f"{_CALIBRATION_NAMESPACE}/{self.manifest_digest}"
+        return f"{CALIBRATION_ARTIFACT_NAMESPACE}/{self.manifest_digest}"
 
 
 def calibration_artifact_ref_to_tree(value: CalibrationArtifactRef) -> dict[str, Any]:
@@ -87,6 +87,7 @@ def decode_calibration_artifact_ref(
 
 
 __all__ = [
+    "CALIBRATION_ARTIFACT_NAMESPACE",
     "CALIBRATION_ARTIFACT_REF_SCHEMA",
     "CalibrationArtifactRef",
     "calibration_artifact_ref_from_tree",

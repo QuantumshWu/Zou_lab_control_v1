@@ -30,6 +30,8 @@ from zlc_storage import (
     ContentStoreAuthority,
     RepositoryRootLease,
     canonical_text as _canonical_text,
+    content_ref_from_tree,
+    content_ref_to_tree,
     decode,
     encode,
     exact_mapping as _exact_map,
@@ -122,7 +124,7 @@ from zlc_pulse import (
 
 CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact"
 _CAPTURE_METADATA_SCHEMA = "zlc_neutral_atom.CameraFrameMetadataSequence"
-_CAPTURE_NAMESPACE = CAPTURE_ARTIFACT_NAMESPACE
+_CAPTURE_ARTIFACT_KIND = "capture"
 _ADMITTED_CAPTURE_EVIDENCE_SCHEMA = "zlc_neutral_atom.AdmittedCaptureEvidence"
 _ADMITTED_CAPTURE_TOKEN = object()
 
@@ -810,7 +812,7 @@ class CaptureRepository:
         self._validate_ref(reference)
         try:
             manifest_payload = authority.store_authority.read_manifest(
-                _CAPTURE_NAMESPACE,
+                CAPTURE_ARTIFACT_NAMESPACE,
                 reference.manifest_digest,
                 max_bytes=authority.resource_policy.max_manifest_bytes,
             )
@@ -892,17 +894,17 @@ class CaptureRepository:
         )
         if data["repository_id"] != repository_id:
             raise ValueError("CaptureArtifact belongs to another repository")
-        block_ref = _content_ref_from_tree(data["data_block_blob"])
-        metadata_ref = _content_ref_from_tree(data["metadata_blob"])
+        block_ref = content_ref_from_tree(data["data_block_blob"])
+        metadata_ref = content_ref_from_tree(data["metadata_blob"])
         pulse_ref = (
             None
             if data["compiled_pulse_blob"] is None
-            else _content_ref_from_tree(data["compiled_pulse_blob"])
+            else content_ref_from_tree(data["compiled_pulse_blob"])
         )
         plan_ref = (
             None
             if data["cell_plan_blob"] is None
-            else _content_ref_from_tree(data["cell_plan_blob"])
+            else content_ref_from_tree(data["cell_plan_blob"])
         )
         _require_content_size(
             block_ref,
@@ -1066,7 +1068,7 @@ class CaptureRepository:
         artifact = self.load(reference)
         target = CommitTarget(
             authority.repository_id,
-            "capture",
+            _CAPTURE_ARTIFACT_KIND,
             CAPTURE_ARTIFACT_SCHEMA,
             reference.target_ref,
             reference.manifest_digest,
@@ -1187,7 +1189,7 @@ class CaptureRepository:
             raise RuntimeError("capture commit subject changed while staging")
         target = CommitTarget(
             authority.repository_id,
-            "capture",
+            _CAPTURE_ARTIFACT_KIND,
             CAPTURE_ARTIFACT_SCHEMA,
             reference.target_ref,
             reference.manifest_digest,
@@ -1197,7 +1199,7 @@ class CaptureRepository:
             self._assert_authority_integrity()
             try:
                 stored = authority.store_authority.publish_manifest(
-                    _CAPTURE_NAMESPACE,
+                    CAPTURE_ARTIFACT_NAMESPACE,
                     manifest_payload,
                     expected_digest=reference.manifest_digest,
                 )
@@ -1209,7 +1211,7 @@ class CaptureRepository:
                 # failure; any visible/unreadable target is reconciled.
                 try:
                     visible = authority.store_authority.read_manifest(
-                        _CAPTURE_NAMESPACE,
+                        CAPTURE_ARTIFACT_NAMESPACE,
                         reference.manifest_digest,
                         max_bytes=authority.resource_policy.max_manifest_bytes,
                     )
@@ -1270,17 +1272,19 @@ class CaptureRepository:
             policy = authority.resource_policy
             repository_id = authority.repository_id
         target = intent.target
-        prefix = f"{_CAPTURE_NAMESPACE}/"
         if (
             target.repository_id != repository_id
-            or target.artifact_kind != "capture"
+            or target.artifact_kind != _CAPTURE_ARTIFACT_KIND
             or target.artifact_format != CAPTURE_ARTIFACT_SCHEMA
-            or not target.target_ref.startswith(prefix)
         ):
             raise ValueError("commit intent is not a CaptureArtifact target")
-        digest = _sha256(target.target_ref[len(prefix) :], "target manifest digest")
-        if digest != target.expected_manifest_digest:
+        reference = CaptureArtifactRef(
+            repository_id,
+            target.expected_manifest_digest,
+        )
+        if target.target_ref != reference.target_ref:
             raise ValueError("capture commit target ref and digest differ")
+        digest = reference.manifest_digest
         operation_kind = (
             "final" if intent.kind is CommitKind.FINAL else "checkpoint"
         )
@@ -1291,7 +1295,7 @@ class CaptureRepository:
             raise ValueError("capture commit id differs from kind/run/target")
         try:
             manifest_payload = store_authority.read_manifest(
-                _CAPTURE_NAMESPACE,
+                CAPTURE_ARTIFACT_NAMESPACE,
                 digest,
                 max_bytes=policy.max_manifest_bytes,
             )
@@ -1301,7 +1305,6 @@ class CaptureRepository:
             raise CaptureResourceExceeded(
                 "capture manifest exceeds repository resource policy"
             ) from exc
-        reference = CaptureArtifactRef(repository_id, digest)
         # The manifest was observed first.  Any missing/corrupt referenced blob
         # is now a visible corrupt artifact and must fail startup closed rather
         # than be misreported as an absent/uncommitted manifest.
@@ -1323,7 +1326,7 @@ class CaptureRepository:
         # barrier verifies/fsyncs only an existing immutable target and never
         # creates one.  Recovery cannot resolve COMMITTED until it succeeds.
         confirmed_payload = store_authority.confirm_manifest_durable(
-            _CAPTURE_NAMESPACE,
+            CAPTURE_ARTIFACT_NAMESPACE,
             digest,
             max_bytes=policy.max_manifest_bytes,
         )
@@ -1542,16 +1545,6 @@ def compile_capture_artifact_pipeline(
     )
 
 
-def _content_ref_to_tree(reference: ContentRef) -> dict[str, object]:
-    return {"digest": reference.digest, "size": reference.size}
-
-
-def _content_ref_from_tree(tree: object) -> ContentRef:
-    if not isinstance(tree, dict) or set(tree) != {"digest", "size"}:
-        raise ValueError("content reference has an unknown field set")
-    return ContentRef(tree["digest"], tree["size"])
-
-
 def _manifest_payload(
     artifact: CaptureArtifact,
     block_ref: ContentRef,
@@ -1566,17 +1559,17 @@ def _manifest_payload(
         {
             "schema": CAPTURE_ARTIFACT_SCHEMA,
             "repository_id": artifact.ref.repository_id,
-            "data_block_blob": _content_ref_to_tree(block_ref),
-            "metadata_blob": _content_ref_to_tree(metadata_ref),
+            "data_block_blob": content_ref_to_tree(block_ref),
+            "metadata_blob": content_ref_to_tree(metadata_ref),
             "compiled_pulse_blob": (
                 None
                 if compiled_pulse_ref is None
-                else _content_ref_to_tree(compiled_pulse_ref)
+                else content_ref_to_tree(compiled_pulse_ref)
             ),
             "cell_plan_blob": (
                 None
                 if cell_plan_ref is None
-                else _content_ref_to_tree(cell_plan_ref)
+                else content_ref_to_tree(cell_plan_ref)
             ),
             "coverage": _coverage_to_tree(artifact.coverage),
             "provenance": _provenance_to_tree(artifact.provenance),

@@ -2485,6 +2485,8 @@ canonical tree 到 bytes、UTF-8、map key order、整数/float/NaN 表示、nda
 
 同一条 canonical primitive 约束也只有这里一个实现：canonical/non-empty text、lowercase SHA-256 text、finite real、integer lower bound 与 exact mapping/discriminator admission 由 `zlc_storage.canonical` 提供；领域 constructor 只保留物理/语义约束，codec 只声明字段集合并委托 owner。领域包不得复制 `_text/_sha256/_positive_int/_exact_map` 一类 helper；架构 AST ratchet 机械禁止重新引入。面向用户输入的 UI label normalizer 可以在 presentation/composition 层 strip 文本，但它必须用不同语义、不得承担 persisted canonical value 的权威校验。
 
+无领域语义的 `ContentRef{digest,size}` 及其 schema-free current tree 只由 `zlc_storage.content_store` 拥有；Capture/Calibration 等 manifest 必须调用 owner codec，不能各抄一份 `{digest,size}` parser。领域 typed Ref 仍分别拥有自己的 repository namespace 与 `target_ref` 文法；recovery 从冻结的 expected manifest digest 构造 typed Ref 后比较完整 `target_ref`，不得手工切 prefix/slice。真实 CAS 地址只能由 `put_blob()` 根据最终 bytes 铸造，领域 repository 使用它返回的 ref 构造 manifest，不能在 storage 外重复 `sha256(payload)+len(payload)` 后再自证相等。manifest 发布前遗留的不可达 blob 是安全 orphan、不是可见 artifact；它不构成重新引入预计算地址或自动 GC 的理由。
+
 F0 第一日即建立 cross-package golden/property contract：同一 primitive tree 在四个 owner 包中产生 byte-identical encoding/digest；嵌入 owner value object 时 outer manifest 使用 owner bytes/digest；字段重排、float edge、NaN、unicode、ndarray order/endianness 与版本变化均有向量。golden 不是允许四份实现漂移的补救，而是守卫唯一 encoder 和 owner codec delegation。
 
 ### 16.2 Atomic commit 与 load

@@ -288,6 +288,125 @@ def test_readout_artifacts_do_not_restore_edit_counter_metadata():
     )
 
 
+def test_content_ref_codec_and_cas_address_have_one_storage_owner():
+    violations = []
+    package_roots = (
+        "fpga",
+        "Zou_lab_control",
+        "zlc_data",
+        "zlc_frontend",
+        "zlc_neutral_atom",
+        "zlc_pulse",
+        "zlc_workbench",
+    )
+    for package_root in package_roots:
+        for source in (ROOT / package_root).rglob("*.py"):
+            relative = source.relative_to(ROOT)
+            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(relative))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Dict):
+                    literal_keys = {
+                        key.value
+                        for key in node.keys
+                        if isinstance(key, ast.Constant)
+                        and isinstance(key.value, str)
+                    }
+                    if len(node.keys) == 2 and literal_keys == {"digest", "size"}:
+                        violations.append(
+                            f"{relative}:{node.lineno} duplicates the ContentRef tree"
+                        )
+                if isinstance(node, ast.Set):
+                    literal_fields = {
+                        item.value
+                        for item in node.elts
+                        if isinstance(item, ast.Constant)
+                        and isinstance(item.value, str)
+                    }
+                    if len(node.elts) == 2 and literal_fields == {"digest", "size"}:
+                        violations.append(
+                            f"{relative}:{node.lineno} duplicates the ContentRef field set"
+                        )
+                if (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name
+                    in {
+                        "content_ref_to_tree",
+                        "content_ref_from_tree",
+                        "_content_ref_to_tree",
+                        "_content_ref_from_tree",
+                    }
+                ):
+                    violations.append(
+                        f"{relative}:{node.lineno} redefines the storage ContentRef codec"
+                    )
+                if not isinstance(node, ast.Call) or len(node.args) < 2:
+                    continue
+                function_name = (
+                    node.func.id
+                    if isinstance(node.func, ast.Name)
+                    else node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else None
+                )
+                if function_name != "ContentRef":
+                    continue
+                digest_call, size_call = node.args[:2]
+                digest_function_names = {
+                    call.func.id
+                    if isinstance(call.func, ast.Name)
+                    else call.func.attr
+                    if isinstance(call.func, ast.Attribute)
+                    else ""
+                    for call in ast.walk(digest_call)
+                    if isinstance(call, ast.Call)
+                }
+                size_uses_len = any(
+                    isinstance(call.func, ast.Name) and call.func.id == "len"
+                    for call in ast.walk(size_call)
+                    if isinstance(call, ast.Call)
+                )
+                if (
+                    any("sha256" in name.lower() for name in digest_function_names)
+                    and size_uses_len
+                ):
+                    violations.append(
+                        f"{relative}:{node.lineno} mints a CAS address outside storage"
+                    )
+
+    for relative in (
+        Path("zlc_neutral_atom/artifacts/capture.py"),
+        Path("zlc_neutral_atom/readout/calibration_repository.py"),
+    ):
+        tree = ast.parse(
+            (ROOT / relative).read_text(encoding="utf-8"),
+            filename=str(relative),
+        )
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "target_ref"
+            ):
+                violations.append(
+                    f"{relative}:{node.lineno} slices typed target_ref grammar"
+                )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "startswith"
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "target_ref"
+            ):
+                violations.append(
+                    f"{relative}:{node.lineno} reparses typed target_ref grammar"
+                )
+
+    assert not violations, (
+        "ContentRef tree/address belong to zlc_storage and each typed Ref owns its "
+        "target_ref grammar:\n" + "\n".join(violations)
+    )
+
+
 def test_artifact_finalizers_do_not_replay_published_payload_digests():
     violations = []
     for relative in (

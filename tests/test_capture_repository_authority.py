@@ -759,6 +759,34 @@ def test_recovery_rejects_kind_commit_id_mismatch_before_absence(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    "target_ref",
+    [
+        f"calibration/{'1' * 64}",
+        f"capture/{'2' * 64}",
+    ],
+)
+def test_capture_recovery_rejects_namespace_or_target_digest_mismatch(
+    tmp_path,
+    target_ref,
+):
+    repository = CaptureRepository(tmp_path / "captures")
+    reference = CaptureArtifactRef(repository.repository_id, "1" * 64)
+    evidence = type(
+        "Evidence",
+        (),
+        {"run_id": "run", "safety_bundle_id": "safety"},
+    )()
+    intent = _pending_intent(reference, evidence, kind=CommitKind.FINAL)
+    mismatched = replace(
+        intent,
+        target=replace(intent.target, target_ref=target_ref),
+    )
+
+    with pytest.raises(ValueError, match="target ref and digest differ"):
+        repository._recover(mismatched)
+
+
 def test_absent_manifest_recovery_aborts_by_inspection_without_publication(tmp_path):
     repository = CaptureRepository(tmp_path / "captures")
     digest = "2" * 64

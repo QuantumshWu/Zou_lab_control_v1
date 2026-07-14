@@ -15,7 +15,12 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .canonical import sha256_digest, sha256_text as _sha256
+from .canonical import (
+    exact_mapping,
+    nonnegative_integer,
+    sha256_digest,
+    sha256_text as _sha256,
+)
 from . import durability
 
 
@@ -42,8 +47,31 @@ class ContentRef:
 
     def __post_init__(self) -> None:
         _sha256(self.digest, "content digest")
-        if isinstance(self.size, bool) or not isinstance(self.size, int) or self.size < 0:
-            raise ValueError("content size must be a non-negative integer")
+        object.__setattr__(
+            self,
+            "size",
+            nonnegative_integer(self.size, "content size"),
+        )
+
+
+def content_ref_to_tree(value: ContentRef) -> dict[str, object]:
+    """Project the storage owner's immutable blob identity to primitives."""
+
+    if not isinstance(value, ContentRef):
+        raise TypeError("value must be ContentRef")
+    return {"digest": value.digest, "size": value.size}
+
+
+def content_ref_from_tree(tree: object) -> ContentRef:
+    """Decode the one current, schema-free ContentRef primitive shape."""
+
+    data = exact_mapping(
+        tree,
+        {"digest", "size"},
+        "ContentRef",
+        discriminator=None,
+    )
+    return ContentRef(data["digest"], data["size"])
 
 
 @dataclass(frozen=True)
@@ -554,12 +582,8 @@ class ContentAddressedStore:
         expected_size: int | None,
         max_bytes: int | None,
     ) -> bytes:
-        if max_bytes is not None and (
-            isinstance(max_bytes, bool)
-            or not isinstance(max_bytes, int)
-            or max_bytes < 0
-        ):
-            raise ValueError("max_bytes must be a non-negative integer or None")
+        if max_bytes is not None:
+            max_bytes = nonnegative_integer(max_bytes, "max_bytes")
         stream.seek(0)
         actual_size = os.fstat(stream.fileno()).st_size
         if max_bytes is not None and actual_size > max_bytes:
@@ -587,4 +611,6 @@ __all__ = [
     "ContentSizeLimitError",
     "ContentRef",
     "StoredManifest",
+    "content_ref_from_tree",
+    "content_ref_to_tree",
 ]

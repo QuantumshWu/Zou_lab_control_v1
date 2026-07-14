@@ -53,7 +53,10 @@ from zlc_neutral_atom.readout.contracts import CalibrationCaptureLayout
 import zlc_neutral_atom.readout.analysis as analysis_impl
 import zlc_neutral_atom.readout.calibration_repository as repository_impl
 import zlc_storage.content_store as content_store_impl
-from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
+from zlc_neutral_atom.readout.calibration_reference import (
+    CALIBRATION_ARTIFACT_NAMESPACE,
+    CalibrationArtifactRef,
+)
 from zlc_neutral_atom.readout.calibration_repository import (
     AdmittedCalibration,
     CALIBRATION_MANIFEST_SCHEMA,
@@ -268,7 +271,12 @@ def committed(tmp_path_factory):
 
 
 def _manifest_root(repository: CalibrationRepository):
-    return repository.root / "content" / "manifests" / "calibration"
+    return (
+        repository.root
+        / "content"
+        / "manifests"
+        / CALIBRATION_ARTIFACT_NAMESPACE
+    )
 
 
 def _assert_no_manifest(repository: CalibrationRepository) -> None:
@@ -279,6 +287,14 @@ def _assert_no_manifest(repository: CalibrationRepository) -> None:
 def _assert_no_content_blobs(repository: CalibrationRepository) -> None:
     root = repository.root / "content" / "blobs"
     assert not root.exists() or tuple(path for path in root.rglob("*") if path.is_file()) == ()
+
+
+def test_calibration_reference_owns_its_typed_target_namespace():
+    reference = CalibrationArtifactRef("calibrations", "a" * 64)
+    assert CALIBRATION_ARTIFACT_NAMESPACE == "calibration"
+    assert reference.target_ref == (
+        f"{CALIBRATION_ARTIFACT_NAMESPACE}/{reference.manifest_digest}"
+    )
 
 
 def _copy_calibration_repository(
@@ -697,6 +713,41 @@ def test_target_repository_budgets_reject_in_preflight_without_analysis_or_blobs
     assert analyze_calls == 0
 
 
+def test_manifest_staging_failure_leaves_only_safe_orphan_blobs(
+    committed,
+    monkeypatch,
+):
+    repository = CalibrationRepository(
+        committed.root / "orphaned-calibration-blobs",
+        repository_id="orphaned-calibration-blobs",
+    )
+    monkeypatch.setattr(
+        repository_impl,
+        "_manifest_payload",
+        lambda **_kwargs: b"x"
+        * (repository.resource_policy.max_manifest_bytes + 1),
+    )
+    try:
+        handle = committed.runtime.controller.start(
+            compile_calibration_artifact_plan(
+                committed.capture_ref,
+                committed.capture_repository,
+                repository,
+                committed.request,
+            )
+        )
+        with pytest.raises(RunFailed, match="manifest exceeds"):
+            handle.result(20.0)
+        _assert_no_manifest(repository)
+        blob_root = repository.root / "content" / "blobs"
+        orphan_blobs = tuple(
+            path for path in blob_root.rglob("*") if path.is_file()
+        )
+        assert len(orphan_blobs) == 2
+    finally:
+        repository.close()
+
+
 def test_dishonest_analysis_request_parameters_are_rejected_before_staging(
     committed,
     monkeypatch,
@@ -996,6 +1047,26 @@ def test_restart_reconciles_visible_manifest_without_rerunning_analysis(
                 commit_id="checkpoint-is-not-calibration-final",
             )
         )
+    mismatches = (
+        (
+            replace(
+                target,
+                target_ref=f"legacy-calibration/{target.expected_manifest_digest}",
+            ),
+            "target ref and digest differ",
+        ),
+        (
+            replace(target, expected_manifest_digest="0" * 64),
+            "target ref and digest differ",
+        ),
+        (
+            replace(target, artifact_kind="other-artifact"),
+            "not a CalibrationArtifact target",
+        ),
+    )
+    for mismatched_target, message in mismatches:
+        with pytest.raises(ValueError, match=message):
+            repository._recover(replace(intent, target=mismatched_target))
     repository.close()
     _append_pending_intent(root, intent)
     monkeypatch.setattr(

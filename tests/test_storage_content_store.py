@@ -10,11 +10,45 @@ import pytest
 from zlc_storage import (
     ContentAddressedStore,
     ContentCorruptionError,
+    ContentRef,
     ContentSizeLimitError,
     ContentStoreAuthority,
     DirectoryDurabilityError,
+    content_ref_from_tree,
+    content_ref_to_tree,
     sha256_digest,
 )
+
+
+def test_content_ref_owner_codec_has_one_schema_free_current_shape():
+    reference = ContentRef("a" * 64, 23)
+    golden = {"digest": "a" * 64, "size": 23}
+
+    assert content_ref_to_tree(reference) == golden
+    assert "schema" not in golden and "version" not in golden
+    assert content_ref_from_tree(golden) == reference
+    assert content_ref_to_tree(content_ref_from_tree(golden)) == golden
+
+
+@pytest.mark.parametrize(
+    "tree",
+    [
+        {"digest": "a" * 64},
+        {"digest": "a" * 64, "size": 1, "schema": "legacy"},
+        {"digest": "not-a-digest", "size": 1},
+        {"digest": "a" * 64, "size": True},
+        {"digest": "a" * 64, "size": -1},
+    ],
+)
+def test_content_ref_owner_codec_rejects_non_current_or_invalid_trees(tree):
+    with pytest.raises((TypeError, ValueError)):
+        content_ref_from_tree(tree)
+
+
+@pytest.mark.parametrize("size", [True, -1])
+def test_content_ref_uses_canonical_nonnegative_integer_contract(size):
+    with pytest.raises((TypeError, ValueError)):
+        ContentRef("a" * 64, size)
 
 
 def test_content_store_publishes_blobs_and_manifests_idempotently(tmp_path):
@@ -123,6 +157,14 @@ def test_blob_size_admission_uses_physical_file_not_untrusted_reference_size(tmp
     reference = store.put_blob(b"larger-than-budget")
     with pytest.raises(ContentSizeLimitError, match="exceeds limit"):
         store.read_blob(reference, max_bytes=1)
+
+
+@pytest.mark.parametrize("max_bytes", [True, -1])
+def test_read_limit_uses_canonical_nonnegative_integer_contract(tmp_path, max_bytes):
+    store = ContentAddressedStore(tmp_path / "repository")
+    reference = store.put_blob(b"bounded")
+    with pytest.raises((TypeError, ValueError)):
+        store.read_blob(reference, max_bytes=max_bytes)
 
 
 @pytest.mark.parametrize("size_delta", [-1, 1])

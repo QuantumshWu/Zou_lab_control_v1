@@ -24,6 +24,8 @@ from zlc_storage import (
     RepositoryRootLease,
     canonical_digest,
     canonical_text as _canonical_text,
+    content_ref_from_tree as _content_ref_from_tree,
+    content_ref_to_tree as _content_ref_to_tree,
     decode,
     encode,
     sha256_digest,
@@ -90,6 +92,7 @@ from .calibration_codec import (
     encode_calibration_source_binding,
 )
 from .calibration_reference import (
+    CALIBRATION_ARTIFACT_NAMESPACE,
     CalibrationArtifactRef,
     calibration_artifact_ref_to_tree,
 )
@@ -119,7 +122,7 @@ _ADMITTED_CALIBRATION_EVIDENCE_SCHEMA = (
 _ADMITTED_CALIBRATION_INTEGRITY_SCHEMA = (
     "zlc_neutral_atom.AdmittedCalibrationIntegrity"
 )
-_CALIBRATION_NAMESPACE = "calibration"
+_CALIBRATION_ARTIFACT_KIND = "calibration"
 _EXECUTED_TOKEN = object()
 _ADMISSION_TOKEN = object()
 _DERIVATION_DECODE_LIMITS = CanonicalDecodeLimits(
@@ -297,7 +300,7 @@ def _calibration_commit_target(
         raise ValueError("CalibrationArtifactRef belongs to another repository")
     return CommitTarget(
         repository_id,
-        "calibration",
+        _CALIBRATION_ARTIFACT_KIND,
         CALIBRATION_MANIFEST_SCHEMA,
         reference.target_ref,
         reference.manifest_digest,
@@ -1014,7 +1017,7 @@ class CalibrationRepository:
             self._assert_authority_integrity()
             try:
                 stored = authority.store_authority.publish_manifest(
-                    _CALIBRATION_NAMESPACE,
+                    CALIBRATION_ARTIFACT_NAMESPACE,
                     manifest_payload,
                     expected_digest=reference.manifest_digest,
                 )
@@ -1029,7 +1032,7 @@ class CalibrationRepository:
                 # recovery protocol instead of aborting a visible artifact.
                 try:
                     visible = authority.store_authority.read_manifest(
-                        _CALIBRATION_NAMESPACE,
+                        CALIBRATION_ARTIFACT_NAMESPACE,
                         reference.manifest_digest,
                         max_bytes=authority.resource_policy.max_manifest_bytes,
                     )
@@ -1150,14 +1153,13 @@ class CalibrationRepository:
             raise CalibrationResourceExceeded(
                 "calibration derivation blob exceeds repository resource policy"
             )
-        artifact_blob = ContentRef(
-            sha256_digest(artifact_payload),
-            len(artifact_payload),
-        )
-        derivation_blob = ContentRef(
-            sha256_digest(derivation_payload),
-            len(derivation_payload),
-        )
+        # The content store owns CAS identity.  Stage immutable blobs first and
+        # build the manifest only from the exact ContentRef values returned by
+        # that owner.  A later manifest-bound/publication failure may leave
+        # unreachable blobs; that is the normal safe CAS orphan semantics and
+        # never makes a calibration visible.
+        artifact_blob = authority.store_authority.put_blob(artifact_payload)
+        derivation_blob = authority.store_authority.put_blob(derivation_payload)
         manifest_payload = _manifest_payload(
             repository_id=authority.repository_id,
             artifact_blob=artifact_blob,
@@ -1169,10 +1171,6 @@ class CalibrationRepository:
             raise CalibrationResourceExceeded(
                 "calibration manifest exceeds repository resource policy"
             )
-        stored_artifact = authority.store_authority.put_blob(artifact_payload)
-        stored_derivation = authority.store_authority.put_blob(derivation_payload)
-        if stored_artifact != artifact_blob or stored_derivation != derivation_blob:
-            raise RuntimeError("calibration content address changed while staging")
         reference = CalibrationArtifactRef(
             authority.repository_id,
             sha256_digest(manifest_payload),
@@ -1190,7 +1188,7 @@ class CalibrationRepository:
         self._validate_reference(reference)
         try:
             return store_authority.read_manifest(
-                _CALIBRATION_NAMESPACE,
+                CALIBRATION_ARTIFACT_NAMESPACE,
                 reference.manifest_digest,
                 max_bytes=policy.max_manifest_bytes,
             )
@@ -1298,25 +1296,23 @@ class CalibrationRepository:
         )
         policy = self.resource_policy if authority is None else authority.resource_policy
         target = intent.target
-        prefix = f"{_CALIBRATION_NAMESPACE}/"
         if (
             intent.kind is not CommitKind.FINAL
             or target.repository_id != self.repository_id
-            or target.artifact_kind != "calibration"
+            or target.artifact_kind != _CALIBRATION_ARTIFACT_KIND
             or target.artifact_format != CALIBRATION_MANIFEST_SCHEMA
-            or not target.target_ref.startswith(prefix)
         ):
             raise ValueError("commit intent is not a CalibrationArtifact target")
-        digest = _sha256(
-            target.target_ref[len(prefix) :],
-            "target manifest digest",
+        reference = CalibrationArtifactRef(
+            self.repository_id,
+            target.expected_manifest_digest,
         )
-        if digest != target.expected_manifest_digest:
+        if target.target_ref != reference.target_ref:
             raise ValueError("calibration commit target ref and digest differ")
+        digest = reference.manifest_digest
         expected_commit_id = _calibration_final_commit_id(intent.run_id, digest)
         if intent.commit_id != expected_commit_id:
             raise ValueError("calibration commit id differs from kind/run/target")
-        reference = CalibrationArtifactRef(self.repository_id, digest)
         try:
             manifest_payload = self._read_manifest_payload(reference)
         except FileNotFoundError:
@@ -1340,7 +1336,7 @@ class CalibrationRepository:
         # barrier verifies/fsyncs only the existing immutable target and never
         # creates a missing manifest.
         confirmed_payload = store_authority.confirm_manifest_durable(
-            _CALIBRATION_NAMESPACE,
+            CALIBRATION_ARTIFACT_NAMESPACE,
             digest,
             max_bytes=policy.max_manifest_bytes,
         )
@@ -1849,16 +1845,6 @@ def _validate_source_capture(
         derivation.request,
         preparation.brackets,
     )
-
-
-def _content_ref_to_tree(reference: ContentRef) -> dict[str, object]:
-    return {"digest": reference.digest, "size": reference.size}
-
-
-def _content_ref_from_tree(tree: Any) -> ContentRef:
-    if not isinstance(tree, dict) or set(tree) != {"digest", "size"}:
-        raise ValueError("calibration content reference has an unknown field set")
-    return ContentRef(tree["digest"], tree["size"])
 
 
 def _derivation_tree(
