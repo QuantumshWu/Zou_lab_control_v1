@@ -12,7 +12,7 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from typing import Callable, Generic, Protocol, TypeVar
 
-from zlc_data import DataBlock, DataPatch, StreamGenerationId
+from zlc_data import DataBlock, DataPatch, StreamGenerationId, Value
 from zlc_storage import (
     canonical_digest,
     canonical_text as _canonical_text,
@@ -67,6 +67,8 @@ class JoinKeyContract(Protocol):
 def _contains_materialization(value: object, seen: set[int] | None = None) -> bool:
     if isinstance(value, (DataBlock, DataPatch)):
         return True
+    if type(value) is Value:
+        return False
     if value is None or isinstance(value, (bool, int, float, str, bytes)):
         return False
     identity = id(value)
@@ -1632,8 +1634,6 @@ class AcquisitionStream(Generic[PayloadT]):
             self._payload_contract.digest(payload),
             "payload digest",
         )
-        if _contains_materialization(payload):
-            raise TypeError("DataBlock/DataPatch are materialization values, not stream payloads")
         size = _positive_int(
             self._payload_contract.retained_nbytes(payload),
             "measured payload bytes",

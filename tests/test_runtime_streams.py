@@ -8,6 +8,7 @@ import weakref
 
 import numpy as np
 import pytest
+import zlc_neutral_atom.runtime.streams as runtime_streams
 
 from zlc_data import (
     AxisId,
@@ -574,8 +575,8 @@ def test_stream_rejects_materialized_dataset_payloads():
             return None
 
         @staticmethod
-        def retained_nbytes(payload):
-            return payload.values.nbytes
+        def retained_nbytes(_payload):
+            return 8
 
         @staticmethod
         def digest(_payload):
@@ -605,6 +606,31 @@ def test_stream_rejects_materialized_dataset_payloads():
             captured_at=0.0,
             trace=trace(),
         )
+    with pytest.raises(TypeError, match="materialization"):
+        producer.emit(
+            ("nested", block),
+            captured_at=0.0,
+            trace=trace(),
+        )
+    assert source.next_sequence == 0
+    assert source.retained_events == 0
+
+
+def test_value_payload_runs_the_materialization_admission_once(monkeypatch):
+    source, producer = stream(events=1)
+    original = runtime_streams._contains_materialization
+    calls = 0
+
+    def counted(value, seen=None):
+        nonlocal calls
+        calls += 1
+        return original(value, seen)
+
+    monkeypatch.setattr(runtime_streams, "_contains_materialization", counted)
+    expected = emit(producer, 1.0)
+
+    assert expected.sequence == 0
+    assert calls == 1
 
 
 def test_stream_requires_payload_contract_owned_content_digest():

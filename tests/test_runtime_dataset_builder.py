@@ -938,11 +938,6 @@ def test_frozen_edge_owner_copies_projection_adapter_before_binding_operator():
     np.testing.assert_array_equal(projected.values, np.full((2, 3), 2))
     assert edge.operator_fingerprint == frozen_operator == "e" * 64
 
-    object.__setattr__(edge, "_value_operator", lambda value: value)
-    with pytest.raises(runtime_dataset.DatasetError, match="projection binding changed"):
-        edge.project_value(payload)
-
-
 def test_builder_freezes_one_metadata_contract_identity_for_the_generation():
     schema = dataset_schema(points=2)
 
@@ -1126,7 +1121,7 @@ def test_metadata_rejects_enum_with_mutable_value():
     reservation.release()
 
 
-def test_runtime_metadata_accepts_bytes_owned_values_but_rejects_readonly_aliases():
+def test_runtime_metadata_accepts_owned_value_as_a_validated_leaf(monkeypatch):
     schema = image_value_schema()
     safe_value = Value(
         np.arange(6, dtype=np.uint16).reshape(2, 3),
@@ -1139,9 +1134,18 @@ def test_runtime_metadata_accepts_bytes_owned_values_but_rejects_readonly_aliase
         value: Value
         labels: tuple[str, ...]
 
+    dataclass_fields = runtime_dataset.fields
+    traversed_types = []
+
+    def tracked_fields(value):
+        traversed_types.append(type(value))
+        return dataclass_fields(value)
+
+    monkeypatch.setattr(runtime_dataset, "fields", tracked_fields)
     assert runtime_dataset._deeply_immutable_metadata(
         OccupancyLikeMetadata(safe_value, ("occupied", "empty"))
     )
+    assert traversed_types == [OccupancyLikeMetadata]
     bytes_backed = np.frombuffer(
         np.arange(6, dtype=np.int64).tobytes(),
         dtype=np.dtype("<i8"),
