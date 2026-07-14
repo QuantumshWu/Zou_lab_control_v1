@@ -809,6 +809,18 @@ def test_manifest_and_derivation_tampering_are_rejected_current_only(committed):
             CalibrationArtifactRef(repository.repository_id, stored.content.digest)
         )
 
+    obsolete_manifest = decode(encode(manifest))
+    obsolete_manifest["algorithm_id"] = "retired-duplicate-identity"
+    obsolete_manifest["algorithm_version"] = "7"
+    stored = repository._store.publish_manifest(
+        "calibration",
+        encode(obsolete_manifest),
+    )
+    with pytest.raises(ValueError, match="unknown field set"):
+        repository.load(
+            CalibrationArtifactRef(repository.repository_id, stored.content.digest)
+        )
+
     forged_manifest = decode(encode(manifest))
     forged_manifest["resource_summary"]["site_count"] += 1
     stored = repository._store.publish_manifest("calibration", encode(forged_manifest))
@@ -836,6 +848,29 @@ def test_manifest_and_derivation_tampering_are_rejected_current_only(committed):
         manifest["derivation_blob"]["size"],
     )
     derivation = decode(repository._store.read_blob(derivation_ref))
+    obsolete_derivation = decode(encode(derivation))
+    obsolete_derivation["algorithm_id"] = "retired-duplicate-identity"
+    obsolete_derivation["algorithm_version"] = "7"
+    obsolete_derivation_blob = repository._store.put_blob(
+        encode(obsolete_derivation)
+    )
+    obsolete_derivation_manifest = decode(encode(manifest))
+    obsolete_derivation_manifest["derivation_blob"] = {
+        "digest": obsolete_derivation_blob.digest,
+        "size": obsolete_derivation_blob.size,
+    }
+    obsolete_derivation_manifest["evidence_digest"] = (
+        obsolete_derivation_blob.digest
+    )
+    stored = repository._store.publish_manifest(
+        "calibration",
+        encode(obsolete_derivation_manifest),
+    )
+    with pytest.raises(ValueError, match="unknown field set"):
+        repository.load(
+            CalibrationArtifactRef(repository.repository_id, stored.content.digest)
+        )
+
     derivation["analysis_run_id"] = "forged-analysis-run"
     forged_derivation = repository._store.put_blob(encode(derivation))
     derivation_only = decode(encode(manifest))

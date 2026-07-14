@@ -1917,14 +1917,13 @@ Calibration 是 `neutral_atom.readout.calibration` 的内建 feature，不使用
 
 ```text
 CalibrationArtifact:
+  source_binding
   frame_contract
   site_map
-  models: tuple[ReadoutModel, ...]
-  capabilities/stage
-  required_model_kinds
-  algorithm_version
-  input_lineage
+  models: tuple[ReadoutModel, ...]  # non-empty, kind unique, canonical order
+  default_model_kind: ReadoutModelKind | None
   parameters
+  fingerprint  # derived from current canonical content
 
 ReadoutModel =
     BoxReadoutModel
@@ -1932,7 +1931,13 @@ ReadoutModel =
   | UniformPsfReadoutModel
 ```
 
-一次 calibration 可产生共享 artifact 中的多种 model。artifact 的 `capabilities/stage` 明确区分 site-map-only、含 threshold、含完整 readout model 等完成态；这是合法的 typed capability，不是 partial-success 模糊状态。每个 Analysis 声明自己需要的 capability/model kind。Occupancy request 可显式选择 model；若用户未指定，只允许按 Definition 声明的稳定 default model policy 在 artifact 内唯一选择，并把实际 model id/version冻结进 request/lineage。没有唯一 default 时构造 request 即提示选择，不能按 tuple 第一项猜，也不能让 notebook 短路径退化成每次手写冗长参数。
+一次 calibration 可产生共享 artifact 中的多种 model，但正式 `CalibrationArtifact` 只表示一次完整、原子成功的校准：`models` 必须非空，每种 `ReadoutModelKind` 最多一个，并按 kind 排成 canonical 顺序。site-map-only 是完整 `SiteMap` 结果（将来若有持久化用例则定义独立 `SiteMapArtifact`），不能用半完成 `CalibrationArtifact`、stage 或 capability flags 冒充成功校准。Analysis request 中的 `model_kinds` 属于冻结请求/derivation；repository 验证实际 model kinds 与请求一致，不把同一集合再复制进 artifact。
+
+Readout model 的唯一选择身份是 `CalibrationArtifactRef + ReadoutModelKind`。每个 concrete model 的 union kind、阈值、方向、boxes/kernels/background、参数和 quality evidence 已被 artifact content fingerprint 覆盖，因此不再保存与 kind 一一映射的 `model_id/model_version`，也不为同一事实建立 `DefaultModelPolicy` 包装。Occupancy request 可显式给 kind；未给时只允许使用 artifact 的 `default_model_kind`，或在 artifact 恰有一个 model 时选择该唯一 model；多 model 且无 default 必须在 request 构造时明确报歧义，永不按 tuple 第一项猜。若以后真实出现同一 artifact 中多个同-kind model 的第二个生产用例，再引入有业务含义的 selector 或 individual-model content digest，不能恢复数字改稿版本。
+
+`CalibrationArtifact.fingerprint` 由 artifact owner 根据当前 canonical 内容重算并与构造时 seal 比较；它不能只返回缓存值。`AdmittedCalibration` 的每次 artifact 权威访问都消费这次验证过的 digest 并与 repository admission binding 对照，因此即使有人绕过 frozen dataclass、反射替换嵌套 model/threshold，也只能 fail closed，不能让 occupancy 执行新数值却保留旧 provenance。
+
+`ReadoutModelQuality` 只表示已经通过准入的完整 per-site evidence，因此不保存调用方可随意写成 `True` 的 `gate_passed`；失败证据属于 `CalibrationAnalysisDiagnostics`，不能进入正式 artifact。描述 exact-binomial/IUT/Holm 等统计语义的 `quality_gate_id`、`reference-valley-gate-id` 与 `reference-ambiguity-gate-id` 必须保留；纯改稿数字 `*_version` 必须删除。artifact、analysis result、derivation 与 manifest 也不复制单一 producer 的 `algorithm_id/version`：request/work-plan/partition/diagnostics/source evidence、artifact fingerprint 与 plan binding 已构成 repository authority，SiteDetectionLineage 直接覆盖这些事实。
 
 NumPy/SciPy 的版本只作为 `CalibrationArtifact.parameters` 顶层的有界、只读 producer lineage 备注。当前 producer 尽力写入两条备注；读取端允许备注缺失或为 `unknown`，不能因此拒绝 load/admit。它们不进入 WorkPlan、模型参数、SiteMap/detection lineage、derivation、manifest 专属字段、科学兼容性判断或 replay，也不与当前进程环境比较。artifact 的 CAS/fingerprint 仍像覆盖其它持久字节一样覆盖这些备注；这是内容完整性，不是数值后端准入权威。资源计划对两条备注使用固定宽度上界，因此环境版本字符串不能改变 WorkPlan 或 plan binding。
 
@@ -1953,7 +1958,7 @@ SiteMap:
 
 Camera geometry、ROI/binning 整除、output shape、spatial axis 与 real-count dtype 的纯规则只由 `zlc_neutral_atom.readout.contracts` 拥有；`CameraCaptureDescriptor`、`FrameContract` 与 runtime `CameraPhysicalFacts` 各自仍验证本对象的完整合同，但必须委托同一组规则，不能复制第二套物理公式。
 
-所有会改变数值解释的采集设置都进入 FrameContract fingerprint。CalibrationRequest 明确列出 required_model_kinds；所有 required model 成功且通过质量 gate 才原子提交 CalibrationArtifact，不能把部分失败 artifact 当成功。每个 model 保存自己的参数 schema、适用 FrameContract/SiteMap fingerprint 和质量指标。
+所有会改变数值解释的采集设置都进入 FrameContract fingerprint。CalibrationAnalysisRequest 明确列出所需 `model_kinds`；所有请求 model 成功并产生完整质量证据后才原子提交 CalibrationArtifact，不能把部分失败 artifact 当成功。每个 model 保存自己的参数、适用 FrameContract/SiteMap fingerprint 与全部 per-site 质量证据；正式 artifact 的实际 kind 集合必须和持久 request 相同。
 
 ### 13.2 输入
 
@@ -1963,7 +1968,7 @@ CalibrationInput =
   | CaptureArtifactInput(CaptureArtifactRef)
 ```
 
-neutral domain/runtime 不接受“执行时读取 session current calibration”、裸 filesystem fallback 或 legacy path search。Notebook `Experiment.readout` 的 binding-keyed calibration ref 只是 composition facade 的可见默认：facade 构造 Occupancy/Detection/Scan request 时必须把具体 ReadoutBindingKey、CalibrationArtifactRef 和 selected/default model id复制为显式字段并冻结；若 ref 为空、binding/FrameContract/capability/model 不适用，request 构造/preflight 失败，运行中不能换成另一个 calibration。Workbench 同样在用户点击 Run 时冻结当前选择，而不是让 processor 回查 mutable session或按 repository 最近文件猜。
+neutral domain/runtime 不接受“执行时读取 session current calibration”、裸 filesystem fallback 或 legacy path search。Notebook `Experiment.readout` 的 binding-keyed calibration ref 只是 composition facade 的可见默认：facade 构造 Occupancy/Detection/Scan request 时必须 load/admit 当前 ref，验证 readout binding，解析显式/default/唯一 model，并把具体 ReadoutBindingKey、CalibrationArtifactRef 与最终 `ReadoutModelKind` 冻结进 request。若 ref 为空、binding/FrameContract/model 不适用或选择歧义，request 构造/preflight 失败；运行中不能因为 facade 的 current ref/default 后来改变而换 calibration。Workbench 同样在用户点击 Run 时冻结当前选择，而不是让 processor 回查 mutable session或按 repository 最近文件猜。
 
 ### 13.3 执行
 
@@ -1983,7 +1988,7 @@ live 路径先提交原始 CaptureArtifact，再与 offline 路径汇合；算�
 
 不需要 CalibrationService、child Measurement Run、calibration StreamProcessor 或 reducer 包装。普通批量校准就是 neutral-owned `CalibrationAnalysisDefinition` 绑定出的 AnalysisStep，在该 Task 的 run-owner/必要时 disposable compute process 中运行，不占用 view/Fit executor，并受同一 RunHandle cancellation/revision 管理。只有出现一个必须在采集完成前产生控制反馈、且不能保存原始样本后批处理的真实用例，才另行设计领域 StreamReducer；baseline 不为 calibration 预留它。
 
-Occupancy request 携带 CalibrationArtifactRef 和 selected model kind；RunPlan 在绑定 `OccupancyStreamProcessor` 前解析为 immutable CalibrationArtifact，并验证输入 sample/capture 的 FrameContract、SiteMap/coordinate frame、model applicability 和 algorithm schema。任何 mismatch 明确失败，不按相同 shape 猜“应该兼容”。
+Occupancy request 携带 CalibrationArtifactRef 和已解析的 `ReadoutModelKind`；RunPlan 在绑定 `OccupancyStreamProcessor` 前解析并 admit immutable CalibrationArtifact，验证 artifact fingerprint/evidence/commit、输入 sample/capture 的 FrameContract、SiteMap/coordinate frame、model kind 与 applicability。任何 mismatch 明确失败，不按相同 shape 猜“应该兼容”。
 
 ## 14. PulseScan
 

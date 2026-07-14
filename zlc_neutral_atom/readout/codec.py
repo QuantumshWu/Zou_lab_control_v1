@@ -1,4 +1,4 @@
-"""Strict current-version codecs for neutral-atom readout contracts."""
+"""Strict current-format codecs for neutral-atom readout contracts."""
 
 from __future__ import annotations
 

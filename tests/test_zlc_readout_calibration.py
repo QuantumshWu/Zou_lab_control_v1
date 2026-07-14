@@ -44,10 +44,8 @@ from zlc_neutral_atom.readout import (
     CalibrationResourceExceeded,
     CalibrationResourcePolicy,
     CalibrationSourceBinding,
-    CalibrationStage,
     CameraCaptureDescriptor,
     CameraEventReadoutSetting,
-    DefaultModelPolicy,
     FrameContract,
     PerSitePsfReadoutModel,
     ReadoutBindingKey,
@@ -166,15 +164,12 @@ def _contracts(*, axis_name_padding: int = 0):
         np.array([0.95, 0.0, 1.0], dtype="<f8"),
         ComponentValidity((site_axis.axis_id,), np.array([True, False, True])),
         "held-out-balanced-fidelity",
-        "2",
-        True,
     )
     boxes = np.array([[0, 0, 1, 1], [0, 0, 1, 1], [4, 3, 1, 1]], dtype="<i8")
     return contract, site_map, quality, boxes
 
 
 def _header(
-    model_id: str,
     contract,
     site_map,
     quality,
@@ -183,8 +178,6 @@ def _header(
     occupied_above=None,
 ):
     return ReadoutModelHeader(
-        model_id,
-        "1",
         contract.fingerprint,
         site_map.fingerprint,
         site_map.site_axis.axis_id,
@@ -277,19 +270,19 @@ def _resolved_capture(*, point_layout=None, contract=None):
 
 def _models(contract, site_map, quality, boxes):
     box = BoxReadoutModel(
-        _header("box-v1", contract, site_map, quality),
+        _header(contract, site_map, quality),
         boxes,
         BoxReducer.SUM,
     )
     per_site = PerSitePsfReadoutModel(
-        _header("per-site-psf-v1", contract, site_map, quality),
+        _header(contract, site_map, quality),
         boxes,
         np.ones((3, 1, 1), dtype="<f8"),
         BackgroundMode.NONE,
         0,
     )
     uniform = UniformPsfReadoutModel(
-        _header("uniform-psf-v1", contract, site_map, quality),
+        _header(contract, site_map, quality),
         boxes,
         np.ones((1, 1), dtype="<f8"),
         BackgroundMode.NONE,
@@ -367,15 +360,7 @@ def _artifact(*, model_order=(2, 0, 1), axis_name_padding: int = 0):
         contract,
         site_map,
         tuple(models[index] for index in model_order),
-        CalibrationStage.COMPLETE,
-        (
-            ReadoutModelKind.UNIFORM_PSF,
-            ReadoutModelKind.BOX,
-            ReadoutModelKind.PER_SITE_PSF,
-        ),
-        DefaultModelPolicy("primary-box", "1", default_kind=ReadoutModelKind.BOX),
-        "rb87-readout-calibration",
-        "1",
+        ReadoutModelKind.BOX,
         (
             CalibrationParameter("psf-half-width", 0),
             CalibrationParameter("strict-validity", True),
@@ -438,7 +423,7 @@ def test_feature_spec_fingerprint_is_canonical_and_rejects_another_models_math()
     validate_readout_feature_spec_model(constructed_spec, selected_model)
 
     other_model = BoxReadoutModel(
-        _header("mean-box-v1", contract, site_map, quality),
+        _header(contract, site_map, quality),
         boxes,
         BoxReducer.MEAN,
     )
@@ -477,7 +462,6 @@ def test_per_site_occupied_direction_supports_inverted_signal_without_tuple_gues
     contract, site_map, quality, boxes = _contracts()
     model = BoxReadoutModel(
         _header(
-            "inverted-site-zero",
             contract,
             site_map,
             quality,
@@ -554,7 +538,7 @@ def test_annulus_nonfinite_pixel_invalidates_only_the_affected_site():
     contract, site_map, quality, _ = _contracts()
     boxes = np.array([[0, 0, 1, 1], [0, 0, 1, 1], [4, 3, 1, 1]], dtype="<i8")
     model = UniformPsfReadoutModel(
-        _header("uniform-annulus", contract, site_map, quality),
+        _header(contract, site_map, quality),
         boxes,
         np.ones((1, 1), dtype="<f8"),
         BackgroundMode.ANNULUS_MEDIAN,
@@ -625,7 +609,7 @@ def test_training_and_runtime_feature_paths_share_annulus_background_and_invalid
     model_kind,
 ):
     contract, site_map, quality, boxes = _contracts()
-    header = _header(f"{model_kind.value.lower()}-annulus", contract, site_map, quality)
+    header = _header(contract, site_map, quality)
     if model_kind is ReadoutModelKind.PER_SITE_PSF:
         model = PerSitePsfReadoutModel(
             header,
@@ -803,13 +787,16 @@ def test_application_requires_named_value_schema_and_rejects_fingerprint_drift()
 def test_artifact_order_is_canonical_and_default_selection_is_stable():
     first = _artifact(model_order=(2, 0, 1))
     second = _artifact(model_order=(1, 2, 0))
-    assert [model.header.model_id for model in first.models] == [
-        "box-v1",
-        "per-site-psf-v1",
-        "uniform-psf-v1",
+    assert [model.kind for model in first.models] == [
+        ReadoutModelKind.BOX,
+        ReadoutModelKind.PER_SITE_PSF,
+        ReadoutModelKind.UNIFORM_PSF,
     ]
-    assert first.select_model().header.model_id == "box-v1"
-    assert first.select_model(kind=ReadoutModelKind.UNIFORM_PSF).header.model_id == "uniform-psf-v1"
+    assert first.select_model().kind is ReadoutModelKind.BOX
+    assert (
+        first.select_model(kind=ReadoutModelKind.UNIFORM_PSF).kind
+        is ReadoutModelKind.UNIFORM_PSF
+    )
     assert encode_calibration_artifact(first) == encode_calibration_artifact(second)
     assert first.fingerprint == second.fingerprint
 
@@ -898,51 +885,62 @@ def test_multi_model_artifact_without_default_is_valid_but_implicit_selection_is
     original = _artifact()
     artifact = replace(
         original,
-        default_model_policy=DefaultModelPolicy("explicit-selection", "1"),
+        default_model_kind=None,
     )
     assert len(artifact.models) == 3
-    with pytest.raises(ValueError, match="resolved to 3 models"):
+    with pytest.raises(ValueError, match="no default model kind.*3 available"):
         artifact.select_model()
-    assert artifact.select_model(model_id="uniform-psf-v1").kind is ReadoutModelKind.UNIFORM_PSF
+    assert (
+        artifact.select_model(kind=ReadoutModelKind.UNIFORM_PSF).kind
+        is ReadoutModelKind.UNIFORM_PSF
+    )
 
 
-def test_default_kind_ambiguity_and_missing_complete_kind_fail_closed():
+def test_duplicate_model_kind_and_missing_default_kind_fail_closed():
     contract, site_map, quality, boxes = _contracts()
     box = _models(contract, site_map, quality, boxes)[0]
     second_box = BoxReadoutModel(
-        _header("box-v2", contract, site_map, quality), boxes, BoxReducer.MEAN
+        _header(contract, site_map, quality), boxes, BoxReducer.MEAN
     )
-    with pytest.raises(ValueError, match="resolved to 2 models"):
+    with pytest.raises(ValueError, match="model kinds must be unique"):
         CalibrationArtifact(
             _source_binding(contract),
             contract,
             site_map,
             (box, second_box),
-            CalibrationStage.COMPLETE,
-            (ReadoutModelKind.BOX,),
-            DefaultModelPolicy("ambiguous", "1", default_kind=ReadoutModelKind.BOX),
-            "algorithm",
-            "1",
+            ReadoutModelKind.BOX,
         )
-    with pytest.raises(ValueError, match="missing required"):
+    with pytest.raises(ValueError, match="at least one readout model"):
+        CalibrationArtifact(
+            _source_binding(contract),
+            contract,
+            site_map,
+            (),
+            None,
+        )
+    with pytest.raises(ValueError, match="resolved to 0 models"):
         CalibrationArtifact(
             _source_binding(contract),
             contract,
             site_map,
             (box,),
-            CalibrationStage.COMPLETE,
-            (ReadoutModelKind.BOX, ReadoutModelKind.PER_SITE_PSF),
-            DefaultModelPolicy("box", "1", default_kind=ReadoutModelKind.BOX),
-            "algorithm",
-            "1",
+            ReadoutModelKind.PER_SITE_PSF,
         )
+    sole = CalibrationArtifact(
+        _source_binding(contract),
+        contract,
+        site_map,
+        (box,),
+        None,
+    )
+    assert sole.select_model() is sole.models[0]
 
 
 def test_invalid_sites_require_explicit_validity_and_canonical_zero_fillers():
     contract, site_map, quality, boxes = _contracts()
     bad_thresholds = np.array([5.0, 6.0, 5.0], dtype="<f8")
     with pytest.raises(ValueError, match="zero threshold"):
-        _header("bad", contract, site_map, quality, thresholds=bad_thresholds)
+        _header(contract, site_map, quality, thresholds=bad_thresholds)
     retained_diagnostic = replace(
         quality,
         dark_training_sample_counts=np.array([10, 1, 11], dtype="<u8"),
@@ -965,7 +963,6 @@ def test_invalid_sites_require_explicit_validity_and_canonical_zero_fillers():
         )
     with pytest.raises(ValueError, match="direction fillers"):
         _header(
-            "bad-direction",
             contract,
             site_map,
             quality,
@@ -975,29 +972,21 @@ def test_invalid_sites_require_explicit_validity_and_canonical_zero_fillers():
     bad_boxes[1] = [2, 1, 1, 1]
     with pytest.raises(ValueError, match="box fillers"):
         BoxReadoutModel(
-            _header("bad-box-filler", contract, site_map, quality),
+            _header(contract, site_map, quality),
             bad_boxes,
             BoxReducer.SUM,
         )
 
 
-def test_model_quality_gate_and_site_map_subset_are_artifact_invariants():
-    contract, site_map, quality, boxes = _contracts()
-    failed = replace(quality, gate_passed=False)
-    failed_box = BoxReadoutModel(
-        _header("failed", contract, site_map, failed), boxes, BoxReducer.SUM
-    )
-    with pytest.raises(ValueError, match="quality gate"):
-        CalibrationArtifact(
-            _source_binding(contract),
-            contract,
-            site_map,
-            (failed_box,),
-            CalibrationStage.COMPLETE,
-            (ReadoutModelKind.BOX,),
-            DefaultModelPolicy("box", "1", default_kind=ReadoutModelKind.BOX),
-            "algorithm",
-            "1",
+def test_model_quality_is_admitted_evidence_not_a_serialized_gate_result():
+    _, _, quality, _ = _contracts()
+    with pytest.raises(ValueError, match="at least one usable site"):
+        replace(
+            quality,
+            usable_sites=ComponentValidity(
+                (quality.site_axis_id,),
+                np.array([False, False, False]),
+            ),
         )
 
 
@@ -1042,7 +1031,7 @@ def test_checked_box_geometry_blocks_int64_wrap_empty_slice_and_center_mismatch(
     overflow = boxes.copy()
     overflow[0] = [np.iinfo(np.int64).max, 0, 1, 1]
     overflow_model = BoxReadoutModel(
-        _header("overflow", contract, site_map, quality),
+        _header(contract, site_map, quality),
         overflow,
         BoxReducer.SUM,
     )
@@ -1057,7 +1046,7 @@ def test_checked_box_geometry_blocks_int64_wrap_empty_slice_and_center_mismatch(
     misses_center = boxes.copy()
     misses_center[0] = [1, 0, 1, 1]
     center_model = BoxReadoutModel(
-        _header("miss-center", contract, site_map, quality),
+        _header(contract, site_map, quality),
         misses_center,
         BoxReducer.SUM,
     )
@@ -1089,12 +1078,8 @@ def test_standalone_model_cannot_bypass_site_count_applicability():
         np.array([0.9, 0.9], dtype="<f8"),
         ComponentValidity((axis_id,), np.array([True, True])),
         "gate",
-        "1",
-        True,
     )
     header = ReadoutModelHeader(
-        "wrong-count",
-        "1",
         contract.fingerprint,
         site_map.fingerprint,
         axis_id,
@@ -1128,7 +1113,7 @@ def test_psf_kernels_are_nonnegative_and_unusable_sites_have_one_placeholder():
     )
     with pytest.raises(ValueError, match="non-negative"):
         PerSitePsfReadoutModel(
-            _header("negative", contract, site_map, quality),
+            _header(contract, site_map, quality),
             boxes,
             negative,
             BackgroundMode.NONE,
@@ -1140,7 +1125,7 @@ def test_psf_kernels_are_nonnegative_and_unusable_sites_have_one_placeholder():
     )
     with pytest.raises(ValueError, match="unit-impulse"):
         PerSitePsfReadoutModel(
-            _header("bad-filler", contract, site_map, quality),
+            _header(contract, site_map, quality),
             boxes,
             bad_filler,
             BackgroundMode.NONE,
@@ -1214,9 +1199,7 @@ def _artifact_encoding_bounds(artifact):
             model.header.parameters for model in artifact.models
         ),
         model_kinds=tuple(model.kind for model in artifact.models),
-        default_model_policy=artifact.default_model_policy,
-        algorithm_id=artifact.algorithm_id,
-        algorithm_version=artifact.algorithm_version,
+        default_model_kind=artifact.default_model_kind,
     )
     wire_bound = calibration_artifact_encoding_upper_bound(
         site_count=summary.site_count,
@@ -1308,19 +1291,15 @@ def test_direct_decode_site_budget_rejects_before_ndarray_materialization(
     assert materializations == 0
 
 
-def test_artifact_is_unhashable_and_fingerprint_is_cached(monkeypatch):
+def test_artifact_is_unhashable_and_fingerprint_rechecks_current_content():
     artifact = _artifact()
     fingerprint = artifact.fingerprint
     with pytest.raises(TypeError):
         hash(artifact)
-    import zlc_neutral_atom.readout.calibration_codec as codec
-
-    monkeypatch.setattr(
-        codec,
-        "calibration_artifact_to_tree",
-        lambda _artifact: pytest.fail("fingerprint was recomputed"),
-    )
     assert artifact.fingerprint == fingerprint
+    object.__setattr__(artifact, "default_model_kind", None)
+    with pytest.raises(ValueError, match="changed after construction"):
+        _ = artifact.fingerprint
 
 
 def test_all_persistent_values_have_strict_current_canonical_codecs():
@@ -1373,8 +1352,6 @@ def test_quality_codec_is_exact_and_carries_adverse_per_class_evidence():
         "held_out_fidelity",
         "held_out_validity",
         "quality_gate_id",
-        "quality_gate_version",
-        "gate_passed",
     }
 
     missing = decode(encode_calibration_artifact(_artifact()))
@@ -1385,6 +1362,35 @@ def test_quality_codec_is_exact_and_carries_adverse_per_class_evidence():
     unknown["models"][0]["header"]["quality"]["legacy_fidelity_gate"] = 0.9
     with pytest.raises(ValueError, match="exactly"):
         decode_calibration_artifact(encode(unknown))
+
+
+@pytest.mark.parametrize(
+    ("path", "obsolete_field", "obsolete_value"),
+    (
+        (("models", 0, "header", "quality"), "quality_gate_version", "2"),
+        (("models", 0, "header", "quality"), "gate_passed", True),
+        (("models", 0, "header"), "model_id", "box-v5"),
+        (("models", 0, "header"), "model_version", "5"),
+        ((), "stage", "COMPLETE"),
+        ((), "capabilities", ["SITE_MAP"]),
+        ((), "required_model_kinds", ["BOX"]),
+        ((), "default_model_policy", {"schema": "obsolete"}),
+        ((), "algorithm_id", "rb87-readout-calibration"),
+        ((), "algorithm_version", "7"),
+    ),
+)
+def test_obsolete_readout_identity_and_derived_fields_fail_closed(
+    path,
+    obsolete_field,
+    obsolete_value,
+):
+    tree = decode(encode_calibration_artifact(_artifact()))
+    target = tree
+    for part in path:
+        target = target[part]
+    target[obsolete_field] = obsolete_value
+    with pytest.raises(ValueError, match="exactly"):
+        decode_calibration_artifact(encode(tree))
 
 
 def test_calibration_reference_codec_is_stable_and_namespace_typed():
@@ -1400,7 +1406,7 @@ def test_out_of_frame_geometry_is_rejected_at_application_not_silently_clipped()
     boxes = boxes.copy()
     boxes[2] = [5, 3, 1, 1]
     model = BoxReadoutModel(
-        _header("bad-geometry", contract, site_map, quality),
+        _header(contract, site_map, quality),
         boxes,
         BoxReducer.SUM,
     )

@@ -245,6 +245,49 @@ def test_pulse_ir_digest_and_affine_formulas_have_one_owner():
     )
 
 
+def test_readout_artifacts_do_not_restore_edit_counter_metadata():
+    forbidden = {
+        "algorithm_id",
+        "algorithm_version",
+        "default_model_policy",
+        "gate_passed",
+        "model_id",
+        "model_version",
+        "policy_version",
+        "quality_gate_version",
+        "required_model_kinds",
+        "CalibrationCapability",
+        "CalibrationStage",
+        "DefaultModelPolicy",
+        "OccupancyModelSelection",
+    }
+    violations = []
+    for source in (ROOT / "zlc_neutral_atom" / "readout").rglob("*.py"):
+        relative = source.relative_to(ROOT)
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(relative))
+        for node in ast.walk(tree):
+            candidate = None
+            if isinstance(node, ast.Name):
+                candidate = node.id
+            elif isinstance(node, ast.Attribute):
+                candidate = node.attr
+            elif isinstance(node, ast.arg):
+                candidate = node.arg
+            elif isinstance(node, ast.keyword):
+                candidate = node.arg
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                candidate = node.value
+            elif isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                candidate = node.name
+            if candidate in forbidden:
+                violations.append(f"{relative}:{node.lineno} restores {candidate}")
+    assert not violations, (
+        "readout identity is CalibrationArtifactRef + ReadoutModelKind; descriptive "
+        "gate ids and content fingerprints replace edit-counter metadata:\n"
+        + "\n".join(violations)
+    )
+
+
 def test_artifact_finalizers_do_not_replay_published_payload_digests():
     violations = []
     for relative in (

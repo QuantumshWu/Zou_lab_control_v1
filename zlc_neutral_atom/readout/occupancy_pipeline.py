@@ -69,13 +69,12 @@ from zlc_neutral_atom.runtime.streams import (
     TraceBinding,
 )
 
-from .calibration import calibration_retained_array_nbytes
+from .calibration import ReadoutModelKind, calibration_retained_array_nbytes
 from .calibration_reference import CalibrationArtifactRef
 from .occupancy import (
     BoundOccupancyStreamProcessor,
     OccupancyDatasetField,
     OccupancyDatasetMetadata,
-    OccupancyModelSelection,
     OccupancyStreamProcessorSpec,
     bind_occupancy_stream_processor,
 )
@@ -268,8 +267,9 @@ class OccupancyPipelineResult:
         "_aggregate_peak_bytes",
         "_memory_profile_fingerprint",
         "_terminal_provenance",
-        "_model_selection",
+        "_model_kind",
         "_calibration_reference",
+        "_calibration_artifact_fingerprint",
         "_calibration_admission_evidence_digest",
         "_processor_binding_digest",
     )
@@ -349,11 +349,16 @@ class OccupancyPipelineResult:
             "_terminal_provenance",
             pipeline.dataset.provenance,
         )
-        object.__setattr__(self, "_model_selection", bound.model_selection)
+        object.__setattr__(self, "_model_kind", bound.model_kind)
         object.__setattr__(
             self,
             "_calibration_reference",
             bound.calibration_reference,
+        )
+        object.__setattr__(
+            self,
+            "_calibration_artifact_fingerprint",
+            bound.calibration_artifact_fingerprint,
         )
         object.__setattr__(
             self,
@@ -420,12 +425,16 @@ class OccupancyPipelineResult:
         return self._terminal_provenance
 
     @property
-    def model_selection(self) -> OccupancyModelSelection:
-        return self._model_selection
+    def model_kind(self) -> ReadoutModelKind:
+        return self._model_kind
 
     @property
     def calibration_reference(self) -> CalibrationArtifactRef:
         return self._calibration_reference
+
+    @property
+    def calibration_artifact_fingerprint(self) -> str:
+        return self._calibration_artifact_fingerprint
 
     @property
     def calibration_admission_evidence_digest(self) -> str:

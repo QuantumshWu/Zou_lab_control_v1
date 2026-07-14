@@ -1,4 +1,4 @@
-"""Strict current-version codecs for readout-calibration analysis evidence.
+"""Strict current-format codecs for readout-calibration analysis evidence.
 
 The calibration repository persists these values inside one derivation blob.  This
 module is their sole serialization owner.  It deliberately stores closed scalar
@@ -89,7 +89,7 @@ class CalibrationAnalysisCodecError(ValueError):
 
 # These are wire/object-amplification ceilings, not scientific analysis limits.
 # Scientific limits remain encoded in CalibrationAnalysisResourcePolicy.  The
-# codec ceilings keep hostile current-version payloads bounded even when they
+# codec ceilings keep hostile current-format payloads bounded even when they
 # claim an arbitrarily permissive embedded policy.
 MAX_ANALYSIS_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_ANALYSIS_WORK_PLAN_BYTES = 64 * 1024

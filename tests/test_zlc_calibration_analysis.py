@@ -392,7 +392,7 @@ def test_one_path_builds_all_closed_models_with_shared_map_and_real_quality_evid
 
     assert artifact.source_binding.source_capture_ref == capture.ref
     assert artifact.source_binding.layout == _request().layout
-    assert artifact.default_model_policy.default_kind is ReadoutModelKind.BOX
+    assert artifact.default_model_kind is ReadoutModelKind.BOX
     assert artifact.select_model().kind is ReadoutModelKind.BOX
     assert {type(model) for model in artifact.models} == {
         BoxReadoutModel,
@@ -425,8 +425,14 @@ def test_one_path_builds_all_closed_models_with_shared_map_and_real_quality_evid
     assert parameters["held-out-family-model-count"] == 3
     assert parameters["held-out-family-hypothesis-count"] == 12
     assert parameters["reference-evidence-bracket-count"] == 33
+    assert "reference-valley-gate-version" not in parameters
+    assert "reference-ambiguity-gate-version" not in parameters
     for model in artifact.models:
         usable = model.header.quality.usable_sites.mask
+        assert not hasattr(model.header, "model_id")
+        assert not hasattr(model.header, "model_version")
+        assert not hasattr(model.header.quality, "quality_gate_version")
+        assert not hasattr(model.header.quality, "gate_passed")
         model_parameters = {
             item.name: item.value for item in model.header.parameters
         }
@@ -1054,6 +1060,16 @@ def test_repository_contract_rejects_coordinated_request_and_geometry_drift():
         with pytest.raises(ValueError, match="parameters differ"):
             validate_calibration_analysis_contract(forged, request, plan)
 
+    default_drift = CalibrationAnalysisResult(
+        replace(
+            result.artifact,
+            default_model_kind=ReadoutModelKind.PER_SITE_PSF,
+        ),
+        result.diagnostics,
+    )
+    with pytest.raises(ValueError, match="default model kind differs"):
+        validate_calibration_analysis_contract(default_drift, request, plan)
+
     sampling_drift = replace(
         result.artifact,
         parameters=changed_parameters(
@@ -1173,8 +1189,8 @@ def test_explicit_no_default_policy_keeps_multi_model_selection_fail_closed():
         _capture(),
         _request(default_model_kind=None),
     ).artifact
-    assert artifact.default_model_policy.default_kind is None
-    with pytest.raises(ValueError, match="resolved to 3 models"):
+    assert artifact.default_model_kind is None
+    with pytest.raises(ValueError, match="default"):
         artifact.select_model()
 
 

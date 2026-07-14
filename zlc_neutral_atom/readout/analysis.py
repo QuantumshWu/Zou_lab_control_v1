@@ -56,9 +56,7 @@ from .calibration import (
     CalibrationResourceExceeded,
     CalibrationResourcePolicy,
     CalibrationSourceBinding,
-    CalibrationStage,
     DEFAULT_CALIBRATION_RESOURCE_POLICY,
-    DefaultModelPolicy,
     PerSitePsfReadoutModel,
     ReadoutFeatureSpec,
     ReadoutModel,
@@ -76,8 +74,6 @@ from .calibration import (
 from .contracts import CalibrationCaptureBracket, CalibrationCaptureLayout, FrameContract
 
 
-CALIBRATION_ANALYSIS_ALGORITHM_ID = "zlc-readout-calibration-analysis"
-CALIBRATION_ANALYSIS_ALGORITHM_VERSION = "7"
 # The partition is an algorithm decision, not a post-capture tuning knob.  A
 # public seed would let callers repeatedly repartition one observed capture
 # until a nominal familywise gate happened to pass.
@@ -92,25 +88,14 @@ _ASSIGNMENT_SCRATCH_BYTES_PER_PAIR = 64
 # sequential and reuse those arrays; they are not concurrent phase peaks.
 _DETECTOR_WORKING_BYTES_PER_PIXEL = 384
 _TOPOGRAPHIC_EDGE_COUNT_PER_PIXEL = 4
-_DEFAULT_MODEL_POLICY_ID = "analysis-request"
-_DEFAULT_MODEL_POLICY_VERSION = "4"
-_MODEL_VERSION = "5"
-_MODEL_ID_BY_KIND = {
-    ReadoutModelKind.BOX: "box-v5",
-    ReadoutModelKind.PER_SITE_PSF: "per-site-psf-v5",
-    ReadoutModelKind.UNIFORM_PSF: "uniform-psf-v5",
-}
 _QUALITY_GATE_ID = (
     "precommitted-frozen-bracket-adverse-missingness-exact-binomial-"
     "iut-artifact-model-site-holm"
 )
-_QUALITY_GATE_VERSION = "2"
 _REFERENCE_VALLEY_GATE_ID = (
     "independent-stationary-complete-three-bin-exact-binomial-iut-holm"
 )
-_REFERENCE_VALLEY_GATE_VERSION = "3"
 _REFERENCE_AMBIGUITY_GATE_ID = "one-level-nested-valley-screen-holm"
-_REFERENCE_AMBIGUITY_GATE_VERSION = "1"
 _REFERENCE_EVIDENCE_ASSUMPTION = (
     "INDEPENDENT_STATIONARY_BRACKETS_COMPLETE_REFERENCE_FEATURES"
 )
@@ -1024,11 +1009,6 @@ class CalibrationAnalysisResult:
             raise TypeError("artifact must be CalibrationArtifact")
         if not isinstance(self.diagnostics, CalibrationAnalysisDiagnostics):
             raise TypeError("diagnostics must be CalibrationAnalysisDiagnostics")
-        if (
-            self.artifact.algorithm_id != CALIBRATION_ANALYSIS_ALGORITHM_ID
-            or self.artifact.algorithm_version != CALIBRATION_ANALYSIS_ALGORITHM_VERSION
-        ):
-            raise ValueError("analysis result artifact names another algorithm")
         site_count = self.artifact.site_map.site_axis.size
         if len(self.diagnostics.consensus_dark_counts) != site_count:
             raise ValueError("diagnostic consensus vectors differ from artifact site count")
@@ -1088,9 +1068,7 @@ class CalibrationAnalysisResult:
             "reference-valley-gate-id": (
                 _REFERENCE_VALLEY_GATE_ID
             ),
-            "reference-valley-gate-version": _REFERENCE_VALLEY_GATE_VERSION,
             "reference-ambiguity-gate-id": _REFERENCE_AMBIGUITY_GATE_ID,
-            "reference-ambiguity-gate-version": _REFERENCE_AMBIGUITY_GATE_VERSION,
             "reference-statistical-unit": "BRACKET",
             "reference-evidence-assumption": (
                 _REFERENCE_EVIDENCE_ASSUMPTION
@@ -1260,11 +1238,7 @@ class CalibrationAnalysisResult:
             ):
                 raise ValueError("model partition counts differ from diagnostics")
             quality = model.header.quality
-            if (
-                quality.quality_gate_id != _QUALITY_GATE_ID
-                or quality.quality_gate_version != _QUALITY_GATE_VERSION
-                or not quality.gate_passed
-            ):
+            if quality.quality_gate_id != _QUALITY_GATE_ID:
                 raise ValueError("model quality gate differs from analysis contract")
             usable = quality.usable_sites.mask
             if any(
@@ -1946,13 +1920,7 @@ def _prepare_calibration_work(
                 model_parameters for _kind in request.model_kinds
             ),
             model_kinds=request.model_kinds,
-            default_model_policy=DefaultModelPolicy(
-                _DEFAULT_MODEL_POLICY_ID,
-                _DEFAULT_MODEL_POLICY_VERSION,
-                default_kind=request.default_model_kind,
-            ),
-            algorithm_id=CALIBRATION_ANALYSIS_ALGORITHM_ID,
-            algorithm_version=CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
+            default_model_kind=request.default_model_kind,
         )
     )
     artifact_encoding_upper_bound = calibration_artifact_encoding_upper_bound(
@@ -3648,11 +3616,9 @@ def _artifact_parameter_values(
         "reference-label-source": request.reference_label_source.value,
         "reference-class-orientation": request.reference_class_orientation.value,
         "reference-valley-gate-id": _REFERENCE_VALLEY_GATE_ID,
-        "reference-valley-gate-version": _REFERENCE_VALLEY_GATE_VERSION,
         "reference-statistical-unit": "BRACKET",
         "reference-evidence-assumption": _REFERENCE_EVIDENCE_ASSUMPTION,
         "reference-ambiguity-gate-id": _REFERENCE_AMBIGUITY_GATE_ID,
-        "reference-ambiguity-gate-version": _REFERENCE_AMBIGUITY_GATE_VERSION,
         "train-bracket-count": train_count,
         "reference-evidence-bracket-count": reference_evidence_count,
         "test-bracket-count": test_count,
@@ -3724,13 +3690,8 @@ def _model_header(
         training.held_out_fidelity,
         ComponentValidity((axis_id,), training.held_out_validity),
         _QUALITY_GATE_ID,
-        _QUALITY_GATE_VERSION,
-        True,
     )
-    model_id = _MODEL_ID_BY_KIND[kind]
     return ReadoutModelHeader(
-        model_id,
-        _MODEL_VERSION,
         frame_contract.fingerprint,
         site_map.fingerprint,
         axis_id,
@@ -3867,17 +3828,10 @@ def validate_calibration_analysis_contract(
     if not _typed_parameter_maps_equal(artifact_values, expected_artifact_values):
         raise ValueError("artifact parameters differ from frozen analysis request")
 
-    expected_policy = DefaultModelPolicy(
-        _DEFAULT_MODEL_POLICY_ID,
-        _DEFAULT_MODEL_POLICY_VERSION,
-        default_kind=request.default_model_kind,
-    )
-    if artifact.default_model_policy != expected_policy:
-        raise ValueError("artifact default model policy differs from request")
-    if artifact.required_model_kinds != request.model_kinds:
-        raise ValueError("artifact required model kinds differ from request")
     if tuple(model.kind for model in artifact.models) != request.model_kinds:
         raise ValueError("artifact model kinds differ from request")
+    if artifact.default_model_kind is not request.default_model_kind:
+        raise ValueError("artifact default model kind differs from request")
 
     box_geometry = _boxes_for_centers(
         artifact.site_map.coordinates_xy,
@@ -3918,9 +3872,7 @@ def validate_calibration_analysis_contract(
             for _kind in request.model_kinds
         ),
         model_kinds=request.model_kinds,
-        default_model_policy=expected_policy,
-        algorithm_id=CALIBRATION_ANALYSIS_ALGORITHM_ID,
-        algorithm_version=CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
+        default_model_kind=request.default_model_kind,
     )
     if work_plan.artifact_metadata_encoding_upper_bound_bytes != (
         expected_metadata_bound
@@ -3935,11 +3887,6 @@ def validate_calibration_analysis_contract(
     if work_plan.artifact_encoding_upper_bound_bytes != expected_artifact_bound:
         raise ValueError("work plan artifact encoding bound is not canonical")
     for model in artifact.models:
-        if (
-            model.header.model_id != _MODEL_ID_BY_KIND[model.kind]
-            or model.header.model_version != _MODEL_VERSION
-        ):
-            raise ValueError("model identity differs from current analysis contract")
         model_values = {
             item.name: item.value for item in model.header.parameters
         }
@@ -4114,8 +4061,6 @@ def analyze_calibration(
             "request": request.fingerprint,
             "template_digest": template_hasher.hexdigest(),
             "work_plan": work_plan.fingerprint,
-            "algorithm": CALIBRATION_ANALYSIS_ALGORITHM_ID,
-            "version": CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
         }
     )
     site_map = SiteMap(
@@ -4240,15 +4185,7 @@ def analyze_calibration(
         frame_contract,
         site_map,
         tuple(models),
-        CalibrationStage.COMPLETE,
-        request.model_kinds,
-        DefaultModelPolicy(
-            _DEFAULT_MODEL_POLICY_ID,
-            _DEFAULT_MODEL_POLICY_VERSION,
-            default_kind=request.default_model_kind,
-        ),
-        CALIBRATION_ANALYSIS_ALGORITHM_ID,
-        CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
+        request.default_model_kind,
         tuple(
             CalibrationParameter(name, value)
             for name, value in {
@@ -4304,8 +4241,6 @@ __all__ = [
     "CalibrationAnalysisResourcePolicy",
     "CalibrationAnalysisResult",
     "CalibrationBracketSamplingAssumption",
-    "CALIBRATION_ANALYSIS_ALGORITHM_ID",
-    "CALIBRATION_ANALYSIS_ALGORITHM_VERSION",
     "CalibrationWorkPlan",
     "GridOrder",
     "ModelAnalysisDiagnostic",

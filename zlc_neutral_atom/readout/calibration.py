@@ -391,17 +391,12 @@ class ReadoutModelQuality:
     held_out_fidelity: np.ndarray
     held_out_validity: ComponentValidity
     quality_gate_id: str
-    quality_gate_version: str
-    gate_passed: bool
     __hash__ = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.site_axis_id, AxisId):
             raise TypeError("site_axis_id must be AxisId")
-        if not isinstance(self.gate_passed, bool):
-            raise TypeError("gate_passed must be bool")
         _canonical_text(self.quality_gate_id, "quality_gate_id")
-        _canonical_text(self.quality_gate_version, "quality_gate_version")
         dark_source = np.asarray(self.dark_training_sample_counts)
         bright_source = np.asarray(self.bright_training_sample_counts)
         if dark_source.ndim != 1 or bright_source.ndim != 1:
@@ -438,6 +433,7 @@ class ReadoutModelQuality:
             site_count=site_count,
             field_name="held_out_validity",
         )
+
         def evidence_counts(values: object, field_name: str) -> np.ndarray:
             return _immutable_array(
                 values,
@@ -540,12 +536,8 @@ class ReadoutModelQuality:
             bright_counts[usable.mask] == 0
         ):
             raise ValueError("usable sites require both dark and bright training samples")
-        if self.gate_passed and not np.any(usable.mask):
-            raise ValueError("a passed quality gate requires at least one usable site")
-        if self.gate_passed and np.any(usable.mask & ~fidelity_validity.mask):
-            raise ValueError(
-                "a passed quality gate requires held-out evidence for every usable site"
-            )
+        if not np.any(usable.mask):
+            raise ValueError("readout model quality requires at least one usable site")
         object.__setattr__(self, "dark_training_sample_counts", dark_counts)
         object.__setattr__(self, "bright_training_sample_counts", bright_counts)
         object.__setattr__(self, "usable_sites", usable)
@@ -581,8 +573,6 @@ class BackgroundMode(str, Enum):
 class ReadoutModelHeader:
     """Fields shared by every member of the closed readout-model union."""
 
-    model_id: str
-    model_version: str
     frame_contract_fingerprint: str
     site_map_fingerprint: str
     site_axis_id: AxisId
@@ -593,8 +583,6 @@ class ReadoutModelHeader:
     __hash__ = None
 
     def __post_init__(self) -> None:
-        _canonical_text(self.model_id, "model_id")
-        _canonical_text(self.model_version, "model_version")
         _sha256(self.frame_contract_fingerprint, "frame_contract_fingerprint")
         _sha256(self.site_map_fingerprint, "site_map_fingerprint")
         if not isinstance(self.site_axis_id, AxisId):
@@ -1096,7 +1084,7 @@ def _validate_model_geometry(
                 and y_slice.start <= center_y < y_slice.stop
             ):
                 raise ValueError(
-                    f"model {model.header.model_id!r} site {site_index} center "
+                    f"model {model.kind.value!r} site {site_index} center "
                     "does not lie inside its extraction box"
                 )
 
@@ -1162,49 +1150,6 @@ def _model(value: object) -> ReadoutModel:
     return value
 
 
-class CalibrationCapability(str, Enum):
-    SITE_MAP = "SITE_MAP"
-    THRESHOLDS = "THRESHOLDS"
-    BOX_READOUT = "BOX_READOUT"
-    PER_SITE_PSF_READOUT = "PER_SITE_PSF_READOUT"
-    UNIFORM_PSF_READOUT = "UNIFORM_PSF_READOUT"
-
-
-class CalibrationStage(str, Enum):
-    SITE_MAP_ONLY = "SITE_MAP_ONLY"
-    THRESHOLDS_READY = "THRESHOLDS_READY"
-    COMPLETE = "COMPLETE"
-
-
-_CAPABILITY_BY_KIND = {
-    ReadoutModelKind.BOX: CalibrationCapability.BOX_READOUT,
-    ReadoutModelKind.PER_SITE_PSF: CalibrationCapability.PER_SITE_PSF_READOUT,
-    ReadoutModelKind.UNIFORM_PSF: CalibrationCapability.UNIFORM_PSF_READOUT,
-}
-
-
-@dataclass(frozen=True)
-class DefaultModelPolicy:
-    """Versioned, order-independent default selection policy."""
-
-    policy_id: str
-    policy_version: str
-    default_model_id: str | None = None
-    default_kind: ReadoutModelKind | None = None
-
-    def __post_init__(self) -> None:
-        _canonical_text(self.policy_id, "default policy id")
-        _canonical_text(self.policy_version, "default policy version")
-        if self.default_model_id is not None:
-            _canonical_text(self.default_model_id, "default_model_id")
-        if self.default_kind is not None and not isinstance(
-            self.default_kind, ReadoutModelKind
-        ):
-            raise TypeError("default_kind must be ReadoutModelKind or None")
-        if self.default_model_id is not None and self.default_kind is not None:
-            raise ValueError("default policy cannot name both a model id and a kind")
-
-
 @dataclass(frozen=True, eq=False)
 class CalibrationArtifact:
     """Immutable calibration result; repository identity lives in its typed ref."""
@@ -1213,17 +1158,8 @@ class CalibrationArtifact:
     frame_contract: FrameContract
     site_map: SiteMap
     models: tuple[ReadoutModel, ...]
-    stage: CalibrationStage
-    required_model_kinds: tuple[ReadoutModelKind, ...]
-    default_model_policy: DefaultModelPolicy
-    algorithm_id: str
-    algorithm_version: str
+    default_model_kind: ReadoutModelKind | None
     parameters: tuple[CalibrationParameter, ...] = ()
-    _capabilities: tuple[CalibrationCapability, ...] = field(
-        init=False,
-        repr=False,
-        compare=False,
-    )
     _fingerprint: str = field(init=False, repr=False, compare=False)
     __hash__ = None
 
@@ -1241,22 +1177,17 @@ class CalibrationArtifact:
             )
         if not isinstance(self.site_map, SiteMap):
             raise TypeError("site_map must be SiteMap")
-        if not isinstance(self.stage, CalibrationStage):
-            raise TypeError("stage must be CalibrationStage")
-        if not isinstance(self.default_model_policy, DefaultModelPolicy):
-            raise TypeError("default_model_policy must be DefaultModelPolicy")
-        _canonical_text(self.algorithm_id, "algorithm_id")
-        _canonical_text(self.algorithm_version, "algorithm_version")
+        if self.default_model_kind is not None and not isinstance(
+            self.default_model_kind,
+            ReadoutModelKind,
+        ):
+            raise TypeError("default_model_kind must be ReadoutModelKind or None")
         models = tuple(_model(model) for model in self.models)
-        if len({model.header.model_id for model in models}) != len(models):
-            raise ValueError("calibration model ids must be unique")
-        models = tuple(sorted(models, key=lambda model: model.header.model_id))
-        required = tuple(self.required_model_kinds)
-        if any(not isinstance(kind, ReadoutModelKind) for kind in required):
-            raise TypeError("required_model_kinds must contain ReadoutModelKind values")
-        if len(set(required)) != len(required):
-            raise ValueError("required_model_kinds must be unique")
-        required = tuple(sorted(required, key=lambda kind: kind.value))
+        if not models:
+            raise ValueError("calibration artifact requires at least one readout model")
+        if len({model.kind for model in models}) != len(models):
+            raise ValueError("calibration model kinds must be unique")
+        models = tuple(sorted(models, key=lambda model: model.kind.value))
         parameters = tuple(self.parameters)
         if any(not isinstance(item, CalibrationParameter) for item in parameters):
             raise TypeError("parameters must contain CalibrationParameter values")
@@ -1272,61 +1203,22 @@ class CalibrationArtifact:
         for model in models:
             header = model.header
             if header.frame_contract_fingerprint != frame_fingerprint:
-                raise ValueError(f"model {header.model_id!r} belongs to another FrameContract")
+                raise ValueError(f"model {model.kind.value!r} belongs to another FrameContract")
             if header.site_map_fingerprint != site_fingerprint:
-                raise ValueError(f"model {header.model_id!r} belongs to another SiteMap")
+                raise ValueError(f"model {model.kind.value!r} belongs to another SiteMap")
             if header.site_axis_id != site_axis_id:
-                raise ValueError(f"model {header.model_id!r} names another site axis")
+                raise ValueError(f"model {model.kind.value!r} names another site axis")
             if header.site_count != self.site_map.site_axis.size:
-                raise ValueError(f"model {header.model_id!r} has the wrong site count")
+                raise ValueError(f"model {model.kind.value!r} has the wrong site count")
             if np.any(header.quality.usable_sites.mask & ~site_valid):
-                raise ValueError(f"model {header.model_id!r} marks an invalid map site usable")
-            if not header.quality.gate_passed:
-                raise ValueError(f"model {header.model_id!r} did not pass its quality gate")
+                raise ValueError(f"model {model.kind.value!r} marks an invalid map site usable")
             _validate_model_geometry(model, self.site_map, self.frame_contract)
 
-        present_kinds = {model.kind for model in models}
-        if self.stage is CalibrationStage.SITE_MAP_ONLY:
-            if models or required:
-                raise ValueError("SITE_MAP_ONLY cannot contain models or required model kinds")
-        elif self.stage is CalibrationStage.THRESHOLDS_READY:
-            if not models or required:
-                raise ValueError(
-                    "THRESHOLDS_READY requires models and no completeness requirement"
-                )
-        else:
-            if not required:
-                raise ValueError("COMPLETE requires at least one required model kind")
-            missing = set(required) - present_kinds
-            if missing:
-                raise ValueError(
-                    "COMPLETE artifact is missing required model kinds: "
-                    + ", ".join(sorted(kind.value for kind in missing))
-                )
-
-        capabilities = {CalibrationCapability.SITE_MAP}
-        if models:
-            capabilities.add(CalibrationCapability.THRESHOLDS)
-            capabilities.update(_CAPABILITY_BY_KIND[model.kind] for model in models)
         object.__setattr__(self, "models", models)
-        object.__setattr__(self, "required_model_kinds", required)
         object.__setattr__(self, "parameters", parameters)
-        object.__setattr__(
-            self,
-            "_capabilities",
-            tuple(sorted(capabilities, key=lambda capability: capability.value)),
-        )
         # Validate a declared default at artifact construction, not first use.
-        if models and (
-            self.default_model_policy.default_model_id is not None
-            or self.default_model_policy.default_kind is not None
-        ):
+        if self.default_model_kind is not None:
             self.select_model()
-        elif (
-            self.default_model_policy.default_model_id is not None
-            or self.default_model_policy.default_kind is not None
-        ):
-            raise ValueError("a site-map-only artifact cannot name a default readout model")
         from .calibration_codec import calibration_artifact_to_tree
 
         object.__setattr__(
@@ -1336,49 +1228,38 @@ class CalibrationArtifact:
         )
 
     @property
-    def capabilities(self) -> tuple[CalibrationCapability, ...]:
-        return self._capabilities
-
-    @property
     def fingerprint(self) -> str:
-        return self._fingerprint
+        from .calibration_codec import calibration_artifact_to_tree
+
+        current = canonical_digest(calibration_artifact_to_tree(self))
+        if current != self._fingerprint:
+            raise ValueError("CalibrationArtifact changed after construction")
+        return current
 
     def select_model(
         self,
         *,
-        model_id: str | None = None,
         kind: ReadoutModelKind | None = None,
     ) -> ReadoutModel:
         """Resolve explicit selection or the stable default; ambiguity is fatal."""
 
-        if model_id is not None:
-            _canonical_text(model_id, "model_id")
         if kind is not None and not isinstance(kind, ReadoutModelKind):
             raise TypeError("kind must be ReadoutModelKind or None")
-        if model_id is not None and kind is not None:
-            raise ValueError("select_model accepts either model_id or kind, not both")
-        if model_id is not None:
-            candidates = tuple(
-                model for model in self.models if model.header.model_id == model_id
-            )
-        elif kind is not None:
+        if kind is not None:
             candidates = tuple(model for model in self.models if model.kind is kind)
+        elif self.default_model_kind is not None:
+            candidates = tuple(
+                model for model in self.models if model.kind is self.default_model_kind
+            )
+        elif len(self.models) == 1:
+            candidates = self.models
         else:
-            policy = self.default_model_policy
-            if policy.default_model_id is not None:
-                candidates = tuple(
-                    model
-                    for model in self.models
-                    if model.header.model_id == policy.default_model_id
-                )
-            elif policy.default_kind is not None:
-                candidates = tuple(
-                    model for model in self.models if model.kind is policy.default_kind
-                )
-            else:
-                candidates = self.models
+            raise ValueError(
+                "no default model kind is declared for "
+                f"{len(self.models)} available models"
+            )
         if len(candidates) != 1:
-            description = model_id or (kind.value if kind is not None else "default policy")
+            description = kind.value if kind is not None else "default model"
             raise ValueError(
                 f"model selection {description!r} resolved to {len(candidates)} models; "
                 "selection must be unique"
@@ -1569,8 +1450,6 @@ def bind_readout_feature_spec(
     model = _model(model)
     if not isinstance(site_map, SiteMap):
         raise TypeError("site_map must be SiteMap")
-    if not model.header.quality.gate_passed:
-        raise ValueError("readout model did not pass its quality gate")
     if model.header.site_map_fingerprint != site_map.fingerprint:
         raise ValueError("readout model does not apply to this SiteMap")
     if model.header.site_axis_id != site_map.site_axis.axis_id:
@@ -1829,8 +1708,6 @@ def classify_occupancy(model: ReadoutModel, signals: ReadoutSignals) -> Occupanc
     model = _model(model)
     if not isinstance(signals, ReadoutSignals):
         raise TypeError("signals must be ReadoutSignals")
-    if not model.header.quality.gate_passed:
-        raise ValueError("readout model did not pass its quality gate")
     if signals.site_axis_id != model.header.site_axis_id:
         raise ValueError("signals and model name different site axes")
     if signals.values.shape != model.header.thresholds.shape:
@@ -1882,8 +1759,6 @@ def _assert_applicable(
     if not isinstance(site_map, SiteMap):
         raise TypeError("site_map must be SiteMap")
     header = model.header
-    if not header.quality.gate_passed:
-        raise ValueError("readout model did not pass its quality gate")
     if header.frame_contract_fingerprint != frame_contract.fingerprint:
         raise ValueError("readout model does not apply to this FrameContract")
     if header.site_map_fingerprint != site_map.fingerprint:
@@ -1932,15 +1807,12 @@ __all__ = [
     "BoxReadoutModel",
     "BoxReducer",
     "CalibrationArtifact",
-    "CalibrationCapability",
     "CalibrationParameter",
     "CalibrationResourceExceeded",
     "CalibrationResourcePolicy",
     "CalibrationResourceSummary",
     "CalibrationSourceBinding",
-    "CalibrationStage",
     "DEFAULT_CALIBRATION_RESOURCE_POLICY",
-    "DefaultModelPolicy",
     "OccupancyDecision",
     "PerSitePsfReadoutModel",
     "ReadoutModel",

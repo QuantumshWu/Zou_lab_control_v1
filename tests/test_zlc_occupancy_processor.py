@@ -86,12 +86,10 @@ from zlc_neutral_atom.readout.occupancy import (
     OccupancyDatasetEventAdapter,
     OccupancyDatasetField,
     OccupancyDatasetMetadata,
-    OccupancyModelSelection,
     OccupancySample,
     OccupancySampleContract,
     OccupancyStreamProcessorSpec,
     bind_occupancy_stream_processor,
-    resolve_occupancy_model_selection,
 )
 from zlc_neutral_atom.readout.occupancy_pipeline import (
     FrozenOccupancyDataset,
@@ -433,12 +431,10 @@ def _bind(
     trusted: _TrustedCalibration,
     session,
     *,
-    selection: OccupancyModelSelection | None = None,
+    model_kind: ReadoutModelKind | None = None,
 ):
-    if selection is None:
-        selection = resolve_occupancy_model_selection(trusted.admitted)
     return bind_occupancy_stream_processor(
-        _processor_spec(trusted, selection=selection),
+        _processor_spec(trusted, model_kind=model_kind),
         session.processor_input_binding,
     )
 
@@ -446,16 +442,14 @@ def _bind(
 def _processor_spec(
     trusted: _TrustedCalibration,
     *,
-    selection: OccupancyModelSelection | None = None,
+    model_kind: ReadoutModelKind | None = None,
     output_stream_id: str = "occupancy.output",
     output_source_id: str = "occupancy",
 ) -> OccupancyStreamProcessorSpec:
-    if selection is None:
-        selection = resolve_occupancy_model_selection(trusted.admitted)
     return OccupancyStreamProcessorSpec(
         calibration=trusted.admitted,
         readout_binding=ReadoutBindingKey("readout"),
-        model=selection,
+        model_kind=model_kind,
         output_stream_id=StreamId(output_stream_id),
         output_source_id=output_source_id,
     )
@@ -598,12 +592,18 @@ def _sample(session, image: np.ndarray, index: int) -> CameraSample:
 
 def test_bind_requires_admitted_calibration_and_freezes_default_model(trusted_calibration):
     session = _source_session(trusted_calibration, points=1)
-    selection = resolve_occupancy_model_selection(trusted_calibration.admitted)
-    assert selection.model_kind is ReadoutModelKind.BOX
-    bound = _bind(trusted_calibration, session, selection=selection)
+    spec = _processor_spec(trusted_calibration)
+    assert spec.model_kind is ReadoutModelKind.BOX
+    bound = bind_occupancy_stream_processor(
+        spec,
+        session.processor_input_binding,
+    )
     assert isinstance(bound, BoundOccupancyStreamProcessor)
-    assert bound.model_selection == selection
+    assert bound.model_kind is ReadoutModelKind.BOX
     assert bound.calibration_reference == trusted_calibration.calibration_ref
+    assert bound.calibration_artifact_fingerprint == (
+        trusted_calibration.admitted.artifact_fingerprint
+    )
     assert bound.calibration_admission_evidence_digest == (
         trusted_calibration.admitted.evidence_digest
     )
@@ -614,7 +614,7 @@ def test_bind_requires_admitted_calibration_and_freezes_default_model(trusted_ca
     assert not hasattr(bound, "config")
 
     artifact = trusted_calibration.admitted.artifact
-    selected_model = artifact.select_model(model_id=selection.model_id)
+    selected_model = artifact.select_model(kind=bound.model_kind)
     assert bound.operator_scratch_nbytes == readout_application_scratch_nbytes(
         bind_readout_feature_spec(selected_model, artifact.site_map),
         artifact.frame_contract.frame_schema,
@@ -623,12 +623,10 @@ def test_bind_requires_admitted_calibration_and_freezes_default_model(trusted_ca
         OccupancyStreamProcessorSpec(
             calibration=artifact,
             readout_binding=ReadoutBindingKey("readout"),
-            model=selection,
+            model_kind=ReadoutModelKind.BOX,
             output_stream_id=StreamId("bad.raw-artifact"),
             output_source_id="bad-raw-artifact",
         )
-    with pytest.raises(TypeError, match="AdmittedCalibration"):
-        resolve_occupancy_model_selection(trusted_calibration.calibration_ref)
 
     forged = object.__new__(AdmittedCalibration)
     for slot in AdmittedCalibration.__slots__:
@@ -652,11 +650,46 @@ def test_bind_requires_admitted_calibration_and_freezes_default_model(trusted_ca
             OccupancyStreamProcessorSpec(
                 calibration=forged,
                 readout_binding=ReadoutBindingKey("readout"),
-                model=selection,
+                model_kind=ReadoutModelKind.BOX,
                 output_stream_id=StreamId("bad-forged-admission"),
                 output_source_id="bad-forged-admission",
             ),
             session.processor_input_binding,
+        )
+
+
+def test_admitted_calibration_rejects_nested_model_mutation(trusted_calibration):
+    admission = trusted_calibration.calibration_repository.admit(
+        trusted_calibration.calibration_ref,
+        trusted_calibration.capture_repository,
+    )
+    artifact = admission.artifact
+    original_models = artifact.models
+    model = artifact.select_model(kind=ReadoutModelKind.BOX)
+    thresholds = model.header.thresholds.copy()
+    thresholds[0] += 1.0
+    forged_model = replace(
+        model,
+        header=replace(model.header, thresholds=thresholds),
+    )
+    object.__setattr__(
+        artifact,
+        "models",
+        tuple(
+            forged_model if item.kind is ReadoutModelKind.BOX else item
+            for item in original_models
+        ),
+    )
+
+    with pytest.raises(ValueError, match="changed after construction"):
+        _ = artifact.fingerprint
+    with pytest.raises(PermissionError, match="authority is invalid"):
+        OccupancyStreamProcessorSpec(
+            calibration=admission,
+            readout_binding=ReadoutBindingKey("readout"),
+            model_kind=ReadoutModelKind.BOX,
+            output_stream_id=StreamId("tampered-calibration"),
+            output_source_id="tampered-calibration",
         )
 
 
@@ -711,11 +744,10 @@ def test_calibration_memory_owner_counts_every_unique_array(trusted_calibration)
 def test_reusable_processor_spec_binds_each_capture_session_generation(
     trusted_calibration,
 ):
-    selection = resolve_occupancy_model_selection(trusted_calibration.admitted)
     spec = OccupancyStreamProcessorSpec(
         calibration=trusted_calibration.admitted,
         readout_binding=ReadoutBindingKey("readout"),
-        model=selection,
+        model_kind=None,
         output_stream_id=StreamId("occupancy.reusable-output"),
         output_source_id="occupancy-reusable",
     )
@@ -731,7 +763,7 @@ def test_reusable_processor_spec_binds_each_capture_session_generation(
         second_session.processor_input_binding,
     )
 
-    assert first.model_selection == second.model_selection == selection
+    assert first.model_kind is second.model_kind is spec.model_kind
     assert first.output_payload_contract.fingerprint == (
         second.output_payload_contract.fingerprint
     )
@@ -751,25 +783,18 @@ def test_bind_rejects_mixed_physical_readout_events(trusted_calibration):
         _bind(trusted_calibration, uniform)
 
 
-def test_bind_rejects_binding_model_version_and_resource_drift(trusted_calibration):
+def test_bind_rejects_binding_and_resource_drift(trusted_calibration):
     session = _source_session(trusted_calibration, points=1)
-    selection = resolve_occupancy_model_selection(trusted_calibration.admitted)
     with pytest.raises(ValueError, match="another readout binding"):
         bind_occupancy_stream_processor(
             OccupancyStreamProcessorSpec(
                 calibration=trusted_calibration.admitted,
                 readout_binding=ReadoutBindingKey("another-readout"),
-                model=selection,
+                model_kind=ReadoutModelKind.BOX,
                 output_stream_id=StreamId("occupancy.wrong-binding"),
                 output_source_id="occupancy-wrong-binding",
             ),
             session.processor_input_binding,
-        )
-    with pytest.raises(ValueError, match="version/kind"):
-        _bind(
-            trusted_calibration,
-            session,
-            selection=replace(selection, model_version="wrong-version"),
         )
     restrictive = replace(
         trusted_calibration.calibration_repository.resource_policy,
@@ -780,7 +805,7 @@ def test_bind_rejects_binding_model_version_and_resource_drift(trusted_calibrati
             OccupancyStreamProcessorSpec(
                 calibration=trusted_calibration.admitted,
                 readout_binding=ReadoutBindingKey("readout"),
-                model=selection,
+                model_kind=ReadoutModelKind.BOX,
                 output_stream_id=StreamId("occupancy.resource-reject"),
                 output_source_id="occupancy-resource-reject",
                 resource_policy=restrictive,
@@ -796,7 +821,7 @@ def test_one_operator_call_preserves_metadata_counts_occupancy_and_invalid_sites
     session = _source_session(trusted_calibration, points=1)
     bound = _bind(trusted_calibration, session)
     artifact = trusted_calibration.admitted.artifact
-    model = artifact.select_model(model_id=bound.model_selection.model_id)
+    model = artifact.select_model(kind=bound.model_kind)
     assert isinstance(model, BoxReadoutModel)
     image = _frame(0, 1, 0)
     schema = session.processor_input_binding.payload_contract.value_schema
@@ -940,6 +965,8 @@ def test_bound_authority_is_sealed_and_rejects_config_drift(
 
     other_model = artifact.select_model(kind=ReadoutModelKind.UNIFORM_PSF)
     other_feature_spec = bind_readout_feature_spec(other_model, artifact.site_map)
+    with pytest.raises(ValueError, match="selected kind"):
+        replace(config, model_kind=ReadoutModelKind.UNIFORM_PSF)
     with pytest.raises(ValueError, match="feature spec does not match"):
         replace(config, feature_spec=other_feature_spec)
     with pytest.raises(ValueError, match="another FrameContract"):
@@ -963,6 +990,15 @@ def test_bound_authority_is_sealed_and_rejects_config_drift(
             config,
             counts_schema=replace(config.counts_schema, value_unit="electron"),
         )
+
+    object.__setattr__(
+        processor,
+        "config",
+        replace(config, calibration_artifact_fingerprint="0" * 64),
+    )
+    with pytest.raises(PermissionError, match="processor semantics changed"):
+        _ = bundle.fingerprint
+    object.__setattr__(processor, "config", config)
 
     original_inputs = processor.artifact_inputs
     object.__setattr__(processor, "artifact_inputs", ())
@@ -1462,8 +1498,11 @@ def test_compiled_occupancy_pipeline_returns_two_coherent_standard_snapshots(
     assert result.terminal_provenance.generation == (
         result.dataset.counts.ref.stream_generation
     )
-    assert result.model_selection == spec.processor.model
+    assert result.model_kind is spec.processor.model_kind
     assert result.calibration_reference == trusted_calibration.calibration_ref
+    assert result.calibration_artifact_fingerprint == (
+        trusted_calibration.admitted.artifact_fingerprint
+    )
     assert result.calibration_admission_evidence_digest == (
         trusted_calibration.admitted.evidence_digest
     )
@@ -1520,7 +1559,7 @@ def test_compiled_occupancy_pipeline_returns_two_coherent_standard_snapshots(
     )
 
     model = trusted_calibration.admitted.artifact.select_model(
-        model_id=spec.processor.model.model_id
+        kind=spec.processor.model_kind
     )
     artifact = trusted_calibration.admitted.artifact
     frame_schema = measurement.capture_contract.dataset_schema.cell_schema

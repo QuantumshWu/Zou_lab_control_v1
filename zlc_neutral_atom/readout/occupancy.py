@@ -101,12 +101,6 @@ _OCCUPANCY_EXECUTION_GUARD_SCHEMA = (
 )
 
 
-def _optional_canonical_text(value: object, field_name: str) -> str | None:
-    if value is None:
-        return None
-    return _canonical_text(value, field_name)
-
-
 def _model(value: object) -> ReadoutModel:
     if not isinstance(value, _READOUT_MODELS):
         raise TypeError("model must be a member of the closed ReadoutModel union")
@@ -509,49 +503,12 @@ class OccupancyDatasetEventAdapter:
 
 
 @dataclass(frozen=True)
-class OccupancyModelSelection:
-    model_id: str
-    model_version: str
-    model_kind: ReadoutModelKind
-
-    def __post_init__(self) -> None:
-        _canonical_text(self.model_id, "model_id")
-        _canonical_text(self.model_version, "model_version")
-        if not isinstance(self.model_kind, ReadoutModelKind):
-            raise TypeError("model_kind must be ReadoutModelKind")
-
-
-def resolve_occupancy_model_selection(
-    calibration: AdmittedCalibration,
-    *,
-    model_id: str | None = None,
-    model_kind: ReadoutModelKind | None = None,
-) -> OccupancyModelSelection:
-    """Resolve explicit/default composition intent into a frozen exact selection."""
-
-    if type(calibration) is not AdmittedCalibration:
-        raise TypeError("calibration must be an exact AdmittedCalibration")
-    model_id = _optional_canonical_text(model_id, "model_id")
-    if model_kind is not None and not isinstance(model_kind, ReadoutModelKind):
-        raise TypeError("model_kind must be ReadoutModelKind or None")
-    if model_id is not None and model_kind is not None:
-        raise ValueError("select by model_id or model_kind, not both")
-    artifact = calibration.artifact
-    model = artifact.select_model(model_id=model_id, kind=model_kind)
-    return OccupancyModelSelection(
-        model.header.model_id,
-        model.header.model_version,
-        model.kind,
-    )
-
-
-@dataclass(frozen=True)
 class OccupancyStreamProcessorSpec:
     """Reusable semantics; a CaptureSession supplies run-local input authority."""
 
     calibration: AdmittedCalibration
     readout_binding: ReadoutBindingKey
-    model: OccupancyModelSelection
+    model_kind: ReadoutModelKind | None
     output_stream_id: StreamId
     output_source_id: str
     resource_policy: CalibrationResourcePolicy = DEFAULT_CALIBRATION_RESOURCE_POLICY
@@ -563,8 +520,13 @@ class OccupancyStreamProcessorSpec:
             raise TypeError("calibration must be an exact AdmittedCalibration")
         if not isinstance(self.readout_binding, ReadoutBindingKey):
             raise TypeError("readout_binding must be ReadoutBindingKey")
-        if not isinstance(self.model, OccupancyModelSelection):
-            raise TypeError("model must be OccupancyModelSelection")
+        if self.model_kind is not None and not isinstance(
+            self.model_kind,
+            ReadoutModelKind,
+        ):
+            raise TypeError("model_kind must be ReadoutModelKind or None")
+        selected = self.calibration.artifact.select_model(kind=self.model_kind)
+        object.__setattr__(self, "model_kind", selected.kind)
         if not isinstance(self.output_stream_id, StreamId):
             raise TypeError("output_stream_id must be StreamId")
         _canonical_text(self.output_source_id, "output_source_id")
@@ -598,7 +560,7 @@ class _OccupancyStreamProcessorConfig:
     frame_contract: FrameContract
     site_map: SiteMap
     readout_binding: ReadoutBindingKey
-    selection: OccupancyModelSelection
+    model_kind: ReadoutModelKind
     input_schema: ValueSchema
     occupied_schema: ValueSchema
     counts_schema: ValueSchema
@@ -624,8 +586,8 @@ class _OccupancyStreamProcessorConfig:
             raise TypeError("site_map must be SiteMap")
         if not isinstance(self.readout_binding, ReadoutBindingKey):
             raise TypeError("readout_binding must be ReadoutBindingKey")
-        if not isinstance(self.selection, OccupancyModelSelection):
-            raise TypeError("selection must be OccupancyModelSelection")
+        if not isinstance(self.model_kind, ReadoutModelKind):
+            raise TypeError("model_kind must be ReadoutModelKind")
         if not isinstance(self.input_schema, ValueSchema):
             raise TypeError("input_schema must be ValueSchema")
         if not isinstance(self.occupied_schema, ValueSchema):
@@ -637,12 +599,8 @@ class _OccupancyStreamProcessorConfig:
         model = _model(self.model)
         if not isinstance(self.resource_policy, CalibrationResourcePolicy):
             raise TypeError("resource_policy must be CalibrationResourcePolicy")
-        if (
-            model.header.model_id != self.selection.model_id
-            or model.header.model_version != self.selection.model_version
-            or model.kind is not self.selection.model_kind
-        ):
-            raise ValueError("frozen model differs from its explicit selection")
+        if model.kind is not self.model_kind:
+            raise ValueError("frozen model differs from its selected kind")
         if model.header.frame_contract_fingerprint != self.frame_contract.fingerprint:
             raise ValueError("selected model belongs to another FrameContract")
         if model.header.site_map_fingerprint != self.site_map.fingerprint:
@@ -1032,11 +990,11 @@ class BoundOccupancyStreamProcessor:
         return self._processor.output_source_id
 
     @property
-    def model_selection(self) -> OccupancyModelSelection:
+    def model_kind(self) -> ReadoutModelKind:
         self._validate_identity()
         config = self._processor.config
         assert isinstance(config, _OccupancyStreamProcessorConfig)
-        return config.selection
+        return config.model_kind
 
     @property
     def calibration_reference(self) -> CalibrationArtifactRef:
@@ -1044,6 +1002,13 @@ class BoundOccupancyStreamProcessor:
         config = self._processor.config
         assert isinstance(config, _OccupancyStreamProcessorConfig)
         return config.calibration_ref
+
+    @property
+    def calibration_artifact_fingerprint(self) -> str:
+        self._validate_identity()
+        config = self._processor.config
+        assert isinstance(config, _OccupancyStreamProcessorConfig)
+        return config.calibration_artifact_fingerprint
 
     @property
     def calibration_admission_evidence_digest(self) -> str:
@@ -1263,12 +1228,9 @@ def bind_occupancy_stream_processor(
         artifact.frame_contract,
         spec.readout_binding,
     )
-    model = _model(artifact.select_model(model_id=spec.model.model_id))
-    if (
-        model.header.model_version != spec.model.model_version
-        or model.kind is not spec.model.model_kind
-    ):
-        raise ValueError("selected model version/kind differs from the frozen spec")
+    model = _model(artifact.select_model(kind=spec.model_kind))
+    if model.kind is not spec.model_kind:
+        raise ValueError("selected model kind differs from the frozen spec")
     validate_readout_model_resources(
         model,
         image_shape_yx=artifact.frame_contract.frame_schema.data_shape,
@@ -1324,7 +1286,7 @@ def bind_occupancy_stream_processor(
         artifact.frame_contract,
         artifact.site_map,
         spec.readout_binding,
-        spec.model,
+        spec.model_kind,
         input_contract.value_schema,
         output_contract.occupied_schema,
         output_contract.counts_schema,
@@ -1379,10 +1341,8 @@ __all__ = [
     "OccupancyDatasetField",
     "OccupancyDatasetMetadata",
     "OccupancyDatasetMetadataContract",
-    "OccupancyModelSelection",
     "OccupancySample",
     "OccupancySampleContract",
     "OccupancyStreamProcessorSpec",
     "bind_occupancy_stream_processor",
-    "resolve_occupancy_model_selection",
 ]

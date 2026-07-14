@@ -55,8 +55,6 @@ from zlc_neutral_atom.runtime.run import (
 )
 
 from .analysis import (
-    CALIBRATION_ANALYSIS_ALGORITHM_ID,
-    CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
     CalibrationAnalysisDiagnostics,
     CalibrationAnalysisRequest,
     CalibrationAnalysisResult,
@@ -239,8 +237,6 @@ def _analysis_result_digest(
                 diagnostics_digest,
                 "diagnostics_digest",
             ),
-            "algorithm_id": artifact.algorithm_id,
-            "algorithm_version": artifact.algorithm_version,
         }
     )
 
@@ -381,7 +377,7 @@ def _admitted_calibration_integrity_digest(
     *,
     repository_token: object,
     reference: CalibrationArtifactRef,
-    artifact: CalibrationArtifact,
+    artifact_fingerprint: str,
     commit_kind: CommitKind,
     commit_id: str,
     evidence_digest: str,
@@ -392,8 +388,6 @@ def _admitted_calibration_integrity_digest(
         raise ValueError("AdmittedCalibration repository authority is absent")
     if not isinstance(reference, CalibrationArtifactRef):
         raise TypeError("reference must be CalibrationArtifactRef")
-    if not isinstance(artifact, CalibrationArtifact):
-        raise TypeError("artifact must be CalibrationArtifact")
     if commit_kind is not CommitKind.FINAL:
         raise ValueError("AdmittedCalibration requires FINAL commit evidence")
     return canonical_digest(
@@ -401,7 +395,10 @@ def _admitted_calibration_integrity_digest(
             "schema": _ADMITTED_CALIBRATION_INTEGRITY_SCHEMA,
             "repository_authority_identity": id(repository_token),
             "reference": calibration_artifact_ref_to_tree(reference),
-            "artifact_fingerprint": artifact.fingerprint,
+            "artifact_fingerprint": _sha256(
+                artifact_fingerprint,
+                "artifact_fingerprint",
+            ),
             "commit_kind": commit_kind.value,
             "commit_id": _canonical_text(commit_id, "commit_id"),
             "evidence_digest": _sha256(evidence_digest, "evidence_digest"),
@@ -485,8 +482,6 @@ class _CalibrationDerivation:
     diagnostics_digest: str
     analysis_result_digest: str
     plan_binding_digest: str
-    algorithm_id: str
-    algorithm_version: str
     analysis_run_id: str
     analysis_safety_bundle_id: str | None
 
@@ -521,8 +516,6 @@ class _CalibrationDerivation:
             "plan_binding_digest",
         ):
             _sha256(getattr(self, name), name)
-        _canonical_text(self.algorithm_id, "algorithm_id")
-        _canonical_text(self.algorithm_version, "algorithm_version")
         _canonical_text(self.analysis_run_id, "analysis_run_id")
         _optional_canonical_text(
             self.analysis_safety_bundle_id,
@@ -607,10 +600,11 @@ class AdmittedCalibration:
         object.__setattr__(self, "_commit_kind", commit_kind)
         object.__setattr__(self, "_commit_id", commit_id)
         object.__setattr__(self, "_evidence_digest", evidence_digest)
+        artifact_fingerprint = artifact.fingerprint
         integrity_digest = _admitted_calibration_integrity_digest(
             repository_token=repository_token,
             reference=reference,
-            artifact=artifact,
+            artifact_fingerprint=artifact_fingerprint,
             commit_kind=commit_kind,
             commit_id=commit_id,
             evidence_digest=evidence_digest,
@@ -636,7 +630,7 @@ class AdmittedCalibration:
     def __reduce_ex__(self, _protocol: int):
         raise TypeError("AdmittedCalibration is process-local and cannot be serialized")
 
-    def _require_authority(self) -> None:
+    def _require_authority(self) -> str:
         with _ADMITTED_CALIBRATION_AUTHORITIES_LOCK:
             authority = _ADMITTED_CALIBRATION_AUTHORITIES.get(self)
         if not isinstance(authority, _AdmittedCalibrationAuthority):
@@ -665,10 +659,11 @@ class AdmittedCalibration:
         ):
             raise PermissionError("AdmittedCalibration authority binding changed")
         try:
+            artifact_fingerprint = artifact.fingerprint
             expected = _admitted_calibration_integrity_digest(
                 repository_token=repository_token,
                 reference=reference,
-                artifact=artifact,
+                artifact_fingerprint=artifact_fingerprint,
                 commit_kind=commit_kind,
                 commit_id=commit_id,
                 evidence_digest=evidence_digest,
@@ -677,6 +672,7 @@ class AdmittedCalibration:
             raise PermissionError("AdmittedCalibration authority is invalid") from error
         if integrity_digest != expected:
             raise PermissionError("AdmittedCalibration integrity binding changed")
+        return artifact_fingerprint
 
     @property
     def reference(self) -> CalibrationArtifactRef:
@@ -690,8 +686,7 @@ class AdmittedCalibration:
 
     @property
     def artifact_fingerprint(self) -> str:
-        self._require_authority()
-        return self._artifact.fingerprint
+        return self._require_authority()
 
     @property
     def commit_kind(self) -> CommitKind:
@@ -1142,8 +1137,6 @@ class CalibrationRepository:
                 diagnostics_digest,
             ),
             plan_binding_digest=prepared.plan_binding_digest,
-            algorithm_id=artifact.algorithm_id,
-            algorithm_version=artifact.algorithm_version,
             analysis_run_id=prepared.run_id,
             analysis_safety_bundle_id=analysis_safety_bundle_id,
         )
@@ -1382,8 +1375,6 @@ _DERIVATION_METADATA_FIELDS = frozenset(
         "diagnostics_digest",
         "analysis_result_digest",
         "plan_binding_digest",
-        "algorithm_id",
-        "algorithm_version",
         "analysis_run_id",
         "analysis_safety_bundle_id",
     }
@@ -1405,8 +1396,6 @@ def _derivation_metadata_values(
     diagnostics_digest: str,
     analysis_result_digest: str,
     plan_binding_digest: str,
-    algorithm_id: str,
-    algorithm_version: str,
     analysis_run_id: str,
     analysis_safety_bundle_id: str | None,
 ) -> dict[str, object]:
@@ -1424,8 +1413,6 @@ def _derivation_metadata_values(
         "diagnostics_digest": diagnostics_digest,
         "analysis_result_digest": analysis_result_digest,
         "plan_binding_digest": plan_binding_digest,
-        "algorithm_id": algorithm_id,
-        "algorithm_version": algorithm_version,
         "analysis_run_id": analysis_run_id,
         "analysis_safety_bundle_id": analysis_safety_bundle_id,
     }
@@ -1487,8 +1474,6 @@ def _manifest_tree_from_metadata(
         "diagnostics_digest": metadata["diagnostics_digest"],
         "analysis_result_digest": metadata["analysis_result_digest"],
         "plan_binding_digest": metadata["plan_binding_digest"],
-        "algorithm_id": metadata["algorithm_id"],
-        "algorithm_version": metadata["algorithm_version"],
         "analysis_run_id": metadata["analysis_run_id"],
         "analysis_safety_bundle_id": metadata["analysis_safety_bundle_id"],
         "evidence_digest": derivation_blob.digest,
@@ -1565,8 +1550,6 @@ def _validate_prepared_repository_resources(
         diagnostics_digest=digest,
         analysis_result_digest=digest,
         plan_binding_digest=prepared.plan_binding_digest,
-        algorithm_id=CALIBRATION_ANALYSIS_ALGORITHM_ID,
-        algorithm_version=CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
         analysis_run_id=prepared.run_id,
         # This software-only plan has no resource/hazard claims.  Finalize
         # asserts that runtime preserved the corresponding absent bundle.
@@ -1805,11 +1788,6 @@ def _validate_persistent_record(
         derivation.analysis_result_digest
     ):
         raise ValueError("analysis result digest differs from derivation")
-    if (
-        artifact.algorithm_id != derivation.algorithm_id
-        or artifact.algorithm_version != derivation.algorithm_version
-    ):
-        raise ValueError("analysis algorithm differs from derivation")
     expected_plan_binding = _plan_binding_digest(
         derivation.source_capture_ref,
         capture_repository_id=derivation.source_capture_ref.repository_id,
@@ -1906,8 +1884,6 @@ def _derivation_tree(
         diagnostics_digest=derivation.diagnostics_digest,
         analysis_result_digest=derivation.analysis_result_digest,
         plan_binding_digest=derivation.plan_binding_digest,
-        algorithm_id=derivation.algorithm_id,
-        algorithm_version=derivation.algorithm_version,
         analysis_run_id=derivation.analysis_run_id,
         analysis_safety_bundle_id=derivation.analysis_safety_bundle_id,
     )
@@ -1966,8 +1942,6 @@ def _derivation_from_payload(
         "diagnostics_digest",
         "analysis_result_digest",
         "plan_binding_digest",
-        "algorithm_id",
-        "algorithm_version",
         "analysis_run_id",
         "analysis_safety_bundle_id",
     }
@@ -2011,8 +1985,6 @@ def _derivation_from_payload(
         tree["diagnostics_digest"],
         tree["analysis_result_digest"],
         tree["plan_binding_digest"],
-        tree["algorithm_id"],
-        tree["algorithm_version"],
         tree["analysis_run_id"],
         tree["analysis_safety_bundle_id"],
     )
@@ -2048,8 +2020,6 @@ def _manifest_payload(
         diagnostics_digest=derivation.diagnostics_digest,
         analysis_result_digest=derivation.analysis_result_digest,
         plan_binding_digest=derivation.plan_binding_digest,
-        algorithm_id=derivation.algorithm_id,
-        algorithm_version=derivation.algorithm_version,
         analysis_run_id=derivation.analysis_run_id,
         analysis_safety_bundle_id=derivation.analysis_safety_bundle_id,
     )
@@ -2084,8 +2054,6 @@ def _manifest_from_tree(tree: Any) -> dict[str, Any]:
         "diagnostics_digest",
         "analysis_result_digest",
         "plan_binding_digest",
-        "algorithm_id",
-        "algorithm_version",
         "analysis_run_id",
         "analysis_safety_bundle_id",
         "evidence_digest",
@@ -2117,8 +2085,6 @@ def _manifest_from_tree(tree: Any) -> dict[str, Any]:
         "source_capture_run_id",
         "source_capture_safety_bundle_id",
         "source_capture_commit_id",
-        "algorithm_id",
-        "algorithm_version",
         "analysis_run_id",
     ):
         _canonical_text(tree[name], name)
@@ -2158,8 +2124,6 @@ def _validate_manifest_evidence(
         "diagnostics_digest": derivation.diagnostics_digest,
         "analysis_result_digest": derivation.analysis_result_digest,
         "plan_binding_digest": derivation.plan_binding_digest,
-        "algorithm_id": derivation.algorithm_id,
-        "algorithm_version": derivation.algorithm_version,
         "analysis_run_id": derivation.analysis_run_id,
         "analysis_safety_bundle_id": derivation.analysis_safety_bundle_id,
         "evidence_digest": derivation_blob.digest,

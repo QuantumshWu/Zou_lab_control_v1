@@ -1,4 +1,4 @@
-"""Strict current-version codecs for neutral-atom calibration values."""
+"""Strict current-format codecs for neutral-atom calibration values."""
 
 from __future__ import annotations
 
@@ -26,14 +26,11 @@ from .calibration import (
     BoxReadoutModel,
     BoxReducer,
     CalibrationArtifact,
-    CalibrationCapability,
     CalibrationParameter,
     CalibrationResourceExceeded,
     CalibrationResourcePolicy,
     CalibrationSourceBinding,
-    CalibrationStage,
     DEFAULT_CALIBRATION_RESOURCE_POLICY,
-    DefaultModelPolicy,
     PerSitePsfReadoutModel,
     ReadoutModel,
     ReadoutModelHeader,
@@ -57,7 +54,6 @@ SITE_MAP_SCHEMA = "zlc_neutral_atom.site-map"
 READOUT_MODEL_QUALITY_SCHEMA = "zlc_neutral_atom.readout-model-quality"
 READOUT_MODEL_HEADER_SCHEMA = "zlc_neutral_atom.readout-model-header"
 READOUT_MODEL_SCHEMA = "zlc_neutral_atom.readout-model"
-DEFAULT_MODEL_POLICY_SCHEMA = "zlc_neutral_atom.default-model-policy"
 CALIBRATION_ARTIFACT_SCHEMA = "zlc_neutral_atom.calibration-artifact"
 
 
@@ -71,12 +67,6 @@ T = TypeVar("T")
 def _list(value: Any, field_name: str) -> list[Any]:
     if not isinstance(value, list):
         raise ValueError(f"{field_name} must be a list")
-    return value
-
-
-def _bool(value: Any, field_name: str) -> bool:
-    if not isinstance(value, bool):
-        raise ValueError(f"{field_name} must be bool")
     return value
 
 
@@ -276,8 +266,6 @@ def readout_model_quality_to_tree(value: ReadoutModelQuality) -> dict[str, Any]:
         "held_out_fidelity": value.held_out_fidelity,
         "held_out_validity": validity_to_tree(value.held_out_validity),
         "quality_gate_id": value.quality_gate_id,
-        "quality_gate_version": value.quality_gate_version,
-        "gate_passed": value.gate_passed,
     }
 
 
@@ -301,8 +289,6 @@ def readout_model_quality_from_tree(tree: Any) -> ReadoutModelQuality:
             "held_out_fidelity",
             "held_out_validity",
             "quality_gate_id",
-            "quality_gate_version",
-            "gate_passed",
         },
         READOUT_MODEL_QUALITY_SCHEMA,
     )
@@ -331,8 +317,6 @@ def readout_model_quality_from_tree(tree: Any) -> ReadoutModelQuality:
         _ndarray(data["held_out_fidelity"], "held_out_fidelity"),
         _component_validity(data["held_out_validity"], "held_out_validity"),
         _text(data["quality_gate_id"], "quality_gate_id"),
-        _text(data["quality_gate_version"], "quality_gate_version"),
-        _bool(data["gate_passed"], "gate_passed"),
     )
     _canonical_tree(
         tree,
@@ -347,8 +331,6 @@ def readout_model_header_to_tree(value: ReadoutModelHeader) -> dict[str, Any]:
         raise TypeError("value must be ReadoutModelHeader")
     return {
         "schema": READOUT_MODEL_HEADER_SCHEMA,
-        "model_id": value.model_id,
-        "model_version": value.model_version,
         "frame_contract_fingerprint": value.frame_contract_fingerprint,
         "site_map_fingerprint": value.site_map_fingerprint,
         "site_axis_id": value.site_axis_id.value,
@@ -364,8 +346,6 @@ def readout_model_header_from_tree(tree: Any) -> ReadoutModelHeader:
         tree,
         {
             "schema",
-            "model_id",
-            "model_version",
             "frame_contract_fingerprint",
             "site_map_fingerprint",
             "site_axis_id",
@@ -377,8 +357,6 @@ def readout_model_header_from_tree(tree: Any) -> ReadoutModelHeader:
         READOUT_MODEL_HEADER_SCHEMA,
     )
     value = ReadoutModelHeader(
-        _text(data["model_id"], "model_id"),
-        _text(data["model_version"], "model_version"),
         _text(data["frame_contract_fingerprint"], "frame_contract_fingerprint"),
         _text(data["site_map_fingerprint"], "site_map_fingerprint"),
         AxisId(_text(data["site_axis_id"], "site_axis_id")),
@@ -466,40 +444,6 @@ def readout_model_from_tree(tree: Any) -> ReadoutModel:
     return value
 
 
-def default_model_policy_to_tree(value: DefaultModelPolicy) -> dict[str, Any]:
-    if not isinstance(value, DefaultModelPolicy):
-        raise TypeError("value must be DefaultModelPolicy")
-    return {
-        "schema": DEFAULT_MODEL_POLICY_SCHEMA,
-        "policy_id": value.policy_id,
-        "policy_version": value.policy_version,
-        "default_model_id": value.default_model_id,
-        "default_kind": None if value.default_kind is None else value.default_kind.value,
-    }
-
-
-def default_model_policy_from_tree(tree: Any) -> DefaultModelPolicy:
-    data = _exact_map(
-        tree,
-        {"schema", "policy_id", "policy_version", "default_model_id", "default_kind"},
-        DEFAULT_MODEL_POLICY_SCHEMA,
-    )
-    model_id = data["default_model_id"]
-    kind = data["default_kind"]
-    value = DefaultModelPolicy(
-        _text(data["policy_id"], "policy_id"),
-        _text(data["policy_version"], "policy_version"),
-        None if model_id is None else _text(model_id, "default_model_id"),
-        None if kind is None else _enum(ReadoutModelKind, kind, "default_kind"),
-    )
-    _canonical_tree(
-        tree,
-        default_model_policy_to_tree(value),
-        DEFAULT_MODEL_POLICY_SCHEMA,
-    )
-    return value
-
-
 def calibration_artifact_to_tree(value: CalibrationArtifact) -> dict[str, Any]:
     if not isinstance(value, CalibrationArtifact):
         raise TypeError("value must be CalibrationArtifact")
@@ -509,14 +453,11 @@ def calibration_artifact_to_tree(value: CalibrationArtifact) -> dict[str, Any]:
         "frame_contract": frame_contract_to_tree(value.frame_contract),
         "site_map": site_map_to_tree(value.site_map),
         "models": [readout_model_to_tree(model) for model in value.models],
-        "stage": value.stage.value,
-        "capabilities": [capability.value for capability in value.capabilities],
-        "required_model_kinds": [kind.value for kind in value.required_model_kinds],
-        "default_model_policy": default_model_policy_to_tree(
-            value.default_model_policy
+        "default_model_kind": (
+            None
+            if value.default_model_kind is None
+            else value.default_model_kind.value
         ),
-        "algorithm_id": value.algorithm_id,
-        "algorithm_version": value.algorithm_version,
         "parameters": [_parameter_to_tree(item) for item in value.parameters],
     }
 
@@ -530,12 +471,7 @@ def calibration_artifact_from_tree(tree: Any) -> CalibrationArtifact:
             "frame_contract",
             "site_map",
             "models",
-            "stage",
-            "capabilities",
-            "required_model_kinds",
-            "default_model_policy",
-            "algorithm_id",
-            "algorithm_version",
+            "default_model_kind",
             "parameters",
         },
         CALIBRATION_ARTIFACT_SCHEMA,
@@ -545,25 +481,20 @@ def calibration_artifact_from_tree(tree: Any) -> CalibrationArtifact:
         frame_contract_from_tree(data["frame_contract"]),
         site_map_from_tree(data["site_map"]),
         tuple(readout_model_from_tree(item) for item in _list(data["models"], "models")),
-        _enum(CalibrationStage, data["stage"], "stage"),
-        tuple(
-            _enum(ReadoutModelKind, item, "required model kind")
-            for item in _list(data["required_model_kinds"], "required_model_kinds")
+        (
+            None
+            if data["default_model_kind"] is None
+            else _enum(
+                ReadoutModelKind,
+                data["default_model_kind"],
+                "default_model_kind",
+            )
         ),
-        default_model_policy_from_tree(data["default_model_policy"]),
-        _text(data["algorithm_id"], "algorithm_id"),
-        _text(data["algorithm_version"], "algorithm_version"),
         tuple(
             _parameter_from_tree(item)
             for item in _list(data["parameters"], "parameters")
         ),
     )
-    capabilities = tuple(
-        _enum(CalibrationCapability, item, "capability")
-        for item in _list(data["capabilities"], "capabilities")
-    )
-    if capabilities != value.capabilities:
-        raise ValueError("serialized calibration capabilities differ from derived capabilities")
     _canonical_tree(
         tree,
         calibration_artifact_to_tree(value),
@@ -733,24 +664,25 @@ def calibration_artifact_metadata_encoding_upper_bound(
     artifact_parameters: tuple[CalibrationParameter, ...],
     model_parameters: tuple[tuple[CalibrationParameter, ...], ...],
     model_kinds: tuple[ReadoutModelKind, ...],
-    default_model_policy: DefaultModelPolicy,
-    algorithm_id: str,
-    algorithm_version: str,
+    default_model_kind: ReadoutModelKind | None,
 ) -> int:
     """Bound every non-array artifact byte from its frozen owner values.
 
     External camera/schema/source text is deliberately measured from the
     owner projections instead of hidden behind a fixed allowance.  The small
-    fixed envelopes cover only codec-owned field names, schemas, fixed model
-    identities, quality-gate identifiers, and scalar wrappers.
+    fixed envelopes cover only codec-owned field names, schemas, model kinds,
+    quality-gate identifiers, and scalar wrappers.
     """
 
     if not isinstance(source_binding, CalibrationSourceBinding):
         raise TypeError("source_binding must be CalibrationSourceBinding")
     if not isinstance(frame_contract, FrameContract):
         raise TypeError("frame_contract must be FrameContract")
-    if not isinstance(default_model_policy, DefaultModelPolicy):
-        raise TypeError("default_model_policy must be DefaultModelPolicy")
+    if default_model_kind is not None and not isinstance(
+        default_model_kind,
+        ReadoutModelKind,
+    ):
+        raise TypeError("default_model_kind must be ReadoutModelKind or None")
     artifact_parameters = tuple(artifact_parameters)
     model_parameters = tuple(tuple(items) for items in model_parameters)
     model_kinds = tuple(model_kinds)
@@ -760,6 +692,10 @@ def calibration_artifact_metadata_encoding_upper_bound(
         not isinstance(item, ReadoutModelKind) for item in model_kinds
     ):
         raise TypeError("model_kinds must contain ReadoutModelKind")
+    if len(set(model_kinds)) != len(model_kinds):
+        raise ValueError("model_kinds must be unique")
+    if default_model_kind is not None and default_model_kind not in model_kinds:
+        raise ValueError("default_model_kind must name one supplied model kind")
     if len(model_parameters) != len(model_kinds) or any(
         any(not isinstance(item, CalibrationParameter) for item in items)
         for items in model_parameters
@@ -767,8 +703,6 @@ def calibration_artifact_metadata_encoding_upper_bound(
         raise TypeError(
             "model_parameters must contain one CalibrationParameter tuple per model"
         )
-    algorithm_id = _text(algorithm_id, "algorithm_id")
-    algorithm_version = _text(algorithm_version, "algorithm_version")
     projected = {
         "source_binding": calibration_source_binding_to_tree(source_binding),
         "frame_contract": frame_contract_to_tree(frame_contract),
@@ -789,14 +723,13 @@ def calibration_artifact_metadata_encoding_upper_bound(
                 strict=True,
             )
         ],
-        "required_model_kinds": [kind.value for kind in model_kinds],
-        "default_model_policy": default_model_policy_to_tree(
-            default_model_policy
+        "default_model_kind": (
+            None
+            if default_model_kind is None
+            else default_model_kind.value
         ),
-        "algorithm_id": algorithm_id,
-        "algorithm_version": algorithm_version,
     }
-    return len(encode(projected)) + 16 * 1024 + 8 * 1024 * len(model_kinds)
+    return len(encode(projected)) + 12 * 1024 + 6 * 1024 * len(model_kinds)
 
 
 def calibration_artifact_encoding_upper_bound(
@@ -899,7 +832,6 @@ def decode_calibration_artifact(
 __all__ = [
     "CALIBRATION_ARTIFACT_SCHEMA",
     "CALIBRATION_SOURCE_BINDING_SCHEMA",
-    "DEFAULT_MODEL_POLICY_SCHEMA",
     "READOUT_MODEL_HEADER_SCHEMA",
     "READOUT_MODEL_QUALITY_SCHEMA",
     "READOUT_MODEL_SCHEMA",
@@ -916,8 +848,6 @@ __all__ = [
     "decode_calibration_source_binding",
     "decode_readout_model",
     "decode_site_map",
-    "default_model_policy_from_tree",
-    "default_model_policy_to_tree",
     "encode_calibration_artifact",
     "encode_calibration_source_binding",
     "encode_readout_model",
