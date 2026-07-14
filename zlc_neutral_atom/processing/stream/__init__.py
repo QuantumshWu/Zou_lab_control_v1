@@ -2,7 +2,6 @@
 
 from .contract import (
     BoundStreamProcessor,
-    ProcessorExecutionGuard,
     StreamProcessorDefinition,
 )
 from .worker import ExactStreamProcessorWorker, StreamProcessorError
@@ -10,7 +9,6 @@ from .worker import ExactStreamProcessorWorker, StreamProcessorError
 __all__ = [
     "BoundStreamProcessor",
     "ExactStreamProcessorWorker",
-    "ProcessorExecutionGuard",
     "StreamProcessorDefinition",
     "StreamProcessorError",
 ]

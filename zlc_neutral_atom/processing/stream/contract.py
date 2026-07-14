@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import math
-from abc import ABC, abstractmethod
+import sys
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from types import MappingProxyType
@@ -29,17 +29,19 @@ from zlc_neutral_atom.runtime.streams import (
 )
 
 
-def _canonical_dtype_tree(value: np.dtype) -> dict[str, object]:
-    """Return one collision-resistant tree for a supported scalar dtype."""
+def _canonical_dtype(value: np.dtype) -> np.dtype:
+    """Admit one supported scalar dtype at the binding boundary."""
 
     dtype = np.dtype(value)
+    canonical = dtype.newbyteorder("<")
     if (
         dtype.hasobject
+        or dtype.metadata is not None
         or dtype.fields is not None
         or dtype.subdtype is not None
         or dtype.itemsize == 0
         or dtype.kind not in "biufc"
-        or dtype != dtype.newbyteorder("<")
+        or dtype != canonical
         or (dtype.kind == "b" and dtype.itemsize != 1)
         or (dtype.kind in "iu" and dtype.itemsize not in (1, 2, 4, 8))
         or (dtype.kind == "f" and dtype.itemsize not in (2, 4, 8))
@@ -48,6 +50,12 @@ def _canonical_dtype_tree(value: np.dtype) -> dict[str, object]:
         raise TypeError(
             "processor config dtypes must be canonical little-endian scalar numeric dtypes"
         )
+    return canonical
+
+
+def _dtype_tree(dtype: np.dtype) -> dict[str, object]:
+    """Project an already-admitted dtype without owning its validation again."""
+
     return {
         "$type": "numpy.dtype",
         "str": dtype.str,
@@ -57,15 +65,51 @@ def _canonical_dtype_tree(value: np.dtype) -> dict[str, object]:
     }
 
 
+def _resolve_module_member(module_name: str, qualname: str) -> object | None:
+    resolved: object = sys.modules.get(module_name)
+    if resolved is None or "<locals>" in qualname.split("."):
+        return None
+    for name in qualname.split("."):
+        try:
+            resolved = vars(resolved)[name]
+        except (KeyError, TypeError):
+            return None
+    return resolved
+
+
+def _admit_stable_binding_type(value: object) -> None:
+    """Require the fingerprint type tag to resolve to this exact class."""
+
+    cls = type(value)
+    if _resolve_module_member(cls.__module__, cls.__qualname__) is not cls:
+        raise TypeError("processor config types must be stable module-owned classes")
+
+
+def _admit_declared_dataclass_storage(
+    value: object,
+    dataclass_fields: tuple[object, ...],
+) -> None:
+    """Reject instance state that the canonical dataclass tree cannot see."""
+
+    field_names = {item.name for item in dataclass_fields}
+    namespace = getattr(value, "__dict__", None)
+    if namespace is not None and set(namespace) - field_names:
+        raise TypeError("processor config dataclasses may only store declared fields")
+    permitted_slots = field_names | {"__dict__", "__weakref__"}
+    for owner in type(value).__mro__:
+        slots = vars(owner).get("__slots__", ())
+        slots = (slots,) if isinstance(slots, str) else tuple(slots)
+        if set(slots) - permitted_slots:
+            raise TypeError("processor config dataclasses may only store declared fields")
+
+
 def _tree(
     value: object,
-    memo: dict[int, object] | None = None,
-    active: set[int] | None = None,
+    memo: dict[int, tuple[object, object]] | None = None,
 ) -> object:
-    """Canonical tree for already-validated declarative binding data."""
+    """Canonical projection of data already admitted by the binding owner."""
 
     memo = {} if memo is None else memo
-    active = set() if active is None else active
     if value is None or type(value) in (bool, int, float, str):
         return value
     if isinstance(value, bytes):
@@ -75,21 +119,15 @@ def _tree(
             "sha256": hashlib.sha256(value).hexdigest(),
         }
     if isinstance(value, np.dtype):
-        return _canonical_dtype_tree(value)
+        return _dtype_tree(value)
     identity = id(value)
-    if identity in active:
-        raise TypeError("processor config contains a recursive cycle")
-    if identity in memo:
-        return memo[identity]
-    active.add(identity)
+    memoized = memo.get(identity)
+    if memoized is not None and memoized[0] is value:
+        return memoized[1]
     if isinstance(value, np.ndarray):
-        if not _is_canonical_immutable_array(value):
-            raise TypeError(
-                "processor config arrays must be canonical immutable ndarrays"
-            )
         result = {
             "$type": "numpy.ndarray-content",
-            "dtype": _canonical_dtype_tree(value.dtype),
+            "dtype": _dtype_tree(value.dtype),
             "shape": list(value.shape),
             "sha256": hashlib.sha256(memoryview(value).cast("B")).hexdigest(),
         }
@@ -97,15 +135,15 @@ def _tree(
         result = {
             "$type": "enum",
             "class": f"{type(value).__module__}.{type(value).__qualname__}",
-            "value": _tree(value.value, memo, active),
+            "value": _tree(value.value, memo),
         }
     elif isinstance(value, tuple):
         result = {
             "$type": "tuple",
-            "items": [_tree(item, memo, active) for item in value],
+            "items": [_tree(item, memo) for item in value],
         }
     elif isinstance(value, frozenset):
-        items = tuple(_tree(item, memo, active) for item in value)
+        items = tuple(_tree(item, memo) for item in value)
         result = {
             "$type": "frozenset",
             "items": sorted(
@@ -114,14 +152,10 @@ def _tree(
             ),
         }
     elif isinstance(value, MappingProxyType):
-        for key in value:
-            if not isinstance(key, str):
-                raise TypeError("processor config mappings require canonical string keys")
-            _text(key, "processor config mapping key")
         result = {
             "$type": "mapping",
             "entries": [
-                [key, _tree(item, memo, active)]
+                [key, _tree(item, memo)]
                 for key, item in sorted(value.items(), key=lambda pair: pair[0])
             ],
         }
@@ -130,113 +164,199 @@ def _tree(
             "$type": "dataclass",
             "class": f"{type(value).__module__}.{type(value).__qualname__}",
             "fields": [
-                [field.name, _tree(getattr(value, field.name), memo, active)]
+                [field.name, _tree(getattr(value, field.name), memo)]
                 for field in fields(value)
             ],
         }
     else:
-        active.remove(identity)
         raise TypeError(f"unsupported declarative binding value {type(value).__name__}")
-    active.remove(identity)
-    memo[identity] = result
+    memo[identity] = (value, result)
     return result
 
 
-def _has_bytes_backing(value: np.ndarray) -> bool:
-    """Reject arrays whose read-only flag can be reversed by a mutable owner."""
+def _snapshot_immutable_array(value: object) -> np.ndarray:
+    """Own an ndarray header directly over its terminal immutable bytes."""
 
+    message = "processor config arrays must be canonical immutable ndarrays"
+    if type(value) is not np.ndarray:
+        raise TypeError(message)
+    try:
+        dtype = _canonical_dtype(value.dtype)
+    except TypeError as error:
+        raise TypeError(message) from error
+    if value.ndim == 0 or not value.flags.c_contiguous:
+        raise TypeError(message)
+    stride = dtype.itemsize
+    reversed_strides: list[int] = []
+    for size in reversed(value.shape):
+        reversed_strides.append(stride)
+        stride *= max(size, 1)
+    canonical_strides = tuple(reversed(reversed_strides))
+    if value.strides != canonical_strides:
+        raise TypeError(message)
     current: object = value
     seen: set[int] = set()
     while isinstance(current, np.ndarray):
         identity = id(current)
         if identity in seen or current.flags.writeable or current.flags.owndata:
-            return False
+            raise TypeError(message)
         seen.add(identity)
         current = current.base
-    if isinstance(current, bytes):
-        return True
-    return isinstance(current, memoryview) and current.readonly and isinstance(
-        current.obj,
-        bytes,
+    if type(current) is bytes:
+        backing = current
+    elif (
+        isinstance(current, memoryview)
+        and current.readonly
+        and type(current.obj) is bytes
+    ):
+        backing = current.obj
+    else:
+        raise TypeError(message)
+    root = np.frombuffer(backing, dtype=np.uint8)
+    if root.nbytes != value.nbytes:
+        raise TypeError(message)
+    if value.nbytes:
+        if int(value.__array_interface__["data"][0]) != int(
+            root.__array_interface__["data"][0]
+        ):
+            raise TypeError(message)
+    return np.ndarray(
+        value.shape,
+        dtype=dtype,
+        buffer=backing,
+        offset=0,
+        strides=canonical_strides,
     )
-
-
-def _is_canonical_immutable_array(value: object) -> bool:
-    if type(value) is not np.ndarray:
-        return False
-    dtype = value.dtype
-    try:
-        _canonical_dtype_tree(dtype)
-    except TypeError:
-        return False
-    return bool(value.ndim > 0 and value.flags.c_contiguous and _has_bytes_backing(value))
 
 
 def _snapshot_binding_value(
     value: object,
-    memo: dict[int, object] | None = None,
+    memo: dict[int, tuple[object, object]] | None = None,
     active: set[int] | None = None,
     preserve: dict[int, object] | None = None,
 ) -> object:
-    """Owner-rebuild binding data while preserving explicit generation identities."""
+    """Admit and owner-rebuild one config graph at its sole boundary."""
 
     preserve = {} if preserve is None else preserve
-    if id(value) in preserve:
-        return preserve[id(value)]
-    if value is None or type(value) in (bool, int, float, str, bytes):
+    if value is None or type(value) in (bool, int, str, bytes):
         return value
-    if isinstance(value, (np.dtype, np.ndarray)):
-        return value
-    if isinstance(value, Enum):
-        snapshot = _snapshot_binding_value(value.value, memo, active, preserve)
-        if snapshot is not value.value:
-            raise TypeError("processor config Enum values must be intrinsically immutable")
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise TypeError("processor config floats must be finite")
         return value
     memo = {} if memo is None else memo
     active = set() if active is None else active
     identity = id(value)
-    if identity in active:
-        raise TypeError("processor config contains a recursive cycle")
-    if identity in memo:
-        return memo[identity]
-    active.add(identity)
-    if isinstance(value, tuple):
-        items = tuple(
-            _snapshot_binding_value(item, memo, active, preserve) for item in value
-        )
-        result = items
-    elif isinstance(value, frozenset):
-        result = frozenset(
-            _snapshot_binding_value(item, memo, active, preserve) for item in value
-        )
-    elif isinstance(value, MappingProxyType):
-        owned = {
-            key: _snapshot_binding_value(item, memo, active, preserve)
-            for key, item in value.items()
-        }
-        result = MappingProxyType(owned)
-    elif is_dataclass(value) and not isinstance(value, type):
-        updates: dict[str, object] = {}
-        for field in fields(value):
-            if field.init:
-                updates[field.name] = _snapshot_binding_value(
-                    getattr(value, field.name),
-                    memo,
-                    active,
-                    preserve,
-                )
-        try:
-            result = replace(value, **updates)
-        except (TypeError, ValueError) as error:
-            active.remove(identity)
-            raise TypeError(
-                f"cannot reconstruct processor config {type(value).__name__}"
-            ) from error
+    memoized = memo.get(identity)
+    if memoized is not None and memoized[0] is value:
+        return memoized[1]
+    dataclass_value = is_dataclass(value) and not isinstance(value, type)
+    if dataclass_value and type(value).__bases__ != (object,):
+        raise TypeError("processor config dataclasses require plain dataclass storage")
+    if isinstance(value, np.dtype):
+        result = _canonical_dtype(value)
+    elif isinstance(value, np.ndarray):
+        result = _snapshot_immutable_array(value)
     else:
-        active.remove(identity)
-        raise TypeError(f"unsupported declarative binding value {type(value).__name__}")
-    active.remove(identity)
-    memo[identity] = result
+        if identity in active:
+            raise TypeError("processor config contains a recursive cycle")
+        active.add(identity)
+        try:
+            if isinstance(value, Enum):
+                _admit_stable_binding_type(value)
+                snapshot = _snapshot_binding_value(value.value, memo, active, preserve)
+                if snapshot is not value.value:
+                    raise TypeError(
+                        "processor config Enum values must be intrinsically immutable"
+                    )
+                result = value
+            elif isinstance(value, tuple):
+                result = tuple(
+                    _snapshot_binding_value(item, memo, active, preserve)
+                    for item in value
+                )
+            elif isinstance(value, frozenset):
+                result = frozenset(
+                    _snapshot_binding_value(item, memo, active, preserve)
+                    for item in value
+                )
+            elif isinstance(value, MappingProxyType):
+                for key in value:
+                    if type(key) is not str:
+                        raise TypeError(
+                            "processor config mappings require canonical string keys"
+                        )
+                    _text(key, "processor config mapping key")
+                result = MappingProxyType(
+                    {
+                        key: _snapshot_binding_value(
+                            value[key],
+                            memo,
+                            active,
+                            preserve,
+                        )
+                        for key in sorted(value)
+                    }
+                )
+            elif dataclass_value:
+                _admit_stable_binding_type(value)
+                namespace = vars(type(value))
+                parameters = namespace.get("__dataclass_params__")
+                declared_fields = namespace.get("__dataclass_fields__")
+                if (
+                    parameters is None
+                    or declared_fields is None
+                    or not parameters.frozen
+                ):
+                    raise TypeError("processor config dataclasses must be frozen")
+                items = fields(value)
+                _admit_declared_dataclass_storage(value, items)
+                updates: dict[str, object] = {}
+                for item in items:
+                    admitted = _snapshot_binding_value(
+                        getattr(value, item.name),
+                        memo,
+                        active,
+                        preserve,
+                    )
+                    if item.init:
+                        updates[item.name] = admitted
+                try:
+                    result = replace(value, **updates)
+                except (TypeError, ValueError) as error:
+                    raise TypeError(
+                        f"cannot reconstruct processor config {type(value).__name__}"
+                    ) from error
+                if type(result) is not type(value):
+                    raise TypeError(
+                        f"cannot reconstruct processor config {type(value).__name__}"
+                    )
+                result_identity = id(result)
+                active.add(result_identity)
+                try:
+                    result_items = fields(result)
+                    _admit_declared_dataclass_storage(result, result_items)
+                    for item in result_items:
+                        admitted = _snapshot_binding_value(
+                            getattr(result, item.name),
+                            memo,
+                            active,
+                            preserve,
+                        )
+                        object.__setattr__(result, item.name, admitted)
+                finally:
+                    active.remove(result_identity)
+            else:
+                raise TypeError(
+                    f"unsupported declarative binding value {type(value).__name__}"
+                )
+        finally:
+            active.remove(identity)
+    preserved = preserve.get(identity)
+    if preserved is not None:
+        result = preserved
+    memo[identity] = (value, result)
+    memo.setdefault(id(result), (result, result))
     return result
 
 
@@ -244,15 +364,16 @@ def _generation_owner_graph(*roots: object) -> dict[int, object]:
     """Collect identity-owned declarative descendants that configs may reference."""
 
     preserved: dict[int, object] = {}
+    seen: set[int] = set()
     pending = list(roots)
     while pending:
         value = pending.pop()
         if value is None or type(value) in (bool, int, float, str, bytes):
             continue
         identity = id(value)
-        if identity in preserved:
+        if identity in seen:
             continue
-        preserved[identity] = value
+        seen.add(identity)
         if isinstance(value, Enum):
             pending.append(value.value)
         elif isinstance(value, (tuple, frozenset)):
@@ -261,250 +382,9 @@ def _generation_owner_graph(*roots: object) -> dict[int, object]:
             pending.extend(value.keys())
             pending.extend(value.values())
         elif is_dataclass(value) and not isinstance(value, type):
+            preserved[identity] = value
             pending.extend(getattr(value, item.name) for item in fields(value))
     return preserved
-
-
-_PROCESSOR_BINDING_MAX_DEPTH = 32
-# Calibration permits up to 100,000 explicitly labelled sites; the binding tree
-# must admit that declared default while still bounding arbitrary recursive data.
-_PROCESSOR_BINDING_MAX_NODES = 131072
-_PROCESSOR_BINDING_MAX_ARRAYS = 64
-_PROCESSOR_BINDING_MAX_ARRAY_RANK = 8
-_PROCESSOR_BINDING_MAX_SINGLE_ARRAY_BYTES = 192 * 1024 * 1024
-_PROCESSOR_BINDING_MAX_TOTAL_ARRAY_BYTES = 256 * 1024 * 1024
-_PROCESSOR_BINDING_MAX_SINGLE_TEXT_BYTES = 1024 * 1024
-_PROCESSOR_BINDING_MAX_TOTAL_TEXT_BYTES = 16 * 1024 * 1024
-_PROCESSOR_BINDING_MAX_EXPANDED_NODES = 262_144
-_PROCESSOR_BINDING_MAX_CANONICAL_BYTES = 32 * 1024 * 1024
-_PROCESSOR_BINDING_MAX_INTEGER_BITS = 4096
-_PROCESSOR_BINDING_MAX_TOTAL_INTEGER_BYTES = 4 * 1024 * 1024
-
-
-@dataclass
-class _ProcessorBindingBudget:
-    nodes: int = 0
-    arrays: int = 0
-    array_bytes: int = 0
-    text_bytes: int = 0
-    expanded_nodes: int = 0
-    canonical_bytes: int = 0
-    integer_bytes: int = 0
-
-    def admit_node(self, depth: int) -> bool:
-        self.nodes += 1
-        return (
-            depth <= _PROCESSOR_BINDING_MAX_DEPTH
-            and self.nodes <= _PROCESSOR_BINDING_MAX_NODES
-        )
-
-    def admit_array(self, value: np.ndarray) -> bool:
-        self.arrays += 1
-        self.array_bytes += int(value.nbytes)
-        return (
-            value.ndim <= _PROCESSOR_BINDING_MAX_ARRAY_RANK
-            and self.arrays <= _PROCESSOR_BINDING_MAX_ARRAYS
-            and value.nbytes <= _PROCESSOR_BINDING_MAX_SINGLE_ARRAY_BYTES
-            and self.array_bytes <= _PROCESSOR_BINDING_MAX_TOTAL_ARRAY_BYTES
-        )
-
-    def admit_text(self, value: str | bytes) -> bool:
-        size = len(value.encode("utf-8")) if isinstance(value, str) else len(value)
-        self.text_bytes += size
-        return (
-            size <= _PROCESSOR_BINDING_MAX_SINGLE_TEXT_BYTES
-            and self.text_bytes <= _PROCESSOR_BINDING_MAX_TOTAL_TEXT_BYTES
-        )
-
-    def admit_integer(self, value: int) -> bool:
-        bits = abs(value).bit_length()
-        # Upper-bound decimal text without materializing an attacker-sized int.
-        encoded_bytes = 1 if bits == 0 else 2 + (bits * 30103) // 100000
-        self.integer_bytes += encoded_bytes
-        return (
-            bits <= _PROCESSOR_BINDING_MAX_INTEGER_BITS
-            and self.integer_bytes <= _PROCESSOR_BINDING_MAX_TOTAL_INTEGER_BYTES
-        )
-
-    def admit_expansion(self, nodes: int, canonical_bytes: int) -> bool:
-        self.expanded_nodes += nodes
-        self.canonical_bytes += canonical_bytes
-        return (
-            self.expanded_nodes <= _PROCESSOR_BINDING_MAX_EXPANDED_NODES
-            and self.canonical_bytes <= _PROCESSOR_BINDING_MAX_CANONICAL_BYTES
-        )
-
-
-def _is_processor_binding_value(
-    value: object,
-    active: set[int] | None = None,
-    memo: dict[int, tuple[int, int]] | None = None,
-    budget: _ProcessorBindingBudget | None = None,
-    depth: int = 0,
-) -> bool:
-    """Binding-only extension of catalog data with content-addressed arrays.
-
-    Catalog definitions remain small declarative values.  Only an already-bound
-    processor may retain numeric calibration arrays, and only when their backing
-    storage is intrinsically immutable rather than a reversible ``writeable=False``
-    view over mutable memory.
-    """
-
-    budget = _ProcessorBindingBudget() if budget is None else budget
-    if value is None or type(value) is bool:
-        return budget.admit_node(depth) and budget.admit_expansion(1, 8)
-    if type(value) is int:
-        return (
-            budget.admit_node(depth)
-            and budget.admit_integer(value)
-            and budget.admit_expansion(
-                1,
-                8 + max(1, (abs(value).bit_length() * 30103) // 100000),
-            )
-        )
-    if type(value) in (str, bytes):
-        canonical_bytes = (
-            len(value.encode("utf-8")) + 16
-            if isinstance(value, str)
-            else 128
-        )
-        return (
-            budget.admit_node(depth)
-            and budget.admit_text(value)
-            and budget.admit_expansion(1, canonical_bytes)
-        )
-    if type(value) is float:
-        return (
-            budget.admit_node(depth)
-            and math.isfinite(value)
-            and budget.admit_expansion(1, 32)
-        )
-    if isinstance(value, np.dtype):
-        if not budget.admit_node(depth):
-            return False
-        try:
-            _canonical_dtype_tree(value)
-        except TypeError:
-            return False
-        return budget.admit_expansion(1, 128)
-    identity = id(value)
-    active = set() if active is None else active
-    memo = {} if memo is None else memo
-    if identity in active:
-        return False
-    if identity in memo:
-        return budget.admit_expansion(*memo[identity])
-    if not budget.admit_node(depth):
-        return False
-    expanded_nodes_before = budget.expanded_nodes
-    canonical_bytes_before = budget.canonical_bytes
-    if isinstance(value, np.ndarray):
-        local_bytes = 192 + 16 * value.ndim
-    elif isinstance(value, Enum):
-        local_bytes = 64 + len(type(value).__module__) + len(type(value).__qualname__)
-    elif isinstance(value, (tuple, frozenset)):
-        local_bytes = 32 + 8 * len(value)
-    elif isinstance(value, MappingProxyType):
-        local_bytes = 48 + 16 * len(value)
-    elif is_dataclass(value) and not isinstance(value, type):
-        local_bytes = (
-            64
-            + len(type(value).__module__)
-            + len(type(value).__qualname__)
-            + sum(len(item.name) + 8 for item in fields(value))
-        )
-    else:
-        return False
-    if not budget.admit_expansion(1, local_bytes):
-        return False
-    if isinstance(value, np.ndarray):
-        result = _is_canonical_immutable_array(value) and budget.admit_array(value)
-    elif isinstance(value, Enum):
-        active.add(identity)
-        result = _is_processor_binding_value(
-            value.value,
-            active,
-            memo,
-            budget,
-            depth + 1,
-        )
-        active.remove(identity)
-    elif isinstance(value, (tuple, frozenset)):
-        active.add(identity)
-        result = all(
-            _is_processor_binding_value(item, active, memo, budget, depth + 1)
-            for item in value
-        )
-        active.remove(identity)
-    elif isinstance(value, MappingProxyType):
-        active.add(identity)
-        result = all(
-            _is_processor_binding_value(key, active, memo, budget, depth + 1)
-            and _is_processor_binding_value(item, active, memo, budget, depth + 1)
-            for key, item in value.items()
-        )
-        active.remove(identity)
-    elif is_dataclass(value) and not isinstance(value, type):
-        parameters = getattr(type(value), "__dataclass_params__", None)
-        if not parameters or not parameters.frozen:
-            return False
-        active.add(identity)
-        result = all(
-            _is_processor_binding_value(
-                getattr(value, field.name),
-                active,
-                memo,
-                budget,
-                depth + 1,
-            )
-            for field in fields(value)
-        )
-        active.remove(identity)
-    else:
-        result = False
-    if result:
-        memo[identity] = (
-            budget.expanded_nodes - expanded_nodes_before,
-            budget.canonical_bytes - canonical_bytes_before,
-        )
-    return result
-
-
-class ProcessorExecutionGuard(ABC):
-    """Process-local authority consulted before an exact worker claims input.
-
-    The stable definition records only :attr:`schema_id`; one runtime binding
-    supplies the matching authority and commits its immutable
-    :attr:`binding_fingerprint` into processor lineage.  The guard itself is
-    deliberately neither snapshotted nor serialized.
-    """
-
-    @property
-    @abstractmethod
-    def schema_id(self) -> str:
-        """Return the stable schema understood by this execution authority."""
-
-    @property
-    @abstractmethod
-    def binding_fingerprint(self) -> str:
-        """Return the digest of the exact process-local authority binding."""
-
-    @abstractmethod
-    def authorize_exact_worker(
-        self,
-        *,
-        bound: BoundStreamProcessor,
-        input_reservation: object,
-        input_cursor: object,
-        input_edge: object,
-        output_producer: object,
-        deadline_monotonic: float,
-        output_cursor: object | None,
-        output_builder: object | None,
-        downstream_readiness: object | None,
-        cancellation: object | None,
-    ) -> None:
-        """Authorize one fully validated exact-worker construction."""
 
 
 @dataclass(frozen=True)
@@ -519,7 +399,6 @@ class StreamProcessorDefinition:
     join_key_contract_fingerprint: str
     operator_deadline_seconds: float = 1.0
     terminal_wait_seconds: float = 1.0
-    execution_guard_schema_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, DefinitionKey):
@@ -542,10 +421,6 @@ class StreamProcessorDefinition:
             ):
                 raise ValueError(f"{field} must be finite and positive")
             object.__setattr__(self, field, float(value))
-        if self.execution_guard_schema_id is not None:
-            _text(self.execution_guard_schema_id, "execution_guard_schema_id")
-
-
 @dataclass(frozen=True)
 class BoundStreamProcessor:
     """Runtime binding of one definition to one trusted synchronous operator.
@@ -570,26 +445,7 @@ class BoundStreamProcessor:
     output_source_id: str
     operator: Callable[[object, object], object]
     artifact_inputs: tuple[ArtifactInputRef, ...] = ()
-    _execution_guard_schema_id: str | None = field(
-        init=False,
-        default=None,
-        repr=False,
-        compare=False,
-    )
-    _execution_guard_binding_fingerprint: str | None = field(
-        init=False,
-        default=None,
-        repr=False,
-        compare=False,
-    )
-    _execution_guard_owner: ProcessorExecutionGuard | None = field(
-        init=False,
-        default=None,
-        repr=False,
-        compare=False,
-    )
     _fingerprint: str = field(init=False, repr=False, compare=False)
-    execution_guard: ProcessorExecutionGuard | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.definition, StreamProcessorDefinition):
@@ -605,10 +461,6 @@ class BoundStreamProcessor:
         output_stream_id = StreamId(source_output_stream_id.value)
         object.__setattr__(self, "output_stream_id", output_stream_id)
         _text(self.output_source_id, "output_source_id")
-        if not _is_processor_binding_value(self.config):
-            raise TypeError(
-                "processor config must be recursively frozen binding data"
-            )
         generation_owners = _generation_owner_graph(
             self.input_payload_contract,
             self.output_payload_contract,
@@ -620,8 +472,6 @@ class BoundStreamProcessor:
             self.config,
             preserve=generation_owners,
         )
-        if not _is_processor_binding_value(config):
-            raise TypeError("processor config snapshot violated its binding contract")
         config_tree = _tree(config)
         object.__setattr__(self, "config", config)
         for name, contract, expected in (
@@ -670,34 +520,6 @@ class BoundStreamProcessor:
             "artifact_inputs",
             provenance.direct_artifact_inputs,
         )
-        guard_schema_id = self.definition.execution_guard_schema_id
-        guard = self.execution_guard
-        guard_binding_fingerprint = None
-        if guard_schema_id is None:
-            if guard is not None:
-                raise ValueError(
-                    "execution_guard requires execution_guard_schema_id in definition"
-                )
-        else:
-            if guard is None:
-                raise ValueError("definition requires an execution_guard")
-            if not isinstance(guard, ProcessorExecutionGuard):
-                raise TypeError("execution_guard must be ProcessorExecutionGuard")
-            actual_schema_id = guard.schema_id
-            _text(actual_schema_id, "execution_guard.schema_id")
-            if actual_schema_id != guard_schema_id:
-                raise ValueError("execution_guard schema differs from definition")
-            guard_binding_fingerprint = _digest(
-                guard.binding_fingerprint,
-                "execution_guard.binding_fingerprint",
-            )
-        object.__setattr__(self, "_execution_guard_schema_id", guard_schema_id)
-        object.__setattr__(
-            self,
-            "_execution_guard_binding_fingerprint",
-            guard_binding_fingerprint,
-        )
-        object.__setattr__(self, "_execution_guard_owner", guard)
         operator = self.operator
         if (
             not inspect.isfunction(operator)
@@ -706,6 +528,8 @@ class BoundStreamProcessor:
             or operator.__closure__ is not None
             or operator.__name__ == "<lambda>"
             or "<locals>" in operator.__qualname__
+            or _resolve_module_member(operator.__module__, operator.__qualname__)
+            is not operator
         ):
             raise TypeError("operator must be one importable top-level Python function")
         parameters = tuple(inspect.signature(operator).parameters.values())
@@ -737,40 +561,9 @@ class BoundStreamProcessor:
                     "artifact_inputs": [
                         item.fingerprint for item in self.artifact_inputs
                     ],
-                    "execution_guard_binding_fingerprint": (
-                        guard_binding_fingerprint
-                    ),
                 }
             ),
         )
-
-    def _validated_execution_guard(self) -> ProcessorExecutionGuard | None:
-        """Return the frozen guard only while its authority identity is stable."""
-
-        expected_schema_id = self._execution_guard_schema_id
-        expected_binding_fingerprint = self._execution_guard_binding_fingerprint
-        guard = self.execution_guard
-        if guard is not self._execution_guard_owner:
-            raise ValueError("execution_guard owner changed after construction")
-        if expected_schema_id is None:
-            if guard is not None or expected_binding_fingerprint is not None:
-                raise ValueError("execution_guard binding changed after construction")
-            return None
-        if not isinstance(guard, ProcessorExecutionGuard):
-            raise TypeError("execution_guard must be ProcessorExecutionGuard")
-        actual_schema_id = guard.schema_id
-        _text(actual_schema_id, "execution_guard.schema_id")
-        if actual_schema_id != expected_schema_id:
-            raise ValueError("execution_guard schema changed after construction")
-        actual_binding_fingerprint = _digest(
-            guard.binding_fingerprint,
-            "execution_guard.binding_fingerprint",
-        )
-        if actual_binding_fingerprint != expected_binding_fingerprint:
-            raise ValueError(
-                "execution_guard binding fingerprint changed after construction"
-            )
-        return guard
 
     @property
     def fingerprint(self) -> str:
@@ -779,6 +572,5 @@ class BoundStreamProcessor:
 
 __all__ = [
     "BoundStreamProcessor",
-    "ProcessorExecutionGuard",
     "StreamProcessorDefinition",
 ]

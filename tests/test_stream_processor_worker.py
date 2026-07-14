@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import gc
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 import threading
 import time
+from typing import ClassVar
 import weakref
 
 import numpy as np
@@ -33,7 +34,6 @@ from zlc_neutral_atom.catalog import DefinitionCatalog, DefinitionKey
 from zlc_neutral_atom.processing.stream import (
     BoundStreamProcessor,
     ExactStreamProcessorWorker,
-    ProcessorExecutionGuard,
     StreamProcessorDefinition,
     StreamProcessorError,
 )
@@ -75,58 +75,61 @@ class ConvertConfig:
     output_schema: ValueSchema
 
 
-class RecordingExecutionGuard(ProcessorExecutionGuard):
-    def __init__(
-        self,
-        *,
-        schema_id: str = "test.processor-execution-guard",
-        binding_fingerprint: str = "e" * 64,
-        reject: bool = False,
-    ) -> None:
-        self._schema_id = schema_id
-        self._binding_fingerprint = binding_fingerprint
-        self.reject = reject
-        self.calls: list[dict[str, object]] = []
+@dataclass
+class MutableConfigForPreserve:
+    factor: int
 
-    @property
-    def schema_id(self) -> str:
-        return self._schema_id
 
-    @property
-    def binding_fingerprint(self) -> str:
-        return self._binding_fingerprint
+@dataclass(frozen=True)
+class FrozenBaseConfig:
+    factor: int
 
-    def authorize_exact_worker(
-        self,
-        *,
-        bound: BoundStreamProcessor,
-        input_reservation: object,
-        input_cursor: object,
-        input_edge: object,
-        output_producer: object,
-        deadline_monotonic: float,
-        output_cursor: object | None,
-        output_builder: object | None,
-        downstream_readiness: object | None,
-        cancellation: object | None,
-    ) -> None:
-        self.calls.append(
-            {
-                "bound": bound,
-                "input_reservation": input_reservation,
-                "input_cursor": input_cursor,
-                "input_edge": input_edge,
-                "output_producer": output_producer,
-                "deadline_monotonic": deadline_monotonic,
-                "output_cursor": output_cursor,
-                "output_builder": output_builder,
-                "downstream_readiness": downstream_readiness,
-                "cancellation": cancellation,
-                "consumer_was_claimed": input_reservation._stream._formal_consumer_claimed,
-            }
-        )
-        if self.reject:
-            raise PermissionError("synthetic execution guard rejection")
+
+class MutableInheritedConfig(FrozenBaseConfig):
+    pass
+
+
+@dataclass
+class MutableReplacementConfig:
+    dtype: np.dtype
+
+
+@dataclass(frozen=True)
+class TypeSwitchingConfig:
+    dtype: np.dtype
+
+    def __new__(cls, dtype: np.dtype):
+        if np.dtype(dtype).byteorder == "<":
+            return MutableReplacementConfig(np.dtype(dtype))
+        return object.__new__(cls)
+
+
+@dataclass(frozen=True)
+class UnsafeDerivedConfig:
+    factor: int
+    hidden: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "hidden", np.arange(4, dtype=np.int64))
+
+
+@dataclass(frozen=True)
+class DerivedAliasConfig:
+    value: object
+    derived: object = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "derived", self.value)
+
+
+@dataclass(frozen=True)
+class RewritesInitFieldConfig:
+    value: object
+    rewrite_on_construction: ClassVar[bool] = False
+
+    def __post_init__(self) -> None:
+        if self.rewrite_on_construction:
+            object.__setattr__(self, "value", np.arange(4, dtype=np.int64))
 
 
 def scale_value(payload: object, config: object) -> object:
@@ -524,8 +527,6 @@ def chain(
     output_trace_source_id: str = "synthetic-processor",
     absolute_deadline_seconds: float = 2.0,
     artifact_inputs: tuple[ArtifactInputRef, ...] = (),
-    execution_guard_schema_id: str | None = None,
-    execution_guard: ProcessorExecutionGuard | None = None,
 ) -> Chain:
     data_schema = schema(points)
     result_schema = (
@@ -600,7 +601,6 @@ def chain(
         dataset_cell_key_fingerprint(data_schema),
         operator_deadline_seconds=operator_deadline_seconds,
         terminal_wait_seconds=terminal_wait_seconds,
-        execution_guard_schema_id=execution_guard_schema_id,
     )
     assert DefinitionCatalog((definition,)).resolve(definition.key) is definition
     bound = BoundStreamProcessor(
@@ -613,7 +613,6 @@ def chain(
         "synthetic-processor",
         operator,
         artifact_inputs,
-        execution_guard,
     )
     if tamper_output_cursor_owner:
         output_reservation._cursor = object()
@@ -660,82 +659,6 @@ def emit(item: Chain, ordinal: int, *, key: DatasetCellAddress | None = None) ->
     )
 
 
-def test_execution_guard_definition_and_binding_must_match_exactly():
-    schema_id = "test.processor-execution-guard"
-    with pytest.raises(ValueError, match="requires an execution_guard"):
-        chain(execution_guard_schema_id=schema_id)
-
-    extra = RecordingExecutionGuard()
-    with pytest.raises(ValueError, match="requires execution_guard_schema_id"):
-        chain(execution_guard=extra)
-
-    wrong = RecordingExecutionGuard(schema_id="test.another-guard")
-    with pytest.raises(ValueError, match="schema differs from definition"):
-        chain(
-            execution_guard_schema_id=schema_id,
-            execution_guard=wrong,
-        )
-
-    invalid_digest = RecordingExecutionGuard(binding_fingerprint="not-a-digest")
-    with pytest.raises(ValueError, match="lowercase SHA-256 digest"):
-        chain(
-            execution_guard_schema_id=schema_id,
-            execution_guard=invalid_digest,
-        )
-
-
-def test_raw_worker_cannot_bypass_guard_and_guard_runs_before_consumer_claim():
-    guard = RecordingExecutionGuard(reject=True)
-    with pytest.raises(PermissionError, match="synthetic execution guard rejection"):
-        chain(
-            execution_guard_schema_id=guard.schema_id,
-            execution_guard=guard,
-        )
-
-    assert len(guard.calls) == 1
-    call = guard.calls[0]
-    assert call["consumer_was_claimed"] is False
-    reservation = call["input_reservation"]
-    assert reservation._stream._formal_consumer_claimed is False
-    assert call["input_cursor"] is reservation._cursor
-    assert call["input_edge"].expected_cells is not None
-    assert call["output_producer"] is not None
-    assert call["output_cursor"] is not None
-    assert call["output_builder"] is not None
-    assert call["downstream_readiness"] is None
-    assert call["cancellation"] is None
-    assert call["bound"].execution_guard is guard
-
-
-def test_worker_authorization_rejects_execution_guard_identity_drift():
-    guard = RecordingExecutionGuard()
-    item = chain(
-        execution_guard_schema_id=guard.schema_id,
-        execution_guard=guard,
-    )
-    bound = item.worker._bound
-    original_fingerprint = bound.fingerprint
-    assert len(original_fingerprint) == 64
-
-    guard._binding_fingerprint = "f" * 64
-    assert bound.fingerprint == original_fingerprint
-    with pytest.raises(ValueError, match="binding fingerprint changed"):
-        bound._validated_execution_guard()
-
-    guard._binding_fingerprint = "e" * 64
-    guard._schema_id = "test.mutated-guard"
-    with pytest.raises(ValueError, match="schema changed"):
-        bound._validated_execution_guard()
-    guard._schema_id = "test.processor-execution-guard"
-
-    replacement = RecordingExecutionGuard()
-    object.__setattr__(bound, "execution_guard", replacement)
-    with pytest.raises(ValueError, match="owner changed"):
-        bound._validated_execution_guard()
-    object.__setattr__(bound, "execution_guard", guard)
-    item.worker.close(2.0)
-
-
 def test_bound_processor_fingerprint_is_computed_once_at_bind(monkeypatch):
     item = chain()
     bound = item.worker._bound
@@ -747,6 +670,14 @@ def test_bound_processor_fingerprint_is_computed_once_at_bind(monkeypatch):
     monkeypatch.setattr(stream_contract, "canonical_digest", unexpected_digest)
     assert bound.fingerprint == expected
     assert bound.fingerprint == expected
+    item.worker.close(2.0)
+
+
+def test_bound_processor_fingerprint_has_a_literal_current_oracle():
+    item = chain(points=1)
+    assert item.worker._bound.fingerprint == (
+        "40a871e122fdb1d6d72a71f0a08c3acaa7d46e2f5843b06d2ee0e61911ff1a4f"
+    )
     item.worker.close(2.0)
 
 
@@ -792,6 +723,7 @@ def test_processor_changes_value_schema_without_changing_cell_key_domain():
         config=ConvertConfig(output_cell),
         output_cell_schema=output_cell,
     )
+    assert item.worker._bound.config.output_schema is output_cell
     assert item.schema.fingerprint != item.output_schema.fingerprint
     assert dataset_cell_key_fingerprint(item.schema) == dataset_cell_key_fingerprint(
         item.output_schema
@@ -1060,14 +992,21 @@ def test_operator_must_be_synchronous(operator):
 
 
 def test_config_mapping_keys_must_be_canonical_strings():
+    class SpecialKey(str):
+        pass
+
     with pytest.raises(TypeError, match="canonical string keys"):
         chain(points=1, config=MappingProxyType({1: "integer", "1": "string"}))
+    with pytest.raises(TypeError, match="canonical string keys"):
+        chain(points=1, config=MappingProxyType({SpecialKey("a"): 1}))
     with pytest.raises(ValueError, match="canonical non-empty text"):
         chain(points=1, config=MappingProxyType({" padded ": 1}))
 
     first = chain(points=1, config=MappingProxyType({"a": 1, "b": 2}))
     second = chain(points=1, config=MappingProxyType({"b": 2, "a": 1}))
     assert first.worker._bound.fingerprint == second.worker._bound.fingerprint
+    assert tuple(first.worker._bound.config) == ("a", "b")
+    assert tuple(second.worker._bound.config) == ("a", "b")
     first.worker.close(2.0)
     second.worker.close(2.0)
 
@@ -1215,24 +1154,41 @@ def test_artifact_input_ref_snapshots_only_canonical_owner_bytes():
         np.dtype(("<i4", (2,))),
         np.dtype("V4"),
         np.dtype(">i4"),
+        np.dtype("<i8", metadata={"meaning": "not-canonical-config"}),
     ],
 )
 def test_config_rejects_non_scalar_or_noncanonical_dtypes(dtype):
-    with pytest.raises(TypeError, match="recursively frozen binding data"):
+    with pytest.raises(TypeError, match="canonical little-endian scalar numeric"):
         chain(points=1, config=dtype)
 
 
-def test_config_text_and_bytes_have_per_item_and_total_byte_budgets(monkeypatch):
-    monkeypatch.setattr(stream_contract, "_PROCESSOR_BINDING_MAX_SINGLE_TEXT_BYTES", 8)
-    monkeypatch.setattr(stream_contract, "_PROCESSOR_BINDING_MAX_TOTAL_TEXT_BYTES", 12)
-    with pytest.raises(TypeError, match="recursively frozen binding data"):
-        chain(points=1, config="123456789")
-    with pytest.raises(TypeError, match="recursively frozen binding data"):
-        chain(points=1, config=(b"12345678", b"abcde"))
+def test_config_owner_normalizes_dtype_and_detaches_array_header():
+    native_dtype = np.dtype("i8")
+    explicit_little_endian = native_dtype.newbyteorder("<")
+    native = chain(points=1, config=native_dtype)
+    explicit = chain(points=1, config=explicit_little_endian)
+    assert native.worker._bound.config.byteorder == "<"
+    assert explicit.worker._bound.config.byteorder == "<"
+    assert native.worker._bound.fingerprint == explicit.worker._bound.fingerprint
+    native.worker.close(2.0)
+    explicit.worker.close(2.0)
+
+    caller = np.ndarray((2, 2), dtype=native_dtype, buffer=bytes(32))
+    item = chain(points=1, config=caller)
+    bound = item.worker._bound.config
+    frozen_fingerprint = item.worker._bound.fingerprint
+    assert bound is not caller
+    assert bound.shape == (2, 2)
+    assert bound.dtype.byteorder == "<"
+    caller.shape = (4,)
+    caller.dtype = np.dtype("u8")
+    assert bound.shape == (2, 2)
+    assert bound.dtype == explicit_little_endian
+    assert item.worker._bound.fingerprint == frozen_fingerprint
+    item.worker.close(2.0)
 
 
-def test_config_budget_memoizes_shared_frozen_objects_but_rejects_cycles(monkeypatch):
-    monkeypatch.setattr(stream_contract, "_PROCESSOR_BINDING_MAX_NODES", 8)
+def test_config_owner_treats_caller_aliases_as_nonsemantic_but_rejects_cycles():
     shared = (1, 2, 3, 4, 5)
     accepted = chain(points=1, config=(shared, shared, shared))
     accepted.worker.close(2.0)
@@ -1240,21 +1196,94 @@ def test_config_budget_memoizes_shared_frozen_objects_but_rejects_cycles(monkeyp
     backing = {}
     recursive = MappingProxyType(backing)
     backing["self"] = recursive
-    with pytest.raises(TypeError, match="recursively frozen binding data"):
+    with pytest.raises(TypeError, match="recursive cycle"):
         chain(points=1, config=recursive)
 
 
-def test_config_alias_expansion_and_integer_encoding_fail_before_digest_dos():
-    shared: object = (0,)
-    for _ in range(20):
-        shared = (shared, shared)
-    started = time.perf_counter()
-    with pytest.raises(TypeError, match="recursively frozen binding data"):
-        chain(points=1, config=shared)
-    assert time.perf_counter() - started < 1.0
+def test_config_owner_rejects_mutable_dataclasses_and_nonfinite_floats():
+    with pytest.raises(TypeError, match="dataclasses must be frozen"):
+        chain(points=1, config=MutableConfigForPreserve(2))
+    with pytest.raises(TypeError, match="plain dataclass storage"):
+        chain(points=1, config=MutableInheritedConfig(2))
+    with pytest.raises(TypeError, match="floats must be finite"):
+        chain(points=1, config=float("nan"))
 
-    with pytest.raises(TypeError, match="recursively frozen binding data"):
-        chain(points=1, config=1 << 5000)
+
+def test_config_owner_validates_preserved_and_derived_fields():
+    mutable = MutableConfigForPreserve(2)
+    with pytest.raises(TypeError, match="dataclasses must be frozen"):
+        stream_contract._snapshot_binding_value(
+            mutable,
+            preserve={id(mutable): mutable},
+        )
+
+    with pytest.raises(TypeError, match="canonical immutable ndarrays"):
+        chain(points=1, config=UnsafeDerivedConfig(2))
+
+    writable = np.arange(4, dtype=np.int64)
+    reversible_read_only = writable.view()
+    reversible_read_only.flags.writeable = False
+    with pytest.raises(TypeError, match="canonical immutable ndarrays"):
+        chain(points=1, config=reversible_read_only)
+
+    canonical = np.ndarray(
+        shape=(1, 3), dtype=np.dtype("<i8"), buffer=bytes(24), strides=(24, 8)
+    )
+    singleton_stride_alias = np.ndarray(
+        shape=(1, 3), dtype=np.dtype("<i8"), buffer=bytes(24), strides=(999, 8)
+    )
+    assert canonical.flags.c_contiguous and singleton_stride_alias.flags.c_contiguous
+    assert np.array_equal(canonical, singleton_stride_alias)
+    owned = stream_contract._snapshot_binding_value(canonical)
+    assert owned is not canonical
+    assert owned.shape == canonical.shape
+    assert owned.strides == canonical.strides
+    empty = np.ndarray((3, 0), dtype=np.dtype("<i8"), buffer=bytes(0))
+    assert stream_contract._snapshot_binding_value(empty).strides == (8, 8)
+    with pytest.raises(TypeError, match="canonical immutable ndarrays"):
+        stream_contract._snapshot_binding_value(singleton_stride_alias)
+
+
+def test_config_owner_preserves_constructor_derived_aliases():
+    caller = {"factor": 2}
+    source = MappingProxyType(caller)
+    item = chain(points=1, config=DerivedAliasConfig(source))
+    bound = item.worker._bound.config
+    assert bound.value is bound.derived
+    assert bound.value is not source
+    caller["factor"] = 99
+    assert bound.value["factor"] == 2
+    item.worker.close(2.0)
+
+    array = np.ndarray((2, 2), dtype="<i8", buffer=bytes(32))
+    array_item = chain(points=1, config=DerivedAliasConfig(array))
+    array_bound = array_item.worker._bound.config
+    assert array_bound.value is array_bound.derived
+    assert array_bound.value is not array
+    assert isinstance(array_bound.value.base, bytes)
+    array_item.worker.close(2.0)
+
+
+def test_config_owner_validates_init_fields_after_reconstruction():
+    source = RewritesInitFieldConfig(1)
+    RewritesInitFieldConfig.rewrite_on_construction = True
+    try:
+        with pytest.raises(TypeError, match="canonical immutable ndarrays"):
+            chain(points=1, config=source)
+    finally:
+        RewritesInitFieldConfig.rewrite_on_construction = False
+
+    with pytest.raises(TypeError, match="cannot reconstruct processor config"):
+        chain(points=1, config=TypeSwitchingConfig(np.dtype("i8")))
+
+
+def test_config_rejects_local_types():
+    @dataclass(frozen=True)
+    class LocalConfig:
+        value: int
+
+    with pytest.raises(TypeError, match="stable module-owned classes"):
+        chain(points=1, config=LocalConfig(1))
 
 
 def test_worker_revalidates_formal_trace_before_operator_or_ack():
