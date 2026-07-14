@@ -8,6 +8,7 @@ artifact; readers only follow a verified manifest.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import threading
@@ -25,6 +26,7 @@ from . import durability
 
 
 _NAMESPACE = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
+_VERIFY_CHUNK_SIZE = 1024 * 1024
 
 
 def _canonical_namespace(value: object) -> str:
@@ -161,6 +163,21 @@ class ContentStoreAuthority:
     ) -> bytes:
         self._require_integrity()
         return ContentAddressedStore._read_blob(
+            self._store,
+            reference,
+            max_bytes=max_bytes,
+        )
+
+    def verify_blob(
+        self,
+        reference: ContentRef,
+        *,
+        max_bytes: int | None = None,
+    ) -> None:
+        """Verify an existing blob without materializing its payload."""
+
+        self._require_integrity()
+        ContentAddressedStore._verify_blob(
             self._store,
             reference,
             max_bytes=max_bytes,
@@ -322,6 +339,30 @@ class ContentAddressedStore:
         if not isinstance(reference, ContentRef):
             raise TypeError("read_blob requires ContentRef")
         return ContentAddressedStore._read_verified(
+            self._blob_path_for_digest(reference.digest),
+            reference,
+            max_bytes=max_bytes,
+        )
+
+    def verify_blob(
+        self,
+        reference: ContentRef,
+        *,
+        max_bytes: int | None = None,
+    ) -> None:
+        """Verify an existing blob without materializing its payload."""
+
+        self.authority().verify_blob(reference, max_bytes=max_bytes)
+
+    def _verify_blob(
+        self,
+        reference: ContentRef,
+        *,
+        max_bytes: int | None = None,
+    ) -> None:
+        if not isinstance(reference, ContentRef):
+            raise TypeError("verify_blob requires ContentRef")
+        ContentAddressedStore._verify_open_handle(
             self._blob_path_for_digest(reference.digest),
             reference,
             max_bytes=max_bytes,
@@ -607,6 +648,47 @@ class ContentAddressedStore:
                 f"stored content does not match immutable reference {expected_digest}"
             )
         return data
+
+    @staticmethod
+    def _verify_open_handle(
+        path: Path,
+        reference: ContentRef,
+        *,
+        max_bytes: int | None,
+    ) -> None:
+        if max_bytes is not None:
+            max_bytes = nonnegative_integer(max_bytes, "max_bytes")
+        with path.open("rb") as stream:
+            actual_size = os.fstat(stream.fileno()).st_size
+            if max_bytes is not None and actual_size > max_bytes:
+                raise ContentSizeLimitError(
+                    f"stored content size {actual_size} exceeds limit {max_bytes}"
+                )
+            if actual_size != reference.size:
+                raise ContentCorruptionError(
+                    "stored content does not match immutable reference "
+                    f"{reference.digest}"
+                )
+
+            digest = hashlib.sha256()
+            remaining = actual_size
+            while remaining:
+                chunk = stream.read(min(_VERIFY_CHUNK_SIZE, remaining))
+                if not chunk:
+                    raise ContentCorruptionError(
+                        "stored content does not match immutable reference "
+                        f"{reference.digest}"
+                    )
+                digest.update(chunk)
+                remaining -= len(chunk)
+
+            # The extra byte detects growth after fstat while keeping the read
+            # bounded to the admitted physical size plus one byte.
+            if stream.read(1) or digest.hexdigest() != reference.digest:
+                raise ContentCorruptionError(
+                    "stored content does not match immutable reference "
+                    f"{reference.digest}"
+                )
 
 __all__ = [
     "ContentAddressedStore",
