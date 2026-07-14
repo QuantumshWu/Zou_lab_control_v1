@@ -13,6 +13,7 @@ from zlc_neutral_atom.runtime import (
     DeviceIdentityAck,
     DeviceIdentityEvidenceKind,
     MemoryQuarantineJournal,
+    PersistentSafetyJournal,
     ResourceArbiter,
     ResourceKey,
     RunController,
@@ -38,6 +39,23 @@ from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
 from zlc_workbench.legacy_neutral_atom import registrations_for
 
 LegacyRuntimeServices = LegacyNeutralAtomRuntime
+
+
+def test_default_safety_journal_prepares_clean_installation_hierarchy(
+    tmp_path,
+    monkeypatch,
+):
+    from zlc_workbench.legacy_neutral_atom import (
+        _prepare_default_safety_journal_path,
+    )
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    expected_root = tmp_path / "ZouLabControl" / "safety"
+    assert not expected_root.exists()
+
+    path = _prepare_default_safety_journal_path()
+    assert path == expected_root / "neutral-atom-runtime.zlcj"
+    PersistentSafetyJournal(path).close()
 
 
 def _asset_map_for(

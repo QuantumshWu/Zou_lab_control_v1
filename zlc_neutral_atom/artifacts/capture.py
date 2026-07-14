@@ -565,10 +565,7 @@ class CaptureRepository:
             )
         owned_policy = replace(resource_policy)
         object.__setattr__(self, "resource_policy", owned_policy)
-        root_lease = RepositoryRootLease(
-            self.root,
-            owner=f"capture:{self.repository_id}",
-        )
+        root_lease = RepositoryRootLease(self.root)
         object.__setattr__(self, "_root_lease", root_lease)
         try:
             # The root lease is deliberately acquired before any content-store,
@@ -943,50 +940,54 @@ class CaptureRepository:
             raise TypeError("checkpoint selector must be bool")
         kind = CommitKind.CHECKPOINT if checkpoint else CommitKind.FINAL
         subject = context.authorize_commit_preparation(kind)
-        reference, manifest_payload = self._stage_pipeline_result(result, context)
-        confirmed_subject = context.authorize_commit_preparation(kind)
-        if confirmed_subject != subject:
-            raise RuntimeError("capture commit subject changed while staging")
-        target = CommitTarget(
-            self.repository_id,
-            _CAPTURE_ARTIFACT_KIND,
-            CAPTURE_ARTIFACT_SCHEMA,
-            reference.target_ref,
-            reference.manifest_digest,
-        )
-
-        def publish() -> PublishedManifest[CaptureArtifactRef]:
-            self._require_active()
-            stored = publish_manifest_with_visibility_reconciliation(
-                self._store_authority,
-                CAPTURE_ARTIFACT_NAMESPACE,
-                manifest_payload,
-                expected_digest=reference.manifest_digest,
-                max_bytes=self.resource_policy.max_manifest_bytes,
-            )
-            if stored.content.digest != reference.manifest_digest:
-                raise RuntimeError("published capture manifest digest changed")
-            return PublishedManifest(
+        # Hold the root before the first CAS write.  prepare() synchronously
+        # mints the long-lived commit borrow before this temporary hold exits.
+        with self._root_lease.borrow() as staging_borrow:
+            staging_borrow.require_active()
+            reference, manifest_payload = self._stage_pipeline_result(result, context)
+            confirmed_subject = context.authorize_commit_preparation(kind)
+            if confirmed_subject != subject:
+                raise RuntimeError("capture commit subject changed while staging")
+            target = CommitTarget(
+                self.repository_id,
+                _CAPTURE_ARTIFACT_KIND,
+                CAPTURE_ARTIFACT_SCHEMA,
                 reference.target_ref,
                 reference.manifest_digest,
-                reference,
             )
 
-        operation_type = CheckpointCommit if checkpoint else FinalCommit
-        operation_kind = "checkpoint" if checkpoint else "final"
-        commit_id = (
-            f"capture-{operation_kind}-{subject.run_id}-"
-            f"{reference.manifest_digest}"
-        )
-        operation = operation_type(
-            self._coordinator.prepare(
-                kind,
-                commit_id,
-                subject,
-                target,
-                publish,
+            def publish() -> PublishedManifest[CaptureArtifactRef]:
+                self._require_active()
+                stored = publish_manifest_with_visibility_reconciliation(
+                    self._store_authority,
+                    CAPTURE_ARTIFACT_NAMESPACE,
+                    manifest_payload,
+                    expected_digest=reference.manifest_digest,
+                    max_bytes=self.resource_policy.max_manifest_bytes,
+                )
+                if stored.content.digest != reference.manifest_digest:
+                    raise RuntimeError("published capture manifest digest changed")
+                return PublishedManifest(
+                    reference.target_ref,
+                    reference.manifest_digest,
+                    reference,
+                )
+
+            operation_type = CheckpointCommit if checkpoint else FinalCommit
+            operation_kind = "checkpoint" if checkpoint else "final"
+            commit_id = (
+                f"capture-{operation_kind}-{subject.run_id}-"
+                f"{reference.manifest_digest}"
             )
-        )
+            operation = operation_type(
+                self._coordinator.prepare(
+                    kind,
+                    commit_id,
+                    subject,
+                    target,
+                    publish,
+                )
+            )
         try:
             context._track_prepared_commit(operation)
         except BaseException:

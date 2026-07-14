@@ -171,10 +171,7 @@ class CalibrationRepository:
         )
         self._lock = threading.RLock()
         self._closed = False
-        self._root_lease = RepositoryRootLease(
-            self.root,
-            owner=f"calibration:{self.repository_id}",
-        )
+        self._root_lease = RepositoryRootLease(self.root)
         try:
             self._store = ContentAddressedStore(self.root / "content")
             self._store_authority = self._store.authority()
@@ -525,38 +522,42 @@ class CalibrationRepository:
             )
         result._require_source_admission(source)
         subject = context.authorize_commit_preparation(CommitKind.FINAL)
-        reference, payload = self._stage_result(result)
-        confirmed = context.authorize_commit_preparation(CommitKind.FINAL)
-        if confirmed != subject:
-            raise RuntimeError("calibration commit subject changed while staging")
-        target = _target(self.repository_id, reference)
+        # Staging writes CAS blobs, so repository lifetime begins before the
+        # first write and overlaps prepare() minting the commit-lifetime hold.
+        with self._root_lease.borrow() as staging_borrow:
+            staging_borrow.require_active()
+            reference, payload = self._stage_result(result)
+            confirmed = context.authorize_commit_preparation(CommitKind.FINAL)
+            if confirmed != subject:
+                raise RuntimeError("calibration commit subject changed while staging")
+            target = _target(self.repository_id, reference)
 
-        def publish() -> PublishedManifest[CalibrationArtifactRef]:
-            authority = self._content_authority()
-            publish_manifest_with_visibility_reconciliation(
-                authority,
-                CALIBRATION_ARTIFACT_NAMESPACE,
-                payload,
-                expected_digest=reference.manifest_digest,
-                max_bytes=_MAX_MANIFEST_BYTES,
-            )
-            return PublishedManifest(
-                reference.target_ref,
-                reference.manifest_digest,
-                reference,
-            )
-
-        with self._lock:
-            self._require_open()
-            operation = FinalCommit(
-                self._coordinator.prepare(
-                    CommitKind.FINAL,
-                    _commit_id(subject.run_id, reference.manifest_digest),
-                    subject,
-                    target,
-                    publish,
+            def publish() -> PublishedManifest[CalibrationArtifactRef]:
+                authority = self._content_authority()
+                publish_manifest_with_visibility_reconciliation(
+                    authority,
+                    CALIBRATION_ARTIFACT_NAMESPACE,
+                    payload,
+                    expected_digest=reference.manifest_digest,
+                    max_bytes=_MAX_MANIFEST_BYTES,
                 )
-            )
+                return PublishedManifest(
+                    reference.target_ref,
+                    reference.manifest_digest,
+                    reference,
+                )
+
+            with self._lock:
+                self._require_open()
+                operation = FinalCommit(
+                    self._coordinator.prepare(
+                        CommitKind.FINAL,
+                        _commit_id(subject.run_id, reference.manifest_digest),
+                        subject,
+                        target,
+                        publish,
+                    )
+                )
         try:
             context._track_prepared_commit(operation)
         except BaseException:

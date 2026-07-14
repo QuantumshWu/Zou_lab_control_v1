@@ -45,24 +45,28 @@ def test_framed_journal_fails_closed_on_complete_frame_corruption(tmp_path):
         FramedJournal(path)
 
 
-def test_framed_journal_serializes_concurrent_appenders(tmp_path):
-    journal = FramedJournal(tmp_path / "journal.zlcj")
+def test_framed_journal_serializes_separate_instances_concurrently(tmp_path):
+    path = tmp_path / "journal.zlcj"
+    journals = (FramedJournal(path), FramedJournal(path))
     errors = []
+    start = threading.Barrier(17)
 
     def append(index: int) -> None:
         try:
-            journal.append(f"record-{index}", {"index": index})
+            start.wait()
+            journals[index % 2].append(f"record-{index}", {"index": index})
         except BaseException as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=append, args=(index,)) for index in range(16)]
     for thread in threads:
         thread.start()
+    start.wait()
     for thread in threads:
         thread.join()
 
     assert not errors
-    assert len(journal.records()) == 16
+    assert len(FramedJournal(path).records()) == 16
 
 
 def test_framed_journal_decodes_each_existing_record_once_per_scan(

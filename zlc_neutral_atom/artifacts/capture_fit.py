@@ -244,10 +244,7 @@ class CaptureFitResultRepository:
             materialization_memory_limit_bytes,
             "materialization_memory_limit_bytes",
         )
-        lease = RepositoryRootLease(
-            self.root,
-            owner=f"capture-fit:{self.repository_id}",
-        )
+        lease = RepositoryRootLease(self.root)
         self._root_lease = lease
         self._lifecycle_lock = threading.RLock()
         try:
@@ -305,32 +302,32 @@ class CaptureFitResultRepository:
         with self._lifecycle_lock:
             self._require_integrity()
             FitExecution._require_authority(execution, self)
-            with self._root_lease.borrow() as lease_borrow:
-                lease_borrow.require_active()
-                result_payload = encode_fit_result_batch(execution._result)
-                if len(result_payload) > _MAX_RESULT_BLOB_BYTES:
-                    raise ValueError("capture-fit result blob exceeds repository limit")
-                result_ref = self._store_authority.put_blob(result_payload)
-                manifest_payload = encode(
-                    {
-                        "schema": CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA,
-                        "repository_id": self.repository_id,
-                        "source_capture_ref": capture_artifact_ref_to_tree(
-                            execution._source_admission.reference
-                        ),
-                        "result_blob": content_ref_to_tree(result_ref),
-                    }
-                )
-                if len(manifest_payload) > _MAX_MANIFEST_BYTES:
-                    raise ValueError("capture-fit manifest exceeds repository limit")
-                stored = self._store_authority.publish_manifest(
-                    CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE,
-                    manifest_payload,
-                )
-                return CaptureFitResultArtifactRef(
-                    self.repository_id,
-                    stored.content.digest,
-                )
+            # close() takes this same lock, so it cannot release the root while
+            # encoding or publishing; a second lease hold adds no guarantee.
+            result_payload = encode_fit_result_batch(execution._result)
+            if len(result_payload) > _MAX_RESULT_BLOB_BYTES:
+                raise ValueError("capture-fit result blob exceeds repository limit")
+            result_ref = self._store_authority.put_blob(result_payload)
+            manifest_payload = encode(
+                {
+                    "schema": CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA,
+                    "repository_id": self.repository_id,
+                    "source_capture_ref": capture_artifact_ref_to_tree(
+                        execution._source_admission.reference
+                    ),
+                    "result_blob": content_ref_to_tree(result_ref),
+                }
+            )
+            if len(manifest_payload) > _MAX_MANIFEST_BYTES:
+                raise ValueError("capture-fit manifest exceeds repository limit")
+            stored = self._store_authority.publish_manifest(
+                CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE,
+                manifest_payload,
+            )
+            return CaptureFitResultArtifactRef(
+                self.repository_id,
+                stored.content.digest,
+            )
 
     def load(
         self,

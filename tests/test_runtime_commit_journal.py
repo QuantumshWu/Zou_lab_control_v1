@@ -225,7 +225,7 @@ def test_durable_coordinator_rejects_a_lease_for_another_root(tmp_path):
         journal_root / "commit-intents.zlcj",
         REPOSITORY_ID,
     )
-    wrong_lease = RepositoryRootLease(tmp_path / "other-root", owner="wrong-root")
+    wrong_lease = RepositoryRootLease(tmp_path / "other-root")
     try:
         with pytest.raises(ValueError, match="different roots"):
             RepositoryCommitCoordinator(
@@ -322,7 +322,7 @@ def test_persistent_journal_and_commit_coordinator_wiring_are_final_and_immutabl
     tmp_path,
 ):
     journal = PersistentCommitJournal(tmp_path / "commit-intents.zlcj", REPOSITORY_ID)
-    lease = RepositoryRootLease(tmp_path, owner="journal-wiring-test")
+    lease = RepositoryRootLease(tmp_path)
     try:
         coordinator = RepositoryCommitCoordinator(
             journal,
@@ -445,7 +445,7 @@ def test_repository_coordinator_fails_closed_until_startup_pending_is_resolved(t
     def unavailable(_intent):
         raise OSError("repository unavailable")
 
-    first_lease = RepositoryRootLease(tmp_path, owner="startup-gate-first")
+    first_lease = RepositoryRootLease(tmp_path)
     with pytest.raises(OSError, match="unavailable"):
         RepositoryCommitCoordinator(
             journal,
@@ -455,7 +455,7 @@ def test_repository_coordinator_fails_closed_until_startup_pending_is_resolved(t
     first_lease.close()
     assert journal.pending() == (pending,)
 
-    second_lease = RepositoryRootLease(tmp_path, owner="startup-gate-second")
+    second_lease = RepositoryRootLease(tmp_path)
     coordinator = RepositoryCommitCoordinator(
         journal,
         lambda value: CommitRecovery(
@@ -568,7 +568,7 @@ def test_abandon_and_consume_race_transfers_one_lease_borrow_exactly_once(
         tmp_path / "commit-intents.zlcj",
         REPOSITORY_ID,
     )
-    lease = RepositoryRootLease(tmp_path, owner="abandon-consume-race")
+    lease = RepositoryRootLease(tmp_path)
     coordinator = RepositoryCommitCoordinator(
         journal,
         lambda _intent: CommitRecovery(False),
@@ -611,7 +611,7 @@ def test_abandon_and_consume_race_transfers_one_lease_borrow_exactly_once(
     assert len(snapshots) + len(consume_errors) == 1
     assert coordinator._authorities == {}
     if snapshots:
-        with pytest.raises(RuntimeError, match="outstanding commit authorities"):
+        with pytest.raises(RuntimeError, match="outstanding operations"):
             lease.close()
         snapshots[0].release_lifetime()
     lease.close()

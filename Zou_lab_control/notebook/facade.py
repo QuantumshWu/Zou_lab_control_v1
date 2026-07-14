@@ -55,6 +55,7 @@ from zlc_pulse import (
     load_pulse_document,
 )
 from zlc_storage import canonical_text as _text
+from zlc_storage import durable_mkdir
 from zlc_storage import positive_integer as _positive_int
 from zlc_workbench._triggered_camera import (
     _TriggeredCameraLayout,
@@ -596,6 +597,9 @@ def connect(
     if not isinstance(repository, (str, Path)):
         raise TypeError("repository must be an explicit experiment workspace root")
     repository_root = Path(repository).expanduser().resolve()
+    # The composition root owns the workspace hierarchy; each repository owns
+    # exactly one child beneath it and never guesses missing ancestors.
+    durable_mkdir(repository_root)
     capture_repository = None
     calibration_repository = None
     fit_repository = None

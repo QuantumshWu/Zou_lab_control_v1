@@ -67,6 +67,93 @@ def test_content_store_publishes_blobs_and_manifests_idempotently(tmp_path):
     assert store.read_manifest("capture", digest) == payload
 
 
+def test_content_store_creates_its_hierarchy_one_owned_level_at_a_time(
+    tmp_path,
+    monkeypatch,
+):
+    import zlc_storage.content_store as content_store
+
+    observed = []
+    real_mkdir = content_store.durability.durable_mkdir
+
+    def observe(directory):
+        result = real_mkdir(directory)
+        observed.append(result)
+        return result
+
+    monkeypatch.setattr(content_store.durability, "durable_mkdir", observe)
+    root = (tmp_path / "repository").resolve()
+    ContentAddressedStore(root)
+    assert observed == [
+        root,
+        root / "blobs",
+        root / "blobs" / "sha256",
+        root / "manifests",
+    ]
+
+
+def test_dynamic_directory_is_cached_only_after_durable_acknowledgement(
+    tmp_path,
+    monkeypatch,
+):
+    import zlc_storage.content_store as content_store
+
+    store = ContentAddressedStore(tmp_path / "repository")
+    payload = b"dynamic-directory-retry"
+    target = store._blob_path(sha256_digest(payload))
+    real_flush = content_store.durability.flush_directory
+    failed = False
+
+    def fail_first_parent_ack(directory):
+        nonlocal failed
+        if directory == target.parent.parent and target.parent.is_dir() and not failed:
+            failed = True
+            raise DirectoryDurabilityError("dynamic directory parent not durable")
+        return real_flush(directory)
+
+    monkeypatch.setattr(
+        content_store.durability,
+        "flush_directory",
+        fail_first_parent_ack,
+    )
+    with pytest.raises(DirectoryDurabilityError, match="parent not durable"):
+        store.put_blob(payload)
+    assert target.parent.is_dir()
+    assert target.parent not in store._durable_directories
+    assert not target.exists()
+
+    assert store.put_blob(payload).digest == sha256_digest(payload)
+    assert target.parent in store._durable_directories
+
+
+def test_dynamic_directory_ack_is_once_per_store_not_restart_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    import zlc_storage.content_store as content_store
+
+    root = tmp_path / "repository"
+    store = ContentAddressedStore(root)
+    namespace_root = store._manifests / "capture"
+    acknowledgements = []
+    real_mkdir = content_store.durability.durable_mkdir
+
+    def observe(directory):
+        result = real_mkdir(directory)
+        if result == namespace_root:
+            acknowledgements.append(result)
+        return result
+
+    monkeypatch.setattr(content_store.durability, "durable_mkdir", observe)
+    store.publish_manifest("capture", b"first")
+    store.publish_manifest("capture", b"second")
+    assert acknowledgements == [namespace_root]
+
+    restarted = ContentAddressedStore(root)
+    restarted.publish_manifest("capture", b"third")
+    assert acknowledgements == [namespace_root, namespace_root]
+
+
 def test_put_blob_borrows_a_mutable_buffer_without_calling_bytes(tmp_path):
     class NoCopyBuffer(bytearray):
         def __bytes__(self):
@@ -220,7 +307,7 @@ def test_visible_target_is_not_acknowledged_until_retry_reconfirms_durability(
 
     def fail_first_target_flush(directory):
         nonlocal failed
-        if directory == target.parent and not failed:
+        if directory == target.parent and target.is_file() and not failed:
             failed = True
             raise DirectoryDurabilityError("lost target-directory acknowledgement")
         return real_flush(directory)

@@ -12,6 +12,11 @@ from typing import Any, Callable, Iterator
 
 from .canonical import canonical_text, decode, encode
 from . import durability
+from .file_lock import (
+    acquire_file_lock,
+    open_durable_lock_file,
+    release_file_lock,
+)
 
 
 _MAGIC = b"ZLCJNL1\n"
@@ -29,35 +34,13 @@ def _record_id(value: str) -> str:
 
 @contextmanager
 def _interprocess_lock(path: Path) -> Iterator[None]:
-    durability.durable_mkdir(path.parent)
-    existed = path.exists()
-    lock_file = path.open("a+b")
+    lock_file = path.open("r+b")
     try:
-        lock_file.seek(0, os.SEEK_END)
-        if lock_file.tell() == 0:
-            lock_file.write(b"\0")
-            lock_file.flush()
-            os.fsync(lock_file.fileno())
-            if not existed:
-                durability.flush_directory(path.parent)
-        lock_file.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
-            try:
-                yield
-            finally:
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        acquire_file_lock(lock_file, blocking=True)
+        try:
+            yield
+        finally:
+            release_file_lock(lock_file)
     finally:
         lock_file.close()
 
@@ -80,7 +63,7 @@ class FramedJournal:
         self.max_record_bytes = max_record_bytes
         self._thread_lock = threading.Lock()
         durability.durable_mkdir(self.path.parent)
-        durability.flush_directory(self.path.parent)
+        open_durable_lock_file(self.lock_path).close()
         existed = self.path.exists()
         with self._thread_lock, _interprocess_lock(self.lock_path):
             with self.path.open("a+b") as stream:

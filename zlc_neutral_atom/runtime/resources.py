@@ -1089,9 +1089,11 @@ class ResourceArbiter:
                 raise RuntimeError("cannot shut down ResourceArbiter with active ownership")
             self._shutdown = True
             token = self._journal_authority_token
-        close_authority = getattr(self._journal, "_close_from_authority", None)
-        if callable(close_authority) and token is not None:
-            close_authority(token)
+            # Keep shutdown linearized through physical journal-owner release.
+            # Concurrent shutdown callers may return only after this handoff.
+            close_authority = getattr(self._journal, "_close_from_authority", None)
+            if callable(close_authority) and token is not None:
+                close_authority(token)
 
     def acquire_all(
         self,

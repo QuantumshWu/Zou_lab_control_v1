@@ -284,6 +284,7 @@ class ContentAddressedStore:
         "_blobs",
         "_manifests",
         "_lock",
+        "_durable_directories",
         "_authority",
         "_sealed",
     )
@@ -298,11 +299,14 @@ class ContentAddressedStore:
         object.__setattr__(self, "_manifests", self.root / "manifests")
         object.__setattr__(self, "_lock", threading.RLock())
         durability.durable_mkdir(self.root)
-        # Construction is a durability preflight even when the hierarchy was
-        # created by an earlier process.
-        durability.flush_directory(self.root)
-        for directory in (self._blobs, self._manifests):
+        blobs_root = self.root / "blobs"
+        for directory in (blobs_root, self._blobs, self._manifests):
             durability.durable_mkdir(directory)
+        object.__setattr__(
+            self,
+            "_durable_directories",
+            {self.root, blobs_root, self._blobs, self._manifests},
+        )
         object.__setattr__(
             self,
             "_authority",
@@ -545,7 +549,11 @@ class ContentAddressedStore:
         reference: ContentRef,
     ) -> None:
         with self._lock:
-            durability.durable_mkdir(target.parent)
+            if target.parent not in self._durable_directories:
+                durability.durable_mkdir(target.parent)
+                # Add only after both child and parent flushes succeed.  A
+                # failed acknowledgement must be repeated by the next retry.
+                self._durable_directories.add(target.parent)
             if target.exists():
                 # Visibility is not durability.  This path is also the retry
                 # barrier after a prior replace became visible but its parent

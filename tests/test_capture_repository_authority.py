@@ -144,6 +144,57 @@ def _pending_intent(
     )
 
 
+def test_capture_staging_holds_repository_before_first_cas_write(
+    tmp_path,
+    capture_runtime,
+    monkeypatch,
+):
+    camera, runtime, spec = capture_runtime
+    repository = CaptureRepository(tmp_path / "captures")
+    entered = threading.Event()
+    release = threading.Event()
+    real_stage = CaptureRepository._stage_pipeline_result
+
+    def blocked_stage(owner, result, context):
+        if owner is repository:
+            entered.set()
+            if not release.wait(2.0):
+                raise TimeoutError("test did not release capture staging")
+        return real_stage(owner, result, context)
+
+    monkeypatch.setattr(CaptureRepository, "_stage_pipeline_result", blocked_stage)
+    base = compile_pipeline(spec)
+
+    def finalize(context, result):
+        return context.commit_final(repository.final_commit(context, result))
+
+    plan = replace(
+        base,
+        name="capture staging repository lifetime",
+        finalize=finalize,
+        requires_final_commit=True,
+    )
+    source, failures = _deliver_when_armed(camera, _images())
+    handle = runtime.controller.start(plan)
+    try:
+        assert entered.wait(2.0)
+        with pytest.raises(RuntimeError, match="outstanding operations"):
+            repository.close()
+        release.set()
+        reference = handle.result(3.0)
+        source.join(2.0)
+        assert not source.is_alive() and failures == []
+        assert repository.admit(reference).reference == reference
+    finally:
+        release.set()
+        if source.is_alive():
+            camera.finish_record_capture()
+            source.join(2.0)
+        repository.close()
+
+    CaptureRepository(repository.root).close()
+
+
 def _journal_writer(repository: CaptureRepository):
     return _journal_mutation_authority(repository._journal)
 
@@ -192,7 +243,7 @@ def test_prepared_unconsumed_authority_blocks_close_until_explicit_discard(
                 repository.checkpoint_commit(context, result),
             )
         )
-        with pytest.raises(RuntimeError, match="outstanding commit authorities"):
+        with pytest.raises(RuntimeError, match="outstanding operations"):
             repository.close()
         with pytest.raises(RepositoryRootBusy, match="live owner"):
             CaptureRepository(repository.root)
@@ -321,7 +372,7 @@ def test_inflight_commit_blocks_close_and_second_writer_without_poisoning_run(
     try:
         handle = runtime.controller.start(plan)
         assert publish_entered.wait(2.0)
-        with pytest.raises(RuntimeError, match="outstanding commit authorities"):
+        with pytest.raises(RuntimeError, match="outstanding operations"):
             repository.close()
         assert repository._root_lease.active
         with pytest.raises(RepositoryRootBusy, match="live owner"):
@@ -361,7 +412,10 @@ def test_lost_manifest_directory_ack_remains_pending_until_durable_confirm(
 
     def fail_first_two_target_flushes(directory):
         nonlocal target_flushes
-        if directory == manifest_parent:
+        visible_manifest = manifest_parent.is_dir() and any(
+            path.suffix == ".manifest" for path in manifest_parent.iterdir()
+        )
+        if directory == manifest_parent and visible_manifest:
             target_flushes += 1
             if target_flushes <= 2:
                 raise DirectoryDurabilityError(
@@ -394,7 +448,7 @@ def test_lost_manifest_directory_ack_remains_pending_until_durable_confirm(
         )
         assert target_flushes == 2
         assert len(repository._journal.pending()) == 1
-        with pytest.raises(RuntimeError, match="outstanding commit authorities"):
+        with pytest.raises(RuntimeError, match="outstanding operations"):
             repository.close()
         with pytest.raises(RepositoryRootBusy, match="live owner"):
             CaptureRepository(repository.root)

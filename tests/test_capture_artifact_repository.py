@@ -1059,7 +1059,7 @@ def test_capture_run_borrow_blocks_repository_close_during_arm(
         close_attempts += 1
         with pytest.raises(
             RuntimeError,
-            match="outstanding commit authorities",
+            match="outstanding operations",
         ):
             repository.close()
         return original_arm(

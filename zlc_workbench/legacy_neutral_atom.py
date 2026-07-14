@@ -50,7 +50,7 @@ from zlc_neutral_atom.runtime import (
     SafeStateAck,
     SafetyOperation,
 )
-from zlc_storage import canonical_digest, canonical_text
+from zlc_storage import canonical_digest, canonical_text, durable_mkdir
 
 from .asset_map import InstallationAsset, InstallationAssetMap
 from .camera_capture import (
@@ -383,11 +383,33 @@ class LegacySequencerFacade:
         return True
 
 
+def _installation_state_root() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "state")
+
+
 def default_safety_journal_path() -> Path:
     """Return the machine-installation ledger, independent of artifact storage."""
 
-    root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "state")
+    root = _installation_state_root()
     return root / "ZouLabControl" / "safety" / "neutral-atom-runtime.zlcj"
+
+
+def _prepare_default_safety_journal_path() -> Path:
+    """Persist each application-owned directory below a platform-owned base."""
+
+    if os.environ.get("LOCALAPPDATA"):
+        state_root = _installation_state_root().expanduser().resolve()
+        if not state_root.is_dir():
+            raise FileNotFoundError(
+                f"platform state root does not exist: {state_root}"
+            )
+    else:
+        home = Path.home().expanduser().resolve()
+        local = durable_mkdir(home / ".local")
+        state_root = durable_mkdir(local / "state")
+    application_root = durable_mkdir(state_root / "ZouLabControl")
+    safety_root = durable_mkdir(application_root / "safety")
+    return safety_root / "neutral-atom-runtime.zlcj"
 
 
 def default_asset_map_path() -> Path:
@@ -396,7 +418,7 @@ def default_asset_map_path() -> Path:
     configured = os.environ.get("ZLC_ASSET_MAP")
     if configured:
         return Path(configured)
-    root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "state")
+    root = _installation_state_root()
     return root / "ZouLabControl" / "installation" / "asset-map.json"
 
 
@@ -423,7 +445,7 @@ class LegacyNeutralAtomRuntime:
         self._persistent = _requires_persistent_safety(registrations)
         journal = (
             PersistentSafetyJournal(
-                self._safety_journal_path or default_safety_journal_path()
+                self._safety_journal_path or _prepare_default_safety_journal_path()
             )
             if self._persistent
             else MemoryQuarantineJournal()

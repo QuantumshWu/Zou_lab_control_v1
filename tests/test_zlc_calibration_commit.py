@@ -455,6 +455,42 @@ def test_runcontroller_commit_load_report_and_admit(capture_fixture, tmp_path):
         repository.close()
 
 
+def test_calibration_staging_holds_repository_before_first_cas_write(
+    capture_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "calibration-staging-lifetime"
+    repository = CalibrationRepository(root)
+    entered = threading.Event()
+    release = threading.Event()
+    real_stage = CalibrationRepository._stage_result
+
+    def blocked_stage(owner, result):
+        if owner is repository:
+            entered.set()
+            if not release.wait(2.0):
+                raise TimeoutError("test did not release calibration staging")
+        return real_stage(owner, result)
+
+    monkeypatch.setattr(CalibrationRepository, "_stage_result", blocked_stage)
+    handle = _controller().start(_plan(capture_fixture, repository))
+    try:
+        assert entered.wait(2.0)
+        with pytest.raises(RuntimeError, match="outstanding operations"):
+            repository.close()
+        release.set()
+        reference = handle.result(30.0)
+        assert repository.load(reference).source_binding.source_capture_ref == (
+            capture_fixture.reference
+        )
+    finally:
+        release.set()
+        repository.close()
+
+    CalibrationRepository(root).close()
+
+
 def test_runtime_load_and_admit_never_read_report_blobs(
     capture_fixture,
     tmp_path,

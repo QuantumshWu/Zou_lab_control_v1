@@ -91,38 +91,37 @@ def flush_directory(directory: str | os.PathLike[str]) -> None:
 
 
 def durable_mkdir(directory: str | os.PathLike[str]) -> Path:
-    """Create a hierarchy and persist every new child then its parent entry.
+    """Create or re-acknowledge one directory below an existing parent.
 
-    Missing components are created top-down.  For each component, flushing the
-    new child first makes its own metadata durable; flushing its parent next
-    persists the directory entry linking that child into the hierarchy.
+    The child and parent are flushed on every call, including retries after a
+    previous parent flush failed.  Hierarchy owners must call this once per
+    level; hiding recursive creation here would make a visible child look
+    durable on retry without re-acknowledging the entry whose flush failed.
     """
 
     target = Path(directory).expanduser().resolve()
-    missing: list[Path] = []
-    cursor = target
-    while not cursor.exists():
-        missing.append(cursor)
-        parent = cursor.parent
-        if parent == cursor:
-            raise FileNotFoundError(
-                f"cannot find an existing ancestor for directory {target}"
-            )
-        cursor = parent
-    if not cursor.is_dir():
-        raise NotADirectoryError(cursor)
-
-    for child in reversed(missing):
+    parent = target.parent
+    if parent == target:
+        if not target.is_dir():
+            raise NotADirectoryError(target)
+        flush_directory(target)
+        return target
+    if not parent.exists():
+        raise FileNotFoundError(
+            f"parent directory does not exist for durable mkdir: {parent}"
+        )
+    if not parent.is_dir():
+        raise NotADirectoryError(parent)
+    if not target.exists():
         try:
-            child.mkdir()
+            target.mkdir()
         except FileExistsError:
-            if not child.is_dir():
-                raise NotADirectoryError(child)
-        flush_directory(child)
-        if child.parent != child:
-            flush_directory(child.parent)
+            if not target.is_dir():
+                raise NotADirectoryError(target)
     if not target.is_dir():
         raise NotADirectoryError(target)
+    flush_directory(target)
+    flush_directory(parent)
     return target
 
 

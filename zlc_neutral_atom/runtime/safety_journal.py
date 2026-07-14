@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import threading
 from typing import Any, Mapping
 
 from zlc_storage import (
     FramedJournal,
     canonical_digest,
     durable_mkdir,
-    flush_directory,
+)
+from zlc_storage.file_lock import (
+    FileLockBusy,
+    acquire_file_lock,
+    open_durable_lock_file,
+    release_file_lock,
 )
 
 from .resources import (
@@ -39,40 +45,16 @@ class SafetyAuthorityBusy(RuntimeError):
 class _InstallationOwnerLock:
     def __init__(self, path: Path) -> None:
         durable_mkdir(path.parent)
-        flush_directory(path.parent)
-        existed = path.exists()
-        self._stream = path.open("a+b")
+        self._stream = open_durable_lock_file(path)
+        self._creator_pid = os.getpid()
         self._closed = False
         try:
-            self._stream.seek(0, os.SEEK_END)
-            if self._stream.tell() == 0:
-                self._stream.write(b"\0")
-                self._stream.flush()
-                os.fsync(self._stream.fileno())
-            self._stream.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                try:
-                    msvcrt.locking(self._stream.fileno(), msvcrt.LK_NBLCK, 1)
-                except OSError as exc:
-                    raise SafetyAuthorityBusy(
-                        "another process owns the installation safety authority"
-                    ) from exc
-            else:
-                import fcntl
-
-                try:
-                    fcntl.flock(
-                        self._stream.fileno(),
-                        fcntl.LOCK_EX | fcntl.LOCK_NB,
-                    )
-                except OSError as exc:
-                    raise SafetyAuthorityBusy(
-                        "another process owns the installation safety authority"
-                    ) from exc
-            if not existed:
-                flush_directory(path.parent)
+            acquire_file_lock(self._stream, blocking=False)
+        except FileLockBusy as exc:
+            self._stream.close()
+            raise SafetyAuthorityBusy(
+                "another process owns the installation safety authority"
+            ) from exc
         except BaseException:
             self._stream.close()
             raise
@@ -80,17 +62,24 @@ class _InstallationOwnerLock:
     def close(self) -> None:
         if self._closed:
             return
-        self._stream.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
-        self._stream.close()
+        if os.getpid() != self._creator_pid:
+            # Never explicitly unlock a flock inherited from the parent.
+            self._stream.close()
+            self._closed = True
+            return
+        error: BaseException | None = None
+        try:
+            release_file_lock(self._stream)
+        except BaseException as exc:
+            error = exc
+        try:
+            self._stream.close()
+        except BaseException as exc:
+            if error is None:
+                error = exc
         self._closed = True
+        if error is not None:
+            raise error
 
     def __del__(self) -> None:
         try:
@@ -346,6 +335,8 @@ class PersistentSafetyJournal:
 
     def __init__(self, path: str | Path) -> None:
         journal_path = Path(path).resolve()
+        self._creator_pid = os.getpid()
+        self._lifecycle_lock = threading.RLock()
         self._owner = _InstallationOwnerLock(
             journal_path.with_name(journal_path.name + ".owner.lock")
         )
@@ -359,29 +350,40 @@ class PersistentSafetyJournal:
             raise
 
     def close(self) -> None:
-        if self._closed:
-            return
-        if self._authority_token is not None:
-            raise RuntimeError(
-                "installation safety journal is owned by ResourceArbiter; use authority shutdown"
-            )
-        self._close_owner()
+        if not self._in_creator_process():
+            self._owner.close()
+            self._closed = True
+            raise RuntimeError("installation safety journal belongs to another process")
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            if self._authority_token is not None:
+                raise RuntimeError(
+                    "installation safety journal is owned by ResourceArbiter; use authority shutdown"
+                )
+            self._close_owner()
 
     def _bind_authority(self, token: object) -> None:
-        self._ensure_open()
-        if self._authority_token is not None:
-            raise RuntimeError("installation safety journal already has an authority")
-        self._authority_token = token
+        self._require_creator_process()
+        with self._lifecycle_lock:
+            self._ensure_open()
+            if self._authority_token is not None:
+                raise RuntimeError("installation safety journal already has an authority")
+            self._authority_token = token
 
     def _close_from_authority(self, token: object) -> None:
-        if self._authority_token is not token:
-            raise PermissionError("invalid installation safety authority")
-        self._authority_token = None
-        self._close_owner()
+        self._require_creator_process()
+        with self._lifecycle_lock:
+            if self._authority_token is not token:
+                raise PermissionError("invalid installation safety authority")
+            self._authority_token = None
+            self._close_owner()
 
     def _close_owner(self) -> None:
-        self._owner.close()
-        self._closed = True
+        try:
+            self._owner.close()
+        finally:
+            self._closed = True
 
     def __enter__(self) -> "PersistentSafetyJournal":
         return self
@@ -399,49 +401,70 @@ class PersistentSafetyJournal:
         if self._closed:
             raise RuntimeError("installation safety authority is closed")
 
+    def _in_creator_process(self) -> bool:
+        return os.getpid() == self._creator_pid
+
+    def _require_creator_process(self) -> None:
+        if not self._in_creator_process():
+            raise RuntimeError("installation safety journal belongs to another process")
+
     def snapshot(self) -> SafetyJournalSnapshot:
-        self._ensure_open()
-        return _replay_entries(_entries(self._journal.records()))
+        self._require_creator_process()
+        with self._lifecycle_lock:
+            self._ensure_open()
+            return _replay_entries(_entries(self._journal.records()))
 
     def append_hazards(self, records: tuple[HazardRecord, ...]) -> HazardAppendStatus:
-        self._ensure_open()
-        records = tuple(records)
-        if any(not isinstance(record, HazardRecord) for record in records):
-            raise TypeError("hazard append requires HazardRecord values")
-        if not records:
-            return HazardAppendStatus.APPENDED
-        if len({record.record_id for record in records}) != len(records):
-            raise ValueError("hazard append record ids must be unique")
-        if len({record.key for record in records}) != len(records):
-            raise ValueError("hazard append keys must be unique")
-        if len({record.run_id for record in records}) != 1:
-            raise ValueError("one hazard append must belong to one run")
-        value = {"kind": "HAZARD_BATCH", "records": [_hazard_value(r) for r in records]}
-        record_id = f"hazards:{canonical_digest(value)}"
-        appended = self._append_checked(record_id, value)
-        if appended:
-            return HazardAppendStatus.APPENDED
-        unresolved = {
-            record.record_id for record in self.snapshot().unresolved_hazards
-        }
-        requested = {record.record_id for record in records}
-        if requested <= unresolved:
-            return HazardAppendStatus.ALREADY_UNRESOLVED_SAME
-        if requested.isdisjoint(unresolved):
-            return HazardAppendStatus.ALREADY_RESOLVED
-        raise ValueError("hazard retry has partially resolved durable state")
+        self._require_creator_process()
+        with self._lifecycle_lock:
+            self._ensure_open()
+            records = tuple(records)
+            if any(not isinstance(record, HazardRecord) for record in records):
+                raise TypeError("hazard append requires HazardRecord values")
+            if not records:
+                return HazardAppendStatus.APPENDED
+            if len({record.record_id for record in records}) != len(records):
+                raise ValueError("hazard append record ids must be unique")
+            if len({record.key for record in records}) != len(records):
+                raise ValueError("hazard append keys must be unique")
+            if len({record.run_id for record in records}) != 1:
+                raise ValueError("one hazard append must belong to one run")
+            value = {
+                "kind": "HAZARD_BATCH",
+                "records": [_hazard_value(record) for record in records],
+            }
+            record_id = f"hazards:{canonical_digest(value)}"
+            appended = self._append_checked(record_id, value)
+            if appended:
+                return HazardAppendStatus.APPENDED
+            unresolved = {
+                record.record_id for record in self.snapshot().unresolved_hazards
+            }
+            requested = {record.record_id for record in records}
+            if requested <= unresolved:
+                return HazardAppendStatus.ALREADY_UNRESOLVED_SAME
+            if requested.isdisjoint(unresolved):
+                return HazardAppendStatus.ALREADY_RESOLVED
+            raise ValueError("hazard retry has partially resolved durable state")
 
     def append_safety_bundle(self, bundle: SafetyDispositionBundle) -> None:
-        self._ensure_open()
-        if not isinstance(bundle, SafetyDispositionBundle):
-            raise TypeError("bundle must be SafetyDispositionBundle")
-        self._append_checked(f"safety:{bundle.bundle_id}", _safety_value(bundle))
+        self._require_creator_process()
+        with self._lifecycle_lock:
+            self._ensure_open()
+            if not isinstance(bundle, SafetyDispositionBundle):
+                raise TypeError("bundle must be SafetyDispositionBundle")
+            self._append_checked(f"safety:{bundle.bundle_id}", _safety_value(bundle))
 
     def append_recovery_bundle(self, bundle: RecoveryBundle) -> None:
-        self._ensure_open()
-        if not isinstance(bundle, RecoveryBundle):
-            raise TypeError("bundle must be RecoveryBundle")
-        self._append_checked(f"recovery:{bundle.bundle_id}", _recovery_value(bundle))
+        self._require_creator_process()
+        with self._lifecycle_lock:
+            self._ensure_open()
+            if not isinstance(bundle, RecoveryBundle):
+                raise TypeError("bundle must be RecoveryBundle")
+            self._append_checked(
+                f"recovery:{bundle.bundle_id}",
+                _recovery_value(bundle),
+            )
 
     def _append_checked(self, record_id: str, value: dict[str, Any]) -> bool:
         return self._journal.append_checked(
