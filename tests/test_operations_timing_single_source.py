@@ -5,8 +5,6 @@ Each test pins one rule:
 
 * a consumer's default camera-frame input derives from the ONE camera signal-naming
   source (``camera_frame_keys`` -> ``FRAME_0``), never a producer-prefixed guess;
-* the readout / threshold method allowlists (``operations.calibration``) flow into every
-  GUI declaration, so a dropdown can never miss a method the cali computes;
 * the shipped probe-template path is typed once, in the timing layer beside its factory;
 * tick tie-rounding has ONE rule (ties away from zero, ``sequence.round_ticks``) shared
   by the seconds-domain and ns-domain snap paths -- the same user duration lands on the
@@ -45,40 +43,15 @@ def test_default_frame_input_derives_from_camera_frame_keys():
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.operations.logic import FRAME_0, camera_frame_keys
     from Zou_lab_control.neutral_atom.operations.processors.analysis import analysis
-    from Zou_lab_control.neutral_atom.operations.processors.occupancy import judge_occupancy
     from Zou_lab_control.neutral_atom.operations.processors.roi import RoiProcessor
 
     assert FRAME_0 == camera_frame_keys(1)[0]          # derived, not a retyped literal
     # empty pick -> the node falls back to the ONE bare name (a publishable signal)
     node = RoiProcessor(SignalHub())
     assert tuple(node.consumes) == (FRAME_0,)
-    # both reactive processors' declared GUI defaults reference the same source
-    for factory in (analysis, judge_occupancy):
-        spec = factory(object())                        # params need no live readout
-        decl = next(p for p in spec.params if p.key == "source")
-        assert decl.default["inputs"] == [FRAME_0], (
-            f"{spec.name}: the default frame input must be the ONE bare name {FRAME_0!r}")
-
-
-# ------------------------------------------------------------------ method allowlists
-def test_method_allowlists_flow_into_gui_declarations():
-    """occupancy's method dropdown and the calibrate task's threshold dropdown derive from
-    the ONE allowlists in ``operations.calibration`` -- a method added there either shows
-    up in the GUI or fails at import (occupancy's module guard), never drifts silently."""
-    from Zou_lab_control.neutral_atom.operations.calibration import (
-        ALL_READOUT_METHODS, SUPPORTED_THRESHOLD_METHODS)
-    from Zou_lab_control.neutral_atom.operations.processors.occupancy import (
-        METHOD_LABELS, judge_occupancy)
-    from Zou_lab_control.neutral_atom.operations.tasks.calibrate import CALIBRATE_PARAMS
-
-    # order included: dict order IS the dropdown order
-    assert tuple(METHOD_LABELS.values()) == tuple(ALL_READOUT_METHODS)
-    method = next(p for p in judge_occupancy(object()).params if p.key == "method")
-    assert method.choices == tuple(METHOD_LABELS)
-    assert METHOD_LABELS[method.default] in ALL_READOUT_METHODS
-    threshold = next(p for p in CALIBRATE_PARAMS if p.key == "threshold_method")
-    assert threshold.choices is SUPPORTED_THRESHOLD_METHODS   # the validator's own tuple
-    assert threshold.default in threshold.choices
+    spec = analysis(object())                        # params need no live readout
+    decl = next(p for p in spec.params if p.key == "source")
+    assert decl.default["inputs"] == [FRAME_0]
 
 
 # ------------------------------------------------------------------ probe-template path

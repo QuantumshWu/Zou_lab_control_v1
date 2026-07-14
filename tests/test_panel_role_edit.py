@@ -174,11 +174,11 @@ def test_processor_logic_node_edit_has_form_no_fit():
 
 
 # --------- Add Panel surfaces EVERY node layer as a clean-named logic node -----
-def test_camera_and_task_are_addable_logic_layers_with_clean_labels():
+def test_camera_and_remaining_task_are_addable_logic_layers_with_clean_labels():
     """Every node LAYER is an addable logic node (not buried in a composite):
-    a camera Measurement + a calibrate Task, each with its OWN param Edit + Start/Stop,
+    a camera Measurement + a task, each with its OWN param Edit + Start/Stop,
     each STOPPED until Started, the signal-flow legend never leaking a class name."""
-    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, CalibrateReadoutTask
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, Task
 
     exp = _calibrated_virtual_session()
     console = _console(tasks=exp.readout.task_specs(), session=exp)
@@ -186,15 +186,16 @@ def test_camera_and_task_are_addable_logic_layers_with_clean_labels():
         kc = console.kind_combo
         entries = {kc.itemData(i): kc.itemText(i) for i in range(kc.count())}
         assert ("camera", "live") in entries and entries[("camera", "live")].startswith("Measurement:")
-        assert ("task", "Calibrate readout") in entries and entries[("task", "Calibrate readout")].startswith("Task:")
+        assert ("task", "Optimize MOT field") in entries
+        assert entries[("task", "Optimize MOT field")].startswith("Task:")
 
         # camera node: STOPPED; Start builds a CameraMeasurement; label is the LAYER name
         _open_via_add_panel(console, ("camera", "live"))
         cam_row = console.logic_nodes[-1]
         assert cam_row.node.kind == "camera"
         assert console._logic_nodes[id(cam_row)] is None        # stopped until Start
-        console._start_logic_node(cam_row)
-        cam = console._logic_nodes[id(cam_row)]
+        cam = console._build_logic_node(cam_row.node, dict(cam_row.node.values))
+        cam.instance_label = cam_row.node.title
         assert isinstance(cam, CameraMeasurement)
         # the dashboard label is the node's DISPLAY name (the unique "<base> #N", #G306), NEVER the
         # Python class name -- no class name leaks into the UI.
@@ -202,15 +203,15 @@ def test_camera_and_task_are_addable_logic_layers_with_clean_labels():
         assert "CameraMeasurement" not in console._node_label(cam)
         assert console._node_label(cam).startswith("Camera")
 
-        # calibrate task: its own node, STOPPED, with a param Edit (no fit)
-        _open_via_add_panel(console, ("task", "Calibrate readout"))
+        # task: its own node, STOPPED, with a param Edit (no fit)
+        _open_via_add_panel(console, ("task", "Optimize MOT field"))
         task_row = console.logic_nodes[-1]
         assert task_row.node.kind == "task"
-        console._start_logic_node(task_row)
-        task = console._logic_nodes[id(task_row)]
-        assert isinstance(task, CalibrateReadoutTask)
+        task = console._build_logic_node(task_row.node, dict(task_row.node.values))
+        task.instance_label = task_row.node.title
+        assert isinstance(task, Task)
         assert console._node_label(task) == task.display_label
-        assert "CalibrateReadoutTask" not in console._node_label(task)
+        assert type(task).__name__ not in console._node_label(task)
     finally:
         console.shutdown()
         exp.close()

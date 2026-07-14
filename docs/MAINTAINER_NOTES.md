@@ -80,58 +80,20 @@ Invariants:
   (`subsystems/`, readout), not in timing. Do not push exposure/threshold/feedback
   decisions down into the sequencer; keep playback and acquisition decoupled.
 
-### Readout-fidelity calibration: the reference-bracket flow
+### Readout calibration and occupancy ownership
 
-`TrapCalibration.signals(image, method=)` extracts one scalar per site by one of three
-readout models — `box` (square ROI, no background subtraction), `psf` (per-site
-matched-filter, annulus background), `uniform_psf` (one shared kernel, annulus). The
-background model is PART of the readout and is carried per method in `by_method`, so
-`signals(method=m)` reads on the SAME scale `m`'s thresholds were trained on.
+The current algorithm owner is `zlc_neutral_atom.readout`: `analysis.py` computes site maps,
+box/per-site-PSF/uniform-PSF models, reference labels, held-out thresholds and component validity;
+`calibration.py` applies the selected immutable model; `occupancy.py` binds that model to an exact
+camera stream. The main-tree physical implementation is the independent oracle for these equations.
 
-`CalibrateReadoutTask` (`operations/logic.py`) follows the Rb87 single-atom flow:
-
-1. **Reference brackets** (`_collect_bracket_groups`): each shot is ONE correlated
-   long-short-long camera sequence imaging the SAME atoms. **The template FILE itself IS the
-   bracket** — `default_imaging_template()` / `pulses/imaging_template.json` is six periods
-   (`load`, `image_0`, `gap_0`, `image_1`, `gap_1`, `image_2`): one cooling/load cycle, then
-   THREE camera-trigger frames separated by trap-held gaps (the gap holds ONLY the persistent
-   trap so the emCCD line drops and re-rises into three DISTINCT triggers; cooling/probe/emCCD
-   are off in the gap, so no re-cooling rearranges the atoms mid-bracket). **`file == fired`**:
-   the cali does NOT unroll/derive a bracket (the deleted `with_imaging_bracket`) — it loads the
-   template and writes ONLY its three exposure cells BY NAME via **unique API slots**:
-   `set_api("a1", reference_exposure)` for image_0, `set_api("a2", readout_exposure)` for
-   image_1, and `set_api("a3", reference_exposure)` for image_2.  The two long cells receive
-   the same parameter value but remain distinct one-field handles. `_imaging_layout` reads the
-   frame count + readout index from the template (emCCD-trigger periods; the `a2`-tagged one is
-   the readout), so a user's own template with N triggers works too. `reference_exposure` (LONG)
-   and `readout_exposure` (SHORT) are both explicit cali params — open the template in the pulse
-   GUI and you SEE exactly the long-short-long the cali fires. Comparing the two long frames
-   tells whether the atom survived; when they
-   AGREE (strict consensus) they vote the ground-truth occupancy for the short readout, and a
-   shot where they disagree (atom loss, modelled by the virtual `detection_lifetime`) is dropped
-   as ambiguous. (`timing.reference_bracket_sequence` builds the equivalent bracket from an explicit
-   `PortCatalog` for tests/notebooks without a template file.)
-2. **Site map + PSF** from averaging the bracket's LONG reference frames (each images a real
-   ~50% loading; the average reveals every trap). This is the SAME path live and from saved
-   frames — there is no separate site-map acquisition pass.
-3. **Held-out per-method fidelity** (`operations.fidelity.characterize_readout`, run per
-   method in `calibration_report._held_out_by_method`): each method's per-site threshold is
-   trained on a split of the labelled short readout and scored on a HELD-OUT split. Because
-   box / per-site PSF / uniform PSF weight the photons differently, their held-out fidelity
-   at a fidelity-limited readout DIFFERS — this is why the report computes all three. The
-   self-consistent otsu-split fidelity estimate is affine-invariant and CANNOT tell the
-   methods apart, so it is only the fallback for folder runs that kept no reference brackets.
-4. The reference-trained per-site thresholds are written back into the calibration
-   (`with_method_thresholds`, `threshold_method="per_site_reference"`) so `detect` reads on
-   the trained boundary, not the otsu quick split.
-
-**Per-frame exposure.** A real externally-triggered camera integrates each frame for the
-window ITS trigger gates, so a heterogeneous bracket images successive frames for different
-durations. The virtual camera honours this via `devices.virtual.exposures_per_frame`
-(parallel to the cooling/trap-off per-frame helpers); a uniform repeated sequence yields one
-equal exposure per frame. The real qCMOS adapter, given a
-non-uniform bracket, integrates for the longest probe (the trigger gates each frame; atoms
-scatter only during their own probe), keeping virtual == real.
+A calibration request names an explicit `CalibrationCaptureLayout`. Correlated long-short-long
+reference frames vote ground truth only when the two reference observations agree; disagreement is
+invalid evidence, never a guessed label. Thresholds are trained and scored on disjoint samples, and
+site-level validity travels with every result so a dead site cannot be averaged into a fit or loading
+fraction. Acquisition, analysis, persistence and display are separate owners: the analysis returns an
+artifact/report, the repository commits it, and the frontend only renders committed data. There is no
+second detector or calibration workflow in the GUI/demo.
 
 ### Fluent tab bar (frontend): water-fill, no scroll arrows
 
@@ -1180,9 +1142,8 @@ They split into two tiers by WHERE the per-point reduce lives, NOT by being diff
   hardware.
 
   **Why these are MEASUREMENTS, not Tasks** (#H3v-1): a recurring question is "isn't Temperature a
-  Task?". No. A `Task` (e.g. `CalibrateReadoutTask`) publishes NOTHING to the SignalHub, yields an
-  off-hub artifact on `self.result`, and renders a SINGLE mid-run frame in a fixed Monitor panel — the
-  shape for a WORKFLOW that produces an artifact (centres/thresholds → a folder). Temperature/fidelity
+  Task?". No. A `Task` coordinates a finite workflow whose primary result is an artifact rather than a
+  reusable live SignalHub stream. Temperature/fidelity
   instead produce a live, hub-published, **fittable x-y curve** (`survival` vs `t_off`,
   `fidelity` vs `detection_time`) that the operator plots in ANY panel and fits (`na.fit_temperature`,
   `operations.fidelity.characterize_readout`). The three properties they share with a task —
@@ -1330,8 +1291,8 @@ rolls a **1-deep ring forever** (a live monitor showing the latest). The kept bl
 **camera takes exactly `repeat` photos then FINISHES** (or rolls forever at 0). **Per-type default:** a
 camera defaults to `0` (∞, a live monitor); a scan defaults to `1` (one finite sweep) — the node ctor
 defaults mirror the GUI form defaults so a headless `run_to_completion()` terminates. Each trigger
-event is its own typed `frame_i=(R,1,H,W)` signal; there is no lumped frame output.
-`OccupancyProcessor` maps every valid `(R,P)` frame cell and preserves both axes.
+ event is its own typed `frame_i=(R,1,H,W)` signal; there is no lumped frame output. Any cell-wise
+ analysis bound to those frames must preserve every valid `(R,P)` address and declare its trailing axes.
 **Two-cameras fix:** the built node's `instance_label` is set to its row TITLE, so its provider label
 matches the declared row (the empty-prefix camera no longer shows `frame_0` under both "camera" and
 "Camera (live frames)").
@@ -1383,7 +1344,7 @@ Start button drive identical acquisition — they cannot drift.
 `MeasurementSpec` / `ParamDecl` (declared once; API default AND GUI control derive
 from the one declaration — explicit declaration, NOT signature reflection/AST, to
 avoid the confocal AST-guess pitfall). `ParamDecl.kind` ∈
-`float/int/axis_range/bool/choice/text/path/signal/signal_expr/pulse_param/pulse_slots`
+`float/int/axis_range/bool/choice/text/path/signal/signal_expr/pulse_slots`
 (the whitelist is enforced in `measurement.py`); **no value is ever `eval`'d** — consumers
 validate/coerce by kind (the confocal free-text-eval lesson). `MeasurementSpec.build`
 closure captures `exp`, so the console never holds the session (decoupling).
@@ -1633,32 +1594,18 @@ declared schema per output. A cell-wise processor preserves every valid `(R,P)` 
 processor returns a canonical `(1,1,*data_shape)` result and says so in its output schema. This is a
 mathematical property of each output, not a second runtime knob or a string attribute.
 
-`OccupancyProcessor`, for example, maps every valid camera cell `(R,P,H,W)` and publishes
-`occupied`/`counts` as `(R,P,N)`, `frame_judged` as `(R,P,H,W)`, and static calibration geometry as
-typed `(1,1,N,2)` / `(1,1,N)` tensors. No signal may omit point/data semantics.
+The current authoritative occupancy path is a finite-exact pipeline, not a live compatibility
+processor. `OccupancyPipelineSpec` freezes the calibration reference and model, and the completed
+`OccupancyDataset` carries `counts` and `occupied` snapshots over the same `(R,P,site)` domain, with one
+component-validity authority and one generation/revision. The repeat axis remains present in both
+artifacts; averaging, histograms, loading probability, or scalar loading rate are explicit view or
+analysis transforms rather than alternate producer state.
 
-So the everyday quantities all come out without a third knob, via ONE mechanism (plot `repeat_mode` over
-the block): **S1** averaged site-map image = a `frame_0` panel `repeat_mode='average'`; **S2** per-site
-loading PROBABILITY = a `sites`/`2d` panel bound to `occupied` with `repeat_mode='average'` (averaging
-the camera's `repeat` shots recovers every site — the user sets how many via `repeat`); **S3**
-loading-rate-vs-time = the processor's scalar `rate` (this block's loading fraction) on a rolling panel;
-**S4** readout fidelity = a `reduce` operation (`readout_fidelity` spec) over a shot set. `OccupancyProcessor`
-keeps only the scalar `rate`; per-site probability is the `occupied` tensor viewed with
-`repeat_mode=average`, so there is no second cumulative signal path.
-The `counts` histogram flattens the WHOLE block (every repeat × site sample), never averaged
-(`_signal_then_repeat` skips the reduce for `kind=='hist'`); a `create`-mode sites panel collapses back
-to one value/site (`_coerce`). The site-map underlay reduces `frame_judged` (`'replace'`) to one coherent
-`(H,W)` shot (`_sites_aux`). SignalTensor transport, producer-schema, scan-tensor, and
-processor-core contract tests guard the two-control design.
-
-**DECOUPLING (#H3o).** A panel reads EXACTLY the signal it is bound to — there is NO frame-coherence
-rewrite. A `frame_0` panel shows the camera's own block (averaged per `repeat_mode`), INDEPENDENT of any
-running Judge; a Judge publishes its OWN keys (`occupied`, `frame_judged`) and never touches `frame_0`.
-The site-map underlay still tracks the rings' shot because `frame_judged` is published ATOMICALLY with
-`occupied` (one transform dict) and the map resolves both from the SAME producing node via
-`_sites_aux` — a separate path, not a binding rewrite. (Per-shot semantics: the site-map underlay is
-the single judged shot, not the 30-shot mean — that is correct for occupancy.) Guarded by
-`test_camera_measurement_multitrigger.py::test_2d_frame_panel_shows_camera_average_decoupled_from_judge`.
+**DECOUPLING (#H3o).** Raw camera monitoring remains its own producer. The occupancy pipeline does not
+rewrite `frame_0`, publish a second decorated-frame signal, or let a panel binding choose authoritative
+physics. A future formal calibration/occupancy controller must join raw capture, calibration reference,
+and occupancy artifact through their explicit provenance. Until that controller is migrated, the task
+console intentionally exposes raw camera views only and never fabricates occupancy for display.
 
 ### Panel board: TOP-LEFT GRAVITY packing over pixel AABBs (#H3s-F8)
 There is **no column grid**: the board is a pure pixel plane and `PanelConfig.col`/`.row` ARE the
@@ -1702,16 +1649,16 @@ SHAPE its `value` must be. Both are data-driven, never an inline `kind == "sites
 centres + frame underlay resolve from `signal[0]`'s producing node, so a 2nd slot is meaningless)
 — it keeps the expression box but has NO `+/-`; every other kind is multi-slot. `PANEL_INPUT_FORMAT`
 declares the accepted `value` size (sites = a per-site `(N,)` vector, 2D = an `(H×W)` frame,
-monitor = a scalar), enforced in `PanelCard._coerce`. Guard: `test_task_cali_modes_and_plot_split`
+monitor = a scalar), enforced in `PanelCard._coerce`. Guard: `test_panel_slots_and_measurement_display`
 asserts sites is single-slot (no `add_slot_button`, keeps `source_edit`) while 2D is multi.
 
 ### Every `kind="signal"` source is now `signal_expr`
 The `ParamDecl(kind="signal_expr")` record lives in `core/params.py` and dispatches through the
 registered `SignalExprHandler` to the reusable multi-input picker + `value = ...` editor. Its value is
-`{"inputs": [...], "source": "value = ..."}`. `OccupancyProcessor.source` builds a `SignalExpr`,
-sets `consumes = tuple(expr.inputs)`, and evaluates a lineage-coherent cursor snapshot; the default is
-`value = signal` on `frame_0`. There is no frontend binding rewrite: if two inputs are combined, their
-coherence requirement is explicit in the typed snapshot/provenance boundary.
+`{"inputs": [...], "source": "value = ..."}`. A reactive processor that declares this parameter builds
+one `SignalExpr`, derives `consumes` from its inputs, and evaluates a lineage-coherent cursor snapshot.
+There is no frontend binding rewrite: if two inputs are combined, their coherence requirement is
+explicit in the typed snapshot/provenance boundary.
 
 ## 21. The catalog / node / UI / layout base-class framework (#H3r, 2026-06-26)
 
@@ -1811,8 +1758,9 @@ Behaviour-neutral throughout. The single sources added/relocated, by layer:
 - `PulseTableState._set_bus_target(bus, period_index, value)` — the ONE "keep a ramp, else force an
   edge" rule + `analog_bus_modes` plan writeback (scan-slot bind / api-field set / slot resolve).
 - `timing.pulse_table.scan_target_label` — the ONE STATE-FUL name label for a `(kind, target)`;
-  `enumerate_pulse_params` routes every label through it (the GUI dropdown + the scan axis read
-  identically). Its complement is the frontend's STATE-FREE index label `pulse_gui.slot_label`.
+  the scan-slot axis and GUI legend both read it. Its complement is the frontend's STATE-FREE
+  index label `pulse_gui.slot_label`. The retired generic `pulse_param` dropdown/enumerator no
+  longer exists; current scans use explicit semantic `pulse_slots`.
 
 **devices**
 - `RuntimeSequenceProgram.__post_init__` — the ONE enforcement of "a finite K-sweep

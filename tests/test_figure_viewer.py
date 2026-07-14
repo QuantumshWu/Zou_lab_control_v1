@@ -485,13 +485,13 @@ def _saved_sites_with_signals_npz(tmp_path) -> Path:
         return {"block": np.asarray(block), "points_shape": ps, "data_shape": ds,
                 "label": label, "unit": unit, "role": role}
 
-    info = {"name": "occupancy", "kind": "sites", "source": "value = occupied",
+    info = {"name": "occupancy", "kind": "sites", "source": "value = signal",
             "labels": ["site", "occupancy", "Z"], "unit": "", "view": {"relim": "tight"},
             "signals": {
-                "occupied": sig(occ, [1], [N], "occupancy", "", "value"),
+                "value": sig(occ, [1], [N], "occupancy", "", "value"),
                 "centers": sig(centers.reshape(1, 1, N, 2), [1], [N, 2],
                                "site centre", "px", "centers"),
-                "frame_judged": sig(frame, [1], [H, W], "camera image", "counts", "frame"),
+                "frame": sig(frame, [1], [H, W], "camera image", "counts", "frame"),
             }}
     path = tmp_path / "occ_sites.npz"
     write_saved_npz(path, data_x=centers, data_y=occ.mean(0).reshape(N, 1), **info)
@@ -879,56 +879,6 @@ def test_pulse_panel_size_round_trips_from_recipe(tmp_path):
         plt.close("all")
 
 
-def test_calibration_report_every_npz_loads_as_correct_kind(tmp_path):
-    """END-TO-END: ``save_calibration_report`` (6 sites, template, psf_weights, by_method) writes its
-    report npz, and EVERY one reopens via ``load_figure`` at the CORRECT kind -- pooled -> ``hist``,
-    site_map -> ``sites`` (WITH its template underlay frame, not an empty board), site_distribution_* /
-    psf_grid -> ``grid``.  This is the reported bug fixed end-to-end (grid unloadable, sites frame missing,
-    single figures falling back to the wrong type)."""
-    from Zou_lab_control.frontend.calibration_report import save_calibration_report
-    from Zou_lab_control.frontend.data_figure import load_figure
-
-    rng = np.random.default_rng(0)
-    n_sites, n_shots = 6, 120
-    dark = rng.normal(200, 40, size=(n_shots // 2, n_sites))
-    bright = rng.normal(1200, 120, size=(n_shots - n_shots // 2, n_sites))
-    counts = np.vstack([dark, bright])
-    thresholds = np.full(n_sites, 700.0)
-    fidelity = np.full(n_sites, 0.99)
-    centers = np.array([[10 + 9 * i, 20.0] for i in range(n_sites)], dtype=float)
-    template = rng.normal(600, 30, size=(48, 64)).astype(float)
-    psf_weights = np.abs(rng.normal(size=(n_sites, 7, 7)))
-    by_method = {
-        "box": {"counts": counts, "thresholds": thresholds, "fidelity": fidelity},
-        "psf": {"counts": counts + rng.normal(0, 10, counts.shape), "thresholds": thresholds, "fidelity": fidelity},
-    }
-    paths = save_calibration_report(
-        tmp_path, counts=counts, thresholds=thresholds, fidelity=fidelity, centers=centers,
-        template=template, threshold_method="otsu", timestamp="t", by_method=by_method,
-        psf_weights=psf_weights)
-
-    expected_kind = {
-        "global_distribution": "hist",
-        "site_map": "sites",
-        "site_distribution_box": "grid",
-        "site_distribution_psf": "grid",
-        "psf_grid": "grid",
-    }
-    try:
-        for name, kind in expected_kind.items():
-            assert name in paths, f"the report is missing {name}"
-            npz = Path(paths[name]).with_suffix(".npz")
-            assert npz.exists(), f"{name} wrote no .npz"
-            saved = load_figure(npz)
-            assert saved.kind == kind, f"{name} loaded as {saved.kind!r}, expected {kind!r}"
-        # the site map is self-contained: its stored signals carry the template FRAME (a non-empty
-        # underlay), so a reopen shows the background image, not bare rings on an empty board
-        site_map = load_figure(Path(paths["site_map"]).with_suffix(".npz"))
-        signals = site_map.info.get("signals")
-        assert isinstance(signals, dict) and any(e.get("role") == "frame" for e in signals.values()), \
-            "the site_map save is self-contained -- it stored its template underlay frame"
-    finally:
-        plt.close("all")
 
 
 def test_pulse_seeds_a_normal_panelcard_via_the_same_load_path(tmp_path):
@@ -1298,9 +1248,8 @@ def test_no_value_role_save_is_rejected_at_load(tmp_path):
 
 def test_bare_sitemap_save_uses_neutral_role_keys_and_binds_fully(tmp_path):
     """#28: a bare LiveSiteMap save's self-contained ``info['signals']`` keys every entry by the
-    NEUTRAL role vocabulary (value / centers / frame) -- never a live processor's private output
-    names ('occupied' / 'frame_judged'): the loader binds by ROLE, and a processor rename must not
-    silently drift the npz.  And every stored entry must be fully bindable by LoadedFigureNode."""
+    NEUTRAL role vocabulary (value / centers / frame), so every stored entry is
+    fully bindable by LoadedFigureNode without private producer names."""
     from Zou_lab_control.frontend.data_figure import load_figure
     from Zou_lab_control.frontend.live import LiveSiteMap
     from Zou_lab_control.neutral_atom.core.signals import SignalHub

@@ -536,7 +536,7 @@ def test_edit_save_image_format_writes_chosen_container(tmp_path):
 
     console = dt.demo_console(shots=4)
     try:
-        card = console.cards[0]                      # the 2d "Readout image" panel (holds data)
+        card = console.cards[0]                      # the 2d "Camera image" panel (holds data)
         assert card.plotter is not None
         console._edit_card(card)
         editor = console._panel_editors[id(card)]

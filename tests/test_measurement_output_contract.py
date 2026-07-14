@@ -14,7 +14,6 @@ from Zou_lab_control.neutral_atom.core.signals import SignalHub
 from Zou_lab_control.neutral_atom.operations.logic import (
     CameraMeasurement,
     Measurement,
-    OccupancyProcessor,
     ScannedMeasurementNode,
     SignalSpec,
 )
@@ -237,35 +236,3 @@ def test_common_publish_boundary_rejects_wrong_shape_for_any_output():
 
     with pytest.raises(ValueError, match="schema requires physical"):
         BadMeasurement(SignalHub()).step()
-
-
-def test_occupancy_declares_every_output_without_static_exceptions():
-    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
-    try:
-        exp.readout.sitemap(frames=4, display=False)
-        exp.readout.thresholds(frames=20, display=False)
-        hub = SignalHub()
-        camera = CameraMeasurement(
-            hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
-        occupancy = OccupancyProcessor(
-            hub,
-            calibration=exp.readout.current,
-            source_expr={"inputs": ["frame_0"], "source": "value = signal"},
-            method="box",
-            grid_shape=(3, 4),
-        )
-        fire_live_imaging(exp)
-        camera.step()
-        occupancy.step()
-
-        schemas = {name: hub.schema(name) for name in occupancy.published_signals()}
-        for schema in schemas.values():
-            assert schema.point_shape and schema.data_shape
-        assert schemas["occupied"].point_shape == (1,)
-        assert schemas["occupied"].data_shape == (12,)
-        assert schemas["rate"].data_shape == (1,)
-        assert schemas["centers"].point_shape == (1,)
-        assert schemas["centers"].data_shape == (12, 2)
-        assert hub.latest("centers").shape == (1, 1, 12, 2)
-    finally:
-        exp.close()

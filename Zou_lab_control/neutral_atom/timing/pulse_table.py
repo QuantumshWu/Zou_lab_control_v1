@@ -2145,64 +2145,6 @@ def default_periods(channels: Sequence[str]) -> list[PulsePeriod]:
     ]
 
 
-def default_imaging_template(
-    channels: Sequence[str] | None = None,
-    *,
-    port_catalog: PortCatalog | None = None,
-    cooling: float = 2e-3,
-    reference_exposure: float = 20e-3,
-    readout_exposure: float = 5e-3,
-    gap: float = READOUT_GAP_SECONDS,
-    trap_channel: str = "trap",
-    cooling_channel: str = "cooling",
-    probe_channel: str = "probe",
-    trigger_channel: str = "emCCD",
-) -> "PulseTableState":
-    """The real, inspectable imaging program the Calibrate task loads -- a literal
-    CONTINUOUS long-short-long bracket (NOT a single window the task secretly unrolls).
-
-    One ``load`` (cooling) cycle, then three back-to-back camera exposures on the SAME
-    atoms -- ``image_0`` (long reference), ``image_1`` (short readout), ``image_2`` (long
-    reference) -- each its own emCCD trigger, separated by a ``gap`` that HOLDS ONLY the
-    trap (cooling/probe/trigger off) so the camera falls and re-arms between frames WITHOUT
-    re-cooling (re-cooling would scramble the atoms and void the reference labels).
-
-    Three API handles -- ``a1`` (first long reference), ``a2`` (short readout), ``a3``
-    (second long reference) -- one per exposure cell, just like the pulse GUI allocates a
-    fresh ``a<N>`` per click.  The Calibrate task sets all three BY NAME
-    (``set_api("a1", long); set_api("a2", short); set_api("a3", long)``); it only changes
-    those durations, never the structure.  What you load IS what is fired: open this
-    template in the pulse GUI and you see exactly the long-short-long the task runs."""
-
-    if port_catalog is not None:
-        chans = list(port_catalog.raw_lanes)
-        if channels is not None and tuple(channels) != port_catalog.raw_lanes:
-            raise ValueError("channels do not match port_catalog.raw_lanes")
-    else:
-        chans = list(channels) if channels else [trap_channel, cooling_channel, probe_channel, trigger_channel]
-        port_catalog = PortCatalog.from_channels(chans)
-
-    def states(active) -> tuple[int, ...]:
-        return tuple(1 if ch in active else 0 for ch in chans)
-
-    image = states({trap_channel, probe_channel, trigger_channel})
-    held = states({trap_channel})   # gap: trap held, NO cooling -> no re-cool between frames
-    periods = [
-        PulsePeriod(float(cooling), states({trap_channel, cooling_channel}), unit="s", name="load"),
-        PulsePeriod(float(reference_exposure), image, unit="s", name="image_0"),
-        PulsePeriod(float(gap), held, unit="s", name="gap_0"),
-        PulsePeriod(float(readout_exposure), image, unit="s", name="image_1"),
-        PulsePeriod(float(gap), held, unit="s", name="gap_1"),
-        PulsePeriod(float(reference_exposure), image, unit="s", name="image_2"),
-    ]
-    state = PulseTableState(port_catalog=port_catalog, periods=periods, name="imaging_template")
-    # One API handle per exposure cell (names are unique, like the GUI allocates):
-    # a1 = first long reference (image_0), a2 = short readout (image_1), a3 = second long
-    # reference (image_2).  The Calibrate task sets all three by name.
-    state.bind_api_field("duration", "1", name="a1", unit="s")
-    state.bind_api_field("duration", "3", name="a2", unit="s")
-    state.bind_api_field("duration", "5", name="a3", unit="s")
-    return state
 
 
 #: The shipped single-image probe program's project-relative path -- the ONE place the
@@ -2230,8 +2172,7 @@ def single_imaging_template(
 
     It is the compact probe program used wherever one editable image window is desired, including
     as the generic Pulse-scan's default pulse table.  Acquisition remains a separate producer.
-    The Calibrate task instead uses :func:`default_imaging_template` (three triggers).  The
-    ``image`` duration is API slot ``a1`` so a notebook/API can set the exposure by name."""
+    The ``image`` duration is API slot ``a1`` so a notebook/API can set the exposure by name."""
 
     if port_catalog is not None:
         chans = list(port_catalog.raw_lanes)
@@ -2254,8 +2195,8 @@ def single_imaging_template(
 
 
 def resolve_pulse_template(template, *, default_name: str, default_factory) -> "PulseTableState":
-    """The SINGLE resolver every form that takes a pulse-template path goes through (the Calibrate
-    task + the Pulse-scan measurement).  Load order: the given path if it is a real file; else the
+    """The resolver for remaining legacy PulseTableState template forms.  Load
+    order: the given path if it is a real file; else the
     same-named file shipped under the project ``pulses/`` folder -- anchored to the PROJECT ROOT via
     ``project_path`` (NOT a fragile ``parents[N]`` count that breaks when a caller moves); else the
     in-memory ``default_factory()`` (e.g. the long-short-long or single-image default)."""
@@ -2814,8 +2755,7 @@ def scan_target_label(state: "PulseTableState", kind: str, target: str) -> str:
     """The STATE-FUL, NAME-based label for a scannable parameter ``(kind, target)`` -- the ONE
     formatter for callers that HOLD a ``PulseTableState``, turning the opaque ``bus@<index>`` /
     bare-index forms into NAME-based text (``probe duration`` / ``da @ image (DAC, signed LSB)``).
-    Shared by the scan-slot axis label, the GUI scan legend, AND ``enumerate_pulse_params`` (so the
-    dropdown + the axis read identically).  The COMPLEMENT is the frontend's
+    Shared by the scan-slot axis label and the GUI scan legend.  The COMPLEMENT is the frontend's
     ``pulse_gui.slot_label`` -- the STATE-FREE, INDEX-based label (``Period 3 duration``) for the
     flat row tuples that carry no state.  The raw ``target`` is unchanged (still the parse key);
     this is display only."""
@@ -2828,7 +2768,7 @@ def scan_target_label(state: "PulseTableState", kind: str, target: str) -> str:
         return f"{_period_display(state, target)} duration"
     if kind == "delay":
         # A plain CHANNEL delay shows the channel's friendly label; a DAC BUS delay (the bus name
-        # is not an individual channel) shows the raw bus name -- matching enumerate_pulse_params.
+        # is not an individual channel) shows the raw bus name.
         name = state.label_for(target) if target in state.port_catalog.raw_lanes else target
         return f"{name} delay"
     return f"{kind} {target}"
@@ -3096,36 +3036,6 @@ def period_index_by_name(state: "PulseTableState", name: str) -> int | None:
                  if str(p.name).strip().lower() == key), None)
 
 
-def enumerate_pulse_params(state: "PulseTableState") -> list[tuple[str, str, str]]:
-    """Every software-scannable parameter of ``state`` as ``(kind, target, label)`` triples --
-    the ONE source the GUI scan-target dropdown and a notebook both read.  Covers every period
-    DURATION, every channel DELAY, and every DAC bus level per period; a duration already bound
-    to a scan slot is flagged in its label (setting it raises until the slot is unbound)."""
-
-    # Labels come from the ONE formatter (scan_target_label); enumerate only adds the
-    # ' (scan-bound)' flag (the duration-already-bound hint), AROUND the call (#B3).
-    out: list[tuple[str, str, str]] = []
-    for i, _period in enumerate(state.periods):
-        bound = state.slot_index_for("duration", str(i)) is not None
-        out.append(("duration", str(i),
-                    scan_target_label(state, "duration", str(i)) + (" (scan-bound)" if bound else "")))
-    # Delays are API-settable (never scannable); a DAC BUS owns a delay just like a
-    # plain channel (it fans out to its members), so both are listed -- buses first so
-    # the bus-delay slot is as discoverable as a TTL channel's.
-    bus_channels = state.bus_channels(min_width=1)
-    bus_members = {channel for members in bus_channels.values() for channel in members}
-    for bus in bus_channels:
-        out.append(("delay", str(bus), scan_target_label(state, "delay", str(bus))))
-    for channel in state.port_catalog.raw_lanes:
-        if channel in bus_members:
-            continue   # its delay is exposed via the owning bus's slot, not per-member
-        out.append(("delay", str(channel), scan_target_label(state, "delay", str(channel))))
-    for bus in bus_channels:
-        for i, _period in enumerate(state.periods):
-            out.append(("dac", f"{bus}@{i}", scan_target_label(state, "dac", f"{bus}@{i}")))
-    return out
-
-
 __all__ = [
     "ANALOG_BUS_MODES",
     "PROBE_TEMPLATE_PATH",
@@ -3134,7 +3044,6 @@ __all__ = [
     "PulsePeriod",
     "PulseTableState",
     "ScanSlot",
-    "enumerate_pulse_params",
     "hardware_tick_ns",
     "period_index_by_name",
     "affine_coeffs",

@@ -37,9 +37,9 @@ def readout_fidelity(readout) -> ProcessorSpec:
     ``sites`` map and the scalar summary (aggregate / mean / min fidelity, ...) for
     the panel's numeric pane.  This panel is a READ-ONLY CHECK by default: it must not
     silently retrain the live readout just because you opened it to look at the numbers
-    (the live Judge-occupancy processor reads that same session calibration).  Turning
+    (the readout pipeline uses that same admitted calibration).  Turning
     ``store_thresholds`` ON overwrites the session calibration's thresholds from this
-    folder -- but the deliberate threshold-storing flow is the Calibrate-readout task."""
+    folder; changing the live model remains an explicit calibration operation."""
 
     params = (
         ParamDecl("data_dir", "Frames folder", "path", default="", path_mode="dir",
@@ -55,7 +55,7 @@ def readout_fidelity(readout) -> ProcessorSpec:
         ParamDecl("store_thresholds", "Write thresholds back", "bool", default=False,
                   tooltip="OFF by default: this panel is a read-only fidelity check.  Turn on ONLY to retrain "
                           "and OVERWRITE the session calibration's thresholds from this folder -- it changes "
-                          "what the live readout uses (the Calibrate-readout task is the deliberate flow)."),
+                          "what the live readout uses."),
     )
 
     def run(ctx: ProcessorContext) -> dict:
@@ -105,8 +105,8 @@ def readout_fidelity(readout) -> ProcessorSpec:
         # The site centers (N, 2) so the default 'sites' atom map can place its
         # circles standalone (no live logic node needed): read from the calibration the
         # characterization just used/updated -- not recomputed here.  Published under a
-        # processor-UNIQUE key (the live 'Judge occupancy' processor owns plain
-        # ``centers``; two processors may not publish the same hub signal).
+        # processor-UNIQUE key (an occupancy stream may own plain ``centers``;
+        # two processors may not publish the same hub signal).
         cal = readout.current
         if cal is not None:
             centers = np.asarray(cal.centers, dtype=float)

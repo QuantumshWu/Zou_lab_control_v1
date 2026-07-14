@@ -26,8 +26,8 @@ from __future__ import annotations
 
 from ...core.selection import Selection, decode_region, region_bins
 from ...core.signals import NO_LINEAGE
-from ..logic import DEFAULT_SOURCE, FRAME_0, Processor, SignalExpr
-from ..signal_expr import ProcessorSignalSnapshot
+from ..logic import FRAME_0, Processor
+from ..signal_expr import DEFAULT_SOURCE, ProcessorSignalSnapshot, SignalExpr
 
 
 class RegionProcessor(Processor):

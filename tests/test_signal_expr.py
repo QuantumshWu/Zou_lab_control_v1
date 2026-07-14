@@ -1,14 +1,10 @@
 """Contract tests for the ONE multi-slot signal + value-expression evaluator.
 
 ``SignalExpr`` is the single source for the slot-packing rule (scalar for one input, list for
-many) and the ``value = ...`` contract, shared by plot panels, the OccupancyProcessor source,
-and PulseScanNode's y.  These guard that single definition so a future "source" field can never
-re-roll the rule.
+many) and the ``value = ...`` contract shared by plot panels and PulseScanNode's y.
 """
 
 from __future__ import annotations
-
-from conftest import raw_device_set
 
 from pathlib import Path
 import sys
@@ -56,8 +52,8 @@ def test_missing_value_assignment_raises():
 
 
 def test_resolve_hook_rewrites_name_before_lookup():
-    ns = {"frame": np.array([1.0]), "frame_judged": np.array([9.0])}
-    out = SignalExpr(["frame"], "value = signal").evaluate(ns, resolve=lambda n: "frame_judged")
+    ns = {"frame": np.array([1.0]), "coherent_frame": np.array([9.0])}
+    out = SignalExpr(["frame"], "value = signal").evaluate(ns, resolve=lambda n: "coherent_frame")
     assert np.array_equal(np.asarray(out), np.array([9.0]))   # the coherence rewrite took effect
 
 
@@ -129,33 +125,3 @@ def test_processor_source_expression_gets_the_shared_helpers():
     hub.publish({"f": frame})    # publish AFTER the processor subscribes at construction (reactive replay)
     out = proc.step()
     assert "roi_value" in out                             # np AND the numpy alias both resolved
-
-
-def test_occupancy_source_default_signal_expr_equals_single_frame_path():
-    """The OccupancyProcessor source is now a signal_expr; its default ({"inputs": ["frame"],
-    "source": "value = signal"}) consumes the single ``frame`` signal exactly as the old single
-    ``source="frame"`` did -- so the migration is behaviour-preserving."""
-    import Zou_lab_control.neutral_atom as na
-    from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor
-
-    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (48, 60)})
-    try:
-        exp.readout.sitemap(method="box", frames=4, display=False)
-        exp.readout.thresholds(frames=20, display=False)
-        cal = exp.readout.require(thresholds=True)
-        # default signal_expr: consumes the bare 'frame' signal
-        occ = OccupancyProcessor(hub := SignalHub(), calibration=cal,
-                                 source_expr={"inputs": ["frame"], "source": "value = signal"},
-                                 grid_shape=(3, 4))
-        assert occ.consumes == ("frame",)                # inputs drive what it reacts to
-        # Acquire a real virtual frame through the SAME firing + camera contract as hardware,
-        # publish it, and judge it -- no simulation ground truth read.
-        from tests.conftest import fire_live_imaging
-        fire_live_imaging(exp)
-        img = raw_device_set(exp).camera.acquire(1)[0]                # the wired camera senses the firing itself
-        hub.publish({"frame": np.asarray(img, dtype=float)})
-        out = occ.step()
-        assert "occupied" in out and "rate" in out        # it judged the consumed frame
-    finally:
-        exp.close()

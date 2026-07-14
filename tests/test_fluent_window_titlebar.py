@@ -104,8 +104,8 @@ def test_tab_overflow_uses_a_menu_button_not_scroll_arrows():
     assert w._tabs_overflow() is False
     assert w._overflow_btn.isVisible() is False
 
-    for name in ("Readout fidelity", "Temperature", "Judge occupancy",
-                 "Calibrate readout", "Loading rate", "Per-site histogram"):
+    for name in ("Readout fidelity", "Temperature", "Analysis",
+                 "Optimize MOT field", "Loading rate", "Per-site histogram"):
         w.add_closable_tab(QtWidgets.QLabel(name), name, focus=False)
     w.resize(560, 320); _settle(app)
     # many tabs in a narrow bar overflow -> the overflow button shows.

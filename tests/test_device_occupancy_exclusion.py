@@ -76,34 +76,6 @@ def test_same_camera_rows_report_conflict_without_preempting_the_owner():
         exp.close()
 
 
-def test_calibration_task_stops_only_the_conflicting_camera():
-    """Starting the Calibrate-readout task (occupies main camera + sequencer) stops the main
-    camera's row but leaves the monitor camera's live view running."""
-    exp = na.connect("virtual")
-    con = make_console(exp)
-    try:
-        _, mon = _start_camera_row(con, camera_name="monitor_camera")
-        main_row, main = _start_camera_row(con)
-        taskrow = add_logic_row(con, ("task", "Calibrate readout"))
-        con._start_logic_node(taskrow)
-        con._poll_logic_nodes()
-        assert con._logic_nodes[id(taskrow)] is None
-        assert main.running and main in con.running_nodes
-        assert mon.running and mon in con.running_nodes
-
-        assert con._stop_logic_node(main_row)
-        con._start_logic_node(taskrow)
-        task = con._logic_nodes.get(id(taskrow)) or con._starting_nodes.get(id(taskrow))
-        assert task is not None
-        assert mon.running and mon in con.running_nodes             # disjoint hardware -> survives
-        devs = set(task.occupied_devices())
-        assert raw_device_set(exp)["camera"] in devs and raw_device_set(exp).sequencer in devs
-        con._stop_logic_node(taskrow)                               # tidy: don't leave the cali running
-    finally:
-        con.shutdown()
-        exp.close()
-
-
 def test_camera_trigger_wire_is_lifecycle_dependency_not_host_observation():
     """The camera node never calls the sequencer API; it only rides its trigger wire."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub

@@ -420,9 +420,17 @@ def test_region_to_acquisition_parameters_is_owned_by_the_source():
     # back as endpoints (full sensor 64x80, no snap needed for /4-aligned values)
     cam_node.set_acquisition_parameters(region=[8, 28, 12, 28])
     assert cam_node.acquisition_parameters()["region"] == [8, 28, 12, 28]
-    # a non-spatial node (a Processor / scan measurement) has no rectangle param
-    from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor
-    assert OccupancyProcessor(hub, calibration=None).region_to_acquisition_parameters(10, 30, 6, 22) == {}
+    # a non-spatial processor has no rectangle parameter.
+    from Zou_lab_control.neutral_atom.operations.logic import Processor
+
+    class _NonSpatialProcessor(Processor):
+        provides = ("value",)
+
+        def transform(self, inputs):
+            return {"value": inputs["frame"]}
+
+    processor = _NonSpatialProcessor(hub, consumes=("frame",))
+    assert processor.region_to_acquisition_parameters(10, 30, 6, 22) == {}
 
 
 # ------------------------------------------------ acquisition-parameter protocol
@@ -590,11 +598,3 @@ def test_running_node_applies_params_in_owner_thread_no_concurrent_acquire():
         assert cam.max_depth == 1                         # never two acquire() at once
     finally:
         assert fence.stop(cam_node, timeout=2.0).terminated
-
-
-# The old monolithic loading-readout in-place re-calibration test was removed: the
-# loading readout is now COMPOSED by the user -- a CameraMeasurement publishing
-# ``frame`` + an OccupancyProcessor turning ``frame`` into occupancy + a
-# CalibrateReadoutTask producing the calibration -- each addressed independently.
-# Composition + the real detect path are covered by
-# tests/test_logic_node_split_contract.py.

@@ -67,13 +67,11 @@ class ParamDecl:
                       ``{"inputs": [name, ...], "source": "value = ..."}`` dict -- so a
                       processor/measurement "source" can subscribe to several running nodes'
                       signals and combine them, never just one bare name.
-    ``"pulse_param"`` a parameter of a pulse template to sweep: a combo box whose choices are
-                      introspected from the template FILE named in the ``depends_on`` field
-                      (its periods / channels / DAC buses), so picking the template repopulates
-                      it.  The value is a ``"kind:target"`` token (e.g. ``"duration:2"``).
+    ``"pulse_slots"`` the current pulse-scan contract: a template-derived form for fixed
+                      API-slot values plus one explicit scan-slot/API-slot program.
 
     ``required`` marks a parameter a GUI must highlight when missing.  ``depends_on`` (kind
-    ``pulse_param``) names the sibling ``path`` field whose pulse template is introspected to
+    ``pulse_slots``) names the sibling ``path`` field whose pulse template is introspected to
     populate this control.  ``display`` is a pure DATA placement flag (not an art/geometry knob)
     that splits a plot panel's params between its two surfaces:
       * ``display=True``  -- a pure DISPLAY knob (how the SAME data is drawn): bins, history length,
@@ -100,7 +98,7 @@ class ParamDecl:
     base_dir: str = ""               # kind="path": the folder a Browse dialog opens in when the
                                      # field doesn't resolve to an existing path (e.g. "pulses"
                                      # for a pulse template, "calibrations" for a data folder)
-    depends_on: str = ""             # kind="pulse_param": the sibling kind="path" field whose
+    depends_on: str = ""             # kind="pulse_slots": the sibling kind="path" field whose
                                      # pulse template is introspected to populate this combo
     display: bool = True             # plot-panel placement flag (DATA, not art): True = a pure DISPLAY
                                      # knob (bins / history / fit / colormap …) in the Setting popup;
@@ -119,11 +117,11 @@ class ParamDecl:
     def __post_init__(self) -> None:
         kind = str(self.kind).lower()
         if kind not in ("float", "int", "axis_range", "bool", "choice", "text", "json", "device",
-                        "path", "signal", "signal_expr", "pulse_param", "pulse_slots"):
+                        "path", "signal", "signal_expr", "pulse_slots"):
             raise ValueError(
                 "ParamDecl.kind must be one of "
                 "float/int/axis_range/bool/choice/text/json/device/path/signal/signal_expr/"
-                f"pulse_param/pulse_slots, got {self.kind!r}."
+                f"pulse_slots, got {self.kind!r}."
             )
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "key", str(self.key))

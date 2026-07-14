@@ -8,8 +8,6 @@ occupancy), instead of mixing the latest of each independently-threaded producer
 
 from __future__ import annotations
 
-from conftest import raw_device_set
-
 import os
 import numpy as np
 import pytest
@@ -54,41 +52,3 @@ def test_snapshot_at_never_substitutes_latest_for_an_evicted_lineage():
     with pytest.raises(SignalHistoryGap, match="cannot substitute its latest value"):
         hub.snapshot_at(1)
     assert hub.snapshot_at(2)["frame_0"][0, 0, 0] == 2.0
-
-
-def test_camera_mints_and_occupancy_inherits():
-    import Zou_lab_control.neutral_atom as na
-    from tests.conftest import fire_live_imaging
-    from Zou_lab_control.neutral_atom.core.signals import SignalHub, NO_LINEAGE
-    from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor
-    exp = na.connect("virtual")
-    try:
-        exp.readout.sitemap(method="box", frames=6, display=False)
-        exp.readout.thresholds(frames=40, display=False)
-        hub = SignalHub()
-        cam = exp.readout.camera_measurement(hub, prefix="")
-        occ = OccupancyProcessor(hub, calibration=exp.readout.current,
-                                 session_calibration=lambda: exp.readout.current,
-                                 source_expr={"inputs": ["frame_0"], "source": "value = signal"},
-                                 method="box", grid_shape=(5, 7), prefix="")
-        # two camera shots mint DISTINCT ids
-        fire_live_imaging(exp, exposure=raw_device_set(exp).camera.exposure); cam.step()
-        first = hub.latest_provenance("frame_0")
-        fire_live_imaging(exp, exposure=raw_device_set(exp).camera.exposure); cam.step()
-        second = hub.latest_provenance("frame_0")
-        assert second > first > 0
-        # reactive replay-in-publication-order: one step judges the FIRST un-consumed frame, so the
-        # derived signals inherit THAT frame's id (`first`), deliberately lagging the live camera --
-        # each occupancy shot is provenance-tied to the exact frame it was judged from.
-        occ.step()
-        assert hub.latest_provenance("occupied") == first
-        assert hub.latest_provenance("frame_judged") == first
-        # camera ahead -> the coherent read at the occupancy's shot holds the ahead frame back
-        fire_live_imaging(exp, exposure=raw_device_set(exp).camera.exposure); cam.step()
-        t = hub.latest_provenance("occupied")
-        assert hub.latest_provenance("frame_0") > t                # camera is ahead
-        held = np.squeeze(np.asarray(hub.snapshot_at(t)["frame_0"]))
-        latest = np.squeeze(np.asarray(hub.snapshot_at(None)["frame_0"]))
-        assert not np.array_equal(held, latest)                  # ahead frame held back at the coherent shot
-    finally:
-        exp.close()

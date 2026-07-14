@@ -1,71 +1,91 @@
-"""Regression: the per-site ``occupied`` signal must NEVER be reshapeable into a 2D grid heatmap.
-
-The user reported the site map (connected to the OccupancyProcessor 'occupied' signal) rendering as a
-7x7 GRID IMSHOW -- each cell brightness = occupancy -- instead of "camera frame underlay + occupancy
-rings".  Root cause: PanelCard._signal_structure attached the producing node's grid_shape (the trap-array
-(5,7)) to 'occupied' even though occupied is per-site DATA (points_shape=(), data_shape=(n_sites,)), so a
-2D panel's _coerce reshaped (n_sites,) -> (5,7) and Live2DDis imshow'd it.
-
-A node's grid_shape un-flattens a 2D SCAN's swept points; it must apply ONLY to a signal that HAS such
-points.  This guards: occupied's structure carries grid_shape=() (no reshape eligibility), so a 2D panel
-on occupied raises an explicit "needs an image" error instead of silently heatmapping -- while a real 2D
-pulse scan still keeps its grid_shape (covered by tests/test_pulse_param_scan.py).
-"""
+"""A per-site data axis must never inherit a producer's scan-grid geometry."""
 
 from __future__ import annotations
 
-from conftest import raw_device_set
-
-import os
 import numpy as np
 import pytest
 
-pytest.importorskip("PyQt5")
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.setdefault("ZLC_VIRTUAL_SLEEP_SCALE", "0")
 
+def test_site_vector_structure_has_no_grid_shape(monkeypatch):
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
 
-def test_occupied_structure_has_no_grid_shape_so_a_2d_panel_cannot_heatmap_it():
-    import Zou_lab_control.neutral_atom as na
-    from tests.conftest import fire_live_imaging
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import LogicNode, SignalSpec
 
-    ensure_qt_app()
-    exp = na.connect("virtual")
-    con = None
+    class _SiteVectorProducer(LogicNode):
+        layer = "processor"
+        node_label = "site vector"
+        grid_shape = (5, 7)
+
+        def shot(self):
+            return {"sites": np.zeros(35, dtype=float)}
+
+        def _bare_published_signals(self):
+            return frozenset({"sites"})
+
+        def _bare_output_specs(self):
+            return (SignalSpec(
+                "sites", "per-site value", points_shape=(1,), data_shape=(35,),
+                dtype=np.float64, repeat_capacity=1),)
+
+    hub = SignalHub()
+    producer = _SiteVectorProducer(hub)
+    producer.step()
+    console = TaskConsole(
+        hub=hub, state=default_console_state(), running_nodes=[producer], window_px=(900, 600))
+    console._timer.stop()
     try:
-        exp.readout.sitemap(method="box", frames=6, display=False)
-        exp.readout.thresholds(frames=40, display=False)
-        con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
-                          measurements=exp.readout.measurement_specs(),
-                          processors=exp.readout.processor_specs(), window_px=(900, 600))
-        con._timer.stop()
-        kc = con.kind_combo
-
-        def add(data):
-            i = next(j for j in range(kc.count()) if kc.itemData(j) == data)
-            kc.setCurrentIndex(i); con._add_panel(); return con.logic_nodes[-1]
-
-        camrow = add(("camera", "live"))
-        judrow = add(("processor", "Judge occupancy"))
-        con._start_logic_node(camrow); con._start_logic_node(judrow)
-        fire_live_imaging(exp, exposure=raw_device_set(exp).camera.exposure)
-        con._logic_nodes[id(camrow)].step()
-        con._logic_nodes[id(judrow)].step()
-
-        # The OccupancyProcessor carries the trap grid_shape (e.g. (5,7)) on the NODE, but 'occupied'
-        # is PER-SITE DATA -- so its structure must expose grid_shape=() (NOT the trap grid), or a 2D
-        # panel could reshape (n_sites,) -> (5,7) and imshow a heatmap.
-        st = con._signal_structure("occupied")
-        assert st is not None, "occupied must resolve a producing-node structure"
-        assert tuple(st["points_shape"]) == (1,), st               # no scan -> exactly one data-point (H4c iron law)
-        data = tuple(st["data_shape"])
-        assert len(data) == 1 and data[0] >= 2, st                 # per-site (n_sites,) DATA
-        assert tuple(st["grid_shape"]) == (), (
-            f"occupied must carry grid_shape=() so it can never become a 2D grid imshow; got {st}")
+        structure = console._signal_structure("sites")
+        assert structure is not None
+        assert tuple(structure["points_shape"]) == (1,)
+        assert tuple(structure["data_shape"]) == (35,)
+        assert tuple(structure["grid_shape"]) == ()
     finally:
-        if con is not None:
-            con.shutdown()
-        exp.close()
+        console.shutdown()
+
+
+def test_site_underlay_uses_the_same_repeat_projection_as_the_site_values(monkeypatch):
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from Zou_lab_control.frontend.live import reduce_repeat
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+
+    sites = np.array([[[0.0, 1.0]], [[1.0, 0.0]], [[1.0, 1.0]]])
+    centers = np.array([[[[4.0, 4.0], [8.0, 8.0]]]])
+    frames = np.stack([
+        np.full((1, 4, 4), 10.0),
+        np.full((1, 4, 4), 20.0),
+        np.full((1, 4, 4), 40.0),
+    ])
+    namespace = {"sites": sites, "centers": centers, "frame": frames}
+
+    def structure_provider(name):
+        if name == "sites":
+            return {"points_shape": (1,), "data_shape": (2,), "grid_shape": ()}
+        return None
+
+    def sites_inputs_provider(name):
+        return ("centers", "frame") if name == "sites" else (None, None)
+
+    def underlay(mode):
+        card = PanelCard(
+            PanelConfig(
+                kind="sites", inputs=["sites"], source="value = signal",
+                params={"repeat_mode": mode}),
+            structure_provider=structure_provider,
+            sites_inputs_provider=sites_inputs_provider,
+        )
+        try:
+            _, image = card._sites_aux(namespace)
+            return np.asarray(image, dtype=float)
+        finally:
+            card.shutdown()
+
+    average = underlay("average")
+    latest = underlay("replace")
+    np.testing.assert_allclose(average, np.squeeze(reduce_repeat(frames, "average")))
+    np.testing.assert_allclose(latest, np.squeeze(reduce_repeat(frames, "replace")))
+    assert not np.array_equal(average, latest)

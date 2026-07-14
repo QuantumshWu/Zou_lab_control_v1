@@ -18,19 +18,8 @@ The data flow (all through public paths):
     sub-dict;
   * ``load_figure`` reads ``info['provenance']`` back; the FigureViewer expands it readably.
 
-These pin:
-1. ``LogicNode.provenance_snapshot()`` unit behaviour: a node HOLDING a camera includes the camera's
-   snapshot + acquisition params; a bare node (no device) returns no ``devices`` and never crashes;
-1b. ONCE-per-run: a running node captures provenance at ``start()`` and it stays IDENTICAL across many
-   shots (not re-snapshotted per shot);
-1c. a PROCESSOR's provenance carries its ``consumes`` list + empty devices, and never crashes;
-2. end-to-end through the CONSOLE Save path: connect virtual -> a camera measurement publishes
-   ``frame_0`` -> save its panel -> ``load_figure`` back -> ``info['provenance']`` carries the camera
-   device snapshot + key acquisition params;
-2b. CHAINED: saving a processor-output panel HOISTS the upstream measurement's device snapshot to the
-   top level ``provenance['devices']`` (a flat record, no nested ``upstream``);
-3. the fallback: no producing node but a session attached -> the whole-session device snapshot;
-4. backward compatibility: an OLD npz with no ``provenance`` loads + the viewer expands nothing (no crash).
+These pin camera-node snapshots, once-per-run capture, derived-node upstream
+device hoisting, console save/load, session fallback, and viewer expansion.
 
 Runs headless (``QT_QPA_PLATFORM=offscreen``); virtual sleeps are fast-forwarded.
 """
@@ -59,12 +48,10 @@ pytest.importorskip("PyQt5")
 
 import Zou_lab_control.neutral_atom as na  # noqa: E402
 from Zou_lab_control.neutral_atom.core.signals import SignalHub  # noqa: E402
-from Zou_lab_control.neutral_atom.operations.logic import (  # noqa: E402
-    CameraMeasurement,
-    OccupancyProcessor,
-)
+from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, Processor  # noqa: E402
 from Zou_lab_control.neutral_atom.operations.figure_capture import (  # noqa: E402
     capture_figure_provenance,
+    raw_data_flow_graph,
 )
 from Zou_lab_control.frontend import load_figure  # noqa: E402
 from Zou_lab_control.frontend.qt_fluent import ensure_qt_app  # noqa: E402
@@ -111,18 +98,6 @@ def test_provenance_snapshot_includes_held_camera_and_params():
         exp.close()
 
 
-def test_provenance_snapshot_of_a_bare_node_has_no_devices_and_never_crashes():
-    """A node holding NO acquisition device (a pure processor) yields a provenance dict with identity +
-    timestamp but no ``devices`` section -- and never raises (the generic device probe finds nothing).
-    Its ``consumes`` (the upstream signals it transforms) IS its provenance substance."""
-    hub = SignalHub()
-    proc = OccupancyProcessor(hub)               # a processor holds no camera / sequencer
-    prov = proc.provenance_snapshot()
-    assert isinstance(prov, dict)
-    assert prov["layer"] == "processor"
-    assert "devices" not in prov, "a node with no held device declares no devices section"
-    # a processor's provenance carries the signals it CONSUMES (default OccupancyProcessor -> frame_0)
-    assert prov.get("consumes") == list(proc.consumes) and "frame_0" in prov["consumes"]
 
 
 def test_provenance_is_captured_once_per_run_not_per_shot():
@@ -148,10 +123,38 @@ def test_provenance_is_captured_once_per_run_not_per_shot():
         exp.close()
 
 
+def test_derived_provenance_hoists_upstream_devices_without_nesting():
+    class _MeanProcessor(Processor):
+        provides = ("mean",)
+
+        def transform(self, inputs):
+            return {"mean": float(np.mean(np.asarray(inputs["cam_frame_0"])))}
+
+    exp = na.connect("virtual")
+    try:
+        hub = SignalHub()
+        camera = CameraMeasurement(
+            hub, raw_device_set(exp).camera,
+            sequencer=raw_device_set(exp).sequencer, prefix="cam_", repeat=1)
+        processor = _MeanProcessor(hub, consumes=("cam_frame_0",), prefix="stats_")
+        camera.refresh_provenance()
+
+        provenance = capture_figure_provenance(
+            processor,
+            resolve_node=lambda name: camera if name == "cam_frame_0" else None,
+        )
+        assert provenance["layer"] == "processor"
+        assert provenance["consumes"] == ["cam_frame_0"]
+        assert set(provenance["devices"]) == {"camera", "sequencer"}
+        assert "exposure" in provenance["acquisition_parameters"]
+        assert "upstream" not in provenance
+    finally:
+        exp.close()
+
+
 # ------------------------------------------------------------------ end-to-end through the console save
 def _camera_console(exp):
-    """A real TaskConsole running a camera MEASUREMENT node that publishes ``frame_0`` -- the node is in
-    ``running_nodes`` so the console's ``_node_for_signal`` resolves it (the Save provenance source)."""
+    """A TaskConsole resolving a stopped camera node's retained signal."""
     from Zou_lab_control.frontend.task_console import (
         TaskConsole, default_console_state, PanelConfig, GAP)
     from Zou_lab_control.frontend import panel_plot
@@ -163,7 +166,9 @@ def _camera_console(exp):
     for _ in range(4):
         cam.step()                                # publish cam_frame_0 + refresh provenance
     console = TaskConsole(hub=hub, state=default_console_state(), session=exp,
-                          running_nodes=[cam], window_px=(900, 600))
+                          running_nodes=[], window_px=(900, 600))
+    # Stopped producers remain the authority for their retained hub values.
+    console._last_node[id(cam)] = cam
     console._timer.stop()
     console.refresh_once = lambda: None
     # The panel is WIRED to cam_frame_0 (so Save resolves the camera node); the plotter kind is
@@ -213,119 +218,8 @@ def test_console_save_writes_producing_node_provenance(tmp_path):
         plt.close("all")
 
 
-def test_console_save_chains_upstream_measurement_provenance():
-    """Saving a panel wired to a PROCESSOR's output records the UPSTREAM measurement's device state,
-    HOISTED to the top level (a FLAT record, identical in shape to a direct camera panel's).
-
-    A camera measurement publishes ``cam_frame_0``; an OccupancyProcessor consumes it and publishes
-    ``occ_occupied``.  A panel bound to ``occ_occupied`` resolves the processor (no device of its own)
-    as its producing node; ``capture_figure_provenance`` then walks the processor's ``consumes`` to the
-    camera node and HOISTS that node's ``devices`` + ``acquisition_parameters`` to the TOP LEVEL of the
-    saved provenance -- so a processed figure carries the source apparatus state at ``prov['devices']``
-    exactly where a direct camera panel carries it (no nested ``upstream`` sub-dict).  The processor's
-    own identity keys (``layer`` / ``consumes`` / ``calibration_fingerprint``) stay top-level too."""
-    ensure_qt_app()
-    from Zou_lab_control.frontend.task_console import (
-        TaskConsole, default_console_state, PanelConfig, PanelEditor, GAP)
-    from Zou_lab_control.frontend import panel_plot
-    from Zou_lab_control.neutral_atom.operations.signal_expr import SignalExpr, DEFAULT_SOURCE
-
-    exp = na.connect("virtual")
-    console = None
-    try:
-        hub = SignalHub()
-        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
-                                prefix="cam_", repeat=2)
-        # the processor CONSUMES cam_frame_0 (its provenance says so) but holds NO device
-        proc = OccupancyProcessor(hub, source_expr=SignalExpr(["cam_frame_0"], DEFAULT_SOURCE),
-                                  prefix="occ_")
-        assert "cam_frame_0" in proc.consumes and "occ_occupied" in proc.published_signals()
-        fire_live_imaging(exp)
-        cam.refresh_provenance()                 # the camera run's base state, captured once
-        console = TaskConsole(hub=hub, state=default_console_state(), session=exp,
-                              running_nodes=[cam, proc], window_px=(900, 600))
-        console._timer.stop()
-        console.refresh_once = lambda: None
-        # a panel bound to the PROCESSOR's output -> its producing node is the processor
-        card = console._new_panel_card(PanelConfig(kind="hist", title="occ", source="value = occ_occupied",
-                                                   inputs=["occ_occupied"], row=GAP, col=GAP, size="2x4"))
-        console._attach_card(card)
-        card.plotter = panel_plot(np.random.default_rng(0).normal(0.5, 0.1, 200),
-                                  kind="hist", size="2x4", bins=20, title="occ")
-        editor = PanelEditor(card, console)
-        editor.rebuild()
-        prov = _console_provenance(editor)
-        # the processor's own identity stays: its layer + the consumed input it transformed
-        assert prov["layer"] == "processor" and "cam_frame_0" in prov.get("consumes", [])
-        # NO nested upstream sub-dict -- the record is flat
-        assert "upstream" not in prov, "the flat provenance never nests an 'upstream' sub-dict"
-        # the upstream camera measurement's device snapshot was HOISTED to the TOP LEVEL: a processed
-        # panel's provenance carries devices in EXACTLY the same place a direct camera panel does
-        assert isinstance(prov.get("devices"), dict) and "camera" in prov["devices"], \
-            "a processed panel hoists the upstream camera's devices to the top level"
-        assert prov["devices"]["camera"]["type"] == type(raw_device_set(exp).camera).__name__
-        assert "sequencer" in prov["devices"], "both held devices travel up (camera + sequencer)"
-        # the upstream node's acquisition params were hoisted too
-        assert "acquisition_parameters" in prov and "exposure" in prov["acquisition_parameters"]
-    finally:
-        if console is not None:
-            console.shutdown()
-        exp.close()
-        plt.close("all")
 
 
-def test_measurement_and_processor_panels_record_the_same_flat_devices_shape():
-    """The CORE flat-provenance invariant: a 2-D panel wired STRAIGHT to a camera measurement and a
-    site-map panel wired to a PROCESSOR of that same camera record provenance with the SAME top-level
-    shape -- both carry ``prov['devices']`` holding camera + sequencer.  The reported inconsistency
-    (the direct panel had a top-level sequencer, the processed panel hid it in a nested sub-dict) is
-    gone: whatever the panel is wired to, the devices that produced the data are at the top level."""
-    ensure_qt_app()
-    from Zou_lab_control.frontend.task_console import (
-        TaskConsole, default_console_state, PanelConfig, PanelEditor, GAP)
-    from Zou_lab_control.frontend import panel_plot
-    from Zou_lab_control.neutral_atom.operations.signal_expr import SignalExpr, DEFAULT_SOURCE
-
-    exp = na.connect("virtual")
-    console = None
-    try:
-        hub = SignalHub()
-        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
-                                prefix="cam_", repeat=2)
-        proc = OccupancyProcessor(hub, source_expr=SignalExpr(["cam_frame_0"], DEFAULT_SOURCE),
-                                  prefix="occ_")
-        fire_live_imaging(exp)
-        cam.refresh_provenance()
-        console = TaskConsole(hub=hub, state=default_console_state(), session=exp,
-                              running_nodes=[cam, proc], window_px=(900, 600))
-        console._timer.stop()
-        console.refresh_once = lambda: None
-
-        def prov_for(kind, source, inputs):
-            card = console._new_panel_card(PanelConfig(kind=kind, title=kind, source=source,
-                                                       inputs=inputs, row=GAP, col=GAP, size="2x4"))
-            console._attach_card(card)
-            card.plotter = panel_plot(np.random.default_rng(0).normal(0.5, 0.1, 200),
-                                      kind="hist", size="2x4", bins=20, title=kind)
-            editor = PanelEditor(card, console)
-            editor.rebuild()
-            return _console_provenance(editor)
-
-        direct = prov_for("2d", "value = cam_frame_0", ["cam_frame_0"])          # measurement panel
-        processed = prov_for("sites", "value = occ_occupied", ["occ_occupied"])   # processor panel
-
-        for label, prov in (("direct/measurement", direct), ("processed/processor", processed)):
-            assert isinstance(prov.get("devices"), dict), f"{label}: devices at the top level"
-            assert "camera" in prov["devices"], f"{label}: camera at the top level"
-            assert "sequencer" in prov["devices"], f"{label}: SEQUENCER at the top level (the reported gap)"
-            assert "upstream" not in prov, f"{label}: no nested upstream sub-dict (flat)"
-        # identical shape: both device sets carry the same roles
-        assert set(direct["devices"]) == set(processed["devices"]) == {"camera", "sequencer"}
-    finally:
-        if console is not None:
-            console.shutdown()
-        exp.close()
-        plt.close("all")
 
 
 def test_save_falls_back_to_session_devices_when_no_producing_node(tmp_path):
@@ -352,9 +246,10 @@ def test_save_falls_back_to_session_devices_when_no_producing_node(tmp_path):
         editor = PanelEditor(card, console)
         editor.rebuild()
         prov = _console_provenance(editor)
-        # no producing node -> the session's device snapshot (keyed by device role name)
-        assert isinstance(prov, dict) and "camera" in prov, \
-            "with no producing node, provenance falls back to the session device snapshot"
+        # no producing node -> the current session's typed device catalog snapshot
+        assert isinstance(prov, dict) and isinstance(prov.get("devices"), dict)
+        roles = {item["ref"]["role"] for item in prov["devices"]["devices"]}
+        assert {"camera", "sequencer"} <= roles
     finally:
         if console is not None:
             console.shutdown()
@@ -362,10 +257,9 @@ def test_save_falls_back_to_session_devices_when_no_producing_node(tmp_path):
         plt.close("all")
 
 
-# ----------------------------------------------------------------- viewer: expand + backward compat
-def test_viewer_expands_provenance_and_tolerates_its_absence(tmp_path):
-    """The FigureViewer's Info column expands a stored ``provenance`` into readable rows, and an OLD npz
-    with none loads + shows nothing extra (no crash) -- backward compatible."""
+# ----------------------------------------------------------------- viewer: optional provenance
+def test_viewer_expands_current_provenance(tmp_path):
+    """The viewer expands a current saved figure's provenance into readable rows."""
     ensure_qt_app()
     from Zou_lab_control.frontend import plot
     from Zou_lab_control.frontend.figure_viewer import show_figure_viewer
@@ -377,7 +271,8 @@ def test_viewer_expands_provenance_and_tolerates_its_absence(tmp_path):
     df = p.to_data_figure()
     prov = {"node": "camera", "layer": "measurement", "captured_at": "2026-06-30 12:00:00",
             "devices": {"camera": {"type": "VirtualCamera", "exposure": 0.003, "roi": None}},
-            "acquisition_parameters": {"exposure": 0.003, "frames_per_cycle": 1}}
+            "acquisition_parameters": {"exposure": 0.003, "frames_per_cycle": 1},
+            "flow_graph": raw_data_flow_graph()}
     out = df.save(str(tmp_path / "withprov"),
                   extra_info={"source": "counts", "kind": "hist", "provenance": prov})
     plt.close(p.fig)
@@ -397,23 +292,6 @@ def test_viewer_expands_provenance_and_tolerates_its_absence(tmp_path):
             win.close(); win.deleteLater()
         v.teardown()
         plt.close("all")
-
-    # an OLD npz with NO provenance: loads and expands nothing, no crash
-    x = np.linspace(0, 1, 20).reshape(-1, 1)
-    legacy = tmp_path / "legacy.npz"
-    np.savez(legacy, data_x=x, data_y=np.sin(x * 6),
-             info={"labels": ["X", "Y", "Z"], "name": "legacy", "kind": "1d"})
-    v2 = show_figure_viewer(legacy)
-    try:
-        texts = _info_column_texts(v2)
-        assert not any("Provenance" == t for t in texts), "an old npz shows no Provenance section"
-    finally:
-        win = v2.window()
-        if win is not None:
-            win.close(); win.deleteLater()
-        v2.teardown()
-        plt.close("all")
-
 
 def _info_column_texts(viewer) -> list[str]:
     """Every visible text in the Info column (section labels + row labels + read-only field values)."""

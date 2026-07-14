@@ -1407,8 +1407,8 @@ def test_task_console_cards_are_modular(monkeypatch):
 
 
 def test_task_console_panels_render_and_update(monkeypatch):
-    """The demo board builds EVERY panel kind against the virtual node -- both
-    rolling-trace variants included -- and keeps updating them on later shots.
+    """The camera demo builds its useful raw-data views -- both rolling-trace
+    variants included -- and keeps updating them on later shots.
 
     The rolling trace is ONE kind ("monitor"); the side distribution is a
     ``show_dist`` toggle, NOT a separate kind.  ``show_dist=True`` builds
@@ -1422,12 +1422,11 @@ def test_task_console_panels_render_and_update(monkeypatch):
 
     console = dt.demo_console(shots=25)
     kinds = {card.config.kind: card for card in console.cards}
-    assert set(kinds) == {"2d", "sites", "1d", "monitor", "hist"}
+    assert set(kinds) == {"2d", "1d", "monitor", "hist"}
     for card in console.cards:
         assert card.plotter is not None, card.config.kind
         assert card.status.text().startswith("shot "), (card.config.kind, card.status.text())
     assert type(kinds["2d"].plotter).__name__ == "Live2DDis"
-    assert type(kinds["sites"].plotter).__name__ == "LiveSiteMap"
     assert type(kinds["hist"].plotter).__name__ == "HistogramFigure"
     assert type(kinds["1d"].plotter).__name__ == "Live1D"
     # the ONE "monitor" kind -> two classes via show_dist (the demo board has both)
@@ -1528,9 +1527,9 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
         return False
 
     datas = _leaf_datas()
-    assert "counts" in datas and "frame_0" in datas
-    # the demo 2d card is the synced readout image -> its input is the judged frame (#5)
-    assert combo.current_signal() == "frame_judged"
+    assert "frame_0" in datas
+    # the camera-only demo binds the image card directly to its raw frame.
+    assert combo.current_signal() == "frame_0"
 
     assert _pick("frame_0")                                # pick a 2-D signal valid for a 2d panel
     card._on_slot_pick(0)
@@ -1926,10 +1925,14 @@ def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import PanelConfig
     from Zou_lab_control.neutral_atom.operations.logic import LogicNode, SignalSpec
 
     console = dt.demo_console(shots=10)
-    sites = next(c for c in console.cards if c.config.kind == "sites")
+    sites = console._new_panel_card(PanelConfig(
+        kind="sites", title="Orphan sites", size="2x2", source="", inputs=[""]))
+    console._attach_card(sites)
+    console._arrange()
     class _OrphanSiteProducer(LogicNode):
         def shot(self):
             return {"orphan_sites": np.zeros((1, 1, 35), dtype=float)}
@@ -1956,7 +1959,7 @@ def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
 
 
 def test_task_console_cross_signal_expression_and_error_isolation(monkeypatch):
-    """A panel source may combine signals arbitrarily (the A-B loading-rate map);
+    """A panel source may combine signals arbitrarily;
     a broken expression lands in that panel's status line and never disturbs the
     other panels or the console loop."""
 
@@ -1964,17 +1967,40 @@ def test_task_console_cross_signal_expression_and_error_isolation(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
     from Zou_lab_control.frontend.task_console import PanelConfig
+    from Zou_lab_control.neutral_atom.core.signal_tensor import SignalTensor
+    from Zou_lab_control.neutral_atom.operations.logic import LogicNode
 
-    console = dt.demo_console(shots=20, dual=True)
+    console = dt.demo_console(shots=20)
+    class _ReferenceProvider(LogicNode):
+        layer = "processor"
+        node_label = "reference"
+
+        def shot(self):
+            return {}
+
+        def published_signals(self):
+            return frozenset({"reference_frame"})
+
+    console.running_nodes.append(_ReferenceProvider(console.hub))
+    frame = console.hub.latest_tensor("frame_0")
+    reference = SignalTensor(
+        np.zeros_like(frame.data),
+        frame.schema,
+        valid=frame.valid,
+    )
+    console.hub.publish(
+        {"reference_frame": reference},
+        provenance=frame.provenance,
+    )
     diff = console._new_panel_card(
-        PanelConfig(kind="1d", title="A-B occupancy", row=4, col=0, size="2x2",
-                    source="value = occupied - b_occupied"))
+        PanelConfig(kind="2d", title="Background-subtracted image", row=4, col=0, size="2x2",
+                    source="value = signal[0][0] - signal[1][0]",
+                    inputs=["frame_0", "reference_frame"]))
     console._attach_card(diff)
     console._arrange()
     console.refresh_once()
     assert diff.plotter is not None and diff.status.text().startswith("shot ")
-    n_sites = np.asarray(console.hub.latest("occupied")).shape[-1]
-    assert diff.plotter.data_y.shape == (1, n_sites)  # P=1, one explicit data series per site
+    assert np.asarray(diff.plotter.grid).shape == reference.shape[-2:]
 
     # break ONE panel: it reports, the siblings keep updating
     victim = next(card for card in console.cards if card.config.kind == "monitor")

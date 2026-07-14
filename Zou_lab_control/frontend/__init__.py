@@ -143,11 +143,14 @@ def _register_neutral_atom_viewer() -> None:
         from types import SimpleNamespace
 
         from Zou_lab_control._viewer_registry import register_plotter
-        from .calibration_report import save_calibration_report, save_frame_image
 
-        register_plotter(SimpleNamespace(plot=plot, grid=grid, display_figure=display_figure, run=run,
-                                         site_map=site_map, save_calibration_report=save_calibration_report,
-                                         save_frame_image=save_frame_image))
+        register_plotter(SimpleNamespace(
+            plot=plot,
+            grid=grid,
+            display_figure=display_figure,
+            run=run,
+            site_map=site_map,
+        ))
     except (ImportError, ModuleNotFoundError):  # pragma: no cover - optional deps absent: never block import
         pass
     except Exception as exc:  # a REAL registration break must SURFACE (warn), not silently vanish

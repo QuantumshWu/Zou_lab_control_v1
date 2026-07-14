@@ -271,7 +271,7 @@ def panel_allows_multi_slot(kind: str) -> bool:
 
 def strip_node_prefix(full: str, prefix: str) -> str:
     """The SHORT signal name = the hub name minus its producing node's disambiguating prefix
-    (``judge_occupancy_rate`` -> ``rate``, ``temperature_survival`` -> ``survival``, ``frame`` ->
+    (``analysis_rate`` -> ``rate``, ``temperature_survival`` -> ``survival``, ``frame`` ->
     ``frame``).  The ONE rule the Logic tab AND the signal picker share, so the nest leaf is ALWAYS the
     short name -- never the full prefixed key, never the verbose axis label."""
     full = str(full)
@@ -2421,11 +2421,12 @@ class PanelCard(FluentGroupBox):
         return cur if cur in modes else modes[0]
 
     def _bound_is_occupancy(self) -> bool:
-        """Whether this panel's bound signal is an OCCUPANCY vector (a Judge-occupancy output) --
-        driven off the signal's ROLE, not a hardcoded panel-kind string: its producing node resolves
-        a site-map centres/underlay for it (only a Judge-occupancy processor does), via the same
-        ``sites_inputs_provider`` the site map already uses (#H3s-F5).  So the occupancy meaning shows
-        for an occupancy signal on ANY plot kind, and stays generic for everything else."""
+        """Whether the bound producer declares site-map companion signals.
+
+        The decision follows producer metadata rather than a processor class or
+        panel-kind string, so any current occupancy producer can supply the same
+        centres/underlay contract.
+        """
         occ = self.config.inputs[0] if self.config.inputs else ""
         if not occ or not callable(self.sites_inputs_provider):
             return False
@@ -3064,7 +3065,7 @@ class PanelCard(FluentGroupBox):
 
     def _refresh_title(self) -> None:
         """Compose the grey frame TITLE: the panel KIND + WHERE its signal comes from (the
-        legend the console computes), e.g. ``1D vector — occupied ← Judge occupancy``.  This is
+        legend the console computes), e.g. ``1D vector — value ← Analysis``.  This is
         the ordinary QGroupBox title -- the grey chip, alignment and font are the frame's own."""
         head = PANEL_KINDS[self.config.kind]
         info = " · ".join(p for p in self._signal_info.splitlines() if p.strip())
@@ -3678,9 +3679,7 @@ class PanelCard(FluentGroupBox):
         ``value = <the one input's name>`` (:func:`is_identity_source`), because naming the signal
         passes it through unchanged so the node's declared structure still describes it.  A transforming
         expression (``value = signal[0]-signal[1]``, ``value = np.log(f)``) rewrites the core shape (#H3o),
-        so it returns ``None`` -> the reshape falls back to shape inference.  (The old gate compared only
-        against ``value = signal``, so a named frame/scan binding like ``value = frame_judged`` lost its
-        structure -> a 2-D frame grid collapsed to a histogram and facet axes vanished.)"""
+        so it returns ``None`` and the reshape falls back to shape inference."""
         from ..neutral_atom.operations.signal_expr import is_identity_source
         if not is_identity_source(self._compiled_source, self.config.inputs):
             return None
@@ -3704,12 +3703,11 @@ class PanelCard(FluentGroupBox):
             repeat_mode=self._repeat_mode_value())
 
     def _sites_aux(self, namespace: Mapping[str, object]):
-        """The site map's centres + camera underlay, resolved from the SAME producing node as its
-        ONE occupancy signal (``config.inputs[0]``).  The occupancy's producing node (a
-        Judge-occupancy processor) publishes occupied + centres + the judged frame together,
-        so the console's ``sites_inputs_provider`` maps the occupancy signal -> (centres,
-        image) signal names from that node's spec metadata, and rings + underlay are always
-        the same shot.  The user therefore picks just ONE signal."""
+        """Resolve a site map's centres and underlay from its value producer.
+
+        The producer declares the companion signal names and publishes all three
+        atomically, so the user binds one value signal without class-specific wiring.
+        """
         occ = self.config.inputs[0] if self.config.inputs else ""
         centers_name, image_name = (None, None)
         if callable(self.sites_inputs_provider) and occ:
@@ -3720,8 +3718,8 @@ class PanelCard(FluentGroupBox):
         centers = namespace.get(centers_name) if centers_name else None
         if centers is None:
             raise ValueError(
-                f"site map needs the centres from `{occ}`'s producing node -- point it at an occupancy "
-                "signal from a Judge-occupancy processor (it publishes occupied + centres + frame).")
+                f"site map needs centres declared by `{occ}`'s producing node; "
+                "bind a producer that supplies value, centres and frame companions.")
         centers = np.asarray(centers, dtype=float)
         if centers.ndim != 4 or centers.shape[:2] != (1, 1) or centers.shape[-1] != 2:
             raise ValueError(
@@ -4733,9 +4731,8 @@ class MeasurementPanel(QtWidgets.QWidget):
         layout (row vs full-width span) and the dependent-combo wiring (a sibling-field
         lookup the form must own)."""
         self._clear_form()
-        # decl + widget kept per key so the dependent-combo wiring (pulse_param / pulse_slots)
-        # can find its sibling ``path`` field and repopulate from the template it names.
-        self._pulse_param_decls: dict[str, object] = {}
+        # Pulse-slot declarations are kept per key so the template-dependent widget can
+        # find its sibling ``path`` field and repopulate from the template it names.
         self._pulse_slots_decls: dict[str, object] = {}
         self._handlers: dict[str, object] = {}    # param key -> ParamWidgetHandler
         self._decls: dict[str, object] = {}        # param key -> ParamDecl
@@ -4774,21 +4771,10 @@ class MeasurementPanel(QtWidgets.QWidget):
             self._widgets[decl.key] = widget
             self._handlers[decl.key] = handler
             self._decls[decl.key] = decl
-            if kind == "pulse_param":
-                self._pulse_param_decls[decl.key] = decl
-            elif kind == "pulse_slots":
+            if kind == "pulse_slots":
                 self._pulse_slots_decls[decl.key] = decl
-        # Wire each pulse_param combo to its source template field (done AFTER the build loop
-        # so the source field exists regardless of declaration order), then fill it once.  This
-        # is the form's only inter-field reactivity: changing the template repopulates the
-        # scan-target choices.
-        for key, decl in self._pulse_param_decls.items():
-            src = self._sibling_path_widget(decl)
-            if src is not None:
-                src.changed.connect(lambda *_a, k=key: self._repopulate_pulse_param(k))
-            self._repopulate_pulse_param(key)
-        # Wire each pulse_slots widget to its template path (same dependency pattern as
-        # pulse_param): when the template changes, rebuild the auto-form's per-slot rows.
+        # Wire each pulse_slots widget to its template path after the build loop so the
+        # source field exists regardless of declaration order.
         for key, decl in self._pulse_slots_decls.items():
             src = self._sibling_path_widget(decl)
             if src is not None:
@@ -4798,7 +4784,7 @@ class MeasurementPanel(QtWidgets.QWidget):
 
     def _sibling_path_widget(self, decl):
         """The ``path`` widget named in ``decl.depends_on`` (the template a dependent
-        pulse_param / pulse_slots field introspects), or None."""
+        pulse_slots field introspects), or None."""
         dep = getattr(decl, "depends_on", "")
         if dep and self._decls.get(dep) is not None and self._decls[dep].kind == "path":
             return self._widgets.get(dep)
@@ -4843,42 +4829,6 @@ class MeasurementPanel(QtWidgets.QWidget):
         ).hexdigest()
         widget.rebuild(api_rows, scan_rows, hardware_program=code, program_id=program_id)
 
-    def _repopulate_pulse_param(self, key: str) -> None:
-        """Fill a ``pulse_param`` combo from the pulse template named in its ``depends_on``
-        path field: each item's text is the human label, its data the ``"kind:target"`` token
-        the measurement consumes.  Preserves the current selection across a reload (the editable
-        combo lets an unknown saved target round-trip).  A bad/empty path -> empty combo (Start
-        stays disabled via ``required``)."""
-        combo = self._widgets.get(key)
-        decl = self._pulse_param_decls.get(key)
-        if combo is None or decl is None:
-            return
-        src = self._sibling_path_widget(decl)
-        path = src.text() if src is not None else ""
-        keep = combo.currentData() or combo.currentText()
-        items: list[tuple[str, str]] = []   # (label, "kind:target")
-        try:
-            # lazy import (frontend stays off neutral_atom's import-time graph; this is a
-            # GUI action) -- reuse the ONE template resolver + the single-source enumerator.
-            from ..neutral_atom.operations.logic import CalibrateReadoutTask
-            from ..neutral_atom.timing import enumerate_pulse_params
-            state = CalibrateReadoutTask._resolve_template(path)
-            items = [(label, f"{kind}:{target}") for kind, target, label in enumerate_pulse_params(state)]
-        except Exception:
-            items = []
-        combo.blockSignals(True)
-        combo.clear()
-        for label, token in items:
-            combo.addItem(label, token)
-        tokens = [token for _label, token in items]
-        if keep in tokens:
-            combo.setCurrentIndex(tokens.index(keep))
-        elif keep:
-            combo.setCurrentText(str(keep))          # round-trip a saved token not in this template
-        elif items:
-            combo.setCurrentIndex(0)
-        combo.blockSignals(False)
-
     # ------------------------------------------------------------- value read
     def collect_values(self) -> dict[str, object]:
         """Read every parameter back BY KIND (no eval) into a build kwargs dict --
@@ -4887,7 +4837,7 @@ class MeasurementPanel(QtWidgets.QWidget):
         return {key: self._handlers[key].read(widget) for key, widget in self._widgets.items()}
 
     def refresh_on_show(self) -> None:
-        """Re-poll providers and rebuild every dynamic combo (signals + pulse_params), so
+        """Re-poll providers and rebuild every dynamic control, so
         switching back to a tab whose providers have changed shows up-to-date choices.
         E.g. a processor's source dropdown was empty when first opened (no signal published
         yet); after a measurement publishes one, returning to this tab shows it -- without
@@ -4902,11 +4852,9 @@ class MeasurementPanel(QtWidgets.QWidget):
         labels = coerce_short_labels(self._short_names_provider)
         for key, widget in list(self._widgets.items()):
             kind = self._decls[key].kind
-            # a DEPENDENT combo (pulse_param / pulse_slots) repopulates via the form's per-key
-            # hook (it reads the sibling template); a signal picker refills from live providers.
-            if kind == "pulse_param":
-                repopulate = lambda _w, k=key: self._repopulate_pulse_param(k)
-            elif kind == "pulse_slots":
+            # pulse_slots repopulates via the form's per-key hook (it reads the sibling
+            # template); a signal picker refills from live providers.
+            if kind == "pulse_slots":
                 repopulate = lambda _w, k=key: self._repopulate_pulse_slots(k)
             else:
                 repopulate = None
@@ -4972,11 +4920,6 @@ class MeasurementPanel(QtWidgets.QWidget):
                 self._handlers[key].write(widget, values[key])
             except (TypeError, ValueError):
                 continue
-        # A pulse_param combo's choices come from its (also-seeded) template field, so
-        # repopulate AFTER seeding so the saved "kind:target" token lands on a real item
-        # (the editable combo round-trips it even if the template changed).
-        for key in getattr(self, "_pulse_param_decls", {}):
-            self._repopulate_pulse_param(key)
         # A pulse_slots auto-form rebuilds from its template field too: repopulate AFTER seeding so
         # the rebuild runs with the stash write() left (saved fixed values + hardware program) and
         # the round-trip restores them, regardless of seed order.
@@ -5085,8 +5028,8 @@ class PanelEditor(QtWidgets.QWidget):
         # ---- Acquisition: the editable parameters of the DATA SOURCE behind this
         # panel.  A panel is a VIEW; the LOGIC NODE whose published signals it reads
         # declares what its source exposes via acquisition_parameters() -- a
-        # raw-frame panel reads the camera Measurement (exposure / ROI), an
-        # occupancy panel reads the OccupancyProcessor.  Each field is PREFILLED with
+        # raw-frame panel reads the camera Measurement (exposure / ROI), while a
+        # derived panel reads its processor.  Each field is PREFILLED with
         # the CURRENT value (with a "now: X" reference); Apply pushes the edit to
         # that source IN PLACE (it does not start anything -- the node is started
         # from its own Logic-tab Edit).
@@ -5134,8 +5077,8 @@ class PanelEditor(QtWidgets.QWidget):
                            if self._source_row is not None else None)
             if source_spec is not None:
                 section(f"Source: {source_spec.name}")
-                # pass the signal providers so a signal-kind param (e.g. the OccupancyProcessor's
-                # 'source') renders the SAME nested-by-producer picker the logic-node Edit uses --
+                # pass the signal providers so a processor's source parameter renders
+                # the SAME nested-by-producer picker the logic-node Edit uses --
                 # not a flat/empty combo (every signal picker is the nested form, everywhere).
                 self.source_form = MeasurementPanel(
                     [source_spec], single=True, controls=False,
@@ -6643,10 +6586,9 @@ class TaskConsole(QtWidgets.QWidget):
         # every update_ms // base ticks.  _tick_count counts base ticks since the last re-base.
         self._tick_count = 0
         self._base_interval_ms = int(self.state.interval_ms)
-        # Display reads each signal at its OWN latest value (one snapshot per tick).  Cross-signal coherence
-        # where it matters is FREE: a readout processor co-publishes occupied + centres + frame_judged in one
-        # publish, so their latest values are always the same physical shot (sitemap rings == frame_judged
-        # underlay == frame_judged 2D).  A live camera repeat block shows its newest, fullest ring -> live.
+        # Display reads each signal at its own latest value.  A producer that owns
+        # related view signals publishes them atomically, so companion values remain
+        # shot-coherent without console-side joins.
 
         # The ONE background render thread: every steady-tick compose (numpy prep + matplotlib
         # artist updates + Agg rasterisation) runs there; the GUI thread only schedules, presents
@@ -7304,11 +7246,10 @@ class TaskConsole(QtWidgets.QWidget):
         = same shot).  This is the #6 "one signal" wiring: the user picks occupancy, the
         rest auto.
 
-        The producing node is found among the ACTUAL running nodes first (the live-readout /
-        notebook path wires a reactive OccupancyProcessor straight into ``running_nodes``
-        without a Logic-tab row), reading the centres/underlay output names off the node
-        itself (``sitemap_centers_key`` / ``sitemap_image_key``).  A configured-but-not-yet-
-        started Logic-tab row is the fallback, resolved from its spec metadata."""
+        The producing node is found among actual running nodes first, reading the
+        centres/underlay output names from ``sitemap_centers_key`` and
+        ``sitemap_image_key``.  A configured-but-not-yet-started Logic-tab row is
+        the fallback, resolved from its spec metadata."""
         occ = str(occ_signal or "")
         if not occ:
             return (None, None)
@@ -7428,10 +7369,9 @@ class TaskConsole(QtWidgets.QWidget):
                 rows.append((f"{key} (result)", self._describe_from_schema(value, schema_of(key)), desc(key)))
             return rows
         # published_signals() are HUB names (incl. the node's disambiguating prefix when two
-        # nodes would collide).  Show the SHORT natural name (strip the prefix) -- "rate", not
-        # "judge_occupancy_rate" -- because the Logic row is already titled by the node.  NOTE
-        # output_specs (and so ``desc``) is keyed by the FULL published name (occupancy's
-        # ``p + "occupied"``, the camera's prefixed frame_i): look descriptions up by ``full``.
+        # nodes would collide).  Show the SHORT natural name (strip the prefix) because the
+        # Logic row is already titled by the node.  ``output_specs`` (and so ``desc``) is
+        # keyed by the FULL published name: look descriptions up by ``full``.
         pfx = str(getattr(node, "prefix", "") or "")
         for full in sorted(node.published_signals()):
             short = strip_node_prefix(full, pfx)             # ONE rule, shared with the picker nest
@@ -7624,9 +7564,8 @@ class TaskConsole(QtWidgets.QWidget):
         if schema is None or node is None:
             return None
         result = self._schema_structure(schema)
-        # A multidimensional TaskOutput point_shape is already the authoritative scan geometry.
-        # Do not borrow an unrelated node ``grid_shape`` (CalibrateReadoutTask uses that name for
-        # trap-site layout while its frame output correctly has point_shape=(1,)).
+        # A multidimensional TaskOutput point_shape is already the authoritative
+        # scan geometry; unrelated domain geometry must not override it.
         if len(schema.point_shape) > 1:
             result["grid_shape"] = tuple(schema.point_shape)
 
@@ -7727,8 +7666,7 @@ class TaskConsole(QtWidgets.QWidget):
                     tag = f"{tag} [{layer}]" if layer and layer != "node" else tag
                     note = "  ⚠ also from another node" if len(providers.get(name, [])) > 1 else ""
                     # The producing node is named to the RIGHT of the arrow, so the signal need
-                    # not repeat its prefix: show "rate ← occupancy", not "judge_occupancy_rate ←
-                    # occupancy" -- the ONE strip_node_prefix rule the nested combo uses.
+                    # not repeat its prefix -- the ONE strip_node_prefix rule the nested combo uses.
                     short = strip_node_prefix(name, getattr(src, "prefix", ""))
                     parts.append(f"{short} ← {tag}{note}")
                 else:
@@ -8121,7 +8059,7 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _unique_logic_title(self, title: str) -> str:
         """Make a logic-node title ``"<base> #N"`` and UNIQUE among the existing Logic rows
-        (G1) -- so two same-kind nodes (two ``Judge occupancy``) are told apart in the Logic
+        (G1) -- so two same-kind nodes are told apart in the Logic
         rows AND get distinct per-instance signal prefixes (see _logic_node_prefix).  Re-indexes
         a loaded title's root, so an already-clean saved layout round-trips."""
         return indexed_unique_name(title, {str(r.node.title) for r in self.logic_nodes})
@@ -8182,8 +8120,8 @@ class TaskConsole(QtWidgets.QWidget):
             except Exception:
                 pass
         # A RESTART reclaims its OWN lingering signals -- they are not a collision (#issue-1): without
-        # this, restarting the only occupancy node sees its own STOPPED 'occupied' still in the hub, takes
-        # a fresh 'judge_occupancy_2_' prefix, and every panel bound to 'occupied' goes UNBOUND.  Its
+        # this, restarting a node sees its own STOPPED outputs still in the hub, takes a fresh
+        # numbered prefix, and every panel bound to the original names goes UNBOUND.  Its
         # prior built node survives Stop in _last_node tagged with instance_label == this node's title.
         # (The same rule is what lets a row SWITCH its camera device and restart: the row keeps its
         # signal names, the new device's frames simply flow under them -- panels follow seamlessly.)

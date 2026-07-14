@@ -66,7 +66,7 @@ def test_gui_namespace_layers_the_one_helper_set_and_excludes_it_from_references
         exp.close()
 
 
-def test_task_frame_source_and_injection_share_one_constant():
+def test_task_mid_run_source_and_injection_share_one_constant():
     """#24: the task mid-run panel's source expression and the namespace injection read the
     SAME reserved key -- a drift between them would blank the panel silently."""
     from Zou_lab_control.frontend.task_console import TASK_FRAME_KEY, MID_RUN_TAG
@@ -74,7 +74,7 @@ def test_task_frame_source_and_injection_share_one_constant():
     exp = na.connect("virtual")
     con = make_console(exp)
     try:
-        taskrow = add_logic_row(con, ("task", "Calibrate readout"))
+        taskrow = add_logic_row(con, ("task", "Optimize MOT field"))
         node = con._build_logic_node(taskrow.node, dict(taskrow.node.values))  # build only, no run
         spec = con._spec_for_logic(taskrow.node)
         cfg = con._task_mid_run_config(spec, node, title="Task: t")
@@ -88,33 +88,30 @@ def test_task_frame_source_and_injection_share_one_constant():
         exp.close()
 
 
-def test_calibrate_task_panel_consumes_typed_task_output_with_schema_and_validity():
-    """The off-hub task channel is still a canonical typed source: a raw ``(H,W)`` publish becomes
-    ``(1,1,H,W)``, the generic 2-D card receives its schema + validity, and builds the real image."""
+def test_task_panel_consumes_typed_task_output_with_schema_and_validity():
+    """The off-hub task channel remains a canonical typed source."""
     from Zou_lab_control.frontend.task_console import SIG_VALID_KEY, TASK_FRAME_KEY
 
     exp = na.connect("virtual")
     con = make_console(exp)
     try:
-        row = add_logic_row(con, ("task", "Calibrate readout"))
+        row = add_logic_row(con, ("task", "Optimize MOT field"))
         node = con._build_logic_node(row.node, dict(row.node.values))
         con._set_task_running(row, node)
-        frame_shape = tuple(node.camera.frame_shape)
-        raw = np.arange(np.prod(frame_shape), dtype=np.uint16).reshape(frame_shape)
-        node.output.publish(frame=raw)
+        raw = np.arange(np.prod(node.grid_shape), dtype=float).reshape(1, -1, 1)
+        node.output.publish(grid=raw)
         con._refresh_task_panel()
 
-        tensor = node.output.latest_tensor("frame")
-        assert tensor.shape == (1, 1, *frame_shape)
+        tensor = node.output.latest_tensor("grid")
+        assert tensor.shape == raw.shape
         structure = con._signal_structure(TASK_FRAME_KEY)
-        assert structure["points_shape"] == (1,)
-        assert structure["data_shape"] == frame_shape
+        assert structure["points_shape"] == node.grid_shape
+        assert structure["data_shape"] == (1,)
         namespace = con._expression_namespace()
         np.testing.assert_array_equal(namespace[TASK_FRAME_KEY], tensor.data)
         np.testing.assert_array_equal(namespace[SIG_VALID_KEY][TASK_FRAME_KEY], tensor.valid)
         assert con._task_card._bound_structure() == structure
         assert con._task_card.plotter is not None
-        assert con._task_card.plotter.grid.shape == frame_shape
     finally:
         con.shutdown()
         exp.close()

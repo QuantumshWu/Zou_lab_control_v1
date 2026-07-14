@@ -40,7 +40,7 @@ def _whitelisted_kinds() -> set[str]:
     # whitelist, so a kind survives this loop iff ParamDecl accepts it.
     candidates = [
         "float", "int", "axis_range", "bool", "choice", "text", "json", "device", "path",
-        "signal", "signal_expr", "pulse_param", "pulse_slots",
+        "signal", "signal_expr", "pulse_slots",
         # decoys that must NOT be accepted (guards the probe itself)
         "bogus", "image", "spinbox",
     ]
@@ -69,6 +69,14 @@ def test_every_paramdecl_kind_has_a_handler():
     # and the registry carries nothing for a kind ParamDecl would reject
     extra = sorted(set(PARAM_WIDGETS) - whitelist)
     assert not extra, f"PARAM_WIDGETS has handlers for non-whitelisted kinds: {extra}."
+
+
+def test_removed_pulse_param_kind_is_rejected_but_pulse_slots_remains():
+    from Zou_lab_control.neutral_atom.core.params import ParamDecl
+
+    assert ParamDecl("slots", "slots", "pulse_slots").kind == "pulse_slots"
+    with pytest.raises(ValueError, match="ParamDecl.kind"):
+        ParamDecl("old", "old", "pulse_param")
 
 
 def test_handler_is_abstract_over_all_five_ops():

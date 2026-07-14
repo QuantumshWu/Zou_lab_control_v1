@@ -8,9 +8,8 @@ model + its evaluation so there is exactly ONE implementation -- the slot-packin
 (scalar for one slot, list for many) and the ``value = ...`` contract live here, never
 re-rolled per call site.
 
-Dependency-free (no frontend, no backend, reads no simulation ground truth), so both the
-analysis layer (``OccupancyProcessor``, ``PulseScanNode``) and the GUI (the panel Setting
-and the measurement param form) import this one definition.
+Dependency-free (no frontend, no backend, reads no simulation ground truth), so both
+stream processors and the GUI import this one definition.
 """
 
 from __future__ import annotations

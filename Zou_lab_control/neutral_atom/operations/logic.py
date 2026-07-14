@@ -6,22 +6,13 @@ consumer).  There are three KINDs, all sharing the :class:`LogicNode` loop:
 * :class:`Measurement` -- drives a device acquisition loop and publishes named
   signals (e.g. a camera :class:`CameraMeasurement` publishing one ``frame_i`` per
   emCCD event, or a swept :class:`ScannedMeasurementNode`);
-* :class:`Processor` -- a reactive TRANSFORM node with no acquisition of its own
-  (the "func" layer): it consumes hub signals and republishes derived ones, e.g.
-  :class:`OccupancyProcessor` running the SAME ``calibration.detect`` contract the
-  real readout uses, frame_0 -> occupancy/counts/rate;
-* :class:`Task` -- a one-shot orchestration (e.g. :class:`CalibrateReadoutTask`,
-  which produces a ``TrapCalibration`` + an npz artifact and streams its template
-  frames to a mid-run output panel).
+* :class:`Processor` -- a reactive transform with no acquisition of its own: it
+  consumes hub signals and republishes derived values;
+* :class:`Task` -- a one-shot orchestration with typed mid-run output.
 
-The loading readout is COMPOSED by the user from these primitives -- a camera
-Measurement publishing ``frame_0`` + an OccupancyProcessor turning ``frame_0`` into
-occupancy/counts/rate, with calibration produced by a CalibrateReadoutTask.  No
-monolithic node fabricates every signal: each layer is independent and explicitly
-wired by the notebook or task console.  Every logic node touches only the camera
-CONTRACT (``camera.acquire(...)``) and backend-neutral helpers, so the SAME nodes
-run on a ``VirtualCamera`` offline and on a real qCMOS -- only the data source
-changes.  That is the "virtual == real" core principle (AGENTS.md §2).
+Each node owns one acquisition or transformation concern and communicates through
+the hub.  Hardware-facing nodes use the same narrow device contracts for virtual
+and real adapters; only the data source changes.
 
 Logic nodes run either synchronously (call ``step()`` yourself: deterministic tests)
 or in a background thread (``start()``); the hub is the only shared state.  The
@@ -40,14 +31,11 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
-from Zou_lab_control._paths import CALIBRATION_DIR
 from ..devices.base import EXCLUSIVE, OBSERVE
-from ..core.analysis import grid_shape_tuple
 from ..core.signals import (
     NO_LINEAGE,
     SignalHub,
@@ -63,9 +51,8 @@ from .measurement import (
     prepare_hardware_scan,
     program_completion_timeout,
     reducer_data_shape,
-    triggered_frames,
 )
-from .signal_expr import DEFAULT_SOURCE, ProcessorSignalSnapshot, SignalExpr, hub_namespace
+from .signal_expr import ProcessorSignalSnapshot, SignalExpr
 
 # The background loop's ONLY two time constants -- and NEITHER is an acquisition-rate cap.  A pass that
 # published (an acquiring measurement, a reactive processor whose input advanced) loops immediately, so
@@ -314,9 +301,9 @@ class LogicNode:
     def display_label(self) -> str:
         """Short human name for this logic node in the GUI -- a per-instance
         ``instance_label`` (set from the node's row title) if given, else its LAYER node
-        name (``camera`` / ``occupancy`` / ``calibrate`` / a measurement's curve), NEVER the
-        Python class name.  The instance label lets two same-kind nodes (e.g. two occupancy
-        judges) be told apart; the hub prefix is a signal-namespacing detail, not the label
+        name (``camera`` / ``analysis`` / a measurement's curve), NEVER the
+        Python class name.  The instance label lets two same-kind nodes be told apart;
+        the hub prefix is a signal-namespacing detail, not the label
         (the namespaced signal names shown alongside also disambiguate A/B)."""
         return str(self.instance_label or self.node_label)
 
@@ -1047,212 +1034,6 @@ class Processor(LogicNode):
         return frozenset(str(key) for key in self.output_keys())
 
 
-class OccupancyProcessor(Processor):
-    """Per-frame atom detection as a live graph node -- the REAL readout pipeline.
-
-    Consumes a camera ``frame`` BLOCK and runs the SAME ``calibration.detect``
-    contract the notebook/real readout uses, judging EACH repeat slice.  THIS is the
-    virtual==real split: the camera produces frames (a Measurement); detection is a
-    SEPARATE node here -- not one node fabricating every signal.  The calibration (site
-    centers + per-site thresholds) comes from a prior calibrate-readout Task, exactly
-    as on real hardware.
-
-    It preserves every valid physical ``(R,P)`` input cell and the canonical
-    ``(R,P,*data_shape)`` layout.  Camera ``data_shape=(H,W)`` becomes occupancy/count/rate
-    ``data_shape=(N,)``, ``(N,)``, and ``(1,)``; ``frame_judged`` retains ``(H,W)``.
-    Logical multi-dimensional point geometry is carried by SignalSchema and only
-    flattened on the physical P axis.  Static calibration geometry is still a
-    physical tensor with no scan: centers ``(1,1,N,2)`` and thresholds
-    ``(1,1,N)``.  Site is data, never a sampling-point axis."""
-
-    node_label = "occupancy"
-    # ``frame_judged`` = the EXACT block this occupancy was computed from, republished so
-    # the site map's underlay is the SAME shots as the rings (the camera keeps streaming
-    # newer frames on its own thread; using the live camera frame would offset the rings).
-    # ``rate`` (scalar) = the loading fraction of THIS block (mean occupancy over its sites x
-    # shots) -- a single number per tick, so a Rolling-trace monitor draws the loading rate vs
-    # time and a pulse scan reads it as the swept y.  Per-site loading PROBABILITY is NOT a
-    # separate signal: it is ``repeat_mode=average`` over ``occupied`` (and the 2-D site map via
-    # grid_shape) -- one mechanism, not a duplicated in-node accumulator.
-    provides = ("occupied", "counts", "rate", "centers", "thresholds", "frame_judged")
-    # The site map takes ONE signal (an occupancy vector this node publishes) and resolves
-    # its ring CENTRES + frame UNDERLAY from the SAME node: these name the two outputs that
-    # carry them.  THIS is the single source -- the panel layer (ProcessorSpec.metadata) and
-    # the console's site-map resolver both read these, so "one signal" wiring never drifts.
-    sitemap_centers_key = "centers"
-    sitemap_image_key = "frame_judged"
-
-    def __init__(self, hub: SignalHub, *, calibration=None, calibration_source=None,
-                 session_calibration=None, source_expr=None,
-                 grid_shape: tuple[int, int] | None = None,
-                 method: str | None = None, prefix: str = ""):
-        # The frame to judge is a signal expression -- the SAME universal multi-slot signal +
-        # ``value = ...`` mechanism every source field uses (default = the camera's first emCCD
-        # event, ``frame_0``).  ``consumes`` (what makes the node reactive) is the picked input
-        # names, so the node re-judges when any of them advances.  Its ``value`` must evaluate to
-        # ONE (H×W) frame; an empty pick falls back to ``frame_0``.
-        expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
-        if not expr.inputs:
-            expr = SignalExpr([FRAME_0], DEFAULT_SOURCE)
-        super().__init__(hub, consumes=tuple(expr.inputs), prefix=prefix)
-        self.source_expr = expr
-        self.calibration = calibration
-        # Optional lazy source: a callable -> calibration (or None while a calibrate
-        # task is still running on its own thread).  Lets the live readout stream
-        # WITHOUT blocking the GUI on calibration -- the detector simply no-ops until
-        # the calibration is ready, then picks it up.
-        self.calibration_source = calibration_source
-        # Optional getter for the LIVE session calibration (built from THIS camera's ROI, so it
-        # matches the live frame).  Used as a fallback when the loaded FILE calibration's ROI does
-        # NOT match the frame (a stale calibration.json from a different camera shape): rather than
-        # raise every shot and wedge the whole readout, the node switches to the matching session
-        # calibration so occupancy / rate keep flowing.
-        self.session_calibration = session_calibration
-        self.grid_shape = None if grid_shape is None else grid_shape_tuple(grid_shape)
-        # The READOUT method (box / per-site PSF / ...) is chosen HERE, not at calibration
-        # time: one calibration carries every method's geometry + thresholds, and the
-        # processor picks which to read with (None = the calibration's default).
-        self.method = None if method in (None, "") else str(method)
-        # Dynamic dimensions are owned by this producer instance.  The calibration
-        # usually supplies N/H/W immediately; the first valid input binds anything
-        # not known at construction before the hub sees a publication.
-        centers = np.asarray(getattr(calibration, "centers", ()))
-        n_sites = int(centers.shape[0]) if centers.ndim == 2 and centers.shape[1:] == (2,) else 1
-        image_shape = tuple(int(n) for n in (getattr(calibration, "metadata", {}) or {}).get(
-            "image_shape", ()))
-        self._point_shape: tuple[int, ...] = (1,)
-        self._site_shape: tuple[int, ...] = (max(1, n_sites),)
-        self._frame_shape: tuple[int, ...] = image_shape if len(image_shape) == 2 else (1, 1)
-        self._output_repeat_capacity = 1
-
-    def _resolve_calibration(self):
-        if self.calibration is None and self.calibration_source is not None:
-            self.calibration = self.calibration_source()
-        return self.calibration
-
-    def transform(self, inputs: dict[str, object]) -> dict[str, object]:
-        calibration = self._resolve_calibration()
-        if calibration is None:
-            return {}
-        block = np.asarray(self.source_expr.evaluate(hub_namespace(self.hub, inputs)))
-        if block.ndim != 4:
-            raise ValueError(
-                f"occupancy source must preserve canonical (R,P,*data_shape) axes with "
-                f"data_shape=(H,W); got {block.shape}.  "
-                "Indexing away R/P in a signal expression is not allowed.")
-
-        repeats, points, height, width = (int(n) for n in block.shape)
-        valid = self.input_validity((repeats, points))
-        if not np.any(valid):
-            return {}
-
-        centers = np.asarray(calibration.centers, dtype=float)
-        if centers.ndim != 2 or centers.shape[1:] != (2,) or centers.shape[0] < 1:
-            raise ValueError(
-                f"occupancy calibration centers must have shape (N,2), got {centers.shape}.")
-        n_sites = int(centers.shape[0])
-        occupied = np.full((repeats, points, n_sites), np.nan, dtype=float)
-        counts = np.full_like(occupied, np.nan)
-        thresholds = None
-
-        for repeat_index in range(repeats):
-            for point_index in range(points):
-                if not valid[repeat_index, point_index]:
-                    continue
-                image = np.asarray(block[repeat_index, point_index], dtype=float)
-                try:
-                    detection = calibration.detect(image, method=self.method)
-                except ValueError as exc:
-                    fallback = self.session_calibration() if callable(self.session_calibration) else None
-                    if fallback is None or fallback is calibration:
-                        raise ValueError(
-                            f"Judge occupancy: the loaded calibration does not fit this frame "
-                            f"(frame {image.shape}, method {self.method or 'default'}): {exc}.  "
-                            "Recalibrate for this camera or select the matching calibration.") from exc
-                    detection = fallback.detect(image, method=self.method)
-                    self.calibration = calibration = fallback
-                    centers = np.asarray(calibration.centers, dtype=float)
-                    if centers.shape != (n_sites, 2):
-                        raise ValueError(
-                            "fallback calibration changes the site count within one tensor update; "
-                            "restart the processor so the schema change is explicit.")
-
-                occ = np.asarray(detection.occupied, dtype=float).reshape(-1)
-                cnt = np.asarray(detection.counts, dtype=float).reshape(-1)
-                thr = np.asarray(detection.thresholds, dtype=float).reshape(-1)
-                if occ.shape != (n_sites,) or cnt.shape != (n_sites,) or thr.shape != (n_sites,):
-                    raise ValueError(
-                        "calibration.detect returned a site vector inconsistent with centers: "
-                        f"occupied={occ.shape}, counts={cnt.shape}, thresholds={thr.shape}, N={n_sites}.")
-                occupied[repeat_index, point_index] = occ
-                counts[repeat_index, point_index] = cnt
-                thresholds = thr
-
-        if thresholds is None:
-            return {}
-        finite = np.isfinite(occupied)
-        denominator = np.sum(finite, axis=-1, keepdims=True)
-        rate = np.divide(
-            np.nansum(occupied, axis=-1, keepdims=True),
-            denominator,
-            out=np.full((repeats, points, 1), np.nan, dtype=float),
-            where=denominator > 0,
-        )
-
-        self._point_shape = self.input_point_shape(points)
-        self._site_shape = (n_sites,)
-        self._frame_shape = (height, width)
-        self._output_repeat_capacity = self.input_repeat_capacity()
-        specs = {spec.name: spec for spec in self._bare_output_specs()}
-
-        def tensor(name: str, data: np.ndarray, mask: np.ndarray) -> SignalTensor:
-            schema = specs[name].to_schema(dtype=data.dtype)
-            return SignalTensor(data, schema, valid=mask)
-
-        static_valid = np.ones((1, 1), dtype=bool)
-        return {
-            "occupied": tensor("occupied", occupied, valid),
-            "counts": tensor("counts", counts, valid),
-            "rate": tensor("rate", rate, valid),
-            "centers": tensor("centers", centers.reshape(1, 1, n_sites, 2), static_valid),
-            "thresholds": tensor(
-                "thresholds", thresholds.reshape(1, 1, n_sites), static_valid),
-            "frame_judged": tensor("frame_judged", block, valid),
-        }
-
-    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
-        """Complete typed schemas for every occupancy output."""
-        sites = self._site_shape
-        frame = self._frame_shape
-        points = self._point_shape
-        repeat_capacity = self._output_repeat_capacity
-        return (
-            SignalSpec("occupied", "occupancy", "",
-                       "per-site occupancy (0/1) for every valid repeat/point cell",
-                       points_shape=points, data_shape=sites, dtype=np.float64,
-                       repeat_capacity=repeat_capacity),
-            SignalSpec("counts", "readout counts", "",
-                       "per-site integrated readout signal for every valid repeat/point cell",
-                       points_shape=points, data_shape=sites, dtype=np.float64,
-                       repeat_capacity=repeat_capacity),
-            SignalSpec("rate", "loading rate", "",
-                       "per-cell mean occupancy across sites",
-                       points_shape=points, data_shape=(1,), dtype=np.float64,
-                       repeat_capacity=repeat_capacity),
-            SignalSpec("centers", "site centre", "px", "site centres in camera pixels",
-                       points_shape=(1,), data_shape=(*sites, 2), dtype=np.float64,
-                       repeat_capacity=1),
-            SignalSpec("thresholds", "threshold", "counts", "per-site bright/dark threshold",
-                       points_shape=(1,), data_shape=sites, dtype=np.float64,
-                       repeat_capacity=1),
-            SignalSpec("frame_judged", "camera image", "counts",
-                       "the EXACT frame this occupancy was judged from -- shot-locked to occupied/centers "
-                       "(one atomic publish).  Use THIS for a 2D readout image that matches the site map "
-                       "(same shot); the camera's live `frame` advances independently and is NOT shot-locked.",
-                       points_shape=points, data_shape=frame,
-                       repeat_capacity=repeat_capacity,
-                       history=IMAGE_STREAM_HISTORY),
-        )
 
 
 class TaskOutput:
@@ -1386,10 +1167,9 @@ class Task(OneShotNode):
 
     layer = "task"
     node_label = "task"
-    # A task orchestrates the full shot flow (arm the camera, fire the sequencer) -- both
-    # shipped tasks (calibrate readout, MOT-field optimize) drive both.  A future task that
-    # merely RECORDS a device declares it OBSERVE instead (holding is not occupying, and
-    # the base then narrows it to the read-only view).
+    # A hardware task may orchestrate the full shot flow (arm a camera, fire a
+    # sequencer).  A task that merely records a device declares it OBSERVE instead
+    # (holding is not occupying, and the base then narrows it to the read-only view).
     _devices = {"camera": EXCLUSIVE, "sequencer": EXCLUSIVE}
     provides: tuple[str, ...] = ()
     # Signals the task streams to its dedicated MID-RUN output panel (via TaskOutput)
@@ -1417,518 +1197,6 @@ class Task(OneShotNode):
         # specs stay keyed by the BARE ``provides`` / ``mid_run`` names the console documents
         # them under.  (published_signals is the base's empty bare set -- no hub names.)
         return self._bare_output_specs()
-
-
-class CalibrateReadoutTask(Task):
-    """Acquire frames and run the REAL sitemap + per-site threshold calibration,
-    producing a ``TrapCalibration`` as a first-class Task.  Mid-run it publishes the
-    template + a sample frame and a
-    progress fraction to a dedicated panel.  The resulting calibration is held on
-    ``self.calibration`` (and optionally saved to ``save_path`` as an ``npz``) for a
-    downstream :class:`OccupancyProcessor`.  Same primitives as the real readout
-    (``calibrate_sitemap_from_images`` / ``calibrate_threshold_from_images``), so it
-    is identical on real hardware -- only the camera frames differ."""
-
-    node_label = "calibrate"
-    provides = ("centers", "thresholds", "n_sites")
-    mid_run = ("frame", "progress", "stage")   # streamed to the dedicated mid-run panel + banner
-
-    # The imaging bracket's three exposure cells, tagged by API slot -- the ONE source for the
-    # role<->slot-name convention.  BOTH the exposure WRITER (_collect_bracket_groups sets each cell
-    # by name) and the short-readout-frame FINDER (_imaging_layout) read it, so renaming a slot can
-    # never desync the two sides (was: "a1"/"a2"/"a3" hand-typed on both sides + in the error text).
-    _EXPOSURE_SLOTS = {"reference_1": "a1", "readout": "a2", "reference_2": "a3"}
-
-    # The imaging pulse TEMPLATE the cali loads -- a REAL, inspectable program that IS the
-    # long-short-long bracket (3 emCCD frames in one cooling cycle), not a single window the
-    # task secretly unrolls.  A bare name resolves to the shipped ``pulses/`` template; an
-    # absolute path to the user's own PulseTableState .json.  Each cali pass LOADS it and sets
-    # ONLY the three exposure cells BY NAME -- API slots a1/a3 receive the long reference value,
-    # and a2 receives the short readout value -- so what is fired == the template file.  The cali does not choose a
-    # readout METHOD: it computes ALL methods (box / per-site PSF / uniform PSF) and the
-    # OccupancyProcessor picks one.
-    # The ONE canonical default imaging-template path (the cali task spec + the generic
-    # Pulse-scan measurement both reference THIS, so every GUI form shows the same real,
-    # project-relative ``pulses/imaging_template.json`` -- never a bare name that the path
-    # widget would anchor to the project ROOT and display as a non-existent file).
-    DEFAULT_PULSE_TEMPLATE = "pulses/imaging_template.json"
-
-    @classmethod
-    def _resolve_template(cls, pulse_template, sequencer=None):
-        """Load the imaging template via the ONE shared FIREABLE resolver (the given path if real,
-        else the same-named file shipped under the project ``pulses/`` folder -- where the pulse GUI
-        saves and the Browse dialog opens, so the default ``pulses/imaging_template.json`` is a REAL
-        inspectable file -- else the in-memory long-short-long default).  Fireable = the authoring
-        grid is snapped to the HARDWARE tick, read from the connected ``sequencer`` when given (the
-        cali run passes its own) -- an old save with a finer ``time_step_ns`` would otherwise fail
-        the clock-grid validation the moment the exposures are set.  The GUI slot preview passes no
-        sequencer and gets the streamer-config default grid, same as every other fire path."""
-        from ..timing import default_imaging_template, resolve_fireable_template
-        return resolve_fireable_template(pulse_template, default_name=cls.DEFAULT_PULSE_TEMPLATE,
-                                         default_factory=default_imaging_template, sequencer=sequencer)
-
-    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
-        """What the calibration PRODUCES (off the hub) + streams mid-run -- keyed by the
-        bare ``provides`` / ``mid_run`` names."""
-        if str(getattr(self, "source", "")) == "saved frames":
-            # The selected run, not the connected camera, owns the saved-frame schema.  RunIndex
-            # reads this shape while indexing paths, before TaskOutput registers its immutable
-            # signal contract, so a 96x128 run cannot be mislabeled as the live camera's 48x60.
-            frame_shape = tuple(int(n) for n in self._index_saved_run().image_shape)
-        else:
-            frame_shape = tuple(int(n) for n in (
-                getattr(getattr(self, "camera", None), "frame_shape", ()) or ()))
-        if len(frame_shape) != 2 or any(n < 1 for n in frame_shape):
-            frame_shape = (1, 1)
-        grid = tuple(int(n) for n in getattr(self, "grid_shape", (1, 1)))
-        n_sites = max(1, int(np.prod(grid, dtype=np.int64)))
-        return (
-            SignalSpec(
-                "frame", "reference frame", "counts",
-                "long-exposure template frame (streamed live)",
-                points_shape=(1,), data_shape=frame_shape,
-                repeat_capacity=1, history=IMAGE_STREAM_HISTORY),
-            SignalSpec(
-                "progress", "progress", "", "task completion fraction",
-                dtype=np.float64, repeat_capacity=1),
-            SignalSpec(
-                "centers", "site centres", "px", "fitted site coordinates",
-                points_shape=(1,), data_shape=(n_sites, 2),
-                dtype=np.float64, repeat_capacity=1),
-            SignalSpec(
-                "thresholds", "threshold", "counts", "per-site bright/dark threshold",
-                points_shape=(1,), data_shape=(n_sites,),
-                dtype=np.float64, repeat_capacity=1),
-            SignalSpec(
-                "n_sites", "site count", "", "number of trap sites found",
-                dtype=np.float64, repeat_capacity=1),
-        )
-
-    def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
-                 grid_shape: tuple[int, int] = (5, 7), roi_radius: int = 1,
-                 reference_exposure: float = 0.020,
-                 readout_exposure: float = 0.005,
-                 pulse_template: str = DEFAULT_PULSE_TEMPLATE,
-                 threshold_frames: int = 100,
-                 threshold_method: str = "otsu",
-                 source: str = "live", folder: str = CALIBRATION_DIR,
-                 save_frames: bool = True,
-                 calibration_sink=None, prefix: str = ""):
-        super().__init__(hub, prefix=prefix)
-        self.camera = camera
-        self.sequencer = sequencer
-        # Where the finished calibration is HANDED BACK to: set by readout.calibrate_task
-        # to write the session calibration (``readout.current``), so a decoupled live
-        # OccupancyProcessor picks it up the instant this task completes -- the
-        # "cali -> occupancy" wiring with NO path to type (the bug this fixes: the task
-        # produced a calibration but never published it, so occupancy stayed on a stale /
-        # empty calibration and showed no sites).
-        self.calibration_sink = calibration_sink
-        self.grid_shape = grid_shape_tuple(grid_shape)
-        self.roi_radius = int(roi_radius)
-        # The Rb87 reference bracket comes from the TEMPLATE (a literal long-short-long), and these
-        # two operator-set exposures only set its frame DURATIONS by name (exactly as the real rb87
-        # readout sets a 20 ms reference + a 5 ms readout): ``reference_exposure`` is the LONG frame
-        # (high-SNR -> votes ground truth + builds the site map / PSF; written to API slots ``a1``
-        # and ``a3``, the two long reference exposures of the long-short-long bracket) and
-        # ``readout_exposure`` is the SHORT readout frame (its per-site thresholds are learnt; API
-        # slot ``a2``).  ``_collect_bracket_groups`` does set_api(a1, long) / set_api(a2, short) /
-        # set_api(a3, long) -- it changes ONLY those durations, never the structure, so what is
-        # fired == the template file.
-        self.reference_exposure = float(reference_exposure)
-        self.readout_exposure = float(readout_exposure)
-        self.pulse_template = str(pulse_template or self.DEFAULT_PULSE_TEMPLATE)
-        self.threshold_frames = max(2, int(threshold_frames))
-        self.threshold_method = str(threshold_method)
-        # ONE folder for input + output (no blank paths); ``source`` decides how it's used.
-        # Anchor a relative folder to the PROJECT root (not the volatile CWD) so the data +
-        # report land where the GUI field says they do, wherever Python was launched.
-        from Zou_lab_control._paths import resolve_under_project
-        self.source = str(source)
-        self.folder = str(resolve_under_project(folder or "calibrations"))
-        # source=live: also SAVE the acquired raw frames to ``folder`` (img1.npy, ...) so a
-        # later source="saved frames" run re-calibrates from them without re-acquiring.
-        self.save_frames = bool(save_frames)
-        self.calibration = None
-
-    def acquisition_parameters(self) -> dict[str, object]:
-        """The calibrate task's tunable parameters (source + folder + pulse template +
-        exposures + grid + frame counts + threshold), as ``{name: current}`` -- shown in
-        the panel's Edit and applied before the next Run.  Every value is concrete (no
-        blank): the pulse template + folder read back as their paths.  The cali computes
-        every readout method into one calibration; the OccupancyProcessor chooses which to
-        read with (box / per-site PSF / uniform PSF), so there is no readout-method param here."""
-        return {
-            "source": str(self.source),
-            "folder": str(self.folder),
-            "save_frames": bool(self.save_frames),
-            "pulse_template": str(self.pulse_template),
-            "grid_shape": tuple(self.grid_shape),
-            "reference_exposure": float(self.reference_exposure),
-            "readout_exposure": float(self.readout_exposure),
-            "roi_radius": int(self.roi_radius),
-            "threshold_frames": int(self.threshold_frames),
-            "threshold_method": str(self.threshold_method),
-        }
-
-    def set_acquisition_parameters(self, **values) -> None:
-        if "source" in values:
-            self.source = str(values["source"])
-        if "folder" in values:
-            self.folder = str(values["folder"]) or "calibrations"
-        if "save_frames" in values:
-            self.save_frames = bool(values["save_frames"])
-        if "pulse_template" in values:
-            self.pulse_template = str(values["pulse_template"]) or self.DEFAULT_PULSE_TEMPLATE
-        if "grid_shape" in values:
-            self.grid_shape = grid_shape_tuple(values["grid_shape"])
-        if "reference_exposure" in values:
-            self.reference_exposure = float(values["reference_exposure"])
-        if "readout_exposure" in values:
-            self.readout_exposure = float(values["readout_exposure"])
-        if "roi_radius" in values:
-            self.roi_radius = int(values["roi_radius"])
-        if "threshold_frames" in values:
-            self.threshold_frames = max(2, int(values["threshold_frames"]))
-        if "threshold_method" in values:
-            self.threshold_method = str(values["threshold_method"])
-
-    def run(self, out: "TaskOutput") -> dict:
-        # TWO sources, both of which BUILD a calibration: a LIVE acquisition (camera + pulse
-        # template) or SAVED FRAMES on disk.  Reusing an already-saved calibration is NOT a
-        # calibration run -- the Judge-occupancy processor loads its calibration.json directly,
-        # so there is no "saved calibration" source here (that was a category error).
-        if str(self.source) == "saved frames":
-            calibration = self._run_from_folder(out)
-        else:
-            calibration = self._run_live(out)
-        self.calibration = calibration
-        self._adopt()                            # hand the calibration to the session NOW
-        centers = np.asarray(self.calibration.centers, dtype=float)
-        thr = np.asarray(self.calibration.thresholds, dtype=float).reshape(-1)
-        # Write the CANONICAL latest calibration to ``<folder>/calibration.json`` -- the stable,
-        # named file the Judge-occupancy processor defaults to, so calibrate-then-judge wires up
-        # with NO path typed yet the file in use is always named.
-        try:
-            Path(self.folder).mkdir(parents=True, exist_ok=True)
-            self.calibration.save(Path(self.folder) / "calibration.json")
-        except Exception:
-            pass
-        # ALWAYS write the rb87-style report (per-site distribution + fidelity + site map +
-        # the loadable calibration.json/npz) DIRECTLY into the user's EXPLICIT ``folder`` --
-        # ONE place, alongside calibration.json + any saved raw frames, with NO hidden
-        # timestamped sub-folder (the user picks the folder; re-running overwrites it, and a
-        # different run goes in a different folder -- explicit, never magic).
-        out.publish(progress=0.98, stage="writing distribution + fidelity report")
-        self.report = self._write_report(Path(self.folder))
-        folder = self.report.get("folder") if isinstance(self.report, dict) else None
-        out.publish(progress=1.0, stage=(f"saved report -> {folder or self.folder}"))
-        return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers)),
-                "report_dir": str(folder or self.folder)}
-
-    def _adopt(self) -> None:
-        """Hand the just-produced calibration to the session via ``calibration_sink`` so the
-        notebook API's ``readout.current`` reflects the latest calibration immediately (the
-        live OccupancyProcessor itself loads the canonical ``calibration.json`` this run also
-        writes -- an explicit named file, not an implicit session handoff)."""
-        if self.calibration_sink is not None and self.calibration is not None:
-            self.calibration_sink(self.calibration)
-
-    def _write_report(self, folder) -> dict:
-        """Write the per-site distribution / fidelity / site-map report for THIS run's
-        readout frames (no-op-safe if a folder run kept no frames)."""
-        from datetime import datetime
-        from .calibration_report import write_calibration_report
-        frames = list(getattr(self, "_readout_samples", []) or [])
-        if not frames:
-            return {}
-        # the reference brackets (if acquired) give the report ground-truth labels, so the
-        # per-method fidelity is held-out classification accuracy (distinct box / PSF / uniform),
-        # not the affine-invariant self-consistent estimate.
-        # Report the calibration's ACTUAL threshold method: after the held-out writeback it is
-        # "per_site_reference", not the pre-train otsu label -- so summary.json matches reality.
-        cal_method = self.calibration.metadata.get("threshold_method", self.threshold_method)
-        return write_calibration_report(
-            folder, calibration=self.calibration, readout_frames=frames,
-            template=getattr(self, "_reference_template", None),
-            threshold_method=cal_method,
-            reference_groups=getattr(self, "_reference_groups", None),
-            readout_by_group=getattr(self, "_readout_by_group", None),
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
-
-    def _run_live(self, out: "TaskOutput"):
-        """Acquire the Rb87 long-short-long reference brackets NOW and run the SAME sitemap +
-        per-site-threshold extraction the real readout uses.
-
-        ONE acquisition, ONE correlated dataset -- this mirrors the saved-frames flow exactly
-        (:meth:`_run_from_folder`), so live == saved.  Every shot fires the loaded imaging
-        template imaged long-short-long (e.g. 20ms-5ms-20ms): the two LONG reference frames
-        serve DOUBLE duty -- (a) they vote, by strict consensus, the ground-truth occupancy
-        that LABELS the middle short readout (a shot where the two long frames disagree is a
-        mid-readout atom-loss event, so it is discarded -- the "data cleaning" the long frames
-        exist for), AND (b) every long frame averages into the high-SNR template the site
-        centres + PSF are fitted from.  The short readout frames drive the box/PSF otsu
-        thresholds (calibrate once, read many ways).  There is NO separate site-finding pass:
-        the site map comes from the SAME bracket frames that vote the labels.  Identical on
-        real hardware (only the camera frames' author differs: virtual == real)."""
-        from .calibration import calibrate_all_methods_from_images
-        out.publish(progress=0.0, stage="loading reference brackets (long-short-long)")
-        # The rb87 calibration shot IS the long-short-long bracket (built from the loaded
-        # template -- its load + image structure, imaged at the long/short exposures).
-        ref_groups, readout_by_group = self._collect_bracket_groups(
-            out, progress_lo=0.0, progress_hi=0.9)
-        # The site map is built from EVERY long reference frame of the brackets (group-major) --
-        # the same frames that vote the per-site ground truth, exactly like the saved-frames flow.
-        template = [f for grp in ref_groups for f in grp]
-        samples = list(readout_by_group)
-        # Optionally SAVE the acquired raw frames so a later source="saved frames" run
-        # re-calibrates from them without re-acquiring (the "don't re-run every time" ask).
-        if self.save_frames:
-            self._save_live_frames(ref_groups, readout_by_group)
-        out.publish(progress=0.95, stage="finding sites + thresholds (box / PSF)")
-        calibration = calibrate_all_methods_from_images(
-            template, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
-            threshold_method=self.threshold_method, exposure=self.readout_exposure)
-        # Use the bracket-voted ground truth to train + write back each method's per-site
-        # boundary (so detect reads on it), and stash the groups for the held-out report.
-        calibration = self._apply_reference_thresholds(calibration, ref_groups, readout_by_group)
-        # Keep the readout frames + averaged template so run() can write the rb87-style report.
-        self._readout_samples = list(samples)
-        self._reference_template = (np.mean(np.asarray(template, dtype=float), axis=0)
-                                    if template else None)
-        return calibration
-
-    def _apply_reference_thresholds(self, calibration, ref_groups, readout_by_group):
-        """Score each readout method's HELD-OUT fidelity against the bracket-voted ground
-        truth and write the reference-trained per-site thresholds back into the calibration,
-        so a downstream ``OccupancyProcessor.detect`` reads on the trained boundary (not the
-        otsu quick split) -- the Rb87 "use the true labels to set where the boundary is" step.
-        A NaN (a site with too few labelled shots to train) falls back to the otsu threshold;
-        if there is no usable ground truth at all, ``_held_out_by_method`` returns ``{}`` and
-        the calibration keeps its otsu thresholds.  Stashes the groups + per-method report so
-        ``run()`` can write the held-out report.  Shared by the live and saved-frames flows."""
-        from .calibration_report import _held_out_by_method
-        self._reference_groups = list(ref_groups or [])
-        self._readout_by_group = list(readout_by_group or [])
-        self._method_fidelity = _held_out_by_method(calibration, self._reference_groups, self._readout_by_group)
-        if not self._method_fidelity:
-            return calibration
-        trained: dict[str, np.ndarray] = {}
-        for m, data in self._method_fidelity.items():
-            thr = np.asarray(data["thresholds"], dtype=float).reshape(-1)
-            fallback = np.asarray(calibration.thresholds_for(m), dtype=float).reshape(-1)
-            bad = ~np.isfinite(thr)
-            if np.any(bad):
-                thr = thr.copy()
-                thr[bad] = fallback[bad]
-            trained[m] = thr
-        return calibration.with_method_thresholds(trained, threshold_method="per_site_reference")
-
-    def _imaging_layout(self, state) -> int:
-        """WHICH captured frame is the short readout (the ``readout_index``), read from the loaded
-        imaging template: the camera-trigger periods IN FIRE ORDER are the frames, and the one
-        tagged API slot ``a2`` (the short readout) is the readout -- the rest are the long
-        references that vote ground truth (else the middle frame).  This is the cali's own
-        INTERPRETATION of its template; it does NOT tell the camera how many frames to take (the
-        camera captures one per trigger).  The cali images exactly the long-short-long the FILE
-        defines -- it does not invent a bracket."""
-        from ..devices.camera_trigger import resolve_camera_trigger_channels
-        # WHICH line gates a frame is the CAMERA's knowledge (it is wired to it), not the sequencer's
-        # -- resolved through the one camera->channels rule (never a re-spelled fallback).
-        raw_lanes = state.port_catalog.raw_lanes
-        trig = [c for c in resolve_camera_trigger_channels(self.camera) if c in raw_lanes]
-        bits = [raw_lanes.index(c) for c in trig]
-        frame_periods = [i for i, p in enumerate(state.periods) if any(p.states[b] for b in bits)]
-        if len(frame_periods) < 2:
-            raise ValueError(
-                "the imaging template must trigger the camera at least twice (>=1 long reference "
-                "frame + 1 short readout) -- a long-short-long bracket. Open the template in the "
-                "pulse GUI and add the camera-trigger frames.")
-        readout_slot = self._EXPOSURE_SLOTS["readout"]
-        a2 = {int(s.target) for s in state.api_slots if s.name == readout_slot and s.kind == "duration"}
-        return next((frame_periods.index(i) for i in frame_periods if i in a2), len(frame_periods) // 2)
-
-    def _collect_bracket_groups(self, out: "TaskOutput", *, progress_lo: float, progress_hi: float):
-        """Acquire ``threshold_frames`` reference BRACKETS.  Each bracket is ONE correlated
-        shot -- a long-short-long camera sequence imaging the SAME atom loading (the trap is
-        held on, no re-cooling between triggers, so a following frame sees the previous
-        frame's survivors).  Returns ``(reference_groups, readout_per_group)``:
-        ``reference_groups[g]`` is the long frames that vote ground truth, and
-        ``readout_per_group[g]`` is the short readout frame scored against them.  Honours the
-        Stop event between brackets (interruptible).  Identical on real hardware -- only the
-        camera frames' author differs (``virtual == real``)."""
-        # The imaging template IS the long-short-long bracket: ONE cooling/load cycle, then the
-        # camera-trigger frames back-to-back with trap-held gaps (no re-cooling between them, so
-        # the long frames bracket and label the SAME atoms).  The cali ONLY sets the exposures
-        # BY NAME -- each exposure cell has its own unique handle: a1 = first long reference,
-        # a2 = short readout, a3 = second long reference.  The two reference handles receive the
-        # same configured value; editing either exposure setting changes only those durations.
-        # What is fired == the template the operator chose: file == fired.
-        template = self._resolve_template(self.pulse_template, self.sequencer)
-        try:
-            # Each exposure cell carries its OWN api handle (names are unique, like the GUI
-            # allocates a fresh a<N> per click): a1 = first long, a2 = short readout, a3 =
-            # second long.  Cali sets all three by name; structure stays as loaded.
-            template.set_api(self._EXPOSURE_SLOTS["reference_1"], self.reference_exposure)
-            template.set_api(self._EXPOSURE_SLOTS["readout"], self.readout_exposure)
-            template.set_api(self._EXPOSURE_SLOTS["reference_2"], self.reference_exposure)
-        except ValueError as exc:
-            raise ValueError(
-                f"{exc}  The Calibrate task sets the imaging template's exposures by API slot: tag "
-                "the three exposure cells as a1 (first long), a2 (short readout), a3 (second long) "
-                "in the pulse GUI (click each duration cell to its API state).") from exc
-        readout_index = self._imaging_layout(template)        # WHICH frame is the short readout (a2)
-        self._readout_index = readout_index                    # shared with _save_live_frames
-        bracket = template.to_sequence(name="reference_bracket")
-        from ..devices.camera_trigger import count_camera_trigger_pulses
-        n_frames = max(1, count_camera_trigger_pulses(self.camera, bracket))
-        n_groups = max(2, int(self.threshold_frames))
-        reference_groups: list = []
-        readout_per_group: list = []
-        for g in range(n_groups):
-            if self._stop.is_set():
-                break
-            # Decoupled shot through the ONE measurement-layer helper: arm the camera for the
-            # bracket's N frames, fire the sequencer, read the frames back -- the camera never
-            # drives (or even sees) the sequencer; its trigger input gates the readout, real or
-            # virtual alike.
-            batch = triggered_frames(self.camera, self.sequencer, bracket, n_frames, stop=self._stop)
-            frames = [np.asarray(f, dtype=float) for f in batch]
-            if len(frames) <= readout_index:
-                break                                          # stopped mid-bracket -> no full shot
-            readout_per_group.append(frames[readout_index])
-            reference_groups.append([f for i, f in enumerate(frames) if i != readout_index])
-            frac = progress_lo + (progress_hi - progress_lo) * (g + 1) / n_groups
-            # Stream the FIRST long reference frame (the high-SNR image the site map is built from)
-            # so the operator watches the site-finding data accumulate, not just the short readout.
-            out.publish(frame=frames[0], progress=frac, stage=f"reference bracket {g + 1}/{n_groups} (long-short-long)")
-        return reference_groups, readout_per_group
-
-    # Raw camera frames are an INPUT-format artifact (the round-trip data for a later
-    # source="saved frames" re-cali), NOT a "save action".  They live in this explicit
-    # semantic sub-folder of ``folder`` so the cali folder root stays clean -- only the
-    # canonical artifacts (calibration.json / .npz / summary.json / run_schema.json) and
-    # the paired (.png + .npz) figure saves live at the root.  An explicit named sub-folder
-    # is NOT the "hidden timestamp" the user banned in #3 -- this name is fixed, predictable,
-    # and the GUI's "folder" field still points at the user-chosen root.
-    FRAMES_SUBDIR = "frames"
-
-    def _save_live_frames(self, ref_groups, readout_by_group) -> None:
-        """Write the live brackets to ``<folder>/frames/`` as a contiguous ``img<n>.npy`` run --
-        the round-trip DATA -- each paired with an ``img<n>.png`` 2D-image render of the SAME frame,
-        plus a ``run_schema.json`` at the cali folder root describing the grouping (and the frames
-        sub-folder), so a later source="saved frames" run re-indexes them with ``index_run`` and
-        re-calibrates WITHOUT re-acquiring.  Each group is written in trigger order (the short
-        readout in the middle of its reference frames); the schema records ``shots_per_group`` /
-        ``short_shot`` / ``ref_shots`` / ``frames_subdir`` so the reader reconstructs the exact
-        bracket -- no frame duplication, no hard-coded layout.
-
-        The ``.png`` is the operator's eyeball companion to the emCCD bracket frames the cali
-        ACTUALLY used: it is rendered through the frontend viewer seam (the same 2D-image imshow the
-        live console uses), so na never imports the frontend.  Headless (no viewer registered) ->
-        the ``.npy`` data is written exactly the same and the png is simply skipped; a render hiccup
-        never costs the saved ``.npy``."""
-        import json
-        from Zou_lab_control._viewer_registry import active_plotter
-        from .imageio import save_frame
-        folder = Path(self.folder)
-        frames_dir = folder / self.FRAMES_SUBDIR
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        # png companion: rendered by the frontend's ``save_frame_image`` when a viewer is registered.
-        _plotter = active_plotter()
-        _render_png = getattr(_plotter, "save_frame_image", None) if _plotter is not None else None
-        # The readout frame's position within the bracket is the template-derived layout the
-        # live acquisition used (``_collect_bracket_groups`` stored it) -- so the saved run
-        # re-reads with the SAME grouping the template defines (any frame count, not a hard 3).
-        readout_index = int(getattr(self, "_readout_index", len(ref_groups[0]) // 2 if ref_groups else 1))
-        n = 0
-        shots_per_group = 1
-        for refs, short in zip(ref_groups, readout_by_group):
-            refs = list(refs)
-            group = refs[:readout_index] + [short] + refs[readout_index:]   # trigger order
-            shots_per_group = len(group)
-            for fr in group:
-                n += 1
-                arr = np.asarray(fr, dtype=float)
-                save_frame(frames_dir / f"img{n}.npy", arr)
-                if _render_png is not None:
-                    try:
-                        _render_png(frames_dir / f"img{n}.png", arr)   # 2D image of this exact frame
-                    except Exception:
-                        pass   # a viewer render hiccup must NEVER lose the round-trip .npy
-        short_shot = readout_index + 1                       # 1-based position of the short frame
-        ref_shots = [i for i in range(1, shots_per_group + 1) if i != short_shot]
-        schema = {"prefix": "img", "shots_per_group": shots_per_group, "short_shot": short_shot,
-                  "ref_shots": ref_shots, "n_groups": int(len(readout_by_group)),
-                  "frames_subdir": self.FRAMES_SUBDIR}
-        (folder / "run_schema.json").write_text(json.dumps(schema, indent=2), encoding="utf-8")
-
-    def _index_saved_run(self):
-        """Index the saved frames, honouring ``run_schema.json`` (the live run wrote it) so a
-        live-saved bracket re-reads with its real grouping + its ``frames_subdir``.  If no
-        schema, fall back to the index_run defaults (the write_virtual_run / 4-shot convention)
-        at the folder root."""
-        import json
-        from .imageio import index_run
-        root = Path(self.folder)
-        schema_path = root / "run_schema.json"
-        if schema_path.is_file():
-            try:
-                s = json.loads(schema_path.read_text(encoding="utf-8"))
-                sub = str(s.get("frames_subdir", "") or "")
-                data_dir = root / sub if sub else root
-                return index_run(data_dir, str(s.get("prefix", "img")),
-                                 shots_per_group=int(s["shots_per_group"]),
-                                 short_shot=int(s["short_shot"]),
-                                 ref_shots=tuple(int(v) for v in s["ref_shots"]))
-            except Exception:
-                pass
-        # No schema: try the named sub-folder first (cleaner layout), else the root (legacy /
-        # write_virtual_run convention -- a flat folder of img<n>.npy).
-        sub = root / self.FRAMES_SUBDIR
-        if sub.is_dir() and (any(sub.glob("img*.npy")) or any(sub.glob("img*.tif*"))):
-            return index_run(sub, "img")
-        return index_run(root, "img")
-
-    def _run_from_folder(self, out: "TaskOutput"):
-        """Calibrate from frames SAVED IN A FOLDER (the real-data flow): index the run,
-        find the sites from the reference template, then per-site thresholds for every
-        readout method (the OccupancyProcessor picks which to use).
-
-        A saved run is grouped exactly like the live bracket -- each group holds the long
-        REFERENCE frames (``ref_shots``) that vote ground truth around its short readout
-        (``short_shot``).  Re-grouping the run's reference frames back into per-group
-        brackets lets the saved-frames flow take the SAME held-out training path as the
-        live flow (:meth:`_apply_reference_thresholds`): distinct box / PSF / uniform
-        held-out fidelity + reference-trained per-site thresholds, NOT the affine-invariant
-        self-consistent estimate.  If the run is too short to vote ground truth, the helper
-        no-ops and the calibration keeps its otsu thresholds (graceful fallback)."""
-        from .calibration import calibrate_all_methods_from_images
-        if not self.folder:
-            raise ValueError("source='saved frames' needs a folder of saved frames.")
-        run = self._index_saved_run()
-        n_ref = len(run.ref_shots)
-        # The long reference frames (group-major) build the all-sites template AND, regrouped,
-        # vote the per-group ground truth -- read the files ONCE for both uses.
-        reference_flat = [np.asarray(f, dtype=float) for f in run.reference_frames()]
-        if reference_flat:
-            out.publish(frame=reference_flat[-1], progress=0.4)
-        samples = [np.asarray(f, dtype=float) for f in run.short_frames()]   # one readout per group
-        if samples:
-            out.publish(frame=samples[-1], progress=0.85)
-        calibration = calibrate_all_methods_from_images(
-            reference_flat, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
-            threshold_method=self.threshold_method, exposure=self.readout_exposure)
-        n_groups = run.n_groups
-        ref_groups = ([reference_flat[g * n_ref:(g + 1) * n_ref] for g in range(n_groups)]
-                      if n_ref and len(reference_flat) >= n_groups * n_ref
-                      and len(samples) == n_groups else [])
-        calibration = self._apply_reference_thresholds(calibration, ref_groups, samples)
-        self._readout_samples = list(samples)
-        self._reference_template = (np.mean(np.asarray(reference_flat, dtype=float), axis=0)
-                                    if reference_flat else None)
-        return calibration
 
 
 def camera_frame_keys(frames_per_cycle, prefix=""):
@@ -2047,8 +1315,8 @@ class CameraMeasurement(Measurement):
             # the absence of hardware trigger edges -- the node sees only "frames or no frames".
             return {}
         # A real cycle WAS acquired -> mint this shot's SOURCE-shot id; every ``frame_i`` published this
-        # cycle carries it, and the OccupancyProcessor consuming a chosen ``frame_i`` inherits it, so the
-        # judged image / occupancy group with the exact frame they came from (#shot-clock).
+        # cycle carries it, so every downstream transform can retain the exact
+        # camera-shot lineage without consulting a newer hub value.
         self._current_source_shot = self.hub.next_source_shot()
         frames = [np.asarray(f) for f in frames]
         n = len(frames)
@@ -2095,7 +1363,7 @@ class CameraMeasurement(Measurement):
             i = bare.split("_")[-1]
             desc = (f"emCCD event {i} of the cycle: (repeat, 1, H, W) block -- plot reduces repeats "
                     f"(average = long exposure of event {i}).  LIVE camera, advances independently of the "
-                    "readout: for a 2D image shot-locked to the site map, bind Judge-occupancy `frame_judged`.")
+                    "readout: a shot-locked processed image must come from the same atomic producer update.")
             specs.append(SignalSpec(
                 bare, "camera image", "counts", desc,
                 points_shape=(1,), data_shape=self._frame_shape,
@@ -3052,9 +2320,7 @@ __all__ = [
     "OneShotNode",
     "grid_for_points",
     "SignalSpec",
-    "CalibrateReadoutTask",
     "CameraMeasurement",
-    "OccupancyProcessor",
     "Measurement",
     "Processor",
     "ProcessorRun",

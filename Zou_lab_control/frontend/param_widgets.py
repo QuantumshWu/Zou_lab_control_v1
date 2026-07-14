@@ -202,8 +202,8 @@ class RefreshProviders:
     """What :meth:`ParamWidgetHandler.refresh` needs to repopulate a dynamic control.
 
     ``signals`` / ``sources`` / ``formats`` populate the grouped signal pickers.
-    ``repopulate`` is a per-widget hook the form supplies for a DEPENDENT combo
-    (``pulse_param`` / ``pulse_slots``) whose choices come from a SIBLING template
+    ``repopulate`` is a per-widget hook the form supplies for the ``pulse_slots``
+    composite whose choices come from a sibling template
     field -- the inter-field reactivity stays owned by the form (it knows the sibling
     layout); the handler just calls it.
     """
@@ -584,7 +584,7 @@ def _grey_label(text: str) -> FluentLabel:
 
 def _common_token_prefix(names) -> str:
     """The longest common UNDERSCORE-token prefix of ``names`` -- e.g. both
-    ``judge_occupancy_rate`` and ``judge_occupancy_occupied`` share ``judge_occupancy_``.
+    ``analysis_rate`` and ``analysis_score`` share ``analysis_``.
     Empty for fewer than two names or no shared leading token.  Used to strip the producer
     prefix the hub prepends from a grouped signal picker's labels (the producer is the group
     header, so its name need not repeat in every signal)."""
@@ -790,35 +790,6 @@ class SignalHandler(ParamWidgetHandler):
                                   formats=providers.formats, labels=providers.labels, current=current)
 
 
-class PulseParamHandler(ParamWidgetHandler):
-    """WHICH pulse-template parameter to sweep: a DEPENDENT editable combo repopulated
-    from a sibling ``path`` field.  The repopulation (which reads the sibling template)
-    is owned by the form (``providers.repopulate``); the handler only builds / reads /
-    seeds the editable combo."""
-
-    def build(self, decl, value, ctx):
-        combo = FluentComboBox()
-        combo.setEditable(True)
-        combo.setToolTip(decl.tooltip)
-        if value is not None:
-            combo.setCurrentText("" if value is None else str(value))
-        _wire(combo.activated, ctx, decl, lambda: read_editable_combo(combo))
-        return combo
-
-    def read(self, widget):
-        return read_editable_combo(widget)
-
-    def write(self, widget, value):
-        widget.setCurrentText("" if value is None else str(value))
-
-    def is_empty(self, widget) -> bool:
-        return not read_editable_combo(widget)
-
-    def refresh(self, widget, providers: RefreshProviders) -> None:
-        if providers.repopulate is not None:
-            providers.repopulate(widget)
-
-
 class SignalExprHandler(ParamWidgetHandler):
     """A multi-slot signal picker + ``value = ...`` expression (the COMPOSITE
     ``_SignalExprWidget``).  Value is ``{"inputs": [...], "source": "value = ..."}``."""
@@ -903,7 +874,6 @@ PARAM_WIDGETS: dict[str, ParamWidgetHandler] = {
     "path": PathHandler(),
     "signal": SignalHandler(),
     "signal_expr": SignalExprHandler(),
-    "pulse_param": PulseParamHandler(),
     "pulse_slots": PulseSlotsHandler(),
 }
 

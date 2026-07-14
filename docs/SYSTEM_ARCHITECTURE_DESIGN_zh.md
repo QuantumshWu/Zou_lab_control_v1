@@ -180,7 +180,7 @@ validity 不能只停在 `(R,P)`：readout fidelity 已经产生 `(group,site)` 
 - TaskOutput 构成第二套 mutable 数据通道；
 - final y 的 reservation 不能自动保证上游 camera -> processor 每条边都 exact。
 
-当前 finite CameraMeasurement 每来一帧重新发布累计 `(1..K)` repeat block，TensorStore full publish 又把整个 repeat-capacity current state复制进 journal，OccupancyProcessor 每次从头遍历所有已累计 R/P；实测 journal payload 随 K² 增长。把 camera pending queue 改成 O(1)、有界且 overrun-fatal 只能解决 adapter 边界的保留与覆写问题，不会自动消除上层的累计重发布。根因是 sample event、mutable materializer 与 immutable dataset 被同一个“signal tensor update”冒充；目标实现必须一次只处理一个 sample、builder 私有增量写、UI 按 revision 请求 snapshot，而不是只把 history size 调小。
+当前 finite CameraMeasurement 每来一帧重新发布累计 `(1..K)` repeat block，TensorStore full publish 又把整个 repeat-capacity current state复制进 journal；已删除的旧 `OccupancyProcessor` 还曾从头遍历所有已累计 R/P，因此实测 journal payload 随 K² 增长。删除旧 processor 并没有消除 camera/materializer 的根因。把 camera pending queue 改成 O(1)、有界且 overrun-fatal 也只能解决 adapter 边界的保留与覆写问题，不会自动消除上层的累计重发布。根因是 sample event、mutable materializer 与 immutable dataset 被同一个“signal tensor update”冒充；目标实现必须一次只处理一个 sample、builder 私有增量写、UI 按 revision 请求 snapshot，而不是只把 history size 调小。
 
 多 signal `next_coherent_update` 当前会寻找下一个共同 provenance 并推进掉更快流的 unmatched 更新；这对 coherent monitor 可以接受，却不能自动代表 formal EXACT_KEY。JoinPolicy 必须在 pipeline 合同中显式区分“允许跳过并计数”与“缺 key 立即失败”。
 
@@ -886,7 +886,7 @@ CameraFrameRecord:                       # adapter_sdk owner，不是 artifact s
 
 record 构造时就必须取得图像 bytes 的 ownership 并冻结 metadata；driver 之后复用 ring slot 不得改变已发布 record。`source_ordinal` 在每次 arm epoch 从0连续增加，duplicate/gap/out-of-budget 立即失败；它是 host adapter 的排空顺序，不是 FPGA emitted-edge receipt。`produced_count` 是读取该帧时观察到的 source 累计快照，batch drain 时可在多个 record 中相同；禁止把它伪造成逐帧 +1 counter。qCMOS adapter 必须从同一次 `buf_getframedata` 保留 `framestamp/camerastamp/timestamp`，并把同一 drain 观察点的 `cap_transferinfo().nFrameCount` 写入 `produced_count`。
 
-arm 时冻结 pending retention capacity：finite capture 以声明的 frame budget 为硬上限，continuous capture 以 adapter/profile 证明的 max-inflight 为上限。adapter pending queue 在两种模式下都不 overwrite 尚未被唯一 capture owner 排空的物理帧；monitor 的 overwrite/missed 只发生在 owner 已将 record 转交给 broker 之后的 bounded monitor tap。容量不足、ordinal 不连续或超过 arm budget 返回 typed `CameraBufferOverrun`，formal CaptureSession 将其上升为 `SourceFailed/RetentionOverrun`；monitor run 也必须明确停止/重建 capture session 并报错，不能在 adapter queue 内悄悄丢帧后只增加 UI missed count。S1-S3迁移期的 `read_frames()` 只能解包同一 record queue 的 `image`，不得维持第二份排队、ordinal 或 metadata 真相源；最后一个 legacy camera consumer 在S3迁走后，array-only acquisition reader 与它的测试一并删除，终态 adapter contract 只交付 record。CaptureSession 在 owner lane 把 record 一次转换为neutral-owned `CameraSample(Value, metadata)`；`CameraFrameRecord` 不穿过 bounded-context 边界进入 zlc_data、processor、UI 或持久 artifact。
+arm 时冻结 pending retention capacity：finite capture 以声明的 frame budget 为硬上限，continuous capture 以 adapter/profile 证明的 max-inflight 为上限。adapter pending queue 在两种模式下都不 overwrite 尚未被唯一 capture owner 排空的物理帧；monitor 的 overwrite/missed 只发生在 owner 已将 record 转交给 broker 之后的 bounded monitor tap。容量不足、ordinal 不连续或超过 arm budget 返回 typed `CameraBufferOverrun`，formal CaptureSession 将其上升为 `SourceFailed/RetentionOverrun`；monitor run 也必须明确停止/重建 capture session 并报错，不能在 adapter queue 内悄悄丢帧后只增加 UI missed count。迁移期的 `read_frames()` 只能解包同一 record queue 的 `image`，不得维持第二份排队、ordinal 或 metadata 真相源；array-only reader 只在**最后一个 legacy camera consumer 所在的 dependency-closed 切片**删除，不能把时点写死为 S3。当前 consumer matrix 仍包含 ROI、monitor、temperature 与剩余 legacy measurement/UI，预计随 S5 收口。终态 adapter contract 只交付 record。CaptureSession 在 owner lane 把 record 一次转换为neutral-owned `CameraSample(Value, metadata)`；`CameraFrameRecord` 不穿过 bounded-context 边界进入 zlc_data、processor、UI 或持久 artifact。
 
 stream_generation/payload contract fingerprint 改变时，旧 exact cursor 终止为 typed SchemaChanged。schema-affecting reconfigure 不是“原地改参数”，而是 generation migration：owner 在 transaction boundary 终止旧 generation、对所有 pending Control revision 发 terminal ack，为每个绑定的 DatasetBuilder 创建新 block_id/DatasetSchema/generation，再允许 Monitor 显式 rebind。旧 pending view/fit 结果 stale，CommittedTransform 因 DatasetSchema fingerprint 改变一律失效，不能按 index 偷迁移。稳定 AxisId 只帮助迁移 workspace preference 的候选匹配，仍须完整 schema/coordinate/validity 校验。正式 finite Run 默认拒绝 schema-affecting reconfigure；value-only 且 schema 不变的参数才可按运行合同在边界 APPLIED。
 
@@ -2295,7 +2295,7 @@ HardwareTriggerStamp:
 
 未来若证据触发逐沿 FIFO方案，其容量、overflow sticky fatal与排空带宽必须共同设计和真机验证，不能先写架构再要求重烧。未触发时不实现、不预留、不把它列为当前 Formal Scan gate；当前 UART/JTAG也不被假定具有尚不存在的高带宽 telemetry能力。
 
-相机 adapter 每帧保留 DCAMBUF_FRAME 的 `framestamp`、`camerastamp`、`timestamp`，并把`cap_transferinfo().nFrameCount`作为带读取位置/时间的session累计快照保存。当前 `CameraFrameRecord` 边界已经做到这一点；S1必须让最终 CameraPort/CaptureSession、exact retention、Q0 与 EndAttestation 端到端消费同一record语义，并在S3删除会解包成纯ndarray的旧public consumer，不能重新退化为array-only路径，也不能把累计`nFrameCount`伪装成per-frame metadata。这些字段的语义必须按具体 qCMOS 型号实测，字段存在本身不等于 TAGGED。
+相机 adapter 每帧保留 DCAMBUF_FRAME 的 `framestamp`、`camerastamp`、`timestamp`，并把`cap_transferinfo().nFrameCount`作为带读取位置/时间的session累计快照保存。当前 `CameraFrameRecord` 边界已经做到这一点；S1必须让最终 CameraPort/CaptureSession、exact retention、Q0 与 EndAttestation 端到端消费同一record语义。会解包成纯ndarray的旧 public consumer 只在其最后一个 legacy consumer 迁走的 dependency-closed 切片删除，不能无条件写成 S3，也不能重新退化为array-only路径或把累计`nFrameCount`伪装成per-frame metadata。这些字段的语义必须按具体 qCMOS 型号实测，字段存在本身不等于 TAGGED。
 
 每个run的camera start boundary也是关联合同的一部分：adapter必须在arm前排空/拒绝旧software pending与driver residual并保存`pre_arm_residual_observation`；随后在`cap_start`/arm-ready后、FIRE前按Q0 reset epoch建立`session_counter_baseline`。若counter或stamp只在首帧存在，Q0必须定义implicit initial、first-snapshot与first-frame successor rule，否则该工作点不具备Formal capability。必须证明arm本身是否可能产生frame，禁止跨cap_start reset把旧epoch绝对值带入delta。任何未声明的pre-fire frame、reset epoch不符、首帧不满足规则或stop后late frame都使整个epoch INVALID；不能只依赖“最终总数恰好相等”来掩盖开头混入旧帧、末尾少一帧的错位。
 
@@ -3037,22 +3037,17 @@ S0.6完成不等于旧DeviceSet实现已物理删除；它可以继续作为封�
 3. 交付 IMAGE ViewContract/ViewSpec/FigureEvaluator、2D live raster+Qt overlay、Workbench LiveDatasetBinding；验证 GUI/worker owner 和 driver buffer reuse。
 4. 交付 CaptureArtifact Repository 和 crash-safe commit；live/save 冻结用户所见 revision。qCMOS EOS 的唯一合法顺序是：唯一I/O owner先读取execution-mode-specific raw terminal evidence或abort/safe ack，只确认对应logical table/segment terminal -> **camera保持capturing、dedicated drain继续运行**，从该观察点完整等待deployment-bound CompiledPulseArtifact/H1 physical output-tail bound并生成`PostTerminalTailEvidence` -> 再在Q0-qualified quiet-window/保守deadline内排空 driver residual -> 读取并冻结最终 counter/stamp -> camera `cap_stop` -> capture/transfer状态稳定复核 -> buffer release -> capture thread/session 真实termination/join ack -> 才调用 producer.finish。任何raw terminal evidence都不证明delay tail idle；固定tail/drain deadline只在H1/Q0合同内构成有限运行保证，不声称逐沿数学证明，也不参与edge调度。正常complete与取消/异常cleanup共享同一个session termination语义；取消先走thread-safe interrupt解除阻塞，再由cleanup-capable、session-specific close command完成tail wait/drain/join，而不是调用已撤销的普通execute command。任何 extra/late/count mismatch、wrong-session/join unknown或物理 capture 后的 decode/schema/key/publish 异常先 `producer.fail`，因此不能生成 SealedDatasetArtifact；仅“已经收到 N 帧”绝不是 EOS 证明。
 5. 同时交付薄 Experiment：`connect -> capture -> inspect/figure -> save` 保持少量语句。
-6. E2E 后只删除**已经迁入新CameraPort/DatasetBuilder的standalone camera use case**对应的旧累计buffer/latest polling/render路径。旧 camera frame producer/LogicNode 仍是 Occupancy/ROI/readout/sitemap 的 reactive 输入，因此它连同其旧live-image presentation必须作为一个不透明LegacyRuntimeFence岛保留到S3；S1不能一边保留旧producer、一边删除它唯一能消费的旧panel，也不能建立把旧Hub翻译成新Dataset的临时bridge。S3迁走最后一个frame consumer后一次删除旧producer、旧live panel与整条reactive链。任何时刻同一真实camera仍只有legacy或new一个owner。TaskOutput仍有CalibrateReadout/OptimizeMotField等消费者，移到最后一个消费者迁走的S5删除。
+6. E2E 后只删除**已经迁入新 CameraPort/DatasetBuilder 的 standalone camera use case**对应的旧累计 buffer/latest polling/render 旁路。旧 `OccupancyProcessor` 已删除，但 generic camera producer/LogicNode 仍服务 ROI、monitor、temperature 及剩余 legacy measurement/UI；它与这些消费者必须作为 dependency-closed island 保留到实际最后消费者迁走（当前预计 S5），不能把删除时点写死为 S3，也不能建立把旧 Hub 翻译成新 Dataset 的临时 bridge。任何时刻同一真实 camera 仍只有 legacy 或 new 一个 owner。当前具体发布 `TaskOutput` 的旧 Task 只剩 `OptimizeMotFieldTask`，在该最后消费者迁走的 S5 删除。
 
 ### H1：Pulse bounded-context 与冻结 bitstream bring-up（与 S0.5-S3 并行）
 
 先建立PulseDocument/TargetIR/CompiledPulseArtifact canonical seam，并以当前已部署bitstream对应的host/model/wire golden bytes、现有xsim/真机回读保护语义。按consumer纵向切换：compiler/server -> neutral Sequencer adapter -> workbench PulsePreviewProjector；每切一个consumer删除其旧timing/compiler/reader，不维持自动fallback。整个H1默认不修改RTL、不生成新bitstream。
 
-2026-07 追溯审查确认了一处已经发生的迁移排序错误：tracked `pulses/*.json` 已全部是 `zlc_pulse.PulseDocument`，但 legacy `CalibrateReadout`、部分 Camera/Task/PulseScan 测试与 `resolve_fireable_template` 路径仍调用 `PulseTableState.load()` 读取这些同名资产；开发机 ignored 的 `T.json/pulse_test.json` 又曾使测试输入集合随工作区变化，掩盖了断口。该状态不是需要兼容的双格式需求，而是未闭合的 consumer cut：禁止恢复旧 tracked 资产、在 `PulseTableState` 中增加 `PulseDocument` 猜测/转换器，或让测试继续依赖 ignored 文件。H1/S3 必须把每个仍需保留的 calibration、camera、PulseScan 与 GUI consumer 直接迁到 current document/compiler/endpoint owner，并在同一 dependency-closed 切片删除相应 legacy reader；完成前这些具体 legacy 用户路径明确 NO-GO，不能靠只测新栈宣称系统全绿。
+2026-07 追溯审查确认 tracked `pulses/*.json` 已全部是 current `zlc_pulse.PulseDocument`；仍调用 `PulseTableState.load()` 的 Camera/Task/PulseScan/GUI 路径属于未闭合的 consumer cut，不是需要兼容的双格式需求。开发机 ignored 的 `T.json/pulse_test.json` 曾使测试输入集合随工作区变化并掩盖断口，因此禁止恢复旧 tracked 资产、在 `PulseTableState` 中加入 `PulseDocument` 猜测/转换器，或让测试依赖 ignored 文件。H1/S3/S5 必须把每个仍需保留的 camera、PulseScan 与 GUI consumer 直接迁到 current document/compiler/endpoint owner，并在同一个 dependency-closed 切片删除对应 legacy reader；完成前这些具体 legacy 用户路径明确 NO-GO，不能靠只测新栈宣称系统全绿。
 
-本轮 clean cut 已先停止广告两个已知破损入口：legacy TaskConsole catalog 不再注册
-`Task: Calibrate readout` 或 `Processor: Judge occupancy`，也删除了零消费者的
-`ParamDecl(kind="pulse_param")`、对应 widget/form special path 与
-`enumerate_pulse_params`。语义明确的 `pulse_slots` 保留。这里没有加入
-`PulseDocument ↔ PulseTableState` converter；`CalibrateReadoutTask` 与
-`OccupancyProcessor` 核心类只因仍有直接算法/API consumer 暂留，不能据此重新暴露 GUI
-入口。S3 完成 current calibration/occupancy controller 之前，TaskConsole 的正式标定与占据
-GUI 路径保持 NO-GO；用户文档不得继续给出点击这两个旧入口的步骤。
+本轮 dependency-closed clean cut 已物理删除 legacy `CalibrateReadoutTask`、`OccupancyProcessor`、对应 wrapper/export、旧 calibration report 生成与 frontend renderer、`calibrate_all_methods_from_images`、legacy `default_imaging_template()` Python factory 及其 mirror/negative tests；也删除了只服务旧 form 的 `ParamDecl(kind="pulse_param")`、widget special path 与 `enumerate_pulse_params`。这些对象不再是等待 H1/S3 迁移的消费者，也不得以 compatibility 名义恢复。语义明确的 `pulse_slots` 保留。
+
+`pulses/imaging_template.json` 明确保留：它是 current `zlc_pulse.PulseDocument` 资产，不是已删除的 legacy Python factory。Camera/PulseScan/PulseGUI 等保留消费者必须直接迁到 current document/compiler/endpoint owner，不建立 `PulseDocument ↔ PulseTableState` converter。当前 calibration/occupancy 领域实现与计划能力继续保留，但正式 Workbench/TaskConsole 标定与占据入口在新 controller 完成前保持 NO-GO。旧 graph 使用过的通用 GUI/runtime 契约——coherent shot、derived provenance/flow、site data axis 与 rerender current snapshot——改由中性 test double 继续验证，不因 fixture owner 被删除而丢掉能力覆盖。
 
 H1完成现有`image.build_fingerprint`/几何/ABI握手、PreparedProgramRef软件guard、repeat轴展开的finite autonomous table与camera-trigger schedule digest、当前UART/AXI/JTAG容量/错误行为，以及raw STATUS/CURSOR的组合读序、logical终态值和双读稳定规则的contract kit。H1同时根据当前RTL delay scheduler语义与CompiledPulseArtifact的冻结channel delay/最后edge推导`max_physical_output_tail_after_logical_done`，用golden/xsim/真机观测验证正常与safe/abort变体并给出保守margin；raw DONE/CURSOR本身不算tail-idle证据。高层`scan_progress()`镜像只供UI，不进入Formal proof。Formal compiler明确强制`repeat_forever=False, scan_repeats=0`并拒绝host wrap-stop；`AUTONOMOUS_RESIDENT`形成近期装载方式基线。超过resident window默认明确拒绝；只有单一I/O owner、保守refill硬上界以及覆盖每个潜在seam的硬件时间观测/完整schedule residual均由contract kit证明，才发布`AUTONOMOUS_REFILLED`条件execution capability。只测试现有RTL实际提供的能力，不增加ProgramToken/CellFireToken、ROM attestation、CRC verifier、PHYSICAL_DONE或telemetry。preview通过S0.5 workbench projector使用frontend FigureDocument，不制造frontend -> pulse反向边。
 
@@ -3096,7 +3091,7 @@ H2默认不排期。只有以下任一证据成立才可创建提案：
 2. 完成 CaptureArtifact -> CalibrationAnalysis -> CalibrationArtifact 的 live/offline 同路算法，以及 FrameContract/SiteMap/ReadoutModel。
 3. 迁 `OccupancyStreamProcessor`，输出单个 `OccupancySample(occupied, counts, metadata)` typed record，并显式绑定 CalibrationArtifactRef/model。
 4. DatasetBuilder 把 occupancy events 物化为 dataset；frontend Figure 与 zlc_data Fit 直接消费该冻结 dataset，证明四平面边界贯通。
-5. integration 通过后删除旧 camera frame producer/LogicNode 与最后一个 Occupancy/ROI/readout reactive consumer组成的完整旧链，同时删除 `read_frames()/acquire()` 等 array-only acquisition reader及其专用测试，不在adapter_sdk保留无metadata便利入口。并删除 runtime/session calibration 回查 fallback、filesystem fallback、legacy search、拆散 scalar signals 和会碰硬件的旧 Processor；保留的只有 notebook/workbench composition 在 request 构造时按 ReadoutBindingKey 冻结显式 CalibrationArtifactRef/model 的可见 convenience pointer。
+5. integration 通过后删除已经被 current Calibration/Occupancy slice 覆盖的旧 readout-specific fallback、filesystem search、拆散 scalar signals 与会碰硬件的旧 Processor。generic camera producer/LogicNode、`read_frames()/acquire()` array-only reader及其测试只有在 ROI、monitor、temperature、remaining legacy measurement/UI 的 consumer matrix 清零时才能随最后消费者所在切片一起删除；不得为了让 S3 “看起来完成”而提前切断 S5 能力。保留的只有 notebook/workbench composition 在 request 构造时按 ReadoutBindingKey 冻结显式 CalibrationArtifactRef/model 的可见 convenience pointer。
 
 ### S4：近期 Formal PulseScan（AUTONOMOUS_STREAMED）
 
@@ -3116,7 +3111,7 @@ S4代码实现可在H1冻结bitstream合同、S1 exact acquisition与S3 StreamPr
 3. 所有 panel 使用 S1/S2 的 render/evaluation lanes；完成 acknowledgement-driven shutdown、persistent quarantine 和 ControlTopic terminal/superseded ack。
 4. 逐条迁 temperature、MOT、readout、device manager 和 notebook convenience；每条都按纵向切片删除自己的旧路径。
 5. 真实入口 E2E 覆盖 fit/gridplot、calibration/occupancy、PulseScan、save/load、cancel/quarantine、shutdown 和 virtual/real adapter parity。
-6. CalibrateReadout/OptimizeMotField 等最后消费者迁走后删除 TaskOutput；每个删除项由“移走最后一个消费者”的切片负责，而不是由第一个碰到该类型的切片负责。
+6. `OptimizeMotFieldTask` 迁走后删除 `TaskOutput`；每个删除项由“移走最后一个消费者”的切片负责，而不是由第一个碰到该类型的切片负责。
 7. 最后一个 consumer 消失时物理删除 `neutral_atom/core`，不保留空 re-export 包。
 
 ### Z0：零残余审计
@@ -3219,7 +3214,7 @@ apps/
 
 ## 21. 删除清单
 
-删除由**最后一个真实 consumer 消失的 dependency-closed 切片**负责。不得因为 S1/S2 首次建立替代品就提前删掉仍被 S3/S5 使用的能力，也不得以“还有别的 consumer”为由让已迁 use case 继续双写/双读。至少固定：已迁standalone camera use case的旧显示路径 -> S1；共享旧 camera frame producer/LogicNode + legacy live-image panel + Occupancy/ROI/readout/sitemap reactive chain -> S3；旧 fitting/selection/facet/raster -> 其最后一个 legacy frontend/processor consumer 所在的 S3/S5/Z0；session calibration fallback/旧 Occupancy outputs -> S3；旧 positional/latest-polling PulseScan -> S4；TaskOutput、LegacyPanelHost、LegacyRuntimeFence、SerializedLegacyAggBridge、剩余 TaskConsole god shell -> 最后 consumer 的 S5/Z0；旧pulse upgrade call site、旧schema writer、runtime/wire reader、compiled sibling与upgrade链 -> H1，直接删除历史parser/fixture、转换器和旧compiler/runtime payload路径，终态只剩当前PulseDocument codec。所有 tracked pulse JSON 已是当前格式，不建立转换阶段。每项在路线图/PR checklist记录replacement、全部consumers、shared ResourceKeys、first migrated slice、last consumer slice与物理删除证据。
+删除由**最后一个真实 consumer 消失的 dependency-closed 切片**负责。不得因为 S1/S2 首次建立替代品就提前删掉仍被 S3/S5 使用的能力，也不得以“还有别的 consumer”为由让已迁 use case 继续双写/双读。当前已经删除 legacy `CalibrateReadoutTask`、`OccupancyProcessor`、旧 calibration report 与 `default_imaging_template()` factory。其余至少固定：已迁 standalone camera use case 的旧显示旁路 -> S1；共享 generic camera producer/LogicNode、legacy live panel、monitor/rolling/ROI/temperature/readout UI 与 array-only reader -> 实际最后消费者所在的 dependency-closed slice（当前预计 S5）；旧 fitting/selection/facet/raster -> 其最后一个 legacy frontend/processor consumer 所在的 S3/S5/Z0；旧 positional/latest-polling PulseScan -> S4；`TaskOutput` -> `OptimizeMotFieldTask` 最后消费者所在的 S5；LegacyPanelHost、LegacyRuntimeFence、SerializedLegacyAggBridge、剩余 TaskConsole god shell -> 最后 consumer 的 S5/Z0；旧 pulse upgrade call site、旧 schema writer、runtime/wire reader、compiled sibling与upgrade链 -> H1，直接删除历史 parser/fixture、转换器和旧 compiler/runtime payload 路径，终态只剩 current PulseDocument codec。所有 tracked pulse JSON 已是当前格式，不建立转换阶段。每项在路线图/PR checklist记录 replacement、全部 consumers、shared ResourceKeys、first migrated slice、last consumer slice 与物理删除证据。
 
 完成态不存在：
 
@@ -3321,7 +3316,7 @@ Pipeline memory admission有真实故障依据：历史2.3MP live路径曾因多
 | calibration/readout | notebook、Workbench、occupancy、site-map/gridplot | 默认继承 main 真机数学；压缩 artifact/codec/evidence 图并建立同帧 golden | 不因未接 composition 删除；只有产品明确取消该实验能力才可删除 |
 | `FitResultBatch`/batch axes | gridplot/site/component fit | 保留；收敛重复 fit owner 与镜像模型测试 | gridplot 不再需要批量 fit 或出现更小等价值类型 |
 | `zlc_frontend` Figure/View/selector | S0.5/S2/S5 Workbench 与 notebook render | 审查 target DAG、最小入口与性能，不以旧 GUI 尚未迁入为由删除 | 新 frontend 设计被正式替换且所有目标用户面有闭环 |
-| legacy PulseTableState readers | 尚未迁完的 CalibrateReadout/PulseScan/PulseGUI 岛 | 先迁每个保留 consumer 到 current PulseDocument/compiler | 最后 consumer 迁走的 H1/S3 dependency-closed commit |
+| legacy PulseTableState readers | 尚未迁完的 Camera/PulseScan/PulseGUI 岛 | 先迁每个保留 consumer 到 current PulseDocument/compiler | 最后 consumer 迁走的 H1/S3/S5 dependency-closed commit |
 
 规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`；只有七条全局规则全部 `COMPLETE` 才能恢复新迁移。目前：规则 1 PARTIAL，规则 2 PARTIAL（已纠正“零当前消费者即删除”的错误判据），规则 3 PARTIAL，规则 4 PARTIAL（calibration/readout/occupancy/capture 子切片 COMPLETE），规则 5 PARTIAL，规则 6 PARTIAL（同一子切片 COMPLETE，但全仓 runtime aggregate 与其它 owner 尚未），规则 7 PARTIAL。最终还需对完整分支做独立对抗审查，证明没有 P0/P1 correctness、边界或可实现性漏洞；子切片 GO 不能被改写成全局 GO。
 

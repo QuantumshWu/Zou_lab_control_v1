@@ -2668,7 +2668,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 is_bus = str(key).startswith("bus:")
                 # The API delay target is the channel itself, or the BARE bus name (the data
                 # layer fans a bus slot out to its members) -- the same token the build path
-                # and enumerate_pulse_params use, so the dot reflects symmetrically.
+                # and the scan-slot editor use, so the dot reflects symmetrically.
                 api_target = str(key).split(":", 1)[1] if is_bus else key
                 api_name = state.api_slot_for("delay", api_target)
                 if is_bus:

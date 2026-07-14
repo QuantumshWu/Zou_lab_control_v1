@@ -4,9 +4,7 @@ from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from
 from .detection import detect_image
 from .figure_capture import capture_figure_provenance, capture_figure_signals
 from .logic import (
-    CalibrateReadoutTask,
     CameraMeasurement,
-    OccupancyProcessor,
     Measurement,
     Processor,
     LogicNode,
@@ -109,8 +107,6 @@ __all__ = [
     "Measurement",
     "Processor",
     "Task",
-    "CalibrateReadoutTask",
-    "OccupancyProcessor",
     "MeasurementSpec",
     "NFramePlan",
     "OtsuFidelityReducer",

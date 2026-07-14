@@ -192,16 +192,13 @@ def demo_editor(*, scale: float = 1.0, size=(1440, 880), bind_scans: bool = True
 
 
 def _demo_board_state(*, board_width: int):
-    """A board exercising EVERY panel kind -- both rolling-trace variants included.
+    """Representative camera dashboard for deterministic GUI screenshots.
 
-    The bare app default (``default_console_state``) is empty; this richer board
-    is the demo/test fixture, so a screenshot or smoke test still covers all five
-    kinds and BOTH rolling-trace variants of the ONE ``monitor`` kind: the
-    side-distribution trace (``show_dist=True`` -> :class:`LiveLiveDis`) AND the
-    bare trace (``show_dist=False`` -> :class:`LiveLive`).  Each panel is a pure
-    VIEW wired to a hub signal the demo's camera Measurement + OccupancyProcessor
-    publish (decoupled VIEW/LOGIC): the camera publishes ``frame``; the
-    OccupancyProcessor publishes ``occupied`` / ``counts`` (per-shot blocks) / ``rate`` / ``centers``."""
+    The fixture uses only the raw camera producer and display-only expressions;
+    it does not fabricate a calibration or occupancy pipeline.  Site-map support
+    remains a generic frontend capability and will be exercised by its current
+    controller once that vertical slice is wired.
+    """
 
     from Zou_lab_control.frontend.task_console import (
         PanelConfig,
@@ -209,64 +206,67 @@ def _demo_board_state(*, board_width: int):
         _first_free_slot,
     )
 
+    frame = ["frame_0"]
+    scalar = "value = np.mean(signal)"
+    curve = "value = np.mean(signal, axis=-2)"
     panels = [
-            # Readout image SYNCED with the site map: both read the occupancy processor's
-            # ``frame_judged`` (the exact frame it judged, co-published atomically with
-            # ``occupied``) -> the 2D image and the rings are always the SAME shot.  (A raw
-            # live-camera view would be ``value = frame_0``, but that runs one cycle AHEAD of
-            # the judged frame, so it would not line up with the rings.)
-            PanelConfig(kind="2d", title="Readout image", size="2x2",
-                        source="value = frame_judged", inputs=["frame_judged"]),
-            PanelConfig(kind="sites", title="Per-site occupancy", size="2x2",
-                        source="value = occupied", inputs=["occupied"]),
-            PanelConfig(kind="monitor", title="Loading rate (dist)", size="1x2",
-                        source="value = rate", params={"length": 300, "show_dist": True}),
-            PanelConfig(kind="monitor", title="Loading rate", size="1x2",
-                        source="value = rate", params={"length": 300, "show_dist": False}),
-            PanelConfig(kind="hist", title="Counts distribution", size="1x2",
-                        source="value = counts", params={"bins": 80}),
-            PanelConfig(kind="1d", title="Per-site counts", size="2x4",
-                        source="value = counts"),
+        PanelConfig(
+            kind="2d",
+            title="Camera image",
+            size="2x2",
+            source="value = signal",
+            inputs=frame,
+        ),
+        PanelConfig(
+            kind="monitor",
+            title="Mean intensity (dist)",
+            size="1x2",
+            source=scalar,
+            inputs=frame,
+            params={"length": 300, "show_dist": True},
+        ),
+        PanelConfig(
+            kind="monitor",
+            title="Mean intensity",
+            size="1x2",
+            source=scalar,
+            inputs=frame,
+            params={"length": 300, "show_dist": False},
+        ),
+        PanelConfig(
+            kind="hist",
+            title="Pixel distribution",
+            size="1x2",
+            source="value = signal",
+            inputs=frame,
+            params={"bins": 80},
+        ),
+        PanelConfig(
+            kind="1d",
+            title="Column profile",
+            size="2x4",
+            source=curve,
+            inputs=frame,
+        ),
     ]
-    # ``row``/``col`` are raw pixel top-lefts.  Seed the representative board through the SAME
-    # geometry/packing primitive as a freshly Added panel; old grid-like 0/2/4 coordinates all
-    # overlapped in pixel space and gravity therefore stacked every card into one column.
     placed = []
     for panel in panels:
         panel.col, panel.row = _first_free_slot(panel, placed, int(board_width))
         placed.append(panel)
-    return TaskConsoleState(name="demo_all_kinds", panels=panels)
+    return TaskConsoleState(name="demo_camera_views", panels=panels)
+
 
 
 def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=None,
-                 shots: int = 8, dual: bool = False):
-    """Return a shown :class:`TaskConsole` on a calibrated VIRTUAL session, with a
-    representative POPULATED dashboard built through the DECOUPLED API.
+                 shots: int = 8):
+    """Return a deterministic virtual-camera dashboard.
 
-    This is the demo/test fixture (the bare app still opens EMPTY -- see
-    ``default_console_state``).  It composes the loading readout from the SAME
-    primitives a notebook would, never a composite:
-
-      * a **camera** Measurement logic node (``CameraMeasurement``) publishing
-        ``frame`` -- added + Started through the public-ish console API
-        (``_add_logic_node`` / ``_start_logic_node``), exactly as Add-Panel does;
-      * a reactive **OccupancyProcessor** consuming ``frame`` and publishing the per-shot
-        ``occupied`` / ``counts`` clean ``(repeat, n_sites)`` blocks + the scalar ``rate`` (this
-        block's loading fraction) + ``centers`` / ``thresholds`` -- built directly (the
-        Add-Panel processor flow builds a ONE-SHOT run; the live readout wires the
-        reactive detector itself, as the notebook does) and registered in
-        ``running_nodes`` so the console's node-discovery + tests see it.
-
-    ``state`` (a :class:`TaskConsoleState`) loads THAT layout instead of the
-    default six-kind board, while STILL building + Starting the camera + detect so
-    ``frame`` / ``rate`` / ... are published for whatever panels it carries.  With
-    ``dual=True`` a second OccupancyProcessor (``prefix="b_"``) is started too, so the
-    ``b_occupied`` / ``b_counts`` / ... A/B signals exist for cross-signal panels.
-
-    ``shots`` shots are stepped (camera FIRST so ``frame`` exists, then each
-    OccupancyProcessor) and one ``refresh_once`` rendered, so every panel holds data
-    and reads "shot N".  The timer is stopped: tests drive ``refresh_once`` /
-    ``running_nodes`` stepping themselves.
+    This developer fixture exercises the TaskConsole shell and display pipeline
+    without standing up a second readout implementation.  One real
+    :class:`CameraMeasurement` publishes ``frame_0``; panels derive their camera
+    image, distribution, profile and scalar monitor as display-only expressions.
+    The timer is stopped and the fixture is stepped synchronously for stable
+    screenshots.
     """
 
     import Zou_lab_control.neutral_atom as na
@@ -276,96 +276,74 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
         screen_fit_window_size,
         set_fluent_scale,
     )
-    from Zou_lab_control.frontend.task_console import LogicNodeConfig, PanelCard, TaskConsole
+    from Zou_lab_control.frontend.task_console import LogicNodeConfig, TaskConsole
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor
 
     ensure_qt_app()
-    install_screenshot_font()  # before building so build-time text metrics match the render font
+    install_screenshot_font()
     exp = na.connect("virtual", sitemap={"grid_shape": tuple(grid)})
-    exp.readout.sitemap(method="box", frames=4, display=False)
-    exp.readout.thresholds(frames=24, display=False)
 
-    # "On Pulse": the streamer fires the CONTINUOUS imaging pulse, so the trigger-driven
-    # camera actually streams frames.  The camera is gated on ``sequencer.firing`` (exactly
-    # like hardware), so WITHOUT this the live 2D would correctly stay frozen -- the demo
-    # mirrors the running state the operator is in after clicking On Pulse.
-    _live_pulse = exp.build_imaging_sequence(name="live", load=True).forever()
-    exp.timing.bind_pulse(_live_pulse).on_pulse(repeat_forever=True, wait=False)
+    # The virtual camera observes the same independently running trigger source as
+    # the hardware adapter; the measurement remains a passive reader.
+    live_pulse = exp.build_imaging_sequence(name="live", load=True).forever()
+    exp.timing.bind_pulse(live_pulse).on_pulse(repeat_forever=True, wait=False)
 
-    # The layout: an explicit state overrides the default six-kind board; either
-    # way the panels are pure views wired to the signals the nodes below publish.
     if state is not None:
         layout = state
     else:
-        # Resolve the SAME fluent scale TaskConsole will install before asking the board geometry SSOT
-        # for pixel card sizes.  ``size=None`` follows the existing screen-fit window rule.
         set_fluent_scale(scale)
-        board_width = int(size[0]) if size is not None \
-            else int(screen_fit_window_size(WINDOW_SCREEN_FRACTION).width())
+        board_width = int(size[0]) if size is not None else int(
+            screen_fit_window_size(WINDOW_SCREEN_FRACTION).width()
+        )
         layout = _demo_board_state(board_width=board_width)
-    console = TaskConsole(hub=SignalHub(), state=layout, session=exp,
-                          measurements=exp.readout.measurement_specs(),
-                          processors=exp.readout.processor_specs(),
-                          tasks=exp.readout.task_specs(), scale=scale, window_px=size)
-    console._timer.stop()          # deterministic: tests drive refresh_once() themselves
 
-    # --- LOGIC NODES (decoupled): a camera Measurement + reactive OccupancyProcessor.
-    # The camera is added as a real Logic-tab node (so it appears on the Logic tab
-    # and `_producing_node` maps a frame panel back to it for its Edit's acquisition
-    # params) but is run by MANUAL STEPPING, not a background thread: the demo is a
-    # deterministic test fixture (the timer is stopped and tests step
-    # `running_nodes` themselves), and an idle node also makes an Edit's Apply
-    # reconfigure the camera synchronously.  The detector is the reactive readout
-    # node the notebook wires by hand.  Order matters -- the camera is in
-    # `running_nodes` BEFORE the detector so one step() publishes the frame the
-    # detector then consumes.
+    console = TaskConsole(
+        hub=SignalHub(),
+        state=layout,
+        session=exp,
+        measurements=exp.readout.measurement_specs(),
+        processors=exp.readout.processor_specs(),
+        tasks=exp.readout.task_specs(),
+        scale=scale,
+        window_px=size,
+    )
+    # This fixture creates and owns the virtual experiment.  Route teardown
+    # through the console's existing resource-close seam so ``shutdown()`` does
+    # not leave the session runtime thread alive after a test or screenshot.
+    console._on_close = exp.close
+    console._timer.stop()
+
     camera_row = console._add_logic_node(
-        # Row title = the authoritative camera spec's display name (ONE source,
-        # readout.camera_spec().name) -- the demo can never drift from the real dropdown.
-        LogicNodeConfig(kind="camera", name="live", title=exp.readout.camera_spec().name), focus=False)
+        LogicNodeConfig(
+            kind="camera",
+            name="live",
+            title=exp.readout.camera_spec().name,
+        ),
+        focus=False,
+    )
     camera = console._build_logic_node(camera_row.node, dict(camera_row.node.values))
     console._logic_nodes[id(camera_row)] = camera
-    console.running_nodes.append(camera)             # stepped manually below, no thread
+    console.running_nodes.append(camera)
     camera_row.set_state("running", status="running")
 
-    calibration = exp.readout.require(thresholds=True)   # the session's calibrated TrapCalibration
-    detectors = [OccupancyProcessor(console.hub, calibration=calibration, grid_shape=tuple(grid))]
-    if dual:
-        # A second detector behind a prefix so b_occupied / b_counts / ... exist
-        # for the A-B cross-signal panels (e.g. value = occupied - b_occupied).
-        detectors.append(OccupancyProcessor(console.hub, calibration=calibration,
-                                         grid_shape=tuple(grid), prefix="b_"))
-    for detector in detectors:
-        console.running_nodes.append(detector)   # so _producing_node / tests see it
-
-    # Seed: step the camera (publishes frame) THEN every detector (reads frame ->
-    # publishes its signals), repeated `shots` times, then render once so every
-    # panel has data and shows "shot N".
     for _ in range(max(1, int(shots))):
-        for node in console.running_nodes:
-            node.step()
+        camera.step()
     console.refresh_once()
-
-    # The demo opens CLEAN (no unsaved-edit star): wiring the nodes above marked the
-    # Save button dirty, but a freshly-built demo dashboard is not a user edit.
     console.save_button.set_dirty(False)
-
     console.show()
     return console
+
 
 
 def demo_console_measurements(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7)):
     """Return a shown :class:`TaskConsole` wired with the readout measurement
     catalog: a measurement is added as a LOGIC NODE (Logic tab) from the header's
     Add Panel, and its OWN Edit tab carries the live parameter form + Start / Stop,
-    fed by a calibrated VIRTUAL session.
+    fed by a virtual session.
 
-    Only the camera frames are virtual -- the session calibrates and the specs
-    build through the SAME contract path real hardware uses, so this exercises
-    exactly what the lab sees (AGENTS.md "virtual == real").  Start a node from its
-    Edit to stream signals to the hub, then add a Plot panel on the Monitor board
-    pointed at them.
+    The catalog and node builder follow the same contract path as real hardware.
+    Start a node from its Edit to stream signals to the hub, then add a Plot panel
+    on the Monitor board pointed at them.
     """
 
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
@@ -376,8 +354,6 @@ def demo_console_measurements(*, scale: float = 1.0, size=(1480, 980), grid=(5, 
     ensure_qt_app()
     install_screenshot_font()
     exp = na.connect("virtual", sitemap={"grid_shape": tuple(grid)})
-    exp.readout.sitemap(method="box", frames=4, display=False)
-    exp.readout.thresholds(frames=24, display=False)
     measurements = exp.readout.measurement_specs()
     hub = SignalHub()
     # Start with an EMPTY board; a measurement is a Logic node, added below, whose

@@ -102,9 +102,8 @@ FIG_X_KEY = "x"
 #: The per-tweezer centres signal (site-map saves) -- a site-map panel resolves its ring centres from
 #: this node via ``sitemap_centers_key``.
 FIG_CENTERS_KEY = "centers"
-#: The camera-frame underlay signal (site-map / 2-D saves that stored the judged frame) -- a site-map
-#: panel resolves its BACKGROUND image from this node via ``sitemap_image_key``, exactly as it pulls the
-#: underlay off a live occupancy processor's ``frame_judged``.
+#: The camera-frame underlay signal for site-map/2-D saves.  A site-map
+#: panel resolves it from the producer through ``sitemap_image_key``.
 FIG_FRAME_KEY = "frame"
 
 #: The node prefix -- so the published hub names are ``fig_value`` / ``fig_x`` / ``fig_centers`` /
@@ -310,15 +309,15 @@ class LoadedFigureNode(LogicNode):
     # -------------------------------------------------------- sites wiring
     @property
     def sitemap_centers_key(self) -> str:
-        """The BARE centres key a site-map panel resolves from this node (the console prepends the
-        node prefix, exactly as it does for a Judge-occupancy processor's ``"centers"``) -- present
+        """The bare centres key a site-map panel resolves from this node (the console prepends the
+        node prefix) -- present
         only when a centres block was stored, else blank so the console skips this node for rings."""
         return self._role_key.get("centers", "")
 
     @property
     def sitemap_image_key(self) -> str:
-        """The BARE camera-frame key a site-map panel resolves its BACKGROUND underlay from (the console
-        prepends the prefix, exactly as it does for a live occupancy processor's ``frame_judged``) --
+        """The bare camera-frame key a site-map panel resolves its background underlay from (the console
+        prepends the prefix) --
         present only when a frame block was stored (new npz), else blank so an OLD site-map save shows
         rings + occupancy with no background image (nothing was stored to draw)."""
         return self._role_key.get("frame", "")

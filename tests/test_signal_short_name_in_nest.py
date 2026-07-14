@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 def test_strip_node_prefix_rule():
     from Zou_lab_control.frontend.task_console import strip_node_prefix
     assert strip_node_prefix("temperature_survival", "temperature_") == "survival"
-    assert strip_node_prefix("judge_occupancy_rate", "judge_occupancy_") == "rate"
+    assert strip_node_prefix("analysis_rate", "analysis_") == "rate"
     assert strip_node_prefix("frame", "") == "frame"            # no prefix -> unchanged
     assert strip_node_prefix("frame_0", "") == "frame_0"        # camera per-trigger stays short+meaningful
 

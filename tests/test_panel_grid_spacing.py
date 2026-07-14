@@ -96,8 +96,8 @@ def test_demo_board_seeds_pixel_positions_from_the_geometry_single_source():
     assert pack(configs, board_w=board_width) is False
 
     by_title = {cfg.title: cfg for cfg in configs}
-    left = by_title["Readout image"]
-    right = by_title["Per-site occupancy"]
+    left = by_title["Camera image"]
+    right = by_title["Mean intensity (dist)"]
     assert (left.col, left.row) == (GAP, GAP)
     assert right.row == GAP
     assert right.col == left.col + _card_size(left.size)[0] + GAP

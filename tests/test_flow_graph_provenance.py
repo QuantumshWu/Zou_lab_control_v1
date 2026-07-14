@@ -1,20 +1,11 @@
-"""Contract: a SAVED figure records the SYSTEMATIC upstream DAG of how its data was produced -- not a
-flat, single-chain record but a BRANCHING tree (a panel consumes several signals, each from a different
-upstream source) -- and the FigureViewer's Flow tab can build a layered node-link diagram from it.
+"""Contracts for saved-figure flow provenance and its layered viewer.
 
 The capture (``operations.figure_capture.capture_flow_graph``) is pure over the ``SignalHub`` +
 ``LogicNode`` contracts (no frontend / Qt / sim ground truth); it is folded into the save's
 ``info['provenance']['flow_graph']`` (an append-only key that never disturbs the flat ``provenance`` /
-``signals`` structure).  These pin:
-
-1. a MULTI-INPUT figure (a processor fusing TWO camera frames) round-trips a graph whose processor node
-   has >= 2 PARENTS (branching), with one edge per consumed signal;
-2. a processor CHAIN keeps the intermediate processor's identity (the old flat hoist DROPPED it): the graph
-   has measurement -> processor -> plot, not a flattened measurement -> plot;
-3. a RAW-DATA figure (a bare array, no ``bind_source``) degrades to a single ``raw data -> plot`` graph;
-4. a device-holding SOURCE node is marked ``has_devices`` (its snapshot lives in ``provenance['devices']``);
-5. the reusable ``FlowGraphView`` builds a layered layout from a graph (node/edge counts, plot in the last
-   layer) and shows a placeholder for an absent graph -- never a crash.
+``signals`` structure).  The focused cases cover multi-input branching, processor
+chain identity, save/load round-trip, raw-data fallback, device leaves, stable
+layout, and the absent-graph placeholder.
 
 Runs headless (``QT_QPA_PLATFORM=offscreen``); virtual sleeps are fast-forwarded.
 """
@@ -45,9 +36,9 @@ import Zou_lab_control.neutral_atom as na  # noqa: E402
 from Zou_lab_control.neutral_atom.core.signals import SignalHub  # noqa: E402
 from Zou_lab_control.neutral_atom.operations.logic import (  # noqa: E402
     CameraMeasurement,
-    OccupancyProcessor,
+    LogicNode,
+    Processor,
 )
-from Zou_lab_control.neutral_atom.operations.signal_expr import SignalExpr, DEFAULT_SOURCE  # noqa: E402
 from Zou_lab_control.neutral_atom.operations.figure_capture import capture_flow_graph  # noqa: E402
 from Zou_lab_control.frontend import load_figure  # noqa: E402
 from conftest import fire_live_imaging  # noqa: E402
@@ -81,83 +72,74 @@ def _role_of(graph, node_id):
     return _graph_by_role(graph)[node_id]["role"]
 
 
-# --------------------------------------------------------------------------- 1: multi-input branching
-def test_multi_input_figure_captures_a_branching_graph():
-    """A processor that CONSUMES TWO camera frames (from two different measurements) -> its node has >= 2
-    PARENTS in the flow graph, and the graph carries one edge per consumed signal.  This is the branching
-    the old flat provenance discarded: the tree forks upward, each fork a different upstream source."""
-    exp = na.connect("virtual")
-    try:
-        hub = SignalHub()
-        cam_a = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
-                                  prefix="a_", repeat=1)
-        cam_b = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
-                                  prefix="b_", repeat=1)
-        # A processor whose source expression FUSES the two cameras' frames -> it consumes BOTH signals.
-        proc = OccupancyProcessor(
-            hub, source_expr=SignalExpr(["a_frame_0", "b_frame_0"], "value = (signal[0] + signal[1]) / 2"),
-            prefix="occ_")
-        assert set(proc.consumes) == {"a_frame_0", "b_frame_0"}
-        fire_live_imaging(exp)
-        for _ in range(2):
-            cam_a.step(); cam_b.step()
-        for m in (cam_a, cam_b):
-            m.refresh_provenance()
+class _ScalarSource(LogicNode):
+    layer = "measurement"
+    node_label = "scalar source"
 
-        resolve = _resolver([cam_a, cam_b, proc])
-        graph = capture_flow_graph(hub, proc, ["occ_occupied"], resolve_node=resolve)
-        assert graph is not None
-        by_id = _graph_by_role(graph)
-        # exactly one plot terminal, one processor, two measurements (device leaves are an ADDITIVE #5a
-        # expansion of each measurement, so assert the PRODUCING roles here, devices asserted separately)
-        roles = sorted(n["role"] for n in graph["nodes"] if n["role"] != "device")
-        assert roles == ["measurement", "measurement", "plot", "processor"], roles
-        # the processor node has TWO parents (the two cameras) -- the branch
-        proc_id = next(nid for nid, n in by_id.items() if n["role"] == "processor")
-        assert len(_parents(graph, proc_id)) == 2, "the fusing processor forks up to BOTH cameras"
-        # one edge per consumed signal -- BOTH cameras' edges are present (not folded into one by the
-        # shared bare name), each labelled with the bare signal name it carries.  Assert the EDGE COUNT
-        # directly: the previous ``{signal}`` set assertion deduped "frame_0"+"frame_0" to one element
-        # and so could not tell a fused single edge from the correct two.
-        into_proc = [e for e in graph["edges"] if str(e["to"]) == proc_id]
-        assert len(into_proc) == 2, f"the fusing processor keeps ONE edge per camera, got {len(into_proc)}"
-        assert all(e.get("signal") == "frame_0" for e in into_proc), "each edge carries its bare signal name"
-        assert all(e.get("shape") for e in into_proc), "each upstream edge carries the block shape"
-    finally:
-        exp.close()
-        plt.close("all")
+    def shot(self):  # pragma: no cover - values are published atomically by the fixture
+        raise NotImplementedError
+
+    def _bare_published_signals(self):
+        return frozenset({"value"})
+
+
+class _FuseProcessor(Processor):
+    provides = ("value",)
+
+    def transform(self, inputs):
+        values = [float(np.asarray(inputs[name]).reshape(-1)[0]) for name in self.consumes]
+        return {"value": float(np.mean(values))}
+
+
+def _branching_fixture():
+    hub = SignalHub()
+    left = _ScalarSource(hub, prefix="left_")
+    right = _ScalarSource(hub, prefix="right_")
+    fused = _FuseProcessor(
+        hub, consumes=("left_value", "right_value"), prefix="fused_")
+    shot = hub.next_source_shot()
+    hub.publish({"left_value": 2.0, "right_value": 6.0}, provenance=shot)
+    fused.step()
+    assert hub.latest_provenance("fused_value") == shot
+    return hub, left, right, fused
+
+
+# --------------------------------------------------------------------------- 1: multi-input branching
+def test_multi_input_processor_captures_a_branching_graph():
+    hub, left, right, fused = _branching_fixture()
+    resolve = _resolver([left, right, fused])
+    graph = capture_flow_graph(hub, fused, ["fused_value"], resolve_node=resolve)
+    by_id = _graph_by_role(graph)
+    roles = sorted(node["role"] for node in graph["nodes"])
+    assert roles == ["measurement", "measurement", "plot", "processor"]
+    processor_id = next(node_id for node_id, node in by_id.items()
+                        if node["role"] == "processor")
+    assert len(_parents(graph, processor_id)) == 2
+    incoming = [edge for edge in graph["edges"] if edge["to"] == processor_id]
+    assert {edge["signal"] for edge in incoming} == {"value"}
+    assert all(edge.get("shape") for edge in incoming)
 
 
 # --------------------------------------------------------------------------- 2: processor chain kept
-def test_processor_chain_keeps_intermediate_identity():
-    """A camera -> occupancy processor -> plot chain keeps the PROCESSOR node in the middle: the graph has
-    measurement -> processor -> plot (three producing roles), NOT a flattened measurement -> plot.  This is
-    exactly what the old flat provenance dropped (it hoisted the camera devices past the processor)."""
-    exp = na.connect("virtual")
-    try:
-        hub = SignalHub()
-        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
-                                prefix="cam_", repeat=1)
-        proc = OccupancyProcessor(hub, source_expr=SignalExpr(["cam_frame_0"], DEFAULT_SOURCE),
-                                  prefix="occ_")
-        fire_live_imaging(exp)
-        for _ in range(2):
-            cam.step()
-        cam.refresh_provenance()
+def test_processor_chain_keeps_each_intermediate_identity():
+    hub, left, right, fused = _branching_fixture()
+    scaled = _FuseProcessor(hub, consumes=("fused_value",), prefix="scaled_")
+    # The downstream subscription starts after the first fused publication, so
+    # publish one new coherent input transaction for it.
+    shot = hub.next_source_shot()
+    hub.publish({"left_value": 4.0, "right_value": 8.0}, provenance=shot)
+    fused.step()
+    scaled.step()
 
-        resolve = _resolver([cam, proc])
-        graph = capture_flow_graph(hub, proc, ["occ_occupied"], resolve_node=resolve)
-        by_id = _graph_by_role(graph)
-        plot_id = next(nid for nid, n in by_id.items() if n["role"] == "plot")
-        proc_id = next(nid for nid, n in by_id.items() if n["role"] == "processor")
-        meas_id = next(nid for nid, n in by_id.items() if n["role"] == "measurement")
-        # the intermediate processor is BETWEEN the measurement and the plot
-        assert proc_id in _parents(graph, plot_id), "the processor feeds the plot"
-        assert meas_id in _parents(graph, proc_id), "the measurement feeds the processor (chain kept)"
-        assert meas_id not in _parents(graph, plot_id), "the measurement does NOT jump straight to the plot"
-    finally:
-        exp.close()
-        plt.close("all")
+    resolve = _resolver([left, right, fused, scaled])
+    graph = capture_flow_graph(hub, scaled, ["scaled_value"], resolve_node=resolve)
+    processor_ids = [node["id"] for node in graph["nodes"] if node["role"] == "processor"]
+    assert len(processor_ids) == 2
+    plot_id = next(node["id"] for node in graph["nodes"] if node["role"] == "plot")
+    terminal = next(node_id for node_id in processor_ids if node_id in _parents(graph, plot_id))
+    intermediate = next(node_id for node_id in processor_ids if node_id != terminal)
+    assert intermediate in _parents(graph, terminal)
+    assert intermediate not in _parents(graph, plot_id)
 
 
 # --------------------------------------------------------------------------- 3: raw-data degrade
@@ -368,112 +350,26 @@ def test_flow_view_labels_are_globally_non_overlapping():
 
 
 # --------------------------------------------------------------------------- end-to-end save/load
-def test_flow_graph_round_trips_through_the_console_save(tmp_path):
-    """The console Save folds the flow graph into ``info['provenance']['flow_graph']``; reopened with
-    ``load_figure`` it carries the branching processor node (>= 2 parents) -- the full multi-input DAG
-    survives the npz round-trip alongside the flat provenance."""
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
-    from Zou_lab_control.frontend.task_console import (
-        TaskConsole, default_console_state, PanelConfig, PanelEditor, GAP)
+def test_branching_flow_graph_round_trips_through_figure_save(tmp_path):
     from Zou_lab_control.frontend import panel_plot
 
-    ensure_qt_app()
-    exp = na.connect("virtual")
-    console = None
+    hub, left, right, fused = _branching_fixture()
+    resolve = _resolver([left, right, fused])
+    plot = panel_plot(np.array([4.0]), kind="hist", size="2x4", bins=4, title="fused")
     try:
-        hub = SignalHub()
-        cam_a = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
-                                  prefix="a_", repeat=1)
-        cam_b = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
-                                  prefix="b_", repeat=1)
-        proc = OccupancyProcessor(
-            hub, source_expr=SignalExpr(["a_frame_0", "b_frame_0"], "value = (signal[0] + signal[1]) / 2"),
-            prefix="occ_")
-        fire_live_imaging(exp)
-        for _ in range(2):
-            cam_a.step(); cam_b.step()
-        for m in (cam_a, cam_b):
-            m.refresh_provenance()
-        console = TaskConsole(hub=hub, state=default_console_state(), session=exp,
-                              running_nodes=[cam_a, cam_b, proc], window_px=(900, 600))
-        console._timer.stop()
-        console.refresh_once = lambda: None
-        card = console._new_panel_card(PanelConfig(kind="hist", title="occ", source="value = occ_occupied",
-                                                   inputs=["occ_occupied"], row=GAP, col=GAP, size="2x4"))
-        console._attach_card(card)
-        card.plotter = panel_plot(np.random.default_rng(0).normal(0.5, 0.1, 200),
-                                  kind="hist", size="2x4", bins=20, title="occ")
-        editor = PanelEditor(card, console)
-        editor.rebuild()
-        editor.save_dir_edit.setText(str(tmp_path / "flow"))
-        editor.save_autoname.setChecked(False)
-        editor.save()
-        npz = next(tmp_path.glob("flow*.npz"), None)
-        assert npz is not None, f"the console Save must write an .npz (status: {editor.status.text()})"
-
-        info = load_figure(npz).info
-        flow = info["provenance"]["flow_graph"]
-        assert isinstance(flow, dict) and flow["nodes"] and flow["edges"]
-        # the PRODUCING roles survive the round-trip (device leaves are an additive #5a expansion)
-        roles = sorted(n["role"] for n in flow["nodes"] if n["role"] != "device")
-        assert roles == ["measurement", "measurement", "plot", "processor"], roles
-        # the device leaves (camera + sequencer per measurement) survive the npz round-trip too
-        assert any(n["role"] == "device" for n in flow["nodes"]), "device leaves round-trip through the npz"
-        proc_id = next(n["id"] for n in flow["nodes"] if n["role"] == "processor")
-        parents = {str(e["from"]) for e in flow["edges"] if str(e["to"]) == proc_id}
-        assert len(parents) == 2, "the branching processor survives the npz round-trip with both parents"
+        plot.bind_source(
+            hub, fused, inputs=["fused_value"], resolve_node=resolve, session=None)
+        path = plot.save(str(tmp_path / "branching_flow"))["data"]
+        graph = load_figure(path).info["provenance"]["flow_graph"]
+        roles = sorted(node["role"] for node in graph["nodes"])
+        assert roles == ["measurement", "measurement", "plot", "processor"]
+        processor_id = next(node["id"] for node in graph["nodes"]
+                            if node["role"] == "processor")
+        assert len(_parents(graph, processor_id)) == 2
     finally:
-        if console is not None:
-            console.shutdown()
-        exp.close()
-        plt.close("all")
+        plt.close(plot.fig)
 
 
-def test_grid_save_folds_the_flow_graph_like_a_single_panel(tmp_path):
-    """D1 parity: a GRID save bound to a REAL producing node folds the SAME ``provenance['flow_graph']``
-    a single-panel save of the identical source folds -- the full measurement -> processor -> plot chain,
-    not the raw fallback and not nothing.  The grid's hand-rolled capture once mis-called
-    ``capture_flow_graph`` (wrong signature), the TypeError was swallowed by a blanket ``except``, and
-    every grid npz silently saved with NO flow graph; both saves now route through the one
-    ``capture_rich_info`` composition point, so the graphs are exactly equal."""
-    from Zou_lab_control.frontend import panel_plot
-    from Zou_lab_control.frontend.live import site_histogram_grid
-
-    exp = na.connect("virtual")
-    try:
-        hub = SignalHub()
-        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
-                                prefix="cam_", repeat=1)
-        proc = OccupancyProcessor(hub, source_expr=SignalExpr(["cam_frame_0"], DEFAULT_SOURCE),
-                                  prefix="occ_")
-        fire_live_imaging(exp)
-        for _ in range(2):
-            cam.step()
-        cam.refresh_provenance()
-        resolve = _resolver([cam, proc])
-        rng = np.random.default_rng(11)
-
-        # GRID save, bound to the processor exactly as the console panel Save binds (bind_source rides
-        # from the plotter onto _GridData through BaseLivePlot.save).
-        grid = site_histogram_grid([rng.normal(0.5, 0.1, 60) for _ in range(4)], display=False)
-        grid.bind_source(hub, proc, inputs=["occ_occupied"], resolve_node=resolve, session=exp)
-        grid_npz = grid.save(str(tmp_path / "grid_flow"))["data"]
-
-        # Single-panel save of the SAME source binding -- the parity reference.
-        flat = panel_plot(rng.normal(0.5, 0.1, 200), kind="hist", size="2x4", bins=20, title="occ")
-        flat.bind_source(hub, proc, inputs=["occ_occupied"], resolve_node=resolve, session=exp)
-        flat_npz = flat.save(str(tmp_path / "flat_flow"))["data"]
-
-        grid_flow = load_figure(grid_npz).info["provenance"]["flow_graph"]
-        flat_flow = load_figure(flat_npz).info["provenance"]["flow_graph"]
-        # The grid's graph is the REAL upstream chain (not the raw fallback the bug degraded to) ...
-        roles = sorted(n["role"] for n in grid_flow["nodes"] if n["role"] != "device")
-        assert roles == ["measurement", "plot", "processor"], roles
-        # ... and EXACTLY the graph a single-panel figure of the same source saves.
-        assert grid_flow == flat_flow, "grid and single-panel saves must fold the identical flow graph"
-    finally:
-        exp.close()
-        plt.close("all")
 
 
 # --------------------------------------------------------------------------- 5: the Flow widget

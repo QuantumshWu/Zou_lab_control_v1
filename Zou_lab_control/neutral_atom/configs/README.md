@@ -44,9 +44,9 @@ by hand — no server needed.
 
 ## Notes
 
-- **`manual_template` / `remote_template` omit `trap_array` by design** — tweezer site centres come
-  from running sitemap **calibration** (`exp.readout.sitemap()` / the Calibrate-readout task), not
-  from a device. Load one, then calibrate before an occupancy readout, or you get a "no sitemap" error.
+- **`manual_template` / `remote_template` omit `trap_array` by design** — tweezer site centres are
+  evidence in a readout calibration artifact, not device configuration. Bind a calibration made from
+  science-camera frames before an occupancy pipeline; a missing binding fails explicitly.
 - Unknown **param** keys are rejected (a typo raises `TypeError` at load); unknown top-level device
   roles are tolerated. Keep comments here in this README, not as `_comment` keys in the JSON.
 - A camera that images single atoms in tweezers (readout / survival / fidelity) must be the science

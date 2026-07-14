@@ -643,8 +643,7 @@ class DataFigure:
         capture (``operations.figure_capture``) writes.  The entry KEYS are the NEUTRAL role vocabulary
         (``value`` / ``centers`` / ``frame`` -- the loader binds by each entry's ``role``, never by key):
         a rich save's keys are its producer's own bare signal names, but a bare save has NO producer, so
-        it must not hand-copy some live processor's private output names (the old ``occupied`` /
-        ``frame_judged`` literals silently drifted from ``OccupancyProcessor.provides``).  Empty when
+        it must not hand-copy a live processor's private output names.  Empty when
         there is nothing to store (no bound site-map plotter / no background frame), so a save is never
         blocked.  The blocks carry the native ``(repeat, *points, *data)`` axes (occupancy ``(1, 1, N)``,
         frame ``(1, 1, H, W)``) so the reloader declares the SAME shape contract a live producer did."""

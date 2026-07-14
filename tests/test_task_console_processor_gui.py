@@ -3,13 +3,10 @@
 A processor is a logic node (Logic tab), added STOPPED, with an auto-generated Edit
 form from the spec's ParamDecls.  Two execution styles share the model:
 
-* ONE-SHOT (``Readout fidelity``): Start runs the action once on its own thread (a
-  ``ProcessorRun``) over a saved frames folder and self-stops.
-* REACTIVE (``Judge occupancy``): Start launches a live node that consumes each
-  ``frame`` signal and republishes per-site occupancy via the real
-  ``calibration.detect`` -- it keeps running until Stop.
+Start runs the ``Readout fidelity`` action once on its own thread (a
+``ProcessorRun``) over a saved frames folder and self-stops.
 
-Either way display is suppressed (no auto plot); you add a Plot panel on the Monitor
+Display is suppressed (no auto plot); you add a Plot panel on the Monitor
 board pointed at a published signal to view it.
 
 Offscreen Qt + the virtual==real path (na.simulation.write_virtual_run / a virtual session); no
@@ -17,8 +14,6 @@ demo GUI fixtures.
 """
 
 from __future__ import annotations
-
-from conftest import raw_device_set
 
 from pathlib import Path
 import sys
@@ -31,9 +26,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
-
-from conftest import fire_live_imaging   # the live "On Pulse" the trigger-driven camera needs
-
 
 @pytest.fixture(autouse=True)
 def _offscreen(monkeypatch):
@@ -90,79 +82,6 @@ def test_processor_node_runs_and_publishes(tmp_path):
         assert console.hub.schema("fidelity_site").data_shape == (20,)
         # display suppressed: running the processor created NO plot panel
         assert console.cards == []
-    finally:
-        console.shutdown()
-        exp.close()
-
-
-def test_judge_occupancy_node_reacts_to_frames(tmp_path):
-    """The REACTIVE 'Judge occupancy' processor consumes each live ``frame`` and
-    republishes per-site occupancy/centers via the REAL ``calibration.detect`` (no
-    folder, no one-shot).  Its calibration param is an EXPLICIT saved file (defaulting to
-    the canonical calibration.json the Calibrate task writes); a Plot panel can then read
-    its published signals."""
-    import Zou_lab_control.neutral_atom as na
-    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
-    from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
-
-    exp = na.connect("virtual", sitemap={"grid_shape": (4, 5), "image_shape": (40, 50)})
-    exp.readout.sitemap(method="box", frames=4, display=False)
-    exp.readout.thresholds(frames=16, display=False)
-
-    hub = SignalHub()
-    console = TaskConsole(hub=hub, state=default_console_state(),
-                          processors=exp.readout.processor_specs(), session=exp)
-    console._timer.stop()
-    try:
-        row, editor = _add_processor_node(console, "Judge occupancy")
-        assert row.node.kind == "processor"
-        # default STOPPED + defaults PREFILLED from the spec (never blank-to-guess): the
-        # calibration field shows the canonical calibration.json path (NOT a blank mystery),
-        # source shows its declared default.  There is no invented `ema` smoothing param.
-        assert console._logic_nodes[id(row)] is None
-        vals = editor.collect_values()
-        assert vals["calibration"].replace("\\", "/").endswith("calibrations/calibration.json")
-        # source is a signal_expr (the universal multi-slot picker): its declared default expression
-        # is ``value = signal`` over the ``frame`` signal -- assert the EXPRESSION, robust to the
-        # widget leaving ``inputs`` empty until that signal exists (an empty pick falls back to frame).
-        from Zou_lab_control.neutral_atom.operations.signal_expr import SignalExpr
-        assert SignalExpr.from_value(vals["source"]).source == "value = signal"
-        assert "ema" not in vals
-
-        # Deliberately switch to the file-owned mode and point it at a real
-        # current-version calibration artifact.
-        cal_file = tmp_path / "cal.json"
-        exp.readout.save(str(cal_file))
-        editor.form._widgets["calibration_origin"].setCurrentText("file")
-        editor.form._widgets["calibration"].setText(str(cal_file))
-
-        # a camera measurement publishes `frame`; the occupancy processor reacts to it
-        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
-        fire_live_imaging(exp)                      # On Pulse: the trigger-driven camera streams
-        cam.step()                                  # first frame on the hub
-        console._start_logic_node(row)
-        node = console._logic_nodes[id(row)]
-        # A SINGLE occupancy node publishes its SHORT, natural names (prefix "" by default -- the
-        # producing node is shown by the flow grouping/legend, not baked into every signal); only
-        # a SECOND colliding judge gets a disambiguating prefix.  Build names off node.prefix so
-        # the assertion holds either way, never a hard-coded bare name.
-        assert node.prefix == ""                    # single instance -> bare names, no prefix
-        occ_name, cen_name = node.prefix + "occupied", node.prefix + "centers"
-        deadline = time.monotonic() + 8.0
-        while occ_name not in hub.names() and time.monotonic() < deadline:
-            cam.step()                              # keep frames coming for the reactive node
-            time.sleep(0.03)
-        assert occ_name in hub.names()
-        cen = np.asarray(hub.latest(cen_name))
-        assert cen.shape == (1, 1, 20, 2)
-        assert hub.schema(cen_name).data_shape == (20, 2)
-        # occupancy is the canonical (R,P,*data_shape) block the processor preserves (#H3q):
-        # one shot judged, one readout point -> (1,1,n_sites), P kept and data_shape=(n_sites,)
-        assert np.asarray(hub.latest(occ_name)).shape == (1, 1, cen.shape[2])
-        # reactive: it keeps running (NOT a one-shot finished node)
-        assert getattr(node, "finished", False) is False
-        cam.stop()
     finally:
         console.shutdown()
         exp.close()

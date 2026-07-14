@@ -21,7 +21,6 @@ import json
 from pathlib import Path
 import sys
 
-import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -29,11 +28,26 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 from Zou_lab_control.neutral_atom.timing import (
+    PulsePeriod,
     PulseTableState,
-    default_imaging_template,
     single_imaging_template,
 )
-from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod
+
+
+def _three_slot_table() -> PulseTableState:
+    catalog = PortCatalog.from_channels(["trap", "cooling", "probe", "emCCD"])
+    periods = [
+        PulsePeriod(2e-3, [1, 1, 0, 0], unit="s", name="load"),
+        PulsePeriod(20e-3, [1, 0, 1, 1], unit="s", name="image_0"),
+        PulsePeriod(100e-6, [1, 0, 0, 0], unit="s", name="gap_0"),
+        PulsePeriod(5e-3, [1, 0, 1, 1], unit="s", name="image_1"),
+        PulsePeriod(100e-6, [1, 0, 0, 0], unit="s", name="gap_1"),
+        PulsePeriod(20e-3, [1, 0, 1, 1], unit="s", name="image_2"),
+    ]
+    state = PulseTableState(port_catalog=catalog, periods=periods, name="api_slots")
+    for index in (1, 3, 5):
+        state.bind_api_field("duration", str(index), unit="s")
+    return state
 
 
 def test_dac_api_slot_unit_is_normalized_to_value():
@@ -80,7 +94,7 @@ def test_api_slot_names_are_unique_each_binds_one_field():
     """Each API handle binds EXACTLY ONE field (names are unique, like the GUI allocates a
     fresh ``a<N>`` per click) -- ``validate`` rejects a duplicate; ``set_api`` writes only its
     one field; ``state.aN`` sugar and a round-trip through ``to_dict``/``from_dict`` both work."""
-    st = default_imaging_template()
+    st = _three_slot_table()
     assert st.api_names() == ["a1", "a2", "a3"]                     # three exposure cells, three handles
 
     st.set_api("a1", 0.03)                                          # first long -> 30 ms
@@ -126,7 +140,7 @@ def test_every_fire_path_records_a_syncable_table():
     try:
         seqr = raw_device_set(exp).sequencer
         # a Task fires a COMPILED bracket (no periods of its own)
-        tpl = default_imaging_template()
+        tpl = _three_slot_table()
         tpl.set_api("a1", 0.02)
         tpl.set_api("a2", 0.005)
         tpl.set_api("a3", 0.02)

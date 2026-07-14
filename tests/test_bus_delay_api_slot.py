@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
-from Zou_lab_control.neutral_atom.timing import PulseTableState, enumerate_pulse_params
+from Zou_lab_control.neutral_atom.timing import PulseTableState
 from Zou_lab_control.neutral_atom.timing.pulse_table import ScanSlot
 
 
@@ -71,22 +71,6 @@ def test_bus_delay_unit_defaults_to_first_member():
     name = st.bind_api_field("delay", BUS)                # no unit= -> derive from first member
     slot = next(s for s in st.api_slots if s.name == name)
     assert slot.unit == "us"
-
-
-def test_bus_delay_slot_is_listed_by_enumerate_pulse_params():
-    """The bus-delay API slot is surfaced by the single-source enumerator (the GUI dropdown +
-    notebook both read it); its label carries the bus NAME (the bus name IS the information)."""
-    st = _bus_state()
-    triples = enumerate_pulse_params(st)
-    delay_targets = [(target, label) for kind, target, label in triples if kind == "delay"]
-    targets = [t for t, _ in delay_targets]
-    assert BUS in targets                                 # the bus-delay target is listed
-    bus_label = next(label for t, label in delay_targets if t == BUS)
-    assert BUS in bus_label                               # label names the bus
-    # the bus's members are exposed VIA the bus slot, not as per-member delay rows
-    for ch in MEMBERS:
-        assert ch not in targets
-    assert "ttl0" in targets                              # a plain channel is still listed
 
 
 def test_bus_delay_symmetric_with_channel_delay():

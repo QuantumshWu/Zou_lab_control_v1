@@ -156,7 +156,7 @@ def test_repeat_is_a_measurement_param_auto_injected_as_one_knob(monkeypatch):
         assert console._repeat_value({"repeat": 0}) == 0
         assert console._repeat_value({}) == 0                    # missing -> ∞ default
 
-        prow = console._add_logic_node(LogicNodeConfig(kind="processor", name="Judge occupancy"))
+        prow = console._add_logic_node(LogicNodeConfig(kind="processor", name="Readout fidelity"))
         console._edit_logic_node(prow)
         pw = console._logic_editors[id(prow)].form._widgets
         assert "repeat" not in pw and "free_run" not in pw   # a processor does not acquire repeats

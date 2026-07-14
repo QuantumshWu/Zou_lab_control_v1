@@ -36,10 +36,9 @@ from ..views.plots import plot_image, plot_threshold_hist
 
 SUPPORTED_THRESHOLD_METHODS = ("otsu", "bimodal")
 
-#: The readout methods a one-shot calibration computes so the OccupancyProcessor can pick any
-#: later (box square-ROI, per-site PSF, one-shared-kernel PSF).  Single source -- the cali, the
-#: calibration's ``by_method`` and the processor choice derive from this, never a retyped literal.
-#: Defined ABOVE the first function so the sitemap builder validates ``method`` against it (#F5).
+#: Readout methods supported by the standalone sitemap builder (box square-ROI,
+#: per-site PSF, one shared-kernel PSF).  The calibration and detector dispatch
+#: derive from this vocabulary rather than retyping it.
 ALL_READOUT_METHODS = ("box", "psf", "uniform_psf")
 
 # Every offered method MUST declare its readout KIND in the core dispatch table, so
@@ -69,10 +68,9 @@ def calibrate_sitemap_from_images(
 ) -> SitemapResult:
     """Calibrate site centers (and, for ``method='psf'``, per-site PSF weights).
 
-    ``centers`` optionally reuses a site map ALREADY detected on the same reference frames (see
-    :func:`calibrate_all_methods_from_images`): centers are a property of the atom lattice, not the
-    readout method, so the expensive :func:`find_site_centers` runs once and is shared across the
-    box/psf/uniform readouts instead of re-detecting the same spots per method."""
+    ``centers`` optionally reuses a site map already detected on the same
+    reference frames: centers are a property of the atom lattice, not the readout
+    method, so callers can share one detection across readout models."""
 
     stack = [np.asarray(image, dtype=float) for image in images]
     if not stack:
@@ -151,10 +149,8 @@ def calibrate_threshold_from_images(
     Signals are extracted with ``calibration.signals`` (box or PSF, matching the
     sitemap), so thresholds apply to the same quantity ``detect`` will use.
 
-    This is the ONE place thresholds are learned (every calibration path -- the
-    ``ReadoutSubsystem.thresholds`` API AND the ``CalibrateReadoutTask`` GUI flow -- routes
-    through it), so it is the single source that records the camera gate time in
-    the typed frame contract.  A threshold is
+    This is the standalone API's one threshold-learning boundary, so it records
+    the camera gate time in the typed frame contract.  A threshold is
     exposure-specific, so any later readout (e.g. the temperature survival frames) must image
     at this SAME exposure; recording it here lets that match happen automatically (#H3w-3).
     """
@@ -200,60 +196,11 @@ def calibrate_threshold_from_images(
 
 
 
-def calibrate_all_methods_from_images(
-    reference_images,
-    readout_images,
-    *,
-    grid_shape: Sequence[int],
-    ordering: str = "row-major",
-    roi_radius: int = 1,
-    reducer: str = "mean",
-    threshold_method: str = "otsu",
-    psf_half_width: int = 3,
-    background: str = "annulus",
-    exposure: float | None = None,
-) -> TrapCalibration:
-    """Calibrate ONCE into a single calibration that can be read with EVERY method.
-
-    The site map is found once (shared centers, from the reference average); then box,
-    per-site-PSF and uniform-PSF readouts are each calibrated (their kernels + per-site
-    thresholds) on the SAME readout frames.  Box is the default top-level readout; the
-    PSF methods are carried in ``by_method``.  So the experimenter calibrates once and the
-    downstream :class:`~..logic.OccupancyProcessor` chooses box / per-site PSF / uniform
-    PSF at read time -- the method is a READOUT choice, not a calibration choice."""
-
-    # Detect the site map ONCE on the reference average and SHARE it across all three methods -- the
-    # box sitemap finds the centers, psf/uniform_psf reuse those exact ones (find_site_centers, the
-    # per-site 2D-Gaussian refine, is the most expensive calibration step; re-running it identically
-    # per method was wasted work and let three "independent" detections drift instead of one source).
-    box_sitemap = calibrate_sitemap_from_images(
-        reference_images, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius,
-        reducer=reducer, method="box", psf_half_width=psf_half_width, background=background, display=False)
-    shared_centers = box_sitemap.calibration.centers
-    cals = {}
-    for method in ALL_READOUT_METHODS:
-        sitemap = box_sitemap if method == "box" else calibrate_sitemap_from_images(
-            reference_images, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius,
-            reducer=reducer, method=method, psf_half_width=psf_half_width,
-            background=background, display=False, centers=shared_centers)
-        result = calibrate_threshold_from_images(
-            readout_images, sitemap.calibration, method=threshold_method, exposure=exposure, display=False)
-        cals[method] = result.calibration
-    box = cals["box"]
-    by_method = {
-        m: {"thresholds": np.asarray(cals[m].thresholds, dtype=float),
-            "psf_weights": cals[m].psf_weights, "psf_boxes": cals[m].psf_boxes,
-            # carry each method's OWN background so signals(method=m) reads on the scale its
-            # thresholds were calibrated on (a psf method's annulus, not box's none).
-            "background": cals[m].background}
-        for m in ALL_READOUT_METHODS if m != "box"
-    }
-    return TrapCalibration(
-        box.centers, box.thresholds, frame_contract=box.frame_contract,
-        grid_shape=box.grid_shape, roi_radius=box.roi_radius,
-        reducer=box.reducer, method="box", background=box.background, by_method=by_method,
-        metadata={**box.metadata, "methods": list(ALL_READOUT_METHODS)})
 
 
-__all__ = ["calibrate_sitemap_from_images", "calibrate_threshold_from_images",
-           "calibrate_all_methods_from_images", "ALL_READOUT_METHODS", "SUPPORTED_THRESHOLD_METHODS"]
+__all__ = [
+    "calibrate_sitemap_from_images",
+    "calibrate_threshold_from_images",
+    "ALL_READOUT_METHODS",
+    "SUPPORTED_THRESHOLD_METHODS",
+]

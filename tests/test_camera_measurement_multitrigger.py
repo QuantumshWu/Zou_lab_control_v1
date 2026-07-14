@@ -25,7 +25,7 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 import Zou_lab_control.neutral_atom as na
-from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, OccupancyProcessor
+from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
 from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
@@ -115,8 +115,8 @@ def test_long_short_long_imaging_bracket_shows_distinct_per_window_exposures():
     shots and EVERY frame collapsed onto window 0's (long) exposure -- all three frames came out equally
     bright.  The criterion is the BASE-CYCLE window count (a bracket carries >= frames per cycle)."""
     from Zou_lab_control.neutral_atom.timing import (
-        default_imaging_template,
         imaging_channel_kwargs,
+        reference_bracket_sequence,
     )
     from Zou_lab_control.neutral_atom.devices.camera_trigger import base_cycle_trigger_pulses
 
@@ -128,10 +128,7 @@ def test_long_short_long_imaging_bracket_shows_distinct_per_window_exposures():
             devices.sequencer,
             trigger_channel=devices.camera.primary_trigger_channel,
         )
-        seq = default_imaging_template(
-            port_catalog=devices.sequencer.port_catalog,
-            **channels,
-        ).to_sequence().forever()
+        seq = reference_bracket_sequence(**channels).forever()
         assert seq.repeat_forever and base_cycle_trigger_pulses(
             seq,
             trigger_channels=devices.camera.effective_trigger_channels,
@@ -161,8 +158,8 @@ def test_live_camera_measurement_shows_the_bracket_exposures_window_for_window()
     per grab (the same block path), so the consumer stays phase-aligned window-for-window.  This
     test pins the REAL call side (shot() -> acquire), not the mechanism layer."""
     from Zou_lab_control.neutral_atom.timing import (
-        default_imaging_template,
         imaging_channel_kwargs,
+        reference_bracket_sequence,
     )
 
     exp = na.connect("virtual")
@@ -173,10 +170,7 @@ def test_live_camera_measurement_shows_the_bracket_exposures_window_for_window()
             seqr,
             trigger_channel=devices.camera.primary_trigger_channel,
         )
-        seq = default_imaging_template(
-            port_catalog=seqr.port_catalog,
-            **channels,
-        ).to_sequence().forever()
+        seq = reference_bracket_sequence(**channels).forever()
         seqr.prepare(seq)
         seqr.fire()                                   # the pulse GUI's "On Pulse"
         node = CameraMeasurement(SignalHub(), raw_device_set(exp).camera, sequencer=seqr, frames_per_cycle=3)
@@ -204,134 +198,12 @@ def test_camera_frame_keys_is_the_single_source_for_published_and_declared_names
         assert camera_frame_keys(n) == [f"frame_{i}" for i in range(n)]       # ordered, frame_0..frame_{n-1}
 
 
-def test_readout_image_frame_judged_is_synced_with_occupancy():
-    """#5: a 2D 'readout image' reads the occupancy processor's ``frame_judged``, which is
-    co-published ATOMICALLY with ``occupied`` (one transform dict) -- so the image and the
-    site-map rings are ALWAYS the same shot.  (A raw live ``frame`` panel runs one cycle
-    ahead of the judged frame; ``frame_judged`` is the bottom-up sync point.)"""
-    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
-    exp.readout.sitemap(frames=4, display=False)
-    exp.readout.thresholds(frames=20, display=False)
-    cal = exp.readout.current
-    hub = SignalHub()
-    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
-    det = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame_0"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
-    fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
-    for _ in range(4):
-        cam.step()
-        det.step()
-    frame_judged = np.asarray(hub.latest("frame_judged"))
-    occupied = np.asarray(hub.latest("occupied"))
-    # canonical (R,P,*data_shape): frame_judged data_shape=(H,W), occupied data_shape=(n_sites,)
-    assert frame_judged.ndim == 4 and occupied.ndim == 3 and frame_judged.shape[1] == occupied.shape[1] == 1
-    # the readout image and the rings are the SAME shots: re-judging each frame_judged slice
-    # reproduces exactly the published occupancy slice (they came from one atomic publish).
-    img = frame_judged[-1, 0]                                       # the last filled shot's (H, W) frame
-    assert np.array_equal(occupied[-1, 0], cal.detect(img, method="box").occupied)
 
 
-def test_2d_frame_panel_shows_camera_average_decoupled_from_judge():
-    """#H3o DECOUPLING: a 2D-image panel bound to the camera ``frame`` shows the CAMERA's OWN
-    ``(repeat,1,H,W)`` block reduced by the plot's ``repeat_mode`` (average = the long-exposure mean
-    that recovers all sites), INDEPENDENT of any running Judge.  A Judge (OccupancyProcessor) is a
-    SEPARATE reactive node: it publishes its OWN keys (``occupied`` / ``frame_judged``) and NEVER
-    rewrites ``frame``, so it cannot change what a ``frame`` panel displays.  This pins the bug where,
-    with a Judge running, a 2D(frame) panel collapsed to the judged single frame and LOST the average
-    -- there is no frame-coherence rewrite; a panel reads exactly the signal it is bound to."""
-    from PyQt5 import QtWidgets
-    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
-    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-
-    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
-    exp.readout.sitemap(frames=4, display=False)
-    exp.readout.thresholds(frames=20, display=False)
-    hub = SignalHub()
-    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, repeat=5)  # 0=∞; 5 = a 5-deep block
-    det = OccupancyProcessor(hub, calibration=exp.readout.current,
-                             source_expr={"inputs": ["frame_0"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
-    fire_live_imaging(exp)
-    for _ in range(6):
-        cam.step(); det.step()           # the camera fills its repeat ring WHILE the Judge runs
-
-    ns = hub.snapshot_latest()
-    block = np.asarray(ns["frame_0"])                     # (repeat, 1, H, W) camera block
-    assert block.ndim == 4 and "frame_judged" in ns       # precondition: a Judge IS running + published
-
-    st = {"points_shape": (1,), "data_shape": tuple(block.shape[2:]), "grid_shape": ()}
-    card = PanelCard(PanelConfig(kind="2d", role="plot", source="value = signal", inputs=["frame_0"],
-                                 params={"repeat_mode": "average", "cmap": "viridis"}),
-                     structure_provider=lambda name: st)
-    try:
-        rendered = np.asarray(card._coerce(card._signal_then_repeat(ns)))
-        expected = np.nanmean(block.reshape(block.shape[0], *block.shape[2:]), axis=0)  # camera block average
-        assert rendered.shape == tuple(block.shape[2:])                    # an (H, W) image
-        assert np.allclose(rendered, expected, equal_nan=True)             # == the camera average
-        assert not np.allclose(rendered, np.asarray(ns["frame_judged"]))   # NOT the Judge's single frame
-    finally:
-        card.shutdown()
 
 
-def test_occupancy_falls_back_to_session_calibration_on_shape_mismatch():
-    """A stale on-disk calibration (different camera ROI) must NOT wedge the readout forever.  When
-    the loaded calibration does not fit the live frame, the node falls back to the session
-    calibration (built from THIS camera, so it matches) and keeps publishing occupancy/rate."""
-    small = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
-    small.readout.sitemap(frames=4, display=False); small.readout.thresholds(frames=20, display=False)
-    stale_cal = small.readout.current                    # a (40,50) calibration
-
-    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (48, 60)})
-    exp.readout.sitemap(frames=4, display=False); exp.readout.thresholds(frames=20, display=False)
-    session_cal = exp.readout.current                    # the matching (48,60) calibration
-    hub = SignalHub()
-    det = OccupancyProcessor(hub, calibration=stale_cal, session_calibration=lambda: session_cal,
-                             source_expr={"inputs": ["frame_0"], "source": "value = signal"}, grid_shape=(3, 4))
-    fire_live_imaging(exp)
-    img = raw_device_set(exp).camera.acquire(1)[0]                # the wired camera senses the firing itself
-    hub.publish({"frame_0": np.asarray(img, dtype=float)})
-    out = det.step()                                     # stale cal mismatches (48,60) -> falls back
-    assert "occupied" in out and "rate" in out           # readout keeps flowing (not wedged)
-    assert det.calibration is session_cal                # adopted the matching one for next shots
-    small.close(); exp.close()
 
 
-def test_occupancy_nodes_publish_short_names_and_disambiguate_on_collision():
-    """#7/#2: a logic node publishes its SHORT natural signal names (``occupied`` / ``rate`` /
-    ... -- NOT a verbose ``judge_occupancy_rate``); the producer is shown by the signal-flow
-    grouping + frame-title legend, not baked into every name.  A SECOND node whose outputs would
-    COLLIDE with an already-running node's signals gets a disambiguating prefix so their hub
-    signals stay disjoint.  Distinct row TITLES + distinct display LABELS too.  Verified through
-    the REAL console helpers (_unique_logic_title + _logic_node_prefix), Qt-free."""
-    from types import SimpleNamespace
-    from Zou_lab_control.frontend.task_console import TaskConsole, LogicNodeConfig
-
-    keys = ("occupied", "counts", "rate", "centers", "thresholds", "frame_judged")
-    spec = SimpleNamespace(result_keys=keys)
-    # _logic_node_prefix checks collisions against EVERY live hub signal (#2) -> the mock console needs a
-    # hub; an empty one suffices here (the running node `a` below is detected via running_nodes).
-    console = SimpleNamespace(logic_nodes=[], running_nodes=[], hub=SignalHub(), _spec_for_logic=lambda n: spec)
-    # the bare-keys / base-prefix helpers are the REAL implementations, bound onto the mock
-    console._node_bare_keys = lambda n: TaskConsole._node_bare_keys(console, n)
-    console._logic_node_base_prefix = lambda n: TaskConsole._logic_node_base_prefix(console, n)
-
-    t1 = TaskConsole._unique_logic_title(console, "Judge occupancy")
-    cfg1 = LogicNodeConfig(kind="processor", name="Judge occupancy", title=t1)
-    console.logic_nodes.append(SimpleNamespace(node=cfg1))
-    # FIRST node, nothing running yet -> NO prefix: it publishes the bare short names.
-    p1 = TaskConsole._logic_node_prefix(console, cfg1)
-    assert p1 == ""
-    a = OccupancyProcessor(SignalHub(), calibration=None, prefix=p1); a.instance_label = t1
-    assert "rate" in a.published_signals() and "occupied" in a.published_signals()   # short names
-    console.running_nodes.append(a)                       # now it's publishing the bare names
-
-    # SECOND node added while the first RUNS -> its keys collide -> disambiguating prefix.
-    t2 = TaskConsole._unique_logic_title(console, "Judge occupancy")
-    cfg2 = LogicNodeConfig(kind="processor", name="Judge occupancy", title=t2)
-    console.logic_nodes.append(SimpleNamespace(node=cfg2))
-    p2 = TaskConsole._logic_node_prefix(console, cfg2)
-    assert t1 != t2 and p2 and p2.endswith("_") and p2 != p1   # distinct title + disambiguating prefix
-    b = OccupancyProcessor(SignalHub(), calibration=None, prefix=p2); b.instance_label = t2
-    assert set(a.published_signals()).isdisjoint(b.published_signals())   # disjoint hub signals
-    assert a.display_label != b.display_label
 
 
 def test_frames_per_cycle_is_live_editable():

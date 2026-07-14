@@ -49,7 +49,7 @@ from ..signal_expr import DEFAULT_SOURCE, SignalExpr
 DEFAULT_PROBE_TEMPLATE = PROBE_TEMPLATE_PATH
 
 #: Default y source: UNBOUND -- a generic pulse-scan measurement must not name another node's private
-#: signal (naming a Judge-occupancy ``rate`` couples this generic measurement to one processor's output
+#: signal (naming a particular processor output would couple this generic measurement to one producer
 #: AND aborts the scan when no such processor is running).  Blank = the same "pick a signal yet" state a
 #: plot panel starts in; the operator binds the scan y to whatever value THEIR running readout publishes
 #: (occupancy loading rate, ROI intensity, survival, ...).  The node still guards a start with no producer

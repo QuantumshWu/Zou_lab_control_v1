@@ -65,28 +65,19 @@ import Zou_lab_control.neutral_atom as na
 exp = na.connect("remote_template.json", open_devices=True)   # 开 qCMOS + RemoteSequencer
 exp.readout.sitemap(method="box", frames=20, display=True)     # 看站点中心检测
 exp.readout.thresholds(frames=100, display=True)               # 看每站点阈值直方图
-# 确认无误后再看板;loading 读出由独立逻辑节点组合(相机出帧 + 真 detect + 标定 task),只换相机即真机:
-from Zou_lab_control.frontend import show_task_console
-from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor
-hub = SignalHub()
-camera = exp.readout.camera_measurement(hub)          # CameraMeasurement:只发 frame_0/frame_1/...
-calibration = exp.readout.require(thresholds=True)    # 上面 sitemap/thresholds 标定出的 TrapCalibration
-detect = OccupancyProcessor(hub, calibration=calibration, grid_shape=(5, 7))  # 逐帧真 detect
-camera.start(); detect.start()                       # 相机按触发事件产 frame_0/frame_1/...，detect 逐帧消费(reactive)
-show_task_console(hub=hub, running_nodes=[camera, detect],
-                  measurements=exp.readout.measurement_specs())
+exp.readout.detect(display=True)                               # 单帧检查阈值极性与占据结果
 ```
 
-确认设置可信后,**例行运行可一键直跑**(自动建组合 loading 读出、走同一标定契约):
+当前 task console 可用于原始相机与通用 plot 的真机检查:
 
 ```bash
 python task_console.py --config remote_template.json --grid 5x7
 ```
 
-- 控制台开局**空、全停**。看 loading:从 **Add Panel** 加 `Measurement: Camera (live frames)` +
-  `Processor: Judge occupancy` + `Task: Calibrate readout` 三个 logic 节点,各自 Start,再加 Plot 面板
-  连它们发的 `frame_0`/`frame_1`/...、`occupied`/`rate`/`centers` 等信号,拼出你要的看板;布局 Save/Load。
+- 控制台开局**空、全停**。从 Add Panel 添加 camera Measurement，再把 2D/hist/monitor/1D
+  plot 绑定到 `frame_0` 等原始信号即可检查实时采集；布局可 Save/Load。
+- 正式 readout calibration/occupancy GUI 尚在迁移，Add Panel 不提供替代 detector。不要用
+  demo、私有类或旧 PulseTableState workflow 绕过这一 NO-GO，也不要建立格式转换器。
 - **无内置预设**——布局都是你自己拼好再 Save 出来的(`--task <你存的名字>` 载回)。
 - 每个 logic 节点的参数表单在它**自己**的 Edit 标签(由 ParamDecl 自动生成);plot 面板的 Edit 也给产它信号
   的那个 measurement/processor 的参数表单。task 运行时占一张固定面板看中途过程、并锁定其他操作只留 Stop。

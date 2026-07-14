@@ -228,7 +228,7 @@ class TrapCalibration:
     psf_boxes: np.ndarray | None = None      # (N, 4) int (x0, y0, w, h), method='psf'
     background: str = "none"                 # extraction background: 'none' | 'annulus'
     # OPTIONAL per-method readout data so ONE calibration supports several readout
-    # methods and the downstream OccupancyProcessor picks which to use (cali once, read
+    # methods and the downstream detector picks which to use (calibrate once, read
     # many ways).  ``{method: {"thresholds": (N,), "psf_weights": (N,h,w)|None,
     # "psf_boxes": (N,4)|None}}`` for every method OTHER than this calibration's own
     # (which lives in the top-level fields).  None / empty = single-method (the default).

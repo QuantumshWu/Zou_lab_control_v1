@@ -2,8 +2,8 @@
 
 A measurement / notebook must be able to LOAD a saved pulse program and retune it
 (durations, a channel delay, append a step) WITHOUT the GUI, so the same program a
-user designs in the editor can be tweaked in code (e.g. a Calibrate task sweeping the
-readout duration).  These pin the programmatic mutators that mirror the GUI edits and
+user designs in the editor can be retuned by a scan or notebook.  These pin the
+programmatic mutators that mirror the GUI edits and
 prove the edits survive ``to_sequence`` + a save/load round-trip.
 """
 

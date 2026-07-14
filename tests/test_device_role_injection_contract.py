@@ -76,7 +76,7 @@ def test_declared_camera_roles_become_real_choice_params(readout):
     dropdown from the resolved devices, not a hardcoded list."""
     from Zou_lab_control.neutral_atom.devices.base import CameraDevice
 
-    cams = readout.raw_device_set(session).device_names(CameraDevice)
+    cams = raw_device_set(readout.session).device_names(CameraDevice)
     assert cams, "virtual config must load at least one camera"
     specs = [*readout.measurement_specs(), *readout.task_specs(), readout.camera_spec()]
     saw_any = False
@@ -103,10 +103,10 @@ def test_injection_passes_a_device_not_a_string(readout):
     node = readout.camera_spec().build(hub, camera="camera")
     assert isinstance(node.camera, CameraDevice), f"camera_spec got {type(node.camera)}"
 
-    # task path: spec.build(hub, camera=name) -> CalibrateReadoutTask.camera is the device
-    cal = next(s for s in readout.task_specs() if s.name == "Calibrate readout")
-    task = cal.build(hub, camera="camera", threshold_frames=2)
-    assert isinstance(task.camera, CameraDevice), f"calibrate task got {type(task.camera)}"
+    # task path: the remaining MOT task also receives a resolved camera, not a string
+    mot = next(s for s in readout.task_specs() if s.name == "Optimize MOT field")
+    task = mot.build(hub, camera="camera", points=2)
+    assert isinstance(task.camera, CameraDevice), f"MOT task got {type(task.camera)}"
 
     # blank / missing selection falls back to the role default (still a device, never None-crash)
     node2 = readout.camera_spec().build(hub, camera=None)

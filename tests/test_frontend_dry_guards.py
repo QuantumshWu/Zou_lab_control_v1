@@ -45,14 +45,22 @@ def test_all_distribution_bands_share_one_count_xlim(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.live import LiveSiteMap
     from Zou_lab_control.frontend.live import _dist_count_xlim
 
     console = dt.demo_console(shots=25)
+    site_plot = LiveSiteMap(
+        np.array([[5.0, 5.0], [15.0, 15.0]]),
+        np.array([1.0, 0.0]),
+        image=np.zeros((20, 20)),
+        labels=("x", "y", "counts"),
+    ).show(display=False)
     try:
         band_plotters = [
             c.plotter for c in console.cards
             if getattr(c.plotter, "axdis", None) is not None and getattr(c.plotter, "n", None) is not None
         ]
+        band_plotters.append(site_plot)
         assert band_plotters, "demo board should carry at least one side-distribution panel"
         for p in band_plotters:
             kind = type(p).__name__
@@ -60,6 +68,8 @@ def test_all_distribution_bands_share_one_count_xlim(monkeypatch):
             assert int(p.axdis.get_xlim()[1]) == expected, (
                 f"{kind} axdis count-xlim {p.axdis.get_xlim()[1]} != single-source {expected}")
     finally:
+        import matplotlib.pyplot as plt
+        plt.close(site_plot.fig)
         console.shutdown()
 
 

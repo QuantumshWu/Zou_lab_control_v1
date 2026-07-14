@@ -30,8 +30,9 @@ hardware needed), so you can practice the whole readout flow at your desk.
 2. **Learn the model + scripted readout:** `tutorials/neutral_atom_tutorial.ipynb`
    (connect virtual, calibrate, detect, scan) — start here. The plotting/pulse
    primitives are in `tutorials/frontend_tutorial.ipynb`.
-3. **Drive the live GUI:** `tutorials/task_console_tutorial.ipynb` + `task_console.bat`
-   (Add Panel → measurement/plot, run a calibration, watch a scan fill in).
+3. **Inspect the live GUI:** `task_console.bat` currently supports the catalog entries it
+   actually lists (including camera/plot workflows). The retired calibration/occupancy
+   wrappers are deliberately absent until their current controller slice lands.
 4. **Go to real hardware:** read `docs/REAL_HARDWARE_BRINGUP_zh.md` (the
    first-power-on checklist), start the FPGA side with
    `tutorials/neutral_atom_fpga_server.ipynb`, then bring up the control PC with
@@ -144,13 +145,12 @@ pulse_gui.bat --no-sequencer --state .\pulses\camera_imaging_address_switch.json
 The **task console** (`task_console.bat`) is the experiment-side dashboard: a
 configurable grid of live panels (2D image with side distribution and draggable
 clim, rolling trace, bimodal-fit histogram, 1D vector), each wired to named
-experiment signals through a small Python expression (`value = occupied -
-b_occupied`).  It opens empty: from **Add Panel** you assemble the logic nodes
-(a camera Measurement publishing `frame_0`, `frame_1`, ... per trigger event, a Judge-occupancy Processor turning one selected frame signal
-into occupancy / loading-rate signals) and plot panels reading those signals.
-A real experiment is the same graph publishing into a `SignalHub` from a real
-camera (see the frontend manual's Task-console chapter).  Layouts save/load as
-one JSON in `tasks/`.
+experiment signals through a small Python expression. It opens empty: from
+**Add Panel** you can currently assemble camera Measurements publishing
+`frame_0`, `frame_1`, ... per trigger event and plot panels reading those raw
+signals. Formal calibration/occupancy panels stay absent until their current
+artifact-backed controller slice lands; there is no fallback detector hidden in
+the demo or GUI. Layouts save/load as one JSON in `tasks/`.
 
 ## Targeted Verification
 

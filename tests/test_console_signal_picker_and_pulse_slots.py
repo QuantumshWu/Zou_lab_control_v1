@@ -8,7 +8,7 @@
       dropdown the plot panels use (grouped headers + indented bare names, read by data);
   #4  the plot panel's source expression has an "expand" affordance that opens a large
       floating editor (so it never has to be typed in the cramped inline field);
-  #5  the Logic tab shows SHORT signal names ("rate"), never the prefixed "judge_occupancy_rate".
+  #5  the Logic tab shows SHORT signal names ("rate"), never a producer-prefixed key.
 
 Run on the offscreen Qt platform; build widgets directly (no flaky demo fixture).
 """
@@ -25,7 +25,23 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
-from Zou_lab_control.neutral_atom.timing import default_imaging_template
+from Zou_lab_control.neutral_atom.ports import PortCatalog
+from Zou_lab_control.neutral_atom.timing import PulsePeriod, PulseTableState
+
+
+def _api_state() -> PulseTableState:
+    state = PulseTableState(
+        port_catalog=PortCatalog.from_channels(["trap", "emCCD"]),
+        periods=[
+            PulsePeriod(2e-3, [1, 0], unit="s", name="load"),
+            PulsePeriod(5e-3, [1, 1], unit="s", name="image"),
+            PulsePeriod(100e-6, [1, 0], unit="s", name="hold"),
+        ],
+        name="api_editor",
+    )
+    for index in range(3):
+        state.bind_api_field("duration", str(index), unit="s")
+    return state
 
 
 @pytest.fixture(autouse=True)
@@ -38,23 +54,26 @@ def _offscreen(monkeypatch):
 
 # --------------------------------------------------------------------------- #2 remove period
 def test_remove_period_with_api_slot_does_not_raise_and_remaps():
-    """The default imaging template binds a1 to TWO frames (periods 1 and 5) and a2 to period 3.
-    Removing a MIDDLE period must drop any slot on it and shift the later ones down so the
+    """Removing a middle period drops its API slot and shifts later targets.
+
+    Each period has one distinct API handle, so this isolates editor remapping from
+    any domain pulse template.
+    The
     surviving slots still bind real periods (the regression was a validate() ValueError)."""
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
 
-    state = default_imaging_template()
+    state = _api_state()
     assert state.api_names() == ["a1", "a2", "a3"]   # one unique handle per exposure cell
     editor = PulseSequenceEditor(state=state)
     try:
-        # remove period 1 (image_0, carries a1): a1 is dropped, a2@3 -> 2, a3@5 -> 4
+        # Remove period 1 (a2); a3 shifts from period 2 to period 1.
         editor._selected_period = 1
         editor.remove_period()                         # must not raise
         after = editor.read_state()
         assert len(after.periods) == len(state.periods) - 1
         targets = {s.name: int(s.target) for s in after.api_slots}
-        assert "a1" not in targets                      # the only a1 was on removed period 1
-        assert targets["a2"] == 2 and targets["a3"] == 4   # later slots re-indexed
+        assert "a2" not in targets
+        assert targets["a1"] == 0 and targets["a3"] == 1
         after.validate()                               # the bug: this used to raise
 
         # and removing the LAST period (the other reproduction) is also clean
@@ -71,7 +90,7 @@ def test_delay_field_can_become_an_api_slot_via_gui():
     API slot in the read-back state, and ``set_api`` then sets that channel's delay by name."""
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
 
-    editor = PulseSequenceEditor(state=default_imaging_template())
+    editor = PulseSequenceEditor(state=_api_state())
     try:
         state = editor.read_state()
         channel = next(
@@ -91,20 +110,18 @@ def test_delay_field_can_become_an_api_slot_via_gui():
 # --------------------------------------------------------------------------- #3 grouped picker
 def test_logic_node_source_picker_groups_by_producer_with_human_labels_and_bare_data():
     """A signal-kind param renders the SAME nested collapsible-tree picker the plot panels use (G2):
-    one producer GROUP, each leaf shown by its HUMAN label (never the raw ``judge_occupancy_rate`` key,
+    one producer GROUP, each leaf shown by its HUMAN label (never the raw ``occupancy_rate`` key,
     #H3w-4) but carrying the BARE signal name as its bind data.  Asserted on the single-source grouping
     (`signal_tree_groups`) the widget is built from, + that the panel reads a pick back by bare name."""
-    from Zou_lab_control.frontend.task_console import MeasurementPanel
     from Zou_lab_control.frontend.param_widgets import signal_tree_groups, read_editable_combo
-    from Zou_lab_control.neutral_atom.core.params import ParamDecl
     from Zou_lab_control.frontend.qt_fluent import FluentTreeComboBox
 
     names = ["occupancy_occupied", "occupancy_rate"]
-    sources = {"occupancy_occupied": ["Judge occupancy #1"], "occupancy_rate": ["Judge occupancy #1"]}
+    sources = {"occupancy_occupied": ["Analysis #1"], "occupancy_rate": ["Analysis #1"]}
     formats = {"occupancy_occupied": "(35,)", "occupancy_rate": "scalar"}
     labels = {"occupancy_occupied": "Occupied", "occupancy_rate": "Loading rate"}
     groups = signal_tree_groups(names, sources, formats, labels)
-    assert [g[0] for g in groups] == ["Judge occupancy #1"]              # one producer group
+    assert [g[0] for g in groups] == ["Analysis #1"]              # one producer group
     leaves = groups[0][1]
     leaf_labels = [lbl for lbl, _bare, _full in leaves]
     bare = [bare for _lbl, bare, _full in leaves]
@@ -167,7 +184,7 @@ def test_signal_picker_can_select_a_declared_not_yet_published_signal():
     ensure_qt_app()
     # 'rate' is declared (in names) but waiting (no live format) -- it must still be pickable
     groups = signal_tree_groups(["frame", "rate"],
-                                {"frame": ["camera"], "rate": ["Judge occupancy #1"]},
+                                {"frame": ["camera"], "rate": ["Analysis #1"]},
                                 {"frame": "(48, 60)"},               # 'rate' has no format -> waiting
                                 {"rate": "Loading rate"})
     combo = FluentTreeComboBox()
@@ -209,7 +226,7 @@ def test_plot_panel_has_floating_expression_editor():
 # --------------------------------------------------------------------------- #5 short logic names
 def test_logic_tab_shows_short_signal_names():
     """``_live_node_formats`` strips the node's disambiguating prefix so the Logic row legend
-    shows "rate"/"occupied", never "judge_occupancy_rate"; the meaning still resolves because
+    shows bare output names; the meaning still resolves because
     output_specs are keyed by the FULL published name (the base class's prefix-join contract:
     published_signals and output_specs carry the SAME hub names), so the legend looks the
     description up by the full name and shortens only the displayed label."""
@@ -217,17 +234,17 @@ def test_logic_tab_shows_short_signal_names():
 
     node = SimpleNamespace(
         layer="processor",
-        prefix="judge_occupancy_",
-        published_signals=lambda: ["judge_occupancy_rate", "judge_occupancy_occupied"],
+        prefix="analysis_",
+        published_signals=lambda: ["analysis_rate", "analysis_score"],
         output_specs=lambda: [
-            SimpleNamespace(name="judge_occupancy_rate", description="cumulative loading"),
-            SimpleNamespace(name="judge_occupancy_occupied", description="per-site occupancy")])
+            SimpleNamespace(name="analysis_rate", description="cumulative rate"),
+            SimpleNamespace(name="analysis_score", description="analysis score")])
     stub = SimpleNamespace(hub=SimpleNamespace(latest=lambda name: None))
     rows = TaskConsole._live_node_formats(stub, node)
     names = [r[0] for r in rows]
-    assert names == ["occupied", "rate"]                       # short + sorted, no prefix
-    assert all("judge_occupancy_" not in n for n in names)
-    assert dict((r[0], r[2]) for r in rows)["rate"] == "cumulative loading"   # desc still resolves
+    assert names == ["rate", "score"]                       # short + sorted, no prefix
+    assert all("analysis_" not in n for n in names)
+    assert dict((r[0], r[2]) for r in rows)["rate"] == "cumulative rate"   # desc still resolves
 
 
 def _live_console():
@@ -235,7 +252,6 @@ def _live_console():
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
-    exp.readout.sitemap(method="box", frames=4, display=False); exp.readout.thresholds(frames=20, display=False)
     con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
                       measurements=exp.readout.measurement_specs(), processors=exp.readout.processor_specs(),
                       tasks=exp.readout.task_specs(), window_px=(1100, 700))

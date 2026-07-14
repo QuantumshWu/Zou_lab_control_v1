@@ -51,7 +51,7 @@ def capture_figure_signals(hub, node, inputs) -> dict[str, dict]:
     """The RAW native hub blocks a panel consumes, keyed by bare name -- folded into a save's
     ``info['signals']`` so ``load_figure`` can REBUILD every panel kind losslessly.
 
-    A site map is the reason this exists: its 2-D underlay FRAME (``frame_judged``) and per-site
+    A site map is the reason this exists: its 2-D underlay frame and per-site
     ``centers`` are NOT recoverable from the flat ``data_x`` / ``data_y`` a scatter saves, so without
     them a reloaded site map has nothing to draw.
 
@@ -374,7 +374,7 @@ def capture_figure_provenance(node, *, resolve_node: ResolveNode | None = None,
       * a DERIVED node (a processor: no device of its own, only a ``consumes`` list) is walked UPSTREAM
         via ``resolve_node`` -- each consumed signal -> its producing node -> ... transitively -- to the
         nearest node that DOES hold devices, and THAT node's ``devices`` + ``acquisition_parameters`` are
-        HOISTED to the top level.  So a site-map panel wired to ``Judge occupancy`` and a 2-D panel wired
+        HOISTED to the top level.  So a site-map panel wired to an occupancy processor and a 2-D panel wired
         straight to the camera both end up with ``provenance['devices']`` carrying camera + sequencer.
 
     The processor's OWN identity keys (``node`` / ``layer`` / ``consumes`` / ``calibration_fingerprint``)

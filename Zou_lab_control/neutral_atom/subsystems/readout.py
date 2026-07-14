@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -29,7 +28,6 @@ from ..operations.measurement import (
     require_pulse_controller,
     triggered_frames,
 )
-from ..operations.tasks.calibrate import CAL_TASK_PREFIX
 from ..operations.temperature import (
     FixedReleaseRecapturePlan,
     ReleaseRecapturePlan,
@@ -677,8 +675,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         """Auto-discovered catalog of orchestration TASKS a GUI can run.
 
         The orchestration tier of :meth:`measurement_specs` / :meth:`processor_specs`:
-        every ``@task`` factory in ``operations/tasks/`` (the built-in readout
-        calibration lives there) plus anything a notebook registered via
+        every ``@task`` factory in ``operations/tasks/`` plus anything a notebook registered via
         ``register_task(...)``.  Each factory receives THIS subsystem, so its
         ``build(hub)`` closure captures the session (camera / sequencer) and returns
         an UNRUN :class:`~..operations.logic.Task` that streams mid-run output to a
@@ -707,12 +704,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
         the instance images is a build parameter, never part of the signal name -- a consumer
         binds a measurement's output, not a sensor.
 
-        This is the standalone live-image logic node -- one of the primitives a
-        notebook or the task console composes the loading readout from by wiring
-        it alongside a :class:`~..operations.logic.OccupancyProcessor` and a
-        :class:`~..operations.logic.CalibrateReadoutTask`.  Its editable
-        parameters ARE the camera's (exposure / region), applied live; only the
-        camera differs on real hardware (virtual == real).
+        This is the standalone live-image logic node used by the notebook or task
+        console.  Its editable parameters ARE the camera's (exposure / region),
+        applied live; only the camera differs on real hardware (virtual == real).
 
         ``repeat`` is the acquisition knob (0 = ∞, the live monitor; K = keep & average a K-deep frame
         block then STOP) -- a FIRST-CLASS build parameter so EVERY entry point (notebook + GUI) applies
@@ -825,63 +819,6 @@ class ReadoutSubsystem(ExperimentSubsystem):
             [("camera", {"tooltip": "Which sensor streams (every camera in the device config is "
                                     "listed; a free-running sensor shows an image with no pulse "
                                     "wiring at all)."})])
-
-    def calibrate_task(self, hub, *, prefix: str = CAL_TASK_PREFIX, camera=None, **params):
-        """Build the calibrate-readout TASK over the session camera (the sitemap +
-        per-site threshold calibration as a first-class one-shot
-        :class:`~..operations.logic.CalibrateReadoutTask`).
-
-        Run it from the console (Add Panel -> "Task: Calibrate readout"): mid-run it
-        streams its template frames + a progress fraction to a dedicated panel
-        (``<prefix>frame`` / ``<prefix>progress``, confocal-task style) and produces a
-        ``TrapCalibration`` (+ optional npz artifact) that an OccupancyProcessor then
-        consumes.  Same calibration primitives the notebook/real readout uses --
-        only the camera frames differ."""
-
-        from ..operations.logic import CalibrateReadoutTask
-
-        s = self._session
-        params["grid_shape"] = s.resolve_grid_shape(params.get("grid_shape"))
-        # ``camera`` is the RESOLVED device the calibrate-readout task's device-role injection
-        # passes (the operator's dropdown choice); the notebook path calls with camera=None and
-        # gets the conventional readout camera.  ONE camera drives the whole calibration.
-        cam = camera if camera is not None else s._device_set.camera
-
-        def _adopt(calibration):
-            # The finished calibration BECOMES the session calibration (``readout.current``),
-            # so a decoupled live OccupancyProcessor begins judging sites the moment this
-            # task completes -- no path to type, the cali->occupancy connection.
-            s.calibration_data = calibration
-            # Pin the LIVE readout exposure to the gate the thresholds were learnt at
-            # (the FrameContract exposure): the live OccupancyProcessor judges the RUNNING pulse's frames,
-            # and a per-site threshold is exposure-specific -- calibrating at the short readout gate but
-            # imaging live at the camera default classifies every atom dark (~50 % occupancy while the
-            # report says 99 %).  Setting the camera exposure to the calibrated gate makes the default
-            # live readout self-match (#issue-2 live path); a frame still imaged at a different gate is
-            # the operator's explicit choice.  The typed exposure is set by
-            # calibrate_threshold_from_images. fallback=None leaves a calibration
-            # without an exposure from forcing a re-pin.
-            expo = calibration.readout_exposure(fallback=None)
-            if expo:
-                # A real camera can REJECT the exposure (out-of-range gate, driver error) -- that
-                # is exactly the wrong-exposure failure described above, so it must be VISIBLE,
-                # never silent.  The adoption itself still succeeds (the calibration is valid;
-                # only the live pin failed), and the sink is called with ONLY the calibration
-                # (CalibrateReadoutTask._adopt passes no output handle), so a logged warning is
-                # the failure channel -- re-plumbing the task API just for this would couple the
-                # sink to the task's mid-run output.  Only plausible device rejections are
-                # tolerated; a coding bug propagates.
-                try:
-                    cam.exposure = float(expo)
-                except (ValueError, TypeError, RuntimeError, OSError) as exc:
-                    logging.getLogger(__name__).warning(
-                        "calibration adopted but pinning the readout exposure failed: %s "
-                        "-- live readout exposure no longer matches the calibration gate "
-                        "(occupancy will read low)", exc)
-
-        return CalibrateReadoutTask(hub, cam,
-                                    sequencer=getattr(s._device_set, "sequencer", None),
-                                    calibration_sink=_adopt, prefix=prefix, **params)
 
     # ------------------------------------------------------------- persistence
     def load(self, path: str | Path) -> TrapCalibration:

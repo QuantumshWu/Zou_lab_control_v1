@@ -10,7 +10,7 @@ clobber an earlier (stopped, lingering) node's signals.
 
 from __future__ import annotations
 
-from conftest import raw_device_set
+from conftest import fire_live_imaging, make_console, raw_device_set
 
 import os
 import sys
@@ -45,31 +45,25 @@ def _console():
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     ensure_qt_app()
     import Zou_lab_control.neutral_atom as na
-    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     exp = na.connect("virtual", sitemap={"grid_shape": (2, 3)})
-    exp.readout.sitemap(method="box", frames=4, display=False)
-    exp.readout.thresholds(frames=20, display=False)
-    console = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
-                          measurements=exp.readout.measurement_specs(),
-                          processors=exp.readout.processor_specs(), window_px=(900, 600))
-    console._timer.stop()
+    console = make_console(exp)
     return exp, console
 
 
 def test_logic_node_prefix_disambiguates_against_a_lingering_hub_signal():
-    """A stopped occupancy node's ``occupied`` lingers in the hub; adding a SECOND occupancy node must
-    get a distinct (non-empty) prefix so it doesn't clobber the lingering signal -- even though NO node
-    is currently running (the bug: prefix only checked running_nodes)."""
+    """A stopped processor's output lingers; a second instance must disambiguate it."""
     from Zou_lab_control.frontend.task_console import LogicNodeConfig
     exp, console = _console()
     try:
-        # simulate an earlier occupancy node that ran then STOPPED -> its 'occupied' lingers, no running node
-        console.hub.publish({"occupied": np.zeros(6), "rate": 0.4})
+        spec = next(item for item in console.processors if item.name == "Analysis")
+        cfg = LogicNodeConfig(kind="processor", name=spec.name, title="Analysis #2")
+        key = console._node_bare_keys(cfg)[0]
+        # Simulate an earlier processor that stopped after publishing its base name.
+        console.hub.publish({key: np.zeros(6)})
         assert list(console.running_nodes) == [] or all(not getattr(n, "running", False) for n in console.running_nodes)
-        cfg = LogicNodeConfig(kind="processor", name="Judge occupancy", title="Judge occupancy #2")
         prefix = console._logic_node_prefix(cfg)
-        assert prefix != "", "second occupancy node must get a disambiguating prefix vs the lingering 'occupied'"
-        assert (prefix + "occupied") not in console.hub.signal_versions()   # the prefixed name is free
+        assert prefix != "", "second processor must disambiguate a lingering output"
+        assert (prefix + key) not in console.hub.signal_versions()
     finally:
         console.shutdown()
         exp.close()
@@ -77,24 +71,26 @@ def test_logic_node_prefix_disambiguates_against_a_lingering_hub_signal():
 
 def test_restart_reclaims_its_own_lingering_prefix_not_a_new_one():
     """#issue-1: restarting the SAME node must REUSE its (empty) prefix -- reclaiming its OWN lingering
-    signals -- not take a fresh 'judge_occupancy_2_' prefix.  Otherwise after Stop->Start its signals are
+    signals -- not take a fresh numbered prefix.  Otherwise after Stop->Start its signals are
     renamed and every panel bound to 'occupied' / the sitemap goes UNBOUND.  A DIFFERENT same-kind node
     still disambiguates (the H3y behaviour is preserved)."""
     from types import SimpleNamespace
     from Zou_lab_control.frontend.task_console import LogicNodeConfig
     exp, console = _console()
     try:
-        cfg = LogicNodeConfig(kind="processor", name="Judge occupancy", title="Judge occupancy")
+        spec = next(item for item in console.processors if item.name == "Analysis")
+        cfg = LogicNodeConfig(kind="processor", name=spec.name, title="Analysis")
+        keys = console._node_bare_keys(cfg)
         assert console._logic_node_prefix(cfg) == ""                 # first start: no collision, short names
-        # it ran then STOPPED: its 'occupied' lingers AND its built node survives in _last_node (tagged
+        # It ran then stopped: its output lingers and its built node survives in _last_node (tagged
         # with instance_label == the node title, as _start_logic_node does).
-        console.hub.publish({"occupied": np.zeros(6), "rate": 0.4})
+        console.hub.publish({key: np.zeros(6) for key in keys})
         console._last_node[id(cfg)] = SimpleNamespace(
-            instance_label="Judge occupancy", published_signals=lambda: ["occupied", "rate"])
+            instance_label="Analysis", published_signals=lambda: list(keys))
         # RESTART the SAME node -> must reclaim "" (its own lingering signals are not a collision)
         assert console._logic_node_prefix(cfg) == "", "restart must reuse its prefix, not rename -> unbound"
-        # a DIFFERENT same-kind node STILL disambiguates against the lingering 'occupied'
-        other = LogicNodeConfig(kind="processor", name="Judge occupancy", title="Judge occupancy #2")
+        # A different same-kind node still disambiguates against the lingering outputs.
+        other = LogicNodeConfig(kind="processor", name=spec.name, title="Analysis #2")
         assert console._logic_node_prefix(other) != ""
     finally:
         console.shutdown()
@@ -121,8 +117,8 @@ def test_declared_signal_name_equals_the_name_the_node_publishes():
         assert "temperature_survival" in declared, declared
         # the Logic-row legend still shows the SHORT name (prefix stripped), like the running path
         assert [strip_node_prefix(k, pfx) for k in declared] == [spec.x_key, spec.y_key]
-        # a processor keeps its empty-default prefix (so existing bare 'occupied' bindings are unchanged)
-        proc = SimpleNamespace(node=LogicNodeConfig(kind="processor", name="Judge occupancy", title="Judge occupancy"))
+        # A processor keeps its empty default prefix.
+        proc = SimpleNamespace(node=LogicNodeConfig(kind="processor", name="Analysis", title="Analysis"))
         assert console._declared_node_prefix(proc) == ""
     finally:
         console.shutdown()
@@ -145,18 +141,14 @@ def test_live_switch_that_drops_outputs_purges_orphans_without_a_rebuild():
     neither _start_logic_node nor _remove_logic_node runs.  The systematic GC in _refresh_signal_info
     catches it: frame_1/frame_2 lose their producer (the camera now publishes only frame_0) -> they are
     purged from the hub so they never linger as '(unbound)' picker entries."""
-    import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
-    from Zou_lab_control.neutral_atom.timing import imaging_sequence
     exp, console = _console()
     try:
         hub = console.hub
         cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                 frames_per_cycle=3, repeat=0)
         console.running_nodes = [cam]
-        raw_device_set(exp).sequencer.prepare(
-            imaging_sequence(exposure=raw_device_set(exp).camera.exposure, load=True).forever())
-        raw_device_set(exp).sequencer.fire()
+        fire_live_imaging(exp)
         cam.step()                                              # frame_0/1/2 published
         assert {"frame_0", "frame_1", "frame_2"} <= set(hub.names())
         console._refresh_signal_info()                          # cache the fpc=3 provider signature
@@ -193,13 +185,10 @@ def test_stop_then_remove_purges_a_lingering_nodes_signals():
     Remove must purge those lingering signals even though the live node ref was already None'd at stop
     (the fix uses ``_last_node``, retained through stop, not ``_logic_nodes`` which is None'd)."""
     import time
-    import Zou_lab_control.neutral_atom as na
-    from Zou_lab_control.neutral_atom.timing import imaging_sequence
     exp, console = _console()
     try:
         # imaging pulse on -> the trigger-driven camera streams frames
-        raw_device_set(exp).sequencer.prepare(imaging_sequence(exposure=raw_device_set(exp).camera.exposure, load=True).forever())
-        raw_device_set(exp).sequencer.fire()
+        fire_live_imaging(exp)
         cam = _add_node(console, lambda d: isinstance(d, tuple) and d and d[0] == "camera")
         console._start_logic_node(cam)
         deadline = time.monotonic() + 2.0
@@ -207,20 +196,13 @@ def test_stop_then_remove_purges_a_lingering_nodes_signals():
             console.refresh_once()
             time.sleep(0.005)
         assert "frame_0" in console.hub.names(), "camera did not publish before the lifecycle deadline"
-        occ = _add_node(console, lambda d: isinstance(d, tuple) and d and "occupanc" in str(d[1]).lower())
-        console._start_logic_node(occ)
-        node = console._logic_nodes.get(id(occ)) or console._last_node.get(id(occ))
-        declared = set(node.published_signals())
-        deadline = time.monotonic() + 2.0
-        while not (declared & set(console.hub.signal_versions())) and time.monotonic() < deadline:
-            console.refresh_once()
-            time.sleep(0.005)
-        occ_sigs = {s for s in node.published_signals()} & set(console.hub.signal_versions())
-        assert occ_sigs, "occupancy node published nothing to the hub"
-        console._stop_logic_node(occ)                                  # STOP -> signals LINGER
-        assert occ_sigs <= set(console.hub.signal_versions()), "STOP must keep the node's signals"
-        console._remove_logic_node(occ)                               # REMOVE -> signals PURGED
-        left = occ_sigs & set(console.hub.signal_versions())
+        node = console._logic_nodes.get(id(cam)) or console._last_node.get(id(cam))
+        camera_signals = set(node.published_signals()) & set(console.hub.signal_versions())
+        assert camera_signals, "camera node published nothing to the hub"
+        console._stop_logic_node(cam)                                  # STOP -> signals LINGER
+        assert camera_signals <= set(console.hub.signal_versions()), "STOP must keep the node's signals"
+        console._remove_logic_node(cam)                                # REMOVE -> signals PURGED
+        left = camera_signals & set(console.hub.signal_versions())
         assert not left, f"REMOVE after STOP must purge the lingering signals, still present: {sorted(left)}"
     finally:
         console.shutdown()
