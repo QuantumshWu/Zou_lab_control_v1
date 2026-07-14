@@ -3223,6 +3223,8 @@ Finite exact 的“event ordinal 到每个 dataset cell 的完整唯一排列”
 
 `MonitorTap`/rolling live capability 是终态 GUI consumer 所需能力，不因当前 composition 尚未接线而删除。订阅时 `max_bytes` 必须至少覆盖 stream contract 的一个 `max_payload_bytes`；不足立即拒绝且不注册 tap，不能接受订阅后对每个合法 full-frame 都静默 drop、让 `next()` 永久等待。合法 monitor 仍使用 bounded overwrite、`missed` 计数和 latest/ordered update，且从不参与 finite exact retention 或 backpressure。
 
+Content store 的 raw manifest `(namespace, digest)` 在每个公开 read/has/durability API 入口各验证一次，随后 path builder 和同一次 verified read 信任已规范化字符串；`has_manifest` 直接使用同一个 path 做内容校验，不再回调公开 reader 重验。`ContentRef` 在构造/root decode 后是 typed immutable blob identity，`read_blob` 信任其 digest/size，不重新跑文本 validator，但仍从同一 open handle 执行实际 size 与 SHA-256 内容核验。Store wrapper 获取 process-local authority 不作一次空的预检再由 operation 重检；真正 filesystem operation 仍恰好执行一次 authority/store/root/path/lock identity 检查。路径逃逸、内容损坏、size budget、fsync 与 manifest 可见性边界全部保留。
+
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 
 | 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |

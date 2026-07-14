@@ -67,6 +67,60 @@ def test_content_store_publishes_blobs_and_manifests_idempotently(tmp_path):
     assert store.read_manifest("capture", digest) == payload
 
 
+def test_typed_blob_reference_is_trusted_after_construction(tmp_path, monkeypatch):
+    import zlc_storage.content_store as content_store
+
+    store = ContentAddressedStore(tmp_path / "repository")
+    reference = store.put_blob(b"typed-reference")
+
+    def unexpected_text_validation(*_args, **_kwargs):
+        raise AssertionError("ContentRef digest was revalidated")
+
+    monkeypatch.setattr(content_store, "_sha256", unexpected_text_validation)
+    assert store.read_blob(reference) == b"typed-reference"
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ("read_manifest", "has_manifest", "confirm_manifest_durable"),
+)
+def test_manifest_identity_is_validated_once_per_raw_api_call(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    import zlc_storage.content_store as content_store
+
+    store = ContentAddressedStore(tmp_path / "repository")
+    payload = b"manifest-identity"
+    digest = store.publish_manifest("capture", payload).content.digest
+    namespace_calls = 0
+    digest_calls = 0
+    real_namespace = content_store._canonical_namespace
+    real_digest = content_store._sha256
+
+    def counted_namespace(value):
+        nonlocal namespace_calls
+        namespace_calls += 1
+        return real_namespace(value)
+
+    def counted_digest(value, field):
+        nonlocal digest_calls
+        digest_calls += 1
+        return real_digest(value, field)
+
+    monkeypatch.setattr(content_store, "_canonical_namespace", counted_namespace)
+    monkeypatch.setattr(content_store, "_sha256", counted_digest)
+
+    result = getattr(store, operation)("capture", digest)
+    if operation == "has_manifest":
+        assert result is True
+    else:
+        assert result == payload
+    assert namespace_calls == 1
+    assert digest_calls == 1
+
+
 @pytest.mark.parametrize("content_kind", ["blob", "manifest"])
 def test_visible_target_is_not_acknowledged_until_retry_reconfirms_durability(
     tmp_path,

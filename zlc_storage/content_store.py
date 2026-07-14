@@ -289,7 +289,6 @@ class ContentAddressedStore:
         object.__setattr__(self, _name, _value)
 
     def authority(self) -> ContentStoreAuthority:
-        self._authority._require_integrity()
         return self._authority
 
     def put_blob(self, payload: bytes) -> ContentRef:
@@ -300,7 +299,7 @@ class ContentAddressedStore:
         reference = ContentRef(sha256_digest(data), len(data))
         ContentAddressedStore._publish_bytes(
             self,
-            ContentAddressedStore._blob_path(self, reference.digest),
+            self._blob_path_for_digest(reference.digest),
             data,
             reference,
         )
@@ -323,7 +322,7 @@ class ContentAddressedStore:
         if not isinstance(reference, ContentRef):
             raise TypeError("read_blob requires ContentRef")
         return ContentAddressedStore._read_verified(
-            ContentAddressedStore._blob_path(self, reference.digest),
+            self._blob_path_for_digest(reference.digest),
             reference,
             max_bytes=max_bytes,
         )
@@ -348,7 +347,6 @@ class ContentAddressedStore:
         *,
         expected_digest: str | None = None,
     ) -> StoredManifest:
-        namespace = _canonical_namespace(namespace)
         data = _payload(payload, "manifest payload")
         digest = sha256_digest(data)
         if expected_digest is not None and digest != _sha256(
@@ -356,13 +354,14 @@ class ContentAddressedStore:
         ):
             raise ValueError("manifest payload differs from expected digest")
         reference = ContentRef(digest, len(data))
+        manifest = StoredManifest(namespace, reference)
         ContentAddressedStore._publish_bytes(
             self,
-            ContentAddressedStore._manifest_path(self, namespace, digest),
+            self._manifest_path_for_identity(manifest.namespace, digest),
             data,
             reference,
         )
-        return StoredManifest(namespace, reference)
+        return manifest
 
     def read_manifest(
         self,
@@ -399,7 +398,7 @@ class ContentAddressedStore:
     ) -> bytes:
         namespace = _canonical_namespace(namespace)
         digest = _sha256(digest, "manifest digest")
-        path = ContentAddressedStore._manifest_path(self, namespace, digest)
+        path = self._manifest_path_for_identity(namespace, digest)
         return ContentAddressedStore._read_verified_digest(
             path,
             digest,
@@ -415,7 +414,7 @@ class ContentAddressedStore:
     ) -> bytes:
         namespace = _canonical_namespace(namespace)
         digest = _sha256(digest, "manifest digest")
-        path = ContentAddressedStore._manifest_path(self, namespace, digest)
+        path = self._manifest_path_for_identity(namespace, digest)
         return ContentAddressedStore._confirm_existing_durable(
             self,
             path,
@@ -446,14 +445,13 @@ class ContentAddressedStore:
     ) -> bool:
         namespace = _canonical_namespace(namespace)
         digest = _sha256(digest, "manifest digest")
-        path = ContentAddressedStore._manifest_path(self, namespace, digest)
+        path = self._manifest_path_for_identity(namespace, digest)
         if not path.is_file():
             return False
         # Existence alone is not recovery evidence.  A corrupt visible manifest
         # must fail loudly so startup reconciliation cannot call it uncommitted.
-        ContentAddressedStore._read_manifest(
-            self,
-            namespace,
+        ContentAddressedStore._read_verified_digest(
+            path,
             digest,
             max_bytes=max_bytes,
         )
@@ -461,11 +459,17 @@ class ContentAddressedStore:
 
     def _blob_path(self, digest: str) -> Path:
         digest = _sha256(digest, "blob digest")
+        return self._blob_path_for_digest(digest)
+
+    def _blob_path_for_digest(self, digest: str) -> Path:
         return self._blobs / digest[:2] / f"{digest[2:]}.blob"
 
     def _manifest_path(self, namespace: str, digest: str) -> Path:
         namespace = _canonical_namespace(namespace)
         digest = _sha256(digest, "manifest digest")
+        return self._manifest_path_for_identity(namespace, digest)
+
+    def _manifest_path_for_identity(self, namespace: str, digest: str) -> Path:
         return self._manifests / namespace / f"{digest}.manifest"
 
     def _publish_bytes(self, target: Path, data: bytes, reference: ContentRef) -> None:
