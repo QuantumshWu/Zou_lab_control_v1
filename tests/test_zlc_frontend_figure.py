@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 import importlib
 from pathlib import Path
@@ -54,17 +55,21 @@ from zlc_frontend.figure import (
     FigureEvaluationPolicy,
     FigureEvaluator,
     FigureLayer,
+    FigureSelection,
     FixedIndex,
+    LatestNonempty,
     RepeatViewMode,
     ResolvedDataset,
     ResolvedDatasetMap,
     SuggestionStatus,
     ViewIntent,
     ViewPreferences,
+    ViewSpec,
     decode_figure_document,
     decode_view_spec,
     encode_figure_document,
     encode_view_spec,
+    figure_document_to_tree,
     suggest_view,
     validate_view_spec,
     view_spec_to_tree,
@@ -193,23 +198,161 @@ def test_ambiguous_axis_and_stale_selection_fail_without_tuple_order_guessing():
     assert stale.reasons[0].code == "STALE_SELECTION_AXIS"
 
 
-def test_view_and_document_codec_are_strict_canonical_and_owner_delegating():
-    repeat = axis("repeat", REPEAT, 2)
-    point = axis("point", SCAN_POINT, 3)
-    block = make_block(
-        np.zeros((2, 3)),
-        repeat_axis=repeat,
-        point_axes=(point,),
-        point_layout=PointLayout.rect_c((3,)),
+def test_view_and_document_codec_are_strict_canonical_and_owner_delegating(
+    monkeypatch,
+):
+    fingerprint = "0" * 64
+    point_id = AxisId("point")
+    repeat_id = AxisId("repeat")
+    shot_id = AxisId("shot")
+    site_id = AxisId("site")
+    selection = Selection.index(site_id, 2)
+    view = ViewSpec(
+        fingerprint,
+        ViewIntent.CURVE,
+        (
+            AxisViewBinding(
+                site_id,
+                AxisViewRole.SELECTED,
+                selector=FixedIndex(2),
+            ),
+            AxisViewBinding(point_id, AxisViewRole.X),
+            AxisViewBinding(
+                shot_id,
+                AxisViewRole.SLIDER,
+                selector=LatestNonempty(),
+            ),
+            AxisViewBinding(
+                repeat_id,
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+            ),
+        ),
+        (selection,),
     )
-    view = suggest_view(block.schema, ViewIntent.CURVE).spec
+    owner_selection_tree = {
+        "schema": "zlc_data.Selection",
+        "terms": [{"kind": "INDEX", "axis_id": "site", "index": 2}],
+    }
+    expected_view_tree = {
+        "schema": "zlc_frontend.ViewSpec",
+        "schema_fingerprint": fingerprint,
+        "intent": "CURVE",
+        "axis_bindings": [
+            {"axis_id": "point", "role": "X", "selector": None, "reduction": None},
+            {
+                "axis_id": "repeat",
+                "role": "REDUCED",
+                "selector": None,
+                "reduction": {"method": "MEAN"},
+            },
+            {
+                "axis_id": "shot",
+                "role": "SLIDER",
+                "selector": {"kind": "LATEST_NONEMPTY"},
+                "reduction": None,
+            },
+            {
+                "axis_id": "site",
+                "role": "SELECTED",
+                "selector": {"kind": "FIXED_INDEX", "index": 2},
+                "reduction": None,
+            },
+        ],
+        "display_selections": [owner_selection_tree],
+    }
+    assert view_spec_to_tree(view) == expected_view_tree
     assert decode_view_spec(encode_view_spec(view)) == view
-    doc, _ = document(block, view)
+
+    dataset_a = DatasetId("dataset-a")
+    dataset_z = DatasetId("dataset-z")
+    doc = FigureDocument(
+        "figure-golden",
+        7,
+        (
+            DatasetDescriptor(dataset_z, "signal z", fingerprint),
+            DatasetDescriptor(dataset_a, "signal a", fingerprint),
+        ),
+        (
+            FigureLayer("layer-z", dataset_z, view),
+            FigureLayer("layer-a", dataset_a, view),
+        ),
+        (FigureSelection("site-choice", dataset_z, selection),),
+    )
+    expected_document_tree = {
+        "schema": "zlc_frontend.FigureDocument",
+        "document_id": "figure-golden",
+        "revision": 7,
+        "datasets": [
+            {
+                "dataset_id": "dataset-a",
+                "label": "signal a",
+                "schema_fingerprint": fingerprint,
+            },
+            {
+                "dataset_id": "dataset-z",
+                "label": "signal z",
+                "schema_fingerprint": fingerprint,
+            },
+        ],
+        "layers": [
+            {"layer_id": "layer-z", "dataset_id": "dataset-z", "view": expected_view_tree},
+            {"layer_id": "layer-a", "dataset_id": "dataset-a", "view": expected_view_tree},
+        ],
+        "selections": [
+            {
+                "selection_id": "site-choice",
+                "dataset_id": "dataset-z",
+                "selection": owner_selection_tree,
+            }
+        ],
+    }
+    assert figure_document_to_tree(doc) == expected_document_tree
     assert decode_figure_document(encode_figure_document(doc)) == doc
-    tree = view_spec_to_tree(view)
-    tree["authority_seed"] = "forbidden"
-    with pytest.raises(ValueError, match="field set"):
-        decode_view_spec(encode(tree))
+
+    codec = importlib.import_module("zlc_frontend.figure.codec")
+    real_to_tree = codec.selection_to_tree
+    real_from_tree = codec.selection_from_tree
+    owner_calls = {"to": 0, "from": 0}
+
+    def observed_to_tree(value):
+        owner_calls["to"] += 1
+        return real_to_tree(value)
+
+    def observed_from_tree(value):
+        owner_calls["from"] += 1
+        return real_from_tree(value)
+
+    monkeypatch.setattr(codec, "selection_to_tree", observed_to_tree)
+    monkeypatch.setattr(codec, "selection_from_tree", observed_from_tree)
+    assert codec.view_spec_from_tree(codec.view_spec_to_tree(view)) == view
+    assert codec.figure_document_from_tree(codec.figure_document_to_tree(doc)) == doc
+    assert owner_calls == {"to": 4, "from": 4}
+
+    extra = deepcopy(expected_view_tree)
+    extra["authority_seed"] = "forbidden"
+    with pytest.raises(ValueError, match="exactly"):
+        decode_view_spec(encode(extra))
+    unknown_view_schema = deepcopy(expected_view_tree)
+    unknown_view_schema["schema"] = "zlc_frontend.UnknownView"
+    with pytest.raises(ValueError, match="expected schema"):
+        decode_view_spec(encode(unknown_view_schema))
+    malformed_selector = deepcopy(expected_view_tree)
+    malformed_selector["axis_bindings"][3]["selector"]["extra"] = True
+    with pytest.raises(ValueError, match="display selector"):
+        decode_view_spec(encode(malformed_selector))
+    noncanonical_view = deepcopy(expected_view_tree)
+    noncanonical_view["axis_bindings"].reverse()
+    with pytest.raises(ValueError, match="non-canonical typed representation"):
+        decode_view_spec(encode(noncanonical_view))
+    noncanonical_document = deepcopy(expected_document_tree)
+    noncanonical_document["datasets"].reverse()
+    with pytest.raises(ValueError, match="non-canonical typed representation"):
+        decode_figure_document(encode(noncanonical_document))
+    unknown_document_schema = deepcopy(expected_document_tree)
+    unknown_document_schema["schema"] = "zlc_frontend.UnknownFigure"
+    with pytest.raises(ValueError, match="expected schema"):
+        decode_figure_document(encode(unknown_document_schema))
 
 
 def test_rect_f_product_layout_recovers_image_axes_before_repeat_mean():

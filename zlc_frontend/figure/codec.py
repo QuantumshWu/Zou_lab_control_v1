@@ -6,10 +6,9 @@ from typing import Any
 
 from zlc_data import AxisId, selection_from_tree, selection_to_tree
 from zlc_storage.canonical import (
-    canonical_text as _text,
     decode,
     encode,
-    integer as _integer,
+    exact_mapping,
 )
 
 from .model import (
@@ -33,12 +32,6 @@ VIEW_SPEC_SCHEMA = "zlc_frontend.ViewSpec"
 FIGURE_DOCUMENT_SCHEMA = "zlc_frontend.FigureDocument"
 
 
-def _exact(tree: Any, fields: set[str], context: str) -> dict[str, Any]:
-    if not isinstance(tree, dict) or set(tree) != fields:
-        raise ValueError(f"{context} has an invalid field set")
-    return tree
-
-
 def _selector_to_tree(selector) -> dict[str, Any] | None:
     if selector is None:
         return None
@@ -52,13 +45,14 @@ def _selector_to_tree(selector) -> dict[str, Any] | None:
 def _selector_from_tree(tree: Any):
     if tree is None:
         return None
-    if not isinstance(tree, dict) or not isinstance(tree.get("kind"), str):
+    if not isinstance(tree, dict):
         raise ValueError("display selector must be a tagged map or null")
-    if tree["kind"] == "FIXED_INDEX" and set(tree) == {"kind", "index"}:
-        return FixedIndex(_integer(tree["index"], "selector index"))
-    if tree["kind"] == "LATEST_NONEMPTY" and set(tree) == {"kind"}:
+    kind = tree.get("kind")
+    if kind == "FIXED_INDEX" and set(tree) == {"kind", "index"}:
+        return FixedIndex(tree["index"])
+    if kind == "LATEST_NONEMPTY" and set(tree) == {"kind"}:
         return LatestNonempty()
-    raise ValueError(f"invalid display selector {tree.get('kind')!r}")
+    raise ValueError(f"invalid display selector {kind!r}")
 
 
 def _reduction_to_tree(reduction: DisplayReduction | None) -> dict[str, Any] | None:
@@ -72,8 +66,13 @@ def _reduction_to_tree(reduction: DisplayReduction | None) -> dict[str, Any] | N
 def _reduction_from_tree(tree: Any) -> DisplayReduction | None:
     if tree is None:
         return None
-    data = _exact(tree, {"method"}, "DisplayReduction")
-    return DisplayReduction(DisplayReductionMethod(_text(data["method"], "reduction method")))
+    data = exact_mapping(
+        tree,
+        {"method"},
+        "DisplayReduction",
+        discriminator=None,
+    )
+    return DisplayReduction(DisplayReductionMethod(data["method"]))
 
 
 def view_spec_to_tree(spec: ViewSpec) -> dict[str, Any]:
@@ -99,7 +98,7 @@ def view_spec_to_tree(spec: ViewSpec) -> dict[str, Any]:
 
 
 def view_spec_from_tree(tree: Any) -> ViewSpec:
-    data = _exact(
+    data = exact_mapping(
         tree,
         {
             "schema",
@@ -108,10 +107,8 @@ def view_spec_from_tree(tree: Any) -> ViewSpec:
             "axis_bindings",
             "display_selections",
         },
-        "ViewSpec",
+        VIEW_SPEC_SCHEMA,
     )
-    if data["schema"] != VIEW_SPEC_SCHEMA:
-        raise ValueError(f"expected schema {VIEW_SPEC_SCHEMA!r}")
     raw_bindings = data["axis_bindings"]
     if not isinstance(raw_bindings, list):
         raise ValueError("ViewSpec axis_bindings must be a list")
@@ -120,22 +117,23 @@ def view_spec_from_tree(tree: Any) -> ViewSpec:
         raise ValueError("ViewSpec display_selections must be a list")
     bindings = []
     for raw in raw_bindings:
-        item = _exact(
+        item = exact_mapping(
             raw,
             {"axis_id", "role", "selector", "reduction"},
             "AxisViewBinding",
+            discriminator=None,
         )
         bindings.append(
             AxisViewBinding(
-                AxisId(_text(item["axis_id"], "axis_id")),
-                AxisViewRole(_text(item["role"], "axis view role")),
+                AxisId(item["axis_id"]),
+                AxisViewRole(item["role"]),
                 _selector_from_tree(item["selector"]),
                 _reduction_from_tree(item["reduction"]),
             )
         )
     return ViewSpec(
-        _text(data["schema_fingerprint"], "schema_fingerprint"),
-        ViewIntent(_text(data["intent"], "intent")),
+        data["schema_fingerprint"],
+        ViewIntent(data["intent"]),
         tuple(bindings),
         tuple(selection_from_tree(item) for item in raw_selections),
     )
@@ -188,13 +186,11 @@ def figure_document_to_tree(document: FigureDocument) -> dict[str, Any]:
 
 
 def figure_document_from_tree(tree: Any) -> FigureDocument:
-    data = _exact(
+    data = exact_mapping(
         tree,
         {"schema", "document_id", "revision", "datasets", "layers", "selections"},
-        "FigureDocument",
+        FIGURE_DOCUMENT_SCHEMA,
     )
-    if data["schema"] != FIGURE_DOCUMENT_SCHEMA:
-        raise ValueError(f"expected schema {FIGURE_DOCUMENT_SCHEMA!r}")
     if not isinstance(data["datasets"], list):
         raise ValueError("FigureDocument datasets must be a list")
     if not isinstance(data["layers"], list):
@@ -203,45 +199,52 @@ def figure_document_from_tree(tree: Any) -> FigureDocument:
         raise ValueError("FigureDocument selections must be a list")
     datasets = []
     for raw in data["datasets"]:
-        item = _exact(
+        item = exact_mapping(
             raw,
             {"dataset_id", "label", "schema_fingerprint"},
             "DatasetDescriptor",
+            discriminator=None,
         )
         datasets.append(
             DatasetDescriptor(
-                DatasetId(_text(item["dataset_id"], "dataset_id")),
-                _text(item["label"], "dataset label"),
-                _text(item["schema_fingerprint"], "schema_fingerprint"),
+                DatasetId(item["dataset_id"]),
+                item["label"],
+                item["schema_fingerprint"],
             )
         )
     layers = []
     for raw in data["layers"]:
-        item = _exact(raw, {"layer_id", "dataset_id", "view"}, "FigureLayer")
+        item = exact_mapping(
+            raw,
+            {"layer_id", "dataset_id", "view"},
+            "FigureLayer",
+            discriminator=None,
+        )
         layers.append(
             FigureLayer(
-                _text(item["layer_id"], "layer_id"),
-                DatasetId(_text(item["dataset_id"], "dataset_id")),
+                item["layer_id"],
+                DatasetId(item["dataset_id"]),
                 view_spec_from_tree(item["view"]),
             )
         )
     selections = []
     for raw in data["selections"]:
-        item = _exact(
+        item = exact_mapping(
             raw,
             {"selection_id", "dataset_id", "selection"},
             "FigureSelection",
+            discriminator=None,
         )
         selections.append(
             FigureSelection(
-                _text(item["selection_id"], "selection_id"),
-                DatasetId(_text(item["dataset_id"], "dataset_id")),
+                item["selection_id"],
+                DatasetId(item["dataset_id"]),
                 selection_from_tree(item["selection"]),
             )
         )
     return FigureDocument(
-        _text(data["document_id"], "document_id"),
-        _integer(data["revision"], "revision"),
+        data["document_id"],
+        data["revision"],
         tuple(datasets),
         tuple(layers),
         tuple(selections),
