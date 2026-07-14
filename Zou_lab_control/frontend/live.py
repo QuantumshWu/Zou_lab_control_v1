@@ -71,6 +71,7 @@ LINE_CYCLE = [LINE_SINGLE, PALETTE.get("bright", "skyblue")] + list(PALETTE["ser
 #: The PLOT's repeat-combine modes (confocal "Update mode" naming: average / add / replace / roll /
 #: create).  ``create`` is 1-D only -- it keeps every repeat as its OWN line (confocal's "create").
 REPEAT_MODES = ("average", "add", "replace", "roll", "create")
+_REDUCE_REPEAT_MODES = frozenset((*REPEAT_MODES, "pool"))
 
 
 def reduce_repeat(raw, mode: str = "average", *, has_repeat: bool = True, valid=None, hist=False):
@@ -96,6 +97,11 @@ def reduce_repeat(raw, mode: str = "average", *, has_repeat: bool = True, valid=
     ``(n_samples, R)`` = one histogram per repeat.  This is why a trace and a histogram, whose blocks can
     share the same canonical rank while giving the data axis different semantics, need the kind to
     pick the layout."""
+    if mode not in _REDUCE_REPEAT_MODES:
+        raise ValueError(
+            f"unknown repeat mode {mode!r}; choose from {sorted(_REDUCE_REPEAT_MODES)}"
+        )
+
     # NATIVE dtype passthrough: an integer block (a camera's uint8/uint16 stream) cannot carry NaN
     # sentinels, so the whole isfinite machinery is skipped and every repeat slice holds data --
     # no float64 expansion of a 2.3 MP frame just to ask "is it finite".  Float blocks (a scan's

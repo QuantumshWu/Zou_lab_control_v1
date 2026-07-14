@@ -102,6 +102,8 @@ def test_reduce_repeat_modes_collapse_the_repeat_axis():
     assert created.shape == (3, 2) and np.allclose(created, [[0, 3], [1, 4], [2, 5]])
     assert repeats_with_data(raw) == 2
     assert set(REPEAT_MODES) == {"average", "add", "replace", "roll", "create"}
+    with pytest.raises(ValueError, match="unknown repeat mode"):
+        reduce_repeat(raw, "not-a-mode")
 
 
 def test_reduce_repeat_average_ignores_not_yet_measured_repeats():
@@ -176,7 +178,6 @@ def test_plot_setting_has_only_repeat_mode_not_repeat(monkeypatch):
     console = dt.demo_console(shots=3)
     try:
         card = console.cards[0]
-        card.config.role = "plot"
         card.config.kind = "1d"
         card._build_settings()
         assert "repeat_mode" in card.param_widgets

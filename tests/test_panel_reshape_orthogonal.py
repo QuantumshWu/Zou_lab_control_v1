@@ -38,7 +38,7 @@ NODES = {
 
 
 def _card(kind, mode, struct):
-    return PanelCard(PanelConfig(kind=kind, role="plot", source="value = signal", inputs=["sig"],
+    return PanelCard(PanelConfig(kind=kind, source="value = signal", inputs=["sig"],
                                  params={"repeat_mode": mode, "cmap": "viridis"}),
                      structure_provider=lambda name, s=struct: s)
 
@@ -103,7 +103,7 @@ def test_custom_expression_falls_back_to_shape_inference():
     """structure is authoritative ONLY for the identity source; a custom ``value=`` expression makes
     _bound_structure return None so reshape degrades to shape inference (no crash, no false image)."""
     blk, st = NODES["camera"]
-    c = PanelCard(PanelConfig(kind="1d", role="plot", source="value = signal[0]", inputs=["sig"],
+    c = PanelCard(PanelConfig(kind="1d", source="value = signal[0]", inputs=["sig"],
                               params={"repeat_mode": "average"}),
                   structure_provider=lambda name: st)
     try:

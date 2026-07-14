@@ -655,3 +655,54 @@ def test_pulse_software_formats_have_no_upgrade_or_edit_counter():
         "legacy pulse software formats are current-only; use their plain schema "
         "name and reject every other shape:\n" + "\n".join(violations)
     )
+
+
+def test_legacy_frontend_persisted_formats_have_no_edit_counter_or_single_role():
+    owners = (
+        (
+            ROOT / "Zou_lab_control" / "frontend" / "data_figure.py",
+            None,
+            {"_SAVED_FIGURE_VERSION", "version"},
+        ),
+        (
+            ROOT / "Zou_lab_control" / "frontend" / "task_console.py",
+            "TaskConsoleState",
+            {"version"},
+        ),
+        (
+            ROOT / "Zou_lab_control" / "frontend" / "task_console.py",
+            "PanelConfig",
+            {"role"},
+        ),
+    )
+    violations = []
+    for path, class_name, forbidden in owners:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        root = tree
+        if class_name is not None:
+            root = next(
+                node for node in tree.body
+                if isinstance(node, ast.ClassDef) and node.name == class_name
+            )
+        for node in ast.walk(root):
+            candidate = None
+            if isinstance(node, ast.Name):
+                candidate = node.id
+            elif isinstance(node, ast.Attribute):
+                candidate = node.attr
+            elif isinstance(node, ast.arg):
+                candidate = node.arg
+            elif isinstance(node, ast.keyword):
+                candidate = node.arg
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                candidate = node.value
+            if candidate in forbidden:
+                violations.append(
+                    f"{path.relative_to(ROOT)}:{node.lineno} contains {candidate!r}"
+                )
+
+    assert not violations, (
+        "legacy frontend persisted records are current-only: SavedFigure and "
+        "TaskConsole keep a plain schema, while single-value panel roles and "
+        "numeric edit counters stay deleted:\n" + "\n".join(violations)
+    )

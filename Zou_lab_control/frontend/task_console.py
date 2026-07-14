@@ -52,7 +52,9 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .live import (
     DEFAULT_HIST_FIT,
+    IMAGE_REPEAT_MODES,
     PANEL_SIZES,
+    PLOT_KIND_BY_KEY,
     PLOT_KINDS,
     coerce_panel_value,
     kind_supports_roi,
@@ -145,6 +147,7 @@ from Zou_lab_control.neutral_atom.core.params import ParamDecl
 # The default mid-run buffer key -- the spec layer's ONE spelling (TaskSpec.mid_run_key's
 # default), imported so the console's spec-less fallbacks can never drift from it.
 from Zou_lab_control.neutral_atom.operations.task import DEFAULT_MID_RUN_KEY
+from zlc_storage import exact_mapping
 
 
 TASK_FILES_ENV = "ZLC_TASK_DIR"
@@ -182,6 +185,26 @@ MID_RUN_TAG = " (mid-run)"
 # below are derived from the WHOLE table so pulse (and any future kind) works on the seed path with
 # no parallel literal to keep in sync.
 _PANEL_KINDS: tuple = tuple(PLOT_KINDS)
+
+
+def _repeat_modes_for_kind(kind: str) -> tuple[str, ...]:
+    spec = PLOT_KIND_BY_KEY.get(str(kind))
+    return tuple(spec.repeat_modes) if spec and spec.repeat_modes else tuple(IMAGE_REPEAT_MODES)
+
+
+_MISSING_REPEAT_MODE = object()
+
+
+def _repeat_mode_for_kind(kind: str, value: object = _MISSING_REPEAT_MODE) -> str:
+    modes = _repeat_modes_for_kind(kind)
+    if value is _MISSING_REPEAT_MODE:
+        return modes[0]
+    if not isinstance(value, str) or value not in modes:
+        raise ValueError(
+            f"invalid repeat_mode {value!r} for panel kind {kind!r}; "
+            f"choose from {list(modes)}"
+        )
+    return value
 
 #: ``key -> label`` for EVERY console panel kind -- the panel/card/frame title + ``PanelConfig`` kind
 #: validation (so a saved ``pulse`` figure seeds a normal panel).  Insertion order = the table order.
@@ -780,14 +803,12 @@ class _SignalExprWidget(QtWidgets.QWidget):
         self._rebuild_slots()
 
 
-# Every Monitor-board panel is a PURE VIEW (role "plot"): it is fully decoupled
+# Every Monitor-board panel is a PURE VIEW: it is fully decoupled
 # from acquisition -- it shows a hub signal and carries the full plotter Edit (the
 # whole DataFigure fit set + manual limits + the display knobs), but it NEVER
 # builds / owns / starts a node.  The things that PRODUCE data
 # (measurement / processor / task) are LOGIC NODES on the separate Logic tab, not
-# board panels (see LogicNodeConfig / LogicNodeRow).  ``role`` stays on PanelConfig
-# (always "plot") only so an older saved layout round-trips cleanly.
-PANEL_ROLES = ("plot",)
+# board panels (see LogicNodeConfig / LogicNodeRow).
 
 # The KINDS of LOGIC NODE the Logic tab hosts -- the node layers (measurement /
 # processor / task).  "camera" is the continuous camera Measurement (a live frame
@@ -1463,7 +1484,7 @@ def _task_files_dir() -> Path:
 #: (the lo/hi inputs reveal only in that mode); tight/normal autoscale as before.
 _RELIM_MODES = ("tight", "normal", "fixed")
 
-#: The relim mode as a declarative ``ParamDecl`` -- so a "plot"-role panel's relim chooser renders
+#: The relim mode as a declarative ``ParamDecl`` -- so every panel's relim chooser renders
 #: through the SAME _make_param_widget / PARAM_WIDGETS path every other plot param uses (one source,
 #: auto-injected into BOTH the Setting popup and the Edit tab, #H3v-4b).  Edits route through
 #: ``_set_param`` (which pushes the mode onto the live plotter + reveals the fixed lo/hi row).
@@ -1513,6 +1534,43 @@ def _unit_df_for(plotter):
 
 
 # ====================================================================== state
+_PANEL_CONFIG_FIELDS = {
+    "kind": str,
+    "title": str,
+    "row": int,
+    "col": int,
+    "size": str,
+    "source": str,
+    "params": dict,
+    "inputs": list,
+}
+_LOGIC_NODE_CONFIG_FIELDS = {"kind": str, "name": str, "title": str, "values": dict}
+_TASK_CONSOLE_STATE_FIELDS = {
+    "schema": str,
+    "name": str,
+    "interval_ms": int,
+    "panels": list,
+    "logic": list,
+}
+
+
+def _layout_record(
+    payload: Mapping[str, object],
+    fields: Mapping[str, type],
+    name: str,
+    *,
+    discriminator: str | None = "schema",
+) -> dict[str, object]:
+    data = exact_mapping(payload, set(fields), name, discriminator=discriminator)
+    for field, expected_type in fields.items():
+        value = data[field]
+        if type(value) is not expected_type:
+            raise TypeError(
+                f"{field} must be {expected_type.__name__}, got {type(value).__name__}"
+            )
+    return data
+
+
 class PanelConfig:
     """One panel: kind + a size PRESET + its pixel top-left on the board (``col`` = pixel x,
     ``row`` = pixel y).  ``_compact`` re-packs these top-left under gravity (no column grid)."""
@@ -1528,12 +1586,9 @@ class PanelConfig:
         source: str | None = None,
         params: Mapping[str, object] | None = None,
         inputs: Sequence[str] | None = None,
-        role: str = "plot",
     ):
         if kind not in PANEL_KINDS:
             raise ValueError(f"unknown panel kind {kind!r}; choose from {sorted(PANEL_KINDS)}.")
-        if role not in PANEL_ROLES:
-            raise ValueError(f"unknown panel role {role!r}; choose from {list(PANEL_ROLES)}.")
         panel_size_cells(size)              # validate against the limited preset list
         self.kind = str(kind)
         self.title = str(title)
@@ -1554,27 +1609,31 @@ class PanelConfig:
         # When the input already names a signal, the default source is ``value = signal``;
         # an empty input leaves it blank ("pick a signal").  A saved layout keeps its
         # stored source verbatim.
-        if source is not None:
-            self.source = str(source)
-        elif self.inputs and self.inputs[0]:
-            self.source = "value = signal"
-        else:
-            self.source = _BLANK_SOURCE
-        # A source written as a bare ``value = <hub signal>`` (a saved layout or a direct
-        # pick) NAMES the input, so reflect it in the input slot -- the picker and the source
-        # must never disagree.  The canonical ``value = signal`` and an expression
-        # (``value = np.log(f)``) do NOT match this and leave the input alone.  The ``len == 1``
-        # guard mirrors :func:`is_identity_source`'s SAME guard (a bare name only names the input
-        # when there is exactly ONE slot -- a 2-slot ``value = counts`` is a custom expression, not a
-        # naming): so once this backfill runs the two agree BY CONSTRUCTION, and the structure-
-        # passthrough gate (:meth:`_bound_structure`, which calls is_identity_source) never disagrees
-        # with the picker on what "just names a signal" means.
-        from ..neutral_atom.operations.signal_expr import IDENTITY_SOURCE_RE
-        m = IDENTITY_SOURCE_RE.fullmatch(self.source.strip())
-        if m and m.group(1) != "signal" and len(self.inputs) == 1:
-            self.inputs[0] = m.group(1)
+        if source is None:
+            source = "value = signal" if self.inputs and self.inputs[0] else _BLANK_SOURCE
+        self.set_source(source)
         self.params = dict(params or {})
-        self.role = str(role)
+        if "repeat_mode" in self.params:
+            self.params["repeat_mode"] = _repeat_mode_for_kind(
+                self.kind,
+                self.params["repeat_mode"],
+            )
+
+    def set_source(self, source: str) -> None:
+        """Set the expression and keep a single-slot bare-name binding canonical.
+
+        ``value = <hub signal>`` names the sole input, whereas ``value = signal``
+        reads the existing picker binding and multi-slot/custom expressions leave
+        the inputs untouched.  Constructor, GUI edit and slot mutations all pass
+        through this owner so the layout writer cannot emit a record its reader
+        would normalize differently.
+        """
+        from ..neutral_atom.operations.signal_expr import IDENTITY_SOURCE_RE
+
+        self.source = str(source)
+        match = IDENTITY_SOURCE_RE.fullmatch(self.source.strip())
+        if match and match.group(1) != "signal" and len(self.inputs) == 1:
+            self.inputs[0] = match.group(1)
 
     @property
     def update_ms(self) -> int:
@@ -1597,22 +1656,24 @@ class PanelConfig:
             "source": self.source,
             "params": dict(self.params),
             "inputs": list(self.inputs),
-            "role": self.role,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "PanelConfig":
-        return cls(
-            kind=str(payload["kind"]),
-            title=str(payload.get("title", "")),
-            row=int(payload.get("row", 0)),
-            col=int(payload.get("col", 0)),
-            size=str(payload.get("size", "2x2")),
-            source=payload.get("source"),
-            params=payload.get("params") or {},
-            inputs=payload.get("inputs"),
-            role=str(payload.get("role", "plot")),
+        data = _layout_record(
+            payload,
+            _PANEL_CONFIG_FIELDS,
+            "PanelConfig",
+            discriminator=None,
         )
+        if data["row"] < 0 or data["col"] < 0:
+            raise ValueError("panel row and col must be non-negative")
+        if any(type(name) is not str for name in data["inputs"]):
+            raise TypeError("panel inputs must contain strings")
+        result = cls(**data)
+        if result.source != data["source"] or result.inputs != data["inputs"]:
+            raise ValueError("PanelConfig is not in current canonical form")
+        return result
 
 
 class LogicNodeConfig:
@@ -1641,19 +1702,22 @@ class LogicNodeConfig:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "LogicNodeConfig":
-        return cls(
-            kind=str(payload["kind"]),
-            name=str(payload.get("name", "")),
-            title=str(payload.get("title", "")),
-            values=payload.get("values") or {},
+        data = _layout_record(
+            payload,
+            _LOGIC_NODE_CONFIG_FIELDS,
+            "LogicNodeConfig",
+            discriminator=None,
         )
+        result = cls(**data)
+        if result.title != data["title"]:
+            raise ValueError("LogicNodeConfig is not in current canonical form")
+        return result
 
 
 class TaskConsoleState:
     """The whole console layout: serialised as ONE machine-portable JSON file."""
 
     schema = "Zou_lab_control.frontend.TaskConsoleState"
-    version = 3
 
     def __init__(
         self,
@@ -1692,7 +1756,6 @@ class TaskConsoleState:
     def to_dict(self) -> dict[str, object]:
         return {
             "schema": self.schema,
-            "version": self.version,
             "name": self.name,
             "interval_ms": self.interval_ms,
             "panels": [panel.to_dict() for panel in self.panels],
@@ -1701,11 +1764,14 @@ class TaskConsoleState:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "TaskConsoleState":
+        data = _layout_record(payload, _TASK_CONSOLE_STATE_FIELDS, cls.schema)
+        if data["interval_ms"] < 50:
+            raise ValueError("interval_ms must be at least 50")
         return cls(
-            name=str(payload.get("name", "task")),
-            interval_ms=int(payload.get("interval_ms", 400)),
-            panels=payload.get("panels") or [],
-            logic=payload.get("logic") or [],
+            name=data["name"],
+            interval_ms=data["interval_ms"],
+            panels=data["panels"],
+            logic=data["logic"],
         )
 
     def save(self, path: str | Path) -> Path:
@@ -1716,8 +1782,6 @@ class TaskConsoleState:
     @classmethod
     def load(cls, path: str | Path) -> "TaskConsoleState":
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        if payload.get("schema") != cls.schema:
-            raise ValueError(f"{path} is not a task-console layout (schema={payload.get('schema')!r}).")
         return cls.from_dict(payload)
 
 
@@ -2150,10 +2214,10 @@ class PanelCard(FluentGroupBox):
 
         # The plot's DISPLAY knobs are DECLARATIVE ParamDecls rendered through the SAME _make_param_widget
         # / PARAM_WIDGETS path everywhere (#H3v-4b): the per-kind colormap / toggles (display=True) for
-        # EVERY role, plus -- on a "plot"-role panel -- the relim chooser.  Adding a plot display
+        # every panel, plus the relim chooser.  Adding a plot display
         # ParamDecl here makes it appear in the Edit tab too with NO hand-wiring (both call
-        # _emit_param_rows).  (size + colormap stay for every role; relim/repeat/unit/update are
-        # plotter-only conveniences, "plot" role only -- restyle a measurement by Adding a Plot panel.)
+        # _emit_param_rows).  Size, colormap, relim, repeat, unit, and update are all view controls;
+        # data production remains on the separate Logic tab.
         self.param_widgets: dict[str, QtWidgets.QWidget] = {}
         # {key: kind} for every declarative Setting control, so refresh_on_show can re-seed each widget
         # from config.params through its kind's PARAM_WIDGETS.write (one source -- no per-key handwiring).
@@ -2162,91 +2226,91 @@ class PanelCard(FluentGroupBox):
         # kind changes later (facet / sub-plot pick, a signal bind), _sync_settings_param_rows
         # rebuilds the popup so the rows below are never a stale bake of the old kind.
         self._settings_param_kind = self._param_kind()
-        display_specs = [s for s in PANEL_PARAMS.get(self._settings_param_kind, ()) if s.display]
-        if self.config.role == "plot":
-            display_specs = display_specs + [_RELIM_PARAM]
+        display_specs = (
+            [s for s in PANEL_PARAMS.get(self._settings_param_kind, ()) if s.display]
+            + [_RELIM_PARAM]
+        )
         self.param_widgets.update(
             self._emit_param_rows(display_specs, sec.addWidget, self._set_param, label_w))
         self.lim_combo = self.param_widgets.get("relim")     # named back-ref (relim is now declarative)
 
-        if self.config.role == "plot":
-            # ``repeat_mode`` (the DISPLAY collapse) is the ONLY repeat knob the plot owns: how to
-            # collapse a measurement's repeat axis for display (average / add / replace / roll / create).
-            # How MANY repeats lives on the MEASUREMENT (``repeat``, 0 = ∞, auto-injected by
-            # _acquisition_param_decls -- #H3l), NOT here.  Rendered through the SAME _make_param_widget
-            # path as every other param (no hand-placed widget); edits route through _set_param.
-            for spec in self._repeat_param_specs():
-                widget = self._make_param_widget(spec)
-                self.param_widgets[spec.key] = widget
-                self._param_kinds[spec.key] = spec.kind    # remember for refresh_on_show re-seed
-                sec.addWidget(FluentSettingRow(spec.label, widget, label_width=label_w))
+        # ``repeat_mode`` (the DISPLAY collapse) is the ONLY repeat knob the plot owns: how to
+        # collapse a measurement's repeat axis for display (average / add / replace / roll / create).
+        # How MANY repeats lives on the MEASUREMENT (``repeat``, 0 = ∞, auto-injected by
+        # _acquisition_param_decls -- #H3l), NOT here.  Rendered through the SAME _make_param_widget
+        # path as every other param (no hand-placed widget); edits route through _set_param.
+        for spec in self._repeat_param_specs():
+            widget = self._make_param_widget(spec)
+            self.param_widgets[spec.key] = widget
+            self._param_kinds[spec.key] = spec.kind    # remember for refresh_on_show re-seed
+            sec.addWidget(FluentSettingRow(spec.label, widget, label_width=label_w))
 
-            # fixed lo/hi inputs (#8): ONE bespoke [lo | hi] row (the single special-cased control,
-            # shown only when relim == "fixed") -- built by the shared helper the Edit tab also uses.
-            self.fixed_lim_row, self.fixed_lo_edit, self.fixed_hi_edit = \
-                self._make_fixed_lim_row(self._on_fixed_lim_edited, label_w)
-            sec.addWidget(self.fixed_lim_row)
+        # fixed lo/hi inputs (#8): ONE bespoke [lo | hi] row (the single special-cased control,
+        # shown only when relim == "fixed") -- built by the shared helper the Edit tab also uses.
+        self.fixed_lim_row, self.fixed_lo_edit, self.fixed_hi_edit = \
+            self._make_fixed_lim_row(self._on_fixed_lim_edited, label_w)
+        sec.addWidget(self.fixed_lim_row)
 
-            # FACET chooser (grid panels only): which axis of the bound (R,P,*data_shape)
-            # block expands into the cells -- the grid-as-axis-expander declaration.  Options derive
-            # from the producing node's declared structure and refresh on every Setting open (the
-            # signal-combo rule); "(recipe)" keeps the loaded-figure snapshot behaviour.  Beside it
-            # the SUB PLOT chooser picks what each cell draws (auto = derive from what the slice
-            # leaves; else an explicit hist / 2d / 1d) -- the params section below always shows the
-            # RESOLVED kind's knobs (see _sync_settings_param_rows).
-            self.facet_combo = None
-            self.sub_kind_combo = None
-            if self.config.kind == "grid":
-                self.facet_combo = FluentComboBox()
-                self.facet_combo.setToolTip(
-                    "Expand ONE axis of the bound block into the grid cells: each repeat / scan-axis "
-                    "entry / data-axis entry becomes its own cell ((recipe) = a loaded figure's snapshot)")
-                self.facet_combo.activated.connect(self._on_facet_changed)
-                sec.addWidget(FluentSettingRow("facet", self.facet_combo, label_width=label_w))
-                self._refresh_facet_combo()
-                from .live import GRID_CELL_BY_KIND
-                self.sub_kind_combo = FluentComboBox()
-                self.sub_kind_combo.addItem("auto", "")
-                for cell_kind in GRID_CELL_BY_KIND:     # the cell families, ONE source
-                    self.sub_kind_combo.addItem(cell_kind, cell_kind)
-                self.sub_kind_combo.setToolTip(
-                    "What each cell draws: auto derives it from what the facet slice leaves "
-                    "(a 2-D frame -> 2d, an ordered axis -> 1d, bare samples -> hist); "
-                    "an explicit pick overrides")
-                self.sub_kind_combo.activated.connect(self._on_sub_kind_changed)
-                sec.addWidget(FluentSettingRow("sub plot", self.sub_kind_combo, label_width=label_w))
-                self._refresh_sub_kind_combo()
+        # FACET chooser (grid panels only): which axis of the bound (R,P,*data_shape)
+        # block expands into the cells -- the grid-as-axis-expander declaration.  Options derive
+        # from the producing node's declared structure and refresh on every Setting open (the
+        # signal-combo rule); "(recipe)" keeps the loaded-figure snapshot behaviour.  Beside it
+        # the SUB PLOT chooser picks what each cell draws (auto = derive from what the slice
+        # leaves; else an explicit hist / 2d / 1d) -- the params section below always shows the
+        # RESOLVED kind's knobs (see _sync_settings_param_rows).
+        self.facet_combo = None
+        self.sub_kind_combo = None
+        if self.config.kind == "grid":
+            self.facet_combo = FluentComboBox()
+            self.facet_combo.setToolTip(
+                "Expand ONE axis of the bound block into the grid cells: each repeat / scan-axis "
+                "entry / data-axis entry becomes its own cell ((recipe) = a loaded figure's snapshot)")
+            self.facet_combo.activated.connect(self._on_facet_changed)
+            sec.addWidget(FluentSettingRow("facet", self.facet_combo, label_width=label_w))
+            self._refresh_facet_combo()
+            from .live import GRID_CELL_BY_KIND
+            self.sub_kind_combo = FluentComboBox()
+            self.sub_kind_combo.addItem("auto", "")
+            for cell_kind in GRID_CELL_BY_KIND:     # the cell families, ONE source
+                self.sub_kind_combo.addItem(cell_kind, cell_kind)
+            self.sub_kind_combo.setToolTip(
+                "What each cell draws: auto derives it from what the facet slice leaves "
+                "(a 2-D frame -> 2d, an ordered axis -> 1d, bare samples -> hist); "
+                "an explicit pick overrides")
+            self.sub_kind_combo.activated.connect(self._on_sub_kind_changed)
+            sec.addWidget(FluentSettingRow("sub plot", self.sub_kind_combo, label_width=label_w))
+            self._refresh_sub_kind_combo()
 
-            # unit cycle: a single row [Unit button | <stretch> | current unit text] under the "unit"
-            # label (one-control-per-row rhythm) -- the IDENTICAL row the Edit tab builds via the helper.
-            unit_row, self.unit_button, self.unit_label = \
-                self._make_unit_cycle_row(self._on_unit_cycle, label_w, with_label=True)
-            sec.addWidget(unit_row)
+        # unit cycle: a single row [Unit button | <stretch> | current unit text] under the "unit"
+        # label (one-control-per-row rhythm) -- the IDENTICAL row the Edit tab builds via the helper.
+        unit_row, self.unit_button, self.unit_label = \
+            self._make_unit_cycle_row(self._on_unit_cycle, label_w, with_label=True)
+        sec.addWidget(unit_row)
 
-            # per-panel display refresh rate (this panel only).  A fixed, harmonic set so
-            # panels that share a beat stay frame-coherent (see UPDATE_INTERVALS); a fast rate
-            # suits a live-1D alignment monitor.  Changing it re-bases the console timer.
-            self.update_combo = FluentComboBox()
-            for ms in UPDATE_INTERVALS:
-                self.update_combo.addItem(f"{ms} ms", ms)
-            idx = self.update_combo.findData(self.config.update_ms)
-            self.update_combo.setCurrentIndex(idx if idx >= 0 else self.update_combo.findData(DEFAULT_UPDATE_MS))
-            self.update_combo.setToolTip(
-                "How often THIS panel redraws.  Every rate shares one base tick, so panels that\n"
-                "share a beat refresh on the SAME tick from the same data -- a 2-D frame and its\n"
-                "site-map stay shot-coherent.  A fast 100 ms suits a live-1D alignment monitor.")
-            self.update_combo.currentIndexChanged.connect(self._on_update_interval)
-            sec.addWidget(FluentSettingRow("update", self.update_combo, label_width=label_w))
+        # per-panel display refresh rate (this panel only).  A fixed, harmonic set so
+        # panels that share a beat stay frame-coherent (see UPDATE_INTERVALS); a fast rate
+        # suits a live-1D alignment monitor.  Changing it re-bases the console timer.
+        self.update_combo = FluentComboBox()
+        for ms in UPDATE_INTERVALS:
+            self.update_combo.addItem(f"{ms} ms", ms)
+        idx = self.update_combo.findData(self.config.update_ms)
+        self.update_combo.setCurrentIndex(idx if idx >= 0 else self.update_combo.findData(DEFAULT_UPDATE_MS))
+        self.update_combo.setToolTip(
+            "How often THIS panel redraws.  Every rate shares one base tick, so panels that\n"
+            "share a beat refresh on the SAME tick from the same data -- a 2-D frame and its\n"
+            "site-map stay shot-coherent.  A fast 100 ms suits a live-1D alignment monitor.")
+        self.update_combo.currentIndexChanged.connect(self._on_update_interval)
+        sec.addWidget(FluentSettingRow("update", self.update_combo, label_width=label_w))
 
-            # ---- Analysis --------------------------------------------------
-            # ONE picker for what a drag-selection DOES, spanning BOTH analyses this section owns: a
-            # general CURVE FIT (its whole state = config.params['fit_request'] presence) and an ROI
-            # crop (selection_action == 'roi').  The combo is a pure VIEW -- it DERIVES its selected
-            # item from that state on every open (_refresh_analysis_controls), so the Setting picker
-            # and the Edit picker can never disagree (#8); picking "curve fit" toggles fit_request
-            # (never writes selection_action='fit'), "ROI" arms the crop, "none" clears both.  The
-            # section is named "Analysis" because it is no longer fit-only nor roi-only (#3 naming).
-            self._build_analysis_section(section_box, label_w)
+        # ---- Analysis --------------------------------------------------
+        # ONE picker for what a drag-selection DOES, spanning BOTH analyses this section owns: a
+        # general CURVE FIT (its whole state = config.params['fit_request'] presence) and an ROI
+        # crop (selection_action == 'roi').  The combo is a pure VIEW -- it DERIVES its selected
+        # item from that state on every open (_refresh_analysis_controls), so the Setting picker
+        # and the Edit picker can never disagree (#8); picking "curve fit" toggles fit_request
+        # (never writes selection_action='fit'), "ROI" arms the crop, "none" clears both.  The
+        # section is named "Analysis" because it is no longer fit-only nor roi-only (#3 naming).
+        self._build_analysis_section(section_box, label_w)
 
         # ---- Panel ---------------------------------------------------------
         sec = section_box("Panel")
@@ -2386,10 +2450,8 @@ class PanelCard(FluentGroupBox):
 
     def _kind_repeat_modes(self) -> list:
         """The repeat modes THIS plot kind offers (its ``PLOT_KINDS`` entry, else the image
-        default) -- the ONE lookup shared by the param spec + the value clamp (#A3)."""
-        from .live import PLOT_KIND_BY_KEY, IMAGE_REPEAT_MODES
-        pk = PLOT_KIND_BY_KEY.get(self.config.kind)
-        return list(pk.repeat_modes) if (pk and pk.repeat_modes) else list(IMAGE_REPEAT_MODES)
+        default) -- the ONE lookup shared by the param spec and strict value reader."""
+        return list(_repeat_modes_for_kind(self.config.kind))
 
     def _relim(self) -> str:
         """The panel's relim mode, defaulting to ``_RELIM_PARAM.default`` -- the ONE place that
@@ -2414,11 +2476,11 @@ class PanelCard(FluentGroupBox):
         )
 
     def _repeat_mode_value(self) -> str:
-        """The stored repeat_mode, CLAMPED to this kind's valid modes (migrates an old saved layout
-        whose mode -- e.g. a histogram saved with 'average' before #issue-1 -- is no longer offered)."""
-        modes = self._kind_repeat_modes()
-        cur = str(self.config.params.get("repeat_mode", modes[0]))
-        return cur if cur in modes else modes[0]
+        """Return the kind-valid stored repeat mode or its declared default."""
+        return _repeat_mode_for_kind(
+            self.config.kind,
+            self.config.params.get("repeat_mode", _MISSING_REPEAT_MODE),
+        )
 
     def _bound_is_occupancy(self) -> bool:
         """Whether the bound producer declares site-map companion signals.
@@ -2594,7 +2656,7 @@ class PanelCard(FluentGroupBox):
         at once; the user can edit it.  Rebuilds the Setting popup so the new row appears."""
         self.config.inputs.append("")
         if len(self.config.inputs) == 2 and self.config.source.strip() in ("value = signal", "", _BLANK_SOURCE.strip()):
-            self.config.source = "value = signal[0] - signal[1]"
+            self.config.set_source("value = signal[0] - signal[1]")
             self._compiled_source = self.config.source
         self._rebuild_settings_popup()
         self._apply_source()
@@ -2606,7 +2668,7 @@ class PanelCard(FluentGroupBox):
             return
         self.config.inputs.pop()
         if len(self.config.inputs) == 1:
-            self.config.source = "value = signal" if self.config.inputs[0] else _BLANK_SOURCE
+            self.config.set_source("value = signal" if self.config.inputs[0] else _BLANK_SOURCE)
             self._compiled_source = self.config.source
         self._rebuild_settings_popup()
         self._apply_source()
@@ -3441,7 +3503,10 @@ class PanelCard(FluentGroupBox):
 
     def _apply_source(self) -> None:
         self._wait_render_idle()
-        self.config.source = self.source_edit.text()
+        previous_inputs = tuple(self.config.inputs)
+        self.config.set_source(self.source_edit.text())
+        if tuple(self.config.inputs) != previous_inputs:
+            self._refresh_signal_combo()
         self._compiled_source = self.config.source
         self._reset_plot()      # output shape may change with the expression
         # Force the console's NEXT tick to re-render this panel against a FRESH hub namespace (the
@@ -5009,21 +5074,17 @@ class PanelEditor(QtWidgets.QWidget):
         # A plot panel is a PURE VIEW: its Edit carries ONLY the plotter controls
         # (acquisition of whatever node already publishes the signal it reads --
         # read-only-ish, snapshot, fit, manual limits, save).  It NEVER builds or
-        # starts a node -- that lives on the Logic tab.  ``is_plot`` is always
-        # True (a board panel's role is always "plot"); it is kept as a local for
-        # the section gates below so the structure stays legible.
-        is_plot = card.config.role == "plot"
+        # starts a node -- that lives on the Logic tab.
 
         # ---- Panel: rename this panel right here in the Edit (kept in sync with the Setting
         # popup's title field; both go through the sealed title API).  Saves a trip back to
         # the Setting popup just to relabel.
-        if is_plot:
-            section("Panel")
-            self.title_edit = FluentLineEdit(card.config.title)
-            self.title_edit.setPlaceholderText("panel title…")
-            self.title_edit.setToolTip("Rename this panel (also the default save name).")
-            self.title_edit.textChanged.connect(self._edit_title)
-            col.addWidget(FluentSettingRow("title", self.title_edit, label_width=scaled_px(96, minimum=72)))
+        section("Panel")
+        self.title_edit = FluentLineEdit(card.config.title)
+        self.title_edit.setPlaceholderText("panel title…")
+        self.title_edit.setToolTip("Rename this panel (also the default save name).")
+        self.title_edit.textChanged.connect(self._edit_title)
+        col.addWidget(FluentSettingRow("title", self.title_edit, label_width=scaled_px(96, minimum=72)))
 
         # ---- Acquisition: the editable parameters of the DATA SOURCE behind this
         # panel.  A panel is a VIEW; the LOGIC NODE whose published signals it reads
@@ -5101,7 +5162,7 @@ class PanelEditor(QtWidgets.QWidget):
         # call exposes" live -- NOT in the basic Setting popup (which keeps only
         # source / size / colormap / relim / unit), so the two never duplicate.
         functional = [s for s in _panel_display_decls(card.config.kind, card._param_kind()) if not s.display]
-        if is_plot and functional:
+        if functional:
             section("Parameters")
             for s in functional:
                 widget = card._make_param_widget(s, apply=self._edit_param)
@@ -5114,46 +5175,45 @@ class PanelEditor(QtWidgets.QWidget):
         # (single source -- Setting and Edit never drift), then re-snapshot this Edit canvas.
         self.ed_cmap = self.ed_relim = self.ed_unit_button = self.ed_fixed_row = None
         self.ed_params: dict[str, QtWidgets.QWidget] = {}
-        if is_plot:
-            section("Display")
-            disp_lw = scaled_px(96, minimum=72)
-            # The SAME declarative display knobs as the Setting popup -- the per-kind colormap / toggles
-            # PLUS the relim chooser -- rendered through the card's SHARED _emit_param_rows, so the Edit
-            # tab auto-exposes EVERY plot display ParamDecl with no hand-wiring (#H3v-4b).  Each edit
-            # routes via _edit_param -> the live card (config.params + re-render) THEN re-snapshots here.
-            # relim AND repeat_mode: the SAME declarative display knobs the Setting popup renders (relim
-            # via _RELIM_PARAM, repeat_mode via _repeat_param_specs) are present HERE too, so the Edit tab
-            # is the FULL data_figure UI (whatever the Setting can tune, the Edit can too).  Both route
-            # through _edit_param -> card._set_param -- the ONE writer -- so Setting and Edit never drift.
-            display_specs = ([s for s in _panel_display_decls(card.config.kind, card._param_kind()) if s.display]
-                             + [_RELIM_PARAM] + list(card._repeat_param_specs()))
-            self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, disp_lw)
-            self.ed_cmap = self.ed_params.get("cmap")        # named back-refs (kept for tests / clarity)
-            self.ed_relim = self.ed_params.get("relim")
-            # fixed lo/hi: the IDENTICAL bespoke [lo | hi] row the Setting popup builds (shared helper),
-            # shown only when relim == "fixed"; _edit_param toggles it when relim changes.  EXCEPTION --
-            # a 2d/sites panel's value axis IS the COLOUR limit (clim), not a y-axis: its manual pin
-            # belongs with the ranges in the Limits section as an always-editable "colour range" row
-            # (built below), NOT here.  Building it in BOTH places would put two inputs on the ONE
-            # fixed_lo/hi source = exactly the drift the single-source rule forbids, so for an image kind
-            # the Display fixed row is absent and self.ed_fixed_* stay None (every reader is None-guarded);
-            # the relim chooser (tight/normal/fixed clim MODE) still lives here.
-            if card.config.kind in ("2d", "sites"):
-                self.ed_fixed_row = self.ed_fixed_lo = self.ed_fixed_hi = None
-            else:
-                self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = \
-                    card._make_fixed_lim_row(self._edit_fixed_lim, disp_lw)
-                col.addWidget(self.ed_fixed_row)
-                # The lo/hi row stays PERMANENTLY in the layout; only its inputs enable when relim ==
-                # "fixed".  A setVisible toggle on a row that sits ABOVE the snapshot canvas in this shared
-                # scroll page reflowed the unit row + the whole canvas DOWN by the row's height on every
-                # relim change -- the reported Edit-tab jump.  Greying in place leaves every widget put.
-                self._sync_fixed_lim_enabled(card._relim())
-            # x-axis unit cycle -- the IDENTICAL row the Setting popup builds (shared helper), minus the
-            # Setting-only current-unit label; the callback re-routes through the card's _on_unit_cycle.
-            ed_unit_row, self.ed_unit_button, _ = \
-                card._make_unit_cycle_row(self._edit_unit_cycle, disp_lw, with_label=False)
-            col.addWidget(ed_unit_row)
+        section("Display")
+        disp_lw = scaled_px(96, minimum=72)
+        # The SAME declarative display knobs as the Setting popup -- the per-kind colormap / toggles
+        # PLUS the relim chooser -- rendered through the card's SHARED _emit_param_rows, so the Edit
+        # tab auto-exposes EVERY plot display ParamDecl with no hand-wiring (#H3v-4b).  Each edit
+        # routes via _edit_param -> the live card (config.params + re-render) THEN re-snapshots here.
+        # relim AND repeat_mode: the SAME declarative display knobs the Setting popup renders (relim
+        # via _RELIM_PARAM, repeat_mode via _repeat_param_specs) are present HERE too, so the Edit tab
+        # is the FULL data_figure UI (whatever the Setting can tune, the Edit can too).  Both route
+        # through _edit_param -> card._set_param -- the ONE writer -- so Setting and Edit never drift.
+        display_specs = ([s for s in _panel_display_decls(card.config.kind, card._param_kind()) if s.display]
+                         + [_RELIM_PARAM] + list(card._repeat_param_specs()))
+        self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, disp_lw)
+        self.ed_cmap = self.ed_params.get("cmap")        # named back-refs (kept for tests / clarity)
+        self.ed_relim = self.ed_params.get("relim")
+        # fixed lo/hi: the IDENTICAL bespoke [lo | hi] row the Setting popup builds (shared helper),
+        # shown only when relim == "fixed"; _edit_param toggles it when relim changes.  EXCEPTION --
+        # a 2d/sites panel's value axis IS the COLOUR limit (clim), not a y-axis: its manual pin
+        # belongs with the ranges in the Limits section as an always-editable "colour range" row
+        # (built below), NOT here.  Building it in BOTH places would put two inputs on the ONE
+        # fixed_lo/hi source = exactly the drift the single-source rule forbids, so for an image kind
+        # the Display fixed row is absent and self.ed_fixed_* stay None (every reader is None-guarded);
+        # the relim chooser (tight/normal/fixed clim MODE) still lives here.
+        if card.config.kind in ("2d", "sites"):
+            self.ed_fixed_row = self.ed_fixed_lo = self.ed_fixed_hi = None
+        else:
+            self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = \
+                card._make_fixed_lim_row(self._edit_fixed_lim, disp_lw)
+            col.addWidget(self.ed_fixed_row)
+            # The lo/hi row stays PERMANENTLY in the layout; only its inputs enable when relim ==
+            # "fixed".  A setVisible toggle on a row that sits ABOVE the snapshot canvas in this shared
+            # scroll page reflowed the unit row + the whole canvas DOWN by the row's height on every
+            # relim change -- the reported Edit-tab jump.  Greying in place leaves every widget put.
+            self._sync_fixed_lim_enabled(card._relim())
+        # x-axis unit cycle -- the IDENTICAL row the Setting popup builds (shared helper), minus the
+        # Setting-only current-unit label; the callback re-routes through the card's _on_unit_cycle.
+        ed_unit_row, self.ed_unit_button, _ = \
+            card._make_unit_cycle_row(self._edit_unit_cycle, disp_lw, with_label=False)
+        col.addWidget(ed_unit_row)
 
         # ---- Processing: frozen snapshot + Refresh (Save is its own row below) -------------
         section("Processing")
@@ -5169,192 +5229,190 @@ class PanelEditor(QtWidgets.QWidget):
         self.canvas_holder.setContentsMargins(0, 0, 0, 0)
         col.addLayout(self.canvas_holder)
 
-        # Fit + manual limits are a PLOT concern (and a plot panel is always
-        # role "plot", so they always build here).  A LOGIC NODE's Edit (on the
+        # Fit + manual limits are a panel concern, so they always build here.  A LOGIC NODE's Edit (on the
         # Logic tab, a LogicNodeEditor) deliberately carries no curve fit -- fitting
         # a curve is a plotter action, so you Add a Plot panel pointed at the
         # signals the node publishes for that.  A PLOT keeps the FULL DataFigure
         # model set (#176).
-        if is_plot:
-            # DataFigure picks the 1D / 2D path from the snapshot, so a 2D image
-            # fits the 2D-Gaussian "2D center" model and lines fit the rest.  Same
-            # [label | control] row idiom as the sections above (aligned label
-            # column), so Fit / limits don't read as a cramped one-line jumble.
-            proc_lw = scaled_px(96, minimum=72)
+        # DataFigure picks the 1D / 2D path from the snapshot, so a 2D image
+        # fits the 2D-Gaussian "2D center" model and lines fit the rest.  Same
+        # [label | control] row idiom as the sections above (aligned label
+        # column), so Fit / limits don't read as a cramped one-line jumble.
+        proc_lw = scaled_px(96, minimum=72)
 
-            def _inline(*widgets, trailing=None):
-                host = QtWidgets.QWidget()
-                row = QtWidgets.QHBoxLayout(host)
-                row.setContentsMargins(0, 0, 0, 0)
-                row.setSpacing(scaled_px(6, minimum=4))
-                for w in widgets:
-                    row.addWidget(w, 0)
-                row.addStretch(1)
-                if trailing is not None:
-                    row.addWidget(trailing, 0)
-                return host
+        def _inline(*widgets, trailing=None):
+            host = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(host)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(scaled_px(6, minimum=4))
+            for w in widgets:
+                row.addWidget(w, 0)
+            row.addStretch(1)
+            if trailing is not None:
+                row.addWidget(trailing, 0)
+            return host
 
-            # ---- Analysis: the SAME control set the Setting popup builds, through the ONE
-            # :class:`AnalysisControls` builder (``surface='edit'`` -- adds the explicit Fit / Clear
-            # buttons + gains the action combo incl. ROI + a result row).  Every action routes through the
-            # ONE card mutator (card.set_fit_request), so the Edit and Setting surfaces are both views of
-            # config.params['fit_request'] and can never disagree (#8).  ``fit_combo`` / ``ed_fix_seed``
-            # stay the attribute names tests key off; ``do_fit`` / ``clear_fit`` delegate to the composite.
-            self.fit_combo = None
-            self.ed_fix_seed = None
-            self._analysis_controls = None
-            if self.card is not None:
-                controls = AnalysisControls(self.card, surface="edit", label_w=proc_lw)
-                if controls.empty:
-                    controls.deleteLater()
-                else:
-                    section("Analysis")
-                    col.addWidget(controls)
-                    self._analysis_controls = controls
-                    self.fit_combo = controls.model_combo
-                    self.ed_fix_seed = controls.fix_seed
+        # ---- Analysis: the SAME control set the Setting popup builds, through the ONE
+        # :class:`AnalysisControls` builder (``surface='edit'`` -- adds the explicit Fit / Clear
+        # buttons + gains the action combo incl. ROI + a result row).  Every action routes through the
+        # ONE card mutator (card.set_fit_request), so the Edit and Setting surfaces are both views of
+        # config.params['fit_request'] and can never disagree (#8).  ``fit_combo`` / ``ed_fix_seed``
+        # stay the attribute names tests key off; ``do_fit`` / ``clear_fit`` delegate to the composite.
+        self.fit_combo = None
+        self.ed_fix_seed = None
+        self._analysis_controls = None
+        if self.card is not None:
+            controls = AnalysisControls(self.card, surface="edit", label_w=proc_lw)
+            if controls.empty:
+                controls.deleteLater()
+            else:
+                section("Analysis")
+                col.addWidget(controls)
+                self._analysis_controls = controls
+                self.fit_combo = controls.model_combo
+                self.ed_fix_seed = controls.fix_seed
 
-            # x/y-range pins (#3): the VIEW window, applied to the LIVE panel AND every grid cell (global,
-            # not the snapshot only).  The boxes EDIT THE STORED PIN (``view_xlim``/``view_ylim``), NOT the
-            # live range -- they hold the pin value (or are empty = autoscale) and are only re-seeded on
-            # build / tab-show / Clear, so typing is NEVER clobbered by the refresh tick.  The live window
-            # is shown as the grey PLACEHOLDER (``refresh_limit_hints``), a non-destructive hint Qt draws
-            # only while a box is empty.  A y-range row exists ONLY where y is a VIEW axis
-            # (``_card_y_is_view_axis``: an image, whose x AND y are pixel coordinates -- pinning both is
-            # what makes an ROI crop real, since the image keeps aspect='equal' and an x-only pin would
-            # letterbox).  On a 1d/dis panel the y VALUE axis is already owned by the relim family
-            # (tight/normal/fixed in the Display section), so it gets no y row.  An image's VALUE axis is
-            # the COLOUR limit -- a genuinely distinct quantity -- pinned by its own "colour range" row.
-            section("Limits")
-            self.xmin = FluentLineEdit(""); self.xmax = FluentLineEdit("")
-            self.ymin = self.ymax = None
-            if _card_y_is_view_axis(card):
-                self.ymin = FluentLineEdit(""); self.ymax = FluentLineEdit("")
-            # an image's value axis IS the colour limit: give 2d/sites an always-editable clim pin (built
-            # into the Limits row below); every other kind has none (its value axis = the relim y).
-            self.clo = self.chi = None
-            if card.config.kind in ("2d", "sites"):
-                self.clo = FluentLineEdit(""); self.chi = FluentLineEdit("")
-            for w in (self.xmin, self.xmax) + ((self.ymin, self.ymax) if self.ymin is not None else ()):
-                w.setFixedWidth(scaled_px(88, minimum=68))   # wide enough not to clip "-0.4960"
-                w.returnPressed.connect(self.apply_limits)
-            apply_btn = FluentButton("Apply lim", color=ACCENT)
-            apply_btn.clicked.connect(self.apply_limits)
-            # Clear releases the window pins back to autoscale -- the Limits counterpart of the Fit/Clear
-            # pair above (without it a pinned window could never be undone: clearing the boxes + Apply
-            # only errored 'bad limits', so the operator was stuck at whatever range they once set).
-            clear_lim_btn = FluentButton("Clear", color=GREY)
-            clear_lim_btn.clicked.connect(self.clear_limits)
-            lim_row = _inline(self.xmin, self.xmax, trailing=apply_btn)
-            lim_row.layout().addWidget(clear_lim_btn, 0)
-            col.addWidget(FluentSettingRow("x range", lim_row, label_width=proc_lw))
-            if self.ymin is not None:
-                # ONE Apply/Clear pair drives BOTH rows (x + y are one view window, applied together).
-                col.addWidget(FluentSettingRow("y range", _inline(self.ymin, self.ymax), label_width=proc_lw))
+        # x/y-range pins (#3): the VIEW window, applied to the LIVE panel AND every grid cell (global,
+        # not the snapshot only).  The boxes EDIT THE STORED PIN (``view_xlim``/``view_ylim``), NOT the
+        # live range -- they hold the pin value (or are empty = autoscale) and are only re-seeded on
+        # build / tab-show / Clear, so typing is NEVER clobbered by the refresh tick.  The live window
+        # is shown as the grey PLACEHOLDER (``refresh_limit_hints``), a non-destructive hint Qt draws
+        # only while a box is empty.  A y-range row exists ONLY where y is a VIEW axis
+        # (``_card_y_is_view_axis``: an image, whose x AND y are pixel coordinates -- pinning both is
+        # what makes an ROI crop real, since the image keeps aspect='equal' and an x-only pin would
+        # letterbox).  On a 1d/dis panel the y VALUE axis is already owned by the relim family
+        # (tight/normal/fixed in the Display section), so it gets no y row.  An image's VALUE axis is
+        # the COLOUR limit -- a genuinely distinct quantity -- pinned by its own "colour range" row.
+        section("Limits")
+        self.xmin = FluentLineEdit(""); self.xmax = FluentLineEdit("")
+        self.ymin = self.ymax = None
+        if _card_y_is_view_axis(card):
+            self.ymin = FluentLineEdit(""); self.ymax = FluentLineEdit("")
+        # an image's value axis IS the colour limit: give 2d/sites an always-editable clim pin (built
+        # into the Limits row below); every other kind has none (its value axis = the relim y).
+        self.clo = self.chi = None
+        if card.config.kind in ("2d", "sites"):
+            self.clo = FluentLineEdit(""); self.chi = FluentLineEdit("")
+        for w in (self.xmin, self.xmax) + ((self.ymin, self.ymax) if self.ymin is not None else ()):
+            w.setFixedWidth(scaled_px(88, minimum=68))   # wide enough not to clip "-0.4960"
+            w.returnPressed.connect(self.apply_limits)
+        apply_btn = FluentButton("Apply lim", color=ACCENT)
+        apply_btn.clicked.connect(self.apply_limits)
+        # Clear releases the window pins back to autoscale -- the Limits counterpart of the Fit/Clear
+        # pair above (without it a pinned window could never be undone: clearing the boxes + Apply
+        # only errored 'bad limits', so the operator was stuck at whatever range they once set).
+        clear_lim_btn = FluentButton("Clear", color=GREY)
+        clear_lim_btn.clicked.connect(self.clear_limits)
+        lim_row = _inline(self.xmin, self.xmax, trailing=apply_btn)
+        lim_row.layout().addWidget(clear_lim_btn, 0)
+        col.addWidget(FluentSettingRow("x range", lim_row, label_width=proc_lw))
+        if self.ymin is not None:
+            # ONE Apply/Clear pair drives BOTH rows (x + y are one view window, applied together).
+            col.addWidget(FluentSettingRow("y range", _inline(self.ymin, self.ymax), label_width=proc_lw))
 
-            # colour range (2d/sites only): an image's value axis is its COLOUR limit, so it gets an
-            # always-editable clim pin here, mirroring the x-range row.  Apply writes the ONE clim source
-            # (relim="fixed" + the card's apply_fixed_lims -> live card + snapshot + save); Auto releases
-            # it to the autoscaled clim (relim="normal").  So this row and the Display relim chooser never
-            # hold two copies of the pin -- they are two faces of the same fixed_lo/hi source.
-            if self.clo is not None:
-                for w in (self.clo, self.chi):
-                    w.setFixedWidth(scaled_px(88, minimum=68))
-                    w.returnPressed.connect(self.apply_clim)
-                clim_apply = FluentButton("Apply", color=ACCENT)
-                clim_apply.clicked.connect(self.apply_clim)
-                clim_auto = FluentButton("Auto", color=GREY)
-                clim_auto.clicked.connect(self.clear_clim)
-                clim_row = _inline(self.clo, self.chi, trailing=clim_apply)
-                clim_row.layout().addWidget(clim_auto, 0)
-                col.addWidget(FluentSettingRow("colour range", clim_row, label_width=proc_lw))
+        # colour range (2d/sites only): an image's value axis is its COLOUR limit, so it gets an
+        # always-editable clim pin here, mirroring the x-range row.  Apply writes the ONE clim source
+        # (relim="fixed" + the card's apply_fixed_lims -> live card + snapshot + save); Auto releases
+        # it to the autoscaled clim (relim="normal").  So this row and the Display relim chooser never
+        # hold two copies of the pin -- they are two faces of the same fixed_lo/hi source.
+        if self.clo is not None:
+            for w in (self.clo, self.chi):
+                w.setFixedWidth(scaled_px(88, minimum=68))
+                w.returnPressed.connect(self.apply_clim)
+            clim_apply = FluentButton("Apply", color=ACCENT)
+            clim_apply.clicked.connect(self.apply_clim)
+            clim_auto = FluentButton("Auto", color=GREY)
+            clim_auto.clicked.connect(self.clear_clim)
+            clim_row = _inline(self.clo, self.chi, trailing=clim_apply)
+            clim_row.layout().addWidget(clim_auto, 0)
+            col.addWidget(FluentSettingRow("colour range", clim_row, label_width=proc_lw))
 
-            # ---- Command: a one-line REPL on the panel's DataFigure (confocal runs the same
-            # `data_figure.<fn>(...)` form).  Type e.g. `data_figure.xlim(0, 10)`,
-            # `df.fit('gaussian')`, `ax.set_title('x')` -- it runs on the snapshot and
-            # the result/exception shows below.  Trusted-local-tool posture (same as the Scan
-            # tab / fit args): only run code you wrote.
-            section("Command")
-            self.cmd_input = FluentLineEdit("")
-            self.cmd_input.setPlaceholderText("data_figure.xlim(0, 10)")
-            self.cmd_input.setStyleSheet(self.cmd_input.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
-            self.cmd_input.setToolTip(
-                "Run a line of Python on this panel's figure.  Names: data_figure / df, fig, ax,\n"
-                "plotter, np.  e.g. df.fit('gaussian') ; ax.set_title('x') ; data_figure.xlim(0,10)")
-            cmd_run = FluentButton("Run", color=ACCENT)
-            cmd_run.clicked.connect(self._run_command)
-            self.cmd_input.returnPressed.connect(self._run_command)
-            # the input FILLS the row (stretch 1) so it is not a tiny box; Run trails it.
-            run_host = QtWidgets.QWidget()
-            run_row = QtWidgets.QHBoxLayout(run_host)
-            run_row.setContentsMargins(0, 0, 0, 0)
-            run_row.setSpacing(scaled_px(6, minimum=4))
-            run_row.addWidget(self.cmd_input, 1)
-            run_row.addWidget(cmd_run, 0)
-            col.addWidget(FluentSettingRow("run", run_host, label_width=proc_lw))
-            # result: a read-only-but-COPYABLE field (FluentReadoutEdit) so you can select +
-            # Ctrl-C the value/error -- a plain label can't be copied.
-            self.cmd_result = FluentReadoutEdit("")
-            self.cmd_result.setPlaceholderText("result / error appears here (select to copy)")
-            self.cmd_result.setToolTip("The command's result or error — read-only, but select + Ctrl-C to copy.")
-            col.addWidget(FluentSettingRow("result", self.cmd_result, label_width=proc_lw))
+        # ---- Command: a one-line REPL on the panel's DataFigure (confocal runs the same
+        # `data_figure.<fn>(...)` form).  Type e.g. `data_figure.xlim(0, 10)`,
+        # `df.fit('gaussian')`, `ax.set_title('x')` -- it runs on the snapshot and
+        # the result/exception shows below.  Trusted-local-tool posture (same as the Scan
+        # tab / fit args): only run code you wrote.
+        section("Command")
+        self.cmd_input = FluentLineEdit("")
+        self.cmd_input.setPlaceholderText("data_figure.xlim(0, 10)")
+        self.cmd_input.setStyleSheet(self.cmd_input.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
+        self.cmd_input.setToolTip(
+            "Run a line of Python on this panel's figure.  Names: data_figure / df, fig, ax,\n"
+            "plotter, np.  e.g. df.fit('gaussian') ; ax.set_title('x') ; data_figure.xlim(0,10)")
+        cmd_run = FluentButton("Run", color=ACCENT)
+        cmd_run.clicked.connect(self._run_command)
+        self.cmd_input.returnPressed.connect(self._run_command)
+        # the input FILLS the row (stretch 1) so it is not a tiny box; Run trails it.
+        run_host = QtWidgets.QWidget()
+        run_row = QtWidgets.QHBoxLayout(run_host)
+        run_row.setContentsMargins(0, 0, 0, 0)
+        run_row.setSpacing(scaled_px(6, minimum=4))
+        run_row.addWidget(self.cmd_input, 1)
+        run_row.addWidget(cmd_run, 0)
+        col.addWidget(FluentSettingRow("run", run_host, label_width=proc_lw))
+        # result: a read-only-but-COPYABLE field (FluentReadoutEdit) so you can select +
+        # Ctrl-C the value/error -- a plain label can't be copied.
+        self.cmd_result = FluentReadoutEdit("")
+        self.cmd_result.setPlaceholderText("result / error appears here (select to copy)")
+        self.cmd_result.setToolTip("The command's result or error — read-only, but select + Ctrl-C to copy.")
+        col.addWidget(FluentSettingRow("result", self.cmd_result, label_width=proc_lw))
 
-            # ---- Save: the ONE place to save from now (Setting no longer has Save).  The path
-            # field is FULL WIDTH (its own row) so a long path is never cut off -- the reusable
-            # FluentPathEdit (Browse picks a folder), prefilled with the LAST place a panel saved
-            # (remembered on the console for the kernel session) or tasks/.  An "auto-name" SWITCH
-            # decides the filename: ON (default) appends ``_<plot-kind>_<timestamp>`` so saves are
-            # unique; OFF writes the path VERBATIM (you control the exact name, overwrites).  A
-            # read-only preview shows the actual file that will be written -- the full name, not
-            # just the folder.
-            section("Save")
-            self.save_dir_edit = FluentPathEdit(
-                self.console._last_save_dir or str(_task_files_dir()),
-                mode="dir", caption="Choose where to save", base_dir=str(_task_files_dir()))
-            self.save_dir_edit.setToolTip(
-                "Where to save (folder, or a full path base).  Remembered across saves this\n"
-                "kernel session.  With auto-name OFF this is the exact output path.")
-            col.addWidget(FluentSettingRow("path", self.save_dir_edit, label_width=proc_lw))
-            # trailing spaces: FluentSwitch.sizeHint reserves the track width but paints the
-            # label past track+gap, clipping the last few px -- the pad absorbs that (scales
-            # with DPR since it is text), so the real label stays whole.
-            self.save_autoname = FluentSwitch("auto-name (type + time)   ")
-            self.save_autoname.setChecked(True)
-            self.save_autoname.setToolTip(
-                "ON: append _<plot-kind>_<timestamp> to the path (unique files).\n"
-                "OFF: write the path verbatim (you set the exact name; overwrites).")
-            # image FORMAT: a DATA-layer choice of the output CONTAINER (png / pdf / jpg), NOT an art
-            # knob -- the figure's geometry/dpi/typography are unchanged, only the file it lands in.
-            # It drives ``DataFigure.save(image_ext=...)`` (the ONE save path) and the file suffix;
-            # the .npz payload is format-independent (same data + info for every choice).  Lowercase
-            # extensions match confocal's ``save_type`` convention (jpg/png).
-            self.save_format_combo = FluentComboBox()
-            self.save_format_combo.addItems(list(SAVE_IMAGE_FORMATS))
-            self.save_format_combo.setCurrentText(SAVE_IMAGE_FORMATS[0])
-            self.save_format_combo.setFixedWidth(scaled_px(72, minimum=56))
-            self.save_format_combo.setToolTip(
-                "Image container for the saved figure (png / pdf / jpg).\n"
-                "The matching .npz data file is the same for every format.")
-            self.save_button = FluentButton("Save Fig", color=ACCENT)
-            self.save_button.setToolTip("Save the edited figure (png / pdf / jpg) + matching data (npz).")
-            col.addWidget(FluentSettingRow(
-                "name", _inline(self.save_autoname, self.save_format_combo, trailing=self.save_button),
-                label_width=proc_lw))
-            # The previewed file path is a read-only-but-COPYABLE field (NOT a word-wrap label):
-            # a long absolute path has no spaces to wrap on, so a word-wrap label would force its
-            # own width to the full path and DRAG the whole Edit panel wider (the bug).  A
-            # FluentReadoutEdit is a QLineEdit -- its size hint is content-INDEPENDENT (it scrolls
-            # a long path instead of widening), so the panel width never tracks the path length,
-            # and the resolved name stays selectable + Ctrl-C-able.
-            self.save_preview = FluentReadoutEdit("")
-            self.save_preview.setToolTip("The exact file that will be written — read-only, select to copy.")
-            self.save_preview.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
-            col.addWidget(FluentSettingRow("file", self.save_preview, label_width=proc_lw))
-            self.save_dir_edit.changed.connect(lambda *_: self._update_save_preview())
-            self.save_autoname.toggled.connect(lambda *_: self._update_save_preview())
-            self.save_format_combo.currentTextChanged.connect(lambda *_: self._update_save_preview())
-            self.save_button.clicked.connect(self.save)
-            self._update_save_preview()
+        # ---- Save: the ONE place to save from now (Setting no longer has Save).  The path
+        # field is FULL WIDTH (its own row) so a long path is never cut off -- the reusable
+        # FluentPathEdit (Browse picks a folder), prefilled with the LAST place a panel saved
+        # (remembered on the console for the kernel session) or tasks/.  An "auto-name" SWITCH
+        # decides the filename: ON (default) appends ``_<plot-kind>_<timestamp>`` so saves are
+        # unique; OFF writes the path VERBATIM (you control the exact name, overwrites).  A
+        # read-only preview shows the actual file that will be written -- the full name, not
+        # just the folder.
+        section("Save")
+        self.save_dir_edit = FluentPathEdit(
+            self.console._last_save_dir or str(_task_files_dir()),
+            mode="dir", caption="Choose where to save", base_dir=str(_task_files_dir()))
+        self.save_dir_edit.setToolTip(
+            "Where to save (folder, or a full path base).  Remembered across saves this\n"
+            "kernel session.  With auto-name OFF this is the exact output path.")
+        col.addWidget(FluentSettingRow("path", self.save_dir_edit, label_width=proc_lw))
+        # trailing spaces: FluentSwitch.sizeHint reserves the track width but paints the
+        # label past track+gap, clipping the last few px -- the pad absorbs that (scales
+        # with DPR since it is text), so the real label stays whole.
+        self.save_autoname = FluentSwitch("auto-name (type + time)   ")
+        self.save_autoname.setChecked(True)
+        self.save_autoname.setToolTip(
+            "ON: append _<plot-kind>_<timestamp> to the path (unique files).\n"
+            "OFF: write the path verbatim (you set the exact name; overwrites).")
+        # image FORMAT: a DATA-layer choice of the output CONTAINER (png / pdf / jpg), NOT an art
+        # knob -- the figure's geometry/dpi/typography are unchanged, only the file it lands in.
+        # It drives ``DataFigure.save(image_ext=...)`` (the ONE save path) and the file suffix;
+        # the .npz payload is format-independent (same data + info for every choice).  Lowercase
+        # extensions match confocal's ``save_type`` convention (jpg/png).
+        self.save_format_combo = FluentComboBox()
+        self.save_format_combo.addItems(list(SAVE_IMAGE_FORMATS))
+        self.save_format_combo.setCurrentText(SAVE_IMAGE_FORMATS[0])
+        self.save_format_combo.setFixedWidth(scaled_px(72, minimum=56))
+        self.save_format_combo.setToolTip(
+            "Image container for the saved figure (png / pdf / jpg).\n"
+            "The matching .npz data file is the same for every format.")
+        self.save_button = FluentButton("Save Fig", color=ACCENT)
+        self.save_button.setToolTip("Save the edited figure (png / pdf / jpg) + matching data (npz).")
+        col.addWidget(FluentSettingRow(
+            "name", _inline(self.save_autoname, self.save_format_combo, trailing=self.save_button),
+            label_width=proc_lw))
+        # The previewed file path is a read-only-but-COPYABLE field (NOT a word-wrap label):
+        # a long absolute path has no spaces to wrap on, so a word-wrap label would force its
+        # own width to the full path and DRAG the whole Edit panel wider (the bug).  A
+        # FluentReadoutEdit is a QLineEdit -- its size hint is content-INDEPENDENT (it scrolls
+        # a long path instead of widening), so the panel width never tracks the path length,
+        # and the resolved name stays selectable + Ctrl-C-able.
+        self.save_preview = FluentReadoutEdit("")
+        self.save_preview.setToolTip("The exact file that will be written — read-only, select to copy.")
+        self.save_preview.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+        col.addWidget(FluentSettingRow("file", self.save_preview, label_width=proc_lw))
+        self.save_dir_edit.changed.connect(lambda *_: self._update_save_preview())
+        self.save_autoname.toggled.connect(lambda *_: self._update_save_preview())
+        self.save_format_combo.currentTextChanged.connect(lambda *_: self._update_save_preview())
+        self.save_button.clicked.connect(self.save)
+        self._update_save_preview()
 
         self.status = FluentLabel("")
         self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
@@ -5915,7 +5973,7 @@ class PanelEditor(QtWidgets.QWidget):
         bug was ``fill_limits`` doing ``setText`` every tick).  The live range is shown separately as a
         non-destructive grey hint (:meth:`refresh_limit_hints`)."""
         if self.xmin is None:
-            return                          # no Limits section (a non-"plot" role)
+            return                          # no Limits controls on this editor instance
         for key, lo_box, hi_box in self._limit_axes():
             pin = self.card.config.params.get(key) if self.card is not None else None
             lo = hi = ""
@@ -5935,7 +5993,7 @@ class PanelEditor(QtWidgets.QWidget):
         successor of the old ``fill_limits`` (whose per-tick ``setText`` clobbered input): the tick calls
         THIS, so the boxes stay a live VIEW of the x-window (unpinned) while remaining freely editable."""
         if self.xmin is None:
-            return                          # no Limits section (a non-"plot" role)
+            return                          # no Limits controls on this editor instance
         # colour-range (2d/sites) live hint: show the current clim as the grey PLACEHOLDER so an empty
         # box (= Auto) still tells the operator what range the image is using -- the clim counterpart of
         # the x-window hint below.  Non-destructive: Qt draws a placeholder only while the box is empty,

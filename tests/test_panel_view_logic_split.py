@@ -1,7 +1,7 @@
-"""MECHANICAL guard for the corrected VIEW / LOGIC split.
+"""Mechanical guard for the current View / Logic split and layout records.
 
-A Monitor-board PANEL is a pure VIEW: always role "plot", fully decoupled from
-acquisition.  Its Edit carries the FULL plotter set (the whole DataFigure fit set,
+A Monitor-board panel is intrinsically a pure View, fully decoupled from
+acquisition.  Its Edit carries the full plotter set (the whole DataFigure fit set,
 task #176) + manual limits + the display knobs (relim / unit) -- but it NEVER
 carries a measurement/processor param form or a Start/Stop (a plot never produces
 data).  The nodes live on the LOGIC tab as logic nodes (measurement /
@@ -61,30 +61,83 @@ def _open_via_add_panel(console, data):
     console._add_panel()
 
 
-# ------------------------------------------------------------------- round-trip
-def test_panel_config_role_roundtrips_and_validates():
-    from Zou_lab_control.frontend.task_console import PanelConfig
+# ------------------------------------------------------------------- current records
+def test_current_layout_records_roundtrip_exactly():
+    from Zou_lab_control.frontend.task_console import (
+        LogicNodeConfig,
+        PanelConfig,
+        TaskConsoleState,
+    )
 
-    # a board panel is always role "plot" -- it is the only valid panel role now
-    cfg = PanelConfig(kind="1d", role="plot", source="value = rate")
-    assert cfg.role == "plot"
-    assert cfg.to_dict()["role"] == "plot"
-    assert PanelConfig.from_dict(cfg.to_dict()).role == "plot"
-    # a config WITHOUT a stored role (older layout) defaults to "plot"
-    payload = cfg.to_dict(); del payload["role"]
-    assert PanelConfig.from_dict(payload).role == "plot"
-    with pytest.raises(ValueError):
-        PanelConfig(kind="1d", role="bogus")
-
-
-def test_logic_node_config_roundtrips_and_validates():
-    from Zou_lab_control.frontend.task_console import LogicNodeConfig
-
+    panel = PanelConfig(kind="1d", source="value = rate")
     node = LogicNodeConfig(kind="measurement", name="Temperature", values={"shots": 8})
-    assert node.kind == "measurement" and node.title == "Temperature"
-    assert LogicNodeConfig.from_dict(node.to_dict()).values == {"shots": 8}
+    state = TaskConsoleState(name="readout", panels=[panel], logic=[node])
+    payload = state.to_dict()
+
+    assert set(payload) == {"schema", "name", "interval_ms", "panels", "logic"}
+    assert set(payload["panels"][0]) == {
+        "kind", "title", "row", "col", "size", "source", "params", "inputs"
+    }
+    assert set(payload["logic"][0]) == {"kind", "name", "title", "values"}
+    assert TaskConsoleState.from_dict(payload).to_dict() == payload
+
+
+def test_source_edit_writer_keeps_single_slot_binding_canonical():
+    from Zou_lab_control.frontend.task_console import TaskConsoleState
+
+    console = _console()
+    try:
+        _open_via_add_panel(console, "1d")
+        card = console.cards[-1]
+        card.source_edit.setText("value = counts")
+        card._apply_source()
+
+        assert card.config.inputs == ["counts"]
+        payload = console.read_state().to_dict()
+        assert TaskConsoleState.from_dict(payload).to_dict() == payload
+    finally:
+        console.shutdown()
+
+
+def test_noncurrent_layout_fields_and_invalid_repeat_modes_are_rejected():
+    from Zou_lab_control.frontend.task_console import (
+        LogicNodeConfig,
+        PanelConfig,
+        TaskConsoleState,
+    )
+
+    panel = PanelConfig(kind="1d", source="value = rate").to_dict()
+    with pytest.raises(ValueError, match="exactly"):
+        PanelConfig.from_dict({**panel, "role": "plot"})
+    missing_panel_field = dict(panel)
+    del missing_panel_field["inputs"]
+    with pytest.raises(ValueError, match="exactly"):
+        PanelConfig.from_dict(missing_panel_field)
+    with pytest.raises(TypeError, match="params must be dict"):
+        PanelConfig.from_dict({**panel, "params": None})
+    with pytest.raises(ValueError, match="canonical form"):
+        PanelConfig.from_dict({**panel, "inputs": []})
+
+    node = LogicNodeConfig(kind="measurement", name="Temperature").to_dict()
+    with pytest.raises(ValueError, match="exactly"):
+        LogicNodeConfig.from_dict({**node, "unexpected": True})
+    with pytest.raises(TypeError, match="values must be dict"):
+        LogicNodeConfig.from_dict({**node, "values": None})
     with pytest.raises(ValueError):
         LogicNodeConfig(kind="bogus", name="x")
+
+    state = TaskConsoleState(panels=[PanelConfig.from_dict(panel)]).to_dict()
+    with pytest.raises(ValueError, match="exactly"):
+        TaskConsoleState.from_dict({**state, "version": 3})
+    with pytest.raises(ValueError, match="expected schema"):
+        TaskConsoleState.from_dict({**state, "schema": "not-the-current-layout"})
+    for field in ("panels", "logic"):
+        with pytest.raises(TypeError, match=f"{field} must be list"):
+            TaskConsoleState.from_dict({**state, field: None})
+
+    assert PanelConfig(kind="1d", params={"repeat_mode": "create"}).params["repeat_mode"] == "create"
+    with pytest.raises(ValueError, match="invalid repeat_mode"):
+        PanelConfig(kind="2d", params={"repeat_mode": "create"})
 
 
 # ------------------------------------------------- plot Edit: FULL fit (#176), no node form
@@ -93,7 +146,6 @@ def test_plot_panel_edit_keeps_full_fit_no_node_form():
     try:
         _open_via_add_panel(console, "1d")              # a plain Plot: 1D vector
         card = console.cards[-1]
-        assert card.config.role == "plot"
         assert card.config.source == ""                 # blank pure view
         console._edit_card(card)
         editor = console._panel_editors[id(card)]
@@ -104,6 +156,10 @@ def test_plot_panel_edit_keeps_full_fit_no_node_form():
         # Setting keeps the plot-display knobs for a plot panel
         assert hasattr(card, "lim_combo")
         assert hasattr(card, "unit_button")
+        card.config.params["repeat_mode"] = "not-a-mode"
+        with pytest.raises(ValueError, match="invalid repeat_mode"):
+            card._repeat_mode_value()
+        card.config.params.pop("repeat_mode")
     finally:
         console.shutdown()
 
@@ -118,7 +174,7 @@ def test_plot_reading_a_signal_still_has_no_node_form():
     try:
         from Zou_lab_control.frontend.task_console import PanelConfig, PanelCard
         spec = specs[0]
-        cfg = PanelConfig(kind="1d", role="plot", source=f"value = {spec.y_key}")
+        cfg = PanelConfig(kind="1d", source=f"value = {spec.y_key}")
         card = PanelCard(cfg, parent=console.board, names_provider=console.hub.names)
         console._attach_card(card)
         console._edit_card(card)
