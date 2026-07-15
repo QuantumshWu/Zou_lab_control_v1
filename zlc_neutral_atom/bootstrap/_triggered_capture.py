@@ -39,7 +39,7 @@ from zlc_pulse import (
 )
 from zlc_storage import canonical_text, positive_integer as _positive_int
 
-from .camera_capture import (
+from ._camera_endpoint import (
     CameraCaptureBindingRequest,
     bind_camera_measurement,
 )
@@ -70,7 +70,7 @@ def _canonical_grouping(
 
 
 @dataclass(frozen=True, slots=True)
-class _TriggeredCameraLayout:
+class TriggeredCameraLayout:
     """Named sampling intent; the compiled schedule supplies scan cardinality."""
 
     repeat_axis_id: AxisId
@@ -118,7 +118,7 @@ class _TriggeredCameraLayout:
 
 
 @dataclass(frozen=True, slots=True)
-class _TriggeredCameraBinding:
+class TriggeredCameraBinding:
     """Run-local, generation-pinned result of the concrete composition join."""
 
     pulse_port: BoundPulsePort
@@ -140,16 +140,16 @@ def _axis(axis_id: AxisId, role, size: int) -> AxisSpec:
     return AxisSpec(axis_id, axis_id.value, role, size, tuple(range(size)))
 
 
-def _bind_triggered_camera_acquisition(
+def bind_triggered_camera_acquisition(
     pulse_port: BoundPulsePort,
     camera_port: BoundCapturePort,
     *,
     pulse_document: PulseDocument,
     execution_form: PulseExecutionForm,
     trigger_channel: str | None,
-    layout: _TriggeredCameraLayout,
+    layout: TriggeredCameraLayout,
     transport_memory_limit_bytes: int,
-) -> _TriggeredCameraBinding:
+) -> TriggeredCameraBinding:
     """Bind one exact finite pulse/camera acquisition without starting hardware."""
 
     if not isinstance(pulse_port, BoundPulsePort):
@@ -162,8 +162,8 @@ def _bind_triggered_camera_acquisition(
         raise TypeError("execution_form must be PulseExecutionForm")
     if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
         raise ValueError("triggered camera acquisition requires a finite pulse form")
-    if not isinstance(layout, _TriggeredCameraLayout):
-        raise TypeError("layout must be _TriggeredCameraLayout")
+    if not isinstance(layout, TriggeredCameraLayout):
+        raise TypeError("layout must be TriggeredCameraLayout")
     transport_memory_limit_bytes = _positive_int(
         transport_memory_limit_bytes,
         "transport_memory_limit_bytes",
@@ -268,7 +268,7 @@ def _bind_triggered_camera_acquisition(
         )
     )
     pulse_request = FinitePulseExecutionRequest(document, artifact)
-    return _TriggeredCameraBinding(
+    return TriggeredCameraBinding(
         pulse_port,
         pulse_request,
         selected_trigger,

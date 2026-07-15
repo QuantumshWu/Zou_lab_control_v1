@@ -4,18 +4,14 @@ from __future__ import annotations
 
 import threading
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Iterator, TYPE_CHECKING
 
-from Zou_lab_control.neutral_atom.device_catalog import (
+from zlc_neutral_atom.installation import (
     DeviceRef,
     DeviceCatalogView,
-    _catalog_from_device_set,
-)
-from Zou_lab_control.neutral_atom.devices import (
-    load_devices,
-    resolve_connect_config,
 )
 from zlc_data import (
     AxisId,
@@ -38,15 +34,12 @@ from zlc_neutral_atom.artifacts import (
 )
 from zlc_neutral_atom.readout.calibration import ResolvedCalibration
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
-from zlc_neutral_atom.readout.calibration_repository import CalibrationRepository
 from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
-from zlc_neutral_atom.runtime import (
-    DatasetMaterializerSpec,
-    MinimalPipelineSpec,
-    PipelineMemoryProfile,
-    RunHandle,
+from zlc_neutral_atom.runtime.pipeline import (
     estimate_pipeline_peak_bytes,
+    MinimalPipelineSpec,
 )
+from zlc_neutral_atom.runtime.run import RunHandle
 from zlc_neutral_atom.timing.capture import TriggeredCaptureSpec
 from zlc_pulse import (
     PulseDocument,
@@ -57,14 +50,14 @@ from zlc_pulse import (
 from zlc_storage import canonical_text as _text
 from zlc_storage import durable_mkdir
 from zlc_storage import positive_integer as _positive_int
-from zlc_workbench._triggered_camera import (
-    _TriggeredCameraLayout,
-    _bind_triggered_camera_acquisition,
-)
-from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
+
+if TYPE_CHECKING:
+    from zlc_neutral_atom.readout.calibration_repository import (
+        CalibrationRepository,
+    )
 
 class _ResourceCleanupError(RuntimeError):
-    """Python-3.9-compatible report retaining every ordinary cleanup failure."""
+    """Report retaining every ordinary cleanup failure."""
 
     def __init__(
         self,
@@ -138,19 +131,16 @@ class CaptureRequest:
                     "readout_events_per_repeat",
                 ),
             )
-        canonical_layout = _TriggeredCameraLayout(
-            AxisId("capture.repeat"),
-            AxisId("capture.scan_row"),
-            AxisId("capture.readout_event"),
-            self.repeat_count,
-            self.readout_events_per_repeat,
-            self.within_point_grouping,
-        )
-        object.__setattr__(
-            self,
-            "within_point_grouping",
-            canonical_layout.within_point_grouping,
-        )
+        if self.within_point_grouping is not None:
+            try:
+                grouping = tuple(
+                    tuple(pair) for pair in self.within_point_grouping
+                )
+            except TypeError as exc:
+                raise TypeError(
+                    "within_point_grouping must be an iterable of pairs"
+                ) from exc
+            object.__setattr__(self, "within_point_grouping", grouping)
         object.__setattr__(
             self,
             "transport_memory_limit_bytes",
@@ -214,33 +204,53 @@ class PlanDescriptor:
 
 @dataclass
 class _ExperimentServices:
-    runtime: LegacyNeutralAtomRuntime
-    devices: object
+    runtime: object
     capture_repository: CaptureRepository
-    calibration_repository: CalibrationRepository
+    calibration_repository_path: Path
+    calibration_repository: "CalibrationRepository | None"
     fit_repository: CaptureFitResultRepository
     catalog: DeviceCatalogView
     operation_lock: threading.RLock
-    closed: bool = False
+    state: str = "OPEN"
 
 
 _AUTHORITY_LOCK = threading.RLock()
 _AUTHORITIES: dict[object, _ExperimentServices] = {}
 
 
-def _register(services: _ExperimentServices) -> object:
-    token = object()
+def _register(token: object, services: _ExperimentServices) -> None:
     with _AUTHORITY_LOCK:
+        if token in _AUTHORITIES:
+            raise RuntimeError("Experiment authority token is already registered")
         _AUTHORITIES[token] = services
-    return token
 
 
-def _services(token: object) -> _ExperimentServices:
+@contextmanager
+def _service_guard(
+    token: object,
+) -> Iterator[_ExperimentServices]:
     with _AUTHORITY_LOCK:
         services = _AUTHORITIES.get(token)
-    if services is None or services.closed:
+    if services is None:
         raise RuntimeError("Experiment is closed")
-    return services
+    with services.operation_lock:
+        if services.state != "OPEN":
+            raise RuntimeError("Experiment is closing or closed")
+        yield services
+
+
+def _calibration_repository(
+    services: _ExperimentServices,
+) -> "CalibrationRepository":
+    repository = services.calibration_repository
+    if repository is None:
+        from zlc_neutral_atom.readout.calibration_repository import (
+            CalibrationRepository,
+        )
+
+        repository = CalibrationRepository(services.calibration_repository_path)
+        services.calibration_repository = repository
+    return repository
 
 
 class TimingFacade:
@@ -251,9 +261,14 @@ class TimingFacade:
 
     @property
     def target(self) -> TimingTargetDescriptor:
-        services = _services(self._token)
-        with services.operation_lock:
-            port = services.runtime.bind_sequencer_port()
+        with _service_guard(self._token) as services:
+            role = _resolve_role(
+                services.catalog,
+                None,
+                "sequencer",
+                ("sequencer",),
+            )
+            port = services.runtime.pulse_port(services.catalog.require(role).ref)
             capability = port.capability
             return TimingTargetDescriptor(
                 capability.target,
@@ -286,10 +301,10 @@ class ReadoutFacade:
         )
         if self._binding is not None and key != self._binding:
             raise ValueError("a bound readout facade cannot switch bindings")
-        services = _services(self._token)
-        info = services.catalog.require(key.value)
-        if info.domain != "camera":
-            raise ValueError(f"readout binding {key.value!r} is not a camera")
+        with _service_guard(self._token) as services:
+            info = services.catalog.require(key.value)
+            if info.domain != "camera":
+                raise ValueError(f"readout binding {key.value!r} is not a camera")
         return ReadoutFacade(self._token, key)
 
     def capture_request(
@@ -307,35 +322,43 @@ class ReadoutFacade:
         pipeline_memory_limit_bytes: int = 256 << 20,
         timeout_seconds: float = 30.0,
     ) -> CaptureRequest:
-        services = _services(self._token)
-        document = pulse if isinstance(pulse, PulseDocument) else load_pulse_document(pulse)
-        if self._binding is not None:
-            if camera_role is not None and camera_role != self._binding.value:
-                raise ValueError("bound readout facade cannot target another camera")
-            camera_role = self._binding.value
-        return CaptureRequest(
-            document,
-            execution_form,
-            services.catalog.require(_resolve_role(
-                services.catalog,
-                camera_role,
-                "camera",
-                ("readout", "camera"),
-            )).ref,
-            services.catalog.require(_resolve_role(
-                services.catalog,
-                sequencer_role,
-                "sequencer",
-                ("sequencer",),
-            )).ref,
-            trigger_channel,
-            repeat_count,
-            readout_events_per_repeat,
-            within_point_grouping,
-            transport_memory_limit_bytes,
-            pipeline_memory_limit_bytes,
-            timeout_seconds,
-        )
+        with _service_guard(self._token) as services:
+            document = (
+                pulse
+                if isinstance(pulse, PulseDocument)
+                else load_pulse_document(pulse)
+            )
+            if self._binding is not None:
+                if camera_role is not None and camera_role != self._binding.value:
+                    raise ValueError("bound readout facade cannot target another camera")
+                camera_role = self._binding.value
+            return CaptureRequest(
+                document,
+                execution_form,
+                services.catalog.require(
+                    _resolve_role(
+                        services.catalog,
+                        camera_role,
+                        "camera",
+                        ("readout", "camera"),
+                    )
+                ).ref,
+                services.catalog.require(
+                    _resolve_role(
+                        services.catalog,
+                        sequencer_role,
+                        "sequencer",
+                        ("sequencer",),
+                    )
+                ).ref,
+                trigger_channel,
+                repeat_count,
+                readout_events_per_repeat,
+                within_point_grouping,
+                transport_memory_limit_bytes,
+                pipeline_memory_limit_bytes,
+                timeout_seconds,
+            )
 
     def capture(self, pulse: PulseDocument | str | Path, **kwargs) -> CaptureArtifactRef:
         return _run(self._token, self.capture_request(pulse, **kwargs))
@@ -344,17 +367,18 @@ class ReadoutFacade:
         return _start(self._token, self.capture_request(pulse, **kwargs))
 
     def load_capture(self, reference: CaptureArtifactRef) -> CaptureArtifact:
-        return _services(self._token).capture_repository.load(reference)
+        with _service_guard(self._token) as services:
+            return services.capture_repository.load(reference)
 
     def load_calibration(
         self,
         reference: CalibrationArtifactRef,
     ) -> ResolvedCalibration:
-        services = _services(self._token)
-        return services.calibration_repository.admit(
-            reference,
-            services.capture_repository,
-        )
+        with _service_guard(self._token) as services:
+            return _calibration_repository(services).admit(
+                reference,
+                services.capture_repository,
+            )
 
 
 class Experiment:
@@ -404,75 +428,77 @@ class Experiment:
             raise TypeError("source must be CaptureArtifactRef")
         if (spec is None) == (model is None):
             raise ValueError("provide exactly one of spec or model")
-        services = _services(self._authority_token)
-        admitted = services.capture_repository.admit(source)
-        if spec is None:
-            assert model is not None
-            spec = fit_spec_for(
-                admitted.artifact.frame_source.schema,
-                model,
-                committed_transform=committed_transform,
-                fit_axis_ids=fit_axis_ids,
-                constraints=constraints,
-                numeric_policy=(
-                    FitNumericPolicy()
-                    if numeric_policy is None
-                    else numeric_policy
-                ),
-            )
-        elif any(
-            value is not None
-            for value in (
-                committed_transform,
-                fit_axis_ids,
-                numeric_policy,
-            )
-        ) or constraints:
-            raise ValueError(
-                "spec cannot be combined with model convenience arguments"
-            )
-        return services.fit_repository.execute(admitted, spec)
+        with _service_guard(self._authority_token) as services:
+            admitted = services.capture_repository.admit(source)
+            if spec is None:
+                assert model is not None
+                spec = fit_spec_for(
+                    admitted.artifact.frame_source.schema,
+                    model,
+                    committed_transform=committed_transform,
+                    fit_axis_ids=fit_axis_ids,
+                    constraints=constraints,
+                    numeric_policy=(
+                        FitNumericPolicy()
+                        if numeric_policy is None
+                        else numeric_policy
+                    ),
+                )
+            elif any(
+                value is not None
+                for value in (
+                    committed_transform,
+                    fit_axis_ids,
+                    numeric_policy,
+                )
+            ) or constraints:
+                raise ValueError(
+                    "spec cannot be combined with model convenience arguments"
+                )
+            return services.fit_repository.execute(admitted, spec)
 
     def load_fit(
         self,
         reference: CaptureFitResultArtifactRef,
     ) -> AdmittedCaptureFitResult:
-        services = _services(self._authority_token)
-        return services.fit_repository.load(
-            reference,
-            services.capture_repository,
-        )
+        with _service_guard(self._authority_token) as services:
+            return services.fit_repository.load(
+                reference,
+                services.capture_repository,
+            )
 
     def close(self) -> None:
         with _AUTHORITY_LOCK:
             services = _AUTHORITIES.get(self._authority_token)
-        if services is None or services.closed:
+        if services is None:
             return
-        failures: list[Exception] = []
         with services.operation_lock:
-            if services.closed:
+            if services.state == "CLOSED":
                 return
+            services.state = "CLOSING"
             shutdown = services.runtime.shutdown(timeout=2.0)
             if not shutdown:
                 raise RuntimeError(
                     "Experiment close is waiting for an active Run to terminate"
                 )
-            failures.extend(
-                _cleanup_failures(
-                    services.devices.close,
-                    services.fit_repository.close,
-                    services.calibration_repository.close,
-                    services.capture_repository.close,
+            failures = _cleanup_failures(
+                services.fit_repository.close,
+                (
+                    None
+                    if services.calibration_repository is None
+                    else services.calibration_repository.close
+                ),
+                services.capture_repository.close,
+            )
+            if failures:
+                raise _ResourceCleanupError(
+                    "Experiment close failed",
+                    tuple(failures),
                 )
-            )
-            services.closed = True
+            services.state = "CLOSED"
         with _AUTHORITY_LOCK:
-            _AUTHORITIES.pop(self._authority_token, None)
-        if failures:
-            raise _ResourceCleanupError(
-                "Experiment close failed",
-                tuple(failures),
-            )
+            if _AUTHORITIES.get(self._authority_token) is services:
+                _AUTHORITIES.pop(self._authority_token, None)
 
     def __enter__(self) -> "Experiment":
         return self
@@ -506,150 +532,142 @@ def _resolve_role(
     return candidates[0]
 
 
-def _compile(token: object, request: CaptureRequest):
+def _compile_for_services(
+    services: _ExperimentServices,
+    request: CaptureRequest,
+):
+    # Concrete binding is composition-private and imported only when a request
+    # is compiled.  Importing the notebook value/facade surface never constructs
+    # adapters or advertises a drive-capable Port.
+    from zlc_neutral_atom.bootstrap._triggered_capture import (
+        bind_triggered_camera_acquisition,
+        TriggeredCameraLayout,
+    )
+
     if not isinstance(request, CaptureRequest):
         raise TypeError("Experiment only accepts declarative CaptureRequest values")
-    services = _services(token)
-    with services.operation_lock:
-        binding = _bind_triggered_camera_acquisition(
-            services.runtime,
-            services.catalog,
-            pulse_document=request.pulse_document,
-            execution_form=request.execution_form,
-            camera_ref=request.camera_ref,
-            sequencer_ref=request.sequencer_ref,
-            trigger_channel=request.trigger_channel,
-            layout=_TriggeredCameraLayout(
-                AxisId("capture.repeat"),
-                AxisId("capture.scan_row"),
-                AxisId("capture.readout_event"),
-                request.repeat_count,
-                request.readout_events_per_repeat,
-                request.within_point_grouping,
-            ),
-            transport_memory_limit_bytes=request.transport_memory_limit_bytes,
-        )
-        pipeline = MinimalPipelineSpec(
-            f"Capture {binding.pulse_request.document.name}",
-            binding.measurement,
-            DatasetMaterializerSpec(
-                BlockId(f"capture-{binding.compiled_artifact.fingerprint[:20]}"),
-                PipelineMemoryProfile(
-                    request.pipeline_memory_limit_bytes
-                ),
-            ),
-            timeout_seconds=request.timeout_seconds,
-        )
-        triggered = TriggeredCaptureSpec(
-            pipeline,
-            binding.pulse_port,
-            binding.pulse_request,
-            binding.trigger_channel,
-            binding.cell_plan,
-        )
-        plan = compile_capture_artifact_pipeline(
-            triggered,
-            services.capture_repository,
-        )
-        descriptor = PlanDescriptor(
-            plan.name,
-            request.camera_ref.role,
-            request.sequencer_ref.role,
-            request.execution_form,
-            binding.trigger_channel,
-            binding.expected_frames,
-            binding.measurement.capture_contract.dataset_schema.physical_shape,
-            binding.measurement.capture_contract.dataset_schema.fingerprint,
-            binding.compiled_artifact.fingerprint,
-            tuple(str(claim.key) for claim in plan.resource_claims),
-            estimate_pipeline_peak_bytes(pipeline),
-        )
-        return plan, descriptor
+    binding = bind_triggered_camera_acquisition(
+        services.runtime.pulse_port(request.sequencer_ref),
+        services.runtime.camera_port(request.camera_ref),
+        pulse_document=request.pulse_document,
+        execution_form=request.execution_form,
+        trigger_channel=request.trigger_channel,
+        layout=TriggeredCameraLayout(
+            AxisId("capture.repeat"),
+            AxisId("capture.scan_row_ordinal"),
+            AxisId("capture.readout_event"),
+            request.repeat_count,
+            request.readout_events_per_repeat,
+            request.within_point_grouping,
+        ),
+        transport_memory_limit_bytes=request.transport_memory_limit_bytes,
+    )
+    pipeline = MinimalPipelineSpec(
+        f"Capture {binding.pulse_request.document.name}",
+        binding.measurement,
+        BlockId(f"capture-{binding.compiled_artifact.fingerprint[:20]}"),
+        request.pipeline_memory_limit_bytes,
+        timeout_seconds=request.timeout_seconds,
+    )
+    triggered = TriggeredCaptureSpec(
+        pipeline,
+        binding.pulse_port,
+        binding.pulse_request,
+        binding.trigger_channel,
+        binding.cell_plan,
+    )
+    plan = compile_capture_artifact_pipeline(
+        triggered,
+        services.capture_repository,
+    )
+    descriptor = PlanDescriptor(
+        plan.name,
+        request.camera_ref.role,
+        request.sequencer_ref.role,
+        request.execution_form,
+        binding.trigger_channel,
+        binding.expected_frames,
+        binding.measurement.capture_contract.dataset_schema.physical_shape,
+        binding.measurement.capture_contract.dataset_schema.fingerprint,
+        binding.compiled_artifact.fingerprint,
+        tuple(str(claim.key) for claim in plan.resource_claims),
+        estimate_pipeline_peak_bytes(pipeline),
+    )
+    return plan, descriptor
+
+
+def _compile(token: object, request: CaptureRequest):
+    with _service_guard(token) as services:
+        return _compile_for_services(services, request)
 
 
 def _start(token: object, request: CaptureRequest) -> RunHandle:
-    services = _services(token)
-    with services.operation_lock:
-        plan, _descriptor = _compile(token, request)
-        return services.runtime.controller.start(plan)
+    with _service_guard(token) as services:
+        plan, _descriptor = _compile_for_services(services, request)
+        return services.runtime.start(plan)
 
 
 def _run(token: object, request: CaptureRequest) -> CaptureArtifactRef:
-    return _start(token, request).result()
+    with _service_guard(token) as services:
+        plan, _descriptor = _compile_for_services(services, request)
+        handle = services.runtime.start(plan)
+        runtime = services.runtime
+    return runtime.wait(handle)
 
 
 def connect(
-    config: str | Path | Mapping[str, object] = "virtual",
+    config: str = "virtual",
     *,
     repository: str | Path,
     name: str = "neutral_atom",
-    asset_map=None,
-    safety_journal_path: str | Path | None = None,
-    open_devices: bool = False,
-    trap_array: dict | None = None,
-    sitemap: dict | None = None,
-    camera: dict | None = None,
-    sequencer: dict | None = None,
-    **virtual_params,
+    seed: int | None = 7,
 ) -> Experiment:
     """Compose one notebook Experiment; raw devices remain authority-private."""
 
+    if not isinstance(config, str):
+        raise TypeError("config must name an explicit target backend")
+    if config != "virtual":
+        raise ValueError(
+            "the target composition currently accepts only the explicit "
+            "'virtual' backend"
+        )
     if not isinstance(repository, (str, Path)):
         raise TypeError("repository must be an explicit experiment workspace root")
+    canonical_name = _text(name, "experiment name")
     repository_root = Path(repository).expanduser().resolve()
     # The composition root owns the workspace hierarchy; each repository owns
     # exactly one child beneath it and never guesses missing ancestors.
     durable_mkdir(repository_root)
     capture_repository = None
-    calibration_repository = None
     fit_repository = None
-    devices = None
     runtime = None
     try:
         capture_repository = CaptureRepository(repository_root / "captures")
-        calibration_repository = CalibrationRepository(
-            repository_root / "calibrations"
-        )
         fit_repository = CaptureFitResultRepository(repository_root / "fits")
-        device_config, device_overrides, _defaults = resolve_connect_config(
-            config,
-            trap_array=trap_array,
-            sitemap=sitemap,
-            camera=camera,
-            sequencer=sequencer,
-            params=virtual_params,
+        from zlc_neutral_atom.bootstrap._installation import (
+            create_virtual_installation,
         )
-        devices = load_devices(
-            device_config,
-            overrides=device_overrides,
-            open_devices=False,
+
+        runtime = create_virtual_installation(
+            safety_journal_path=(
+                repository_root / ".runtime" / "safety.journal"
+            ),
+            seed=seed,
         )
-        runtime = LegacyNeutralAtomRuntime(
-            devices,
-            asset_map=asset_map,
-            safety_journal_path=safety_journal_path,
-        )
-        if open_devices:
-            runtime.ensure_device_set_connections(devices)
-        installation_id = f"installation-{runtime.asset_map.revision[:20]}"
-        catalog = _catalog_from_device_set(
-            devices,
-            installation_id=installation_id,
-            installation_generation=1,
-            installation_state_revision=1,
-            revision=1,
-        )
+        catalog = runtime.device_catalog
         services = _ExperimentServices(
             runtime,
-            devices,
             capture_repository,
-            calibration_repository,
+            repository_root / "calibrations",
+            None,
             fit_repository,
             catalog,
             threading.RLock(),
         )
-        token = _register(services)
-        return Experiment(token, name=name, device_catalog=catalog)
+        token = object()
+        experiment = Experiment(token, name=canonical_name, device_catalog=catalog)
+        _register(token, services)
+        return experiment
     except BaseException as error:
         failures = _cleanup_failures(
             (
@@ -657,9 +675,7 @@ def connect(
                 if runtime is None
                 else lambda: _require_runtime_shutdown(runtime, timeout=2.0)
             ),
-            None if devices is None else devices.close,
             None if fit_repository is None else fit_repository.close,
-            None if calibration_repository is None else calibration_repository.close,
             None if capture_repository is None else capture_repository.close,
         )
         if failures and isinstance(error, Exception):
@@ -672,6 +688,9 @@ def connect(
 
 __all__ = [
     "AdmittedCaptureFitResult",
+    "CalibrationArtifactRef",
+    "CaptureArtifactRef",
+    "CaptureFitResultArtifactRef",
     "CaptureRequest",
     "connect",
     "Experiment",

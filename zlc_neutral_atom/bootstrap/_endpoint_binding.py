@@ -1,4 +1,4 @@
-"""Private identity check shared by composition-owned device endpoints."""
+"""Private identity check shared by neutral-atom composition endpoints."""
 
 from zlc_neutral_atom.runtime.ports import BoundDevice
 

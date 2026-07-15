@@ -60,9 +60,20 @@ class PulseExecutionBackend(Protocol):
 
     def safe_state(self) -> None: ...
 
-    def request_interrupt(self) -> None: ...
+    def request_interrupt(self) -> None:
+        """Request interruption without waiting for the ordinary backend I/O owner.
 
-    def snapshot(self) -> dict[str, object]: ...
+        Implementations must be thread-safe and non-blocking relative to
+        ``prepare``/``fire``/``await_completion``.  The service calls this
+        before it waits for the backend-operation gate needed by physical SAFE.
+        """
+
+        ...
+
+    def snapshot(self) -> dict[str, object]:
+        """Return a thread-safe, non-blocking observation of backend state."""
+
+        ...
 
 
 @dataclass(frozen=True)
@@ -141,6 +152,8 @@ class PulseExecutionService:
         self._generation = connection_generation or uuid.uuid4().hex
         _text(self._generation, "connection_generation")
         self._lock = threading.RLock()
+        self._safe_state_lock = threading.Lock()
+        self._backend_operation_lock = threading.Lock()
         self._state = "IDLE"
         self._artifact: CompiledPulseArtifact | None = None
         self._prepared_ref: PreparedPulseRef | None = None
@@ -167,19 +180,22 @@ class PulseExecutionService:
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
-            prepared = self._prepared_ref
-            state = self._state
-            backend = dict(self._backend.snapshot())
-            return {
-                "schema": "zlc_pulse.PulseExecutionSnapshot",
-                "connection_generation": self._generation,
-                "target": pulse_target_to_tree(self._target),
-                "clock_hz": self._clock_hz,
-                "geometry_fingerprint": self._geometry_fingerprint,
-                "state": state,
-                "prepared_ref": None if prepared is None else prepared_pulse_ref_to_tree(prepared),
-                "backend": backend,
-            }
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict[str, object]:
+        prepared = self._prepared_ref
+        return {
+            "schema": "zlc_pulse.PulseExecutionSnapshot",
+            "connection_generation": self._generation,
+            "target": pulse_target_to_tree(self._target),
+            "clock_hz": self._clock_hz,
+            "geometry_fingerprint": self._geometry_fingerprint,
+            "state": self._state,
+            "prepared_ref": (
+                None if prepared is None else prepared_pulse_ref_to_tree(prepared)
+            ),
+            "backend": dict(self._backend.snapshot()),
+        }
 
     def prepare(self, artifact: CompiledPulseArtifact) -> PreparedPulseRef:
         with self._lock:
@@ -211,7 +227,16 @@ class PulseExecutionService:
                 )
             self._state = "PREPARING"
         try:
-            self._backend.prepare(artifact)
+            with self._backend_operation_lock:
+                with self._lock:
+                    if (
+                        operation_epoch != self._operation_epoch
+                        or self._state != "PREPARING"
+                    ):
+                        raise RuntimeError(
+                            "pulse prepare was superseded before backend admission"
+                        )
+                self._backend.prepare(artifact)
         except BaseException as error:
             with self._lock:
                 superseded = operation_epoch != self._operation_epoch
@@ -247,7 +272,16 @@ class PulseExecutionService:
             self._state = "FIRING"
             operation_epoch = self._operation_epoch
         try:
-            self._backend.fire(artifact)
+            with self._backend_operation_lock:
+                with self._lock:
+                    if (
+                        operation_epoch != self._operation_epoch
+                        or self._state != "FIRING"
+                    ):
+                        raise RuntimeError(
+                            "pulse FIRE was superseded before backend admission"
+                        )
+                self._backend.fire(artifact)
         except BaseException as error:
             with self._lock:
                 superseded = operation_epoch != self._operation_epoch
@@ -296,7 +330,19 @@ class PulseExecutionService:
             self._state = "COMPLETING"
             operation_epoch = self._operation_epoch
         try:
-            backend_completion = self._backend.await_completion(artifact, timeout)
+            with self._backend_operation_lock:
+                with self._lock:
+                    if (
+                        operation_epoch != self._operation_epoch
+                        or self._state != "COMPLETING"
+                    ):
+                        raise RuntimeError(
+                            "pulse completion was superseded before backend admission"
+                        )
+                backend_completion = self._backend.await_completion(
+                    artifact,
+                    timeout,
+                )
             if backend_completion is not None:
                 validate_backend_completion_for_artifact(
                     backend_completion,
@@ -342,13 +388,27 @@ class PulseExecutionService:
     def safe_state(self) -> None:
         self._safe_state(expected_generation=None)
 
-    def _safe_state(self, *, expected_generation: str | None) -> None:
+    def _safe_state(
+        self,
+        *,
+        expected_generation: str | None,
+    ) -> tuple[dict[str, object], BaseException | None]:
+        with self._safe_state_lock:
+            return self._safe_state_owned(expected_generation=expected_generation)
+
+    def _safe_state_owned(
+        self,
+        *,
+        expected_generation: str | None,
+    ) -> tuple[dict[str, object], BaseException | None]:
         with self._lock:
             if (
                 expected_generation is not None
                 and expected_generation != self._generation
             ):
                 raise RuntimeError("interrupt connection generation is stale")
+            if self._state == "SAFE" and self._prepared_ref is None:
+                return self._snapshot_locked(), None
             self._operation_epoch += 1
             operation_epoch = self._operation_epoch
             self._state = "INTERRUPTING"
@@ -358,7 +418,8 @@ class PulseExecutionService:
         except BaseException as error:
             interrupt_error = error
         try:
-            self._backend.safe_state()
+            with self._backend_operation_lock:
+                self._backend.safe_state()
         except BaseException as error:
             if interrupt_error is not None:
                 error.add_note(
@@ -379,37 +440,27 @@ class PulseExecutionService:
             self._prepared_ref = None
             self._completion = None
             self._state = "SAFE"
+            return self._snapshot_locked(), interrupt_error
 
     def safe_state_for_generation(self, generation: str) -> dict[str, object]:
         """Authorize a separate abort connection without granting normal control."""
 
         _text(generation, "connection_generation")
-        self._safe_state(expected_generation=generation)
-        with self._lock:
-            if generation != self._generation:
-                raise RuntimeError(
-                    "interrupt connection generation changed before safe receipt"
-                )
-            return self.snapshot()
+        snapshot, _interrupt_error = self._safe_state(
+            expected_generation=generation
+        )
+        return snapshot
 
     def _best_effort_safe_after_failure(self, primary: BaseException) -> None:
-        interrupt_error: BaseException | None = None
         try:
-            self._backend.request_interrupt()
-        except BaseException as error:
-            interrupt_error = error
-        try:
-            self._backend.safe_state()
+            _snapshot, interrupt_error = self._safe_state(
+                expected_generation=None
+            )
         except BaseException as safety_error:
             primary.add_note(
                 "pulse backend safe_state also failed after the primary operation: "
                 f"{type(safety_error).__name__}: {safety_error}"
             )
-            if interrupt_error is not None:
-                primary.add_note(
-                    "pulse backend request_interrupt also failed: "
-                    f"{type(interrupt_error).__name__}: {interrupt_error}"
-                )
         else:
             if interrupt_error is not None:
                 primary.add_note(

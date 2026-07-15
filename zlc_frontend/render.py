@@ -12,11 +12,14 @@ from enum import Enum
 import threading
 from typing import Protocol, runtime_checkable
 
+from zlc_data import BlockId, StreamGenerationId
 from zlc_storage import (
     canonical_text as _text,
     nonnegative_integer as _nonnegative,
     sha256_text,
 )
+
+from .figure import DatasetId, EvaluatedInput
 
 
 class RenderSurface(Enum):
@@ -44,33 +47,131 @@ class PixelFormat(Enum):
 
 
 @dataclass(frozen=True)
-class FrameIdentity:
-    """Complete identity needed to reject mixed-shot or stale board frames."""
+class SourceIdentity:
+    """Identity of the dataset producer rendered by one panel.
 
-    run_id: str
-    dataset_id: str
-    producer_generation: int
+    This value deliberately contains no run/shot position.  Producer identity
+    changes when the dataset, schema, or producer generation changes; display
+    coherence is represented independently by :class:`CoherenceStamp`.
+    """
+
+    dataset_id: DatasetId
+    block_id: BlockId
+    stream_generation: StreamGenerationId
     schema_fingerprint: str
-    revision: int
-    coherence_key: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "run_id", _text(self.run_id, "run_id"))
-        object.__setattr__(self, "dataset_id", _text(self.dataset_id, "dataset_id"))
-        object.__setattr__(
-            self,
-            "producer_generation",
-            _nonnegative(self.producer_generation, "producer_generation"),
-        )
+        if not isinstance(self.dataset_id, DatasetId):
+            raise TypeError("dataset_id must be DatasetId")
+        if not isinstance(self.block_id, BlockId):
+            raise TypeError("block_id must be BlockId")
+        if not isinstance(self.stream_generation, StreamGenerationId):
+            raise TypeError("stream_generation must be StreamGenerationId")
         object.__setattr__(
             self,
             "schema_fingerprint",
             sha256_text(self.schema_fingerprint, "schema_fingerprint"),
         )
-        object.__setattr__(self, "revision", _nonnegative(self.revision, "revision"))
+
+
+@dataclass(frozen=True)
+class CoherenceStamp:
+    """Frozen evaluation identity shared by panels from one causation point.
+
+    The evaluator mints this value only after freezing the typed join key, every
+    input dataset revision, and the presentation intent.  Equality therefore
+    means more than matching two bare counters from unrelated producers.
+    """
+
+    run_id: str
+    provenance_epoch_id: str
+    join_key_type: str
+    join_key_schema_fingerprint: str
+    join_key_digest: str
+    inputs: tuple[EvaluatedInput, ...]
+    presentations: tuple["PanelPresentationIdentity", ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "run_id", _text(self.run_id, "run_id"))
         object.__setattr__(
-            self, "coherence_key", _text(self.coherence_key, "coherence_key")
+            self,
+            "provenance_epoch_id",
+            _text(self.provenance_epoch_id, "provenance_epoch_id"),
         )
+        object.__setattr__(
+            self,
+            "join_key_type",
+            _text(self.join_key_type, "join_key_type"),
+        )
+        object.__setattr__(
+            self,
+            "join_key_schema_fingerprint",
+            sha256_text(
+                self.join_key_schema_fingerprint,
+                "join_key_schema_fingerprint",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "join_key_digest",
+            sha256_text(self.join_key_digest, "join_key_digest"),
+        )
+        inputs = tuple(self.inputs)
+        if not inputs or any(not isinstance(value, EvaluatedInput) for value in inputs):
+            raise ValueError("inputs must contain at least one EvaluatedInput")
+        input_ids = tuple(value.dataset_id for value in inputs)
+        if len(set(input_ids)) != len(input_ids):
+            raise ValueError("CoherenceStamp input dataset ids must be unique")
+        object.__setattr__(
+            self,
+            "inputs",
+            tuple(sorted(inputs, key=lambda value: value.dataset_id.value)),
+        )
+        presentations = tuple(self.presentations)
+        if not presentations or any(
+            not isinstance(value, PanelPresentationIdentity)
+            for value in presentations
+        ):
+            raise ValueError(
+                "presentations must contain at least one PanelPresentationIdentity"
+            )
+        panel_ids = tuple(value.panel_id for value in presentations)
+        if len(set(panel_ids)) != len(panel_ids):
+            raise ValueError("presentation panel ids must be unique")
+        object.__setattr__(
+            self,
+            "presentations",
+            tuple(sorted(presentations, key=lambda value: value.panel_id)),
+        )
+
+
+@dataclass(frozen=True)
+class PanelPresentationIdentity:
+    """Exact per-panel view intent frozen before raster work is admitted."""
+
+    panel_id: str
+    document_id: str
+    document_revision: int
+    selection_revision: int
+    panel_revision: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "panel_id", _text(self.panel_id, "panel_id"))
+        object.__setattr__(
+            self,
+            "document_id",
+            _text(self.document_id, "document_id"),
+        )
+        for field in (
+            "document_revision",
+            "selection_revision",
+            "panel_revision",
+        ):
+            object.__setattr__(
+                self,
+                field,
+                _nonnegative(getattr(self, field), field),
+            )
 
 
 @dataclass(frozen=True)
@@ -104,7 +205,8 @@ class RasterBuffer:
 class PanelFrame:
     panel_id: str
     coherence_group: str
-    identity: FrameIdentity
+    source_identity: SourceIdentity
+    coherence_stamp: CoherenceStamp
     raster: RasterBuffer
 
     def __post_init__(self) -> None:
@@ -114,8 +216,10 @@ class PanelFrame:
             "coherence_group",
             _text(self.coherence_group, "coherence_group"),
         )
-        if not isinstance(self.identity, FrameIdentity):
-            raise TypeError("identity must be FrameIdentity")
+        if not isinstance(self.source_identity, SourceIdentity):
+            raise TypeError("source_identity must be SourceIdentity")
+        if not isinstance(self.coherence_stamp, CoherenceStamp):
+            raise TypeError("coherence_stamp must be CoherenceStamp")
         if not isinstance(self.raster, RasterBuffer):
             raise TypeError("raster must be RasterBuffer")
 
@@ -145,23 +249,42 @@ class BoardFrame:
         ids = tuple(panel.panel_id for panel in panels)
         if len(set(ids)) != len(ids):
             raise ValueError("BoardFrame panel ids must be unique")
-        identity_by_group: dict[str, FrameIdentity] = {}
+        panels_by_group: dict[str, list[PanelFrame]] = {}
         for panel in panels:
-            existing = identity_by_group.setdefault(
-                panel.coherence_group, panel.identity
-            )
-            if existing != panel.identity:
+            panels_by_group.setdefault(panel.coherence_group, []).append(panel)
+        for group_panels in panels_by_group.values():
+            stamp = group_panels[0].coherence_stamp
+            if any(panel.coherence_stamp != stamp for panel in group_panels[1:]):
                 raise ValueError(
-                    "panels in one coherence group must carry one exact FrameIdentity"
+                    "panels in one coherence group must carry one exact CoherenceStamp"
                 )
+            expected_panel_ids = tuple(sorted(panel.panel_id for panel in group_panels))
+            if (
+                tuple(value.panel_id for value in stamp.presentations)
+                != expected_panel_ids
+            ):
+                raise ValueError(
+                    "CoherenceStamp presentations must cover its coherence group exactly"
+                )
+            inputs = {value.dataset_id: value.ref for value in stamp.inputs}
+            for panel in group_panels:
+                try:
+                    source_ref = inputs[panel.source_identity.dataset_id]
+                except KeyError as exc:
+                    raise ValueError(
+                        "CoherenceStamp does not freeze a panel source input"
+                    ) from exc
+                if (
+                    source_ref.block_id != panel.source_identity.block_id
+                    or source_ref.stream_generation
+                    != panel.source_identity.stream_generation
+                    or source_ref.schema_fingerprint
+                    != panel.source_identity.schema_fingerprint
+                ):
+                    raise ValueError(
+                        "panel source identity differs from its frozen input revision"
+                    )
         object.__setattr__(self, "panels", panels)
-
-    @property
-    def coherence_stamps(self) -> tuple[tuple[str, FrameIdentity], ...]:
-        by_group: dict[str, FrameIdentity] = {}
-        for panel in self.panels:
-            by_group.setdefault(panel.coherence_group, panel.identity)
-        return tuple(sorted(by_group.items()))
 
 
 @runtime_checkable
@@ -169,6 +292,8 @@ class BoardPresenter(Protocol):
     """GUI-side sink; one call presents the entire board coherently."""
 
     def present(self, frame: BoardFrame) -> None: ...
+
+    def clear(self) -> None: ...
 
 
 class AtomicBoardFront:
@@ -193,12 +318,18 @@ class AtomicBoardFront:
         with self._lock:
             return self._current
 
+    def clear(self) -> None:
+        with self._lock:
+            self._current = None
+
 
 __all__ = [
     "BoardFrame",
     "BoardPresenter",
     "AtomicBoardFront",
-    "FrameIdentity",
+    "CoherenceStamp",
+    "PanelPresentationIdentity",
+    "SourceIdentity",
     "PanelFrame",
     "PixelFormat",
     "RasterBuffer",

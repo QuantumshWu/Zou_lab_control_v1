@@ -5,12 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import threading
 from typing import Protocol, runtime_checkable
+import weakref
 
-from zlc_frontend import BoardFrame, BoardPresenter, RenderSurface
+from zlc_frontend import (
+    BoardFrame,
+    BoardPresenter,
+    CoherenceStamp,
+    PanelPresentationIdentity,
+    RenderSurface,
+    SourceIdentity,
+)
 from zlc_storage import (
     canonical_text as _text,
     nonnegative_integer,
-    sha256_text,
 )
 
 
@@ -129,40 +136,57 @@ class PanelHost(Protocol):
 
 
 @dataclass(frozen=True)
-class CoherenceSourceBinding:
-    coherence_group: str
-    producer_generation: int
-    schema_fingerprint: str
+class PanelSourceBinding:
+    """Expected producer identity for one panel in the active board layout."""
+
+    source_identity: SourceIdentity
+    presentation: PanelPresentationIdentity
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "coherence_group",
-            _text(self.coherence_group, "coherence_group"),
-        )
-        object.__setattr__(
-            self,
-            "producer_generation",
-            nonnegative_integer(self.producer_generation, "producer_generation"),
-        )
-        object.__setattr__(
-            self,
-            "schema_fingerprint",
-            sha256_text(self.schema_fingerprint, "schema_fingerprint"),
-        )
+        if not isinstance(self.source_identity, SourceIdentity):
+            raise TypeError("source_identity must be SourceIdentity")
+        if not isinstance(self.presentation, PanelPresentationIdentity):
+            raise TypeError("presentation must be PanelPresentationIdentity")
+
+    @property
+    def panel_id(self) -> str:
+        return self.presentation.panel_id
 
 
 class BoardPublishPort:
-    """Revocable worker capability bound to one board layout and source generation."""
+    """Revocable board-work capability.
 
-    __slots__ = ("_controller", "_token")
+    ``admit`` is owner-thread-only and runs before raster work is dispatched;
+    ``publish`` is worker-safe and consumes the returned one-shot token.
+    """
+
+    __slots__ = ("_controller_ref", "_token")
 
     def __init__(self, controller: "BoardController", token: object) -> None:
-        self._controller = controller
+        self._controller_ref = weakref.ref(controller)
         self._token = token
 
-    def publish(self, frame: BoardFrame) -> bool:
-        return self._controller._publish(self._token, frame)
+    def admit(
+        self,
+        sequence: int,
+        coherence_stamps: tuple[tuple[str, CoherenceStamp], ...],
+    ) -> object:
+        controller = self._controller_ref()
+        if controller is None:
+            raise RuntimeError("board controller no longer exists")
+        return controller._admit_work(
+            self._token,
+            sequence,
+            coherence_stamps,
+        )
+
+    def publish(self, work_token: object, frame: BoardFrame) -> bool:
+        controller = self._controller_ref()
+        return (
+            False
+            if controller is None
+            else controller._publish(self._token, work_token, frame)
+        )
 
 
 class BoardController:
@@ -183,24 +207,27 @@ class BoardController:
         self._owner_thread = threading.get_ident()
         self._lock = threading.Lock()
         self._model = model
-        self._presenter = presenter
+        self._presenter: BoardPresenter | None = presenter
         self._post_to_owner = post_to_owner
         self._pending: BoardFrame | None = None
-        self._accepted_sequence = -1
-        self._last_sequence = -1
+        self._requested_sequence = -1
+        self._work_token: object | None = None
+        self._expected_stamps: dict[str, CoherenceStamp] = {}
         self._wake_queued = False
         self._publish_token: object | None = None
-        self._source_bindings: dict[str, CoherenceSourceBinding] = {}
+        self._source_bindings: dict[str, PanelSourceBinding] = {}
         self._closed = False
         self._fault: BaseException | None = None
 
     @property
     def model(self) -> BoardModel:
-        return self._model
+        with self._lock:
+            return self._model
 
     @property
     def fault(self) -> BaseException | None:
-        return self._fault
+        with self._lock:
+            return self._fault
 
     def reconfigure(self, model: BoardModel) -> None:
         self._require_owner()
@@ -214,45 +241,144 @@ class BoardController:
             self._ensure_usable()
             self._model = model
             self._pending = None
-            self._accepted_sequence = -1
-            self._last_sequence = -1
+            self._requested_sequence = -1
+            self._work_token = None
+            self._expected_stamps = {}
             self._wake_queued = False
             self._publish_token = None
             self._source_bindings = {}
+        self._clear_presenter()
 
     def open_publish_port(
         self,
-        bindings: tuple[CoherenceSourceBinding, ...],
+        bindings: tuple[PanelSourceBinding, ...],
     ) -> BoardPublishPort:
         self._require_owner()
         bindings = tuple(bindings)
-        if any(not isinstance(value, CoherenceSourceBinding) for value in bindings):
-            raise TypeError("bindings must contain CoherenceSourceBinding values")
-        by_group = {value.coherence_group: value for value in bindings}
-        if len(by_group) != len(bindings):
-            raise ValueError("coherence source bindings must have unique groups")
-        expected = {panel.coherence_group for panel in self._model.panels}
-        if set(by_group) != expected:
-            raise ValueError("source bindings must cover every active coherence group exactly")
+        if any(not isinstance(value, PanelSourceBinding) for value in bindings):
+            raise TypeError("bindings must contain PanelSourceBinding values")
+        by_panel = {value.panel_id: value for value in bindings}
+        if len(by_panel) != len(bindings):
+            raise ValueError("panel source bindings must have unique panel ids")
+        expected = set(self._model.panel_ids)
+        if set(by_panel) != expected:
+            raise ValueError("source bindings must cover every active panel exactly")
         token = object()
         with self._lock:
             self._ensure_usable()
             self._publish_token = token
-            self._source_bindings = by_group
+            self._source_bindings = by_panel
             self._pending = None
-            self._accepted_sequence = -1
-            self._last_sequence = -1
+            self._requested_sequence = -1
+            self._work_token = None
+            self._expected_stamps = {}
             self._wake_queued = False
+        self._clear_presenter()
         return BoardPublishPort(self, token)
 
-    def _publish(self, token: object, frame: BoardFrame) -> bool:
+    def _admit_work(
+        self,
+        token: object,
+        sequence: int,
+        coherence_stamps: tuple[tuple[str, CoherenceStamp], ...],
+    ) -> object:
+        """Freeze the latest requested board job before raster work begins."""
+
+        self._require_owner()
+        sequence = nonnegative_integer(sequence, "board work sequence")
+        try:
+            pairs = tuple(coherence_stamps)
+        except TypeError as exc:
+            raise TypeError("coherence_stamps must be a tuple of pairs") from exc
+        if any(
+            not isinstance(pair, tuple)
+            or len(pair) != 2
+            or not isinstance(pair[1], CoherenceStamp)
+            for pair in pairs
+        ):
+            raise TypeError(
+                "coherence_stamps must contain (group, CoherenceStamp) pairs"
+            )
+        by_group = {
+            _text(group, "coherence group"): stamp
+            for group, stamp in pairs
+        }
+        if len(by_group) != len(pairs):
+            raise ValueError("coherence_stamps must have unique groups")
+        with self._lock:
+            if (
+                self._closed
+                or self._fault is not None
+                or token is not self._publish_token
+            ):
+                raise RuntimeError("board publish port is revoked")
+            if sequence <= self._requested_sequence:
+                raise ValueError("board work sequence must increase")
+            model_groups: dict[str, list[str]] = {}
+            for panel in self._model.panels:
+                model_groups.setdefault(panel.coherence_group, []).append(
+                    panel.panel_id
+                )
+            if set(by_group) != set(model_groups):
+                raise ValueError(
+                    "coherence_stamps must cover every active group exactly"
+                )
+            for group, panel_ids in model_groups.items():
+                stamp = by_group[group]
+                presentations = {
+                    value.panel_id: value for value in stamp.presentations
+                }
+                if set(presentations) != set(panel_ids):
+                    raise ValueError(
+                        "coherence stamp presentations differ from its board group"
+                    )
+                inputs = {value.dataset_id: value.ref for value in stamp.inputs}
+                for panel_id in panel_ids:
+                    binding = self._source_bindings[panel_id]
+                    if presentations[panel_id] != binding.presentation:
+                        raise ValueError(
+                            "coherence stamp presentation differs from the publish port"
+                        )
+                    source = binding.source_identity
+                    try:
+                        ref = inputs[source.dataset_id]
+                    except KeyError as exc:
+                        raise ValueError(
+                            "coherence stamp omits a bound panel source"
+                        ) from exc
+                    if (
+                        ref.block_id != source.block_id
+                        or ref.stream_generation != source.stream_generation
+                        or ref.schema_fingerprint != source.schema_fingerprint
+                    ):
+                        raise ValueError(
+                            "coherence stamp input differs from the publish port"
+                        )
+            work_token = object()
+            self._requested_sequence = sequence
+            self._work_token = work_token
+            self._expected_stamps = by_group
+            self._pending = None
+            return work_token
+
+    def _publish(
+        self,
+        token: object,
+        work_token: object,
+        frame: BoardFrame,
+    ) -> bool:
         """Worker-safe replace-pending operation; stale frames are rejected, never mixed."""
 
         if not isinstance(frame, BoardFrame):
             raise TypeError("frame must be BoardFrame")
         schedule = False
         with self._lock:
-            if self._closed or self._fault is not None or token is not self._publish_token:
+            if (
+                self._closed
+                or self._fault is not None
+                or token is not self._publish_token
+                or work_token is not self._work_token
+            ):
                 return False
             model = self._model
             if frame.board_id != model.board_id:
@@ -265,22 +391,27 @@ class BoardController:
             actual_groups = tuple(panel.coherence_group for panel in frame.panels)
             if actual_groups != expected_groups:
                 raise ValueError("frame coherence groups do not match the active board layout")
-            for group, identity in frame.coherence_stamps:
-                binding = self._source_bindings[group]
-                if identity.producer_generation != binding.producer_generation:
-                    return False
-                if identity.schema_fingerprint != binding.schema_fingerprint:
-                    return False
-            if frame.sequence <= self._accepted_sequence:
+            frame_stamps: dict[str, CoherenceStamp] = {}
+            for panel in frame.panels:
+                frame_stamps.setdefault(
+                    panel.coherence_group,
+                    panel.coherence_stamp,
+                )
+            if frame_stamps != self._expected_stamps:
                 return False
-            self._accepted_sequence = frame.sequence
+            if frame.sequence != self._requested_sequence:
+                return False
+            self._work_token = None
             self._pending = frame
             if not self._wake_queued:
                 self._wake_queued = True
                 schedule = True
         if schedule:
             try:
-                self._post_to_owner(self.present_pending)
+                post_to_owner = self._post_to_owner
+                if post_to_owner is None:
+                    return False
+                post_to_owner(self.present_pending)
             except BaseException as exc:
                 with self._lock:
                     if token is self._publish_token:
@@ -303,24 +434,61 @@ class BoardController:
         if frame is None:
             return False
         try:
-            self._presenter.present(frame)
+            presenter = self._presenter
+            if presenter is None:
+                return False
+            presenter.present(frame)
         except BaseException as exc:
             with self._lock:
                 self._fault = exc
                 self._pending = None
             raise
-        with self._lock:
-            self._last_sequence = frame.sequence
         return True
 
     def close(self) -> None:
         self._require_owner()
+        presenter: BoardPresenter | None
         with self._lock:
+            if self._closed:
+                return
             self._pending = None
             self._publish_token = None
             self._source_bindings = {}
+            self._work_token = None
+            self._expected_stamps = {}
             self._wake_queued = False
             self._closed = True
+            presenter = self._presenter
+            self._post_to_owner = None
+        if presenter is None:
+            with self._lock:
+                self._fault = None
+            return
+        try:
+            presenter.clear()
+        except BaseException as exc:
+            with self._lock:
+                if self._presenter is presenter:
+                    self._fault = exc
+                    self._closed = False
+            raise
+        with self._lock:
+            if self._presenter is presenter:
+                self._presenter = None
+                self._fault = None
+
+    def _clear_presenter(self) -> None:
+        presenter = self._presenter
+        if presenter is None:
+            return
+        try:
+            presenter.clear()
+        except BaseException as exc:
+            with self._lock:
+                self._fault = exc
+                self._pending = None
+                self._publish_token = None
+            raise
 
     def _require_owner(self) -> None:
         if threading.get_ident() != self._owner_thread:
@@ -337,7 +505,7 @@ __all__ = [
     "BoardController",
     "BoardModel",
     "BoardPublishPort",
-    "CoherenceSourceBinding",
+    "PanelSourceBinding",
     "PanelHost",
     "PanelSlot",
     "WorkspaceModel",

@@ -17,7 +17,7 @@ from zlc_neutral_atom.runtime.resources import DeviceIdentityEvidenceKind, Resou
 from zlc_storage import canonical_digest, canonical_text as _canonical_text
 
 
-ASSET_MAP_FORMAT = "zlc_workbench.InstallationAssetMap"
+ASSET_MAP_FORMAT = "zlc_neutral_atom.InstallationAssetMap"
 
 def adapter_kind(device: object) -> str:
     cls = type(device)
@@ -84,7 +84,6 @@ class InstallationAssetMap:
         }
         self._assets = normalized
         self._by_role = MappingProxyType(by_role)
-        self._canonical = MappingProxyType(canonical)
         self._revision = canonical_digest(canonical)
 
     @property

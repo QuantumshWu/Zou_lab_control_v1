@@ -302,7 +302,7 @@ def dataset_storage_nbytes(schema: DatasetSchema) -> int:
     return value_bytes + validity_bytes
 
 
-def _estimate_pipeline_peak_bytes(spec: MinimalPipelineSpec) -> int:
+def estimate_pipeline_peak_bytes(spec: MinimalPipelineSpec) -> int:
     """Conservative peak of buffers whose sizes are owned by this pipeline.
 
     This is not a claim about interpreter or third-party allocator overhead.
@@ -328,7 +328,7 @@ def _estimate_pipeline_peak_bytes(spec: MinimalPipelineSpec) -> int:
 def _require_pipeline_memory_budget(spec: MinimalPipelineSpec) -> None:
     """Compute the owner-derived peak and reject it before any allocation."""
 
-    peak = _estimate_pipeline_peak_bytes(spec)
+    peak = estimate_pipeline_peak_bytes(spec)
     limit = spec.memory_limit_bytes
     if peak > limit:
         raise MemoryError(f"pipeline peak budget {peak} exceeds limit {limit}")
@@ -579,6 +579,7 @@ __all__ = [
     "compile_pipeline",
     "dataset_storage_nbytes",
     "ExactCaptureTransaction",
+    "estimate_pipeline_peak_bytes",
     "finalize_pipeline_result",
     "MeasurementDefinition",
     "MinimalPipelineSpec",

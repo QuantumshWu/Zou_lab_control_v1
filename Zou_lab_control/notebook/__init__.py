@@ -2,6 +2,9 @@
 
 from .facade import (
     AdmittedCaptureFitResult,
+    CalibrationArtifactRef,
+    CaptureArtifactRef,
+    CaptureFitResultArtifactRef,
     CaptureRequest,
     connect,
     Experiment,
@@ -14,6 +17,9 @@ from .facade import (
 
 __all__ = [
     "AdmittedCaptureFitResult",
+    "CalibrationArtifactRef",
+    "CaptureArtifactRef",
+    "CaptureFitResultArtifactRef",
     "CaptureRequest",
     "connect",
     "Experiment",

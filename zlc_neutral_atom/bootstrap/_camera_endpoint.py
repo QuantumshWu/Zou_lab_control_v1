@@ -1,4 +1,4 @@
-"""Composition-owned bridge from concrete cameras to the exact capture runtime."""
+"""Composition-owned camera endpoint for the exact neutral-atom runtime."""
 
 from __future__ import annotations
 
@@ -8,15 +8,6 @@ from dataclasses import dataclass
 from numbers import Integral
 
 import numpy as np
-
-from Zou_lab_control.neutral_atom.devices.base import (
-    CameraCaptureTerminalRecord,
-    CameraDevice,
-    CameraFrameRecord,
-)
-from Zou_lab_control.neutral_atom.devices.pylon import PylonCamera
-from Zou_lab_control.neutral_atom.devices.qcmos import QCMOSCamera
-from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualMotCamera
 from zlc_data import (
     AxisId,
     AxisSpec,
@@ -69,6 +60,9 @@ from zlc_neutral_atom.runtime.dataset import (
 from zlc_neutral_atom.runtime.pipeline import BoundMeasurement, MeasurementDefinition
 from zlc_neutral_atom.runtime.ports import (
     BoundDevice,
+    CleanupStepAck,
+    SafeStateAck,
+    SafetyOperation,
     SessionClosedAck,
     SessionCloseCommand,
 )
@@ -87,36 +81,18 @@ from zlc_storage import (
 )
 
 from ._endpoint_binding import require_current_endpoint_binding as _require_binding
+from ._virtual_hardware import (
+    CameraCaptureTerminalRecord,
+    CameraFrameRecord,
+    VirtualCamera,
+)
 
 
-_SUPPORTED_CAMERA_TYPES = (QCMOSCamera, PylonCamera, VirtualCamera, VirtualMotCamera)
-
-def _camera_dtype(camera: CameraDevice) -> np.dtype:
-    if type(camera) in (QCMOSCamera, VirtualCamera):
-        return np.dtype("<u2")
-    if type(camera) is VirtualMotCamera:
-        return np.dtype("u1")
-    if type(camera) is PylonCamera:
-        pixel_format = str(camera.applied_pixel_format).strip().lower()
-        if pixel_format == "mono8":
-            return np.dtype("u1")
-        if pixel_format in {"mono10", "mono12", "mono16"}:
-            return np.dtype("<u2")
-        raise ValueError(
-            f"Pylon pixel format {camera.pixel_format!r} has no exact scalar frame contract"
-        )
-    raise TypeError(f"unsupported camera adapter type {type(camera).__qualname__}")
+_CAMERA_DTYPE = np.dtype("<u2")
+_CAMERA_MODE = CameraAcquisitionMode.EXTERNAL_TRIGGERED
 
 
-def _camera_mode(camera: CameraDevice) -> CameraAcquisitionMode:
-    return (
-        CameraAcquisitionMode.FREE_RUNNING
-        if camera._free_run
-        else CameraAcquisitionMode.EXTERNAL_TRIGGERED
-    )
-
-
-def _settings_tree(camera: CameraDevice) -> dict[str, object]:
+def _settings_tree(camera: VirtualCamera) -> dict[str, object]:
     shape = camera.frame_shape
     if shape is None or len(shape) != 2 or any(int(size) < 1 for size in shape):
         raise RuntimeError("camera frame shape is unavailable after connection handshake")
@@ -143,8 +119,8 @@ def _settings_tree(camera: CameraDevice) -> dict[str, object]:
                 if camera.sensor_shape is None
                 else tuple(int(size) for size in camera.sensor_shape)
             ),
-            "frame_dtype": _camera_dtype(camera).str,
-            "acquisition_mode": _camera_mode(camera).value,
+            "frame_dtype": _CAMERA_DTYPE.str,
+            "acquisition_mode": _CAMERA_MODE.value,
             # Passive installation wiring remains authoritative even while a
             # camera is temporarily free-running and therefore has no active
             # trigger channel.
@@ -152,84 +128,23 @@ def _settings_tree(camera: CameraDevice) -> dict[str, object]:
             "effective_trigger_channels": tuple(camera.effective_trigger_channels),
         }
     )
-    if type(camera) is QCMOSCamera:
-        applied_exposure = snapshot.get("applied_exposure_seconds")
-        minimum_interval = snapshot.get(
-            "required_external_trigger_interval_seconds"
-        )
-        applied_readout_speed = snapshot.pop("applied_readout_speed", None)
-        applied_sensor_mode = snapshot.pop("applied_sensor_mode", None)
-        applied_trigger_global_exposure = snapshot.pop(
-            "applied_trigger_global_exposure",
-            None,
-        )
-        if (
-            applied_exposure is None
-            or minimum_interval is None
-            or applied_readout_speed is None
-            or applied_sensor_mode is None
-            or applied_trigger_global_exposure is None
-        ):
-            raise RuntimeError(
-                "qCMOS physical working-point readback is unavailable"
-            )
-        snapshot.update(
-            {
-                "readout_speed": int(applied_readout_speed),
-                "sensor_mode": int(applied_sensor_mode),
-                "trigger_global_exposure": int(
-                    applied_trigger_global_exposure
-                ),
-                # E0 has not qualified the edge-to-integration latency for the
-                # deployed qCMOS mode.  A DCAM timing-rate readback is not proof
-                # of this separate physical fact.
-                "external_trigger_integration_start_offset_seconds": None,
-            }
-        )
-    elif type(camera) is PylonCamera:
-        applied_exposure = snapshot.get("applied_exposure_seconds")
-        if applied_exposure is None:
-            raise RuntimeError("pylon applied exposure readback is unavailable")
-        # Pylon exposes no sufficient exposure+readout+dead-time bound in this
-        # adapter.  Exposure alone is only necessary, not sufficient; keep the
-        # exact-trigger interval explicitly unqualified so preflight refuses it.
-        snapshot["required_external_trigger_interval_seconds"] = None
-        snapshot["external_trigger_integration_start_offset_seconds"] = None
-        snapshot.pop("exposure", None)
-    else:
-        # These adapters currently expose no independently measured trigger-rate
-        # lower bound.  Zero means exactly that -- no additional known lower
-        # bound -- rather than claiming unlimited physical trigger bandwidth.
-        snapshot["applied_exposure_seconds"] = float(snapshot["exposure"])
-        snapshot["required_external_trigger_interval_seconds"] = 0.0
-        snapshot["external_trigger_integration_start_offset_seconds"] = (
-            0.0
-            if type(camera) in (VirtualCamera, VirtualMotCamera)
-            else None
-        )
+    # The in-process wire is deterministic and has no independent sensor-rate
+    # limit.  Real adapters live behind separate, evidence-qualified endpoints.
+    snapshot["applied_exposure_seconds"] = float(snapshot["exposure"])
+    snapshot["required_external_trigger_interval_seconds"] = 0.0
+    snapshot["external_trigger_integration_start_offset_seconds"] = 0.0
     return snapshot
 
 
 def _readout_mode_from_settings(
-    camera: CameraDevice,
+    camera: VirtualCamera,
     settings: dict[str, object],
 ) -> str:
-    if type(camera) is QCMOSCamera:
-        return (
-            f"qcmos:readout-speed={int(settings['readout_speed'])}:"
-            f"sensor-mode={settings.get('sensor_mode')}:"
-            f"global-exposure={settings.get('trigger_global_exposure')}"
-        )
-    if type(camera) is PylonCamera:
-        return (
-            f"pylon:pixel-format={settings['pixel_format']}:"
-            f"trigger-source={settings['trigger_source']}"
-        )
-    return f"{type(camera).__name__}:mode={settings['acquisition_mode']}"
+    return f"target-virtual:mode={settings['acquisition_mode']}"
 
 
 def _physical_facts(
-    camera: CameraDevice,
+    camera: VirtualCamera,
     binding: BoundDevice,
     source_id: str,
     payload_contract: CameraSampleContract,
@@ -288,7 +203,7 @@ def _physical_facts(
     return facts
 
 
-def _value_schema(camera: CameraDevice, source_id: str) -> ValueSchema:
+def _value_schema(camera: VirtualCamera, source_id: str) -> ValueSchema:
     shape = camera.frame_shape
     if shape is None:
         raise RuntimeError("camera frame shape is unavailable")
@@ -318,7 +233,7 @@ def _value_schema(camera: CameraDevice, source_id: str) -> ValueSchema:
     return ValueSchema(
         (y, x),
         ValidityContract.value(),
-        _camera_dtype(camera),
+        _CAMERA_DTYPE,
         "count",
     )
 
@@ -428,16 +343,16 @@ class CameraCaptureEndpoint:
 
     def __init__(
         self,
-        camera: CameraDevice,
+        camera: VirtualCamera,
         source_id: str,
         *,
         max_source_burst_events: int | None = None,
         max_blocking_call_seconds: float | None = None,
         max_capture_spec_bytes: int = 4096,
     ) -> None:
-        if type(camera) not in _SUPPORTED_CAMERA_TYPES:
+        if type(camera) is not VirtualCamera:
             raise TypeError(
-                f"camera capture endpoint has no exact adapter for {type(camera).__qualname__}"
+                "target virtual endpoint accepts only the target-owned VirtualCamera"
             )
         self._camera = camera
         self._source_id = _canonical_text(source_id, "source_id")
@@ -459,21 +374,13 @@ class CameraCaptureEndpoint:
             max_capture_spec_bytes,
             "max_capture_spec_bytes",
         )
-        exact_external_trigger_qualification_digest = None
-        if type(camera) in (
-            VirtualCamera,
-            VirtualMotCamera,
-        ):
-            exact_external_trigger_qualification_digest = canonical_digest(
-                {
-                    "evidence": "deterministic in-process trigger delivery",
-                    "adapter_type": (
-                        f"{type(camera).__module__}.{type(camera).__qualname__}"
-                    ),
-                }
-            )
-        self._exact_external_trigger_qualification_digest = (
-            exact_external_trigger_qualification_digest
+        self._exact_external_trigger_qualification_digest = canonical_digest(
+            {
+                "evidence": "target-owned deterministic in-process trigger wire",
+                "adapter_type": (
+                    f"{type(camera).__module__}.{type(camera).__qualname__}"
+                ),
+            }
         )
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -485,12 +392,8 @@ class CameraCaptureEndpoint:
         self._session: _EndpointSession | None = None
 
     @staticmethod
-    def _default_timeout(camera: CameraDevice) -> float:
-        if type(camera) is QCMOSCamera:
-            return float(camera.config.timeout_ms) / 1000.0
-        if type(camera) is PylonCamera:
-            return float(camera.timeout)
-        return 2.0
+    def _default_timeout(camera: VirtualCamera) -> float:
+        return float(camera.timeout)
 
     def payload_contract(self, binding: BoundDevice) -> CameraSampleContract:
         with self._lock:
@@ -597,7 +500,7 @@ class CameraCaptureEndpoint:
                 raise ValueError("camera capture settings fingerprint differs")
             if command.capability_fingerprint != capability.capability_fingerprint:
                 raise ValueError("camera capability fingerprint differs")
-            if spec.mode is not _camera_mode(self._camera):
+            if spec.mode is not _CAMERA_MODE:
                 raise ValueError("camera acquisition mode differs from live adapter")
             if spec.mode is CameraAcquisitionMode.FREE_RUNNING:
                 raise ValueError(
@@ -946,6 +849,29 @@ class CameraCaptureEndpoint:
             with self._condition:
                 self._physical_operations_inflight -= 1
                 self._condition.notify_all()
+
+    def cleanup(self) -> CleanupStepAck:
+        """Stop the physical source and acknowledge the declared DISARM step."""
+
+        return CleanupStepAck(SafetyOperation.DISARM, self.interrupt())
+
+    def verify_safe_state(self) -> SafeStateAck:
+        """Read the adapter-owned armed/pending state without changing it."""
+
+        armed, pending = self._camera.capture_state()
+        if armed:
+            raise RuntimeError(
+                f"camera {self._source_id!r} still owns an armed acquisition"
+            )
+        if pending:
+            raise RuntimeError(
+                f"camera {self._source_id!r} still retains pending frames"
+            )
+        return SafeStateAck(
+            canonical_digest(
+                {"source_id": self._source_id, "armed": False, "pending": 0}
+            )
+        )
 
     def _terminalize_with_deadline(
         self,

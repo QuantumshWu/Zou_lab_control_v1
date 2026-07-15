@@ -6,23 +6,40 @@ build-backend = "setuptools.build_meta"
 name = "zou-lab-control"
 version = "0.1.0"
 description = "Jupyter plotting frontend and neutral-atom control helpers for Zou lab experiments."
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+analysis = [
+    "scipy",
+]
+render = [
+    "matplotlib",
+]
+notebook = [
     "ipython",
     "ipykernel",
     "ipympl",
     "ipywidgets",
     "jupyterlab",
-    "matplotlib",
-    "nbconvert",
-    "nbformat",
     "notebook",
-    "numpy",
-    "pyserial",
+    "scipy",
+]
+workbench = [
+    "matplotlib",
     "PyQt5-Frameless-Window",
     "PyQt5",
-    "rpyc",
     "scipy",
+]
+hardware = [
+    "pyserial",
+    "rpyc",
+]
+docs = [
+    "nbconvert",
+    "nbformat",
 ]
 
 [tool.setuptools.packages.find]

@@ -269,6 +269,7 @@ zlc_workbench -> zlc_neutral_atom
 Zou_lab_control.notebook -> zlc_data
 Zou_lab_control.notebook -> zlc_neutral_atom
 Zou_lab_control.notebook -> zlc_pulse public API
+Zou_lab_control.notebook -> zlc_storage
 Zou_lab_control.notebook -> zlc_frontend.figure
 Zou_lab_control.notebook[render] -> zlc_frontend.render (optional)
 Zou_lab_control.notebook[workbench] -> zlc_workbench (optional GUI launcher)
@@ -284,13 +285,13 @@ Zou_lab_control.notebook[workbench] -> zlc_workbench (optional GUI launcher)
 
 ### 4.2 Composition roots
 
-允许三个明确装配入口：
+只允许三类明确的 application composition；其中只有普通用户入口公开领域 facade：
 
-- `zlc_neutral_atom.bootstrap.create_domain_experiment`：headless 领域实验；
-- `zlc_pulse.fpga.server.bootstrap`：可独立部署的 FPGA server；
-- `zlc_workbench.composition.create_workbench`：desktop/Qt 应用。
+- `Zou_lab_control.notebook.connect(...) -> Experiment`：headless/notebook 实验根；
+- `zlc_workbench.composition.create_workbench(...)`：desktop/Qt 应用根，待 GUI 纵切交付；
+- `zlc_pulse.server_app` 与 FPGA launcher：可独立部署的 current pulse server 根。
 
-另有一个薄的公开 notebook composition module `Zou_lab_control.notebook`：它依赖上述公开 API，提供 `connect -> Experiment`，但不成为领域包之间的新依赖层。顶层 `Zou_lab_control.connect` 可以密封地转发这一入口；禁止把所有 bounded context 的 symbol 做 umbrella re-export。公开名称只使用 `Zou_lab_control.notebook`；若仓库保留 `apps/zlc_notebook` launcher，它只能是导入该 module 的应用入口，不能形成第二套 facade/API 名称。
+`zlc_neutral_atom.bootstrap` 是 composition-private implementation package，包根 `__init__` 不导出构造器；当前 notebook root 只在 `connect()` 内惰性调用私有 installation factory。不存在 public `create_domain_experiment`、第二个 headless session root或顶层 `Zou_lab_control.connect` 转发。这样用户只有 `Zou_lab_control.notebook` 一个 canonical connect，领域包之间也不会多出 notebook 依赖层；若仓库保留独立 launcher，它只能调用上述 application root，不能形成第二套 facade/API 名称。
 
 可复用 library 内禁止通过 FQCN、包扫描或 service locator 动态构造依赖。
 
@@ -353,6 +354,10 @@ load + exclusively lock PersistentSafetyJournal
 ```
 
 ResourceArbiter 不提供 connection-establishment lease：正常 open/bind 发生时还没有普通 Run admission，互斥由 process-level physical-owner proof、owner lane 与 `DeviceBroker.bind` 的 current/active/recovery 检查完成。若某 SDK 的 open 本身会改变危险输出，它必须在 adapter 的启动/恢复安全 recipe 中得到显式 hazard/safe 处理；不能用一个名为“只读连接”的 lease 洗白。任一 open、identity、AssetMap、capability、recovery 或 graph freeze 失败都不发布 `Experiment` 或 drive facade，composition 按 §12.7 安全关闭已经建立的子集并使启动失败。
+
+当前已交付的 target-owned virtual root 是这条真实启动顺序的明确非物理例外，而不是可复制到真机的捷径：它先构造并探测 deterministic in-process atom array、camera、sequencer与broker binding，成功后才取得本地 safety journal authority；这些对象没有外部物理输出或跨进程竞争者。即便如此，composition claim仍是**一次进程生命周期、永不复用**：正常 `CLOSED` 后不能在同一进程重新 compose；startup rollback任一close失败会强引用保留整个partial graph/journal authority并永久拒绝后续compose，直到替换进程。真实adapter、remote FPGA与qCMOS不得使用此例外，仍必须按上面的journal/physical-owner/AssetMap顺序启动。
+
+当前virtual graph直接消费 `zlc_pulse.load_deployed_pulse_target()`，不再把旧 `PortCatalog` 投影成第二份拓扑；canonical clock来自同一checked-in FPGA config。标准物理接线固定为cooling `ch00/ch01`、probe `ch03`、trap `ch09`、camera trigger `ch11`，每条均须是deployed target中的单lane digital port。trap只作为camera背后的私有物理模型，不进入public catalog；public catalog只含camera/sequencer immutable `DeviceInfo`，关闭顺序固定camera→sequencer→trap。
 
 `InstallationDeviceGraph` 只在 composition/runtime owner lane 内可达，也不能通过 debug property、generic resolver、callback closure 或 frontend ViewModel 泄漏。这里的 typed facades 是 runtime-instance-pinned、immutable binding surface/descriptor，不包含用户可变的 calibration convenience pointer或UI state。public `Experiment`只发布`device_catalog`与稳定的领域 convenience facade；每个 facade 操作在一个 composition 临界区恰好取得一次当前 RUNNING runtime snapshot，据此构造并冻结 request/binding stamp，不能分别读取 descriptor 和 runtime 指针。所有依赖标定的请求都显式接收 `CalibrationArtifactRef` 并在构造时与 binding/model 一起冻结；headless domain session 本身不是普通用户的硬件 service locator。
 
@@ -461,7 +466,7 @@ frontend codec 不认识 PulseDocument。若 workspace 需要可编辑 replay，
 
 ### 4.5 Notebook-first Experiment 门面
 
-notebook 不是“绕过正式架构的调试入口”，而是一等 composition root。`zlc_neutral_atom.bootstrap` 只装配 headless domain/runtime；`Zou_lab_control.notebook` 提供薄 `Experiment` 门面，把 domain experiment、repositories、RunController 与可选 renderer 显式组合：
+notebook 不是“绕过正式架构的调试入口”，而是一等 application composition root。`zlc_neutral_atom.bootstrap` 只保存不公开的装配实现；`Zou_lab_control.notebook` 提供薄 `Experiment` 门面，把私有 `InstallationRuntime`、repositories、RunController 与领域 facade 显式组合：
 
 ```text
 Experiment                         # notebook/application facade，不含领域算法
@@ -483,6 +488,8 @@ neutral domain Result
   typed values/artifact refs
   no FigureDocument/DataFigure/Qt/Matplotlib object
 ```
+
+当前纵切已实现 `connect(config="virtual", repository=...)`、immutable `device_catalog`、`.timing.target`、declarative capture request、`start/run/inspect`、capture load以及capture-fit save/load；Figure/workbench入口仍属于后续U01产品接线，不能因列在终态门面图中就宣称已实现。导入 `Zou_lab_control.notebook` 不加载Qt、Matplotlib、SciPy、serial/RPyC、旧 `Zou_lab_control.neutral_atom` umbrella或concrete bootstrap；`connect()`才惰性导入virtual composition，compile request才惰性导入triggered binding，calibration repository第一次使用时才构造。`pyproject.toml`是依赖的唯一真相，base只含NumPy，analysis/render/notebook/workbench/hardware/docs按能力拆成extras；安装脚本直接安装这些extras，删除平行`requirements.txt`。
 
 `Experiment` 只做参数便利、typed request 构造、结果解包和composition delegation；它不调用raw adapter，不复制 calibration/fit/scan 算法，也不让 domain object lazy 回查全局 session。notebook baseline 不保存 `current_calibration` 指针、revision 或“最近一次”映射：这些状态在当前实现没有业务消费者，还会让短 API 的物理输入变成隐式。所有依赖 calibration 的 convenience request 必须显式接收 `calibration=CalibrationArtifactRef`，在请求构造时 load/admit 并与具体 `ReadoutBindingKey`、model 一起冻结；多 camera 不能猜 ref，运行时也不回查 facade。结果、internal RunPlan 与 artifact lineage 始终记录实际使用的 binding/ref/digest，因此短 notebook 路径不以隐藏物理输入换便利。
 
@@ -1102,7 +1109,11 @@ RunController registry 强引用所有 active handle，以及已经发布 termin
 - 不可中断的 SciPy/NumPy 计算等待返回后丢弃 stale result；
 - 需要 hard deadline 的计算使用 disposable subprocess。
 
-当前 RemoteSequencer 的单条同步 RPyC connection 会让 `wait_done` 占住同一请求通道，且 transport backstop 可长达 3600 s；软件重构必须先缩短/分解阻塞调用，使用现有transport支持的timeout、cancel/abort/safe并在故障注入中测量最坏停止时间。第二条RPyC socket若共享backend/`_io_lock`只能改善RPC调度，不能宣称硬件独立；但baseline也不要求因此新增watchdog、SAFE寄存器或重烧bitstream。无法确认safe时Run保持CANCELLING或内部FINALIZING_SAFETY/SAFETY_JOURNAL_BLOCKED并持有claims；本installation的同一个SafetyDispositionBundle durable、UNSAFE quarantine projection成立后，才发布FAILED。只有真机证据表明现有safe路径违反既定安全要求，才按bug修复流程评估硬件改变。
+current `RemotePulseExecutionClient` 必须建立两条不同的RPyC connection：control通道执行snapshot/prepare/fire/complete，interrupt通道只执行generation-bound safe-state；endpoint的logical blocking limit必须严格小于transport backstop。server返回的 `PreparedPulseRef(connection_generation, artifact_digest)` 在prepare acknowledgement前原子写入同一private session，后续fire/complete只消费该exact ref；每次操作重验server generation、target、clock与geometry，禁止transparent reconnect。第二条socket保证长complete RPC不会在客户端协议层堵死safe请求，但若两条请求最终共享backend/硬件 `_io_lock`，它仍不能冒充独立硬件中断路径；baseline也不因此新增watchdog、SAFE寄存器或重烧bitstream。
+
+logical deadline必须覆盖endpoint的SAFE single-flight lock等待与interrupt RPC本身，不能在transport backstop返回后才检查时钟。当前client用RPyC timed request消费调用方传入的剩余时限；超时后先永久撤销整个client，再直接切断两条本地transport，使迟到ack永远不能成为当前证据且调用方按logical deadline返回。transport断开会触发server owner-disconnect SAFE，所以真正的重复调用约束由`PulseExecutionService`唯一拥有：所有generation-bound SAFE、disconnect SAFE和failure recovery SAFE共用一个single-flight gate；后到者等待正在执行的物理SAFE，若其成功并清空prepared authority则直接复用同一SAFE snapshot，只有前一SAFE失败才允许新的物理重试。这样不依赖client/endpoint/runtime对象寿命，不因GC再发第二次backend SAFE，也不启动detached watchdog或伪装远端调用已经终止。
+
+SAFE还必须与prepare/FIRE/complete在**物理backend边界**线性化，而不只是更新Python state。server先把operation epoch推进到INTERRUPTING并调用声明为out-of-band的`request_interrupt()`，再等待唯一backend-operation gate；因此已经进入backend的调用会先退出，随后同一owner才真正执行`backend.safe_state()`。尚未进入backend的普通调用在取得gate后必须重新校验epoch/state，已被SAFE超越就零硬件调用失败。普通调用完成backend后也要在发布ack前再校验epoch；这样不存在“软件先宣布SAFE、迟到prepare/FIRE随后又改硬件”的窗口。`request_interrupt()`故意不取得这个gate，否则它会排在正在阻塞的硬件调用之后而失去中断意义；adapter contract必须明确它线程安全、非阻塞且不等待普通I/O owner。service state lock不得跨backend-operation gate等待或阻塞式backend命令；failure recovery也只能在释放该gate后复用同一SAFE owner。只有physical SAFE成功、prepared authority清空后才能发布权威SAFE snapshot；运行中普通snapshot只是观察值，其backend部分必须由thread-safe、non-blocking readback提供，不能冒充terminal proof。普通session cleanup不再先执行一遍独立SAFE再close；`close_session`是该路径唯一SAFE owner：它先触发server的上述物理顺序，若本地operation线程仍在收尾则join后只再次确认同一SAFE snapshot，不重复backend SAFE。无法确认safe时Run保持CANCELLING或内部FINALIZING_SAFETY/SAFETY_JOURNAL_BLOCKED并持有claims；本installation的同一个SafetyDispositionBundle durable、UNSAFE quarantine projection成立后，才发布FAILED。只有真机证据表明现有safe路径违反既定安全要求，才按bug修复流程评估硬件改变。target-native remote endpoint已保留，但真实 `RemotePulseExecutionClient -> DeviceBroker -> BoundPulsePort` composition在AssetMap/identity/SafeStateContract闭合前仍为NO-GO，旧`RemoteSequencer`不得恢复或包装。
 
 ### 8.4 Cleanup
 
@@ -1822,20 +1833,27 @@ axis 编辑器读取 ViewSuggestion，并只从其中的 ViewSpec 派生 display
 
 ```text
 BoardFrame:
-  board_revision
-  immutable front raster(s)
-  panel_rects + ViewportTransform(s)
-  coherence_groups: group -> CoherenceStamp
-  per_panel_status/missed
+  board_id + layout_generation + monotonically increasing sequence
+  PanelFrame[]:
+    panel_id + coherence_group
+    SourceIdentity(dataset_id, block_id, stream_generation, schema_fingerprint)
+    CoherenceStamp
+    immutable RasterBuffer
 
 CoherenceStamp:
   run_id/provenance_epoch_id
   join_key type/schema/digest
-  input DatasetRevisionRef(s)
-  panel/document/selection revisions
+  EvaluatedInput(dataset_id -> exact DatasetRevisionRef)[]
+  PanelPresentationIdentity(panel_id, document_id,
+                            document_revision, selection_revision,
+                            panel_revision)[]
 ```
 
 同一 coherence group 的 panel 必须从同一个 causation domain 与完整 CoherenceStamp 求值，并在一次 GUI transaction 中 `present(BoardFrame)`；裸 `JoinKey==7` 或裸 `revision==5` 在不同 run/block/generation/schema 间不具有可比性。不能让 per-panel latest-only 各自成功后拼成看似同 shot 的 board。互相独立的 monitor 可以带不同 revision，但 BoardFrame 必须显式标出它们不是 coherent group。强像素级 coherence 使用一个 parent raster/front-buffer 原子换页；多个独立 QWidget surface 最多声明 model transaction coherent，不能声称 OS paint 同一时刻完成。后台慢时丢弃未开始的旧 board revision，不能逐 panel 呈现半新半旧状态。
+
+U01当前交付的是这些值对象与**整板最终准入闸**，不是尚未实现的scheduler/renderer：owner thread先以 `BoardPublishPort.admit(sequence, group->exact stamp)` 冻结完整期望向量并签发一次性work token，worker只可用该token提交完全匹配的 `BoardFrame`；新admit、reconfigure、port replacement或close会使旧token失效，首次成功publish即消费token。admit与present都在owner thread线性化，worker只替换一个bounded pending whole-board mailbox；close/reconfigure清空front，不留下旧layout raster。上游per-group join/coalesce、tile cache、公平render lane与PanelHost仍由后续Workbench scheduler拥有，不能把最终闸门误写成第二个scheduler。
+
+`BoardPresenter.present()`必须是old-or-new原子交换：失败要么在修改front前抛出，要么保留上一张完整front；controller随后进入sticky fault，UI在上一张完整图上覆盖明确错误状态，绝不呈现半张新board。`clear()`只在reconfigure、publish-port replacement或close的owner thread调用，并释放front raster引用。close在调用clear前先撤销publish/work authority；若clear失败则记录fault、保留同一presenter/front且close不宣称完成，后续close只重试该clear；只有clear成功才丢掉presenter与旧fault引用并使close幂等。普通present异常不把上一张有效图静默清空。
 
 GUI 不读取 worker-owned Figure/artist；所有命中测试和选择都使用随 front buffer 一起发布的 ViewportTransform。静态 axes/labels/colorbar 可由 worker raster 缓存，动态 overlay 由 Qt 画；export 始终从 FigureDocument + frozen data revision 重画，不保存屏幕 texture。
 
@@ -3312,14 +3330,14 @@ Rules 1–8 的canonical定义与COMPLETE条件如下。前七条评估existing-
 | `R01_STREAM_DATASET_PROCESSOR` | `zlc_neutral_atom/processing/*`、`runtime/dataset.py`、`runtime/streams.py` | 6 | COMPLETE | exact/live kernel READY；Workbench live接线仍属U01 backlog |
 | `N01_READOUT_CAPTURE` | target acquisition/artifacts/readout/timing（pulse 除外） | 26 | COMPLETE | readout/calibration/capture core IMPLEMENTED；真实Formal硬件资格仍受H01约束 |
 | `F01_FIGURE_VIEW` | `zlc_frontend` figure/core owner | 7 | COMPLETE | headless figure/view READY；完整render/GUI属于U01 backlog |
-| `R02_RUNTIME_INSTALLATION` | target runtime（dataset/streams除外）、catalog、全部Workbench endpoint，以及尚待删除的旧`device_catalog/installation`边界 | 22 | COMPLETE：现有target leaves已完成Rules 1/2/6/7 target-only审查 | BACKLOG/NO-GO：唯一process-lifetime `InstallationRuntime + InstallationDeviceGraph`尚未实现，列为解冻后首个纵切 |
+| `R02_RUNTIME_INSTALLATION` | target runtime（dataset/streams除外）、catalog、全部Workbench endpoint，以及尚待删除的旧`device_catalog/installation`边界 | 22 | COMPLETE：existing leaves与本轮composition差量均完成target-only复审 | virtual process-lifetime InstallationRuntime/graph READY；真实AssetMap/physical-owner/recovery composition仍NO-GO |
 | `P01_PULSE_EXECUTION` | `zlc_pulse/*`、5个pulse JSON、`timing/pulse.py`、旧timing persistence/table/sequence最后消费者 | 33 | COMPLETE：33/33 existing production paths逐文件覆盖，current codec/resource、resident transport、schedule、terminal与legacy删除账闭合，P0/P1=0 | resident autonomous core READY；experiment ScanContract与`API_SLOT_SEGMENTED_EXISTING`为BACKLOG |
 | `H01_HARDWARE_ADAPTERS` | `fpga/*`、旧devices中仍实际changed的真实adapter（不含已恢复main的registry/discovery与A01 public init）、adapter SDK、simulation/testing | 22 | COMPLETE：22/22 existing production paths逐文件覆盖，冻结RTL、host transport及当前adapter seam P0/P1=0 | real qCMOS Formal exact NO-GO，直到typed Q0、tail/EOS、EndAttestation与真机资格化完成；当前正确fail-closed |
-| `U01_GUI_WORKBENCH` | frontend render、Workbench shell、旧frontend与`pulse_gui.py` launcher | 17 | PARTIAL | BACKLOG；render/thread/board/legacy bridge/GUI等价与性能闭包待完成 |
-| `E01_EXPERIMENT_OPERATIONS` | 旧neutral core、operations、measurements、processors、tasks、subsystems | 22 | PARTIAL | BACKLOG；须按measurement/task/processor use case做dependency-closed审查与迁移 |
-| `A01_PUBLIC_SURFACE` | `pyproject.toml`、包根/umbrella、`_gui`、manual launcher、notebook public facade | 8 | PARTIAL | BACKLOG；最后封ordinary-user object graph、notebook、packaging与文档一致性 |
+| `U01_GUI_WORKBENCH` | frontend render、Workbench shell、旧frontend与`pulse_gui.py` launcher | 17 | COMPLETE：existing primary paths及最新coherence差量复审闭合 | board identity/final gate IMPLEMENTED；scheduler/renderer/PanelHost与legacy GUI迁移BACKLOG/NO-GO |
+| `E01_EXPERIMENT_OPERATIONS` | 旧neutral core、operations、measurements、processors、tasks、subsystems | 22 | COMPLETE：existing primary paths按task/measurement/processor语义及最后consumer账闭合 | raw exact coordinator IMPLEMENTED；Formal ScanOutput与旧operations迁移BACKLOG，真实链NO-GO |
+| `A01_PUBLIC_SURFACE` | `pyproject.toml`、包根/umbrella、`_gui`、manual launcher、notebook public facade | 8 | COMPLETE：existing primary paths及本轮notebook/packaging差量复审闭合 | target virtual notebook READY；legacy launchers、Workbench与真实composition仍NO-GO |
 
-计数为`18+7+6+26+7+22+33+22+17+22+8=188`。当前8个owner audit COMPLETE、3个PARTIAL；下一步只剩E01、U01、A01。横向Rule-3历史格式清理不是第十二个闭包；已完成owner的文件若作为另一个闭包secondary seam被修改，只做差量复验，不重新计数。只有这三个剩余owner、Rules 1–7全分支清点和最后一次独立对抗验收均完成，才解除“不得新增迁移代码”的审查冻结；解除后按implementation轴从R02 composition首个dependency-closed纵切开始。解除审查冻结不等于任何真实硬件或用户capability自动READY。
+计数仍按审查冻结快照为`18+7+6+26+7+22+33+22+17+22+8=188`；新增implementation文件作为其owner的差量复验记录，不伪造为第十二个闭包。11个owner audit与Rules 1–8追溯门规现均COMPLETE，故“先完成1–7再迁移”的审查冻结已经解除，并已从R02/A01/U01的第一个dependency-closed virtual纵切恢复实现。解除冻结、局部READY与全迁移完成是三件不同的事：真实qCMOS/remote composition、正式GUI/launchers与Formal Scan仍按implementation轴NO-GO，不能由owner audit COMPLETE冒充可用。
 
 `P01_PULSE_EXECUTION` 以本节记录的 `9b2662aae8cb` 快照为差量基线，对33个primary production path逐文件阅读，并沿current document→compiler→TargetIR→wire/schedule→artifact/RPC/storage→neutral/workbench consumer追踪完整producer-consumer闭包；旧 timing/PulseTable 只登记最后消费者与删除点，没有用旧测试或旧`DeviceSet/Registry`语义反向修改target。收口共修复9类不重叠根因：逐edge Python对象图放大、TargetIR scan canonical list放大、canonical producer缺少与decoder同源的结构资源域、artifact aggregate edge/byte总预算缺口、准入前复制、下游可放宽owner上限、wire `<u4` 前未拒绝越界地址、空`steady_rises`在巨大loop count下空转，以及旧`.edges`物化API/重复session state残余。`DigitalTriggerSchedule`现以只读`<u4 point_indices>/<u4 loop_iterations>/<u8 ticks>`保存物理列；channel由schedule拥有，global ordinal为行号，point-local ordinal按声明的单调point列派生，`TriggerEdge`只是在`iter_edges()`消费边界产生的临时typed row。TargetIR scan table、duration与wire words也使用定宽array codec；这只改变内存/编码表示，不改变多维scan row、repeat、trigger归属或任何data trailing axis。
 
@@ -3459,13 +3477,21 @@ R02重新结案要求的四类证据现均已交付：目标production current�
 
 本次 target-only 复核以 parent checkpoint `f45c17a8e1ba9b936b424219cc482a35d2e36a1b` 为机械边界；该点为 `main..HEAD = 189`、`main...HEAD = 389`，合并唯一 untracked target production 文件后 worktree 集合为 390 个路径。复核没有运行或修改任何测试，也没有打开旧 `DeviceSet/Registry` 兼容面；证据只来自 changed-file/consumer/owner/AST 搜索、109 个 target production module 的 import-DAG parse、34 个 changed module 的 `py_compile`、32 个 changed module 的真实 import、`git diff --check` 与两项有明确内存风险的 profile。旧 `zlc_workbench.legacy_neutral_atom/legacy_runtime/pulse_control` 已物理删除；旧 notebook/session 对它们的引用只登记到 A01 最后消费者账本，不能成为恢复旧 bridge 的理由。
 
-R02必须按§22.1双轴记账：**现有target leaves的owner audit为COMPLETE；implementation/capability为BACKLOG/NO-GO。** 目标树尚未交付process-lifetime `InstallationRuntime + private immutable InstallationDeviceGraph`唯一composition owner，`ResourceArbiter/DeviceBroker/RecoveryController`也尚未由该root实例化。Rules 1–7全仓追溯仍冻结新增迁移代码，所以现在既不能补这块composition，也不能把旧`LegacyNeutralAtomRuntime`接回来；它被登记为全部owner audit完成、审查冻结解除后的第一个dependency-closed实现切片。当前中间态不可作为notebook可运行或真实设备authority完成声明，但“未来composition尚缺”不再制造R02 audit永远PARTIAL的死锁。
+R02继续按§22.1双轴记账：**owner audit为COMPLETE；virtual implementation为READY；real implementation仍NO-GO。** 审查冻结解除后，目标树已交付一个process-lifetime `_VirtualInstallationRuntime`：它唯一实例化并持有`ResourceArbiter`、`DeviceBroker`、`RunController`、private raw graph、typed camera/pulse ports与immutable public catalog；public `Experiment`只保存opaque authority token，不能到达raw graph、BoundDevice或drive-capable Port。runtime close不持lifecycle lock等待Run，先关闭admission并join controller，再broker shutdown、camera→sequencer→trap reverse close，最后释放journal/arbiter；失败停在可重试`CLOSING`，不会谎报CLOSED。真实composition尚缺canonical AssetMap、backend physical-owner proof、target-owned qCMOS adapter和recovery-only startup，因此不能把virtual READY改写成真机authority完成，也不能把旧`LegacyNeutralAtomRuntime`接回来。
 
 严格 R02 现有实现范围为 19 个 production 文件，按 `PLOC / NCLOC / classes / dataclasses / enums / functions` 由 parent 的 `16373 / 14685 / 186 / 99 / 14 / 860` 降为 `15133 / 13529 / 162 / 82 / 11 / 814`，净减 `1240 / 1156 / 24 / 17 / 3 / 46`；Git numstat 为 `+4872/-6112`。分项如下：lifecycle `2338/2098`，commit+journal `1049/924`，resource authority `2985/2628`，capture kernel `4516/4023`，artifact `2639/2456`，timing `1606/1400`。lifecycle 对 main `722/652` 为 `3.24x/3.22x`，增量对应 cancellation/deadline/safety cleanup/terminal authority；capture 对 main narrow `917/814` 为 `4.92x/4.94x`，但对包含 measurement/value/dataset 的 generous envelope `1614/1387` 为 `2.80x/2.90x`；artifact 对 main `imageio.py 375/321` 为 `7.04x/7.65x`，增量是 main 不具备的 chunked CAS、bounded lazy reader、完整 event index、inverse lookup 与 crash recovery；timing 对 main `744/642` 为 `2.16x/2.18x`。commit/journal 与 resource authority 没有 main 同职责实现，不伪造倍率，也不计算 heterogeneous 总倍率。
 
 finite exact 的 event ordinal→cell 事实现在只有一个 `DatasetCellSchedule` owner：它以 immutable sealed u32/u64 bytes 保存完整 permutation，跨 `CompiledCaptureCellPlan -> CameraCaptureBindingRequest -> FrozenDatasetEdge -> DatasetBuilder/CaptureSession -> artifact/occupancy` 共享同一实例；processor 即使改变 `ValueSchema/data_shape` 也只复用 key-domain schedule，完整 schema 仍由各自 `DatasetSchema` 绑定。因此数值形状始终是 `(R, P, *data_shape)`，禁止 flatten、取第零项或丢 trailing axes。旧 100k-cell Python tuple plan 常驻约 12.797 MB、plan+edge 22.398 MB、构造峰 36.075 MB；新 packed payload 400,000 B、traced steady 405,591 B、构造峰 807,448 B，分别约缩小 31.5、55.2、44.7 倍。1M cells 为 4,000,000 B，构造约 1.27 s，`cell_at` 约 0.789 Mcells/s，完整 iteration 约 1.015 Mcells/s；相机/设备调用、stream lock 与 value projection 会先成为真实瓶颈。`CaptureFrameSource` 的 durable load 同一次流式读取建立 metadata/permutation receipt 与 compact inverse，只常驻 4/8-byte inverse、chunk refs 与一个最多 256-event chunk；1M cells 的 inverse 为 4 MiB、构造峰约 8 MiB，而旧 eager Python cell/metadata graph 估计约 447–472 MB。recovery 只补验未读的 frame chunks，不再重读 event index。
 
 installation authority 的本地 live identity 已收敛为唯一 `DeviceBindingStamp(PhysicalDeviceIdentity, binding_instance_id)`；broker 只 mint 一个 UUID，exact-once bind 后没有 rebind/hot-swap/stale-generation 分支。camera/sequencer capability 与 camera provenance 直接携 stamp，阶段 ACK 只回显一个 binding instance；远端 pulse server 的 `server_connection_generation` 是独立 transport 事实，继续保留。durable recovery 在 journal acknowledgement 不确定后保留同一 bundle/evidence/claim，禁止 abort，只允许幂等重试；`CommitRecovery(bool, optional result)` 也已删除，known absent 直接为 `None`、known committed 直接为 `PublishedManifest`、unknown 继续用异常表达。terminal publication 与 resource release 仍在同一 arbiter 临界区，Run wait 仍等待 owner thread 真正退出。这些是有 crash/错 owner/内存爆炸根因的保留机制，不是旧 Registry 的适配层。
+
+审查冻结解除后的首个R02/A01/U01实现切片以parent `84f8f93d9faf978bcb98db4a4d6204e9c18b98bb`为边界；该点机械得到`main..HEAD=191`、`main...HEAD=383`，合并当前tracked与untracked worktree后为411个去重路径。只审本切片target production与本设计文档；并行dirty tests、tutorials、manual/PDF/assets、`fpga/run_server.bat`与`pulses/README.md`没有进入证据或stage。证据仅为逐文件阅读、AST/import/consumer扫描、`py_compile`、fresh isolated import、current-format手写vertical oracle、deterministic main物理交叉和有界queue/board反例；没有运行pytest，也没有修改历史测试或旧`DeviceSet/Registry/session`去迎合中间态。
+
+R02 endpoint迁址不是重写膨胀：五个private target endpoint文件为`2432 physical / 2253 PLOC / 2224 NCLOC / 14 classes / 8 dataclasses / 93 functions`，被删除的五个Workbench等价物为`2434 / 2264 / 2228 / 13 / 8 / 86`，即约`1.00x/1.00x`；增加的一个class与七个函数来自remote+virtual共用finite session owner、target-native remote backend和virtual safe-state readback，不是兼容wrapper。新virtual hardware为`869 / 791 / 791 / 5 / 2 / 49`；main等价的`VirtualTrapArray + _TriggerWiredCamera + VirtualCamera + VirtualSequencer`为`1731 physical / 1638 PLOC / 1252 NCLOC`，即`0.48x PLOC / 0.63x NCLOC`。它只保留当前finite pulse/camera纵切消费的物理模型，恒false的`_pinned/consume_pin`、unused brightness-jitter knob、ROI/free-run/MOT monitor/laser/RF控制等未声明能力没有伪装成已迁移。新的installation+catalog没有main同职责process-lifetime owner，故只报告绝对`743 physical / 659 PLOC / 646 NCLOC`，不拿旧registry/session伪造倍率。remote deadline整改后的current `zlc_pulse.client + server`为`1045 physical / 937 PLOC / 937 NCLOC / 7 classes / 3 dataclasses / 58 functions`，parent为`938 / 841 / 841 / 7 / 3 / 53`，PLOC为`1.11x`；净增五函数与两个简单互斥gate只关闭已经复现的“logical close deadline晚于transport RPC返回”、timeout/GC后disconnect第二次SAFE、failure-recovery并发SAFE，以及“软件SAFE先完成、迟到backend operation随后改变硬件”竞态。没有新增线程、工作流状态机、兼容层或超过3倍项；SAFE gate有generation interrupt/disconnect/failure recovery三个真实入口，backend-operation gate被prepare/FIRE/complete/SAFE四条真实物理路径共同消费，均不是单消费者wrapper。
+
+U01三文件从parent的`657 physical / 571 PLOC / 15 classes / 8 dataclasses / 32 functions`变为`962 / 857 / 17 / 10 / 39`，为`1.46x/1.50x`，没有超过3倍项。新增两个值类分别表达稳定source identity与per-panel presentation identity；没有它们，同组不同dataset source会被错误要求同ref，或document/selection revision会再次混进producer generation。BoardController仍只有一个whole-board pending mailbox和一次性work token，没有预建第二个scheduler、tile graph或render state machine；新增的close失败分支不增加类型/函数，只保证真实GUI presenter清空失败时保留同一front供重试而不恢复publish authority。故障注入证明第一次clear失败保留资源与fault、第二次close成功后presenter可被GC、第三次close幂等。A01既有8-file范围为`1469 PLOC/1270 NCLOC/8 classes/4 dataclasses/56 functions`，对main `1092/952/0/0/26`为`1.35x/1.33x`；新增复杂度是opaque authority registry、declarative request、typed facade与repository lifecycle。删除`requirements.txt`并让两个installer直接消费pyproject extras后，依赖真相也恢复为一个owner。
+
+current virtual deterministic oracle固定使用tracked `pulses/imaging_template.json`、seed 7、deployed target以及同一个current compiler/playback：target-owned三帧与main已验证`VirtualTrapArray`逐像素相等，frame sums为`3152983/2627189/3154651`；同一模板的完整notebook exact链产生只读`(R=1,P=3,Y=96,X=128)`且保持同一三帧sum，没有把trailing image axes折成匿名`data_dim`或取第零项。bounded producer按ordinal发布，声明`NON_BACKPRESSURE_CAPTURED`后queue满即显式poison/fail，绝不等待消费者、覆盖旧帧或伪装成backpressure。远程endpoint保留exact `PreparedPulseRef`与server generation；真实RPyC反例让server SAFE阻塞`0.30 s`而client logical deadline为`0.05 s`，`0.058 s`即失败，随后立刻删除client并`gc.collect()`、重连新generation，backend全程仍只收到一次SAFE且server稳定为SAFE。另一并发反例让prepare停在backend内，同时请求SAFE；硬件事件严格为`prepare_start -> interrupt -> prepare_end -> safe`，被超越的prepare只得到RuntimeError且SAFE snapshot不含prepared ref，证明物理SAFE不会被迟到operation反写。由于没有real composition consumer与真机SafeStateContract，它仍是已排期能力owner而不是READY声明。旧root PulseGUI/TaskConsole、`session.connect`、manual/devtools与教程仍是legacy最后消费者，只进入删除/迁移账；当前普通用户GUI与真机链因此保持NO-GO，不能回填umbrella或旧RemoteSequencer协议。
 
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 
@@ -3479,7 +3505,7 @@ installation authority 的本地 live identity 已收敛为唯一 `DeviceBinding
 | `zlc_frontend` Figure/View/selector | S0.5/S2/S5 Workbench 与 notebook render | 审查 target DAG、最小入口与性能，不以旧 GUI 尚未迁入为由删除 | 新 frontend 设计被正式替换且所有目标用户面有闭环 |
 | legacy PulseTableState readers | 尚未迁完的 Camera/PulseScan/PulseGUI 岛 | 先迁每个保留 consumer 到 current PulseDocument/compiler | 最后 consumer 迁走的 H1/S3/S5 dependency-closed commit |
 
-规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`；只有八条全局规则全部 `COMPLETE` 才能恢复新迁移。目前：规则 1 PARTIAL，规则 2 PARTIAL（已纠正“零当前消费者即删除”的错误判据），规则 3 COMPLETE，规则 4 PARTIAL（calibration/readout/occupancy/capture 子切片 COMPLETE），规则 5 PARTIAL，规则 6 PARTIAL（同一子切片 COMPLETE，但全仓 runtime aggregate 与其它 owner 尚未），规则 7 PARTIAL，规则 8 COMPLETE（迁移期 pytest 全冻结、历史测试不修改、旧树只登记/删除）。最终还需对完整分支做独立对抗审查，证明没有 P0/P1 correctness、边界或可实现性漏洞；子切片 GO 不能被改写成全局 GO。
+规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`。§22.1固定的11个互斥production owner闭包已经逐一完成，规则1–8的**existing-code追溯审查轴全部COMPLETE**，所以“完成1–7前不得继续迁移”的冻结已经解除；这不等于implementation全部READY。当前首个恢复实现的纵切只有virtual finite capture/pulse owner与BoardController coherence foundation为GO；remote/real qCMOS、正式scan物理资格、完整GUI scheduler/render接线和普通用户真实设备入口仍分别NO-GO。每个后续dependency-closed切片仍须按规则1–8做增量审查，完整迁移结束后还必须对最终分支做一次独立对抗验收；局部GO或owner audit COMPLETE都不能改写成全局实现完成。
 
 ### 22.2 终态验收清单
 
@@ -3568,7 +3594,7 @@ Pulse/FPGA：
 - runtime不声称验证当前bitstream content digest、implementation seed或timing-signoff token；
 - PreparedProgramRef + connection generation + artifact/table digest使旧软件引用不能进入正式FIRE，完整自主table在fire前冻结；
 - current resident/streamed bank按现有RTL真实能力完成golden/真机验证，不要求不存在的RTL CRC；
-- RemoteSequencer现有timeout/cancel/abort/safe与故障时quarantine通过真机测试；不要求新watchdog/独立SAFE硬件；
+- current `RemotePulseExecutionClient/RemotePulseExecutionEndpoint` 的logical deadline覆盖SAFE lock与RPC，timeout撤权且不并发第二次SAFE；server以唯一backend-operation gate线性化prepare/FIRE/complete与physical SAFE，SAFE先发布INTERRUPTING并发出thread-safe non-blocking interrupt，再排到已入硬件操作之后，任何superseded返回都不得mint ref/ack/terminal；真实composition、backend bound、cancel/safe与quarantine仍须在对应SafeStateContract中通过真机recipe，不要求新watchdog/独立SAFE硬件；
 - RTL/bitstream保持冻结；只有E0a/Q0在已批准工作余量、正确camera配置和充分软件reservation下仍实测loss/reorder，且camera设置、软件保留/排空策略、降低trigger rate与扩大margin均不能修正；或已证实RTL bug/设计偏离，才允许H2硬件修复评审。
 
 性能：

@@ -1,4 +1,4 @@
-"""Composition-private adapter from installed sequencers to the typed pulse Port."""
+"""Composition-owned sequencer endpoint for the typed pulse Port."""
 
 from __future__ import annotations
 
@@ -7,10 +7,11 @@ import time
 from dataclasses import dataclass
 
 from fpga.pulse_streamer.host.image import StreamerParams, build_fingerprint
-from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
-from Zou_lab_control.neutral_atom.ports import PortCatalog
 from zlc_neutral_atom.runtime.ports import (
     BoundDevice,
+    CleanupStepAck,
+    SafeStateAck,
+    SafetyOperation,
     SessionClosedAck,
     SessionCloseCommand,
 )
@@ -29,38 +30,17 @@ from zlc_neutral_atom.timing.pulse import (
 )
 from zlc_pulse import (
     PreparedPulseRef,
-    PulsePortSpec,
-    PulseTarget,
     RemotePulseExecutionClient,
     build_pulse_playback,
 )
-from zlc_storage import canonical_digest, canonical_text as _text
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _text,
+    positive_real as _positive_real,
+)
 
 from ._endpoint_binding import require_current_endpoint_binding as _require_binding
-
-
-def _pulse_target_from_port_catalog(catalog: PortCatalog) -> PulseTarget:
-    """Project the installed sequencer's typed topology at the composition boundary."""
-
-    if not isinstance(catalog, PortCatalog):
-        raise TypeError("virtual sequencer port_catalog must be PortCatalog")
-    return PulseTarget(
-        tuple(catalog.raw_lanes),
-        tuple(
-            PulsePortSpec(
-                key=port.key,
-                kind=port.kind,
-                lanes=tuple(port.lanes),
-                label=port.label,
-                bus_index=port.bus_index,
-                width=port.width,
-                encoding=port.encoding,
-                safe_value=port.safe_value,
-                latch_clock=port.latch_clock,
-            )
-            for port in catalog.ports
-        ),
-    )
+from ._virtual_hardware import VirtualSequencer
 
 
 @dataclass
@@ -84,8 +64,14 @@ class _SequencerSessionOwner:
     def __init__(
         self,
         backend: VirtualSequencerExecutionEndpoint | RemotePulseExecutionEndpoint,
+        *,
+        max_blocking_call_seconds: float,
     ) -> None:
         self._backend = backend
+        self._max_blocking_call_seconds = _positive_real(
+            max_blocking_call_seconds,
+            "max_blocking_call_seconds",
+        )
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._safe_state_lock = threading.Lock()
@@ -163,8 +149,8 @@ class _SequencerSessionOwner:
                 self._validate_binding(binding)
                 if self._superseded(provisional, operation_epoch):
                     raise RuntimeError("sequencer prepare was superseded by interrupt")
-                provisional.prepared = True
                 provisional.prepared_ref = prepared_ref
+                provisional.prepared = True
                 fingerprint = self._capability_fingerprint
                 assert fingerprint is not None
             acknowledgement = PulsePreparedAck(
@@ -281,13 +267,13 @@ class _SequencerSessionOwner:
             was_in_flight = bool(
                 session is not None and session.physical_operation_in_flight
             )
-        snapshot = self._set_safe_state()
+        snapshot = self._set_safe_state(deadline)
         if time.monotonic() >= deadline:
             raise TimeoutError("sequencer close exceeded its bounded deadline")
         if session is not None and not self._wait_until_joined(session, deadline):
             raise TimeoutError("sequencer physical operation did not join before close")
         if was_in_flight:
-            snapshot = self._set_safe_state()
+            snapshot = self._set_safe_state(deadline)
             if time.monotonic() >= deadline:
                 raise TimeoutError("sequencer close exceeded its bounded deadline")
         safe, digest = self._backend._backend_close_evidence(
@@ -369,12 +355,50 @@ class _SequencerSessionOwner:
                 self._condition.wait(remaining)
             return True
 
-    def _set_safe_state(self) -> object:
-        with self._safe_state_lock:
-            return self._backend._backend_set_safe_state()
+    def _set_safe_state(self, deadline: float | None = None) -> object:
+        if deadline is None:
+            deadline = time.monotonic() + self._max_blocking_call_seconds
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._safe_state_lock.acquire(timeout=remaining):
+            raise TimeoutError("sequencer safe-state deadline elapsed")
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("sequencer safe-state deadline elapsed")
+            return self._backend._backend_set_safe_state(remaining)
+        finally:
+            self._safe_state_lock.release()
 
 
-class VirtualSequencerExecutionEndpoint:
+class _OwnedSequencerEndpoint:
+    """Public composition callbacks backed by one private session owner."""
+
+    _owner: _SequencerSessionOwner
+
+    def capability_probe(self, binding: BoundDevice) -> SequencerCapabilitySnapshot:
+        return self._owner.capability_probe(binding)
+
+    def execute_command(self, binding: BoundDevice, command: object) -> object:
+        return self._owner.execute_command(binding, command)
+
+    def close_session(
+        self,
+        binding: BoundDevice,
+        command: SessionCloseCommand,
+    ) -> SessionClosedAck:
+        return self._owner.close_session(binding, command)
+
+    def interrupt(self) -> str:
+        return self._owner.interrupt()
+
+    def cleanup(self) -> CleanupStepAck:
+        return CleanupStepAck(SafetyOperation.SAFE_STATE, self.interrupt())
+
+    def verify_safe_state(self) -> SafeStateAck:
+        return self._backend_verify_safe_state()
+
+
+class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
     """Typed finite execution endpoint for the in-process hardware simulator."""
 
     def __init__(
@@ -386,14 +410,18 @@ class VirtualSequencerExecutionEndpoint:
     ) -> None:
         if type(sequencer) is not VirtualSequencer:
             raise TypeError("this endpoint is specific to VirtualSequencer")
-        if max_blocking_call_seconds <= 0:
-            raise ValueError("max_blocking_call_seconds must be positive")
         self._sequencer = sequencer
-        self._timeout = float(max_blocking_call_seconds)
+        self._timeout = _positive_real(
+            max_blocking_call_seconds,
+            "max_blocking_call_seconds",
+        )
         self._params = params or StreamerParams()
-        self._target = _pulse_target_from_port_catalog(sequencer.port_catalog)
+        self._target = sequencer.target
         self._geometry = build_fingerprint(self._params) & 0xFFFFFFFF
-        self._owner = _SequencerSessionOwner(self)
+        self._owner = _SequencerSessionOwner(
+            self,
+            max_blocking_call_seconds=self._timeout,
+        )
 
     def _backend_capability_snapshot(
         self, binding: BoundDevice
@@ -476,13 +504,13 @@ class VirtualSequencerExecutionEndpoint:
         playback = build_pulse_playback(artifact)
         return SimulatedPulseReceipt(
             session.artifact_digest,
-            "Zou_lab_control.VirtualSequencer",
+            "zlc_neutral_atom.target.VirtualSequencer",
             counts,
             playback.logical_duration,
             artifact.max_configured_output_delay_ticks / artifact.target_ir.clock_hz,
         )
 
-    def _backend_set_safe_state(self) -> object:
+    def _backend_set_safe_state(self, _timeout_seconds: float) -> object:
         self._sequencer.set_safe_state()
         return dict(self._sequencer.snapshot())
 
@@ -505,8 +533,20 @@ class VirtualSequencerExecutionEndpoint:
             {"operation": "SAFE_STATE", "state": snapshot.get("state")}
         )
 
+    def _backend_verify_safe_state(self) -> SafeStateAck:
+        snapshot = dict(self._sequencer.snapshot())
+        if snapshot.get("state") != "safe":
+            raise RuntimeError("virtual sequencer is not in its safe state")
+        if self._sequencer.firing is not None or self._sequencer.last_fired is not None:
+            raise RuntimeError("virtual sequencer still retains an active output")
+        if snapshot.get("prepared_program") is not None:
+            raise RuntimeError("virtual sequencer still retains a prepared program")
+        return SafeStateAck(
+            canonical_digest({"state": "safe", "firing": None})
+        )
 
-class RemotePulseExecutionEndpoint:
+
+class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
     """Typed target endpoint over one current, non-reconnecting pulse RPC owner."""
 
     def __init__(
@@ -518,37 +558,48 @@ class RemotePulseExecutionEndpoint:
     ) -> None:
         if not isinstance(client, RemotePulseExecutionClient):
             raise TypeError("remote endpoint requires RemotePulseExecutionClient")
-        _text(endpoint_label, "endpoint_label")
-        limit = (
-            client.transport_timeout_seconds * 0.9
-            if max_blocking_call_seconds is None
-            else float(max_blocking_call_seconds)
+        limit = _positive_real(
+            (
+                client.transport_timeout_seconds * 0.9
+                if max_blocking_call_seconds is None
+                else max_blocking_call_seconds
+            ),
+            "max_blocking_call_seconds",
         )
-        if limit <= 0 or limit >= client.transport_timeout_seconds:
-            raise ValueError("max blocking call must be shorter than the client transport backstop")
+        if limit >= client.transport_timeout_seconds:
+            raise ValueError(
+                "max blocking call must be shorter than the client transport backstop"
+            )
         snapshot = client.snapshot()
         self._client = client
-        self._endpoint_label = endpoint_label
+        self._endpoint_label = _text(endpoint_label, "endpoint_label")
         self._timeout = limit
         self._target = snapshot.target
         self._clock_hz = snapshot.clock_hz
         self._geometry = snapshot.geometry_fingerprint
         self._server_connection_generation = snapshot.connection_generation
-        self._owner = _SequencerSessionOwner(self)
+        self._owner = _SequencerSessionOwner(
+            self,
+            max_blocking_call_seconds=self._timeout,
+        )
 
     def _backend_capability_snapshot(
-        self, binding: BoundDevice
+        self,
+        binding: BoundDevice,
     ) -> SequencerCapabilitySnapshot:
         snapshot = self._validate_server_connection_generation()
         if snapshot.state not in {"IDLE", "SAFE", "DONE"}:
             raise RuntimeError(
-                f"remote pulse server is not ready for capability probe: {snapshot.state}"
+                "remote pulse server is not ready for capability probe: "
+                f"{snapshot.state}"
             )
         fingerprint = canonical_digest(
             {
                 "contract": "zlc.remote-pulse-execution",
                 "endpoint_label": self._endpoint_label,
-                "server_connection_generation": self._server_connection_generation,
+                "server_connection_generation": (
+                    self._server_connection_generation
+                ),
                 "target_abi_fingerprint": self._target.abi_fingerprint,
                 "clock_hz": self._clock_hz,
                 "geometry_fingerprint": self._geometry,
@@ -564,7 +615,9 @@ class RemotePulseExecutionEndpoint:
             clock_hz=self._clock_hz,
             geometry_fingerprint=self._geometry,
             max_blocking_call_seconds=self._timeout,
-            terminal_evidence_kind=PulseTerminalEvidenceKind.HARDWARE_RAW_REGISTERS,
+            terminal_evidence_kind=(
+                PulseTerminalEvidenceKind.HARDWARE_RAW_REGISTERS
+            ),
             server_connection_generation=self._server_connection_generation,
             capability_fingerprint=fingerprint,
         )
@@ -581,10 +634,7 @@ class RemotePulseExecutionEndpoint:
         if artifact.wire_image.geometry_fingerprint != self._geometry:
             raise ValueError("compiled wire geometry differs from remote sequencer")
 
-    def _backend_prepare(
-        self,
-        session: _EndpointSession,
-    ) -> PreparedPulseRef:
+    def _backend_prepare(self, session: _EndpointSession) -> PreparedPulseRef:
         return self._client.prepare(session.request.artifact)
 
     def _backend_fire(self, session: _EndpointSession) -> None:
@@ -605,8 +655,8 @@ class RemotePulseExecutionEndpoint:
             raise RuntimeError("remote sequencer session has no prepared reference")
         return self._client.complete(reference, timeout=timeout_seconds)
 
-    def _backend_set_safe_state(self) -> object:
-        return self._client.safe_state()
+    def _backend_set_safe_state(self, timeout_seconds: float) -> object:
+        return self._client.safe_state(timeout=timeout_seconds)
 
     def _backend_close_evidence(
         self,
@@ -616,7 +666,9 @@ class RemotePulseExecutionEndpoint:
         return True, canonical_digest(
             {
                 "session_id": session_id,
-                "server_connection_generation": self._server_connection_generation,
+                "server_connection_generation": (
+                    self._server_connection_generation
+                ),
                 "state": snapshot.state,
                 "backend": snapshot.backend,
             }
@@ -626,9 +678,27 @@ class RemotePulseExecutionEndpoint:
         return canonical_digest(
             {
                 "operation": "SAFE_STATE",
-                "server_connection_generation": self._server_connection_generation,
+                "server_connection_generation": (
+                    self._server_connection_generation
+                ),
                 "state": snapshot.state,
             }
+        )
+
+    def _backend_verify_safe_state(self) -> SafeStateAck:
+        snapshot = self._validate_server_connection_generation()
+        if snapshot.state != "SAFE" or snapshot.prepared_ref is not None:
+            raise RuntimeError("remote pulse server has not published SAFE")
+        return SafeStateAck(
+            canonical_digest(
+                {
+                    "server_connection_generation": (
+                        self._server_connection_generation
+                    ),
+                    "state": snapshot.state,
+                    "prepared_ref": None,
+                }
+            )
         )
 
     def _validate_server_connection_generation(self):
@@ -640,8 +710,11 @@ class RemotePulseExecutionEndpoint:
             or snapshot.clock_hz != self._clock_hz
             or snapshot.geometry_fingerprint != self._geometry
         ):
-            raise RuntimeError("remote pulse server capability changed within one connection")
+            raise RuntimeError(
+                "remote pulse server capability changed within one connection"
+            )
         return snapshot
+
 
 __all__ = [
     "RemotePulseExecutionEndpoint",

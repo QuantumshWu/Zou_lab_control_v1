@@ -5,8 +5,9 @@ python.exe is not available from PowerShell:
 
     %run ../install_current_kernel.py
 
-It mirrors the important parts of ``install_requirements.bat``: requirements,
-editable package install, Jupyter kernel registration, and ``.zlc_python_path``.
+It mirrors the important parts of ``install_requirements.bat``: editable
+installation with the declared project extras, Jupyter kernel registration,
+and ``.zlc_python_path``.
 """
 
 from __future__ import annotations
@@ -17,8 +18,8 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parent
-REQUIREMENTS = ROOT / "requirements.txt"
 PYTHON_PATH_RECORD = ROOT / ".zlc_python_path"
+FULL_EDITABLE = f"{ROOT}[notebook,workbench,hardware,docs]"
 
 
 def run(*args: str) -> None:
@@ -32,8 +33,7 @@ except Exception:
     run("-m", "ensurepip", "--upgrade")
 
 run("-m", "pip", "install", "--upgrade", "pip")
-run("-m", "pip", "install", "-r", str(REQUIREMENTS))
-run("-m", "pip", "install", "-e", str(ROOT))
+run("-m", "pip", "install", "-e", FULL_EDITABLE)
 PYTHON_PATH_RECORD.write_text(sys.executable, encoding="utf-8")
 run(
     "-m",

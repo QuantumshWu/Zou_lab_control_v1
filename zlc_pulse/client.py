@@ -119,6 +119,7 @@ class RemotePulseExecutionClient:
         self._root = root
         self._interrupt_root = interrupt_root
         self._transport_timeout = timeout
+        self._safe_state_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._closed = False
         snapshot = self.snapshot()
@@ -219,17 +220,49 @@ class RemotePulseExecutionClient:
             raise RuntimeError("pulse completion belongs to another prepared reference")
         return completion
 
-    def safe_state(self) -> PulseServerSnapshot:
-        self._require_open()
-        snapshot = pulse_server_snapshot_from_tree(
-            decode(
-                bytes(
-                    self._interrupt_root.current_interrupt_safe_state(
-                        self._generation
-                    )
-                )
-            )
+    def safe_state(self, *, timeout: float | None = None) -> PulseServerSnapshot:
+        """Enter SAFE through the interrupt connection within a logical deadline.
+
+        The transport timeout is only a final socket backstop.  Callers own the
+        shorter operation deadline; if it expires, client authority is revoked
+        and both local streams are severed so a late reply cannot be accepted.
+        The server coalesces the resulting disconnect SAFE with the in-flight
+        generation-bound SAFE request.
+        """
+
+        logical_timeout = (
+            self._transport_timeout * 0.9
+            if timeout is None
+            else float(timeout)
         )
+        if not math.isfinite(logical_timeout) or logical_timeout <= 0:
+            raise ValueError("safe_state timeout must be finite and positive")
+        if logical_timeout >= self._transport_timeout:
+            raise ValueError(
+                "safe_state timeout must be shorter than the transport backstop"
+            )
+        with self._safe_state_lock:
+            return self._safe_state_owned(logical_timeout)
+
+    def _safe_state_owned(self, logical_timeout: float) -> PulseServerSnapshot:
+        self._require_open()
+        try:
+            import rpyc
+            from rpyc.core.async_ import AsyncResultTimeout
+        except ImportError as exc:  # pragma: no cover - deployment dependency
+            raise RuntimeError("remote pulse execution requires rpyc") from exc
+        try:
+            pending = rpyc.timed(
+                self._interrupt_root.current_interrupt_safe_state,
+                logical_timeout,
+            )(self._generation)
+            payload = pending.value
+        except AsyncResultTimeout as exc:
+            self._abort_connections()
+            raise TimeoutError(
+                "remote pulse safe_state exceeded its logical deadline"
+            ) from exc
+        snapshot = pulse_server_snapshot_from_tree(decode(bytes(payload)))
         if snapshot.connection_generation != self._generation:
             raise RuntimeError("interrupt safe_state returned another connection generation")
         if snapshot.state != "SAFE" or snapshot.prepared_ref is not None:
@@ -237,25 +270,48 @@ class RemotePulseExecutionClient:
         return snapshot
 
     def close(self) -> None:
+        with self._safe_state_lock:
+            with self._close_lock:
+                if self._closed:
+                    return
+            try:
+                self._safe_state_owned(self._transport_timeout * 0.9)
+            finally:
+                self._close_connections()
+
+    def _abort_connections(self) -> None:
+        """Revoke both local transports without waiting for remote replies."""
+
         with self._close_lock:
             if self._closed:
                 return
-            try:
-                self.safe_state()
-            finally:
-                self._closed = True
-                close = getattr(self._connection, "close", None)
+            self._closed = True
+        for connection in (self._connection, self._interrupt_connection):
+            channel = getattr(connection, "_channel", None)
+            abort = getattr(channel, "close", None)
+            if callable(abort):
                 try:
-                    if callable(close):
-                        close()
-                finally:
-                    close_interrupt = getattr(
-                        self._interrupt_connection,
-                        "close",
-                        None,
-                    )
-                    if callable(close_interrupt):
-                        close_interrupt()
+                    abort()
+                except Exception:
+                    pass
+
+    def _close_connections(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        close = getattr(self._connection, "close", None)
+        try:
+            if callable(close):
+                close()
+        finally:
+            close_interrupt = getattr(
+                self._interrupt_connection,
+                "close",
+                None,
+            )
+            if callable(close_interrupt):
+                close_interrupt()
 
     def _validate_reference(self, reference: PreparedPulseRef) -> None:
         self._require_open()

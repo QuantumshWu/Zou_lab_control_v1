@@ -1481,8 +1481,22 @@ class RunController:
         *,
         cancel_join_timeout: float = 5.0,
     ) -> FinalT:
+        return self.wait(
+            self.start(plan),
+            cancel_join_timeout=cancel_join_timeout,
+        )
+
+    def wait(
+        self,
+        handle: RunHandle[FinalT],
+        *,
+        cancel_join_timeout: float = 5.0,
+    ) -> FinalT:
+        """Wait for one admitted Run while owning notebook interrupt semantics."""
+
+        if not isinstance(handle, RunHandle):
+            raise TypeError("handle must be RunHandle")
         timeout = finite_real(cancel_join_timeout, "cancel_join_timeout", minimum=0.0)
-        handle = self.start(plan)
         try:
             return handle.result()
         except KeyboardInterrupt:

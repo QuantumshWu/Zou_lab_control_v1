@@ -79,7 +79,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo Installing Python packages from requirements.txt into this kernel...
+echo Installing this repository and its declared notebook/workbench/hardware/docs extras...
 %PYTHON_CMD% -m pip install --upgrade pip
 if errorlevel 1 (
     echo.
@@ -88,21 +88,11 @@ if errorlevel 1 (
     echo Continuing with the existing pip.
 )
 
-%PYTHON_CMD% -m pip install -r "%~dp0requirements.txt"
-if errorlevel 1 (
-    echo.
-    echo Normal install failed. Retrying with --user to avoid Windows permission error 5...
-    %PYTHON_CMD% -m pip install --user -r "%~dp0requirements.txt"
-    if errorlevel 1 goto install_failed
-)
-
-echo.
-echo Installing this repository in editable mode...
-%PYTHON_CMD% -m pip install -e "%~dp0."
+%PYTHON_CMD% -m pip install -e "%~dp0.[notebook,workbench,hardware,docs]"
 if errorlevel 1 (
     echo.
     echo Normal editable install failed. Retrying with --user...
-    %PYTHON_CMD% -m pip install --user -e "%~dp0."
+    %PYTHON_CMD% -m pip install --user -e "%~dp0.[notebook,workbench,hardware,docs]"
     if errorlevel 1 goto install_failed
 )
 
@@ -140,7 +130,7 @@ echo Usage:
 echo   install_requirements.bat
 echo   install_requirements.bat C:\path\to\python.exe
 echo.
-echo The script installs requirements.txt, installs this repo with pip install -e .,
+echo The script installs this repo with its declared pyproject extras,
 echo registers the Jupyter kernel, and writes .zlc_python_path for pulse_gui.bat.
 exit /b 0
 
