@@ -10,6 +10,7 @@ every layer.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from enum import Enum
 from typing import TypeAlias
@@ -322,6 +323,9 @@ class _ResolvedCalibrationSource:
 def _resolve_calibration_source(
     capture: object,
     layout: CalibrationCaptureLayout,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+    physical_memory_limit_bytes: int | None = None,
 ) -> _ResolvedCalibrationSource:
     """Resolve source lineage, physical contract, and sparse event join once."""
 
@@ -360,6 +364,8 @@ def _resolve_calibration_source(
             capture,
             layout,
             contract,
+            checkpoint=checkpoint,
+            physical_memory_limit_bytes=physical_memory_limit_bytes,
         ),
         join,
     )
@@ -368,14 +374,19 @@ def _resolve_calibration_source(
 def _validate_calibration_artifact_source_compatibility(
     artifact: "CalibrationArtifact",
     capture: object,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+    physical_memory_limit_bytes: int | None = None,
 ) -> _ResolvedCalibrationSource:
-    """Re-admit the declared raw capture and compare its physical contract."""
+    """Compare one admitted source while honoring cancellation/resource bounds."""
 
     if not isinstance(artifact, CalibrationArtifact):
         raise TypeError("artifact must be CalibrationArtifact")
     resolved = _resolve_calibration_source(
         capture,
         artifact.source_binding.layout,
+        checkpoint=checkpoint,
+        physical_memory_limit_bytes=physical_memory_limit_bytes,
     )
     if resolved.source_binding != artifact.source_binding:
         raise ValueError("calibration source differs from the resolved capture")
@@ -392,6 +403,9 @@ def derive_calibration_readout_physical_context(
     capture: object,
     layout: CalibrationCaptureLayout,
     frame_contract: FrameContract,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+    physical_memory_limit_bytes: int | None = None,
 ) -> ReadoutPhysicalContext:
     """Derive calibration applicability only from admitted pulse/camera lineage."""
 
@@ -422,6 +436,8 @@ def derive_calibration_readout_physical_context(
         readout_event_index=layout.readout_event_index,
         integration_start_offset_seconds=integration_offset,
         integration_seconds=frame_contract.exposure_seconds,
+        checkpoint=checkpoint,
+        physical_memory_limit_bytes=physical_memory_limit_bytes,
     )
 
 
@@ -681,12 +697,21 @@ class CalibrationArtifact:
         raise KeyError(selected)
 
 
-@dataclass(frozen=True, init=False)
-class ResolvedCalibration:
-    """A repository-resolved artifact and the durable reference it came from."""
+_RESOLVED_CALIBRATION_TOKEN = object()
 
-    reference: CalibrationArtifactRef
-    artifact: CalibrationArtifact
+
+class ResolvedCalibration:
+    """Process-local proof that one exact calibration target was committed."""
+
+    __slots__ = (
+        "_token",
+        "_repository_token",
+        "_reference",
+        "_artifact",
+    )
+
+    def __init_subclass__(cls, **_kwargs) -> None:
+        raise TypeError("ResolvedCalibration is final and cannot be subclassed")
 
     def __init__(self, *_args, **_kwargs) -> None:
         raise TypeError(
@@ -694,20 +719,68 @@ class ResolvedCalibration:
             "reference/artifact pairs cannot be assembled by callers"
         )
 
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("ResolvedCalibration is immutable")
+
+    def __reduce__(self):
+        raise TypeError("ResolvedCalibration is process-local and cannot be serialized")
+
+    def __reduce_ex__(self, _protocol: int):
+        raise TypeError("ResolvedCalibration is process-local and cannot be serialized")
+
     @classmethod
     def _from_admission(
         cls,
+        token: object,
+        *,
+        repository_token: object,
         reference: CalibrationArtifactRef,
         artifact: CalibrationArtifact,
     ) -> "ResolvedCalibration":
+        if token is not _RESOLVED_CALIBRATION_TOKEN:
+            raise PermissionError(
+                "ResolvedCalibration can only be minted by CalibrationRepository.admit"
+            )
+        if repository_token is None:
+            raise ValueError("ResolvedCalibration repository authority is absent")
         if not isinstance(reference, CalibrationArtifactRef):
             raise TypeError("reference must be CalibrationArtifactRef")
         if not isinstance(artifact, CalibrationArtifact):
             raise TypeError("artifact must be CalibrationArtifact")
         resolved = object.__new__(cls)
-        object.__setattr__(resolved, "reference", reference)
-        object.__setattr__(resolved, "artifact", artifact)
+        object.__setattr__(resolved, "_token", token)
+        object.__setattr__(resolved, "_repository_token", repository_token)
+        object.__setattr__(resolved, "_reference", reference)
+        object.__setattr__(resolved, "_artifact", artifact)
         return resolved
+
+    def _require_authority(self) -> None:
+        if (
+            type(self) is not ResolvedCalibration
+            or self._token is not _RESOLVED_CALIBRATION_TOKEN
+            or self._repository_token is None
+        ):
+            raise PermissionError("ResolvedCalibration authority is invalid")
+
+    @property
+    def reference(self) -> CalibrationArtifactRef:
+        self._require_authority()
+        return self._reference
+
+    @property
+    def artifact(self) -> CalibrationArtifact:
+        self._require_authority()
+        return self._artifact
+
+    def _matches_admission(self, other: object) -> bool:
+        self._require_authority()
+        if type(other) is not ResolvedCalibration:
+            return False
+        other._require_authority()
+        return (
+            self._repository_token is other._repository_token
+            and self._reference == other._reference
+        )
 
 
 @dataclass(frozen=True)
@@ -966,7 +1039,13 @@ def apply_calibration(
 
 
 def calibration_retained_array_nbytes(artifact: CalibrationArtifact) -> int:
-    """Count the immutable arrays actually retained by one artifact."""
+    """Return a codec-stable upper bound for retained logical array payloads.
+
+    In-memory analysis may share one immutable validity array between several
+    fields, while a canonical decode is free to reconstruct equal fields as
+    distinct arrays.  Resource admission therefore counts every persisted
+    logical field instead of depending on process-local ndarray identity.
+    """
 
     if not isinstance(artifact, CalibrationArtifact):
         raise TypeError("artifact must be CalibrationArtifact")
@@ -987,14 +1066,7 @@ def calibration_retained_array_nbytes(artifact: CalibrationArtifact) -> int:
             arrays.append(model.feature.kernels)
         elif isinstance(model.feature, UniformPsfFeature):
             arrays.append(model.feature.kernel)
-    seen: set[int] = set()
-    total = 0
-    for array in arrays:
-        owner = id(array)
-        if owner not in seen:
-            seen.add(owner)
-            total += int(array.nbytes)
-    return total
+    return sum(int(array.nbytes) for array in arrays)
 
 
 def readout_runtime_scratch_nbytes(

@@ -200,10 +200,13 @@ def estimate_calibration_analysis_peak_bytes(
         + lattice_slope_working_set
         + site_object_working_set
     )
-    # Publication deliberately performs a fresh source admission.  At that
-    # boundary the report remains live while the compact join is rebuilt, so
-    # its retained arrays/object graphs must overlap the join-build peak even
-    # though scientific scratch has already been released.
+    # The authority-bearing result remains live through canonical staging.
+    # Full-resolution diagnostic images are raw CAS blobs, so staging adds one
+    # exact image/mask byte copy rather than base64 amplification.  All other
+    # artifact/report arrays do pass through canonical ndarray normalization,
+    # base64, JSON, and a writer-side decode round-trip; eight times their
+    # retained footprint conservatively covers that overlap without pretending
+    # the raw diagnostic image uses the same path.
     retained_result = int(
         group_contexts_working_set
         + pixels * 16
@@ -215,8 +218,14 @@ def estimate_calibration_analysis_peak_bytes(
         + site_admission_working_set
         + site_object_working_set
     )
-    finalize_peak = join_build_peak + retained_result
-    return max(join_build_peak, analysis_peak, finalize_peak)
+    non_image_result = max(0, retained_result - pixels * 16)
+    staging_peak = (
+        join_retained
+        + retained_result
+        + pixels * 9
+        + 8 * non_image_result
+    )
+    return max(join_build_peak, analysis_peak, staging_peak)
 
 
 @dataclass(frozen=True)
@@ -728,14 +737,35 @@ class CalibrationAnalysisResult:
 
     artifact: CalibrationArtifact
     report: CalibrationReport
+    _token: object = field(repr=False, compare=False)
     _source_admission: object = field(repr=False, compare=False)
+    _source_resolution: _ResolvedCalibrationSource = field(
+        repr=False,
+        compare=False,
+    )
+    _memory_admission_peak_bytes: int = field(repr=False, compare=False)
+    _context_codec_workspace_upper_bound_bytes: int = field(
+        repr=False,
+        compare=False,
+    )
+    _memory_admission_limit_bytes: int = field(repr=False, compare=False)
 
     def __init_subclass__(cls, **_kwargs) -> None:
         raise TypeError("CalibrationAnalysisResult is final and cannot be subclassed")
 
     def __init__(self, *_args, **_kwargs) -> None:
         raise TypeError(
-            "CalibrationAnalysisResult is returned by analyze_calibration"
+            "CalibrationAnalysisResult is returned by a committed calibration Run"
+        )
+
+    def __reduce__(self):
+        raise TypeError(
+            "CalibrationAnalysisResult is process-local and cannot be serialized"
+        )
+
+    def __reduce_ex__(self, _protocol: int):
+        raise TypeError(
+            "CalibrationAnalysisResult is process-local and cannot be serialized"
         )
 
     @classmethod
@@ -744,36 +774,109 @@ class CalibrationAnalysisResult:
         token: object,
         computation: CalibrationComputation,
         source: object,
+        resolved: _ResolvedCalibrationSource,
+        memory_admission_peak_bytes: int,
+        context_codec_workspace_upper_bound_bytes: int,
+        memory_admission_limit_bytes: int,
     ) -> "CalibrationAnalysisResult":
         from zlc_neutral_atom.artifacts.capture import AdmittedCapture
 
         if token is not _ADMITTED_ANALYSIS_TOKEN:
             raise PermissionError(
-                "admitted calibration results are minted by analyze_calibration"
+                "admitted calibration results are minted by the calibration Run"
             )
         if not isinstance(computation, CalibrationComputation):
             raise TypeError("computation must be CalibrationComputation")
         if type(source) is not AdmittedCapture:
             raise TypeError("source must be an exact AdmittedCapture")
+        if not isinstance(resolved, _ResolvedCalibrationSource):
+            raise TypeError("resolved must be _ResolvedCalibrationSource")
+        memory_peak = _positive_integer(
+            memory_admission_peak_bytes,
+            "memory_admission_peak_bytes",
+        )
+        memory_limit = _positive_integer(
+            memory_admission_limit_bytes,
+            "memory_admission_limit_bytes",
+        )
+        context_workspace = _positive_integer(
+            context_codec_workspace_upper_bound_bytes,
+            "context_codec_workspace_upper_bound_bytes",
+        )
+        if memory_peak > memory_limit:
+            raise MemoryError("calibration result exceeds its memory admission")
+        if context_workspace > memory_peak:
+            raise ValueError("calibration codec proof exceeds its whole-run peak")
         if computation.artifact.source_binding.source_capture_ref != source.reference:
             raise ValueError("calibration result names another admitted capture")
+        if computation.artifact.source_binding != resolved.source_binding or (
+            computation.artifact.frame_contract != resolved.frame_contract
+        ) or (
+            computation.artifact.readout_physical_context
+            != resolved.readout_physical_context
+        ):
+            raise ValueError(
+                "calibration result differs from its admitted source resolution"
+            )
         result = object.__new__(cls)
         object.__setattr__(result, "artifact", computation.artifact)
         object.__setattr__(result, "report", computation.report)
+        object.__setattr__(result, "_token", token)
         object.__setattr__(result, "_source_admission", source)
+        object.__setattr__(result, "_source_resolution", resolved)
+        object.__setattr__(result, "_memory_admission_peak_bytes", memory_peak)
+        object.__setattr__(
+            result,
+            "_context_codec_workspace_upper_bound_bytes",
+            context_workspace,
+        )
+        object.__setattr__(result, "_memory_admission_limit_bytes", memory_limit)
         return result
 
-    def _require_source_admission(self, source: object) -> None:
-        """Require the exact capture repository/journal authority used in analysis."""
+    def _source_for_commit(
+        self,
+    ) -> tuple[object, _ResolvedCalibrationSource, int, int, int]:
+        """Return the exact retained input after validating result authority."""
 
         from zlc_neutral_atom.artifacts.capture import AdmittedCapture
 
+        if type(self) is not CalibrationAnalysisResult or (
+            self._token is not _ADMITTED_ANALYSIS_TOKEN
+        ):
+            raise PermissionError("calibration result authority is invalid")
+        source = self._source_admission
         if type(source) is not AdmittedCapture:
-            raise TypeError("source must be an exact AdmittedCapture")
-        if not self._source_admission._matches_admission(source):
+            raise PermissionError("calibration result source authority is invalid")
+        source._require_authority()
+        if self.artifact.source_binding.source_capture_ref != source.reference:
+            raise PermissionError("calibration result source changed after analysis")
+        resolved = self._source_resolution
+        if not isinstance(resolved, _ResolvedCalibrationSource) or (
+            self.artifact.source_binding != resolved.source_binding
+        ) or self.artifact.frame_contract != resolved.frame_contract or (
+            self.artifact.readout_physical_context
+            != resolved.readout_physical_context
+        ):
             raise PermissionError(
-                "calibration result belongs to another source admission"
+                "calibration result source resolution changed after analysis"
             )
+        peak = _positive_integer(
+            self._memory_admission_peak_bytes,
+            "memory_admission_peak_bytes",
+        )
+        limit = _positive_integer(
+            self._memory_admission_limit_bytes,
+            "memory_admission_limit_bytes",
+        )
+        if peak > limit:
+            raise PermissionError("calibration memory admission is inconsistent")
+        context_workspace = _positive_integer(
+            self._context_codec_workspace_upper_bound_bytes,
+            "context_codec_workspace_upper_bound_bytes",
+        )
+        if context_workspace > peak:
+            raise PermissionError("calibration codec admission is inconsistent")
+        return source, resolved, peak, context_workspace, limit
 
 def _gaussian_2d(coords, offset, amplitude, x0, y0, sigma_x, sigma_y):
     x, y = coords
@@ -2098,7 +2201,7 @@ def _calibrate_readout_frames(
 
     This path is for deterministic physics tests and offline diagnostics.  A
     durable calibration must be recomputed from an ``AdmittedCapture`` through
-    :func:`analyze_calibration`; caller-supplied lineage never becomes commit
+    the flat calibration RunPlan; caller-supplied lineage never becomes commit
     authority.
     """
 
@@ -2270,6 +2373,10 @@ def _analyze_calibration_resolved(
     source: object,
     request: CalibrationAnalysisRequest,
     resolved: _ResolvedCalibrationSource,
+    *,
+    memory_admission_peak_bytes: int,
+    context_codec_workspace_upper_bound_bytes: int,
+    memory_admission_limit_bytes: int,
 ) -> CalibrationAnalysisResult:
     from zlc_neutral_atom.artifacts.capture import AdmittedCapture
 
@@ -2289,23 +2396,11 @@ def _analyze_calibration_resolved(
         _ADMITTED_ANALYSIS_TOKEN,
         computation,
         source,
+        resolved,
+        memory_admission_peak_bytes,
+        context_codec_workspace_upper_bound_bytes,
+        memory_admission_limit_bytes,
     )
-
-
-def analyze_calibration(
-    source: object,
-    request: CalibrationAnalysisRequest,
-) -> CalibrationAnalysisResult:
-    """Analyze one repository-admitted capture into a submittable result."""
-
-    from zlc_neutral_atom.artifacts.capture import AdmittedCapture
-
-    if type(source) is not AdmittedCapture:
-        raise TypeError("calibration analysis requires an exact AdmittedCapture")
-    if not isinstance(request, CalibrationAnalysisRequest):
-        raise TypeError("request must be CalibrationAnalysisRequest")
-    resolved = _resolve_calibration_source(source.artifact, request.layout)
-    return _analyze_calibration_resolved(source, request, resolved)
 
 
 __all__ = [
@@ -2320,7 +2415,6 @@ __all__ = [
     "ReferenceLabels",
     "SiteFidelity",
     "TrainTestSplit",
-    "analyze_calibration",
     "characterize_readout",
     "compute_calibration",
     "estimate_calibration_analysis_peak_bytes",

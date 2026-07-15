@@ -14,6 +14,7 @@ from zlc_neutral_atom.installation import (
     DeviceCatalogView,
 )
 from zlc_data import (
+    READOUT_EVENT,
     AxisId,
     BlockId,
     CommittedTransform,
@@ -41,6 +42,7 @@ from zlc_neutral_atom.readout.calibration import (
     ResolvedCalibration,
 )
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
+from zlc_neutral_atom.readout.occupancy_reference import OccupancyArtifactRef
 from zlc_neutral_atom.readout.contracts import (
     CalibrationCaptureLayout,
     ReadoutBindingKey,
@@ -67,10 +69,14 @@ if TYPE_CHECKING:
     from zlc_neutral_atom.readout.calibration_repository import (
         CalibrationRepository,
     )
+    from zlc_neutral_atom.readout.occupancy import ResolvedOccupancy
+    from zlc_neutral_atom.readout.occupancy_repository import OccupancyRepository
 
 
 _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_CALIBRATION_TIMEOUT_SECONDS = 300.0
+_DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES = 512 << 20
+_DEFAULT_OCCUPANCY_TIMEOUT_SECONDS = 300.0
 
 
 class _ResourceCleanupError(RuntimeError):
@@ -211,6 +217,41 @@ class CalibrationArtifactRequest:
 
 
 @dataclass(frozen=True)
+class DetectionRequest:
+    """Freeze two committed inputs and one concrete occupancy model."""
+
+    source_capture_ref: CaptureArtifactRef
+    calibration_ref: CalibrationArtifactRef
+    readout_binding: ReadoutBindingKey
+    readout_event_axis_id: AxisId
+    model_kind: ReadoutModelKind
+    memory_limit_bytes: int = _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES
+    timeout_seconds: float = _DEFAULT_OCCUPANCY_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_capture_ref, CaptureArtifactRef):
+            raise TypeError("source_capture_ref must be CaptureArtifactRef")
+        if not isinstance(self.calibration_ref, CalibrationArtifactRef):
+            raise TypeError("calibration_ref must be CalibrationArtifactRef")
+        if not isinstance(self.readout_binding, ReadoutBindingKey):
+            raise TypeError("readout_binding must be ReadoutBindingKey")
+        if not isinstance(self.readout_event_axis_id, AxisId):
+            raise TypeError("readout_event_axis_id must be AxisId")
+        if not isinstance(self.model_kind, ReadoutModelKind):
+            raise TypeError("model_kind must be a concrete ReadoutModelKind")
+        object.__setattr__(
+            self,
+            "memory_limit_bytes",
+            _positive_int(self.memory_limit_bytes, "memory_limit_bytes"),
+        )
+        object.__setattr__(
+            self,
+            "timeout_seconds",
+            _positive_real(self.timeout_seconds, "timeout_seconds"),
+        )
+
+
+@dataclass(frozen=True)
 class TimingTargetDescriptor:
     target: PulseTarget
     clock_hz: float
@@ -255,6 +296,8 @@ class _ExperimentServices:
     capture_repository: CaptureRepository
     calibration_repository_path: Path
     calibration_repository: "CalibrationRepository | None"
+    occupancy_repository_path: Path
+    occupancy_repository: "OccupancyRepository | None"
     fit_repository: CaptureFitResultRepository
     catalog: DeviceCatalogView
     operation_lock: threading.RLock
@@ -297,6 +340,20 @@ def _calibration_repository(
 
         repository = CalibrationRepository(services.calibration_repository_path)
         services.calibration_repository = repository
+    return repository
+
+
+def _occupancy_repository(
+    services: _ExperimentServices,
+) -> "OccupancyRepository":
+    repository = services.occupancy_repository
+    if repository is None:
+        from zlc_neutral_atom.readout.occupancy_repository import (
+            OccupancyRepository,
+        )
+
+        repository = OccupancyRepository(services.occupancy_repository_path)
+        services.occupancy_repository = repository
     return repository
 
 
@@ -434,22 +491,27 @@ class ReadoutFacade:
         memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
         timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS,
     ) -> CalibrationArtifactRequest:
-        """Bind explicit calibration intent to an admitted raw capture."""
+        """Freeze explicit calibration intent from one FINAL capture inspection."""
 
         if not isinstance(source, CaptureArtifactRef):
             raise TypeError("source must be CaptureArtifactRef")
         if not isinstance(analysis, CalibrationAnalysisRequest):
             raise TypeError("analysis must be CalibrationAnalysisRequest")
+        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        timeout = _positive_real(timeout_seconds, "timeout_seconds")
         with _service_guard(self._token) as services:
-            admitted = services.capture_repository.admit(source)
-            binding = admitted.artifact.camera_provenance.binding
+            inspected = services.capture_repository.inspect_final(
+                source,
+                memory_limit_bytes=memory_limit,
+            )
+            binding = inspected.readout_binding
             self._require_binding(binding)
             return CalibrationArtifactRequest(
                 source,
                 binding,
                 analysis,
-                memory_limit_bytes,
-                timeout_seconds,
+                memory_limit,
+                timeout,
             )
 
     def start_calibration(
@@ -473,11 +535,15 @@ class ReadoutFacade:
     def load_calibration(
         self,
         reference: CalibrationArtifactRef,
+        *,
+        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
     ) -> ResolvedCalibration:
+        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         with _service_guard(self._token) as services:
             resolved = _calibration_repository(services).admit(
                 reference,
                 services.capture_repository,
+                memory_limit_bytes=memory_limit,
             )
             self._require_binding(resolved.artifact.frame_contract.binding)
             return resolved
@@ -485,12 +551,113 @@ class ReadoutFacade:
     def load_calibration_report(
         self,
         reference: CalibrationArtifactRef,
+        *,
+        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
     ) -> "CalibrationReport":
+        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         with _service_guard(self._token) as services:
             repository = _calibration_repository(services)
-            artifact = repository.load(reference)
-            self._require_binding(artifact.frame_contract.binding)
-            return repository.load_report(reference)
+            self._require_binding(
+                repository.inspect_final(
+                    reference,
+                    memory_limit_bytes=memory_limit,
+                ).readout_binding
+            )
+            return repository.load_report(
+                reference,
+                memory_limit_bytes=memory_limit,
+            )
+
+    def detection_request(
+        self,
+        source: CaptureArtifactRef,
+        calibration: CalibrationArtifactRef,
+        *,
+        model_kind: ReadoutModelKind | None = None,
+        memory_limit_bytes: int = _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES,
+        timeout_seconds: float = _DEFAULT_OCCUPANCY_TIMEOUT_SECONDS,
+    ) -> DetectionRequest:
+        """Freeze one committed single-event capture for occupancy analysis."""
+
+        if not isinstance(source, CaptureArtifactRef):
+            raise TypeError("source must be CaptureArtifactRef")
+        if not isinstance(calibration, CalibrationArtifactRef):
+            raise TypeError("calibration must be CalibrationArtifactRef")
+        if model_kind is not None and not isinstance(model_kind, ReadoutModelKind):
+            raise TypeError("model_kind must be ReadoutModelKind or None")
+        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        timeout = _positive_real(timeout_seconds, "timeout_seconds")
+        with _service_guard(self._token) as services:
+            inspected_source = services.capture_repository.inspect_final(
+                source,
+                memory_limit_bytes=memory_limit,
+            )
+            inspected_calibration = _calibration_repository(
+                services
+            ).inspect_final(
+                calibration,
+                memory_limit_bytes=memory_limit,
+            )
+            binding = inspected_source.readout_binding
+            if inspected_calibration.readout_binding != binding:
+                raise ValueError("capture and calibration name different readout bindings")
+            self._require_binding(binding)
+            event_axes = tuple(
+                axis
+                for axis in inspected_source.dataset_schema.point_axes
+                if axis.role == READOUT_EVENT
+            )
+            if len(event_axes) != 1 or event_axes[0].size != 1:
+                raise ValueError(
+                    "detection requires exactly one singleton READOUT_EVENT axis"
+                )
+            selected_model = (
+                inspected_calibration.default_model_kind
+                if model_kind is None
+                else model_kind
+            )
+            if selected_model not in inspected_calibration.model_kinds:
+                raise KeyError(selected_model)
+            return DetectionRequest(
+                source,
+                calibration,
+                binding,
+                event_axes[0].axis_id,
+                selected_model,
+                memory_limit,
+                timeout,
+            )
+
+    def start_detection(self, request: DetectionRequest) -> RunHandle:
+        if not isinstance(request, DetectionRequest):
+            raise TypeError("request must be DetectionRequest")
+        self._require_binding(request.readout_binding)
+        return _start_detection(self._token, request)
+
+    def detect(self, request: DetectionRequest) -> OccupancyArtifactRef:
+        if not isinstance(request, DetectionRequest):
+            raise TypeError("request must be DetectionRequest")
+        self._require_binding(request.readout_binding)
+        return _run_detection(self._token, request)
+
+    def load_occupancy(
+        self,
+        reference: OccupancyArtifactRef,
+        *,
+        memory_limit_bytes: int = _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES,
+    ) -> "ResolvedOccupancy":
+        if not isinstance(reference, OccupancyArtifactRef):
+            raise TypeError("reference must be OccupancyArtifactRef")
+        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        with _service_guard(self._token) as services:
+            resolved = _occupancy_repository(services).admit(
+                reference,
+                services.capture_repository,
+                _calibration_repository(services),
+                memory_limit_bytes=memory_limit,
+            )
+            self._require_binding(resolved.readout_binding)
+            return resolved
 
 
 class Experiment:
@@ -595,6 +762,11 @@ class Experiment:
                 )
             failures = _cleanup_failures(
                 services.fit_repository.close,
+                (
+                    None
+                    if services.occupancy_repository is None
+                    else services.occupancy_repository.close
+                ),
                 (
                     None
                     if services.calibration_repository is None
@@ -768,6 +940,47 @@ def _run_calibration(
     return runtime.wait(handle)
 
 
+def _compile_detection_for_services(
+    services: _ExperimentServices,
+    request: DetectionRequest,
+):
+    if not isinstance(request, DetectionRequest):
+        raise TypeError("request must be DetectionRequest")
+    from zlc_neutral_atom.readout.occupancy_repository import (
+        compile_occupancy_artifact_plan,
+    )
+
+    return compile_occupancy_artifact_plan(
+        request.source_capture_ref,
+        services.capture_repository,
+        request.calibration_ref,
+        _calibration_repository(services),
+        _occupancy_repository(services),
+        expected_readout_binding=request.readout_binding,
+        readout_event_axis_id=request.readout_event_axis_id,
+        model_kind=request.model_kind,
+        memory_limit_bytes=request.memory_limit_bytes,
+        timeout_seconds=request.timeout_seconds,
+    )
+
+
+def _start_detection(token: object, request: DetectionRequest) -> RunHandle:
+    with _service_guard(token) as services:
+        plan = _compile_detection_for_services(services, request)
+        return services.runtime.start(plan)
+
+
+def _run_detection(
+    token: object,
+    request: DetectionRequest,
+) -> OccupancyArtifactRef:
+    with _service_guard(token) as services:
+        plan = _compile_detection_for_services(services, request)
+        handle = services.runtime.start(plan)
+        runtime = services.runtime
+    return runtime.wait(handle)
+
+
 def connect(
     config: str = "virtual",
     *,
@@ -809,13 +1022,15 @@ def connect(
         )
         catalog = runtime.device_catalog
         services = _ExperimentServices(
-            runtime,
-            capture_repository,
-            repository_root / "calibrations",
-            None,
-            fit_repository,
-            catalog,
-            threading.RLock(),
+            runtime=runtime,
+            capture_repository=capture_repository,
+            calibration_repository_path=repository_root / "calibrations",
+            calibration_repository=None,
+            occupancy_repository_path=repository_root / "occupancy",
+            occupancy_repository=None,
+            fit_repository=fit_repository,
+            catalog=catalog,
+            operation_lock=threading.RLock(),
         )
         token = object()
         experiment = Experiment(token, name=canonical_name, device_catalog=catalog)
@@ -851,9 +1066,11 @@ __all__ = [
     "CaptureFitResultArtifactRef",
     "CaptureRequest",
     "connect",
+    "DetectionRequest",
     "Experiment",
     "FitExecution",
     "GridOrder",
+    "OccupancyArtifactRef",
     "PlanDescriptor",
     "ReadoutFacade",
     "ReadoutModelKind",

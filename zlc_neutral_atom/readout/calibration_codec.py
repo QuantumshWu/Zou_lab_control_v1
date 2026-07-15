@@ -9,7 +9,7 @@ module enforces exact field sets, scalar types, and canonical bytes.
 from __future__ import annotations
 
 from numbers import Integral, Real
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -30,16 +30,6 @@ from zlc_storage import (
     exact_mapping as _exact_map,
 )
 
-from .analysis import (
-    AblationPoint,
-    BimodalFit,
-    CalibrationReport,
-    ModelCalibrationReport,
-    PsfFitDiagnostic,
-    ReferenceLabels,
-    SiteFidelity,
-    TrainTestSplit,
-)
 from .calibration import (
     BackgroundMode,
     BoxFeature,
@@ -55,6 +45,18 @@ from .calibration import (
     SiteMap,
     UniformPsfFeature,
 )
+
+if TYPE_CHECKING:
+    from .analysis import (
+        AblationPoint,
+        BimodalFit,
+        CalibrationReport,
+        ModelCalibrationReport,
+        PsfFitDiagnostic,
+        ReferenceLabels,
+        SiteFidelity,
+        TrainTestSplit,
+    )
 from .codec import (
     calibration_capture_layout_from_tree,
     calibration_capture_layout_to_tree,
@@ -62,7 +64,9 @@ from .codec import (
     frame_contract_to_tree,
 )
 from .physical_context import (
+    ReadoutPhysicalContext,
     readout_physical_context_from_tree,
+    readout_physical_context_retained_upper_bound_bytes,
     readout_physical_context_to_tree,
 )
 
@@ -70,6 +74,15 @@ from .physical_context import (
 CALIBRATION_ARTIFACT_FORMAT = "zlc_neutral_atom.calibration-artifact"
 CALIBRATION_REPORT_FORMAT = "zlc_neutral_atom.calibration-report"
 
+_ARTIFACT_DECODE_LIMITS = CanonicalDecodeLimits(
+    max_depth=48,
+    max_nodes=100_000,
+    max_container_entries=50_000,
+    max_arrays=256,
+    max_total_array_bytes=256 * 1024 * 1024,
+)
+_CONTEXT_ROUNDTRIP_FIXED_WORKSPACE_BYTES = 1 << 20
+_CONTEXT_ROUNDTRIP_WORKSPACE_MULTIPLIER = 8
 _REPORT_DECODE_LIMITS = CanonicalDecodeLimits(
     max_depth=64,
     max_nodes=500_000,
@@ -77,6 +90,68 @@ _REPORT_DECODE_LIMITS = CanonicalDecodeLimits(
     max_arrays=4_096,
     max_total_array_bytes=256 * 1024 * 1024,
 )
+
+
+def _json_string_payload_upper_bound(value: str) -> int:
+    """Bound UTF-8 JSON payload bytes for one already-validated text value."""
+
+    total = 0
+    for character in value:
+        if ord(character) < 0x20:
+            total += 6
+        elif character in {'"', "\\"}:
+            total += 2
+        else:
+            total += len(character.encode("utf-8"))
+    return total
+
+
+def estimate_calibration_context_roundtrip_workspace(
+    context: ReadoutPhysicalContext,
+) -> int:
+    """Return the exact-cardinality context workspace bound for final staging."""
+
+    if not isinstance(context, ReadoutPhysicalContext):
+        raise TypeError("context must be ReadoutPhysicalContext")
+    traces = len(context.digital) + len(context.buses)
+    transitions = sum(len(item.transitions) for item in context.digital) + sum(
+        len(item.changes) for item in context.buses
+    )
+    # Primitive context shape before the generic canonical tag expansion.  This
+    # only rejects a context that by itself exhausts the artifact domain; the
+    # complete artifact still receives the codec's normal structural admission.
+    context_nodes = 7 + 4 * traces + 3 * transitions
+    context_entries = 6 + 4 * traces + 3 * transitions
+    if context_nodes >= _ARTIFACT_DECODE_LIMITS.max_nodes or (
+        context_entries >= _ARTIFACT_DECODE_LIMITS.max_container_entries
+    ):
+        raise MemoryError(
+            "readout physical context cannot fit the calibration artifact "
+            "canonical structure domain"
+        )
+    escaped_name_bytes = sum(
+        _json_string_payload_upper_bound(item.output_key)
+        for item in context.digital
+    ) + sum(
+        _json_string_payload_upper_bound(item.bus_name) for item in context.buses
+    )
+    # Names are shared by the semantic pulse/context graph, but tree/JSON/decode
+    # representations duplicate their UTF-8 content.  Keep that duplication in
+    # the codec workspace rather than inflating physical semantic retention.
+    return (
+        _CONTEXT_ROUNDTRIP_FIXED_WORKSPACE_BYTES
+        + _CONTEXT_ROUNDTRIP_WORKSPACE_MULTIPLIER
+        * readout_physical_context_retained_upper_bound_bytes(context)
+        + 8 * escaped_name_bytes
+    )
+
+
+def _analysis_types():
+    """Load report-only scientific values only on a report code path."""
+
+    from . import analysis
+
+    return analysis
 
 
 def _fields(tree: Any, fields: set[str], name: str) -> dict[str, Any]:
@@ -153,12 +228,19 @@ def _component_validity(tree: Any, field: str) -> ComponentValidity:
     return value
 
 
-def _decode_typed(payload: bytes | bytearray | memoryview, parser, projector, name: str):
+def _decode_typed(
+    payload: bytes | bytearray | memoryview,
+    parser,
+    projector,
+    name: str,
+    *,
+    limits: CanonicalDecodeLimits,
+):
     if not isinstance(payload, (bytes, bytearray, memoryview)):
         raise TypeError(f"{name} payload must be bytes-like")
     raw = bytes(payload)
-    value = parser(decode(raw))
-    if encode(projector(value)) != raw:
+    value = parser(decode(raw, limits=limits))
+    if encode(projector(value), limits=limits) != raw:
         raise ValueError(f"{name} payload is typed but non-canonical")
     return value
 
@@ -485,7 +567,8 @@ _BIMODAL_FLOATS = (
 
 
 def _bimodal_to_tree(value: BimodalFit) -> dict[str, Any]:
-    if not isinstance(value, BimodalFit):
+    analysis = _analysis_types()
+    if not isinstance(value, analysis.BimodalFit):
         raise TypeError("value must be BimodalFit")
     tree = {field: _real(getattr(value, field), field) for field in _BIMODAL_FLOATS}
     tree.update(
@@ -498,13 +581,14 @@ def _bimodal_to_tree(value: BimodalFit) -> dict[str, Any]:
 
 
 def _bimodal_from_tree(tree: Any) -> BimodalFit:
+    analysis = _analysis_types()
     data = _fields(
         tree,
         set(_BIMODAL_FLOATS) | {"bright_above", "ok"},
         "bimodal fit",
     )
     values = {field: _real(data[field], field) for field in _BIMODAL_FLOATS}
-    return BimodalFit(
+    return analysis.BimodalFit(
         **values,
         bright_above=_bool(data["bright_above"], "bright_above"),
         ok=_bool(data["ok"], "ok"),
@@ -512,7 +596,8 @@ def _bimodal_from_tree(tree: Any) -> BimodalFit:
 
 
 def _labels_to_tree(value: ReferenceLabels) -> dict[str, Any]:
-    if not isinstance(value, ReferenceLabels):
+    analysis = _analysis_types()
+    if not isinstance(value, analysis.ReferenceLabels):
         raise TypeError("value must be ReferenceLabels")
     return {
         "occupied": value.occupied,
@@ -524,12 +609,13 @@ def _labels_to_tree(value: ReferenceLabels) -> dict[str, Any]:
 
 
 def _labels_from_tree(tree: Any) -> ReferenceLabels:
+    analysis = _analysis_types()
     data = _fields(
         tree,
         {"occupied", "dark", "valid", "fits", "n_reference_shots"},
         "reference labels",
     )
-    return ReferenceLabels(
+    return analysis.ReferenceLabels(
         occupied=_array(data["occupied"], "occupied"),
         dark=_array(data["dark"], "dark"),
         valid=_array(data["valid"], "valid"),
@@ -539,7 +625,8 @@ def _labels_from_tree(tree: Any) -> ReferenceLabels:
 
 
 def _split_to_tree(value: TrainTestSplit) -> dict[str, Any]:
-    if not isinstance(value, TrainTestSplit):
+    analysis = _analysis_types()
+    if not isinstance(value, analysis.TrainTestSplit):
         raise TypeError("value must be TrainTestSplit")
     return {
         "train": value.train,
@@ -550,8 +637,9 @@ def _split_to_tree(value: TrainTestSplit) -> dict[str, Any]:
 
 
 def _split_from_tree(tree: Any) -> TrainTestSplit:
+    analysis = _analysis_types()
     data = _fields(tree, {"train", "test", "seed", "train_fraction"}, "train/test split")
-    return TrainTestSplit(
+    return analysis.TrainTestSplit(
         train=_array(data["train"], "train"),
         test=_array(data["test"], "test"),
         seed=_int(data["seed"], "seed"),
@@ -574,7 +662,8 @@ _SITE_FIDELITY_INTS = ("site", "n_test", "n_train_dark", "n_train_bright")
 
 
 def _site_fidelity_to_tree(value: SiteFidelity) -> dict[str, Any]:
-    if not isinstance(value, SiteFidelity):
+    analysis = _analysis_types()
+    if not isinstance(value, analysis.SiteFidelity):
         raise TypeError("value must be SiteFidelity")
     tree = {field: _real(getattr(value, field), field) for field in _SITE_FIDELITY_FLOATS}
     tree.update({field: _int(getattr(value, field), field) for field in _SITE_FIDELITY_INTS})
@@ -583,18 +672,20 @@ def _site_fidelity_to_tree(value: SiteFidelity) -> dict[str, Any]:
 
 
 def _site_fidelity_from_tree(tree: Any) -> SiteFidelity:
+    analysis = _analysis_types()
     fields = set(_SITE_FIDELITY_FLOATS) | set(_SITE_FIDELITY_INTS) | {"bright_above"}
     data = _fields(tree, fields, "site fidelity")
     values = {field: _real(data[field], field) for field in _SITE_FIDELITY_FLOATS}
     values.update({field: _int(data[field], field) for field in _SITE_FIDELITY_INTS})
-    return SiteFidelity(
+    return analysis.SiteFidelity(
         **values,
         bright_above=_bool(data["bright_above"], "bright_above"),
     )
 
 
 def _ablation_to_tree(value: AblationPoint) -> dict[str, Any]:
-    if not isinstance(value, AblationPoint):
+    analysis = _analysis_types()
+    if not isinstance(value, analysis.AblationPoint):
         raise TypeError("value must be AblationPoint")
     return {
         "drop_worst_k": value.drop_worst_k,
@@ -606,12 +697,13 @@ def _ablation_to_tree(value: AblationPoint) -> dict[str, Any]:
 
 
 def _ablation_from_tree(tree: Any) -> AblationPoint:
+    analysis = _analysis_types()
     data = _fields(
         tree,
         {"drop_worst_k", "excluded_sites", "fidelity", "errors", "n_valid"},
         "ablation point",
     )
-    return AblationPoint(
+    return analysis.AblationPoint(
         drop_worst_k=_int(data["drop_worst_k"], "drop_worst_k"),
         excluded_sites=_array(data["excluded_sites"], "excluded_sites"),
         fidelity=_real(data["fidelity"], "fidelity"),
@@ -621,7 +713,8 @@ def _ablation_from_tree(tree: Any) -> AblationPoint:
 
 
 def _model_report_to_tree(value: ModelCalibrationReport) -> dict[str, Any]:
-    if not isinstance(value, ModelCalibrationReport):
+    analysis = _analysis_types()
+    if not isinstance(value, analysis.ModelCalibrationReport):
         raise TypeError("value must be ModelCalibrationReport")
     return {
         "kind": value.kind.value,
@@ -643,6 +736,7 @@ def _model_report_to_tree(value: ModelCalibrationReport) -> dict[str, Any]:
 
 
 def _model_report_from_tree(tree: Any) -> ModelCalibrationReport:
+    analysis = _analysis_types()
     fields = {
         "kind",
         "quick_thresholds",
@@ -658,7 +752,7 @@ def _model_report_from_tree(tree: Any) -> ModelCalibrationReport:
         "ablation",
     }
     data = _fields(tree, fields, "model calibration report")
-    return ModelCalibrationReport(
+    return analysis.ModelCalibrationReport(
         kind=_enum(ReadoutModelKind, data["kind"], "kind"),
         quick_thresholds=_array(data["quick_thresholds"], "quick_thresholds"),
         short_signals=_array(data["short_signals"], "short_signals"),
@@ -683,7 +777,8 @@ def _model_report_from_tree(tree: Any) -> ModelCalibrationReport:
 
 
 def _psf_fit_to_tree(value: PsfFitDiagnostic) -> dict[str, Any]:
-    if not isinstance(value, PsfFitDiagnostic):
+    analysis = _analysis_types()
+    if not isinstance(value, analysis.PsfFitDiagnostic):
         raise TypeError("value must be PsfFitDiagnostic")
     return {
         "site": _int(value.site, "site"),
@@ -694,8 +789,9 @@ def _psf_fit_to_tree(value: PsfFitDiagnostic) -> dict[str, Any]:
 
 
 def _psf_fit_from_tree(tree: Any) -> PsfFitDiagnostic:
+    analysis = _analysis_types()
     data = _fields(tree, {"site", "center_xy", "sigma_xy", "fit_ok"}, "PSF fit diagnostic")
-    return PsfFitDiagnostic(
+    return analysis.PsfFitDiagnostic(
         site=_int(data["site"], "site"),
         center_xy=_real_pair(data["center_xy"], "center_xy"),
         sigma_xy=_real_pair(data["sigma_xy"], "sigma_xy"),
@@ -776,7 +872,8 @@ def _report_to_tree(
     reference_average_blob: ContentRef,
     reference_average_validity_blob: ContentRef,
 ) -> dict[str, Any]:
-    if not isinstance(value, CalibrationReport):
+    analysis = _analysis_types()
+    if not isinstance(value, analysis.CalibrationReport):
         raise TypeError("value must be CalibrationReport")
     if not isinstance(reference_average_blob, ContentRef):
         raise TypeError("reference_average_blob must be ContentRef")
@@ -815,10 +912,11 @@ def _report_from_tree(
     reference_average: np.ndarray,
     reference_average_validity: np.ndarray,
 ) -> CalibrationReport:
+    analysis = _analysis_types()
     data = _report_data(tree)
     content_ref_from_tree(data["reference_average_blob"])
     content_ref_from_tree(data["reference_average_validity_blob"])
-    return CalibrationReport(
+    return analysis.CalibrationReport(
         request=_request_from_tree(data["request"]),
         software_lineage=_lineage_from_tree(data["software_lineage"]),
         group_contexts=_group_contexts_from_tree(data["group_contexts"]),
@@ -840,7 +938,7 @@ def _report_from_tree(
 
 
 def encode_calibration_artifact(value: CalibrationArtifact) -> bytes:
-    return encode(_artifact_to_tree(value))
+    return encode(_artifact_to_tree(value), limits=_ARTIFACT_DECODE_LIMITS)
 
 
 def decode_calibration_artifact(
@@ -851,6 +949,7 @@ def decode_calibration_artifact(
         _artifact_from_tree,
         _artifact_to_tree,
         CALIBRATION_ARTIFACT_FORMAT,
+        limits=_ARTIFACT_DECODE_LIMITS,
     )
 
 
@@ -865,7 +964,8 @@ def encode_calibration_report_metadata(
             value,
             reference_average_blob,
             reference_average_validity_blob,
-        )
+        ),
+        limits=_REPORT_DECODE_LIMITS,
     )
 
 
@@ -971,7 +1071,8 @@ def decode_calibration_report(
         reference_average_validity=reference_average_validity,
     )
     if encode(
-        _report_to_tree(report, average_blob, validity_blob)
+        _report_to_tree(report, average_blob, validity_blob),
+        limits=_REPORT_DECODE_LIMITS,
     ) != raw:
         raise ValueError("calibration report payload is typed but non-canonical")
     return report
@@ -987,5 +1088,6 @@ __all__ = [
     "encode_calibration_reference_average",
     "encode_calibration_reference_average_validity",
     "encode_calibration_report_metadata",
+    "estimate_calibration_context_roundtrip_workspace",
     "calibration_report_blob_refs",
 ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from zlc_storage import (
     CanonicalArrayEvent,
@@ -20,6 +21,7 @@ from zlc_storage import (
     decode,
     encode,
     exact_mapping as _exact_map,
+    positive_integer,
     sha256_digest,
 )
 
@@ -83,20 +85,32 @@ from zlc_neutral_atom.timing.lineage import (
 
 from .capture_frames import (
     CaptureFrameSource,
+    _CaptureFrameSourceInspection,
     _FrameResourceExceeded,
+    _inspect_capture_frame_source,
     _load_capture_frame_source,
     _stage_capture_frame_source,
 )
 from zlc_pulse import (
     MAX_COMPILED_PULSE_ARTIFACT_BYTES,
+    CompiledPulseRuntimeSummary,
+    compiled_pulse_runtime_summary,
+    compiled_pulse_runtime_summary_from_tree,
+    compiled_pulse_runtime_summary_to_tree,
     decode_compiled_pulse_artifact,
     encode_compiled_pulse_artifact,
 )
 
+if TYPE_CHECKING:
+    from zlc_data import DatasetSchema
+    from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
 
-CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact"
+
+CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact.v2"
 _CAPTURE_ARTIFACT_KIND = "capture"
 _ADMITTED_CAPTURE_TOKEN = object()
+_CAPTURE_ADMISSION_FIXED_BYTES = 512 * 1024
+_CAPTURE_MANIFEST_DECODE_MULTIPLIER = 8
 
 
 class CaptureResourceExceeded(RuntimeError):
@@ -136,6 +150,113 @@ class CaptureRepositoryResourcePolicy:
             )
 
 DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY = CaptureRepositoryResourcePolicy()
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureArtifactInspection:
+    """FINAL request/preflight facts obtained without decoding pulse IR."""
+
+    reference: CaptureArtifactRef
+    dataset_schema: DatasetSchema
+    readout_binding: ReadoutBindingKey
+    event_count: int
+    max_read_scratch_bytes: int
+    inspection_retained_upper_bound_bytes: int
+    admission_retained_upper_bound_bytes: int
+    admission_decode_peak_upper_bound_bytes: int
+    pulse_runtime_summary: CompiledPulseRuntimeSummary | None
+
+    def __post_init__(self) -> None:
+        from zlc_data import DatasetSchema
+        from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
+
+        if not isinstance(self.reference, CaptureArtifactRef):
+            raise TypeError("reference must be CaptureArtifactRef")
+        if not isinstance(self.dataset_schema, DatasetSchema):
+            raise TypeError("dataset_schema must be DatasetSchema")
+        if not isinstance(self.readout_binding, ReadoutBindingKey):
+            raise TypeError("readout_binding must be ReadoutBindingKey")
+        for field in (
+            "event_count",
+            "max_read_scratch_bytes",
+            "inspection_retained_upper_bound_bytes",
+            "admission_retained_upper_bound_bytes",
+            "admission_decode_peak_upper_bound_bytes",
+        ):
+            value = getattr(self, field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field} must be a non-negative integer")
+        if self.event_count == 0:
+            raise ValueError("event_count must be positive")
+        if (
+            self.admission_decode_peak_upper_bound_bytes
+            < self.admission_retained_upper_bound_bytes
+        ):
+            raise ValueError("capture decode bound is smaller than retained state")
+        if (
+            self.inspection_retained_upper_bound_bytes
+            > self.admission_retained_upper_bound_bytes
+        ):
+            raise ValueError("capture inspection bound exceeds admitted state")
+        if self.pulse_runtime_summary is not None and not isinstance(
+            self.pulse_runtime_summary,
+            CompiledPulseRuntimeSummary,
+        ):
+            raise TypeError(
+                "pulse_runtime_summary must be CompiledPulseRuntimeSummary or None"
+            )
+
+
+_CAPTURE_MANIFEST_FIELDS = {
+    "schema",
+    "repository_id",
+    "frame_index_blob",
+    "compiled_pulse_blob",
+    "compiled_pulse_runtime_summary",
+    "provenance",
+    "terminal",
+    "camera_provenance",
+    "camera_capability_evidence",
+    "camera_arm_spec",
+    "safety_bundle_id",
+    "pulse_evidence",
+}
+
+
+def _decode_capture_manifest(
+    payload: bytes,
+    policy: CaptureRepositoryResourcePolicy,
+) -> dict[str, object]:
+    if not isinstance(payload, bytes):
+        raise TypeError("capture manifest payload must be bytes")
+    if not isinstance(policy, CaptureRepositoryResourcePolicy):
+        raise TypeError("policy must be CaptureRepositoryResourcePolicy")
+    if len(payload) > policy.max_manifest_bytes:
+        raise CaptureResourceExceeded(
+            "capture manifest exceeds repository resource policy"
+        )
+
+    def admit_manifest_structure(events) -> None:
+        if any(isinstance(event, CanonicalArrayEvent) for event in events):
+            raise CaptureResourceExceeded(
+                "capture manifest cannot embed ndarray payloads"
+            )
+
+    return _exact_map(
+        decode(
+            payload,
+            admit_structure=admit_manifest_structure,
+            limits=CanonicalDecodeLimits(
+                max_depth=128,
+                max_nodes=policy.max_canonical_nodes,
+                max_container_entries=policy.max_canonical_container_entries,
+                max_arrays=0,
+                max_total_array_bytes=0,
+            ),
+        ),
+        _CAPTURE_MANIFEST_FIELDS,
+        CAPTURE_ARTIFACT_SCHEMA,
+    )
 
 
 class AdmittedCapture:
@@ -446,6 +567,7 @@ class CaptureRepository:
         object.__setattr__(self, "resource_policy", owned_policy)
         root_lease = RepositoryRootLease(self.root)
         object.__setattr__(self, "_root_lease", root_lease)
+        journal = None
         try:
             # The root lease is deliberately acquired before any content-store,
             # journal, or startup-reconciliation I/O.  A losing second writer
@@ -467,6 +589,8 @@ class CaptureRepository:
             )
             object.__setattr__(self, "_coordinator", coordinator)
         except BaseException:
+            if journal is not None:
+                journal.close()
             root_lease.close()
             raise
         object.__setattr__(self, "_sealed", True)
@@ -482,6 +606,10 @@ class CaptureRepository:
     def close(self) -> None:
         """Close only after every prepared/in-flight commit authority is resolved."""
 
+        coordinator = getattr(self, "_coordinator", None)
+        if coordinator is not None:
+            coordinator.close()
+            return
         root_lease = getattr(self, "_root_lease", None)
         if root_lease is not None:
             root_lease.close()
@@ -502,25 +630,202 @@ class CaptureRepository:
     def load(self, reference: CaptureArtifactRef) -> CaptureArtifact:
         """Fully validate a structurally visible artifact for inspection only."""
 
-        self._require_active()
-        self._validate_ref(reference)
-        try:
-            manifest_payload = self._store_authority.read_manifest(
-                CAPTURE_ARTIFACT_NAMESPACE,
-                reference.manifest_digest,
-                max_bytes=self.resource_policy.max_manifest_bytes,
+        with self._root_lease.borrow() as read_borrow:
+            read_borrow.require_active()
+            self._validate_ref(reference)
+            try:
+                manifest_payload = self._store_authority.read_manifest(
+                    CAPTURE_ARTIFACT_NAMESPACE,
+                    reference.manifest_digest,
+                    max_bytes=self.resource_policy.max_manifest_bytes,
+                )
+            except ContentSizeLimitError as exc:
+                raise CaptureResourceExceeded(
+                    "capture manifest exceeds repository resource policy"
+                ) from exc
+            return self._load_manifest(
+                reference,
+                manifest_payload,
+                store_authority=self._store_authority,
+                policy=self.resource_policy,
+                repository_id=self.repository_id,
             )
-        except ContentSizeLimitError as exc:
-            raise CaptureResourceExceeded(
-                "capture manifest exceeds repository resource policy"
-            ) from exc
-        return self._load_manifest(
-            reference,
-            manifest_payload,
-            store_authority=self._store_authority,
-            policy=self.resource_policy,
-            repository_id=self.repository_id,
+
+    def _committed_intents(
+        self,
+        reference: CaptureArtifactRef,
+    ) -> tuple[CommitIntent, ...]:
+        self._validate_ref(reference)
+        target = CommitTarget(
+            self.repository_id,
+            _CAPTURE_ARTIFACT_KIND,
+            CAPTURE_ARTIFACT_SCHEMA,
+            reference.target_ref,
+            reference.manifest_digest,
         )
+        matching = self._coordinator.committed_for(target)
+        if not matching:
+            raise PermissionError(
+                "CaptureArtifact is visible but has no committed journal authority"
+            )
+        for intent in matching:
+            if intent.commit_id != (
+                f"capture-final-{intent.run_id}-{reference.manifest_digest}"
+            ):
+                raise ValueError(
+                    "committed capture identity differs from its FINAL target"
+                )
+        return matching
+
+    def inspect_final(
+        self,
+        reference: CaptureArtifactRef,
+        *,
+        memory_limit_bytes: int | None = None,
+    ) -> CaptureArtifactInspection:
+        """Read FINAL request/resource facts without decoding compiled pulse IR."""
+
+        memory_limit = (
+            None
+            if memory_limit_bytes is None
+            else positive_integer(memory_limit_bytes, "memory_limit_bytes")
+        )
+        manifest_limit = self.resource_policy.max_manifest_bytes
+        if memory_limit is not None:
+            available = memory_limit - _CAPTURE_ADMISSION_FIXED_BYTES
+            if available < _CAPTURE_MANIFEST_DECODE_MULTIPLIER:
+                raise MemoryError(
+                    "capture inspection fixed state exceeds caller memory limit"
+                )
+            manifest_limit = min(
+                manifest_limit,
+                available // _CAPTURE_MANIFEST_DECODE_MULTIPLIER,
+            )
+        with self._root_lease.borrow() as read_borrow:
+            read_borrow.require_active()
+            self._committed_intents(reference)
+            try:
+                payload = self._store_authority.read_manifest(
+                    CAPTURE_ARTIFACT_NAMESPACE,
+                    reference.manifest_digest,
+                    max_bytes=manifest_limit,
+                )
+            except ContentSizeLimitError as exc:
+                if memory_limit is not None and (
+                    manifest_limit < self.resource_policy.max_manifest_bytes
+                ):
+                    raise MemoryError(
+                        "capture manifest inspection exceeds caller memory limit"
+                    ) from exc
+                raise CaptureResourceExceeded(
+                    "capture manifest exceeds repository resource policy"
+                ) from exc
+            data = _decode_capture_manifest(payload, self.resource_policy)
+            if data["repository_id"] != self.repository_id:
+                raise ValueError("CaptureArtifact belongs to another repository")
+            frame_index_ref = content_ref_from_tree(data["frame_index_blob"])
+            pulse_ref = (
+                None
+                if data["compiled_pulse_blob"] is None
+                else content_ref_from_tree(data["compiled_pulse_blob"])
+            )
+            pulse_summary = (
+                None
+                if data["compiled_pulse_runtime_summary"] is None
+                else compiled_pulse_runtime_summary_from_tree(
+                    data["compiled_pulse_runtime_summary"]
+                )
+            )
+            if (pulse_ref is None) != (pulse_summary is None):
+                raise ValueError(
+                    "compiled-pulse ref and runtime summary presence differ"
+                )
+            if pulse_ref is not None:
+                _require_content_size(
+                    pulse_ref,
+                    self.resource_policy.max_compiled_pulse_blob_bytes,
+                    "compiled-pulse",
+                )
+                assert pulse_summary is not None
+                pulse_summary.require_encoded_size(pulse_ref.size)
+            manifest_peak = (
+                _CAPTURE_ADMISSION_FIXED_BYTES
+                + _CAPTURE_MANIFEST_DECODE_MULTIPLIER * len(payload)
+            )
+            if memory_limit is not None and manifest_peak > memory_limit:
+                raise MemoryError(
+                    "capture manifest inspection exceeds caller memory limit"
+                )
+            frame_memory_limit = (
+                None
+                if memory_limit is None
+                else memory_limit - manifest_peak
+            )
+            if frame_memory_limit is not None and frame_memory_limit < 1:
+                raise MemoryError(
+                    "capture frame inspection exceeds caller memory limit"
+                )
+            try:
+                frame = _inspect_capture_frame_source(
+                    frame_index_ref,
+                    store_authority=self._store_authority,
+                    max_cells=self.resource_policy.max_cells,
+                    max_total_frame_bytes=self.resource_policy.max_total_frame_bytes,
+                    max_chunk_blob_bytes=(
+                        self.resource_policy.max_frame_chunk_blob_bytes
+                    ),
+                    max_frame_index_blob_bytes=(
+                        self.resource_policy.max_frame_index_blob_bytes
+                    ),
+                    max_canonical_nodes=self.resource_policy.max_canonical_nodes,
+                    max_canonical_container_entries=(
+                        self.resource_policy.max_canonical_container_entries
+                    ),
+                    memory_limit_bytes=frame_memory_limit,
+                )
+            except (_FrameResourceExceeded, ContentSizeLimitError) as exc:
+                raise CaptureResourceExceeded(
+                    "capture frame storage exceeds repository resource policy"
+                ) from exc
+            provenance = camera_capture_provenance_from_tree(
+                data["camera_provenance"]
+            )
+            pulse_retained = (
+                0 if pulse_summary is None else pulse_summary.retained_upper_bound_bytes
+            )
+            pulse_decode = (
+                0 if pulse_summary is None else pulse_summary.decode_peak_upper_bound_bytes
+            )
+            retained = (
+                _CAPTURE_ADMISSION_FIXED_BYTES
+                + frame.retained_upper_bound
+                + pulse_retained
+            )
+            inspection_retained = (
+                _CAPTURE_ADMISSION_FIXED_BYTES + frame.retained_upper_bound
+            )
+            decode_peak = max(
+                frame.decode_peak_upper_bound + pulse_retained,
+                frame.retained_upper_bound + pulse_decode,
+            ) + (
+                _CAPTURE_ADMISSION_FIXED_BYTES
+                + _CAPTURE_MANIFEST_DECODE_MULTIPLIER * len(payload)
+            )
+            if memory_limit is not None and max(retained, decode_peak) > memory_limit:
+                raise MemoryError(
+                    "capture admission exceeds caller memory limit"
+                )
+            return CaptureArtifactInspection(
+                reference,
+                frame.dataset_schema,
+                provenance.binding,
+                frame.event_count,
+                frame.max_read_scratch_bytes,
+                inspection_retained,
+                retained,
+                max(retained, decode_peak),
+                pulse_summary,
+            )
 
     def _load_manifest(
         self,
@@ -532,45 +837,7 @@ class CaptureRepository:
         repository_id: str,
     ) -> CaptureArtifact:
         self._require_active()
-        if len(manifest_payload) > policy.max_manifest_bytes:
-            raise CaptureResourceExceeded(
-                "capture manifest exceeds repository resource policy"
-            )
-        def admit_manifest_structure(events) -> None:
-            for event in events:
-                if isinstance(event, CanonicalArrayEvent):
-                    raise CaptureResourceExceeded(
-                        "capture manifest cannot embed ndarray payloads"
-                    )
-
-        tree = decode(
-            manifest_payload,
-            admit_structure=admit_manifest_structure,
-            limits=CanonicalDecodeLimits(
-                max_depth=128,
-                max_nodes=policy.max_canonical_nodes,
-                max_container_entries=policy.max_canonical_container_entries,
-                max_arrays=0,
-                max_total_array_bytes=0,
-            ),
-        )
-        data = _exact_map(
-            tree,
-            {
-                "schema",
-                "repository_id",
-                "frame_index_blob",
-                "compiled_pulse_blob",
-                "provenance",
-                "terminal",
-                "camera_provenance",
-                "camera_capability_evidence",
-                "camera_arm_spec",
-                "safety_bundle_id",
-                "pulse_evidence",
-            },
-            CAPTURE_ARTIFACT_SCHEMA,
-        )
+        data = _decode_capture_manifest(manifest_payload, policy)
         if data["repository_id"] != repository_id:
             raise ValueError("CaptureArtifact belongs to another repository")
         frame_index_ref = content_ref_from_tree(data["frame_index_blob"])
@@ -579,6 +846,17 @@ class CaptureRepository:
             if data["compiled_pulse_blob"] is None
             else content_ref_from_tree(data["compiled_pulse_blob"])
         )
+        pulse_summary = (
+            None
+            if data["compiled_pulse_runtime_summary"] is None
+            else compiled_pulse_runtime_summary_from_tree(
+                data["compiled_pulse_runtime_summary"]
+            )
+        )
+        if (pulse_ref is None) != (pulse_summary is None):
+            raise ValueError(
+                "compiled-pulse ref and runtime summary presence differ"
+            )
         _require_content_size(
             frame_index_ref,
             policy.max_frame_index_blob_bytes,
@@ -590,6 +868,8 @@ class CaptureRepository:
                 policy.max_compiled_pulse_blob_bytes,
                 "compiled-pulse",
             )
+            assert pulse_summary is not None
+            pulse_summary.require_encoded_size(pulse_ref.size)
         try:
             frame_source = _load_capture_frame_source(
                 frame_index_ref,
@@ -628,6 +908,13 @@ class CaptureRepository:
                 raise ValueError(
                     "compiled-pulse blob digest differs from artifact fingerprint"
                 )
+            if compiled_pulse_runtime_summary(
+                compiled_pulse,
+                encoded_size=pulse_ref.size,
+            ) != pulse_summary:
+                raise ValueError(
+                    "compiled-pulse runtime summary differs from decoded lineage"
+                )
         artifact = CaptureArtifact(
             ref=reference,
             frame_source=frame_source,
@@ -651,6 +938,7 @@ class CaptureRepository:
             repository_id=artifact.ref.repository_id,
             frame_index_ref=frame_index_ref,
             compiled_pulse_ref=pulse_ref,
+            compiled_pulse_runtime_summary=pulse_summary,
             provenance=artifact.provenance,
             terminal=artifact.terminal,
             camera_provenance=artifact.camera_provenance,
@@ -669,45 +957,31 @@ class CaptureRepository:
     def admit(self, reference: CaptureArtifactRef) -> AdmittedCapture:
         """Mint authority only for an exact journal-committed capture target."""
 
-        self._require_active()
-        artifact = self.load(reference)
-        target = CommitTarget(
-            self.repository_id,
-            _CAPTURE_ARTIFACT_KIND,
-            CAPTURE_ARTIFACT_SCHEMA,
-            reference.target_ref,
-            reference.manifest_digest,
-        )
-        matching = tuple(
-            intent
-            for intent in self._coordinator.committed_intents()
-            if intent.target == target
-        )
-        if not matching:
-            raise PermissionError(
-                "CaptureArtifact is visible but has no committed journal authority"
-            )
-        for intent in matching:
-            expected_commit_id = (
-                f"capture-final-{artifact.run_id}-"
-                f"{reference.manifest_digest}"
-            )
-            if (
-                intent.run_id != artifact.run_id
-                or intent.safety_bundle_id != artifact.safety_bundle_id
-                or intent.commit_id != expected_commit_id
-            ):
-                raise ValueError(
-                    "committed capture intent differs from persisted artifact evidence"
+        with self._root_lease.borrow() as admission_borrow:
+            admission_borrow.require_active()
+            artifact = self.load(reference)
+            matching = self._committed_intents(reference)
+            for intent in matching:
+                expected_commit_id = (
+                    f"capture-final-{artifact.run_id}-"
+                    f"{reference.manifest_digest}"
                 )
-        selected = min(matching, key=lambda intent: intent.commit_id)
-        return AdmittedCapture(
-            _ADMITTED_CAPTURE_TOKEN,
-            repository_token=self._root_lease,
-            reference=reference,
-            artifact=artifact,
-            commit_id=selected.commit_id,
-        )
+                if (
+                    intent.run_id != artifact.run_id
+                    or intent.safety_bundle_id != artifact.safety_bundle_id
+                    or intent.commit_id != expected_commit_id
+                ):
+                    raise ValueError(
+                        "committed capture intent differs from persisted artifact evidence"
+                    )
+            selected = min(matching, key=lambda intent: intent.commit_id)
+            return AdmittedCapture(
+                _ADMITTED_CAPTURE_TOKEN,
+                repository_token=self._root_lease,
+                reference=reference,
+                artifact=artifact,
+                commit_id=selected.commit_id,
+            )
 
     def _final_commit(
         self,
@@ -932,10 +1206,19 @@ class CaptureRepository:
                 policy.max_compiled_pulse_blob_bytes,
                 "compiled-pulse",
             )
+        pulse_summary = (
+            None
+            if evidence is None or compiled_pulse_ref is None
+            else compiled_pulse_runtime_summary(
+                evidence.compiled_artifact,
+                encoded_size=compiled_pulse_ref.size,
+            )
+        )
         manifest_payload = _manifest_payload(
             repository_id=self.repository_id,
             frame_index_ref=frame_index_ref,
             compiled_pulse_ref=compiled_pulse_ref,
+            compiled_pulse_runtime_summary=pulse_summary,
             provenance=base.dataset.provenance,
             terminal=base.capture_terminal,
             camera_provenance=base.camera_provenance,
@@ -1148,6 +1431,7 @@ def _manifest_payload(
     repository_id: str,
     frame_index_ref: ContentRef,
     compiled_pulse_ref: ContentRef | None,
+    compiled_pulse_runtime_summary: CompiledPulseRuntimeSummary | None,
     provenance: DatasetSealProvenance,
     terminal: CaptureTerminalAck,
     camera_provenance: CameraCaptureProvenance,
@@ -1157,8 +1441,12 @@ def _manifest_payload(
     pulse_evidence: PulseCaptureEvidence | None,
 ) -> bytes:
     absent = pulse_evidence is None
-    if absent != (compiled_pulse_ref is None):
-        raise ValueError("pulse evidence and compiled-pulse blob presence differ")
+    if absent != (compiled_pulse_ref is None) or absent != (
+        compiled_pulse_runtime_summary is None
+    ):
+        raise ValueError(
+            "pulse evidence, compiled-pulse blob, and runtime summary presence differ"
+        )
     return encode(
         {
             "schema": CAPTURE_ARTIFACT_SCHEMA,
@@ -1168,6 +1456,13 @@ def _manifest_payload(
                 None
                 if compiled_pulse_ref is None
                 else content_ref_to_tree(compiled_pulse_ref)
+            ),
+            "compiled_pulse_runtime_summary": (
+                None
+                if compiled_pulse_runtime_summary is None
+                else compiled_pulse_runtime_summary_to_tree(
+                    compiled_pulse_runtime_summary
+                )
             ),
             "provenance": raw_dataset_seal_provenance_to_tree(provenance),
             "terminal": capture_terminal_ack_to_tree(terminal),
@@ -1195,6 +1490,7 @@ __all__ = [
     "AdmittedCapture",
     "CAPTURE_ARTIFACT_SCHEMA",
     "CaptureArtifact",
+    "CaptureArtifactInspection",
     "CaptureArtifactRef",
     "CaptureFrameSource",
     "CaptureRepositoryResourcePolicy",

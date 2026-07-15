@@ -69,6 +69,10 @@ _FRAME_SCHEMA_MAX_BYTES = 16 * 1024 * 1024
 _FRAME_EVENT_CHUNK_MAX_BYTES = 1 * 1024 * 1024
 _FRAME_EVENT_CHUNK_MAX_EVENTS = 256
 _VALIDITY_KINDS = frozenset({"valid", "invalid", "cell", "component"})
+_FRAME_SOURCE_FIXED_RETAINED_BYTES = 1 * 1024 * 1024
+_FRAME_SOURCE_REF_RETAINED_BYTES = 512
+_FRAME_SOURCE_SCHEMA_RETAINED_MULTIPLIER = 8
+_FRAME_SOURCE_CANONICAL_DECODE_MULTIPLIER = 8
 
 
 class _FrameResourceExceeded(RuntimeError):
@@ -85,6 +89,33 @@ class _FrameRecordGeometry:
     frames_per_chunk: int
     expected_chunks: int
     largest_chunk_nbytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CaptureFrameSourceInspection:
+    """Cheap root/schema admission shared with the full lazy-source load.
+
+    Event metadata chunks and raw frame chunks have not been read.  The two
+    memory bounds describe the eventual fully admitted ``CaptureFrameSource``:
+    retained owner state and the conservative peak while its event chunks and
+    compact inverse ordinal index are decoded.
+    """
+
+    dataset_schema: DatasetSchema
+    block_id: BlockId
+    revision: DatasetRevision
+    event_count: int
+    event_chunk_refs: tuple[ContentRef, ...]
+    frame_chunk_refs: tuple[ContentRef, ...]
+    validity_kind: str
+    validity_axis_ids: tuple[AxisId, ...]
+    geometry: _FrameRecordGeometry
+    event_chunk_limit: int
+    used_canonical_nodes: int
+    used_canonical_container_entries: int
+    max_read_scratch_bytes: int
+    retained_upper_bound: int
+    decode_peak_upper_bound: int
 
 
 def _capture_frame_record_geometry(
@@ -181,6 +212,20 @@ def _capture_frame_read_scratch_bytes(
         + 2 * geometry.frame_nbytes
         + 2 * geometry.validity_nbytes
         + nan_mask_nbytes
+    )
+
+
+def _capture_frame_event_decode_scratch_bytes(
+    event_chunk_refs: tuple[ContentRef, ...],
+) -> int:
+    refs = tuple(event_chunk_refs)
+    if not refs or any(not isinstance(item, ContentRef) for item in refs):
+        raise ValueError("event_chunk_refs must contain at least one ContentRef")
+    return (
+        _FRAME_SOURCE_CANONICAL_DECODE_MULTIPLIER
+        * max(item.size for item in refs)
+        + _FRAME_EVENT_CHUNK_MAX_EVENTS
+        * (CameraFrameMetadataContract().max_retained_nbytes + 128)
     )
 
 
@@ -632,11 +677,7 @@ class CaptureFrameSource:
         )
         object.__setattr__(self, "_inverse_ordinal_width", inverse_ordinal_width)
         object.__setattr__(self, "_geometry", geometry)
-        event_decode_scratch = (
-            8 * max(item.size for item in event_refs)
-            + _FRAME_EVENT_CHUNK_MAX_EVENTS
-            * (CameraFrameMetadataContract().max_retained_nbytes + 128)
-        )
+        event_decode_scratch = _capture_frame_event_decode_scratch_bytes(event_refs)
         object.__setattr__(
             self,
             "_max_read_scratch_bytes",
@@ -706,11 +747,11 @@ class CaptureFrameSource:
     def iter_event_records(
         self,
     ) -> Iterator[tuple[DatasetCellAddress, CameraFrameMetadata]]:
-        self._root_lease.require_active()
-        for chunk_index in range(len(self._event_chunk_refs)):
-            self._root_lease.require_active()
-            records = self._read_event_chunk(chunk_index)
-            yield from records
+        with self._root_lease.borrow() as read_borrow:
+            read_borrow.require_active()
+            for chunk_index in range(len(self._event_chunk_refs)):
+                records = self._read_event_chunk(chunk_index)
+                yield from records
 
     def iter_cell_schedule(self) -> Iterator[DatasetCellAddress]:
         for cell, _metadata in self.iter_event_records():
@@ -784,120 +825,151 @@ class CaptureFrameSource:
         self,
         cells: Iterable[DatasetCellAddress],
     ) -> Iterator[tuple[DatasetCellAddress, CameraSample]]:
-        self._root_lease.require_active()
-        active_chunk = -1
-        payload: bytes | None = None
-        active_event_chunk = -1
-        event_records: tuple[
-            tuple[DatasetCellAddress, CameraFrameMetadata], ...
-        ] | None = None
-        for cell in cells:
-            self._root_lease.require_active()
-            if not isinstance(cell, DatasetCellAddress):
-                raise TypeError("iter_cells requires DatasetCellAddress values")
-            if (
-                cell.repeat_index >= self._schema.repeat_axis.size
-                or cell.point_storage_index >= self._schema.point_layout.storage_size
-            ):
-                raise KeyError("cell is outside this capture frame source")
-            linear_cell = (
-                cell.repeat_index * self._schema.point_layout.storage_size
-                + cell.point_storage_index
-            )
-            ordinal = _read_inverse_ordinal(
-                self._ordinal_by_linear_cell,
-                self._inverse_ordinal_width,
-                linear_cell,
-            )
-            event_chunk = ordinal // _FRAME_EVENT_CHUNK_MAX_EVENTS
-            if event_chunk != active_event_chunk:
-                event_records = self._read_event_chunk(event_chunk)
-                active_event_chunk = event_chunk
-            assert event_records is not None
-            persisted_cell, metadata = event_records[
-                ordinal % _FRAME_EVENT_CHUNK_MAX_EVENTS
-            ]
-            if persisted_cell != cell:
-                raise RuntimeError("capture inverse index differs from event chunk")
-            chunk = ordinal // self._geometry.frames_per_chunk
-            if chunk != active_chunk:
-                payload = None
-                payload = self._store.read_blob(
-                    self._chunk_refs[chunk],
-                    max_bytes=self._max_chunk_blob_bytes,
+        with self._root_lease.borrow() as read_borrow:
+            read_borrow.require_active()
+            active_chunk = -1
+            payload: bytes | None = None
+            active_event_chunk = -1
+            event_records: tuple[
+                tuple[DatasetCellAddress, CameraFrameMetadata], ...
+            ] | None = None
+            for cell in cells:
+                if not isinstance(cell, DatasetCellAddress):
+                    raise TypeError("iter_cells requires DatasetCellAddress values")
+                if (
+                    cell.repeat_index >= self._schema.repeat_axis.size
+                    or cell.point_storage_index >= self._schema.point_layout.storage_size
+                ):
+                    raise KeyError("cell is outside this capture frame source")
+                linear_cell = (
+                    cell.repeat_index * self._schema.point_layout.storage_size
+                    + cell.point_storage_index
                 )
-                active_chunk = chunk
-            assert payload is not None
-            yield cell, self._sample(ordinal, payload, metadata)
+                ordinal = _read_inverse_ordinal(
+                    self._ordinal_by_linear_cell,
+                    self._inverse_ordinal_width,
+                    linear_cell,
+                )
+                event_chunk = ordinal // _FRAME_EVENT_CHUNK_MAX_EVENTS
+                if event_chunk != active_event_chunk:
+                    event_records = self._read_event_chunk(event_chunk)
+                    active_event_chunk = event_chunk
+                assert event_records is not None
+                persisted_cell, metadata = event_records[
+                    ordinal % _FRAME_EVENT_CHUNK_MAX_EVENTS
+                ]
+                if persisted_cell != cell:
+                    raise RuntimeError("capture inverse index differs from event chunk")
+                chunk = ordinal // self._geometry.frames_per_chunk
+                if chunk != active_chunk:
+                    payload = None
+                    payload = self._store.read_blob(
+                        self._chunk_refs[chunk],
+                        max_bytes=self._max_chunk_blob_bytes,
+                    )
+                    active_chunk = chunk
+                assert payload is not None
+                yield cell, self._sample(ordinal, payload, metadata)
 
     def iter_event_order(
         self,
     ) -> Iterator[tuple[DatasetCellAddress, CameraSample]]:
-        self._root_lease.require_active()
-        active_chunk = -1
-        payload: bytes | None = None
-        for ordinal, (cell, metadata) in enumerate(self.iter_event_records()):
-            chunk = ordinal // self._geometry.frames_per_chunk
-            if chunk != active_chunk:
-                payload = self._store.read_blob(
-                    self._chunk_refs[chunk],
-                    max_bytes=self._max_chunk_blob_bytes,
-                )
-                active_chunk = chunk
-            assert payload is not None
-            yield cell, self._sample(ordinal, payload, metadata)
+        with self._root_lease.borrow() as read_borrow:
+            read_borrow.require_active()
+            active_chunk = -1
+            payload: bytes | None = None
+            for ordinal, (cell, metadata) in enumerate(self.iter_event_records()):
+                chunk = ordinal // self._geometry.frames_per_chunk
+                if chunk != active_chunk:
+                    payload = self._store.read_blob(
+                        self._chunk_refs[chunk],
+                        max_bytes=self._max_chunk_blob_bytes,
+                    )
+                    active_chunk = chunk
+                assert payload is not None
+                yield cell, self._sample(ordinal, payload, metadata)
 
     def materialize(self, *, memory_limit_bytes: int) -> DataBlock:
-        self._root_lease.require_active()
-        limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-        cell_count = self._event_count
-        values_nbytes = cell_count * self._geometry.frame_nbytes
-        validity_nbytes = cell_count * self._geometry.validity_nbytes
-        required = 2 * values_nbytes + 2 * validity_nbytes + self.max_read_scratch_bytes
-        if required > limit:
-            raise MemoryError(
-                f"capture materialization peak {required} exceeds limit {limit}"
+        with self._root_lease.borrow() as read_borrow:
+            read_borrow.require_active()
+            limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
+            cell_count = self._event_count
+            values_nbytes = cell_count * self._geometry.frame_nbytes
+            validity_nbytes = cell_count * self._geometry.validity_nbytes
+            required = (
+                2 * values_nbytes
+                + 2 * validity_nbytes
+                + self.max_read_scratch_bytes
             )
-        values = np.empty(self._schema.physical_shape, dtype=self._schema.cell_schema.dtype)
-        validity_values = (
-            None
-            if self._validity_kind in {"valid", "invalid"}
-            else np.empty(
-                (self._schema.repeat_axis.size, self._schema.point_layout.storage_size)
-                + (() if self._validity_kind == "cell" else tuple(
-                    self._schema.cell_schema.axis(axis_id).size
-                    for axis_id in self._validity_axis_ids
-                )),
-                dtype=bool,
+            if required > limit:
+                raise MemoryError(
+                    f"capture materialization peak {required} exceeds limit {limit}"
+                )
+            values = np.empty(
+                self._schema.physical_shape,
+                dtype=self._schema.cell_schema.dtype,
             )
-        )
-        for cell, sample in self.iter_event_order():
-            location = (cell.repeat_index, cell.point_storage_index)
-            values[location] = sample.image.values
-            if self._validity_kind == "cell":
+            validity_values = (
+                None
+                if self._validity_kind in {"valid", "invalid"}
+                else np.empty(
+                    (
+                        self._schema.repeat_axis.size,
+                        self._schema.point_layout.storage_size,
+                    )
+                    + (
+                        ()
+                        if self._validity_kind == "cell"
+                        else tuple(
+                            self._schema.cell_schema.axis(axis_id).size
+                            for axis_id in self._validity_axis_ids
+                        )
+                    ),
+                    dtype=bool,
+                )
+            )
+            for cell, sample in self.iter_event_order():
+                location = (cell.repeat_index, cell.point_storage_index)
+                values[location] = sample.image.values
+                if self._validity_kind == "cell":
+                    assert validity_values is not None
+                    validity_values[location] = isinstance(
+                        sample.image.validity,
+                        Valid,
+                    )
+                elif self._validity_kind == "component":
+                    assert validity_values is not None
+                    assert isinstance(sample.image.validity, ComponentValidity)
+                    validity_values[location] = sample.image.validity.mask
+            if self._validity_kind == "valid":
+                validity = VALID
+            elif self._validity_kind == "invalid":
+                validity = INVALID
+            elif self._validity_kind == "cell":
                 assert validity_values is not None
-                validity_values[location] = isinstance(sample.image.validity, Valid)
-            elif self._validity_kind == "component":
+                validity = CellValidity(validity_values)
+            else:
                 assert validity_values is not None
-                assert isinstance(sample.image.validity, ComponentValidity)
-                validity_values[location] = sample.image.validity.mask
-        if self._validity_kind == "valid":
-            validity = VALID
-        elif self._validity_kind == "invalid":
-            validity = INVALID
-        elif self._validity_kind == "cell":
-            assert validity_values is not None
-            validity = CellValidity(validity_values)
-        else:
-            assert validity_values is not None
-            validity = ComponentValidity(self._validity_axis_ids, validity_values)
-        return DataBlock(self._block_id, self._revision, values, validity, self._schema)
+                validity = ComponentValidity(
+                    self._validity_axis_ids,
+                    validity_values,
+                )
+            return DataBlock(
+                self._block_id,
+                self._revision,
+                values,
+                validity,
+                self._schema,
+            )
 
     def _verify_all_frame_chunks(self) -> None:
-        self._root_lease.require_active()
-        for reference in self._chunk_refs:
-            self._root_lease.require_active()
-            self._store.verify_blob(reference, max_bytes=self._max_chunk_blob_bytes)
+        with self._root_lease.borrow() as read_borrow:
+            read_borrow.require_active()
+            for reference in self._chunk_refs:
+                self._store.verify_blob(
+                    reference,
+                    max_bytes=self._max_chunk_blob_bytes,
+                )
 
 
 def _frame_schema_tree(schema: DatasetSchema) -> dict[str, object]:
@@ -1170,18 +1242,25 @@ def _load_capture_frame_source(
     )
 
 
-def _capture_frame_source_from_payload(
-    payload: bytes,
+def _inspect_capture_frame_source(
+    reference_or_payload: ContentRef | bytes,
     *,
     store_authority: ContentStoreAuthority,
-    root_lease: RepositoryRootLease,
     max_cells: int,
     max_total_frame_bytes: int,
     max_chunk_blob_bytes: int,
     max_frame_index_blob_bytes: int,
     max_canonical_nodes: int,
     max_canonical_container_entries: int,
-) -> CaptureFrameSource:
+    memory_limit_bytes: int | None = None,
+) -> _CaptureFrameSourceInspection:
+    """Admit only the root, schema, references, and canonical frame geometry.
+
+    Passing a ``ContentRef`` reads that root blob; passing already-read ``bytes``
+    avoids a second root read.  Neither form reads an event metadata chunk or a
+    raw frame chunk.
+    """
+
     max_cells = positive_integer(max_cells, "max_cells")
     max_total_frame_bytes = positive_integer(
         max_total_frame_bytes,
@@ -1203,7 +1282,34 @@ def _capture_frame_source_from_payload(
         max_canonical_container_entries,
         "max_canonical_container_entries",
     )
+    memory_limit = (
+        None
+        if memory_limit_bytes is None
+        else positive_integer(memory_limit_bytes, "memory_limit_bytes")
+    )
     root_limit = min(_FRAME_INDEX_ROOT_MAX_BYTES, max_frame_index_blob_bytes)
+    if isinstance(reference_or_payload, ContentRef):
+        if reference_or_payload.size > root_limit:
+            raise _FrameResourceExceeded(
+                "capture frame-index root exceeds its byte policy"
+            )
+        if memory_limit is not None and (
+            _FRAME_SOURCE_FIXED_RETAINED_BYTES
+            + (1 + _FRAME_SOURCE_CANONICAL_DECODE_MULTIPLIER)
+            * reference_or_payload.size
+            > memory_limit
+        ):
+            raise MemoryError(
+                "capture frame-index root inspection exceeds caller memory limit"
+            )
+        payload = store_authority.read_blob(
+            reference_or_payload,
+            max_bytes=root_limit,
+        )
+    elif type(reference_or_payload) is bytes:
+        payload = reference_or_payload
+    else:
+        raise TypeError("reference_or_payload must be ContentRef or bytes")
     if len(payload) > root_limit:
         raise _FrameResourceExceeded("capture frame-index root exceeds its byte policy")
     max_event_chunks = (
@@ -1259,7 +1365,10 @@ def _capture_frame_source_from_payload(
         max_canonical_container_entries,
     )
     validity = exact_mapping(
-        tree["validity"], {"kind", "axis_ids"}, "frame validity", discriminator=None
+        tree["validity"],
+        {"kind", "axis_ids"},
+        "frame validity",
+        discriminator=None,
     )
     axis_ids = validity["axis_ids"]
     if not isinstance(axis_ids, list):
@@ -1274,17 +1383,19 @@ def _capture_frame_source_from_payload(
             "capture dataset-schema index component exceeds byte policy"
         )
     event_chunk_tree = tree["event_chunks"]
-    chunk_tree = tree["frame_chunks"]
-    if not isinstance(event_chunk_tree, list) or not isinstance(chunk_tree, list):
+    frame_chunk_tree = tree["frame_chunks"]
+    if not isinstance(event_chunk_tree, list) or not isinstance(frame_chunk_tree, list):
         raise ValueError("frame index event and frame chunks must be lists")
     expected_event_chunks = (
         event_count + _FRAME_EVENT_CHUNK_MAX_EVENTS - 1
     ) // _FRAME_EVENT_CHUNK_MAX_EVENTS
     if len(event_chunk_tree) != expected_event_chunks:
         raise ValueError("frame-event chunk count differs from event cardinality")
-    if len(chunk_tree) > max_cells:
+    if len(frame_chunk_tree) > max_cells:
         raise _FrameResourceExceeded("frame chunk count exceeds repository policy")
-    frame_chunk_refs = tuple(content_ref_from_tree(item) for item in chunk_tree)
+    frame_chunk_refs = tuple(
+        content_ref_from_tree(item) for item in frame_chunk_tree
+    )
     event_chunk_refs = tuple(
         content_ref_from_tree(item) for item in event_chunk_tree
     )
@@ -1310,6 +1421,23 @@ def _capture_frame_source_from_payload(
                 "capture dataset-schema index component cannot embed ndarrays"
             )
 
+    inverse_ordinal_bytes = event_count * _inverse_ordinal_width(event_count)
+    retained_upper_bound = (
+        _FRAME_SOURCE_FIXED_RETAINED_BYTES
+        + _FRAME_SOURCE_SCHEMA_RETAINED_MULTIPLIER * schema_ref.size
+        + _FRAME_SOURCE_REF_RETAINED_BYTES
+        * (len(event_chunk_refs) + len(frame_chunk_refs))
+        + inverse_ordinal_bytes
+    )
+    root_schema_decode_peak = (
+        retained_upper_bound
+        + (1 + _FRAME_SOURCE_CANONICAL_DECODE_MULTIPLIER)
+        * (len(payload) + schema_ref.size)
+    )
+    if memory_limit is not None and root_schema_decode_peak > memory_limit:
+        raise MemoryError(
+            "capture frame-index schema inspection exceeds caller memory limit"
+        )
     schema_payload = store_authority.read_blob(
         schema_ref,
         max_bytes=schema_limit,
@@ -1337,7 +1465,6 @@ def _capture_frame_source_from_payload(
         max_canonical_container_entries,
     )
     schema = dataset_schema_from_tree(schema_tree["dataset_schema"])
-    del schema_payload, schema_tree
     physical_cells = schema.repeat_axis.size * schema.point_layout.storage_size
     if event_count != physical_cells:
         raise ValueError("frame event count differs from DatasetSchema storage")
@@ -1363,8 +1490,86 @@ def _capture_frame_source_from_payload(
             raise ValueError("frame chunk size differs from canonical record layout")
         if reference.size > max_chunk_blob_bytes:
             raise _FrameResourceExceeded("frame chunk exceeds repository policy")
+
     block_id = BlockId(tree["block_id"])
     revision = DatasetRevision(nonnegative_integer(tree["revision"], "revision"))
+    event_decode_scratch = _capture_frame_event_decode_scratch_bytes(
+        event_chunk_refs
+    )
+    max_read_scratch_bytes = (
+        _capture_frame_read_scratch_bytes(
+            schema,
+            geometry,
+            geometry.largest_chunk_nbytes,
+        )
+        + event_decode_scratch
+    )
+    # ``schema_ref.size`` and ``len(schema_payload)`` are required to agree by
+    # ContentRef verification.  Keep the exact materialized length in the final
+    # bound so a storage-owner regression cannot silently weaken it.
+    root_schema_decode_peak = (
+        retained_upper_bound
+        + (1 + _FRAME_SOURCE_CANONICAL_DECODE_MULTIPLIER)
+        * (len(payload) + len(schema_payload))
+    )
+    full_load_decode_peak = (
+        retained_upper_bound
+        + inverse_ordinal_bytes
+        + event_decode_scratch
+    )
+    decode_peak = max(root_schema_decode_peak, full_load_decode_peak)
+    if memory_limit is not None and decode_peak > memory_limit:
+        raise MemoryError(
+            "capture frame-source admission exceeds caller memory limit"
+        )
+    return _CaptureFrameSourceInspection(
+        dataset_schema=schema,
+        block_id=block_id,
+        revision=revision,
+        event_count=event_count,
+        event_chunk_refs=event_chunk_refs,
+        frame_chunk_refs=frame_chunk_refs,
+        validity_kind=validity_kind,
+        validity_axis_ids=validity_axis_ids,
+        geometry=geometry,
+        event_chunk_limit=event_chunk_limit,
+        used_canonical_nodes=used_nodes,
+        used_canonical_container_entries=used_container_entries,
+        max_read_scratch_bytes=max_read_scratch_bytes,
+        retained_upper_bound=retained_upper_bound,
+        decode_peak_upper_bound=decode_peak,
+    )
+
+
+def _capture_frame_source_from_payload(
+    payload: bytes,
+    *,
+    store_authority: ContentStoreAuthority,
+    root_lease: RepositoryRootLease,
+    max_cells: int,
+    max_total_frame_bytes: int,
+    max_chunk_blob_bytes: int,
+    max_frame_index_blob_bytes: int,
+    max_canonical_nodes: int,
+    max_canonical_container_entries: int,
+) -> CaptureFrameSource:
+    inspection = _inspect_capture_frame_source(
+        payload,
+        store_authority=store_authority,
+        max_cells=max_cells,
+        max_total_frame_bytes=max_total_frame_bytes,
+        max_chunk_blob_bytes=max_chunk_blob_bytes,
+        max_frame_index_blob_bytes=max_frame_index_blob_bytes,
+        max_canonical_nodes=max_canonical_nodes,
+        max_canonical_container_entries=max_canonical_container_entries,
+    )
+    schema = inspection.dataset_schema
+    event_count = inspection.event_count
+    event_chunk_refs = inspection.event_chunk_refs
+    frame_chunk_refs = inspection.frame_chunk_refs
+    event_chunk_limit = inspection.event_chunk_limit
+    used_nodes = inspection.used_canonical_nodes
+    used_container_entries = inspection.used_canonical_container_entries
 
     metadata_contract = CameraFrameMetadataContract()
     metadata_hasher = OrderedDatasetMetadataHasher(metadata_contract.fingerprint)
@@ -1415,16 +1620,16 @@ def _capture_frame_source_from_payload(
     source = CaptureFrameSource(
         _CAPTURE_FRAME_SOURCE_TOKEN,
         schema=schema,
-        block_id=block_id,
-        revision=revision,
+        block_id=inspection.block_id,
+        revision=inspection.revision,
         event_count=event_count,
         event_chunk_refs=event_chunk_refs,
         ordered_metadata_digest=ordered_metadata_digest,
         join_plan_digest=join_plan_digest,
         ordinal_by_linear_cell=bytes(ordinal_by_linear_cell),
         inverse_ordinal_width=inverse_ordinal_width,
-        validity_kind=validity_kind,
-        validity_axis_ids=validity_axis_ids,
+        validity_kind=inspection.validity_kind,
+        validity_axis_ids=inspection.validity_axis_ids,
         chunk_refs=frame_chunk_refs,
         store_authority=store_authority,
         root_lease=root_lease,

@@ -325,6 +325,7 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
         "_recover",
         "_authority_lock",
         "_authorities",
+        "_closed",
         "_sealed",
     )
 
@@ -359,6 +360,7 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
         object.__setattr__(self, "_recover", recover)
         object.__setattr__(self, "_authority_lock", threading.Lock())
         object.__setattr__(self, "_authorities", {})
+        object.__setattr__(self, "_closed", False)
         _reconcile_pending_commits(journal, repository_id, recover)
         object.__setattr__(self, "_sealed", True)
 
@@ -367,11 +369,20 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
             raise AttributeError("RepositoryCommitCoordinator wiring is immutable")
         object.__setattr__(self, _name, _value)
 
-    def committed_intents(self) -> tuple[CommitIntent, ...]:
-        """Sealed repository-owner view used to mint downstream admission proof."""
+    def committed_for(self, target: CommitTarget) -> tuple[CommitIntent, ...]:
+        """Return the exact FINAL authorities for one immutable target."""
 
         self._root_lease.require_active()
-        return self._journal.committed()
+        return self._journal.committed_for(target)
+
+    def close(self) -> None:
+        """Close the journal under the root lease after every operation drains."""
+
+        with self._authority_lock:
+            if self._closed:
+                return
+            self._root_lease.close_guarded(self._journal.close)
+            object.__setattr__(self, "_closed", True)
 
     def prepare(
         self,
@@ -397,32 +408,33 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
             raise ValueError("CommitTarget belongs to another repository")
         if not callable(publish):
             raise TypeError("publish must be callable")
-        lease_borrow = self._root_lease.borrow()
-        try:
-            snapshot = _CommitAuthoritySnapshot(
-                preparation=preparation,
-                journal=self._journal,
-                publish_callback=publish,
-                recover_callback=self._recover,
-                lease_borrow=lease_borrow,
-            )
-            nonce = object()
-            with self._authority_lock:
-                self._authorities[nonce] = snapshot
+        with self._authority_lock:
+            if self._closed:
+                raise RuntimeError("commit coordinator is closed")
+            lease_borrow = self._root_lease.borrow()
             try:
-                return FinalCommit(
-                    _COMMIT_AUTHORITY_TOKEN,
-                    coordinator=self,
-                    nonce=nonce,
+                snapshot = _CommitAuthoritySnapshot(
                     preparation=preparation,
+                    journal=self._journal,
+                    publish_callback=publish,
+                    recover_callback=self._recover,
+                    lease_borrow=lease_borrow,
                 )
-            except BaseException:
-                with self._authority_lock:
+                nonce = object()
+                self._authorities[nonce] = snapshot
+                try:
+                    return FinalCommit(
+                        _COMMIT_AUTHORITY_TOKEN,
+                        coordinator=self,
+                        nonce=nonce,
+                        preparation=preparation,
+                    )
+                except BaseException:
                     self._authorities.pop(nonce, None)
+                    raise
+            except BaseException:
+                lease_borrow.close()
                 raise
-        except BaseException:
-            lease_borrow.close()
-            raise
 
     def _consume_authority(
         self,
@@ -466,11 +478,13 @@ class PersistentCommitJournal:
     __slots__ = (
         "repository_id",
         "repository_root",
-        "_journal",
+        "_session",
         "_lock",
         "_intents",
         "_committed",
         "_aborted",
+        "_committed_by_target",
+        "_closed",
         "_sealed",
     )
 
@@ -484,18 +498,28 @@ class PersistentCommitJournal:
             "repository_id",
             _canonical(repository_id, "repository_id"),
         )
-        journal = FramedJournal(path)
-        object.__setattr__(self, "_journal", journal)
-        object.__setattr__(self, "repository_root", journal.path.parent)
-        self._journal.append(
-            "repository",
-            {"kind": "REPOSITORY", "repository_id": self.repository_id},
+        session = FramedJournal.open_exclusive(path)
+        object.__setattr__(self, "_session", session)
+        object.__setattr__(
+            self,
+            "repository_root",
+            Path(path).expanduser().resolve().parent,
         )
         object.__setattr__(self, "_lock", threading.Lock())
         object.__setattr__(self, "_intents", {})
         object.__setattr__(self, "_committed", set())
         object.__setattr__(self, "_aborted", set())
-        self._replay()
+        object.__setattr__(self, "_committed_by_target", {})
+        object.__setattr__(self, "_closed", False)
+        try:
+            self._session.append(
+                "repository",
+                {"kind": "REPOSITORY", "repository_id": self.repository_id},
+            )
+            self._reload_projection()
+        except BaseException:
+            self._session.close()
+            raise
         object.__setattr__(self, "_sealed", True)
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -525,68 +549,104 @@ class PersistentCommitJournal:
             "created_at": intent.created_at,
         }
         with self._lock:
-            self._journal.append_checked(
-                f"intent:{intent.commit_id}",
-                value,
-                self._validate_records,
-            )
-            self._replay()
+            self._require_open()
+            previous = self._intents.get(intent.commit_id)
+            if previous is not None and previous != intent:
+                raise ValueError("commit journal contains conflicting intent")
+            self._append(f"intent:{intent.commit_id}", value)
+            self._intents[intent.commit_id] = intent
 
     def _mark_committed(self, token: object, commit_id: str) -> None:
         if token is not _JOURNAL_MUTATION_TOKEN:
             raise PermissionError("journal mutation requires coordinator authority")
         commit_id = _canonical(commit_id, "commit_id")
         with self._lock:
-            self._journal.append_checked(
+            self._require_open()
+            intent = self._intents.get(commit_id)
+            if intent is None:
+                raise ValueError("commit marker precedes its intent")
+            if commit_id in self._aborted:
+                raise ValueError("commit journal resolves one intent both ways")
+            self._append(
                 f"committed:{commit_id}",
                 {
                     "kind": "COMMITTED",
                     "commit_id": commit_id,
                 },
-                self._validate_records,
             )
-            self._replay()
+            self._committed.add(commit_id)
+            self._committed_by_target.setdefault(intent.target, {})[
+                commit_id
+            ] = intent
 
     def _mark_aborted(self, token: object, commit_id: str) -> None:
         if token is not _JOURNAL_MUTATION_TOKEN:
             raise PermissionError("journal mutation requires coordinator authority")
         commit_id = _canonical(commit_id, "commit_id")
         with self._lock:
-            self._journal.append_checked(
+            self._require_open()
+            if commit_id not in self._intents:
+                raise ValueError("abort marker precedes its intent")
+            if commit_id in self._committed:
+                raise ValueError("commit journal resolves one intent both ways")
+            self._append(
                 f"aborted:{commit_id}",
                 {"kind": "ABORTED", "commit_id": commit_id},
-                self._validate_records,
             )
-            self._replay()
+            self._aborted.add(commit_id)
 
     def pending(self) -> tuple[CommitIntent, ...]:
         with self._lock:
-            self._replay()
-            return tuple(
-                intent
-                for commit_id, intent in self._intents.items()
-                if commit_id not in self._committed and commit_id not in self._aborted
-            )
-
-    def committed(self) -> tuple[CommitIntent, ...]:
-        """Replay and return an immutable snapshot of committed intent records."""
-
-        with self._lock:
-            self._replay()
+            self._require_open()
             return tuple(
                 sorted(
                     (
                         intent
                         for commit_id, intent in self._intents.items()
-                        if commit_id in self._committed
+                        if commit_id not in self._committed
+                        and commit_id not in self._aborted
                     ),
                     key=lambda intent: intent.commit_id,
                 )
             )
 
-    def _replay(self) -> None:
+    def committed_for(self, target: CommitTarget) -> tuple[CommitIntent, ...]:
+        """Return only authorities whose exact immutable target matches."""
+
+        if not isinstance(target, CommitTarget):
+            raise TypeError("target must be CommitTarget")
+        if target.repository_id != self.repository_id:
+            raise ValueError("CommitTarget belongs to another repository")
+        with self._lock:
+            self._require_open()
+            return tuple(
+                sorted(
+                    self._committed_by_target.get(target, {}).values(),
+                    key=lambda intent: intent.commit_id,
+                )
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._session.close()
+            object.__setattr__(self, "_closed", True)
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("commit journal is closed")
+
+    def _append(self, record_id: str, value: object) -> bool:
+        try:
+            return self._session.append(record_id, value)
+        except BaseException:
+            self._reload_projection()
+            raise
+
+    def _reload_projection(self) -> None:
         intents, committed, aborted = self._state_from_records(
-            self._journal.records(),
+            self._session.records(),
             expected_repository_id=self.repository_id,
         )
         if any(
@@ -597,12 +657,11 @@ class PersistentCommitJournal:
         object.__setattr__(self, "_intents", intents)
         object.__setattr__(self, "_committed", committed)
         object.__setattr__(self, "_aborted", aborted)
-
-    def _validate_records(self, records: tuple[tuple[str, object], ...]) -> None:
-        self._state_from_records(
-            records,
-            expected_repository_id=self.repository_id,
-        )
+        committed_by_target: dict[CommitTarget, dict[str, CommitIntent]] = {}
+        for commit_id in committed:
+            intent = intents[commit_id]
+            committed_by_target.setdefault(intent.target, {})[commit_id] = intent
+        object.__setattr__(self, "_committed_by_target", committed_by_target)
 
     @staticmethod
     def _state_from_records(

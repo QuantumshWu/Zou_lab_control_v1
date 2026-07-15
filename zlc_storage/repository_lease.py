@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from .durability import durable_mkdir
@@ -145,6 +146,19 @@ class RepositoryRootLease:
             object.__setattr__(self, "_borrow_count", self._borrow_count - 1)
 
     def close(self) -> None:
+        self.close_guarded(lambda: None)
+
+    def close_guarded(self, finalize_owner: Callable[[], None]) -> None:
+        """Finalize dependent owners while new borrows remain atomically barred.
+
+        Repository-owned journals and other lifetime resources must close while
+        the root's OS lease is still held.  The state lock makes the quiescence
+        check, dependent finalization, and root release one exclusion region, so
+        an operation cannot acquire a late borrow between those steps.
+        """
+
+        if not callable(finalize_owner):
+            raise TypeError("finalize_owner must be callable")
         if not self._in_creator_process():
             # ``flock`` ownership is shared by open-file descriptions after
             # fork.  Close only this inherited descriptor; explicit LOCK_UN
@@ -161,6 +175,7 @@ class RepositoryRootLease:
                 raise RuntimeError(
                     "repository root lease has outstanding operations"
                 )
+            finalize_owner()
             object.__setattr__(self, "_owner_closed", True)
             # Keep the state lock through the OS unlock/close.  A concurrent
             # close may return only after this one has actually released the

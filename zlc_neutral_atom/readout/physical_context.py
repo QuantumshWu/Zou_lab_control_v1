@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
-from zlc_pulse import (
+from zlc_pulse.artifact import (
     CompiledPulseArtifact,
-    expand_physical_bus_value_changes,
-    expand_physical_digital_high_intervals,
+    CompiledPulseRuntimeSummary,
+)
+from zlc_pulse.physical import (
+    PhysicalWindowProjection,
+    build_physical_waveform_index,
+    estimate_physical_window_projection_peak_bytes,
+    estimate_physical_waveform_index_peak_bytes,
 )
 from zlc_data import DatasetSchema, READOUT_EVENT
 from zlc_storage import (
@@ -24,6 +29,106 @@ from zlc_neutral_atom.timing.lineage import (
     PulseCaptureBinding,
     PulseCaptureEvidence,
 )
+
+
+_DEFAULT_PHYSICAL_WINDOW_PROJECTION_BYTES = 64 * 1024 * 1024
+_CONTEXT_FIXED_RETAINED_BYTES = 128 * 1024
+_CONTEXT_TRACE_RETAINED_BYTES = 2_048
+_CONTEXT_TRANSITION_RETAINED_BYTES = 384
+
+
+def _noop_checkpoint() -> None:
+    return None
+
+
+def estimate_readout_physical_context_peak_bytes(
+    artifact: CompiledPulseArtifact,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> int:
+    """Bound index construction and the worst multi-cell comparison phase."""
+
+    if not isinstance(artifact, CompiledPulseArtifact):
+        raise TypeError("artifact must be CompiledPulseArtifact")
+    if checkpoint is not None and not callable(checkpoint):
+        raise TypeError("checkpoint must be callable or None")
+    ir = artifact.target_ir
+    index_peak = estimate_physical_waveform_index_peak_bytes(
+        ir,
+        checkpoint=checkpoint,
+    )
+    projection_peak = min(
+        estimate_physical_window_projection_peak_bytes(
+            ir,
+            checkpoint=checkpoint,
+        ),
+        _DEFAULT_PHYSICAL_WINDOW_PROJECTION_BYTES,
+    )
+    return _readout_context_derive_peak(index_peak, projection_peak)
+
+
+def estimate_readout_physical_context_peak_from_summary(
+    summary: CompiledPulseRuntimeSummary,
+) -> int:
+    """Apply the readout projection policy to pulse-owned resource facts."""
+
+    if not isinstance(summary, CompiledPulseRuntimeSummary):
+        raise TypeError("summary must be CompiledPulseRuntimeSummary")
+    return _readout_context_derive_peak(
+        summary.physical_index_peak_upper_bound_bytes,
+        min(
+            summary.physical_projection_peak_upper_bound_bytes,
+            _DEFAULT_PHYSICAL_WINDOW_PROJECTION_BYTES,
+        ),
+    )
+
+
+def estimate_readout_physical_context_retained_from_summary(
+    summary: CompiledPulseRuntimeSummary,
+) -> int:
+    """Bound the one normalized context retained after index/projection release."""
+
+    if not isinstance(summary, CompiledPulseRuntimeSummary):
+        raise TypeError("summary must be CompiledPulseRuntimeSummary")
+    # The neutral context reconstructs immutable trace tuples from the pulse
+    # projection.  Twice the pulse-owned projection bound covers both its
+    # scalar/container representation and the neutral owner copy without
+    # treating the larger build peak as permanently retained state.
+    return _context_retained_from_projection_peak(
+        min(
+            summary.physical_projection_peak_upper_bound_bytes,
+            _DEFAULT_PHYSICAL_WINDOW_PROJECTION_BYTES,
+        )
+    )
+
+
+def _context_retained_from_projection_peak(projection_peak_bytes: int) -> int:
+    projection_peak = nonnegative_integer(
+        projection_peak_bytes,
+        "projection_peak_bytes",
+    )
+    return 2 * projection_peak
+
+
+def _readout_context_derive_peak(
+    index_peak_bytes: int,
+    projection_peak_bytes: int,
+) -> int:
+    """Single phase model for projection-to-neutral context comparison.
+
+    After the first cell, its normalized neutral context remains resident while
+    the next pulse projection is built and converted to a second neutral
+    context.  The comparison peak is therefore index + first context + next
+    projection + next context, not merely index + two pulse projections.
+    """
+
+    index_peak = nonnegative_integer(index_peak_bytes, "index_peak_bytes")
+    projection_peak = nonnegative_integer(
+        projection_peak_bytes,
+        "projection_peak_bytes",
+    )
+    context_retained = _context_retained_from_projection_peak(projection_peak)
+    return index_peak + 2 * context_retained + projection_peak
 
 
 @dataclass(frozen=True)
@@ -147,6 +252,24 @@ class ReadoutPhysicalContext:
         object.__setattr__(self, "buses", buses)
 
 
+def readout_physical_context_retained_upper_bound_bytes(
+    context: ReadoutPhysicalContext,
+) -> int:
+    """Bound the retained neutral context from its exact trace cardinalities."""
+
+    if not isinstance(context, ReadoutPhysicalContext):
+        raise TypeError("context must be ReadoutPhysicalContext")
+    traces = len(context.digital) + len(context.buses)
+    transitions = sum(len(item.transitions) for item in context.digital) + sum(
+        len(item.changes) for item in context.buses
+    )
+    return (
+        _CONTEXT_FIXED_RETAINED_BYTES
+        + _CONTEXT_TRACE_RETAINED_BYTES * traces
+        + _CONTEXT_TRANSITION_RETAINED_BYTES * transitions
+    )
+
+
 def derive_readout_physical_context(
     pulse_binding: PulseCaptureBinding,
     *,
@@ -172,17 +295,14 @@ def derive_readout_physical_context(
     exposure = positive_real(integration_seconds, "integration_seconds")
     schedule = pulse_binding.trigger_schedule
     grouping = cell_plan.join_contract.within_point_grouping
-    selected_edges = tuple(
-        edge
-        for edge in schedule.iter_edges()
-        if grouping[edge.point_trigger_ordinal][1] == event_index
-    )
-    if not selected_edges:
-        raise ValueError("readout event has no compiled capture cells")
     return _derive_readout_context(
         artifact,
         cell_plan.trigger_channel,
-        tuple(edge.tick_from_run_start for edge in selected_edges),
+        (
+            edge.tick_from_run_start
+            for edge in schedule.iter_edges()
+            if grouping[edge.point_trigger_ordinal][1] == event_index
+        ),
         integration_start_offset_seconds=integration_offset,
         integration_seconds=exposure,
     )
@@ -196,6 +316,8 @@ def _derive_readout_physical_context_from_evidence(
     readout_event_index: int,
     integration_start_offset_seconds: float,
     integration_seconds: float,
+    checkpoint: Callable[[], None] | None = None,
+    physical_memory_limit_bytes: int | None = None,
 ) -> ReadoutPhysicalContext:
     """Derive a persisted context by ordinal-joining pulse edges and cells."""
 
@@ -215,35 +337,47 @@ def _derive_readout_physical_context_from_evidence(
     event_index = nonnegative_integer(readout_event_index, "readout_event_index")
     if event_index >= event_axis.size:
         raise ValueError("readout_event_index is outside DatasetSchema")
-    anchor_ticks = []
-    for ordinal, (edge, cell) in enumerate(
-        zip(edges, cell_schedule, strict=True)
-    ):
-        if not isinstance(cell, DatasetCellAddress):
-            raise TypeError("cell_schedule must contain DatasetCellAddress values")
-        if edge.trigger_ordinal != ordinal:
-            raise ValueError("pulse trigger ordinals are not contiguous")
-        point_multi = schema.point_layout.multi_index(cell.point_storage_index)
-        if point_multi[event_position] == event_index:
-            anchor_ticks.append(edge.tick_from_run_start)
-    if not anchor_ticks:
-        raise ValueError("readout event has no persisted capture cells")
+    if checkpoint is not None and not callable(checkpoint):
+        raise TypeError("checkpoint must be callable or None")
+
+    def anchor_ticks():
+        for ordinal, (edge, cell) in enumerate(
+            zip(edges, cell_schedule, strict=True)
+        ):
+            if checkpoint is not None:
+                checkpoint()
+            if not isinstance(cell, DatasetCellAddress):
+                raise TypeError(
+                    "cell_schedule must contain DatasetCellAddress values"
+                )
+            if edge.trigger_ordinal != ordinal:
+                raise ValueError("pulse trigger ordinals are not contiguous")
+            point_multi = schema.point_layout.multi_index(
+                cell.point_storage_index
+            )
+            if point_multi[event_position] == event_index:
+                yield edge.tick_from_run_start
+
     return _derive_readout_context(
         evidence.compiled_artifact,
         evidence.trigger_channel,
-        tuple(anchor_ticks),
+        anchor_ticks(),
         integration_start_offset_seconds=integration_start_offset_seconds,
         integration_seconds=integration_seconds,
+        checkpoint=checkpoint,
+        physical_memory_limit_bytes=physical_memory_limit_bytes,
     )
 
 
 def _derive_readout_context(
     artifact: CompiledPulseArtifact,
     trigger_channel: str,
-    anchor_ticks: tuple[int, ...],
+    anchor_ticks: Iterable[int],
     *,
     integration_start_offset_seconds: float,
     integration_seconds: float,
+    checkpoint: Callable[[], None] | None = None,
+    physical_memory_limit_bytes: int | None = None,
 ) -> ReadoutPhysicalContext:
     integration_offset = nonnegative_real(
         integration_start_offset_seconds,
@@ -256,100 +390,100 @@ def _derive_readout_context(
     )
     if len(trigger_outputs) != 1:
         raise ValueError("capture trigger lane is not one logical digital output")
-    intervals = expand_physical_digital_high_intervals(ir)
-    bus_changes = expand_physical_bus_value_changes(ir)
-    contexts = tuple(
-        _context_at_trigger(
-            artifact,
-            anchor_tick,
-            trigger_output_key=trigger_outputs[0],
+    if checkpoint is not None and not callable(checkpoint):
+        raise TypeError("checkpoint must be callable or None")
+    callback = _noop_checkpoint if checkpoint is None else checkpoint
+    index_peak = estimate_physical_waveform_index_peak_bytes(
+        ir,
+        checkpoint=callback,
+    )
+    projection_bound = min(
+        estimate_physical_window_projection_peak_bytes(
+            ir,
+            checkpoint=callback,
+        ),
+        _DEFAULT_PHYSICAL_WINDOW_PROJECTION_BYTES,
+    )
+    if physical_memory_limit_bytes is None:
+        index_limit = index_peak
+        projection_limit = projection_bound
+    else:
+        index_limit = nonnegative_integer(
+            physical_memory_limit_bytes,
+            "physical_memory_limit_bytes",
+        )
+        if index_limit == 0:
+            raise ValueError("physical_memory_limit_bytes must be positive")
+        projection_limit = min(
+            index_limit,
+            projection_bound,
+        )
+    index = build_physical_waveform_index(
+        ir,
+        max_peak_bytes=index_limit,
+        checkpoint=callback,
+    )
+    iterator = iter(anchor_ticks)
+    try:
+        first_tick = next(iterator)
+    except StopIteration as exc:
+        raise ValueError("readout event has no capture cells") from exc
+    first = _context_from_projection(
+        index.window(
+            first_tick,
             integration_start_offset_seconds=integration_offset,
             integration_seconds=exposure,
-            intervals=intervals,
-            bus_changes=bus_changes,
+            exclude_output_key=trigger_outputs[0],
+            max_projection_bytes=projection_limit,
+            checkpoint=callback,
         )
-        for anchor_tick in anchor_ticks
     )
-    first = contexts[0]
-    if any(item != first for item in contexts[1:]):
-        raise ValueError(
-            "selected readout physical context varies across repeat/scan cells"
+    for anchor_tick in iterator:
+        item = _context_from_projection(
+            index.window(
+                anchor_tick,
+                integration_start_offset_seconds=integration_offset,
+                integration_seconds=exposure,
+                exclude_output_key=trigger_outputs[0],
+                max_projection_bytes=projection_limit,
+                checkpoint=callback,
+            )
         )
+        if item != first:
+            raise ValueError(
+                "selected readout physical context varies across repeat/scan cells"
+            )
     return first
 
 
-def _context_at_trigger(
-    artifact: CompiledPulseArtifact,
-    anchor_tick: int,
-    *,
-    trigger_output_key: str,
-    integration_start_offset_seconds: float,
-    integration_seconds: float,
-    intervals,
-    bus_changes,
+def _context_from_projection(
+    projection: PhysicalWindowProjection,
 ) -> ReadoutPhysicalContext:
-    ir = artifact.target_ir
-
-    window_start = anchor_tick + integration_start_offset_seconds * ir.clock_hz
-    window_stop = window_start + integration_seconds * ir.clock_hz
-
-    def inside(absolute_tick: int) -> bool:
-        return window_start < absolute_tick < window_stop
-
-    digital = []
-    for output_key, lane in ir.logical_digital_outputs:
-        if output_key == trigger_output_key:
-            continue
-        selected = tuple(item for item in intervals if item.output_key == output_key)
-        state = any(
-            item.start_tick <= window_start < item.stop_tick
-            for item in selected
+    if not isinstance(projection, PhysicalWindowProjection):
+        raise TypeError("projection must be PhysicalWindowProjection")
+    digital = tuple(
+        DigitalReadoutTrace(
+            item.output_key,
+            item.high_at_window_start,
+            item.transitions,
         )
-        boundary_ticks = sorted(
-            {
-                tick
-                for item in selected
-                for tick in (item.start_tick, item.stop_tick)
-                if inside(tick)
-            }
+        for item in projection.digital
+    )
+    buses = tuple(
+        BusReadoutTrace(
+            item.bus_name,
+            item.value_at_window_start,
+            item.changes,
         )
-        transitions = []
-        previous = state
-        for tick in boundary_ticks:
-            current = any(item.start_tick <= tick < item.stop_tick for item in selected)
-            if current is not previous:
-                transitions.append((tick - anchor_tick, current))
-                previous = current
-        digital.append(DigitalReadoutTrace(output_key, state, tuple(transitions)))
-
-    buses = []
-    for bus_index, bus_name in enumerate(ir.bus_names):
-        value = ir.bus_safe_values[bus_index]
-        selected_changes = tuple(
-            item for item in bus_changes if item.bus_name == bus_name
-        )
-        for item in selected_changes:
-            if item.tick <= window_start:
-                value = item.value
-            else:
-                break
-        changes = []
-        current = value
-        for item in selected_changes:
-            relative = item.tick - anchor_tick
-            if not inside(item.tick):
-                continue
-            if item.value != current:
-                changes.append((relative, item.value))
-                current = item.value
-        buses.append(BusReadoutTrace(bus_name, value, tuple(changes)))
+        for item in projection.buses
+    )
     return ReadoutPhysicalContext(
-        ir.clock_hz,
-        ir.target_abi_fingerprint,
-        integration_start_offset_seconds,
-        integration_seconds,
-        tuple(sorted(digital, key=lambda item: item.output_key)),
-        tuple(sorted(buses, key=lambda item: item.bus_name)),
+        projection.clock_hz,
+        projection.target_abi_fingerprint,
+        projection.integration_start_offset_seconds,
+        projection.integration_seconds,
+        digital,
+        buses,
     )
 
 
@@ -447,6 +581,10 @@ __all__ = [
     "DigitalReadoutTrace",
     "ReadoutPhysicalContext",
     "derive_readout_physical_context",
+    "estimate_readout_physical_context_peak_bytes",
+    "estimate_readout_physical_context_peak_from_summary",
+    "estimate_readout_physical_context_retained_from_summary",
+    "readout_physical_context_retained_upper_bound_bytes",
     "readout_physical_context_from_tree",
     "readout_physical_context_to_tree",
 ]
