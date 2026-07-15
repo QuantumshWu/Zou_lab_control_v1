@@ -27,6 +27,7 @@ from zlc_storage import (
     encode,
     exact_mapping,
     positive_integer,
+    positive_real,
     sha256_digest,
 )
 
@@ -46,9 +47,13 @@ from zlc_neutral_atom.runtime.run import (
     RunContext,
     RunPlan,
 )
+from zlc_neutral_atom.runtime.resources import (
+    ClaimMode,
+    ResourceClaim,
+    ResourceKey,
+)
 
 from .analysis import (
-    CalibrationAnalysisRequest,
     CalibrationAnalysisResult,
     CalibrationComputation,
     CalibrationReport,
@@ -56,6 +61,7 @@ from .analysis import (
     estimate_calibration_analysis_peak_bytes,
 )
 from .calibration import (
+    CalibrationAnalysisRequest,
     CalibrationArtifact,
     ResolvedCalibration,
     _ResolvedCalibrationSource,
@@ -76,6 +82,7 @@ from .calibration_reference import (
     CALIBRATION_ARTIFACT_NAMESPACE,
     CalibrationArtifactRef,
 )
+from .contracts import ReadoutBindingKey
 
 if TYPE_CHECKING:
     from zlc_neutral_atom.artifacts.capture import AdmittedCapture, CaptureRepository
@@ -90,6 +97,10 @@ _DEFAULT_DIAGNOSTIC_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 _METADATA_DECODE_MULTIPLIER = 8
 _MANIFEST_FIELDS = frozenset(
     {"format", "repository_id", "artifact_blob", "report_blob"}
+)
+_CALIBRATION_ANALYSIS_CLAIM = ResourceClaim(
+    ResourceKey(("analysis", "neutral-atom-calibration")),
+    ClaimMode.EXCLUSIVE,
 )
 
 
@@ -615,7 +626,9 @@ def compile_calibration_artifact_plan(
     calibration_repository: CalibrationRepository,
     request: CalibrationAnalysisRequest,
     *,
+    expected_readout_binding: ReadoutBindingKey,
     memory_limit_bytes: int,
+    timeout_seconds: float,
 ) -> RunPlan:
     """Adapt one synchronous calibration calculation to the generic RunPlan."""
 
@@ -629,13 +642,25 @@ def compile_calibration_artifact_plan(
         raise TypeError("calibration_repository must be CalibrationRepository")
     if not isinstance(request, CalibrationAnalysisRequest):
         raise TypeError("request must be CalibrationAnalysisRequest")
+    if request.expected_centers_xy is None:
+        raise ValueError(
+            "authoritative calibration requires independent expected_centers_xy "
+            "and maximum_site_residual_px"
+        )
+    if not isinstance(expected_readout_binding, ReadoutBindingKey):
+        raise TypeError("expected_readout_binding must be ReadoutBindingKey")
     memory_limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
+    timeout = positive_real(timeout_seconds, "timeout_seconds")
     if source_capture_ref.repository_id != capture_repository.repository_id:
         raise ValueError("source capture belongs to another repository")
 
     def preflight(context: RunContext) -> _PreparedCalibrationAnalysis:
         context.checkpoint()
         source = capture_repository.admit(source_capture_ref)
+        if source.artifact.camera_provenance.binding != expected_readout_binding:
+            raise ValueError(
+                "source capture readout binding differs from the frozen request"
+            )
         frame_source = source.artifact.frame_source
         estimated_peak = estimate_calibration_analysis_peak_bytes(
             frame_source.schema,
@@ -685,12 +710,16 @@ def compile_calibration_artifact_plan(
 
     return RunPlan(
         name="calibrate committed camera capture",
-        resource_claims=(),
+        # The per-run estimator cannot make two concurrent 500 MiB analyses
+        # safe in aggregate.  One flat non-device claim serializes this CPU and
+        # memory-heavy owner without inventing a scheduler or workflow engine.
+        resource_claims=(_CALIBRATION_ANALYSIS_CLAIM,),
         bound_devices=(),
         preflight=preflight,
         execute=execute,
         cleanup=cleanup,
         finalize=finalize,
+        timeout_seconds=timeout,
         requires_final_commit=True,
     )
 

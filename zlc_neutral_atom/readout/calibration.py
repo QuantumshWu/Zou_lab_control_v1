@@ -10,7 +10,7 @@ every layer.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum
 from typing import TypeAlias
 
@@ -31,7 +31,11 @@ from zlc_data import (
 )
 from zlc_neutral_atom.artifacts.capture_frames import CaptureFrameSource
 from zlc_neutral_atom.capture_reference import CaptureArtifactRef
-from zlc_storage import positive_integer as _positive_integer
+from zlc_storage import (
+    finite_real as _finite_float,
+    nonnegative_integer as _nonnegative_integer,
+    positive_integer as _positive_integer,
+)
 
 from .calibration_reference import CalibrationArtifactRef
 from .physical_context import (
@@ -87,6 +91,172 @@ def _immutable_array(
             f"{field_name} must have shape {expected_shape}, got {array.shape}"
         )
     return immutable_array(array, dtype=target_dtype, shape=expected_shape)
+
+
+@dataclass(frozen=True, eq=False)
+class CalibrationAnalysisRequest:
+    """Explicit physical and statistical intent for one calibration artifact.
+
+    ``expected_centers_xy`` is independent spatial admission evidence in the
+    declared ``ordering``.  It constrains authority; detector output can never
+    fill or replace it.
+    """
+
+    layout: CalibrationCaptureLayout
+    grid_shape_yx: tuple[int, int]
+    ordering: GridOrder = GridOrder.ROW_MAJOR
+    box_radius: int = 1
+    box_reducer: BoxReducer = BoxReducer.MEAN
+    psf_half_width: int = 3
+    psf_background: BackgroundMode = BackgroundMode.ANNULUS_MEDIAN
+    psf_background_padding: int = 3
+    model_kinds: tuple[ReadoutModelKind, ...] = (
+        ReadoutModelKind.BOX,
+        ReadoutModelKind.PER_SITE_PSF,
+        ReadoutModelKind.UNIFORM_PSF,
+    )
+    default_model_kind: ReadoutModelKind = ReadoutModelKind.BOX
+    train_fraction: float = 0.9
+    split_seed: int = 0
+    histogram_bins: int = 120
+    minimum_site_fidelity: float = 0.5
+    max_drop: int | None = None
+    detector_min_distance: int | None = None
+    detector_threshold_rel: float = 0.35
+    detector_refine_half: int = 2
+    expected_centers_xy: np.ndarray | None = None
+    maximum_site_residual_px: float | None = None
+
+    __hash__ = None
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, CalibrationAnalysisRequest):
+            return NotImplemented
+        for item in fields(self):
+            if item.name == "expected_centers_xy":
+                continue
+            if getattr(self, item.name) != getattr(other, item.name):
+                return False
+        if self.expected_centers_xy is None or other.expected_centers_xy is None:
+            return self.expected_centers_xy is other.expected_centers_xy
+        return bool(np.array_equal(self.expected_centers_xy, other.expected_centers_xy))
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.layout, CalibrationCaptureLayout):
+            raise TypeError("layout must be CalibrationCaptureLayout")
+        try:
+            raw_grid = tuple(self.grid_shape_yx)
+        except TypeError as exc:
+            raise ValueError("grid_shape_yx must contain two positive integers") from exc
+        if len(raw_grid) != 2:
+            raise ValueError("grid_shape_yx must contain two positive integers")
+        grid = (
+            _positive_integer(raw_grid[0], "grid_shape_yx[0]"),
+            _positive_integer(raw_grid[1], "grid_shape_yx[1]"),
+        )
+        if not isinstance(self.ordering, GridOrder):
+            raise TypeError("ordering must be GridOrder")
+        radius = _nonnegative_integer(self.box_radius, "box_radius")
+        if not isinstance(self.box_reducer, BoxReducer):
+            raise TypeError("box_reducer must be BoxReducer")
+        psf_half = _nonnegative_integer(self.psf_half_width, "psf_half_width")
+        if not isinstance(self.psf_background, BackgroundMode):
+            raise TypeError("psf_background must be BackgroundMode")
+        padding = _positive_integer(
+            self.psf_background_padding,
+            "psf_background_padding",
+        )
+        kinds = tuple(self.model_kinds)
+        if not kinds or any(not isinstance(kind, ReadoutModelKind) for kind in kinds):
+            raise TypeError("model_kinds must contain ReadoutModelKind values")
+        if len(set(kinds)) != len(kinds):
+            raise ValueError("model_kinds must be unique")
+        kinds = tuple(kind for kind in ReadoutModelKind if kind in kinds)
+        if not isinstance(self.default_model_kind, ReadoutModelKind):
+            raise TypeError("default_model_kind must be ReadoutModelKind")
+        if self.default_model_kind not in kinds:
+            raise ValueError("default_model_kind must be present in model_kinds")
+        fraction = _finite_float(self.train_fraction, "train_fraction")
+        if not 0.0 < fraction < 1.0:
+            raise ValueError("train_fraction must be in (0, 1)")
+        seed = _nonnegative_integer(self.split_seed, "split_seed")
+        bins = _positive_integer(self.histogram_bins, "histogram_bins")
+        if bins < 2:
+            raise ValueError("histogram_bins must be at least two")
+        minimum_site_fidelity = _finite_float(
+            self.minimum_site_fidelity,
+            "minimum_site_fidelity",
+        )
+        if not 0.5 <= minimum_site_fidelity <= 1.0:
+            raise ValueError("minimum_site_fidelity must be in [0.5, 1.0]")
+        site_count = grid[0] * grid[1]
+        max_drop = (
+            min(5, site_count)
+            if self.max_drop is None
+            else _nonnegative_integer(self.max_drop, "max_drop")
+        )
+        if max_drop > site_count:
+            raise ValueError(
+                f"max_drop must not exceed the {site_count} declared sites"
+            )
+        min_distance = self.detector_min_distance
+        if min_distance is not None:
+            min_distance = _positive_integer(min_distance, "detector_min_distance")
+        threshold_rel = _finite_float(
+            self.detector_threshold_rel,
+            "detector_threshold_rel",
+        )
+        if not 0.0 <= threshold_rel <= 1.0:
+            raise ValueError("detector_threshold_rel must be in [0, 1]")
+        refine_half = _nonnegative_integer(
+            self.detector_refine_half,
+            "detector_refine_half",
+        )
+        expected_centers = self.expected_centers_xy
+        maximum_residual = self.maximum_site_residual_px
+        if (expected_centers is None) != (maximum_residual is None):
+            raise ValueError(
+                "expected_centers_xy and maximum_site_residual_px must be "
+                "provided together"
+            )
+        if expected_centers is not None:
+            expected_centers = _immutable_array(
+                expected_centers,
+                dtype="<f8",
+                shape=(site_count, 2),
+                field_name="expected_centers_xy",
+            )
+            if not np.all(np.isfinite(expected_centers)):
+                raise ValueError("expected_centers_xy must be finite")
+            maximum_residual = _finite_float(
+                maximum_residual,
+                "maximum_site_residual_px",
+            )
+            if maximum_residual <= 0.0:
+                raise ValueError("maximum_site_residual_px must be positive")
+        object.__setattr__(self, "grid_shape_yx", grid)
+        object.__setattr__(self, "box_radius", radius)
+        object.__setattr__(self, "psf_half_width", psf_half)
+        object.__setattr__(self, "psf_background_padding", padding)
+        object.__setattr__(self, "model_kinds", kinds)
+        object.__setattr__(self, "train_fraction", fraction)
+        object.__setattr__(self, "split_seed", seed)
+        object.__setattr__(self, "histogram_bins", bins)
+        object.__setattr__(
+            self,
+            "minimum_site_fidelity",
+            minimum_site_fidelity,
+        )
+        object.__setattr__(self, "max_drop", max_drop)
+        object.__setattr__(self, "detector_min_distance", min_distance)
+        object.__setattr__(self, "detector_threshold_rel", threshold_rel)
+        object.__setattr__(self, "detector_refine_half", refine_half)
+        object.__setattr__(self, "expected_centers_xy", expected_centers)
+        object.__setattr__(self, "maximum_site_residual_px", maximum_residual)
+
+    @property
+    def site_count(self) -> int:
+        return self.grid_shape_yx[0] * self.grid_shape_yx[1]
 
 
 def _site_validity(
@@ -889,6 +1059,7 @@ __all__ = [
     "BackgroundMode",
     "BoxFeature",
     "BoxReducer",
+    "CalibrationAnalysisRequest",
     "CalibrationArtifact",
     "CalibrationSourceBinding",
     "GridOrder",

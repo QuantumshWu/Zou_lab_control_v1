@@ -32,9 +32,19 @@ from zlc_neutral_atom.artifacts import (
     FitExecution,
     compile_capture_artifact_pipeline,
 )
-from zlc_neutral_atom.readout.calibration import ResolvedCalibration
+from zlc_neutral_atom.readout.calibration import (
+    BackgroundMode,
+    BoxReducer,
+    CalibrationAnalysisRequest,
+    GridOrder,
+    ReadoutModelKind,
+    ResolvedCalibration,
+)
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
-from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
+from zlc_neutral_atom.readout.contracts import (
+    CalibrationCaptureLayout,
+    ReadoutBindingKey,
+)
 from zlc_neutral_atom.runtime.pipeline import (
     estimate_pipeline_peak_bytes,
     MinimalPipelineSpec,
@@ -50,11 +60,18 @@ from zlc_pulse import (
 from zlc_storage import canonical_text as _text
 from zlc_storage import durable_mkdir
 from zlc_storage import positive_integer as _positive_int
+from zlc_storage import positive_real as _positive_real
 
 if TYPE_CHECKING:
+    from zlc_neutral_atom.readout.analysis import CalibrationReport
     from zlc_neutral_atom.readout.calibration_repository import (
         CalibrationRepository,
     )
+
+
+_DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES = 512 << 20
+_DEFAULT_CALIBRATION_TIMEOUT_SECONDS = 300.0
+
 
 class _ResourceCleanupError(RuntimeError):
     """Report retaining every ordinary cleanup failure."""
@@ -157,10 +174,40 @@ class CaptureRequest:
                 "pipeline_memory_limit_bytes",
             ),
         )
-        timeout = float(self.timeout_seconds)
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("timeout_seconds must be finite and positive")
-        object.__setattr__(self, "timeout_seconds", timeout)
+        object.__setattr__(
+            self,
+            "timeout_seconds",
+            _positive_real(self.timeout_seconds, "timeout_seconds"),
+        )
+
+
+@dataclass(frozen=True)
+class CalibrationArtifactRequest:
+    """Freeze one committed capture, its binding, and calibration intent."""
+
+    source_capture_ref: CaptureArtifactRef
+    readout_binding: ReadoutBindingKey
+    analysis: CalibrationAnalysisRequest
+    memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES
+    timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_capture_ref, CaptureArtifactRef):
+            raise TypeError("source_capture_ref must be CaptureArtifactRef")
+        if not isinstance(self.readout_binding, ReadoutBindingKey):
+            raise TypeError("readout_binding must be ReadoutBindingKey")
+        if not isinstance(self.analysis, CalibrationAnalysisRequest):
+            raise TypeError("analysis must be CalibrationAnalysisRequest")
+        object.__setattr__(
+            self,
+            "memory_limit_bytes",
+            _positive_int(self.memory_limit_bytes, "memory_limit_bytes"),
+        )
+        object.__setattr__(
+            self,
+            "timeout_seconds",
+            _positive_real(self.timeout_seconds, "timeout_seconds"),
+        )
 
 
 @dataclass(frozen=True)
@@ -307,6 +354,15 @@ class ReadoutFacade:
                 raise ValueError(f"readout binding {key.value!r} is not a camera")
         return ReadoutFacade(self._token, key)
 
+    def _require_binding(self, actual: ReadoutBindingKey) -> None:
+        if not isinstance(actual, ReadoutBindingKey):
+            raise TypeError("actual readout binding must be ReadoutBindingKey")
+        if self._binding is not None and actual != self._binding:
+            raise ValueError(
+                f"bound readout facade requires {self._binding.value!r}, "
+                f"not {actual.value!r}"
+            )
+
     def capture_request(
         self,
         pulse: PulseDocument | str | Path,
@@ -370,15 +426,71 @@ class ReadoutFacade:
         with _service_guard(self._token) as services:
             return services.capture_repository.load(reference)
 
+    def calibration_request(
+        self,
+        source: CaptureArtifactRef,
+        analysis: CalibrationAnalysisRequest,
+        *,
+        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
+        timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS,
+    ) -> CalibrationArtifactRequest:
+        """Bind explicit calibration intent to an admitted raw capture."""
+
+        if not isinstance(source, CaptureArtifactRef):
+            raise TypeError("source must be CaptureArtifactRef")
+        if not isinstance(analysis, CalibrationAnalysisRequest):
+            raise TypeError("analysis must be CalibrationAnalysisRequest")
+        with _service_guard(self._token) as services:
+            admitted = services.capture_repository.admit(source)
+            binding = admitted.artifact.camera_provenance.binding
+            self._require_binding(binding)
+            return CalibrationArtifactRequest(
+                source,
+                binding,
+                analysis,
+                memory_limit_bytes,
+                timeout_seconds,
+            )
+
+    def start_calibration(
+        self,
+        request: CalibrationArtifactRequest,
+    ) -> RunHandle:
+        if not isinstance(request, CalibrationArtifactRequest):
+            raise TypeError("request must be CalibrationArtifactRequest")
+        self._require_binding(request.readout_binding)
+        return _start_calibration(self._token, request)
+
+    def calibrate(
+        self,
+        request: CalibrationArtifactRequest,
+    ) -> CalibrationArtifactRef:
+        if not isinstance(request, CalibrationArtifactRequest):
+            raise TypeError("request must be CalibrationArtifactRequest")
+        self._require_binding(request.readout_binding)
+        return _run_calibration(self._token, request)
+
     def load_calibration(
         self,
         reference: CalibrationArtifactRef,
     ) -> ResolvedCalibration:
         with _service_guard(self._token) as services:
-            return _calibration_repository(services).admit(
+            resolved = _calibration_repository(services).admit(
                 reference,
                 services.capture_repository,
             )
+            self._require_binding(resolved.artifact.frame_contract.binding)
+            return resolved
+
+    def load_calibration_report(
+        self,
+        reference: CalibrationArtifactRef,
+    ) -> "CalibrationReport":
+        with _service_guard(self._token) as services:
+            repository = _calibration_repository(services)
+            artifact = repository.load(reference)
+            self._require_binding(artifact.frame_contract.binding)
+            return repository.load_report(reference)
 
 
 class Experiment:
@@ -615,6 +727,47 @@ def _run(token: object, request: CaptureRequest) -> CaptureArtifactRef:
     return runtime.wait(handle)
 
 
+def _compile_calibration_for_services(
+    services: _ExperimentServices,
+    request: CalibrationArtifactRequest,
+):
+    if not isinstance(request, CalibrationArtifactRequest):
+        raise TypeError("request must be CalibrationArtifactRequest")
+    from zlc_neutral_atom.readout.calibration_repository import (
+        compile_calibration_artifact_plan,
+    )
+
+    return compile_calibration_artifact_plan(
+        request.source_capture_ref,
+        services.capture_repository,
+        _calibration_repository(services),
+        request.analysis,
+        expected_readout_binding=request.readout_binding,
+        memory_limit_bytes=request.memory_limit_bytes,
+        timeout_seconds=request.timeout_seconds,
+    )
+
+
+def _start_calibration(
+    token: object,
+    request: CalibrationArtifactRequest,
+) -> RunHandle:
+    with _service_guard(token) as services:
+        plan = _compile_calibration_for_services(services, request)
+        return services.runtime.start(plan)
+
+
+def _run_calibration(
+    token: object,
+    request: CalibrationArtifactRequest,
+) -> CalibrationArtifactRef:
+    with _service_guard(token) as services:
+        plan = _compile_calibration_for_services(services, request)
+        handle = services.runtime.start(plan)
+        runtime = services.runtime
+    return runtime.wait(handle)
+
+
 def connect(
     config: str = "virtual",
     *,
@@ -688,15 +841,22 @@ def connect(
 
 __all__ = [
     "AdmittedCaptureFitResult",
+    "BackgroundMode",
+    "BoxReducer",
+    "CalibrationAnalysisRequest",
+    "CalibrationArtifactRequest",
     "CalibrationArtifactRef",
+    "CalibrationCaptureLayout",
     "CaptureArtifactRef",
     "CaptureFitResultArtifactRef",
     "CaptureRequest",
     "connect",
     "Experiment",
     "FitExecution",
+    "GridOrder",
     "PlanDescriptor",
     "ReadoutFacade",
+    "ReadoutModelKind",
     "TimingFacade",
     "TimingTargetDescriptor",
 ]

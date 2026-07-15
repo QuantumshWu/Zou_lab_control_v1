@@ -33,7 +33,6 @@ from zlc_storage import (
 from .analysis import (
     AblationPoint,
     BimodalFit,
-    CalibrationAnalysisRequest,
     CalibrationReport,
     ModelCalibrationReport,
     PsfFitDiagnostic,
@@ -45,6 +44,7 @@ from .calibration import (
     BackgroundMode,
     BoxFeature,
     BoxReducer,
+    CalibrationAnalysisRequest,
     CalibrationArtifact,
     CalibrationSourceBinding,
     GridOrder,
