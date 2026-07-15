@@ -9,12 +9,12 @@ from zlc_neutral_atom.acquisition import (
     CameraAcquisitionMode,
     decode_camera_capture_spec,
 )
-from zlc_neutral_atom.runtime import (
-    CaptureStreamContract,
-    CleanupReport,
+from zlc_neutral_atom.runtime.capture import (
+    CameraCaptureContract,
     FrozenCaptureSpec,
-    RunContext,
 )
+from zlc_neutral_atom.runtime.cleanup import CleanupReport
+from zlc_neutral_atom.runtime.run import RunContext
 from zlc_neutral_atom.runtime._failure import record_secondary_failure
 from zlc_pulse import DigitalTriggerSchedule
 
@@ -67,15 +67,15 @@ def execute_autonomous_single_fire(
 def validate_single_trigger_capture_binding(
     *,
     capture_spec: FrozenCaptureSpec,
-    contract: CaptureStreamContract,
+    contract: CameraCaptureContract,
     pulse_binding: PulseCaptureBinding,
 ) -> DigitalTriggerSchedule:
     """Validate the exact single-wire camera/pulse join shared by coordinators."""
 
     if not isinstance(capture_spec, FrozenCaptureSpec):
         raise TypeError("capture_spec must be FrozenCaptureSpec")
-    if not isinstance(contract, CaptureStreamContract):
-        raise TypeError("contract must be CaptureStreamContract")
+    if not isinstance(contract, CameraCaptureContract):
+        raise TypeError("contract must be CameraCaptureContract")
     if not isinstance(pulse_binding, PulseCaptureBinding):
         raise TypeError("pulse_binding must be PulseCaptureBinding")
     artifact = pulse_binding.compiled_artifact
@@ -85,18 +85,22 @@ def validate_single_trigger_capture_binding(
     if camera_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
         raise ValueError("exact triggered capture requires an external-trigger camera")
     evidence = contract.capability.camera_capability_evidence
-    if evidence is None:
-        raise ValueError(
-            "exact triggered capture requires broker-attested camera physical facts"
-        )
     evidence.physical_facts.require_single_capture_trigger_channel(
         trigger_channel
     )
+    if evidence.exact_external_trigger_qualification_digest is None:
+        raise ValueError(
+            "exact triggered capture requires E0-qualified ordered one-frame-per-trigger evidence"
+        )
     schedule = pulse_binding.trigger_schedule
     minimum_interval_ticks = schedule.minimum_interval_ticks
     required_interval = (
         evidence.physical_facts.required_external_trigger_interval_seconds
     )
+    if required_interval is None:
+        raise ValueError(
+            "exact triggered capture requires a qualified safe external-trigger interval"
+        )
     if minimum_interval_ticks is not None:
         actual_interval = minimum_interval_ticks / artifact.target_ir.clock_hz
         if actual_interval < required_interval:
@@ -107,7 +111,7 @@ def validate_single_trigger_capture_binding(
                 f"{required_interval:.12g} s"
             )
     cell_plan.validate_dataset_schema(contract.dataset_schema)
-    if cell_plan.expected_cells != contract.expected_cells:
+    if not cell_plan.cell_schedule.same_order_as(contract.cell_schedule):
         raise ValueError("capture cell plan permutation differs from capture contract")
     expected = contract.total_events
     if pulse_binding.expected_trigger_count != expected:

@@ -14,25 +14,27 @@ import numpy as np
 from zlc_data import BlockId, ComponentValidity, DataBlock, DatasetSchema, OwnedSnapshot
 from zlc_storage import canonical_text, positive_real
 
-from zlc_neutral_atom.acquisition.camera import CameraFrameMetadata
+from zlc_neutral_atom.acquisition.camera import (
+    CameraFrameMetadata,
+    CameraFrameMetadataContract,
+)
 from zlc_neutral_atom.processing.stream import ExactStreamProcessorWorker
 from zlc_neutral_atom.runtime._failure import record_secondary_failure
 from zlc_neutral_atom.runtime.capture import CaptureSession, CaptureSessionState
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
-    DatasetCellAddress,
+    DatasetCellSchedule,
     OrderedDatasetMetadataHasher,
 )
 from zlc_neutral_atom.runtime.pipeline import (
     BoundMeasurement,
-    PipelineMemoryAdmission,
-    PipelineMemoryProfile,
     PipelineResult,
-    admit_pipeline_memory,
+    _require_direct_capture,
     dataset_storage_nbytes,
     finalize_pipeline_result,
 )
-from zlc_neutral_atom.runtime.run import CleanupReport, PostSafetyContext, RunContext, RunMode, RunPlan
+from zlc_neutral_atom.runtime.cleanup import CleanupReport
+from zlc_neutral_atom.runtime.run import PostSafetyContext, RunContext, RunPlan
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
     ExactReservation,
@@ -62,7 +64,7 @@ class OccupancyPipelineSpec:
     processor: OccupancyStreamProcessorSpec
     counts_block_id: BlockId
     occupied_block_id: BlockId
-    memory: PipelineMemoryProfile
+    memory_limit_bytes: int
     timeout_seconds: float
 
     def __post_init__(self) -> None:
@@ -75,8 +77,12 @@ class OccupancyPipelineSpec:
             raise TypeError("counts_block_id and occupied_block_id must be BlockId")
         if self.counts_block_id == self.occupied_block_id:
             raise ValueError("counts and occupied require distinct BlockId values")
-        if not isinstance(self.memory, PipelineMemoryProfile):
-            raise TypeError("memory must be PipelineMemoryProfile")
+        if (
+            isinstance(self.memory_limit_bytes, bool)
+            or not isinstance(self.memory_limit_bytes, int)
+            or self.memory_limit_bytes <= 0
+        ):
+            raise ValueError("memory_limit_bytes must be a positive integer")
         object.__setattr__(self, "timeout_seconds", positive_real(self.timeout_seconds, "timeout_seconds"))
 
 
@@ -86,15 +92,17 @@ class OccupancyDataset:
 
     counts: OwnedSnapshot
     occupied: OwnedSnapshot
-    events: tuple[tuple[DatasetCellAddress, CameraFrameMetadata], ...]
+    cell_schedule: DatasetCellSchedule
+    event_metadata: tuple[CameraFrameMetadata, ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.counts, OwnedSnapshot) or not isinstance(self.occupied, OwnedSnapshot):
             raise TypeError("counts and occupied must be OwnedSnapshot")
-        events = tuple(self.events)
-        if any(not isinstance(cell, DatasetCellAddress) or not isinstance(meta, CameraFrameMetadata)
-               for cell, meta in events):
-            raise TypeError("events must pair DatasetCellAddress and CameraFrameMetadata")
+        if not isinstance(self.cell_schedule, DatasetCellSchedule):
+            raise TypeError("cell_schedule must be DatasetCellSchedule")
+        metadata = tuple(self.event_metadata)
+        if any(not isinstance(item, CameraFrameMetadata) for item in metadata):
+            raise TypeError("event_metadata must contain CameraFrameMetadata")
         left, right = self.counts.block.schema, self.occupied.block.schema
         left_domain = (left.repeat_axis, left.point_axes, left.point_layout, left.cell_schema.data_axes)
         right_domain = (right.repeat_axis, right.point_axes, right.point_layout, right.cell_schema.data_axes)
@@ -106,17 +114,10 @@ class OccupancyDataset:
             raise ValueError("occupancy fields do not share generation/revision")
         if self.counts.block.validity is not self.occupied.block.validity:
             raise ValueError("occupancy fields must share one validity authority")
-        repeats, points = left.repeat_axis.size, left.point_layout.storage_size
-        addresses = {(cell.repeat_index, cell.point_storage_index) for cell, _meta in events}
-        if len(events) != repeats * points or len(addresses) != len(events):
-            raise ValueError("occupancy events do not cover each dataset cell exactly once")
-        if any(repeat >= repeats or point >= points for repeat, point in addresses):
-            raise ValueError("occupancy event address is outside its dataset domain")
-        object.__setattr__(self, "events", events)
-
-    @property
-    def cell_schedule(self) -> tuple[DatasetCellAddress, ...]:
-        return tuple(cell for cell, _meta in self.events)
+        self.cell_schedule.validate_schema(left)
+        if len(metadata) != len(self.cell_schedule):
+            raise ValueError("occupancy metadata does not cover the cell schedule")
+        object.__setattr__(self, "event_metadata", metadata)
 
 @dataclass(frozen=True, slots=True)
 class OccupancyPipelineResult:
@@ -144,27 +145,42 @@ class ExactOccupancyTransaction:
     session: CaptureSession
     bound: BoundOccupancyStreamProcessor
     worker: ExactStreamProcessorWorker | None
-    memory_admission: PipelineMemoryAdmission
-    pipeline: PipelineResult | None = None
 
     def start(self, context: RunContext) -> None:
         self.session.prepare(context)
         self.session.start(context)
 
     def capture_all(self, context: RunContext) -> None:
-        for _cell in self.spec.measurement.capture_contract.expected_cells:
+        for _ordinal in range(self.spec.measurement.capture_contract.total_events):
             context.checkpoint()
             self.session.capture_next(context)
 
-    def complete(self, context: RunContext) -> "ExactOccupancyTransaction":
-        if self.pipeline is not None or self.worker is None:
+    def complete(self, context: RunContext) -> "ExecutedOccupancy":
+        if self.worker is None:
             raise RuntimeError("occupancy transaction is complete or released")
         completion = self.session.complete(context)
         sealed = self.worker.finish(completion.eos, _remaining_seconds(context))
-        self.pipeline = finalize_pipeline_result(
-            dataset=sealed, capture_completion=completion, memory_admission=self.memory_admission
+        pipeline = finalize_pipeline_result(
+            dataset=sealed,
+            capture_completion=completion,
         )
-        return self
+        cell_schedule = self.bound.output_edge.cell_schedule
+        if cell_schedule is None:
+            raise RuntimeError("exact occupancy edge has no frozen cell schedule")
+        metadata_contract = (
+            self.spec.measurement.capture_contract.dataset_edge.metadata_contract
+        )
+        if not isinstance(metadata_contract, CameraFrameMetadataContract):
+            raise TypeError("occupancy capture uses another metadata contract")
+        return ExecutedOccupancy(
+            pipeline=pipeline,
+            occupied_block_id=self.spec.occupied_block_id,
+            occupied_schema=_occupied_schema(self.bound),
+            cell_schedule=cell_schedule,
+            source_metadata_contract=metadata_contract,
+            calibration_reference=self.bound.calibration_reference,
+            model_kind=self.bound.model_kind,
+        )
 
     def fail(self, error: BaseException) -> None:
         if self.session.state is CaptureSessionState.COMPLETED:
@@ -198,10 +214,37 @@ class ExactOccupancyTransaction:
             return report
         return CleanupReport(report.safety_proofs, report.decisions, (*report.errors, *errors))
 
-    def completed_pipeline(self) -> PipelineResult:
-        if self.pipeline is None:
-            raise RuntimeError("occupancy transaction has no completed pipeline")
-        return self.pipeline
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutedOccupancy:
+    """Post-safety occupancy facts with no session, worker, or reservation."""
+
+    pipeline: PipelineResult
+    occupied_block_id: BlockId
+    occupied_schema: DatasetSchema
+    cell_schedule: DatasetCellSchedule
+    source_metadata_contract: CameraFrameMetadataContract
+    calibration_reference: CalibrationArtifactRef
+    model_kind: ReadoutModelKind
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pipeline, PipelineResult):
+            raise TypeError("pipeline must be PipelineResult")
+        if not isinstance(self.occupied_block_id, BlockId):
+            raise TypeError("occupied_block_id must be BlockId")
+        if not isinstance(self.occupied_schema, DatasetSchema):
+            raise TypeError("occupied_schema must be DatasetSchema")
+        if not isinstance(self.source_metadata_contract, CameraFrameMetadataContract):
+            raise TypeError("source_metadata_contract has another owner")
+        if not isinstance(self.calibration_reference, CalibrationArtifactRef):
+            raise TypeError("calibration_reference must be CalibrationArtifactRef")
+        if not isinstance(self.model_kind, ReadoutModelKind):
+            raise TypeError("model_kind must be ReadoutModelKind")
+        if not isinstance(self.cell_schedule, DatasetCellSchedule):
+            raise TypeError("cell_schedule must be DatasetCellSchedule")
+        self.cell_schedule.validate_schema(self.pipeline.dataset.block.schema)
+        self.cell_schedule.validate_schema(self.occupied_schema)
 
 
 def _remaining_seconds(context: RunContext) -> float:
@@ -229,9 +272,7 @@ def _estimate_peak_bytes(spec: OccupancyPipelineSpec, bound: BoundOccupancyStrea
     metadata_bytes = events * bound.output_edge.metadata_max_retained_nbytes
     artifact = spec.processor.calibration.artifact
     calibration_bytes = calibration_retained_array_nbytes(artifact)
-    runtime_bytes = (spec.memory.fixed_runtime_overhead_bytes
-                     + events * spec.memory.per_event_reference_overhead_bytes)
-    common = contract.estimated_transport_bytes + metadata_bytes + calibration_bytes + runtime_bytes
+    common = contract.estimated_transport_bytes + metadata_bytes + calibration_bytes
     execution = common + output.max_retained_nbytes + 2 * counts_bytes + readout_runtime_scratch_nbytes(artifact, bound.model_kind)
     finalization = common + output.max_retained_nbytes + 2 * counts_bytes + 2 * occupied_bytes + output.finalization_scratch_nbytes
     return max(execution, finalization)
@@ -272,7 +313,7 @@ def _failed_open(session: CaptureSession, worker: ExactStreamProcessorWorker | N
         record_secondary_failure(primary, "preflight teardown also failed", error)
 
 
-def open_exact_occupancy(spec: OccupancyPipelineSpec, context: RunContext) -> ExactOccupancyTransaction:
+def _open_exact_occupancy(spec: OccupancyPipelineSpec, context: RunContext) -> ExactOccupancyTransaction:
     """Allocate the complete software chain without touching hardware."""
 
     if not isinstance(spec, OccupancyPipelineSpec):
@@ -286,8 +327,11 @@ def open_exact_occupancy(spec: OccupancyPipelineSpec, context: RunContext) -> Ex
         capture_input = session.processor_input_binding
         bound = bind_occupancy_stream_processor(spec.processor, capture_input)
         peak = _estimate_peak_bytes(spec, bound)
-        if peak > spec.memory.memory_limit_bytes:
-            raise MemoryError(f"occupancy pipeline peak budget {peak} exceeds limit {spec.memory.memory_limit_bytes}")
+        if peak > spec.memory_limit_bytes:
+            raise MemoryError(
+                f"occupancy pipeline owned-buffer peak {peak} exceeds "
+                f"limit {spec.memory_limit_bytes}"
+            )
         source = session.reserve_exact()
         source_cursor = source.activate()
         payload = bound.output_payload_contract
@@ -313,36 +357,30 @@ def open_exact_occupancy(spec: OccupancyPipelineSpec, context: RunContext) -> Ex
         )
         worker.start()
         readiness = worker.exact_readiness()
-        admission = admit_pipeline_memory(
-            aggregate_peak_bytes=peak, memory_profile=spec.memory,
-            chain_contract_digest=readiness.chain_contract_digest,
-        )
         session.bind_exact_consumer(readiness)
-        return ExactOccupancyTransaction(spec, session, bound, worker, admission)
+        return ExactOccupancyTransaction(spec, session, bound, worker)
     except BaseException as error:
         _failed_open(session, worker, builder, source, output_reservation, error)
         raise
 
 
 def finalize_occupancy_result(context: PostSafetyContext,
-                              transaction: ExactOccupancyTransaction) -> OccupancyPipelineResult:
+                              executed: ExecutedOccupancy) -> OccupancyPipelineResult:
     """Build occupied beside counts after generic terminal validation."""
 
-    if not isinstance(transaction, ExactOccupancyTransaction):
-        raise TypeError("transaction must be ExactOccupancyTransaction")
-    pipeline, bound = transaction.completed_pipeline(), transaction.bound
+    if not isinstance(executed, ExecutedOccupancy):
+        raise TypeError("executed must be ExecutedOccupancy")
+    pipeline = executed.pipeline
     terminal, counts = pipeline.dataset, pipeline.dataset.snapshot
     validity = counts.block.validity
     if not isinstance(validity, ComponentValidity):
         raise TypeError("occupancy counts block requires ComponentValidity")
-    cells = bound.output_edge.expected_cells
-    if cells is None:
-        raise RuntimeError("exact occupancy edge has no frozen cell schedule")
-    schema = _occupied_schema(bound)
+    cells = executed.cell_schedule
+    schema = executed.occupied_schema
     values = np.zeros(schema.physical_shape, dtype=bool)
-    capture_edge = transaction.spec.measurement.capture_contract.dataset_edge
-    hasher = OrderedDatasetMetadataHasher(capture_edge.metadata_contract_fingerprint)
-    events: list[tuple[DatasetCellAddress, CameraFrameMetadata]] = []
+    metadata_contract = executed.source_metadata_contract
+    hasher = OrderedDatasetMetadataHasher(metadata_contract.fingerprint)
+    event_metadata: list[CameraFrameMetadata] = []
     for cell, metadata in zip(cells, terminal.event_metadata, strict=True):
         context.checkpoint()
         if not isinstance(metadata, OccupancyDatasetMetadata):
@@ -354,17 +392,25 @@ def finalize_occupancy_result(context: PostSafetyContext,
         if (validity.axis_ids != occupied_validity.axis_ids
                 or not np.array_equal(validity.mask[location], occupied_validity.mask)):
             raise RuntimeError("counts and occupied validity differ at one dataset cell")
-        hasher.update(capture_edge.metadata_contract.digest(metadata.source_metadata))
+        hasher.update(metadata_contract.digest(metadata.source_metadata))
         values[location] = metadata.occupied.values
-        events.append((cell, metadata.source_metadata))
+        event_metadata.append(metadata.source_metadata)
     if hasher.digest() != pipeline.capture_terminal.ordered_metadata_digest:
         raise RuntimeError("occupancy source metadata differs from physical capture")
-    block = DataBlock(transaction.spec.occupied_block_id, counts.block.revision, values, validity, schema)
+    block = DataBlock(executed.occupied_block_id, counts.block.revision, values, validity, schema)
     occupied = OwnedSnapshot(block.ref(terminal.provenance.generation), block)
-    result = OccupancyDataset(counts, occupied, tuple(events))
+    result = OccupancyDataset(
+        counts,
+        occupied,
+        cells,
+        tuple(event_metadata),
+    )
     context.checkpoint()
     return OccupancyPipelineResult(
-        pipeline, result, bound.calibration_reference, bound.model_kind
+        pipeline,
+        result,
+        executed.calibration_reference,
+        executed.model_kind,
     )
 
 
@@ -373,9 +419,10 @@ def compile_occupancy_pipeline(spec: OccupancyPipelineSpec) -> RunPlan:
 
     if not isinstance(spec, OccupancyPipelineSpec):
         raise TypeError("spec must be OccupancyPipelineSpec")
+    _require_direct_capture(spec.measurement)
     port = spec.measurement.capture_port
 
-    def execute(context: RunContext, prepared: ExactOccupancyTransaction) -> ExactOccupancyTransaction:
+    def execute(context: RunContext, prepared: ExactOccupancyTransaction) -> ExecutedOccupancy:
         try:
             prepared.start(context)
             prepared.capture_all(context)
@@ -388,18 +435,18 @@ def compile_occupancy_pipeline(spec: OccupancyPipelineSpec) -> RunPlan:
                 _primary: BaseException | None) -> CleanupReport:
         return port.verify_idle(context) if prepared is None else prepared.cleanup(context)
 
-    def finalize(context: PostSafetyContext, executed: ExactOccupancyTransaction) -> OccupancyPipelineResult:
-        if not isinstance(executed, ExactOccupancyTransaction):
-            raise TypeError("occupancy finalize requires its exact transaction")
-        if executed.completed_pipeline().run_id != context.run_id.value:
+    def finalize(context: PostSafetyContext, executed: ExecutedOccupancy) -> OccupancyPipelineResult:
+        if not isinstance(executed, ExecutedOccupancy):
+            raise TypeError("occupancy finalize requires executed occupancy facts")
+        if executed.pipeline.run_id != context.run_id.value:
             raise ValueError("executed occupancy result belongs to another Run")
         context.checkpoint()
         return finalize_occupancy_result(context, executed)
 
     return RunPlan(
-        name=spec.name, mode=RunMode.FINITE_EXACT,
-        resource_claims=(port.resource_claim,), hazard_claims=(port.hazard_claim,),
-        bound_devices=(port.device,), preflight=lambda context: open_exact_occupancy(spec, context),
+        name=spec.name,
+        resource_claims=(port.resource_claim,),
+        bound_devices=(port.device,), preflight=lambda context: _open_exact_occupancy(spec, context),
         execute=execute, cleanup=cleanup, finalize=finalize,
         interrupt_operations=port.interrupt_operations, timeout_seconds=spec.timeout_seconds,
         requires_final_commit=False,
@@ -408,10 +455,10 @@ def compile_occupancy_pipeline(spec: OccupancyPipelineSpec) -> RunPlan:
 
 __all__ = [
     "compile_occupancy_pipeline",
+    "ExecutedOccupancy",
     "ExactOccupancyTransaction",
     "finalize_occupancy_result",
     "OccupancyDataset",
     "OccupancyPipelineResult",
     "OccupancyPipelineSpec",
-    "open_exact_occupancy",
 ]

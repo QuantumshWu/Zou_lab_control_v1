@@ -54,6 +54,28 @@ class FramedJournal:
         *,
         max_record_bytes: int = _DEFAULT_MAX_RECORD_BYTES,
     ) -> None:
+        self._initialize(path, max_record_bytes=max_record_bytes, scan=True)
+
+    @classmethod
+    def open_exclusive(
+        cls,
+        path: str | os.PathLike[str],
+        *,
+        max_record_bytes: int = _DEFAULT_MAX_RECORD_BYTES,
+    ) -> "FramedJournalSession":
+        """Create a lifetime-exclusive session with one startup scan."""
+
+        journal = cls.__new__(cls)
+        journal._initialize(path, max_record_bytes=max_record_bytes, scan=False)
+        return FramedJournalSession(journal)
+
+    def _initialize(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        max_record_bytes: int,
+        scan: bool,
+    ) -> None:
         if isinstance(max_record_bytes, bool) or not isinstance(max_record_bytes, int):
             raise TypeError("max_record_bytes must be an integer")
         if max_record_bytes <= 0:
@@ -64,6 +86,8 @@ class FramedJournal:
         self._thread_lock = threading.Lock()
         durability.durable_mkdir(self.path.parent)
         open_durable_lock_file(self.lock_path).close()
+        if not scan:
+            return
         existed = self.path.exists()
         with self._thread_lock, _interprocess_lock(self.lock_path):
             with self.path.open("a+b") as stream:
@@ -188,3 +212,127 @@ class FramedJournal:
             stream.flush()
             os.fsync(stream.fileno())
         return records
+
+
+class FramedJournalSession:
+    """Exclusive cached writer for one :class:`FramedJournal` lifetime."""
+
+    def __init__(self, journal: FramedJournal) -> None:
+        if not isinstance(journal, FramedJournal):
+            raise TypeError("journal must be FramedJournal")
+        self._journal = journal
+        self._creator_pid = os.getpid()
+        self._closed = False
+        self._owns_lock = False
+        self._lock_stream = None
+        self._stream = None
+        try:
+            self._lock_stream = journal.lock_path.open("r+b")
+            acquire_file_lock(self._lock_stream, blocking=False)
+            self._owns_lock = True
+            existed = journal.path.exists()
+            self._stream = journal.path.open("a+b")
+            self._records = journal._scan(self._stream, repair_torn_tail=True)
+            if not existed:
+                self._stream.flush()
+                os.fsync(self._stream.fileno())
+                durability.flush_directory(journal.path.parent)
+        except BaseException as exc:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                raise cleanup_error from exc
+            raise
+
+    def records(self) -> tuple[tuple[str, Any], ...]:
+        self._ensure_open()
+        return self._journal._record_values(self._records)
+
+    def append(self, record_id: str, value: Any) -> bool:
+        """Append against the cached projection without rescanning old frames."""
+
+        self._ensure_open()
+        record_id = _record_id(record_id)
+        payload = encode({"record_id": record_id, "value": value})
+        if len(payload) > self._journal.max_record_bytes:
+            raise ValueError("journal record exceeds max_record_bytes")
+        previous = self._records.get(record_id)
+        if previous is not None:
+            if previous[0] != payload:
+                raise ValueError(
+                    f"journal record id {record_id!r} has conflicting content"
+                )
+            return False
+        frame = (
+            _HEADER.pack(_MAGIC, len(payload), hashlib.sha256(payload).digest())
+            + payload
+        )
+        candidate_value = decode(payload)["value"]
+        assert self._stream is not None
+        try:
+            self._stream.seek(0, os.SEEK_END)
+            self._stream.write(frame)
+            self._stream.flush()
+            os.fsync(self._stream.fileno())
+        except BaseException:
+            # A failed write/fsync has ambiguous durability.  Rebuild the cache
+            # from the same locked file before returning control to the caller.
+            self._records = self._journal._scan(
+                self._stream,
+                repair_torn_tail=True,
+            )
+            raise
+        self._records[record_id] = (payload, candidate_value)
+        return True
+
+    @property
+    def owns_file_lock(self) -> bool:
+        """Whether this process still owns the journal authority lock."""
+
+        return os.getpid() == self._creator_pid and self._owns_lock
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self._stream is not None:
+            stream = self._stream
+            try:
+                stream.close()
+            except BaseException:
+                if stream.closed:
+                    self._stream = None
+                raise
+            self._stream = None
+        if self._lock_stream is not None:
+            lock_stream = self._lock_stream
+            if os.getpid() == self._creator_pid and self._owns_lock:
+                release_file_lock(lock_stream)
+                self._owns_lock = False
+            elif os.getpid() != self._creator_pid:
+                # A fork child owns only duplicated descriptors.  Explicitly
+                # unlocking their shared file description would unlock the parent.
+                self._owns_lock = False
+            try:
+                lock_stream.close()
+            except BaseException:
+                if lock_stream.closed:
+                    self._lock_stream = None
+                    self._closed = not self._owns_lock
+                raise
+            self._lock_stream = None
+        self._closed = not self._owns_lock
+        if not self._closed:
+            raise RuntimeError("framed journal session still owns its file lock")
+
+    def _ensure_open(self) -> None:
+        if os.getpid() != self._creator_pid:
+            raise RuntimeError("framed journal session belongs to another process")
+        if self._closed or not self._owns_lock or self._stream is None:
+            raise RuntimeError("framed journal session is closed")
+
+    def __enter__(self) -> "FramedJournalSession":
+        self._ensure_open()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()

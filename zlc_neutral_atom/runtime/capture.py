@@ -6,8 +6,7 @@ import hashlib
 import math
 import threading
 import uuid
-import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, TypeVar
 
@@ -37,25 +36,40 @@ from zlc_neutral_atom.readout.contracts import (
     normalize_camera_geometry,
     validate_camera_spatial_axes,
 )
+from zlc_neutral_atom.readout.codec import (
+    camera_capture_descriptor_from_tree,
+    camera_capture_descriptor_to_tree,
+    readout_binding_key_from_tree,
+    readout_binding_key_to_tree,
+)
 
 from ._failure import record_secondary_failure, safe_error_summary
+from .cleanup import CleanupReport
 from .dataset import (
-    DatasetCellAddress,
     DatasetCellKeyContract,
+    DatasetCellSchedule,
     DatasetEventAdapter,
     FrozenDatasetEdge,
     OrderedDatasetMetadataHasher,
     SealedDatasetArtifact,
-    dataset_cell_key_fingerprint,
 )
 from .ports import (
     BoundDevice,
     SafetyInterrupt,
     SafetyOperation,
     VerifiedDeviceCapability,
+    admit_bound_capability,
+    cleanup_device_session,
+    verify_cleanup_device_safe_state,
 )
-from .resources import ClaimMode, HazardClaim, ResourceClaim
-from .run import CleanupReport, RunContext
+from .resources import (
+    ClaimMode,
+    DeviceBindingStamp,
+    ResourceClaim,
+    device_binding_stamp_from_tree,
+    device_binding_stamp_to_tree,
+)
+from .run import RunContext
 from .streams import (
     AcquisitionProducer,
     AcquisitionStream,
@@ -64,6 +78,7 @@ from .streams import (
     ExactConsumerReadiness,
     ExactReservation,
     OrderedEventSpanHasher,
+    PayloadContract,
     ProcessorStageProvenance,
     ProducerFlowControl,
     ReservationState,
@@ -89,11 +104,12 @@ class CameraPhysicalFacts:
     physical trigger wiring, exposure, gain, readout mode, geometry, identity,
     dtype, or unit attested by this capability.
 
-    ``required_external_trigger_interval_seconds == 0`` means the adapter has
-    no additional measured lower bound to assert.  It is not a claim that the
-    physical camera has unlimited trigger bandwidth.  A ``None`` integration
-    start offset is likewise an explicit unqualified fact; consumers must not
-    reinterpret it as zero.
+    ``required_external_trigger_interval_seconds is None`` means no sufficient
+    safe interval has been qualified for exact capture and preflight must
+    reject.  Zero is reserved for a source (such as the deterministic virtual
+    camera) that is explicitly qualified with no positive lower bound.  A
+    ``None`` integration start offset is likewise an explicit unqualified fact;
+    consumers must not reinterpret it as zero.
     """
 
     camera_identity: str
@@ -110,7 +126,7 @@ class CameraPhysicalFacts:
     dtype: np.dtype
     count_unit: str
     exposure_seconds: float
-    required_external_trigger_interval_seconds: float
+    required_external_trigger_interval_seconds: float | None
     external_trigger_integration_start_offset_seconds: float | None
     gain: float
     readout_mode: str
@@ -162,20 +178,22 @@ class CameraPhysicalFacts:
             _positive_finite(self.exposure_seconds, "exposure_seconds"),
         )
         interval = self.required_external_trigger_interval_seconds
-        if (
-            isinstance(interval, bool)
-            or not isinstance(interval, (int, float))
-            or not math.isfinite(float(interval))
-            or float(interval) < 0
-        ):
-            raise ValueError(
-                "required_external_trigger_interval_seconds must be finite "
-                "and non-negative"
-            )
+        if interval is not None:
+            if (
+                isinstance(interval, bool)
+                or not isinstance(interval, (int, float))
+                or not math.isfinite(float(interval))
+                or float(interval) < 0
+            ):
+                raise ValueError(
+                    "required_external_trigger_interval_seconds must be finite, "
+                    "non-negative, or None"
+                )
+            interval = float(interval)
         object.__setattr__(
             self,
             "required_external_trigger_interval_seconds",
-            float(interval),
+            interval,
         )
         integration_offset = self.external_trigger_integration_start_offset_seconds
         if integration_offset is not None:
@@ -277,14 +295,14 @@ class CameraPhysicalFacts:
     def fingerprint(self) -> str:
         """Digest of this owner-minted physical-facts value."""
 
-        return canonical_digest(camera_physical_facts_to_tree(self))
+        return canonical_digest(_camera_physical_facts_to_tree(self))
 
 
 _CAMERA_PHYSICAL_FACTS_SCHEMA = "zlc_neutral_atom.CameraPhysicalFacts"
 _CAMERA_CAPABILITY_EVIDENCE_SCHEMA = "zlc_neutral_atom.CameraCapabilityEvidence"
 
 
-def camera_physical_facts_to_tree(value: CameraPhysicalFacts) -> dict[str, object]:
+def _camera_physical_facts_to_tree(value: CameraPhysicalFacts) -> dict[str, object]:
     if not isinstance(value, CameraPhysicalFacts):
         raise TypeError("value must be CameraPhysicalFacts")
     return {
@@ -317,7 +335,7 @@ def camera_physical_facts_to_tree(value: CameraPhysicalFacts) -> dict[str, objec
     }
 
 
-def camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:
+def _camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:
     fields = {
         "schema",
         "camera_identity",
@@ -382,7 +400,6 @@ class CameraCapabilityEvidence:
 
     adapter_type: str
     source_id: str
-    settings_fingerprint: str
     payload_contract_fingerprint: str
     capture_spec_owner_fingerprint: str
     flow_control: ProducerFlowControl
@@ -392,12 +409,12 @@ class CameraCapabilityEvidence:
     max_blocking_call_seconds: float
     max_capture_spec_bytes: int
     physical_facts: CameraPhysicalFacts
+    exact_external_trigger_qualification_digest: str | None = None
 
     def __post_init__(self) -> None:
         _canonical_text(self.adapter_type, "adapter_type")
         _canonical_text(self.source_id, "source_id")
         for name in (
-            "settings_fingerprint",
             "payload_contract_fingerprint",
             "capture_spec_owner_fingerprint",
         ):
@@ -437,11 +454,27 @@ class CameraCapabilityEvidence:
         )
         if not isinstance(self.physical_facts, CameraPhysicalFacts):
             raise TypeError("physical_facts must be CameraPhysicalFacts")
-        if (
-            self.physical_facts.opaque_frame_settings_fingerprint
-            != self.settings_fingerprint
-        ):
-            raise ValueError("camera physical facts differ from capability settings")
+        qualification = self.exact_external_trigger_qualification_digest
+        if qualification is not None:
+            _sha256(
+                qualification,
+                "exact_external_trigger_qualification_digest",
+            )
+            if (
+                self.physical_facts.required_external_trigger_interval_seconds
+                is None
+                or self.physical_facts.external_trigger_integration_start_offset_seconds
+                is None
+            ):
+                raise ValueError(
+                    "exact external-trigger qualification requires timing readback"
+                )
+
+    @property
+    def settings_fingerprint(self) -> str:
+        """The settings digest owned by the frozen physical-facts snapshot."""
+
+        return self.physical_facts.opaque_frame_settings_fingerprint
 
     @property
     def fingerprint(self) -> str:
@@ -457,7 +490,6 @@ def camera_capability_evidence_to_tree(
         "schema": _CAMERA_CAPABILITY_EVIDENCE_SCHEMA,
         "adapter_type": value.adapter_type,
         "source_id": value.source_id,
-        "settings_fingerprint": value.settings_fingerprint,
         "payload_contract_fingerprint": value.payload_contract_fingerprint,
         "capture_spec_owner_fingerprint": value.capture_spec_owner_fingerprint,
         "flow_control": value.flow_control.value,
@@ -466,8 +498,10 @@ def camera_capability_evidence_to_tree(
         "adapter_record_retention_bytes": value.adapter_record_retention_bytes,
         "max_blocking_call_seconds": value.max_blocking_call_seconds,
         "max_capture_spec_bytes": value.max_capture_spec_bytes,
-        "physical_facts_fingerprint": value.physical_facts.fingerprint,
-        "physical_facts": camera_physical_facts_to_tree(value.physical_facts),
+        "physical_facts": _camera_physical_facts_to_tree(value.physical_facts),
+        "exact_external_trigger_qualification_digest": (
+            value.exact_external_trigger_qualification_digest
+        ),
     }
 
 
@@ -476,7 +510,6 @@ def camera_capability_evidence_from_tree(tree: object) -> CameraCapabilityEviden
         "schema",
         "adapter_type",
         "source_id",
-        "settings_fingerprint",
         "payload_contract_fingerprint",
         "capture_spec_owner_fingerprint",
         "flow_control",
@@ -485,20 +518,14 @@ def camera_capability_evidence_from_tree(tree: object) -> CameraCapabilityEviden
         "adapter_record_retention_bytes",
         "max_blocking_call_seconds",
         "max_capture_spec_bytes",
-        "physical_facts_fingerprint",
         "physical_facts",
+        "exact_external_trigger_qualification_digest",
     }
     data = _exact_tree(tree, fields, _CAMERA_CAPABILITY_EVIDENCE_SCHEMA)
-    facts = camera_physical_facts_from_tree(data["physical_facts"])
-    if facts.fingerprint != _sha256(
-        data["physical_facts_fingerprint"],
-        "physical_facts_fingerprint",
-    ):
-        raise ValueError("camera physical-facts fingerprint differs from evidence")
+    facts = _camera_physical_facts_from_tree(data["physical_facts"])
     return CameraCapabilityEvidence(
         adapter_type=data["adapter_type"],
         source_id=data["source_id"],
-        settings_fingerprint=data["settings_fingerprint"],
         payload_contract_fingerprint=data["payload_contract_fingerprint"],
         capture_spec_owner_fingerprint=data["capture_spec_owner_fingerprint"],
         flow_control=ProducerFlowControl(data["flow_control"]),
@@ -508,19 +535,13 @@ def camera_capability_evidence_from_tree(tree: object) -> CameraCapabilityEviden
         max_blocking_call_seconds=data["max_blocking_call_seconds"],
         max_capture_spec_bytes=data["max_capture_spec_bytes"],
         physical_facts=facts,
+        exact_external_trigger_qualification_digest=data[
+            "exact_external_trigger_qualification_digest"
+        ],
     )
 
 
-class CapturePayloadContract(Protocol[PayloadT]):
-    fingerprint: str
-    max_retained_nbytes: int
-
-    def snapshot(self, payload: PayloadT) -> PayloadT: ...
-
-    def retained_nbytes(self, payload: PayloadT) -> int: ...
-
-    def digest(self, payload: PayloadT) -> str: ...
-
+class CapturePayloadContract(PayloadContract[PayloadT], Protocol[PayloadT]):
     def source_ordinal(self, payload: PayloadT) -> int: ...
 
     def captured_at(self, payload: PayloadT) -> float: ...
@@ -548,115 +569,201 @@ class FrozenCaptureSpec:
         object.__setattr__(self, "digest", digest)
 
 
+def frozen_capture_spec_to_tree(value: FrozenCaptureSpec) -> dict[str, object]:
+    if not isinstance(value, FrozenCaptureSpec):
+        raise TypeError("value must be FrozenCaptureSpec")
+    return {
+        "owner_fingerprint": value.owner_fingerprint,
+        "payload": value.payload,
+    }
+
+
+def frozen_capture_spec_from_tree(tree: object) -> FrozenCaptureSpec:
+    data = _exact_tree(
+        tree,
+        {"owner_fingerprint", "payload"},
+        "frozen capture spec",
+        discriminator=None,
+    )
+    return FrozenCaptureSpec(data["owner_fingerprint"], data["payload"])
+
+
 @dataclass(frozen=True)
 class CaptureCapabilitySnapshot:
-    binding_id: str
-    stable_device_identity: str
-    connection_generation: str
-    capability_fingerprint: str
-    settings_fingerprint: str
-    payload_contract_fingerprint: str
-    capture_spec_owner_fingerprint: str
-    flow_control: ProducerFlowControl
-    max_source_burst_events: int
-    driver_ring_bytes: int
-    adapter_record_retention_bytes: int
-    max_blocking_call_seconds: float
-    max_capture_spec_bytes: int
-    camera_capability_evidence: CameraCapabilityEvidence | None = None
+    binding_stamp: DeviceBindingStamp
+    payload_contract: CapturePayloadContract
+    camera_capability_evidence: CameraCapabilityEvidence
 
     def __post_init__(self) -> None:
-        for field in (
-            "binding_id",
-            "stable_device_identity",
-            "connection_generation",
-        ):
-            _canonical_text(getattr(self, field), field)
-        for field in (
-            "capability_fingerprint",
-            "settings_fingerprint",
-            "payload_contract_fingerprint",
-            "capture_spec_owner_fingerprint",
-        ):
-            _sha256(getattr(self, field), field)
-        if not isinstance(self.flow_control, ProducerFlowControl):
-            raise TypeError("flow_control must be ProducerFlowControl")
-        object.__setattr__(
-            self,
-            "max_source_burst_events",
-            _positive_int(self.max_source_burst_events, "max_source_burst_events"),
-        )
-        object.__setattr__(
-            self,
-            "driver_ring_bytes",
-            _positive_int(self.driver_ring_bytes, "driver_ring_bytes"),
-        )
-        object.__setattr__(
-            self,
-            "adapter_record_retention_bytes",
-            _nonnegative_int(
-                self.adapter_record_retention_bytes,
-                "adapter_record_retention_bytes",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "max_capture_spec_bytes",
-            _positive_int(self.max_capture_spec_bytes, "max_capture_spec_bytes"),
-        )
-        object.__setattr__(
-            self,
-            "max_blocking_call_seconds",
-            _positive_finite(
-                self.max_blocking_call_seconds,
-                "max_blocking_call_seconds",
-            ),
-        )
+        if not isinstance(self.binding_stamp, DeviceBindingStamp):
+            raise TypeError("binding_stamp must be DeviceBindingStamp")
         evidence = self.camera_capability_evidence
-        if evidence is not None:
-            if not isinstance(evidence, CameraCapabilityEvidence):
-                raise TypeError(
-                    "camera_capability_evidence must be CameraCapabilityEvidence or None"
-                )
-            if evidence.fingerprint != self.capability_fingerprint:
-                raise ValueError(
-                    "camera capability fingerprint differs from canonical evidence"
-                )
-            if evidence.physical_facts.camera_identity != self.stable_device_identity:
-                raise ValueError(
-                    "camera physical identity differs from capability stable identity"
-                )
-            for snapshot_field, evidence_field in (
-                ("settings_fingerprint", "settings_fingerprint"),
-                ("payload_contract_fingerprint", "payload_contract_fingerprint"),
-                ("capture_spec_owner_fingerprint", "capture_spec_owner_fingerprint"),
-                ("flow_control", "flow_control"),
-                ("max_source_burst_events", "max_source_burst_events"),
-                ("driver_ring_bytes", "driver_ring_bytes"),
-                (
-                    "adapter_record_retention_bytes",
-                    "adapter_record_retention_bytes",
-                ),
-                ("max_blocking_call_seconds", "max_blocking_call_seconds"),
-                ("max_capture_spec_bytes", "max_capture_spec_bytes"),
-            ):
-                if getattr(self, snapshot_field) != getattr(evidence, evidence_field):
-                    raise ValueError(
-                        f"camera capability {snapshot_field} differs from evidence"
-                    )
+        if not isinstance(evidence, CameraCapabilityEvidence):
+            raise TypeError(
+                "camera_capability_evidence must be CameraCapabilityEvidence"
+            )
+        if getattr(self.payload_contract, "fingerprint", None) != (
+            evidence.payload_contract_fingerprint
+        ):
+            raise ValueError(
+                "camera capability payload contract differs from its fingerprint"
+            )
+        if evidence.physical_facts.camera_identity != (
+            self.binding_stamp.physical_identity.stable_device_identity
+        ):
+            raise ValueError(
+                "camera physical identity differs from capability stable identity"
+            )
 
     @property
-    def camera_physical_facts(self) -> CameraPhysicalFacts | None:
-        evidence = self.camera_capability_evidence
-        return None if evidence is None else evidence.physical_facts
+    def capability_fingerprint(self) -> str:
+        return self.camera_capability_evidence.fingerprint
+
+    @property
+    def settings_fingerprint(self) -> str:
+        return self.camera_capability_evidence.settings_fingerprint
+
+    @property
+    def capture_spec_owner_fingerprint(self) -> str:
+        return self.camera_capability_evidence.capture_spec_owner_fingerprint
+
+    @property
+    def flow_control(self) -> ProducerFlowControl:
+        return self.camera_capability_evidence.flow_control
+
+    @property
+    def max_source_burst_events(self) -> int:
+        return self.camera_capability_evidence.max_source_burst_events
+
+    @property
+    def driver_ring_bytes(self) -> int:
+        return self.camera_capability_evidence.driver_ring_bytes
+
+    @property
+    def adapter_record_retention_bytes(self) -> int:
+        return self.camera_capability_evidence.adapter_record_retention_bytes
+
+    @property
+    def max_blocking_call_seconds(self) -> float:
+        return self.camera_capability_evidence.max_blocking_call_seconds
+
+    @property
+    def max_capture_spec_bytes(self) -> int:
+        return self.camera_capability_evidence.max_capture_spec_bytes
+
+    @property
+    def camera_physical_facts(self) -> CameraPhysicalFacts:
+        return self.camera_capability_evidence.physical_facts
 
 
 @dataclass(frozen=True)
-class CaptureRuntimeProfile:
-    required_consumer_lag_events: int
-    transport_memory_limit_bytes: int
+class CameraCaptureProvenance:
+    """Owner-derived physical facts for one raw camera capture binding.
+
+    No readout event is selected here.  A later calibration/analysis request
+    combines this raw descriptor with an explicit ``CalibrationCaptureLayout``
+    to derive a ``FrameContract``.  ``camera_arm_spec_fingerprint`` is only the
+    frozen camera arm/capture-spec digest; it is not an FPGA pulse-schedule digest.
+    """
+
+    descriptor: CameraCaptureDescriptor
+    binding: ReadoutBindingKey
+    binding_stamp: DeviceBindingStamp
+    capability_fingerprint: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.descriptor, CameraCaptureDescriptor):
+            raise TypeError("descriptor must be CameraCaptureDescriptor")
+        if not isinstance(self.binding, ReadoutBindingKey):
+            raise TypeError("binding must be ReadoutBindingKey")
+        settings_fingerprints = {
+            setting.opaque_frame_settings_fingerprint
+            for setting in self.descriptor.event_settings
+        }
+        if None in settings_fingerprints or len(settings_fingerprints) != 1:
+            raise ValueError(
+                "descriptor event settings require one active settings fingerprint"
+            )
+        if self.descriptor.camera_arm_spec_fingerprint is None:
+            raise ValueError(
+                "camera descriptor requires camera_arm_spec_fingerprint"
+            )
+        if not isinstance(self.binding_stamp, DeviceBindingStamp):
+            raise TypeError("binding_stamp must be DeviceBindingStamp")
+        if (
+            self.descriptor.camera_identity
+            != self.binding_stamp.physical_identity.stable_device_identity
+        ):
+            raise ValueError("camera descriptor identity differs from binding stamp")
+        _sha256(self.capability_fingerprint, "capability_fingerprint")
+
+    @property
+    def camera_arm_spec_fingerprint(self) -> str:
+        value = self.descriptor.camera_arm_spec_fingerprint
+        assert value is not None
+        return value
+
+    @property
+    def active_settings_fingerprint(self) -> str:
+        value = self.descriptor.event_settings[0].opaque_frame_settings_fingerprint
+        assert value is not None
+        return value
+
+    def validate_schema(self, schema: DatasetSchema) -> None:
+        if not isinstance(schema, DatasetSchema):
+            raise TypeError("schema must be DatasetSchema")
+        self.descriptor.validate_schema(schema)
+
+
+def camera_capture_provenance_to_tree(
+    value: CameraCaptureProvenance,
+) -> dict[str, object]:
+    if not isinstance(value, CameraCaptureProvenance):
+        raise TypeError("value must be CameraCaptureProvenance")
+    return {
+        "descriptor": camera_capture_descriptor_to_tree(value.descriptor),
+        "binding": readout_binding_key_to_tree(value.binding),
+        "binding_stamp": device_binding_stamp_to_tree(value.binding_stamp),
+        "capability_fingerprint": value.capability_fingerprint,
+    }
+
+
+def camera_capture_provenance_from_tree(tree: object) -> CameraCaptureProvenance:
+    data = _exact_tree(
+        tree,
+        {
+            "descriptor",
+            "binding",
+            "binding_stamp",
+            "capability_fingerprint",
+        },
+        "camera capture provenance",
+        discriminator=None,
+    )
+    return CameraCaptureProvenance(
+        descriptor=camera_capture_descriptor_from_tree(data["descriptor"]),
+        binding=readout_binding_key_from_tree(data["binding"]),
+        binding_stamp=device_binding_stamp_from_tree(data["binding_stamp"]),
+        capability_fingerprint=data["capability_fingerprint"],
+    )
+
+
+@dataclass(frozen=True)
+class CameraCaptureContract:
+    stream_id: StreamId
+    dataset_edge: FrozenDatasetEdge
+    capability: CaptureCapabilitySnapshot
+    required_consumer_lag_events: int
+    transport_memory_limit_bytes: int
+    camera_provenance: CameraCaptureProvenance
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stream_id, StreamId):
+            raise TypeError("stream_id must be StreamId")
+        if not isinstance(self.dataset_edge, FrozenDatasetEdge):
+            raise TypeError("dataset_edge must be FrozenDatasetEdge")
+        if not isinstance(self.capability, CaptureCapabilitySnapshot):
+            raise TypeError("capability must be CaptureCapabilitySnapshot")
         object.__setattr__(
             self,
             "required_consumer_lag_events",
@@ -673,218 +780,88 @@ class CaptureRuntimeProfile:
                 "transport_memory_limit_bytes",
             ),
         )
-
-
-@dataclass(frozen=True)
-class CameraCaptureProvenance:
-    """Owner-derived physical facts for one raw camera capture binding.
-
-    No readout event is selected here.  A later calibration/analysis request
-    combines this raw descriptor with an explicit ``CalibrationCaptureLayout``
-    to derive a ``FrameContract``.  ``camera_arm_spec_fingerprint`` is only the
-    frozen camera arm/capture-spec digest; it is not an FPGA pulse-schedule digest.
-    """
-
-    descriptor: CameraCaptureDescriptor
-    binding: ReadoutBindingKey
-    active_settings_fingerprint: str
-    binding_id: str
-    connection_generation: str
-    capability_fingerprint: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.descriptor, CameraCaptureDescriptor):
-            raise TypeError("descriptor must be CameraCaptureDescriptor")
-        if not isinstance(self.binding, ReadoutBindingKey):
-            raise TypeError("binding must be ReadoutBindingKey")
-        _sha256(
-            self.active_settings_fingerprint,
-            "active_settings_fingerprint",
-        )
-        if any(
-            setting.opaque_frame_settings_fingerprint
-            != self.active_settings_fingerprint
-            for setting in self.descriptor.event_settings
-        ):
+        edge = self.dataset_edge
+        if edge.cell_schedule is None:
+            raise ValueError("capture dataset edge requires an exact cell schedule")
+        if self.capability.payload_contract is not edge.payload_contract:
             raise ValueError(
-                "descriptor event settings differ from active settings evidence"
+                "capture capability and dataset edge must share the payload owner"
             )
-        if self.descriptor.camera_arm_spec_fingerprint is None:
-            raise ValueError(
-                "camera descriptor requires camera_arm_spec_fingerprint"
-            )
-        _canonical_text(self.binding_id, "binding_id")
-        _canonical_text(self.connection_generation, "connection_generation")
-        _sha256(self.capability_fingerprint, "capability_fingerprint")
-
-    @property
-    def camera_arm_spec_fingerprint(self) -> str:
-        value = self.descriptor.camera_arm_spec_fingerprint
-        assert value is not None
-        return value
-
-    def validate_schema(self, schema: DatasetSchema) -> None:
-        if not isinstance(schema, DatasetSchema):
-            raise TypeError("schema must be DatasetSchema")
-        self.descriptor.validate_schema(schema)
-
-
-@dataclass(frozen=True)
-class CaptureStreamContract:
-    stream_id: StreamId
-    source_id: str
-    dataset_schema: DatasetSchema
-    payload_contract: CapturePayloadContract
-    event_adapter: DatasetEventAdapter
-    expected_cells: tuple[DatasetCellAddress, ...]
-    capability: CaptureCapabilitySnapshot
-    runtime_profile: CaptureRuntimeProfile
-    capture_spec_owner_fingerprint: str
-    camera_provenance: CameraCaptureProvenance | None = None
-    dataset_edge: FrozenDatasetEdge = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.stream_id, StreamId):
-            raise TypeError("stream_id must be StreamId")
-        _canonical_text(self.source_id, "source_id")
-        if not isinstance(self.dataset_schema, DatasetSchema):
-            raise TypeError("dataset_schema must be DatasetSchema")
-        if not isinstance(self.capability, CaptureCapabilitySnapshot):
-            raise TypeError("capability must be CaptureCapabilitySnapshot")
-        if not isinstance(self.runtime_profile, CaptureRuntimeProfile):
-            raise TypeError("runtime_profile must be CaptureRuntimeProfile")
-        edge = FrozenDatasetEdge(
-            self.dataset_schema,
-            self.event_adapter,
-            tuple(self.expected_cells),
-        )
-        object.__setattr__(self, "expected_cells", edge.expected_cells)
-        object.__setattr__(self, "dataset_edge", edge)
-        object.__setattr__(self, "event_adapter", edge.event_adapter)
-        if edge.source_payload_contract is not self.payload_contract:
-            raise ValueError("DatasetEventAdapter must share CapturePayloadContract owner")
-        object.__setattr__(self, "payload_contract", edge.payload_contract)
-        if edge.value_schema is not self.dataset_schema.cell_schema:
-            raise ValueError("DatasetEventAdapter schema differs from DatasetSchema")
-        _sha256(edge.payload_contract_fingerprint, "payload contract fingerprint")
-        _sha256(
-            self.capture_spec_owner_fingerprint,
-            "capture spec owner fingerprint",
-        )
-        for member in (
-            "snapshot",
-            "retained_nbytes",
-            "digest",
-            "source_ordinal",
-            "captured_at",
-            "correlation_id",
-        ):
-            if not callable(getattr(self.payload_contract, member, None)):
+        for member in ("source_ordinal", "captured_at", "correlation_id"):
+            if not callable(getattr(edge.payload_contract, member, None)):
                 raise TypeError(f"payload_contract.{member} must be callable")
-        _positive_int(
-            edge.payload_max_retained_nbytes,
-            "payload contract max_retained_nbytes",
+        # A raw camera CaptureArtifact is defined by the acquisition owner, not
+        # by schema equality.  Require the exact identity adapter implementation.
+        from zlc_neutral_atom.acquisition.camera import CameraDatasetEventAdapter
+        from zlc_neutral_atom.camera_operator import (
+            CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
         )
-        metadata_contract = edge.metadata_contract
-        _sha256(edge.metadata_contract_fingerprint, "metadata contract fingerprint")
-        _sha256(edge.operator_fingerprint, "event adapter operator fingerprint")
-        _nonnegative_int(
-            edge.metadata_max_retained_nbytes,
-            "metadata contract max_retained_nbytes",
-        )
-        for member in ("snapshot", "validate", "retained_nbytes", "digest"):
-            if not callable(getattr(metadata_contract, member, None)):
-                raise TypeError(f"metadata_contract.{member} must be callable")
-        if self.capability.payload_contract_fingerprint != edge.payload_contract_fingerprint:
-            raise ValueError("capture capability and payload contract fingerprints differ")
-        if (
-            self.capability.capture_spec_owner_fingerprint
-            != self.capture_spec_owner_fingerprint
-        ):
-            raise ValueError("capture capability and spec owner fingerprints differ")
-        if self.camera_provenance is not None:
-            # A raw camera CaptureArtifact is defined by the acquisition owner,
-            # not by schema equality.  A caller-defined adapter may preserve the
-            # same schema while numerically changing every pixel, so require the
-            # exact owner implementation as well as its canonical operator id.
-            from zlc_neutral_atom.acquisition.camera import CameraDatasetEventAdapter
-            from zlc_neutral_atom.camera_operator import (
-                CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
-            )
 
-            if type(self.event_adapter) is not CameraDatasetEventAdapter or (
-                edge.operator_fingerprint != CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT
-            ):
-                raise ValueError(
-                    "raw camera provenance requires the owner identity event adapter"
-                )
-            if not isinstance(self.camera_provenance, CameraCaptureProvenance):
-                raise TypeError(
-                    "camera_provenance must be CameraCaptureProvenance or None"
-                )
-            self.camera_provenance.validate_schema(self.dataset_schema)
-            if self.camera_provenance.binding.value != self.source_id:
-                raise ValueError(
-                    "camera provenance binding differs from capture source_id"
-                )
-            if (
-                self.camera_provenance.active_settings_fingerprint
-                != self.capability.settings_fingerprint
-            ):
-                raise ValueError(
-                    "camera readout active settings differ from capture capability"
-                )
-            if (
-                self.camera_provenance.descriptor.camera_identity
-                != self.capability.stable_device_identity
-            ):
-                raise ValueError(
-                    "camera readout identity differs from capture capability"
-                )
-            if self.camera_provenance.binding_id != self.capability.binding_id:
-                raise ValueError("camera provenance binding_id differs from capability")
-            if (
-                self.camera_provenance.connection_generation
-                != self.capability.connection_generation
-            ):
-                raise ValueError(
-                    "camera provenance connection generation differs from capability"
-                )
-            if (
-                self.camera_provenance.capability_fingerprint
-                != self.capability.capability_fingerprint
-            ):
-                raise ValueError(
-                    "camera provenance capability fingerprint differs from capability"
-                )
-            physical_facts = self.capability.camera_physical_facts
-            if physical_facts is None:
-                raise ValueError(
-                    "camera provenance requires broker-attested physical facts"
-                )
-            physical_facts.validate_descriptor(self.camera_provenance.descriptor)
-            evidence = self.capability.camera_capability_evidence
-            assert evidence is not None
-            if evidence.source_id != self.source_id:
-                raise ValueError(
-                    "camera capability evidence source differs from capture source_id"
-                )
-        if self.estimated_transport_bytes > self.runtime_profile.transport_memory_limit_bytes:
+        if type(edge.event_adapter) is not CameraDatasetEventAdapter or (
+            edge.operator_fingerprint != CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT
+        ):
+            raise ValueError(
+                "raw camera provenance requires the owner identity event adapter"
+            )
+        if not isinstance(self.camera_provenance, CameraCaptureProvenance):
+            raise TypeError("camera_provenance must be CameraCaptureProvenance")
+        self.camera_provenance.validate_schema(edge.schema)
+        if self.camera_provenance.binding.value != self.source_id:
+            raise ValueError("camera provenance binding differs from capture source_id")
+        if self.camera_provenance.binding_stamp != self.capability.binding_stamp:
+            raise ValueError("camera provenance binding differs from capability")
+        if (
+            self.camera_provenance.capability_fingerprint
+            != self.capability.capability_fingerprint
+        ):
+            raise ValueError(
+                "camera provenance capability fingerprint differs from capability"
+            )
+        self.capability.camera_physical_facts.validate_descriptor(
+            self.camera_provenance.descriptor
+        )
+        if self.estimated_transport_bytes > self.transport_memory_limit_bytes:
             raise MemoryError(
                 f"capture transport budget {self.estimated_transport_bytes} exceeds "
-                f"limit {self.runtime_profile.transport_memory_limit_bytes}"
+                f"limit {self.transport_memory_limit_bytes}"
             )
+
+    @property
+    def source_id(self) -> str:
+        return self.capability.camera_capability_evidence.source_id
+
+    @property
+    def dataset_schema(self) -> DatasetSchema:
+        return self.dataset_edge.schema
+
+    @property
+    def payload_contract(self) -> CapturePayloadContract:
+        return self.dataset_edge.payload_contract  # type: ignore[return-value]
+
+    @property
+    def event_adapter(self) -> DatasetEventAdapter:
+        return self.dataset_edge.event_adapter
+
+    @property
+    def cell_schedule(self) -> DatasetCellSchedule:
+        schedule = self.dataset_edge.cell_schedule
+        assert schedule is not None
+        return schedule
+
+    @property
+    def capture_spec_owner_fingerprint(self) -> str:
+        return self.capability.capture_spec_owner_fingerprint
 
     @property
     def total_events(self) -> int:
-        return len(self.expected_cells)
+        return len(self.cell_schedule)
 
     @property
     def max_inflight_events(self) -> int:
         return min(
             self.total_events,
             self.capability.max_source_burst_events
-            + self.runtime_profile.required_consumer_lag_events,
+            + self.required_consumer_lag_events,
         )
 
     @property
@@ -892,9 +869,15 @@ class CaptureStreamContract:
         return self.max_inflight_events * self.dataset_edge.payload_max_retained_nbytes
 
     @property
+    def exact_frame_budget_bytes(self) -> int:
+        """Worst-case resident frames when hardware can outrun host draining."""
+
+        return self.total_events * self.dataset_edge.payload_max_retained_nbytes
+
+    @property
     def estimated_transport_bytes(self) -> int:
         return (
-            self.capability.driver_ring_bytes
+            max(self.capability.driver_ring_bytes, self.exact_frame_budget_bytes)
             + self.capability.adapter_record_retention_bytes
             + self.max_inflight_bytes
             + self.dataset_edge.payload_max_retained_nbytes
@@ -906,8 +889,6 @@ class CaptureStreamContract:
 @dataclass(frozen=True)
 class PrepareCaptureCommand:
     session_id: str
-    run_id: str
-    source_id: str
     capture_spec_payload: bytes
     capture_spec_owner_fingerprint: str
     capture_spec_fingerprint: str
@@ -917,8 +898,7 @@ class PrepareCaptureCommand:
     timeout_seconds: float
 
     def __post_init__(self) -> None:
-        for name in ("session_id", "run_id", "source_id"):
-            _canonical_text(getattr(self, name), name)
+        _canonical_text(self.session_id, "session_id")
         for name in (
             "capture_spec_owner_fingerprint",
             "capture_spec_fingerprint",
@@ -945,14 +925,13 @@ class PrepareCaptureCommand:
 @dataclass(frozen=True)
 class CapturePreparedAck:
     session_id: str
-    binding_id: str
-    connection_generation: str
+    binding_instance_id: str
     settings_fingerprint: str
     capability_fingerprint: str
     capture_spec_fingerprint: str
 
     def __post_init__(self) -> None:
-        for name in ("session_id", "binding_id", "connection_generation"):
+        for name in ("session_id", "binding_instance_id"):
             _canonical_text(getattr(self, name), name)
         _sha256(self.settings_fingerprint, "settings_fingerprint")
         _sha256(self.capability_fingerprint, "capability_fingerprint")
@@ -976,11 +955,10 @@ class StartCaptureCommand:
 @dataclass(frozen=True)
 class CaptureStartedAck:
     session_id: str
-    binding_id: str
-    connection_generation: str
+    binding_instance_id: str
 
     def __post_init__(self) -> None:
-        for name in ("session_id", "binding_id", "connection_generation"):
+        for name in ("session_id", "binding_instance_id"):
             _canonical_text(getattr(self, name), name)
 
 
@@ -1001,12 +979,11 @@ class ReadCaptureCommand:
 @dataclass(frozen=True)
 class CapturedPayloadAck:
     session_id: str
-    binding_id: str
-    connection_generation: str
+    binding_instance_id: str
     payload: object
 
     def __post_init__(self) -> None:
-        for name in ("session_id", "binding_id", "connection_generation"):
+        for name in ("session_id", "binding_instance_id"):
             _canonical_text(getattr(self, name), name)
 
 
@@ -1033,8 +1010,7 @@ class CompleteCaptureCommand:
 @dataclass(frozen=True)
 class CaptureTerminalAck:
     session_id: str
-    binding_id: str
-    connection_generation: str
+    binding_instance_id: str
     produced_count: int
     drained_count: int
     source_stopped: bool
@@ -1046,7 +1022,7 @@ class CaptureTerminalAck:
     capture_spec_fingerprint: str
 
     def __post_init__(self) -> None:
-        for name in ("session_id", "binding_id", "connection_generation"):
+        for name in ("session_id", "binding_instance_id"):
             _canonical_text(getattr(self, name), name)
         object.__setattr__(
             self,
@@ -1067,13 +1043,50 @@ class CaptureTerminalAck:
         _sha256(self.capture_spec_fingerprint, "capture_spec_fingerprint")
 
 
+def capture_terminal_ack_to_tree(value: CaptureTerminalAck) -> dict[str, object]:
+    if not isinstance(value, CaptureTerminalAck):
+        raise TypeError("value must be CaptureTerminalAck")
+    return {
+        "session_id": value.session_id,
+        "binding_instance_id": value.binding_instance_id,
+        "produced_count": value.produced_count,
+        "drained_count": value.drained_count,
+        "source_stopped": value.source_stopped,
+        "no_more_frames": value.no_more_frames,
+        "joined": value.joined,
+        "ordered_metadata_digest": value.ordered_metadata_digest,
+        "settings_fingerprint": value.settings_fingerprint,
+        "capability_fingerprint": value.capability_fingerprint,
+        "capture_spec_fingerprint": value.capture_spec_fingerprint,
+    }
+
+
+def capture_terminal_ack_from_tree(tree: object) -> CaptureTerminalAck:
+    data = _exact_tree(
+        tree,
+        {
+            "session_id",
+            "binding_instance_id",
+            "produced_count",
+            "drained_count",
+            "source_stopped",
+            "no_more_frames",
+            "joined",
+            "ordered_metadata_digest",
+            "settings_fingerprint",
+            "capability_fingerprint",
+            "capture_spec_fingerprint",
+        },
+        "capture terminal acknowledgement",
+        discriminator=None,
+    )
+    return CaptureTerminalAck(**data)
+
+
 class CaptureSessionState(str, Enum):
     NEW = "NEW"
-    PREPARING = "PREPARING"
     PREPARED = "PREPARED"
-    STARTING = "STARTING"
     STARTED = "STARTED"
-    COMPLETING = "COMPLETING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
@@ -1121,7 +1134,7 @@ class CaptureCompletion:
         object.__setattr__(
             self,
             "_source_cell_schedule",
-            session._contract.expected_cells,
+            session._contract.cell_schedule,
         )
         object.__setattr__(
             self,
@@ -1203,15 +1216,15 @@ class CaptureCompletion:
         return self._source_dataset_schema
 
     @property
-    def source_cell_schedule(self) -> tuple[DatasetCellAddress, ...]:
+    def source_cell_schedule(self) -> DatasetCellSchedule:
         return self._source_cell_schedule
 
     @property
-    def camera_provenance(self) -> CameraCaptureProvenance | None:
+    def camera_provenance(self) -> CameraCaptureProvenance:
         return self._camera_provenance
 
     @property
-    def camera_capability_evidence(self) -> CameraCapabilityEvidence | None:
+    def camera_capability_evidence(self) -> CameraCapabilityEvidence:
         return self._camera_capability_evidence
 
     @property
@@ -1283,28 +1296,10 @@ class BoundCapturePort:
     cleanup_operations: tuple[SafetyOperation, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.capability_attestation, VerifiedDeviceCapability):
-            raise TypeError("capability_attestation must be broker-minted")
-        if not isinstance(self.capability_attestation.device, BoundDevice):
-            raise TypeError("capture capability has no BoundDevice")
-        if not isinstance(
-            self.capability_attestation.snapshot,
+        admit_bound_capability(
+            self.capability_attestation,
             CaptureCapabilitySnapshot,
-        ):
-            raise TypeError("capture capability attestation has the wrong snapshot type")
-        if (
-            self.capability_attestation.device.validate_capability(
-                self.capability_attestation
-            )
-            is not self.capability_attestation.snapshot
-        ):
-            raise RuntimeError("capture capability attestation snapshot changed")
-        if self.capability.binding_id != self.device.binding_id:
-            raise ValueError("capture capability binding_id differs from BoundDevice")
-        if self.capability.stable_device_identity != self.device.stable_device_identity:
-            raise ValueError("capture capability stable identity differs from BoundDevice")
-        if self.capability.connection_generation != self.device.connection_generation:
-            raise ValueError("capture capability generation differs from BoundDevice")
+        )
         if not self.device.session_cleanup_capable:
             raise ValueError("capture port requires session-specific cleanup capability")
         if not any(
@@ -1339,14 +1334,6 @@ class BoundCapturePort:
         return ResourceClaim(self.device.key, ClaimMode.EXCLUSIVE)
 
     @property
-    def hazard_claim(self) -> HazardClaim:
-        return HazardClaim(
-            self.device.key,
-            self.device.stable_device_identity,
-            self.device.connection_generation,
-        )
-
-    @property
     def interrupt_operations(self) -> tuple[SafetyInterrupt, ...]:
         preferred = tuple(
             operation
@@ -1357,98 +1344,54 @@ class BoundCapturePort:
 
     def open_session(
         self,
-        contract: CaptureStreamContract,
+        contract: CameraCaptureContract,
         trace_binding: TraceBinding,
         capture_spec: FrozenCaptureSpec,
     ) -> "CaptureSession":
         if contract.capability is not self.capability:
-            raise ValueError("CaptureStreamContract must share BoundCapturePort capability")
+            raise ValueError("CameraCaptureContract must share BoundCapturePort capability")
         return CaptureSession(self, contract, trace_binding, capture_spec)
 
     def cleanup(self, context: RunContext, session_id: str) -> CleanupReport:
-        errors: list[BaseException] = []
         device = context.cleanup_device(self.device.key)
-        for operation in self.cleanup_operations:
-            try:
-                device.perform(operation)
-            except BaseException as error:
-                errors.append(error)
-        try:
-            closed = device.close_session(
-                session_id,
-                self.capability.max_blocking_call_seconds,
-            )
-            if not (closed.source_stopped and closed.no_more_work and closed.joined):
-                raise RuntimeError("capture session stop/drain/join acknowledgement failed")
-        except BaseException as error:
-            errors.append(error)
-        if errors:
-            return CleanupReport.unsafe(
-                (self.device.key,),
-                reason="capture cleanup did not acknowledge every required operation",
-                recovery_action="verify camera session termination and physical safe state",
-                errors=tuple(errors),
-            )
-        try:
-            proof = device.verify_safe_state()
-        except BaseException as error:
-            return CleanupReport.unsafe(
-                (self.device.key,),
-                reason="capture device safe-state verification failed",
-                recovery_action="inspect and recover the camera before reuse",
-                errors=(error,),
-            )
-        return CleanupReport.safe((proof,))
+        return cleanup_device_session(
+            device,
+            self.cleanup_operations,
+            session_id,
+            self.capability.max_blocking_call_seconds,
+            termination_failure_reason=(
+                "capture cleanup did not acknowledge every required operation"
+            ),
+            termination_recovery_action=(
+                "verify camera session termination and physical safe state"
+            ),
+            verification_failure_reason=(
+                "capture device safe-state verification failed"
+            ),
+            verification_recovery_action=(
+                "inspect and recover the camera before reuse"
+            ),
+        )
 
     def verify_idle(self, context: RunContext) -> CleanupReport:
         """Verify safety when no physical capture prepare was ever attempted."""
 
-        try:
-            proof = context.cleanup_device(self.device.key).verify_safe_state()
-        except BaseException as error:
-            return CleanupReport.unsafe(
-                (self.device.key,),
-                reason="unopened capture device safe-state verification failed",
-                recovery_action="inspect and recover the camera before reuse",
-                errors=(error,),
-            )
-        return CleanupReport.safe((proof,))
-
-
-@dataclass
-class _CaptureProcessorInputAuthority:
-    capture_contract: CaptureStreamContract
-    stream: AcquisitionStream
-    payload_contract: CapturePayloadContract
-    join_key_contract: DatasetCellKeyContract
-    input_edge: FrozenDatasetEdge
-    stream_generation: StreamGenerationId
-    session_reservation: ExactReservation | None = None
-
-
-_CAPTURE_PROCESSOR_INPUT_AUTHORITIES = weakref.WeakKeyDictionary()
-_CAPTURE_PROCESSOR_INPUT_AUTHORITIES_LOCK = threading.RLock()
+        return verify_cleanup_device_safe_state(
+            context.cleanup_device(self.device.key),
+            failure_reason="unopened capture device safe-state verification failed",
+            recovery_action="inspect and recover the camera before reuse",
+        )
 
 
 class CaptureProcessorInputBinding:
-    """Sealed process-local input authority shared with one capture session.
-
-    The binding exposes the exact owners already frozen by ``CaptureSession``;
-    it never reconstructs an equivalent payload or join-key contract.  That
-    identity is required by exact stream processors, while the redundant
-    fingerprint checks fail closed if a future construction path wires
-    semantically different contracts together.
-    """
+    """The exact stream edge and reservation minted by one capture session."""
 
     __slots__ = (
-        "_authority",
         "_capture_contract",
         "_stream",
-        "_payload_contract",
         "_join_key_contract",
         "_input_edge",
-        "_stream_generation",
-        "__weakref__",
+        "_session_reservation",
     )
 
     def __init_subclass__(cls, **_kwargs) -> None:
@@ -1458,162 +1401,51 @@ class CaptureProcessorInputBinding:
         self,
         authority: object,
         *,
-        capture_contract: CaptureStreamContract,
+        capture_contract: CameraCaptureContract,
         stream: AcquisitionStream,
     ) -> None:
         if authority is not _PROCESSOR_INPUT_BINDING_TOKEN:
             raise PermissionError(
                 "CaptureProcessorInputBinding can only be minted by CaptureSession"
             )
-        if not isinstance(capture_contract, CaptureStreamContract):
-            raise TypeError("capture_contract must be CaptureStreamContract")
+        if not isinstance(capture_contract, CameraCaptureContract):
+            raise TypeError("capture_contract must be CameraCaptureContract")
         if not isinstance(stream, AcquisitionStream):
             raise TypeError("stream must be AcquisitionStream")
         input_edge = capture_contract.dataset_edge
-        if not isinstance(input_edge, FrozenDatasetEdge):
-            raise TypeError("capture contract has no FrozenDatasetEdge")
-        payload_contract = capture_contract.payload_contract
         join_key_contract = stream._join_key_contract
         if not isinstance(join_key_contract, DatasetCellKeyContract):
             raise TypeError("capture stream has no DatasetCellKeyContract owner")
-        object.__setattr__(self, "_authority", authority)
+        input_edge.validate_stream(stream)
+        if stream.stream_id != capture_contract.stream_id:
+            raise ValueError("processor stream id differs from capture contract")
         object.__setattr__(self, "_capture_contract", capture_contract)
         object.__setattr__(self, "_stream", stream)
-        object.__setattr__(self, "_payload_contract", payload_contract)
         object.__setattr__(self, "_join_key_contract", join_key_contract)
         object.__setattr__(self, "_input_edge", input_edge)
-        object.__setattr__(self, "_stream_generation", stream.generation)
-        with _CAPTURE_PROCESSOR_INPUT_AUTHORITIES_LOCK:
-            _CAPTURE_PROCESSOR_INPUT_AUTHORITIES[self] = (
-                _CaptureProcessorInputAuthority(
-                    capture_contract,
-                    stream,
-                    payload_contract,
-                    join_key_contract,
-                    input_edge,
-                    stream.generation,
-                )
-            )
-        self._validate_identity()
+        object.__setattr__(self, "_session_reservation", None)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("CaptureProcessorInputBinding is immutable")
 
-    def __reduce__(self):
-        raise TypeError("CaptureProcessorInputBinding is process-local")
-
-    def __reduce_ex__(self, _protocol: int):
-        raise TypeError("CaptureProcessorInputBinding is process-local")
-
-    def _require_authority(self) -> None:
-        try:
-            authority = object.__getattribute__(self, "_authority")
-        except AttributeError:
-            raise PermissionError(
-                "CaptureProcessorInputBinding was not minted by CaptureSession"
-            ) from None
-        if (
-            type(self) is not CaptureProcessorInputBinding
-            or authority is not _PROCESSOR_INPUT_BINDING_TOKEN
-        ):
-            raise PermissionError(
-                "CaptureProcessorInputBinding was not minted by CaptureSession"
-            )
-
-    def _authority_record(self) -> _CaptureProcessorInputAuthority:
-        with _CAPTURE_PROCESSOR_INPUT_AUTHORITIES_LOCK:
-            record = _CAPTURE_PROCESSOR_INPUT_AUTHORITIES.get(self)
-        if not isinstance(record, _CaptureProcessorInputAuthority):
-            raise PermissionError(
-                "CaptureProcessorInputBinding was not registered by CaptureSession"
-            )
-        return record
-
-    def _validate_identity(self) -> _CaptureProcessorInputAuthority:
-        self._require_authority()
-        record = self._authority_record()
-        capture_contract = object.__getattribute__(self, "_capture_contract")
-        stream = object.__getattribute__(self, "_stream")
-        payload_contract = object.__getattribute__(self, "_payload_contract")
-        join_key_contract = object.__getattribute__(self, "_join_key_contract")
-        input_edge = object.__getattribute__(self, "_input_edge")
-        stream_generation = object.__getattribute__(self, "_stream_generation")
-        if (
-            capture_contract is not record.capture_contract
-            or stream is not record.stream
-            or payload_contract is not record.payload_contract
-            or join_key_contract is not record.join_key_contract
-            or input_edge is not record.input_edge
-            or stream_generation is not record.stream_generation
-        ):
-            raise PermissionError(
-                "CaptureProcessorInputBinding owner graph changed after minting"
-            )
-        if capture_contract.dataset_edge is not input_edge:
-            raise RuntimeError("processor input edge differs from capture contract owner")
-        if input_edge.schema is not capture_contract.dataset_schema:
-            raise RuntimeError("processor input edge differs from capture schema owner")
-        if input_edge.event_adapter is not capture_contract.event_adapter:
-            raise RuntimeError("processor input edge differs from capture adapter owner")
-        if input_edge.expected_cells is not capture_contract.expected_cells:
-            raise RuntimeError("processor input edge differs from capture cell schedule")
-        if capture_contract.payload_contract is not payload_contract:
-            raise RuntimeError("processor payload differs from capture contract owner")
-        if input_edge.payload_contract is not payload_contract:
-            raise RuntimeError("processor payload differs from dataset edge owner")
-        if stream._payload_contract is not payload_contract:
-            raise RuntimeError("processor payload differs from capture stream owner")
-        if stream._join_key_contract is not join_key_contract:
-            raise RuntimeError("processor join key differs from capture stream owner")
-        if stream.stream_id != capture_contract.stream_id:
-            raise RuntimeError("processor stream id differs from capture contract")
-        if stream.generation != stream_generation:
-            raise RuntimeError("processor stream generation differs from its minting witness")
-        if (
-            record.session_reservation is not None
-            and record.session_reservation._stream is not stream
-        ):
-            raise RuntimeError("processor reservation belongs to another stream generation")
-        payload_fingerprint = input_edge.payload_contract_fingerprint
-        if payload_contract.fingerprint != payload_fingerprint:
-            raise RuntimeError("processor payload owner fingerprint changed")
-        if stream.payload_contract_fingerprint != payload_fingerprint:
-            raise RuntimeError("processor stream payload fingerprint differs")
-        if (
-            capture_contract.capability.payload_contract_fingerprint
-            != payload_fingerprint
-        ):
-            raise RuntimeError("processor capability payload fingerprint differs")
-        if stream.max_payload_bytes != input_edge.payload_max_retained_nbytes:
-            raise RuntimeError("processor payload byte bound differs from input edge")
-        if join_key_contract.fingerprint != input_edge.key_contract_fingerprint:
-            raise RuntimeError("processor join-key fingerprint differs from input edge")
-        input_edge.validate_stream(stream)
-        return record
-
     @property
-    def capture_contract(self) -> CaptureStreamContract:
-        self._validate_identity()
+    def capture_contract(self) -> CameraCaptureContract:
         return self._capture_contract
 
     @property
     def stream(self) -> AcquisitionStream:
-        self._validate_identity()
         return self._stream
 
     @property
     def payload_contract(self) -> CapturePayloadContract:
-        self._validate_identity()
-        return self._payload_contract
+        return self._input_edge.payload_contract
 
     @property
     def join_key_contract(self) -> DatasetCellKeyContract:
-        self._validate_identity()
         return self._join_key_contract
 
     @property
     def input_edge(self) -> FrozenDatasetEdge:
-        self._validate_identity()
         return self._input_edge
 
     def _bind_session_reservation(
@@ -1627,35 +1459,29 @@ class CaptureProcessorInputBinding:
             raise PermissionError("capture reservation binding is session-owned")
         if type(reservation) is not ExactReservation:
             raise TypeError("reservation must be an exact ExactReservation")
-        record = self._validate_identity()
         stream = self._stream
         if reservation._stream is not stream:
             raise PermissionError("reservation belongs to another capture stream")
         with stream._condition:
-            if self._validate_identity() is not record:
-                raise PermissionError("capture processor input authority changed")
-            if record.session_reservation is not None:
+            if self._session_reservation is not None:
                 raise RuntimeError("capture session reservation was already bound")
             if stream._reservations.get(reservation._token) is not reservation:
                 raise RuntimeError("capture session reservation is not registered")
             if reservation.state is not ReservationState.RESERVED:
                 raise RuntimeError("capture session reservation is not RESERVED")
-            record.session_reservation = reservation
+            object.__setattr__(self, "_session_reservation", reservation)
 
     def require_reservation(self, reservation: ExactReservation) -> None:
         """Require the active reservation minted by this exact CaptureSession."""
 
         if type(reservation) is not ExactReservation:
             raise TypeError("reservation must be an exact ExactReservation")
-        record = self._validate_identity()
         stream = self._stream
-        if reservation is not record.session_reservation:
+        if reservation is not self._session_reservation:
             raise PermissionError(
                 "reservation was not minted by this CaptureSession"
             )
         with stream._condition:
-            if self._validate_identity() is not record:
-                raise PermissionError("capture processor input authority changed")
             if stream._reservations.get(reservation._token) is not reservation:
                 raise RuntimeError(
                     "reservation is no longer registered with the capture stream"
@@ -1670,18 +1496,18 @@ class CaptureSession:
     def __init__(
         self,
         port: BoundCapturePort,
-        contract: CaptureStreamContract,
+        contract: CameraCaptureContract,
         trace_binding: TraceBinding,
         capture_spec: FrozenCaptureSpec,
     ) -> None:
         if not isinstance(trace_binding, TraceBinding):
             raise TypeError("trace_binding must be TraceBinding")
         if trace_binding.source_id != contract.source_id:
-            raise ValueError("TraceBinding source differs from CaptureStreamContract")
+            raise ValueError("TraceBinding source differs from CameraCaptureContract")
         if not isinstance(capture_spec, FrozenCaptureSpec):
             raise TypeError("capture_spec must be FrozenCaptureSpec")
         if capture_spec.owner_fingerprint != contract.capture_spec_owner_fingerprint:
-            raise ValueError("capture spec owner differs from CaptureStreamContract")
+            raise ValueError("capture spec owner differs from CameraCaptureContract")
         if len(capture_spec.payload) > contract.capability.max_capture_spec_bytes:
             raise MemoryError("capture spec exceeds device capability byte bound")
         self._port = port
@@ -1696,7 +1522,9 @@ class CaptureSession:
             flow_control=contract.capability.flow_control,
             retention_events=contract.max_inflight_events,
             retention_bytes=contract.max_inflight_bytes,
-            join_key_contract=DatasetCellKeyContract(contract.dataset_schema),
+            join_key_contract=DatasetCellKeyContract.from_schema(
+                contract.dataset_schema
+            ),
         )
         processor_input_binding = CaptureProcessorInputBinding(
             _PROCESSOR_INPUT_BINDING_TOKEN,
@@ -1732,7 +1560,6 @@ class CaptureSession:
                     "processor input binding is only available while capture session is NEW"
                 )
             binding = self._processor_input_binding
-            binding._validate_identity()
             return binding
 
     @property
@@ -1817,17 +1644,14 @@ class CaptureSession:
             self._validate_current_capability()
             with self._lock:
                 self._hardware_prepare_attempted = True
-                self._state = CaptureSessionState.PREPARING
             try:
                 ack = context.device(self._port.device.key).execute(
                     PrepareCaptureCommand(
                         session_id=self._session_id,
-                        run_id=context.run_id.value,
-                        source_id=self._contract.source_id,
-                    capture_spec_payload=self._capture_spec.payload,
-                    capture_spec_owner_fingerprint=(
-                        self._capture_spec.owner_fingerprint
-                    ),
+                        capture_spec_payload=self._capture_spec.payload,
+                        capture_spec_owner_fingerprint=(
+                            self._capture_spec.owner_fingerprint
+                        ),
                         capture_spec_fingerprint=self._capture_spec_digest,
                         capability_fingerprint=self._port.capability.capability_fingerprint,
                         settings_fingerprint=self._port.capability.settings_fingerprint,
@@ -1871,7 +1695,6 @@ class CaptureSession:
                 if readiness is None:
                     raise RuntimeError("capture has no exact consumer readiness proof")
                 self._validate_readiness(readiness, reservation)
-                self._state = CaptureSessionState.STARTING
             try:
                 ack = context.device(self._port.device.key).execute(
                     StartCaptureCommand(
@@ -1899,9 +1722,9 @@ class CaptureSession:
             payload_contract_fingerprint=(
                 self._contract.dataset_edge.payload_contract_fingerprint
             ),
-            join_key_contract_fingerprint=dataset_cell_key_fingerprint(
+            join_key_contract_fingerprint=DatasetCellKeyContract.from_schema(
                 self._contract.dataset_schema
-            ),
+            ).fingerprint,
             source_contract_digest=self._contract.dataset_edge.consumer_contract_digest,
             source_schedule_digest=self._contract.dataset_edge.schedule_digest,
             source_key_sequence_digest=(
@@ -1922,7 +1745,7 @@ class CaptureSession:
                 expected_ordinal = self._delivered
                 if expected_ordinal >= self._contract.total_events:
                     raise RuntimeError("capture already delivered its frozen event budget")
-                join_key = self._contract.expected_cells[expected_ordinal]
+                join_key = self._contract.cell_schedule.cell_at(expected_ordinal)
             try:
                 ack = context.device(self._port.device.key).execute(
                     ReadCaptureCommand(
@@ -2000,7 +1823,6 @@ class CaptureSession:
                     raise RuntimeError(
                         "cannot complete before every scheduled payload is delivered"
                     )
-                self._state = CaptureSessionState.COMPLETING
             try:
                 ack = context.device(self._port.device.key).execute(
                     CompleteCaptureCommand(
@@ -2200,10 +2022,7 @@ class CaptureSession:
             if self._state is CaptureSessionState.COMPLETED:
                 raise RuntimeError("completed capture session cannot fail")
             self._state = CaptureSessionState.FAILED
-        try:
-            self._producer.fail(error)
-        except BaseException:
-            pass
+        self._producer.fail(error)
 
     def _validate_ack(self, ack: object, expected_type: type) -> None:
         if not isinstance(ack, expected_type):
@@ -2212,10 +2031,8 @@ class CaptureSession:
             )
         if ack.session_id != self._session_id:
             raise RuntimeError("capture acknowledgement session_id differs")
-        if ack.binding_id != self._port.device.binding_id:
-            raise RuntimeError("capture acknowledgement binding_id differs")
-        if ack.connection_generation != self._port.device.connection_generation:
-            raise RuntimeError("capture acknowledgement generation differs")
+        if ack.binding_instance_id != self._port.device.binding_instance_id:
+            raise RuntimeError("capture acknowledgement binding instance differs")
 
     def _assert_owner_thread(self) -> None:
         if threading.get_ident() != self._owner_thread_id:
@@ -2228,20 +2045,23 @@ __all__ = [
     "CapturePayloadContract",
     "CapturePreparedAck",
     "CaptureProcessorInputBinding",
-    "CaptureRuntimeProfile",
     "FrozenCaptureSpec",
+    "frozen_capture_spec_from_tree",
+    "frozen_capture_spec_to_tree",
     "CaptureSession",
     "CaptureSessionState",
     "CaptureStartedAck",
-    "CaptureStreamContract",
+    "CameraCaptureContract",
     "CaptureTerminalAck",
+    "capture_terminal_ack_from_tree",
+    "capture_terminal_ack_to_tree",
     "CameraCapabilityEvidence",
     "CameraCaptureProvenance",
+    "camera_capture_provenance_from_tree",
+    "camera_capture_provenance_to_tree",
     "CameraPhysicalFacts",
     "camera_capability_evidence_from_tree",
     "camera_capability_evidence_to_tree",
-    "camera_physical_facts_from_tree",
-    "camera_physical_facts_to_tree",
     "CapturedPayloadAck",
     "CompleteCaptureCommand",
     "PrepareCaptureCommand",

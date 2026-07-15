@@ -1,66 +1,78 @@
-"""Monotonic cooperative cancellation for one run invocation."""
+"""Read-only cooperative cancellation observed by one runtime operation."""
 
 from __future__ import annotations
 
 import threading
-import time
-from dataclasses import dataclass
 
 from zlc_storage import canonical_text
-
-
-@dataclass(frozen=True)
-class CancellationSnapshot:
-    requested: bool
-    reason: str | None
-    requested_at: float | None
 
 
 class CancellationRequested(RuntimeError):
     """Raised at a cooperative cancellation checkpoint."""
 
     def __init__(self, reason: str | None = None) -> None:
-        super().__init__("run cancellation requested" if reason is None else reason)
+        super().__init__("operation cancellation requested" if reason is None else reason)
         self.reason = reason
 
 
-class CancellationToken:
-    """A one-way token: active -> cancelled, never reset or reused."""
+class _CancellationState:
+    __slots__ = ("event", "lock", "reason")
 
     def __init__(self) -> None:
-        self._event = threading.Event()
-        self._lock = threading.Lock()
-        self._reason: str | None = None
-        self._requested_at: float | None = None
+        self.event = threading.Event()
+        self.lock = threading.Lock()
+        self.reason: str | None = None
+
+
+_TOKEN_MINT = object()
+
+
+class CancellationToken:
+    """Read-only view of a monotonic cancellation source.
+
+    A token deliberately has no ``request`` method.  Code receiving a token may
+    observe its owner's decision, but cannot steal cancellation ownership or
+    suppress the owner's hardware-sealing transition by requesting first.
+    """
+
+    __slots__ = ("_state",)
+
+    def __init__(self, mint: object, state: _CancellationState) -> None:
+        if mint is not _TOKEN_MINT:
+            raise PermissionError("CancellationToken is minted by its cancellation owner")
+        self._state = state
 
     @property
     def is_cancelled(self) -> bool:
-        return self._event.is_set()
+        return self._state.event.is_set()
 
-    def request(self, reason: str | None = None) -> bool:
-        """Request cancellation once; return True only for the first request."""
-
-        if reason is not None:
-            canonical_text(reason, "cancellation reason")
-        with self._lock:
-            if self._event.is_set():
-                return False
-            self._reason = reason
-            self._requested_at = time.monotonic()
-            self._event.set()
-            return True
-
-    def wait(self, timeout: float | None = None) -> bool:
-        return self._event.wait(timeout)
+    @property
+    def reason(self) -> str | None:
+        with self._state.lock:
+            return self._state.reason
 
     def checkpoint(self) -> None:
-        if self._event.is_set():
-            raise CancellationRequested(self.snapshot().reason)
+        if self._state.event.is_set():
+            raise CancellationRequested(self.reason)
 
-    def snapshot(self) -> CancellationSnapshot:
-        with self._lock:
-            return CancellationSnapshot(
-                requested=self._event.is_set(),
-                reason=self._reason,
-                requested_at=self._requested_at,
-            )
+
+class _CancellationSource:
+    """Private write authority owned by a RunHandle or worker."""
+
+    __slots__ = ("_state", "token")
+
+    def __init__(self) -> None:
+        state = _CancellationState()
+        self._state = state
+        self.token = CancellationToken(_TOKEN_MINT, state)
+
+    def request(self, reason: str | None = None) -> bool:
+        if reason is not None:
+            canonical_text(reason, "cancellation reason")
+        state = self._state
+        with state.lock:
+            if state.event.is_set():
+                return False
+            state.reason = reason
+            state.event.set()
+            return True

@@ -10,11 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from Zou_lab_control.neutral_atom.device_catalog import (
-    DeviceCatalogView,
-    DeviceRef,
-    InstallationAvailability,
-)
 from zlc_data import (
     AxisId,
     AxisSpec,
@@ -24,8 +19,9 @@ from zlc_data import (
     REPEAT,
     SCAN_POINT,
 )
-from zlc_neutral_atom.acquisition import CameraAcquisitionMode
-from zlc_neutral_atom.runtime import BoundMeasurement
+from zlc_neutral_atom.acquisition import CameraAcquisitionMode, CameraSampleContract
+from zlc_neutral_atom.runtime.pipeline import BoundMeasurement
+from zlc_neutral_atom.runtime.capture import BoundCapturePort
 from zlc_neutral_atom.timing.capture_plan import (
     CompiledCaptureCellPlan,
     compile_capture_cell_plan,
@@ -43,9 +39,10 @@ from zlc_pulse import (
 )
 from zlc_storage import canonical_text, positive_integer as _positive_int
 
-from .camera_capture import CameraCaptureBindingRequest
-from .legacy_neutral_atom import LegacyNeutralAtomRuntime
-from .sequencer_execution import SequencerBindingRequest
+from .camera_capture import (
+    CameraCaptureBindingRequest,
+    bind_camera_measurement,
+)
 
 def _canonical_grouping(
     value: tuple[tuple[int, int], ...] | None,
@@ -143,46 +140,22 @@ def _axis(axis_id: AxisId, role, size: int) -> AxisSpec:
     return AxisSpec(axis_id, axis_id.value, role, size, tuple(range(size)))
 
 
-def _require_current_device(
-    catalog: DeviceCatalogView,
-    reference: DeviceRef,
-    *,
-    domain: str,
-) -> str:
-    if not isinstance(reference, DeviceRef):
-        raise TypeError(f"{domain} reference must be DeviceRef")
-    if catalog.availability is not InstallationAvailability.AVAILABLE:
-        raise RuntimeError("installation is not available for hardware binding")
-    info = catalog.require(reference.role)
-    if info.ref != reference:
-        raise RuntimeError(
-            f"{domain} reference belongs to a stale installation generation"
-        )
-    if info.domain != domain:
-        raise ValueError(
-            f"device role {reference.role!r} is {info.domain!r}, not {domain!r}"
-        )
-    return reference.role
-
-
 def _bind_triggered_camera_acquisition(
-    runtime: LegacyNeutralAtomRuntime,
-    catalog: DeviceCatalogView,
+    pulse_port: BoundPulsePort,
+    camera_port: BoundCapturePort,
     *,
     pulse_document: PulseDocument,
     execution_form: PulseExecutionForm,
-    camera_ref: DeviceRef,
-    sequencer_ref: DeviceRef,
     trigger_channel: str | None,
     layout: _TriggeredCameraLayout,
     transport_memory_limit_bytes: int,
 ) -> _TriggeredCameraBinding:
     """Bind one exact finite pulse/camera acquisition without starting hardware."""
 
-    if not isinstance(runtime, LegacyNeutralAtomRuntime):
-        raise TypeError("runtime must be LegacyNeutralAtomRuntime")
-    if not isinstance(catalog, DeviceCatalogView):
-        raise TypeError("catalog must be DeviceCatalogView")
+    if not isinstance(pulse_port, BoundPulsePort):
+        raise TypeError("pulse_port must be BoundPulsePort")
+    if not isinstance(camera_port, BoundCapturePort):
+        raise TypeError("camera_port must be BoundCapturePort")
     if not isinstance(pulse_document, PulseDocument):
         raise TypeError("pulse_document must be PulseDocument")
     if not isinstance(execution_form, PulseExecutionForm):
@@ -196,29 +169,26 @@ def _bind_triggered_camera_acquisition(
         "transport_memory_limit_bytes",
     )
 
-    camera_role = _require_current_device(catalog, camera_ref, domain="camera")
-    sequencer_role = _require_current_device(
-        catalog,
-        sequencer_ref,
-        domain="sequencer",
-    )
-    pulse_port = runtime.bind_sequencer_port(
-        SequencerBindingRequest(sequencer_role)
-    )
     document = bind_pulse_document_target(
         pulse_document,
         pulse_port.capability.target,
     )
-    camera_description = runtime.describe_camera(camera_role)
+    camera_capability = camera_port.capability
+    camera_evidence = camera_capability.camera_capability_evidence
+    camera_role = camera_evidence.source_id
+    camera_facts = camera_evidence.physical_facts
+    camera_payload_contract = camera_capability.payload_contract
+    if not isinstance(camera_payload_contract, CameraSampleContract):
+        raise TypeError("camera capability payload contract has the wrong type")
     if trigger_channel is None:
-        if len(camera_description.capture_trigger_channels) != 1:
+        if len(camera_facts.capture_trigger_channels) != 1:
             raise ValueError(
                 "exact capture requires exactly one physical camera trigger channel"
             )
-        selected_trigger = camera_description.capture_trigger_channels[0]
+        selected_trigger = camera_facts.capture_trigger_channels[0]
     else:
         selected_trigger = canonical_text(trigger_channel, "trigger_channel")
-    camera_description.physical_facts.require_single_capture_trigger_channel(
+    camera_facts.require_single_capture_trigger_channel(
         selected_trigger
     )
 
@@ -268,7 +238,7 @@ def _bind_triggered_camera_acquisition(
         repeat_axis,
         point_axes,
         point_layout,
-        camera_description.payload_contract.value_schema,
+        camera_payload_contract.value_schema,
     )
     cell_plan = compile_capture_cell_plan(
         artifact,
@@ -280,18 +250,19 @@ def _bind_triggered_camera_acquisition(
         ),
         within_point_grouping=layout.within_point_grouping,
     )
-    measurement = runtime.bind_camera_measurement(
+    measurement = bind_camera_measurement(
+        camera_port,
         CameraCaptureBindingRequest(
             camera_role,
             repeat_axis,
             point_axes,
             point_layout,
-            cell_plan.expected_cells,
+            cell_plan.cell_schedule,
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             0,
             transport_memory_limit_bytes,
             tuple(
-                camera_description.event_setting(index)
+                camera_facts.event_setting(index)
                 for index in range(events_per_repeat)
             ),
         )

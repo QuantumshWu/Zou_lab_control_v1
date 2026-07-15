@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 from zlc_storage import canonical_text as _canonical_text, finite_real
 
 
@@ -54,6 +54,100 @@ class ResourceKey:
         return "/".join(self.segments)
 
 
+class DeviceIdentityEvidenceKind(str, Enum):
+    """How an adapter established the identity of a physical asset."""
+
+    HARDWARE_IDENTITY_READBACK = "HARDWARE_IDENTITY_READBACK"
+    INSTALLATION_ASSERTED_ENDPOINT = "INSTALLATION_ASSERTED_ENDPOINT"
+
+
+@dataclass(frozen=True, order=True)
+class PhysicalDeviceIdentity:
+    """Connection-independent identity and the evidence that supports it."""
+
+    stable_device_identity: str
+    evidence_kind: DeviceIdentityEvidenceKind
+    evidence_digest: str
+    asset_map_revision: str
+
+    def __post_init__(self) -> None:
+        _canonical_text(self.stable_device_identity, "stable_device_identity")
+        if not isinstance(self.evidence_kind, DeviceIdentityEvidenceKind):
+            raise TypeError("evidence_kind must be DeviceIdentityEvidenceKind")
+        _canonical_text(self.evidence_digest, "evidence_digest")
+        _canonical_text(self.asset_map_revision, "asset_map_revision")
+
+
+@dataclass(frozen=True, order=True)
+class DeviceBindingStamp:
+    """Exact physical identity plus one broker-minted binding instance."""
+
+    physical_identity: PhysicalDeviceIdentity
+    binding_instance_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.physical_identity, PhysicalDeviceIdentity):
+            raise TypeError("physical_identity must be PhysicalDeviceIdentity")
+        _canonical_segment(self.binding_instance_id, "binding_instance_id")
+
+
+def physical_device_identity_to_tree(
+    value: PhysicalDeviceIdentity,
+) -> dict[str, object]:
+    """Encode the resource owner's current physical-identity value."""
+
+    if not isinstance(value, PhysicalDeviceIdentity):
+        raise TypeError("value must be PhysicalDeviceIdentity")
+    return {
+        "stable_device_identity": value.stable_device_identity,
+        "evidence_kind": value.evidence_kind.value,
+        "evidence_digest": value.evidence_digest,
+        "asset_map_revision": value.asset_map_revision,
+    }
+
+
+def physical_device_identity_from_tree(tree: object) -> PhysicalDeviceIdentity:
+    """Decode only the resource owner's current physical-identity schema."""
+
+    fields = {
+        "stable_device_identity",
+        "evidence_kind",
+        "evidence_digest",
+        "asset_map_revision",
+    }
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("physical device identity has an unknown field set")
+    return PhysicalDeviceIdentity(
+        stable_device_identity=tree["stable_device_identity"],
+        evidence_kind=DeviceIdentityEvidenceKind(tree["evidence_kind"]),
+        evidence_digest=tree["evidence_digest"],
+        asset_map_revision=tree["asset_map_revision"],
+    )
+
+
+def device_binding_stamp_to_tree(value: DeviceBindingStamp) -> dict[str, object]:
+    """Encode the resource owner's current binding-stamp value."""
+
+    if not isinstance(value, DeviceBindingStamp):
+        raise TypeError("value must be DeviceBindingStamp")
+    return {
+        "physical_identity": physical_device_identity_to_tree(value.physical_identity),
+        "binding_instance_id": value.binding_instance_id,
+    }
+
+
+def device_binding_stamp_from_tree(tree: object) -> DeviceBindingStamp:
+    """Decode only the resource owner's current binding-stamp schema."""
+
+    fields = {"physical_identity", "binding_instance_id"}
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("device binding stamp has an unknown field set")
+    return DeviceBindingStamp(
+        physical_identity=physical_device_identity_from_tree(tree["physical_identity"]),
+        binding_instance_id=tree["binding_instance_id"],
+    )
+
+
 class ClaimMode(str, Enum):
     EXCLUSIVE = "EXCLUSIVE"
     OBSERVE = "OBSERVE"
@@ -69,24 +163,6 @@ class ResourceClaim:
             raise TypeError("ResourceClaim.key must be ResourceKey")
         if not isinstance(self.mode, ClaimMode):
             raise TypeError("ResourceClaim.mode must be ClaimMode")
-
-
-@dataclass(frozen=True)
-class ConnectionEstablishmentClaim:
-    """Exclusive, non-hazardous ownership for open + identity + generation bind."""
-
-    attempt_id: str
-    keys: tuple[ResourceKey, ...]
-
-    def __post_init__(self) -> None:
-        _canonical_segment(self.attempt_id, "connection establishment attempt id")
-        if not isinstance(self.keys, tuple) or not self.keys:
-            raise ValueError("connection establishment requires at least one ResourceKey")
-        if any(not isinstance(key, ResourceKey) for key in self.keys):
-            raise TypeError("connection establishment keys must be ResourceKey values")
-        canonical = tuple(sorted(set(self.keys)))
-        if canonical != self.keys:
-            raise ValueError("connection establishment keys must be unique canonical order")
 
 
 @dataclass(frozen=True)
@@ -106,22 +182,20 @@ class ResourceQuarantined:
 @dataclass(frozen=True, order=True)
 class HazardClaim:
     key: ResourceKey
-    stable_device_identity: str
-    connection_generation: str
+    binding_stamp: DeviceBindingStamp
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, ResourceKey):
             raise TypeError("hazard key must be ResourceKey")
-        _canonical_text(self.stable_device_identity, "stable_device_identity")
-        _canonical_segment(self.connection_generation, "connection_generation")
+        if not isinstance(self.binding_stamp, DeviceBindingStamp):
+            raise TypeError("hazard binding_stamp must be DeviceBindingStamp")
 
 
 @dataclass(frozen=True)
 class HazardRecord:
     record_id: str
     key: ResourceKey
-    stable_device_identity: str
-    connection_generation: str
+    binding_stamp: DeviceBindingStamp
     run_id: str
     activated_at: float
 
@@ -129,8 +203,8 @@ class HazardRecord:
         _canonical_segment(self.record_id, "hazard record id")
         if not isinstance(self.key, ResourceKey):
             raise TypeError("hazard record key must be ResourceKey")
-        _canonical_text(self.stable_device_identity, "stable_device_identity")
-        _canonical_segment(self.connection_generation, "connection_generation")
+        if not isinstance(self.binding_stamp, DeviceBindingStamp):
+            raise TypeError("hazard record binding_stamp must be DeviceBindingStamp")
         _canonical_text(self.run_id, "hazard run_id")
         finite_real(self.activated_at, "hazard activated_at")
 
@@ -143,16 +217,15 @@ class SafetyOutcome(str, Enum):
 @dataclass(frozen=True, order=True)
 class SafeReceipt:
     key: ResourceKey
-    stable_device_identity: str
-    connection_generation: str
+    binding_stamp: DeviceBindingStamp
     operation_id: str
     acknowledgement_digest: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, ResourceKey):
             raise TypeError("safe receipt key must be ResourceKey")
-        _canonical_text(self.stable_device_identity, "stable_device_identity")
-        _canonical_segment(self.connection_generation, "connection generation")
+        if not isinstance(self.binding_stamp, DeviceBindingStamp):
+            raise TypeError("safe receipt binding_stamp must be DeviceBindingStamp")
         _canonical_segment(self.operation_id, "safe operation id")
         _canonical_segment(self.acknowledgement_digest, "safe acknowledgement digest")
 
@@ -214,9 +287,8 @@ class SafetyDispositionRecord:
     disposition_id: str
     key: ResourceKey
     outcome: SafetyOutcome
-    hazard_record_id: str | None
-    stable_device_identity: str | None
-    connection_generation: str | None
+    hazard_record_id: str
+    binding_stamp: DeviceBindingStamp
     safe_receipt: SafeReceipt | None
     reason: str | None
     recovery_action: str | None
@@ -227,38 +299,22 @@ class SafetyDispositionRecord:
             raise TypeError("safety disposition key must be ResourceKey")
         if not isinstance(self.outcome, SafetyOutcome):
             raise TypeError("safety disposition outcome must be SafetyOutcome")
-        hazard_identity = (
-            self.hazard_record_id,
-            self.stable_device_identity,
-            self.connection_generation,
-        )
-        if any(value is None for value in hazard_identity) != all(
-            value is None for value in hazard_identity
-        ):
-            raise ValueError("hazard record id, stable identity, and generation must appear together")
-        if self.hazard_record_id is not None:
-            _canonical_segment(self.hazard_record_id, "hazard record id")
-            _canonical_text(self.stable_device_identity, "stable device identity")
-            _canonical_segment(self.connection_generation, "connection generation")
+        _canonical_segment(self.hazard_record_id, "hazard record id")
+        if not isinstance(self.binding_stamp, DeviceBindingStamp):
+            raise TypeError("binding_stamp must be DeviceBindingStamp")
         if self.outcome is SafetyOutcome.SAFE:
             if not isinstance(self.safe_receipt, SafeReceipt):
                 raise TypeError("SAFE disposition requires SafeReceipt")
             if (
                 self.safe_receipt.key != self.key
-                or self.safe_receipt.stable_device_identity
-                != self.stable_device_identity
-                or self.safe_receipt.connection_generation != self.connection_generation
+                or self.safe_receipt.binding_stamp != self.binding_stamp
             ):
-                raise ValueError("safe receipt does not match disposition key/generation")
+                raise ValueError("safe receipt does not match disposition binding stamp")
             if self.reason is not None or self.recovery_action is not None:
                 raise ValueError("SAFE disposition cannot contain quarantine fields")
-            if self.hazard_record_id is None:
-                raise ValueError("SAFE disposition must resolve an existing hazard")
         else:
             if self.safe_receipt is not None:
                 raise ValueError("UNSAFE disposition cannot contain safe receipt")
-            if self.hazard_record_id is None:
-                raise ValueError("UNSAFE disposition must resolve an existing hazard")
             _canonical_text(self.reason, "unsafe reason")
             _canonical_text(self.recovery_action, "recovery action")
 
@@ -278,15 +334,13 @@ class SafetyDispositionBundle:
         records = tuple(self.records)
         if any(not isinstance(record, SafetyDispositionRecord) for record in records):
             raise TypeError("safety bundle records must be SafetyDispositionRecord")
+        if not records:
+            raise ValueError("safety bundle must resolve at least one hazard")
         if len({record.disposition_id for record in records}) != len(records):
             raise ValueError("safety disposition ids must be unique")
         if len({record.key for record in records}) != len(records):
             raise ValueError("safety disposition keys must be unique")
-        hazard_ids = [
-            record.hazard_record_id
-            for record in records
-            if record.hazard_record_id is not None
-        ]
+        hazard_ids = [record.hazard_record_id for record in records]
         if len(set(hazard_ids)) != len(hazard_ids):
             raise ValueError("one hazard cannot have multiple safety dispositions")
         object.__setattr__(self, "records", records)
@@ -297,7 +351,7 @@ class SafetyDispositionBundle:
 class QuarantineRecord:
     record_id: str
     key: ResourceKey
-    stable_device_identity: str
+    binding_stamp: DeviceBindingStamp
     run_id: str
     reason: str
     recovery_action: str
@@ -308,7 +362,8 @@ class QuarantineRecord:
         _canonical_segment(self.record_id, "quarantine record id")
         if not isinstance(self.key, ResourceKey):
             raise TypeError("quarantine key must be ResourceKey")
-        _canonical_text(self.stable_device_identity, "stable_device_identity")
+        if not isinstance(self.binding_stamp, DeviceBindingStamp):
+            raise TypeError("quarantine binding_stamp must be DeviceBindingStamp")
         _canonical_text(self.run_id, "quarantine run_id")
         _canonical_text(self.reason, "quarantine reason")
         _canonical_text(self.recovery_action, "quarantine recovery action")
@@ -318,86 +373,27 @@ class QuarantineRecord:
 
 @dataclass(frozen=True)
 class RecoveryEvidence:
-    stable_device_identity: str
-    connection_generation: str
-    health_digest: str
+    binding_stamp: DeviceBindingStamp
     safe_state_digest: str
-    verified_at: float
 
     def __post_init__(self) -> None:
-        _canonical_text(self.stable_device_identity, "stable device identity")
-        _canonical_segment(self.connection_generation, "connection generation")
-        _canonical_segment(self.health_digest, "health digest")
+        if not isinstance(self.binding_stamp, DeviceBindingStamp):
+            raise TypeError("recovery binding_stamp must be DeviceBindingStamp")
         _canonical_segment(self.safe_state_digest, "safe-state digest")
-        finite_real(self.verified_at, "recovery verified_at")
 
 
 @dataclass(frozen=True)
 class RecoveryClaim:
     key: ResourceKey
-    stable_device_identity: str
-    quarantine_record_ids: tuple[str, ...]
-    hazard_record_ids: tuple[str, ...]
+    physical_identity: PhysicalDeviceIdentity
+    blocking_record_id: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, ResourceKey):
             raise TypeError("recovery claim key must be ResourceKey")
-        _canonical_text(self.stable_device_identity, "stable_device_identity")
-        quarantine_ids = tuple(self.quarantine_record_ids)
-        hazard_ids = tuple(self.hazard_record_ids)
-        if not quarantine_ids and not hazard_ids:
-            raise ValueError("recovery claim must reference unresolved safety records")
-        if len(set(quarantine_ids)) != len(quarantine_ids):
-            raise ValueError("recovery quarantine ids must be unique")
-        if len(set(hazard_ids)) != len(hazard_ids):
-            raise ValueError("recovery hazard ids must be unique")
-        for value in quarantine_ids + hazard_ids:
-            _canonical_segment(value, "recovery claim record id")
-        object.__setattr__(self, "quarantine_record_ids", quarantine_ids)
-        object.__setattr__(self, "hazard_record_ids", hazard_ids)
-
-
-_VERIFIED_RECOVERY_TOKEN = object()
-
-
-class VerifiedRecoveryProof:
-    """Opaque authorization; RecoveryEvidence alone cannot clear safety records."""
-
-    __slots__ = ("_claim", "_evidence")
-
-    def __init__(
-        self,
-        token: object,
-        *,
-        claim: RecoveryClaim,
-        evidence: RecoveryEvidence,
-    ) -> None:
-        if token is not _VERIFIED_RECOVERY_TOKEN:
-            raise PermissionError("VerifiedRecoveryProof requires device authority")
-        object.__setattr__(self, "_claim", claim)
-        object.__setattr__(self, "_evidence", evidence)
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("VerifiedRecoveryProof is immutable")
-
-    @property
-    def claim(self) -> RecoveryClaim:
-        return self._claim
-
-    @property
-    def evidence(self) -> RecoveryEvidence:
-        return self._evidence
-
-
-def _mint_verified_recovery(
-    claim: RecoveryClaim,
-    evidence: RecoveryEvidence,
-) -> VerifiedRecoveryProof:
-    return VerifiedRecoveryProof(
-        _VERIFIED_RECOVERY_TOKEN,
-        claim=claim,
-        evidence=evidence,
-    )
+        if not isinstance(self.physical_identity, PhysicalDeviceIdentity):
+            raise TypeError("recovery claim physical_identity must be PhysicalDeviceIdentity")
+        _canonical_segment(self.blocking_record_id, "recovery blocking record id")
 
 
 @dataclass(frozen=True)
@@ -442,237 +438,189 @@ class SafetyJournal(Protocol):
     def append_recovery_bundle(self, bundle: RecoveryBundle) -> None: ...
 
 
-class QuarantineJournalError(RuntimeError):
+class SafetyJournalWriteError(RuntimeError):
     """A safety fact could not be made durable, so ownership remains fail-closed."""
 
 
-class HazardEpochExpired(QuarantineJournalError):
+class HazardEpochExpired(SafetyJournalWriteError):
     """A retried hazard epoch was already durably resolved and cannot be revived."""
 
 
-class MemoryQuarantineJournal:
-    """Contract-test implementation; real device bootstraps must use persistent storage."""
+class _SafetyProjection:
+    """Incremental materialized view of an append-only safety fact stream."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._entries: list[
-            HazardRecord | SafetyDispositionBundle | RecoveryBundle
-        ] = []
+        self.hazards: dict[str, HazardRecord] = {}
+        self.quarantines: dict[str, QuarantineRecord] = {}
+        self.seen: dict[
+            str, HazardRecord | SafetyDispositionBundle | RecoveryBundle
+        ] = {}
+        self.hazard_ids_by_run: dict[str, set[str]] = {}
+        self.hazard_ids_by_key: dict[ResourceKey, set[str]] = {}
+        self.quarantine_ids_by_key: dict[ResourceKey, set[str]] = {}
+        self.blocker_keys: set[tuple[str, ...]] = set()
+        self.blocker_prefix_counts: dict[tuple[str, ...], int] = {}
 
-    def snapshot(self) -> SafetyJournalSnapshot:
-        with self._lock:
-            return _replay_entries(tuple(self._entries))
-
-    def unresolved_hazards(self) -> tuple[HazardRecord, ...]:
-        return self.snapshot().unresolved_hazards
-
-    def unresolved_quarantines(self) -> tuple[QuarantineRecord, ...]:
-        return self.snapshot().unresolved_quarantines
-
-    def append_hazards(self, records: tuple[HazardRecord, ...]) -> HazardAppendStatus:
-        records = tuple(records)
-        with self._lock:
-            if any(not isinstance(record, HazardRecord) for record in records):
-                raise TypeError("hazard append requires HazardRecord values")
-            if len({record.record_id for record in records}) != len(records):
-                raise ValueError("hazard append record ids must be unique")
-            if len({record.key for record in records}) != len(records):
-                raise ValueError("hazard append keys must be unique")
-            if len({record.run_id for record in records}) > 1:
-                raise ValueError("one hazard append must belong to one run")
-            if not records:
-                return HazardAppendStatus.APPENDED
-            additions = self._missing_entries(
-                tuple((record.record_id, record) for record in records)
-            )
-            _replay_entries(tuple(self._entries) + additions)
-            self._entries.extend(additions)
-            if additions:
-                return HazardAppendStatus.APPENDED
-            unresolved = {
-                record.record_id for record in _replay_entries(tuple(self._entries)).unresolved_hazards
-            }
-            requested = {record.record_id for record in records}
-            if requested <= unresolved:
-                return HazardAppendStatus.ALREADY_UNRESOLVED_SAME
-            if requested.isdisjoint(unresolved):
-                return HazardAppendStatus.ALREADY_RESOLVED
-            raise ValueError("hazard retry has partially resolved durable state")
-
-    def append_safety_bundle(self, bundle: SafetyDispositionBundle) -> None:
-        if not isinstance(bundle, SafetyDispositionBundle):
-            raise TypeError("bundle must be SafetyDispositionBundle")
-        with self._lock:
-            additions = self._missing_entries(((bundle.bundle_id, bundle),))
-            _replay_entries(tuple(self._entries) + additions)
-            self._entries.extend(additions)
-
-    def append_recovery_bundle(self, bundle: RecoveryBundle) -> None:
-        if not isinstance(bundle, RecoveryBundle):
-            raise TypeError("bundle must be RecoveryBundle")
-        with self._lock:
-            additions = self._missing_entries(((bundle.bundle_id, bundle),))
-            _replay_entries(tuple(self._entries) + additions)
-            self._entries.extend(additions)
-
-    def entries(
-        self,
-    ) -> tuple[HazardRecord | SafetyDispositionBundle | RecoveryBundle, ...]:
-        with self._lock:
-            return tuple(self._entries)
-
-    def _missing_entries(
-        self,
-        candidates: tuple[
-            tuple[str, HazardRecord | SafetyDispositionBundle | RecoveryBundle], ...
-        ],
-    ) -> tuple[HazardRecord | SafetyDispositionBundle | RecoveryBundle, ...]:
-        existing_by_id = {
-            (
-                entry.record_id if isinstance(entry, HazardRecord) else entry.bundle_id
-            ): entry
-            for entry in self._entries
-        }
-        additions = []
-        for record_id, value in candidates:
-            existing = existing_by_id.get(record_id)
-            if existing is not None:
-                if existing != value:
-                    raise ValueError(
-                        f"safety journal id {record_id} has conflicting content"
-                    )
-                continue
-            additions.append(value)
-            existing_by_id[record_id] = value
-        return tuple(additions)
-
-
-def _replay_entries(
-    entries: tuple[HazardRecord | SafetyDispositionBundle | RecoveryBundle, ...],
-) -> SafetyJournalSnapshot:
-    hazards: dict[str, HazardRecord] = {}
-    quarantines: dict[str, QuarantineRecord] = {}
-    seen: dict[str, HazardRecord | SafetyDispositionBundle | RecoveryBundle] = {}
-    for entry in entries:
-        entry_id = (
-            entry.record_id if isinstance(entry, HazardRecord) else entry.bundle_id
+    def _has_overlapping_blocker(self, key: ResourceKey) -> bool:
+        segments = key.segments
+        return self.blocker_prefix_counts.get(segments, 0) > 0 or any(
+            segments[:depth] in self.blocker_keys
+            for depth in range(1, len(segments) + 1)
         )
-        previous_entry = seen.get(entry_id)
-        if previous_entry is not None:
-            if previous_entry != entry:
+
+    def _add_blocker(self, key: ResourceKey) -> None:
+        if key.segments in self.blocker_keys:
+            raise ValueError("one ResourceKey cannot have multiple safety blockers")
+        self.blocker_keys.add(key.segments)
+        for depth in range(1, len(key.segments) + 1):
+            prefix = key.segments[:depth]
+            self.blocker_prefix_counts[prefix] = (
+                self.blocker_prefix_counts.get(prefix, 0) + 1
+            )
+
+    def _remove_blocker(self, key: ResourceKey) -> None:
+        self.blocker_keys.remove(key.segments)
+        for depth in range(1, len(key.segments) + 1):
+            prefix = key.segments[:depth]
+            remaining = self.blocker_prefix_counts[prefix] - 1
+            if remaining:
+                self.blocker_prefix_counts[prefix] = remaining
+            else:
+                self.blocker_prefix_counts.pop(prefix)
+
+    def apply(
+        self,
+        entry: HazardRecord | SafetyDispositionBundle | RecoveryBundle,
+    ) -> bool:
+        entry_id = entry.record_id if isinstance(entry, HazardRecord) else entry.bundle_id
+        previous = self.seen.get(entry_id)
+        if previous is not None:
+            if previous != entry:
                 raise ValueError(f"safety journal id {entry_id} has conflicting content")
-            continue
-        seen[entry_id] = entry
+            return False
         if isinstance(entry, HazardRecord):
-            if any(
-                existing.key.overlaps(entry.key)
-                for existing in hazards.values()
-            ) or any(
-                existing.key.overlaps(entry.key)
-                for existing in quarantines.values()
-            ):
+            if self._has_overlapping_blocker(entry.key):
                 raise ValueError("hazard keys cannot overlap unresolved safety records")
-            hazards[entry.record_id] = entry
-            continue
+            self.hazards[entry.record_id] = entry
+            self.hazard_ids_by_run.setdefault(entry.run_id, set()).add(entry.record_id)
+            self.hazard_ids_by_key.setdefault(entry.key, set()).add(entry.record_id)
+            self._add_blocker(entry.key)
+            self.seen[entry_id] = entry
+            return True
         if isinstance(entry, SafetyDispositionBundle):
-            hazards_for_run = {
-                record_id
-                for record_id, hazard in hazards.items()
-                if hazard.run_id == entry.run_id
-            }
+            expected = self.hazard_ids_by_run.get(entry.run_id, set())
             referenced = {
-                record.hazard_record_id
-                for record in entry.records
-                if record.hazard_record_id is not None
+                record.hazard_record_id for record in entry.records
             }
-            if referenced != hazards_for_run:
+            if referenced != expected:
                 raise ValueError(
                     "safety bundle must exactly cover all unresolved hazards for its run"
                 )
             for record in entry.records:
-                if record.hazard_record_id is not None:
-                    hazard = hazards.get(record.hazard_record_id)
-                    if hazard is None:
-                        raise ValueError("safety bundle references an unknown hazard")
-                    if (
-                        hazard.run_id != entry.run_id
-                        or hazard.key != record.key
-                        or hazard.stable_device_identity
-                        != record.stable_device_identity
-                        or hazard.connection_generation != record.connection_generation
-                    ):
-                        raise ValueError(
-                            "safety disposition does not match hazard run/key/generation"
-                        )
-                    if entry.recorded_at < hazard.activated_at:
-                        raise ValueError("safety disposition predates hazard activation")
-                    hazards.pop(record.hazard_record_id)
+                hazard = self.hazards.get(record.hazard_record_id)
+                if (
+                    hazard is None
+                    or hazard.run_id != entry.run_id
+                    or hazard.key != record.key
+                    or hazard.binding_stamp != record.binding_stamp
+                ):
+                    raise ValueError(
+                        "safety disposition does not match hazard run/key/binding"
+                    )
+            for record in entry.records:
+                hazard = self.hazards.pop(record.hazard_record_id)
+                run_ids = self.hazard_ids_by_run[hazard.run_id]
+                run_ids.remove(hazard.record_id)
+                if not run_ids:
+                    self.hazard_ids_by_run.pop(hazard.run_id)
+                key_ids = self.hazard_ids_by_key[hazard.key]
+                key_ids.remove(hazard.record_id)
+                if not key_ids:
+                    self.hazard_ids_by_key.pop(hazard.key)
+                self._remove_blocker(hazard.key)
                 if record.outcome is SafetyOutcome.UNSAFE:
                     assert record.reason is not None
                     assert record.recovery_action is not None
-                    assert record.stable_device_identity is not None
-                    quarantines[record.disposition_id] = QuarantineRecord(
+                    quarantine = QuarantineRecord(
                         record_id=record.disposition_id,
                         key=record.key,
-                        stable_device_identity=record.stable_device_identity,
+                        binding_stamp=record.binding_stamp,
                         run_id=entry.run_id,
                         reason=record.reason,
                         recovery_action=record.recovery_action,
                         recorded_at=entry.recorded_at,
                         safety_bundle_id=entry.bundle_id,
                     )
-            continue
-        hazards_for_key = {
-            record_id
-            for record_id, hazard in hazards.items()
-            if hazard.key == entry.claim.key
-        }
-        quarantines_for_key = {
-            record_id
-            for record_id, quarantine in quarantines.items()
-            if quarantine.key == entry.claim.key
-        }
-        if set(entry.claim.hazard_record_ids) != hazards_for_key:
-            raise ValueError("recovery bundle must exactly cover hazards for its key")
-        if set(entry.claim.quarantine_record_ids) != quarantines_for_key:
-            raise ValueError("recovery bundle must exactly cover quarantines for its key")
-        if entry.recorded_at < entry.evidence.verified_at:
-            raise ValueError("recovery bundle predates its verified evidence")
-        if entry.evidence.stable_device_identity != entry.claim.stable_device_identity:
-            raise ValueError("recovery evidence does not match claimed stable identity")
-        for record_id in entry.claim.hazard_record_ids:
-            hazard = hazards.get(record_id)
+                    self.quarantines[quarantine.record_id] = quarantine
+                    self.quarantine_ids_by_key.setdefault(quarantine.key, set()).add(
+                        quarantine.record_id
+                    )
+                    self._add_blocker(quarantine.key)
+            self.seen[entry_id] = entry
+            return True
+        blockers = self.hazard_ids_by_key.get(
+            entry.claim.key, set()
+        ) | self.quarantine_ids_by_key.get(entry.claim.key, set())
+        if blockers != {entry.claim.blocking_record_id}:
+            raise ValueError("recovery bundle must exactly reference the blocker for its key")
+        if (
+            entry.evidence.binding_stamp.physical_identity
+            != entry.claim.physical_identity
+        ):
+            raise ValueError("recovery evidence does not match claimed physical identity")
+        record_id = entry.claim.blocking_record_id
+        hazard = self.hazards.get(record_id)
+        quarantine = self.quarantines.get(record_id)
+        if hazard is not None:
             if (
-                hazard is None
-                or hazard.key != entry.claim.key
-                or hazard.stable_device_identity != entry.claim.stable_device_identity
+                hazard.key != entry.claim.key
+                or hazard.binding_stamp.physical_identity != entry.claim.physical_identity
             ):
                 raise ValueError("recovery bundle references unknown or cross-key hazard")
-            if entry.evidence.verified_at < hazard.activated_at:
-                raise ValueError("recovery evidence predates hazard activation")
-            hazards.pop(record_id)
-        for record_id in entry.claim.quarantine_record_ids:
-            quarantine = quarantines.get(record_id)
+        elif quarantine is not None:
             if (
-                quarantine is None
-                or quarantine.key != entry.claim.key
-                or quarantine.stable_device_identity != entry.claim.stable_device_identity
+                quarantine.key != entry.claim.key
+                or quarantine.binding_stamp.physical_identity
+                != entry.claim.physical_identity
             ):
-                raise ValueError("recovery bundle references unknown or cross-key quarantine")
-            if entry.evidence.verified_at < quarantine.recorded_at:
-                raise ValueError("recovery evidence predates quarantine")
-            quarantines.pop(record_id)
-    return SafetyJournalSnapshot(
-        unresolved_hazards=tuple(
-            sorted(hazards.values(), key=lambda value: (str(value.key), value.record_id))
-        ),
-        unresolved_quarantines=tuple(
-            sorted(
-                quarantines.values(),
-                key=lambda value: (str(value.key), value.recorded_at, value.record_id),
-            )
-        ),
-    )
+                raise ValueError(
+                    "recovery bundle references unknown or cross-key quarantine"
+                )
+        else:
+            raise ValueError("recovery bundle references an unknown blocker")
+        if hazard is not None:
+            hazard = self.hazards.pop(record_id)
+            self.hazard_ids_by_run[hazard.run_id].remove(record_id)
+            if not self.hazard_ids_by_run[hazard.run_id]:
+                self.hazard_ids_by_run.pop(hazard.run_id)
+            self.hazard_ids_by_key[hazard.key].remove(record_id)
+            if not self.hazard_ids_by_key[hazard.key]:
+                self.hazard_ids_by_key.pop(hazard.key)
+            self._remove_blocker(hazard.key)
+        else:
+            quarantine = self.quarantines.pop(record_id)
+            self.quarantine_ids_by_key[quarantine.key].remove(record_id)
+            if not self.quarantine_ids_by_key[quarantine.key]:
+                self.quarantine_ids_by_key.pop(quarantine.key)
+            self._remove_blocker(quarantine.key)
+        self.seen[entry_id] = entry
+        return True
+
+    def snapshot(self) -> SafetyJournalSnapshot:
+        return SafetyJournalSnapshot(
+            unresolved_hazards=tuple(
+                sorted(
+                    self.hazards.values(),
+                    key=lambda value: (str(value.key), value.record_id),
+                )
+            ),
+            unresolved_quarantines=tuple(
+                sorted(
+                    self.quarantines.values(),
+                    key=lambda value: (str(value.key), value.record_id),
+                )
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -804,8 +752,7 @@ class ResourceLease:
                 original = tuple(
                     HazardClaim(
                         record.key,
-                        record.stable_device_identity,
-                        record.connection_generation,
+                        record.binding_stamp,
                     )
                     for record in self._pending_hazards
                 )
@@ -819,7 +766,7 @@ class ResourceLease:
                 self._pending_hazards = None
                 self._state = "ACTIVE"
                 raise
-            except QuarantineJournalError:
+            except SafetyJournalWriteError:
                 self._state = "HAZARD_JOURNAL_FAILED"
                 raise
             self._state = "ACTIVE"
@@ -859,7 +806,7 @@ class ResourceLease:
                     self._run_id,
                     bundle,
                 )
-            except QuarantineJournalError:
+            except SafetyJournalWriteError:
                 self._state = "SAFETY_JOURNAL_FAILED"
                 raise
             self._safety_bundle = bundle
@@ -920,46 +867,6 @@ class ResourceLease:
         return self.release_after_safety(disposition="UNARMED")
 
 
-class ConnectionEstablishmentLease:
-    """Resource capability for a connection transaction that never changes outputs."""
-
-    __slots__ = ("_arbiter", "_capability", "claim", "_released", "_lock")
-
-    def __init__(
-        self,
-        arbiter: "ResourceArbiter",
-        capability: object,
-        claim: ConnectionEstablishmentClaim,
-    ) -> None:
-        self._arbiter = arbiter
-        self._capability = capability
-        self.claim = claim
-        self._released = False
-        self._lock = threading.Lock()
-
-    @property
-    def released(self) -> bool:
-        with self._lock:
-            return self._released
-
-    def close(self) -> bool:
-        with self._lock:
-            if self._released:
-                return False
-            self._arbiter._release_connection_establishment(
-                self._capability, self.claim
-            )
-            self._released = True
-            return True
-
-    def __enter__(self) -> "ConnectionEstablishmentLease":
-        return self
-
-    def __exit__(self, _exc_type, _exc, _tb) -> bool:
-        self.close()
-        return False
-
-
 _UNSET = object()
 
 
@@ -993,12 +900,9 @@ class RecoveryLease:
         with self._lock:
             return self._released
 
-    def complete(self, proof: VerifiedRecoveryProof) -> RecoveryBundle:
-        if not isinstance(proof, VerifiedRecoveryProof):
-            raise TypeError("recovery completion requires VerifiedRecoveryProof")
-        if proof.claim != self.claim:
-            raise ValueError("recovery proof does not match the held RecoveryClaim")
-        evidence = proof.evidence
+    def _complete(self, evidence: RecoveryEvidence) -> RecoveryBundle:
+        if not isinstance(evidence, RecoveryEvidence):
+            raise TypeError("recovery completion requires RecoveryEvidence")
         with self._lock:
             if self._released:
                 raise RuntimeError("recovery lease is already released")
@@ -1022,6 +926,11 @@ class RecoveryLease:
         with self._lock:
             if self._released:
                 return False
+            if self._pending_bundle is not None:
+                raise RuntimeError(
+                    "recovery journal durability is ambiguous; retry the same "
+                    "RecoveryBundle instead of aborting"
+                )
             self._arbiter._abort_recovery(self._capability, self.claim)
             self._released = True
             return True
@@ -1029,9 +938,6 @@ class RecoveryLease:
 
 AcquireResult = ResourceLease | ResourceBusy | ResourceQuarantined
 RecoveryAcquireResult = RecoveryLease | ResourceBusy | None
-ConnectionEstablishmentAcquireResult = (
-    ConnectionEstablishmentLease | ResourceBusy | ResourceQuarantined
-)
 
 
 class ResourceArbiter:
@@ -1040,7 +946,7 @@ class ResourceArbiter:
     def __init__(self, journal: SafetyJournal) -> None:
         if journal is None:
             raise TypeError(
-                "journal is required; real composition uses persistent storage and tests pass MemoryQuarantineJournal explicitly"
+                "journal is required; composition must provide the persistent safety authority"
             )
         if not all(
             callable(getattr(journal, method, None))
@@ -1053,6 +959,7 @@ class ResourceArbiter:
         ):
             raise TypeError("journal does not implement the SafetyJournal contract")
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._active: dict[object, _ActiveLease] = {}
         self._active_by_run: dict[str, object] = {}
         self._journal = journal
@@ -1077,23 +984,51 @@ class ResourceArbiter:
         self._active_hazards: dict[object, tuple[HazardRecord, ...]] = {}
         self._safety_committed: dict[object, SafetyDispositionBundle | None] = {}
         self._journal_pending: dict[object, tuple[str, object]] = {}
-        self._shutdown = False
+        self._shutdown_state = "OPEN"
+        self._shutdown_done = threading.Event()
+        self._shutdown_error: str | None = None
 
     def shutdown(self) -> None:
         """Release installation authority only after all ownership has ended."""
 
+        close_authority = None
+        token = None
+        owner = False
         with self._lock:
-            if self._shutdown:
+            if self._shutdown_state == "CLOSED":
                 return
-            if self._active or self._journal_pending:
-                raise RuntimeError("cannot shut down ResourceArbiter with active ownership")
-            self._shutdown = True
-            token = self._journal_authority_token
-            # Keep shutdown linearized through physical journal-owner release.
-            # Concurrent shutdown callers may return only after this handoff.
-            close_authority = getattr(self._journal, "_close_from_authority", None)
+            if self._shutdown_state == "OPEN":
+                if self._active or self._journal_pending:
+                    raise RuntimeError(
+                        "cannot shut down ResourceArbiter with active ownership"
+                    )
+                self._shutdown_state = "CLOSING"
+                token = self._journal_authority_token
+                close_authority = getattr(
+                    self._journal, "_close_from_authority", None
+                )
+                owner = True
+        if not owner:
+            self._shutdown_done.wait()
+            if self._shutdown_error is not None:
+                raise RuntimeError(
+                    f"ResourceArbiter shutdown failed: {self._shutdown_error}"
+                )
+            return
+        try:
             if callable(close_authority) and token is not None:
                 close_authority(token)
+        except BaseException as exc:
+            with self._lock:
+                self._shutdown_error = f"{type(exc).__name__}: {exc}"
+                self._shutdown_state = "FAILED"
+                self._shutdown_done.set()
+                self._condition.notify_all()
+            raise
+        with self._lock:
+            self._shutdown_state = "CLOSED"
+            self._shutdown_done.set()
+            self._condition.notify_all()
 
     def acquire_all(
         self,
@@ -1104,7 +1039,7 @@ class ResourceArbiter:
         normalized = self._validate_claim_set(tuple(claims))
         capability = object()
         with self._lock:
-            if self._shutdown:
+            if self._shutdown_state != "OPEN":
                 raise RuntimeError("ResourceArbiter is shut down")
             if run_id in self._active_by_run:
                 raise RuntimeError(f"run {run_id!r} already owns a resource lease")
@@ -1134,12 +1069,12 @@ class ResourceArbiter:
             self._active_by_run[run_id] = capability
         return ResourceLease(self, capability, run_id, normalized)
 
-    def begin_recovery(self, key: ResourceKey) -> RecoveryAcquireResult:
+    def _begin_recovery(self, key: ResourceKey) -> RecoveryAcquireResult:
         if not isinstance(key, ResourceKey):
             raise TypeError("key must be ResourceKey")
         capability = object()
         with self._lock:
-            if self._shutdown:
+            if self._shutdown_state != "OPEN":
                 raise RuntimeError("ResourceArbiter is shut down")
             requested = ResourceClaim(key, ClaimMode.EXCLUSIVE)
             for active in self._active.values():
@@ -1154,67 +1089,20 @@ class ResourceArbiter:
             )
             if not quarantines and not hazards:
                 return None
-            identities = {
-                record.stable_device_identity for record in quarantines + hazards
-            }
-            if len(identities) != 1:
-                raise RuntimeError("recovery records disagree on stable device identity")
+            if len(quarantines) + len(hazards) != 1:
+                raise RuntimeError(
+                    "safety projection has multiple blockers for one ResourceKey"
+                )
+            blocker = (quarantines + hazards)[0]
             claim = RecoveryClaim(
                 key=key,
-                stable_device_identity=next(iter(identities)),
-                quarantine_record_ids=tuple(
-                    sorted(record.record_id for record in quarantines)
-                ),
-                hazard_record_ids=tuple(sorted(record.record_id for record in hazards)),
+                physical_identity=blocker.binding_stamp.physical_identity,
+                blocking_record_id=blocker.record_id,
             )
             run_id = f"recovery:{uuid.uuid4().hex}"
             self._active[capability] = _ActiveLease(run_id, (requested,))
             self._active_by_run[run_id] = capability
             return RecoveryLease(self, capability, claim)
-
-    def begin_connection_establishment(
-        self,
-        keys: tuple[ResourceKey, ...],
-    ) -> ConnectionEstablishmentAcquireResult:
-        """Atomically exclude Runs/recovery while adapters establish live connections."""
-
-        normalized_keys = tuple(sorted(set(keys)))
-        if not normalized_keys:
-            raise ValueError("connection establishment requires at least one ResourceKey")
-        if any(not isinstance(key, ResourceKey) for key in normalized_keys):
-            raise TypeError("connection establishment keys must be ResourceKey values")
-        claims = tuple(ResourceClaim(key, ClaimMode.EXCLUSIVE) for key in normalized_keys)
-        attempt_id = uuid.uuid4().hex
-        claim = ConnectionEstablishmentClaim(attempt_id, normalized_keys)
-        capability = object()
-        run_id = f"connection:{attempt_id}"
-        with self._lock:
-            if self._shutdown:
-                raise RuntimeError("ResourceArbiter is shut down")
-            for requested in claims:
-                hazard = self._matching_hazard(requested.key)
-                if hazard is not None:
-                    return ResourceQuarantined(
-                        requested=requested,
-                        reason=f"unresolved hazardous run {hazard.run_id}",
-                        recovery_action=(
-                            "use RecoveryClaim before reconnecting this device"
-                        ),
-                    )
-                quarantined = self._matching_quarantine(requested.key)
-                if quarantined is not None:
-                    return ResourceQuarantined(
-                        requested=requested,
-                        reason=quarantined.reason,
-                        recovery_action=quarantined.recovery_action,
-                    )
-                for active in self._active.values():
-                    for held in active.claims:
-                        if _claims_conflict(requested, held):
-                            return ResourceBusy(requested, active.run_id, held)
-            self._active[capability] = _ActiveLease(run_id, claims)
-            self._active_by_run[run_id] = capability
-        return ConnectionEstablishmentLease(self, capability, claim)
 
     def active_claims(self) -> Mapping[str, tuple[ResourceClaim, ...]]:
         with self._lock:
@@ -1227,7 +1115,7 @@ class ResourceArbiter:
             return tuple(
                 sorted(
                     self._quarantine.values(),
-                    key=lambda record: (str(record.key), record.recorded_at, record.record_id),
+                    key=lambda record: (str(record.key), record.record_id),
                 )
             )
 
@@ -1262,8 +1150,7 @@ class ResourceArbiter:
                 HazardRecord(
                     record_id=uuid.uuid4().hex,
                     key=hazard.key,
-                    stable_device_identity=hazard.stable_device_identity,
-                    connection_generation=hazard.connection_generation,
+                    binding_stamp=hazard.binding_stamp,
                     run_id=run_id,
                     activated_at=now,
                 )
@@ -1304,7 +1191,7 @@ class ResourceArbiter:
             with self._lock:
                 if self._journal_pending.get(capability) == pending:
                     self._journal_pending.pop(capability, None)
-            raise QuarantineJournalError(
+            raise SafetyJournalWriteError(
                 "failed to persist HAZARD_ACTIVE; no hardware operation may start"
             ) from exc
         with self._lock:
@@ -1345,29 +1232,27 @@ class ResourceArbiter:
             hazard_by_key = {record.key: record for record in hazards}
             decision_by_key = {decision.key: decision for decision in decisions}
             missing = set(hazard_by_key) - set(decision_by_key)
-            if missing:
+            extra = set(decision_by_key) - set(hazard_by_key)
+            if missing or extra:
                 raise ValueError(
-                    "every active hazard requires exactly one safety decision: "
-                    + ", ".join(str(key) for key in sorted(missing))
+                    "safety decisions must exactly cover active hazards; missing="
+                    + ",".join(str(key) for key in sorted(missing))
+                    + "; extra="
+                    + ",".join(str(key) for key in sorted(extra))
                 )
             if not decisions:
                 return None
             now = time.time()
             records = []
             for decision in decisions:
-                hazard = hazard_by_key.get(decision.key)
+                hazard = hazard_by_key[decision.key]
                 records.append(
                     SafetyDispositionRecord(
                         disposition_id=uuid.uuid4().hex,
                         key=decision.key,
                         outcome=decision.outcome,
-                        hazard_record_id=None if hazard is None else hazard.record_id,
-                        stable_device_identity=(
-                            None if hazard is None else hazard.stable_device_identity
-                        ),
-                        connection_generation=(
-                            None if hazard is None else hazard.connection_generation
-                        ),
+                        hazard_record_id=hazard.record_id,
+                        binding_stamp=hazard.binding_stamp,
                         safe_receipt=decision.safe_receipt,
                         reason=decision.reason,
                         recovery_action=decision.recovery_action,
@@ -1421,7 +1306,7 @@ class ResourceArbiter:
                 with self._lock:
                     if self._journal_pending.get(capability) == pending:
                         self._journal_pending.pop(capability, None)
-                raise QuarantineJournalError(
+                raise SafetyJournalWriteError(
                     "failed to persist SafetyDispositionBundle; claims remain held"
                 ) from exc
         with self._lock:
@@ -1437,7 +1322,7 @@ class ResourceArbiter:
                     self._quarantine[record.disposition_id] = QuarantineRecord(
                         record_id=record.disposition_id,
                         key=record.key,
-                        stable_device_identity=record.stable_device_identity,
+                        binding_stamp=record.binding_stamp,
                         run_id=run_id,
                         reason=record.reason,
                         recovery_action=record.recovery_action,
@@ -1462,6 +1347,7 @@ class ResourceArbiter:
             del self._active[capability]
             del self._active_by_run[run_id]
             self._safety_committed.pop(capability, None)
+            self._condition.notify_all()
 
     def _release_after_safety(self, capability: object, run_id: str) -> None:
         with self._lock:
@@ -1471,19 +1357,7 @@ class ResourceArbiter:
             del self._active[capability]
             del self._active_by_run[run_id]
             self._safety_committed.pop(capability, None)
-
-    def _quarantines_for_bundle(self, bundle_id: str) -> tuple[QuarantineRecord, ...]:
-        with self._lock:
-            return tuple(
-                sorted(
-                    (
-                        record
-                        for record in self._quarantine.values()
-                        if record.safety_bundle_id == bundle_id
-                    ),
-                    key=lambda record: record.key,
-                )
-            )
+            self._condition.notify_all()
 
     def _complete_recovery(
         self,
@@ -1497,31 +1371,22 @@ class ResourceArbiter:
                 ResourceClaim(bundle.claim.key, ClaimMode.EXCLUSIVE),
             ):
                 raise RuntimeError("recovery capability is no longer active")
-            current_quarantines = {
+            current_blockers = {
                 record.record_id
                 for record in self._quarantine.values()
                 if record.key == bundle.claim.key
-            }
-            current_hazards = {
+            } | {
                 record.record_id
                 for record in self._unresolved_hazards.values()
                 if record.key == bundle.claim.key
             }
-            if current_quarantines != set(bundle.claim.quarantine_record_ids):
-                raise RuntimeError("quarantine records changed during recovery")
-            if current_hazards != set(bundle.claim.hazard_record_ids):
-                raise RuntimeError("hazard records changed during recovery")
-            if bundle.evidence.stable_device_identity != bundle.claim.stable_device_identity:
-                raise ValueError("recovery evidence does not match stable device identity")
-            referenced_times = [
-                self._quarantine[record_id].recorded_at
-                for record_id in bundle.claim.quarantine_record_ids
-            ] + [
-                self._unresolved_hazards[record_id].activated_at
-                for record_id in bundle.claim.hazard_record_ids
-            ]
-            if referenced_times and bundle.evidence.verified_at < max(referenced_times):
-                raise ValueError("recovery evidence predates the safety records it clears")
+            if current_blockers != {bundle.claim.blocking_record_id}:
+                raise RuntimeError("safety blocker changed during recovery")
+            if (
+                bundle.evidence.binding_stamp.physical_identity
+                != bundle.claim.physical_identity
+            ):
+                raise ValueError("recovery evidence does not match physical device identity")
             if capability in self._journal_pending:
                 raise RuntimeError("another recovery journal transaction is pending")
             self._journal_pending[capability] = pending
@@ -1531,7 +1396,7 @@ class ResourceArbiter:
             with self._lock:
                 if self._journal_pending.get(capability) == pending:
                     self._journal_pending.pop(capability, None)
-            raise QuarantineJournalError(
+            raise SafetyJournalWriteError(
                 "failed to persist RecoveryBundle; recovery claim remains held"
             ) from exc
         with self._lock:
@@ -1540,12 +1405,11 @@ class ResourceArbiter:
                 raise RuntimeError("recovery capability disappeared during journal commit")
             if self._journal_pending.pop(capability, None) != pending:
                 raise RuntimeError("recovery journal transaction identity changed")
-            for record_id in bundle.claim.quarantine_record_ids:
-                self._quarantine.pop(record_id, None)
-            for record_id in bundle.claim.hazard_record_ids:
-                self._unresolved_hazards.pop(record_id, None)
+            self._quarantine.pop(bundle.claim.blocking_record_id, None)
+            self._unresolved_hazards.pop(bundle.claim.blocking_record_id, None)
             del self._active[capability]
             del self._active_by_run[active.run_id]
+            self._condition.notify_all()
 
     def _abort_recovery(
         self,
@@ -1562,23 +1426,7 @@ class ResourceArbiter:
                 raise RuntimeError("cannot abort while recovery journal I/O is pending")
             del self._active[capability]
             del self._active_by_run[active.run_id]
-
-    def _release_connection_establishment(
-        self,
-        capability: object,
-        claim: ConnectionEstablishmentClaim,
-    ) -> None:
-        with self._lock:
-            active = self._active.get(capability)
-            expected = tuple(
-                ResourceClaim(key, ClaimMode.EXCLUSIVE) for key in claim.keys
-            )
-            if active is None or active.claims != expected:
-                raise RuntimeError("connection establishment capability is no longer active")
-            if capability in self._journal_pending:
-                raise RuntimeError("connection establishment cannot own journal I/O")
-            del self._active[capability]
-            del self._active_by_run[active.run_id]
+            self._condition.notify_all()
 
     def _require_active(self, capability: object, run_id: str) -> _ActiveLease:
         active = self._active.get(capability)
@@ -1590,7 +1438,9 @@ class ResourceArbiter:
         matches = [record for record in self._quarantine.values() if key.overlaps(record.key)]
         if not matches:
             return None
-        return max(matches, key=lambda record: (record.recorded_at, record.record_id))
+        if len(matches) != 1:
+            raise RuntimeError("safety projection has overlapping quarantine blockers")
+        return matches[0]
 
     def _matching_hazard(self, key: ResourceKey) -> HazardRecord | None:
         matches = [
@@ -1598,7 +1448,9 @@ class ResourceArbiter:
         ]
         if not matches:
             return None
-        return max(matches, key=lambda record: (record.activated_at, record.record_id))
+        if len(matches) != 1:
+            raise RuntimeError("safety projection has overlapping hazard blockers")
+        return matches[0]
 
     @staticmethod
     def _validate_claim_set(

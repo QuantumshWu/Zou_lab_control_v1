@@ -13,7 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
-from zlc_neutral_atom.runtime import DeviceIdentityEvidenceKind, ResourceKey
+from zlc_neutral_atom.runtime.resources import DeviceIdentityEvidenceKind, ResourceKey
 from zlc_storage import canonical_digest, canonical_text as _canonical_text
 
 

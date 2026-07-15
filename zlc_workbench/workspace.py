@@ -10,7 +10,6 @@ from zlc_frontend import BoardFrame, BoardPresenter, RenderSurface
 from zlc_storage import (
     canonical_text as _text,
     nonnegative_integer,
-    normalized_text,
     sha256_text,
 )
 
@@ -281,7 +280,7 @@ class BoardController:
                 schedule = True
         if schedule:
             try:
-                self._post_to_owner(self._scheduled_present)
+                self._post_to_owner(self.present_pending)
             except BaseException as exc:
                 with self._lock:
                     if token is self._publish_token:
@@ -290,9 +289,6 @@ class BoardController:
                         self._publish_token = None
                 raise
         return True
-
-    def _scheduled_present(self) -> None:
-        self.present_pending()
 
     def present_pending(self) -> bool:
         """Owner-thread atomic board flip; never presents individual panels separately."""
@@ -337,48 +333,6 @@ class BoardController:
             raise RuntimeError("BoardController is faulted") from self._fault
 
 
-@dataclass(frozen=True)
-class RunStatusView:
-    run_id: str
-    revision: int
-    state: str
-    phase: str
-    final_committed: bool
-    primary_error: str | None
-    cleanup_errors: tuple[str, ...]
-
-
-class RunHandleStatusBinding:
-    """Read-only projection of a runtime handle; cancellation remains handle-owned."""
-
-    def __init__(self, handle: object) -> None:
-        if not callable(getattr(handle, "snapshot", None)) or not callable(
-            getattr(handle, "cancel", None)
-        ):
-            raise TypeError("handle must provide snapshot() and cancel()")
-        self._handle = handle
-
-    def snapshot(self) -> RunStatusView:
-        value = self._handle.snapshot()
-        run_id = _text(str(value.run_id), "run_id")
-        raw_revision = getattr(value.revision, "value", value.revision)
-        if not isinstance(raw_revision, int) or isinstance(raw_revision, bool) or raw_revision < 0:
-            raise TypeError("run snapshot revision must be a non-negative integer value")
-        state = getattr(value.state, "value", value.state)
-        return RunStatusView(
-            run_id=run_id,
-            revision=raw_revision,
-            state=_text(str(state), "state"),
-            phase=_text(value.phase, "phase"),
-            final_committed=bool(value.final_committed),
-            primary_error=value.primary_error,
-            cleanup_errors=tuple(value.cleanup_errors),
-        )
-
-    def cancel(self, reason: str = "user requested stop") -> object:
-        return self._handle.cancel(normalized_text(reason, "cancel reason"))
-
-
 __all__ = [
     "BoardController",
     "BoardModel",
@@ -386,7 +340,5 @@ __all__ = [
     "CoherenceSourceBinding",
     "PanelHost",
     "PanelSlot",
-    "RunHandleStatusBinding",
-    "RunStatusView",
     "WorkspaceModel",
 ]

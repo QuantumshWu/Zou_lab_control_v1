@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from numbers import Integral
 
 import numpy as np
 
-from Zou_lab_control.neutral_atom.devices.base import CameraDevice, CameraFrameRecord
+from Zou_lab_control.neutral_atom.devices.base import (
+    CameraCaptureTerminalRecord,
+    CameraDevice,
+    CameraFrameRecord,
+)
 from Zou_lab_control.neutral_atom.devices.pylon import PylonCamera
 from Zou_lab_control.neutral_atom.devices.qcmos import QCMOSCamera
 from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualMotCamera
@@ -43,30 +48,31 @@ from zlc_neutral_atom.readout.contracts import (
     CameraEventReadoutSetting,
     ReadoutBindingKey,
 )
-from zlc_neutral_atom.runtime import (
+from zlc_neutral_atom.runtime.capture import (
     BoundCapturePort,
-    BoundDevice,
-    BoundMeasurement,
     CaptureCapabilitySnapshot,
     CapturePreparedAck,
-    CaptureRuntimeProfile,
     CaptureStartedAck,
-    CaptureStreamContract,
+    CameraCaptureContract,
     CaptureTerminalAck,
     CapturedPayloadAck,
     CompleteCaptureCommand,
-    DatasetCellAddress,
-    MeasurementDefinition,
-    OrderedDatasetMetadataHasher,
     PrepareCaptureCommand,
-    ProducerFlowControl,
     ReadCaptureCommand,
-    SafetyOperation,
+    StartCaptureCommand,
+)
+from zlc_neutral_atom.runtime.dataset import (
+    DatasetCellSchedule,
+    FrozenDatasetEdge,
+    OrderedDatasetMetadataHasher,
+)
+from zlc_neutral_atom.runtime.pipeline import BoundMeasurement, MeasurementDefinition
+from zlc_neutral_atom.runtime.ports import (
+    BoundDevice,
     SessionClosedAck,
     SessionCloseCommand,
-    StartCaptureCommand,
-    StreamId,
 )
+from zlc_neutral_atom.runtime.streams import ProducerFlowControl, StreamId
 from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.runtime.capture import (
     CameraCapabilityEvidence,
@@ -81,7 +87,6 @@ from zlc_storage import (
 )
 
 from ._endpoint_binding import require_current_endpoint_binding as _require_binding
-from .legacy_runtime import LegacyDeviceRegistry, TargetDeviceEndpoint
 
 
 _SUPPORTED_CAMERA_TYPES = (QCMOSCamera, PylonCamera, VirtualCamera, VirtualMotCamera)
@@ -92,7 +97,7 @@ def _camera_dtype(camera: CameraDevice) -> np.dtype:
     if type(camera) is VirtualMotCamera:
         return np.dtype("u1")
     if type(camera) is PylonCamera:
-        pixel_format = str(camera.pixel_format).strip().lower()
+        pixel_format = str(camera.applied_pixel_format).strip().lower()
         if pixel_format == "mono8":
             return np.dtype("u1")
         if pixel_format in {"mono10", "mono12", "mono16"}:
@@ -122,6 +127,13 @@ def _settings_tree(camera: CameraDevice) -> dict[str, object]:
     # remains identical.
     for presentation_or_state_field in ("open", "last_sequence", "last_levels"):
         snapshot.pop(presentation_or_state_field, None)
+    # Requested intent remains available on the adapter snapshot for UI and
+    # diagnostics, but capability authority is minted only from hardware-applied
+    # readback.  Never let a requested mirror self-attest a physical setting.
+    for requested_field in tuple(
+        key for key in snapshot if str(key).startswith("requested_")
+    ):
+        snapshot.pop(requested_field, None)
     snapshot.update(
         {
             "adapter_type": f"{type(camera).__module__}.{type(camera).__qualname__}",
@@ -174,6 +186,16 @@ def _settings_tree(camera: CameraDevice) -> dict[str, object]:
                 "external_trigger_integration_start_offset_seconds": None,
             }
         )
+    elif type(camera) is PylonCamera:
+        applied_exposure = snapshot.get("applied_exposure_seconds")
+        if applied_exposure is None:
+            raise RuntimeError("pylon applied exposure readback is unavailable")
+        # Pylon exposes no sufficient exposure+readout+dead-time bound in this
+        # adapter.  Exposure alone is only necessary, not sufficient; keep the
+        # exact-trigger interval explicitly unqualified so preflight refuses it.
+        snapshot["required_external_trigger_interval_seconds"] = None
+        snapshot["external_trigger_integration_start_offset_seconds"] = None
+        snapshot.pop("exposure", None)
     else:
         # These adapters currently expose no independently measured trigger-rate
         # lower bound.  Zero means exactly that -- no additional known lower
@@ -181,7 +203,9 @@ def _settings_tree(camera: CameraDevice) -> dict[str, object]:
         snapshot["applied_exposure_seconds"] = float(snapshot["exposure"])
         snapshot["required_external_trigger_interval_seconds"] = 0.0
         snapshot["external_trigger_integration_start_offset_seconds"] = (
-            0.0 if type(camera) is VirtualCamera else None
+            0.0
+            if type(camera) in (VirtualCamera, VirtualMotCamera)
+            else None
         )
     return snapshot
 
@@ -229,9 +253,10 @@ def _physical_facts(
     y_axis, x_axis = payload_contract.value_schema.data_axes
     gain_value = settings_tree.get("gain", 1.0)
     gain = float(gain_value)
+    stable_identity = binding.binding_stamp.physical_identity.stable_device_identity
     facts = CameraPhysicalFacts(
-        camera_identity=binding.stable_device_identity,
-        sensor_identity=f"{binding.stable_device_identity}/sensor",
+        camera_identity=stable_identity,
+        sensor_identity=f"{stable_identity}/sensor",
         optical_path=f"installation-role/{source_id}",
         capture_trigger_channels=settings_tree["capture_trigger_channels"],
         sensor_shape_yx=(sensor_y, sensor_x),
@@ -244,9 +269,9 @@ def _physical_facts(
         dtype=payload_contract.value_schema.dtype,
         count_unit=payload_contract.value_schema.value_unit,
         exposure_seconds=float(settings_tree["applied_exposure_seconds"]),
-        required_external_trigger_interval_seconds=float(
-            settings_tree["required_external_trigger_interval_seconds"]
-        ),
+        required_external_trigger_interval_seconds=settings_tree[
+            "required_external_trigger_interval_seconds"
+        ],
         external_trigger_integration_start_offset_seconds=settings_tree[
             "external_trigger_integration_start_offset_seconds"
         ],
@@ -298,6 +323,15 @@ def _value_schema(camera: CameraDevice, source_id: str) -> ValueSchema:
     )
 
 
+@dataclass(frozen=True)
+class _AppliedCameraWorkingPoint:
+    """One owner-read configuration used by schema, timing, and admission."""
+
+    settings_fingerprint: str
+    payload_contract: CameraSampleContract
+    physical_facts: CameraPhysicalFacts
+
+
 @dataclass
 class _EndpointSession:
     session_id: str
@@ -307,99 +341,29 @@ class _EndpointSession:
     metadata_hasher: OrderedDatasetMetadataHasher
     started: bool = False
     drained_count: int = 0
-    terminal: object | None = None
+    terminal: CameraCaptureTerminalRecord | None = None
+    terminal_attempt: "_TerminalAttempt | None" = None
+    metadata_presence: tuple[bool, bool, bool] | None = None
+    last_produced_count: int | None = None
+    last_frame_stamp: int | None = None
+    last_camera_stamp: int | None = None
+    last_captured_at: float | None = None
     closed: bool = False
+    superseded: bool = False
 
 
-_DESCRIPTION_TOKEN = object()
+@dataclass
+class _TerminalAttempt:
+    """The one physical terminalization attempt owned by a capture session."""
+
+    done: threading.Event
+    outcome: dict[str, object]
+    worker: threading.Thread | None = None
+    owner_joined: bool = False
 
 
-@dataclass(frozen=True)
-class CameraCaptureDescription:
-    _authority: object
-    source_id: str
-    payload_contract: CameraSampleContract
-    settings_fingerprint: str
-    physical_facts: CameraPhysicalFacts
-
-    def __post_init__(self) -> None:
-        if self._authority is not _DESCRIPTION_TOKEN:
-            raise PermissionError(
-                "CameraCaptureDescription can only be minted by CameraCaptureEndpoint"
-            )
-        _canonical_text(self.source_id, "source_id")
-        if not isinstance(self.payload_contract, CameraSampleContract):
-            raise TypeError("payload_contract must be CameraSampleContract")
-        _sha256(self.settings_fingerprint, "settings_fingerprint")
-        if not isinstance(self.physical_facts, CameraPhysicalFacts):
-            raise TypeError("physical_facts must be CameraPhysicalFacts")
-        if (
-            self.physical_facts.opaque_frame_settings_fingerprint
-            != self.settings_fingerprint
-        ):
-            raise ValueError("physical facts and settings fingerprint differ")
-
-    @property
-    def capture_trigger_channels(self) -> tuple[str, ...]:
-        """The one broker-attested physical trigger-wiring tuple."""
-
-        return self.physical_facts.capture_trigger_channels
-
-    def event_setting(self, event_index: int) -> CameraEventReadoutSetting:
-        return self.physical_facts.event_setting(event_index)
-
-    def mint_descriptor(
-        self,
-        schema: DatasetSchema,
-        event_settings: tuple[CameraEventReadoutSetting, ...],
-        *,
-        camera_arm_spec_fingerprint: str,
-    ) -> CameraCaptureDescriptor:
-        if not isinstance(schema, DatasetSchema):
-            raise TypeError("schema must be DatasetSchema")
-        settings = tuple(event_settings)
-        if any(not isinstance(item, CameraEventReadoutSetting) for item in settings):
-            raise TypeError("event_settings must contain CameraEventReadoutSetting")
-        readout_axes = tuple(
-            axis for axis in schema.point_axes if axis.role == READOUT_EVENT
-        )
-        if len(readout_axes) > 1:
-            raise ValueError("camera schema has multiple READOUT_EVENT axes")
-        event_axis = readout_axes[0] if readout_axes else None
-        expected_indices = (
-            (0,) if event_axis is None else tuple(range(event_axis.size))
-        )
-        if tuple(item.event_index for item in settings) != expected_indices:
-            raise ValueError(
-                "event_settings must explicitly cover every READOUT_EVENT index"
-            )
-        for setting in settings:
-            if setting != self.physical_facts.event_setting(setting.event_index):
-                raise ValueError(
-                    "event setting differs from broker-attested camera settings"
-                )
-        facts = self.physical_facts
-        descriptor = CameraCaptureDescriptor(
-            camera_identity=facts.camera_identity,
-            sensor_identity=facts.sensor_identity,
-            optical_path=facts.optical_path,
-            sensor_shape_yx=facts.sensor_shape_yx,
-            roi_origin_yx=facts.roi_origin_yx,
-            roi_shape_yx=facts.roi_shape_yx,
-            binning_yx=facts.binning_yx,
-            spatial_y_axis_id=facts.spatial_y_axis_id,
-            spatial_x_axis_id=facts.spatial_x_axis_id,
-            coordinate_frame=facts.coordinate_frame,
-            dtype=facts.dtype,
-            count_unit=facts.count_unit,
-            readout_event_axis_id=(None if event_axis is None else event_axis.axis_id),
-            event_settings=settings,
-            camera_arm_spec_fingerprint=_sha256(
-                camera_arm_spec_fingerprint,
-                "camera_arm_spec_fingerprint",
-            ),
-        )
-        return descriptor
+def _terminal_proved(record: CameraCaptureTerminalRecord) -> bool:
+    return record.source_stopped and record.no_more_frames and record.joined
 
 
 @dataclass(frozen=True)
@@ -410,7 +374,7 @@ class CameraCaptureBindingRequest:
     repeat_axis: AxisSpec
     point_axes: tuple[AxisSpec, ...]
     point_layout: PointLayout
-    expected_cells: tuple[DatasetCellAddress, ...]
+    cell_schedule: DatasetCellSchedule
     mode: CameraAcquisitionMode
     required_consumer_lag_events: int
     transport_memory_limit_bytes: int
@@ -428,9 +392,8 @@ class CameraCaptureBindingRequest:
             raise TypeError("point_layout must be PointLayout")
         if self.point_layout.logical_shape != tuple(axis.size for axis in points):
             raise ValueError("point_layout shape differs from point axes")
-        # The runtime FrozenDatasetEdge is the sole complete-permutation owner.
-        # This request only snapshots the caller's declarative sequence.
-        object.__setattr__(self, "expected_cells", tuple(self.expected_cells))
+        if not isinstance(self.cell_schedule, DatasetCellSchedule):
+            raise TypeError("cell_schedule must be DatasetCellSchedule")
         if not isinstance(self.mode, CameraAcquisitionMode):
             raise TypeError("mode must be CameraAcquisitionMode")
         lag = self.required_consumer_lag_events
@@ -468,7 +431,7 @@ class CameraCaptureEndpoint:
         camera: CameraDevice,
         source_id: str,
         *,
-        max_inflight_frames: int | None = None,
+        max_source_burst_events: int | None = None,
         max_blocking_call_seconds: float | None = None,
         max_capture_spec_bytes: int = 4096,
     ) -> None:
@@ -478,9 +441,11 @@ class CameraCaptureEndpoint:
             )
         self._camera = camera
         self._source_id = _canonical_text(source_id, "source_id")
-        self._max_inflight_frames = _positive_int(
-            max_inflight_frames or camera.recent_capacity,
-            "max_inflight_frames",
+        self._max_source_burst_events = _positive_int(
+            camera.recent_capacity
+            if max_source_burst_events is None
+            else max_source_burst_events,
+            "max_source_burst_events",
         )
         timeout = (
             self._default_timeout(camera)
@@ -494,15 +459,30 @@ class CameraCaptureEndpoint:
             max_capture_spec_bytes,
             "max_capture_spec_bytes",
         )
+        exact_external_trigger_qualification_digest = None
+        if type(camera) in (
+            VirtualCamera,
+            VirtualMotCamera,
+        ):
+            exact_external_trigger_qualification_digest = canonical_digest(
+                {
+                    "evidence": "deterministic in-process trigger delivery",
+                    "adapter_type": (
+                        f"{type(camera).__module__}.{type(camera).__qualname__}"
+                    ),
+                }
+            )
+        self._exact_external_trigger_qualification_digest = (
+            exact_external_trigger_qualification_digest
+        )
         self._lock = threading.RLock()
-        self._payload_contract: CameraSampleContract | None = None
-        self._settings_fingerprint: str | None = None
-        self._capability_fingerprint: str | None = None
-        self._binding_id: str | None = None
-        self._generation: str | None = None
-        self._description: CameraCaptureDescription | None = None
+        self._condition = threading.Condition(self._lock)
+        self._capability: CaptureCapabilitySnapshot | None = None
+        self._working_point: _AppliedCameraWorkingPoint | None = None
+        self._operation_epoch = 0
+        self._command_operation_token: object | None = None
+        self._physical_operations_inflight = 0
         self._session: _EndpointSession | None = None
-        self._last_prepare_session_id: str | None = None
 
     @staticmethod
     def _default_timeout(camera: CameraDevice) -> float:
@@ -512,75 +492,53 @@ class CameraCaptureEndpoint:
             return float(camera.timeout)
         return 2.0
 
-    @property
-    def target_endpoint(self) -> TargetDeviceEndpoint:
-        return TargetDeviceEndpoint(
-            self.execute_command,
-            self.capability_probe,
-            self.close_session,
-            self.describe,
-            {SafetyOperation.DISARM: self.interrupt},
-        )
-
-    def describe(self, binding: BoundDevice) -> CameraCaptureDescription:
-        with self._lock:
-            self._validate_binding(binding)
-            if self._description is None:
-                raise RuntimeError("camera capability has not been probed")
-            return self._description
-
     def payload_contract(self, binding: BoundDevice) -> CameraSampleContract:
         with self._lock:
             self._validate_binding(binding)
-            if self._payload_contract is None:
-                raise RuntimeError("camera capability has not been probed")
-            return self._payload_contract
+            payload_contract = self._capability_snapshot().payload_contract
+            if not isinstance(payload_contract, CameraSampleContract):
+                raise RuntimeError("camera capability payload contract is invalid")
+            return payload_contract
 
     def settings_fingerprint(self, binding: BoundDevice) -> str:
         with self._lock:
             self._validate_binding(binding)
-            if self._settings_fingerprint is None:
-                raise RuntimeError("camera capability has not been probed")
-            return self._settings_fingerprint
+            return self._capability_snapshot().settings_fingerprint
 
     def capability_probe(self, binding: BoundDevice) -> CaptureCapabilitySnapshot:
         with self._lock:
             if self._session is not None and not self._session.closed:
                 raise RuntimeError("cannot probe camera capability during a capture session")
-            settings_tree = _settings_tree(self._camera)
-            settings = canonical_digest(settings_tree)
-            payload_contract = CameraSampleContract(
-                _value_schema(self._camera, self._source_id)
+            if self._physical_operations_inflight:
+                raise RuntimeError(
+                    "cannot probe camera capability while a physical operation is in flight"
+                )
+            if self._capability is not None:
+                self._validate_binding(binding)
+            working_point = self._read_working_point(binding)
+            settings = working_point.settings_fingerprint
+            payload_contract = working_point.payload_contract
+            physical_facts = working_point.physical_facts
+            retained_frame_bytes = payload_contract.max_retained_nbytes
+            driver_ring_bytes = (
+                self._max_source_burst_events * retained_frame_bytes
             )
-            frame_bytes = int(np.prod(payload_contract.value_schema.data_shape)) * int(
-                payload_contract.value_schema.dtype.itemsize
-            )
-            physical_facts = _physical_facts(
-                self._camera,
-                binding,
-                self._source_id,
-                payload_contract,
-                settings_tree,
-                settings,
-            )
-            driver_ring_bytes = self._max_inflight_frames * frame_bytes
             adapter_record_retention_bytes = max(
-                self._max_inflight_frames,
+                self._max_source_burst_events,
                 int(self._camera.recent_capacity),
-            ) * frame_bytes
+            ) * retained_frame_bytes
             capability_evidence = CameraCapabilityEvidence(
                 adapter_type=(
                     f"{type(self._camera).__module__}."
                     f"{type(self._camera).__qualname__}"
                 ),
                 source_id=self._source_id,
-                settings_fingerprint=settings,
                 payload_contract_fingerprint=payload_contract.fingerprint,
                 capture_spec_owner_fingerprint=(
                     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
                 ),
                 flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
-                max_source_burst_events=self._max_inflight_frames,
+                max_source_burst_events=self._max_source_burst_events,
                 driver_ring_bytes=driver_ring_bytes,
                 adapter_record_retention_bytes=(
                     adapter_record_retention_bytes
@@ -588,36 +546,18 @@ class CameraCaptureEndpoint:
                 max_blocking_call_seconds=self._max_blocking_call_seconds,
                 max_capture_spec_bytes=self._max_capture_spec_bytes,
                 physical_facts=physical_facts,
+                exact_external_trigger_qualification_digest=(
+                    self._exact_external_trigger_qualification_digest
+                ),
             )
-            capability = capability_evidence.fingerprint
-            self._payload_contract = payload_contract
-            self._settings_fingerprint = settings
-            self._capability_fingerprint = capability
-            self._binding_id = binding.binding_id
-            self._generation = binding.connection_generation
+            stamp = binding.binding_stamp
             snapshot = CaptureCapabilitySnapshot(
-                binding.binding_id,
-                binding.stable_device_identity,
-                binding.connection_generation,
-                capability,
-                settings,
-                payload_contract.fingerprint,
-                CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
-                ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
-                self._max_inflight_frames,
-                driver_ring_bytes,
-                adapter_record_retention_bytes,
-                self._max_blocking_call_seconds,
-                self._max_capture_spec_bytes,
-                capability_evidence,
+                binding_stamp=stamp,
+                payload_contract=payload_contract,
+                camera_capability_evidence=capability_evidence,
             )
-            self._description = CameraCaptureDescription(
-                _DESCRIPTION_TOKEN,
-                self._source_id,
-                payload_contract,
-                settings,
-                physical_facts,
-            )
+            self._working_point = working_point
+            self._capability = snapshot
             return snapshot
 
     def execute_command(self, binding: BoundDevice, command: object) -> object:
@@ -638,13 +578,16 @@ class CameraCaptureEndpoint:
     ) -> CapturePreparedAck:
         with self._lock:
             self._validate_binding(binding)
-            self._last_prepare_session_id = command.session_id
+            if self._physical_operations_inflight:
+                raise RuntimeError(
+                    "camera endpoint still owns an in-flight physical operation"
+                )
             if self._session is not None and not self._session.closed:
                 raise RuntimeError("camera endpoint already owns an active session")
+            capability = self._capability_snapshot()
             payload_contract = self.payload_contract(binding)
-            settings = self.settings_fingerprint(binding)
-            if canonical_digest(_settings_tree(self._camera)) != settings:
-                raise RuntimeError("camera settings changed after capability probe")
+            settings = capability.settings_fingerprint
+            self._require_working_point_unchanged(binding)
             if command.capture_spec_owner_fingerprint != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT:
                 raise ValueError("camera capture spec owner differs")
             spec = decode_camera_capture_spec(command.capture_spec_payload)
@@ -652,7 +595,7 @@ class CameraCaptureEndpoint:
                 raise ValueError("camera spec cardinality differs from prepared run")
             if spec.settings_fingerprint != settings or command.settings_fingerprint != settings:
                 raise ValueError("camera capture settings fingerprint differs")
-            if command.capability_fingerprint != self._capability_fingerprint:
+            if command.capability_fingerprint != capability.capability_fingerprint:
                 raise ValueError("camera capability fingerprint differs")
             if spec.mode is not _camera_mode(self._camera):
                 raise ValueError("camera acquisition mode differs from live adapter")
@@ -660,6 +603,12 @@ class CameraCaptureEndpoint:
                 raise ValueError(
                     "free-running cameras are monitor sources, not finite exact captures"
                 )
+            evidence = capability.camera_capability_evidence
+            if evidence.exact_external_trigger_qualification_digest is None:
+                raise ValueError(
+                    "real exact capture requires E0-qualified ordered one-frame-per-trigger evidence"
+                )
+            self._operation_epoch += 1
             self._session = _EndpointSession(
                 command.session_id,
                 command.capture_spec_fingerprint,
@@ -671,10 +620,9 @@ class CameraCaptureEndpoint:
             )
             return CapturePreparedAck(
                 command.session_id,
-                binding.binding_id,
-                binding.connection_generation,
+                binding.binding_instance_id,
                 settings,
-                self._capability_fingerprint,
+                capability.capability_fingerprint,
                 command.capture_spec_fingerprint,
             )
 
@@ -688,39 +636,62 @@ class CameraCaptureEndpoint:
             if session.started:
                 raise RuntimeError("camera session already started")
             expected = session.expected_frames
-        self._camera.arm(
-            expected,
-            max_inflight_frames=min(expected, self._max_inflight_frames),
-            timeout=command.timeout_seconds,
-        )
+            operation_epoch = self._operation_epoch
+            operation_token = self._begin_command_operation()
+        arm_returned = False
         try:
-            with self._lock:
-                session = self._active_session(binding, command.session_id)
-                if (
-                    canonical_digest(_settings_tree(self._camera))
-                    != self._settings_fingerprint
-                ):
-                    raise RuntimeError(
-                        "camera settings changed between prepare and armed start"
-                    )
-                session.started = True
-        except BaseException as primary:
             try:
-                self._camera.finish_record_capture()
-            except BaseException as secondary:
-                try:
-                    primary.add_note(
-                        "camera disarm after armed-start validation also failed: "
-                        f"{type(secondary).__name__}: {secondary}"
+                self._camera.arm(
+                    expected,
+                    # Autonomous hardware may complete before the host drains
+                    # its first frame.  Formal exact capture therefore reserves
+                    # the complete run budget unless a later measured adapter
+                    # contract proves a smaller safe outstanding bound.
+                    max_inflight_frames=expected,
+                    timeout=command.timeout_seconds,
+                )
+                arm_returned = True
+                with self._lock:
+                    self._require_current_operation(
+                        binding,
+                        session,
+                        operation_epoch,
                     )
-                except BaseException:
-                    pass
-            raise
-        return CaptureStartedAck(
-            command.session_id,
-            binding.binding_id,
-            binding.connection_generation,
-        )
+                    self._require_working_point_unchanged(binding)
+                    session.started = True
+                    return CaptureStartedAck(
+                        command.session_id,
+                        binding.binding_instance_id,
+                    )
+            except BaseException as primary:
+                terminal: CameraCaptureTerminalRecord | None = None
+                # Once arm() returned, this same owner thread must re-enter the
+                # terminal boundary even when an interrupt already stopped the
+                # source.  It consumes the cached record and releases arm()'s
+                # thread-owned RLock before the operation is declared joined.
+                if arm_returned:
+                    try:
+                        terminal = self._terminalize_with_deadline(
+                            session,
+                            command.timeout_seconds,
+                            require_owner_join=True,
+                        )
+                    except BaseException as secondary:
+                        try:
+                            primary.add_note(
+                                "camera disarm after armed-start validation also failed: "
+                                f"{type(secondary).__name__}: {secondary}"
+                            )
+                        except BaseException:
+                            pass
+                with self._lock:
+                    if self._session is session:
+                        if terminal is not None:
+                            session.terminal = terminal
+                        session.superseded = True
+                raise
+        finally:
+            self._end_command_operation(operation_token)
 
     def _read(
         self,
@@ -735,33 +706,49 @@ class CameraCaptureEndpoint:
             if expected_ordinal >= session.expected_frames:
                 raise RuntimeError("camera session exhausted its finite frame budget")
             payload_contract = session.payload_contract
-        records = self._camera.read_frame_records(
-            1,
-            timeout=command.timeout_seconds,
-            exact=True,
-        )
-        if len(records) != 1:
-            raise RuntimeError("camera returned a short read for an exact capture")
-        record = records[0]
-        payload = self._sample(record, command.session_id, payload_contract)
-        if payload.metadata.source_ordinal != expected_ordinal:
-            raise RuntimeError(
-                f"camera ordinal {payload.metadata.source_ordinal} differs from "
-                f"expected {expected_ordinal}"
+            operation_epoch = self._operation_epoch
+            operation_token = self._begin_command_operation()
+        try:
+            records = self._camera.read_frame_records(
+                1,
+                timeout=command.timeout_seconds,
+                exact=True,
             )
-        metadata_digest = payload_contract.metadata_contract.digest(payload.metadata)
-        with self._lock:
-            session = self._active_session(binding, command.session_id)
-            if session.closed or session.drained_count != expected_ordinal:
-                raise RuntimeError("camera session changed during frame read")
-            session.metadata_hasher.update(metadata_digest)
-            session.drained_count += 1
-        return CapturedPayloadAck(
-            command.session_id,
-            binding.binding_id,
-            binding.connection_generation,
-            payload,
-        )
+            with self._lock:
+                self._require_current_operation(
+                    binding,
+                    session,
+                    operation_epoch,
+                )
+                if len(records) != 1:
+                    raise RuntimeError("camera returned a short read for an exact capture")
+                record = records[0]
+                payload = self._sample(record, command.session_id, payload_contract)
+                if payload.metadata.source_ordinal != expected_ordinal:
+                    raise RuntimeError(
+                        f"camera ordinal {payload.metadata.source_ordinal} differs from "
+                        f"expected {expected_ordinal}"
+                    )
+                self._validate_frame_sequence(session, payload.metadata)
+                metadata_digest = payload_contract.metadata_contract.digest(
+                    payload.metadata
+                )
+                if session.drained_count != expected_ordinal:
+                    raise RuntimeError("camera session changed during frame read")
+                session.metadata_hasher.update(metadata_digest)
+                session.drained_count += 1
+                return CapturedPayloadAck(
+                    command.session_id,
+                    binding.binding_instance_id,
+                    payload,
+                )
+        except BaseException:
+            with self._lock:
+                if self._session is session:
+                    session.superseded = True
+            raise
+        finally:
+            self._end_command_operation(operation_token)
 
     @staticmethod
     def _sample(
@@ -802,98 +789,359 @@ class CameraCaptureEndpoint:
                 raise ValueError("terminal frame cardinality differs from prepared session")
             if session.drained_count != session.expected_frames:
                 raise RuntimeError("camera cannot complete before every frame is drained")
-        terminal = self._camera.finish_record_capture()
-        with self._lock:
-            session = self._active_session(binding, command.session_id)
-            if canonical_digest(_settings_tree(self._camera)) != self._settings_fingerprint:
-                raise RuntimeError("camera settings changed during capture")
-            session.terminal = terminal
-            session.closed = True
-            return CaptureTerminalAck(
-                command.session_id,
-                binding.binding_id,
-                binding.connection_generation,
-                terminal.produced_count,
-                session.drained_count,
-                terminal.source_stopped,
-                terminal.no_more_frames,
-                terminal.joined,
-                session.metadata_hasher.digest(),
-                self._settings_fingerprint,
-                self._capability_fingerprint,
-                session.spec_fingerprint,
+            operation_epoch = self._operation_epoch
+            operation_token = self._begin_command_operation()
+        terminal: CameraCaptureTerminalRecord | None = None
+        try:
+            terminal = self._terminalize_with_deadline(
+                session,
+                command.timeout_seconds,
+                require_owner_join=True,
             )
+            with self._lock:
+                self._require_current_operation(
+                    binding,
+                    session,
+                    operation_epoch,
+                )
+                capability = self._capability_snapshot()
+                self._require_working_point_unchanged(binding)
+                if not _terminal_proved(terminal):
+                    raise RuntimeError(
+                        "camera terminal readback did not prove stop, drain, and join"
+                    )
+                session.terminal = terminal
+                session.closed = True
+                return CaptureTerminalAck(
+                    command.session_id,
+                    binding.binding_instance_id,
+                    terminal.produced_count,
+                    session.drained_count,
+                    terminal.source_stopped,
+                    terminal.no_more_frames,
+                    terminal.joined,
+                    session.metadata_hasher.digest(),
+                    capability.settings_fingerprint,
+                    capability.capability_fingerprint,
+                    session.spec_fingerprint,
+                )
+        except BaseException:
+            with self._lock:
+                if self._session is session:
+                    if terminal is not None:
+                        session.terminal = terminal
+                    session.superseded = True
+            raise
+        finally:
+            self._end_command_operation(operation_token)
 
     def close_session(
         self,
         binding: BoundDevice,
         command: SessionCloseCommand,
     ) -> SessionClosedAck:
-        with self._lock:
+        with self._condition:
             self._validate_binding(binding)
             session = self._session
             if session is None:
-                if command.session_id != self._last_prepare_session_id:
-                    raise RuntimeError("camera cleanup session id is unknown")
-            elif session.session_id != command.session_id:
+                raise RuntimeError("camera cleanup session id is unknown")
+            if session.session_id != command.session_id:
                 raise RuntimeError("camera cleanup belongs to another session")
+            self._operation_epoch += 1
+            if session is not None:
+                session.superseded = True
+            deadline = time.monotonic() + command.timeout_seconds
+            while self._physical_operations_inflight:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError(
+                        "camera session physical operation did not join before cleanup timeout"
+                    )
+                self._condition.wait(remaining)
             # Always re-enter the idempotent terminal boundary for a known
             # session.  An out-of-band interrupt may already have stopped the
             # source from another thread, but only this run-owner thread can
             # release the RLock acquired by arm().
-            needs_terminal_join = session is not None or bool(
-                self._camera._recent_state()["armed"]
-            )
-        terminal = (
-            self._camera.finish_record_capture()
-            if needs_terminal_join
-            else None
+            terminal_budget = deadline - time.monotonic()
+            if terminal_budget <= 0.0:
+                raise TimeoutError(
+                    "camera session exhausted cleanup timeout before terminal readback"
+                )
+        terminal = self._terminalize_with_deadline(
+            session,
+            terminal_budget,
+            require_owner_join=True,
         )
         with self._lock:
-            session = self._session
-            if session is not None:
-                if terminal is not None:
-                    session.terminal = terminal
-                session.closed = True
-            state = self._camera._recent_state()
-            with state["cond"]:
-                stopped = not bool(state["armed"])
-                no_more = stopped and not bool(state["pending"])
+            self._validate_binding(binding)
+            if self._session is not session:
+                raise RuntimeError("camera cleanup session is no longer current")
+            session.terminal = terminal
+            session.closed = _terminal_proved(terminal)
             return SessionClosedAck(
                 command.session_id,
-                binding.binding_id,
-                binding.connection_generation,
-                stopped,
-                no_more,
-                stopped,
+                binding.binding_instance_id,
+                terminal.source_stopped,
+                terminal.no_more_frames,
+                terminal.joined,
                 canonical_digest(
                     {
                         "session_id": command.session_id,
-                        "source_stopped": stopped,
-                        "no_more_frames": no_more,
+                        "produced_count": terminal.produced_count,
+                        "source_stopped": terminal.source_stopped,
+                        "no_more_frames": terminal.no_more_frames,
+                        "joined": terminal.joined,
                     }
                 ),
             )
 
     def interrupt(self) -> str:
-        state = self._camera._recent_state()
-        with state["cond"]:
-            armed = bool(state["armed"])
-        terminal = self._camera.finish_record_capture() if armed else None
-        with self._lock:
-            if self._session is not None and terminal is not None:
-                self._session.terminal = terminal
-                self._session.closed = True
-        return canonical_digest(
-            {
-                "operation": "DISARM",
-                "source_id": self._source_id,
-                "source_stopped": terminal is None or terminal.source_stopped,
-            }
-        )
+        with self._condition:
+            self._operation_epoch += 1
+            session = self._session
+            if session is not None:
+                session.superseded = True
+            self._physical_operations_inflight += 1
+        terminal: CameraCaptureTerminalRecord | None = None
+        try:
+            if session is not None and (
+                session.started
+                or session.terminal_attempt is not None
+                or session.terminal is not None
+            ):
+                terminal = self._terminalize_with_deadline(
+                    session,
+                    self._max_blocking_call_seconds,
+                    require_owner_join=False,
+                )
+            with self._lock:
+                if (
+                    self._session is session
+                    and session is not None
+                    and terminal is not None
+                ):
+                    session.terminal = terminal
+            return canonical_digest(
+                {
+                    "operation": "DISARM",
+                    "source_id": self._source_id,
+                    "terminal": (
+                        None
+                        if terminal is None
+                        else {
+                            "produced_count": terminal.produced_count,
+                            "source_stopped": terminal.source_stopped,
+                            "no_more_frames": terminal.no_more_frames,
+                            "joined": terminal.joined,
+                        }
+                    ),
+                }
+            )
+        finally:
+            with self._condition:
+                self._physical_operations_inflight -= 1
+                self._condition.notify_all()
+
+    def _terminalize_with_deadline(
+        self,
+        session: _EndpointSession,
+        timeout_seconds: float,
+        *,
+        require_owner_join: bool,
+    ) -> CameraCaptureTerminalRecord:
+        """Bound an SDK stop without transferring the arm owner's RLock.
+
+        The backend stop runs on an isolated I/O worker.  On timely completion
+        this calling thread re-enters the idempotent terminal boundary: when it
+        is the original arm owner that second call consumes the cached terminal
+        record and releases the thread-owned acquisition RLock.  A timed-out
+        worker may finish later, but no acknowledgement is minted and the
+        superseded session remains unavailable until a later bounded cleanup
+        consumes that frozen result.
+        """
+
+        if not isinstance(session, _EndpointSession):
+            raise TypeError("camera terminalization requires an endpoint session")
+        with self._condition:
+            if self._session is not session:
+                raise RuntimeError("camera terminalization session is no longer current")
+            attempt = session.terminal_attempt
+            if attempt is None:
+                attempt = _TerminalAttempt(threading.Event(), {})
+                session.terminal_attempt = attempt
+                self._physical_operations_inflight += 1
+
+                def terminalize() -> None:
+                    try:
+                        attempt.outcome["terminal"] = (
+                            self._camera.finish_record_capture()
+                        )
+                    except BaseException as error:
+                        attempt.outcome["error"] = error
+                    finally:
+                        attempt.done.set()
+                        with self._condition:
+                            self._physical_operations_inflight -= 1
+                            self._condition.notify_all()
+
+                attempt.worker = threading.Thread(
+                    target=terminalize,
+                    name=f"camera-terminal-{self._source_id}",
+                    daemon=True,
+                )
+                try:
+                    attempt.worker.start()
+                except BaseException:
+                    # No backend call ran, so this is the one case where the
+                    # session may discard the attempt and let a later bounded
+                    # cleanup create a new physical terminalization worker.
+                    session.terminal_attempt = None
+                    self._physical_operations_inflight -= 1
+                    self._condition.notify_all()
+                    raise
+            self._physical_operations_inflight += 1
+        try:
+            if not attempt.done.wait(float(timeout_seconds)):
+                raise TimeoutError(
+                    "camera backend terminalization exceeded its blocking-call budget"
+                )
+            error = attempt.outcome.get("error")
+            if isinstance(error, BaseException):
+                raise error
+            terminal = attempt.outcome.get("terminal")
+            if not isinstance(terminal, CameraCaptureTerminalRecord):
+                raise RuntimeError("camera terminal worker returned no terminal record")
+            if not require_owner_join:
+                return terminal
+            with self._condition:
+                if not attempt.owner_joined:
+                    owner_terminal = self._camera.finish_record_capture()
+                    if owner_terminal != terminal:
+                        raise RuntimeError(
+                            "camera terminal readback changed across owner join"
+                        )
+                    attempt.owner_joined = True
+                session.terminal = terminal
+                return terminal
+        finally:
+            with self._condition:
+                self._physical_operations_inflight -= 1
+                self._condition.notify_all()
 
     def _validate_binding(self, binding: BoundDevice) -> None:
-        _require_binding(binding, "camera", self._binding_id, self._generation)
+        capability = self._capability_snapshot()
+        _require_binding(
+            binding,
+            "camera",
+            capability.binding_stamp.binding_instance_id,
+        )
+
+    def _capability_snapshot(self) -> CaptureCapabilitySnapshot:
+        capability = self._capability
+        if capability is None:
+            raise RuntimeError("camera capability has not been probed")
+        return capability
+
+    def _read_working_point(
+        self,
+        binding: BoundDevice,
+    ) -> _AppliedCameraWorkingPoint:
+        settings_tree = _settings_tree(self._camera)
+        settings_fingerprint = canonical_digest(settings_tree)
+        payload_contract = CameraSampleContract(
+            _value_schema(self._camera, self._source_id)
+        )
+        physical_facts = _physical_facts(
+            self._camera,
+            binding,
+            self._source_id,
+            payload_contract,
+            settings_tree,
+            settings_fingerprint,
+        )
+        return _AppliedCameraWorkingPoint(
+            settings_fingerprint,
+            payload_contract,
+            physical_facts,
+        )
+
+    def _require_working_point_unchanged(self, binding: BoundDevice) -> None:
+        expected = self._working_point
+        if expected is None:
+            raise RuntimeError("camera working point has not been probed")
+        observed = self._read_working_point(binding)
+        if observed != expected:
+            raise RuntimeError("camera applied working point changed during capture")
+
+    @staticmethod
+    def _validate_frame_sequence(
+        session: _EndpointSession,
+        metadata: CameraFrameMetadata,
+    ) -> None:
+        presence = (
+            metadata.frame_stamp is not None,
+            metadata.camera_stamp is not None,
+            metadata.timestamp_seconds is not None,
+        )
+        if session.metadata_presence is None:
+            session.metadata_presence = presence
+        elif presence != session.metadata_presence:
+            raise RuntimeError("camera metadata availability changed within one arm epoch")
+        produced = metadata.produced_count
+        if produced is not None:
+            if produced < metadata.source_ordinal + 1:
+                raise RuntimeError("camera produced-count trails the delivered ordinal")
+            if (
+                session.last_produced_count is not None
+                and produced < session.last_produced_count
+            ):
+                raise RuntimeError("camera produced-count moved backwards")
+        for label, current, previous in (
+            ("frame stamp", metadata.frame_stamp, session.last_frame_stamp),
+            ("camera stamp", metadata.camera_stamp, session.last_camera_stamp),
+        ):
+            if current is not None and previous is not None and current <= previous:
+                raise RuntimeError(f"camera {label} is not strictly increasing")
+        captured_at = metadata.captured_at
+        if session.last_captured_at is not None and captured_at < session.last_captured_at:
+            raise RuntimeError("camera capture timestamp moved backwards")
+        session.last_produced_count = produced
+        session.last_frame_stamp = metadata.frame_stamp
+        session.last_camera_stamp = metadata.camera_stamp
+        session.last_captured_at = captured_at
+
+    def _begin_command_operation(self) -> object:
+        if self._command_operation_token is not None:
+            raise RuntimeError(
+                "camera endpoint already owns an in-flight physical command"
+            )
+        token = object()
+        self._command_operation_token = token
+        self._physical_operations_inflight += 1
+        return token
+
+    def _end_command_operation(self, token: object) -> None:
+        with self._condition:
+            if self._command_operation_token is not token:
+                raise RuntimeError("camera endpoint physical-operation token differs")
+            self._command_operation_token = None
+            self._physical_operations_inflight -= 1
+            self._condition.notify_all()
+
+    def _require_current_operation(
+        self,
+        binding: BoundDevice,
+        session: _EndpointSession,
+        operation_epoch: int,
+    ) -> None:
+        self._validate_binding(binding)
+        if (
+            self._session is not session
+            or self._operation_epoch != operation_epoch
+            or session.superseded
+            or session.closed
+        ):
+            raise RuntimeError("camera endpoint operation was superseded")
 
     def _active_session(
         self,
@@ -904,60 +1152,45 @@ class CameraCaptureEndpoint:
         session = self._session
         if session is None or session.session_id != session_id:
             raise RuntimeError("camera command belongs to another session")
+        if session.superseded:
+            raise RuntimeError("camera session was superseded")
         return session
 
 
 def bind_camera_measurement(
-    device_set: object,
-    registry: LegacyDeviceRegistry,
+    port: BoundCapturePort,
     request: CameraCaptureBindingRequest,
 ) -> BoundMeasurement:
-    """Resolve one installation role into a generation-pinned camera binding."""
+    """Bind one already-resolved camera Port to a finite dataset request.
 
-    if not isinstance(registry, LegacyDeviceRegistry):
-        raise TypeError("registry must be LegacyDeviceRegistry")
+    Role resolution and raw-device ownership belong to the installation
+    composition root; this binder receives only the resolved typed Port.
+    """
+
+    if not isinstance(port, BoundCapturePort):
+        raise TypeError("port must be BoundCapturePort")
     if not isinstance(request, CameraCaptureBindingRequest):
         raise TypeError("request must be CameraCaptureBindingRequest")
-    devices = dict(getattr(device_set, "devices", {}) or {})
-    try:
-        camera = devices[request.role]
-    except KeyError as exc:
-        raise KeyError(f"camera role {request.role!r} is absent from installation") from exc
-    if not isinstance(camera, CameraDevice):
-        raise TypeError(f"installation role {request.role!r} is not a camera")
-    registration = registry.registration_for(camera)
-    target = registration.target_endpoint
-    if target is None:
-        raise RuntimeError(f"camera role {request.role!r} has no target capture endpoint")
-    binding = registry.binding_for(camera)
-    attestation = registry.broker.verify_capability(binding)
-    description = target.describe(binding)
-    if not isinstance(description, CameraCaptureDescription):
-        raise TypeError("camera target endpoint returned the wrong description type")
-    if description.source_id != request.role:
+    capability = port.capability
+    evidence = capability.camera_capability_evidence
+    if evidence.source_id != request.role:
         raise ValueError("camera endpoint source id differs from installation role")
-    capability = attestation.snapshot
-    if not isinstance(capability, CaptureCapabilitySnapshot):
-        raise TypeError("camera capability attestation has the wrong snapshot type")
-    if capability.settings_fingerprint != description.settings_fingerprint:
-        raise RuntimeError("camera description and capability settings differ")
-    if capability.camera_physical_facts is not description.physical_facts:
-        raise RuntimeError(
-            "camera description does not share broker-attested physical facts"
-        )
-    payload_contract = description.payload_contract
+    payload_contract = capability.payload_contract
+    if not isinstance(payload_contract, CameraSampleContract):
+        raise TypeError("camera capability payload contract has the wrong type")
+    facts = evidence.physical_facts
     dataset_schema = DatasetSchema(
         request.repeat_axis,
         request.point_axes,
         request.point_layout,
         payload_contract.value_schema,
     )
-    expected_cells = request.expected_cells
+    cell_schedule = request.cell_schedule
     capture_spec = freeze_camera_capture_spec(
         CameraCaptureSpec(
             request.mode,
-            len(expected_cells),
-            description.settings_fingerprint,
+            len(cell_schedule),
+            evidence.settings_fingerprint,
         )
     )
     readout_axes = tuple(
@@ -971,36 +1204,58 @@ def bind_camera_measurement(
             raise ValueError(
                 "multi-event camera capture requires explicit event_settings"
             )
-        event_settings = (description.event_setting(0),)
+        event_settings = (facts.event_setting(0),)
     else:
         event_settings = request.event_settings
-    descriptor = description.mint_descriptor(
-        dataset_schema,
-        event_settings,
-        camera_arm_spec_fingerprint=capture_spec.digest,
+    expected_indices = (0,) if not readout_axes else tuple(range(event_count))
+    if tuple(item.event_index for item in event_settings) != expected_indices:
+        raise ValueError(
+            "event_settings must explicitly cover every READOUT_EVENT index"
+        )
+    for setting in event_settings:
+        if setting != facts.event_setting(setting.event_index):
+            raise ValueError(
+                "event setting differs from broker-attested camera settings"
+            )
+    descriptor = CameraCaptureDescriptor(
+        camera_identity=facts.camera_identity,
+        sensor_identity=facts.sensor_identity,
+        optical_path=facts.optical_path,
+        sensor_shape_yx=facts.sensor_shape_yx,
+        roi_origin_yx=facts.roi_origin_yx,
+        roi_shape_yx=facts.roi_shape_yx,
+        binning_yx=facts.binning_yx,
+        spatial_y_axis_id=facts.spatial_y_axis_id,
+        spatial_x_axis_id=facts.spatial_x_axis_id,
+        coordinate_frame=facts.coordinate_frame,
+        dtype=facts.dtype,
+        count_unit=facts.count_unit,
+        readout_event_axis_id=(
+            None if not readout_axes else readout_axes[0].axis_id
+        ),
+        event_settings=event_settings,
+        camera_arm_spec_fingerprint=_sha256(
+            capture_spec.digest,
+            "camera_arm_spec_fingerprint",
+        ),
     )
     camera_provenance = CameraCaptureProvenance(
         descriptor=descriptor,
         binding=ReadoutBindingKey(request.role),
-        active_settings_fingerprint=description.settings_fingerprint,
-        binding_id=capability.binding_id,
-        connection_generation=capability.connection_generation,
+        binding_stamp=capability.binding_stamp,
         capability_fingerprint=capability.capability_fingerprint,
     )
-    capture_contract = CaptureStreamContract(
-        StreamId(f"camera.{request.role}.frames"),
-        request.role,
-        dataset_schema,
-        payload_contract,
-        CameraDatasetEventAdapter(payload_contract),
-        expected_cells,
-        capability,
-        CaptureRuntimeProfile(
-            request.required_consumer_lag_events,
-            request.transport_memory_limit_bytes,
+    capture_contract = CameraCaptureContract(
+        stream_id=StreamId(f"camera.{request.role}.frames"),
+        dataset_edge=FrozenDatasetEdge(
+            dataset_schema,
+            CameraDatasetEventAdapter(payload_contract),
+            cell_schedule,
         ),
-        CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
-        camera_provenance,
+        capability=capability,
+        required_consumer_lag_events=request.required_consumer_lag_events,
+        transport_memory_limit_bytes=request.transport_memory_limit_bytes,
+        camera_provenance=camera_provenance,
     )
     definition = MeasurementDefinition(
         DefinitionKey(
@@ -1015,7 +1270,7 @@ def bind_camera_measurement(
     )
     return BoundMeasurement(
         definition,
-        BoundCapturePort(attestation, ()),
+        port,
         capture_contract,
         capture_spec,
     )
@@ -1023,7 +1278,6 @@ def bind_camera_measurement(
 
 __all__ = [
     "CameraCaptureBindingRequest",
-    "CameraCaptureDescription",
     "CameraCaptureEndpoint",
     "bind_camera_measurement",
 ]

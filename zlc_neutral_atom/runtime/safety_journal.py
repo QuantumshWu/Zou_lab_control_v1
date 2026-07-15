@@ -10,14 +10,8 @@ from typing import Any, Mapping
 from zlc_storage import (
     FramedJournal,
     canonical_digest,
-    durable_mkdir,
 )
-from zlc_storage.file_lock import (
-    FileLockBusy,
-    acquire_file_lock,
-    open_durable_lock_file,
-    release_file_lock,
-)
+from zlc_storage.file_lock import FileLockBusy
 
 from .resources import (
     HazardRecord,
@@ -31,7 +25,11 @@ from .resources import (
     SafetyDispositionRecord,
     SafetyJournalSnapshot,
     SafetyOutcome,
-    _replay_entries,
+    _SafetyProjection,
+    device_binding_stamp_from_tree,
+    device_binding_stamp_to_tree,
+    physical_device_identity_from_tree,
+    physical_device_identity_to_tree,
 )
 
 
@@ -40,52 +38,6 @@ SafetyEntry = HazardRecord | SafetyDispositionBundle | RecoveryBundle
 
 class SafetyAuthorityBusy(RuntimeError):
     pass
-
-
-class _InstallationOwnerLock:
-    def __init__(self, path: Path) -> None:
-        durable_mkdir(path.parent)
-        self._stream = open_durable_lock_file(path)
-        self._creator_pid = os.getpid()
-        self._closed = False
-        try:
-            acquire_file_lock(self._stream, blocking=False)
-        except FileLockBusy as exc:
-            self._stream.close()
-            raise SafetyAuthorityBusy(
-                "another process owns the installation safety authority"
-            ) from exc
-        except BaseException:
-            self._stream.close()
-            raise
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        if os.getpid() != self._creator_pid:
-            # Never explicitly unlock a flock inherited from the parent.
-            self._stream.close()
-            self._closed = True
-            return
-        error: BaseException | None = None
-        try:
-            release_file_lock(self._stream)
-        except BaseException as exc:
-            error = exc
-        try:
-            self._stream.close()
-        except BaseException as exc:
-            if error is None:
-                error = exc
-        self._closed = True
-        if error is not None:
-            raise error
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
 
 
 def _object(value: Any, fields: set[str], kind: str) -> Mapping[str, Any]:
@@ -99,8 +51,7 @@ def _receipt_value(receipt: SafeReceipt | None) -> dict[str, Any] | None:
         return None
     return {
         "key": str(receipt.key),
-        "stable_device_identity": receipt.stable_device_identity,
-        "connection_generation": receipt.connection_generation,
+        "binding_stamp": device_binding_stamp_to_tree(receipt.binding_stamp),
         "operation_id": receipt.operation_id,
         "acknowledgement_digest": receipt.acknowledgement_digest,
     }
@@ -113,8 +64,7 @@ def _receipt_from(value: Any) -> SafeReceipt | None:
         value,
         {
             "key",
-            "stable_device_identity",
-            "connection_generation",
+            "binding_stamp",
             "operation_id",
             "acknowledgement_digest",
         },
@@ -122,8 +72,7 @@ def _receipt_from(value: Any) -> SafeReceipt | None:
     )
     return SafeReceipt(
         key=ResourceKey.parse(item["key"]),
-        stable_device_identity=item["stable_device_identity"],
-        connection_generation=item["connection_generation"],
+        binding_stamp=device_binding_stamp_from_tree(item["binding_stamp"]),
         operation_id=item["operation_id"],
         acknowledgement_digest=item["acknowledgement_digest"],
     )
@@ -133,8 +82,7 @@ def _hazard_value(record: HazardRecord) -> dict[str, Any]:
     return {
         "record_id": record.record_id,
         "key": str(record.key),
-        "stable_device_identity": record.stable_device_identity,
-        "connection_generation": record.connection_generation,
+        "binding_stamp": device_binding_stamp_to_tree(record.binding_stamp),
         "run_id": record.run_id,
         "activated_at": record.activated_at,
     }
@@ -146,8 +94,7 @@ def _hazard_from(value: Any) -> HazardRecord:
         {
             "record_id",
             "key",
-            "stable_device_identity",
-            "connection_generation",
+            "binding_stamp",
             "run_id",
             "activated_at",
         },
@@ -156,8 +103,7 @@ def _hazard_from(value: Any) -> HazardRecord:
     return HazardRecord(
         record_id=item["record_id"],
         key=ResourceKey.parse(item["key"]),
-        stable_device_identity=item["stable_device_identity"],
-        connection_generation=item["connection_generation"],
+        binding_stamp=device_binding_stamp_from_tree(item["binding_stamp"]),
         run_id=item["run_id"],
         activated_at=item["activated_at"],
     )
@@ -169,8 +115,7 @@ def _disposition_value(record: SafetyDispositionRecord) -> dict[str, Any]:
         "key": str(record.key),
         "outcome": record.outcome.value,
         "hazard_record_id": record.hazard_record_id,
-        "stable_device_identity": record.stable_device_identity,
-        "connection_generation": record.connection_generation,
+        "binding_stamp": device_binding_stamp_to_tree(record.binding_stamp),
         "safe_receipt": _receipt_value(record.safe_receipt),
         "reason": record.reason,
         "recovery_action": record.recovery_action,
@@ -185,8 +130,7 @@ def _disposition_from(value: Any) -> SafetyDispositionRecord:
             "key",
             "outcome",
             "hazard_record_id",
-            "stable_device_identity",
-            "connection_generation",
+            "binding_stamp",
             "safe_receipt",
             "reason",
             "recovery_action",
@@ -198,8 +142,7 @@ def _disposition_from(value: Any) -> SafetyDispositionRecord:
         key=ResourceKey.parse(item["key"]),
         outcome=SafetyOutcome(item["outcome"]),
         hazard_record_id=item["hazard_record_id"],
-        stable_device_identity=item["stable_device_identity"],
-        connection_generation=item["connection_generation"],
+        binding_stamp=device_binding_stamp_from_tree(item["binding_stamp"]),
         safe_receipt=_receipt_from(item["safe_receipt"]),
         reason=item["reason"],
         recovery_action=item["recovery_action"],
@@ -235,37 +178,28 @@ def _safety_from(value: Any) -> SafetyDispositionBundle:
 def _claim_value(claim: RecoveryClaim) -> dict[str, Any]:
     return {
         "key": str(claim.key),
-        "stable_device_identity": claim.stable_device_identity,
-        "quarantine_record_ids": list(claim.quarantine_record_ids),
-        "hazard_record_ids": list(claim.hazard_record_ids),
+        "physical_identity": physical_device_identity_to_tree(claim.physical_identity),
+        "blocking_record_id": claim.blocking_record_id,
     }
 
 
 def _claim_from(value: Any) -> RecoveryClaim:
     item = _object(
         value,
-        {"key", "stable_device_identity", "quarantine_record_ids", "hazard_record_ids"},
+        {"key", "physical_identity", "blocking_record_id"},
         "recovery claim",
     )
-    if not isinstance(item["quarantine_record_ids"], list) or not isinstance(
-        item["hazard_record_ids"], list
-    ):
-        raise ValueError("recovery claim ids must be lists")
     return RecoveryClaim(
         key=ResourceKey.parse(item["key"]),
-        stable_device_identity=item["stable_device_identity"],
-        quarantine_record_ids=tuple(item["quarantine_record_ids"]),
-        hazard_record_ids=tuple(item["hazard_record_ids"]),
+        physical_identity=physical_device_identity_from_tree(item["physical_identity"]),
+        blocking_record_id=item["blocking_record_id"],
     )
 
 
 def _evidence_value(evidence: RecoveryEvidence) -> dict[str, Any]:
     return {
-        "stable_device_identity": evidence.stable_device_identity,
-        "connection_generation": evidence.connection_generation,
-        "health_digest": evidence.health_digest,
+        "binding_stamp": device_binding_stamp_to_tree(evidence.binding_stamp),
         "safe_state_digest": evidence.safe_state_digest,
-        "verified_at": evidence.verified_at,
     }
 
 
@@ -273,15 +207,15 @@ def _evidence_from(value: Any) -> RecoveryEvidence:
     item = _object(
         value,
         {
-            "stable_device_identity",
-            "connection_generation",
-            "health_digest",
+            "binding_stamp",
             "safe_state_digest",
-            "verified_at",
         },
         "recovery evidence",
     )
-    return RecoveryEvidence(**item)
+    return RecoveryEvidence(
+        binding_stamp=device_binding_stamp_from_tree(item["binding_stamp"]),
+        safe_state_digest=item["safe_state_digest"],
+    )
 
 
 def _recovery_value(bundle: RecoveryBundle) -> dict[str, Any]:
@@ -337,25 +271,40 @@ class PersistentSafetyJournal:
         journal_path = Path(path).resolve()
         self._creator_pid = os.getpid()
         self._lifecycle_lock = threading.RLock()
-        self._owner = _InstallationOwnerLock(
-            journal_path.with_name(journal_path.name + ".owner.lock")
-        )
         self._closed = False
         self._authority_token: object | None = None
+        self._session = None
         try:
-            self._journal = FramedJournal(journal_path)
-            _replay_entries(_entries(self._journal.records()))
+            self._session = FramedJournal.open_exclusive(journal_path)
+            self._projection = _SafetyProjection()
+            for entry in _entries(self._session.records()):
+                self._projection.apply(entry)
+        except FileLockBusy as exc:
+            raise SafetyAuthorityBusy(
+                "another process owns the installation safety authority"
+            ) from exc
         except BaseException:
-            self._owner.close()
+            if self._session is not None:
+                self._session.close()
             raise
 
     def close(self) -> None:
         if not self._in_creator_process():
-            self._owner.close()
+            if self._closed:
+                return
+            assert self._session is not None
+            self._session.close()
+            self._session = None
             self._closed = True
             raise RuntimeError("installation safety journal belongs to another process")
         with self._lifecycle_lock:
             if self._closed:
+                # Logical authority may already be closed even if closing the
+                # now-unlocked OS handle previously failed.  Retrying here is
+                # cleanup only and can never revive journal authority.
+                if self._session is not None:
+                    self._session.close()
+                    self._session = None
                 return
             if self._authority_token is not None:
                 raise RuntimeError(
@@ -376,14 +325,26 @@ class PersistentSafetyJournal:
         with self._lifecycle_lock:
             if self._authority_token is not token:
                 raise PermissionError("invalid installation safety authority")
-            self._authority_token = None
-            self._close_owner()
+            try:
+                self._close_owner()
+            finally:
+                # Once the file lock is gone, the logical authority is gone
+                # even if closing its inert handle raised.  Never leave a token
+                # that can still serve reads or appends without the hard lock.
+                if self._closed:
+                    self._authority_token = None
 
     def _close_owner(self) -> None:
+        session = self._session
+        assert session is not None
         try:
-            self._owner.close()
-        finally:
-            self._closed = True
+            session.close()
+        except BaseException:
+            if not session.owns_file_lock:
+                self._closed = True
+            raise
+        self._session = None
+        self._closed = True
 
     def __enter__(self) -> "PersistentSafetyJournal":
         return self
@@ -412,7 +373,7 @@ class PersistentSafetyJournal:
         self._require_creator_process()
         with self._lifecycle_lock:
             self._ensure_open()
-            return _replay_entries(_entries(self._journal.records()))
+            return self._projection.snapshot()
 
     def append_hazards(self, records: tuple[HazardRecord, ...]) -> HazardAppendStatus:
         self._require_creator_process()
@@ -434,12 +395,10 @@ class PersistentSafetyJournal:
                 "records": [_hazard_value(record) for record in records],
             }
             record_id = f"hazards:{canonical_digest(value)}"
-            appended = self._append_checked(record_id, value)
+            appended = self._append_checked(record_id, value, records)
             if appended:
                 return HazardAppendStatus.APPENDED
-            unresolved = {
-                record.record_id for record in self.snapshot().unresolved_hazards
-            }
+            unresolved = set(self._projection.hazards)
             requested = {record.record_id for record in records}
             if requested <= unresolved:
                 return HazardAppendStatus.ALREADY_UNRESOLVED_SAME
@@ -453,7 +412,11 @@ class PersistentSafetyJournal:
             self._ensure_open()
             if not isinstance(bundle, SafetyDispositionBundle):
                 raise TypeError("bundle must be SafetyDispositionBundle")
-            self._append_checked(f"safety:{bundle.bundle_id}", _safety_value(bundle))
+            self._append_checked(
+                f"safety:{bundle.bundle_id}",
+                _safety_value(bundle),
+                (bundle,),
+            )
 
     def append_recovery_bundle(self, bundle: RecoveryBundle) -> None:
         self._require_creator_process()
@@ -464,11 +427,26 @@ class PersistentSafetyJournal:
             self._append_checked(
                 f"recovery:{bundle.bundle_id}",
                 _recovery_value(bundle),
+                (bundle,),
             )
 
-    def _append_checked(self, record_id: str, value: dict[str, Any]) -> bool:
-        return self._journal.append_checked(
-            record_id,
-            value,
-            lambda records: _replay_entries(_entries(records)),
-        )
+    def _append_checked(
+        self,
+        record_id: str,
+        value: dict[str, Any],
+        entries: tuple[SafetyEntry, ...],
+    ) -> bool:
+        assert self._session is not None
+        try:
+            for entry in entries:
+                self._projection.apply(entry)
+            appended = self._session.append(record_id, value)
+        except BaseException:
+            # append() repairs an ambiguous torn tail while retaining the lock;
+            # rebuild the semantic projection from that recovered byte stream.
+            projection = _SafetyProjection()
+            for entry in _entries(self._session.records()):
+                projection.apply(entry)
+            self._projection = projection
+            raise
+        return appended

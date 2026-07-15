@@ -8,12 +8,15 @@ import math
 
 from zlc_storage import canonical_digest
 from zlc_neutral_atom.runtime._failure import (
-    clear_exception_traceback,
-    detach_exception_graph,
+    detach_failure,
     record_secondary_failure,
     safe_error_summary,
 )
-from zlc_neutral_atom.runtime.cancellation import CancellationRequested, CancellationToken
+from zlc_neutral_atom.runtime.cancellation import (
+    CancellationRequested,
+    CancellationToken,
+    _CancellationSource,
+)
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
     DatasetCellKeyContract,
@@ -28,7 +31,6 @@ from zlc_neutral_atom.runtime.streams import (
     Envelope,
     ExactConsumerReadiness,
     ExactReservation,
-    EventSpanRef,
     OrderedEventSpanHasher,
     ProcessorStageProvenance,
     ReservationState,
@@ -44,27 +46,14 @@ class StreamProcessorError(RuntimeError):
     pass
 
 
-def _drop_exception_tracebacks(error: BaseException | None) -> BaseException | None:
-    """Retain bounded failure location evidence without retaining stack frames."""
-
-    return detach_exception_graph(
-        error,
-        note_prefix="detached processor traceback",
-        sever_chaining=True,
-        replace_with_evidence=True,
-    )
-
-
 def _compact_failure(error: BaseException | None) -> BaseException | None:
     try:
-        return _drop_exception_tracebacks(error)
+        return detach_failure(
+            error,
+            note_prefix="detached processor traceback",
+        )
     except BaseException:
-        if error is not None:
-            try:
-                clear_exception_traceback(error)
-            except BaseException:
-                pass
-        return error
+        return None
 
 
 class _TerminalDatasetOutput:
@@ -229,7 +218,7 @@ class ExactStreamProcessorWorker:
             raise ValueError("input_cursor does not belong to input_reservation")
         if not isinstance(input_edge, FrozenDatasetEdge):
             raise TypeError("input_edge must be FrozenDatasetEdge")
-        if input_edge.expected_cells is None:
+        if input_edge.cell_schedule is None:
             raise ValueError("exact processor input_edge requires a frozen schedule")
         input_stream = input_reservation._stream
         input_edge.validate_stream(input_stream)
@@ -248,10 +237,10 @@ class ExactStreamProcessorWorker:
             raise ValueError("input stream join-key contract differs from processor")
         if input_key_contract.fingerprint != input_edge.key_contract_fingerprint:
             raise ValueError("input join-key domain differs from input_edge")
-        keys = input_edge.expected_cells
-        assert keys is not None
+        schedule = input_edge.cell_schedule
+        assert schedule is not None
         total = input_reservation.end_sequence - input_reservation.start_sequence
-        if len(keys) != total:
+        if len(schedule) != total:
             raise ValueError("expected_keys length differs from exact reservation")
         if not isinstance(output_producer, AcquisitionProducer):
             raise TypeError("output_producer must be AcquisitionProducer")
@@ -299,7 +288,7 @@ class ExactStreamProcessorWorker:
                 raise ValueError(
                     "output reservation TraceBinding differs from processor lineage"
                 )
-            if output_builder._expected_cells != keys:
+            if not output_builder._cell_schedule.same_order_as(schedule):
                 raise ValueError("output builder schedule differs from expected_keys")
             if (
                 output_builder.edge.exact_key_sequence_digest
@@ -347,10 +336,10 @@ class ExactStreamProcessorWorker:
         self._input_reservation = input_reservation
         self._input_cursor = input_cursor
         self._input_stream = input_stream
-        self._expected_keys = keys
         self._output_producer = output_producer
         self._output_sink = output_sink
-        self._cancellation = cancellation or CancellationToken()
+        self._parent_cancellation = cancellation
+        self._local_cancellation = _CancellationSource()
         self._deadline_monotonic = deadline_monotonic
         self._condition = threading.Condition(threading.Lock())
         self._thread: threading.Thread | None = None
@@ -400,7 +389,11 @@ class ExactStreamProcessorWorker:
                 self._done
                 or self._closing
                 or self._error is not None
-                or self._cancellation.is_cancelled
+                or self._local_cancellation.token.is_cancelled
+                or (
+                    self._parent_cancellation is not None
+                    and self._parent_cancellation.is_cancelled
+                )
                 or time.monotonic() >= self._deadline_monotonic
                 or not thread.is_alive()
             ):
@@ -546,7 +539,7 @@ class ExactStreamProcessorWorker:
             raise StreamProcessorError("exact stream processor failed") from error
 
     def cancel(self, reason: str | None = None) -> bool:
-        return self._cancellation.request(reason)
+        return self._local_cancellation.request(reason)
 
     def close(self, timeout: float | None = None) -> None:
         """Idempotently cancel/join, including the preflight-before-start path."""
@@ -609,7 +602,7 @@ class ExactStreamProcessorWorker:
                 raise StreamProcessorError("processor lost its exact readiness proof")
             result = result._with_derivation(
                 readiness,
-                self._input_event_span(),
+                self._ordered_input_refs.seal(self._input_reservation.end_sequence),
             )
             self._input_stream._complete_consumer(
                 self._input_reservation,
@@ -720,10 +713,6 @@ class ExactStreamProcessorWorker:
                 raise StreamProcessorError("supplied EOS belongs to another source receipt")
             return eos
 
-    def _input_event_span(self) -> EventSpanRef:
-        reservation = self._input_reservation
-        return self._ordered_input_refs.seal(reservation.end_sequence)
-
     def _remaining(self) -> float:
         remaining = self._deadline_monotonic - time.monotonic()
         if remaining <= 0:
@@ -731,7 +720,9 @@ class ExactStreamProcessorWorker:
         return remaining
 
     def _checkpoint(self) -> None:
-        self._cancellation.checkpoint()
+        if self._parent_cancellation is not None:
+            self._parent_cancellation.checkpoint()
+        self._local_cancellation.token.checkpoint()
         self._remaining()
 
     def _propagate_output_failure(self, error: BaseException | None) -> None:

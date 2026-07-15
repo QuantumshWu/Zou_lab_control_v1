@@ -454,8 +454,8 @@ class BoundOccupancyStreamProcessor:
             raise ValueError("processor lost the capture key owner")
         if self.output_edge.payload_contract is not self.processor.output_payload_contract:
             raise ValueError("processor and output edge use different payload owners")
-        if self.output_edge.expected_cells != (
-            self.capture_input.capture_contract.expected_cells
+        if self.output_edge.cell_schedule is not (
+            self.capture_input.capture_contract.cell_schedule
         ):
             raise ValueError("occupancy output schedule differs from camera input")
 
@@ -531,16 +531,11 @@ def _readout_event_index(capture_input: CaptureProcessorInputBinding) -> int:
         return 0
     if len(event_axes) != 1 or event_axes[0][1].axis_id != event_axis_id:
         raise ValueError("camera descriptor and schema name different READOUT_EVENT axes")
-    position = event_axes[0][0]
-    indices = {
-        int(contract.dataset_schema.point_layout.multi_index(cell.point_storage_index)[position])
-        for cell in contract.expected_cells
-    }
-    if len(indices) != 1:
+    if event_axes[0][1].size != 1:
         raise ValueError(
             "occupancy input must contain exactly one physical READOUT_EVENT"
         )
-    return next(iter(indices))
+    return 0
 
 
 def _validate_camera_binding(
@@ -634,7 +629,7 @@ def bind_occupancy_stream_processor(
     output_edge = FrozenDatasetEdge(
         output_schema,
         candidate_adapter,
-        source.expected_cells,
+        source.cell_schedule,
     )
     output_contract = output_edge.payload_contract
     if not isinstance(output_contract, OccupancySampleContract):

@@ -27,20 +27,25 @@ from zlc_pulse import (
     validate_target_ir_for_target,
 )
 
-from zlc_neutral_atom.runtime import (
+from zlc_neutral_atom.runtime.ports import (
     BoundDevice,
-    ClaimMode,
-    CleanupReport,
-    HazardClaim,
-    ResourceClaim,
-    RunContext,
     SafetyInterrupt,
     SafetyOperation,
     VerifiedDeviceCapability,
+    admit_bound_capability,
+    cleanup_device_session,
+    verify_cleanup_device_safe_state,
 )
+from zlc_neutral_atom.runtime.cleanup import CleanupReport
+from zlc_neutral_atom.runtime.resources import (
+    ClaimMode,
+    DeviceBindingStamp,
+    ResourceClaim,
+)
+from zlc_neutral_atom.runtime.run import RunContext
 
 
-PULSE_TERMINAL_ACK_SCHEMA = "zlc_neutral_atom.PulseTerminalAck"
+_PULSE_TERMINAL_ACK_SCHEMA = "zlc_neutral_atom.PulseTerminalAck"
 
 
 @dataclass(frozen=True)
@@ -90,19 +95,18 @@ class PulseTerminalEvidenceKind(str, Enum):
 
 @dataclass(frozen=True)
 class SequencerCapabilitySnapshot:
-    binding_id: str
-    stable_device_identity: str
-    connection_generation: str
+    binding_stamp: DeviceBindingStamp
     target: PulseTarget
     clock_hz: float
     geometry_fingerprint: int
     max_blocking_call_seconds: float
     terminal_evidence_kind: "PulseTerminalEvidenceKind"
+    server_connection_generation: str | None
     capability_fingerprint: str
 
     def __post_init__(self) -> None:
-        for field in ("binding_id", "stable_device_identity", "connection_generation"):
-            _text(getattr(self, field), field)
+        if not isinstance(self.binding_stamp, DeviceBindingStamp):
+            raise TypeError("binding_stamp must be DeviceBindingStamp")
         if not isinstance(self.target, PulseTarget):
             raise TypeError("target must be PulseTarget")
         object.__setattr__(self, "clock_hz", _positive_float(self.clock_hz, "clock_hz"))
@@ -119,6 +123,11 @@ class SequencerCapabilitySnapshot:
         )
         if not isinstance(self.terminal_evidence_kind, PulseTerminalEvidenceKind):
             raise TypeError("terminal_evidence_kind must be PulseTerminalEvidenceKind")
+        if self.server_connection_generation is not None:
+            _text(
+                self.server_connection_generation,
+                "server_connection_generation",
+            )
         _sha256(self.capability_fingerprint, "capability_fingerprint")
 
     @property
@@ -150,13 +159,12 @@ class PreparePulseCommand:
 @dataclass(frozen=True)
 class PulsePreparedAck:
     session_id: str
-    binding_id: str
-    connection_generation: str
+    binding_instance_id: str
     artifact_digest: str
     capability_fingerprint: str
 
     def __post_init__(self) -> None:
-        for field in ("session_id", "binding_id", "connection_generation"):
+        for field in ("session_id", "binding_instance_id"):
             _text(getattr(self, field), field)
         _sha256(self.artifact_digest, "artifact_digest")
         _sha256(self.capability_fingerprint, "capability_fingerprint")
@@ -175,12 +183,11 @@ class FirePulseCommand:
 @dataclass(frozen=True)
 class PulseFiredAck:
     session_id: str
-    binding_id: str
-    connection_generation: str
+    binding_instance_id: str
     artifact_digest: str
 
     def __post_init__(self) -> None:
-        for field in ("session_id", "binding_id", "connection_generation"):
+        for field in ("session_id", "binding_instance_id"):
             _text(getattr(self, field), field)
         _sha256(self.artifact_digest, "artifact_digest")
 
@@ -244,12 +251,11 @@ PulseTerminalReceipt = PulseCompletion | SimulatedPulseReceipt
 @dataclass(frozen=True)
 class PulseTerminalAck:
     session_id: str
-    binding_id: str
-    connection_generation: str
+    binding_instance_id: str
     receipt: PulseTerminalReceipt
 
     def __post_init__(self) -> None:
-        for field in ("session_id", "binding_id", "connection_generation"):
+        for field in ("session_id", "binding_instance_id"):
             _text(getattr(self, field), field)
         if not isinstance(self.receipt, (PulseCompletion, SimulatedPulseReceipt)):
             raise TypeError("receipt must be PulseCompletion or SimulatedPulseReceipt")
@@ -378,10 +384,9 @@ def pulse_terminal_ack_to_tree(value: PulseTerminalAck) -> dict[str, object]:
         raise TypeError("value must be PulseTerminalAck")
     hardware = isinstance(value.receipt, PulseCompletion)
     return {
-        "schema": PULSE_TERMINAL_ACK_SCHEMA,
+        "schema": _PULSE_TERMINAL_ACK_SCHEMA,
         "session_id": value.session_id,
-        "binding_id": value.binding_id,
-        "connection_generation": value.connection_generation,
+        "binding_instance_id": value.binding_instance_id,
         "receipt_kind": "HARDWARE" if hardware else "SIMULATED",
         "receipt": (
             pulse_completion_to_tree(value.receipt)
@@ -395,14 +400,13 @@ def pulse_terminal_ack_from_tree(tree: object) -> PulseTerminalAck:
     fields = {
         "schema",
         "session_id",
-        "binding_id",
-        "connection_generation",
+        "binding_instance_id",
         "receipt_kind",
         "receipt",
     }
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("PulseTerminalAck has an unknown field set")
-    if tree["schema"] != PULSE_TERMINAL_ACK_SCHEMA:
+    if tree["schema"] != _PULSE_TERMINAL_ACK_SCHEMA:
         raise ValueError("PulseTerminalAck schema differs")
     kind = tree["receipt_kind"]
     if kind == "HARDWARE":
@@ -413,8 +417,7 @@ def pulse_terminal_ack_from_tree(tree: object) -> PulseTerminalAck:
         raise ValueError("PulseTerminalAck receipt kind differs")
     return PulseTerminalAck(
         tree["session_id"],
-        tree["binding_id"],
-        tree["connection_generation"],
+        tree["binding_instance_id"],
         receipt,
     )
 
@@ -425,22 +428,10 @@ class BoundPulsePort:
     cleanup_operations: tuple[SafetyOperation, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.capability_attestation, VerifiedDeviceCapability):
-            raise TypeError("pulse capability attestation must be broker-minted")
-        if not isinstance(self.capability_attestation.snapshot, SequencerCapabilitySnapshot):
-            raise TypeError("pulse capability attestation has the wrong snapshot type")
-        if (
-            self.device.validate_capability(self.capability_attestation)
-            is not self.capability_attestation.snapshot
-        ):
-            raise RuntimeError("pulse capability attestation snapshot changed")
-        capability = self.capability
-        if (
-            capability.binding_id != self.device.binding_id
-            or capability.stable_device_identity != self.device.stable_device_identity
-            or capability.connection_generation != self.device.connection_generation
-        ):
-            raise ValueError("pulse capability identity differs from BoundDevice")
+        admit_bound_capability(
+            self.capability_attestation,
+            SequencerCapabilitySnapshot,
+        )
         if not self.device.session_cleanup_capable:
             raise ValueError("pulse port requires session-specific cleanup")
         if not any(
@@ -475,14 +466,6 @@ class BoundPulsePort:
         return ResourceClaim(self.device.key, ClaimMode.EXCLUSIVE)
 
     @property
-    def hazard_claim(self) -> HazardClaim:
-        return HazardClaim(
-            self.device.key,
-            self.device.stable_device_identity,
-            self.device.connection_generation,
-        )
-
-    @property
     def interrupt_operations(self) -> tuple[SafetyInterrupt, ...]:
         preferred = tuple(
             operation
@@ -499,51 +482,30 @@ class BoundPulsePort:
         return PulseSession(self, request)
 
     def cleanup(self, context: RunContext, session_id: str) -> CleanupReport:
-        errors: list[BaseException] = []
         device = context.cleanup_device(self.device.key)
-        for operation in self.cleanup_operations:
-            try:
-                device.perform(operation)
-            except BaseException as error:
-                errors.append(error)
-        try:
-            closed = device.close_session(
-                session_id,
-                self.capability.max_blocking_call_seconds,
-            )
-            if not (closed.source_stopped and closed.no_more_work and closed.joined):
-                raise RuntimeError("sequencer session safe/terminal acknowledgement failed")
-        except BaseException as error:
-            errors.append(error)
-        if errors:
-            return CleanupReport.unsafe(
-                (self.device.key,),
-                reason="sequencer cleanup did not reach a verified safe terminal",
-                recovery_action="verify sequencer output state and recover the connection",
-                errors=tuple(errors),
-            )
-        try:
-            proof = device.verify_safe_state()
-        except BaseException as error:
-            return CleanupReport.unsafe(
-                (self.device.key,),
-                reason="sequencer safe-state verification failed",
-                recovery_action="inspect outputs and recover the sequencer before reuse",
-                errors=(error,),
-            )
-        return CleanupReport.safe((proof,))
+        return cleanup_device_session(
+            device,
+            self.cleanup_operations,
+            session_id,
+            self.capability.max_blocking_call_seconds,
+            termination_failure_reason=(
+                "sequencer cleanup did not reach a verified safe terminal"
+            ),
+            termination_recovery_action=(
+                "verify sequencer output state and recover the connection"
+            ),
+            verification_failure_reason="sequencer safe-state verification failed",
+            verification_recovery_action=(
+                "inspect outputs and recover the sequencer before reuse"
+            ),
+        )
 
     def verify_idle(self, context: RunContext) -> CleanupReport:
-        try:
-            proof = context.cleanup_device(self.device.key).verify_safe_state()
-        except BaseException as error:
-            return CleanupReport.unsafe(
-                (self.device.key,),
-                reason="unopened sequencer safe-state verification failed",
-                recovery_action="inspect and recover the sequencer before reuse",
-                errors=(error,),
-            )
-        return CleanupReport.safe((proof,))
+        return verify_cleanup_device_safe_state(
+            context.cleanup_device(self.device.key),
+            failure_reason="unopened sequencer safe-state verification failed",
+            recovery_action="inspect and recover the sequencer before reuse",
+        )
 
 
 class PulseSessionState(str, Enum):
@@ -682,10 +644,8 @@ class PulseSession:
             )
         if ack.session_id != self._session_id:
             raise RuntimeError("pulse acknowledgement session_id differs")
-        if ack.binding_id != self._port.device.binding_id:
-            raise RuntimeError("pulse acknowledgement binding_id differs")
-        if ack.connection_generation != self._port.device.connection_generation:
-            raise RuntimeError("pulse acknowledgement generation differs")
+        if ack.binding_instance_id != self._port.device.binding_instance_id:
+            raise RuntimeError("pulse acknowledgement binding instance differs")
 
     def _assert_owner_thread(self) -> None:
         if threading.get_ident() != self._owner_thread_id:
@@ -703,7 +663,6 @@ __all__ = [
     "PulseSession",
     "PulseSessionState",
     "PulseTerminalAck",
-    "PULSE_TERMINAL_ACK_SCHEMA",
     "PulseTerminalEvidenceKind",
     "PulseTerminalReceipt",
     "SimulatedPulseReceipt",

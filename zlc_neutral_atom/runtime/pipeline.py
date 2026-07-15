@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from zlc_data import BlockId, DatasetSchema, ValidityMode
 from zlc_storage import (
@@ -12,9 +12,13 @@ from zlc_storage import (
     sha256_text,
 )
 
-from zlc_neutral_atom.catalog import DefinitionCatalog, DefinitionKey
+from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.camera_operator import (
     CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
+)
+from zlc_neutral_atom.acquisition.camera import (
+    CameraAcquisitionMode,
+    decode_camera_capture_spec,
 )
 
 from ._failure import record_secondary_failure
@@ -25,15 +29,16 @@ from .capture import (
     CaptureCompletion,
     CaptureSession,
     FrozenCaptureSpec,
-    CaptureStreamContract,
+    CameraCaptureContract,
     CaptureTerminalAck,
 )
 from .dataset import (
     DatasetBuilder,
-    DatasetCellAddress,
+    DatasetCellSchedule,
     SealedDatasetArtifact,
 )
-from .run import CleanupReport, RunContext, RunMode, RunPlan
+from .cleanup import CleanupReport
+from .run import RunContext, RunPlan
 from .streams import (
     AcquisitionCursor,
     EventSpanRef,
@@ -71,7 +76,7 @@ class MeasurementDefinition:
 class BoundMeasurement:
     definition: MeasurementDefinition
     capture_port: BoundCapturePort
-    capture_contract: CaptureStreamContract
+    capture_contract: CameraCaptureContract
     capture_spec: FrozenCaptureSpec
 
     def __post_init__(self) -> None:
@@ -79,8 +84,8 @@ class BoundMeasurement:
             raise TypeError("definition must be MeasurementDefinition")
         if not isinstance(self.capture_port, BoundCapturePort):
             raise TypeError("capture_port must be BoundCapturePort")
-        if not isinstance(self.capture_contract, CaptureStreamContract):
-            raise TypeError("capture_contract must be CaptureStreamContract")
+        if not isinstance(self.capture_contract, CameraCaptureContract):
+            raise TypeError("capture_contract must be CameraCaptureContract")
         if self.capture_contract.capability is not self.capture_port.capability:
             raise ValueError("measurement contract and port must share capability owner")
         if not isinstance(self.capture_spec, FrozenCaptureSpec):
@@ -97,142 +102,33 @@ class BoundMeasurement:
             != self.capture_contract.dataset_schema.fingerprint
         ):
             raise ValueError("measurement definition output schema differs")
-        camera_provenance = self.capture_contract.camera_provenance
         if (
-            camera_provenance is not None
-            and camera_provenance.camera_arm_spec_fingerprint != self.capture_spec.digest
+            self.capture_contract.camera_provenance.camera_arm_spec_fingerprint
+            != self.capture_spec.digest
         ):
             raise ValueError(
                 "camera provenance arm spec differs from FrozenCaptureSpec"
             )
 
-    @property
-    def definition_key(self) -> DefinitionKey:
-        return self.definition.key
-
-
-def resolve_measurement_definition(
-    catalog: DefinitionCatalog,
-    key: DefinitionKey,
-) -> MeasurementDefinition:
-    if not isinstance(catalog, DefinitionCatalog):
-        raise TypeError("catalog must be DefinitionCatalog")
-    definition = catalog.resolve(key, MeasurementDefinition)
-    if not isinstance(definition, MeasurementDefinition):
-        raise TypeError("catalog entry is not a MeasurementDefinition")
-    return definition
-
-
-@dataclass(frozen=True, slots=True)
-class PipelineMemoryProfile:
-    """User memory limit plus runtime-owned conservative Python overhead."""
-
-    memory_limit_bytes: int
-    fixed_runtime_overhead_bytes: int = field(init=False, default=1 << 20)
-    per_event_reference_overhead_bytes: int = field(init=False, default=2048)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "memory_limit_bytes",
-            _positive_int(self.memory_limit_bytes, "memory_limit_bytes"),
-        )
-
-
-_MEMORY_ADMISSION_TOKEN = object()
-
-
-class PipelineMemoryAdmission:
-    """Process-local proof that one exact chain passed its memory policy."""
-
-    __slots__ = (
-        "_aggregate_peak_bytes",
-        "_chain_contract_digest",
-    )
-
-    def __init__(
-        self,
-        authority: object,
-        *,
-        aggregate_peak_bytes: int,
-        memory_profile: PipelineMemoryProfile,
-        chain_contract_digest: str,
-    ) -> None:
-        if authority is not _MEMORY_ADMISSION_TOKEN:
-            raise PermissionError(
-                "PipelineMemoryAdmission must be minted by admit_pipeline_memory"
-            )
-        if not isinstance(memory_profile, PipelineMemoryProfile):
-            raise TypeError("memory_profile must be PipelineMemoryProfile")
-        peak = _positive_int(aggregate_peak_bytes, "aggregate_peak_bytes")
-        if peak > memory_profile.memory_limit_bytes:
-            raise MemoryError(
-                f"pipeline peak budget {peak} exceeds "
-                f"limit {memory_profile.memory_limit_bytes}"
-            )
-        sha256_text(chain_contract_digest, "chain_contract_digest")
-        object.__setattr__(self, "_aggregate_peak_bytes", peak)
-        object.__setattr__(self, "_chain_contract_digest", chain_contract_digest)
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("PipelineMemoryAdmission is immutable")
-
-    def __reduce__(self):
-        raise TypeError("PipelineMemoryAdmission is process-local")
-
-    def __reduce_ex__(self, _protocol: int):
-        raise TypeError("PipelineMemoryAdmission is process-local")
-
-    @property
-    def aggregate_peak_bytes(self) -> int:
-        return self._aggregate_peak_bytes
-
-    @property
-    def chain_contract_digest(self) -> str:
-        return self._chain_contract_digest
-
-
-def admit_pipeline_memory(
-    *,
-    aggregate_peak_bytes: int,
-    memory_profile: PipelineMemoryProfile,
-    chain_contract_digest: str,
-) -> PipelineMemoryAdmission:
-    """Admit a compiler-derived peak before its exact chain touches hardware."""
-
-    return PipelineMemoryAdmission(
-        _MEMORY_ADMISSION_TOKEN,
-        aggregate_peak_bytes=aggregate_peak_bytes,
-        memory_profile=memory_profile,
-        chain_contract_digest=chain_contract_digest,
-    )
-
-
-@dataclass(frozen=True)
-class DatasetMaterializerSpec:
-    block_id: BlockId
-    memory: PipelineMemoryProfile
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.block_id, BlockId):
-            raise TypeError("block_id must be BlockId")
-        if not isinstance(self.memory, PipelineMemoryProfile):
-            raise TypeError("memory must be PipelineMemoryProfile")
-
-
 @dataclass(frozen=True)
 class MinimalPipelineSpec:
     name: str
     measurement: BoundMeasurement
-    materializer: DatasetMaterializerSpec
+    block_id: BlockId
+    memory_limit_bytes: int
     timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
         _canonical_text(self.name, "name")
         if not isinstance(self.measurement, BoundMeasurement):
             raise TypeError("measurement must be BoundMeasurement")
-        if not isinstance(self.materializer, DatasetMaterializerSpec):
-            raise TypeError("materializer must be DatasetMaterializerSpec")
+        if not isinstance(self.block_id, BlockId):
+            raise TypeError("block_id must be BlockId")
+        object.__setattr__(
+            self,
+            "memory_limit_bytes",
+            _positive_int(self.memory_limit_bytes, "memory_limit_bytes"),
+        )
 
 
 _PIPELINE_RESULT_TOKEN = object()
@@ -243,18 +139,7 @@ class PipelineResult:
 
     __slots__ = (
         "_dataset",
-        "_capture_terminal",
-        "_memory_admission",
-        "_aggregate_peak_bytes",
-        "_run_id",
-        "_source_dataset_schema",
-        "_camera_provenance",
-        "_camera_capability_evidence",
-        "_camera_arm_spec",
-        "_source_cell_schedule",
-        "_source_event_span",
-        "_processor_stages",
-        "_chain_contract_digest",
+        "_capture_completion",
         "_direct_raw_capture",
     )
 
@@ -263,7 +148,6 @@ class PipelineResult:
         authority: object,
         dataset: SealedDatasetArtifact,
         capture_completion: CaptureCompletion,
-        memory_admission: PipelineMemoryAdmission,
     ) -> None:
         if authority is not _PIPELINE_RESULT_TOKEN:
             raise PermissionError(
@@ -281,10 +165,6 @@ class PipelineResult:
             raise RuntimeError(
                 "sealed dataset belongs to another exact terminal consumer"
             )
-        if type(memory_admission) is not PipelineMemoryAdmission:
-            raise TypeError("memory_admission must be an exact PipelineMemoryAdmission")
-        if memory_admission.chain_contract_digest != capture_completion.chain_contract_digest:
-            raise RuntimeError("memory admission belongs to another exact chain")
         provenance = dataset.provenance
         if provenance.trace_binding.run_id != capture_completion.trace_binding.run_id:
             raise RuntimeError("pipeline dataset and capture completion run_id differ")
@@ -330,65 +210,19 @@ class PipelineResult:
             != provenance.ordered_metadata_digest
         ):
             raise RuntimeError("direct pipeline metadata differs from capture terminal")
-        object.__setattr__(self, "_dataset", dataset)
-        object.__setattr__(self, "_capture_terminal", capture_terminal)
-        object.__setattr__(self, "_memory_admission", memory_admission)
-        object.__setattr__(
-            self,
-            "_aggregate_peak_bytes",
-            memory_admission.aggregate_peak_bytes,
-        )
-        object.__setattr__(self, "_run_id", capture_completion.trace_binding.run_id)
-        object.__setattr__(
-            self,
-            "_source_dataset_schema",
-            capture_completion.source_dataset_schema,
-        )
-        object.__setattr__(
-            self,
-            "_camera_provenance",
-            capture_completion.camera_provenance,
-        )
-        object.__setattr__(
-            self,
-            "_camera_capability_evidence",
-            capture_completion.camera_capability_evidence,
-        )
-        object.__setattr__(
-            self,
-            "_camera_arm_spec",
-            capture_completion.camera_arm_spec,
-        )
-        object.__setattr__(
-            self,
-            "_source_cell_schedule",
-            capture_completion.source_cell_schedule,
-        )
-        object.__setattr__(
-            self,
-            "_source_event_span",
-            capture_completion.source_event_span,
-        )
-        object.__setattr__(
-            self,
-            "_processor_stages",
-            capture_completion.processor_stages,
-        )
-        object.__setattr__(
-            self,
-            "_chain_contract_digest",
-            capture_completion.chain_contract_digest,
-        )
-        object.__setattr__(
-            self,
-            "_direct_raw_capture",
+        direct_raw_capture = (
             capture_completion.direct_terminal_consumer
-            and capture_completion.camera_provenance is not None
-            and capture_completion.camera_capability_evidence is not None
             and dataset.block.schema == capture_completion.source_dataset_schema
             and capture_completion.source_event_adapter_operator_fingerprint
-            == CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
+            == CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT
         )
+        # Install every immutable result reference before the final no-fail
+        # authority commit.  The consumed completion has its live session and
+        # reservation references cleared by that commit, so retaining it avoids
+        # nine mirrored evidence fields without extending the runtime graph.
+        object.__setattr__(self, "_dataset", dataset)
+        object.__setattr__(self, "_capture_completion", capture_completion)
+        object.__setattr__(self, "_direct_raw_capture", direct_raw_capture)
         # Every validation and value copy above must succeed before the one
         # CaptureSession-owned commit consumes dataset and completion authority
         # together.  Public results retain immutable evidence, never the live
@@ -404,51 +238,47 @@ class PipelineResult:
 
     @property
     def capture_terminal(self) -> CaptureTerminalAck:
-        return self._capture_terminal
+        return self._capture_completion.terminal
 
     @property
     def run_id(self) -> str:
-        return self._run_id
+        return self._capture_completion.trace_binding.run_id
 
     @property
     def source_dataset_schema(self) -> DatasetSchema:
-        return self._source_dataset_schema
+        return self._capture_completion.source_dataset_schema
 
     @property
-    def camera_provenance(self) -> CameraCaptureProvenance | None:
-        return self._camera_provenance
+    def camera_provenance(self) -> CameraCaptureProvenance:
+        return self._capture_completion.camera_provenance
 
     @property
-    def camera_capability_evidence(self) -> CameraCapabilityEvidence | None:
-        return self._camera_capability_evidence
+    def camera_capability_evidence(self) -> CameraCapabilityEvidence:
+        return self._capture_completion.camera_capability_evidence
 
     @property
     def camera_arm_spec(self) -> FrozenCaptureSpec:
-        return self._camera_arm_spec
+        return self._capture_completion.camera_arm_spec
 
     @property
-    def source_cell_schedule(self) -> tuple[DatasetCellAddress, ...]:
-        return self._source_cell_schedule
+    def source_cell_schedule(self) -> DatasetCellSchedule:
+        return self._capture_completion.source_cell_schedule
 
     @property
     def source_event_span(self) -> EventSpanRef:
-        return self._source_event_span
+        return self._capture_completion.source_event_span
 
     @property
     def processor_stages(self) -> tuple[ProcessorStageProvenance, ...]:
-        return self._processor_stages
+        return self._capture_completion.processor_stages
 
     @property
     def chain_contract_digest(self) -> str:
-        return self._chain_contract_digest
+        return self._capture_completion.chain_contract_digest
 
     @property
     def is_direct_raw_capture(self) -> bool:
         return self._direct_raw_capture
-
-    @property
-    def aggregate_peak_bytes(self) -> int:
-        return self._aggregate_peak_bytes
 
 def dataset_storage_nbytes(schema: DatasetSchema) -> int:
     """Return exact value-plus-validity bytes for one materialized DataBlock."""
@@ -472,7 +302,14 @@ def dataset_storage_nbytes(schema: DatasetSchema) -> int:
     return value_bytes + validity_bytes
 
 
-def estimate_pipeline_peak_bytes(spec: MinimalPipelineSpec) -> int:
+def _estimate_pipeline_peak_bytes(spec: MinimalPipelineSpec) -> int:
+    """Conservative peak of buffers whose sizes are owned by this pipeline.
+
+    This is not a claim about interpreter or third-party allocator overhead.
+    Every term below comes from a frozen byte contract or ndarray geometry;
+    guessed per-object constants are deliberately excluded.
+    """
+
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
     contract = spec.measurement.capture_contract
@@ -481,14 +318,20 @@ def estimate_pipeline_peak_bytes(spec: MinimalPipelineSpec) -> int:
     metadata_bytes = (
         events * contract.dataset_edge.metadata_max_retained_nbytes
     )
-    memory = spec.materializer.memory
     return (
         contract.estimated_transport_bytes
         + 2 * dataset_bytes
         + metadata_bytes
-        + memory.fixed_runtime_overhead_bytes
-        + events * memory.per_event_reference_overhead_bytes
     )
+
+
+def _require_pipeline_memory_budget(spec: MinimalPipelineSpec) -> None:
+    """Compute the owner-derived peak and reject it before any allocation."""
+
+    peak = _estimate_pipeline_peak_bytes(spec)
+    limit = spec.memory_limit_bytes
+    if peak > limit:
+        raise MemoryError(f"pipeline peak budget {peak} exceeds limit {limit}")
 
 
 def _release_preflight_software(
@@ -535,15 +378,14 @@ class ExactCaptureTransaction:
     cursor: AcquisitionCursor
     builder: DatasetBuilder
     port: BoundCapturePort
-    contract: CaptureStreamContract
-    memory_admission: PipelineMemoryAdmission
+    contract: CameraCaptureContract
 
     def start(self, context: RunContext) -> None:
         self.session.prepare(context)
         self.session.start(context)
 
     def capture_all(self, context: RunContext) -> None:
-        for _cell in self.contract.expected_cells:
+        for _ordinal in range(self.contract.total_events):
             context.checkpoint()
             self.session.capture_next(context)
             self.builder.consume(
@@ -571,7 +413,6 @@ class ExactCaptureTransaction:
         return finalize_pipeline_result(
             dataset=dataset,
             capture_completion=completion,
-            memory_admission=self.memory_admission,
         )
 
     def fail(self, error: BaseException) -> None:
@@ -610,7 +451,7 @@ class ExactCaptureTransaction:
         )
 
 
-def open_exact_capture(
+def _open_exact_capture_transaction(
     spec: MinimalPipelineSpec,
     context: RunContext,
 ) -> ExactCaptureTransaction:
@@ -618,12 +459,14 @@ def open_exact_capture(
 
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
-    aggregate_peak = estimate_pipeline_peak_bytes(spec)
-    if aggregate_peak > spec.materializer.memory.memory_limit_bytes:
-        raise MemoryError(
-            f"pipeline peak budget {aggregate_peak} exceeds "
-            f"limit {spec.materializer.memory.memory_limit_bytes}"
-        )
+    _require_pipeline_memory_budget(spec)
+    return _allocate_exact_capture(spec, context)
+
+
+def _allocate_exact_capture(
+    spec: MinimalPipelineSpec,
+    context: RunContext,
+) -> ExactCaptureTransaction:
     measurement = spec.measurement
     port = measurement.capture_port
     contract = measurement.capture_contract
@@ -638,16 +481,11 @@ def open_exact_capture(
         reservation = session.reserve_exact()
         cursor = reservation.activate()
         builder = DatasetBuilder(
-            spec.materializer.block_id,
+            spec.block_id,
             reservation,
             contract.dataset_edge,
         )
         readiness = builder.exact_readiness()
-        memory_admission = admit_pipeline_memory(
-            aggregate_peak_bytes=aggregate_peak,
-            memory_profile=spec.materializer.memory,
-            chain_contract_digest=readiness.chain_contract_digest,
-        )
         session.bind_exact_consumer(readiness)
         return ExactCaptureTransaction(
             session,
@@ -656,11 +494,20 @@ def open_exact_capture(
             builder,
             port,
             contract,
-            memory_admission,
         )
     except BaseException as error:
         _release_preflight_software(session, reservation, builder, error)
         raise
+
+
+def _require_direct_capture(measurement: BoundMeasurement) -> None:
+    """Reject a hardware-timed source outside its timing coordinator."""
+
+    camera_spec = decode_camera_capture_spec(measurement.capture_spec)
+    if camera_spec.mode is CameraAcquisitionMode.EXTERNAL_TRIGGERED:
+        raise ValueError(
+            "external-trigger capture requires a pulse timing coordinator"
+        )
 
 
 def compile_pipeline(spec: MinimalPipelineSpec) -> RunPlan:
@@ -668,16 +515,12 @@ def compile_pipeline(spec: MinimalPipelineSpec) -> RunPlan:
 
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
-    aggregate_peak = estimate_pipeline_peak_bytes(spec)
-    if aggregate_peak > spec.materializer.memory.memory_limit_bytes:
-        raise MemoryError(
-            f"pipeline peak budget {aggregate_peak} exceeds "
-            f"limit {spec.materializer.memory.memory_limit_bytes}"
-        )
+    _require_direct_capture(spec.measurement)
+    _require_pipeline_memory_budget(spec)
     port = spec.measurement.capture_port
 
     def preflight(context: RunContext) -> ExactCaptureTransaction:
-        return open_exact_capture(spec, context)
+        return _allocate_exact_capture(spec, context)
 
     def execute(context: RunContext, prepared: ExactCaptureTransaction) -> PipelineResult:
         try:
@@ -699,9 +542,7 @@ def compile_pipeline(spec: MinimalPipelineSpec) -> RunPlan:
 
     return RunPlan(
         name=spec.name,
-        mode=RunMode.FINITE_EXACT,
         resource_claims=(port.resource_claim,),
-        hazard_claims=(port.hazard_claim,),
         bound_devices=(port.device,),
         preflight=preflight,
         execute=execute,
@@ -717,7 +558,6 @@ def finalize_pipeline_result(
     *,
     dataset: SealedDatasetArtifact,
     capture_completion: CaptureCompletion,
-    memory_admission: PipelineMemoryAdmission,
 ) -> PipelineResult:
     """Validate and mint the result of a direct or processed exact pipeline.
 
@@ -731,24 +571,16 @@ def finalize_pipeline_result(
         _PIPELINE_RESULT_TOKEN,
         dataset,
         capture_completion,
-        memory_admission,
     )
 
 
 __all__ = [
-    "admit_pipeline_memory",
     "BoundMeasurement",
     "compile_pipeline",
     "dataset_storage_nbytes",
-    "DatasetMaterializerSpec",
     "ExactCaptureTransaction",
-    "estimate_pipeline_peak_bytes",
     "finalize_pipeline_result",
     "MeasurementDefinition",
     "MinimalPipelineSpec",
-    "open_exact_capture",
-    "PipelineMemoryProfile",
-    "PipelineMemoryAdmission",
     "PipelineResult",
-    "resolve_measurement_definition",
 ]

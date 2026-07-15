@@ -36,7 +36,7 @@ from zlc_storage import positive_integer as _positive_integer
 from .calibration_reference import CalibrationArtifactRef
 from .physical_context import (
     ReadoutPhysicalContext,
-    derive_readout_physical_context,
+    _derive_readout_physical_context_from_evidence,
 )
 from .contracts import (
     CalibrationCaptureLayout,
@@ -230,10 +230,10 @@ def derive_calibration_readout_physical_context(
     if not isinstance(frame_contract, FrameContract):
         raise TypeError("frame_contract must be FrameContract")
     try:
-        lineage = capture.pulse_lineage  # type: ignore[attr-defined]
+        evidence = capture.pulse_evidence  # type: ignore[attr-defined]
     except AttributeError as exc:
         raise TypeError("capture must be a resolved raw CaptureArtifact") from exc
-    if lineage is None:
+    if evidence is None:
         raise ValueError(
             "authoritative calibration requires pulse-trigger lineage"
         )
@@ -244,8 +244,11 @@ def derive_calibration_readout_physical_context(
     integration_offset = (
         physical_facts.external_trigger_integration_start_offset_seconds
     )
-    return derive_readout_physical_context(
-        lineage.binding,
+    frame_source = capture.frame_source  # type: ignore[attr-defined]
+    return _derive_readout_physical_context_from_evidence(
+        evidence,
+        frame_source.schema,
+        frame_source.iter_cell_schedule(),
         readout_event_index=layout.readout_event_index,
         integration_start_offset_seconds=integration_offset,
         integration_seconds=frame_contract.exposure_seconds,

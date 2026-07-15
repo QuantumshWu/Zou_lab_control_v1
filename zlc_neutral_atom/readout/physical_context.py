@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from zlc_pulse import (
@@ -9,6 +10,7 @@ from zlc_pulse import (
     expand_physical_bus_value_changes,
     expand_physical_digital_high_intervals,
 )
+from zlc_data import DatasetSchema, READOUT_EVENT
 from zlc_storage import (
     canonical_text,
     nonnegative_integer,
@@ -17,7 +19,11 @@ from zlc_storage import (
     sha256_text,
 )
 
-from zlc_neutral_atom.timing.lineage import PulseCaptureBinding
+from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
+from zlc_neutral_atom.timing.lineage import (
+    PulseCaptureBinding,
+    PulseCaptureEvidence,
+)
 
 
 @dataclass(frozen=True)
@@ -165,41 +171,105 @@ def derive_readout_physical_context(
     )
     exposure = positive_real(integration_seconds, "integration_seconds")
     schedule = pulse_binding.trigger_schedule
-    edge_by_ordinal = {item.trigger_ordinal: item for item in schedule.edges}
-    selected = tuple(
-        item
-        for item in cell_plan.assignments
-        if item.readout_event_index == event_index
+    grouping = cell_plan.join_contract.within_point_grouping
+    selected_edges = tuple(
+        edge
+        for edge in schedule.edges
+        if grouping[edge.point_trigger_ordinal][1] == event_index
     )
-    if not selected:
+    if not selected_edges:
         raise ValueError("readout event has no compiled capture cells")
+    return _derive_readout_context(
+        artifact,
+        cell_plan.trigger_channel,
+        tuple(edge.tick_from_run_start for edge in selected_edges),
+        integration_start_offset_seconds=integration_offset,
+        integration_seconds=exposure,
+    )
+
+
+def _derive_readout_physical_context_from_evidence(
+    evidence: PulseCaptureEvidence,
+    schema: DatasetSchema,
+    cell_schedule: Iterable[DatasetCellAddress],
+    *,
+    readout_event_index: int,
+    integration_start_offset_seconds: float,
+    integration_seconds: float,
+) -> ReadoutPhysicalContext:
+    """Derive a persisted context by ordinal-joining pulse edges and cells."""
+
+    if not isinstance(evidence, PulseCaptureEvidence):
+        raise TypeError("evidence must be PulseCaptureEvidence")
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    edges = evidence.trigger_schedule.edges
+    event_axes = tuple(
+        (index, axis)
+        for index, axis in enumerate(schema.point_axes)
+        if axis.role == READOUT_EVENT
+    )
+    if len(event_axes) != 1:
+        raise ValueError("persisted triggered capture requires one READOUT_EVENT axis")
+    event_position, event_axis = event_axes[0]
+    event_index = nonnegative_integer(readout_event_index, "readout_event_index")
+    if event_index >= event_axis.size:
+        raise ValueError("readout_event_index is outside DatasetSchema")
+    anchor_ticks = []
+    for ordinal, (edge, cell) in enumerate(
+        zip(edges, cell_schedule, strict=True)
+    ):
+        if not isinstance(cell, DatasetCellAddress):
+            raise TypeError("cell_schedule must contain DatasetCellAddress values")
+        if edge.trigger_ordinal != ordinal:
+            raise ValueError("pulse trigger ordinals are not contiguous")
+        point_multi = schema.point_layout.multi_index(cell.point_storage_index)
+        if point_multi[event_position] == event_index:
+            anchor_ticks.append(edge.tick_from_run_start)
+    if not anchor_ticks:
+        raise ValueError("readout event has no persisted capture cells")
+    return _derive_readout_context(
+        evidence.compiled_artifact,
+        evidence.trigger_channel,
+        tuple(anchor_ticks),
+        integration_start_offset_seconds=integration_start_offset_seconds,
+        integration_seconds=integration_seconds,
+    )
+
+
+def _derive_readout_context(
+    artifact: CompiledPulseArtifact,
+    trigger_channel: str,
+    anchor_ticks: tuple[int, ...],
+    *,
+    integration_start_offset_seconds: float,
+    integration_seconds: float,
+) -> ReadoutPhysicalContext:
+    integration_offset = nonnegative_real(
+        integration_start_offset_seconds,
+        "integration_start_offset_seconds",
+    )
+    exposure = positive_real(integration_seconds, "integration_seconds")
     ir = artifact.target_ir
     trigger_outputs = tuple(
-        key
-        for key, lane in ir.logical_digital_outputs
-        if lane == cell_plan.trigger_channel
+        key for key, lane in ir.logical_digital_outputs if lane == trigger_channel
     )
     if len(trigger_outputs) != 1:
         raise ValueError("capture trigger lane is not one logical digital output")
     intervals = expand_physical_digital_high_intervals(ir)
     bus_changes = expand_physical_bus_value_changes(ir)
-    contexts = []
-    for assignment in selected:
-        try:
-            edge = edge_by_ordinal[assignment.trigger_ordinal]
-        except KeyError as exc:  # pragma: no cover - cell-plan validation owns this
-            raise ValueError("capture cell has no trigger edge") from exc
-        contexts.append(
-            _context_at_trigger(
-                artifact,
-                edge.tick_from_run_start,
-                trigger_output_key=trigger_outputs[0],
-                integration_start_offset_seconds=integration_offset,
-                integration_seconds=exposure,
-                intervals=intervals,
-                bus_changes=bus_changes,
-            )
+    contexts = tuple(
+        _context_at_trigger(
+            artifact,
+            anchor_tick,
+            trigger_output_key=trigger_outputs[0],
+            integration_start_offset_seconds=integration_offset,
+            integration_seconds=exposure,
+            intervals=intervals,
+            bus_changes=bus_changes,
         )
+        for anchor_tick in anchor_ticks
+    )
     first = contexts[0]
     if any(item != first for item in contexts[1:]):
         raise ValueError(

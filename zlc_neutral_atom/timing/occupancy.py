@@ -5,20 +5,20 @@ from __future__ import annotations
 from dataclasses import InitVar, dataclass, field
 
 from zlc_neutral_atom.readout.occupancy_pipeline import (
+    ExecutedOccupancy,
     ExactOccupancyTransaction,
     OccupancyPipelineResult,
     OccupancyPipelineSpec,
+    _open_exact_occupancy,
     finalize_occupancy_result,
-    open_exact_occupancy,
 )
 from zlc_neutral_atom.readout.physical_context import (
     derive_readout_physical_context,
 )
+from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.run import (
-    CleanupReport,
     PostSafetyContext,
     RunContext,
-    RunMode,
     RunPlan,
 )
 from zlc_storage import canonical_text
@@ -34,7 +34,6 @@ from .pulse import (
     BoundPulsePort,
     FinitePulseExecutionRequest,
     PulseSession,
-    PulseTerminalAck,
 )
 
 
@@ -73,20 +72,14 @@ class TriggeredOccupancySpec:
             pulse_binding=pulse_binding,
         )
         object.__setattr__(self, "pulse_binding", pulse_binding)
-        expected_cells = set(contract.expected_cells)
-        event_indices = {
-            item.readout_event_index
-            for item in pulse_binding.cell_plan.assignments
-            if item.cell in expected_cells
-        }
+        grouping = pulse_binding.cell_plan.join_contract.within_point_grouping
+        event_indices = {event for _repeat, event in grouping}
         if len(event_indices) != 1:
             raise ValueError(
                 "triggered occupancy requires one physical READOUT_EVENT"
             )
         calibration = self.occupancy.processor.calibration.artifact
         physical_facts = contract.capability.camera_physical_facts
-        if physical_facts is None:
-            raise ValueError("triggered occupancy lacks camera physical facts")
         integration_offset = (
             physical_facts.external_trigger_integration_start_offset_seconds
         )
@@ -124,13 +117,12 @@ class TriggeredOccupancyPipelineResult:
             pipeline.source_dataset_schema,
         )
         if (
-            self.occupancy.dataset.cell_schedule
-            != self.lineage.cell_plan.expected_cells
+            not self.occupancy.dataset.cell_schedule.same_order_as(
+                self.lineage.cell_plan.cell_schedule
+            )
         ):
             raise ValueError("occupancy event order differs from pulse cell plan")
         evidence = pipeline.camera_capability_evidence
-        if evidence is None:
-            raise ValueError("triggered occupancy lacks camera capability evidence")
         evidence.physical_facts.require_single_capture_trigger_channel(
             self.lineage.trigger_channel
         )
@@ -140,7 +132,7 @@ class TriggeredOccupancyPipelineResult:
             expected
             == terminal.produced_count
             == terminal.drained_count
-            == len(self.occupancy.dataset.events)
+            == len(self.occupancy.dataset.event_metadata)
         ):
             raise RuntimeError("pulse, camera, plan, and occupancy counts differ")
 
@@ -149,7 +141,12 @@ class TriggeredOccupancyPipelineResult:
 class _PreparedTriggeredOccupancy:
     occupancy: ExactOccupancyTransaction
     pulse: PulseSession
-    pulse_terminal: PulseTerminalAck | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutedTriggeredOccupancy:
+    occupancy: ExecutedOccupancy
+    lineage: PulseCaptureLineage
 
 
 def compile_triggered_occupancy_pipeline(spec: TriggeredOccupancySpec) -> RunPlan:
@@ -159,13 +156,14 @@ def compile_triggered_occupancy_pipeline(spec: TriggeredOccupancySpec) -> RunPla
         raise TypeError("spec must be TriggeredOccupancySpec")
     camera_port = spec.occupancy.measurement.capture_port
     pulse_port = spec.pulse_port
+    pulse_binding = spec.pulse_binding
     if camera_port.device.key == pulse_port.device.key:
         raise ValueError("camera and sequencer must be distinct physical resources")
 
     def preflight(context: RunContext) -> _PreparedTriggeredOccupancy:
         pulse = pulse_port.open_session(spec.pulse_request)
         try:
-            occupancy = open_exact_occupancy(spec.occupancy, context)
+            occupancy = _open_exact_occupancy(spec.occupancy, context)
         except BaseException:
             pulse.fail()
             raise
@@ -174,16 +172,18 @@ def compile_triggered_occupancy_pipeline(spec: TriggeredOccupancySpec) -> RunPla
     def execute(
         context: RunContext,
         prepared: _PreparedTriggeredOccupancy,
-    ) -> _PreparedTriggeredOccupancy:
+    ) -> _ExecutedTriggeredOccupancy:
         completed, terminal = execute_autonomous_single_fire(
             context,
             pulse=prepared.pulse,
             capture=prepared.occupancy,
         )
-        if completed is not prepared.occupancy:
-            raise RuntimeError("occupancy completion changed transaction identity")
-        prepared.pulse_terminal = terminal
-        return prepared
+        if not isinstance(completed, ExecutedOccupancy):
+            raise TypeError("occupancy capture returned another executed value")
+        return _ExecutedTriggeredOccupancy(
+            completed,
+            PulseCaptureLineage(pulse_binding, terminal),
+        )
 
     def cleanup(
         context: RunContext,
@@ -202,30 +202,20 @@ def compile_triggered_occupancy_pipeline(spec: TriggeredOccupancySpec) -> RunPla
 
     def finalize(
         context: PostSafetyContext,
-        executed: _PreparedTriggeredOccupancy,
+        executed: _ExecutedTriggeredOccupancy,
     ) -> TriggeredOccupancyPipelineResult:
-        if type(executed) is not _PreparedTriggeredOccupancy:
+        if type(executed) is not _ExecutedTriggeredOccupancy:
             raise TypeError("triggered occupancy finalize received another value")
-        pipeline = executed.occupancy.completed_pipeline()
+        pipeline = executed.occupancy.pipeline
         if pipeline.run_id != context.run_id.value:
             raise ValueError("triggered occupancy result belongs to another Run")
-        terminal = executed.pulse_terminal
-        if terminal is None:
-            raise RuntimeError("triggered occupancy has no pulse terminal")
-        if not executed.pulse.owns_terminal(terminal):
-            raise PermissionError("triggered occupancy pulse terminal changed")
         occupancy = finalize_occupancy_result(context, executed.occupancy)
         context.checkpoint()
-        return TriggeredOccupancyPipelineResult(
-            occupancy,
-            PulseCaptureLineage(spec.pulse_binding, terminal),
-        )
+        return TriggeredOccupancyPipelineResult(occupancy, executed.lineage)
 
     return RunPlan(
         name=spec.occupancy.name,
-        mode=RunMode.FINITE_EXACT,
         resource_claims=(pulse_port.resource_claim, camera_port.resource_claim),
-        hazard_claims=(pulse_port.hazard_claim, camera_port.hazard_claim),
         bound_devices=(pulse_port.device, camera_port.device),
         preflight=preflight,
         execute=execute,

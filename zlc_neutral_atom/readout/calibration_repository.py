@@ -33,8 +33,6 @@ from zlc_storage import (
 from zlc_neutral_atom.capture_reference import CaptureArtifactRef
 from zlc_neutral_atom.runtime.commit import (
     CommitIntent,
-    CommitKind,
-    CommitRecovery,
     CommitTarget,
     FinalCommit,
     PersistentCommitJournal,
@@ -42,11 +40,10 @@ from zlc_neutral_atom.runtime.commit import (
     RepositoryCommitCoordinator,
     publish_manifest_with_visibility_reconciliation,
 )
+from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.run import (
-    CleanupReport,
     PostSafetyContext,
     RunContext,
-    RunMode,
     RunPlan,
 )
 
@@ -184,7 +181,7 @@ class CalibrationRepository:
         try:
             self._store = ContentAddressedStore(self.root / "content")
             self._store_authority = self._store.authority()
-            self._journal = PersistentCommitJournal(
+            journal = PersistentCommitJournal(
                 self.root / "calibration-commit.journal",
                 self.repository_id,
             )
@@ -193,7 +190,7 @@ class CalibrationRepository:
             self._coordinator: RepositoryCommitCoordinator[
                 CalibrationArtifactRef
             ] = RepositoryCommitCoordinator(
-                self._journal,
+                journal,
                 self._recover,
                 root_lease=self._root_lease,
             )
@@ -205,13 +202,6 @@ class CalibrationRepository:
         if self._closed:
             raise RuntimeError("calibration repository is closed")
         self._root_lease.require_active()
-        if self._store_authority.root != self.root / "content":
-            raise RuntimeError("calibration content store escaped repository root")
-        if (
-            self._journal.repository_id != self.repository_id
-            or self._journal.repository_root != self.root
-        ):
-            raise RuntimeError("calibration journal binding changed")
 
     def close(self) -> None:
         with self._lock:
@@ -234,12 +224,6 @@ class CalibrationRepository:
             self.close()
         except BaseException:
             pass
-
-    @property
-    def startup_reconciliations(self):
-        with self._lock:
-            self._require_open()
-            return self._coordinator.startup_reconciliations
 
     def _validate_reference(self, reference: CalibrationArtifactRef) -> None:
         if not isinstance(reference, CalibrationArtifactRef):
@@ -272,7 +256,7 @@ class CalibrationRepository:
             matching = tuple(
                 intent
                 for intent in self._coordinator.committed_intents()
-                if intent.kind is CommitKind.FINAL and intent.target == target
+                if intent.target == target
             )
             if not matching:
                 raise PermissionError(
@@ -523,14 +507,14 @@ class CalibrationRepository:
                 "calibration report group contexts differ from the admitted source"
             )
         result._require_source_admission(source)
-        subject = context.authorize_commit_preparation(CommitKind.FINAL)
+        run_id, safety_bundle_id = context.authorize_commit_preparation()
         # Staging writes CAS blobs, so repository lifetime begins before the
         # first write and overlaps prepare() minting the commit-lifetime hold.
         with self._root_lease.borrow() as staging_borrow:
             staging_borrow.require_active()
             reference, payload = self._stage_result(result)
-            confirmed = context.authorize_commit_preparation(CommitKind.FINAL)
-            if confirmed != subject:
+            confirmed = context.authorize_commit_preparation()
+            if confirmed != (run_id, safety_bundle_id):
                 raise RuntimeError("calibration commit subject changed while staging")
             target = _target(self.repository_id, reference)
 
@@ -551,14 +535,12 @@ class CalibrationRepository:
 
             with self._lock:
                 self._require_open()
-                operation = FinalCommit(
-                    self._coordinator.prepare(
-                        CommitKind.FINAL,
-                        _commit_id(subject.run_id, reference.manifest_digest),
-                        subject,
-                        target,
-                        publish,
-                    )
+                operation = self._coordinator.prepare(
+                    _commit_id(run_id, reference.manifest_digest),
+                    run_id,
+                    safety_bundle_id,
+                    target,
+                    publish,
                 )
         try:
             context._track_prepared_commit(operation)
@@ -570,14 +552,13 @@ class CalibrationRepository:
     def _recover(
         self,
         intent: CommitIntent,
-    ) -> CommitRecovery[CalibrationArtifactRef]:
+    ) -> PublishedManifest[CalibrationArtifactRef] | None:
         """Resolve one pending intent by inspecting, never publishing, storage."""
 
         authority = self._content_authority()
         target = intent.target
         if (
-            intent.kind is not CommitKind.FINAL
-            or target.repository_id != self.repository_id
+            target.repository_id != self.repository_id
             or target.artifact_kind != _CALIBRATION_ARTIFACT_KIND
             or target.artifact_format != CALIBRATION_MANIFEST_FORMAT
         ):
@@ -600,7 +581,7 @@ class CalibrationRepository:
                 max_bytes=_MAX_MANIFEST_BYTES,
             )
         except FileNotFoundError:
-            return CommitRecovery(False)
+            return None
         # Once the visibility point exists, missing/corrupt blobs are a
         # repository fault and startup remains fail-closed.
         artifact, report_ref = self._artifact_and_report_ref(
@@ -621,13 +602,10 @@ class CalibrationRepository:
         )
         if confirmed != payload:
             raise RuntimeError("recovery durability check changed manifest")
-        return CommitRecovery(
-            True,
-            PublishedManifest(
-                reference.target_ref,
-                reference.manifest_digest,
-                reference,
-            ),
+        return PublishedManifest(
+            reference.target_ref,
+            reference.manifest_digest,
+            reference,
         )
 
 
@@ -707,9 +685,7 @@ def compile_calibration_artifact_plan(
 
     return RunPlan(
         name="calibrate committed camera capture",
-        mode=RunMode.FINITE_EXACT,
         resource_claims=(),
-        hazard_claims=(),
         bound_devices=(),
         preflight=preflight,
         execute=execute,
