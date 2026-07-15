@@ -23,7 +23,6 @@ from zlc_data import (
     CellValidity,
     ComponentValidity,
     DataBlock,
-    DataPatch,
     DatasetRevision,
     DatasetSchema,
     INVALID,
@@ -40,41 +39,6 @@ from zlc_data import (
     expand_value_validity,
     expand_component_validity,
 )
-
-
-def test_data_patch_is_atomic_immutable_and_revision_linear():
-    schema = image_schema()
-    patch = DataPatch(
-        block_id=BlockId("capture"),
-        base_revision=DatasetRevision(2),
-        result_revision=DatasetRevision(3),
-        target_cells=((0, 1), (0, 2)),
-        values=np.arange(24, dtype=np.uint16).reshape(2, 3, 4),
-        validity_patch=(VALID, INVALID),
-        schema_fingerprint=schema.fingerprint,
-    )
-    assert patch.target_cells == ((0, 1), (0, 2))
-    assert not patch.values.flags.writeable
-    with pytest.raises(ValueError, match="immediately follow"):
-        DataPatch(
-            block_id=patch.block_id,
-            base_revision=DatasetRevision(2),
-            result_revision=DatasetRevision(4),
-            target_cells=((0, 1),),
-            values=patch.values[:1],
-            validity_patch=(VALID,),
-            schema_fingerprint=schema.fingerprint,
-        )
-    with pytest.raises(ValueError, match="unique"):
-        DataPatch(
-            block_id=patch.block_id,
-            base_revision=DatasetRevision(2),
-            result_revision=DatasetRevision(3),
-            target_cells=((0, 1), (0, 1)),
-            values=patch.values,
-            validity_patch=(VALID, VALID),
-            schema_fingerprint=schema.fingerprint,
-        )
 
 
 def axis(name: str, role, size: int) -> AxisSpec:

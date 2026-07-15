@@ -33,7 +33,6 @@ from .codec import (
     TypedCodecError,
 )
 from .layout import AxisLayout, AxisLayoutMode, PointLayout
-from .patch import DataPatch, ValueValidity
 from .schema import DatasetSchema, ValueSchema
 from .validity import (
     INVALID,
@@ -130,7 +129,6 @@ __all__ = [
     "ComponentValidity",
     "CoordinateFrameId",
     "DataBlock",
-    "DataPatch",
     "DataTransformSpec",
     "DatasetRevision",
     "DatasetRevisionRef",
@@ -180,7 +178,6 @@ __all__ = [
     "ValidityPolicy",
     "Value",
     "ValuePayloadContract",
-    "ValueValidity",
     "ValueSchema",
     "axis_from_tree",
     "axis_layout_from_tree",

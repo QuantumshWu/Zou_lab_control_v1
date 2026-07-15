@@ -673,7 +673,7 @@ def test_bound_processor_fingerprint_is_computed_once_at_bind(monkeypatch):
 def test_bound_processor_fingerprint_has_a_literal_current_oracle():
     item = chain(points=1)
     assert item.worker._bound.fingerprint == (
-        "40a871e122fdb1d6d72a71f0a08c3acaa7d46e2f5843b06d2ee0e61911ff1a4f"
+        "e7fd5a496b8bae508ad2231632fbb4bc32b6734e671af86a5269c78e3e96c832"
     )
     item.worker.close(2.0)
 

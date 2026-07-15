@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from typing import Callable, Generic, Protocol, TypeVar
 
-from zlc_data import DataBlock, DataPatch, StreamGenerationId, Value
+from zlc_data import DataBlock, StreamGenerationId, Value
 from zlc_storage import (
     canonical_digest,
     canonical_text as _canonical_text,
@@ -64,7 +64,7 @@ class JoinKeyContract(Protocol):
 
 
 def _contains_materialization(value: object, seen: set[int] | None = None) -> bool:
-    if isinstance(value, (DataBlock, DataPatch)):
+    if isinstance(value, DataBlock):
         return True
     if type(value) is Value:
         return False
@@ -409,7 +409,7 @@ class Envelope(Generic[PayloadT]):
 
     def __post_init__(self) -> None:
         if _contains_materialization(self.payload):
-            raise TypeError("DataBlock/DataPatch are materialization values, not stream payloads")
+            raise TypeError("DataBlock is a materialization value, not a stream payload")
         if not isinstance(self.event_ref, EventRef):
             raise TypeError("event_ref must be EventRef")
         object.__setattr__(self, "emitted_at", finite_real(self.emitted_at, "emitted_at"))

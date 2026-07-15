@@ -466,7 +466,7 @@ def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
     assert first.block.values.shape == (1, 3, 2, 3)
     assert np.all(first.block.values[0, 0] == 10)
     assert progress.coverage.written_cells == 1
-    assert not hasattr(progress, "patch") and not hasattr(progress, "block")
+    assert not hasattr(progress, "block")
 
     for point, number in ((1, 20), (2, 30)):
         emit(producer, value(number), DatasetCellAddress(0, point), point)
