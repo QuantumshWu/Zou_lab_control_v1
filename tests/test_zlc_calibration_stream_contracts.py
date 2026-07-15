@@ -10,6 +10,7 @@ from pathlib import Path
 import textwrap
 import threading
 import time
+import tracemalloc
 from types import SimpleNamespace
 
 import numpy as np
@@ -26,10 +27,16 @@ from zlc_data import (
     READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
+    SPATIAL_X,
+    SPATIAL_Y,
     AxisId,
     AxisSpec,
     BlockId,
+    CoordinateFrameId,
+    DatasetSchema,
     PointLayout,
+    ValidityContract,
+    ValueSchema,
 )
 from zlc_neutral_atom.acquisition import CameraAcquisitionMode
 from zlc_neutral_atom.artifacts.capture import (
@@ -542,6 +549,78 @@ def test_max_drop_is_bounded_by_sites_and_changes_memory_admission(
     )
 
 
+def test_slender_grid_lattice_allocation_is_covered_by_preflight() -> None:
+    site_count = 1000
+    event_axis_id = AxisId("readout-event")
+    coordinate_frame = CoordinateFrameId("slender-grid-camera-pixels")
+    schema = DatasetSchema(
+        repeat_axis=AxisSpec(AxisId("repeat"), "repeat", REPEAT, 2),
+        point_axes=(
+            AxisSpec(event_axis_id, "readout event", READOUT_EVENT, 3),
+        ),
+        point_layout=PointLayout.rect_c((3,)),
+        cell_schema=ValueSchema(
+            (
+                AxisSpec(
+                    AxisId("camera-y"),
+                    "camera y",
+                    SPATIAL_Y,
+                    2,
+                    coordinates=(0, 1),
+                    unit="pixel",
+                    coordinate_frame=coordinate_frame,
+                ),
+                AxisSpec(
+                    AxisId("camera-x"),
+                    "camera x",
+                    SPATIAL_X,
+                    site_count,
+                    coordinates=tuple(range(site_count)),
+                    unit="pixel",
+                    coordinate_frame=coordinate_frame,
+                ),
+            ),
+            ValidityContract.value(),
+            np.dtype("<u2"),
+            "camera-count",
+        ),
+    )
+    request = CalibrationAnalysisRequest(
+        layout=CalibrationCaptureLayout(event_axis_id, (0, 1), 2),
+        grid_shape_yx=(1, site_count),
+        box_radius=0,
+        psf_half_width=0,
+        psf_background_padding=1,
+        model_kinds=(ReadoutModelKind.BOX,),
+        default_model_kind=ReadoutModelKind.BOX,
+        histogram_bins=2,
+        max_drop=0,
+        detector_min_distance=1,
+        detector_refine_half=0,
+        expected_centers_xy=np.column_stack(
+            (np.arange(site_count, dtype=float), np.zeros(site_count))
+        ),
+        maximum_site_residual_px=0.1,
+    )
+
+    # This profiles the inherited numerical implementation itself rather than
+    # re-deriving its allocation formula in the test.  Before the resource fix,
+    # the legal 1x1000 request was admitted at ~1.46 MiB while this pairwise
+    # slope workspace peaked above 20 MiB.
+    tracemalloc.start()
+    try:
+        analysis_impl._robust_axis_lattice(
+            np.arange(site_count, dtype=float),
+            site_count,
+        )
+        _, lattice_peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    estimate = estimate_calibration_analysis_peak_bytes(schema, request)
+    assert estimate >= lattice_peak
+
+
 def _numpy_attribute_calls(function, names: set[str]) -> tuple[str, ...]:
     tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
     return tuple(
@@ -713,13 +792,17 @@ def test_multiple_models_read_short_frames_once_and_match_single_feature_oracle(
         default_model_kind=ReadoutModelKind.BOX,
     )
     real_capture_source = analysis_impl._capture_frame_source
+    resolved = calibration_impl._resolve_calibration_source(
+        case.capture,
+        request.layout,
+    )
     short_factory_calls = 0
     short_frames_yielded = 0
 
-    def counted_capture_source(source, layout):
+    def counted_capture_source(source, join):
         group_count, references, shorts, contexts = real_capture_source(
             source,
-            layout,
+            join,
         )
 
         def counted_shorts():
@@ -743,7 +826,7 @@ def test_multiple_models_read_short_frames_once_and_match_single_feature_oracle(
 
     group_count, _references, oracle_shorts, _contexts = real_capture_source(
         case.capture.frame_source,
-        request.layout,
+        resolved.join,
     )
     for model in result.artifact.models:
         expected_signals, expected_validity = analysis_impl._extract_source_stack(

@@ -43,6 +43,7 @@ from .contracts import (
     CameraCaptureDescriptor,
     FrameContract,
     ReadoutBindingKey,
+    _CalibrationCaptureJoin,
 )
 
 
@@ -140,11 +141,19 @@ class CalibrationSourceBinding:
             raise TypeError("layout must be CalibrationCaptureLayout")
 
 
-def derive_calibration_source_binding(
+@dataclass(frozen=True, slots=True)
+class _ResolvedCalibrationSource:
+    source_binding: CalibrationSourceBinding
+    frame_contract: FrameContract
+    readout_physical_context: ReadoutPhysicalContext
+    join: _CalibrationCaptureJoin
+
+
+def _resolve_calibration_source(
     capture: object,
     layout: CalibrationCaptureLayout,
-) -> tuple[CalibrationSourceBinding, FrameContract]:
-    """Resolve source lineage and the complete readout FrameContract once."""
+) -> _ResolvedCalibrationSource:
+    """Resolve source lineage, physical contract, and sparse event join once."""
 
     if not isinstance(layout, CalibrationCaptureLayout):
         raise TypeError("layout must be CalibrationCaptureLayout")
@@ -167,45 +176,46 @@ def derive_calibration_source_binding(
         raise TypeError("capture camera descriptor must be CameraCaptureDescriptor")
     if not isinstance(binding, ReadoutBindingKey):
         raise TypeError("capture readout binding must be ReadoutBindingKey")
-    layout.validate_schema(source.schema)
-    contract = FrameContract.from_calibration_capture(
+    contract, join = FrameContract._resolve_calibration_capture(
         binding,
         descriptor,
         source.schema,
         layout,
     )
-    return CalibrationSourceBinding(reference, layout), contract
+    source_binding = CalibrationSourceBinding(reference, layout)
+    return _ResolvedCalibrationSource(
+        source_binding,
+        contract,
+        derive_calibration_readout_physical_context(
+            capture,
+            layout,
+            contract,
+        ),
+        join,
+    )
 
 
-def validate_calibration_artifact_source_compatibility(
+def _validate_calibration_artifact_source_compatibility(
     artifact: "CalibrationArtifact",
-    capture_resolver,
-) -> object:
+    capture: object,
+) -> _ResolvedCalibrationSource:
     """Re-admit the declared raw capture and compare its physical contract."""
 
     if not isinstance(artifact, CalibrationArtifact):
         raise TypeError("artifact must be CalibrationArtifact")
-    if not callable(capture_resolver):
-        raise TypeError("capture_resolver must be callable")
-    capture = capture_resolver(artifact.source_binding.source_capture_ref)
-    binding, contract = derive_calibration_source_binding(
+    resolved = _resolve_calibration_source(
         capture,
         artifact.source_binding.layout,
     )
-    if binding != artifact.source_binding:
+    if resolved.source_binding != artifact.source_binding:
         raise ValueError("calibration source differs from the resolved capture")
-    if contract != artifact.frame_contract:
+    if resolved.frame_contract != artifact.frame_contract:
         raise ValueError("calibration FrameContract differs from the resolved capture")
-    context = derive_calibration_readout_physical_context(
-        capture,
-        artifact.source_binding.layout,
-        contract,
-    )
-    if context != artifact.readout_physical_context:
+    if resolved.readout_physical_context != artifact.readout_physical_context:
         raise ValueError(
             "calibration readout physical context differs from the resolved capture"
         )
-    return capture
+    return resolved
 
 
 def derive_calibration_readout_physical_context(
@@ -890,9 +900,7 @@ __all__ = [
     "apply_calibration",
     "calibration_retained_array_nbytes",
     "classify_occupancy",
-    "derive_calibration_source_binding",
     "derive_calibration_readout_physical_context",
     "extract_readout_features",
     "readout_runtime_scratch_nbytes",
-    "validate_calibration_artifact_source_compatibility",
 ]

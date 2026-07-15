@@ -8,8 +8,9 @@ row order is never treated as semantic correspondence.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, fields
-from numbers import Integral
+import math
 
 import numpy as np
 
@@ -329,48 +330,53 @@ class CameraCaptureDescriptor:
             raise ValueError("event_settings must cover every READOUT_EVENT index exactly once")
 
 
-@dataclass(frozen=True)
-class CalibrationCaptureBracket:
-    """One context-keyed, event-indexed calibration row bracket."""
+@dataclass(frozen=True, slots=True, eq=False)
+class _CalibrationCaptureJoin:
+    """Compact owner-produced join reused by preflight, analysis, and commit."""
 
-    context_key: tuple[tuple[AxisId, int], ...]
-    reference_point_storage_rows: tuple[tuple[int, int], ...]
-    readout_point_storage_row: int
+    repeat_axis_id: AxisId
+    repeat_count: int
+    context_axis_ids: tuple[AxisId, ...]
+    _context_indices: tuple[tuple[int, ...], ...]
+    _selected_point_storage_rows: tuple[tuple[int, ...], ...]
 
-    def __post_init__(self) -> None:
-        context = tuple(self.context_key)
-        if any(
-            not isinstance(axis_id, AxisId)
-            or isinstance(index, bool)
-            or not isinstance(index, Integral)
-            or index < 0
-            for axis_id, index in context
-        ):
-            raise ValueError("context_key must contain non-negative named logical indices")
-        if len({axis_id for axis_id, _ in context}) != len(context):
-            raise ValueError("context_key axis ids must be unique")
-        references = tuple(
-            (
-                _nonnegative_integer(event_index, "reference event index"),
-                _nonnegative_integer(storage_row, "reference point storage row"),
-            )
-            for event_index, storage_row in self.reference_point_storage_rows
-        )
-        if len({event_index for event_index, _ in references}) != len(references):
-            raise ValueError("reference event indices must be unique")
-        object.__setattr__(
-            self,
-            "context_key",
-            tuple((axis_id, int(index)) for axis_id, index in context),
-        )
-        object.__setattr__(self, "reference_point_storage_rows", references)
-        object.__setattr__(
-            self,
-            "readout_point_storage_row",
-            _nonnegative_integer(
-                self.readout_point_storage_row,
-                "readout point storage row",
-            ),
+    @property
+    def group_count(self) -> int:
+        return self.repeat_count * len(self._context_indices)
+
+    def rows(self) -> Iterator[tuple[int, tuple[int, ...], int]]:
+        for repeat_index in range(self.repeat_count):
+            for selected_rows in self._selected_point_storage_rows:
+                yield (
+                    repeat_index,
+                    selected_rows[:-1],
+                    selected_rows[-1],
+                )
+
+    def contexts(self) -> Iterator[tuple[tuple[AxisId, int], ...]]:
+        for repeat_index in range(self.repeat_count):
+            for indices in self._context_indices:
+                yield (
+                    (self.repeat_axis_id, repeat_index),
+                    *tuple(
+                        (axis_id, int(index))
+                        for axis_id, index in zip(
+                            self.context_axis_ids,
+                            indices,
+                            strict=True,
+                        )
+                    ),
+                )
+
+    def matches_contexts(
+        self,
+        observed: tuple[tuple[tuple[AxisId, int], ...], ...],
+    ) -> bool:
+        if len(observed) != self.group_count:
+            return False
+        return all(
+            expected == actual
+            for expected, actual in zip(self.contexts(), observed, strict=True)
         )
 
 
@@ -403,23 +409,6 @@ class CalibrationCaptureLayout:
         object.__setattr__(self, "reference_event_indices", references)
         object.__setattr__(self, "readout_event_index", readout)
 
-    @classmethod
-    def from_schema(
-        cls,
-        schema: DatasetSchema,
-        *,
-        readout_event_axis_id: AxisId,
-        reference_event_indices: tuple[int, ...],
-        readout_event_index: int,
-    ) -> "CalibrationCaptureLayout":
-        layout = cls(
-            readout_event_axis_id,
-            reference_event_indices,
-            readout_event_index,
-        )
-        layout.validate_schema(schema)
-        return layout
-
     def _axis_position(self, schema: DatasetSchema) -> tuple[int, AxisSpec]:
         if not isinstance(schema, DatasetSchema):
             raise TypeError("schema must be DatasetSchema")
@@ -438,14 +427,10 @@ class CalibrationCaptureLayout:
             raise ValueError("calibration event index is outside the READOUT_EVENT axis")
         return position, axis
 
-    def _rows_by_event_and_context(
-        self,
-        schema: DatasetSchema,
-    ) -> tuple[
-        tuple[AxisId, ...],
-        dict[int, dict[tuple[int, ...], int]],
-    ]:
-        event_position, _ = self._axis_position(schema)
+    def _resolve(self, schema: DatasetSchema) -> _CalibrationCaptureJoin:
+        """Join selected events by named context, never by filtered row position."""
+
+        event_position, _event_axis = self._axis_position(schema)
         context_positions = tuple(
             position
             for position in range(len(schema.point_axes))
@@ -454,72 +439,85 @@ class CalibrationCaptureLayout:
         context_axis_ids = tuple(
             schema.point_axes[position].axis_id for position in context_positions
         )
-        selected = self.reference_event_indices + (self.readout_event_index,)
-        rows: dict[int, dict[tuple[int, ...], int]] = {
-            event_index: {} for event_index in selected
+        selected_events = self.reference_event_indices + (self.readout_event_index,)
+        event_slots = {
+            event_index: slot for slot, event_index in enumerate(selected_events)
         }
+        rows_by_context: dict[tuple[int, ...], list[int | None]] = {}
         for storage_row in range(schema.point_layout.storage_size):
             logical = schema.point_layout.multi_index(storage_row)
-            event_index = logical[event_position]
-            if event_index not in rows:
+            slot = event_slots.get(logical[event_position])
+            if slot is None:
                 continue
             context = tuple(logical[position] for position in context_positions)
-            if context in rows[event_index]:  # pragma: no cover - PointLayout forbids it
-                raise ValueError("duplicate calibration event/context row")
-            rows[event_index][context] = storage_row
-        context_sets = tuple(set(rows[event_index]) for event_index in selected)
-        if not context_sets or not context_sets[0]:
+            rows = rows_by_context.get(context)
+            if rows is None:
+                rows = [None] * len(selected_events)
+                rows_by_context[context] = rows
+            rows[slot] = storage_row
+        if not rows_by_context:
             raise ValueError("calibration selected events have no physical context rows")
-        if any(context != context_sets[0] for context in context_sets[1:]):
-            raise ValueError(
-                "reference/readout events do not have identical logical context sets"
-            )
-        return context_axis_ids, rows
-
-    def validate_schema(self, schema: DatasetSchema) -> None:
-        self._rows_by_event_and_context(schema)
-
-    def brackets(self, schema: DatasetSchema) -> tuple[CalibrationCaptureBracket, ...]:
-        """Join selected events by named context, never by filtered row position."""
-
-        context_axis_ids, rows = self._rows_by_event_and_context(schema)
-        contexts = sorted(rows[self.readout_event_index])
-        return tuple(
-            CalibrationCaptureBracket(
-                context_key=(
-                    (schema.repeat_axis.axis_id, repeat_index),
-                    *tuple(
-                        (axis_id, context[position])
-                        for position, axis_id in enumerate(context_axis_ids)
-                    ),
-                ),
-                reference_point_storage_rows=tuple(
-                    (event_index, rows[event_index][context])
-                    for event_index in self.reference_event_indices
-                ),
-                readout_point_storage_row=rows[self.readout_event_index][context],
-            )
-            for repeat_index in range(schema.repeat_axis.size)
-            for context in contexts
+        context_indices = tuple(sorted(rows_by_context))
+        selected_rows = []
+        for context in context_indices:
+            rows = rows_by_context[context]
+            if any(row is None for row in rows):
+                raise ValueError(
+                    "reference/readout events do not have identical logical context sets"
+                )
+            selected_rows.append(tuple(int(row) for row in rows if row is not None))
+        return _CalibrationCaptureJoin(
+            schema.repeat_axis.axis_id,
+            schema.repeat_axis.size,
+            context_axis_ids,
+            context_indices,
+            tuple(selected_rows),
         )
 
-    def diagnostic_storage_rows_for_event(
+    def _memory_upper_bounds(
         self,
         schema: DatasetSchema,
-        event_index: int,
-    ) -> tuple[int, ...]:
-        """Return raw rows for diagnostics only; this is not a pairing interface."""
+    ) -> tuple[int, int, int]:
+        """Return group-count, join-build, and retained-join upper bounds."""
 
-        event_position, axis = self._axis_position(schema)
-        index = _nonnegative_integer(event_index, "event_index")
-        if index >= axis.size:
-            raise ValueError("event_index is outside the READOUT_EVENT axis")
-        return tuple(
-            storage_row
-            for storage_row in range(schema.point_layout.storage_size)
-            if schema.point_layout.multi_index(storage_row)[event_position] == index
+        event_position, _event_axis = self._axis_position(schema)
+        context_rank = len(schema.point_axes) - 1
+        selected_events = self.reference_event_indices + (self.readout_event_index,)
+        event_count = len(selected_events)
+        logical_contexts = math.prod(
+            axis.size
+            for position, axis in enumerate(schema.point_axes)
+            if position != event_position
         )
-
+        layout = schema.point_layout
+        if layout.storage_size == math.prod(layout.logical_shape):
+            event_row_counts = [logical_contexts] * event_count
+        else:
+            event_slots = {
+                event_index: slot for slot, event_index in enumerate(selected_events)
+            }
+            event_row_counts = [0] * event_count
+            for storage_row in range(layout.storage_size):
+                slot = event_slots.get(layout.multi_index(storage_row)[event_position])
+                if slot is not None:
+                    event_row_counts[slot] += 1
+        complete_contexts = max(event_row_counts)
+        build_contexts = min(logical_contexts, sum(event_row_counts))
+        # Conservative CPython object-graph allowances.  The build bound also
+        # covers an invalid sparse source in which every selected row opens a
+        # different incomplete context before the join rejects it.
+        retained = complete_contexts * (
+            512 + 64 * (context_rank + event_count)
+        )
+        build_peak = (
+            build_contexts * (1024 + 128 * (context_rank + event_count))
+            + retained
+        )
+        return (
+            schema.repeat_axis.size * complete_contexts,
+            build_peak,
+            retained,
+        )
 
 @dataclass(frozen=True)
 class FrameContract:
@@ -590,42 +588,6 @@ class FrameContract:
         )
 
     @classmethod
-    def from_schema(
-        cls,
-        binding: ReadoutBindingKey,
-        descriptor: CameraCaptureDescriptor,
-        schema: DatasetSchema,
-        *,
-        readout_event_index: int,
-    ) -> "FrameContract":
-        return cls._from_schema_impl(
-            binding,
-            descriptor,
-            schema,
-            readout_event_index=readout_event_index,
-            require_physical_event_witness=True,
-        )
-
-    @classmethod
-    def _from_witnessed_schema(
-        cls,
-        binding: ReadoutBindingKey,
-        descriptor: CameraCaptureDescriptor,
-        schema: DatasetSchema,
-        *,
-        readout_event_index: int,
-    ) -> "FrameContract":
-        """Build after a CalibrationCaptureLayout join witnessed this event row."""
-
-        return cls._from_schema_impl(
-            binding,
-            descriptor,
-            schema,
-            readout_event_index=readout_event_index,
-            require_physical_event_witness=False,
-        )
-
-    @classmethod
     def _from_schema_impl(
         cls,
         binding: ReadoutBindingKey,
@@ -680,35 +642,29 @@ class FrameContract:
         )
 
     @classmethod
-    def from_calibration_capture(
+    def _resolve_calibration_capture(
         cls,
         binding: ReadoutBindingKey,
         descriptor: CameraCaptureDescriptor,
         schema: DatasetSchema,
         layout: CalibrationCaptureLayout,
-    ) -> "FrameContract":
+    ) -> tuple["FrameContract", _CalibrationCaptureJoin]:
+        """Resolve the named sparse join once and derive its frame contract."""
+
         if not isinstance(layout, CalibrationCaptureLayout):
             raise TypeError("layout must be CalibrationCaptureLayout")
-        layout.validate_schema(schema)
+        if not isinstance(descriptor, CameraCaptureDescriptor):
+            raise TypeError("descriptor must be CameraCaptureDescriptor")
         if descriptor.readout_event_axis_id != layout.readout_event_axis_id:
             raise ValueError("capture descriptor and calibration layout name different event axes")
-        return cls._from_witnessed_schema(
+        contract = cls._from_schema_impl(
             binding,
             descriptor,
             schema,
             readout_event_index=layout.readout_event_index,
+            require_physical_event_witness=False,
         )
-
-    @property
-    def digest(self) -> str:
-        from .codec import frame_contract_to_tree
-        from zlc_storage import canonical_digest
-
-        return canonical_digest(frame_contract_to_tree(self))
-
-    @property
-    def fingerprint(self) -> str:
-        return self.digest
+        return contract, layout._resolve(schema)
 
     def assert_compatible(
         self,
@@ -718,11 +674,12 @@ class FrameContract:
         *,
         readout_event_index: int,
     ) -> None:
-        observed = type(self).from_schema(
+        observed = type(self)._from_schema_impl(
             binding,
             descriptor,
             schema,
             readout_event_index=readout_event_index,
+            require_physical_event_witness=True,
         )
         if observed == self:
             return
@@ -735,7 +692,6 @@ class FrameContract:
 
 
 __all__ = [
-    "CalibrationCaptureBracket",
     "CalibrationCaptureLayout",
     "CameraCaptureDescriptor",
     "CameraEventReadoutSetting",

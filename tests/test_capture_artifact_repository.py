@@ -64,6 +64,10 @@ from zlc_neutral_atom.runtime import (
 )
 from zlc_neutral_atom.runtime.capture import camera_physical_facts_from_tree
 from zlc_neutral_atom.runtime.capture import FrozenCaptureSpec
+from zlc_neutral_atom.readout.codec import (
+    camera_capture_descriptor_to_tree,
+    readout_binding_key_to_tree,
+)
 from zlc_storage import (
     ContentCorruptionError,
     content_ref_from_tree,
@@ -202,6 +206,12 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
         # or unknown field is not treated as a compatible CaptureArtifact.
         manifest = decode(
             repository._store.read_manifest("capture", reference.manifest_digest)
+        )
+        assert manifest["camera_provenance"]["descriptor"] == (
+            camera_capture_descriptor_to_tree(artifact.camera_provenance.descriptor)
+        )
+        assert manifest["camera_provenance"]["binding"] == (
+            readout_binding_key_to_tree(artifact.camera_provenance.binding)
         )
         assert "readout_event_index" not in manifest["camera_provenance"]
         assert "frame_contract" not in manifest["camera_provenance"]

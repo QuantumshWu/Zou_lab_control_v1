@@ -52,10 +52,14 @@ from .calibration import (
     _annulus_background,
     _extract_readout_arrays,
     _immutable_array,
-    derive_calibration_source_binding,
-    derive_calibration_readout_physical_context,
+    _ResolvedCalibrationSource,
+    _resolve_calibration_source,
 )
-from .contracts import CalibrationCaptureLayout, FrameContract
+from .contracts import (
+    CalibrationCaptureLayout,
+    FrameContract,
+    _CalibrationCaptureJoin,
+)
 from .physical_context import ReadoutPhysicalContext
 
 
@@ -296,14 +300,16 @@ def estimate_calibration_analysis_peak_bytes(
         source_read_scratch_bytes,
         "source_read_scratch_bytes",
     )
-    request.layout.validate_schema(schema)
     if len(schema.cell_schema.data_shape) != 2:
         raise CalibrationAnalysisError("calibration source cells must be 2D frames")
-    group_count = len(request.layout.brackets(schema))
+    group_count, join_build_peak, join_retained = (
+        request.layout._memory_upper_bounds(schema)
+    )
     reference_shots = len(request.layout.reference_event_indices)
     pixels = math.prod(schema.cell_schema.data_shape)
     sites = request.site_count
     model_count = len(request.model_kinds)
+    rows, columns = request.grid_shape_yx
     reference_samples = group_count * reference_shots * sites
     short_samples = group_count * sites
     psf_extent = 2 * request.psf_half_width + 1
@@ -331,8 +337,27 @@ def estimate_calibration_analysis_peak_bytes(
         if request.expected_centers_xy is None
         else request.expected_centers_xy.nbytes
     )
-    return int(
+    # The inherited robust lattice fit retains one Python scalar per unordered
+    # pair on each grid axis while np.median materializes its numeric workspace.
+    # A 1x1000 profile exposed the otherwise-hidden quadratic peak; 64 bytes per
+    # pair covers the measured CPython list/scalar/median overlap.
+    lattice_slope_working_set = 64 * (
+        math.comb(rows, 2) + math.comb(columns, 2)
+    )
+    # The report retains one BimodalFit plus per-model SiteFidelity/diagnostic
+    # object graphs for each site.  Their Python containers dominate the small
+    # ndarray payloads for slender grids and therefore need an explicit bound.
+    site_object_working_set = sites * (1 + model_count) * 1024
+    # CalibrationReport retains one named context tuple per group.  AxisId
+    # values are shared, while tuple/int/container overhead is conservatively
+    # bounded per logical axis rather than inferred from data shape.
+    group_contexts_working_set = group_count * (
+        256 + 128 * len(schema.point_axes)
+    )
+    analysis_peak = int(
         read_scratch
+        + join_retained
+        + group_contexts_working_set
         + frame_working_set
         + reference_working_set
         + short_working_set
@@ -340,7 +365,26 @@ def estimate_calibration_analysis_peak_bytes(
         + ablation_working_set
         + psf_working_set
         + site_admission_working_set
+        + lattice_slope_working_set
+        + site_object_working_set
     )
+    # Publication deliberately performs a fresh source admission.  At that
+    # boundary the report remains live while the compact join is rebuilt, so
+    # its retained arrays/object graphs must overlap the join-build peak even
+    # though scientific scratch has already been released.
+    retained_result = int(
+        group_contexts_working_set
+        + pixels * 16
+        + reference_samples * 8
+        + short_samples * (5 + 10 * model_count)
+        + histogram_working_set
+        + ablation_working_set
+        + psf_working_set
+        + site_admission_working_set
+        + site_object_working_set
+    )
+    finalize_peak = join_build_peak + retained_result
+    return max(join_build_peak, analysis_peak, finalize_peak)
 
 
 @dataclass(frozen=True)
@@ -591,16 +635,29 @@ class CalibrationReport:
         if len({name for name, _version in lineage}) != len(lineage):
             raise ValueError("software_lineage names must be unique")
         lineage = tuple(sorted(lineage))
-        contexts = tuple(
-            tuple((axis_id, _nonnegative_integer(index, "group context index")) for axis_id, index in context)
-            for context in self.group_contexts
-        )
-        if len(contexts) != self.labels.n_groups or len(set(contexts)) != len(contexts):
+        if not isinstance(self.group_contexts, tuple) or any(
+            not isinstance(context, tuple) for context in self.group_contexts
+        ):
+            raise TypeError("group_contexts must be nested tuples")
+        contexts = self.group_contexts
+        if (
+            not contexts
+            or len(contexts) != self.labels.n_groups
+            or len(set(contexts)) != len(contexts)
+        ):
             raise ValueError("group_contexts must uniquely identify every calibration group")
         context_axis_ids = tuple(axis_id for axis_id, _index in contexts[0])
         for context in contexts:
-            if any(not isinstance(axis_id, AxisId) for axis_id, _index in context):
-                raise TypeError("group context keys must use AxisId")
+            if any(
+                not isinstance(item, tuple) or len(item) != 2
+                for item in context
+            ):
+                raise TypeError("group context entries must be (AxisId, int) tuples")
+            if any(
+                not isinstance(axis_id, AxisId) or type(index) is not int or index < 0
+                for axis_id, index in context
+            ):
+                raise TypeError("group context entries must use AxisId and non-negative int")
             if len({axis_id for axis_id, _index in context}) != len(context):
                 raise ValueError("group context axes must be unique")
             if tuple(axis_id for axis_id, _index in context) != context_axis_ids:
@@ -2044,16 +2101,8 @@ def _calibrate_readout_source(
         raise ValueError("calibration requires at least one frame group")
     if reference_shot_count != len(request.layout.reference_event_indices):
         raise ValueError("reference shot count differs from the capture layout")
-    if len(group_contexts) != group_count or len(set(group_contexts)) != group_count:
-        raise ValueError("calibration group contexts must be complete and unique")
-    context_axis_ids = tuple(axis_id for axis_id, _index in group_contexts[0])
-    if any(
-        tuple(axis_id for axis_id, _index in context) != context_axis_ids
-        for context in group_contexts
-    ):
-        raise ValueError(
-            "calibration group contexts must share the same ordered AxisIds"
-        )
+    if len(group_contexts) != group_count:
+        raise ValueError("calibration group contexts must be complete")
     image_shape = frame_contract.frame_schema.data_shape
     total = np.zeros(image_shape, dtype=float)
     count_dtype = np.min_scalar_type(group_count * reference_shot_count)
@@ -2283,7 +2332,7 @@ def _calibrate_readout_frames(
 
 def _capture_frame_source(
     source: CaptureFrameSource,
-    layout: CalibrationCaptureLayout,
+    join: _CalibrationCaptureJoin,
 ) -> tuple[
     int,
     Callable[[], Iterator[tuple[np.ndarray, np.ndarray]]],
@@ -2292,17 +2341,10 @@ def _capture_frame_source(
 ]:
     if not isinstance(source, CaptureFrameSource):
         raise TypeError("source must be CaptureFrameSource")
+    if not isinstance(join, _CalibrationCaptureJoin):
+        raise TypeError("join must be _CalibrationCaptureJoin")
     if len(source.schema.cell_schema.data_shape) != 2:
         raise CalibrationAnalysisError("calibration source cells must be 2D frames")
-    brackets = layout.brackets(source.schema)
-    repeat_axis_id = source.schema.repeat_axis.axis_id
-    normalized = []
-    for bracket in brackets:
-        context = dict(bracket.context_key)
-        if repeat_axis_id not in context:
-            raise CalibrationAnalysisError("calibration bracket omits repeat AxisId")
-        normalized.append((bracket, context[repeat_axis_id]))
-    frozen = tuple(normalized)
 
     def frame_sequence(
         cell_sequence: Callable[[], Iterator[DatasetCellAddress]],
@@ -2325,15 +2367,15 @@ def _capture_frame_source(
             )
 
     def reference_cells() -> Iterator[DatasetCellAddress]:
-        for bracket, repeat in frozen:
-            for _event, row in bracket.reference_point_storage_rows:
+        for repeat, reference_rows, _readout_row in join.rows():
+            for row in reference_rows:
                 yield DatasetCellAddress(repeat, row)
 
     def short_cells() -> Iterator[DatasetCellAddress]:
-        for bracket, repeat in frozen:
+        for repeat, _reference_rows, readout_row in join.rows():
             yield DatasetCellAddress(
                 repeat,
-                bracket.readout_point_storage_row,
+                readout_row,
             )
 
     def reference_sequence() -> Iterator[tuple[np.ndarray, np.ndarray]]:
@@ -2342,8 +2384,38 @@ def _capture_frame_source(
     def short_sequence() -> Iterator[tuple[np.ndarray, np.ndarray]]:
         return frame_sequence(short_cells)
 
-    contexts = tuple(tuple(bracket.context_key) for bracket, _repeat in frozen)
-    return len(frozen), reference_sequence, short_sequence, contexts
+    contexts = tuple(join.contexts())
+    return join.group_count, reference_sequence, short_sequence, contexts
+
+
+def _compute_calibration_resolved(
+    capture: object,
+    request: CalibrationAnalysisRequest,
+    resolved: _ResolvedCalibrationSource,
+) -> CalibrationComputation:
+    """Run the science core from facts bound by one source resolution."""
+
+    try:
+        source = capture.frame_source  # type: ignore[attr-defined]
+    except AttributeError as exc:
+        raise TypeError("capture must be a resolved raw CaptureArtifact") from exc
+    if not isinstance(source, CaptureFrameSource):
+        raise TypeError("capture.frame_source must be CaptureFrameSource")
+    group_count, reference_frames, short_frames, contexts = _capture_frame_source(
+        source,
+        resolved.join,
+    )
+    return _calibrate_readout_source(
+        group_count=group_count,
+        reference_shot_count=len(request.layout.reference_event_indices),
+        reference_frames=reference_frames,
+        short_frames=short_frames,
+        group_contexts=contexts,
+        source_binding=resolved.source_binding,
+        frame_contract=resolved.frame_contract,
+        readout_physical_context=resolved.readout_physical_context,
+        request=request,
+    )
 
 
 def compute_calibration(
@@ -2358,35 +2430,33 @@ def compute_calibration(
 
     if not isinstance(capture, CaptureArtifact):
         raise TypeError("capture must be a resolved raw CaptureArtifact")
-    try:
-        source = capture.frame_source  # type: ignore[attr-defined]
-    except AttributeError as exc:
-        raise TypeError("capture must be a resolved raw CaptureArtifact") from exc
-    if not isinstance(source, CaptureFrameSource):
-        raise TypeError("capture.frame_source must be CaptureFrameSource")
-    source_binding, frame_contract = derive_calibration_source_binding(
-        capture,
-        request.layout,
-    )
-    readout_physical_context = derive_calibration_readout_physical_context(
-        capture,
-        request.layout,
-        frame_contract,
-    )
-    group_count, reference_frames, short_frames, contexts = _capture_frame_source(
+    resolved = _resolve_calibration_source(capture, request.layout)
+    return _compute_calibration_resolved(capture, request, resolved)
+
+
+def _analyze_calibration_resolved(
+    source: object,
+    request: CalibrationAnalysisRequest,
+    resolved: _ResolvedCalibrationSource,
+) -> CalibrationAnalysisResult:
+    from zlc_neutral_atom.artifacts.capture import AdmittedCapture
+
+    if type(source) is not AdmittedCapture:
+        raise TypeError("calibration analysis requires an exact AdmittedCapture")
+    if not isinstance(request, CalibrationAnalysisRequest):
+        raise TypeError("request must be CalibrationAnalysisRequest")
+    if request.expected_centers_xy is None:
+        raise CalibrationAnalysisError(
+            "authoritative calibration requires expected_centers_xy and "
+            "maximum_site_residual_px"
+        )
+    if not isinstance(resolved, _ResolvedCalibrationSource):
+        raise TypeError("resolved must be _ResolvedCalibrationSource")
+    computation = _compute_calibration_resolved(source.artifact, request, resolved)
+    return CalibrationAnalysisResult._from_admitted_analysis(
+        _ADMITTED_ANALYSIS_TOKEN,
+        computation,
         source,
-        request.layout,
-    )
-    return _calibrate_readout_source(
-        group_count=group_count,
-        reference_shot_count=len(request.layout.reference_event_indices),
-        reference_frames=reference_frames,
-        short_frames=short_frames,
-        group_contexts=contexts,
-        source_binding=source_binding,
-        frame_contract=frame_contract,
-        readout_physical_context=readout_physical_context,
-        request=request,
     )
 
 
@@ -2402,17 +2472,8 @@ def analyze_calibration(
         raise TypeError("calibration analysis requires an exact AdmittedCapture")
     if not isinstance(request, CalibrationAnalysisRequest):
         raise TypeError("request must be CalibrationAnalysisRequest")
-    if request.expected_centers_xy is None:
-        raise CalibrationAnalysisError(
-            "authoritative calibration requires expected_centers_xy and "
-            "maximum_site_residual_px"
-        )
-    computation = compute_calibration(source.artifact, request)
-    return CalibrationAnalysisResult._from_admitted_analysis(
-        _ADMITTED_ANALYSIS_TOKEN,
-        computation,
-        source,
-    )
+    resolved = _resolve_calibration_source(source.artifact, request.layout)
+    return _analyze_calibration_resolved(source, request, resolved)
 
 
 __all__ = [

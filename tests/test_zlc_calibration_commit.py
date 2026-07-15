@@ -52,7 +52,12 @@ from zlc_neutral_atom.readout.calibration_repository import (
 )
 import zlc_neutral_atom.readout.calibration_repository as repository_impl
 import zlc_neutral_atom.readout.analysis as analysis_impl
+import zlc_neutral_atom.readout.calibration as calibration_impl
 from zlc_neutral_atom.readout.contracts import CalibrationCaptureLayout
+from zlc_neutral_atom.readout.codec import (
+    calibration_capture_layout_to_tree,
+    frame_contract_to_tree,
+)
 from zlc_neutral_atom.runtime import (
     CancelOutcome, DatasetCellAddress, DatasetMaterializerSpec,
     MemoryQuarantineJournal, MinimalPipelineSpec, PipelineMemoryProfile,
@@ -392,6 +397,17 @@ def _commit(
 def test_real_analysis_artifact_and_report_codec_roundtrip(capture_fixture):
     result = capture_fixture.result
     artifact_payload = encode_calibration_artifact(result.artifact)
+    artifact_tree = decode(artifact_payload)
+    assert artifact_tree["source"]["layout"] == calibration_capture_layout_to_tree(
+        result.artifact.source_binding.layout
+    )
+    assert artifact_tree["frame_contract"] == frame_contract_to_tree(
+        result.artifact.frame_contract
+    )
+    noncanonical = decode(artifact_payload)
+    noncanonical["source"]["layout"]["reference_event_indices"].reverse()
+    with pytest.raises(ValueError, match="non-canonical"):
+        decode_calibration_artifact(encode(noncanonical))
     average_payload = encode_calibration_reference_average(
         result.report.reference_average
     )
@@ -751,21 +767,21 @@ def test_committed_artifact_remains_loadable_if_diagnostic_blob_is_lost(
 
 
 def test_cancel_and_execute_failure_never_publish(capture_fixture, tmp_path, monkeypatch):
-    real_analyze = repository_impl.analyze_calibration
+    real_analyze = repository_impl._analyze_calibration_resolved
 
     cancel_repository = _repository(tmp_path, "cancelled")
     started = threading.Event()
     release = threading.Event()
     cancelled_result: list[CalibrationAnalysisResult] = []
 
-    def paused(capture, request):
-        result = real_analyze(capture, request)
+    def paused(capture, request, resolved):
+        result = real_analyze(capture, request, resolved)
         cancelled_result.append(result)
         started.set()
         assert release.wait(10.0)
         return result
 
-    monkeypatch.setattr(repository_impl, "analyze_calibration", paused)
+    monkeypatch.setattr(repository_impl, "_analyze_calibration_resolved", paused)
     handle = _controller().start(_plan(capture_fixture, cancel_repository))
     assert started.wait(20.0)
     assert handle.cancel("test cancellation") is CancelOutcome.REQUESTED
@@ -783,12 +799,12 @@ def test_cancel_and_execute_failure_never_publish(capture_fixture, tmp_path, mon
     failed_repository = _repository(tmp_path, "failed")
     failed_result: list[CalibrationAnalysisResult] = []
 
-    def failed(capture, request):
-        result = real_analyze(capture, request)
+    def failed(capture, request, resolved):
+        result = real_analyze(capture, request, resolved)
         failed_result.append(result)
         raise RuntimeError("injected analysis failure")
 
-    monkeypatch.setattr(repository_impl, "analyze_calibration", failed)
+    monkeypatch.setattr(repository_impl, "_analyze_calibration_resolved", failed)
     failed_handle = _controller().start(_plan(capture_fixture, failed_repository))
     with pytest.raises(RunFailed, match="injected analysis failure"):
         failed_handle.result(20.0)
@@ -814,13 +830,28 @@ def test_analysis_memory_budget_rejects_before_scientific_execute(
         source_read_scratch_bytes=source.max_read_scratch_bytes,
     )
     called = False
+    resolved = False
 
     def forbidden_analysis(*_args, **_kwargs):
         nonlocal called
         called = True
         raise AssertionError("analysis ran after memory admission failed")
 
-    monkeypatch.setattr(repository_impl, "analyze_calibration", forbidden_analysis)
+    def forbidden_resolution(*_args, **_kwargs):
+        nonlocal resolved
+        resolved = True
+        raise AssertionError("join resolved before memory admission failed")
+
+    monkeypatch.setattr(
+        repository_impl,
+        "_analyze_calibration_resolved",
+        forbidden_analysis,
+    )
+    monkeypatch.setattr(
+        repository_impl,
+        "_resolve_calibration_source",
+        forbidden_resolution,
+    )
     plan = compile_calibration_artifact_plan(
         capture_fixture.reference,
         capture_fixture.repository,
@@ -835,7 +866,42 @@ def test_analysis_memory_budget_rejects_before_scientific_execute(
         assert failure.value.primary is not None
         assert failure.value.primary.original_type == "MemoryError"
         assert not called
+        assert not resolved
         assert repository.startup_reconciliations == ()
+    finally:
+        repository.close()
+
+
+def test_each_capture_admission_resolves_the_calibration_join_once(
+    capture_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    repository = _repository(tmp_path, "single-resolution-per-admission")
+    real_resolve = calibration_impl._resolve_calibration_source
+    resolutions = 0
+
+    def counted_resolution(capture, layout):
+        nonlocal resolutions
+        resolutions += 1
+        return real_resolve(capture, layout)
+
+    monkeypatch.setattr(
+        repository_impl,
+        "_resolve_calibration_source",
+        counted_resolution,
+    )
+    monkeypatch.setattr(
+        calibration_impl,
+        "_resolve_calibration_source",
+        counted_resolution,
+    )
+    try:
+        _handle, reference = _commit(capture_fixture, repository)
+        assert repository.has(reference)
+        # One preflight admission feeds execute; the publication boundary
+        # deliberately performs one fresh admission and one fresh join.
+        assert resolutions == 2
     finally:
         repository.close()
 
@@ -935,8 +1001,8 @@ def test_source_capture_frame_contract_is_rechecked_before_publication(
     )
     monkeypatch.setattr(
         analysis_impl,
-        "compute_calibration",
-        lambda _capture, _request: mismatched,
+        "_compute_calibration_resolved",
+        lambda _capture, _request, _resolved: mismatched,
     )
     handle = _controller().start(_plan(capture_fixture, repository))
     with pytest.raises(RunFailed) as failure:
@@ -968,8 +1034,8 @@ def test_source_capture_pulse_context_is_rederived_before_publication(
     mismatched = CalibrationComputation(mismatched_artifact, original.report)
     monkeypatch.setattr(
         analysis_impl,
-        "compute_calibration",
-        lambda _capture, _request: mismatched,
+        "_compute_calibration_resolved",
+        lambda _capture, _request, _resolved: mismatched,
     )
 
     handle = _controller().start(_plan(capture_fixture, repository))
@@ -995,8 +1061,8 @@ def test_pure_calibration_computation_cannot_enter_final_commit(
     )
     monkeypatch.setattr(
         repository_impl,
-        "analyze_calibration",
-        lambda _source, _request: pure,
+        "_analyze_calibration_resolved",
+        lambda _source, _request, _resolved: pure,
     )
 
     handle = _controller().start(_plan(capture_fixture, repository))
@@ -1029,8 +1095,8 @@ def test_group_contexts_are_rejoined_to_the_admitted_capture_before_publish(
     )
     monkeypatch.setattr(
         analysis_impl,
-        "compute_calibration",
-        lambda _capture, _request: mismatched,
+        "_compute_calibration_resolved",
+        lambda _capture, _request, _resolved: mismatched,
     )
     handle = _controller().start(_plan(capture_fixture, repository))
     try:

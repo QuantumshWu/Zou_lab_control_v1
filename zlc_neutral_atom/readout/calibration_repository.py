@@ -9,6 +9,7 @@ commit coordinator.  This module deliberately adds no second proof graph.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 from pathlib import Path
 import threading
@@ -54,13 +55,15 @@ from .analysis import (
     CalibrationAnalysisResult,
     CalibrationComputation,
     CalibrationReport,
-    analyze_calibration,
+    _analyze_calibration_resolved,
     estimate_calibration_analysis_peak_bytes,
 )
 from .calibration import (
     CalibrationArtifact,
     ResolvedCalibration,
-    validate_calibration_artifact_source_compatibility,
+    _ResolvedCalibrationSource,
+    _resolve_calibration_source,
+    _validate_calibration_artifact_source_compatibility,
 )
 from .calibration_codec import (
     calibration_report_blob_refs,
@@ -91,6 +94,12 @@ _METADATA_DECODE_MULTIPLIER = 8
 _MANIFEST_FIELDS = frozenset(
     {"format", "repository_id", "artifact_blob", "report_blob"}
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedCalibrationAnalysis:
+    source: "AdmittedCapture"
+    resolved: _ResolvedCalibrationSource
 
 
 def _manifest_payload(
@@ -395,18 +404,15 @@ class CalibrationRepository:
     def _validate_source_admission(
         artifact: CalibrationArtifact,
         source: "AdmittedCapture",
-    ) -> None:
+    ) -> _ResolvedCalibrationSource:
         from zlc_neutral_atom.artifacts.capture import AdmittedCapture
 
         if type(source) is not AdmittedCapture:
             raise TypeError("source must be an exact AdmittedCapture")
-
-        def resolve(reference: CaptureArtifactRef):
-            if reference != source.reference:
-                raise ValueError("calibration requested another source capture")
-            return source.artifact
-
-        validate_calibration_artifact_source_compatibility(artifact, resolve)
+        return _validate_calibration_artifact_source_compatibility(
+            artifact,
+            source.artifact,
+        )
 
     def admit(
         self,
@@ -511,12 +517,8 @@ class CalibrationRepository:
             raise TypeError("calibration commit requires PostSafetyContext")
         if type(result) is not CalibrationAnalysisResult:
             raise TypeError("result must be CalibrationAnalysisResult")
-        self._validate_source_admission(result.artifact, source)
-        expected_contexts = tuple(
-            tuple(bracket.context_key)
-            for bracket in result.report.request.layout.brackets(source.artifact.frame_source.schema)
-        )
-        if result.report.group_contexts != expected_contexts:
+        resolved = self._validate_source_admission(result.artifact, source)
+        if not resolved.join.matches_contexts(result.report.group_contexts):
             raise ValueError(
                 "calibration report group contexts differ from the admitted source"
             )
@@ -653,7 +655,7 @@ def compile_calibration_artifact_plan(
     if source_capture_ref.repository_id != capture_repository.repository_id:
         raise ValueError("source capture belongs to another repository")
 
-    def preflight(context: RunContext) -> AdmittedCapture:
+    def preflight(context: RunContext) -> _PreparedCalibrationAnalysis:
         context.checkpoint()
         source = capture_repository.admit(source_capture_ref)
         frame_source = source.artifact.frame_source
@@ -667,23 +669,28 @@ def compile_calibration_artifact_plan(
                 f"calibration analysis requires {estimated_peak} bytes; "
                 f"limit {memory_limit}"
             )
+        resolved = _resolve_calibration_source(source.artifact, request.layout)
         context.checkpoint()
-        return source
+        return _PreparedCalibrationAnalysis(source, resolved)
 
     def execute(
         context: RunContext,
-        source: AdmittedCapture,
+        prepared: _PreparedCalibrationAnalysis,
     ) -> CalibrationAnalysisResult:
-        if type(source) is not AdmittedCapture:
+        if type(prepared) is not _PreparedCalibrationAnalysis:
             raise TypeError("calibration execute requires its preflight admission")
         context.checkpoint()
-        result = analyze_calibration(source, request)
+        result = _analyze_calibration_resolved(
+            prepared.source,
+            request,
+            prepared.resolved,
+        )
         context.checkpoint()
         return result
 
     def cleanup(
         _context: RunContext,
-        _prepared: AdmittedCapture | None,
+        _prepared: _PreparedCalibrationAnalysis | None,
         _primary: BaseException | None,
     ) -> CleanupReport:
         return CleanupReport()

@@ -399,7 +399,6 @@ class CameraCaptureDescription:
                 "camera_arm_spec_fingerprint",
             ),
         )
-        descriptor.validate_schema(schema)
         return descriptor
 
 

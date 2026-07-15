@@ -20,8 +20,8 @@ from zlc_data import (
     PointLayout,
     ValidityContract,
     ValueSchema,
+    value_schema_to_tree,
 )
-from zlc_storage import encode
 from zlc_neutral_atom.readout.contracts import (
     CalibrationCaptureLayout,
     CameraCaptureDescriptor,
@@ -34,18 +34,6 @@ from zlc_neutral_atom.readout.codec import (
     calibration_capture_layout_to_tree,
     camera_capture_descriptor_from_tree,
     camera_capture_descriptor_to_tree,
-    camera_event_readout_setting_from_tree,
-    camera_event_readout_setting_to_tree,
-    decode_calibration_capture_layout,
-    decode_camera_capture_descriptor,
-    decode_camera_event_readout_setting,
-    decode_frame_contract,
-    decode_readout_binding_key,
-    encode_calibration_capture_layout,
-    encode_camera_capture_descriptor,
-    encode_camera_event_readout_setting,
-    encode_frame_contract,
-    encode_readout_binding_key,
     frame_contract_from_tree,
     frame_contract_to_tree,
     readout_binding_key_from_tree,
@@ -148,24 +136,20 @@ def _schema(
     )
 
 
-def _calibration_layout(schema: DatasetSchema) -> CalibrationCaptureLayout:
-    return CalibrationCaptureLayout.from_schema(
-        schema,
-        readout_event_axis_id=EVENT,
-        reference_event_indices=(2, 0),
-        readout_event_index=1,
-    )
+def _calibration_layout() -> CalibrationCaptureLayout:
+    return CalibrationCaptureLayout(EVENT, (2, 0), 1)
 
 
 def _contract() -> FrameContract:
     descriptor = _descriptor()
     schema = _schema(descriptor=descriptor)
-    return FrameContract.from_calibration_capture(
+    contract, _join = FrameContract._resolve_calibration_capture(
         BINDING,
         descriptor,
         schema,
-        _calibration_layout(schema),
+        _calibration_layout(),
     )
+    return contract
 
 
 def _physical_facts() -> CameraPhysicalFacts:
@@ -375,22 +359,15 @@ def test_multievent_calibration_contract_matches_same_single_event_occupancy() -
     calibrated = _contract()
     occupancy = _single_event_descriptor()
     occupancy_schema = _single_event_schema(occupancy)
-    observed = FrameContract.from_schema(
-        BINDING,
-        occupancy,
-        occupancy_schema,
-        readout_event_index=0,
-    )
-    assert observed == calibrated
     calibrated.assert_compatible(
         BINDING,
         occupancy,
         occupancy_schema,
         readout_event_index=0,
     )
-    assert observed.exposure_seconds == 0.002
-    assert observed.gain == 2.0
-    assert observed.readout_mode == "low-noise"
+    assert calibrated.exposure_seconds == 0.002
+    assert calibrated.gain == 2.0
+    assert calibrated.readout_mode == "low-noise"
 
 
 def test_reference_schedule_and_capture_fingerprint_do_not_leak_into_frame_applicability() -> None:
@@ -415,12 +392,10 @@ def test_reference_schedule_and_capture_fingerprint_do_not_leak_into_frame_appli
         camera_arm_spec_fingerprint="c" * 64,
     )
     schema = _schema(descriptor=descriptor)
-    assert FrameContract.from_calibration_capture(
-        BINDING, descriptor, schema, _calibration_layout(schema)
-    ) == _contract()
-    assert len(decode_camera_capture_descriptor(
-        encode_camera_capture_descriptor(descriptor)
-    ).event_settings) == 3
+    observed, _join = FrameContract._resolve_calibration_capture(
+        BINDING, descriptor, schema, _calibration_layout()
+    )
+    assert observed == _contract()
 
 
 @pytest.mark.parametrize(
@@ -522,11 +497,11 @@ def test_binding_validity_and_selected_event_metadata_mismatch_fail_closed() -> 
 @pytest.mark.parametrize("dtype", [np.dtype("uint8"), np.dtype("int32"), np.dtype("float32")])
 def test_real_integer_and_float_count_dtypes_are_supported(dtype: np.dtype) -> None:
     descriptor = _descriptor(dtype=dtype)
-    FrameContract.from_calibration_capture(
+    FrameContract._resolve_calibration_capture(
         BINDING,
         descriptor,
         _schema(descriptor=descriptor),
-        _calibration_layout(_schema(descriptor=descriptor)),
+        _calibration_layout(),
     )
 
 
@@ -545,7 +520,7 @@ def _axes_with_event_at(position: int) -> tuple[AxisSpec, ...]:
     return tuple(axes)
 
 
-def _assert_brackets_preserve_context(
+def _assert_join_preserves_context(
     schema: DatasetSchema,
     capture_layout: CalibrationCaptureLayout,
 ) -> None:
@@ -557,19 +532,30 @@ def _assert_brackets_preserve_context(
         schema.repeat_axis.axis_id,
         *(schema.point_axes[position].axis_id for position in context_positions),
     )
-    brackets = capture_layout.brackets(schema)
-    assert len(brackets) == schema.repeat_axis.size * 4
-    assert len({bracket.context_key for bracket in brackets}) == len(brackets)
-    for bracket in brackets:
-        assert tuple(axis_id for axis_id, _ in bracket.context_key) == expected_axis_ids
-        repeat_index = bracket.context_key[0][1]
+    join = capture_layout._resolve(schema)
+    contexts = tuple(join.contexts())
+    rows = tuple(join.rows())
+    assert join.group_count == schema.repeat_axis.size * 4
+    assert len(contexts) == len(rows) == join.group_count
+    assert len(set(contexts)) == len(contexts)
+    for context_key, (repeat_index, reference_rows, readout_row) in zip(
+        contexts,
+        rows,
+        strict=True,
+    ):
+        assert tuple(axis_id for axis_id, _ in context_key) == expected_axis_ids
+        assert repeat_index == context_key[0][1]
         assert 0 <= repeat_index < schema.repeat_axis.size
-        context = tuple(index for _, index in bracket.context_key[1:])
-        for event_index, storage_row in bracket.reference_point_storage_rows:
+        context = tuple(index for _, index in context_key[1:])
+        for event_index, storage_row in zip(
+            capture_layout.reference_event_indices,
+            reference_rows,
+            strict=True,
+        ):
             logical = schema.point_layout.multi_index(storage_row)
             assert logical[event_position] == event_index
             assert tuple(logical[position] for position in context_positions) == context
-        logical = schema.point_layout.multi_index(bracket.readout_point_storage_row)
+        logical = schema.point_layout.multi_index(readout_row)
         assert logical[event_position] == capture_layout.readout_event_index
         assert tuple(logical[position] for position in context_positions) == context
 
@@ -584,19 +570,15 @@ def test_context_join_handles_event_axis_anywhere_in_c_and_f_layouts(
     shape = tuple(axis.size for axis in axes)
     point_layout = PointLayout.rect_c(shape) if order == "C" else PointLayout.rect_f(shape)
     schema = _schema(point_axes=axes, point_layout=point_layout)
-    capture_layout = CalibrationCaptureLayout.from_schema(
-        schema,
-        readout_event_axis_id=EVENT,
-        reference_event_indices=(0, 2),
-        readout_event_index=1,
-    )
-    _assert_brackets_preserve_context(schema, capture_layout)
-    assert FrameContract.from_calibration_capture(
+    capture_layout = CalibrationCaptureLayout(EVENT, (0, 2), 1)
+    _assert_join_preserves_context(schema, capture_layout)
+    resolved, _join = FrameContract._resolve_calibration_capture(
         BINDING,
         _descriptor(),
         schema,
         capture_layout,
-    ).exposure_seconds == 0.002
+    )
+    assert resolved.exposure_seconds == 0.002
 
 
 @pytest.mark.parametrize("event_position", [0, 1, 2])
@@ -613,13 +595,34 @@ def test_random_explicit_permutations_join_by_context_not_filtered_row_position(
             point_axes=axes,
             point_layout=PointLayout.explicit(shape, tuple(shuffled)),
         )
-        capture_layout = CalibrationCaptureLayout.from_schema(
-            schema,
-            readout_event_axis_id=EVENT,
-            reference_event_indices=(2, 0),
-            readout_event_index=1,
-        )
-        _assert_brackets_preserve_context(schema, capture_layout)
+        capture_layout = CalibrationCaptureLayout(EVENT, (2, 0), 1)
+        _assert_join_preserves_context(schema, capture_layout)
+
+
+def test_join_keeps_repeat_lazy_when_event_is_the_only_point_axis() -> None:
+    event_axis = AxisSpec(EVENT, "readout event", READOUT_EVENT, 3)
+    schema = _schema(
+        point_axes=(event_axis,),
+        point_layout=PointLayout.rect_c((3,)),
+    )
+    layout = CalibrationCaptureLayout(EVENT, (0, 2), 1)
+    join = layout._resolve(schema)
+    assert join.group_count == schema.repeat_axis.size
+    assert tuple(join.contexts()) == tuple(
+        ((schema.repeat_axis.axis_id, repeat),)
+        for repeat in range(schema.repeat_axis.size)
+    )
+
+    many_repeat_schema = replace(
+        schema,
+        repeat_axis=replace(schema.repeat_axis, size=1000),
+    )
+    many_repeat_join = layout._resolve(many_repeat_schema)
+    assert many_repeat_join._context_indices == join._context_indices == ((),)
+    assert many_repeat_join._selected_point_storage_rows == (
+        join._selected_point_storage_rows
+    )
+    assert many_repeat_join.group_count == 1000
 
 
 @pytest.mark.parametrize(
@@ -638,28 +641,18 @@ def test_missing_or_unbalanced_context_sets_fail_closed(
 ) -> None:
     schema = _schema(point_layout=PointLayout.explicit((3, 2), mapping))
     with pytest.raises(ValueError, match="context"):
-        CalibrationCaptureLayout.from_schema(
+        CalibrationCaptureLayout(EVENT, (0, 2), 1)._resolve(schema)
+    with pytest.raises(ValueError, match="context"):
+        FrameContract._resolve_calibration_capture(
+            BINDING,
+            _descriptor(),
             schema,
-            readout_event_axis_id=EVENT,
-            reference_event_indices=(0, 2),
-            readout_event_index=1,
+            CalibrationCaptureLayout(EVENT, (0, 2), 1),
         )
 
 
-def test_raw_event_rows_are_diagnostic_only_and_no_pairing_lists_are_exposed() -> None:
-    schema = _schema()
-    layout = _calibration_layout(schema)
-    assert layout.diagnostic_storage_rows_for_event(schema, 1) == (2, 3)
-    assert not hasattr(layout, "reference_storage_rows")
-    assert not hasattr(layout, "readout_storage_rows")
-
-
-def test_frame_contract_is_canonical_and_immutable() -> None:
+def test_frame_contract_is_immutable() -> None:
     contract = _contract()
-    assert len(contract.digest) == 64
-    assert contract.fingerprint == contract.digest
-    assert decode_frame_contract(encode_frame_contract(contract)) == contract
-    assert frame_contract_from_tree(frame_contract_to_tree(contract)) == contract
     with pytest.raises(FrozenInstanceError):
         contract.binding = ReadoutBindingKey("other")  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
@@ -684,79 +677,91 @@ def test_event_setting_permutation_has_one_canonical_capture_descriptor() -> Non
         event_settings=(_event_settings()[2], _event_settings()[0], _event_settings()[1])
     )
     assert permuted == forward
-    assert encode_camera_capture_descriptor(permuted) == encode_camera_capture_descriptor(
+    assert camera_capture_descriptor_to_tree(
+        permuted
+    ) == camera_capture_descriptor_to_tree(
         forward
     )
 
 
-@pytest.mark.parametrize(
-    ("value", "encoder", "decoder", "projector", "parser"),
-    [
-        (
-            BINDING,
-            encode_readout_binding_key,
-            decode_readout_binding_key,
-            readout_binding_key_to_tree,
-            readout_binding_key_from_tree,
-        ),
-        (
-            _event_settings()[0],
-            encode_camera_event_readout_setting,
-            decode_camera_event_readout_setting,
-            camera_event_readout_setting_to_tree,
-            camera_event_readout_setting_from_tree,
-        ),
-        (
-            _descriptor(),
-            encode_camera_capture_descriptor,
-            decode_camera_capture_descriptor,
-            camera_capture_descriptor_to_tree,
-            camera_capture_descriptor_from_tree,
-        ),
-        (
-            _contract(),
-            encode_frame_contract,
-            decode_frame_contract,
-            frame_contract_to_tree,
-            frame_contract_from_tree,
-        ),
-        (
-            CalibrationCaptureLayout(EVENT, (2, 0), 1),
-            encode_calibration_capture_layout,
-            decode_calibration_capture_layout,
-            calibration_capture_layout_to_tree,
-            calibration_capture_layout_from_tree,
-        ),
-    ],
-)
-def test_every_persistent_value_has_strict_current_canonical_codec(
-    value: object,
-    encoder: object,
-    decoder: object,
-    projector: object,
-    parser: object,
-) -> None:
-    encoded = encoder(value)  # type: ignore[operator]
-    assert decoder(encoded) == value  # type: ignore[operator]
-    tree = projector(value)  # type: ignore[operator]
-    tree["unknown_future_field"] = "forbidden"
-    with pytest.raises(ValueError):
-        parser(tree)  # type: ignore[operator]
-    with pytest.raises(ValueError):
-        decoder(encode(tree))  # type: ignore[operator]
+def test_embedded_readout_trees_match_an_independent_field_oracle() -> None:
+    common = {
+        "camera_identity": "qcm-camera:serial-42",
+        "sensor_identity": "qcm-sensor:serial-42",
+        "optical_path": "science-imaging-v1",
+        "sensor_shape_yx": [100, 120],
+        "roi_origin_yx": [10, 20],
+        "roi_shape_yx": [40, 60],
+        "binning_yx": [2, 3],
+        "spatial_y_axis_id": "camera-y",
+        "spatial_x_axis_id": "camera-x",
+        "coordinate_frame": "qcm-camera-pixels",
+        "dtype": "<u2",
+        "count_unit": "camera-count",
+    }
+    descriptor_tree = {
+        **common,
+        "readout_event_axis_id": "readout-event",
+        "event_settings": [
+            {
+                "event_index": 0,
+                "exposure_seconds": 0.001,
+                "gain": 1.0,
+                "readout_mode": "fast",
+                "opaque_frame_settings_fingerprint": "0" * 64,
+            },
+            {
+                "event_index": 1,
+                "exposure_seconds": 0.002,
+                "gain": 2.0,
+                "readout_mode": "low-noise",
+                "opaque_frame_settings_fingerprint": "1" * 64,
+            },
+            {
+                "event_index": 2,
+                "exposure_seconds": 0.003,
+                "gain": 3.0,
+                "readout_mode": "low-noise",
+                "opaque_frame_settings_fingerprint": "2" * 64,
+            },
+        ],
+        "camera_arm_spec_fingerprint": "a" * 64,
+    }
+    contract = _contract()
+    frame_tree = {
+        "binding": {"value": "primary-readout"},
+        **common,
+        "exposure_seconds": 0.002,
+        "gain": 2.0,
+        "readout_mode": "low-noise",
+        "opaque_frame_settings_fingerprint": "1" * 64,
+        "frame_schema": value_schema_to_tree(contract.frame_schema),
+    }
+    layout = CalibrationCaptureLayout(EVENT, (2, 0), 1)
+    layout_tree = {
+        "readout_event_axis_id": "readout-event",
+        "reference_event_indices": [0, 2],
+        "readout_event_index": 1,
+    }
 
+    assert camera_capture_descriptor_to_tree(_descriptor()) == descriptor_tree
+    assert camera_capture_descriptor_from_tree(descriptor_tree) == _descriptor()
+    assert frame_contract_to_tree(contract) == frame_tree
+    assert frame_contract_from_tree(frame_tree) == contract
+    assert calibration_capture_layout_to_tree(layout) == layout_tree
+    assert calibration_capture_layout_from_tree(layout_tree) == layout
+    assert readout_binding_key_to_tree(BINDING) == {"value": "primary-readout"}
+    assert readout_binding_key_from_tree({"value": "primary-readout"}) == BINDING
 
-def test_noncanonical_sequences_are_rejected_instead_of_silently_resorted() -> None:
-    descriptor_tree = camera_capture_descriptor_to_tree(_descriptor())
-    descriptor_tree["event_settings"] = list(reversed(descriptor_tree["event_settings"]))
-    with pytest.raises(ValueError, match="non-canonical"):
-        camera_capture_descriptor_from_tree(descriptor_tree)
-    layout_tree = calibration_capture_layout_to_tree(
-        CalibrationCaptureLayout(EVENT, (0, 2), 1)
-    )
-    layout_tree["reference_event_indices"] = [2, 0]
-    with pytest.raises(ValueError, match="non-canonical"):
-        calibration_capture_layout_from_tree(layout_tree)
+    for parser, tree in (
+        (camera_capture_descriptor_from_tree, descriptor_tree),
+        (frame_contract_from_tree, frame_tree),
+        (calibration_capture_layout_from_tree, layout_tree),
+    ):
+        unknown = dict(tree)
+        unknown["unknown_future_field"] = "forbidden"
+        with pytest.raises(ValueError, match="exactly"):
+            parser(unknown)
 
 
 def test_roi_binning_dtype_unit_frame_and_axis_order_are_cross_validated() -> None:
