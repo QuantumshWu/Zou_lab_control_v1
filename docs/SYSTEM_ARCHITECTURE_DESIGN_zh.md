@@ -295,19 +295,25 @@ Zou_lab_control.notebook[workbench] -> zlc_workbench (optional GUI launcher)
 DeviceSet 是 composition root 拥有的 concrete connection/lane lifecycle container，不是运行时可随处查询的 service locator。composition root 同时提供 typed `DeviceBindingResolver`，把 request 中的 `DeviceBinding(role/id, required capability)` 原子解析为：
 
 ```text
-BoundDevice[P]:
-  port: P
+BoundDevice:
   resource_key
-  thread_affinity_key
-  capability_snapshot
-  connection_generation
+  binding_stamp:
+    physical_identity:
+      stable_device_identity
+      evidence_kind
+      evidence_digest
+      asset_map_revision
+    connection_generation
+  opaque binding_id
+  safety/interrupt/session capability summary
+  private broker reference
 ```
 
-Definition.bind 只能通过 resolver 一次取得自己显式声明的 BoundDevice，并把该对象放进 BoundDependencies；Port、claim、affinity、capability 和 generation 不能作为五份平行字段分别传递。execute 不能按字符串回查 DeviceSet，resolver 也不能从全局 registry 隐式挑“第一个相机”。
+Definition.bind 只能通过 resolver 一次取得自己显式声明的 BoundDevice，并把该对象放进领域私有的 immutable bindings；Port、claim、affinity、capability 和 identity/generation 不能作为平行字段分别传递。generic runtime 不定义公共的泛型bindings容器；领域 composition 把 typed request/bindings 冻结在计划构造边界，随后只向 `RunPlan` 交付 `BoundDevice` 与阶段 callable。execute 不能按字符串回查 DeviceSet，resolver 也不能从全局 registry 隐式挑“第一个相机”。
 
 #### 4.2.1 InstallationState 与 public DeviceCatalog
 
-composition root必须有一个跨config swap稳定存活的`InstallationSupervisor`，它唯一拥有ResourceArbiter、DeviceBroker、DeviceControlLease authority、Safety/QuarantineJournal owner lock、swap/recovery coordinator与current-state原子引用。当前generation的binding事实由一个immutable、单指针发布的`InstallationState`拥有，不能让session分别保存DeviceSet、binding registry、catalog与facade：
+composition root必须有一个跨config swap稳定存活的`InstallationSupervisor`，它唯一拥有ResourceArbiter、DeviceBroker、覆盖RunController/ResourceArbiter/DeviceBroker/legacy fence四个authority域的installation-wide transition gate、SafetyJournal owner lock、swap/recovery coordinator与current-state原子引用。三个child authority的terminal `shutdown`只能消费composition root私有lifecycle capability；普通runtime/adapter调用者即使拿到child对象也不能提前关闭Run admission、broker binding或journal owner。quarantine 是 SafetyJournal 中一种 unresolved record/projection，不是第二个 journal 或第二套 authority。当前generation的binding事实由一个immutable、单指针发布的`InstallationState`拥有，不能让session分别保存DeviceSet、binding registry、catalog与facade：
 
 ```text
 InstallationSupervisor                 # 跨swap稳定，不进入public object graph
@@ -331,8 +337,8 @@ UnavailableInstallationState
   installation_id
   installation_generation
   installation_state_revision
-  DeviceCatalogView(UNAVAILABLE/SWAPPING/RECOVERY_REQUIRED observations)
-  opaque RecoveryStatusRef
+  DeviceCatalogView(UNAVAILABLE/SWAPPING/RECOVERY_REQUIRED observations,
+                    opaque canonical recovery_status_ref only when recovery is required)
   no raw graph / binding registry / drive facade / partial binding
 ```
 
@@ -369,17 +375,17 @@ DeviceCatalogView:
 
 这些对象递归 immutable、canonical-serializable，且不含 raw adapter、SDK handle、callable、lazy getter/setter、任意 callback 或 `configure/arm/acquire/prepare/fire/abort/open/close`。`require()` 只取 `DeviceInfo`，绝不解析 control capability。旧 `DeviceCatalogView` 是合法历史值，但其中旧 generation 的 `DeviceRef` 不能被任何 command facade 执行；authority 必须在触碰 adapter 前以零底层调用拒绝 stale ref。
 
-`installation_generation`、每个binding的`connection_generation`与`installation_state_revision/catalog revision`不混用。进入不可逆swap边界、发布UNAVAILABLE、恢复/发布AVAILABLE都会单调mint不可复用的installation generation；live binding只有在ConnectionEstablishmentClaim握手成功后才由broker mint自己的connection generation。同一available binding下纯观察health变化只推进state/catalog revision，并以新的完整state快照发布。不可逆边界前失败不消费generation；在不可用窗口构造或排队的command绑定UNAVAILABLE generation且没有drive facade，恢复后必须因installation generation不符以零adapter调用失败。
+`installation_generation`、每个binding的`connection_generation`与`installation_state_revision/catalog revision`不混用。进入不可逆swap边界、发布UNAVAILABLE、恢复/发布AVAILABLE都会单调mint不可复用的installation generation；live binding只有在持有 `ConnectionEstablishmentLease` 的握手中才由broker mint自己的connection generation。同一available binding下纯观察health变化只推进state/catalog revision，并以新的完整state快照发布。不可逆边界前失败不消费generation；在不可用窗口构造或排队的command绑定UNAVAILABLE generation且没有drive facade，恢复后必须因installation generation不符以零adapter调用失败。
 
 generic catalog 只回答“安装中有哪些角色、当前观察状态是什么”。领域事实由具名、冻结的 facade descriptor 单源提供，例如 `Experiment.timing.target` 的 clock/port catalog、`Experiment.readout.camera_descriptor(binding)` 的 frame/trigger contract、`Experiment.trap.geometry` 的 site/grid geometry。禁止把这些异质事实重新塞进任意 `snapshot: dict`，也禁止 frontend/Definition 按 role 字符串从 catalog 找到一个对象后调用领域方法；否则 catalog 会退化成新的 service locator。
 
 #### 4.2.2 原子 config/device swap
 
-swap前只能stage一个**inert** `InstallationCandidate`：canonical config/asset refs、adapter factories、预计roles/descriptors与验证计划；它不持有open connection、不签发generation、不复制authority/journal owner，也不能冒充完整InstallationState。稳定InstallationSupervisor关闭admission、等待旧claims/reference_keys terminal并完成safety后，在第一次old connection close前先durable推进DeviceSwapIntent、mint新installation generation并原子发布不含任何drive capability的`UnavailableInstallationState(status=SWAPPING)`；从此public不再观察旧AVAILABLE。然后复用同一个authority关闭old connections、依次取得ConnectionEstablishmentClaims，在owner lanes完成new live handshake并为各binding mint connection generations。全部成功后再mint新的installation generation，构造完整`AvailableInstallationState`，其中new raw graph、generation-bound binding registry、typed facades/descriptors与catalog全部绑定该generation，并原子替换current-state。**单指针原子发布是每次state transition的规则，不是整个swap只能publish一次。**任何读者在任一revision只能看到完整old AVAILABLE、完整UNAVAILABLE或完整new AVAILABLE，不能观察混合字段。普通swap不创建第二个ResourceArbiter、SafetyJournal、owner lock或平行installation authority。
+swap前只能stage一个**inert** `InstallationCandidate`：canonical config/asset refs、adapter factories、预计roles/descriptors与验证计划；它不持有open connection、不签发generation、不复制authority/journal owner，也不能冒充完整InstallationState。进入transition前，composition把它解析成一个owner签发且topology sealed的exact prepared artifact；该artifact同时冻结候选DeviceSet的不可变role→raw-object close manifest、registration tuple与唯一registry实例。transition只能认领这一个prepared实例，connection establishment、identity verification与最终publish都必须核对同一实例，不能prepare两次后验证A却发布B，也不能在prepare后增删raw device或registration。稳定InstallationSupervisor关闭admission、等待旧claims/reference_keys terminal并完成safety后，在第一次old connection close前先durable推进DeviceSwapIntent、mint新installation generation并原子发布不含任何drive capability的`UnavailableInstallationState(status=SWAPPING)`；从此public不再观察旧AVAILABLE。然后复用同一个authority关闭old connections、依次取得 connection-establishment leases，在owner lanes完成new live handshake并为各binding mint connection generations。全部成功后再mint新的installation generation，构造完整`AvailableInstallationState`，其中new raw graph、generation-bound binding registry、typed facades/descriptors与catalog全部绑定该generation，并原子替换current-state。**单指针原子发布是每次state transition的规则，不是整个swap只能publish一次。**任何读者在任一revision只能看到完整old AVAILABLE、完整UNAVAILABLE或完整new AVAILABLE，不能观察混合字段。普通swap不创建第二个ResourceArbiter、SafetyJournal、owner lock或平行installation authority。
 
-异步通知不承担权威事实，也不能有“先读、后订阅”的丢失窗口。installation owner维护跨generation严格单调的`installation_state_revision`；私有authority在owner临界区读取完整InstallationState，public `DeviceCatalogReader`则提供原子的`snapshot_and_subscribe()`或等价`watch(after_revision)` replay协议，只返回`PublicInstallationSnapshot(catalog, availability, RecoveryStatusRef?)`，绝不返回InstallationState/raw graph/facade。注册与取得public snapshot在同一owner临界区线性化；每个通知只携带revision/轻量提示，consumer随后从reader取得不小于该revision的完整public snapshot。UI可coalesce到最新revision，但必须丢弃小于已应用revision的反序queued event；检测gap或replay retention不足时重新读取current public snapshot，不能回退到旧catalog。authority、swap与safety正确性从不等待subscriber ACK。
+异步通知不承担权威事实，也不能有“先读、后订阅”的丢失窗口。installation owner维护跨generation严格单调的`installation_state_revision`；私有authority在owner临界区读取完整InstallationState，public `DeviceCatalogReader`则提供原子的`snapshot()`与`watch(after_revision)` replay协议，直接返回同一个不可变`DeviceCatalogView`；availability与可选的opaque canonical `recovery_status_ref`均由catalog单源持有，绝不再复制成平行snapshot/ref DTO，也绝不返回InstallationState/raw graph/facade。订阅与取得public snapshot在同一owner临界区线性化；consumer从reader取得不小于目标revision的完整public snapshot。UI可coalesce到最新revision，但必须丢弃小于已应用revision的反序queued event；检测gap或replay retention不足时重新读取current public snapshot，不能回退到旧catalog。authority、swap与safety正确性从不等待subscriber ACK。
 
-不可逆边界前失败继续发布完整旧AVAILABLE state；一旦已发布SWAPPING并进入close，任何close/handshake/commit失败都只把current state原子推进为新的`UnavailableInstallationState(status=RECOVERY_REQUIRED)`，不重新暴露旧catalog，也不包含partial raw graph/facade。partial old/new binding与raw-graph lifecycle state、authority-domain refs、intent和gates只由稳定InstallationSupervisor的私有`SwapRecoveryContext`持有；public只能取得opaque RecoveryStatusRef/DTO并通过窄RecoveryAdminPort请求reconcile或maintenance shutdown，不能取得context本体。TaskConsole/PulseGUI/DeviceViewer只能异步接收immutable state/catalog变化并更新UI，既不能确认/veto swap，也不能持有raw reference阻止换代。
+不可逆边界前失败继续发布完整旧AVAILABLE state；一旦已发布SWAPPING并进入close，任何close/handshake/commit失败都只把current state原子推进为新的`UnavailableInstallationState(status=RECOVERY_REQUIRED)`，不重新暴露旧catalog，也不包含partial raw graph/facade。partial old/new binding与raw-graph lifecycle state、authority-domain refs、intent和gates只由稳定InstallationSupervisor的私有`SwapRecoveryContext`持有；public只能取得`DeviceCatalogView.recovery_status_ref`这一opaque canonical string并通过窄RecoveryAdminPort请求reconcile或maintenance shutdown，不能取得context本体。TaskConsole/PulseGUI/DeviceViewer只能异步接收immutable state/catalog变化并更新UI，既不能确认/veto swap，也不能持有raw reference阻止换代。
 
 #### 4.2.3 adapter 作者、测试与 simulation 的命名空间
 
@@ -464,9 +470,9 @@ neutral domain Result
 
 `Experiment` 只做参数便利、typed request 构造、结果解包和composition delegation；它不调用raw adapter，不复制 calibration/fit/scan 算法，也不让 domain object lazy 回查全局 session。notebook baseline 不保存 `current_calibration` 指针、revision 或“最近一次”映射：这些状态在当前实现没有业务消费者，还会让短 API 的物理输入变成隐式。所有依赖 calibration 的 convenience request 必须显式接收 `calibration=CalibrationArtifactRef`，在请求构造时 load/admit 并与具体 `ReadoutBindingKey`、model 一起冻结；多 camera 不能猜 ref，运行时也不回查 facade。结果、internal RunPlan 与 artifact lineage 始终记录实际使用的 binding/ref/digest，因此短 notebook 路径不以隐藏物理输入换便利。
 
-`Experiment`、TaskConsole、PulseGUI 与 standalone launcher 都不得公开 raw `CameraDevice`、`SequencerDevice`、DeviceSet、SDK handle、BoundDevice/drive-capable Port、含BoundDependencies的RunPlan，或可直接执行 `configure/arm/acquire/prepare/fire/abort/safe` 的 adapter。普通实验硬件动作必须转换为 declarative typed request/窄command facade，经同一个 installation authority、RunController、ResourceArbiter、DeviceControlLease 与 owner I/O lane 执行；连接建立与故障恢复分别只能走§9的ConnectionEstablishmentClaim/RecoveryClaim维护入口，composition/workbench只编排这些入口，不取得第三种raw adapter capability。`.pulse_gui()` 得到的是 workbench-owned pulse command facade，而不是 `session.sequencer`；`.readout` 得到的是领域 convenience facade，而不是 `session.camera`；`.device_catalog` 返回 immutable 值，而不是 `session.devices` 的兼容代理。若某 standalone 入口无法加入同一 installation authority，real mode 启动即失败，只可显式运行 virtual/offline 模式，不能以“独立窗口”为由绕过 quarantine、generation 或 active claim。
+`Experiment`、TaskConsole、PulseGUI 与 standalone launcher 都不得公开 raw `CameraDevice`、`SequencerDevice`、DeviceSet、SDK handle、BoundDevice/drive-capable Port、internal RunPlan，或可直接执行 `configure/arm/acquire/prepare/fire/abort/safe` 的 adapter。普通实验硬件动作必须转换为 declarative typed request/窄command facade，经同一个 installation authority、RunController、ResourceArbiter、DeviceBroker 与 adapter owner 执行；跨进程物理排他由具体backend/composition提供可验证proof，不在generic runtime中再建一套平行lease框架。连接建立与故障恢复只能走§9的ConnectionEstablishmentLease/RecoveryAttempt入口，composition/workbench只编排这些入口，不取得第三种raw adapter capability。`.pulse_gui()` 得到的是 workbench-owned pulse command facade，而不是 `session.sequencer`；`.readout` 得到的是领域 convenience facade，而不是 `session.camera`；`.device_catalog` 返回 immutable 值，而不是 `session.devices` 的兼容代理。若某 standalone 入口无法加入同一 installation authority，real mode 启动即失败，只可显式运行 virtual/offline 模式，不能以“独立窗口”为由绕过 quarantine、generation 或 active claim。
 
-不存在 public `NeutralAtomSession.devices/.camera/.sequencer`、`Experiment.devices` raw alias、`__getattr__` warning fallback 或“只读时返回 raw、写入时再检查”的 wrapper。`Experiment.device_catalog` 是新语义，不为旧调用保持 duck typing。领域对象、Definition、internal RunPlan 和 frontend 也不得保存 `DeviceBindingResolver`；resolver 只在 composition/bind 边界把已声明的 requirement 解析成 `BoundDependencies`，随后立即退出调用栈。RunPlan、PreparedRun、BoundDependencies只存在于composition/RunController私有registry；`inspect()`只返回claims/schema/budget/summary组成的immutable PlanDescriptor。baseline不提供public延迟Plan对象；若未来真实用例需要，只能由authority签发opaque、generation-bound、one-shot PlanHandle，handle本身不含或暴露Port。
+不存在 public `NeutralAtomSession.devices/.camera/.sequencer`、`Experiment.devices` raw alias、`__getattr__` warning fallback 或“只读时返回 raw、写入时再检查”的 wrapper。`Experiment.device_catalog` 是新语义，不为旧调用保持 duck typing。领域对象、Definition、internal RunPlan 和 frontend 也不得保存 `DeviceBindingResolver`；resolver 只在 composition/bind 边界把已声明的 requirement 解析成领域私有immutable bindings，随后立即退出调用栈。RunPlan与preflight的私有prepared value只存在于composition/RunController执行图，且owner结束时主动断开；`inspect()`只返回claims/schema/budget/summary组成的immutable PlanDescriptor。baseline不提供public延迟Plan对象；若未来真实用例需要，只能由authority签发opaque、generation-bound、one-shot PlanHandle，handle本身不含或暴露Port。
 
 `figure_document` 由 notebook composition 的 result projector 生成，避免 neutral_atom 反向依赖 frontend.figure。render extra 不可用时，采集与分析仍完整工作，FigureDocument 可保存或交给其它 renderer。GUI launcher 不是 headless notebook baseline；只有安装 `notebook[workbench]` 时 `.task_console()`/`.pulse_gui()` 才通过单向 optional edge 调用 workbench composition，workbench 不反向 import notebook facade。
 
@@ -963,6 +969,8 @@ Headless render worker
   永久拥有独立 export Figure
 ```
 
+上图的 Blocking I/O lane 与 `ThreadAffinityKey` 是后续 adapter-hosting 的**终态迁移门**，不是本 runtime authority 闭包已经兑现的事实。当前 `DeviceBroker` 仍在 run-owner/interrupt 调用路径直接调用已登记callback，因此只有明确声明线程安全且通过contract test的adapter可接入；需要SDK owner-thread affinity的adapter在其composition/adapter owner中串行化，迁完前不得把generic broker描述成已有公平lane scheduler。引入共享lane前必须先有真实第二消费者与bounded blocking/interrupt证据，不能为了图完整预建通用调度框架。
+
 不使用“每种职责固定一个全局 OS thread”。连续 camera monitor 不能阻塞无冲突设备；同一 thread-affine device 的调用必须串行。
 
 独立 panel latest-only 是逻辑 mailbox（每 panel 最多一个 pending revision）；声明为同一 coherence group 的 panel 使用一个 board mailbox/evaluation revision，不各自挑 latest。它们由少量 bounded workers 消费，不是每个 panel 新建线程。worker 数和队列预算来自 WorkbenchProfile；满载时只替换尚未开始的旧 view/board work。Analysis executor 区分 formal/offline 与 interactive QoS：interactive 同 panel 新 revision 可替换尚未开始的旧 fit；formal/offline/明确保存的 Analysis 不 coalesce，满载时返回 typed Busy 或在 Run deadline 内排队。正式 StreamProcessor event 绝不进入可丢弃 view/interactive 队列。
@@ -974,7 +982,7 @@ RunController.run(plan)   -> Result      # 同步，notebook/test
 RunController.start(plan) -> RunHandle   # 后台，workbench
 ```
 
-这两个是composition内部入口，不是notebook public API。public `Experiment.run/start`只接收declarative Request；composition在同一generation snapshot内bind成internal RunPlan并立即提交给RunController，既不返回plan也不把它挂到RunHandle。RunHandle公开面只有run id、status/wait/cancel/recovery/result/ref等生命周期DTO，不含RunPlan、PreparedRun、BoundDependencies、RunDevice/CleanupDevice或drive-capable Port。
+这两个是composition内部入口，不是notebook public API。public `Experiment.run/start`只接收declarative Request；composition在同一generation snapshot内bind成internal RunPlan并立即提交给RunController，既不返回plan也不把它挂到RunHandle。RunHandle公开面只有run id、status/wait/cancel/recovery/result/ref等生命周期DTO，不含RunPlan、prepared value、领域bindings、RunDevice/CleanupDevice或drive-capable Port。
 
 `RunController` 是所有用户可启动 Run 的唯一 lifecycle owner，包括 one-shot Task、finite/continuous Measurement、FormalPulseScan、DatasetBuilders、StreamProcessorWorkers 和 formal Analyses。每次 `start()` 创建一个 run-owner thread；terminal state 只能在所有 I/O call、CaptureSession、online worker、materializer 和 required Analysis 确认退出后产生。
 
@@ -996,36 +1004,32 @@ MeasurementDefinition只含DefinitionKey、request/binding schema id、capture-s
 `RunPlan` 是扁平静态计划：
 
 ```text
-RunPlan:
-  request
-  bound_dependencies
-  typed request/output contract
-  static ResourceClaims
-  hazardous device claims + connection generations
-  preflight(ctx, request, bound_dependencies) -> PreparedRun
-  execute(ctx, prepared_run) -> Result
-  cleanup(ctx, prepared_run, outcome) -> CleanupReport
-  finalize(ctx, result) -> unpublished final artifact
-  mode = FINITE_EXACT | CONTINUOUS_MONITOR
-  expected/max events/samples/grouping
-  deadline: optional monotonic deadline
+RunPlan[Prepared, Executed, Final]:
+  name
+  resource_claims: tuple[ResourceClaim, ...]
+  bound_devices: tuple[BoundDevice, ...]
+  preflight(ctx) -> Prepared
+  execute(ctx, prepared) -> Executed
+  cleanup(ctx, prepared | None, primary_error | None) -> CleanupReport
+  finalize(PostSafetyContext, executed) -> Final
+  interrupt_operations: tuple[SafetyInterrupt, ...]
+  timeout_seconds: optional finite monotonic duration
+  requires_final_commit: bool
 ```
 
-FINITE_EXACT 必须给出可验证 max budget/deadline policy；CONTINUOUS_MONITOR 明确允许 overwrite/missed count，不产生宣称完整的正式 artifact。所有 timeout/deadline 必须是finite、非负且使用 monotonic clock，NaN/inf/负值在bind时拒绝；artifact timestamp另用wall clock。
+generic runtime 不保存领域 request/bindings 容器、execution mode 或 event/grouping 等领域字段。有限 exact 与 continuous monitor 的完整性、预算和 overwrite 语义属于 Measurement/Pipeline/Dataset contract；领域 composition 先冻结 typed request/bindings，再用不可变输入构造上述 callbacks。所有 timeout 必须 finite、非负且只用 monotonic clock；artifact timestamp 才使用 wall clock。
 
-`PreparedRun` 显式携带 request、与 claims 对应的 BoundDependencies、resolved schemas、reservations、cursors 和其它 preflight 结果。`execute` 只能收到该 PreparedRun，不能通过 closure、session、global registry 或 service locator 找回未声明 Port。不包含 child run、递归 DAG 或运行中新增资源。
+`preflight` 的返回值就是领域私有的 typed prepared value，不再套公共运行包装对象。它可以携带 resolved schemas、reservations、cursors 和其它准备结果；`execute` 只能收到这一个值与 `RunContext`，不能从 session、global registry 或 service locator 找回未声明 Port。不包含 child run、递归 DAG 或运行中新增资源。
 
-任何可能执行configure-output、session start、arm、fire、safe、abort或interrupt的EXCLUSIVE device claim都必须在RunPlan中对应恰好一个`HazardClaim(stable DeviceIdentity, connection_generation)`；普通CPU、repository和纯只读资源不伪装成hazard。stable identity/generation不能由普通Run preflight临时发现：composition root先按§9的connection-establishment合同取得DeviceControlLease，在owner lane执行只读identity/health handshake，产出verified `BoundDeviceIdentity`；RunPlan只能pin这个既有generation，preflight发现reconnect/generation变化立即拒绝并要求重新bind。RunController取得全部ResourceClaims并确认generation后，必须先把这些HazardClaims作为同一run epoch的`HAZARD_ACTIVE`记录持久化，才允许任何可能改变设备/输出/采集状态的configure、session start、arm、fire、safe、abort或interrupt。记录尚未持久化时只允许不改变设备状态的identity/generation recheck，cancel只能单调设置token，不能调用可能改变硬件的interrupt/abort/safe；若此时journal写失败，run保持`safety-journal-failed`、claims不释放，显式重试成功后若token已取消则直接进入无硬件cleanup。这样既没有identity/open循环，也不存在“先触碰危险状态、后补安全账”的窗口。
+每个 `device/...` 的 EXCLUSIVE claim 必须在 `bound_devices` 中恰好出现一次；普通 CPU、repository 和纯只读资源不伪装成 device。调用者不再构造第二份 `HazardClaim`：RunController 在完成 live binding identity recheck 后，唯一地从每个 `BoundDevice.binding_stamp` 派生内部 hazard。这样 claim、identity、evidence 与 connection generation 没有平行输入可错配。RunController 取得全部 ResourceClaims 后，必须先把同一 run 的 `HAZARD_ACTIVE` records durable append，才允许 configure、session start、arm、fire、safe、abort 或 interrupt。记录尚未持久化时 cancel 只单调设置 token；journal 写失败时 claims 保持占用且硬件调用次数为零。
 
-多个installation authority之间不假装原子写HAZARD_ACTIVE：RunController按canonical authority顺序逐域提交，但在**全部**required hazard refs durable之前对所有设备保持零状态变化。若中途某域失败，run不得configure/arm/fire；已经durable的域用同一run/hazard id执行verify-idle并按§8.4提交该域的disposition，失败域保持未开始/不可用，全部事实完成reconciliation后run才terminal。不能因为另一域尚未写成功就删除或遗忘已经durable的hazard record。
-
-在向第一个authority提交HAZARD_ACTIVE前，RunController先在local crash-recovery ledger持久化`RunSafetyDispositionIntent(run_id, plan_digest, canonical_authority_ids, ResourceKeys, preallocated_hazard_ids, authority_recovery_endpoints/asset_ids, digest)`；每个authority HazardRecord与后续SafetyDispositionBundle都引用该intent digest。它不授权任何hardware call，只保证进程重启、当前config已移除某authority或部分authority不可达时仍知道必须向谁核对哪些hazard。全部bundle refs与RunSafetyDispositionSet durable后，intent才以set digest标记RESOLVED；任一authority不可达时保持SAFETY_JOURNAL_BLOCKED/claims，不靠扫描当前config猜“应该已经完成”。
+baseline 的一个 `RunPlan` 只能使用同一个 `DeviceBroker`/installation authority；跨机器 endpoint 必须在它自己的 adapter/server 边界提供单一可验证 binding，而不是让一个 plan 拼接多套本地 arbiter。只有出现第二个必须共同驱动且无法归入同一 authority 的真实用例，才另行设计跨 authority 协调；当前只实现一个 ResourceLease、一个 SafetyJournal 和一个 run 级 SafetyDispositionBundle，不预建分布式提交器。
 
 stable identity 必须由当前live connection的adapter receipt与installation-owned AssetMap共同建立；普通实验config、role、Python class、device index、枚举顺序或用户填写的字符串都不能自证物理身份。AssetMap不是一个手写revision标签：它必须是machine/device级持久、canonical序列化的`asset_id -> canonical ResourceKey + exact adapter kind + expected live identity/endpoint matcher`，revision取其canonical内容digest。真实runtime缺少AssetMap、adapter kind不符或live readback不匹配时，composition直接NO-GO；普通`load_config`不能创建/覆盖ResourceKey、expected matcher或revision，同role换成另一serial即使重启了进程和broker也必须拒绝，只有显式maintenance/device-swap事务可以更新映射并保留旧安全事实。
 
-identity evidence明确分为`HARDWARE_IDENTITY_READBACK`与`INSTALLATION_ASSERTED_ENDPOINT`：前者读取设备serial/DNA等不可混淆硬件标识；后者只在现有接口确实没有硬件标识时，用稳定deployment endpoint + AssetMap revision证明“当前连接到被安装声明占用的控制端点”，不得声称已经读回同一块物理板。`VerifiedBoundDeviceIdentity`、Q0、HazardRecord、RunFailureRecord与最终artifact都保存evidence kind、receipt/endpoint digest、AssetMap revision及后者的剩余换板风险。adapter只返回绑定当前live connection的identity/readback receipt；每次成功open/reconnect handshake后，由installation DeviceBroker/connection authority单调签发新的connection generation，adapter不能选择、复用或自报generation。active Run内owner lane**首次检测到**transport断开、device-removed或live-readback failure时，authority立即原子失效旧binding/capability；检测发生前系统不得声称已知断线，SAFE verifier仍必须执行自己的live readback，不能只信缓存连接状态。禁止transparent reconnect后继续execute或cleanup；显式reconnect只能发生在ConnectionEstablishmentClaim/RecoveryClaim下，并在握手成功后取得新generation。每次Run start与每个safety verifier都重新核对live receipt/evidence kind/AssetMap revision与authority generation，不能让broker把缓存的旧generation盲贴到新的readback上。
+identity evidence明确分为`HARDWARE_IDENTITY_READBACK`与`INSTALLATION_ASSERTED_ENDPOINT`：前者读取设备serial/DNA等不可混淆硬件标识；后者只在现有接口确实没有硬件标识时，用稳定deployment endpoint + AssetMap revision证明“当前连接到被安装声明占用的控制端点”，不得声称已经读回同一块物理板。`PhysicalDeviceIdentity(stable_device_identity, evidence_kind, evidence_digest, asset_map_revision)` 是跨连接稳定的完整身份；`DeviceBindingStamp(physical_identity, connection_generation)` 是一次 live connection 的精确身份。`VerifiedPhysicalDeviceIdentity` 只是 broker-minted、一次消费的握手结果，成功 bind 后即被 `BoundDevice.binding_stamp` 取代。adapter只返回绑定当前live connection的 identity readback；每次成功open/reconnect handshake后，由DeviceBroker签发新的connection generation，adapter不能选择、复用或自报generation。active Run首次检测到transport断开、device-removed或live-readback failure时，authority使旧binding失效；SAFE verifier仍必须执行自己的live readback，不能只信缓存状态。禁止transparent reconnect后继续execute或cleanup；显式reconnect只能发生在 connection-establishment/recovery owner 下，并取得新generation。每次Run start与每个safety verifier都重新核对完整 physical identity 与 authority generation。
 
-BoundDependencies 只含 consumer-owned Port/factory、typed Repository 和 immutable config，不含 QWidget、open CaptureSession 或任意线程外可直接调用的 raw driver。Port 调用由 RunController 路由到 owner lane；PreparedRun 中的 session token/handle 也只能由该 lane 消费。
+领域 composition 的 immutable bindings 只含 consumer-owned Port/factory、typed Repository 和 immutable config，不含 QWidget、open CaptureSession 或任意线程外可直接调用的 raw driver。Port 调用由 RunController 路由到 owner lane；preflight 返回值中的 session token/handle 也只能由该 lane 消费。
 
 bind 必须从 request/bindings 计算完整或保守 superset ResourceClaims。preflight 可以拒绝 claim 与硬件 capability 不匹配，却不能发现后临时追加资源；若某 adapter 的条件资源无法在 bind 时确定，Definition 必须声明 superset 或拒绝该 request。
 
@@ -1037,7 +1041,7 @@ bind -> RunPlan
 -> 在正确 I/O lane 使用DeviceSet已持有的verified physical connection，
    创建本run的session/capture handle并执行configure/query preflight；不得reconnect
 -> resolve ValueSchema/DatasetSchema、event/sample/byte budget
--> PreparedRun(reservations, cursors, resolved contracts)
+-> private prepared value(reservations, cursors, resolved contracts)
 -> arm/sources ready
 -> fire/execute
 ```
@@ -1055,7 +1059,7 @@ RUNNING -> CANCELLING -> CANCELLED | FAILED
 
 waiting resource、arming、capturing、fitting、saving、finalizing、commit-reconciliation-blocked 是 phase，不是通用工作流状态。
 
-由 `RunController.requires_final_commit` 管理的最终 artifact，其可见提交与 cancellation 使用同一个短原子 gate。`finalize` 可以在 gate 外构造和校验临时 artifact；`commit_final(FinalCommit)`只能使用owner Repository的`RepositoryCommitCoordinator`在startup reconciliation成功后铸造的opaque、不可变、单次 `CommitAuthority`。公开authority是无副作用handle：除冻结CommitTarget外不暴露`publish()`、journal、recover或callback；真正的`target/journal/publish/recover`快照只存在coordinator私有registry。普通plan只能携带handle，RunController通过内部consumer token原子pop签发快照；同一authority跨run/commit_id复用直接拒绝。lost-ack重试使用RunController已经持有的快照与稳定commit_id做reconciliation，不重新开放publish capability。随后在该Repository同一durability域持久化`CommitIntent(commit_id, run_id, safety_disposition_set_digest, CommitTarget)`。`CommitTarget`至少冻结repository_id、artifact_kind、artifact_format、target_ref与expected_manifest_digest，使重启后无需内存closure即可路由到唯一owner并验证目标内容。repository publish必须返回typed `PublishedManifest(target_ref, manifest_digest, result)`，owner快照逐字段匹配CommitTarget后才允许写COMMITTED，正常成功路径也不能跳过digest验证。返回类型错误、target/digest不符及其它确定性合同违例直接写ABORTED并失败，绝不能调用recover“洗白”；只有Repository明确抛出`PublishVisibilityUnknown`，表示atomic replace后可见性确实无法判定，才进入inspection-only recovery。intent fsync期间cancellation仍可受理。intent完成后在短内存gate内做最后一次CancellationToken checkpoint并关闭cancel gate，随后才允许manifest/rename publish：cancel先取得gate，则把intent幂等标为`ABORTED`、publish调用次数必须为0，run不能产生成功artifact；publish先取得gate，则之后的cancel明确返回`TOO_LATE_ALREADY_COMMITTED`（若run已terminal则为`ALREADY_TERMINAL`），不得把已经可见的成功artifact报成CANCELLED。长时间序列化、blob写入和intent fsync不在不可取消gate内；gate只保护最终可见发布及其结果判定。当前 `FitExecution.save()` 是 notebook/direct CAS 保存面，不携带 Run final-commit authority；它只能把同一 repository `execute()` 铸造的 process-local execution 交回 private `_save_execution`。publish acknowledgement 丢失时不返回成功 ref，可见但未被调用者引用的 manifest 只算 content-addressed orphan。它尚未纳入上述 lost-ack coordinator，不能被本轮 raw Capture/Calibration repository 的闭合结论代称为“全部 capture artifact 已闭合”。
+由 `RunController.requires_final_commit` 管理的最终 artifact，其可见提交与 cancellation 使用同一个短原子 gate。`finalize` 可以在 gate 外构造和校验临时 artifact；`commit_final(FinalCommit)`只能使用owner Repository的`RepositoryCommitCoordinator`在startup reconciliation成功后铸造的opaque、不可变、单次 `CommitAuthority`。公开authority是无副作用handle：除冻结CommitTarget外不暴露`publish()`、journal、recover或callback；真正的`target/journal/publish/recover`快照只存在coordinator私有registry。普通plan只能携带handle，RunController通过内部consumer token原子pop签发快照；同一authority跨run/commit_id复用直接拒绝。lost-ack重试使用RunController已经持有的快照与稳定commit_id做reconciliation，不重新开放publish capability。随后在该Repository同一durability域持久化`CommitIntent(kind, commit_id, run_id, safety_bundle_id, target, created_at)`；无硬件hazard时`safety_bundle_id=None`。`CommitTarget`至少冻结repository_id、artifact_kind、artifact_format、target_ref与expected_manifest_digest，使重启后无需内存closure即可路由到唯一owner并验证目标内容。repository publish必须返回typed `PublishedManifest(target_ref, manifest_digest, result)`，owner快照逐字段匹配CommitTarget后才允许写COMMITTED，正常成功路径也不能跳过digest验证。返回类型错误、target/digest不符及其它确定性合同违例直接写ABORTED并失败，绝不能调用recover“洗白”；只有Repository明确抛出`PublishVisibilityUnknown`，表示atomic replace后可见性确实无法判定，才进入inspection-only recovery。intent fsync期间cancellation仍可受理。intent完成后在短内存gate内做最后一次CancellationToken checkpoint并关闭cancel gate，随后才允许manifest/rename publish：cancel先取得gate，则把intent幂等标为`ABORTED`、publish调用次数必须为0，run不能产生成功artifact；publish先取得gate，则之后的cancel明确返回`TOO_LATE_ALREADY_COMMITTED`（若run已terminal则为`ALREADY_TERMINAL`），不得把已经可见的成功artifact报成CANCELLED。长时间序列化、blob写入和intent fsync不在不可取消gate内；gate只保护最终可见发布及其结果判定。当前 `FitExecution.save()` 是 notebook/direct CAS 保存面，不携带 Run final-commit authority；它只能把同一 repository `execute()` 铸造的 process-local execution 交回 private `_save_execution`。publish acknowledgement 丢失时不返回成功 ref，可见但未被调用者引用的 manifest 只算 content-addressed orphan。它尚未纳入上述 lost-ack coordinator，不能被本轮 raw Capture/Calibration repository 的闭合结论代称为“全部 capture artifact 已闭合”。
 
 `CommitTarget` journal 的字段名切换是 current-only durable protocol cutover：部署新软件前必须完成 startup reconciliation 并确认没有 pending 旧 intent；本项目不保留双 reader，也不建立在线 upgrade fallback。若现场仍存在 pending intent，先用旧 release 完成或明确终止该提交，再部署新 release。
 
@@ -1065,11 +1069,11 @@ pending reconciliation必须冻结“事实是否已经确定”，不能每次�
 
 `run(plan)` 内部也使用同一个 RunHandle。Notebook/test 遇到 KeyboardInterrupt 时先 cancel 该 RunHandle、等待 cleanup acknowledgement，再重新抛出或返回取消结果。若等待超过 join deadline，抛出携带 run_id/RunHandle lookup 的 `RunStillCancelling`，RunController registry 继续持有 handle/claims；不能丢掉 handle 后把 cell 当成已经停止。notebook 可继续 `status()/wait()/recovery_instructions()`。
 
-RunController registry永久强引用全部非terminal handle，因为它们可能仍持有thread/claim/hazard；terminal后只保留有界数量/时间的轻量RunSnapshot与RunFailureRecord ref。超过窗口的terminal handle可由显式`forget_terminal(run_id)`或自动retention移除，但不得删除artifact、safety journal或仍未解决的quarantine/hazard；对非terminal调用forget必须拒绝。这样长期Workbench不会因每次run累积closure、result和thread对象而无界增长，同时诊断事实仍由持久record保存。
+RunController registry 强引用所有 active handle，以及已经发布 terminal 但 owner thread 尚未被确认退出的 handle；只有另一个线程完成 join/reap 后才移除。`RunHandle.wait/result` 在返回 terminal 结果前也必须确认 owner thread 已退出，不能把“状态字段已写入”冒充线程终止。handle/snapshot 只保存有界字符串错误摘要与必要结果，不保存 `BaseException`、traceback、plan、prepared value、context 或 raw device graph；owner 收尾时主动断开这些引用。baseline 不另建 terminal-handle archive/`forget_terminal` 状态机，持久诊断事实归 artifact、commit journal 与 SafetyJournal。
 
 ### 8.3 CancellationToken
 
-- 每个 Run 新建；
+- 每个 Run 由 controller 私有 `_CancellationSource` 新建，只向 plan/worker 暴露不可 clear、不可 request 的只读 `CancellationToken`；
 - 单调从 active 变 cancelled；
 - 绝不 clear/reuse；
 - cancel requested 不等于 worker terminated；
@@ -1082,7 +1086,7 @@ RunController registry永久强引用全部非terminal handle，因为它们可�
 - 不可中断的 SciPy/NumPy 计算等待返回后丢弃 stale result；
 - 需要 hard deadline 的计算使用 disposable subprocess。
 
-当前 RemoteSequencer 的单条同步 RPyC connection 会让 `wait_done` 占住同一请求通道，且 transport backstop 可长达 3600 s；软件重构必须先缩短/分解阻塞调用，使用现有transport支持的timeout、cancel/abort/safe并在故障注入中测量最坏停止时间。第二条RPyC socket若共享backend/`_io_lock`只能改善RPC调度，不能宣称硬件独立；但baseline也不要求因此新增watchdog、SAFE寄存器或重烧bitstream。无法确认safe时Run保持CANCELLING或内部FINALIZING_SAFETY/SAFETY_JOURNAL_BLOCKED并持有claims；远端authority自己的SafetyDispositionBundle以及本run其它authority bundles全部durable、RunSafetyDispositionSet封存后，才发布FAILED和resource quarantine。只有真机证据表明现有safe路径违反既定安全要求，才按bug修复流程评估硬件改变。
+当前 RemoteSequencer 的单条同步 RPyC connection 会让 `wait_done` 占住同一请求通道，且 transport backstop 可长达 3600 s；软件重构必须先缩短/分解阻塞调用，使用现有transport支持的timeout、cancel/abort/safe并在故障注入中测量最坏停止时间。第二条RPyC socket若共享backend/`_io_lock`只能改善RPC调度，不能宣称硬件独立；但baseline也不要求因此新增watchdog、SAFE寄存器或重烧bitstream。无法确认safe时Run保持CANCELLING或内部FINALIZING_SAFETY/SAFETY_JOURNAL_BLOCKED并持有claims；本installation的同一个SafetyDispositionBundle durable、UNSAFE quarantine projection成立后，才发布FAILED。只有真机证据表明现有safe路径违反既定安全要求，才按bug修复流程评估硬件改变。
 
 ### 8.4 Cleanup
 
@@ -1093,53 +1097,40 @@ cancel intent
 sequencer out-of-band abort/safe -> logical terminal/safe acknowledgement + H1 post-terminal tail recipe
 CaptureSession cleanup: adapter-specific terminal drain -> camera stop/disarm -> stable check -> release/join
 workers/builders abort or drain + join
-DeviceSet/application shutdown: camera close
 temporary handle: only its creating CaptureSession closes it
-sequencer safe_state
 temporary config restore
 reservation release
-resource release
+live identity + terminal safe verification -> SafetyProof or UNSAFE decision
+revoke this Run's broker execution/cleanup lease
+append the same SafetyDispositionBundle durably
+construct hardware-free PostSafetyContext
+finalize/commit
+terminal publication + ResourceClaim release as one arbiter-visible boundary
 ```
+
+长期 DeviceSet/raw connection 不属于单次Run cleanup；它只在installation/session shutdown按本节后述的composition顺序关闭。
 
 业务错误保留为 primary error，cleanup/safety failure 作为附加错误。安全清理失败不能报告成功或普通取消。
 
 一旦adapter的terminal recipe证明最后一个硬件 sample 已取得、trigger source不再产生新工作且设备不再需要，正常路径立即退出 CaptureSession、完成适用的drain/stop/disarm/safe，再进行长时间 fit/calibration/artifact commit；`finally` 是异常兜底，不是把安全动作拖到所有磁盘/CPU 工作之后。对Formal qCMOS，“最后一个sample已取得”必须按§14.5保持camera capturing完成terminal drain、冻结final metadata后才成立，不能以“队列暂时达到expected N”或先`cap_stop`代替。硬件 safe acknowledgement 失败时不得提交宣称整个 Run 成功的最终 artifact。
 
-cleanup command ACK与物理安全证明必须分型。`abort/disarm/read-status/safe-state-command`只产生`CleanupStepAck`，表示该步骤返回，不能直接解除hazard；session termination使用独立`SessionCloseCommand(session_id)`与typed `SessionClosedAck(session_id,binding_id,generation,source_stopped,no_more_work,joined,digest)`，不能退化成通用字符串ACK。即使该typed ack通过，它仍只证明本session终止，不自动等于整个设备安全。只有adapter声明的终态verification recipe完成所需步骤并对真实safe-state/no-more-trigger/readback作肯定验证后，DeviceBroker才铸run-scoped、单次消费的`VerifiedSafeStateProof`。CleanupReport的SAFE分支只接受该opaque proof；公开可构造的receipt、普通step ACK或低层ResourceLease便利方法均不能提交SAFE disposition。
+cleanup command ACK与物理安全证明必须分型。`abort/disarm/read-status/safe-state-command`只产生`CleanupStepAck`，表示该步骤返回，不能直接解除hazard；session termination使用独立`SessionCloseCommand`与typed `SessionClosedAck`，仍只证明本session终止。只有adapter的终态verification recipe完成真实safe-state/no-more-trigger/readback肯定验证后，DeviceBroker私有run lease才返回绑定完整stamp的`SafeReceipt`，随后RunContext用run-scoped私有nonce/registry铸`SafetyProof`；CleanupReport的SAFE分支只接受该proof，公开可构造的receipt或普通step ACK不能提交SAFE disposition。
 
-所有会改变安全、物理所有权或最终提交事实的 capability——至少包括`VerifiedBoundDeviceIdentity`、`BoundDevice`、`VerifiedSafeStateProof`、`VerifiedRecoveryProof`、RecoveryBindingLease、`BundleSubmitAuthority`与`CommitAuthority`——统一遵守同一签发合同：只能由owner构造；公开对象不可变；带opaque nonce并在owner私有registry保存签发时的原始identity/receipt/target快照；默认单次消费，确需重试者必须声明稳定id下的幂等语义；消费时核对registry快照、run_id、ResourceKey、stable DeviceIdentity与connection generation，绝不相信调用方可写payload。受限构造但签发后字段可改，不算capability安全。测试威胁模型覆盖普通进程内协作代码的赋值、复用和跨设备替换；恶意反射/`object.__setattr__`不作为Python进程内安全边界，真实隔离依赖进程/服务边界与DeviceControlLease。
+capability 生命周期不能用一条“默认单次消费”抹平不同语义：`VerifiedPhysicalDeviceIdentity` 是一次握手结果，bind 成功即消费；`BoundDevice` 是不含raw callback的immutable binding reference，直到rebind或broker shutdown失效；`VerifiedDeviceCapability` 是当前 binding generation 的冻结能力事实，不是execution lease，它跨Run有效，直到成功re-probe supersede、rebind或broker shutdown；真正的执行排他由broker私有 `_DeviceRunLease` 承担；`SafetyProof` 只属于一个run并在cleanup中消费。所有对象都由owner签发并在消费时核对owner、ResourceKey、完整 `DeviceBindingStamp` 与私有nonce/registry事实，但不能为了表面统一给每种事实再包一层一次性lease。
 
-同样地，closure introspection、扫描`__closure__`或检查finalize函数签名不是capability confinement：它既漏掉global/container/bound-method引用，也会误伤普通纯函数。post-safety“不能再碰硬件”的证明由构造边界完成——raw driver从未离开owner lane，plan只拿可撤销RunDevice/CleanupDevice代理。每个installation authority必须在自己的owner/server线性化锁内先不可逆撤销该run/domain的execute、session与cleanup capability epoch，只保留不含任何hardware verb的一次性`BundleSubmitAuthority`，随后才能把SafetyDispositionBundle追加为durable并返回ref；远端server不能把这一步推迟给client。bundle/ref携带authority-side revoke epoch/token digest，RunController只接受与原run/keys/generation匹配的ref；client收到ref后撤销本地proxy nonce只是防御性镜像。RunSafetyDispositionSet只聚合已经完成“authority capability revoked + disposition durable”的refs。若任意application模块仍可持有raw SDK对象并在finalize直接调用，系统只能被视为违反composition contract，不能宣称CapabilityRevoked已覆盖该路径；迁移验收必须通过import/constructor allowlist与真实入口E2E把这种泄漏降为0。
+closure introspection、扫描`__closure__`或检查finalize函数签名不是capability confinement。post-safety“不能再碰硬件”由构造边界完成：raw driver从未离开owner，plan只拿RunDevice/CleanupDevice代理；cleanup完成后broker run lease先被不可逆revoke，再构造不含hardware verb的`PostSafetyContext`并执行finalize。若任意application模块仍可持有raw SDK对象并在finalize直接调用，系统就是违反composition contract，必须用import/constructor allowlist与真实入口E2E清零，而不是增加更多proof wrapper掩盖泄漏。
 
-只有 worker/session 已退出且 safe/disarm 得到肯定 acknowledgement，RunController 才准备释放对应 ResourceClaim。若 join 超时，Run 保持 CANCELLING 且 claim 仍由原 run 持有；若 worker 已退出但 safe/disarm 明确失败，Run进入内部`FINALIZING_SAFETY`并准备FAILED disposition，ResourceArbiter将设备标记为待QUARANTINE；只有全部相关authority-scoped SafetyDispositionBundles durable并封存RunSafetyDispositionSet后，才发布外部FAILED、安装各authority的QUARANTINED projection并释放claims。QUARANTINED资源不能被普通acquire，只有用户通过§9的RecoveryPlan执行adapter声明的recovery action、随后identity/health/safe验证通过并显式确认，才可解除；不能在finally中无条件release。
+只有 worker/session 与 in-flight interrupt 已退出，且每个device hazard都得到恰好一个 `SAFE(SafetyProof)` 或 `UNSAFE(reason, recovery_action)` 决定后，RunController 才撤销broker run lease。join 超时保持 CANCELLING 与原claims；safe verification失败生成UNSAFE，不能在finally中无条件release。一个run的全部决定由同一个 `SafetyDispositionBundle` 原子覆盖：SAFE record必须引用完全相等的 `DeviceBindingStamp`，UNSAFE record产生quarantine projection；bundle durable以后才进入不含硬件能力的PostSafetyContext，UNSAFE run不提交成功artifact。
 
-ResourceArbiter 使用 machine/device-installation 级稳定安全目录中的 append-only `QuarantineJournal`，不能放在用户可切换的 artifact RepositoryRoot 中。journal 记录 stable DeviceIdentity、connection generation、run_id、prepared artifact/table digest、原因、required recovery、首次/最近时间和解除证明。每个 hazardous control-lease/run epoch 在本epoch**第一次可能改变设备/输出/采集状态的configure、session start、arm、fire、safe、abort或interrupt之前**原子追加一次 `HAZARD_ACTIVE` write-ahead record，不为每个 trigger做磁盘fsync。只有整个hazard epoch通过现有safe/status回读、正常completion+保守drain合同或人工recovery验证后才追加`RESOLVED`。这样进程在任何危险状态变化后直接崩溃也会留下未解除事实，又不要求新硬件receipt。FPGA identity使用板卡DNA/serial（若现有接口可读）或稳定部署endpoint+人工资产映射，qCMOS使用model/serial，不能只用device_index或枚举顺序。
+ResourceArbiter 使用 machine/device-installation 稳定目录中的 append-only `SafetyJournal`，不能放在用户可切换的 artifact RepositoryRoot 中。它统一记录 `HazardRecord`、`SafetyDispositionBundle` 与 `RecoveryBundle`；quarantine只是UNSAFE disposition产生的未解决projection，不建立第二本日志或第二套authority。每个run在第一次可能改变设备状态前一次性追加hazards，不为每个trigger fsync。HazardRecord携带完整 `DeviceBindingStamp`；SAFE必须匹配同一 physical identity 与同一 connection generation。时间字段只用于人类诊断，不参与admission、重放顺序、幂等或因果判断；因果只来自exclusive claim、append顺序和精确 record id引用。
 
-HazardClaim、HazardRecord、quarantine与RecoveryClaim必须逐项携带同一个stable DeviceIdentity；key相同但physical identity不同的替换设备不能解除旧设备记录，真正换机建立新ResourceKey/资产映射并保留旧记录待人工处置。任何新HAZARD_ACTIVE若与未解决hazard或quarantine的ResourceKey层级重叠，journal在同一个跨进程锁内拒绝，ResourceArbiter不得只信启动时内存projection。
+MemorySafetyJournal 在每个entry完整验证后增量维护 unresolved projection，不能每次append全量重放。PersistentSafetyJournal委托 storage-owned `FramedJournal` exclusive append session：启动时scan/repair一次，正常steady append不重扫历史；lost-ack使缓存未知并至多触发一次refresh。持久实现启动时持有覆盖整个installation lifecycle的owner lock，第二个authority直接拒绝。已绑定ResourceArbiter的journal不能被外部提前close。
 
-该journal的权威位置必须与能全局执行`DeviceControlLease`的owner共置，而不是笼统等于“启动client的本机目录”。本机直连设备由唯一adapter host在设备安装目录持有lease+journal；RemoteSequencer由硬件server持有权威owner token、hazard index、journal与Recovery gate，client本地记录只作缓存/诊断，不能决定AVAILABLE。server必须在允许危险输出前确认HAZARD_ACTIVE durable，并在bundle提交前拒绝其它client接管。若当前server尚不能提供这一闭环，只能声明一个固定真实控制入口并禁止其它机器/launcher并发控制，不能宣称跨机器EXCLUSIVE或靠各client自己的journal拼出安全性。
+Recovery采用claim-first：`RecoveryController.begin(ResourceKey)`先在broker为空也可行的情况下取得该**精确** blocked key的exclusive recovery claim，并冻结唯一 `blocking_record_id + PhysicalDeviceIdentity`。composition随后建立或取得recovery-only live binding，`RecoveryAttempt.complete(binding)`在同一claim内验证live identity与safe state。正常SAFE要求full stamp完全相等；跨重启recovery允许新的connection generation，但 `PhysicalDeviceIdentity` 四字段必须完全相等。journal acknowledgement丢失时retry必须复用同一binding、evidence与bundle id；历史已resolved时返回既有事实，不复活旧run。abort或进程故障保留原blocker。普通connection establishment仍拒绝blocked key。
 
-持久SafetyJournal启动时必须取得覆盖整个进程生命周期的installation-owner文件锁；第二个arbiter/recovery authority直接拒绝启动，而不是各持一份stale projection。已绑定ResourceArbiter的journal不能被外部提前close；只能由arbiter在确认无active claim、pending journal I/O或recovery lease后执行shutdown并释放owner lock。RecoveryController取得Resource RecoveryClaim后，还必须在DeviceBroker取得同key的RecoveryBindingLease；该lease从probe开始一直覆盖到RecoveryBundle durable complete/abort，期间rebind、普通run open和第二个recovery全部拒绝。probe返回后仍重验binding object、stable identity与generation。lost-ack重试若发现同一HAZARD_ACTIVE已被durable RESOLVED，返回`ALREADY_RESOLVED`并使旧run失败；绝不能在本地“复活”旧epoch或再次启硬件，只有重新acquire生成新hazard id才可开始新run。
+同一physical identity不能同时绑定两个ResourceKey，同key也不能静默换成另一个physical identity；换机必须新建ResourceKey/AssetMap事实并保留旧blocker。硬件sticky fatal/status若存在优先于软件观察；没有该能力时SafetyJournal仍覆盖进程崩溃、driver无持久fatal和remote socket重建。真实adapter必须使用持久journal；MemorySafetyJournal只用于virtual与测试。
 
-DeviceBroker的只读identity/health probe只铸一次性`VerifiedBoundDeviceIdentity`；bind成功即消费nonce，并在broker registry维护`stable DeviceIdentity -> ResourceKey + generation`唯一映射。同一receipt不得复用，同一物理identity不得通过两个逻辑key并发绑定，同一key也不能在未显式换机流程中悄悄换成另一physical identity。换机必须建立新的ResourceKey/资产映射并保留旧hazard事实。Recovery proof同样不可变并由签发registry绑定原RecoveryClaim；仅比较公开字段或`isinstance`不足以解除quarantine。
-
-每个新 device connection generation 初始为 UNVERIFIED；若同一 DeviceIdentity 有未解除 journal entry，则初始为 QUARANTINED_PENDING_VERIFY，而不是因进程重启回到 AVAILABLE。adapter 完成 identity/layout/fatal-status/health/safe handshake 只能提供解除证明，不能自行删除记录；用户确认 recovery 后追加 RESOLVED。设备确实更换且 stable identity 不同时建立新资源记录，不继承另一个物理设备的 quarantine。journal 的写入失败本身使安全相关 resource 保持 unavailable。
-
-现有硬件若暴露sticky fatal/status，它是最高优先级事实；没有该能力时QuarantineJournal覆盖进程崩溃、driver无持久fatal或远端socket重建等软件边界。诊断日志只用于观察，不能代替持久状态合同，也不能因此要求新增RTL状态位。
-
-该 baseline 不是多装置工作流数据库：只需一个由 zlc_storage 原子追加的本地安全 ledger、按 stable DeviceIdentity 查询未解决记录、追加 RESOLVED，且不承担分布式协调/自动恢复/通用审计 UI。virtual adapter 和纯单元测试可用内存实现；任何能驱动真实安全关键输出的 adapter 必须使用持久实现。不能把它降成仅进程内状态，因为进程崩溃、RPyC断线和stop join timeout会让“硬件是否safe”跨重启未知；现有status/safe/reconnect handshake用于解除记录，不能让重启自动洗白。
-
-cleanup对每个HazardClaim必须给出且只给出一种safety disposition：`SAFE(proof)`或`UNSAFE(reason, recovery_action)`。多设备run不能因为设备B safe失败就把设备A也留成未解决hazard，反之也不能因A safe就释放B。disposition按其installation authority/durability domain分区。每个authority的固定顺序是：其全部CaptureSession/临时handle/in-flight interrupt真实退出 -> live verifier对绑定identity/generation产出proof或UNSAFE reason -> authority owner/server撤销该run对本域的全部execute/session/cleanup capability epoch -> mint只绑定run/keys/generation/proof/revoke epoch与稳定bundle_id的`BundleSubmitAuthority` -> 用它把安全keyHazardResolution、失败key quarantine record及proof/revoke digests原子、幂等追加为`SafetyDispositionBundle(authority_id, bundle_id, ...)` -> 返回durable ref。禁止把本机camera journal与远端FPGA/server journal伪装成一次跨域原子追加。RunController只有在所有所需authority bundles都返回可验证的durable ref后，才在自己已有的local crash-recovery ledger中封存durable、不可变的`RunSafetyDispositionSet(run_id, ordered_bundle_refs, digest)`。该set只是有序证明索引与后续commit gate，不是分布式事务或新的工作流数据库；任一authority未durable或set record未durable时，Run保持非terminal并持有全部相关claims。
-
-`SAFE(proof)`只能由该adapter针对同一个`VerifiedBoundDeviceIdentity` evidence receipt/kind、AssetMap revision与同一个authority-signed connection generation执行的肯定终态readback产生；`HARDWARE_IDENTITY_READBACK`可声明同一物理设备，`INSTALLATION_ASSERTED_ENDPOINT`只能声明同一控制端点并继承已记录的换板剩余风险。部署若不接受该风险，该adapter/工作点就是NO-GO；若经PI/installation policy明确接受，它可作为冻结硬件baseline，但artifact和recovery UI不得改写成物理serial证明。`safe_requested`、命令成功返回、本地 `state="safe"`、缓存 snapshot、缺失字段或 broker 事后补写 expected identity/generation 都只是意图或软件事实，不能 mint SAFE。若现有硬件/transport没有可验证终态readback，结果必须是 `UNSAFE`/quarantine 或显式人工 RecoveryPlan，而不是为了让流程结束伪造确认。Manual/no-control backend应被建模为不拥有危险输出能力的人工边界；一旦它声明 hazardous control capability，就必须遵守同一证明要求。
-
-authority capability epoch撤销后，任何迟到的本域closure/session/旧remote token调用都必须在owner/server处返回`CapabilityRevoked`；对应claims仍作为排他token保留，不能在等待bundle append或其它authority时重新碰已经裁决的设备。若bundle append/journal ack失败，旧hazard仍unresolved、capability保持撤销、claims保持；authority进程仍存活时只能用同一个缓存bundle与`BundleSubmitAuthority`幂等重交，不能重新运行普通run verifier/cleanup、重新mint capability或生成另一份事实。若authority进程自身崩溃导致缓存丢失，原run不能继续；startup按HAZARD_ACTIVE/RunSafetyDispositionIntent保持blocked，只有显式RecoveryClaim可重新验证并生成关联原hazard的RecoveryBundle，绝不恢复旧run capability。RunController消费verified durable ref后再撤销本地proxy nonce并写domain completion。全部bundles与RunSafetyDispositionSet均durable后，RunController确认PreparedRun已不含任何device capability并只生成`PostSafetyContext(result, lineage, repositories, safety_set_ref)`。此后cancel只参与artifact commit gate，不再调用interrupt/abort/safe；否则刚写下的SAFE/UNSAFE事实会立即失真。
-
-RunSafetyDispositionSet封存前，各authority先在自己的durability domain更新quarantine/hazard index。set中若存在任何UNSAFE key，run不得提交成功artifact，直接进入terminal发布；若全部SAFE，才使用PostSafetyContext继续provenance validation与artifact commit。最终artifact manifest记录safety set digest及全部ordered bundle refs；commit成功或失败后，ResourceArbiter在同一互斥边界内发布terminal snapshot并释放尚未提前phase-release的claims，竞争run不能观察到“claim已空闲但旧handle仍非terminal”的中间状态。进程若在部分bundle durable或set封存后、terminal前崩溃，startup逐authority验证bundle refs并结合final manifest确定性写入RunRecoveryRecord：全部refs durable且manifest存在并验证通过才恢复SUCCEEDED，否则恢复FAILED/ABANDONED或保持SAFETY_JOURNAL_BLOCKED；绝不重新fire。因为每个hardware hazard都已在自己的authority域durable resolve/quarantine，恢复不猜设备是否safe。
-
-journal append 失败时，run 保持内部`SAFETY_JOURNAL_BLOCKED`非终态阶段并继续持有全部相关claims；RunHandle外部仍为RUNNING/CANCELLING且phase明确显示失败原因，绝不能提前发布FAILED/CANCELLED/SUCCEEDED。重试只向失败authority重交**该authority同一个已缓存SafetyDispositionBundle**，不能重新生成record id/time、改变已经durable的其它bundle、把safe-resolution failure错路由为quarantine，或在部分写后追加语义不同的第二批记录；全部refs齐备后以同一ordered refs/digest幂等重试local recovery ledger中的唯一RunSafetyDispositionSet，set写入失败同样保持SAFETY_JOURNAL_BLOCKED。人工解除quarantine同样在各自authority域使用幂等`RecoveryBundle`解除其quarantine/hazard records；进程重启或部分I/O failure后重放同一bundle/set不改变最终事实。memory journal必须通过同一合同测试，但真实adapter的composition root不得隐式退回memory实现。
-
-若使用 §9 的静态 last-use phase 提前释放，必须在对应authority域走同样的per-resource durable SAFE resolution，并永久移除PreparedRun对该Port的capability；这是一条显式`RESOURCE_PHASE_RELEASED`事件，不冒充run terminal。没有完整静态证明的baseline一律持有claim到RunSafetyDispositionSet封存与最终terminal提交完成。
+journal append失败时run保持内部`safety-journal-failed`非终态phase并继续持有claims。retry只重交同一个已缓存bundle，不能生成新record id、改变决定或重新运行硬件cleanup。baseline持有所有claims直到safety bundle与terminal publication完成；没有第二个真实last-use消费者与独立证明前，不引入phase-release状态机。
 
 ### 8.5 Owner-thread command mailbox
 
@@ -1161,9 +1152,9 @@ ResourceClaim:
 
 Run 启动前一次解析全部 claims 并原子 acquire_all。运行中禁止新增 capability 或 lease。
 
-ResourceArbiter 只证明同一 composition root 内的互斥。真实 adapter/server connection 还必须取得窄 `DeviceControlLease`，用 SDK exclusive-open、server-side owner token 或本机 interprocess lock 证明 notebook、standalone launcher、Workbench 和远端 client 之间的物理排他；无法证明时只能开放一个真实控制入口，不能把 EXCLUSIVE 描述成跨进程事实。lease丢失走现有safe/connection-recovery路径并quarantine，而不是让另一个进程静默接管；不因此要求新硬件watchdog。
+ResourceArbiter 只证明同一 composition root 内的互斥。真实 adapter/server connection 还必须由具体backend/composition用 SDK exclusive-open、server-side owner token 或本机 interprocess lock 证明 notebook、standalone launcher、Workbench 和远端 client 之间的物理排他；无法证明时只能开放一个真实控制入口，不能把 EXCLUSIVE 描述成跨进程事实。物理owner proof丢失走现有safe/connection-recovery路径并quarantine，而不是让另一个进程静默接管；generic runtime不为此新增平行lease类型，也不因此要求新硬件watchdog。
 
-claims 在 bind 时仍声明完整 superset，但 `PreparedRun` 可以静态标记每个 claim 的最后使用 phase。CaptureSession 已退出且 hardware safe ack 后，RunController 可提前释放 camera/sequencer claim再做长 fit/save；释放后后续 phase不再持有对应 Port capability，且禁止重取或重新 acquire。没有这条静态 phase 证明时，一律持有到 Run terminal。
+claims 在 bind 时声明完整superset，baseline始终持有到SafetyDispositionBundle durable、finalize/commit结束并线性化发布terminal。当前没有第二个真实消费者证明提前phase release值得新增状态机，因此不在private prepared value上标last-use，也不提供运行中re-acquire。
 
 ResourceArbiter 只返回：
 
@@ -1178,29 +1169,34 @@ ResourceQuarantined(reason, recovery_action)
 普通Run之外只有两个窄、显式且仍受Arbiter约束的设备生命周期入口：
 
 ```text
-ConnectionEstablishmentClaim(ResourceKey)
-  -> DeviceControlLease + owner lane
+begin_connection_establishment(tuple[ResourceKey, ...])
+  -> ConnectionEstablishmentLease
+  -> composition/backend physical-exclusive proof + adapter owner
   -> allowlist: open/connect、read identity/health/capability
-  -> transfer the still-open connection to DeviceSet as
-     VerifiedBoundDeviceIdentity(stable identity, connection_generation)
+  -> DeviceBroker.verify_identity(probe)
+  -> one-shot VerifiedPhysicalDeviceIdentity
+  -> DeviceBroker.bind(...) -> BoundDevice
 
-RecoveryClaim(ResourceKey, unresolved quarantine/hazard refs)
-  -> RecoveryPlan(allowlisted identity/status/safe/reset/reconnect steps)
-  -> DeviceControlLease + owner lane
-  -> RecoveryBundle or remain quarantined
+RecoveryController.begin(ResourceKey)
+  -> RecoveryAttempt(exact blocking_record_id, PhysicalDeviceIdentity)
+  -> composition establishes/obtains recovery-only BoundDevice
+  -> attempt.complete(binding) -> RecoveryBundle
+  -> attempt.abort() -> original blocker remains
 ```
 
-ConnectionEstablishmentClaim与同ResourceKey任何普通/Recovery claim互斥，不能configure output、arm或fire；若某SDK的open本身会改变危险输出，它必须按RecoveryPlan处理并保持未解决safety record，不能冒充只读连接。成功后claim结束只把同一条仍由DeviceSet/owner lane持有的physical connection从ESTABLISHING原子转为AVAILABLE，不close；application shutdown/disconnect/close立即使VerifiedBoundDeviceIdentity失效。普通Run的“open CaptureSession”只能在这条已验证connection上创建session handle，不得reconnect。Recovery若执行reconnect，RecoveryBundle必须同时提交新generation的identity/health证明并产出新的VerifiedBoundDeviceIdentity；证据不完整则只能回到UNVERIFIED/QUARANTINED，不能直接AVAILABLE。
+ConnectionEstablishmentLease与同ResourceKey任何普通/recovery claim互斥，不能configure output、arm或fire；若某SDK的open本身会改变危险输出，它必须保持safety blocker，不能冒充只读连接。成功后lease结束只把同一条仍由DeviceSet/adapter owner持有的physical connection转交给broker，不close；application shutdown/disconnect/close通过broker invalidation使BoundDevice失效。普通Run只能在这条已验证connection上创建session handle，不得reconnect。
 
-RecoveryClaim只能引用已经存在的quarantine/hazard records，只开放adapter声明的最小recovery allowlist，与所有普通EXCLUSIVE/OBSERVE/connection claims互斥。它不是绕过RunController的“管理员后门”：仍使用唯一DeviceControlLease、同一owner lane、bounded timeout和可查询RecoveryHandle；进程在recovery中崩溃时原记录继续未解决。全部验证通过并经用户确认后才原子提交RecoveryBundle并转AVAILABLE；失败或journal失败保持QUARANTINED，不能升级为普通control claim。
+RecoveryAttempt只能引用一个已经存在的精确blocker，与所有普通EXCLUSIVE/OBSERVE/connection claims互斥。它不是绕过RunController的“管理员后门”：composition只开放adapter声明的identity/status/safe最小路径和bounded timeout。`complete(binding)`在probe前后都重验binding对象；相同PhysicalDeviceIdentity但新connection_generation可以跨重启恢复，任一physical identity字段不同都拒绝。进程在recovery中崩溃、abort或journal失败时原记录继续未解决，不能升级为普通control claim。用户确认若产品需要，属于composition/UI policy，不进入generic runtime状态机。
 
 `AssetMap` 是 installation-owned、machine/device级持久配置，只保存 `asset_id -> canonical ResourceKey + exact adapter kind + expected physical identity/endpoint matcher`；revision是完整canonical内容的digest，不能是代码常量、版本昵称或由实验role派生的字符串。它不在实验preset、用户可切换repository或普通`load_config`中，也不是另一套device registry。更新AssetMap属于显式维护/换机操作，必须保留旧hazard/quarantine事实并重新执行identity/recovery验证；普通实验只能引用已有asset_id。启动时必须检查map的当前 plain format name、canonical digest、ResourceKey唯一性、matcher可判定性与所有真实adapter覆盖；缺项、歧义或未知adapter一律在composition阶段拒绝，不能留到某个LogicNode首次使用时才失败。
 
-运行时设备替换、`load_config` 或 virtual/real authority切换不是普通对象赋值，也不是第三种设备生命周期入口，而是 installation authority 对§9既有入口的 fail-closed 编排事务：先按canonical `(authority_id, ResourceKey)`顺序取得全部affected swap gates并禁止新start；任一gate取得失败时只按相反顺序释放已经取得且尚未执行close的gates，不能留下部分replacement。随后由同一composition authority（RunController + ResourceArbiter + DeviceBroker）取消并等待所有相关legacy/new/console外Run terminal、全部authority SafetyDispositionBundles durable、RunSafetyDispositionSet封存且claims释放。**设备生命周期终止只由该authority判定**：TaskConsole/PulseGUI等GUI只能在RunHandle已经terminal后通过Qt owner-thread queued reconciliation更新列表、按钮和surface，QWidget callback不得同步执行stop/close、持有swap gate、阻止safety progress或成为“旧设备可以关闭”的证据；notebook/kernel线程发起swap时也遵守同一规则。
+运行时设备替换、`load_config` 或 virtual/real authority切换不是普通对象赋值，也不是第三种设备生命周期入口，而是 installation authority 对§9既有入口的 fail-closed 编排事务。调用者只得到一个不透明transition capability；child token、candidate/prepared artifact与phase都留在composition root私有`TransitionState`。状态严格为`GATED -> QUIESCED -> INVALIDATED -> COMMITTED`：begin在同一临界区关闭RunController、ResourceArbiter、DeviceBroker与legacy fence四个域的新authority admission；quiesce只有在controller owner thread、全部resource/recovery/connection ownership、broker run/probe/identity handshake与legacy reference owner都退出后才由私有state推进；invalidate不接受调用者字段或bool，跳过quiesce机械拒绝。任一步取得失败都整体回滚，不能留下部分replacement。随后由同一composition authority取消并等待所有相关legacy/new/console外Run完成join、其单一SafetyDispositionBundle durable且claims释放。**设备生命周期终止只由该authority判定**：TaskConsole/PulseGUI等GUI只能在RunHandle已经terminal且join完成后通过Qt owner-thread queued reconciliation更新列表、按钮和surface，QWidget callback不得同步执行stop/close、持有transition capability、阻止safety progress或成为“旧设备可以关闭”的证据；notebook/kernel线程发起swap时也遵守同一规则。
 
-在第一次close前，local recovery ledger必须持久化`DeviceSwapIntent(swap_id, ordered_authorities/ResourceKeys, old/new asset refs, expected identity evidence policy, phase=QUIESCED, digest)`；写失败时旧connections仍未关闭，按相反顺序释放gates并明确失败。close前只允许验证inert InstallationCandidate，不能open new connection、预签connection generation或创建第二套authority/journal。intent durable后，supervisor先mint不可复用的installation generation并原子发布`UnavailableInstallationState(SWAPPING)`，再由各DeviceSet在owner lane关闭旧connection；因此public pointer不会在old physical close后仍声称AVAILABLE。随后为每个new binding正式取得ConnectionEstablishmentClaim + DeviceControlLease，在owner lane完成live identity/health handshake、AssetMap校验并由同一个authority签发各自connection generation；每个close/handshake/binding-registry exchange都只把同一intent推进到新的单调durable phase，不生成第二个swap。全部live binding验证后才mint另一个installation generation并构造完整`AvailableInstallationState(private raw graph, generation-bound binding/runtime registry, typed facades/descriptors, DeviceCatalogView)`；broker registry交换完成后先写`SWAP_COMMITTED`，再在supervisor临界区一次替换current-state指针，最后才按相反顺序解除gates。每次state transition解锁后发布其单个immutable change event；不得分别赋值`session.devices/runtime/readout/timing`，也不得让observer在两次赋值之间读取。编排者自身不取得raw adapter drive capability，也不宣称跨authority原子commit；startup发现未完成intent时先mint/恢复不可复用installation generation并发布完整`UnavailableInstallationState(RECOVERY_REQUIRED)`，按intent中保存的authority-domain/asset refs路由重取gates并reconcile，不按当前config猜测或自动fire。任何close之后的handshake/commit失败都保持整个installation显式UNAVAILABLE，partial bindings只留在supervisor私有recovery context，保持剩余gates/start禁令直到reconciliation或维护恢复，不能半发布或暴露部分可运行设备。跨过首次close后，稳定InstallationSupervisor继续强持有old/new binding与raw-graph lifecycle state、journal owner lock、未完成intent、swap gates与SwapRecoveryContext，直到reconcile成功或显式maintenance shutdown；把公开state替换成UNAVAILABLE、抛出异常或丢弃局部变量都不得让这些私有状态被GC/提前close。跨远端authority domain时context可保存既有domain refs用于recovery routing，但普通swap绝不创建第二个本地ResourceArbiter/SafetyJournal owner或复制installation authority。普通实验config只能引用installation-owned asset id，不能定义或改写ResourceKey/stable identity，也不能假装回滚到已关闭旧connection。
+capability probe一次返回完整frozen snapshot，camera/sequencer descriptor只能从该snapshot纯函数投影；`TargetDeviceEndpoint`没有第二个`describe()`硬件/RPC入口。这样probe lease退出后不存在仍可读取旧raw connection的裸callback。commit发布后逐个child gate finalization时，composition私有state为每个已完成child清除token；shutdown使用child提供的原子`resume_or_begin(expected_token)`接管“仍current”或“已生效但上层收到异常”的两种情况，不能拿stale token永久卡死。任一晚期失败都强制public state为`RECOVERY_REQUIRED`并保留old/new raw graph、exact prepared artifact与恢复上下文；不能在catalog已AVAILABLE时丢失failure owner。
 
-这里的“持续拥有”落实为supervisor私有的`SwapRecoveryContext(stable InstallationSupervisor ref, old/new binding states, old/new raw-graph lifecycle state, existing authority-domain refs, intent ref, gates, durable phase)`；public `UnavailableInstallationState`只暴露opaque RecoveryStatusRef/immutable status DTO，显式reconcile/maintenance-shutdown通过窄RecoveryAdminPort进入supervisor。只有reconcile成功或显式maintenance shutdown完成后才能释放这些owner与token。
+在第一次close前，local recovery ledger必须持久化`DeviceSwapIntent(swap_id, ordered ResourceKeys, old/new asset refs, expected identity evidence policy, phase=QUIESCED, digest)`；写失败时旧connections仍未关闭，整体释放installation transition capability并明确失败。close前只允许验证inert InstallationCandidate，不能open new connection、预签connection generation或创建第二套authority/journal。intent durable后，supervisor先mint不可复用的installation generation并原子发布`UnavailableInstallationState(SWAPPING)`，再由各DeviceSet在adapter owner上关闭旧connection；因此public pointer不会在old physical close后仍声称AVAILABLE。DeviceSet的role map与close manifest在构造后不可改；热配置只能创建新generation，不能从现有map `pop`/替换raw adapter让它逃过close。随后为exact prepared artifact中的每个new binding取得ConnectionEstablishmentLease，在同一composition authority内完成live identity/health handshake、AssetMap校验并由DeviceBroker签发connection generation。全部live binding验证后才mint另一个installation generation并构造完整`AvailableInstallationState`；broker registry交换完成后先写`SWAP_COMMITTED`，再在supervisor临界区替换current-state指针，最后一次性完成transition。任何close之后的handshake/commit失败都保持installation显式UNAVAILABLE，partial bindings只留在supervisor私有recovery context。稳定InstallationSupervisor继续强持有old/new raw-graph lifecycle state、SafetyJournal owner lock、未完成intent和transition capability，直到reconcile成功或显式maintenance shutdown；普通swap不创建第二个ResourceArbiter/SafetyJournal owner。普通实验config只能引用installation-owned asset id，不能定义或改写ResourceKey/physical identity，也不能假装回滚到已关闭旧connection。
+
+这里的“持续拥有”落实为supervisor私有的`SwapRecoveryContext(stable InstallationSupervisor ref, old/new binding states, old/new raw-graph lifecycle state, existing authority-domain refs, intent ref, gates, durable phase)`；public `UnavailableInstallationState`只投影为不可变`DeviceCatalogView`，RECOVERY_REQUIRED时由该catalog单源携带opaque canonical `recovery_status_ref`；显式reconcile/maintenance-shutdown通过窄RecoveryAdminPort进入supervisor。只有reconcile成功或显式maintenance shutdown完成后才能释放这些owner与token。
 
 OBSERVE 应尽量使用独立只读 capability Protocol，而不是把同一个控制对象运行时阉割为 read-only wrapper。
 
@@ -1214,7 +1210,7 @@ OBSERVE 不等于允许第二个 session 并发读同一 driver。对 camera 等
 
 Definition 是 frozen metadata + callable，不需要每类再建立 Handler Protocol 和公共 ABC。
 
-Definition 中 callable 只能是显式 top-level builder/operator 引用，不能 closure 捕获 Device、Session、Repository、GUI 或 mutable config；所有运行依赖必须出现在 request/bindings/BoundDependencies，所有可变参数必须进入 config revision。
+Definition 中 callable 只能是显式 top-level builder/operator 引用，不能 closure 捕获 Device、Session、Repository、GUI 或 mutable config；所有运行依赖必须出现在 typed request 与领域私有immutable bindings，所有可变参数必须进入 config revision。
 
 只有会出现在 catalog/UI/API 的能力需要 Definition；Task 内部私有算法保持普通函数。
 
@@ -1881,21 +1877,24 @@ Fit 面板先调用 authority-side `suggest_fit_draft(schema, FitPolicy, Selecti
 reject new commands
 -> mark UI shutting_down
 -> terminal-ack pending ControlTopic revisions
--> cancel all RunHandles
--> await termination acknowledgement without blocking GUI event loop
 -> stop producers/subscriptions and reject new view/fit jobs
 -> cancel queued latest-only work; drain in-flight view evaluation/raster work
 -> deliver/discard final revision-checked GUI results
 -> close interactive FigureSessions/renderers on GUI thread
 -> verify/release all opt-in BorrowedSnapshot tokens
 -> stop view-evaluation/Fit/raster workers
--> close DeviceSet on owner I/O lanes
--> stop lanes
--> flush QuarantineJournal/artifact repository diagnostics
+-> installation owner closes ResourceArbiter admission (ordinary/recovery/connection) and RunController admission
+-> RunController owner-shutdown: cancel all RunHandles, join owner+interrupt threads
+-> wait all in-flight connection establishments to finish
+-> atomically gate/wait DeviceBroker identity/capability/session authority
+-> DeviceBroker owner-shutdown: irreversibly invalidate every binding/capability
+-> close the monotonic union of current and retained raw DeviceSet graphs
+-> seal raw-graph ownership transfer; after every adapter confirms closed, ResourceArbiter owner-shutdown releases SafetyJournal owner lock
+-> stop any remaining adapter lanes
 -> destroy Qt views
 ```
 
-存在 CANCELLING、join timeout、QUARANTINED resource 或 safe failure 时，普通 close 不能假装完成；UI 显示阻塞原因并提供继续等待或明确的强制进程退出。强制退出是用户确认的最后手段，不改变日志中的失败/安全不确定状态。queued result 通过 application lifetime token + run/panel revision 双重检查后丢弃，不能更新已销毁或 id 被复用的新 panel。
+上述顺序是authority边界，不由GUI线程是否仍响应来证明。ResourceArbiter、DeviceBroker与RunController在被installation composition绑定后，普通public `shutdown()`必须拒绝；只有root私有lifecycle capability能推进terminal teardown。broker必须先于raw close失效，journal owner lock必须晚于最后一个raw close acknowledgement释放。adapter close失败时保留原handle/整张raw graph供同一shutdown重试；重试的graph集合只能单调增加，不能因为current pointer改变而忘掉失败对象。并发shutdown在raw-graph manifest seal前先原子转交additional graph，active owner逐批drain单调集合；seal之后的新graph立即拒绝且仍由调用者持有。不得持composition lifecycle lock跨SDK close、journal unlock或其它物理I/O，等待者必须能按自己的monotonic deadline返回。存在join timeout、connection establishment未退出或raw close未确认时，普通close不能假装完成，并保持全部admission关闭供重试；若SafetyJournal owner close进入sticky `FAILED`，runtime发布明确的terminal `FAILED_CLOSED`诊断并在后续调用幂等重报原因，不能退化成stale-token错误。UI显示阻塞原因并提供继续等待或明确的强制进程退出。持久quarantine本身不阻止干净进程关闭——它跨重启继续阻止下一次普通admission。queued result通过application lifetime token + run/panel revision双重检查后丢弃，不能更新已销毁或id被复用的新panel。
 
 ## 13. Calibration
 
@@ -2085,7 +2084,7 @@ ScanPlan:
   total event/byte/cardinality budgets
 ```
 
-`BoundSourceAssociationContract`逐source冻结`source_id`、expected input/output keys与grouping、qualification或capability ref、terminal recipe id/version、required proof class和source-specific budget；它不是插件registry，也不把qCMOS字段强塞给其它Measurement。`PulseScanDefinition.bind(request, bindings) -> RunPlan[ScanArtifactRef]`完成纯 request/port/claim 绑定；preflight 在正确 I/O lanes 解析硬件 capability、schema、counter mode、compiled pulse compatibility 与全部预算，生成 ScanPlan 并放入 PreparedRun。ScanPlan 一旦生成不可被 GUI/ControlTopic 修改，也不包含 child RunPlan。
+`BoundSourceAssociationContract`逐source冻结`source_id`、expected input/output keys与grouping、qualification或capability ref、terminal recipe id/version、required proof class和source-specific budget；它不是插件registry，也不把qCMOS字段强塞给其它Measurement。`PulseScanDefinition.bind(request, bindings) -> RunPlan[ScanArtifactRef]`完成纯 request/port/claim 绑定；preflight 在正确 I/O lanes 解析硬件 capability、schema、counter mode、compiled pulse compatibility 与全部预算，返回领域私有的 ScanPlan 作为该RunPlan的prepared value。ScanPlan 一旦生成不可被 GUI/ControlTopic 修改，也不包含 child RunPlan。
 
 point_axes/PointLayout 决定 logical cell 顺序，trigger schedule 明确每个 ScanCellKey 期望的 TriggerKeys。`slot_binding` 是用户/模板的参数语义；`execution_mode` 只描述物理装载/执行方式。`AUTONOMOUS_RESIDENT`和`AUTONOMOUS_REFILLED`共同属于现有bitstream的`AUTONOMOUS_STREAMED`方式族：SCAN_SLOT/MOT 的**完整逻辑 finite table**必须在fire前冻结、编译并digest，FPGA在一次fire后自主决定微观时序。resident模式在fire前上传全部物理table；只有显式通过§15.4强证明的refilled capability才预装初始banks并在运行中按已冻结table的immutable chunks补充，host不得选择下一point或调度edge。只有 selected=API_SLOT 且 adapter明确证明该 API值无法在一次自主 sweep中更新时，才允许既有 `API_SLOT_SEGMENTED_EXISTING` 路径；它不能反向成为 SCAN_SLOT fallback。任一数量、slot、所需source qualification/capability、schema或 output contract无法在 fire前解析，preflight失败且不 arm。类型模型允许未来多个source-specific合同，但近期S4 Formal enablement只开放**恰好一个Q0-qualified qCMOS physical source**；多physical source或非camera source在其association/terminal contract、contract kit和真实用例完成前typed NO-GO，不能借source-neutral接口自动获得Formal资格。
 
@@ -2126,8 +2125,8 @@ FormalPulseScanRun 在 fire 前为本次 run 创建并启动整条 dedicated exa
 ```text
 PREFLIGHT -> RESERVED -> SOURCES_READY -> FIRED -> DRAINING
 -> SOURCES_STOPPED -> SAFE_CONFIRMED -> FINALIZING_SAFETY
--> all authority SafetyDispositionBundles durable
--> RunSafetyDispositionSet sealed(all SAFE) -> PROVENANCE_VALIDATED
+-> one SafetyDispositionBundle durable -> hardware-free PostSafetyContext
+-> PROVENANCE_VALIDATED
 -> COMMITTING -> terminal publish + claim release -> SUCCEEDED
 ```
 
@@ -2136,12 +2135,12 @@ PREFLIGHT -> RESERVED -> SOURCES_READY -> FIRED -> DRAINING
 ```text
 ABORTING -> SAFE_CONFIRMED --+
          -> SAFE_FAILED ------+-> FINALIZING_SAFETY
-                                  -> all authority SafetyDispositionBundles durable
-                                  -> RunSafetyDispositionSet sealed
-                                  -> FAILED + release-safe-keys/quarantine-failed-keys
+                                  -> one SafetyDispositionBundle durable
+                                  -> FAILED + quarantine-unsafe-keys
+                                  -> terminal publish + all claim release
 ```
 
-若错误发生在RunSafetyDispositionSet已封存后的PROVENANCE_VALIDATED/COMMITTING，不再重复调用硬件safe；删除未提交temp或保留已原子提交manifest这个客观事实，再按§8.4的ordered bundle refs/set digest + manifest reconciliation发布FAILED或SUCCEEDED并释放claims。未提交manifest时绝不把保存失败误报成采集成功，已提交manifest时也绝不谎报CANCELLED；两种情况都不重复fire/重开source。正常成功同样必须先在各authority域durable resolve全部hazards并封存set，再执行final artifact publish，最后线性化terminal+release。
+若错误发生在本run唯一SafetyDispositionBundle已经durable、硬件能力已经撤销后的PROVENANCE_VALIDATED/COMMITTING，不再重复调用硬件safe；删除未提交temp或保留已原子提交manifest这个客观事实，再按§8.4的`safety_bundle_id + commit_id + manifest digest` reconciliation发布FAILED或SUCCEEDED并释放claims。未提交manifest时绝不把保存失败误报成采集成功，已提交manifest时也绝不谎报CANCELLED；两种情况都不重复fire/重开source。正常成功同样必须先用一个bundle durable resolve该run全部hazards，再进入PostSafetyContext执行final artifact publish，最后线性化terminal+release。
 
 正常和abort路径都在artifact commit前终止physical sources并按现有协议请求sequencer safe。abort顺序固定为：设置cancel intent -> 调用现有abort/safe尽快阻止更多trigger并取得logical terminal/safe ack -> 按H1验证的safe/abort tail recipe保守等待可能仍在delay scheduler中的物理输出排空 -> camera仍保持capturing，在Q0合同内保守drain并冻结final metadata -> camera stop/disarm、stable check与buffer release -> abort/drain workers/builders -> join acknowledgement。不能先做长CPU/磁盘工作再请求safe，也不能在camera drain前调用`cap_stop/disarm`。只有SAFE_CONFIRMED且mode-specific sequencer terminal evidence、deployment-bound compiled/H1 post-terminal tail evidence、全部source metadata/terminal recipes、join、DatasetBuilder coverage与最终EOS全链通过EndAttestation，才允许ScanArtifact commit；无法确认safe或tail bound则ResourceClaim quarantine。provenance validation失败只产生RunFailureRecord，不保留已显示的provisional rows。
 
@@ -2252,7 +2251,7 @@ EndAttestation
 
 `CameraExternalTriggerQualification`是neutral camera/scan领域拥有的immutable artifact，blob/manifest由zlc_storage canonical repository保存；它包含qualification id/revision/digest、设备与软件身份、批准工作点集合、统计证据、margin、PI批准和创建时间。installation级`CameraQualificationIndex`是`ACTIVE | SUSPENDED_PENDING_ATTRIBUTION | SUSPENDED_PENDING_RECORD | REVOKED`状态的唯一权威，使用append-only activation/suspension/exoneration/revocation records并跨重启恢复，不能靠覆盖artifact或删除文件撤销。record必须绑定qualification revision、device identity、工作点、effective scope/time和具名evidence；只有`ACTIVE`可进入Formal FIRE gate。
 
-qualification authority与camera ResourceArbiter/DeviceControlLease共享同一个installation级跨进程线性化权威。RunController在任何camera/sequencer configure或arm之前已按§8.2为全部HazardClaims持久化本run既有的HAZARD_ACTIVE records；preflight取得camera claim后解析active revision并pin其digest。真正提交FIRE时调用短原子`pin_for_fire` gate，在同一锁/owner lane内复核既有hazard id仍active、identity/generation/settings与qualification revision仍匹配，生成引用该hazard id与revision的immutable `QualificationFireAuthorization`，并把FIRE命令提交给既有transport后才释放gate；它不在arm之后新建或替换HAZARD_ACTIVE。activation、suspension、exoneration、revocation和其它FIRE gate均与它串行，因此不存在“复核后、FIRE前”插入撤销的窗口。真实camera Formal run由EXCLUSIVE claim串行；尚未fire且pin旧revision的run在gate处失败。
+qualification authority与camera运行入口必须加入同一个installation authority及其跨进程物理owner proof，不能创建平行控制面。RunController在任何camera/sequencer configure或arm之前，已经从`RunPlan.bound_devices[*].binding_stamp`内部派生并持久化本run的HAZARD_ACTIVE records；调用者不提交第二份hazard列表。preflight取得camera claim后解析active revision并pin其digest。真正提交FIRE时调用短原子`pin_for_fire` gate，在同一installation线性化边界内复核既有hazard id仍active、identity/generation/settings与qualification revision仍匹配，生成引用该hazard id与revision的immutable `QualificationFireAuthorization`，并把FIRE命令提交给既有transport后才释放gate；它不在arm之后新建或替换HAZARD_ACTIVE。activation、suspension、exoneration、revocation和其它FIRE gate均与它串行，因此不存在“复核后、FIRE前”插入撤销的窗口。真实camera Formal run由EXCLUSIVE claim串行；尚未fire且pin旧revision的run在gate处失败。
 
 同一个`pin_for_fire`还必须复核ScanPlan pin住的`ProgrammedImageDeploymentRecordRef`仍是该sequencer endpoint的active revision；authorization保存该revision/digest。deployment record变化与Q0 activation/suspension使用同一installation线性化gate，不能在复核后、FIRE前换成另一份installation mapping。
 
@@ -2544,7 +2543,7 @@ F0 第一日即建立 cross-package golden/property contract：同一 primitive 
 
 各 owner context 的 typed Repository 委托 `zlc_storage` 的同一个 `BlobStore/ManifestCommitter` 实现 immutable content-addressed bytes、锁、fsync 与 atomic replace；owner Repository 仍负责 typed Ref、schema、canonical codec、lineage 和 load validation。`zlc_storage` 不 import AxisSpec、FigureArtifactRef、ScanArtifactRef 或任何领域类型，也不提供“万能 artifact repository”。commit point 是最后原子发布的 owner canonical manifest：
 
-SafetyJournal与CommitJournal共享`zlc_storage.FramedJournal`的纯存储机制，但记录schema与状态机仍分别由neutral runtime owner定义。frame使用canonical bytes、稳定record id与SHA-256，append在同一跨进程文件锁内先重放并验证prospective state，再写入、file fsync并同步parent directory；Windows必须真实调用可验证的directory-handle `FlushFileBuffers`或在root probe时拒绝该backend，不能把directory durability静默降成no-op。仅允许修复校验明确失败的最后一个torn frame；中间frame损坏、冲突duplicate id或非法COMMITTED/ABORTED、HAZARD/RESOLVED跃迁均fail closed，不能截断历史继续启动。
+SafetyJournal与CommitJournal共享`zlc_storage.FramedJournal`的纯存储机制，但记录schema与状态机仍分别由neutral runtime owner定义。frame使用canonical bytes、稳定record id与SHA-256。普通`FramedJournal.append_checked()`在一次跨进程文件锁内重扫并验证prospective state后append并file fsync；PersistentSafetyJournal则在installation启动时用`FramedJournal.open_exclusive()`取得生命周期排他session，scan/repair一次并缓存已验证record index，steady append只对缓存执行幂等/冲突检查后写入并file fsync，不重新扫描整个历史。journal/lock文件首次创建时才需要同步parent directory；已存在文件的steady append不伪造额外目录变更。Windows必须真实调用可验证的directory-handle `FlushFileBuffers`或在root probe时拒绝需要目录durability的backend，不能把directory durability静默降成no-op。仅允许修复校验明确失败的最后一个torn frame；中间frame损坏、冲突duplicate id或非法COMMITTED/ABORTED、HAZARD/RESOLVED跃迁均fail closed，不能截断历史继续启动。
 
 ```text
 write blobs to temporary names
@@ -2562,7 +2561,7 @@ manifest 出现前的 blob 都不是成功 artifact；baseline maintenance 只�
 
 每个 manifest atomic replace 是该 artifact 的 commit linearization point；Run 声明的 final result manifest 是其 SUCCEEDED commit point。Repository在replace前已有durable CommitIntent；CancellationToken在intent之后、final replace之前最后检查：此前取消则删除final temp、不发布final manifest并把intent标为ABORTED，进入CANCELLED/FAILED(cleanup error)；replace成功后final artifact已是事实，后到cancel返回`TOO_LATE_ALREADY_COMMITTED`，Run完成SUCCEEDED并可记录late-cancel warning，不能删除artifact后谎报取消。replace返回异常不等于未提交，必须由owner Repository按commit_id检查最终manifest/digest后才能写COMMITTED或ABORTED。更早独立提交的upstream artifact遵守自己的commit point，不随父Run回滚。
 
-hazardous Run还必须先让§8.4全部authority-scoped SafetyDispositionBundles durable并封存RunSafetyDispositionSet；任一UNSAFE key禁止发布成功final manifest，全部SAFE时manifest写入set digest与ordered bundle refs。各authority bundle、set seal、CommitIntent、manifest replace/COMMITTED-or-ABORTED resolution与Run terminal是有顺序但不伪装成跨authority/跨文件原子事务的linearization points，startup按bundle refs、set digest、commit_id和manifest digest执行确定性reconciliation。普通Repository不得跳过这个outer RunController gate直接保存“成功run artifact”。
+hazardous Run必须先让§8.4中该run唯一的SafetyDispositionBundle durable；任一UNSAFE key禁止发布成功final manifest，全部SAFE时CommitIntent直接记录该bundle id。SafetyDispositionBundle append、CommitIntent、manifest replace、COMMITTED-or-ABORTED resolution与Run terminal是有顺序但不伪装成跨文件原子事务的linearization points，startup按`safety_bundle_id + commit_id + target/manifest digest`执行确定性reconciliation。普通Repository不得跳过这个outer RunController gate直接保存“成功run artifact”。
 
 content-addressed blob 允许并发 writer 幂等复用；manifest publish 使用 digest/id 冲突检查，不能覆盖不同内容。只有 repository 规模证明 unreferenced blob 回收是实际问题、且所有 owner 能提供已验证 committed-manifest roots 后，才增加 maintenance-lock 下的 mark-and-sweep；storage 不自行解析产品 manifest。这样 baseline 先共享崩溃安全机制和 canonical bytes，不为尚未出现的多 backend/复杂 GC 建一套存储平台。
 
@@ -2719,12 +2718,12 @@ Architecture：
 - catalog Definition callable 无 hidden closure/device/session/global mutable dependency；
 - PipelineSpec 编译成唯一顶层 RunPlan，节点不能 start child run 或自行拥有 terminal state；
 - bind claim superset 完整，preflight/execute 尝试新增 ResourceKey 失败；
-- 同一物理 DeviceIdentity 的 Workbench/notebook/standalone/remote client 只有取得 DeviceControlLease 的一个控制 owner；两个进程各自的 ResourceArbiter 不能同时 Acquired；
+- 同一PhysicalDeviceIdentity在Workbench/notebook/standalone/remote入口间只有一个installation authority和一份backend可验证physical-owner proof；两个进程各自的ResourceArbiter不能同时把本地EXCLUSIVE冒充成同一物理设备的跨进程所有权；
 - TaskConsole、PulseGUI、Experiment/session与standalone real入口均拿不到raw device drive verb；quarantine或其它owner持claim时，从每个公开入口尝试camera acquire或sequencer prepare/fire都被同一authority拒绝；
 - S0.5 legacy start 必须经过 LegacyRuntimeFence并登记`LegacyRunFootprint(claims, reference_keys)`；claims与实际host读写一致，reference_keys覆盖全部raw connection/lifecycle依赖；旧 thread 未真实退出/safe 前swap/close不能越过对应reference，新 Run只被真实冲突claim阻塞，所有 direct LogicNode.start 入口被机械禁止或限定为无硬件测试；
 - device/config swap 与并发start线性化；console外handle和target Run同样被authority发现并停止，旧connection关闭前claims归零，新registry commit失败时session不半发布，普通config改identity/key不能绕过旧quarantine；
 - console打开时从非Qt notebook/kernel线程发起device/config swap，硬件quiescence、safety disposition与close仍完全由installation authority完成；GUI只在Qt owner thread queued reconcile，event loop阻塞、QWidget callback失败或窗口已销毁都不改变硬件正确性，也不存在跨线程QWidget调用；
-- 在首次close之后分别注入new-binding handshake、registry exchange、`SWAP_COMMITTED`记录与facade publish失败，session保持UNAVAILABLE且`SwapRecoveryContext`仍可查询、reconcile、显式shutdown；稳定InstallationSupervisor、old/new binding/raw-graph lifecycle state、既有authority-domain refs、journal owner lock、swap gates和未完成intent不能泄漏或随局部对象析构消失；
+- 在首次close之后分别注入new-binding handshake、registry exchange、`SWAP_COMMITTED`记录与facade publish失败，session保持UNAVAILABLE且`SwapRecoveryContext`仍可查询、reconcile、显式shutdown；稳定InstallationSupervisor、old/new binding/raw-graph lifecycle state、既有authority refs、journal owner lock、唯一installation transition capability和未完成intent不能泄漏或随局部对象析构消失；
 - DeviceSwapIntent在每个close/handshake/registry-exchange相邻crash点可重放；startup即使当前config已移除旧authority也按intent路由reconcile，SWAP_COMMITTED前session facade始终UNAVAILABLE；
 - StreamProcessor/Analysis callable 不读 global RNG/time/config，显式 seed/config 可重放；
 - BEST_EFFORT_MONITOR 只能是 monitor 叶子，其失败不 abort exact，且不能流回 authority/artifact；
@@ -2803,28 +2802,28 @@ Thread/UI：
 - reset/reconnect 未通过 health/safe check 不能解除 quarantine；
 - 新 connection generation 在 UNVERIFIED handshake 完成前不可 acquire，应用重启不洗白 sticky fatal；
 - active Run内transport断开不透明reconnect；新server/board或同设备重连产生新generation，旧run cleanup不能用新generation readback生成旧generation的SAFE receipt；
-- ConnectionEstablishmentClaim只允许open/identity/health且与普通/recovery claim互斥；成功后同一live connection转交DeviceSet，close/disconnect使binding失效；verified generation变化使已bind RunPlan拒绝，不能在普通preflight偷偷reconnect；
+- ConnectionEstablishmentLease只允许open/identity/health且与普通/recovery claim互斥；成功后同一live connection转交DeviceSet，close/disconnect使binding失效；connection generation变化使已bind RunPlan拒绝，不能在普通preflight偷偷reconnect；
 - RecoveryClaim只针对既有unresolved refs，和普通claim完全互斥且只能执行allowlisted identity/status/safe/reset/reconnect；recovery中崩溃/超时/journal失败后仍quarantined；
-- `VerifiedBoundDeviceIdentity`不可变且一次性消费；同一receipt复用、同一stable physical identity绑定两个ResourceKey、同key静默换physical identity全部拒绝；
+- `VerifiedPhysicalDeviceIdentity`不可变且只能由DeviceBroker握手mint并在bind时一次消费；成功后唯一长期事实是`DeviceBindingStamp(PhysicalDeviceIdentity, connection_generation)`。同一握手结果复用、同一PhysicalDeviceIdentity绑定两个ResourceKey、同key静默换physical identity全部拒绝；
 - identity evidence明确区分HARDWARE_IDENTITY_READBACK与INSTALLATION_ASSERTED_ENDPOINT；后者保存endpoint/AssetMap revision与剩余换板风险，不能在Q0/artifact/UI中显示成硬件serial readback；
 - 真实runtime缺失AssetMap、map revision不是canonical内容digest、exact adapter kind/expected matcher不符时composition拒绝；新进程+新broker下把同role换成另一serial仍拒绝，只有显式maintenance/device-swap可更新map；
-- `VerifiedSafeStateProof`与`VerifiedRecoveryProof`不可变，owner按nonce消费签发快照；字段赋值、proof复用、设备A proof替换设备B receipt以及跨run/key/generation substitution全部拒绝，且未调用B verifier时B绝不转SAFE；
+- run cleanup的`SafetyProof`由RunContext消费broker签发且stamp完全匹配的`SafeReceipt`后mint；recovery使用`RecoveryEvidence(DeviceBindingStamp, safe_state_digest)`并原子写入`RecoveryBundle`。字段赋值、proof/evidence复用、设备A的值替换设备B receipt以及跨run/key/generation substitution全部拒绝，且未调用B verifier时B绝不转SAFE；
 - `safe_requested`、command return、本地state/cache、缺失readback与broker补写expected generation均不能产生SAFE；每个真实adapter的live terminal verifier覆盖肯定/否定/读取失败，未知adapter在composition时拒绝；
 - DeviceSet中的每个BaseDevice均有exact-type三态分类；任意未知class/subclass不能default continue；所有LogicNode按全部referenced devices登记reference_keys并在swap前terminal，但只有真实host读取/控制进入ResourceClaim；虚拟trigger-wire等adapter内部接线不得伪造OBSERVE claim；
 - qCMOS、Pylon、Remote FPGA与Manual backend各自SafeStateContract矩阵覆盖肯定/否定/readback失败/disconnect/generation-change；缺失肯定readback时Formal保持NO-GO且不制造fake寄存器测试；
 - Pylon拔线fake保留缓存GetDeviceInfo且令IsGrabbing为false/IsOpen为true时，`IsCameraDeviceRemoved`或资格化live readback必须使start与SAFE mint失败、旧generation失效并进入quarantine；cleanup前一步失败仍尝试后续声明动作，但缺少全部MUST_SUCCEED ack与最终肯定readback时仍不得SAFE；
-- 每个hazardous run epoch在首次可能改变设备/输出/采集状态的configure/session-start/arm/fire/safe/abort/interrupt前完成RunSafetyDispositionIntent与各authority HAZARD_ACTIVE write-ahead（非逐cell fsync）；partial-authority write或crash-after-state-change重启后恢复SAFETY_JOURNAL_BLOCKED/QUARANTINED_PENDING_VERIFY；只有现有safe/status或recovery验证 + 用户确认追加RESOLVED；切换artifact repository root不洗白machine/device safety ledger；
-- RunSafetyDispositionIntent固定expected authority/resource/hazard ids与recovery routing；当前config移除authority、部分bundle durable后crash或set record写失败时，startup仍重放同一intent/bundles/set且不遗忘远端hazard；
-- safe、unsafe与同run多device mixed disposition按authority/durability domain分别提交：owner/server先撤销本域execute/session/cleanup capability epoch并mint无hardware verb的BundleSubmitAuthority，再原子幂等append稳定id的SafetyDispositionBundle；append/ack失败时hazard/claims保留、capability仍撤销，只能重放同一bundle，late remote/local call均为CapabilityRevoked；ref必须绑定revoke epoch/token digest，client proxy revoke只作镜像；全部refs齐备后在local recovery ledger幂等封存唯一RunSafetyDispositionSet；
-- 任一authority bundle未durable或RunSafetyDispositionSet未封存时，RunHandle不发布FAILED/CANCELLED/SUCCEEDED，只显示FINALIZING_SAFETY/SAFETY_JOURNAL_BLOCKED phase并保留claims；全部safe时set后继续artifact commit，任一unsafe时禁止成功artifact；最终terminal与剩余claim release一次可见；
-- bundle构造前session/interrupt全部退出；durable后PreparedRun只转换为无device Port的PostSafetyContext，claims仅保留排他性；注入旧session/closure或late cancel硬件调用必须得到CapabilityRevoked且调用计数为0；
+- 每个hazardous run在首次可能改变设备/输出/采集状态的configure/session-start/arm/fire/safe/abort/interrupt前，由RunController从`BoundDevice.binding_stamp`唯一派生并向同一SafetyJournal原子write-ahead全部HAZARD_ACTIVE records（非逐cell fsync）；append失败或crash后启动重放未解决hazard并阻止普通admission，切换artifact repository root不能洗白machine/device safety ledger；
+- HazardRecord固定run_id、ResourceKey、完整DeviceBindingStamp与稳定record id；journal acknowledgement丢失时retry必须提交同一组records，部分已知、identity/generation变化或相同id内容冲突全部fail closed；
+- session/worker/in-flight interrupt全部退出且run hardware capability不可逆撤销后，同run所有SAFE/UNSAFE决定由ResourceLease一次构造并幂等append唯一SafetyDispositionBundle；append/ack失败时全部claims保留，只能重放缓存的同一bundle，late hardware call为CapabilityRevoked，不建立多bundle聚合或额外set；
+- 唯一SafetyDispositionBundle未durable时，RunHandle不发布FAILED/CANCELLED/SUCCEEDED，只显示FINALIZING_SAFETY/SAFETY_JOURNAL_BLOCKED phase并保留claims；全部SAFE时继续artifact commit，任一UNSAFE时禁止成功artifact；最终terminal与全部claim release一次可见；
+- bundle构造前session/interrupt全部退出；durable后领域prepared value被丢弃，只把executed facts交给无device Port的PostSafetyContext，claims仅保留排他性；注入旧session/closure或late cancel硬件调用必须得到CapabilityRevoked且调用计数为0；
 - raw SDK/driver只在allowlisted owner lane构造和保存；RunPlan/Definition/finalize的对象图、global、container与bound method均不存在driver或可直达driver的callback，验收不以closure introspection冒充隔离；
-- cancellation在CommitIntent fsync期间仍可受理；intent后取消写ABORTED且publish调用次数为0；manifest replace确认丢失、COMMITTED marker确认丢失和Repository暂时不可达均保持非terminal/claim，不重复publish；startup用ordered bundle refs+safety set digest+commit id+manifest digest把pending intent唯一解析为COMMITTED或ABORTED；
+- cancellation在CommitIntent fsync期间仍可受理；intent后取消写ABORTED且publish调用次数为0；manifest replace确认丢失、COMMITTED marker确认丢失和Repository暂时不可达均保持非terminal/claim，不重复publish；startup用`safety_bundle_id + commit_id + CommitTarget/manifest digest`把pending intent唯一解析为COMMITTED或ABORTED；
 - `CommitAuthority`只能由startup-reconciled RepositoryCommitCoordinator签发，是不含public publish/journal/recover的无副作用opaque handle且单次消费；直接发布、替换payload、重复/跨run消费、ephemeral journal生产签发与绕过startup pending gate全部拒绝；错误PublishedManifest类型/target/digest直接ABORTED且recover调用次数为0，只有typed PublishVisibilityUnknown进入recover，recovered PublishedManifest仍须再次匹配target/digest；
 - commit reconciliation三态不可反转：wrong digest + abort-marker failure仍FORCE_ABORT且recover为0；visibility recovery已判uncommitted + marker failure仍FORCE_ABORT；validated publish/recovery + commit-marker failure仍FORCE_COMMIT且不再调用recover；
 - crash发生在safety bundle、commit intent、artifact manifest、commit resolution和terminal任意相邻边界时，startup确定性恢复SUCCEEDED或FAILED/ABANDONED，不重新fire、不把temp当成功；
 - terminal snapshot与剩余claim释放对竞争acquire线性化；真实adapter bootstrap缺少persistent journal时拒绝启动，memory journal只用于virtual/unit test；
-- remote DeviceControlLease/journal/recovery authority位于硬件server；不同client本地journal不能洗白server quarantine，server不支持时contract明确拒绝多入口；
+- remote endpoint的physical-owner proof、journal与recovery authority位于硬件server；不同client本地journal不能洗白server quarantine，server不支持唯一owner时contract明确拒绝多入口；
 - schema-affecting reconfigure 建新 generation/block_id，旧 cursor/view/fit terminal；每个 accepted ControlTopic revision 恰有一个 terminal ack；
 - I/O lane 饱和 monitor 负载下，测试按冻结的 LaneFairnessPolicy 验证 `max_monitor_burst`、accepted finite 最大越过 turns、control 最大排队时间与每类 transaction deadline；超限产生唯一 terminal ack/run failure，monitor 不能 starvation finite/control，超时 driver call 不能在后台继续碰硬件，safety interrupt 不经普通队列；
 - stale queued result 不更新 UI；
@@ -2851,8 +2850,8 @@ Thread/UI：
 
 Public hardware capability boundary：
 
-- 从 Experiment、所有领域 facade、RunHandle、TaskConsole、PulseGUI、DeviceManager/Viewer、DeviceCatalogView/DeviceInfo 作为根递归遍历 public object graph；拒绝 BaseDevice/DeviceSet/SDK handle、BoundDevice/RunDevice/CleanupDevice、drive-capable Port、含BoundDependencies的RunPlan、raw bound method、resolver、driver callback 与 drive verb；
-- public Experiment.run/start signature只接受declarative Request；inspect只返回PlanDescriptor DTO。RunPlan/PreparedRun/BoundDependencies只在composition/RunController私有registry可达，RunHandle对象图不含plan或Port；
+- 从 Experiment、所有领域 facade、RunHandle、TaskConsole、PulseGUI、DeviceManager/Viewer、DeviceCatalogView/DeviceInfo 作为根递归遍历 public object graph；拒绝 BaseDevice/DeviceSet/SDK handle、BoundDevice/RunDevice/CleanupDevice、drive-capable Port、含设备binding或driver callback的internal RunPlan、raw bound method、resolver与drive verb；
+- public Experiment.run/start signature只接受declarative Request；inspect只返回PlanDescriptor DTO。internal RunPlan、领域prepared value和immutable bindings只在composition/RunController私有执行图可达，RunHandle对象图不含plan或Port；
 - public GUI constructor signature 不接受 Experiment/Session/DeviceSet、raw camera/sequencer、`devices_provider` 或返回 raw object 的 callback；TaskConsole running nodes 只暴露 DTO；
 - `Zou_lab_control` 与 `neutral_atom` umbrella 的 raw symbol deny-list既不在`__all__`，`getattr`也必须AttributeError；frontend import graph不出现device adapter/registry/server module；
 - AST drive-owner gate扫描`open/configure/arm/acquire/prepare/fire/abort/safe/close`，只允许 adapter owner、installation authority、owner I/O lane bridge 与明确的 maintenance/recovery implementation；教程、frontend、Definition、RunPlan/finalize不在allowlist；
@@ -2862,7 +2861,7 @@ Public hardware capability boundary：
 - 同binding health变化只推进catalog/state revision；进入不可逆swap先mint installation generation并在first close前发布无capability的UNAVAILABLE/SWAPPING，成功bindings各自mint connection generations，恢复AVAILABLE再mint新installation generation；所有generation不可复用，恢复前排队command永远不能迟到执行；
 - 所有旧DeviceRef、command facade与pending GUI command在swap后以零adapter调用失败；旧DeviceCatalogView仍可作为历史值显示但不能执行；
 - config swap在不可逆边界前只存在inert candidate且失败保持完整旧AVAILABLE；不允许第二authority/journal owner或pre-close connection generation；DeviceSwapIntent durable后、first close前必须先发布不含raw/facade的UNAVAILABLE/SWAPPING state，之后任一点失败只推进完整RECOVERY_REQUIRED state且稳定InstallationSupervisor/私有SwapRecoveryContext仍被强持有；成功后以另一installation generation发布完整AVAILABLE；GUI缺席、卡住或销毁不影响结果；
-- public capture、PulseGUI、TaskConsole、DeviceControlPort与notebook路径在claim conflict、quarantine、stale generation和swap gate下全部fail closed；
+- public capture、PulseGUI、TaskConsole、DeviceControlPort与notebook路径在claim conflict、quarantine、stale generation和installation-wide transition gate下全部fail closed；
 - adapter contract tests从adapter SDK/owner module导入并由fixture在composition前保留raw spy；runtime/public/GUI tests不得为了断言底层调用从Experiment反向取得raw object；
 - 仓库级 fixture 集合只能从 Git tracked set 或显式 committed manifest 枚举，禁止用目录 glob 把开发者本机的 ignored 实验文件变成隐形测试输入；可选私有文件不存在时 skip 的测试不计入回归覆盖，观测事故必须转成 committed 最小 golden 或由独立模型生成的确定性场景；
 - docs、notebook templates与生成的notebooks grep禁止`exp.devices` raw、`exp.camera/sequencer`、直接QCMOSCamera/RemoteSequencer构造及直接open/acquire/prepare/fire；关键virtual notebook在CI执行。
@@ -2941,7 +2940,7 @@ producer/adapter
 + 删除该 use case 的旧实现、alias、fallback、测试和文档
 ```
 
-同一个 use case 不允许双写、双读或自动 fallback；尚未迁移的其它 use case 可以暂时停留在旧实现，但不能通过 bridge 污染新合同。S0.5 只允许 host/catalog/render/resource containment，不允许把旧 Hub/LogicNode/metadata vocabulary 适配成新 event/data/runtime 类型；这叫迁移隔离，不是领域兼容层。旧 panel 可由 LegacyPanelHost 逐项托管，旧 hardware workflow 必须经过 LegacyRuntimeFence 使用同一 ResourceArbiter/DeviceControlLease。共享 primitive 只在首个消费它的切片中建立最小正式版本；后续若无第二用例，不提前泛化。
+同一个 use case 不允许双写、双读或自动 fallback；尚未迁移的其它 use case 可以暂时停留在旧实现，但不能通过 bridge 污染新合同。S0.5 只允许 host/catalog/render/resource containment，不允许把旧 Hub/LogicNode/metadata vocabulary 适配成新 event/data/runtime 类型；这叫迁移隔离，不是领域兼容层。旧 panel 可由 LegacyPanelHost 逐项托管，旧 hardware workflow 必须经过 LegacyRuntimeFence，加入同一ResourceArbiter、DeviceBroker和installation-wide transition gate。共享 primitive 只在首个消费它的切片中建立最小正式版本；后续若无第二用例，不提前泛化。
 
 追溯审查判断“是否保留”时必须看终态职责和已排期 consumer，不能把中间提交的 production reachability 当成唯一标准。`MonitorTap -> MonitorDataset -> LiveDatasetSlot` 的未来 GUI live/rolling consumer、calibration/occupancy 的 S3 consumer、FitResultBatch 的 gridplot consumer 都是明确需求；它们可以因职责混杂、重复 owner 或过度包装而重构、压缩或替换，但不能仅因当前 composition 尚未接线就整簇删除。只有目标职责已有更小的唯一 owner、全部当前与已排期 consumer 都完成迁移，并有 dependency-closed 删除证据时才物理删除。
 
@@ -2984,7 +2983,7 @@ E0a报告是S1/H1设计、Q0测试矩阵、preflight margin候选与PerformanceB
 
 只建立后续 S1 立即消费的正式能力：
 
-1. safety spine：RunController/RunHandle、ResourceArbiter、跨入口 DeviceControlLease、BoundDevice/owner I/O lane、真实 termination acknowledgement 与 machine/device级 write-ahead quarantine journal；先用阻塞 fake/virtual camera证明HAZARD_ACTIVE durable前cancel不调用硬件、interrupt/join未完成不发布terminal或释放claim，并用per-authority幂等SafetyDispositionBundle + RunSafetyDispositionSet覆盖safe、mixed unsafe、跨domain partial success、restart、retry及bundle-set/artifact/terminal crash reconciliation；真实bootstrap缺少persistent journal必须拒绝启动。
+1. safety spine：RunController/RunHandle、单一ResourceArbiter、DeviceBroker/BoundDevice、adapter owner、installation-wide transition gate、真实termination acknowledgement与machine/device级单一SafetyJournal；先用阻塞fake/virtual camera证明HAZARD_ACTIVE durable前cancel不调用硬件、interrupt/join未完成不发布terminal或释放claim，并用每run唯一、幂等的SafetyDispositionBundle覆盖safe、mixed unsafe、restart、lost-ack retry及bundle/artifact/terminal相邻crash；真实bootstrap缺少persistent journal必须拒绝启动。
 2. zlc_data：AxisId/AxisSpec、ValueSchema/DatasetSchema、Value/DataBlock、Validity、PointLayout、ValuePayloadContract 和 canonical codec；它是这些通用数据类型、数值 snapshot/byte-accounting 合同的唯一 owner。
 3. zlc_storage：canonical primitive encoder/digest、BlobStore/ManifestCommitter/atomic probe；各 owner 保留 typed Repository/schema codec，并从第一天用 cross-package golden/property test 锁定 canonical bytes。
 4. neutral stream：broker-minted generation、AcquisitionProducer/read-side stream、Payload/JoinKey contracts、opaque Delivery/EOS、single-formal reservation/ack、TraceBinding、BACKPRESSURE_CAPABLE/NON_BACKPRESSURE_CAPTURED、RetentionOverrun poison，以及 exact `DatasetBuilder/DatasetProgress/DatasetPreviewSnapshot/SealedDatasetArtifact` 与 bounded `MonitorTap/MonitorDataset/MonitorDatasetSnapshot`；不发布累计 DataBlock，live owner 在 S5 aggregate admission 完成前不接真实 Workbench。
@@ -3013,7 +3012,7 @@ S0.5 解决的是“新切片住在哪里”，不是预先重写 9000 行 UI；
 
 1. 建立长寿命`InstallationSupervisor`、inert `InstallationCandidate`、post-handshake immutable `InstallationState`、`DeviceRef/DeviceInfo/DeviceCatalogView`、typed timing/readout/trap descriptors与窄command/admin ports；raw DeviceSet/adapter graph转为composition/runtime私有实现，authority/journal不随普通config state替换。
 2. 把config/device swap改为candidate prevalidation -> intent durable + 原子发布UNAVAILABLE/SWAPPING -> old close -> 同一supervisor authority完成new live handshake/connection generations -> 以新installation generation原子发布完整AVAILABLE；每个transition均为单指针发布，partial binding只在supervisor私有context，并保证stale DeviceRef/command在触碰adapter前失败。
-3. 先迁 production 内部 consumer：只有`InstallationSupervisor`、installation authority/current-state owner与其明确的swap/recovery implementation可持有InstallationState。Experiment facade每次操作只在临界区snapshot一次并立即构造generation-pinned request；Definition bind、measurement/task、provenance和runtime helper只能接收声明的BoundDependencies或immutable DTO，resolver只存在于bind调用栈，任何consumer都不能保存整个private composition state。仍未迁完的legacy node只可在LegacyRuntimeFence岛内通过私有binding运行。
+3. 先迁 production 内部 consumer：只有`InstallationSupervisor`、installation authority/current-state owner与其明确的swap/recovery implementation可持有InstallationState。Experiment facade每次操作只在临界区snapshot一次并立即构造generation-pinned request；Definition bind、measurement/task、provenance和runtime helper只能接收领域声明的immutable typed bindings或DTO，resolver只存在于bind调用栈，任何consumer都不能保存整个private composition state。仍未迁完的legacy node只可在LegacyRuntimeFence岛内通过私有binding运行。
 4. 迁workbench与frontend边界：TaskConsole controller去掉Session/fence并只接RunCommandPort+DTO；PulseGUI controller改为PulseTargetDescriptor+projector+PulseCommandPort；DeviceViewer/Manager controller改为catalog reader+窄control/admin port；zlc_frontend只接workbench ViewModel/纯widget props，不接neutral/pulse/runtime类型；standalone real launcher若未加入同一authority立即拒绝。
 5. 将adapter作者文档与测试移到adapter_sdk/testing/simulation namespace；普通notebook教程全部改为`connect -> Experiment facade`与`device_catalog`/typed descriptors。测试需要raw spy时在composition前保留，不从Experiment取回。
 6. 一次删除public raw aliases、fallback与umbrella exports，不提供deprecation `__getattr__`或compatibility proxy。机械object-graph/import/signature/AST/docs gates变为required。
@@ -3054,7 +3053,7 @@ qCMOS要求同identity/generation的capture terminal、DCAM status、buffer/sess
 Q0只能在F0 safety spine、S1最终CameraPort/CaptureSession/driver-buffer ownership与drain policy、H1 compiled trigger schedule语义稳定后执行。它复用E0a选出的工作点与预算，但必须用将要发布的真实adapter、SDK/driver和buffer policy重新跑qualification；E0a报告不能被重命名或复制成Q0 artifact。
 
 1. 对每个发布工作点生成immutable `CameraExternalTriggerQualification`，保存设备/firmware/SDK/driver/adapter identity及其evidence kind/receipt digest/AssetMap revision、ProgrammedImageDeploymentRecordRef revision、camera readback、buffer/drain policy、arm-ready/first-edge、active/inactive width、trigger interval/margin、last-edge-to-driver tail/quiet-window，以及nFrameCount累计快照与per-frame stamp/timestamp各自的width/signedness/modulus/reset/rollover/first-frame语义、样本规模/持续时间、loss/reorder统计上界和PI批准。
-2. 通过与camera ResourceArbiter/DeviceControlLease共用跨进程线性化权威的`CameraQualificationIndex`原子activate revision；旧revision保留但不再active。version/identity/设置集合改变、合理疑似camera违例或已归因的`CAMERA_ENVELOPE_VIOLATION`分别追加suspension/revocation，重启后仍不可用。
+2. `CameraQualificationIndex`必须加入camera所在的同一installation authority，并与FIRE共享一个跨进程可验证的physical-owner/linearization gate后才能原子activate revision；不得在ResourceArbiter旁建立平行控制authority。旧revision保留但不再active。version/identity/设置集合改变、合理疑似camera违例或已归因的`CAMERA_ENVELOPE_VIOLATION`分别追加suspension/revocation，重启后仍不可用。
 3. contract tests覆盖activation、version mismatch、setting越界、explicit suspension/revocation/exoneration、journal lost-ack/failure、crash/restart replay、两个preflight pin旧/新revision、revocation-vs-FIRE gate竞态、历史effective scope，以及processor/EOS失败不会误撤销camera qualification。
 4. Q0通过只说明相机在批准envelope内具备关联前提；它不单独授予Formal ScanArtifact。S4仍须逐run满足execution mode、exact pipeline、association proof、EndAttestation和authority commit。
 
@@ -3252,6 +3251,19 @@ apps/
 
 ### 22.1 追溯整改范围与当前 gate
 
+#### 规则 8：活动迁移测试与旧树边界
+
+迁移期间唯一可执行的 pytest 集合由 tracked 文件 `tests/migration_active_tests.txt` 给出。它只列目标新架构的 import-DAG、`test_zlc_*`、endpoint/contract/runtime/data/storage 等定向测试；新测试必须先加入该清单才能执行。唯一合法入口是 `python tests/run_migration_active.py`，定向运行使用其 `--select TEST[::NODE]` 参数；runner 对不在清单中的文件或 node fail closed。不得直接运行 `pytest`，也不得用临时 glob、失败后扩表或“顺手跑一下全量”绕过清单。
+
+闭包证据严格定义为两类，且仅此两类：
+
+1. 白名单内与本次边界直接相关的定向测试；
+2. 机械扫描，包括 changed-file/owner 账本、AST/symbol/consumer 搜索、import-DAG、canonical/digest/版本常量/重复 validator 扫描、main 行数与物理算法只读对照、必要的真实 profile。
+
+不在白名单中的历史测试在迁移完成前视为不存在：不执行、不修改，也不因其失败改变目标实现。迁移结束时再按终态架构整批删除或重写。旧树 `Zou_lab_control/**` 与 main 只允许两种动作：登记“分支改过什么、最后消费者、删除切片”，或在 dependency-closed 切片中删除；禁止为旧语义新增适配、修守卫或追求旧测试通过。main 仍可只读用于行数锚点和已验证物理/算法 oracle。教程、手册与旧 GUI 说明在迁移完成前不做同步；本设计文档例外，任何计划级取舍必须与代码同 commit 更新。
+
+本门规来自一次已复现的工作流失败：审查过程反复让历史测试和 legacy `DeviceSet/Registry` 竞态反向驱动目标架构，造成无价值守卫、镜像测试和重复执行。故它不是通用预防机制。违反清单或触碰旧树适配即使测试通过也不能形成闭包证据。
+
 规则 1–7 的审查集合必须每次由 Git 机械产生，不能靠上下文记忆或“我记得写过哪些提交”。整改启动时的固定证据是 `git rev-list --count main..HEAD = 113`、`git diff --name-only main...HEAD = 315`；在纠正误删并完成 tracked-fixture 整改的 checkpoint `12f3414`，分支变为 139/323；清除错误 calibration 历史并把唯一 oracle 重新冻结到 exact main 后，checkpoint `455ff97` 为 160 个领先提交、330 个 changed files；`e31cb9407ae8` 为 161/330；完成 superseded calibration/readout graph 删除后的 checkpoint `5e2e2f6` 为 170/375；清除当前活动代码、构建与审计 skip 中的历史 reference/archive 残余后，checkpoint `8285e43` 为 177/386。后续数字会随整改提交增长，因此报告必须同时写 checkpoint commit，不能把任一组历史数字当永久常量。
 
 本文件是目标架构、迁移顺序和 Rules 1–7 gate 的唯一计划级权威。`docs/MAINTAINER_NOTES.md` 以及 `Zou_lab_control/frontend` 内的说明和结构测试只描述仍在 `SerializedLegacyAggBridge` 后运行的 legacy island；它们可以在最后 consumer 迁走前保护现状，但不得反向规定 `zlc_frontend`、`zlc_workbench` 或其它目标包的类型、继承树和 UI/runtime 架构。旧 roadmap 不再作为并行计划源；计划级决定必须与实现同 commit 回填本文件。
@@ -3259,6 +3271,24 @@ apps/
 `12f3414` 的 323 文件第一集合按顶层 owner 分布为：tests 142、旧树 `Zou_lab_control` 48、`zlc_neutral_atom` 42、`zlc_pulse` 23、`zlc_data` 20、`zlc_workbench` 10、`zlc_frontend` 8、FPGA host/config 8、tracked pulse assets 6、`zlc_storage` 6、tutorials 5、docs 2、root/config 3；文件类型为 Python 298、JSON 9、Markdown 7、notebook 5，其余 TOML/gitignore/TeX body/batch 各 1。每个文件必须分配一个 primary owner/slice，测试跟随被测 owner审查；跨域文件还要记录 secondary seam，不能因“另一路 agent 看过相邻包”漏掉。
 
 机械覆盖至少包含：完整 changed-file set；Python AST 的 class/dataclass/enum/function/import/call-site 清点；重复 validator/digest/codec/版本常量的符号与语义搜索；production + 已排期 target consumer 图；测试 oracle/fixture 来源；main 等价物的 NCLOC/class/dataclass 比；以及对大帧 digest/copy、fit/calibration、journal、pulse compile/pack 的针对性 profile。每条规则的完成报告必须给出覆盖 checkpoint、发现总数（包含点名样本之外的新发现）、净行数变化、涉及 owner、独立验证和未来 ratchet。只给抽样或只说测试通过，不算完成。
+
+为防止上下文压缩后重复审查、漏审或把 secondary seam 误算成新闭包，最终生产代码 owner 账本固定为下列 11 个互斥闭包。账本以 `merge-base(main, HEAD)=6c337d49`、本轮 parent checkpoint `48d4606c295466525855de945d87a1e25e510d0a` 为机械基线：`main..HEAD` 为 188 个提交，`main...HEAD` 为 387 个路径；合并当前工作树真实内容后共有 408 个唯一路径，其中 194 个是 production `.py/.json/.toml/.bat/.tcl`（排除 tests/docs/tutorials）。194 个 production 文件全部恰好分配一次，无遗漏、无重复；其余 214 个测试、文档、教程和说明资产跟随其 primary owner 作为证据，不增加闭包数。
+
+| owner id | 唯一 primary scope | production 文件数 | Rules 1–7 owner 状态 |
+|---|---|---:|---|
+| `D01_DATA_FIT` | `zlc_data/*` | 18 | COMPLETE |
+| `S01_STORAGE` | `zlc_storage/*` | 7 | COMPLETE；当前 journal 生命周期接缝已随 R02 复验 |
+| `R01_STREAM_DATASET_PROCESSOR` | `zlc_neutral_atom/processing/*`、`runtime/dataset.py`、`runtime/streams.py` | 6 | COMPLETE；worker 接缝已随 R02 复验 |
+| `N01_READOUT_CAPTURE` | target acquisition/artifacts/readout/timing（pulse 除外） | 26 | COMPLETE；capture/readout 生命周期接缝已随 R02 复验 |
+| `F01_FIGURE_VIEW` | `zlc_frontend` figure/core owner | 7 | COMPLETE |
+| `R02_RUNTIME_INSTALLATION` | target runtime（dataset/streams 除外）、catalog、Workbench endpoint；旧 device/session 文件只登记最终删除点 | 22 | PARTIAL；旧测试/旧桥曾被错误当作验收证据，须按规则 8 重做 target-only 收尾 |
+| `P01_PULSE_EXECUTION` | `zlc_pulse/*`、5 个 pulse JSON、`timing/pulse.py`、旧 timing persistence/table/sequence 与 `pulse_control.py` | 35 | PARTIAL；完整 authoring→compile→wire→transport→legacy-consumer 审查待完成 |
+| `H01_HARDWARE_ADAPTERS` | `fpga/*`、旧 devices、adapter SDK、simulation/testing | 26 | PARTIAL；完整 adapter/host/trigger/真机合同审查待完成，RTL 继续冻结，除非证据证明现有 bug |
+| `U01_GUI_WORKBENCH` | frontend render、Workbench shell、旧 frontend 与 `pulse_gui.py` launcher | 17 | PARTIAL；render/thread/board/legacy bridge/GUI 等价与性能闭包待完成 |
+| `E01_EXPERIMENT_OPERATIONS` | 旧 neutral core、operations、measurements、processors、tasks、subsystems | 22 | PARTIAL；须按 measurement/task/processor use case 做 dependency-closed 审查 |
+| `A01_PUBLIC_SURFACE` | `pyproject.toml`、包根/umbrella、`_gui`、manual launcher、notebook public facade | 8 | PARTIAL；最后封 ordinary-user object graph、notebook、packaging 与文档一致性 |
+
+计数为 `18+7+6+26+7+22+35+26+17+22+8=194`。当前 5 个 owner 完成、6 个 owner 尚未完成；整改顺序为先按规则 8 重做 R02 target-only 收尾，再做 P01 与 H01 交叉审查、E01、U01、A01。横向 Rule-3 历史格式清理不是第十二个闭包；已完成 owner 的文件若作为另一个闭包的 secondary seam 被修改，只做差量复验，不重新计数或从头执行整轮。只有六个剩余 owner、规则 1–8 的全分支清点和最后一次独立对抗验收均完成，才可恢复迁移并最终宣告 GO。
 
 当前 gate 仍是 **NO-GO：迁移继续冻结**。Calibration/readout/occupancy/raw CaptureArtifact 子切片的 main 同帧 oracle、流式内存、多轴物理 context、exact triggered consumer、typed codec、Calibration 与 raw CaptureArtifact 的 coordinator-backed 持久提交及本轮 Rule-6 重复 owner 已闭合；direct-CAS `CaptureFitResultRepository` 不在这项持久提交结论内。qCMOS Formal 仍受 E0/Q0 common-aperture、first-edge/run-boundary 与 ordered-trigger 真机资格化约束。更重要的是，规则 1–7 尚未对完整 changed-file set 全局完成，剩余 owner/版本戳/镜像 oracle/海拔与 profile 清点仍必须按文件账本推进；不能因为一个纵切变绿就提前恢复新迁移。
 
@@ -3352,7 +3382,7 @@ Fit / capture-fit 的 Rule-6 回顾以 parent checkpoint `f0f13d2` 加当前候�
 
 Storage durability / repository lifetime 的 Rules 1/2/5/6 复核以 parent checkpoint `95997cdd5b1d`（184 个领先提交、386 个 changed files）为范围，沿 `durable_mkdir -> lock-file -> FramedJournal/RepositoryRootLease/PersistentSafetyJournal -> ResourceArbiter -> Capture/Calibration commit -> notebook composition` 追到所有生产 caller。复核确认的根因不是“少几个 fsync”，而是 visibility、durability acknowledgement 与 authority lifetime 曾被混为一件事：递归 `durable_mkdir` 在 child 已可见而 parent flush 失败后，重试会跳过该 entry；三份平台 advisory-lock 实现对错误分类、锁文件持久化和 close 语义发生漂移；repository/safety 的并发 close、safety close-vs-ResourceArbiter bind、unlock-error 后外层未关闭、并发 arbiter shutdown 早返回及 POSIX fork 继承 `flock` 都能让返回值早于真实 ownership 变化；Capture/Calibration 又在取得 repository hold 前开始 CAS staging；默认 safety path 在干净机器上依赖隐式多层建目录。以上都已用确定性交叉或故障注入复现后整改，不以测试偶然通过代替原因证明。
 
-整改后的单一 owner 边界是：`durable_mkdir` 只创建/重新确认“已存在 parent 下的一个 child”，每次都按 child -> parent flush，composition root 显式逐级建立 workspace 与默认 installation safety 目录；`zlc_storage.file_lock` 是唯一平台锁机械 owner，只负责持久准备永久 lock inode、blocking/nonblocking acquire、release 与真实 contention 分类，不拥有 repository borrow、safety token 或 journal transaction。CAS base hierarchy显式逐级建立；动态 shard/namespace 仅在已有 store RLock 下、两次目录 flush 都成功后进入 store-local cache，新 store 首次使用必须重新确认。Repository owner close 一直持有 state lock 到 OS unlock/close与进程 registry释放完成；borrow close 自身线性化，creator-PID guard保证 fork child只关闭继承 fd而绝不显式 `LOCK_UN`。PersistentSafetyJournal 用一个 lifecycle RLock 原子覆盖 bind/close/authority-close/snapshot/append，outer closed 在 unlock失败时也在 `finally` 成立；ResourceArbiter shutdown 持有自己的 RLock直到物理 owner release。Capture/Calibration 的临时 hold 在第一笔 CAS write 前取得，并与 coordinator `prepare()` 同步产生的长期 hold重叠；capture-fit save 已由现有 lifecycle RLock完整覆盖，删除冗余 borrow。`owner` 标签、`_os_released` 双状态和三份平台分支均物理删除，不留兼容参数、alias或旧路径。
+整改后的单一 owner 边界是：`durable_mkdir` 只创建/重新确认“已存在 parent 下的一个 child”，每次都按 child -> parent flush，composition root 显式逐级建立 workspace 与默认 installation safety 目录；`zlc_storage.file_lock` 是唯一平台锁机械 owner，只负责持久准备永久 lock inode、blocking/nonblocking acquire、release 与真实 contention 分类，不拥有 repository borrow、safety token 或 journal transaction。CAS base hierarchy显式逐级建立；动态 shard/namespace 仅在已有 store RLock 下、两次目录 flush 都成功后进入 store-local cache，新 store 首次使用必须重新确认。Repository owner close 一直持有 state lock 到 OS unlock/close与进程 registry释放完成；borrow close 自身线性化，creator-PID guard保证 fork child只关闭继承 fd而绝不显式 `LOCK_UN`。PersistentSafetyJournal 用一个 lifecycle RLock 原子覆盖 bind/close/authority-close/snapshot/append，outer closed 在 unlock失败时也在 `finally` 成立；ResourceArbiter shutdown只在自己的RLock内把OPEN原子推进到CLOSING并快照authority token，随后释放该RLock再执行可能阻塞的journal owner unlock/close，并发shutdown等待同一个completion event，最后重新持锁发布CLOSED或sticky FAILED。Capture/Calibration 的临时 hold 在第一笔 CAS write 前取得，并与 coordinator `prepare()` 同步产生的长期 hold重叠；capture-fit save 已由现有 lifecycle RLock完整覆盖，删除冗余 borrow。`owner` 标签、`_os_released` 双状态和三份平台分支均物理删除，不留兼容参数、alias或旧路径。
 
 Rule-6 以 physical/nonblank/AST 计数审查而不是按每个局部抽象辩护。五个 storage primary-owner 文件从 parent 的 `1414 / 1221 / 12 classes / 2 dataclasses / 99 functions` 变为 `1490 / 1283 / 13 / 2 / 102`，净增 `76 / 62 / 1 / 0 / 3`；唯一新增 class 是 `FileLockBusy`，三个函数就是共享平台机制，没有 lock framework、repository基类或新状态机。Safety + ResourceArbiter lifecycle seam 从 `2075 / 1830 / 33 / 17 / 123` 变为 `2100 / 1857 / 33 / 17 / 125`；Capture/Calibration/notebook/default-path caller seams 从 `4817 / 4370 / 23 / 7 / 237` 变为 `4842 / 4390 / 23 / 7 / 239`。总 production 净增 `126 PLOC / 109 nonblank`，用于失败重试、真实 close/handoff、fork与首启目录保证；同时 `repository_lease.py` 从291降到277行、`framed_journal.py` 从207降到190行、capture-fit净减3行。main 没有同职责 crash-durable storage/installation authority owner，因此只报告 parent 绝对变化，不拿普通文件保存或旧GUI代码伪造倍率；该切片不改变任何物理/数值算法，Rule 4 为不适用而不是“由新测试证明物理等价”。
 
@@ -3378,6 +3408,10 @@ Rule-6 机械计数中，primary `contracts.py + codec.py` 从 `1212 / 1071 / 7 
 
 同一 profile 固定为90,000 physical point rows、4 repeats、120,000 analysis groups：旧 repeat-expanded bracket实现约 `2.46 s / 64.09 MiB` peak；compact point-context join为 `1.276 s / 11.274 MiB` peak、`7.504 MiB` retained，repeat从1增长只改变惰性group count，不改变point join大小。join-build预算为 `65.918 MiB`，保守高于实测；materialize 120,000个named `group_contexts` 为 `0.513 s / 20.319 MiB`，对应预算 `58.594 MiB`，因此preflight不再先分配后拒绝，也不再把Python对象图算作零。首次终审的resource路由仍抓到一个真实P1：继承自main的robust lattice会为每条grid axis保留全部unordered pair slopes，旧estimator在合法`1×1000` grid上以`1.46 MiB`放行了`23.27 MiB`实测峰值；现按实测`48.8 bytes/pair`的上界`64 bytes/pair`及约`1000 bytes/site`的result graph上界`1024 bytes/site/model`计费，新预算`35,549,616 bytes`（`33.90 MiB`）约为实测`1.46×`，并由直接tracemalloc数值实现的独立oracle固定。最终12个focused readout/capture/calibration/camera/notebook/import-DAG模块为`193 passed`，资源审查另以`69 passed`和四组独立profile复核三阶段预算；production py_compile、删除表面全仓搜索与diff check在同一闭包收尾执行。
 
+`R02_RUNTIME_INSTALLATION` 的上一轮结案无效，当前状态重置为 PARTIAL。原因不是已发现某个 runtime bug，而是结案证据混入了旧 session、legacy `DeviceSet/Registry` 与历史测试，并由这些旧语义反向驱动了新守卫；这违反本节规则 8，也无法回答“目标架构若删除旧桥，哪些代码仍有价值”。R02 target-only 收尾只审 `zlc_neutral_atom.runtime` 的 authority/resource/run/capture 边界、`zlc_workbench` 的新 endpoint/port composition、target notebook facade 与 artifact 单一事实源；旧树相关 diff 只进入删除账本，不再修补。上一轮收集的历史测试数量、legacy swap 竞态和 old-session 兼容结论均不再是闭包证据。
+
+R02 重新结案前必须给出：目标 production 文件的 current→main 海拔与每个超过 3 倍抽象的存在理由；重复 capability/digest/terminal/lifecycle owner 的全仓机械清点；只来自白名单的新 endpoint/runtime/artifact 定向证据；以及旧树文件的最后消费者与删除切片。任何为了让 `test_session_*`、`test_legacy_*`、旧 device contract 或旧 GUI 测试变绿而产生的代码必须撤销，不能以“迁移桥暂时需要”为理由进入 target package。
+
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 
 | 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |
@@ -3390,7 +3424,7 @@ Rule-6 机械计数中，primary `contracts.py + codec.py` 从 `1212 / 1071 / 7 
 | `zlc_frontend` Figure/View/selector | S0.5/S2/S5 Workbench 与 notebook render | 审查 target DAG、最小入口与性能，不以旧 GUI 尚未迁入为由删除 | 新 frontend 设计被正式替换且所有目标用户面有闭环 |
 | legacy PulseTableState readers | 尚未迁完的 Camera/PulseScan/PulseGUI 岛 | 先迁每个保留 consumer 到 current PulseDocument/compiler | 最后 consumer 迁走的 H1/S3/S5 dependency-closed commit |
 
-规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`；只有七条全局规则全部 `COMPLETE` 才能恢复新迁移。目前：规则 1 PARTIAL，规则 2 PARTIAL（已纠正“零当前消费者即删除”的错误判据），规则 3 COMPLETE，规则 4 PARTIAL（calibration/readout/occupancy/capture 子切片 COMPLETE），规则 5 PARTIAL，规则 6 PARTIAL（同一子切片 COMPLETE，但全仓 runtime aggregate 与其它 owner 尚未），规则 7 PARTIAL。最终还需对完整分支做独立对抗审查，证明没有 P0/P1 correctness、边界或可实现性漏洞；子切片 GO 不能被改写成全局 GO。
+规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`；只有八条全局规则全部 `COMPLETE` 才能恢复新迁移。目前：规则 1 PARTIAL，规则 2 PARTIAL（已纠正“零当前消费者即删除”的错误判据），规则 3 COMPLETE，规则 4 PARTIAL（calibration/readout/occupancy/capture 子切片 COMPLETE），规则 5 PARTIAL，规则 6 PARTIAL（同一子切片 COMPLETE，但全仓 runtime aggregate 与其它 owner 尚未），规则 7 PARTIAL，规则 8 COMPLETE（tracked whitelist、唯一 runner、旧树只登记/删除）。最终还需对完整分支做独立对抗审查，证明没有 P0/P1 correctness、边界或可实现性漏洞；子切片 GO 不能被改写成全局 GO。
 
 ### 22.2 终态验收清单
 
@@ -3404,7 +3438,7 @@ Rule-6 机械计数中，primary `contracts.py + codec.py` 从 `1212 / 1071 / 7 
 - Fit/Selection/FitResultBatch/BoundFit 只有 zlc_data owner，DataFigure/selector controller 只有 frontend owner；BoundFit + DatasetInputSlot -> AnalysisStep 的适配只发生在 neutral/composition 侧；
 - sample event、materialized dataset、analysis result、presentation 四个平面之间只有声明的三处边界；
 - 每个事实有唯一 owner；
-- physical device 在 Workbench/notebook/standalone/remote 入口间只有一个经 DeviceControlLease 证明的 owner；迁移期 legacy runtime也不能绕过同一 ResourceArbiter；
+- physical device 在 Workbench/notebook/standalone/remote 入口间只有一个installation authority和backend可验证physical-owner proof；迁移期legacy runtime也不能绕过同一ResourceArbiter、DeviceBroker或installation-wide transition gate；
 - public Experiment/RunHandle/TaskConsole/PulseGUI/session/DeviceViewer/DeviceManager不暴露raw hardware drive capability；public根对象图中BaseDevice/DeviceSet/SDK handle/BoundDevice/drive-capable Port/internal RunPlan/resolver/drive bound method计数为0；public run/start只收declarative Request；
 - Experiment只通过`device_catalog`暴露immutable观察值，并通过timing/readout/trap等typed facade暴露领域descriptor；catalog不含callable、arbitrary snapshot service locator或command；
 - config/device swap由稳定InstallationSupervisor与同一authority冻结start、清空claims/reference_keys；pre-close只有inert candidate，intent durable后在first close前原子发布无capability的UnavailableInstallationState，关闭旧binding后才验证new live identity/connection generation，post-handshake以新installation generation原子发布AvailableInstallationState；并发读者只见完整old AVAILABLE/UNAVAILABLE/new AVAILABLE，partial binding永不公开，旧DeviceRef零底层调用失败；
@@ -3443,7 +3477,7 @@ Rule-6 机械计数中，primary `contracts.py + codec.py` 从 `1212 / 1071 / 7 
 - HAZARD_ACTIVE durable前cancel不调用任何可能触碰硬件的interrupt/abort/safe；interrupt in-flight阻止cleanup并发、terminal与claim release；
 - final artifact publish与cancel共享短原子gate，cancel-first无artifact，commit-first不谎报CANCELLED；
 - join timeout 不释放 owner，safe failure quarantine resource；
-- safe/unsafe/mixed multi-device safety disposition按authority domain由各自幂等SafetyDispositionBundle提交，全部durable refs封存为RunSafetyDispositionSet；任一domain journal失败都保留claims并只重试该domain同一bundle，artifact outcome之后的terminal publication与剩余claims释放线性化；
+- safe/unsafe/mixed multi-device safety disposition由同一ResourceLease收集为每run唯一、幂等的SafetyDispositionBundle并提交同一SafetyJournal；journal失败保留全部claims并只重试缓存的同一bundle，artifact outcome之后的terminal publication与全部claims释放线性化；
 - safety bundle durable前没有外部terminal snapshot；connection establishment/recovery各有窄claim并与普通run互斥，quarantine不存在旁路或吸收态；
 - live identity evidence区分硬件标识readback与installation-asserted endpoint，后者不冒充物理板卡readback并在artifact保存剩余风险；connection generation由installation authority在成功握手后签发；active Run断线不透明跨generation重连，safe intent或软件state不能冒充硬件safe proof；
 - safety bundle durable后所有device capability不可逆撤销，post-safety fit/save/cancel不能再触碰硬件；
