@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import math
 from numbers import Integral
@@ -16,12 +16,7 @@ from .axis import AxisId, AxisSpec
 from .layout import AxisLayout, AxisLayoutMode
 from .numeric import canonical_mean_dtype, canonical_sum_dtype, checked_numeric_sum
 from .schema import DatasetSchema
-from .selection import (
-    CoordinateRangeSelection,
-    IndexRangeSelection,
-    IndexSelection,
-    Selection,
-)
+from .selection import Selection, resolve_selection_indices
 from .validity import (
     INVALID,
     VALID,
@@ -33,9 +28,7 @@ from .validity import (
     ValidityMode,
 )
 from .value import (
-    BlockId,
     DataBlock,
-    DatasetRevision,
     DatasetRevisionRef,
     OwnedSnapshot,
 )
@@ -66,22 +59,6 @@ class ValidityPolicy(str, Enum):
     REQUIRE_ALL = "REQUIRE_ALL"
     OMIT_INVALID = "OMIT_INVALID"
     MIN_COUNT = "MIN_COUNT"
-
-
-class TransformOrigin(str, Enum):
-    USER = "USER"
-    ACCEPTED_SUGGESTION = "ACCEPTED_SUGGESTION"
-    SAVED = "SAVED"
-
-
-@dataclass(frozen=True, order=True)
-class TransformRevision:
-    value: int
-
-    def __post_init__(self) -> None:
-        if isinstance(self.value, bool) or not isinstance(self.value, Integral) or self.value < 0:
-            raise ValueError("TransformRevision must be a non-negative integer")
-        object.__setattr__(self, "value", int(self.value))
 
 
 @dataclass(frozen=True)
@@ -118,33 +95,15 @@ class ReductionSpec:
 
 
 @dataclass(frozen=True)
-class Select:
-    selection: Selection
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.selection, Selection):
-            raise TypeError("selection must be Selection")
-
-
-@dataclass(frozen=True)
-class Reduce:
-    reduction: ReductionSpec
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.reduction, ReductionSpec):
-            raise TypeError("reduction must be ReductionSpec")
-
-
-TransformOperation = Select | Reduce
-
-
-@dataclass(frozen=True)
 class DataTransformSpec:
-    operations: tuple[TransformOperation, ...]
+    operations: tuple[Selection | ReductionSpec, ...]
 
     def __post_init__(self) -> None:
         operations = tuple(self.operations)
-        if any(not isinstance(operation, (Select, Reduce)) for operation in operations):
+        if any(
+            not isinstance(operation, (Selection, ReductionSpec))
+            for operation in operations
+        ):
             raise TypeError("DataTransformSpec contains an unsupported operation")
         object.__setattr__(self, "operations", operations)
 
@@ -157,6 +116,12 @@ class TransformedSchema:
     validity_axis_ids: tuple[AxisId, ...]
     dtype: np.dtype
     value_unit: str | None
+    _fingerprint: str | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
 
     def __post_init__(self) -> None:
         cell_axes = tuple(self.cell_axes)
@@ -203,9 +168,13 @@ class TransformedSchema:
 
     @property
     def fingerprint(self) -> str:
-        from .transform_codec import transformed_schema_to_tree
+        fingerprint = self._fingerprint
+        if fingerprint is None:
+            from .transform_codec import transformed_schema_to_tree
 
-        return canonical_digest(transformed_schema_to_tree(self))
+            fingerprint = canonical_digest(transformed_schema_to_tree(self))
+            object.__setattr__(self, "_fingerprint", fingerprint)
+        return fingerprint
 
     def axis(self, axis_id: AxisId) -> AxisSpec:
         for axis in self.axes:
@@ -215,64 +184,34 @@ class TransformedSchema:
 
 
 @dataclass(frozen=True)
-class TransformRecord:
-    operation_index: int
-    operation_kind: str
-    operation_digest: str
+class CommittedTransform:
     input_schema_fingerprint: str
+    spec: DataTransformSpec
     output_schema_fingerprint: str
-    input_present_cells: int
-    output_present_cells: int
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.operation_index, bool)
-            or not isinstance(self.operation_index, Integral)
-            or self.operation_index < 0
-        ):
-            raise ValueError("operation_index must be a non-negative integer")
-        if self.operation_kind not in {"SELECT", "REDUCE"}:
-            raise ValueError("operation_kind is not a closed transform operation")
-        for field, value in (
-            ("operation_digest", self.operation_digest),
-            ("input_schema_fingerprint", self.input_schema_fingerprint),
-            ("output_schema_fingerprint", self.output_schema_fingerprint),
-        ):
-            sha256_text(value, field)
-        for field, value in (
-            ("input_present_cells", self.input_present_cells),
-            ("output_present_cells", self.output_present_cells),
-        ):
-            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-                raise ValueError(f"{field} must be a non-negative integer")
+        sha256_text(self.input_schema_fingerprint, "input_schema_fingerprint")
+        sha256_text(self.output_schema_fingerprint, "output_schema_fingerprint")
+        if not isinstance(self.spec, DataTransformSpec) or not self.spec.operations:
+            raise ValueError("CommittedTransform requires a non-empty DataTransformSpec")
 
 
 @dataclass(frozen=True, eq=False)
 class TransformedData:
     source_ref: DatasetRevisionRef
-    transform_digest: str
-    transform_revision: TransformRevision
-    transform_origin: TransformOrigin
+    transform: CommittedTransform
     values: np.ndarray
     validity: Valid | Invalid | RowComponentValidity
     schema: TransformedSchema
-    records: tuple[TransformRecord, ...]
     __hash__ = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_ref, DatasetRevisionRef):
             raise TypeError("source_ref must be DatasetRevisionRef")
-        sha256_text(self.transform_digest, "transform_digest")
-        if not isinstance(self.transform_revision, TransformRevision):
-            raise TypeError("transform_revision must be TransformRevision")
-        if not isinstance(self.transform_origin, TransformOrigin):
-            raise TypeError("transform_origin must be TransformOrigin")
+        if not isinstance(self.transform, CommittedTransform):
+            raise TypeError("transform must be CommittedTransform")
         if not isinstance(self.schema, TransformedSchema):
             raise TypeError("schema must be TransformedSchema")
-        records = tuple(self.records)
-        if any(not isinstance(record, TransformRecord) for record in records):
-            raise TypeError("records must contain TransformRecord values")
-        object.__setattr__(self, "records", records)
         object.__setattr__(
             self,
             "values",
@@ -286,74 +225,11 @@ class TransformedData:
         return _expand_transformed_validity(self.validity, self.schema)
 
 
-@dataclass(frozen=True, eq=False)
-class PreviewTransformedData:
-    """Non-authoritative transform evaluation; cannot enter fit/artifact APIs."""
-
-    source_block_id: BlockId
-    source_revision: DatasetRevision
-    source_schema_fingerprint: str
-    values: np.ndarray
-    validity: Valid | Invalid | RowComponentValidity
-    schema: TransformedSchema
-    records: tuple[TransformRecord, ...]
-    __hash__ = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.source_block_id, BlockId):
-            raise TypeError("source_block_id must be BlockId")
-        if not isinstance(self.source_revision, DatasetRevision):
-            raise TypeError("source_revision must be DatasetRevision")
-        sha256_text(self.source_schema_fingerprint, "source_schema_fingerprint")
-        if not isinstance(self.schema, TransformedSchema):
-            raise TypeError("schema must be TransformedSchema")
-        records = tuple(self.records)
-        if any(not isinstance(record, TransformRecord) for record in records):
-            raise TypeError("records must contain TransformRecord values")
-        object.__setattr__(self, "records", records)
-        object.__setattr__(
-            self,
-            "values",
-            immutable_array(self.values, dtype=self.schema.dtype, shape=self.schema.physical_shape),
-        )
-        _validate_transformed_validity(self.validity, self.schema)
-
-    def expanded_validity(self) -> np.ndarray:
-        return _expand_transformed_validity(self.validity, self.schema)
-
-
-@dataclass(frozen=True)
-class CommittedTransform:
-    input_schema_fingerprint: str
-    spec: DataTransformSpec
-    output_schema_fingerprint: str
-    revision: TransformRevision
-    origin: TransformOrigin
-    transform_digest: str
-
-    def __post_init__(self) -> None:
-        sha256_text(self.input_schema_fingerprint, "input_schema_fingerprint")
-        sha256_text(self.output_schema_fingerprint, "output_schema_fingerprint")
-        sha256_text(self.transform_digest, "transform_digest")
-        if not isinstance(self.revision, TransformRevision):
-            raise TypeError("revision must be TransformRevision")
-        if not isinstance(self.origin, TransformOrigin):
-            raise TypeError("origin must be TransformOrigin")
-        if not isinstance(self.spec, DataTransformSpec) or not self.spec.operations:
-            raise ValueError("CommittedTransform requires a non-empty DataTransformSpec")
-        from .transform_codec import committed_transform_payload_tree
-
-        expected = canonical_digest(committed_transform_payload_tree(self))
-        if self.transform_digest != expected:
-            raise ValueError("transform_digest does not match committed transform content")
-
-
 @dataclass
 class _State:
     schema: TransformedSchema
     values: np.ndarray | None
     validity: Valid | Invalid | RowComponentValidity | None
-    records: list[TransformRecord]
 
 
 def _source_validity(
@@ -424,7 +300,7 @@ def _select_validity_rows(
 def _select_validity_data(
     validity: Valid | Invalid | RowComponentValidity,
     axis_id: AxisId,
-    indices: tuple[int, ...],
+    indices: range | tuple[int, ...],
     drop: bool,
 ) -> Valid | Invalid | RowComponentValidity:
     if isinstance(validity, (Valid, Invalid)) or axis_id not in validity.axis_ids:
@@ -435,7 +311,12 @@ def _select_validity_data(
         mask = np.take(validity.mask, indices[0], axis=array_axis)
         axis_ids = validity.axis_ids[:position] + validity.axis_ids[position + 1 :]
     else:
-        mask = np.take(validity.mask, indices, axis=array_axis)
+        if isinstance(indices, range):
+            selection = [slice(None)] * validity.mask.ndim
+            selection[array_axis] = slice(indices.start, indices.stop)
+            mask = validity.mask[tuple(selection)]
+        else:
+            mask = np.take(validity.mask, indices, axis=array_axis)
         axis_ids = validity.axis_ids
     return RowComponentValidity(axis_ids, mask)
 
@@ -472,9 +353,6 @@ def _compact_transformed_validity(
 def commit_transform(
     schema: DatasetSchema,
     authoritative_spec: DataTransformSpec,
-    *,
-    revision: TransformRevision,
-    origin: TransformOrigin,
 ) -> CommittedTransform:
     """Validate and freeze an authoritative transform without touching dataset values."""
 
@@ -484,28 +362,11 @@ def commit_transform(
         raise ValueError("identity input uses None; an empty transform cannot be committed")
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
-    if not isinstance(revision, TransformRevision):
-        raise TypeError("revision must be TransformRevision")
-    if not isinstance(origin, TransformOrigin):
-        raise TypeError("origin must be TransformOrigin")
     output_schema = _compile_transform_schema(schema, authoritative_spec)
-    provisional = object.__new__(CommittedTransform)
-    object.__setattr__(provisional, "input_schema_fingerprint", schema.fingerprint)
-    object.__setattr__(provisional, "spec", authoritative_spec)
-    object.__setattr__(provisional, "output_schema_fingerprint", output_schema.fingerprint)
-    object.__setattr__(provisional, "revision", revision)
-    object.__setattr__(provisional, "origin", origin)
-    object.__setattr__(provisional, "transform_digest", "0" * 64)
-    from .transform_codec import committed_transform_payload_tree
-
-    digest = canonical_digest(committed_transform_payload_tree(provisional))
     return CommittedTransform(
         schema.fingerprint,
         authoritative_spec,
         output_schema.fingerprint,
-        revision,
-        origin,
-        digest,
     )
 
 
@@ -555,33 +416,10 @@ def apply_transform(
     assert state.values is not None and state.validity is not None
     return TransformedData(
         snapshot.ref,
-        transform.transform_digest,
-        transform.revision,
-        transform.origin,
+        transform,
         state.values,
         state.validity,
         state.schema,
-        tuple(state.records),
-    )
-
-
-def preview_transform(block: DataBlock, spec: DataTransformSpec) -> PreviewTransformedData:
-    """Evaluate an uncommitted draft into a type that cannot masquerade as authority."""
-
-    if not isinstance(block, DataBlock):
-        raise TypeError("block must be DataBlock")
-    if not isinstance(spec, DataTransformSpec):
-        raise TypeError("spec must be DataTransformSpec")
-    state = _execute_transform(block, spec)
-    assert state.values is not None and state.validity is not None
-    return PreviewTransformedData(
-        block.block_id,
-        block.revision,
-        block.schema.fingerprint,
-        state.values,
-        state.validity,
-        state.schema,
-        tuple(state.records),
     )
 
 
@@ -600,25 +438,18 @@ def _source_state(
     values: np.ndarray | None,
     validity: Valid | Invalid | RowComponentValidity | None,
 ) -> _State:
+    return _State(_source_transformed_schema(schema), values, validity)
+
+
+def _source_transformed_schema(schema: DatasetSchema) -> TransformedSchema:
+    """Project one DatasetSchema into the transform domain exactly once."""
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
     cell_axes = (schema.repeat_axis, *schema.point_axes)
-    if schema.point_layout.mode is AxisLayoutMode.RECT_C or (
-        schema.point_layout.mode is AxisLayoutMode.RECT_F
-        and len(schema.point_axes) <= 1
-    ):
-        cell_layout = AxisLayout.rect_c(tuple(axis.size for axis in cell_axes))
-    else:
-        point_layout = AxisLayout(
-            schema.point_layout.logical_shape,
-            schema.point_layout.mode,
-            schema.point_layout.storage_size,
-            schema.point_layout.storage_to_multi,
-        )
-        cell_layout = AxisLayout.product(
-            AxisLayout.rect_c((schema.repeat_axis.size,)), point_layout
-        )
     transformed_schema = TransformedSchema(
         cell_axes,
-        cell_layout,
+        schema.cell_layout,
         schema.cell_schema.data_axes,
         schema.cell_schema.validity_contract.component_axis_ids
         if schema.cell_schema.validity_contract.mode is ValidityMode.COMPONENTS
@@ -626,36 +457,16 @@ def _source_state(
         schema.cell_schema.dtype,
         schema.cell_schema.value_unit,
     )
-    return _State(transformed_schema, values, validity, [])
+    return transformed_schema
 
 
 def _run_operations(state: _State, spec: DataTransformSpec) -> _State:
-    for operation_index, operation in enumerate(spec.operations):
-        before = state.schema
-        if isinstance(operation, Select):
-            state = _apply_selection(state, operation.selection)
-            operation_kind = "SELECT"
+    for operation in spec.operations:
+        if isinstance(operation, Selection):
+            state = _apply_selection(state, operation)
         else:
-            state = _apply_reduction(state, operation.reduction)
-            operation_kind = "REDUCE"
-        state.records.append(
-            TransformRecord(
-                operation_index,
-                operation_kind,
-                _operation_digest(operation),
-                before.fingerprint,
-                state.schema.fingerprint,
-                before.cell_layout.storage_size,
-                state.schema.cell_layout.storage_size,
-            )
-        )
+            state = _apply_reduction(state, operation)
     return state
-
-
-def _operation_digest(operation: TransformOperation) -> str:
-    from .transform_codec import data_transform_spec_to_tree
-
-    return canonical_digest(data_transform_spec_to_tree(DataTransformSpec((operation,))))
 
 
 def _apply_selection(state: _State, selection: Selection) -> _State:
@@ -671,63 +482,45 @@ def _apply_selection(state: _State, selection: Selection) -> _State:
     return state
 
 
-def _selection_indices(axis: AxisSpec, term) -> tuple[tuple[int, ...], bool]:
-    if isinstance(term, IndexSelection):
-        if term.index >= axis.size:
-            raise IndexError(f"selection index {term.index} is outside axis {axis.axis_id}")
-        return (term.index,), True
-    if isinstance(term, IndexRangeSelection):
-        if term.stop > axis.size:
-            raise IndexError(f"selection range stop {term.stop} is outside axis {axis.axis_id}")
-        return tuple(range(term.start, term.stop)), False
-    if not isinstance(term, CoordinateRangeSelection):
-        raise TypeError(f"unsupported selection term {type(term).__name__}")
+def _selected_axis(
+    axis: AxisSpec,
+    indices: range | tuple[int, ...],
+) -> AxisSpec:
+    if isinstance(indices, range) and indices.start == 0 and indices.stop == axis.size:
+        return axis
     if axis.coordinates is None:
-        raise ValueError(f"axis {axis.axis_id} has no coordinates for coordinate selection")
-    if axis.coordinate_frame != term.coordinate_frame:
-        raise ValueError(f"coordinate frame mismatch for axis {axis.axis_id}")
-    if any(
-        value is None or isinstance(value, (bool, str))
-        for value in axis.coordinates
-    ):
-        raise TypeError(f"axis {axis.axis_id} coordinates are not entirely numeric")
-    indices = tuple(
-        index
-        for index, value in enumerate(axis.coordinates)
-        if term.lower <= value <= term.upper
-    )
-    if not indices:
-        raise ValueError(f"coordinate selection is empty on axis {axis.axis_id}")
-    return indices, False
-
-
-def _selected_axis(axis: AxisSpec, indices: tuple[int, ...]) -> AxisSpec:
-    if axis.coordinates is None:
-        # A range selection changes the output axis length, not the physical
-        # meaning of its surviving logical indices.  Keeping ``coordinates``
-        # as ``None`` would silently rebase e.g. camera x[20:41] to 0..20 in
-        # every downstream fit/overlay.  Materialize the original logical
-        # indices and their canonical coordinate unit so repeated selections
-        # remain absolute and serializable.
-        coordinates = tuple(indices)
-        unit = "index"
+        if not isinstance(indices, range):  # coordinate selections require declared coordinates
+            raise RuntimeError("implicit-coordinate selection is not contiguous")
+        coordinates = None
+        index_origin = axis.index_origin + indices.start
+    elif isinstance(indices, range):
+        coordinates = axis.coordinates[indices.start : indices.stop]
+        index_origin = 0
     else:
         coordinates = tuple(axis.coordinates[index] for index in indices)
-        unit = axis.unit
+        index_origin = 0
     return AxisSpec(
         axis.axis_id,
         axis.name,
         axis.role,
         len(indices),
         coordinates,
-        unit,
+        axis.unit,
         axis.coordinate_frame,
+        index_origin,
     )
 
 
 def _select_cell_axis(state: _State, position: int, term) -> _State:
     axis = state.schema.cell_axes[position]
-    indices, drop = _selection_indices(axis, term)
+    indices, drop = resolve_selection_indices(axis, term)
+    if (
+        not drop
+        and isinstance(indices, range)
+        and indices.start == 0
+        and indices.stop == axis.size
+    ):
+        return state
     axes = list(state.schema.cell_axes)
     if drop:
         axes.pop(position)
@@ -746,18 +539,30 @@ def _select_cell_axis(state: _State, position: int, term) -> _State:
         values = None
         validity = None
     else:
-        selected = np.isin(_axis_index_vector(state.schema.cell_layout, position), indices)
+        logical_indices = state.schema.cell_layout.axis_indices(position)
+        if isinstance(indices, range):
+            selected = logical_indices >= indices.start
+            np.logical_and(logical_indices < indices.stop, selected, out=selected)
+        else:
+            selected = np.isin(logical_indices, indices)
         values = state.values[selected]
         assert state.validity is not None
         validity = _select_validity_rows(state.validity, selected)
         if values.shape[0] != layout.storage_size:
             raise RuntimeError("cell selection layout disagrees with selected physical rows")
-    return _State(schema, values, validity, state.records)
+    return _State(schema, values, validity)
 
 
 def _select_data_axis(state: _State, position: int, term) -> _State:
     axis = state.schema.data_axes[position]
-    indices, drop = _selection_indices(axis, term)
+    indices, drop = resolve_selection_indices(axis, term)
+    if (
+        not drop
+        and isinstance(indices, range)
+        and indices.start == 0
+        and indices.stop == axis.size
+    ):
+        return state
     array_axis = 1 + position
     axes = list(state.schema.data_axes)
     if drop:
@@ -765,7 +570,14 @@ def _select_data_axis(state: _State, position: int, term) -> _State:
         values = None if state.values is None else np.take(state.values, indices[0], axis=array_axis)
     else:
         axes[position] = _selected_axis(axis, indices)
-        values = None if state.values is None else np.take(state.values, indices, axis=array_axis)
+        if state.values is None:
+            values = None
+        elif isinstance(indices, range):
+            selection = [slice(None)] * state.values.ndim
+            selection[array_axis] = slice(indices.start, indices.stop)
+            values = state.values[tuple(selection)]
+        else:
+            values = np.take(state.values, indices, axis=array_axis)
     validity_axis_ids = tuple(
         axis_id
         for axis_id in state.schema.validity_axis_ids
@@ -784,7 +596,7 @@ def _select_data_axis(state: _State, position: int, term) -> _State:
         state.schema.dtype,
         state.schema.value_unit,
     )
-    return _State(schema, values, validity, state.records)
+    return _State(schema, values, validity)
 
 
 def _apply_reduction(state: _State, reduction: ReductionSpec) -> _State:
@@ -832,7 +644,7 @@ def _apply_reduction(state: _State, reduction: ReductionSpec) -> _State:
         state.schema.value_unit,
     )
     if state.values is None:
-        return _State(schema, None, None, state.records)
+        return _State(schema, None, None)
     assert state.validity is not None
 
     if not cell_positions:
@@ -849,7 +661,6 @@ def _apply_reduction(state: _State, reduction: ReductionSpec) -> _State:
             schema,
             reduced_values,
             _compact_transformed_validity(reduced_validity, schema),
-            state.records,
         )
 
     if _is_full_layout(state.schema.cell_layout):
@@ -876,7 +687,6 @@ def _apply_reduction(state: _State, reduction: ReductionSpec) -> _State:
             schema,
             values_array,
             _compact_transformed_validity(validity_array, schema),
-            state.records,
         )
 
     factor_axes = _factor_aligned_reduction_axes(
@@ -917,12 +727,11 @@ def _apply_reduction(state: _State, reduction: ReductionSpec) -> _State:
             schema,
             values_array,
             _compact_transformed_validity(validity_array, schema),
-            state.records,
         )
 
-    source_mapping = _layout_mapping(state.schema.cell_layout)
     groups: OrderedDict[tuple[int, ...], list[int]] = OrderedDict()
-    for row, multi in enumerate(source_mapping):
+    for row in range(state.schema.cell_layout.storage_size):
+        multi = state.schema.cell_layout.multi_index(row)
         key = tuple(value for index, value in enumerate(multi) if index not in cell_positions)
         groups.setdefault(key, []).append(row)
     expected_contributors = math.prod(
@@ -963,10 +772,10 @@ def _apply_reduction(state: _State, reduction: ReductionSpec) -> _State:
         output_values.append(reduced_values)
         output_validity.append(reduced_validity)
 
-    runtime_layout = _layout_from_mapping(
-        tuple(axis.size for axis in remaining_cell_axes), tuple(output_mapping)
-    )
-    if _layout_mapping(runtime_layout) != _layout_mapping(output_layout):
+    if len(output_mapping) != output_layout.storage_size or any(
+        multi != output_layout.multi_index(index)
+        for index, multi in enumerate(output_mapping)
+    ):
         raise RuntimeError("reduction runtime layout disagrees with schema compilation")
     if output_values:
         values_array = np.stack(output_values, axis=0).astype(output_dtype, copy=False)
@@ -978,7 +787,6 @@ def _apply_reduction(state: _State, reduction: ReductionSpec) -> _State:
         schema,
         values_array,
         _compact_transformed_validity(validity_array, schema),
-        state.records,
     )
 
 
@@ -1039,7 +847,7 @@ def _logical_c_indices(layout: AxisLayout) -> np.ndarray:
     if layout.mode is AxisLayoutMode.RECT_C:
         return np.arange(layout.storage_size, dtype=np.int64)
     columns = tuple(
-        _axis_index_vector(layout, position)
+        layout.axis_indices(position)
         for position in range(len(layout.logical_shape))
     )
     if not columns:
@@ -1090,7 +898,11 @@ def _reduce_arrays(
     if method in (ReductionMethod.MEAN, ReductionMethod.SUM):
         safe = np.where(validity, values, 0)
         if method is ReductionMethod.SUM and values.dtype.kind in "biu":
-            summed = _checked_integer_sum(safe, axes, output_dtype)
+            summed = checked_numeric_sum(
+                safe,
+                axes,
+                output_dtype=output_dtype,
+            )
         else:
             with np.errstate(over="ignore", invalid="ignore"):
                 summed = np.sum(safe, axis=axes, dtype=output_dtype)
@@ -1119,30 +931,10 @@ def _reduction_dtype(dtype: np.dtype, method: ReductionMethod) -> np.dtype:
     return dtype
 
 
-def _checked_integer_sum(
-    safe_values: np.ndarray,
-    axes: tuple[int, ...],
-    output_dtype: np.dtype,
-) -> np.ndarray:
-    return checked_numeric_sum(
-        safe_values,
-        axes,
-        output_dtype=output_dtype,
-    )
-
-
-def _layout_mapping(layout: AxisLayout) -> tuple[tuple[int, ...], ...]:
-    return tuple(layout.multi_index(index) for index in range(layout.storage_size))
-
-
-def _axis_index_vector(layout: AxisLayout, position: int) -> np.ndarray:
-    return layout.axis_indices(position)
-
-
 def _select_layout(
     layout: AxisLayout,
     position: int,
-    indices: tuple[int, ...],
+    indices: range | tuple[int, ...],
     drop: bool,
 ) -> AxisLayout:
     if layout.mode in (AxisLayoutMode.RECT_C, AxisLayoutMode.RECT_F):
@@ -1155,17 +947,28 @@ def _select_layout(
         return factory(tuple(shape))
     if layout.mode is AxisLayoutMode.EXPLICIT:
         assert layout.storage_to_multi is not None
-        remap = {old: new for new, old in enumerate(indices)}
+        remap = (
+            None
+            if isinstance(indices, range)
+            else {old: new for new, old in enumerate(indices)}
+        )
         mapping: list[tuple[int, ...]] = []
         for multi in layout.storage_to_multi:
-            if multi[position] not in remap:
-                continue
+            old = multi[position]
+            if remap is None:
+                if not indices.start <= old < indices.stop:
+                    continue
+                new = old - indices.start
+            else:
+                if old not in remap:
+                    continue
+                new = remap[old]
             if drop:
                 mapping.append(multi[:position] + multi[position + 1 :])
             else:
                 mapping.append(
                     multi[:position]
-                    + (remap[multi[position]],)
+                    + (new,)
                     + multi[position + 1 :]
                 )
         shape = list(layout.logical_shape)
@@ -1173,7 +976,7 @@ def _select_layout(
             shape.pop(position)
         else:
             shape[position] = len(indices)
-        return _layout_from_mapping(tuple(shape), tuple(mapping))
+        return AxisLayout.from_mapping(tuple(shape), tuple(mapping))
     assert layout.factors is not None
     axis_offset = 0
     factors = list(layout.factors)
@@ -1221,7 +1024,7 @@ def _reduce_layout(
         shape = tuple(
             size for index, size in enumerate(layout.logical_shape) if index not in position_set
         )
-        return _layout_from_mapping(shape, mapping)
+        return AxisLayout.from_mapping(shape, mapping)
     assert layout.factors is not None
     axis_offset = 0
     output_factors: list[AxisLayout] = []
@@ -1236,30 +1039,16 @@ def _reduce_layout(
     return AxisLayout.product(*output_factors)
 
 
-def _layout_from_mapping(
-    logical_shape: tuple[int, ...],
-    mapping: tuple[tuple[int, ...], ...],
-) -> AxisLayout:
-    return AxisLayout.from_mapping(logical_shape, mapping)
-
-
 __all__ = [
     "CommittedTransform",
     "DataTransformSpec",
     "MissingPolicy",
-    "PreviewTransformedData",
-    "Reduce",
     "ReductionMethod",
     "ReductionSpec",
-    "Select",
-    "TransformRecord",
-    "TransformOrigin",
-    "TransformRevision",
     "TransformedData",
     "TransformedSchema",
     "ValidityPolicy",
     "apply_transform",
     "commit_transform",
-    "preview_transform",
     "resolve_transformed_schema",
 ]

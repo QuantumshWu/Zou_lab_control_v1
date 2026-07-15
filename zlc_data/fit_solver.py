@@ -75,7 +75,7 @@ def _fit_analysis(
     all other independently successful grid/site fits.
     """
 
-    if not isinstance(bound, BoundFit):
+    if type(bound) is not BoundFit:
         raise TypeError("bound must be BoundFit")
     if not isinstance(snapshot, OwnedSnapshot):
         raise TypeError("snapshot must be OwnedSnapshot")

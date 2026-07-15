@@ -240,7 +240,7 @@ FitResultBatch 的 canonical payload codec 属于 `zlc_data`，但 durable ident
 
 zlc_data 用 `bind_fit(FitSpec, expected DatasetSchema) -> BoundFit` 冻结并验证 fit/batch axes、CommittedTransform、model 与数值策略，但不捕获尚未产生的数据。`BoundFit.run(OwnedSnapshot) -> FitResultBatch` 是 formal、interactive 与 offline 三条路径共享的唯一执行值；OwnedSnapshot 同时持有 frozen DataBlock 与 exact DatasetRevisionRef，禁止 adapter 只传裸 block 丢掉 lineage。neutral runtime 只把 `BoundFit + DatasetInputSlot` 放进无 Fit 语义的通用 `AnalysisStep`。baseline 不再建立 `FitAnalysisDescriptor -> DataAnalysisProgram` 两层通用分析框架；出现第二个确实需要相同跨 context bind/replay 语义的领域中立 Analysis 后再提取。neutral 不得定义 `FitProcessor`、`FitOperator` 或 neutral-owned `FitAnalysisDefinition`，Workbench 只把 zlc_data 的 FitSpec/editor capability 投影进 `Add Analysis`。
 
-`zlc_data.codec` 是该 bounded context 内 typed canonical-byte admission 的唯一 owner；fit/transform 等 sibling codec 复用它的 canonical round-trip 判定，不各自复制“decode→project→re-encode→compare”辅助函数。已排期的 AnalysisPreset/保存 FitSpec 通过 public `fit_spec_to_tree/from_tree` 或 `encode/decode_fit_spec` 委托同一 schema owner；FitResultBatch 的 tree projector 仍为 codec 私有，公开面只给 current canonical bytes，不能顺势恢复 generic result tree/ref codec。各领域类型仍由自己的 projector/parser 负责，primitive bytes 继续委托 `zlc_storage.canonical`。
+`zlc_data.codec` 是该 bounded context 内 typed canonical-byte admission 的唯一 owner；当前只有确有 durable consumer 的 FitSpec/FitResultBatch 暴露 standalone current canonical bytes，并复用这一处 canonical round-trip 判定。Axis/DatasetSchema、Selection 与 CommittedTransform 只公开供外层 artifact 嵌入的 owner tree projector/parser；它们不各自预建无人消费的 bytes wrapper。大型 Value/DataBlock 更不经过通用 JSON/tree codec，真实持久化边界使用 bounded binary chunk/CAS。已排期的 AnalysisPreset/保存 FitSpec 通过 public `fit_spec_to_tree/from_tree` 或 `encode/decode_fit_spec` 委托同一 schema owner；FitResultBatch 的 tree projector 仍为 codec 私有，公开面只给 current canonical bytes，不能顺势恢复 generic result tree/ref codec。各领域类型仍由自己的 projector/parser 负责，primitive bytes 继续委托 `zlc_storage.canonical`。
 
 `zlc_pulse` 是一个逻辑 bounded context，而不是“为了目录好看必须独立发布的产品”。它内部包含 `model`（PulseDocument/IR）与当前唯一生产 target `fpga`（TargetSpec/compiler/wire/host/RTL/build）。FPGA server、sim/build 和 neutral sequencer adapter 已是独立消费者，所以禁止它反向 import neutral；若未来出现第二硬件 target，再在 pulse 内抽出 target Protocol，baseline 不预建插件系统。
 
@@ -614,14 +614,14 @@ DatasetSchema:
 
 - stable AxisId；
 - name、role；
-- size、coordinates；
+- size、coordinates；隐式坐标另带 `index_origin`，连续裁剪只移动 origin，不物化整根坐标轴；
 - unit: canonical unit id 或 `None`、coordinate_frame: CoordinateFrameId。
 
-AxisId 由 producer Definition 的稳定字段语义派生，在相同 semantic axis 的不同 run/adapter 间保持一致；不能每次构造随机 UUID，也不能用可修改 display name 或 tuple position 充当 identity。Select/Transpose/Rename 保留来源 AxisId；Create/Stack/Reduction 的新 AxisId 由 operation id、输入 AxisIds 与 transform digest 确定性派生，并在 TransformRecord 中记录来源。
+AxisId 由 producer Definition 的稳定字段语义派生，在相同 semantic axis 的不同 run/adapter 间保持一致；不能每次构造随机 UUID，也不能用可修改 display name 或 tuple position 充当 identity。baseline 的 Selection 保留被保留轴的 AxisId，Reduction 只移除被约简轴，不创造匿名 replacement axis。没有真实消费者的 Transpose/Stack/Create/Rename 与逐 operation 历史对象不预建；出现第二个必须创建派生轴的生产用例时，再由该 operation owner 定义稳定 AxisId 与 lineage。
 
-单位采用 zlc_data 单源维护的 canonical id（例如 `Hz`、`MHz`、`s`、`count`），display label 与物理单位分开。baseline 不建立量纲代数、单位表达式 AST 或自动推导系统；兼容性只允许“相同 canonical id”或显式列入封闭 `UnitConversionTable` 的转换。未知单位作为 opaque id round-trip，但不能自动换算。CoordinateFrameId 同样是 stable opaque id，只做等值检查；跨 frame 必须提供显式、版本化 CoordinateTransform 及其参数/lineage，不能因 shape、名字或数值范围相似而默认兼容。
+单位采用 canonical string（例如 `Hz`、`MHz`、`s`、`count`），display label 与物理单位分开。baseline 不建立量纲代数、单位表达式 AST、UnitConversionTable 或自动换算；只有完全相同的 canonical string 才兼容。未知单位作为 opaque string round-trip。CoordinateFrameId 同样是 stable opaque id，只做等值检查；不同 frame 在 baseline 直接拒绝，不能因 shape、名字或数值范围相似而默认兼容。
 
-UnitConversion/CoordinateTransform 都是 serializable value，只引用 zlc_data 的封闭实现；不携带 callable/FQCN。需要相机畸变标定、物理模型等领域映射时使用带 CalibrationArtifactRef 的 neutral StreamProcessor 或 Analysis，不能把领域 calibration 藏进通用坐标转换。出现第二个确需组合量纲或坐标代数的生产用例后，才评估引入更强模型。
+需要相机畸变标定、单位换算或其它带物理模型的映射时，先由带 CalibrationArtifactRef 的 neutral StreamProcessor/Analysis 显式产生新值与新 schema；不能把领域 calibration 藏进通用坐标 metadata。只有真实用例证明多个领域需要同一纯转换合同后，才从这些用例中提取 serializable UnitConversion/CoordinateTransform，baseline 不预建。
 
 `role: AxisRoleId` 是 producer 声明的 stable、可序列化语义，例如 repeat、scan-point、monitor-history、spatial-x、spatial-y、spectral、site 或 component。built-in role 由 zlc_data 单源定义；领域扩展使用 namespaced id，不注册可变全局对象。不认识的 role 仍能 round-trip，但默认 preserve/select。role 不能从 rank、长度、singleton 或数值内容反推。`MONITOR_HISTORY` 只表示 live snapshot 内 newest-first 的可见 slot，不是物理 scan point、readout setting 或可直接进入权威 Fit 的自变量。
 
@@ -629,7 +629,7 @@ ValidityContract 是 ValueSchema 的一部分并进入 fingerprint：VALUE 表�
 
 Data schema 不枚举“当前软件允许哪些 projection/reducer”。数据身份与已安装分析功能必须解耦：
 
-- Select/Transpose/Stack 等结构变换由 zlc_data 的显式 DataTransformSpec 定义；
+- Selection 与 Reduction 由 zlc_data 的显式 DataTransformSpec 定义；其它结构变换在出现真实消费者前不进入 baseline；
 - display-only mean/latest/sample policy 由 frontend.figure 的 ViewContract 定义；
 - 权威通用 mean/sum 使用 zlc_data ReductionSpec，用户/AnalysisSpec 必须显式选择并记录 unit/validity rule；
 - ROI photon count、occupancy、calibration 等领域 reduction 是 neutral_atom StreamProcessor/Analysis，不伪装成 ValueSchema/DatasetSchema 的内建能力。
@@ -659,6 +659,8 @@ PointLayout:
 RECT_C/RECT_F 要求 `storage_size == product(logical_shape)`，映射由 order 唯一派生。EXPLICIT 要求 `storage_size == len(storage_to_multi)`，每个 multi-index 维数正确、范围内且唯一；它可以只覆盖逻辑笛卡尔空间的稀疏子集。serpentine、非规则轨迹或自定义扫描携带显式映射；若多个物理采样落在同一个逻辑 point，必须增加独立 sample/repeat axis，不能在映射表中重复 index 后静默覆盖。
 
 没有 point axis 时 logical_shape=()、storage_size=P=1。将 EXPLICIT 数据 densify 到 logical_shape 必须同时产生 validity/mapping；算法若只需采集顺序就沿 P 和 PointLayout 工作，不能假设 P 等于逻辑尺寸乘积。
+
+`DatasetSchema.cell_layout` 是 repeat + PointLayout 合成后的唯一 canonical physical-row mapping owner。它在 schema 构造时只合成一次并缓存；transform、fit 与 frontend evaluator 都直接复用该对象，不能各自重写 C/F/EXPLICIT 组合规则。对于稀疏 PointLayout，PRODUCT factor 必须保留原 immutable PointLayout 实例及其已经建立的反向索引，不能为了消除 subclass equality 差异复制一份 mapping/dict；AxisLayout 的值相等与 hash 按结构而非 specialization class 判断，使 owner tree codec 把 factor 还原为通用 AxisLayout 后仍保持同一 canonical identity。live render 不得每帧重建 layout 或反向索引。
 
 ### 6.3 DataBlock 与 validity
 
@@ -710,7 +712,7 @@ Value 是 stream event 内的 zlc_data 数值值对象；Envelope 的 key/proven
 
 默认使用紧凑 CellValidity；只有 producer/processor 确实产生 component 级缺失时才使用 ComponentValidity。实现可用只读 broadcast view、packed bitmap 或按 chunk 存储，不能强迫所有完整 image 复制同尺寸 boolean mask；但优化不能改变具名 axis 语义。
 
-Value.validity 与 DataBlock.validity 必须符合 cell_schema.validity_contract；COMPONENTS 合同仍允许用整体 Valid/Invalid 或 CellValidity 表示“本 revision 所有 component 同生同灭”的紧凑特例，但一旦提供 ComponentValidity，其 axis_ids 只能是合同声明集合的子集。VALUE 合同绝不接受 component mask。Select/Transpose/Stack/Reduce 必须同时派生新的 validity_contract，不能只变 values/schema axes 而忘记 mask 语义。
+Value.validity 与 DataBlock.validity 必须符合 cell_schema.validity_contract；COMPONENTS 合同仍允许用整体 Valid/Invalid 或 CellValidity 表示“本 revision 所有 component 同生同灭”的紧凑特例，但一旦提供 ComponentValidity，其 axis_ids 只能是合同声明集合的子集。VALUE 合同绝不接受 component mask。Selection/Reduction 必须同时派生新的 validity_contract，不能只变 values/schema axes 而忘记 mask 语义。
 
 ReductionSpec 必须声明 `validity_policy`（例如 `ALL_REQUIRED`、`ANY_VALID`、`MIN_COUNT(n)` 或所选 reducer 合同自己的规则）。reducer 只在 mask 为真的 component 上运算，并产生新的具名 validity；不能把 NaN 当通用 validity，也不能用 `nanmean` 在未声明策略时悄悄吞掉坏 site。FitProblem 逐 batch cell 过滤无效 observation，并记录有效样本数；不足模型最小点数时只使该 batch result 失败。Histogram 丢弃无效 sample 但记录 dropped count；Meter 在目标 component 无效时显示 invalid，不回退其它 component。
 
@@ -758,25 +760,16 @@ DataPatch 不是 sample stream/StreamProcessor edge 或普通 UI queue 的 paylo
 
 ### 6.6 Axis transform
 
-允许：
+baseline 只允许已经被 fit、scan 与 frontend authority draft 消费的两类 operation：
 
 ```text
-Select(axis_ids, index/range/geometry Selection)
-Reduce(input_axis_ids, ReductionSpec)
-Transpose(axis_ids)
-Stack(axis_ids, new_axis_spec, reversible_mapping)
-Unstack(axis_id, original_axis_specs, reversible_mapping)
-TransformCoordinates(axis_ids, CoordinateTransform)
-ConvertUnit(target_axis_or_values, UnitConversion)
-Create(axis_spec)
-Rename(axis_id, name)
+Selection(index / contiguous index range / coordinate range)
+ReductionSpec(axis_ids, MEAN | SUM | MIN | MAX, missing_policy, validity_policy)
 ```
 
-每次变换同时返回 TransformedData 与 TransformRecord，并验证 values、validity、AxisId、coordinates 和 mapping。
+`DataTransformSpec.operations` 直接保存 `Selection | ReductionSpec`，不再为二者各包一层单字段 Select/Reduce。`commit_transform(schema, spec)` 只冻结 `{input_schema_fingerprint, spec, output_schema_fingerprint}`；UI revision/origin 属于 Workbench draft，durable digest 属于外层 artifact/CAS，不能塞回 data authority 形成自证 metadata。`apply_transform(OwnedSnapshot, CommittedTransform)` 返回带 source ref、完整 committed transform、values、validity 与派生 schema 的 TransformedData；不建立无人消费的 preview type 或逐 operation record。
 
-Rename 只改 display name，不改变 role/unit/frame；unit conversion 与 frame transform 使用各自显式 operation，不能通过改 metadata 假装数值已转换。
-
-不提供匿名 `flatten()`。`Stack` 必须给出新 AxisSpec、来源 AxisId 和可逆坐标映射；因此它不能把 `(repeat, point, *data_axes)` 偷换成三个无语义长度，也不能被用作“先摊平再猜”。DataBlock 的物理 P 维始终由 PointLayout 映射回完整 point_axes。
+连续隐式坐标 range 用 `index_origin + local_index` 表示，保留原 unit/frame/name/role；不得按逻辑 axis 长度建立 tuple/remap。显式稀疏 PointLayout 只遍历实际 physical rows。任何 operation 都不得匿名 `flatten()`，也不能把 `(repeat, point, *data_axes)` 偷换成三个无语义长度；DataBlock 的物理 P 维始终由 PointLayout 映射回完整 point_axes。
 
 ## 7. Stream、buffer 与一致性
 
@@ -808,7 +801,7 @@ CausationRef =
   | ArtifactInputRef(typed_ref, content_digest)
 ```
 
-数值/领域数据 Envelope 额外包含 payload contract fingerprint 与 captured timestamp。payload 的 snapshot/validate/retained-bytes/max-bytes 必须由一个 generation-owned `PayloadContract` 单源提供，不能让三个 lambda 分别估计并漂移；`ValuePayloadContract` 还要求所有 event 共享同一个 ValueSchema 对象，并把 ComponentValidity mask 的 owned bytes 纳入预算，禁止每帧夹带未计费的重复 schema/coordinates。普通 stream payload 是 Value 或包含 Value 字段的 frozen domain record；DataBlock/DataPatch 只属于 DatasetBuilder/materialization 边界，不能作为“当前累计 signal”反复发布。Provenance 是 causation graph、payload fingerprint 和 TransformRecords 的派生视图，不是另一套含义模糊字段。
+数值/领域数据 Envelope 额外包含 payload contract fingerprint 与 captured timestamp。payload 的 snapshot/validate/retained-bytes/max-bytes 必须由一个 generation-owned `PayloadContract` 单源提供，不能让三个 lambda 分别估计并漂移；`ValuePayloadContract` 还要求所有 event 共享同一个 ValueSchema 对象，并把 ComponentValidity mask 的 owned bytes 纳入预算，禁止每帧夹带未计费的重复 schema/coordinates。普通 stream payload 是 Value 或包含 Value 字段的 frozen domain record；DataBlock/DataPatch 只属于 DatasetBuilder/materialization 边界，不能作为“当前累计 signal”反复发布。Provenance 是 causation graph、payload fingerprint、CommittedTransform 与外层 artifact lineage 的派生视图，不是另一套含义模糊字段。
 
 JoinKey 是 frozen、可序列化的领域值（例如 TriggerKey/ScanCellKey/ShotKey），不是字符串拼接或 payload 私有字段。generation-owned `JoinKeyContract.snapshot(key)` 是唯一 admission owner：它同时验证并返回 owned frozen key，stream 不在下一行重复 validate；fingerprint 绑定其语义。exact DatasetBuilder 另绑定由编译计划独立产生的完整 `sequence -> DatasetCellAddress` schedule，event key 必须逐项相等；仅有合法 key 类型并不足以证明 row 没有对调。keyed live cycle 同样验证物理 schedule；append history 则故意不把 producer join key 当 panel slot，slot 只由 consumer sequence 决定。TraceContext.correlation_id 只用于追踪，不能代替数据关联 key。
 
@@ -1427,17 +1420,21 @@ BoundFit.run()
 
 ```text
 DataTransformSpec:
-  transforms: tuple[AxisTransform, ...]
+  operations: tuple[Selection | ReductionSpec, ...]
 
 ReductionSpec:
-  reducer_id
-  input_axis_ids
-  operation
-  parameters
+  axis_ids
+  method: MEAN | SUM | MIN | MAX
+  missing_policy: REQUIRE_ALL | OMIT_MISSING
   validity_policy
+
+CommittedTransform:
+  input_schema_fingerprint
+  spec: DataTransformSpec
+  output_schema_fingerprint
 ```
 
-`apply_transform(block, spec) -> TransformedData` 是 zlc_data 的纯函数。它验证 AxisId、所选 reducer 的封闭合同、单位、coordinates、validity 和 transform 顺序，并返回派生 schema 与 TransformRecords。DataTransformSpec 只描述“对数据做什么”，不包含 auto/default 或显示 binding。Reducer 能力属于 zlc_data 算法目录，不写入 ValueSchema/DatasetSchema；新增 renderer/analysis 不改变数据 fingerprint。
+`commit_transform(DatasetSchema, DataTransformSpec) -> CommittedTransform` 在不接触 values 的情况下验证并冻结 authority；`apply_transform(OwnedSnapshot, CommittedTransform) -> TransformedData` 是唯一执行入口。它验证 input/output schema fingerprint、AxisId、reducer 封闭合同、coordinates、validity 和 operation 顺序，并保留 exact DatasetRevisionRef。DataTransformSpec 只描述“对数据做什么”，不包含 auto/default、UI revision/origin 或显示 binding；CommittedTransform 也不保存自嵌 digest、逐 operation record 或 artifact identity。Reducer 能力属于 zlc_data 算法目录，不写入 ValueSchema/DatasetSchema；新增 renderer/analysis 不改变数据 fingerprint。
 
 frontend figure 拥有只服务于呈现的：
 
@@ -1557,7 +1554,7 @@ role 只说明 axis 是什么；ViewIntent 说明用户现在想怎么看。两�
 | spectral | curve x/facet/fixed slider；不能把最大波长索引叫 latest | 优先作为 x | batch/facet | 带标签 fixed；band/integral 必须显式 |
 | site/component | facet/batch/select | facet/batch/select | 默认逐 site；pool 必须显式 | select |
 
-`mean`、`sum`、`integrate` 是不同物理 reduction，不能编码成一个含义模糊的 reducer。通用 `mean/sum` 使用 zlc_data 中封闭、版本化的 reducer 合同，并由用户/analysis spec 显式选择；ROI photon count、相机畸变校正等带设备/物理含义的操作由 neutral 领域 StreamProcessor/Analysis 定义，不能因输入恰好是 image 就由 frontend 自动提出。普通 image 默认只能显示、选择或保留 spatial axes。
+`mean`、`sum`、`integrate` 是不同物理 reduction，不能编码成一个含义模糊的 reducer。通用 `mean/sum/min/max` 使用 zlc_data 中封闭的 current reducer 合同，并由用户/analysis spec 显式选择；ROI photon count、相机畸变校正等带设备/物理含义的操作由 neutral 领域 StreamProcessor/Analysis 定义，不能因输入恰好是 image 就由 frontend 自动提出。普通 image 默认只能显示、选择或保留 spatial axes。
 
 histogram 的 repeat 语义是 sample binding，不是 reduction，也不是把轴 flatten 后丢掉身份。ViewSpec 保留 repeat AxisId，Histogram layer 将其声明为 `sample_axes`。这由 `HISTOGRAM` 的 ViewContract 表达，render 主干不允许再出现 `if kind == "hist"` 特例。
 
@@ -1569,21 +1566,19 @@ histogram 的 repeat 语义是 sample binding，不是 reduction，也不是把�
 ViewSpec                         # presentation-only；axis binding/display operation 不可提交
 
 CommittedTransform:
-  spec: DataTransformSpec
   input_schema_fingerprint
-  transform_digest
-  revision
-  origin: USER | ACCEPTED_SUGGESTION | SAVED
+  spec: DataTransformSpec
+  output_schema_fingerprint
 ```
 
-CommittedTransform 中的 select/ROI 必须是坐标系和 Selection revision 已解析的不可变快照，不得保存指向 live ControlTopic、slider 或 mutable FigureSession 的引用。ViewSpec 的 x/image/sample/batch/facet binding 与 display operation 不进入 CommittedTransform；fit axes/batch axes 由 FitProblem 明确表达，scan batch axes 由 ScanOutputContract 表达。
+CommittedTransform 中的 selection/ROI 必须是根据当前 Selection snapshot 解析并重建的不可变 authority intent，不得保存 UI revision、origin、live ControlTopic、slider 或 mutable FigureSession 引用。ViewSpec 的 x/image/sample/batch/facet binding 与 display operation 不进入 CommittedTransform；fit axes/batch axes 由 FitProblem 明确表达，scan batch axes 由 ScanOutputContract 表达。
 
 ```text
-commit_transform(schema, authoritative_spec, revision, origin)
+commit_transform(schema, authoritative_spec)
   -> CommittedTransform
 ```
 
-该 zlc_data 函数只验证并冻结完整 DataTransformSpec，不做建议，并从 canonical serialization 计算 transform_digest。Notebook/headless 用户可以显式构造 DataTransformSpec 后调用它，或加载已保存的 CommittedTransform，不依赖 frontend figure/Qt。
+该 zlc_data 函数只验证并冻结完整 DataTransformSpec，不做建议。CommittedTransform 本身只保存 input/output schema fingerprint 与 spec；需要 durable content identity 时由外层 artifact/CAS 对 owner tree 求 digest。Notebook/headless 用户可以显式构造 DataTransformSpec 后调用它，或从所属 artifact 加载已保存的 CommittedTransform，不依赖 frontend figure/Qt。
 
 提交规则：
 
@@ -1594,7 +1589,7 @@ commit_transform(schema, authoritative_spec, revision, origin)
 5. `RESOLVED` 可由紧邻权威 draft 摘要的正常动作直接提交；`REVIEW_REQUIRED` 必须突出显示有损步骤，用户接受该摘要或编辑后再生成 CommittedTransform。这里的 status 来自 Fit/Scan draft validator，不沿用显示 ViewSuggestion 的 status；
 6. 需要 transform 的 RunPlan/AnalysisCommand 字段只接收 CommittedTransform，运行中 UI 改选择会产生新 revision，不能改变已启动 run；
 7. schema fingerprint 不匹配时提交失效，重新建议或要求修正，不能按 axis index 迁移；
-8. `commit_transform` 的参数类型只接受 DataTransformSpec，frontend.figure 不提供 ViewSpec/display operation -> DataTransformSpec 转换 API；Analysis result、FitResultBatch、ScanArtifact 和派生 artifact 记录 spec、revision、schema fingerprint 与 TransformRecord。
+8. `commit_transform` 的参数类型只接受 DataTransformSpec，frontend.figure 不提供 ViewSpec/display operation -> DataTransformSpec 转换 API；Analysis result、FitResultBatch、ScanArtifact 和派生 artifact 保存完整 CommittedTransform、input lineage 与 artifact owner digest，不保存 UI revision 或逐 operation 历史对象。
 
 保存 workspace 时保存用户最终选择的 ViewSpec，保证重开后的画面一致；保存权威派生 artifact 时还必须保存 CommittedTransform 与 input lineage。保存视图不等于把显示结果冒充原始数据。
 
@@ -1642,11 +1637,11 @@ BoundFit:
 
 FitResultBatch:
   batch_axis_specs
-  batch_layout: RECT_C | RECT_F | EXPLICIT
+  batch_layout: RECT_C | RECT_F | EXPLICIT | PRODUCT(factors)
   parameter_schema/unit（由 FitSpec model_id + fit AxisSpec + value unit 唯一派生）
   parameter_values: (B, parameter)
   covariance/uncertainty
-  RSS + derived RMSE + R²
+  RSS + R²
   per_batch numeric status/error
   source_ref + FitSpec（包含 input/transform/model/constraints/numeric policy）
   scipy_version（仅 producer lineage）
@@ -1662,7 +1657,7 @@ initializer 只提供有限 seed，不拥有 hard bound。唯一 hard bound 来�
 
 generic damped-sine 只拟合 catalog 定义的 `baseband_frequency` 数值，不宣称证明无混叠，也不从 coordinate gap、shape 或 rank 猜 Nyquist。formal 物理频率 consumer 若需要无混叠结论，必须在领域 request 中持有采样设计与 band-limit prior（或提高硬件采样率）；软件不能从已 alias 的样本反推出“真实高频”。因此 FitProblem 不再持久或传播 sampling quantum/index-gcd 这类只服务一个推测性 acceptance gate 的字段。
 
-packing 以 declared coordinate 为主排序、logical index 为 duplicate-coordinate tie-break，物理 storage permutation 不能改变入选观测。coordinate-less axis 在 Selection 后物化原始 logical index coordinates 与 `index` unit，重复选择仍保留 absolute index，不重基。有限 sample budget 使用确定性 Cartesian preferred grid 加小比例 value-feature 候选；max/min 与局部邻域公平交错，剩余额度再按 canonical rank chunk-stream 填充。valid NaN/Inf 必须优先进入样本并使数值路径 fail closed，invalid nonfinite 不进入。dense qCMOS image 路径不构造全帧 rank/value 副本；当前 compressed irregular 2D point-layout 的 preferred-grid 仍允许一次 O(N) `np.unique` 工作数组，因为它不是 dense camera 主路径，后续只有在 profile 证明它成为瓶颈时才替换，不能为假设风险再造索引框架。
+packing 以 declared coordinate 为主排序、logical index 为 duplicate-coordinate tie-break，物理 storage permutation 不能改变入选观测。coordinate-less axis 使用 `index_origin + logical_index` 的 absolute coordinate；若 AxisSpec 声明 unit 就保留该 unit，否则参数 unit 才是 `index`。连续整数坐标必须在 bind 时证明每一点都能被 float64 精确区分，不能只验端点后让中间 x 静默重复。完整 coordinate admission 只在 `BoundFit` 绑定时执行一次并缓存每根 fit axis 的 source；packing 无条件消费该 proof，不能在每个 batch、FitProblem 或 property 中重新扫描 declared coordinate。`BoundFit` 只接收 FitSpec 与 expected DatasetSchema，effective schema/model 均在内部单次派生；package-private packing/solver 只接受 exact BoundFit，不能把可覆写 `__post_init__` 的普通子类当成已验证 proof。TransformedSchema 的 canonical fingerprint 在同一 immutable 实例首次需要时计算一次并缓存；identity bind 不为未消费的 digest 付出 O(P) 成本。Selection 后重复选择仍保留 absolute coordinate，不重基。有限 sample budget 使用确定性 Cartesian preferred grid 加小比例 value-feature 候选；max/min 与局部邻域公平交错，剩余额度再按 canonical rank chunk-stream 填充。valid NaN/Inf 必须优先进入样本并使数值路径 fail closed，invalid nonfinite 不进入。dense qCMOS image 路径不构造全帧 rank/value 副本；sparse point axis 的坐标 gather 与 canonical row order 只按 present physical rows 分配，绝不能先建立 logical-size coordinate array。当前 compressed irregular 2D point-layout 的 preferred-grid 仍允许一次 O(N) `np.unique` 工作数组，因为它不是 dense camera 主路径，后续只有在 profile 证明它成为瓶颈时才替换，不能为假设风险再造索引框架。
 
 时间模型继承当前真机验证过的 absolute-coordinate 语义：decay amplitude 仍表示 x=0 的幅度，damped-sine phase 仍相对 absolute x；Selection/CommittedTransform 只筛选观测，不偷偷用选区最小值重定相位或幅度。若未来确有“从选区起点计时”的物理需求，必须使用显式权威坐标变换或新的描述性 model id。`FitResultBatch.evaluate_batch()` 是 overlay/replay 的唯一结果求值入口，使用相同 absolute coordinates 与 catalog evaluator。damped-sine 将 amplitude 约束为非负、phase 约束在主值区间，消除 `(A, φ) == (-A, φ+π)` 的 artifact 歧义。
 
@@ -2045,7 +2040,7 @@ compiled binder 现在会用上述冻结 working point 对**同一 artifact 内�
 
 CaptureArtifact 的大帧面只有一个公共 owner：`frame_source: CaptureFrameSource`。它保存完整 `DatasetSchema`、block/revision、精确 cell schedule、event-order metadata 与固定大小 raw frame chunks；不再并列暴露 `.block`、`.event_metadata`、`.source_cell_schedule` alias，也不保留旧 whole-DataBlock blob reader。chunk 以约 64 MiB 为目标并受 repository policy 上限约束；普通 `load/admit` 只验证 manifest/index及 chunk refs，实际 `read/iter_cells` 首次用到某 chunk 时核验其 size+SHA，pending-commit recovery 才逐块流式全验。这里的 admission 证明 commit/journal authority 与索引可解析，不等于全介质健康扫描；未读取 chunk 的损坏会在第一次读取/计算时以内容损坏明确拒绝。显式 `materialize(memory_limit_bytes=...)` 是唯一 whole-dataset 入口，预算同时包含最终 block、构造 copy、validity 与最大单 chunk scratch。index 写入和读取共用同一个 size、canonical-node/container、typed reconstruction 和 re-encode owner；任何 writer 自己读不回的 index 在 manifest 可见前拒绝。compiled capture plan 在任何 camera arm/FPGA fire 前取得 repository root borrow；close 若先赢则 run 在硬件前拒绝，run 若先赢则 borrow 阻止 repository 在 finalize/cleanup 前关闭，不能完成硬件后才发现保存根已经失效。
 
-frame bytes 的 invalid/component-invalid/NaN 规范化只由 `zlc_data.canonical_value_array` 拥有：普通 C-contiguous uint16 VALID frame 返回原 view，不为 hash/持久化前检查复制整帧；Capture repository 仅在真正写 CAS 的边界转为 bytes。schema-level INVALID 沿用既有 `canonical-invalid-values` event digest，component-invalid 则以相同 mask 与零 filler 产生相同 identity，不能让两条路径漂移。float/complex NaN payload canonicalization 需要的临时 mask 是独立 admitted scratch，不能因为结果最终仍是一块 frame bytes 就漏算峰值。
+frame bytes 的 invalid/component-invalid/NaN 规范化只由 `zlc_data.canonical_value_array` 拥有：它在 schema-level INVALID 快捷返回前仍验证 dtype/shape/validity，避免任意错误 frame 取得合法 invalid digest；普通 C-contiguous uint16 VALID frame 返回原 view，不为 hash/持久化前检查复制整帧；Capture repository 仅在真正写 CAS 的边界转为 bytes。native/big-endian 等数值等价 dtype 先转换到 schema 的 canonical endian，再对 float/complex 的每个 NaN component 规范 payload；不能用 canonical component dtype 去解释尚未换 endian 的 complex bytes。schema-level INVALID 沿用既有 `canonical-invalid-values` event digest，component-invalid 则以相同 mask 与零 filler 产生相同 identity，不能让两条路径漂移。float/complex NaN payload canonicalization 需要的临时 mask 是独立 admitted scratch，不能因为结果最终仍是一块 frame bytes 就漏算峰值。
 
 analysis 按 bracket/context 从 `CaptureFrameSource` 流式消费；不 `np.stack` 原始 frame、不为每帧构造第二份 owned image，也不生成 `(groups, shots, H, W)` 临时栈。reference 阶段允许为“平均图”和“按最终 site feature 提取”各走一次可重复源遍历；short 阶段对每帧只准备一次并同时填入全部 model 的小型 `(model, groups, sites)` signal/validity 数组，禁止每个 model 重读整套 qCMOS frame。reference average 使用一个 float64 image accumulator和按真实 shot 数选择的最小无符号 count image，最终原位除法；空间复杂度是 `O(HW + groups*shots*sites + models*groups*sites)`，不是 `O(groups*shots*HW)`。cell 地址用可重复惰性 generator，不提前构造完整对象元组；report 逐组保存原来的 `(AxisId, logical index)` context，repeat、多条 point axis和二维 data axes各自保留语义，绝不能变成匿名 `data_points/data_dim`。
 
@@ -2650,7 +2645,7 @@ Formal Scan性能预算另包含两项硬门：展开repeat后的`total_frames �
 - exact pipeline 的必要 StreamProcessor/DatasetBuilder 不与可丢弃 UI fit 共用一个拥塞队列；
 - `suggest_view` 只遍历 axis metadata，复杂度 O(axis count)，不触碰大型 values；
 - ViewSuggestion 可按 `(schema fingerprint, ViewIntent, Selection revision, preference revision)` 缓存；
-- Select/Transpose/Stack 优先产生只读 view，只有 reduction、driver buffer ownership 或持久化边界才复制；
+- 连续 Selection 优先产生只读 view，显式稀疏选择只按实际输出 gather；只有 reduction、driver buffer ownership 或持久化边界才复制；
 - 显示用 mean/latest 不复制或覆盖权威 DataBlock，缓存键必须包含 input revision 与 ViewSpec digest；
 - EventSpanRef 的 count/ordered_digest 随 exact sequence 增量更新，不为每个累计输出复制历史 event_id。
 
@@ -2689,12 +2684,12 @@ Data：
 - scalar 与长度一 axis；
 - arbitrary-schema property tests：AxisId 唯一、coordinate/size、shape 与 axis coverage 不变量；
 - 不同 revision/generation domain 不能互相比较、赋值或通过裸 int 混用；
-- 同一 Definition 的 virtual/real/不同 run AxisId 稳定，派生 AxisId 对相同 transform 确定；
+- 同一 Definition 的 virtual/real/不同 run AxisId 稳定；Selection 保留 AxisId，Reduction 只移除 axis，baseline 不制造匿名派生 axis；
 - PointLayout RECT_C/RECT_F/EXPLICIT sparse mapping round-trip，public path 不假设 P=product 或自行 reshape P；
 - ValueSchema/DatasetSchema fingerprint 分离：前者包含 data axes、dtype/unit、ValidityContract，后者另含 repeat/point axes 与 PointLayout；两者都不包含 renderer、ViewIntent 或已安装 reducer 列表；
-- canonical unit conversion、CoordinateFrameId mismatch 与显式 CoordinateTransform lineage；
+- canonical unit string 与 CoordinateFrameId mismatch 必须拒绝；baseline 没有隐式或通用自动换算；
 - 多轴 ROI/integrate contract 同时验证 input axes、output axes、unit 与 validity；
-- 未知 reducer id、axis 不兼容或缺少领域 CalibrationArtifact 的 reduction 失败；
+- 不支持的 reduction method、axis 不兼容或把需要 CalibrationArtifact 的领域 reduction 伪装成通用 reduction 时失败；
 - native uint/image + partial validity；
 - CellValidity 与按具名 axis 广播的 ComponentValidity；`(group,site)` dead-site mask 在 reduce/fit/histogram/meter 中一致传播；
 - validity mask axis/shape 不匹配失败，NaN 不能替代 integer/bool/component validity；
@@ -3373,6 +3368,16 @@ Storage durability / repository lifetime 的 Rules 1/2/5/6 复核以 parent chec
 Rule-6 以 physical/nonblank/AST 计数审查而不是按每个局部抽象辩护。五个 storage primary-owner 文件从 parent 的 `1414 / 1221 / 12 classes / 2 dataclasses / 99 functions` 变为 `1490 / 1283 / 13 / 2 / 102`，净增 `76 / 62 / 1 / 0 / 3`；唯一新增 class 是 `FileLockBusy`，三个函数就是共享平台机制，没有 lock framework、repository基类或新状态机。Safety + ResourceArbiter lifecycle seam 从 `2075 / 1830 / 33 / 17 / 123` 变为 `2100 / 1857 / 33 / 17 / 125`；Capture/Calibration/notebook/default-path caller seams 从 `4817 / 4370 / 23 / 7 / 237` 变为 `4842 / 4390 / 23 / 7 / 239`。总 production 净增 `126 PLOC / 109 nonblank`，用于失败重试、真实 close/handoff、fork与首启目录保证；同时 `repository_lease.py` 从291降到277行、`framed_journal.py` 从207降到190行、capture-fit净减3行。main 没有同职责 crash-durable storage/installation authority owner，因此只报告 parent 绝对变化，不拿普通文件保存或旧GUI代码伪造倍率；该切片不改变任何物理/数值算法，Rule 4 为不适用而不是“由新测试证明物理等价”。
 
 Rule-5 的独立证据覆盖：parent-flush失败后同一可见 child必须重新flush；lock file已可见时仍重新fsync file+parent；只有EACCES/EAGAIN/EDEADLK类竞争映射Busy，EIO原样抛出且registry可重开；两个FramedJournal实例并发追加；repository/safety双close、close-vs-bind、shutdown-vs-shutdown、unlock失败、跨进程排它与POSIX fork child不能解锁parent；CAS动态目录失败不进cache、同store只确认一次而新store重新确认；Capture/Calibration在第一笔staging前阻止close，capture-fit则由同一lifecycle lock阻塞close；干净LOCALAPPDATA首启能逐级建立并打开真实PersistentSafetyJournal。最终唯一 focused 集合为 `246 passed, 2 skipped`；两项skip只是当前Windows主机没有`os.fork`，对应POSIX路径另有creator-PID静态复核。`py_compile`、`git diff --check`及22项import-DAG均通过。额外试跑的旧 `test_save_capture_single_source` 仍因 legacy TaskConsole 的 device-bearing `running_nodes` fixture未提供runtime authority而失败；它不经过本 storage owner、未被本提交掩盖或修改，继续归GUI/runtime全局审查账本，因此不能把本纵切GO改写成全局GO。三路独立对抗复审最终均未找到剩余P0/P1；Windows `LK_LOCK`约10秒的CRT有限重试明确记录为fail-closed平台行为，不为假设的无限等待再造线程/轮询器。本纵切 Rules 1/2/5/6/7 可局部判 GO，但完整 changed-file Rules 1–7 仍为 PARTIAL，迁移继续冻结。
+
+Data kernel / transform / fit 的 Rules 1/2/3/5/6/7 闭包以 parent checkpoint `d4a0559410f62ab3f5fc166d095d07b940408760` 为比较基线；全分支范围继续机械取自 `main...HEAD`，本提交前为185个领先提交、388个 changed files，而不是依赖上下文记忆。当前纵切逐文件覆盖16个 production owner（13个 zlc_data 文件、frontend figure 的 contract/evaluator、neutral readout schema seam）、6个直接/architecture测试文件及本设计文档；清点方法同时使用 `git diff`、全仓 symbol/reachability 搜索、AST constructor/codec/owner ratchet、手写 canonical tree/golden、随机 layout/selection/reduction/fit oracle，以及按 logical/physical 尺度分离的 tracemalloc/time profile。共关闭21类 production/设计根因与1组跨 seam stale golden：numeric coordinate 别名/布尔与隐式 origin、伪 REPEAT role、C/F/EXPLICIT/PRODUCT 多重身份、cell-layout 重建及 sparse mapping/reverse-index clone、dtype endian、INVALID 快捷路径漏 admission、big-endian complex NaN、固定宽度 retained-byte 乘法、codec leaf 二次校验、零消费者 bulk/standalone bytes surface、selection 双 owner/range 膨胀、transform preview/history/revision/origin/self-digest/单字段 wrapper、source schema 重建与重复 fingerprint、fit 的 unit/float64/absolute-coordinate边界、logical-size sparse allocation、declared coordinate 按 batch 重扫、BoundFit 双派生与普通子类伪 proof、sparse reduction 的多份 mapping 自证，以及 readout 对 numeric spelling 的重复约束。Axis/DatasetSchema/Selection/CommittedTransform 仍保留外层 artifact 所需的 owner tree projector；删除的是无人消费的 standalone bytes 与历史机器，不是删除目标能力。
+
+整改后的唯一边界是：AxisSpec 规范 numeric identity 并保存 implicit `index_origin`；DatasetSchema 构造并缓存唯一 cell_layout，sparse PRODUCT 直接复用原 PointLayout factor，而 AxisLayout/PointLayout 以结构相等/hash保证 codec round-trip；Value canonical owner 在任何 shortcut 前验证 shape/dtype/validity并先规范 endian；Selection 只由一个 resolver解释；DataTransformSpec 直接保存 Selection/ReductionSpec，CommittedTransform只冻结input/spec/output；TransformedSchema fingerprint按需一次缓存。`BoundFit(FitSpec, DatasetSchema)`内部单次派生effective schema/model并一次准入fit coordinates，packing/solver只接受exact BoundFit并消费缓存source，不再让FitProblem/property/batch循环重复验证。大型Value/DataBlock持久化只走已有bounded binary chunk/CAS。runtime dataset的schedule/key/consumer三枚identity golden因AxisSpec current grammar新增`index_origin`而变化，已由不调用runtime helper的手写schema/domain/consumer tree独立交叉计算，不用同款writer自证。
+
+Rule-6 对上述16个production文件按physical/nonblank/AST计数：parent为 `8753 / 7870 / 66 classes / 50 dataclasses / 7 enums / 311 functions`，当前为 `8375 / 7563 / 60 / 45 / 6 / 282`，净减 `378 physical / 307 nonblank / 6 classes / 5 dataclasses / 1 enum / 29 functions`；其中zlc_data自身净减340 physical、271 nonblank、6 classes、5 dataclasses、1 enum和28 functions。6个直接测试文件净增518 physical、460 nonblank、1 fixture class与21 functions，新增内容是手写typed tree、跨specialization equality/hash、稀疏物理行、proof-subclass反例、坐标/endianness与跨seam固定digest，不复制production算法。main没有同职责的headless named-axis data kernel，故Rule-4对本纵切为不适用；既有fit物理/数值算法与main的倍率及差异理由已在前一fit账本单列，当前只改数据身份、packing与authority边界，不拿legacy GUI shape猜测伪造分母。
+
+针对性证据为：2304×2304 uint16全valid canonical path约`0.00049 s / 0.0025 MiB`且共享source，单坏点约`0.00497 s / 10.127 MiB`且只保留一帧canonical输出；1亿logical/2 physical sparse rows的selection约`0.00169 s / 0.0186 MiB`、fit packing约`0.00167 s / 0.0166 MiB`；20万declared coordinates、40 batch×2 physical rows由bind完整扫描一次，packing降至约`0.0170 s / 0.105 MiB`，不再是原约17秒的`O(batch × logical_size)`；50k sparse identity bind约`0.0002 s / 0.0023 MiB`，首次确实消费TransformedSchema fingerprint时约`1.08 s / 20.1 MiB`，后续读取为微秒/零级分配。最终本体、runtime dataset及fit artifact/repository/calibration直接consumer集合为`391 passed`，py_compile、import-DAG、git diff check均通过；三路独立对抗复审均判当前闭包GO、P0=0、P1=0。两个无真实生产热点证据的P2如实保留而不预建机器：完整EXPLICIT映射识别RECT仍逐physical row canonicalize（100k约0.84秒），sparse partial-axis reduction fallback仍按physical rows线性group（20k output groups约0.45秒）；两者均不按logical extent densify、不静默错数，只有真实profile命中才优化。
+
+该GO只属于DataPatch之外的data-kernel/transform/fit纵切。`DataPatch`仍只有package export与stream negative type check，没有producer/applier/snapshot-store/persistence consumer，必须作为下一独立Rule-2闭包删除或由明确已排期consumer证明；它没有被本账本偷算完成。完整Rules 1–7仍为PARTIAL，迁移NO-GO不变；全部剩余代码闭包结束后还必须做一次全分支独立对抗验收。
 
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 

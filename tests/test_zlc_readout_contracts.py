@@ -329,8 +329,11 @@ def test_frame_axes_are_explicit_roi_local_output_pixel_coordinates() -> None:
             ),
         ),
     )
-    with pytest.raises(ValueError, match="ROI-local"):
-        descriptor.validate_schema(float_spelling)
+    descriptor.validate_schema(float_spelling)
+    assert all(
+        all(type(coordinate) is int for coordinate in axis.coordinates)
+        for axis in float_spelling.cell_schema.data_axes
+    )
 
 
 def _single_event_descriptor(

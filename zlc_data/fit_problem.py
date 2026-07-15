@@ -16,7 +16,6 @@ from .fit_contract import (
     FitProblem,
     FitResultBatch,
     FitSpec,
-    _coordinate_source_for_axis,
 )
 from .layout import AxisLayout, AxisLayoutMode
 from .schema import DatasetSchema
@@ -35,7 +34,7 @@ _FEATURE_CANDIDATE_LIMIT = 512
 def bind_fit(spec: FitSpec, expected_schema: DatasetSchema) -> BoundFit:
     """Validate a serializable request against one immutable input schema."""
 
-    return BoundFit.bind(spec, expected_schema)
+    return BoundFit(spec, expected_schema)
 
 
 def build_fit_problem(
@@ -51,7 +50,7 @@ def build_fit_problem(
     so the solver can report a cell failure without densifying sparse input.
     """
 
-    if not isinstance(bound, BoundFit):
+    if type(bound) is not BoundFit:
         raise TypeError("bound must be BoundFit")
     if not isinstance(snapshot, OwnedSnapshot):
         raise TypeError("snapshot must be OwnedSnapshot")
@@ -95,7 +94,13 @@ def build_fit_problem(
         batch_layout,
         present_counts,
     ) = _schema_batch_plan(bound, abort_check)
-    coordinate_sources = tuple(_coordinate_source_for_axis(axis) for axis in fit_axes)
+    coordinate_sources = bound.coordinate_sources
+    coordinate_source_by_id = dict(zip(bound.spec.fit_axis_ids, coordinate_sources))
+    data_dimension_indices = _data_fit_dimension_indices(
+        schema,
+        data_fit_positions,
+        coordinate_source_by_id,
+    )
     observations_parts: list[np.ndarray] = []
     coordinate_parts: list[list[np.ndarray]] = [list() for _ in fit_axes]
     valid_counts: list[int] = []
@@ -114,8 +119,9 @@ def build_fit_problem(
             schema,
             row_ids,
             axis_indices,
-            data_fit_positions,
             bound.spec.fit_axis_ids,
+            coordinate_source_by_id,
+            data_dimension_indices,
         )
         for data_multi in data_combinations:
             _check_abort(abort_check)
@@ -380,11 +386,16 @@ def _coordinates_for_indices(
     source: FitCoordinateSource,
     logical_indices: np.ndarray,
 ) -> np.ndarray:
+    indices = np.asarray(logical_indices, dtype=np.int64)
     if source is FitCoordinateSource.LOGICAL_INDEX:
-        return np.asarray(logical_indices, dtype=np.float64)
+        return np.asarray(indices, dtype=np.float64) + axis.index_origin
     assert axis.coordinates is not None
-    declared = np.asarray(axis.coordinates, dtype=np.float64)
-    return np.asarray(declared[logical_indices], dtype=np.float64)
+    values = np.fromiter(
+        (float(axis.coordinates[int(index)]) for index in indices.reshape(-1)),
+        dtype=np.dtype("<f8"),
+        count=indices.size,
+    )
+    return values.reshape(indices.shape)
 
 
 def _compact_row_selector(row_ids: np.ndarray) -> slice | np.ndarray:
@@ -401,7 +412,7 @@ def _sample_valid_positions(
     validity: np.ndarray,
     budget: int,
     dimension_order: tuple[int, ...],
-    dimension_indices: tuple[np.ndarray, ...],
+    dimension_indices: tuple[np.ndarray | None, ...],
     compressed_fit_coordinates: tuple[np.ndarray, np.ndarray] | None,
     abort_check: Callable[[], None] | None,
 ) -> tuple[np.ndarray, int]:
@@ -523,7 +534,7 @@ def _scan_canonical_observations(
     validity: np.ndarray,
     limit: int,
     dimension_order: tuple[int, ...],
-    dimension_indices: tuple[np.ndarray, ...],
+    dimension_indices: tuple[np.ndarray | None, ...],
     abort_check: Callable[[], None] | None,
 ) -> tuple[np.ndarray, int, tuple[int, ...]]:
     """Find bad ranks and finite extrema without materializing canonical data."""
@@ -655,7 +666,7 @@ def _finite_candidate_ranks(
     observations: np.ndarray,
     validity: np.ndarray,
     dimension_order: tuple[int, ...],
-    dimension_indices: tuple[np.ndarray, ...],
+    dimension_indices: tuple[np.ndarray | None, ...],
 ) -> np.ndarray:
     if not candidate_ranks.size:
         return np.empty(0, dtype=np.int64)
@@ -676,7 +687,7 @@ def _available_ranks_at_ordinals(
     excluded_ranks: np.ndarray,
     ordinals: np.ndarray,
     dimension_order: tuple[int, ...],
-    dimension_indices: tuple[np.ndarray, ...],
+    dimension_indices: tuple[np.ndarray | None, ...],
     abort_check: Callable[[], None] | None,
 ) -> np.ndarray:
     """Map finite-valid ordinals to ranks with bounded chunk temporaries."""
@@ -802,11 +813,12 @@ def _canonical_observation_order(
     schema: TransformedSchema,
     row_ids: np.ndarray,
     axis_indices: tuple[np.ndarray, ...],
-    data_fit_positions: tuple[int, ...],
     fit_axis_ids: tuple[AxisId, ...],
+    coordinate_source_by_id: dict[AxisId, FitCoordinateSource],
+    data_dimension_indices: dict[AxisId, np.ndarray | None],
 ) -> tuple[
     tuple[int, ...],
-    tuple[np.ndarray, ...],
+    tuple[np.ndarray | None, ...],
     tuple[np.ndarray, np.ndarray] | None,
 ]:
     """Describe logical fit-axis order without allocating full coordinate grids."""
@@ -815,9 +827,11 @@ def _canonical_observation_order(
     data_ids = tuple(axis.axis_id for axis in schema.data_axes)
     cell_fit_ids = tuple(axis_id for axis_id in fit_axis_ids if axis_id in cell_ids)
     row_keys = tuple(
-        _resolved_axis_values(schema.axis(axis_id))[
-            axis_indices[cell_ids.index(axis_id)][row_ids]
-        ]
+        _coordinates_for_indices(
+            schema.axis(axis_id),
+            coordinate_source_by_id[axis_id],
+            axis_indices[cell_ids.index(axis_id)][row_ids],
+        )
         for axis_id in cell_fit_ids
     )
     logical_row_keys = tuple(
@@ -836,7 +850,7 @@ def _canonical_observation_order(
 
     row_token = "__fit_cell_rows__"
     current_tokens: list[AxisId | str] = [row_token]
-    current_tokens.extend(data_ids[position] for position in data_fit_positions)
+    current_tokens.extend(axis_id for axis_id in data_ids if axis_id in fit_axis_ids)
     if cell_fit_ids:
         desired_tokens: list[AxisId | str] = []
         inserted_rows = False
@@ -850,15 +864,12 @@ def _canonical_observation_order(
     else:
         desired_tokens = [row_token, *fit_axis_ids]
     dimension_order = tuple(current_tokens.index(token) for token in desired_tokens)
-    dimension_indices: list[np.ndarray] = []
+    dimension_indices: list[np.ndarray | None] = []
     for token in desired_tokens:
         if token == row_token:
             dimension_indices.append(row_order)
         else:
-            values = _resolved_axis_values(schema.axis(token))
-            dimension_indices.append(
-                np.argsort(values, kind="stable").astype(np.int64, copy=False)
-            )
+            dimension_indices.append(data_dimension_indices[token])
     compressed_fit_coordinates = (
         tuple(np.asarray(key[row_order], dtype=np.float64) for key in row_keys)
         if len(cell_fit_ids) == 2
@@ -867,11 +878,38 @@ def _canonical_observation_order(
     return dimension_order, tuple(dimension_indices), compressed_fit_coordinates
 
 
+def _data_fit_dimension_indices(
+    schema: TransformedSchema,
+    data_fit_positions: tuple[int, ...],
+    coordinate_source_by_id: dict[AxisId, FitCoordinateSource],
+) -> dict[AxisId, np.ndarray | None]:
+    """Resolve dense data-axis order once per packing operation."""
+
+    resolved: dict[AxisId, np.ndarray | None] = {}
+    for position in data_fit_positions:
+        axis = schema.data_axes[position]
+        source = coordinate_source_by_id[axis.axis_id]
+        if source is FitCoordinateSource.LOGICAL_INDEX:
+            resolved[axis.axis_id] = None
+            continue
+        values = _coordinates_for_indices(
+            axis,
+            source,
+            np.arange(axis.size, dtype=np.int64),
+        )
+        resolved[axis.axis_id] = (
+            None
+            if values.size < 2 or np.all(values[:-1] <= values[1:])
+            else np.argsort(values, kind="stable").astype(np.int64, copy=False)
+        )
+    return resolved
+
+
 def _canonical_ranks_to_physical(
     canonical_ranks: np.ndarray,
     physical_shape: tuple[int, ...],
     dimension_order: tuple[int, ...],
-    dimension_indices: tuple[np.ndarray, ...],
+    dimension_indices: tuple[np.ndarray | None, ...],
 ) -> np.ndarray:
     if canonical_ranks.size == 0:
         return np.empty(0, dtype=np.int64)
@@ -879,20 +917,17 @@ def _canonical_ranks_to_physical(
     canonical_multi = np.unravel_index(canonical_ranks, canonical_shape, order="C")
     physical_multi: list[np.ndarray | None] = [None] * len(physical_shape)
     for canonical_axis, physical_axis in enumerate(dimension_order):
-        physical_multi[physical_axis] = dimension_indices[canonical_axis][
+        index_order = dimension_indices[canonical_axis]
+        physical_multi[physical_axis] = (
             canonical_multi[canonical_axis]
-        ]
+            if index_order is None
+            else index_order[canonical_multi[canonical_axis]]
+        )
     assert all(value is not None for value in physical_multi)
     return np.asarray(
         np.ravel_multi_index(tuple(physical_multi), physical_shape, order="C"),
         dtype=np.int64,
     )
-
-
-def _resolved_axis_values(axis: AxisSpec) -> np.ndarray:
-    if axis.coordinates is None:
-        return np.arange(axis.size, dtype=np.float64)
-    return np.asarray(axis.coordinates, dtype=np.float64)
 
 
 def _evenly_spaced_ranks(size: int, count: int) -> np.ndarray:

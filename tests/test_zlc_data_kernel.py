@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import subprocess
 import tracemalloc
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -16,6 +17,7 @@ from zlc_data import (
     SPATIAL_X,
     SPATIAL_Y,
     AxisId,
+    AxisLayout,
     AxisSpec,
     BlockId,
     CellValidity,
@@ -27,19 +29,14 @@ from zlc_data import (
     INVALID,
     PointLayout,
     StreamGenerationId,
-    TypedCodecError,
     VALID,
     ValidityContract,
     Value,
     ValuePayloadContract,
     ValueSchema,
     canonical_value_array,
-    decode_dataset_schema,
-    decode_data_block,
-    decode_value,
-    encode_data_block,
-    encode_dataset_schema,
-    encode_value,
+    dataset_schema_from_tree,
+    dataset_schema_to_tree,
     expand_value_validity,
     expand_component_validity,
 )
@@ -223,6 +220,13 @@ def test_datablock_owns_intrinsically_immutable_bytes():
 
 def test_dataset_ref_carries_complete_identity():
     schema = dataset_schema(explicit=True)
+    assert schema.cell_layout is schema.cell_layout
+    assert schema.cell_layout.factors is not None
+    assert schema.cell_layout.factors[-1] is schema.point_layout
+    restored = dataset_schema_from_tree(dataset_schema_to_tree(schema))
+    assert restored.cell_layout == schema.cell_layout
+    assert restored.cell_layout.factors is not None
+    assert restored.cell_layout.factors[-1] is restored.point_layout
     block = DataBlock(
         BlockId("sparse-capture"),
         DatasetRevision(3),
@@ -236,63 +240,97 @@ def test_dataset_ref_carries_complete_identity():
     assert ref.schema_fingerprint == schema.fingerprint
 
 
-def test_schema_codec_round_trip_and_fingerprint_cover_layout_and_validity():
-    schema = dataset_schema(explicit=True, component_validity=True)
-    restored = decode_dataset_schema(encode_dataset_schema(schema))
+def test_point_layout_specialization_has_generic_structural_identity():
+    point = PointLayout.explicit((4,), ((3,), (1,)))
+    generic = AxisLayout.explicit((4,), ((3,), (1,)))
+
+    assert point == generic
+    assert generic == point
+    assert hash(point) == hash(generic)
+
+
+def test_dataset_schema_tree_matches_the_independent_current_grammar():
+    schema = dataset_schema()
+    literal = {
+        "schema": "zlc_data.DatasetSchema",
+        "repeat_axis": {
+            "schema": "zlc_data.AxisSpec",
+            "axis_id": "capture.repeat",
+            "name": "capture.repeat",
+            "role": "repeat",
+            "size": 2,
+            "coordinates": [0, 1],
+            "unit": None,
+            "coordinate_frame": None,
+            "index_origin": 0,
+        },
+        "point_axes": [
+            {
+                "schema": "zlc_data.AxisSpec",
+                "axis_id": "scan.detuning",
+                "name": "scan.detuning",
+                "role": "scan-point",
+                "size": 3,
+                "coordinates": [0, 1, 2],
+                "unit": None,
+                "coordinate_frame": None,
+                "index_origin": 0,
+            }
+        ],
+        "point_layout": {
+            "logical_shape": [3],
+            "mode": "RECT_C",
+            "storage_size": 3,
+            "storage_to_multi": None,
+        },
+        "cell_schema": {
+            "schema": "zlc_data.ValueSchema",
+            "data_axes": [
+                {
+                    "schema": "zlc_data.AxisSpec",
+                    "axis_id": "camera.image.y",
+                    "name": "camera.image.y",
+                    "role": "spatial-y",
+                    "size": 3,
+                    "coordinates": [0, 1, 2],
+                    "unit": None,
+                    "coordinate_frame": None,
+                    "index_origin": 0,
+                },
+                {
+                    "schema": "zlc_data.AxisSpec",
+                    "axis_id": "camera.image.x",
+                    "name": "camera.image.x",
+                    "role": "spatial-x",
+                    "size": 4,
+                    "coordinates": [0, 1, 2, 3],
+                    "unit": None,
+                    "coordinate_frame": None,
+                    "index_origin": 0,
+                },
+            ],
+            "validity_contract": {"mode": "VALUE", "component_axis_ids": []},
+            "dtype": "<u2",
+            "value_unit": "count",
+        },
+    }
+
+    assert dataset_schema_to_tree(schema) == literal
+    restored = dataset_schema_from_tree(literal)
     assert restored == schema
     assert restored.fingerprint == schema.fingerprint
 
+    malformed = dict(literal, revision=1)
+    with pytest.raises(ValueError, match="exactly"):
+        dataset_schema_from_tree(malformed)
+
+
+def test_schema_fingerprint_covers_layout_and_component_validity():
+    sparse = dataset_schema(explicit=True, component_validity=True)
     dense = dataset_schema(explicit=False, component_validity=True)
-    assert dense.fingerprint != schema.fingerprint
     value_only = dataset_schema(explicit=True, component_validity=False)
-    assert value_only.fingerprint != schema.fingerprint
-
-
-def test_value_and_datablock_codecs_are_strict_owned_round_trips():
-    value_schema = image_schema(component_validity=True)
-    x = value_schema.data_axes[1]
-    value = Value(
-        np.arange(12, dtype=np.uint16).reshape(3, 4),
-        ComponentValidity((x.axis_id,), np.array([True, False, True, False])),
-        value_schema,
-    )
-    restored_value = decode_value(encode_value(value))
-    assert restored_value.schema == value.schema
-    np.testing.assert_array_equal(restored_value.validity.mask, value.validity.mask)
-    assert not restored_value.values.flags.writeable
-
-    schema = dataset_schema()
-    block = DataBlock(
-        BlockId("codec-roundtrip"),
-        DatasetRevision(4),
-        np.arange(np.prod(schema.physical_shape), dtype=np.uint16).reshape(schema.physical_shape),
-        CellValidity(np.ones((2, 3), dtype=bool)),
-        schema,
-    )
-    restored_block = decode_data_block(encode_data_block(block))
-    assert restored_block.block_id == block.block_id
-    assert restored_block.revision == block.revision
-    assert restored_block.schema == block.schema
-    np.testing.assert_array_equal(restored_block.values, block.values)
-
-
-def test_invalid_storage_bytes_do_not_change_logical_content_encoding():
-    schema = DatasetSchema(
-        axis("repeat", REPEAT, 1),
-        (axis("point", SCAN_POINT, 2),),
-        PointLayout.rect_c((2,)),
-        ValueSchema((), ValidityContract.value(), np.dtype(np.int16)),
-    )
-    validity = CellValidity(np.array([[True, False]]))
-    left = DataBlock(
-        BlockId("same"), DatasetRevision(1), np.array([[7, 123]], dtype=np.int16), validity, schema
-    )
-    right = DataBlock(
-        BlockId("same"), DatasetRevision(1), np.array([[7, 999]], dtype=np.int16), validity, schema
-    )
-    assert encode_data_block(left) == encode_data_block(right)
-    restored = decode_data_block(encode_data_block(left))
-    np.testing.assert_array_equal(restored.values, [[7, 0]])
+    assert dense.fingerprint != sparse.fingerprint
+    assert value_only.fingerprint != sparse.fingerprint
 
 
 def test_value_payload_digest_binds_valid_content_and_normalizes_invalid_fillers():
@@ -414,45 +452,141 @@ def test_axis_coordinates_reject_nonfinite_values():
         AxisSpec(AxisId("bad"), "bad", SCAN_POINT, 1, (float("nan"),))
 
 
-def test_typed_decoders_reject_alternate_primitive_spellings():
-    from zlc_storage.canonical import decode, encode
-
-    schema = dataset_schema()
-    schema_tree = decode(encode_dataset_schema(schema))
-    schema_tree["cell_schema"]["dtype"] = "uint16"
-    with pytest.raises(TypedCodecError, match="non-canonical typed"):
-        decode_dataset_schema(encode(schema_tree))
-
-    block = DataBlock(
-        BlockId("typed-canonical"),
-        DatasetRevision(0),
-        np.zeros(schema.physical_shape, dtype=np.uint16),
-        CellValidity(np.ones((2, 3), dtype=bool)),
-        schema,
+def test_numeric_coordinates_have_one_python_and_fingerprint_identity():
+    negative_zero = AxisSpec(
+        AxisId("scan.coordinate"),
+        "coordinate",
+        SCAN_POINT,
+        2,
+        (-0.0, np.float64(1.0)),
     )
-    block_tree = decode(encode_data_block(block))
-    block_tree["validity"]["mask"] = block_tree["validity"]["mask"].tolist()
-    with pytest.raises(ValueError, match="ndarray"):
-        decode_data_block(encode(block_tree))
+    integers = AxisSpec(
+        AxisId("scan.coordinate"),
+        "coordinate",
+        SCAN_POINT,
+        2,
+        (0, 1),
+    )
+    assert negative_zero == integers
+    assert negative_zero.coordinates == (0, 1)
+    assert all(type(value) is int for value in negative_zero.coordinates)
 
-    invalid_schema = DatasetSchema(
-        axis("repeat", REPEAT, 1),
-        (axis("point", SCAN_POINT, 2),),
-        PointLayout.rect_c((2,)),
-        ValueSchema((), ValidityContract.value(), np.dtype(np.int16)),
+    repeat = axis("repeat", REPEAT, 1)
+    left = DatasetSchema(repeat, (negative_zero,), PointLayout.rect_c((2,)), image_schema())
+    right = DatasetSchema(repeat, (integers,), PointLayout.rect_c((2,)), image_schema())
+    assert left == right
+    assert left.fingerprint == right.fingerprint
+
+    with pytest.raises(TypeError, match="boolean"):
+        AxisSpec(AxisId("bool"), "bool", SCAN_POINT, 1, (True,))
+    with pytest.raises(TypeError, match="scalar"):
+        AxisSpec(AxisId("fraction"), "fraction", SCAN_POINT, 1, (Fraction(1, 2),))
+
+
+def test_layout_constructor_normalizes_equal_physical_mappings():
+    assert PointLayout.rect_f((3,)) == PointLayout.rect_c((3,))
+    assert PointLayout.rect_f((1, 3, 1)) == PointLayout.rect_c((1, 3, 1))
+
+    c_mapping = tuple(np.ndindex(2, 3))
+    explicit_c = PointLayout.explicit((2, 3), c_mapping)
+    assert explicit_c == PointLayout.rect_c((2, 3))
+
+    f_mapping = tuple(
+        tuple(int(index) for index in np.unravel_index(row, (2, 3), order="F"))
+        for row in range(6)
     )
-    invalid_block = DataBlock(
-        BlockId("invalid-bytes"),
-        DatasetRevision(0),
-        np.array([[4, 99]], dtype=np.int16),
-        CellValidity(np.array([[True, False]])),
-        invalid_schema,
+    explicit_f = PointLayout.explicit((2, 3), f_mapping)
+    assert explicit_f == PointLayout.rect_f((2, 3))
+
+    repeat = axis("repeat", REPEAT, 1)
+    points = (axis("row", SCAN_POINT, 2), axis("column", SCAN_POINT, 3))
+    left = DatasetSchema(repeat, points, explicit_c, image_schema())
+    right = DatasetSchema(repeat, points, PointLayout.rect_c((2, 3)), image_schema())
+    assert left.fingerprint == right.fingerprint
+
+    with_singleton = AxisLayout.product(
+        AxisLayout.rect_c((1,)),
+        AxisLayout.rect_f((2, 3)),
     )
-    noncanonical_tree = decode(encode_data_block(invalid_block))
-    noncanonical_tree["values"].setflags(write=True)
-    noncanonical_tree["values"][0, 1] = 123
-    with pytest.raises(TypedCodecError, match="non-canonical typed"):
-        decode_data_block(encode(noncanonical_tree))
+    assert with_singleton == AxisLayout.rect_f((1, 2, 3))
+
+    empty_product = AxisLayout.product(
+        AxisLayout.explicit((4,), ()),
+        AxisLayout.rect_c((3,)),
+    )
+    assert empty_product == AxisLayout.explicit((4, 3), ())
+
+
+def test_repeat_role_has_exactly_one_structural_owner():
+    repeat = axis("repeat", REPEAT, 1)
+    counterfeit_point = axis("counterfeit.point", REPEAT, 2)
+    with pytest.raises(ValueError, match="only"):
+        DatasetSchema(
+            repeat,
+            (counterfeit_point,),
+            PointLayout.rect_c((2,)),
+            image_schema(),
+        )
+
+    counterfeit_data = axis("counterfeit.data", REPEAT, 2)
+    with pytest.raises(ValueError, match="only"):
+        DatasetSchema(
+            repeat,
+            (),
+            PointLayout.rect_c(()),
+            ValueSchema(
+                (counterfeit_data,),
+                ValidityContract.value(),
+                np.dtype(np.float64),
+            ),
+        )
+
+
+def test_invalid_digest_still_validates_shape_and_dtype():
+    schema = image_schema(component_validity=False)
+    contract = ValuePayloadContract(schema)
+    with pytest.raises(ValueError, match="shape"):
+        contract.digest_content(np.zeros((1,), dtype=np.uint16), INVALID)
+    with pytest.raises(TypeError, match="dtype"):
+        contract.digest_content(np.zeros(schema.data_shape, dtype=np.float32), INVALID)
+
+
+def test_value_canonicalization_accepts_endian_equivalent_input():
+    schema = ValueSchema((), ValidityContract.value(), np.dtype("<i2"))
+    source = np.array(513, dtype=">i2")
+    canonical = canonical_value_array(source, VALID, schema)
+    assert canonical is not None
+    assert canonical.dtype == np.dtype("<i2")
+    assert canonical.item() == 513
+
+
+def test_big_endian_complex_nan_payloads_have_one_content_identity():
+    sample = axis("sample", SITE, 1)
+    schema = ValueSchema((sample,), ValidityContract.value(), np.dtype("<c8"))
+    first = np.zeros(1, dtype=">c8")
+    second = np.zeros(1, dtype=">c8")
+    first.view(">u4")[:] = (0x7FC00001, 0x3F800000)
+    second.view(">u4")[:] = (0x7FA12345, 0x3F800000)
+
+    first_canonical = canonical_value_array(first, VALID, schema)
+    second_canonical = canonical_value_array(second, VALID, schema)
+    assert first_canonical is not None and second_canonical is not None
+    assert first_canonical.dtype == np.dtype("<c8")
+    assert first_canonical.tobytes() == second_canonical.tobytes()
+    contract = ValuePayloadContract(schema)
+    assert contract.digest_content(first, VALID) == contract.digest_content(second, VALID)
+
+
+def test_retained_byte_bound_uses_unbounded_integer_arithmetic():
+    height = AxisSpec(AxisId("huge.y"), "y", SPATIAL_Y, 2**32)
+    width = AxisSpec(AxisId("huge.x"), "x", SPATIAL_X, 2**32 + 1)
+    schema = ValueSchema(
+        (height, width),
+        ValidityContract.components(height.axis_id, width.axis_id),
+        np.dtype(np.uint16),
+    )
+    expected_elements = (2**32) * (2**32 + 1)
+    assert ValuePayloadContract(schema).max_retained_nbytes == expected_elements * 3
 
 
 def test_import_is_headless_and_does_not_pull_legacy_domain():

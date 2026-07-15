@@ -141,7 +141,7 @@ def _validate_frame_schema_facts(
         axis.coordinates is None
         or len(axis.coordinates) != axis.size
         or any(
-            type(coordinate) is not int or coordinate != index
+            coordinate != index
             for index, coordinate in enumerate(axis.coordinates)
         )
         for axis in axes

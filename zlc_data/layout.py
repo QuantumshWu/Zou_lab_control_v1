@@ -19,7 +19,29 @@ class AxisLayoutMode(str, Enum):
     PRODUCT = "PRODUCT"
 
 
-@dataclass(frozen=True)
+def _rectangular_mode_for_mapping(
+    logical_shape: tuple[int, ...],
+    mapping: tuple[tuple[int, ...], ...],
+) -> AxisLayoutMode | None:
+    if len(mapping) != math.prod(logical_shape):
+        return None
+    for mode, order in (
+        (AxisLayoutMode.RECT_C, "C"),
+        (AxisLayoutMode.RECT_F, "F"),
+    ):
+        if all(
+            multi
+            == tuple(
+                int(index)
+                for index in np.unravel_index(row, logical_shape, order=order)
+            )
+            for row, multi in enumerate(mapping)
+        ):
+            return mode
+    return None
+
+
+@dataclass(frozen=True, eq=False)
 class AxisLayout:
     """A finite physical row table over a logical Cartesian axis space.
 
@@ -45,6 +67,11 @@ class AxisLayout:
         object.__setattr__(self, "logical_shape", logical_shape)
         if not isinstance(self.mode, AxisLayoutMode):
             raise TypeError("mode must be AxisLayoutMode")
+        if (
+            self.mode is AxisLayoutMode.RECT_F
+            and sum(size > 1 for size in logical_shape) <= 1
+        ):
+            object.__setattr__(self, "mode", AxisLayoutMode.RECT_C)
         if isinstance(self.storage_size, bool) or not isinstance(self.storage_size, Integral):
             raise TypeError("storage_size must be an integer")
         object.__setattr__(self, "storage_size", int(self.storage_size))
@@ -77,12 +104,6 @@ class AxisLayout:
             ):
                 raise ValueError("PRODUCT identity factors are non-canonical")
             if any(
-                factor.mode is AxisLayoutMode.RECT_F
-                and len(factor.logical_shape) <= 1
-                for factor in factors
-            ):
-                raise ValueError("rank-one RECT_F PRODUCT factors are non-canonical")
-            if any(
                 left.mode is AxisLayoutMode.RECT_C
                 and right.mode is AxisLayoutMode.RECT_C
                 for left, right in zip(factors, factors[1:])
@@ -107,6 +128,16 @@ class AxisLayout:
         for multi in mapping:
             self._validate_multi_index(multi)
         mapping = tuple(tuple(int(index) for index in multi) for multi in mapping)
+        rectangular_mode = _rectangular_mode_for_mapping(logical_shape, mapping)
+        if rectangular_mode is not None:
+            if (
+                rectangular_mode is AxisLayoutMode.RECT_F
+                and sum(size > 1 for size in logical_shape) <= 1
+            ):
+                rectangular_mode = AxisLayoutMode.RECT_C
+            object.__setattr__(self, "mode", rectangular_mode)
+            object.__setattr__(self, "storage_to_multi", None)
+            return
         object.__setattr__(self, "storage_to_multi", mapping)
         object.__setattr__(
             self,
@@ -143,19 +174,6 @@ class AxisLayout:
 
         shape = tuple(logical_shape)
         mapping = tuple(tuple(index) for index in storage_to_multi)
-        if len(mapping) == math.prod(shape):
-            rectangular_c = cls.rect_c(shape)
-            if all(
-                multi == rectangular_c.multi_index(index)
-                for index, multi in enumerate(mapping)
-            ):
-                return rectangular_c
-            rectangular_f = cls.rect_f(shape)
-            if all(
-                multi == rectangular_f.multi_index(index)
-                for index, multi in enumerate(mapping)
-            ):
-                return rectangular_f
         return cls.explicit(shape, mapping)
 
     @classmethod
@@ -176,10 +194,11 @@ class AxisLayout:
         ]
         if not flattened:
             return AxisLayout.rect_c(())
+        shape = tuple(size for factor in flattened for size in factor.logical_shape)
+        if any(factor.storage_size == 0 for factor in flattened):
+            return cls.explicit(shape, ())
         merged: list[AxisLayout] = []
         for factor in flattened:
-            if factor.mode is AxisLayoutMode.RECT_F and len(factor.logical_shape) <= 1:
-                factor = AxisLayout.rect_c(factor.logical_shape)
             if (
                 merged
                 and merged[-1].mode is AxisLayoutMode.RECT_C
@@ -191,9 +210,18 @@ class AxisLayout:
             else:
                 merged.append(factor)
         flattened = merged
+        nontrivial = tuple(factor for factor in flattened if factor.storage_size > 1)
+        if len(nontrivial) <= 1 and all(
+            factor.mode in (AxisLayoutMode.RECT_C, AxisLayoutMode.RECT_F)
+            for factor in flattened
+        ):
+            mode = (
+                nontrivial[0].mode if nontrivial else AxisLayoutMode.RECT_C
+            )
+            factory = cls.rect_f if mode is AxisLayoutMode.RECT_F else cls.rect_c
+            return factory(shape)
         if len(flattened) == 1:
             return flattened[0]
-        shape = tuple(size for factor in flattened for size in factor.logical_shape)
         return cls(
             shape,
             AxisLayoutMode.PRODUCT,
@@ -300,6 +328,28 @@ class AxisLayout:
         result.setflags(write=False)
         return result
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, AxisLayout):
+            return NotImplemented
+        return (
+            self.logical_shape == other.logical_shape
+            and self.mode is other.mode
+            and self.storage_size == other.storage_size
+            and self.storage_to_multi == other.storage_to_multi
+            and self.factors == other.factors
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.logical_shape,
+                self.mode,
+                self.storage_size,
+                self.storage_to_multi,
+                self.factors,
+            )
+        )
+
     def _validate_storage_index(self, index: int) -> None:
         if isinstance(index, bool) or not isinstance(index, Integral) or not 0 <= index < self.storage_size:
             raise IndexError(f"storage index {index!r} is outside [0, {self.storage_size})")
@@ -314,7 +364,7 @@ class AxisLayout:
                 raise ValueError(f"multi-index {multi} is outside logical shape {self.logical_shape}")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class PointLayout(AxisLayout):
     """Dataset point-axis specialization of :class:`AxisLayout`."""
 

@@ -9,10 +9,7 @@ import numpy as np
 from zlc_storage.canonical import (
     canonical_digest,
     canonical_text as _text,
-    decode,
-    encode,
     exact_mapping as _exact_map,
-    integer as _integer,
 )
 
 from .axis import AxisId, AxisRoleId, AxisSpec, CoordinateFrameId
@@ -28,21 +25,11 @@ from .validity import (
     ValidityContract,
     ValidityMode,
 )
-from .value import (
-    BlockId,
-    DataBlock,
-    DatasetRevision,
-    Value,
-    expand_dataset_validity,
-    expand_value_validity,
-)
 
 
 AXIS_SCHEMA = "zlc_data.AxisSpec"
 VALUE_SCHEMA = "zlc_data.ValueSchema"
 DATASET_SCHEMA = "zlc_data.DatasetSchema"
-VALUE = "zlc_data.Value"
-DATA_BLOCK = "zlc_data.DataBlock"
 
 
 class TypedCodecError(ValueError):
@@ -61,6 +48,7 @@ def axis_to_tree(axis: AxisSpec) -> dict[str, Any]:
         "coordinate_frame": None
         if axis.coordinate_frame is None
         else axis.coordinate_frame.value,
+        "index_origin": axis.index_origin,
     }
 
 
@@ -76,6 +64,7 @@ def axis_from_tree(tree: Any) -> AxisSpec:
             "coordinates",
             "unit",
             "coordinate_frame",
+            "index_origin",
         },
         AXIS_SCHEMA,
     )
@@ -84,13 +73,14 @@ def axis_from_tree(tree: Any) -> AxisSpec:
         raise ValueError("AxisSpec coordinates must be a list or null")
     frame = data["coordinate_frame"]
     return AxisSpec(
-        axis_id=AxisId(_text(data["axis_id"], "axis_id")),
-        name=_text(data["name"], "name"),
-        role=AxisRoleId(_text(data["role"], "role")),
-        size=_integer(data["size"], "size"),
+        axis_id=AxisId(data["axis_id"]),
+        name=data["name"],
+        role=AxisRoleId(data["role"]),
+        size=data["size"],
         coordinates=None if coordinates is None else tuple(coordinates),
-        unit=None if data["unit"] is None else _text(data["unit"], "unit"),
-        coordinate_frame=None if frame is None else CoordinateFrameId(_text(frame, "coordinate_frame")),
+        unit=data["unit"],
+        coordinate_frame=None if frame is None else CoordinateFrameId(frame),
+        index_origin=data["index_origin"],
     )
 
 
@@ -121,17 +111,17 @@ def value_schema_from_tree(tree: Any) -> ValueSchema:
     validity = data["validity_contract"]
     if not isinstance(validity, dict) or set(validity) != {"mode", "component_axis_ids"}:
         raise ValueError("invalid ValueSchema validity_contract")
-    mode = ValidityMode(_text(validity["mode"], "validity mode"))
+    mode = ValidityMode(validity["mode"])
     component_ids = validity["component_axis_ids"]
     if not isinstance(component_ids, list):
         raise ValueError("component_axis_ids must be a list")
-    contract = ValidityContract(mode, tuple(AxisId(_text(item, "component axis")) for item in component_ids))
+    contract = ValidityContract(mode, tuple(AxisId(item) for item in component_ids))
     unit = data["value_unit"]
     return ValueSchema(
         data_axes=tuple(axis_from_tree(axis) for axis in axes),
         validity_contract=contract,
         dtype=np.dtype(_text(data["dtype"], "dtype")),
-        value_unit=None if unit is None else _text(unit, "value_unit"),
+        value_unit=unit,
     )
 
 
@@ -196,13 +186,18 @@ def axis_layout_from_tree(tree: Any) -> AxisLayout:
         shape = tree["logical_shape"]
         if not isinstance(factors, list) or not isinstance(shape, list):
             raise ValueError("PRODUCT AxisLayout factors/shape must be lists")
-        layout = AxisLayout.product(*(axis_layout_from_tree(item) for item in factors))
+        decoded_factors = tuple(axis_layout_from_tree(item) for item in factors)
+        layout = AxisLayout.product(*decoded_factors)
         if layout.mode is not AxisLayoutMode.PRODUCT:
             raise ValueError("PRODUCT AxisLayout has a non-canonical factorization")
-        if layout.logical_shape != tuple(_integer(item, "logical shape") for item in shape):
-            raise ValueError("PRODUCT AxisLayout logical_shape is non-canonical")
-        if layout.storage_size != _integer(tree["storage_size"], "storage_size"):
-            raise ValueError("PRODUCT AxisLayout storage_size is non-canonical")
+        declared = AxisLayout(
+            tuple(shape),
+            AxisLayoutMode.PRODUCT,
+            tree["storage_size"],
+            factors=decoded_factors,
+        )
+        if declared != layout:
+            raise ValueError("PRODUCT AxisLayout fields are non-canonical")
         if axis_layout_to_tree(layout) != tree:
             raise ValueError("PRODUCT AxisLayout tree is non-canonical")
         return layout
@@ -243,16 +238,15 @@ def _axis_layout_fields(
         raise ValueError("point layout logical_shape must be a list")
     if mapping_data is not None and not isinstance(mapping_data, list):
         raise ValueError("point layout storage_to_multi must be a list or null")
+    if mapping_data is not None and any(not isinstance(item, list) for item in mapping_data):
+        raise ValueError("point layout multi-indices must be lists")
     return (
-        tuple(_integer(size, "logical shape") for size in shape_data),
-        AxisLayoutMode(_text(tree["mode"], "layout mode")),
-        _integer(tree["storage_size"], "storage_size"),
+        tuple(shape_data),
+        AxisLayoutMode(tree["mode"]),
+        tree["storage_size"],
         None
         if mapping_data is None
-        else tuple(
-            tuple(_integer(index, "multi-index") for index in item)
-            for item in mapping_data
-        ),
+        else tuple(tuple(item) for item in mapping_data),
     )
 
 
@@ -262,87 +256,6 @@ def value_schema_fingerprint(schema: ValueSchema) -> str:
 
 def dataset_schema_fingerprint(schema: DatasetSchema) -> str:
     return canonical_digest(dataset_schema_to_tree(schema))
-
-
-def encode_dataset_schema(schema: DatasetSchema) -> bytes:
-    return encode(dataset_schema_to_tree(schema))
-
-
-def decode_dataset_schema(payload: bytes) -> DatasetSchema:
-    schema = dataset_schema_from_tree(decode(payload))
-    _require_typed_canonical(payload, encode_dataset_schema(schema), DATASET_SCHEMA)
-    return schema
-
-
-def value_to_tree(value: Value) -> dict[str, Any]:
-    return {
-        "schema": VALUE,
-        "value_schema": value_schema_to_tree(value.schema),
-        "values": _normalized_values(value.values, expand_value_validity(value.validity, value.schema)),
-        "validity": validity_to_tree(value.validity),
-    }
-
-
-def value_from_tree(tree: Any) -> Value:
-    data = _exact_map(tree, {"schema", "value_schema", "values", "validity"}, VALUE)
-    schema = value_schema_from_tree(data["value_schema"])
-    values = data["values"]
-    if not isinstance(values, np.ndarray):
-        raise ValueError("Value values must be an ndarray")
-    return Value(values, validity_from_tree(data["validity"]), schema)
-
-
-def data_block_to_tree(block: DataBlock) -> dict[str, Any]:
-    return {
-        "schema": DATA_BLOCK,
-        "block_id": block.block_id.value,
-        "revision": block.revision.value,
-        "dataset_schema": dataset_schema_to_tree(block.schema),
-        "values": _normalized_values(
-            block.values,
-            expand_dataset_validity(block.validity, block.schema),
-        ),
-        "validity": validity_to_tree(block.validity),
-    }
-
-
-def data_block_from_tree(tree: Any) -> DataBlock:
-    data = _exact_map(
-        tree,
-        {"schema", "block_id", "revision", "dataset_schema", "values", "validity"},
-        DATA_BLOCK,
-    )
-    schema = dataset_schema_from_tree(data["dataset_schema"])
-    values = data["values"]
-    if not isinstance(values, np.ndarray):
-        raise ValueError("DataBlock values must be an ndarray")
-    return DataBlock(
-        block_id=BlockId(_text(data["block_id"], "block_id")),
-        revision=DatasetRevision(_integer(data["revision"], "revision")),
-        values=values,
-        validity=validity_from_tree(data["validity"]),
-        schema=schema,
-    )
-
-
-def encode_value(value: Value) -> bytes:
-    return encode(value_to_tree(value))
-
-
-def decode_value(payload: bytes) -> Value:
-    value = value_from_tree(decode(payload))
-    _require_typed_canonical(payload, encode_value(value), VALUE)
-    return value
-
-
-def encode_data_block(block: DataBlock) -> bytes:
-    return encode(data_block_to_tree(block))
-
-
-def decode_data_block(payload: bytes) -> DataBlock:
-    block = data_block_from_tree(decode(payload))
-    _require_typed_canonical(payload, encode_data_block(block), DATA_BLOCK)
-    return block
 
 
 def validity_to_tree(
@@ -382,16 +295,10 @@ def validity_from_tree(tree: Any) -> Valid | Invalid | CellValidity | ComponentV
         if not isinstance(tree["mask"], np.ndarray):
             raise ValueError("component validity mask must be an ndarray")
         return ComponentValidity(
-            tuple(AxisId(_text(axis_id, "validity axis id")) for axis_id in axis_ids),
+            tuple(AxisId(axis_id) for axis_id in axis_ids),
             tree["mask"],
         )
     raise ValueError(f"invalid validity payload for kind {kind!r}")
-
-
-def _normalized_values(values: np.ndarray, validity_mask: np.ndarray) -> np.ndarray:
-    normalized = np.array(values, copy=True, order="C")
-    normalized[~validity_mask] = 0
-    return normalized
 
 
 def _require_typed_canonical(got: bytes, expected: bytes, schema_id: str) -> None:

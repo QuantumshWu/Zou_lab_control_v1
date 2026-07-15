@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 
 import numpy as np
 from zlc_storage.canonical import canonical_text, sha256_text
 
-from ._arrays import immutable_array
+from ._arrays import canonical_dtype, immutable_array
 from .axis import AxisId
 from .schema import DatasetSchema, ValueSchema
 from .validity import (
@@ -96,7 +97,7 @@ def canonical_value_array(
     if not isinstance(schema, ValueSchema):
         raise TypeError("schema must be ValueSchema")
     array = np.asarray(values)
-    if array.dtype != schema.dtype:
+    if canonical_dtype(array.dtype) != schema.dtype:
         raise TypeError(
             f"values dtype {array.dtype} does not match schema dtype {schema.dtype}"
         )
@@ -110,7 +111,8 @@ def canonical_value_array(
         and schema.validity_contract.mode is not ValidityMode.COMPONENTS
     ):
         return None
-    normalized = array
+    normalized: np.ndarray
+    owns_normalized = False
     if isinstance(validity, (Invalid, ComponentValidity)):
         expanded = expand_value_validity(validity, schema)
         if not np.all(expanded):
@@ -118,11 +120,19 @@ def canonical_value_array(
             # indexing with ``~expanded``.  The latter materializes another
             # dense boolean frame for component validity, which breaks the
             # capture source's bounded read-scratch contract on large images.
-            normalized = np.zeros_like(array, order="C")
+            normalized = np.zeros(schema.data_shape, dtype=schema.dtype, order="C")
             np.copyto(normalized, array, where=expanded)
+            owns_normalized = True
+        else:
+            normalized = np.ascontiguousarray(array, dtype=schema.dtype)
+    else:
+        normalized = np.ascontiguousarray(array, dtype=schema.dtype)
+    if not owns_normalized:
+        owns_normalized = not np.shares_memory(normalized, array)
     if normalized.dtype.kind in "fc" and np.any(np.isnan(normalized)):
-        if normalized is array:
+        if not owns_normalized:
             normalized = np.array(array, copy=True, order="C")
+            owns_normalized = True
         if normalized.dtype.kind == "f":
             canonical_nan = np.array(float("nan"), dtype=normalized.dtype)
             np.copyto(normalized, canonical_nan, where=np.isnan(normalized))
@@ -133,7 +143,7 @@ def canonical_value_array(
             components = normalized.reshape(-1).view(component_dtype)
             canonical_nan = np.array(float("nan"), dtype=component_dtype)
             np.copyto(components, canonical_nan, where=np.isnan(components))
-    return np.ascontiguousarray(normalized, dtype=schema.dtype)
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -153,12 +163,12 @@ class ValuePayloadContract:
 
     @property
     def max_retained_nbytes(self) -> int:
-        value_bytes = int(np.prod(self.schema.data_shape, dtype=np.int64)) * self.schema.dtype.itemsize
+        value_bytes = math.prod(self.schema.data_shape) * self.schema.dtype.itemsize
         validity = self.schema.validity_contract
         if validity.mode is not ValidityMode.COMPONENTS:
             return value_bytes
         component_shape = tuple(self.schema.axis(axis_id).size for axis_id in validity.component_axis_ids)
-        return value_bytes + int(np.prod(component_shape, dtype=np.int64))
+        return value_bytes + math.prod(component_shape)
 
     def snapshot(self, payload: Value) -> Value:
         self.validate(payload)
@@ -199,6 +209,7 @@ class ValuePayloadContract:
         avoiding a full image copy merely to reconstruct the transient wrapper.
         """
 
+        canonical_values = canonical_value_array(values, validity, self.schema)
         hasher = hashlib.sha256()
         hasher.update(b"zlc_data.ValuePayloadContent\x00")
 
@@ -223,7 +234,6 @@ class ValuePayloadContract:
             return hasher.hexdigest()
         else:  # pragma: no cover - validation closes VALUE validity above
             raise TypeError("VALUE validity requires Valid or Invalid")
-        canonical_values = canonical_value_array(values, validity, self.schema)
         assert canonical_values is not None
         update(memoryview(canonical_values).cast("B"))
         return hasher.hexdigest()

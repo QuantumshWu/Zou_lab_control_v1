@@ -7,6 +7,7 @@ import hashlib
 import subprocess
 import sys
 import time
+import tracemalloc
 
 import numpy as np
 import pytest
@@ -45,11 +46,8 @@ from zlc_data import (
     OwnedSnapshot,
     ParameterUnitRelation,
     PointLayout,
-    Select,
     Selection,
     StreamGenerationId,
-    TransformOrigin,
-    TransformRevision,
     VALID,
     ValidityContract,
     ValueSchema,
@@ -450,6 +448,178 @@ def test_binding_is_axis_total_role_checked_and_declared_coordinates_are_not_ign
         bind_fit(labelled_spec, labelled.block.schema)
 
 
+def test_implicit_fit_coordinates_require_consecutive_float64_identity():
+    scan = AxisSpec(
+        AxisId("scan"),
+        "scan",
+        SCAN_POINT,
+        3,
+        index_origin=2**53 + 2,
+    )
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(scan,),
+        point_layout=PointLayout.rect_c((3,)),
+        values=np.zeros((1, 3), dtype=np.float64),
+    )
+    spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        None,
+        (scan.axis_id,),
+        (snapshot.block.schema.repeat_axis.axis_id,),
+        "gaussian_offset",
+    )
+    with pytest.raises(ValueError, match="consecutively float64-representable"):
+        bind_fit(spec, snapshot.block.schema)
+
+
+def test_sparse_implicit_fit_cost_tracks_present_rows_and_preserves_axis_unit():
+    logical_size = 5_000_000
+    scan = AxisSpec(
+        AxisId("scan"),
+        "scan",
+        SCAN_POINT,
+        logical_size,
+        unit="MHz",
+    )
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(scan,),
+        point_layout=PointLayout.explicit(
+            (logical_size,),
+            ((0,), (logical_size - 1,)),
+        ),
+        values=np.array([[1.0, 2.0]]),
+    )
+    spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        None,
+        (scan.axis_id,),
+        (snapshot.block.schema.repeat_axis.axis_id,),
+        "gaussian_offset",
+    )
+    bound = bind_fit(spec, snapshot.block.schema)
+    tracemalloc.start()
+    tracemalloc.clear_traces()
+    problem = build_fit_problem(bound, snapshot)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    np.testing.assert_array_equal(
+        problem.independent_values[0],
+        (0.0, float(logical_size - 1)),
+    )
+    assert bound.parameter_units == ("count", "count", "MHz", "MHz")
+    assert peak < 2_000_000
+
+
+def test_sparse_declared_fit_validates_coordinates_only_when_binding(monkeypatch):
+    logical_size = 20_000
+    group_count = 12
+    group = axis("group", SITE, group_count)
+    scan = axis(
+        "scan",
+        SCAN_POINT,
+        logical_size,
+        coordinates=range(logical_size),
+        unit="MHz",
+    )
+    mapping = tuple(
+        (group_index, scan_index)
+        for group_index in range(group_count)
+        for scan_index in (0, logical_size - 1)
+    )
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(group, scan),
+        point_layout=PointLayout.explicit((group_count, logical_size), mapping),
+        values=np.ones((1, len(mapping))),
+    )
+    spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        None,
+        (scan.axis_id,),
+        (snapshot.block.schema.repeat_axis.axis_id, group.axis_id),
+        "gaussian_offset",
+    )
+    bound = bind_fit(spec, snapshot.block.schema)
+
+    import zlc_data.fit_contract as fit_contract_module
+
+    def reject_revalidation(_axis):
+        raise AssertionError("packing repeated fit-coordinate admission")
+
+    monkeypatch.setattr(
+        fit_contract_module,
+        "_coordinate_source_for_axis",
+        reject_revalidation,
+    )
+    problem = build_fit_problem(bound, snapshot)
+
+    assert problem.batch_layout.storage_size == group_count
+    assert bound.parameter_units == ("count", "count", "MHz", "MHz")
+
+
+@pytest.mark.parametrize(
+    "layout",
+    (
+        PointLayout.rect_f((2, 3)),
+        PointLayout.explicit((2, 3), ((0, 0), (1, 2))),
+    ),
+    ids=("rect-f", "sparse-explicit"),
+)
+def test_identity_and_noop_transform_share_one_source_schema_owner(layout):
+    group = axis("group", SITE, 2)
+    scan = axis("scan", SCAN_POINT, 3, coordinates=(-1.0, 0.0, 1.0), unit="MHz")
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(group, scan),
+        point_layout=layout,
+        values=np.zeros((1, layout.storage_size), dtype=np.float64),
+    )
+    identity_spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        None,
+        (scan.axis_id,),
+        (snapshot.block.schema.repeat_axis.axis_id, group.axis_id),
+        "gaussian_offset",
+    )
+    no_op = commit_transform(
+        snapshot.block.schema,
+        DataTransformSpec((Selection.index_range(scan.axis_id, 0, scan.size),)),
+    )
+    transformed_spec = replace(identity_spec, committed_transform=no_op)
+
+    identity_schema = bind_fit(identity_spec, snapshot.block.schema).effective_schema
+    transformed_schema = bind_fit(
+        transformed_spec, snapshot.block.schema
+    ).effective_schema
+    assert identity_schema == transformed_schema
+    assert type(identity_schema.cell_layout) is AxisLayout
+
+
+def test_identity_fit_defers_transformed_schema_digest_and_caches_first_read(monkeypatch):
+    snapshot, scan = gaussian_snapshot(repeat=1)
+    import zlc_data.transform as transform_module
+
+    digest = transform_module.canonical_digest
+    calls = 0
+
+    def counted_digest(value):
+        nonlocal calls
+        calls += 1
+        return digest(value)
+
+    monkeypatch.setattr(transform_module, "canonical_digest", counted_digest)
+    bound = bind_fit(gaussian_spec(snapshot, scan), snapshot.block.schema)
+    assert calls == 0
+
+    first = bound.effective_schema.fingerprint
+    assert calls == 1
+    assert bound.effective_schema.fingerprint == first
+    assert calls == 1
+
+
 def test_radial_center_requires_x_then_y_with_compatible_units_and_frames():
     x = axis("x", SPATIAL_X, 9, coordinates=range(9), unit="px", frame="camera")
     y = axis("y", SPATIAL_Y, 7, coordinates=range(7), unit="px", frame="camera")
@@ -499,10 +669,8 @@ def test_identity_and_committed_transform_keep_complete_source_lineage():
     committed = commit_transform(
         snapshot.block.schema,
         DataTransformSpec(
-            (Select(Selection.index(snapshot.block.schema.repeat_axis.axis_id, 0)),)
+            (Selection.index(snapshot.block.schema.repeat_axis.axis_id, 0),)
         ),
-        revision=TransformRevision(1),
-        origin=TransformOrigin.USER,
     )
     transformed_spec = gaussian_spec(
         snapshot,
@@ -517,7 +685,7 @@ def test_identity_and_committed_transform_keep_complete_source_lineage():
     np.testing.assert_allclose(transformed.parameter_values[0], (3.0, 1.2, 0.8, 0.7))
 
 
-def test_public_bound_fit_cannot_forge_effective_axis_metadata():
+def test_bound_fit_derives_effective_axis_metadata_instead_of_accepting_it():
     snapshot, scan = gaussian_snapshot(repeat=1)
     bound = bind_fit(gaussian_spec(snapshot, scan), snapshot.block.schema)
     shifted = replace(
@@ -528,8 +696,20 @@ def test_public_bound_fit_cannot_forge_effective_axis_metadata():
         bound.effective_schema,
         cell_axes=(snapshot.block.schema.repeat_axis, shifted),
     )
-    with pytest.raises(ValueError, match="not derived from FitSpec authority"):
-        BoundFit(bound.spec, bound.expected_schema, forged_schema, bound.model)
+    with pytest.raises(TypeError):
+        BoundFit(bound.spec, bound.expected_schema, forged_schema)
+
+
+def test_fit_packing_rejects_a_subclass_that_skips_proof_admission():
+    snapshot, scan = gaussian_snapshot(repeat=1)
+
+    class UncheckedBoundFit(BoundFit):
+        def __post_init__(self):
+            pass
+
+    forged = UncheckedBoundFit(gaussian_spec(snapshot, scan), snapshot.block.schema)
+    with pytest.raises(TypeError, match="bound must be BoundFit"):
+        build_fit_problem(forged, snapshot)
 
 
 def test_grid_site_batch_uses_component_validity_without_collapsing_sites():
@@ -751,10 +931,8 @@ def test_nonfactor_sparse_mapping_stays_explicit_after_authoritative_repeat_sele
     committed = commit_transform(
         snapshot.block.schema,
         DataTransformSpec(
-            (Select(Selection.index(snapshot.block.schema.repeat_axis.axis_id, 0)),)
+            (Selection.index(snapshot.block.schema.repeat_axis.axis_id, 0),)
         ),
-        revision=TransformRevision(1),
-        origin=TransformOrigin.USER,
     )
     spec = FitSpec(
         snapshot.block.schema.fingerprint,
@@ -843,21 +1021,37 @@ def test_radial_roi_keeps_absolute_coordinate_less_centers_and_index_units():
         snapshot.block.schema,
         DataTransformSpec(
             (
-                Select(Selection.index_range(x.axis_id, 20, 41)),
-                Select(Selection.index_range(y.axis_id, 5, 26)),
+                Selection.index_range(x.axis_id, 20, 41),
+                Selection.index_range(y.axis_id, 5, 26),
             )
         ),
-        revision=TransformRevision(3),
-        origin=TransformOrigin.USER,
     )
-    roi = run(roi_transform)
+    roi_spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        roi_transform,
+        (x.axis_id, y.axis_id),
+        (snapshot.block.schema.repeat_axis.axis_id,),
+        "radial_gaussian_center",
+    )
+    roi_bound = bind_fit(roi_spec, snapshot.block.schema)
+    roi_problem = build_fit_problem(roi_bound, snapshot)
+    roi = roi_bound.run(snapshot)
 
     assert full.statuses == roi.statuses == (FitBatchStatus.CONVERGED,)
     np.testing.assert_allclose(full.parameter_values[0], expected, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(roi.parameter_values[0], expected, rtol=1e-5, atol=1e-5)
     assert roi.parameter_units == ("count", "count", "index", "index", "index")
-    assert tuple(axis.unit for axis in roi.fit_axis_specs) == ("index", "index")
-    assert tuple(axis.coordinates[0] for axis in roi.fit_axis_specs) == (20, 5)
+    assert tuple(axis.unit for axis in roi.fit_axis_specs) == (None, None)
+    assert tuple(axis.coordinates for axis in roi.fit_axis_specs) == (None, None)
+    assert tuple(axis.index_origin for axis in roi.fit_axis_specs) == (20, 5)
+    np.testing.assert_array_equal(
+        np.unique(roi_problem.independent_values[0]),
+        np.arange(20.0, 41.0),
+    )
+    np.testing.assert_array_equal(
+        np.unique(roi_problem.independent_values[1]),
+        np.arange(5.0, 26.0),
+    )
 
 
 def test_value_aware_2d_sampling_keeps_a_narrow_feature_between_grid_points():
@@ -1941,9 +2135,9 @@ def test_fit_result_wire_format_has_one_frozen_current_golden():
     )
 
     payload = encode_fit_result_batch(result)
-    assert len(payload) == 2770
+    assert len(payload) == 2735
     assert hashlib.sha256(payload).hexdigest() == (
-        "c443df1a06cf185db803da50ce2a5b2f68a4e9b0dd4bdd51b35ee08fa4b14186"
+        "615906e94861e9e74fa84904f0bcfed183532b1cbd15febe472f25a6aa26e9a5"
     )
 
 

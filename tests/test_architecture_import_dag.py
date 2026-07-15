@@ -285,9 +285,176 @@ def test_zlc_data_typed_byte_admission_has_one_owner():
                 and node.name in {"_require_canonical", "_require_typed_canonical"}
             ):
                 violations.append(f"{relative}:{node.lineno} defines {node.name}")
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name.startswith("decode_")
+            ):
+                calls = {
+                    call.func.id
+                    for call in ast.walk(node)
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                }
+                if "_require_typed_canonical" not in calls:
+                    violations.append(
+                        f"{relative}:{node.lineno} bypasses typed canonical-byte admission"
+                    )
     assert not violations, (
         "zlc_data.codec owns typed canonical-byte admission; sibling codecs "
         "must delegate:\n" + "\n".join(violations)
+    )
+
+
+def test_zlc_data_codecs_delegate_leaf_invariants_to_typed_owners():
+    owner_constructors = {
+        "AxisId",
+        "AxisLayout",
+        "AxisRoleId",
+        "AxisSpec",
+        "BlockId",
+        "CommittedTransform",
+        "CoordinateFrameId",
+        "CoordinateRangeSelection",
+        "DatasetRevision",
+        "DatasetRevisionRef",
+        "FitNumericPolicy",
+        "FitParameterConstraint",
+        "FitResultBatch",
+        "FitSpec",
+        "IndexRangeSelection",
+        "IndexSelection",
+        "ReductionSpec",
+        "StreamGenerationId",
+    }
+    primitive_prevalidators = {
+        "_integer",
+        "_text",
+        "canonical_text",
+        "finite_real",
+        "integer",
+    }
+    sources = (
+        ROOT / "zlc_data/codec.py",
+        ROOT / "zlc_data/fit_codec.py",
+        ROOT / "zlc_data/selection.py",
+        ROOT / "zlc_data/transform_codec.py",
+    )
+    violations = []
+    for source in sources:
+        relative = source.relative_to(ROOT)
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(relative))
+        for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+            constructor = None
+            if isinstance(call.func, ast.Name):
+                constructor = call.func.id
+            elif isinstance(call.func, ast.Attribute):
+                constructor = call.func.attr
+            if constructor not in owner_constructors:
+                continue
+            for nested in ast.walk(call):
+                if nested is call or not isinstance(nested, ast.Call):
+                    continue
+                helper = None
+                if isinstance(nested.func, ast.Name):
+                    helper = nested.func.id
+                elif isinstance(nested.func, ast.Attribute):
+                    helper = nested.func.attr
+                if helper in primitive_prevalidators:
+                    violations.append(
+                        f"{relative}:{nested.lineno} prevalidates {constructor} with {helper}"
+                    )
+    assert not violations, (
+        "codec owns wire structure; typed constructors own their leaf invariants:\n"
+        + "\n".join(violations)
+    )
+
+
+def test_dataset_cell_layout_and_source_transform_schema_have_one_owner():
+    violations = []
+    for source in (
+        *(ROOT / "zlc_data").rglob("*.py"),
+        ROOT / "zlc_frontend/figure/evaluate.py",
+    ):
+        relative = source.relative_to(ROOT)
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(relative))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "TransformedSchema"
+                and relative != Path("zlc_data/transform.py")
+            ):
+                violations.append(
+                    f"{relative}:{node.lineno} reconstructs TransformedSchema outside its owner"
+                )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "AxisLayout"
+                and node.func.attr == "product"
+                and relative != Path("zlc_data/schema.py")
+                and any(
+                    isinstance(descendant, ast.Attribute)
+                    and descendant.attr == "point_layout"
+                    for descendant in ast.walk(node)
+                )
+            ):
+                violations.append(
+                    f"{relative}:{node.lineno} reconstructs DatasetSchema.cell_layout"
+                )
+    assert not violations, (
+        "DatasetSchema.cell_layout and zlc_data.transform own source layout/schema "
+        "projection respectively:\n" + "\n".join(violations)
+    )
+
+
+def test_zlc_data_does_not_restore_unused_bulk_or_transform_history_surfaces():
+    forbidden = {
+        "PreviewTransformedData",
+        "Reduce",
+        "Select",
+        "TransformOrigin",
+        "TransformRecord",
+        "TransformRevision",
+        "data_block_from_tree",
+        "data_block_to_tree",
+        "decode_committed_transform",
+        "decode_data_block",
+        "decode_selection",
+        "decode_transform_record",
+        "decode_value",
+        "encode_committed_transform",
+        "encode_data_block",
+        "encode_selection",
+        "encode_transform_record",
+        "encode_value",
+        "preview_transform",
+        "transform_record_from_tree",
+        "transform_record_to_tree",
+        "transformed_schema_from_tree",
+        "value_from_tree",
+        "value_to_tree",
+    }
+    violations = []
+    for source in (ROOT / "zlc_data").rglob("*.py"):
+        relative = source.relative_to(ROOT)
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(relative))
+        for node in ast.walk(tree):
+            candidate = None
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                candidate = node.name
+            elif isinstance(node, ast.Name):
+                candidate = node.id
+            elif isinstance(node, ast.Attribute):
+                candidate = node.attr
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                candidate = node.value
+            if candidate in forbidden:
+                violations.append(f"{relative}:{node.lineno} restores {candidate}")
+    assert not violations, (
+        "zlc_data persists large frame payloads through bounded artifact chunks; "
+        "the data authority must not regrow zero-consumer bulk codecs, edit-history "
+        "metadata, or one-field operation wrappers:\n" + "\n".join(violations)
     )
 
 

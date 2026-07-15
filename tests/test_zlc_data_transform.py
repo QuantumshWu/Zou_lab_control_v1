@@ -29,16 +29,12 @@ from zlc_data import (
     MissingPolicy,
     OwnedSnapshot,
     PointLayout,
-    PreviewTransformedData,
-    Reduce,
     ReductionMethod,
     ReductionSpec,
     RowComponentValidity,
-    Select,
     Selection,
     StreamGenerationId,
-    TransformOrigin,
-    TransformRevision,
+    TransformedData,
     VALID,
     ValidityContract,
     ValidityPolicy,
@@ -47,14 +43,11 @@ from zlc_data import (
     axis_layout_from_tree,
     axis_layout_to_tree,
     commit_transform,
-    decode_committed_transform,
-    decode_selection,
-    decode_transform_record,
-    encode_committed_transform,
-    encode_selection,
-    encode_transform_record,
-    preview_transform,
+    committed_transform_from_tree,
+    committed_transform_to_tree,
     resolve_transformed_schema,
+    selection_from_tree,
+    selection_to_tree,
 )
 from zlc_data.numeric import (
     canonical_mean_dtype,
@@ -102,6 +95,16 @@ def block_for(
     )
 
 
+def apply_spec(block: DataBlock, spec: DataTransformSpec) -> TransformedData:
+    """Exercise the real authority path; tests never get a preview shortcut."""
+
+    committed = commit_transform(block.schema, spec)
+    snapshot = OwnedSnapshot(
+        block.ref(StreamGenerationId("transform-test-generation")), block
+    )
+    return apply_transform(snapshot, committed)
+
+
 def test_selection_is_canonical_as_an_axis_constraint_set():
     x = AxisId("x")
     y = AxisId("y")
@@ -118,18 +121,28 @@ def test_selection_is_canonical_as_an_axis_constraint_set():
         )
     )
     assert left == right
-    assert encode_selection(left) == encode_selection(right)
-    assert decode_selection(encode_selection(left)) == left
+
+    literal = {
+        "schema": "zlc_data.Selection",
+        "terms": [
+            {"kind": "INDEX_RANGE", "axis_id": "x", "start": 0, "stop": 2},
+            {"kind": "INDEX_RANGE", "axis_id": "y", "start": 1, "stop": 3},
+        ],
+    }
+    assert selection_to_tree(left) == literal
+    assert selection_from_tree(literal) == left
 
     frame = CoordinateFrameId("camera-pixel")
     integer_bounds = Selection.coordinate_range(x, 1, 2, coordinate_frame=frame)
     float_bounds = Selection.coordinate_range(x, 1.0, 2.0, coordinate_frame=frame)
     assert integer_bounds == float_bounds
-    assert encode_selection(integer_bounds) == encode_selection(float_bounds)
+    assert selection_to_tree(integer_bounds) == selection_to_tree(float_bounds)
 
 
 def test_repeated_index_ranges_preserve_absolute_coordinate_less_axis_indices():
-    point = AxisSpec(AxisId("point"), "point", SCAN_POINT, 8)
+    point = AxisSpec(
+        AxisId("point"), "point", SCAN_POINT, 8, unit="pixel"
+    )
     block = block_for(
         repeat=1,
         point_axes=(point,),
@@ -138,29 +151,18 @@ def test_repeated_index_ranges_preserve_absolute_coordinate_less_axis_indices():
     )
     spec = DataTransformSpec(
         (
-            Select(Selection((IndexRangeSelection(point.axis_id, 2, 7),))),
-            Select(Selection((IndexRangeSelection(point.axis_id, 1, 4),))),
+            Selection((IndexRangeSelection(point.axis_id, 2, 7),)),
+            Selection((IndexRangeSelection(point.axis_id, 1, 4),)),
         )
     )
 
-    preview = preview_transform(block, spec)
-    selected_axis = preview.schema.axis(point.axis_id)
-    assert selected_axis.coordinates == (3, 4, 5)
-    assert selected_axis.unit == "index"
-
-    committed = commit_transform(
-        block.schema,
-        spec,
-        revision=TransformRevision(2),
-        origin=TransformOrigin.USER,
-    )
-    restored = decode_committed_transform(encode_committed_transform(committed))
-    assert resolve_transformed_schema(block.schema, restored).axis(point.axis_id) \
-        == selected_axis
-    snapshot = OwnedSnapshot(block.ref(StreamGenerationId("selection-generation")), block)
-    replayed = apply_transform(snapshot, restored)
-    assert replayed.schema.axis(point.axis_id) == selected_axis
-    np.testing.assert_array_equal(replayed.values, (3, 4, 5))
+    result = apply_spec(block, spec)
+    selected_axis = result.schema.axis(point.axis_id)
+    assert selected_axis.coordinates is None
+    assert selected_axis.index_origin == 3
+    assert selected_axis.unit == "pixel"
+    assert tuple(selected_axis.coordinate_at(index) for index in range(3)) == (3, 4, 5)
+    np.testing.assert_array_equal(result.values, (3, 4, 5))
 
 
 def test_empty_axis_layout_is_only_for_derived_sparse_results():
@@ -184,9 +186,9 @@ def test_rect_f_multi_point_mapping_is_recovered_before_selecting():
         layout=PointLayout.rect_f((2, 3)),
         values=values,
     )
-    result = preview_transform(
+    result = apply_spec(
         block,
-        DataTransformSpec((Select(Selection.index(b.axis_id, 1)),)),
+        DataTransformSpec((Selection.index(b.axis_id, 1),)),
     )
 
     assert tuple(item.axis_id for item in result.schema.cell_axes) == (
@@ -208,9 +210,9 @@ def test_selecting_a_logically_valid_sparse_hole_returns_no_physical_row():
         layout=PointLayout.explicit((4,), ((0,), (3,))),
         values=np.array([[10, 40]], dtype=np.int16),
     )
-    result = preview_transform(
+    result = apply_spec(
         block,
-        DataTransformSpec((Select(Selection.index(point.axis_id, 2)),)),
+        DataTransformSpec((Selection.index(point.axis_id, 2),)),
     )
     assert result.schema.cell_axes == (block.schema.repeat_axis,)
     assert result.schema.cell_layout.storage_size == 0
@@ -229,9 +231,9 @@ def test_data_axis_selection_preserves_every_other_data_axis():
         data_axes=(site, component),
         values=np.arange(6, dtype=np.int16).reshape(1, 1, 3, 2),
     )
-    result = preview_transform(
+    result = apply_spec(
         block,
-        DataTransformSpec((Select(Selection.index_range(site.axis_id, 1, 3)),)),
+        DataTransformSpec((Selection.index_range(site.axis_id, 1, 3),)),
     )
     assert tuple(axis.axis_id for axis in result.schema.data_axes) == (
         site.axis_id,
@@ -239,6 +241,39 @@ def test_data_axis_selection_preserves_every_other_data_axis():
     )
     assert result.schema.data_shape == (2, 2)
     np.testing.assert_array_equal(result.values[0], [[2, 3], [4, 5]])
+
+
+def test_transform_keeps_repeat_point_and_every_trailing_data_axis_distinct():
+    point = axis("point", SCAN_POINT, 3)
+    site = axis("site", SITE, 2)
+    component = axis("component", SPATIAL_X, 2)
+    source = np.arange(2 * 3 * 2 * 2, dtype=np.int16).reshape(2, 3, 2, 2)
+    block = block_for(
+        repeat=2,
+        point_axes=(point,),
+        layout=PointLayout.rect_c((3,)),
+        data_axes=(site, component),
+        values=source,
+    )
+
+    result = apply_spec(
+        block,
+        DataTransformSpec((Selection.index_range(site.axis_id, 1, 2),)),
+    )
+
+    assert block.values.shape == (2, 3, 2, 2)
+    assert tuple(item.axis_id for item in result.schema.cell_axes) == (
+        AxisId("repeat"),
+        point.axis_id,
+    )
+    assert result.schema.cell_layout.logical_shape == (2, 3)
+    assert tuple(item.axis_id for item in result.schema.data_axes) == (
+        site.axis_id,
+        component.axis_id,
+    )
+    assert result.schema.data_shape == (1, 2)
+    assert result.values.shape == (6, 1, 2)
+    np.testing.assert_array_equal(result.values, source[:, :, 1:2, :].reshape(6, 1, 2))
 
 
 def test_sparse_missing_policy_never_turns_holes_into_invalid_rows():
@@ -250,17 +285,15 @@ def test_sparse_missing_policy_never_turns_holes_into_invalid_rows():
         layout=PointLayout.explicit((2, 2), ((0, 0), (1, 0), (0, 1))),
         values=np.array([[2.0, 4.0, 10.0]]),
     )
-    required = preview_transform(
+    required = apply_spec(
         block,
         DataTransformSpec(
             (
-                Reduce(
-                    ReductionSpec(
-                        (a.axis_id,),
-                        ReductionMethod.MEAN,
-                        MissingPolicy.REQUIRE_ALL,
-                        ValidityPolicy.OMIT_INVALID,
-                    )
+                ReductionSpec(
+                    (a.axis_id,),
+                    ReductionMethod.MEAN,
+                    MissingPolicy.REQUIRE_ALL,
+                    ValidityPolicy.OMIT_INVALID,
                 ),
             )
         ),
@@ -270,17 +303,15 @@ def test_sparse_missing_policy_never_turns_holes_into_invalid_rows():
     np.testing.assert_allclose(required.values, [3.0])
     np.testing.assert_array_equal(required.expanded_validity(), [True])
 
-    omitted = preview_transform(
+    omitted = apply_spec(
         block,
         DataTransformSpec(
             (
-                Reduce(
-                    ReductionSpec(
-                        (a.axis_id,),
-                        ReductionMethod.MEAN,
-                        MissingPolicy.OMIT_MISSING,
-                        ValidityPolicy.OMIT_INVALID,
-                    )
+                ReductionSpec(
+                    (a.axis_id,),
+                    ReductionMethod.MEAN,
+                    MissingPolicy.OMIT_MISSING,
+                    ValidityPolicy.OMIT_INVALID,
                 ),
             )
         ),
@@ -306,16 +337,14 @@ def test_component_validity_is_reduced_per_named_component():
         validity=validity,
         component_axes=(site.axis_id,),
     )
-    result = preview_transform(
+    result = apply_spec(
         block,
         DataTransformSpec(
             (
-                Reduce(
-                    ReductionSpec(
-                        (block.schema.repeat_axis.axis_id,),
-                        ReductionMethod.MEAN,
-                        validity_policy=ValidityPolicy.OMIT_INVALID,
-                    )
+                ReductionSpec(
+                    (block.schema.repeat_axis.axis_id,),
+                    ReductionMethod.MEAN,
+                    validity_policy=ValidityPolicy.OMIT_INVALID,
                 ),
             )
         ),
@@ -339,16 +368,14 @@ def test_mixed_cell_and_data_mean_uses_one_valid_contributor_count():
         validity=validity,
         component_axes=(site.axis_id,),
     )
-    result = preview_transform(
+    result = apply_spec(
         block,
         DataTransformSpec(
             (
-                Reduce(
-                    ReductionSpec(
-                        (block.schema.repeat_axis.axis_id, site.axis_id),
-                        ReductionMethod.MEAN,
-                        validity_policy=ValidityPolicy.OMIT_INVALID,
-                    )
+                ReductionSpec(
+                    (block.schema.repeat_axis.axis_id, site.axis_id),
+                    ReductionMethod.MEAN,
+                    validity_policy=ValidityPolicy.OMIT_INVALID,
                 ),
             )
         ),
@@ -366,16 +393,14 @@ def test_require_all_validity_marks_present_output_invalid_not_missing():
         values=np.array([[1.0], [9.0]]),
         validity=CellValidity(np.array([[True], [False]])),
     )
-    result = preview_transform(
+    result = apply_spec(
         block,
         DataTransformSpec(
             (
-                Reduce(
-                    ReductionSpec(
-                        (block.schema.repeat_axis.axis_id,),
-                        ReductionMethod.MEAN,
-                        validity_policy=ValidityPolicy.REQUIRE_ALL,
-                    )
+                ReductionSpec(
+                    (block.schema.repeat_axis.axis_id,),
+                    ReductionMethod.MEAN,
+                    validity_policy=ValidityPolicy.REQUIRE_ALL,
                 ),
             )
         ),
@@ -385,7 +410,33 @@ def test_require_all_validity_marks_present_output_invalid_not_missing():
     np.testing.assert_array_equal(result.values, [0.0])
 
 
-def test_commit_is_schema_bound_nonempty_and_strictly_round_trips():
+def test_committed_transform_tree_has_one_hand_written_current_shape():
+    spec = DataTransformSpec((Selection.index(AxisId("point"), 0),))
+    committed = CommittedTransform("a" * 64, spec, "b" * 64)
+    literal = {
+        "schema": "zlc_data.CommittedTransform",
+        "input_schema_fingerprint": "a" * 64,
+        "spec": {
+            "schema": "zlc_data.DataTransformSpec",
+            "operations": [
+                {
+                    "kind": "SELECT",
+                    "selection": {
+                        "schema": "zlc_data.Selection",
+                        "terms": [
+                            {"kind": "INDEX", "axis_id": "point", "index": 0}
+                        ],
+                    },
+                }
+            ],
+        },
+        "output_schema_fingerprint": "b" * 64,
+    }
+    assert committed_transform_to_tree(committed) == literal
+    assert committed_transform_from_tree(literal) == committed
+
+
+def test_commit_is_schema_bound_nonempty_and_authoritative():
     point = axis("point", SCAN_POINT, 2)
     block = block_for(
         repeat=1,
@@ -394,70 +445,57 @@ def test_commit_is_schema_bound_nonempty_and_strictly_round_trips():
         values=np.array([[1, 2]], dtype=np.int16),
     )
     with pytest.raises(ValueError, match="identity"):
-        commit_transform(
-            block.schema,
-            DataTransformSpec(()),
-            revision=TransformRevision(0),
-            origin=TransformOrigin.USER,
-        )
+        commit_transform(block.schema, DataTransformSpec(()))
 
-    spec = DataTransformSpec((Select(Selection.index(point.axis_id, 0)),))
-    committed = commit_transform(
-        block.schema,
-        spec,
-        revision=TransformRevision(4),
-        origin=TransformOrigin.USER,
-    )
-    restored = decode_committed_transform(encode_committed_transform(committed))
-    assert restored == committed
-    assert resolve_transformed_schema(block.schema, restored).fingerprint \
-        == restored.output_schema_fingerprint
+    spec = DataTransformSpec((Selection.index(point.axis_id, 0),))
+    committed = commit_transform(block.schema, spec)
+    assert resolve_transformed_schema(block.schema, committed).fingerprint \
+        == committed.output_schema_fingerprint
     snapshot = OwnedSnapshot(block.ref(StreamGenerationId("generation-1")), block)
-    authoritative = apply_transform(snapshot, restored)
+    authoritative = apply_transform(snapshot, committed)
     np.testing.assert_array_equal(authoritative.values, [1])
     assert authoritative.source_ref == snapshot.ref
-    assert authoritative.transform_digest == restored.transform_digest
-    assert decode_transform_record(encode_transform_record(authoritative.records[0])) \
-        == authoritative.records[0]
+    assert authoritative.transform == committed
 
-    wrong = CommittedTransform(
-        committed.input_schema_fingerprint,
-        committed.spec,
-        committed.output_schema_fingerprint,
-        committed.revision,
-        committed.origin,
-        committed.transform_digest,
+
+def test_huge_sparse_range_cost_tracks_present_rows_not_logical_length():
+    logical_size = 100_000_000
+    huge = AxisSpec(
+        AxisId("huge"), "huge", SCAN_POINT, logical_size, unit="shot"
     )
-    assert wrong == committed
-    with pytest.raises(ValueError, match="transform_digest"):
-        CommittedTransform(
-            committed.input_schema_fingerprint,
-            committed.spec,
-            committed.output_schema_fingerprint,
-            TransformRevision(committed.revision.value + 1),
-            committed.origin,
-            committed.transform_digest,
-        )
-
-
-def test_large_sparse_logical_shape_allocates_only_present_rows():
-    huge = AxisSpec(AxisId("huge"), "huge", SCAN_POINT, 10_000_000)
     block = block_for(
         repeat=2,
         point_axes=(huge,),
-        layout=PointLayout.explicit((10_000_000,), ((3,), (9_999_999,))),
+        layout=PointLayout.explicit(
+            (logical_size,), ((3,), (logical_size - 1,))
+        ),
         values=np.array([[1, 2], [3, 4]], dtype=np.int16),
     )
-    result = preview_transform(
-        block,
-        DataTransformSpec((Select(Selection.index_range(huge.axis_id, 0, 10)),)),
+    spec = DataTransformSpec(
+        (Selection.index_range(huge.axis_id, 1, logical_size - 1),)
     )
+    tracemalloc.start()
+    started = time.perf_counter()
+    result = apply_spec(
+        block,
+        spec,
+    )
+    elapsed = time.perf_counter() - started
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
     assert result.schema.cell_layout.storage_size == 2
     assert result.values.nbytes == 4
+    selected_axis = result.schema.axis(huge.axis_id)
+    assert selected_axis.coordinates is None
+    assert selected_axis.index_origin == 1
+    assert selected_axis.unit == "shot"
     assert [
         result.schema.cell_layout.multi_index(index)
         for index in range(result.schema.cell_layout.storage_size)
-    ] == [(0, 3), (1, 3)]
+    ] == [(0, 2), (1, 2)]
+    assert peak < 2_000_000
+    assert elapsed < 5.0
 
 
 def test_coordinate_selection_requires_exact_frame():
@@ -471,10 +509,10 @@ def test_coordinate_selection_requires_exact_frame():
         values=np.array([[5, 6, 7]], dtype=np.int16),
     )
     spec = DataTransformSpec(
-        (Select(Selection.coordinate_range(point.axis_id, 0, 1, coordinate_frame=world)),)
+        (Selection.coordinate_range(point.axis_id, 0, 1, coordinate_frame=world),)
     )
     with pytest.raises(ValueError, match="frame mismatch"):
-        preview_transform(block, spec)
+        commit_transform(block.schema, spec)
 
 
 def test_reduction_axes_are_a_canonical_set_and_min_max_respect_validity():
@@ -503,17 +541,15 @@ def test_reduction_axes_are_a_canonical_set_and_min_max_respect_validity():
         validity_policy=ValidityPolicy.OMIT_INVALID,
     )
     assert left == right
-    minimum = preview_transform(block, DataTransformSpec((Reduce(left),)))
-    maximum = preview_transform(
+    minimum = apply_spec(block, DataTransformSpec((left,)))
+    maximum = apply_spec(
         block,
         DataTransformSpec(
             (
-                Reduce(
-                    ReductionSpec(
-                        (repeat_id, site.axis_id),
-                        ReductionMethod.MAX,
-                        validity_policy=ValidityPolicy.OMIT_INVALID,
-                    )
+                ReductionSpec(
+                    (repeat_id, site.axis_id),
+                    ReductionMethod.MAX,
+                    validity_policy=ValidityPolicy.OMIT_INVALID,
                 ),
             )
         ),
@@ -548,16 +584,14 @@ def test_data_only_reduce_drops_the_artificial_row_axis(method, layout):
     )
     spec = DataTransformSpec(
         (
-            Reduce(
-                ReductionSpec(
-                    (d0.axis_id,),
-                    method,
-                    validity_policy=ValidityPolicy.OMIT_INVALID,
-                )
+            ReductionSpec(
+                (d0.axis_id,),
+                method,
+                validity_policy=ValidityPolicy.OMIT_INVALID,
             ),
         )
     )
-    result = preview_transform(block, spec)
+    result = apply_spec(block, spec)
     physical = values.reshape((-1, 2, 3))
     expected = {
         ReductionMethod.MEAN: np.mean,
@@ -581,14 +615,12 @@ def test_integer_sum_is_exact_and_overflow_fails_closed():
             data_axes=(component,),
             values=np.asarray(values).reshape(1, 1, 2),
         )
-        return preview_transform(
+        return apply_spec(
             block,
             DataTransformSpec(
                 (
-                    Reduce(
-                        ReductionSpec(
-                            (component.axis_id,), ReductionMethod.SUM
-                        )
+                    ReductionSpec(
+                        (component.axis_id,), ReductionMethod.SUM
                     ),
                 )
             ),
@@ -619,28 +651,21 @@ def test_min_count_is_distinct_from_missing_and_invalid():
     )
     reduction = lambda count: DataTransformSpec(
         (
-            Reduce(
-                ReductionSpec(
-                    (block.schema.repeat_axis.axis_id,),
-                    ReductionMethod.MEAN,
-                    validity_policy=ValidityPolicy.MIN_COUNT,
-                    minimum_valid_count=count,
-                )
+            ReductionSpec(
+                (block.schema.repeat_axis.axis_id,),
+                ReductionMethod.MEAN,
+                validity_policy=ValidityPolicy.MIN_COUNT,
+                minimum_valid_count=count,
             ),
         )
     )
-    valid = preview_transform(block, reduction(2))
-    invalid = preview_transform(block, reduction(3))
+    valid = apply_spec(block, reduction(2))
+    invalid = apply_spec(block, reduction(3))
     np.testing.assert_array_equal(valid.values, [2.0])
     np.testing.assert_array_equal(valid.expanded_validity(), [True])
     np.testing.assert_array_equal(invalid.expanded_validity(), [False])
     with pytest.raises(ValueError, match="maximum contributor"):
-        commit_transform(
-            block.schema,
-            reduction(4),
-            revision=TransformRevision(0),
-            origin=TransformOrigin.USER,
-        )
+        commit_transform(block.schema, reduction(4))
 
 
 def test_large_integral_coordinate_is_selected_without_float_rounding():
@@ -662,7 +687,7 @@ def test_large_integral_coordinate_is_selected_without_float_rounding():
     selection = Selection.coordinate_range(
         point.axis_id, value, value, coordinate_frame=frame
     )
-    result = preview_transform(block, DataTransformSpec((Select(selection),)))
+    result = apply_spec(block, DataTransformSpec((selection,)))
     np.testing.assert_array_equal(result.values, [22])
 
 
@@ -678,9 +703,9 @@ def test_validity_stays_named_and_compact_for_large_images():
         values=np.zeros((2, 1, 100, 100), dtype=np.uint16),
         validity=CellValidity(np.array([[True], [False]])),
     )
-    result = preview_transform(
+    result = apply_spec(
         block,
-        DataTransformSpec((Select(Selection.index_range(point.axis_id, 0, 1)),)),
+        DataTransformSpec((Selection.index_range(point.axis_id, 0, 1),)),
     )
     assert isinstance(result.validity, RowComponentValidity)
     assert result.validity.axis_ids == ()
@@ -697,11 +722,13 @@ def test_authority_api_rejects_raw_blocks_and_raw_specs():
         layout=PointLayout.rect_c((1,)),
         values=np.array([[1]], dtype=np.int16),
     )
-    spec = DataTransformSpec((Select(Selection.index(point.axis_id, 0)),))
-    preview = preview_transform(block, spec)
-    assert isinstance(preview, PreviewTransformedData)
+    spec = DataTransformSpec((Selection.index(point.axis_id, 0),))
+    committed = commit_transform(block.schema, spec)
+    snapshot = OwnedSnapshot(block.ref(StreamGenerationId("authority-generation")), block)
     with pytest.raises(TypeError, match="OwnedSnapshot"):
-        apply_transform(block, spec)  # type: ignore[arg-type]
+        apply_transform(block, committed)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="CommittedTransform"):
+        apply_transform(snapshot, spec)  # type: ignore[arg-type]
 
 
 def test_dense_schema_commit_does_not_materialize_repeat_times_points():
@@ -715,19 +742,12 @@ def test_dense_schema_commit_does_not_materialize_repeat_times_points():
     )
     spec = DataTransformSpec(
         (
-            Reduce(
-                ReductionSpec((repeat.axis_id,), ReductionMethod.MEAN)
-            ),
+            ReductionSpec((repeat.axis_id,), ReductionMethod.MEAN),
         )
     )
     tracemalloc.start()
     started = time.perf_counter()
-    committed = commit_transform(
-        schema,
-        spec,
-        revision=TransformRevision(1),
-        origin=TransformOrigin.USER,
-    )
+    committed = commit_transform(schema, spec)
     elapsed = time.perf_counter() - started
     _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
@@ -791,10 +811,10 @@ def test_factored_f_order_reduction_has_a_vectorized_performance_guard():
         schema,
     )
     started = time.perf_counter()
-    result = preview_transform(
+    result = apply_spec(
         block,
         DataTransformSpec(
-            (Reduce(ReductionSpec((p0.axis_id,), ReductionMethod.SUM)),)
+            (ReductionSpec((p0.axis_id,), ReductionMethod.SUM),)
         ),
     )
     elapsed = time.perf_counter() - started

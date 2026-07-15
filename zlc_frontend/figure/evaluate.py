@@ -14,7 +14,6 @@ import numpy as np
 
 from zlc_data import (
     AxisId,
-    AxisLayout,
     AxisSpec,
     CellValidity,
     ComponentValidity,
@@ -215,7 +214,7 @@ class _WorkingData:
 
 
 def _axis_coordinate(axis: AxisSpec, index: int) -> Any:
-    return index if axis.coordinates is None else axis.coordinates[index]
+    return axis.coordinate_at(index)
 
 
 def _evaluated_axis(axis: AxisSpec, indices: tuple[int, ...]) -> EvaluatedAxis:
@@ -233,13 +232,6 @@ def _selection_index_sets(block: DataBlock, view) -> dict[AxisId, Sequence[int]]
         axis.axis_id: display_axis_indices(axis, view.display_selections)
         for axis in dataset_axes(block.schema)
     }
-
-
-def _cell_layout(block: DataBlock) -> AxisLayout:
-    return AxisLayout.product(
-        AxisLayout.rect_c((block.schema.repeat_axis.size,)),
-        block.schema.point_layout,
-    )
 
 
 def _sequence_indexer(indices: Sequence[int] | np.ndarray) -> slice | np.ndarray:
@@ -395,7 +387,7 @@ def _extract(
     allowed_indices: dict[AxisId, Sequence[int]],
 ) -> _WorkingData:
     cell_axes = (block.schema.repeat_axis, *block.schema.point_axes)
-    layout = _cell_layout(block)
+    layout = block.schema.cell_layout
     coordinate_columns = {
         axis.axis_id: layout.axis_indices(position)
         for position, axis in enumerate(cell_axes)

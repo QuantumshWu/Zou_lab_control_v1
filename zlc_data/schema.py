@@ -9,7 +9,7 @@ from zlc_storage.canonical import canonical_text
 
 from ._arrays import canonical_dtype
 from .axis import AxisId, AxisSpec, REPEAT
-from .layout import PointLayout
+from .layout import AxisLayout, PointLayout
 from .validity import ValidityContract, ValidityMode
 
 
@@ -80,6 +80,7 @@ class DatasetSchema:
     point_layout: PointLayout
     cell_schema: ValueSchema
     _fingerprint: str = field(init=False, repr=False, compare=False)
+    _cell_layout: AxisLayout = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.repeat_axis, AxisSpec) or self.repeat_axis.role != REPEAT:
@@ -92,6 +93,11 @@ class DatasetSchema:
             raise TypeError("point_layout must be PointLayout")
         if not isinstance(self.cell_schema, ValueSchema):
             raise TypeError("cell_schema must be ValueSchema")
+        if any(
+            axis.role == REPEAT
+            for axis in points + self.cell_schema.data_axes
+        ):
+            raise ValueError("REPEAT role belongs only to DatasetSchema.repeat_axis")
         logical_shape = tuple(axis.size for axis in points)
         if self.point_layout.logical_shape != logical_shape:
             raise ValueError(
@@ -99,6 +105,14 @@ class DatasetSchema:
             )
         all_axes = (self.repeat_axis,) + points + self.cell_schema.data_axes
         _unique_axis_ids(all_axes, context="dataset")
+        object.__setattr__(
+            self,
+            "_cell_layout",
+            AxisLayout.product(
+                AxisLayout.rect_c((self.repeat_axis.size,)),
+                self.point_layout,
+            ),
+        )
         from .codec import dataset_schema_fingerprint
 
         object.__setattr__(self, "_fingerprint", dataset_schema_fingerprint(self))
@@ -110,6 +124,12 @@ class DatasetSchema:
             self.point_layout.storage_size,
             *self.cell_schema.data_shape,
         )
+
+    @property
+    def cell_layout(self) -> AxisLayout:
+        """Canonical physical-row mapping over repeat and logical point axes."""
+
+        return self._cell_layout
 
     @property
     def fingerprint(self) -> str:

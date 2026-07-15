@@ -1,21 +1,16 @@
-"""Canonical current-schema codecs for zlc_data transform authority values."""
+"""Canonical current-schema trees for zlc_data transform authority values."""
 
 from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-
 from zlc_storage.canonical import (
-    canonical_text as _text,
-    decode,
-    encode,
-    integer as _integer,
+    exact_mapping as _exact_map,
 )
 
 from .axis import AxisId
-from .codec import axis_from_tree, axis_layout_from_tree, axis_layout_to_tree, axis_to_tree
-from .selection import selection_from_tree, selection_to_tree
+from .codec import axis_layout_to_tree, axis_to_tree
+from .selection import Selection, selection_from_tree, selection_to_tree
 from .transform import (
     COMMITTED_TRANSFORM_SCHEMA,
     TRANSFORMED_SCHEMA_SCHEMA,
@@ -23,20 +18,11 @@ from .transform import (
     CommittedTransform,
     DataTransformSpec,
     MissingPolicy,
-    Reduce,
     ReductionMethod,
     ReductionSpec,
-    Select,
-    TransformOperation,
-    TransformOrigin,
-    TransformRecord,
-    TransformRevision,
     TransformedSchema,
     ValidityPolicy,
 )
-
-
-TRANSFORM_RECORD_SCHEMA = "zlc_data.TransformRecord"
 
 
 def transformed_schema_to_tree(schema: TransformedSchema) -> dict[str, Any]:
@@ -51,215 +37,108 @@ def transformed_schema_to_tree(schema: TransformedSchema) -> dict[str, Any]:
     }
 
 
-def transformed_schema_from_tree(tree: Any) -> TransformedSchema:
-    if not isinstance(tree, dict) or set(tree) != {
-        "schema",
-        "cell_axes",
-        "cell_layout",
-        "data_axes",
-        "validity_axis_ids",
-        "dtype",
-        "value_unit",
-    }:
-        raise ValueError("invalid TransformedSchema field set")
-    if tree["schema"] != TRANSFORMED_SCHEMA_SCHEMA:
-        raise ValueError(f"expected schema {TRANSFORMED_SCHEMA_SCHEMA!r}")
-    if (
-        not isinstance(tree["cell_axes"], list)
-        or not isinstance(tree["data_axes"], list)
-        or not isinstance(tree["validity_axis_ids"], list)
-    ):
-        raise ValueError("transformed axes must be lists")
-    unit = tree["value_unit"]
-    return TransformedSchema(
-        tuple(axis_from_tree(item) for item in tree["cell_axes"]),
-        axis_layout_from_tree(tree["cell_layout"]),
-        tuple(axis_from_tree(item) for item in tree["data_axes"]),
-        tuple(AxisId(_text(item, "validity_axis_id")) for item in tree["validity_axis_ids"]),
-        np.dtype(_text(tree["dtype"], "dtype")),
-        None if unit is None else _text(unit, "value_unit"),
-    )
-
-
 def data_transform_spec_to_tree(spec: DataTransformSpec) -> dict[str, Any]:
     if not isinstance(spec, DataTransformSpec):
         raise TypeError("spec must be DataTransformSpec")
     operations: list[dict[str, Any]] = []
     for operation in spec.operations:
-        if isinstance(operation, Select):
+        if isinstance(operation, Selection):
             operations.append(
-                {"kind": "SELECT", "selection": selection_to_tree(operation.selection)}
+                {"kind": "SELECT", "selection": selection_to_tree(operation)}
             )
         else:
-            reduction = operation.reduction
             operations.append(
                 {
                     "kind": "REDUCE",
-                    "axis_ids": [axis_id.value for axis_id in reduction.axis_ids],
-                    "method": reduction.method.value,
-                    "missing_policy": reduction.missing_policy.value,
-                    "validity_policy": reduction.validity_policy.value,
-                    "minimum_valid_count": reduction.minimum_valid_count,
+                    "axis_ids": [axis_id.value for axis_id in operation.axis_ids],
+                    "method": operation.method.value,
+                    "missing_policy": operation.missing_policy.value,
+                    "validity_policy": operation.validity_policy.value,
+                    "minimum_valid_count": operation.minimum_valid_count,
                 }
             )
     return {"schema": TRANSFORM_SPEC_SCHEMA, "operations": operations}
 
 
 def data_transform_spec_from_tree(tree: Any) -> DataTransformSpec:
-    if not isinstance(tree, dict) or set(tree) != {"schema", "operations"}:
-        raise ValueError("DataTransformSpec must contain exactly schema and operations")
-    if tree["schema"] != TRANSFORM_SPEC_SCHEMA or not isinstance(tree["operations"], list):
-        raise ValueError("invalid DataTransformSpec payload")
-    operations: list[TransformOperation] = []
-    for raw in tree["operations"]:
+    data = _exact_map(tree, {"schema", "operations"}, TRANSFORM_SPEC_SCHEMA)
+    if not isinstance(data["operations"], list):
+        raise ValueError("DataTransformSpec operations must be a list")
+    operations: list[Selection | ReductionSpec] = []
+    for raw in data["operations"]:
         if not isinstance(raw, dict) or not isinstance(raw.get("kind"), str):
             raise ValueError("transform operation must be a tagged map")
-        if raw["kind"] == "SELECT" and set(raw) == {"kind", "selection"}:
-            operations.append(Select(selection_from_tree(raw["selection"])))
-        elif raw["kind"] == "REDUCE" and set(raw) == {
-            "kind",
-            "axis_ids",
-            "method",
-            "missing_policy",
-            "validity_policy",
-            "minimum_valid_count",
-        }:
-            if not isinstance(raw["axis_ids"], list):
+        if raw["kind"] == "SELECT":
+            item = _exact_map(
+                raw,
+                {"kind", "selection"},
+                "SELECT",
+                discriminator="kind",
+            )
+            operations.append(selection_from_tree(item["selection"]))
+        elif raw["kind"] == "REDUCE":
+            item = _exact_map(
+                raw,
+                {
+                    "kind",
+                    "axis_ids",
+                    "method",
+                    "missing_policy",
+                    "validity_policy",
+                    "minimum_valid_count",
+                },
+                "REDUCE",
+                discriminator="kind",
+            )
+            if not isinstance(item["axis_ids"], list):
                 raise ValueError("reduction axis_ids must be a list")
             operations.append(
-                Reduce(
-                    ReductionSpec(
-                        tuple(AxisId(_text(item, "axis_id")) for item in raw["axis_ids"]),
-                        ReductionMethod(_text(raw["method"], "method")),
-                        MissingPolicy(_text(raw["missing_policy"], "missing_policy")),
-                        ValidityPolicy(_text(raw["validity_policy"], "validity_policy")),
-                        None
-                        if raw["minimum_valid_count"] is None
-                        else _integer(raw["minimum_valid_count"], "minimum_valid_count"),
-                    )
+                ReductionSpec(
+                    tuple(AxisId(value) for value in item["axis_ids"]),
+                    ReductionMethod(item["method"]),
+                    MissingPolicy(item["missing_policy"]),
+                    ValidityPolicy(item["validity_policy"]),
+                    item["minimum_valid_count"],
                 )
             )
         else:
-            raise ValueError(f"invalid transform operation for kind {raw['kind']!r}")
+            raise ValueError(f"invalid transform operation kind {raw['kind']!r}")
     return DataTransformSpec(tuple(operations))
-
-
-def committed_transform_payload_tree(transform: CommittedTransform) -> dict[str, Any]:
-    return {
-        "schema": COMMITTED_TRANSFORM_SCHEMA,
-        "input_schema_fingerprint": transform.input_schema_fingerprint,
-        "spec": data_transform_spec_to_tree(transform.spec),
-        "output_schema_fingerprint": transform.output_schema_fingerprint,
-        "revision": transform.revision.value,
-        "origin": transform.origin.value,
-    }
 
 
 def committed_transform_to_tree(transform: CommittedTransform) -> dict[str, Any]:
     if not isinstance(transform, CommittedTransform):
         raise TypeError("transform must be CommittedTransform")
-    tree = committed_transform_payload_tree(transform)
-    tree["transform_digest"] = transform.transform_digest
-    return tree
-
-
-def committed_transform_from_tree(tree: Any) -> CommittedTransform:
-    if not isinstance(tree, dict) or set(tree) != {
-        "schema",
-        "input_schema_fingerprint",
-        "spec",
-        "output_schema_fingerprint",
-        "revision",
-        "origin",
-        "transform_digest",
-    }:
-        raise ValueError("invalid CommittedTransform field set")
-    if tree["schema"] != COMMITTED_TRANSFORM_SCHEMA:
-        raise ValueError(f"expected schema {COMMITTED_TRANSFORM_SCHEMA!r}")
-    return CommittedTransform(
-        _text(tree["input_schema_fingerprint"], "input_schema_fingerprint"),
-        data_transform_spec_from_tree(tree["spec"]),
-        _text(tree["output_schema_fingerprint"], "output_schema_fingerprint"),
-        TransformRevision(_integer(tree["revision"], "revision")),
-        TransformOrigin(_text(tree["origin"], "origin")),
-        _text(tree["transform_digest"], "transform_digest"),
-    )
-
-
-def encode_committed_transform(transform: CommittedTransform) -> bytes:
-    return encode(committed_transform_to_tree(transform))
-
-
-def decode_committed_transform(payload: bytes) -> CommittedTransform:
-    transform = committed_transform_from_tree(decode(payload))
-    if bytes(payload) != encode_committed_transform(transform):
-        raise ValueError("CommittedTransform payload uses a non-canonical typed representation")
-    return transform
-
-
-def transform_record_to_tree(record: TransformRecord) -> dict[str, Any]:
-    if not isinstance(record, TransformRecord):
-        raise TypeError("record must be TransformRecord")
     return {
-        "schema": TRANSFORM_RECORD_SCHEMA,
-        "operation_index": record.operation_index,
-        "operation_kind": record.operation_kind,
-        "operation_digest": record.operation_digest,
-        "input_schema_fingerprint": record.input_schema_fingerprint,
-        "output_schema_fingerprint": record.output_schema_fingerprint,
-        "input_present_cells": record.input_present_cells,
-        "output_present_cells": record.output_present_cells,
+        "schema": COMMITTED_TRANSFORM_SCHEMA,
+        "input_schema_fingerprint": transform.input_schema_fingerprint,
+        "spec": data_transform_spec_to_tree(transform.spec),
+        "output_schema_fingerprint": transform.output_schema_fingerprint,
     }
 
 
-def transform_record_from_tree(tree: Any) -> TransformRecord:
-    if not isinstance(tree, dict) or set(tree) != {
-        "schema",
-        "operation_index",
-        "operation_kind",
-        "operation_digest",
-        "input_schema_fingerprint",
-        "output_schema_fingerprint",
-        "input_present_cells",
-        "output_present_cells",
-    }:
-        raise ValueError("invalid TransformRecord field set")
-    if tree["schema"] != TRANSFORM_RECORD_SCHEMA:
-        raise ValueError(f"expected schema {TRANSFORM_RECORD_SCHEMA!r}")
-    return TransformRecord(
-        _integer(tree["operation_index"], "operation_index"),
-        _text(tree["operation_kind"], "operation_kind"),
-        _text(tree["operation_digest"], "operation_digest"),
-        _text(tree["input_schema_fingerprint"], "input_schema_fingerprint"),
-        _text(tree["output_schema_fingerprint"], "output_schema_fingerprint"),
-        _integer(tree["input_present_cells"], "input_present_cells"),
-        _integer(tree["output_present_cells"], "output_present_cells"),
+def committed_transform_from_tree(tree: Any) -> CommittedTransform:
+    data = _exact_map(
+        tree,
+        {
+            "schema",
+            "input_schema_fingerprint",
+            "spec",
+            "output_schema_fingerprint",
+        },
+        COMMITTED_TRANSFORM_SCHEMA,
     )
-
-
-def encode_transform_record(record: TransformRecord) -> bytes:
-    return encode(transform_record_to_tree(record))
-
-
-def decode_transform_record(payload: bytes) -> TransformRecord:
-    record = transform_record_from_tree(decode(payload))
-    if bytes(payload) != encode_transform_record(record):
-        raise ValueError("TransformRecord payload uses a non-canonical typed representation")
-    return record
+    return CommittedTransform(
+        data["input_schema_fingerprint"],
+        data_transform_spec_from_tree(data["spec"]),
+        data["output_schema_fingerprint"],
+    )
 
 
 __all__ = [
     "committed_transform_from_tree",
-    "committed_transform_payload_tree",
     "committed_transform_to_tree",
     "data_transform_spec_from_tree",
     "data_transform_spec_to_tree",
-    "decode_committed_transform",
-    "encode_committed_transform",
-    "decode_transform_record",
-    "encode_transform_record",
-    "transform_record_from_tree",
-    "transform_record_to_tree",
-    "transformed_schema_from_tree",
     "transformed_schema_to_tree",
 ]

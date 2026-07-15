@@ -7,12 +7,9 @@ from typing import Any
 import numpy as np
 
 from zlc_storage.canonical import (
-    canonical_text as _text,
     decode,
     encode,
     exact_mapping as _exact_map,
-    finite_real,
-    integer as _integer,
 )
 
 from .axis import AxisId
@@ -78,17 +75,13 @@ def fit_spec_from_tree(tree: Any) -> FitSpec:
         raise ValueError("FitSpec axes and constraints must be lists")
     transform = data["committed_transform"]
     return FitSpec(
-        input_schema_fingerprint=_text(
-            data["input_schema_fingerprint"], "input_schema_fingerprint"
-        ),
+        input_schema_fingerprint=data["input_schema_fingerprint"],
         committed_transform=(
             None if transform is None else committed_transform_from_tree(transform)
         ),
-        fit_axis_ids=tuple(AxisId(_text(value, "fit_axis_id")) for value in fit_axes),
-        batch_axis_ids=tuple(
-            AxisId(_text(value, "batch_axis_id")) for value in batch_axes
-        ),
-        model_id=_text(data["model_id"], "model_id"),
+        fit_axis_ids=tuple(AxisId(value) for value in fit_axes),
+        batch_axis_ids=tuple(AxisId(value) for value in batch_axes),
+        model_id=data["model_id"],
         constraints=tuple(_constraint_from_tree(value) for value in constraints),
         numeric_policy=_numeric_policy_from_tree(data["numeric_policy"]),
     )
@@ -177,24 +170,18 @@ def _fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
     )
     if any(not isinstance(data[field], np.ndarray) for field in arrays):
         raise ValueError("FitResultBatch numeric fields must be ndarrays")
-    errors = tuple(None if value is None else _text(value, "fit error") for value in data["errors"])
-    value_unit = data["value_unit"]
-    if value_unit is not None:
-        value_unit = _text(value_unit, "value_unit")
     return FitResultBatch(
         source_ref=_revision_ref_from_tree(data["source_ref"]),
         spec=fit_spec_from_tree(data["fit_spec"]),
         fit_axis_specs=tuple(axis_from_tree(value) for value in data["fit_axis_specs"]),
         batch_axis_specs=tuple(axis_from_tree(value) for value in data["batch_axis_specs"]),
         batch_layout=axis_layout_from_tree(data["batch_layout"]),
-        value_unit=value_unit,
+        value_unit=data["value_unit"],
         parameter_values=data["parameter_values"],
         covariance=data["covariance"],
         covariance_valid=data["covariance_valid"],
-        statuses=tuple(
-            FitBatchStatus(_text(value, "fit_status")) for value in data["statuses"]
-        ),
-        errors=errors,
+        statuses=tuple(FitBatchStatus(value) for value in data["statuses"]),
+        errors=tuple(data["errors"]),
         present_observation_counts=data["present_observation_counts"],
         valid_observation_counts=data["valid_observation_counts"],
         used_observation_counts=data["used_observation_counts"],
@@ -202,7 +189,7 @@ def _fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
         residual_sum_squares=data["residual_sum_squares"],
         r_squared=data["r_squared"],
         r_squared_valid=data["r_squared_valid"],
-        scipy_version=_text(data["scipy_version"], "scipy_version"),
+        scipy_version=data["scipy_version"],
     )
 
 
@@ -238,11 +225,11 @@ def _constraint_from_tree(tree: Any) -> FitParameterConstraint:
         discriminator=None,
     )
     return FitParameterConstraint(
-        _text(data["parameter_name"], "parameter_name"),
-        _optional_real(data["initial"], "initial"),
-        _optional_real(data["lower"], "lower"),
-        _optional_real(data["upper"], "upper"),
-        _optional_real(data["fixed"], "fixed"),
+        data["parameter_name"],
+        data["initial"],
+        data["lower"],
+        data["upper"],
+        data["fixed"],
     )
 
 
@@ -271,18 +258,11 @@ def _numeric_policy_from_tree(tree: Any) -> FitNumericPolicy:
         discriminator=None,
     )
     return FitNumericPolicy(
-        max_evaluations=_integer(data["max_evaluations"], "max_evaluations"),
-        max_batch_cells=_integer(data["max_batch_cells"], "max_batch_cells"),
-        sample_budget_per_batch=_integer(
-            data["sample_budget_per_batch"], "sample_budget_per_batch"
-        ),
-        max_packed_observations=_integer(
-            data["max_packed_observations"], "max_packed_observations"
-        ),
-        covariance_rcond=finite_real(
-            data["covariance_rcond"],
-            "covariance_rcond",
-        ),
+        max_evaluations=data["max_evaluations"],
+        max_batch_cells=data["max_batch_cells"],
+        sample_budget_per_batch=data["sample_budget_per_batch"],
+        max_packed_observations=data["max_packed_observations"],
+        covariance_rcond=data["covariance_rcond"],
     )
 
 
@@ -303,15 +283,11 @@ def _revision_ref_from_tree(tree: Any) -> DatasetRevisionRef:
         DATASET_REVISION_REF_SCHEMA,
     )
     return DatasetRevisionRef(
-        BlockId(_text(data["block_id"], "block_id")),
-        StreamGenerationId(_text(data["stream_generation"], "stream_generation")),
-        _text(data["schema_fingerprint"], "schema_fingerprint"),
-        DatasetRevision(_integer(data["revision"], "revision")),
+        BlockId(data["block_id"]),
+        StreamGenerationId(data["stream_generation"]),
+        data["schema_fingerprint"],
+        DatasetRevision(data["revision"]),
     )
-
-
-def _optional_real(value: Any, field: str) -> float | None:
-    return None if value is None else finite_real(value, field)
 
 
 __all__ = [

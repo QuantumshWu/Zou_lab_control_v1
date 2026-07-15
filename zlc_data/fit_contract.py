@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import math
 from numbers import Integral, Real
@@ -14,10 +14,14 @@ from zlc_storage.canonical import canonical_text, sha256_text
 
 from ._arrays import immutable_array, immutable_bool_array
 from .axis import AxisId, AxisSpec
-from .layout import AxisLayout, AxisLayoutMode
+from .layout import AxisLayout
 from .schema import DatasetSchema
-from .transform import CommittedTransform, TransformedSchema, resolve_transformed_schema
-from .validity import ValidityMode
+from .transform import (
+    CommittedTransform,
+    TransformedSchema,
+    _source_transformed_schema,
+    resolve_transformed_schema,
+)
 from .value import DatasetRevisionRef, OwnedSnapshot
 from .fit_model import (
     FitModelDefinition,
@@ -30,6 +34,9 @@ from .fit_model import (
 class FitCoordinateSource(str, Enum):
     DECLARED = "DECLARED"
     LOGICAL_INDEX = "LOGICAL_INDEX"
+
+
+_MAX_CONSECUTIVE_FLOAT64_INTEGER = 1 << 53
 
 
 class FitBatchStatus(str, Enum):
@@ -198,43 +205,28 @@ def _minimum_observation_count(spec: FitSpec, model: FitModelDefinition) -> int:
 class BoundFit:
     spec: FitSpec
     expected_schema: DatasetSchema
-    effective_schema: TransformedSchema
-    model: FitModelDefinition
-
-    @classmethod
-    def bind(cls, spec: FitSpec, expected_schema: DatasetSchema) -> "BoundFit":
-        if not isinstance(spec, FitSpec):
-            raise TypeError("spec must be FitSpec")
-        if not isinstance(expected_schema, DatasetSchema):
-            raise TypeError("expected_schema must be DatasetSchema")
-        if expected_schema.fingerprint != spec.input_schema_fingerprint:
-            raise ValueError("FitSpec input schema fingerprint is stale")
-        return cls(
-            spec,
-            expected_schema,
-            _resolve_fit_effective_schema(spec, expected_schema),
-            fit_model_definition(spec.model_id),
-        )
+    effective_schema: TransformedSchema = field(init=False)
+    model: FitModelDefinition = field(init=False)
+    _coordinate_sources: tuple[FitCoordinateSource, ...] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.spec, FitSpec):
             raise TypeError("spec must be FitSpec")
         if not isinstance(self.expected_schema, DatasetSchema):
             raise TypeError("expected_schema must be DatasetSchema")
-        if not isinstance(self.effective_schema, TransformedSchema):
-            raise TypeError("effective_schema must be TransformedSchema")
-        if not isinstance(self.model, FitModelDefinition):
-            raise TypeError("model must be FitModelDefinition")
         if self.expected_schema.fingerprint != self.spec.input_schema_fingerprint:
             raise ValueError("BoundFit expected schema disagrees with FitSpec")
-        if self.model != fit_model_definition(self.spec.model_id):
-            raise ValueError("BoundFit model disagrees with FitSpec")
-        derived_schema = _resolve_fit_effective_schema(self.spec, self.expected_schema)
-        if self.effective_schema != derived_schema:
-            raise ValueError("BoundFit effective schema is not derived from FitSpec authority")
-        if self.effective_schema.dtype.kind not in "biuf":
+        effective_schema = _resolve_fit_effective_schema(self.spec, self.expected_schema)
+        model = fit_model_definition(self.spec.model_id)
+        object.__setattr__(self, "effective_schema", effective_schema)
+        object.__setattr__(self, "model", model)
+        if effective_schema.dtype.kind not in "biuf":
             raise TypeError("fit observations must use a real numeric dtype")
-        effective_ids = tuple(axis.axis_id for axis in self.effective_schema.axes)
+        effective_ids = tuple(axis.axis_id for axis in effective_schema.axes)
         requested_ids = self.spec.fit_axis_ids + self.spec.batch_axis_ids
         if len(requested_ids) != len(effective_ids) or set(requested_ids) != set(effective_ids):
             raise ValueError("BoundFit axes do not cover the effective schema exactly")
@@ -246,17 +238,17 @@ class BoundFit:
             raise ValueError(
                 "max_packed_observations is below this fit request's minimum observation count"
             )
-        if len(self.spec.fit_axis_ids) != self.model.independent_arity:
+        if len(self.spec.fit_axis_ids) != model.independent_arity:
             raise ValueError(
-                f"model {self.model.model_id!r} requires "
-                f"{self.model.independent_arity} fit axes"
+                f"model {model.model_id!r} requires "
+                f"{model.independent_arity} fit axes"
             )
         fit_axes = tuple(
-            self.effective_schema.axis(axis_id) for axis_id in self.spec.fit_axis_ids
+            effective_schema.axis(axis_id) for axis_id in self.spec.fit_axis_ids
         )
         sources = tuple(_coordinate_source_for_axis(axis) for axis in fit_axes)
         for position, (axis, requirement) in enumerate(
-            zip(fit_axes, self.model.axis_requirements)
+            zip(fit_axes, model.axis_requirements)
         ):
             if axis.role not in requirement:
                 roles = ", ".join(role.value for role in requirement)
@@ -264,19 +256,18 @@ class BoundFit:
                     f"fit axis {position} ({axis.axis_id}) role {axis.role.value!r} "
                     f"does not satisfy model roles [{roles}]"
                 )
-        if self.model.require_common_axis_unit:
+        if model.require_common_axis_unit:
             units = tuple(
-                "index"
-                if source is FitCoordinateSource.LOGICAL_INDEX
-                else (axis.unit or "1")
+                _coordinate_unit(axis, source)
                 for axis, source in zip(fit_axes, sources)
             )
             if len(set(units)) != 1:
                 raise ValueError("model fit axes require compatible coordinate units")
-        if self.model.require_common_coordinate_frame and len(
+        if model.require_common_coordinate_frame and len(
             set(axis.coordinate_frame for axis in fit_axes)
         ) != 1:
             raise ValueError("model fit axes require the same coordinate frame")
+        object.__setattr__(self, "_coordinate_sources", sources)
 
     def run(
         self,
@@ -303,6 +294,10 @@ class BoundFit:
         return self.model.parameters
 
     @property
+    def coordinate_sources(self) -> tuple[FitCoordinateSource, ...]:
+        return self._coordinate_sources
+
+    @property
     def parameter_units(self) -> tuple[str, ...]:
         fit_axes = tuple(
             self.effective_schema.axis(axis_id) for axis_id in self.spec.fit_axis_ids
@@ -310,7 +305,7 @@ class BoundFit:
         return resolve_parameter_units(
             self.parameter_definitions,
             fit_axes,
-            tuple(_coordinate_source_for_axis(axis) for axis in fit_axes),
+            self.coordinate_sources,
             self.effective_schema.value_unit,
         )
 
@@ -339,16 +334,12 @@ class FitProblem:
             raise ValueError("fit problem source lineage disagrees with FitSpec")
         fit_axes = tuple(self.fit_axis_specs)
         batch_axes = tuple(self.batch_axis_specs)
-        sources = tuple(_coordinate_source_for_axis(axis) for axis in fit_axes)
         if any(not isinstance(axis, AxisSpec) for axis in fit_axes + batch_axes):
             raise TypeError("fit problem axes must contain AxisSpec values")
         if tuple(axis.axis_id for axis in fit_axes) != self.spec.fit_axis_ids:
             raise ValueError("fit problem axis order disagrees with FitSpec")
         if tuple(axis.axis_id for axis in batch_axes) != self.spec.batch_axis_ids:
             raise ValueError("batch problem axis order disagrees with FitSpec")
-        if len(sources) != len(fit_axes) or any(not isinstance(item, FitCoordinateSource) for item in sources):
-            raise ValueError("coordinate_sources must describe every fit axis")
-        _validate_coordinate_sources(fit_axes, sources)
         if not isinstance(self.batch_layout, AxisLayout):
             raise TypeError("batch_layout must be AxisLayout")
         if self.batch_layout.logical_shape != tuple(axis.size for axis in batch_axes):
@@ -404,11 +395,6 @@ class FitProblem:
             return self.spec.input_schema_fingerprint
         return self.spec.committed_transform.output_schema_fingerprint
 
-    @property
-    def coordinate_sources(self) -> tuple[FitCoordinateSource, ...]:
-        return tuple(_coordinate_source_for_axis(axis) for axis in self.fit_axis_specs)
-
-
 @dataclass(frozen=True, eq=False)
 class FitResultBatch:
     source_ref: DatasetRevisionRef
@@ -430,6 +416,11 @@ class FitResultBatch:
     r_squared: np.ndarray
     r_squared_valid: np.ndarray
     scipy_version: str
+    _coordinate_sources: tuple[FitCoordinateSource, ...] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
     __hash__ = None
 
     def __post_init__(self) -> None:
@@ -441,18 +432,15 @@ class FitResultBatch:
             raise ValueError("fit result source lineage disagrees with FitSpec")
         fit_axes = tuple(self.fit_axis_specs)
         batch_axes = tuple(self.batch_axis_specs)
+        if any(not isinstance(axis, AxisSpec) for axis in fit_axes + batch_axes):
+            raise TypeError("fit result axes must contain AxisSpec values")
         sources = tuple(_coordinate_source_for_axis(axis) for axis in fit_axes)
         model = fit_model_definition(self.spec.model_id)
         parameters = model.parameters
-        if any(not isinstance(axis, AxisSpec) for axis in fit_axes + batch_axes):
-            raise TypeError("fit result axes must contain AxisSpec values")
         if tuple(axis.axis_id for axis in fit_axes) != self.spec.fit_axis_ids:
             raise ValueError("fit result axis order disagrees with FitSpec")
         if tuple(axis.axis_id for axis in batch_axes) != self.spec.batch_axis_ids:
             raise ValueError("batch result axis order disagrees with FitSpec")
-        if len(sources) != len(fit_axes) or any(not isinstance(item, FitCoordinateSource) for item in sources):
-            raise ValueError("coordinate_sources must describe every fit axis")
-        _validate_coordinate_sources(fit_axes, sources)
         if not isinstance(self.batch_layout, AxisLayout):
             raise TypeError("batch_layout must be AxisLayout")
         if self.batch_layout.logical_shape != tuple(axis.size for axis in batch_axes):
@@ -642,6 +630,7 @@ class FitResultBatch:
         object.__setattr__(self, "batch_axis_specs", batch_axes)
         object.__setattr__(self, "statuses", statuses)
         object.__setattr__(self, "errors", errors)
+        object.__setattr__(self, "_coordinate_sources", sources)
 
     @property
     def rmse(self) -> np.ndarray:
@@ -667,7 +656,7 @@ class FitResultBatch:
 
     @property
     def coordinate_sources(self) -> tuple[FitCoordinateSource, ...]:
-        return tuple(_coordinate_source_for_axis(axis) for axis in self.fit_axis_specs)
+        return self._coordinate_sources
 
     @property
     def parameter_definitions(self) -> tuple[FitParameterDefinition, ...]:
@@ -720,9 +709,7 @@ def resolve_parameter_units(
     if len(coordinate_sources) != len(fit_axes):
         raise ValueError("coordinate sources must describe the fit axes")
     axis_units = tuple(
-        "index"
-        if source is FitCoordinateSource.LOGICAL_INDEX
-        else (axis.unit or "1")
+        _coordinate_unit(axis, source)
         for axis, source in zip(fit_axes, coordinate_sources)
     )
     units: list[str] = []
@@ -755,18 +742,22 @@ def _immutable_numeric(values, dtype: str, shape: tuple[int, ...]) -> np.ndarray
     return immutable_array(array, dtype=np.dtype(dtype), shape=shape)
 
 
-def _validate_coordinate_sources(
-    axes: tuple[AxisSpec, ...],
-    sources: tuple[FitCoordinateSource, ...],
-) -> None:
-    for axis, source in zip(axes, sources):
-        expected = _coordinate_source_for_axis(axis)
-        if source is not expected:
-            raise ValueError("coordinate source disagrees with authoritative AxisSpec")
-
-
 def _coordinate_source_for_axis(axis: AxisSpec) -> FitCoordinateSource:
     if axis.coordinates is None:
+        last = axis.index_origin + axis.size - 1
+        if axis.size > 1 and last > _MAX_CONSECUTIVE_FLOAT64_INTEGER:
+            raise ValueError(
+                "implicit fit coordinates are not consecutively float64-representable"
+            )
+        for value in {axis.index_origin, last}:
+            try:
+                converted = float(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "implicit fit coordinate is not float64-representable"
+                ) from exc
+            if not math.isfinite(converted) or int(converted) != value:
+                raise ValueError("implicit fit coordinate is not exactly float64-representable")
         return FitCoordinateSource.LOGICAL_INDEX
     if not all(
         not isinstance(value, bool) and isinstance(value, Real)
@@ -787,37 +778,19 @@ def _coordinate_source_for_axis(axis: AxisSpec) -> FitCoordinateSource:
     return FitCoordinateSource.DECLARED
 
 
+def _coordinate_unit(axis: AxisSpec, source: FitCoordinateSource) -> str:
+    if axis.unit is not None:
+        return axis.unit
+    return "index" if source is FitCoordinateSource.LOGICAL_INDEX else "1"
+
+
 def _resolve_fit_effective_schema(
     spec: FitSpec,
     expected_schema: DatasetSchema,
 ) -> TransformedSchema:
     if spec.committed_transform is not None:
         return resolve_transformed_schema(expected_schema, spec.committed_transform)
-    cell_axes = (expected_schema.repeat_axis, *expected_schema.point_axes)
-    point_layout = expected_schema.point_layout
-    if point_layout.mode is AxisLayoutMode.RECT_C or (
-        point_layout.mode is AxisLayoutMode.RECT_F
-        and len(expected_schema.point_axes) <= 1
-    ):
-        cell_layout = AxisLayout.rect_c(tuple(axis.size for axis in cell_axes))
-    else:
-        cell_layout = AxisLayout.product(
-            AxisLayout.rect_c((expected_schema.repeat_axis.size,)),
-            point_layout,
-        )
-    validity_axes = (
-        expected_schema.cell_schema.validity_contract.component_axis_ids
-        if expected_schema.cell_schema.validity_contract.mode is ValidityMode.COMPONENTS
-        else ()
-    )
-    return TransformedSchema(
-        cell_axes,
-        cell_layout,
-        expected_schema.cell_schema.data_axes,
-        validity_axes,
-        expected_schema.cell_schema.dtype,
-        expected_schema.cell_schema.value_unit,
-    )
+    return _source_transformed_schema(expected_schema)
 
 
 __all__ = [

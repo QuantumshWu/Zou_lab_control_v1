@@ -380,13 +380,13 @@ def test_frozen_edge_validates_and_projects_one_exact_schedule_once(monkeypatch)
 
     assert validate_calls == 1
     assert edge.schedule_digest == (
-        "f7e14715db33ff71419d1e9b3925d78d5f1f289ba4d32cddd0147a119026d1d2"
+        "804db444ad86a9709c808ed1b205976ae563dd41c61de915670d64269aca9d28"
     )
     assert edge.key_sequence_digest == (
-        "35e3dc24b8941846b0d1daf1057893fce860d9699e882eef7428dfae9147936b"
+        "c55bf0d3545f3082ae0e18e19b8ac418b485354df2b53cf11fbca5029bce164a"
     )
     assert edge.consumer_contract_digest == (
-        "fe061889cfb9e19eaab1e01ef261db9b5760930902af26847be585bc7e7a250d"
+        "36fce4323cd1176f8f0463e9149653c9ac2040611cf3747180f1cc2a5e290607"
     )
 
 

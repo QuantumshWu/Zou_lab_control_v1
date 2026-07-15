@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from numbers import Real
 from typing import Sequence
 
 from zlc_data import (
@@ -16,11 +15,9 @@ from zlc_data import (
     SPATIAL_Y,
     SPECTRAL,
     AxisSpec,
-    CoordinateRangeSelection,
     DatasetSchema,
-    IndexRangeSelection,
-    IndexSelection,
     Selection,
+    resolve_selection_indices,
 )
 
 from .model import (
@@ -179,35 +176,8 @@ def display_axis_indices(
     term = terms[0] if terms else None
     if term is None:
         return range(axis.size)
-    if isinstance(term, IndexSelection):
-        if term.index >= axis.size:
-            raise IndexError(f"selection index is outside axis {axis.axis_id}")
-        return range(term.index, term.index + 1)
-    if isinstance(term, IndexRangeSelection):
-        if term.stop > axis.size:
-            raise IndexError(f"selection range is outside axis {axis.axis_id}")
-        return range(term.start, term.stop)
-    if not isinstance(term, CoordinateRangeSelection):
-        raise TypeError("unsupported display selection term")
-    if axis.coordinates is None:
-        raise ValueError(f"coordinate selection axis {axis.axis_id} has no coordinates")
-    if axis.coordinate_frame != term.coordinate_frame:
-        raise ValueError(f"coordinate selection frame mismatch for axis {axis.axis_id}")
-    if any(
-        isinstance(coordinate, bool) or not isinstance(coordinate, Real)
-        for coordinate in axis.coordinates
-    ):
-        raise ValueError(f"coordinate selection axis {axis.axis_id} is not numeric")
-    indices = [
-        index
-        for index, coordinate in enumerate(axis.coordinates)
-        if term.lower <= coordinate <= term.upper
-    ]
-    if not indices:
-        raise ValueError(f"coordinate selection is empty for axis {axis.axis_id}")
-    if indices[-1] - indices[0] + 1 == len(indices):
-        return range(indices[0], indices[-1] + 1)
-    return tuple(indices)
+    indices, _drop = resolve_selection_indices(axis, term)
+    return indices
 
 
 def _first_visible_point_tuple(
