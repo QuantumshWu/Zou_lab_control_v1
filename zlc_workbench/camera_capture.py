@@ -636,6 +636,11 @@ class CameraCaptureEndpoint:
             if session.started:
                 raise RuntimeError("camera session already started")
             expected = session.expected_frames
+            max_inflight = min(
+                expected,
+                self._capability_snapshot()
+                .camera_capability_evidence.max_source_burst_events,
+            )
             operation_epoch = self._operation_epoch
             operation_token = self._begin_command_operation()
         arm_returned = False
@@ -643,11 +648,11 @@ class CameraCaptureEndpoint:
             try:
                 self._camera.arm(
                     expected,
-                    # Autonomous hardware may complete before the host drains
-                    # its first frame.  Formal exact capture therefore reserves
-                    # the complete run budget unless a later measured adapter
-                    # contract proves a smaller safe outstanding bound.
-                    max_inflight_frames=expected,
+                    # The camera ring retains only the capability-qualified
+                    # maximum outstanding burst.  The host exact stream/dataset
+                    # retention owns the complete run; allocating that cardinality
+                    # again in the driver would violate the preflight byte budget.
+                    max_inflight_frames=max_inflight,
                     timeout=command.timeout_seconds,
                 )
                 arm_returned = True

@@ -87,7 +87,11 @@ from .capture_frames import (
     _load_capture_frame_source,
     _stage_capture_frame_source,
 )
-from zlc_pulse import decode_compiled_pulse_artifact, encode_compiled_pulse_artifact
+from zlc_pulse import (
+    MAX_COMPILED_PULSE_ARTIFACT_BYTES,
+    decode_compiled_pulse_artifact,
+    encode_compiled_pulse_artifact,
+)
 
 
 CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact"
@@ -108,7 +112,7 @@ class CaptureRepositoryResourcePolicy:
     max_total_frame_bytes: int = 8 * 1024 * 1024 * 1024
     max_frame_chunk_blob_bytes: int = 512 * 1024 * 1024
     max_frame_index_blob_bytes: int = 512 * 1024 * 1024
-    max_compiled_pulse_blob_bytes: int = 256 * 1024 * 1024
+    max_compiled_pulse_blob_bytes: int = MAX_COMPILED_PULSE_ARTIFACT_BYTES
     max_canonical_nodes: int = 32_000_000
     max_canonical_container_entries: int = 16_000_000
 
@@ -126,6 +130,10 @@ class CaptureRepositoryResourcePolicy:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.max_compiled_pulse_blob_bytes > MAX_COMPILED_PULSE_ARTIFACT_BYTES:
+            raise ValueError(
+                "capture compiled-pulse budget cannot exceed the pulse owner limit"
+            )
 
 DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY = CaptureRepositoryResourcePolicy()
 

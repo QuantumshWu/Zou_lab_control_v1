@@ -11,6 +11,8 @@ import math
 from dataclasses import dataclass, replace
 from typing import Mapping, Sequence
 
+import numpy as np
+
 from fpga.pulse_streamer.host.image import StreamerParams
 from zlc_storage import positive_real as _positive_float
 
@@ -206,33 +208,20 @@ def _join_source_trigger_groups(
     ):
         if (
             physical_schedule.point_count != grouped_schedule.point_count
-            or len(physical_schedule.edges) != len(grouped_schedule.edges)
+            or physical_schedule.total != grouped_schedule.total
         ):
             raise RuntimeError("source and physical trigger cardinality differ")
-        edges = []
-        for physical_edge, grouped_edge in zip(
-            physical_schedule.edges,
-            grouped_schedule.edges,
-            strict=True,
+        if not np.array_equal(
+            physical_schedule.point_indices,
+            grouped_schedule.point_indices,
         ):
-            if (
-                physical_edge.channel != grouped_edge.channel
-                or physical_edge.point_index != grouped_edge.point_index
-                or physical_edge.trigger_ordinal != grouped_edge.trigger_ordinal
-                or physical_edge.point_trigger_ordinal
-                != grouped_edge.point_trigger_ordinal
-            ):
-                raise RuntimeError("source and physical trigger order differ")
-            edges.append(
-                replace(
-                    physical_edge,
-                    loop_iteration=grouped_edge.loop_iteration,
-                )
-            )
+            raise RuntimeError("source and physical trigger order differ")
         joined.append(
             DigitalTriggerSchedule(
                 physical_schedule.channel,
-                tuple(edges),
+                physical_schedule.point_indices,
+                grouped_schedule.loop_iterations,
+                physical_schedule.ticks_from_run_start,
                 physical_schedule.point_count,
                 grouped_schedule.loop_count,
                 grouped_schedule.full_point_loop,

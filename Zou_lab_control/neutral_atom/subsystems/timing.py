@@ -47,24 +47,16 @@ class TimingSubsystem(ExperimentSubsystem):
         """
 
         s = self._session
-        cam = getattr(s._device_set, "camera", None)
-
-        def configure_and_build():
-            if exposure is not None and hasattr(cam, "configure"):
-                cam.configure(exposure=exposure)
-            s.sequence = s.build_imaging_sequence(
-                exposure=s.camera_exposure() if exposure is None else exposure,
-                trigger_width=trigger_width,
-                pre_trigger=pre_trigger,
-                load=load,
-            )
-            return s.sequence
-
-        if cam is None:
-            return configure_and_build()
-        return s._run_hardware_call(
-            (cam,), configure_and_build, name="configure-imaging"
+        cam = getattr(s.devices, "camera", None)
+        if exposure is not None and hasattr(cam, "configure"):
+            cam.configure(exposure=exposure)
+        s.sequence = s.build_imaging_sequence(
+            exposure=s.camera_exposure() if exposure is None else exposure,
+            trigger_width=trigger_width,
+            pre_trigger=pre_trigger,
+            load=load,
         )
+        return s.sequence
 
     def plot_sequence(self, *, sequence: PulseSequence | None = None, display: bool = True):
         from ..timing import plot_sequence
@@ -78,7 +70,7 @@ class TimingSubsystem(ExperimentSubsystem):
         sequence = sequence or s.sequence
         errors: list[str] = []
         warnings: list[str] = []
-        sequencer = getattr(s._device_set, "sequencer", None)
+        sequencer = getattr(s.devices, "sequencer", None)
         clock = getattr(sequencer, "clock_hz", DEFAULT_CLOCK_HZ)
         channels = getattr(sequencer, "channels", None)
         pulse_report = sequence.validate(clock_hz=clock, channels=channels)
@@ -95,7 +87,7 @@ class TimingSubsystem(ExperimentSubsystem):
             errors=errors,
             warnings=warnings,
             sequence_table=sequence.table(),
-            device_snapshot=s.device_catalog.to_dict(),
+            device_snapshot=s.devices.snapshot(),
             verilog=build,
         )
 
@@ -105,12 +97,11 @@ class TimingSubsystem(ExperimentSubsystem):
         from ..devices import bind_pulse
 
         s = self._session
-        sequencer = getattr(s._device_set, "sequencer", None)
+        sequencer = getattr(s.devices, "sequencer", None)
         if sequencer is None:
             raise RuntimeError("This session has no sequencer device to bind a pulse to.")
         payload = s.sequence if pulse is None else load_pulse_payload(pulse)
-        managed = s._require_runtime_services().pulse_facade(sequencer)
-        return bind_pulse(managed, payload)
+        return bind_pulse(sequencer, payload)
 
     def write_verilog(self, output_dir: str | Path = GENERATED_SEQUENCES_DIR, *,
                       sequence: PulseSequence | None = None) -> Path:
@@ -118,7 +109,7 @@ class TimingSubsystem(ExperimentSubsystem):
 
         s = self._session
         sequence = sequence or s.sequence
-        sequencer = getattr(s._device_set, "sequencer", None)
+        sequencer = getattr(s.devices, "sequencer", None)
         channels = getattr(sequencer, "channels", sequence.channels)
         clock = getattr(sequencer, "clock_hz", DEFAULT_CLOCK_HZ)
         pin_map = getattr(sequencer, "pin_map", None)

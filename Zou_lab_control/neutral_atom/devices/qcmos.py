@@ -176,6 +176,11 @@ class QCMOSCamera(CameraDevice):
         # the DCAM buffer depth of the current session + the next frame index to transfer.
         self._buf_alloc = 0
         self._next_frame = 0
+        self._last_transfer_count = 0
+        self._last_transfer_newest_index: int | None = None
+        self._capture_io_condition = threading.Condition()
+        self._active_grabs = 0
+        self._capture_terminalizing = False
 
     # ------------------------------------------------------------------ config schema (self-describing)
     @classmethod
@@ -416,6 +421,10 @@ class QCMOSCamera(CameraDevice):
         waiting for FPGA trigger edges.  ``frames=None`` (continuous) allocates a
         ``recent_capacity``-deep ring the sequence capture cycles through."""
         dcam = self._dcam                        # arm() ensured the DCAM handle is open (base ensure_open)
+        with self._capture_io_condition:
+            if self._active_grabs:
+                raise RuntimeError("qCMOS cannot arm while a frame read is still active")
+            self._capture_terminalizing = False
         alloc = (
             int(max_inflight_frames)
             if max_inflight_frames is not None
@@ -469,6 +478,8 @@ class QCMOSCamera(CameraDevice):
             raise
         self._buf_alloc = alloc
         self._next_frame = 0
+        self._last_transfer_count = 0
+        self._last_transfer_newest_index = None
 
     def _grab(
         self,
@@ -478,42 +489,140 @@ class QCMOSCamera(CameraDevice):
         stop=None,
         exact: bool = False,
     ) -> bool:
-        """Wait for and transfer up to ``n`` externally triggered frames from the DCAM buffer
-        into the base-class frame queue.  The qCMOS fault model is LOUD: a trigger that never
+        """Run one DCAM read under the adapter's terminalization join gate."""
+
+        requested = positive_int(n, "n")
+        with self._capture_io_condition:
+            if self._capture_terminalizing:
+                raise AcquisitionCancelled("qCMOS capture is terminalizing")
+            self._active_grabs += 1
+        try:
+            return self._grab_owned(
+                requested,
+                timeout=timeout,
+                stop=stop,
+                exact=exact,
+            )
+        finally:
+            with self._capture_io_condition:
+                self._active_grabs -= 1
+                self._capture_io_condition.notify_all()
+
+    def _grab_owned(
+        self,
+        n: int,
+        *,
+        timeout: float | None = None,
+        stop=None,
+        exact: bool = False,
+    ) -> bool:
+        """Wait for externally triggered frames, then drain every frame already reported by
+        DCAM into the bounded base-class queue.  The caller may request only one frame, but a
+        single ready event can represent a larger backlog; leaving that backlog in DCAM would
+        incorrectly depend on a second ready event for frames that already exist.
+
+        The qCMOS fault model is LOUD: a trigger that never
         comes raises ``TimeoutError`` after ``timeout`` (seconds; the config ``timeout_ms``
         default), and a Stop raises :class:`AcquisitionCancelled` within one poll slice.
 
-        ``timeout`` is the budget PER AWAITED TRIGGER, not for the whole ``n``-frame read: it
-        resets each time a frame arrives.  So an FPGA firing ``n`` triggers spaced under the
-        timeout succeeds the same whether or not a Stop event is passed -- the stop event only
-        shortens the POLL SLICE (so a Stop is honoured within ~one slice), never the trigger
-        budget itself."""
+        ``timeout`` bounds the complete call, including every ready wait and every frame copied
+        from an already reported backlog.  A Stop event shortens the wait poll slice and is also
+        checked between copies; neither path may extend the advertised blocking-call bound."""
         dcam = self._dcam
-        n = positive_int(n, "n")
         timeout_ms = self.config.timeout_ms if timeout is None else max(1, int(float(timeout) * 1000))
         # When a live logic node passes a stop event, wait in short slices and check it between
         # slices so Stop interrupts a wedged trigger within ~one slice instead of blocking the
-        # full per-trigger timeout.  Without a stop event, one wait of the full timeout.
+        # complete call budget.  Without a stop event, one wait may use the remaining budget.
         poll_ms = min(timeout_ms, 200) if stop is not None else timeout_ms
-        got = 0
         deadline = time.monotonic() + timeout_ms / 1000.0
-        while got < n:
+        last_observed_available = max(
+            self._next_frame,
+            self._last_transfer_count,
+        )
+        last_observed_newest = self._last_transfer_newest_index
+        ready_without_count = False
+
+        def transfer_window() -> tuple[int, int | None]:
+            nonlocal last_observed_available, last_observed_newest, ready_without_count
+            info = dcam.cap_transferinfo()
+            if info is False:
+                if exact:
+                    raise RuntimeError(
+                        "qCMOS cap_transferinfo failed during exact capture; "
+                        f"produced-count/overrun state is unknown: {dcam.lasterr()}"
+                    )
+                if ready_without_count:
+                    ready_without_count = False
+                    return self._next_frame + 1, None
+                return self._next_frame, None
+            available = int(info.nFrameCount)
+            newest = int(info.nNewestFrameIndex)
+            if available < 0:
+                raise RuntimeError("qCMOS nFrameCount is negative")
+            if available < last_observed_available:
+                raise RuntimeError(
+                    "qCMOS nFrameCount moved backwards during capture: "
+                    f"{available} < prior observation {last_observed_available}"
+                )
+            if available > 0 and not 0 <= newest < int(self._buf_alloc):
+                raise RuntimeError(
+                    "qCMOS newest frame index is outside the allocated ring: "
+                    f"{newest} not in [0, {int(self._buf_alloc)})"
+                )
+            if (
+                available > 0
+                and last_observed_available > 0
+                and last_observed_newest is not None
+            ):
+                expected_newest = (
+                    last_observed_newest
+                    + available
+                    - last_observed_available
+                ) % int(self._buf_alloc)
+                if newest != expected_newest:
+                    raise RuntimeError(
+                        "qCMOS transfer count/newest-index pair is inconsistent: "
+                        f"count advanced {available - last_observed_available} but "
+                        f"newest index is {newest}, expected {expected_newest}"
+                    )
+            last_observed_available = available
+            last_observed_newest = newest if available > 0 else None
+            self._last_transfer_count = available
+            self._last_transfer_newest_index = last_observed_newest
+            ready_without_count = False
+            return available, newest
+
+        while True:
+            with self._capture_io_condition:
+                if self._capture_terminalizing:
+                    raise AcquisitionCancelled("qCMOS capture is terminalizing")
             if stop is not None and stop.is_set():
                 raise AcquisitionCancelled(f"qCMOS cancelled while waiting for frame {self._next_frame}.")
-            slice_ms = poll_ms
-            if stop is not None:
-                slice_ms = max(1, min(poll_ms, int((deadline - time.monotonic()) * 1000)))
-            if dcam.wait_capevent_frameready(slice_ms) is False:
-                if stop is not None and not stop.is_set() and time.monotonic() < deadline:
-                    continue  # slice expired but neither stopped nor timed out -- keep polling
-                if stop is not None and stop.is_set():
-                    raise AcquisitionCancelled(f"qCMOS cancelled while waiting for frame {self._next_frame}.")
-                raise TimeoutError(f"qCMOS timed out after {timeout_ms} ms waiting for frame {self._next_frame}.")
-            info = dcam.cap_transferinfo()
-            available = int(getattr(info, "nFrameCount", self._next_frame + 1)) if info is not False else self._next_frame + 1
+            available, newest = transfer_window()
+            if available == self._next_frame:
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    raise TimeoutError(
+                        f"qCMOS timed out after {timeout_ms} ms waiting for frame "
+                        f"{self._next_frame}."
+                    )
+                slice_ms = max(1, min(poll_ms, remaining_ms))
+                if dcam.wait_capevent_frameready(slice_ms) is False:
+                    if stop is not None and stop.is_set():
+                        raise AcquisitionCancelled(
+                            f"qCMOS cancelled while waiting for frame {self._next_frame}."
+                        )
+                    if time.monotonic() < deadline:
+                        continue
+                    raise TimeoutError(
+                        f"qCMOS timed out after {timeout_ms} ms waiting for frame "
+                        f"{self._next_frame}."
+                    )
+                ready_without_count = True
+                continue
             # Ring-overrun guard: the DCAM buffer holds ``_buf_alloc`` frames; if the camera has
             # produced more than that beyond our read cursor, the hardware has already overwritten
-            # the slot we are about to read (``next % buf_alloc`` now points at a NEWER frame).
+            # the slot we are about to read.
             # Fail LOUD with the dropped-frame count rather than silently deliver mis-ordered frames.
             if available - self._next_frame > int(self._buf_alloc):
                 dropped = available - self._next_frame - int(self._buf_alloc)
@@ -521,96 +630,189 @@ class QCMOSCamera(CameraDevice):
                     f"qCMOS ring overrun: {dropped} frame(s) overwritten -- the camera produced "
                     f"{available} frames but the {self._buf_alloc}-deep buffer was read only up to "
                     f"frame {self._next_frame}. Read frames faster or allocate a deeper ring.")
-            while self._next_frame < available and got < n:
-                # A continuous session cycles the allocated ring; a finite one indexes 0..N-1.
-                data = dcam.buf_getframedata(self._next_frame % max(1, int(self._buf_alloc)))
+            snapshot_available = available
+            snapshot_newest = newest
+            while self._next_frame < snapshot_available:
+                if stop is not None and stop.is_set():
+                    raise AcquisitionCancelled(
+                        f"qCMOS cancelled while draining frame {self._next_frame}."
+                    )
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"qCMOS exceeded its {timeout_ms} ms read budget while draining "
+                        f"frame {self._next_frame}."
+                    )
+                if snapshot_newest is None:
+                    # Only a non-authoritative preview whose count read failed may
+                    # use the historical next-slot fallback after a ready event.
+                    ring_index = self._next_frame % int(self._buf_alloc)
+                else:
+                    distance_from_newest = (
+                        snapshot_available - 1 - self._next_frame
+                    )
+                    ring_index = (
+                        snapshot_newest - distance_from_newest
+                    ) % int(self._buf_alloc)
+                data = dcam.buf_getframedata(ring_index)
                 if data is False:
-                    raise RuntimeError(f"qCMOS buf_getframedata({self._next_frame}) failed: {dcam.lasterr()}")
+                    raise RuntimeError(
+                        f"qCMOS buf_getframedata({ring_index}) failed for source frame "
+                        f"{self._next_frame}: {dcam.lasterr()}"
+                    )
                 frame_info, pixels = data
                 timestamp = getattr(frame_info, "timestamp", None)
+                if stop is not None and stop.is_set():
+                    raise AcquisitionCancelled(
+                        f"qCMOS cancelled after copying frame {self._next_frame}."
+                    )
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"qCMOS exceeded its {timeout_ms} ms read budget while copying "
+                        f"frame {self._next_frame}."
+                    )
 
+                if exact:
+                    post_copy_available, _post_copy_newest = transfer_window()
+                    if post_copy_available - self._next_frame > int(self._buf_alloc):
+                        raise RuntimeError(
+                            "qCMOS ring advanced far enough to overwrite the frame "
+                            f"being copied at source ordinal {self._next_frame}"
+                        )
                 def metadata_int(owner, name):
                     value = getattr(owner, name, None) if owner is not None else None
                     return None if value is None else int(value)
 
-                ring_index = self._next_frame % max(1, int(self._buf_alloc))
-                self._deliver_records(
-                    [
-                        CameraFrameRecord(
-                            image=np.asarray(pixels),
-                            source_ordinal=self._next_frame,
-                            produced_count=available,
-                            frame_stamp=metadata_int(frame_info, "framestamp"),
-                            camera_stamp=metadata_int(frame_info, "camerastamp"),
-                            timestamp_seconds=metadata_int(timestamp, "sec"),
-                            timestamp_microseconds=metadata_int(timestamp, "microsec"),
-                            host_received_at_ns=time.time_ns(),
-                            driver_buffer_index=ring_index,
-                        )
-                    ]
+                # CameraFrameRecord takes the final owner-owned ndarray copy.  It may be
+                # materially slower than the SDK copy for a full sensor frame, so construct
+                # it before the final deadline/Stop decision.  Commit and terminalization
+                # then linearize under one short adapter-owned condition.
+                record = CameraFrameRecord(
+                    image=np.asarray(pixels),
+                    source_ordinal=self._next_frame,
+                    produced_count=available,
+                    frame_stamp=metadata_int(frame_info, "framestamp"),
+                    camera_stamp=metadata_int(frame_info, "camerastamp"),
+                    timestamp_seconds=metadata_int(timestamp, "sec"),
+                    timestamp_microseconds=metadata_int(timestamp, "microsec"),
+                    host_received_at_ns=time.time_ns(),
+                    driver_buffer_index=ring_index,
                 )
-                self._next_frame += 1
-                got += 1
-                deadline = time.monotonic() + timeout_ms / 1000.0   # per-trigger budget resets on delivery
-        return True
+                with self._capture_io_condition:
+                    if self._capture_terminalizing:
+                        raise AcquisitionCancelled(
+                            f"qCMOS terminalized before frame {self._next_frame} commit"
+                        )
+                    if stop is not None and stop.is_set():
+                        raise AcquisitionCancelled(
+                            f"qCMOS cancelled before committing frame {self._next_frame}."
+                        )
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"qCMOS exceeded its {timeout_ms} ms read budget before committing "
+                            f"frame {self._next_frame}."
+                        )
+                    self._deliver_records([record])
+                    self._next_frame += 1
+            # The hook promises at least one newly queued frame, not the caller's
+            # complete cardinality.  Return after this bounded driver snapshot so
+            # the base owner can consume pending before another burst arrives.
+            return True
 
     def _disarm(self) -> None:
         self._finish_record_capture()
 
     def _finish_record_capture(self) -> CameraCaptureTerminalRecord:
-        """Stop DCAM, freeze its final frame count, then release the driver ring."""
+        """Stop DCAM, join every reader, freeze final count, then release the ring."""
 
         dcam = self._dcam
         if dcam is None:
             return CameraCaptureTerminalRecord(0, True, True, True)
-        stop_ok = False
-        release_ok = False
-        produced_count: int | None = None
-        stop_error: BaseException | None = None
-        transfer_error: BaseException | None = None
+        with self._capture_io_condition:
+            self._capture_terminalizing = True
         try:
             stop_ok = dcam.cap_stop() is True
         except BaseException as exc:
-            stop_error = exc
-        if stop_ok:
-            try:
-                info = dcam.cap_transferinfo()
-                if info is False:
+            raise RuntimeError(
+                "qCMOS cap_stop raised; active driver ring is retained"
+            ) from exc
+        if not stop_ok:
+            raise RuntimeError(
+                "qCMOS cap_stop was not acknowledged; active driver ring is retained"
+            )
+
+        # A cross-thread interrupt may issue cap_stop to unblock the SDK, but it
+        # must never release storage while dcambuf_copyframe/transferinfo is still
+        # executing.  The terminal owner waits for the sole read boundary to join.
+        with self._capture_io_condition:
+            while self._active_grabs:
+                self._capture_io_condition.wait()
+
+        def final_snapshot() -> tuple[int, int]:
+            info = dcam.cap_transferinfo()
+            if info is False:
+                raise RuntimeError(
+                    f"qCMOS final cap_transferinfo failed: {dcam.lasterr()}"
+                )
+            count = int(info.nFrameCount)
+            newest = int(info.nNewestFrameIndex)
+            if count < 0:
+                raise RuntimeError("qCMOS final nFrameCount is negative")
+            if count > 0 and not 0 <= newest < int(self._buf_alloc):
+                raise RuntimeError(
+                    "qCMOS final newest frame index is outside the allocated ring"
+                )
+            return count, newest
+
+        transfer_error: BaseException | None = None
+        produced_count: int | None = None
+        newest_index: int | None = None
+        try:
+            first = final_snapshot()
+            second = final_snapshot()
+            if second != first:
+                raise RuntimeError(
+                    "qCMOS transfer count/newest index did not stabilize after cap_stop"
+                )
+            produced_count, newest_index = second
+            if produced_count < max(
+                self._next_frame,
+                self._last_transfer_count,
+            ):
+                raise RuntimeError(
+                    "qCMOS final nFrameCount moved backwards from the armed epoch"
+                )
+            if (
+                produced_count > 0
+                and self._last_transfer_count > 0
+                and self._last_transfer_newest_index is not None
+            ):
+                expected_newest = (
+                    self._last_transfer_newest_index
+                    + produced_count
+                    - self._last_transfer_count
+                ) % int(self._buf_alloc)
+                if newest_index != expected_newest:
                     raise RuntimeError(
-                        f"qCMOS final cap_transferinfo failed: {dcam.lasterr()}"
+                        "qCMOS final count/newest-index pair is inconsistent"
                     )
-                produced_count = int(info.nFrameCount)
-                if produced_count < 0:
-                    raise RuntimeError("qCMOS final nFrameCount is negative")
-            except BaseException as exc:
-                transfer_error = exc
-        release_error: BaseException | None = None
+        except BaseException as exc:
+            transfer_error = exc
+
         try:
             release_ok = dcam.buf_release() is True
         except BaseException as exc:
-            release_error = exc
-        if (
-            not stop_ok
-            or stop_error is not None
-            or transfer_error is not None
-            or not release_ok
-            or release_error is not None
-        ):
-            failed = []
-            if not stop_ok or stop_error is not None:
-                failed.append("cap_stop")
-            if transfer_error is not None:
-                failed.append("cap_transferinfo")
-            if not release_ok or release_error is not None:
-                failed.append("buf_release")
-            error = RuntimeError(
-                "qCMOS disarm did not acknowledge " + " and ".join(failed)
-            )
-            cause = stop_error or transfer_error or release_error
-            if cause is not None:
-                raise error from cause
-            raise error
+            raise RuntimeError("qCMOS buf_release raised after cap_stop") from exc
+        if not release_ok:
+            raise RuntimeError("qCMOS buf_release was not acknowledged after cap_stop")
+        if transfer_error is not None:
+            raise RuntimeError(
+                "qCMOS final transfer state was not stable after cap_stop"
+            ) from transfer_error
         assert produced_count is not None
+        self._last_transfer_count = produced_count
+        self._last_transfer_newest_index = (
+            newest_index if produced_count > 0 else None
+        )
         return CameraCaptureTerminalRecord(produced_count, True, True, True)
 
     def _set_prop(self, idprop, value, name: str, *, verify: bool = False) -> None:

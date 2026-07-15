@@ -6,10 +6,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from zlc_storage import (
-    canonical_digest,
     canonical_text as _text,
     decode,
     encode,
+    sha256_digest,
     sha256_text as _sha256,
 )
 
@@ -21,13 +21,15 @@ from .fpga import (
 from .ir import TargetIR, target_ir_from_tree, target_ir_to_tree
 from .schedule import (
     DigitalTriggerSchedule,
-    build_digital_trigger_schedules,
+    MAX_MATERIALIZED_TRIGGER_EDGES,
+    _same_physical_digital_trigger_schedules,
     digital_trigger_schedule_from_tree,
     digital_trigger_schedule_to_tree,
 )
 
 
 COMPILED_PULSE_ARTIFACT_SCHEMA = "zlc_pulse.CompiledPulseArtifact"
+MAX_COMPILED_PULSE_ARTIFACT_BYTES = 128 * 1024 * 1024
 
 
 class PulseExecutionForm(str, Enum):
@@ -63,6 +65,11 @@ class CompiledPulseArtifact:
             raise TypeError("trigger_schedules must contain DigitalTriggerSchedule values")
         if len({item.channel for item in schedules}) != len(schedules):
             raise ValueError("trigger schedule channels must be unique")
+        if sum(item.total for item in schedules) > MAX_MATERIALIZED_TRIGGER_EDGES:
+            raise ValueError(
+                "compiled pulse exceeds the materialization limit of "
+                f"{MAX_MATERIALIZED_TRIGGER_EDGES} trigger edges"
+            )
         object.__setattr__(self, "trigger_schedules", schedules)
         scan = self.target_ir.scan_enabled
         if self.execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
@@ -81,20 +88,15 @@ class CompiledPulseArtifact:
         if (
             not self.target_ir.repeat_forever
             and bool(schedules)
-            and not _same_physical_trigger_schedule(
+            and not _same_physical_digital_trigger_schedules(
+                self.target_ir,
                 schedules,
-                build_digital_trigger_schedules(
-                    self.target_ir,
-                    tuple(item.channel for item in schedules),
-                ),
             )
         ):
             raise ValueError("trigger schedules are not the deterministic TargetIR expansion")
-        object.__setattr__(
-            self,
-            "_fingerprint",
-            canonical_digest(compiled_pulse_artifact_to_tree(self)),
-        )
+        payload = encode(compiled_pulse_artifact_to_tree(self))
+        admit_compiled_pulse_payload_size(len(payload))
+        object.__setattr__(self, "_fingerprint", sha256_digest(payload))
 
     @property
     def target_abi_fingerprint(self) -> str:
@@ -109,35 +111,6 @@ class CompiledPulseArtifact:
     @property
     def fingerprint(self) -> str:
         return self._fingerprint
-
-
-def _same_physical_trigger_schedule(
-    actual: tuple[DigitalTriggerSchedule, ...],
-    expected: tuple[DigitalTriggerSchedule, ...],
-) -> bool:
-    """Compare wire facts while retaining source loop provenance sidecars."""
-
-    if len(actual) != len(expected):
-        return False
-    for left, right in zip(actual, expected, strict=True):
-        if (
-            left.channel != right.channel
-            or left.point_count != right.point_count
-            or len(left.edges) != len(right.edges)
-        ):
-            return False
-        for left_edge, right_edge in zip(left.edges, right.edges, strict=True):
-            if (
-                left_edge.channel != right_edge.channel
-                or left_edge.point_index != right_edge.point_index
-                or left_edge.trigger_ordinal != right_edge.trigger_ordinal
-                or left_edge.point_trigger_ordinal
-                != right_edge.point_trigger_ordinal
-                or left_edge.tick_from_run_start != right_edge.tick_from_run_start
-            ):
-                return False
-    return True
-
 
 def compiled_pulse_artifact_to_tree(value: CompiledPulseArtifact) -> dict[str, object]:
     if not isinstance(value, CompiledPulseArtifact):
@@ -185,22 +158,45 @@ def compiled_pulse_artifact_from_tree(tree: object) -> CompiledPulseArtifact:
 
 
 def encode_compiled_pulse_artifact(value: CompiledPulseArtifact) -> bytes:
-    return encode(compiled_pulse_artifact_to_tree(value))
+    payload = encode(compiled_pulse_artifact_to_tree(value))
+    admit_compiled_pulse_payload_size(len(payload))
+    return payload
 
 
-def decode_compiled_pulse_artifact(payload: bytes) -> CompiledPulseArtifact:
-    value = compiled_pulse_artifact_from_tree(decode(payload))
-    if encode_compiled_pulse_artifact(value) != bytes(payload):
+def decode_compiled_pulse_artifact(
+    payload: bytes | bytearray | memoryview,
+) -> CompiledPulseArtifact:
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise TypeError("compiled pulse payload must be bytes-like")
+    admit_compiled_pulse_payload_size(memoryview(payload).nbytes)
+    raw = bytes(payload)
+    value = compiled_pulse_artifact_from_tree(decode(raw))
+    if encode_compiled_pulse_artifact(value) != raw:
         raise ValueError("CompiledPulseArtifact payload is not canonical")
     return value
 
 
+def admit_compiled_pulse_payload_size(size: int) -> int:
+    """Own the current compiled-artifact byte ceiling across RPC and storage."""
+
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise TypeError("compiled pulse payload size must be a non-negative integer")
+    if size > MAX_COMPILED_PULSE_ARTIFACT_BYTES:
+        raise ValueError(
+            "compiled pulse artifact exceeds the payload limit of "
+            f"{MAX_COMPILED_PULSE_ARTIFACT_BYTES} bytes"
+        )
+    return size
+
+
 __all__ = [
     "COMPILED_PULSE_ARTIFACT_SCHEMA",
+    "MAX_COMPILED_PULSE_ARTIFACT_BYTES",
     "CompiledPulseArtifact",
     "PulseExecutionForm",
     "compiled_pulse_artifact_from_tree",
     "compiled_pulse_artifact_to_tree",
+    "admit_compiled_pulse_payload_size",
     "decode_compiled_pulse_artifact",
     "encode_compiled_pulse_artifact",
 ]

@@ -174,7 +174,7 @@ def derive_readout_physical_context(
     grouping = cell_plan.join_contract.within_point_grouping
     selected_edges = tuple(
         edge
-        for edge in schedule.edges
+        for edge in schedule.iter_edges()
         if grouping[edge.point_trigger_ordinal][1] == event_index
     )
     if not selected_edges:
@@ -203,7 +203,7 @@ def _derive_readout_physical_context_from_evidence(
         raise TypeError("evidence must be PulseCaptureEvidence")
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
-    edges = evidence.trigger_schedule.edges
+    edges = evidence.trigger_schedule.iter_edges()
     event_axes = tuple(
         (index, axis)
         for index, axis in enumerate(schema.point_axes)

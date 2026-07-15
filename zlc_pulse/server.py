@@ -10,7 +10,6 @@ from typing import Protocol
 
 from fpga.pulse_streamer.host.image import StreamerParams, build_fingerprint
 from zlc_storage import (
-    canonical_digest,
     canonical_text as _text,
     decode,
     encode,
@@ -20,6 +19,7 @@ from zlc_storage import (
 from .artifact import (
     CompiledPulseArtifact,
     PulseExecutionForm,
+    admit_compiled_pulse_payload_size,
     decode_compiled_pulse_artifact,
     encode_compiled_pulse_artifact,
 )
@@ -69,17 +69,10 @@ class PulseExecutionBackend(Protocol):
 class PreparedPulseRef:
     connection_generation: str
     artifact_digest: str
-    source_ir_digest: str
-    wire_image_digest: str
 
     def __post_init__(self) -> None:
         _text(self.connection_generation, "connection_generation")
-        for field in ("artifact_digest", "source_ir_digest", "wire_image_digest"):
-            _sha256(getattr(self, field), field)
-
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(prepared_pulse_ref_to_tree(self))
+        _sha256(self.artifact_digest, "artifact_digest")
 
 
 @dataclass(frozen=True)
@@ -241,8 +234,6 @@ class PulseExecutionService:
             reference = PreparedPulseRef(
                 self._generation,
                 artifact.fingerprint,
-                artifact.target_ir.fingerprint,
-                artifact.wire_image.digest,
             )
             self._artifact = artifact
             self._prepared_ref = reference
@@ -466,8 +457,6 @@ def prepared_pulse_ref_to_tree(value: PreparedPulseRef) -> dict[str, object]:
         "schema": PREPARED_PULSE_REF_SCHEMA,
         "connection_generation": value.connection_generation,
         "artifact_digest": value.artifact_digest,
-        "source_ir_digest": value.source_ir_digest,
-        "wire_image_digest": value.wire_image_digest,
     }
 
 
@@ -476,8 +465,6 @@ def prepared_pulse_ref_from_tree(tree: object) -> PreparedPulseRef:
         "schema",
         "connection_generation",
         "artifact_digest",
-        "source_ir_digest",
-        "wire_image_digest",
     }
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("PreparedPulseRef has an unknown field set")
@@ -486,8 +473,6 @@ def prepared_pulse_ref_from_tree(tree: object) -> PreparedPulseRef:
     return PreparedPulseRef(
         tree["connection_generation"],
         tree["artifact_digest"],
-        tree["source_ir_digest"],
-        tree["wire_image_digest"],
     )
 
 
@@ -621,6 +606,7 @@ def serve_pulse_execution_service(
 
         def exposed_current_prepare(self, artifact_bytes):
             self._require_owner()
+            admit_compiled_pulse_payload_size(len(artifact_bytes))
             return encode_prepared_ref_message(
                 service.prepare(decode_artifact_message(bytes(artifact_bytes)))
             )

@@ -247,7 +247,7 @@ def build_pulse_playback(
     terminal_with_delay = terminal_tick + max(ir.channel_delays, default=0)
     group_counts: dict[tuple[int, int], dict[str, int]] = {}
     for schedule in artifact.trigger_schedules:
-        for edge in schedule.edges:
+        for edge in schedule.iter_edges():
             counts = group_counts.setdefault(
                 (edge.point_index, edge.loop_iteration),
                 {},

@@ -234,6 +234,29 @@ class _InspectionState:
     total_array_bytes: int = 0
 
 
+def _admit_node(state: _InspectionState, *, path: str, depth: int) -> None:
+    state.nodes += 1
+    if depth > state.limits.max_depth:
+        raise CanonicalEncodingError(f"{path}: maximum canonical depth exceeded")
+    if state.nodes > state.limits.max_nodes:
+        raise CanonicalEncodingError("maximum canonical node count exceeded")
+
+
+def _admit_container_entries(state: _InspectionState, count: int) -> None:
+    state.container_entries += int(count)
+    if state.container_entries > state.limits.max_container_entries:
+        raise CanonicalEncodingError("maximum canonical container entries exceeded")
+
+
+def _admit_array_bytes(state: _InspectionState, nbytes: int) -> None:
+    state.arrays += 1
+    state.total_array_bytes += int(nbytes)
+    if state.arrays > state.limits.max_arrays:
+        raise CanonicalEncodingError("maximum canonical ndarray count exceeded")
+    if state.total_array_bytes > state.limits.max_total_array_bytes:
+        raise CanonicalEncodingError("maximum canonical ndarray bytes exceeded")
+
+
 CanonicalStructureEvent: TypeAlias = CanonicalListEvent | CanonicalArrayEvent
 CanonicalStructureAdmission: TypeAlias = Callable[
     [tuple[CanonicalStructureEvent, ...]],
@@ -253,17 +276,25 @@ def canonical_digest(value: Any) -> str:
     return sha256_digest(encode(value))
 
 
-def encode(value: Any) -> bytes:
+def encode(
+    value: Any,
+    *,
+    limits: CanonicalDecodeLimits = DEFAULT_CANONICAL_DECODE_LIMITS,
+) -> bytes:
     """Encode a canonical primitive tree into deterministic framed UTF-8 bytes.
 
     Supported leaves are ``None``, bool, int, float, str, bytes-like values and
     non-object NumPy arrays. Lists and tuples share the canonical list meaning;
     mappings require string keys. Arrays are normalized to C-contiguous,
     little-endian storage so host byte order and input strides cannot change an
-    artifact digest.
+    artifact digest. ``limits`` defines the same structural resource domain used
+    by :func:`decode`, so a producer and consumer can share one explicit policy.
     """
 
-    tagged = _encode_value(value, path="$")
+    if not isinstance(limits, CanonicalDecodeLimits):
+        raise TypeError("limits must be CanonicalDecodeLimits")
+    state = _InspectionState(limits, [])
+    tagged = _encode_value(value, path="$", depth=0, state=state)
     payload = json.dumps(
         tagged,
         ensure_ascii=False,
@@ -322,7 +353,7 @@ def decode(
         admit_structure(tuple(events))
     try:
         value = _decode_value(tagged, path="$")
-        rebuilt = encode(value)
+        rebuilt = encode(value, limits=limits)
     except RecursionError as exc:
         raise CanonicalEncodingError("canonical structure exceeds recursion limit") from exc
     if rebuilt != raw:
@@ -360,11 +391,7 @@ def _inspect_value(
     depth: int,
     state: _InspectionState,
 ) -> None:
-    state.nodes += 1
-    if depth > state.limits.max_depth:
-        raise CanonicalEncodingError(f"{path}: maximum canonical depth exceeded")
-    if state.nodes > state.limits.max_nodes:
-        raise CanonicalEncodingError("maximum canonical node count exceeded")
+    _admit_node(state, path=path, depth=depth)
     if not isinstance(tagged, list) or not tagged or not isinstance(tagged[0], str):
         raise CanonicalEncodingError(f"{path}: expected a tagged canonical value")
     tag = tagged[0]
@@ -412,9 +439,7 @@ def _inspect_value(
         payload = tagged[1]
         if not isinstance(payload, list):
             raise CanonicalEncodingError(f"{path}: list payload must be a JSON list")
-        state.container_entries += len(payload)
-        if state.container_entries > state.limits.max_container_entries:
-            raise CanonicalEncodingError("maximum canonical container entries exceeded")
+        _admit_container_entries(state, len(payload))
         state.events.append(CanonicalListEvent(event_path, len(payload)))
         for index, item in enumerate(payload):
             _inspect_value(
@@ -438,12 +463,7 @@ def _inspect_value(
     if tag == "ndarray":
         _require_arity(tagged, 2, path)
         event = _inspect_array(tagged[1], path=path, event_path=event_path)
-        state.arrays += 1
-        state.total_array_bytes += event.nbytes
-        if state.arrays > state.limits.max_arrays:
-            raise CanonicalEncodingError("maximum canonical ndarray count exceeded")
-        if state.total_array_bytes > state.limits.max_total_array_bytes:
-            raise CanonicalEncodingError("maximum canonical ndarray bytes exceeded")
+        _admit_array_bytes(state, event.nbytes)
         state.events.append(event)
         return
     raise CanonicalEncodingError(f"{path}: unknown canonical tag {tag!r}")
@@ -459,9 +479,7 @@ def _inspect_map(
 ) -> None:
     if not isinstance(payload, list):
         raise CanonicalEncodingError(f"{path}: map payload must be a JSON list")
-    state.container_entries += len(payload)
-    if state.container_entries > state.limits.max_container_entries:
-        raise CanonicalEncodingError("maximum canonical container entries exceeded")
+    _admit_container_entries(state, len(payload))
     previous: str | None = None
     for index, pair in enumerate(payload):
         if not isinstance(pair, list) or len(pair) != 2 or not isinstance(pair[0], str):
@@ -550,7 +568,14 @@ def _inspect_array(
     return CanonicalArrayEvent(event_path, shape, dtype.str, expected)
 
 
-def _encode_value(value: Any, *, path: str) -> list[Any]:
+def _encode_value(
+    value: Any,
+    *,
+    path: str,
+    depth: int,
+    state: _InspectionState,
+) -> list[Any]:
+    _admit_node(state, path=path, depth=depth)
     if value is None:
         return ["null"]
     if isinstance(value, (bool, np.bool_)):
@@ -574,31 +599,57 @@ def _encode_value(value: Any, *, path: str) -> list[Any]:
         payload = base64.b64encode(bytes(value)).decode("ascii")
         return ["bytes", payload]
     if isinstance(value, np.ndarray):
-        return _encode_array(value, path=path)
+        return _encode_array(value, path=path, state=state)
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise CanonicalEncodingError(f"{path}: mapping keys must be strings")
+        _admit_container_entries(state, len(value))
         items: list[list[Any]] = []
         for key in sorted(value):
-            items.append([key, _encode_value(value[key], path=f"{path}.{key}")])
+            items.append(
+                [
+                    key,
+                    _encode_value(
+                        value[key],
+                        path=f"{path}.{key}",
+                        depth=depth + 1,
+                        state=state,
+                    ),
+                ]
+            )
         return ["map", items]
     if isinstance(value, Sequence):
+        _admit_container_entries(state, len(value))
         return [
             "list",
-            [_encode_value(item, path=f"{path}[{index}]") for index, item in enumerate(value)],
+            [
+                _encode_value(
+                    item,
+                    path=f"{path}[{index}]",
+                    depth=depth + 1,
+                    state=state,
+                )
+                for index, item in enumerate(value)
+            ],
         ]
     raise CanonicalEncodingError(
         f"{path}: unsupported canonical value type {type(value).__name__}"
     )
 
 
-def _encode_array(value: np.ndarray, *, path: str) -> list[Any]:
+def _encode_array(
+    value: np.ndarray,
+    *,
+    path: str,
+    state: _InspectionState,
+) -> list[Any]:
     array = np.asarray(value)
     if array.dtype.itemsize == 0 or array.dtype.hasobject or array.dtype.fields is not None:
         raise CanonicalEncodingError(
             f"{path}: zero-itemsize, object, and structured ndarrays are forbidden"
         )
     dtype = array.dtype.newbyteorder("<")
+    _admit_array_bytes(state, int(array.nbytes))
     normalized = np.array(array, dtype=dtype, order="C", copy=True).reshape(array.shape)
     if dtype.kind == "f":
         canonical_nan = np.array(float("nan"), dtype=dtype)

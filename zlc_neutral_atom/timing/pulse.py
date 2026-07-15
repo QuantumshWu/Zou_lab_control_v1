@@ -307,12 +307,6 @@ def validate_pulse_terminal_for_artifact(
 
     receipt = acknowledgement.receipt
     if isinstance(receipt, PulseCompletion):
-        reference = receipt.prepared_ref
-        if (
-            reference.source_ir_digest != artifact.target_ir.fingerprint
-            or reference.wire_image_digest != artifact.wire_image.digest
-        ):
-            raise ValueError("hardware completion differs from compiled IR or wire image")
         validate_backend_completion_for_artifact(
             PulseBackendCompletion(
                 receipt.hardware_terminal,
@@ -508,7 +502,7 @@ class BoundPulsePort:
         )
 
 
-class PulseSessionState(str, Enum):
+class _PulseSessionState(str, Enum):
     NEW = "NEW"
     PREPARED = "PREPARED"
     FIRED = "FIRED"
@@ -523,7 +517,7 @@ class PulseSession:
         self._port = port
         self._request = request
         self._session_id = uuid.uuid4().hex
-        self._state = PulseSessionState.NEW
+        self._state = _PulseSessionState.NEW
         self._owner_thread_id = threading.get_ident()
         self._hardware_prepare_attempted = False
         self._terminal: PulseTerminalAck | None = None
@@ -531,10 +525,6 @@ class PulseSession:
     @property
     def session_id(self) -> str:
         return self._session_id
-
-    @property
-    def state(self) -> PulseSessionState:
-        return self._state
 
     @property
     def terminal(self) -> PulseTerminalAck:
@@ -547,13 +537,13 @@ class PulseSession:
 
         self._assert_owner_thread()
         return (
-            self._state is PulseSessionState.COMPLETED
+            self._state is _PulseSessionState.COMPLETED
             and self._terminal is terminal
         )
 
     def prepare(self, context: RunContext) -> None:
         self._assert_owner_thread()
-        if self._state is not PulseSessionState.NEW:
+        if self._state is not _PulseSessionState.NEW:
             raise RuntimeError("pulse session can only be prepared once")
         self._validate_capability()
         self._hardware_prepare_attempted = True
@@ -574,13 +564,13 @@ class PulseSession:
             ):
                 raise RuntimeError("pulse prepare acknowledgement differs from frozen request")
         except BaseException:
-            self._state = PulseSessionState.FAILED
+            self._state = _PulseSessionState.FAILED
             raise
-        self._state = PulseSessionState.PREPARED
+        self._state = _PulseSessionState.PREPARED
 
     def fire(self, context: RunContext) -> None:
         self._assert_owner_thread()
-        if self._state is not PulseSessionState.PREPARED:
+        if self._state is not _PulseSessionState.PREPARED:
             raise RuntimeError("pulse session must be prepared before FIRE")
         try:
             ack = context.device(self._port.device.key).execute(
@@ -590,13 +580,13 @@ class PulseSession:
             if ack.artifact_digest != self._request.artifact_digest:
                 raise RuntimeError("FIRE acknowledgement artifact differs")
         except BaseException:
-            self._state = PulseSessionState.FAILED
+            self._state = _PulseSessionState.FAILED
             raise
-        self._state = PulseSessionState.FIRED
+        self._state = _PulseSessionState.FIRED
 
     def complete(self, context: RunContext) -> PulseTerminalAck:
         self._assert_owner_thread()
-        if self._state is not PulseSessionState.FIRED:
+        if self._state is not _PulseSessionState.FIRED:
             raise RuntimeError("pulse session must be fired before completion")
         try:
             ack = context.device(self._port.device.key).execute(
@@ -611,10 +601,10 @@ class PulseSession:
                 raise RuntimeError("pulse terminal evidence kind differs from capability")
             validate_pulse_terminal_for_artifact(ack, self._request.artifact)
         except BaseException:
-            self._state = PulseSessionState.FAILED
+            self._state = _PulseSessionState.FAILED
             raise
         self._terminal = ack
-        self._state = PulseSessionState.COMPLETED
+        self._state = _PulseSessionState.COMPLETED
         return ack
 
     def cleanup(self, context: RunContext) -> CleanupReport:
@@ -627,8 +617,8 @@ class PulseSession:
 
     def fail(self) -> None:
         self._assert_owner_thread()
-        if self._state is not PulseSessionState.COMPLETED:
-            self._state = PulseSessionState.FAILED
+        if self._state is not _PulseSessionState.COMPLETED:
+            self._state = _PulseSessionState.FAILED
 
     def _validate_capability(self) -> None:
         if (
@@ -661,7 +651,6 @@ __all__ = [
     "PulseFiredAck",
     "PulsePreparedAck",
     "PulseSession",
-    "PulseSessionState",
     "PulseTerminalAck",
     "PulseTerminalEvidenceKind",
     "PulseTerminalReceipt",

@@ -14,10 +14,10 @@ it lists every resource with its ``*IDN?`` identity so the operator can wire the
 custom device class (``register_device_class``).  This module only AGGREGATES the two
 registries -- adding a discoverable device or a new bus never touches this file.
 
-Discovery is an installation-maintenance operation.  Workbench Device Manager
-calls this internal provider and turns a selected row into a candidate config;
-ordinary experiment notebooks consume only the resulting ``na.connect(config)``
-session and its immutable ``device_catalog``.
+    >>> import Zou_lab_control.neutral_atom as na
+    >>> found = na.discover_devices()          # prints a table, returns the rows
+    >>> cams = [d for d in found if d.config]  # rows with a ready config
+    >>> devices = na.load_devices({"monitor_camera": cams[0].config})
 """
 
 from __future__ import annotations

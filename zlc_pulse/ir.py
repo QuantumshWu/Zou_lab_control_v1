@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Sequence
 
+import numpy as np
+
 from zlc_storage import (
     canonical_digest,
     canonical_text as _text,
@@ -18,6 +20,9 @@ from zlc_storage import (
 TARGET_IR_SCHEMA = "zlc_pulse.TargetIR"
 BUS_MODES = frozenset(("edge", "ramp"))
 SLOT_KINDS = frozenset(("duration", "dac"))
+MAX_MATERIALIZED_SCAN_POINTS = 1_000_000
+_SCAN_POINT_DTYPE = np.dtype("<i4")
+_SCAN_DURATION_DTYPE = np.dtype("<f8")
 
 
 @dataclass(frozen=True)
@@ -161,6 +166,11 @@ class TargetIR:
             raise ValueError("scan point width differs from slot count")
         if bool(points) != bool(slot_count):
             raise ValueError("scan points and slot schema must appear together")
+        if len(points) > MAX_MATERIALIZED_SCAN_POINTS:
+            raise ValueError(
+                "scan point table exceeds the materialization limit of "
+                f"{MAX_MATERIALIZED_SCAN_POINTS} rows"
+            )
         object.__setattr__(self, "scan_points", points)
         if not points and any(right <= left for left, right in zip(ticks, ticks[1:])):
             raise ValueError("static TargetIR edge ticks must strictly increase")
@@ -436,8 +446,11 @@ def target_ir_to_tree(value: TargetIR) -> dict[str, object]:
         "slot_kinds": list(value.slot_kinds),
         "loop_end_slot_coeffs": list(value.loop_end_slot_coeffs),
         "tick_slot_coeffs": [list(row) for row in value.tick_slot_coeffs],
-        "scan_points": [list(row) for row in value.scan_points],
-        "scan_point_durations": list(value.scan_point_durations),
+        "scan_points": _scan_point_matrix(value),
+        "scan_point_durations": np.asarray(
+            value.scan_point_durations,
+            dtype=_SCAN_DURATION_DTYPE,
+        ),
         "scan_coeff_frac_bits": value.scan_coeff_frac_bits,
         "bus_names": list(value.bus_names),
         "bus_segments": [_bus_segment_to_tree(segment) for segment in value.bus_segments],
@@ -493,8 +506,6 @@ def target_ir_from_tree(tree: object) -> TargetIR:
         "slot_kinds",
         "loop_end_slot_coeffs",
         "tick_slot_coeffs",
-        "scan_points",
-        "scan_point_durations",
         "bus_names",
         "bus_segments",
         "bus_delays",
@@ -518,8 +529,11 @@ def target_ir_from_tree(tree: object) -> TargetIR:
         tuple(tree["slot_kinds"]),
         tuple(tree["loop_end_slot_coeffs"]),
         tuple(_row(row, "tick_slot_coeffs") for row in tree["tick_slot_coeffs"]),
-        tuple(_row(row, "scan_points") for row in tree["scan_points"]),
-        tuple(tree["scan_point_durations"]),
+        _scan_point_rows_from_tree(
+            tree["scan_points"],
+            slot_count=len(tree["slot_kinds"]),
+        ),
+        _scan_durations_from_tree(tree["scan_point_durations"]),
         tree["scan_coeff_frac_bits"],
         tuple(tree["bus_names"]),
         tuple(_bus_segment_from_tree(item) for item in tree["bus_segments"]),
@@ -529,6 +543,46 @@ def target_ir_from_tree(tree: object) -> TargetIR:
         tuple(_logical_digital_output_from_tree(item) for item in tree["logical_digital_outputs"]),
         tuple(tree["bus_safe_values"]),
     )
+
+
+def _scan_point_matrix(value: TargetIR) -> np.ndarray:
+    try:
+        return np.asarray(value.scan_points, dtype=_SCAN_POINT_DTYPE).reshape(
+            len(value.scan_points),
+            value.slot_count,
+        )
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("scan point value exceeds the signed 32-bit artifact domain") from exc
+
+
+def _scan_point_rows_from_tree(
+    value: object,
+    *,
+    slot_count: int,
+) -> tuple[tuple[int, ...], ...]:
+    if (
+        not isinstance(value, np.ndarray)
+        or value.dtype != _SCAN_POINT_DTYPE
+        or value.ndim != 2
+        or value.shape[1] != slot_count
+    ):
+        raise TypeError(
+            "TargetIR scan_points must be a two-dimensional <i4 ndarray "
+            "matching slot_kinds"
+        )
+    return tuple(tuple(int(item) for item in row) for row in value)
+
+
+def _scan_durations_from_tree(value: object) -> tuple[float, ...]:
+    if (
+        not isinstance(value, np.ndarray)
+        or value.dtype != _SCAN_DURATION_DTYPE
+        or value.ndim != 1
+    ):
+        raise TypeError(
+            "TargetIR scan_point_durations must be a one-dimensional <f8 ndarray"
+        )
+    return tuple(float(item) for item in value)
 
 
 def _logical_digital_output_from_tree(tree: object) -> tuple[object, object]:
@@ -598,6 +652,7 @@ def _row(value: object, field: str) -> tuple[object, ...]:
 
 __all__ = [
     "BUS_MODES",
+    "MAX_MATERIALIZED_SCAN_POINTS",
     "SLOT_KINDS",
     "TARGET_IR_SCHEMA",
     "TargetBusDelay",

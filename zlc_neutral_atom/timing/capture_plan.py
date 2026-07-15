@@ -24,10 +24,8 @@ from zlc_pulse import (
     CompiledPulseArtifact,
     DigitalTriggerSchedule,
     PulseExecutionForm,
-    digital_trigger_schedule_to_tree,
 )
 from zlc_storage import (
-    canonical_digest,
     canonical_text as _text,
     nonnegative_integer as _index,
 )
@@ -122,7 +120,7 @@ class CaptureCellJoinContract:
         scan_position = {
             axis.axis_id: position for position, axis in enumerate(scan_axes)
         }
-        for edge in schedule.edges:
+        for edge in schedule.iter_edges():
             try:
                 repeat_index, event_index = self.within_point_grouping[
                     edge.point_trigger_ordinal
@@ -271,9 +269,7 @@ def compile_capture_cell_plan(
         compiled_pulse_artifact_digest=artifact.fingerprint,
         execution_form=artifact.execution_form,
         trigger_channel=trigger_channel,
-        trigger_schedule_digest=canonical_digest(
-            digital_trigger_schedule_to_tree(schedule)
-        ),
+        trigger_schedule_digest=schedule.fingerprint,
         dataset_schema=dataset_schema,
         join_contract=join_contract,
         cell_schedule=cell_schedule,

@@ -104,8 +104,10 @@ from .server import (
 )
 from .artifact import (
     COMPILED_PULSE_ARTIFACT_SCHEMA,
+    MAX_COMPILED_PULSE_ARTIFACT_BYTES,
     CompiledPulseArtifact,
     PulseExecutionForm,
+    admit_compiled_pulse_payload_size,
     compiled_pulse_artifact_from_tree,
     compiled_pulse_artifact_to_tree,
     decode_compiled_pulse_artifact,
@@ -150,6 +152,7 @@ from .target import (
 
 __all__ = [
     "COMPILED_PULSE_ARTIFACT_SCHEMA",
+    "MAX_COMPILED_PULSE_ARTIFACT_BYTES",
     "APPROVED_DEPLOYED_TARGET_ABI",
     "AUTONOMOUS_TABLE_READ_RECIPE",
     "COMPILER_ID",
@@ -210,6 +213,7 @@ __all__ = [
     "TargetBusSegment",
     "TargetIR",
     "TriggerEdge",
+    "admit_compiled_pulse_payload_size",
     "build_digital_trigger_schedules",
     "build_pulse_playback",
     "expand_physical_digital_high_intervals",

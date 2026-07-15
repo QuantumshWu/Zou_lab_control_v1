@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import numpy as np
+
 from fpga.pulse_streamer.host.image import (
     StreamerParams,
     build_fingerprint,
@@ -40,6 +42,8 @@ class PulseWireImage:
                 or address <= previous
             ):
                 raise ValueError("wire word addresses must be strictly increasing non-negative ints")
+            if address > 0xFFFFFFFF:
+                raise ValueError("wire word addresses must be unsigned 32-bit integers")
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF:
                 raise ValueError("wire values must be unsigned 32-bit integers")
             previous = address
@@ -104,7 +108,7 @@ def _pulse_wire_image_payload_tree(value: PulseWireImage) -> dict[str, object]:
         "schema": "zlc_pulse.PulseWireImage",
         "geometry_fingerprint": value.geometry_fingerprint,
         "source_ir_digest": value.source_ir_digest,
-        "words": [list(item) for item in value.words],
+        "words": np.asarray(value.words, dtype="<u4").reshape(len(value.words), 2),
     }
 
 
@@ -123,17 +127,19 @@ def pulse_wire_image_from_tree(tree: object) -> PulseWireImage:
         raise ValueError("PulseWireImage has an unknown field set")
     if tree["schema"] != "zlc_pulse.PulseWireImage":
         raise ValueError("PulseWireImage schema differs")
-    if not isinstance(tree["words"], list):
-        raise TypeError("PulseWireImage words must be a list")
-    words = []
-    for item in tree["words"]:
-        if not isinstance(item, list) or len(item) != 2:
-            raise ValueError("PulseWireImage word must be [address, value]")
-        words.append((item[0], item[1]))
+    words_array = tree["words"]
+    if (
+        not isinstance(words_array, np.ndarray)
+        or words_array.dtype != np.dtype("<u4")
+        or words_array.ndim != 2
+        or words_array.shape[1] != 2
+    ):
+        raise TypeError("PulseWireImage words must be a two-column <u4 ndarray")
+    words = tuple((int(address), int(word)) for address, word in words_array)
     value = PulseWireImage(
         tree["geometry_fingerprint"],
         tree["source_ir_digest"],
-        tuple(words),
+        words,
     )
     if tree["digest"] != value.digest:
         raise ValueError("PulseWireImage digest differs")

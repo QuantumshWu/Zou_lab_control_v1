@@ -203,7 +203,7 @@ def _bind_triggered_camera_acquisition(
     if schedule.total < 1:
         raise ValueError("compiled pulse emits no camera trigger edge")
     point_counts = [0] * schedule.point_count
-    for edge in schedule.edges:
+    for edge in schedule.iter_edges():
         point_counts[edge.point_index] += 1
     per_point_counts = tuple(point_counts)
     if len(set(per_point_counts)) != 1:

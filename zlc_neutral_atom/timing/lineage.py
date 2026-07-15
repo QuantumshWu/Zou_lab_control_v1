@@ -8,9 +8,8 @@ from zlc_data import DatasetSchema
 from zlc_pulse import (
     CompiledPulseArtifact,
     DigitalTriggerSchedule,
-    digital_trigger_schedule_to_tree,
 )
-from zlc_storage import canonical_digest, canonical_text, exact_mapping
+from zlc_storage import canonical_text, exact_mapping
 
 from .capture_plan import (
     CaptureCellJoinContract,
@@ -64,9 +63,7 @@ class PulseCaptureBinding:
             raise ValueError("capture cell plan execution form differs from lineage")
         if self.cell_plan.trigger_channel != self.trigger_channel:
             raise ValueError("capture cell plan trigger channel differs from lineage")
-        if self.cell_plan.trigger_schedule_digest != canonical_digest(
-            digital_trigger_schedule_to_tree(schedule)
-        ):
+        if self.cell_plan.trigger_schedule_digest != schedule.fingerprint:
             raise ValueError("capture cell plan trigger schedule digest differs")
         object.__setattr__(self, "_trigger_schedule", schedule)
 
