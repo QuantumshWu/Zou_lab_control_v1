@@ -45,6 +45,14 @@ from zlc_neutral_atom.capture_application import (
     compile_bound_capture_plan,
     prepare_finite_capture,
 )
+from zlc_neutral_atom.pulse_application import (
+    PreparedPulseExecution,
+    PulseRunDescriptor,
+    PulseRunRequest,
+    PulseRunResult,
+    PulseTargetDescriptor,
+    prepare_pulse_execution,
+)
 from zlc_neutral_atom.readout.calibration import (
     BackgroundMode,
     BoxReducer,
@@ -70,7 +78,6 @@ from zlc_neutral_atom.runtime.run import RunHandle
 from zlc_pulse import (
     PulseDocument,
     PulseExecutionForm,
-    PulseTarget,
     bind_pulse_document_target,
     expand_autonomous_scan_repeats,
     require_autonomous_scan_resident_capacity,
@@ -328,30 +335,6 @@ class DetectionRequest:
         )
 
 
-@dataclass(frozen=True)
-class TimingTargetDescriptor:
-    target: PulseTarget
-    clock_hz: float
-    geometry_fingerprint: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.target, PulseTarget):
-            raise TypeError("target must be PulseTarget")
-        if not math.isfinite(float(self.clock_hz)) or float(self.clock_hz) <= 0:
-            raise ValueError("clock_hz must be finite and positive")
-        object.__setattr__(self, "clock_hz", float(self.clock_hz))
-        if (
-            isinstance(self.geometry_fingerprint, bool)
-            or not isinstance(self.geometry_fingerprint, int)
-            or not 0 <= self.geometry_fingerprint <= 0xFFFFFFFF
-        ):
-            raise ValueError("geometry_fingerprint must be an unsigned 32-bit integer")
-
-    @property
-    def time_step_ns(self) -> float:
-        return 1e9 / self.clock_hz
-
-
 @dataclass
 class _ExperimentServices:
     runtime: object
@@ -420,14 +403,14 @@ def _occupancy_repository(
     return repository
 
 
-class TimingFacade:
+class PulseFacade:
     __slots__ = ("_token",)
 
     def __init__(self, token: object) -> None:
         self._token = token
 
     @property
-    def target(self) -> TimingTargetDescriptor:
+    def target(self) -> PulseTargetDescriptor:
         with _service_guard(self._token) as services:
             role = _resolve_role(
                 services.catalog,
@@ -435,13 +418,56 @@ class TimingFacade:
                 "sequencer",
                 ("sequencer",),
             )
-            port = services.runtime.pulse_port(services.catalog.require(role).ref)
+            reference = services.catalog.require(role).ref
+            port = services.runtime.pulse_port(reference)
             capability = port.capability
-            return TimingTargetDescriptor(
+            return PulseTargetDescriptor(
+                reference,
                 capability.target,
                 capability.clock_hz,
                 capability.geometry_fingerprint,
+                capability.resident_scan_point_capacity,
             )
+
+    def request(
+        self,
+        document: PulseDocument,
+        execution_form: PulseExecutionForm = PulseExecutionForm.STATIC_ONCE,
+        *,
+        sequencer_role: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> PulseRunRequest:
+        with _service_guard(self._token) as services:
+            role = _resolve_role(
+                services.catalog,
+                sequencer_role,
+                "sequencer",
+                ("sequencer",),
+            )
+            reference = services.catalog.require(role).ref
+        timeout = (
+            None
+            if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR
+            else 30.0 if timeout_seconds is None else timeout_seconds
+        )
+        if (
+            execution_form is PulseExecutionForm.CONTINUOUS_MONITOR
+            and timeout_seconds is not None
+        ):
+            raise ValueError("continuous pulse execution does not accept a timeout")
+        return PulseRunRequest(document, execution_form, reference, timeout)
+
+    def inspect(self, request: PulseRunRequest) -> PulseRunDescriptor:
+        with _service_guard(self._token) as services:
+            return _prepare_pulse_for_services(services, request).descriptor
+
+    def start(self, request: PulseRunRequest) -> RunHandle:
+        return _start_pulse(self._token, request)
+
+    def run(self, request: PulseRunRequest) -> PulseRunResult:
+        if request.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
+            raise ValueError("continuous pulse execution must be started and cancelled")
+        return _run_pulse(self._token, request)
 
 
 class ReadoutFacade:
@@ -915,7 +941,7 @@ class ReadoutFacade:
 class Experiment:
     """Public notebook root containing values, requests, and narrow facades only."""
 
-    __slots__ = ("_authority_token", "name", "device_catalog", "readout", "timing")
+    __slots__ = ("_authority_token", "name", "device_catalog", "pulse", "readout")
 
     def __init__(
         self,
@@ -930,7 +956,7 @@ class Experiment:
             raise TypeError("device_catalog must be DeviceCatalogView")
         self.device_catalog = device_catalog
         self.readout = ReadoutFacade(authority_token)
-        self.timing = TimingFacade(authority_token)
+        self.pulse = PulseFacade(authority_token)
 
     def start(self, request: CaptureRequest) -> RunHandle:
         return _start(self._authority_token, request)
@@ -1104,6 +1130,44 @@ def _prepare_capture_for_workbench(
         raise TypeError("experiment must be Experiment")
     with _service_guard(experiment._authority_token) as services:
         return _prepare_capture_for_services(services, request)
+
+
+def _prepare_pulse_for_services(
+    services: _ExperimentServices,
+    request: PulseRunRequest,
+) -> PreparedPulseExecution:
+    return prepare_pulse_execution(
+        request,
+        pulse_port=services.runtime.pulse_port(request.sequencer_ref),
+        start_run=services.runtime.start,
+    )
+
+
+def _prepare_pulse_for_workbench(
+    experiment: Experiment,
+    request: PulseRunRequest,
+) -> PreparedPulseExecution:
+    """Private friend seam; Workbench receives no notebook authority or raw Port."""
+
+    if not isinstance(experiment, Experiment):
+        raise TypeError("experiment must be Experiment")
+    with _service_guard(experiment._authority_token) as services:
+        return _prepare_pulse_for_services(services, request)
+
+
+def _start_pulse(token: object, request: PulseRunRequest) -> RunHandle:
+    with _service_guard(token) as services:
+        return _prepare_pulse_for_services(services, request).start()
+
+
+def _run_pulse(token: object, request: PulseRunRequest) -> PulseRunResult:
+    with _service_guard(token) as services:
+        handle = _prepare_pulse_for_services(services, request).start()
+        runtime = services.runtime
+    result = runtime.wait(handle)
+    if not isinstance(result, PulseRunResult):
+        raise TypeError("pulse Run returned an unexpected result")
+    return result
 
 
 def _start(token: object, request: CaptureRequest) -> RunHandle:
@@ -1436,6 +1500,12 @@ __all__ = [
     "MaterializedScanData",
     "OccupancyArtifactRef",
     "PlanDescriptor",
+    "PreparedPulseExecution",
+    "PulseFacade",
+    "PulseRunDescriptor",
+    "PulseRunRequest",
+    "PulseRunResult",
+    "PulseTargetDescriptor",
     "ReadoutFacade",
     "ReadoutModelKind",
     "ScanArtifactRef",
@@ -1446,6 +1516,4 @@ __all__ = [
     "ScanRequest",
     "SitemapCalibrationFailed",
     "SitemapCalibrationInterrupted",
-    "TimingFacade",
-    "TimingTargetDescriptor",
 ]

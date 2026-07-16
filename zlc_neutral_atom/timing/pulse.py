@@ -1,4 +1,4 @@
-"""Finite pulse execution as a generation-bound neutral-atom device Port."""
+"""Pulse execution as a generation-bound neutral-atom device Port."""
 
 from __future__ import annotations
 
@@ -54,16 +54,9 @@ class FinitePulseExecutionRequest:
     artifact: CompiledPulseArtifact
 
     def __post_init__(self) -> None:
-        if not isinstance(self.document, PulseDocument):
-            raise TypeError("document must be PulseDocument")
-        if not isinstance(self.artifact, CompiledPulseArtifact):
-            raise TypeError("artifact must be CompiledPulseArtifact")
+        _validate_execution_request(self.document, self.artifact)
         if self.artifact.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
             raise ValueError("finite pulse execution cannot use a continuous artifact")
-        if self.artifact.source_document_digest != self.document.fingerprint:
-            raise ValueError("compiled artifact belongs to another PulseDocument")
-        if self.artifact.target_abi_fingerprint != self.document.target.abi_fingerprint:
-            raise ValueError("compiled artifact target differs from PulseDocument")
         repeat = self.document.repeat
         expected_loop_count = 1 if repeat is None else repeat.count
         expected_full_point_loop = repeat is None or (
@@ -78,14 +71,49 @@ class FinitePulseExecutionRequest:
             raise ValueError(
                 "compiled trigger execution groups differ from PulseDocument"
             )
-        validate_target_ir_for_target(
-            self.artifact.target_ir,
-            self.document.target,
-        )
 
     @property
     def artifact_digest(self) -> str:
         return self.artifact.fingerprint
+
+
+@dataclass(frozen=True)
+class ContinuousPulseExecutionRequest:
+    """One cyclic pulse that remains active until its Run is cancelled."""
+
+    document: PulseDocument
+    artifact: CompiledPulseArtifact
+
+    def __post_init__(self) -> None:
+        _validate_execution_request(self.document, self.artifact)
+        if self.artifact.execution_form is not PulseExecutionForm.CONTINUOUS_MONITOR:
+            raise ValueError(
+                "continuous pulse execution requires a CONTINUOUS_MONITOR artifact"
+            )
+
+    @property
+    def artifact_digest(self) -> str:
+        return self.artifact.fingerprint
+
+
+PulseExecutionRequest = FinitePulseExecutionRequest | ContinuousPulseExecutionRequest
+
+
+def _validate_execution_request(
+    document: PulseDocument,
+    artifact: CompiledPulseArtifact,
+) -> None:
+    """Own the document/artifact binding invariant for both execution forms."""
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    if not isinstance(artifact, CompiledPulseArtifact):
+        raise TypeError("artifact must be CompiledPulseArtifact")
+    if artifact.source_document_digest != document.fingerprint:
+        raise ValueError("compiled artifact belongs to another PulseDocument")
+    if artifact.target_abi_fingerprint != document.target.abi_fingerprint:
+        raise ValueError("compiled artifact target differs from PulseDocument")
+    validate_target_ir_for_target(artifact.target_ir, document.target)
 
 
 class PulseTerminalEvidenceKind(str, Enum):
@@ -148,15 +176,18 @@ class SequencerCapabilitySnapshot:
 class PreparePulseCommand:
     session_id: str
     run_id: str
-    request: FinitePulseExecutionRequest
+    request: PulseExecutionRequest
     capability_fingerprint: str
     timeout_seconds: float
 
     def __post_init__(self) -> None:
         _text(self.session_id, "session_id")
         _text(self.run_id, "run_id")
-        if not isinstance(self.request, FinitePulseExecutionRequest):
-            raise TypeError("request must be FinitePulseExecutionRequest")
+        if not isinstance(
+            self.request,
+            (FinitePulseExecutionRequest, ContinuousPulseExecutionRequest),
+        ):
+            raise TypeError("request must be a pulse execution request")
         _sha256(self.capability_fingerprint, "capability_fingerprint")
         object.__setattr__(
             self,
@@ -477,7 +508,12 @@ class BoundPulsePort:
         )
         return tuple(SafetyInterrupt(self.device.key, operation) for operation in preferred)
 
-    def open_session(self, request: FinitePulseExecutionRequest) -> "PulseSession":
+    def open_session(self, request: PulseExecutionRequest) -> "PulseSession":
+        if not isinstance(
+            request,
+            (FinitePulseExecutionRequest, ContinuousPulseExecutionRequest),
+        ):
+            raise TypeError("request must be a pulse execution request")
         if request.artifact.target_abi_fingerprint != self.capability.target_abi_fingerprint:
             raise ValueError("pulse request target differs from live sequencer")
         if request.artifact.wire_image.geometry_fingerprint != self.capability.geometry_fingerprint:
@@ -520,9 +556,9 @@ class _PulseSessionState(str, Enum):
 
 
 class PulseSession:
-    """Single-thread owner of one finite prepared pulse and terminal receipt."""
+    """Single-thread owner of one prepared pulse until finite completion or SAFE."""
 
-    def __init__(self, port: BoundPulsePort, request: FinitePulseExecutionRequest) -> None:
+    def __init__(self, port: BoundPulsePort, request: PulseExecutionRequest) -> None:
         self._port = port
         self._request = request
         self._session_id = uuid.uuid4().hex
@@ -595,6 +631,10 @@ class PulseSession:
 
     def complete(self, context: RunContext) -> PulseTerminalAck:
         self._assert_owner_thread()
+        if isinstance(self._request, ContinuousPulseExecutionRequest):
+            raise RuntimeError(
+                "continuous pulse execution has no finite completion; cancel its Run"
+            )
         if self._state is not _PulseSessionState.FIRED:
             raise RuntimeError("pulse session must be fired before completion")
         try:
@@ -654,6 +694,7 @@ class PulseSession:
 __all__ = [
     "BoundPulsePort",
     "CompletePulseCommand",
+    "ContinuousPulseExecutionRequest",
     "FinitePulseExecutionRequest",
     "FirePulseCommand",
     "PreparePulseCommand",

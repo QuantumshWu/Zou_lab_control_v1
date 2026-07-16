@@ -55,6 +55,12 @@ class CancellationToken:
         if self._state.event.is_set():
             raise CancellationRequested(self.reason)
 
+    def wait_requested(self) -> None:
+        """Block without polling, then raise the owner's cancellation signal."""
+
+        self._state.event.wait()
+        self.checkpoint()
+
 
 class _CancellationSource:
     """Private write authority owned by a RunHandle or worker."""

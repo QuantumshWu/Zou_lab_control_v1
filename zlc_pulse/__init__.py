@@ -33,10 +33,15 @@ from .authoring import (
     insert_period,
     inspect_remove_period,
     move_period,
+    new_pulse_document,
     new_period,
+    replace_field_binding,
     remove_period,
     replace_pulse_field,
     resolve_api_parameters,
+    set_analog_action,
+    set_digital_output,
+    set_output_delay,
 )
 from .client import PulseServerSnapshot, RemotePulseExecutionClient, pulse_server_snapshot_from_tree
 from .ir import (
@@ -169,6 +174,13 @@ from .target import (
     pulse_target_to_tree,
     save_pulse_target,
 )
+from .timeline import (
+    PulseTimelineAnnotation,
+    PulseTimelineDocument,
+    PulseTimelineRow,
+    PulseTimelineSegment,
+    build_pulse_timeline,
+)
 
 __all__ = [
     "COMPILED_PULSE_ARTIFACT_SCHEMA",
@@ -235,6 +247,10 @@ __all__ = [
     "ScanRecipeProvenance",
     "StaticOnceTerminalEvidence",
     "PulseTarget",
+    "PulseTimelineAnnotation",
+    "PulseTimelineDocument",
+    "PulseTimelineRow",
+    "PulseTimelineSegment",
     "TARGET_IR_SCHEMA",
     "TargetBusDelay",
     "TargetBusSegment",
@@ -243,6 +259,7 @@ __all__ = [
     "admit_compiled_pulse_payload_size",
     "build_digital_trigger_schedules",
     "build_pulse_playback",
+    "build_pulse_timeline",
     "build_physical_waveform_index",
     "estimate_physical_waveform_index_peak_bytes",
     "estimate_physical_window_projection_peak_bytes",
@@ -281,6 +298,7 @@ __all__ = [
     "pulse_document_to_tree",
     "pack_target_ir",
     "move_period",
+    "new_pulse_document",
     "new_period",
     "prepared_pulse_ref_from_tree",
     "prepared_pulse_ref_to_tree",
@@ -296,8 +314,12 @@ __all__ = [
     "pulse_completion_to_tree",
     "pulse_server_snapshot_from_tree",
     "remove_period",
+    "replace_field_binding",
     "replace_pulse_field",
     "resolve_api_parameters",
+    "set_analog_action",
+    "set_digital_output",
+    "set_output_delay",
     "require_approved_target_abi",
     "expand_autonomous_scan_repeats",
     "resident_scan_point_capacity",

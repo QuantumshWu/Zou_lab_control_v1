@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from numbers import Real
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, TypeVar
 from uuid import uuid4
 
 from .document import (
@@ -29,6 +29,7 @@ from .document import (
     _number,
     _time_tick_ratio,
 )
+from .target import PORT_DAC, PORT_DIGITAL, PulseTarget
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,340 @@ class DestructivePulseEditError(ValueError):
     def __init__(self, impact: PulseEditImpact) -> None:
         self.impact = impact
         super().__init__("pulse edit has cascading authoritative effects; pass cascade=True")
+
+
+def new_pulse_document(
+    target: PulseTarget,
+    *,
+    time_step_ns: int | float,
+    name: str = "Untitled pulse",
+    duration: int | float = 1000,
+    unit: str = "ns",
+) -> PulseDocument:
+    """Create the one-period, all-safe document used by a new editor session."""
+
+    if not isinstance(target, PulseTarget):
+        raise TypeError("target must be PulseTarget")
+    return PulseDocument(
+        name=name,
+        target=target,
+        time_step_ns=time_step_ns,
+        periods=(
+            PulsePeriod(
+                period_id="p1",
+                duration=duration,
+                unit=unit,
+                name="",
+                states=tuple(0 for _ in target.raw_lanes),
+            ),
+        ),
+        visible_ports=tuple(
+            port.key for port in target.ports if port.kind in (PORT_DIGITAL, PORT_DAC)
+        ),
+    )
+
+
+def set_digital_output(
+    document: PulseDocument,
+    period_id: str,
+    port: str,
+    high: bool,
+) -> PulseDocument:
+    """Set one logical digital output without exposing the target lane layout."""
+
+    if not isinstance(high, bool):
+        raise TypeError("high must be bool")
+    target_port = document.target.by_key.get(port)
+    if target_port is None or target_port.kind != PORT_DIGITAL:
+        raise ValueError(f"port {port!r} is not a digital output")
+    period = _period(document, period_id)
+    lane_index = document.target.raw_lanes.index(target_port.lanes[0])
+    states = list(period.states)
+    states[lane_index] = int(high)
+    if tuple(states) == period.states:
+        return document
+    periods = tuple(
+        replace(item, states=tuple(states)) if item.period_id == period_id else item
+        for item in document.periods
+    )
+    return replace(document, periods=periods)
+
+
+def set_analog_action(
+    document: PulseDocument,
+    period_id: str,
+    port: str,
+    action: AnalogStep | None,
+    *,
+    cascade: bool = False,
+) -> PulseEditResult:
+    """Add, replace, or remove one DAC action and its dependent binding atomically."""
+
+    target_port = document.target.by_key.get(port)
+    if target_port is None or target_port.kind != PORT_DAC:
+        raise ValueError(f"port {port!r} is not a DAC output")
+    period = _period(document, period_id)
+    current = next((item for item in period.analog_steps if item.port == port), None)
+    if action is not None:
+        if not isinstance(action, AnalogStep):
+            raise TypeError("action must be AnalogStep or None")
+        if action.port != port:
+            raise ValueError("action port differs from the selected DAC output")
+        steps = tuple(
+            action if item.port == port else item for item in period.analog_steps
+        )
+        if current is None:
+            steps = (*steps, action)
+        periods = tuple(
+            replace(item, analog_steps=steps) if item.period_id == period_id else item
+            for item in document.periods
+        )
+        return PulseEditResult(replace(document, periods=periods), PulseEditImpact())
+    if current is None:
+        return PulseEditResult(document, PulseEditImpact())
+
+    unbound = replace_field_binding(
+        document,
+        PulseFieldRef(FIELD_DAC, period_id, port),
+        None,
+        cascade=cascade,
+    )
+    periods = tuple(
+        replace(
+            item,
+            analog_steps=tuple(step for step in item.analog_steps if step.port != port),
+        )
+        if item.period_id == period_id
+        else item
+        for item in unbound.document.periods
+    )
+    return PulseEditResult(replace(unbound.document, periods=periods), unbound.impact)
+
+
+def set_output_delay(
+    document: PulseDocument,
+    port: str,
+    delay: OutputDelay | None,
+    *,
+    cascade: bool = False,
+) -> PulseEditResult:
+    """Add, replace, or remove one output delay and its dependent API binding."""
+
+    target_port = document.target.by_key.get(port)
+    if target_port is None or target_port.kind not in (PORT_DIGITAL, PORT_DAC):
+        raise ValueError(f"port {port!r} cannot have an output delay")
+    current = next((item for item in document.delays if item.port == port), None)
+    if delay is not None:
+        if not isinstance(delay, OutputDelay):
+            raise TypeError("delay must be OutputDelay or None")
+        if delay.port != port:
+            raise ValueError("delay port differs from the selected output")
+        delays = tuple(delay if item.port == port else item for item in document.delays)
+        if current is None:
+            delays = (*delays, delay)
+        return PulseEditResult(replace(document, delays=delays), PulseEditImpact())
+    if current is None:
+        return PulseEditResult(document, PulseEditImpact())
+
+    unbound = replace_field_binding(
+        document,
+        PulseFieldRef(FIELD_DELAY, None, port),
+        None,
+        cascade=cascade,
+    )
+    delays = tuple(item for item in unbound.document.delays if item.port != port)
+    return PulseEditResult(replace(unbound.document, delays=delays), unbound.impact)
+
+
+def replace_field_binding(
+    document: PulseDocument,
+    field: PulseFieldRef,
+    binding: ScanParameter | ApiParameter | None,
+    *,
+    cascade: bool = False,
+) -> PulseEditResult:
+    """Atomically switch one existing field between literal, scan, and API binding."""
+
+    if not isinstance(field, PulseFieldRef):
+        raise TypeError("field must be PulseFieldRef")
+    if binding is not None and not isinstance(binding, (ScanParameter, ApiParameter)):
+        raise TypeError("binding must be ScanParameter, ApiParameter, or None")
+    document.field_value(field)
+    if binding is not None and binding.field != field:
+        raise ValueError("binding field differs from the selected physical field")
+
+    old_scan = next(
+        (item for item in document.scan_parameters if item.field == field),
+        None,
+    )
+    old_api = next(
+        (item for item in document.api_parameters if item.field == field),
+        None,
+    )
+    if (
+        binding is None
+        and old_scan is None
+        and old_api is None
+    ) or (
+        isinstance(binding, ScanParameter) and binding == old_scan
+    ) or (
+        isinstance(binding, ApiParameter) and binding == old_api
+    ):
+        return PulseEditResult(document, PulseEditImpact())
+
+    scan_parameters = _replace_binding_member(
+        document.scan_parameters,
+        old_scan,
+        binding if isinstance(binding, ScanParameter) else None,
+    )
+    api_parameters = _replace_binding_member(
+        document.api_parameters,
+        old_api,
+        binding if isinstance(binding, ApiParameter) else None,
+    )
+    scan_table = _replace_scan_column(document, old_scan, binding)
+    scan_definition_changed = _scan_binding_identity(old_scan) != _scan_binding_identity(
+        binding if isinstance(binding, ScanParameter) else None
+    )
+    recipe_removed = document.scan_recipe is not None and scan_definition_changed
+    recipe = None if recipe_removed else document.scan_recipe
+
+    replacement_scan = binding if isinstance(binding, ScanParameter) else None
+    replacement_api = binding if isinstance(binding, ApiParameter) else None
+    impact = PulseEditImpact(
+        removed_scan_parameters=(
+            (old_scan.parameter_id,)
+            if old_scan is not None
+            and (
+                replacement_scan is None
+                or replacement_scan.parameter_id != old_scan.parameter_id
+            )
+            else ()
+        ),
+        removed_scan_columns=(
+            (old_scan.parameter_id,)
+            if old_scan is not None
+            and document.scan_table is not None
+            and (
+                replacement_scan is None
+                or replacement_scan.parameter_id != old_scan.parameter_id
+            )
+            else ()
+        ),
+        removed_api_parameters=(
+            (old_api.parameter_id,)
+            if old_api is not None
+            and (
+                replacement_api is None
+                or replacement_api.parameter_id != old_api.parameter_id
+            )
+            else ()
+        ),
+        scan_provenance_removed=recipe_removed,
+    )
+    if impact.destructive and not cascade:
+        raise DestructivePulseEditError(impact)
+    return PulseEditResult(
+        replace(
+            document,
+            scan_parameters=scan_parameters,
+            scan_table=scan_table,
+            scan_recipe=recipe,
+            api_parameters=api_parameters,
+        ),
+        impact,
+    )
+
+
+_Binding = TypeVar("_Binding", ScanParameter, ApiParameter)
+
+
+def _period(document: PulseDocument, period_id: str) -> PulsePeriod:
+    try:
+        return document.period_by_id[period_id]
+    except KeyError as exc:
+        raise KeyError(f"unknown period {period_id!r}") from exc
+
+
+def _replace_binding_member(
+    values: tuple[_Binding, ...],
+    old: _Binding | None,
+    new: _Binding | None,
+) -> tuple[_Binding, ...]:
+    if old is None:
+        return values if new is None else (*values, new)
+    return tuple(
+        new if item == old and new is not None else item
+        for item in values
+        if item != old or new is not None
+    )
+
+
+def _scan_binding_identity(
+    binding: ScanParameter | None,
+) -> tuple[str, PulseFieldRef, str] | None:
+    if binding is None:
+        return None
+    return binding.parameter_id, binding.field, binding.unit
+
+
+def _replace_scan_column(
+    document: PulseDocument,
+    old: ScanParameter | None,
+    binding: ScanParameter | ApiParameter | None,
+) -> FrozenScanTable | None:
+    table = document.scan_table
+    if table is None:
+        return None
+    new = binding if isinstance(binding, ScanParameter) else None
+    columns = list(table.columns)
+    rows = [list(row) for row in table.rows]
+    if old is not None:
+        index = columns.index(old.parameter_id)
+        if new is None:
+            columns.pop(index)
+            for row in rows:
+                row.pop(index)
+        else:
+            columns[index] = new.parameter_id
+            if old.unit != new.unit:
+                for row in rows:
+                    row[index] = _convert_binding_value(
+                        row[index],
+                        old.field.kind,
+                        old.unit,
+                        new.unit,
+                    )
+    elif new is not None:
+        nominal, nominal_unit = document.field_value(new.field)
+        value = _convert_binding_value(
+            nominal,
+            new.field.kind,
+            nominal_unit,
+            new.unit,
+        )
+        columns.append(new.parameter_id)
+        for row in rows:
+            row.append(value)
+    if not columns:
+        return None
+    return FrozenScanTable(tuple(columns), tuple(tuple(row) for row in rows))
+
+
+def _convert_binding_value(
+    value: int | float,
+    field_kind: str,
+    source_unit: str,
+    target_unit: str,
+) -> int | float:
+    if field_kind != FIELD_DURATION or source_unit == target_unit:
+        return value
+    converted = (
+        Fraction(str(value))
+        * Fraction(str(TIME_UNIT_TO_NS[source_unit]))
+        / Fraction(str(TIME_UNIT_TO_NS[target_unit]))
+    )
+    return converted.numerator if converted.denominator == 1 else float(converted)
 
 
 def freeze_scan_table(
@@ -285,7 +620,7 @@ def resolve_api_parameters(
     document: PulseDocument,
     values: Mapping[str, int | float],
 ) -> PulseDocument:
-    """Resolve named host-side API values into a new literal PulseDocument."""
+    """Resolve supplied host-side API values and remove their declarations."""
 
     if not isinstance(document, PulseDocument):
         raise TypeError("document must be PulseDocument")
@@ -302,7 +637,14 @@ def resolve_api_parameters(
                 requested[parameter.parameter_id],
                 unit=parameter.unit,
             )
-    return resolved
+    return replace(
+        resolved,
+        api_parameters=tuple(
+            parameter
+            for parameter in resolved.api_parameters
+            if parameter.parameter_id not in requested
+        ),
+    )
 
 
 def _map_field_ref_ports(
@@ -635,8 +977,13 @@ __all__ = [
     "insert_period",
     "inspect_remove_period",
     "move_period",
+    "new_pulse_document",
     "new_period",
+    "replace_field_binding",
     "remove_period",
     "replace_pulse_field",
     "resolve_api_parameters",
+    "set_analog_action",
+    "set_digital_output",
+    "set_output_delay",
 ]

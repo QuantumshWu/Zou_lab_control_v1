@@ -379,9 +379,13 @@ class PulseDocument:
 
         visible = tuple(_text(key, "visible port") for key in self.visible_ports)
         if len(set(visible)) != len(visible) or any(
-            key not in self.target.by_key for key in visible
+            key not in self.target.by_key
+            or self.target.by_key[key].kind not in (PORT_DIGITAL, PORT_DAC)
+            for key in visible
         ):
-            raise ValueError("visible_ports must be unique keys in the PulseTarget")
+            raise ValueError(
+                "visible_ports must be unique digital/DAC keys in the PulseTarget"
+            )
         object.__setattr__(self, "visible_ports", visible)
 
         delays = tuple(self.delays)

@@ -19,6 +19,12 @@ from .facade import (
     MaterializedScanData,
     OccupancyArtifactRef,
     PlanDescriptor,
+    PreparedPulseExecution,
+    PulseFacade,
+    PulseRunDescriptor,
+    PulseRunRequest,
+    PulseRunResult,
+    PulseTargetDescriptor,
     ReadoutFacade,
     ReadoutModelKind,
     ScanArtifactRef,
@@ -29,8 +35,6 @@ from .facade import (
     ScanRequest,
     SitemapCalibrationFailed,
     SitemapCalibrationInterrupted,
-    TimingFacade,
-    TimingTargetDescriptor,
 )
 
 __all__ = [
@@ -52,6 +56,12 @@ __all__ = [
     "MaterializedScanData",
     "OccupancyArtifactRef",
     "PlanDescriptor",
+    "PreparedPulseExecution",
+    "PulseFacade",
+    "PulseRunDescriptor",
+    "PulseRunRequest",
+    "PulseRunResult",
+    "PulseTargetDescriptor",
     "ReadoutFacade",
     "ReadoutModelKind",
     "ScanArtifactRef",
@@ -62,6 +72,4 @@ __all__ = [
     "ScanRequest",
     "SitemapCalibrationFailed",
     "SitemapCalibrationInterrupted",
-    "TimingFacade",
-    "TimingTargetDescriptor",
 ]
