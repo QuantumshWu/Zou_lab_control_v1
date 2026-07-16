@@ -538,6 +538,12 @@ def _select_cell_axis(state: _State, position: int, term) -> _State:
     if state.values is None:
         values = None
         validity = None
+    elif drop and axis.size == 1:
+        # Removing a singleton logical cell axis changes only the schema.  Every
+        # physical row survives in the same order, so boolean indexing would be
+        # a full-array copy with no data-semantic effect.
+        values = state.values
+        validity = state.validity
     else:
         logical_indices = state.schema.cell_layout.axis_indices(position)
         if isinstance(indices, range):

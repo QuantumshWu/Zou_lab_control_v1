@@ -24,6 +24,7 @@ from zlc_storage import (
     positive_integer,
     sha256_digest,
 )
+from zlc_data import OwnedSnapshot
 
 from zlc_neutral_atom.acquisition import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
@@ -342,6 +343,22 @@ class AdmittedCapture:
             self._repository_token is other._repository_token
             and self._reference == other._reference
             and self._commit_id == other._commit_id
+        )
+
+    def materialize_snapshot(
+        self,
+        *,
+        memory_limit_bytes: int,
+    ) -> OwnedSnapshot:
+        """Materialize this admitted raw capture with its exact dataset identity."""
+
+        self._require_authority()
+        block = self._artifact.frame_source.materialize(
+            memory_limit_bytes=memory_limit_bytes,
+        )
+        return OwnedSnapshot(
+            block.ref(self._artifact.provenance.generation),
+            block,
         )
 
 

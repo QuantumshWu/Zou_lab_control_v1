@@ -99,21 +99,40 @@ class CaptureCellJoinContract:
             axis.size for axis in scan_axes
         ):
             raise ValueError("capture join scan layout differs from DatasetSchema")
-        if self.scan_point_layout.storage_size != schedule.point_count:
-            raise ValueError("capture join scan layout differs from pulse points")
         repeat_count = schema.repeat_axis.size
         event_count = event_axis.size
-        if (
-            len(self.within_point_grouping) != repeat_count * event_count
-            or any(
-                repeat >= repeat_count or event >= event_count
-                for repeat, event in self.within_point_grouping
-            )
-        ):
-            raise ValueError("capture join grouping is not a complete R by E domain")
-        if schema.point_layout.storage_size != schedule.point_count * event_count:
+        scan_count = self.scan_point_layout.storage_size
+        if schema.point_layout.storage_size != scan_count * event_count:
             raise ValueError("capture join DatasetSchema storage differs from P * E")
-        expected_total = schedule.point_count * len(self.within_point_grouping)
+        repeat_major_points = (
+            schedule.loop_count == 1
+            and schedule.full_point_loop
+            and schedule.point_count == repeat_count * scan_count
+        )
+        if repeat_major_points:
+            if (
+                len(self.within_point_grouping) != event_count
+                or any(
+                    repeat != 0 or event >= event_count
+                    for repeat, event in self.within_point_grouping
+                )
+            ):
+                raise ValueError(
+                    "expanded scan grouping is not a complete event domain"
+                )
+            expected_total = repeat_count * scan_count * event_count
+        else:
+            if scan_count != schedule.point_count:
+                raise ValueError("capture join scan layout differs from pulse points")
+            if (
+                len(self.within_point_grouping) != repeat_count * event_count
+                or any(
+                    repeat >= repeat_count or event >= event_count
+                    for repeat, event in self.within_point_grouping
+                )
+            ):
+                raise ValueError("capture join grouping is not a complete R by E domain")
+            expected_total = schedule.point_count * len(self.within_point_grouping)
         if schedule.total != expected_total:
             raise ValueError("capture join cardinality differs from pulse and dataset")
 
@@ -122,14 +141,22 @@ class CaptureCellJoinContract:
         }
         for edge in schedule.iter_edges():
             try:
-                repeat_index, event_index = self.within_point_grouping[
+                grouped_repeat, event_index = self.within_point_grouping[
                     edge.point_trigger_ordinal
                 ]
             except IndexError as exc:
                 raise ValueError(
                     "capture join grouping differs from pulse point ordinals"
                 ) from exc
-            scan_multi = self.scan_point_layout.multi_index(edge.point_index)
+            if repeat_major_points:
+                repeat_index, scan_storage_index = divmod(
+                    edge.point_index,
+                    scan_count,
+                )
+            else:
+                repeat_index = grouped_repeat
+                scan_storage_index = edge.point_index
+            scan_multi = self.scan_point_layout.multi_index(scan_storage_index)
             full_multi = tuple(
                 event_index
                 if position == event_position
@@ -249,7 +276,15 @@ def compile_capture_cell_plan(
         raise ValueError("readout event axis must have role 'readout-event'")
     repeat_count = dataset_schema.repeat_axis.size
     event_count = event_axis.size
-    if within_point_grouping is None:
+    repeat_major_points = (
+        schedule.loop_count == 1
+        and schedule.full_point_loop
+        and schedule.point_count
+        == repeat_count * scan_point_layout.storage_size
+    )
+    if repeat_major_points and within_point_grouping is None:
+        grouping = _repeat_major_capture_grouping(1, event_count)
+    elif within_point_grouping is None:
         if repeat_count > 1 and event_count > 1:
             raise ValueError(
                 "within_point_grouping is required when repeat and readout-event "
@@ -259,7 +294,10 @@ def compile_capture_cell_plan(
     else:
         grouping = within_point_grouping
 
-    join_contract = CaptureCellJoinContract(scan_point_layout, grouping)
+    join_contract = CaptureCellJoinContract(
+        scan_point_layout,
+        grouping,
+    )
     cell_schedule = DatasetCellSchedule.from_cells(
         dataset_schema,
         join_contract.iter_cell_schedule(schedule, dataset_schema),

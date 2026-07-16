@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from fpga.pulse_streamer.host.image import StreamerParams
 
 from .artifact import CompiledPulseArtifact
+from .document import FrozenScanTable, PulseDocument
 from .fpga import pack_target_ir
+from .ir import MAX_MATERIALIZED_SCAN_POINTS
 from .target import (
     DAC_OFFSET_BINARY,
     PORT_CLOCK,
@@ -22,6 +26,76 @@ from .validation import validate_target_ir_for_target
 APPROVED_DEPLOYED_TARGET_ABI = (
     "d9ce9aea5da7380f0670ee89c5f936f5f32edfc00c98939b4dd06af32a8563c9"
 )
+
+
+def _autonomous_scan_repeat_domain(
+    document: PulseDocument,
+) -> tuple[FrozenScanTable, int, int]:
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    table = document.scan_table
+    if table is None:
+        raise ValueError("autonomous scan requires a frozen scan table")
+    repeat = document.repeat
+    if repeat is not None and (
+        repeat.start_period_id != document.periods[0].period_id
+        or repeat.end_period_id != document.periods[-1].period_id
+    ):
+        raise ValueError(
+            "formal scan repeat axis requires a whole-document RepeatRegion"
+        )
+    repeat_count = 1 if repeat is None else repeat.count
+    return table, repeat_count, repeat_count * len(table.rows)
+
+
+def require_autonomous_scan_resident_capacity(
+    document: PulseDocument,
+    resident_scan_point_capacity: int,
+) -> None:
+    """Check logical R*P against the bound sequencer before row expansion."""
+
+    if (
+        isinstance(resident_scan_point_capacity, bool)
+        or not isinstance(resident_scan_point_capacity, int)
+        or resident_scan_point_capacity < 1
+    ):
+        raise ValueError("resident_scan_point_capacity must be a positive integer")
+    _, _, total_points = _autonomous_scan_repeat_domain(document)
+    if total_points > resident_scan_point_capacity:
+        raise ValueError(
+            "formal autonomous scan exceeds the bound sequencer's fully resident "
+            f"capacity: {total_points} points > "
+            f"{resident_scan_point_capacity}"
+        )
+
+
+def expand_autonomous_scan_repeats(document: PulseDocument) -> PulseDocument:
+    """Freeze a whole-document logical repeat into a repeat-major scan table.
+
+    A partial-period RepeatRegion cannot represent a dataset repeat axis: its
+    triggers need not occur once per loop.  Exact scan therefore removes the
+    hardware loop and duplicates the frozen SCAN_SLOT rows in ``repeat, point``
+    order.  Deployment capacity is checked separately against the bound port.
+    """
+
+    table, repeat_count, total_points = _autonomous_scan_repeat_domain(document)
+    if total_points > MAX_MATERIALIZED_SCAN_POINTS:
+        raise ValueError(
+            "repeat-major scan expansion exceeds the pulse owner's materialization "
+            f"limit: {total_points} points > {MAX_MATERIALIZED_SCAN_POINTS}"
+        )
+    repeat = document.repeat
+    if repeat is None:
+        return document
+    return replace(
+        document,
+        scan_table=FrozenScanTable(
+            table.columns,
+            tuple(row for _repeat in range(repeat_count) for row in table.rows),
+        ),
+        scan_recipe=None,
+        repeat=None,
+    )
 
 
 def require_approved_target_abi(target_abi_fingerprint: str) -> None:
@@ -123,8 +197,10 @@ def validate_resident_scan_capacity(
 ) -> None:
     """Reject scans whose timing would depend on unqualified host refill."""
 
+    if not isinstance(params, StreamerParams):
+        raise TypeError("params must be StreamerParams")
     total_points = len(artifact.target_ir.scan_points)
-    resident_capacity = 2 * params.bank_size
+    resident_capacity = resident_scan_point_capacity(params)
     if total_points > resident_capacity:
         raise ValueError(
             "formal autonomous scan exceeds the frozen bitstream's fully resident "
@@ -132,8 +208,19 @@ def validate_resident_scan_capacity(
         )
 
 
+def resident_scan_point_capacity(params: StreamerParams) -> int:
+    """Return the frozen streamer's two-bank resident scan capacity."""
+
+    if not isinstance(params, StreamerParams):
+        raise TypeError("params must be StreamerParams")
+    return 2 * params.bank_size
+
+
 __all__ = [
     "APPROVED_DEPLOYED_TARGET_ABI",
+    "expand_autonomous_scan_repeats",
+    "resident_scan_point_capacity",
+    "require_autonomous_scan_resident_capacity",
     "require_approved_target_abi",
     "validate_artifact_for_deployment",
     "validate_deployed_target",

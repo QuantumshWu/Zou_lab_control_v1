@@ -24,7 +24,10 @@ from .artifact import (
     encode_compiled_pulse_artifact,
 )
 from .fpga import pack_target_ir
-from .deployment import validate_resident_scan_capacity
+from .deployment import (
+    resident_scan_point_capacity,
+    validate_resident_scan_capacity,
+)
 from .evidence import (
     AutonomousTableTerminalEvidence,
     PostTerminalTailEvidence,
@@ -190,6 +193,9 @@ class PulseExecutionService:
             "target": pulse_target_to_tree(self._target),
             "clock_hz": self._clock_hz,
             "geometry_fingerprint": self._geometry_fingerprint,
+            "resident_scan_point_capacity": resident_scan_point_capacity(
+                self._params
+            ),
             "state": self._state,
             "prepared_ref": (
                 None if prepared is None else prepared_pulse_ref_to_tree(prepared)

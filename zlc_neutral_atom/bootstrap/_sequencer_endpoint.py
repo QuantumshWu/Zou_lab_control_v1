@@ -32,6 +32,8 @@ from zlc_pulse import (
     PreparedPulseRef,
     RemotePulseExecutionClient,
     build_pulse_playback,
+    resident_scan_point_capacity,
+    validate_resident_scan_capacity,
 )
 from zlc_storage import (
     canonical_digest,
@@ -432,6 +434,9 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
                 "target_abi_fingerprint": self._target.abi_fingerprint,
                 "clock_hz": float(self._sequencer.clock_hz),
                 "geometry_fingerprint": self._geometry,
+                "resident_scan_point_capacity": resident_scan_point_capacity(
+                    self._params
+                ),
                 "max_blocking_call_seconds": self._timeout,
                 "terminal_evidence_kind": PulseTerminalEvidenceKind.SIMULATED.value,
             }
@@ -441,6 +446,9 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
             target=self._target,
             clock_hz=float(self._sequencer.clock_hz),
             geometry_fingerprint=self._geometry,
+            resident_scan_point_capacity=resident_scan_point_capacity(
+                self._params
+            ),
             max_blocking_call_seconds=self._timeout,
             terminal_evidence_kind=PulseTerminalEvidenceKind.SIMULATED,
             server_connection_generation=None,
@@ -455,6 +463,7 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
             raise ValueError("compiled pulse clock differs from live sequencer")
         if artifact.wire_image.geometry_fingerprint != self._geometry:
             raise ValueError("compiled wire geometry differs from live sequencer")
+        validate_resident_scan_capacity(artifact, self._params)
 
     def _backend_prepare(self, session: _EndpointSession) -> None:
         artifact = session.request.artifact
@@ -577,6 +586,7 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
         self._target = snapshot.target
         self._clock_hz = snapshot.clock_hz
         self._geometry = snapshot.geometry_fingerprint
+        self._resident_scan_point_capacity = snapshot.resident_scan_point_capacity
         self._server_connection_generation = snapshot.connection_generation
         self._owner = _SequencerSessionOwner(
             self,
@@ -603,6 +613,7 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
                 "target_abi_fingerprint": self._target.abi_fingerprint,
                 "clock_hz": self._clock_hz,
                 "geometry_fingerprint": self._geometry,
+                "resident_scan_point_capacity": self._resident_scan_point_capacity,
                 "max_blocking_call_seconds": self._timeout,
                 "terminal_evidence_kind": (
                     PulseTerminalEvidenceKind.HARDWARE_RAW_REGISTERS.value
@@ -614,6 +625,7 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
             target=self._target,
             clock_hz=self._clock_hz,
             geometry_fingerprint=self._geometry,
+            resident_scan_point_capacity=self._resident_scan_point_capacity,
             max_blocking_call_seconds=self._timeout,
             terminal_evidence_kind=(
                 PulseTerminalEvidenceKind.HARDWARE_RAW_REGISTERS
@@ -709,6 +721,8 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
             snapshot.target != self._target
             or snapshot.clock_hz != self._clock_hz
             or snapshot.geometry_fingerprint != self._geometry
+            or snapshot.resident_scan_point_capacity
+            != self._resident_scan_point_capacity
         ):
             raise RuntimeError(
                 "remote pulse server capability changed within one connection"

@@ -71,36 +71,30 @@ def _canonical_grouping(
 
 @dataclass(frozen=True, slots=True)
 class TriggeredCameraLayout:
-    """Named sampling intent; the compiled schedule supplies scan cardinality."""
+    """Named sampling intent; the compiled schedule supplies scan cardinality.
 
-    repeat_axis_id: AxisId
-    scan_axis_id: AxisId
+    Ordinary captures may leave ``scan_axes`` absent and receive one explicit
+    ordinal axis.  A scan authority instead supplies its physical axes and
+    sparse/rectangular row mapping together; this binding never infers those
+    semantics from the numeric table shape.
+    """
+
+    repeat_axis: AxisSpec
     readout_event_axis_id: AxisId
-    repeat_count: int = 1
+    ordinal_scan_axis_id: AxisId | None = None
     readout_events_per_repeat: int | None = None
     within_point_grouping: tuple[tuple[int, int], ...] | None = None
+    scan_axes: tuple[AxisSpec, ...] | None = None
+    scan_point_layout: PointLayout | None = None
 
     def __post_init__(self) -> None:
-        for field in (
-            "repeat_axis_id",
-            "scan_axis_id",
-            "readout_event_axis_id",
+        if (
+            not isinstance(self.repeat_axis, AxisSpec)
+            or self.repeat_axis.role != REPEAT
         ):
-            if not isinstance(getattr(self, field), AxisId):
-                raise TypeError(f"{field} must be AxisId")
-        if len(
-            {
-                self.repeat_axis_id,
-                self.scan_axis_id,
-                self.readout_event_axis_id,
-            }
-        ) != 3:
-            raise ValueError("triggered-camera sampling AxisIds must be distinct")
-        object.__setattr__(
-            self,
-            "repeat_count",
-            _positive_int(self.repeat_count, "repeat_count"),
-        )
+            raise ValueError("repeat_axis must be an AxisSpec with repeat role")
+        if not isinstance(self.readout_event_axis_id, AxisId):
+            raise TypeError("readout_event_axis_id must be AxisId")
         if self.readout_events_per_repeat is not None:
             object.__setattr__(
                 self,
@@ -115,6 +109,48 @@ class TriggeredCameraLayout:
             "within_point_grouping",
             _canonical_grouping(self.within_point_grouping),
         )
+        if self.scan_axes is None:
+            if self.scan_point_layout is not None:
+                raise ValueError("scan_point_layout requires declared scan_axes")
+            if not isinstance(self.ordinal_scan_axis_id, AxisId):
+                raise TypeError(
+                    "ordinary capture requires one ordinal_scan_axis_id"
+                )
+            axis_ids = {
+                self.repeat_axis.axis_id,
+                self.ordinal_scan_axis_id,
+                self.readout_event_axis_id,
+            }
+            if len(axis_ids) != 3:
+                raise ValueError("triggered-camera sampling AxisIds must be distinct")
+        else:
+            if self.ordinal_scan_axis_id is not None:
+                raise ValueError(
+                    "physical scan_axes replace the ordinal scan axis identity"
+                )
+            axes = tuple(self.scan_axes)
+            if not axes or any(
+                not isinstance(axis, AxisSpec) or axis.role != SCAN_POINT
+                for axis in axes
+            ):
+                raise ValueError("scan_axes must contain SCAN_POINT AxisSpec values")
+            if len({axis.axis_id for axis in axes}) != len(axes):
+                raise ValueError("scan_axes must have unique AxisIds")
+            if len(
+                {
+                    self.repeat_axis.axis_id,
+                    self.readout_event_axis_id,
+                    *(axis.axis_id for axis in axes),
+                }
+            ) != len(axes) + 2:
+                raise ValueError("triggered-camera sampling AxisIds must be distinct")
+            if not isinstance(self.scan_point_layout, PointLayout):
+                raise TypeError("declared scan_axes require a PointLayout")
+            if self.scan_point_layout.logical_shape != tuple(
+                axis.size for axis in axes
+            ):
+                raise ValueError("scan PointLayout shape differs from scan_axes")
+            object.__setattr__(self, "scan_axes", axes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,31 +245,71 @@ def bind_triggered_camera_acquisition(
     if len(set(per_point_counts)) != 1:
         raise ValueError("camera trigger count must be uniform across scan points")
     per_point = per_point_counts[0]
+    repeat_major_points = (
+        execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_ONCE
+        and layout.scan_axes is not None
+    )
     events_per_repeat = layout.readout_events_per_repeat
     if events_per_repeat is None:
-        if layout.repeat_count != 1:
+        if not repeat_major_points and layout.repeat_axis.size != 1:
             raise ValueError(
                 "readout_events_per_repeat is required when repeat_count exceeds one"
             )
         events_per_repeat = per_point
-    if layout.repeat_count * events_per_repeat != per_point:
+    expected_per_point = (
+        events_per_repeat
+        if repeat_major_points
+        else layout.repeat_axis.size * events_per_repeat
+    )
+    if expected_per_point != per_point:
         raise ValueError(
             "declared repeat/event layout differs from per-point trigger count"
         )
 
-    repeat_axis = _axis(layout.repeat_axis_id, REPEAT, layout.repeat_count)
-    scan_axes = (
-        (_axis(layout.scan_axis_id, SCAN_POINT, schedule.point_count),)
-        if schedule.point_count > 1
-        else ()
-    )
+    repeat_axis = layout.repeat_axis
+    if layout.scan_axes is None:
+        assert layout.ordinal_scan_axis_id is not None
+        scan_axes = (
+            (_axis(layout.ordinal_scan_axis_id, SCAN_POINT, schedule.point_count),)
+            if schedule.point_count > 1
+            else ()
+        )
+        scan_point_layout = PointLayout.rect_c(
+            tuple(axis.size for axis in scan_axes)
+        )
+    else:
+        scan_axes = layout.scan_axes
+        assert layout.scan_point_layout is not None
+        scan_point_layout = layout.scan_point_layout
+        expected_execution_points = (
+            layout.repeat_axis.size * scan_point_layout.storage_size
+            if repeat_major_points
+            else scan_point_layout.storage_size
+        )
+        if repeat_major_points and (
+            schedule.loop_count != 1 or not schedule.full_point_loop
+        ):
+            raise ValueError(
+                "autonomous scan requires one complete repeat-major finite table"
+            )
+        if expected_execution_points != schedule.point_count:
+            raise ValueError(
+                "declared scan PointLayout rows differ from compiled pulse points"
+            )
     event_axis = _axis(
         layout.readout_event_axis_id,
         READOUT_EVENT,
         events_per_repeat,
     )
     point_axes = (*scan_axes, event_axis)
-    point_layout = PointLayout.rect_c(tuple(axis.size for axis in point_axes))
+    point_layout = PointLayout.from_mapping(
+        tuple(axis.size for axis in point_axes),
+        tuple(
+            (*scan_point_layout.multi_index(scan_row), event_index)
+            for scan_row in range(scan_point_layout.storage_size)
+            for event_index in range(event_axis.size)
+        ),
+    )
     dataset_schema = DatasetSchema(
         repeat_axis,
         point_axes,
@@ -245,9 +321,7 @@ def bind_triggered_camera_acquisition(
         selected_trigger,
         dataset_schema,
         readout_event_axis_id=event_axis.axis_id,
-        scan_point_layout=PointLayout.rect_c(
-            tuple(axis.size for axis in scan_axes)
-        ),
+        scan_point_layout=scan_point_layout,
         within_point_grouping=layout.within_point_grouping,
     )
     measurement = bind_camera_measurement(

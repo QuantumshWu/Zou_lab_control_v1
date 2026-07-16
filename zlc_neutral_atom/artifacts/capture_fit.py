@@ -15,7 +15,6 @@ import threading
 from zlc_data import (
     FitResultBatch,
     FitSpec,
-    OwnedSnapshot,
     bind_fit,
     decode_fit_result_batch,
     encode_fit_result_batch,
@@ -52,22 +51,6 @@ _ADMITTED_FIT_TOKEN = object()
 _DEFAULT_MATERIALIZATION_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 64 * 1024
 _MAX_RESULT_BLOB_BYTES = 64 * 1024 * 1024
-
-
-def _capture_snapshot(
-    admission: AdmittedCapture,
-    memory_limit_bytes: int,
-) -> OwnedSnapshot:
-    if type(admission) is not AdmittedCapture:
-        raise TypeError("capture source must be an AdmittedCapture")
-    capture = admission.artifact
-    block = capture.frame_source.materialize(
-        memory_limit_bytes=memory_limit_bytes,
-    )
-    return OwnedSnapshot(
-        block.ref(capture.provenance.generation),
-        block,
-    )
 
 
 class _ProcessLocalProof:
@@ -281,9 +264,8 @@ class CaptureFitResultRepository:
     ) -> FitExecution:
         with self._lifecycle_lock:
             self._require_integrity()
-        snapshot = _capture_snapshot(
-            source,
-            self.materialization_memory_limit_bytes,
+        snapshot = source.materialize_snapshot(
+            memory_limit_bytes=self.materialization_memory_limit_bytes,
         )
         result = bind_fit(spec, snapshot.block.schema).run(snapshot)
         with self._lifecycle_lock:

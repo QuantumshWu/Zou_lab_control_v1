@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import math
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, TYPE_CHECKING
 
@@ -15,12 +15,17 @@ from zlc_neutral_atom.installation import (
 )
 from zlc_data import (
     READOUT_EVENT,
+    REPEAT,
     AxisId,
+    AxisSpec,
     BlockId,
     CommittedTransform,
+    DataTransformSpec,
     FitNumericPolicy,
     FitParameterConstraint,
     FitSpec,
+    Selection,
+    commit_transform,
     fit_spec_for,
 )
 from zlc_neutral_atom.artifacts import (
@@ -48,6 +53,12 @@ from zlc_neutral_atom.readout.contracts import (
     ReadoutBindingKey,
 )
 from zlc_neutral_atom.readout.sitemap import SitemapAcquisitionProfile
+from zlc_neutral_atom.scan import (
+    MaterializedScanData,
+    ScanPointTable,
+    bind_scan_output_contract,
+)
+from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_neutral_atom.runtime.pipeline import (
     estimate_pipeline_peak_bytes,
     MinimalPipelineSpec,
@@ -58,6 +69,9 @@ from zlc_pulse import (
     PulseDocument,
     PulseExecutionForm,
     PulseTarget,
+    bind_pulse_document_target,
+    expand_autonomous_scan_repeats,
+    require_autonomous_scan_resident_capacity,
     load_pulse_document,
 )
 from zlc_storage import canonical_text as _text
@@ -72,15 +86,19 @@ if TYPE_CHECKING:
     )
     from zlc_neutral_atom.readout.occupancy import ResolvedOccupancy
     from zlc_neutral_atom.readout.occupancy_repository import OccupancyRepository
+    from zlc_neutral_atom.scan.repository import ScanArtifact, ScanRepository
 
 
 _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_CALIBRATION_TIMEOUT_SECONDS = 300.0
 _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_OCCUPANCY_TIMEOUT_SECONDS = 300.0
+_DEFAULT_SCAN_MATERIALIZATION_MEMORY_LIMIT_BYTES = 512 << 20
 _CAPTURE_REPEAT_AXIS_ID = AxisId("capture.repeat")
 _CAPTURE_SCAN_AXIS_ID = AxisId("capture.scan_row_ordinal")
 _CAPTURE_READOUT_EVENT_AXIS_ID = AxisId("capture.readout_event")
+_SCAN_REPEAT_AXIS_ID = AxisId("scan.repeat")
+_SCAN_READOUT_EVENT_AXIS_ID = AxisId("scan.readout_event")
 
 
 class _ResourceCleanupError(RuntimeError):
@@ -192,6 +210,53 @@ class CaptureRequest:
 
 
 @dataclass(frozen=True)
+class ScanRequest:
+    """Freeze one autonomous SCAN_SLOT table and its direct-camera intent."""
+
+    pulse_document: PulseDocument
+    camera_ref: DeviceRef
+    sequencer_ref: DeviceRef
+    trigger_channel: str | None = None
+    output_transform_spec: DataTransformSpec | None = None
+    transport_memory_limit_bytes: int = 64 << 20
+    pipeline_memory_limit_bytes: int = 256 << 20
+    timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pulse_document, PulseDocument):
+            raise TypeError("pulse_document must be PulseDocument")
+        if self.pulse_document.scan_table is None:
+            raise ValueError("scan request requires a frozen PulseDocument scan table")
+        if not isinstance(self.camera_ref, DeviceRef):
+            raise TypeError("camera_ref must be DeviceRef")
+        if not isinstance(self.sequencer_ref, DeviceRef):
+            raise TypeError("sequencer_ref must be DeviceRef")
+        if self.trigger_channel is not None:
+            _text(self.trigger_channel, "trigger_channel")
+        transform = self.output_transform_spec
+        if transform is not None:
+            if not isinstance(transform, DataTransformSpec):
+                raise TypeError(
+                    "output_transform_spec must be DataTransformSpec or None"
+                )
+            if not transform.operations:
+                raise ValueError("empty output_transform_spec must be None")
+        for field in (
+            "transport_memory_limit_bytes",
+            "pipeline_memory_limit_bytes",
+        ):
+            object.__setattr__(
+                self,
+                field,
+                _positive_int(getattr(self, field), field),
+            )
+        object.__setattr__(
+            self,
+            "timeout_seconds",
+            _positive_real(self.timeout_seconds, "timeout_seconds"),
+        )
+
+@dataclass(frozen=True)
 class CalibrationArtifactRequest:
     """Freeze one committed capture, its binding, and calibration intent."""
 
@@ -247,6 +312,59 @@ class SitemapCalibrationInterrupted(KeyboardInterrupt):
         super().__init__(
             "sitemap calibration interrupted; the committed raw capture remains "
             f"available as {source_capture_ref!r}"
+        )
+
+
+class ScanPromotionFailed(RuntimeError):
+    """Scan semantics failed after its exact raw capture became FINAL."""
+
+    __slots__ = ("source_capture_ref",)
+
+    def __init__(self, source_capture_ref: CaptureArtifactRef) -> None:
+        if not isinstance(source_capture_ref, CaptureArtifactRef):
+            raise TypeError("source_capture_ref must be CaptureArtifactRef")
+        self.source_capture_ref = source_capture_ref
+        super().__init__(
+            "scan promotion failed; the committed raw capture and its durable "
+            f"intent remain recoverable via promote_scan({source_capture_ref!r})"
+        )
+
+
+class ScanPromotionInterrupted(KeyboardInterrupt):
+    """Notebook interrupt after the exact raw capture became FINAL."""
+
+    __slots__ = ("source_capture_ref",)
+
+    def __init__(self, source_capture_ref: CaptureArtifactRef) -> None:
+        if not isinstance(source_capture_ref, CaptureArtifactRef):
+            raise TypeError("source_capture_ref must be CaptureArtifactRef")
+        self.source_capture_ref = source_capture_ref
+        super().__init__(
+            "scan promotion was interrupted before a confirmed final manifest; "
+            "the committed raw capture and durable intent remain recoverable via "
+            f"promote_scan({source_capture_ref!r})"
+        )
+
+
+class ScanPromotionReconciliationRequired(RuntimeError):
+    """The final scan manifest may be visible and must not be called failed."""
+
+    __slots__ = ("source_capture_ref", "expected_scan_ref")
+
+    def __init__(
+        self,
+        source_capture_ref: CaptureArtifactRef,
+        expected_scan_ref: ScanArtifactRef,
+    ) -> None:
+        if not isinstance(source_capture_ref, CaptureArtifactRef):
+            raise TypeError("source_capture_ref must be CaptureArtifactRef")
+        if not isinstance(expected_scan_ref, ScanArtifactRef):
+            raise TypeError("expected_scan_ref must be ScanArtifactRef")
+        self.source_capture_ref = source_capture_ref
+        self.expected_scan_ref = expected_scan_ref
+        super().__init__(
+            "scan manifest visibility is unknown; retain the raw capture and "
+            f"retry promotion or inspect {expected_scan_ref!r}"
         )
 
 
@@ -328,6 +446,7 @@ class PlanDescriptor:
 class _ExperimentServices:
     runtime: object
     capture_repository: CaptureRepository
+    scan_repository: "ScanRepository"
     calibration_repository_path: Path
     calibration_repository: "CalibrationRepository | None"
     occupancy_repository_path: Path
@@ -524,6 +643,106 @@ class ReadoutFacade:
     def load_capture(self, reference: CaptureArtifactRef) -> CaptureArtifact:
         with _service_guard(self._token) as services:
             return services.capture_repository.load(reference)
+
+    def scan_request(
+        self,
+        pulse: PulseDocument | str | Path,
+        *,
+        camera_role: str | None = None,
+        sequencer_role: str | None = None,
+        trigger_channel: str | None = None,
+        output_transform_spec: DataTransformSpec | None = None,
+        transport_memory_limit_bytes: int = 64 << 20,
+        pipeline_memory_limit_bytes: int = 256 << 20,
+        timeout_seconds: float = 30.0,
+    ) -> ScanRequest:
+        """Build one direct-camera autonomous SCAN_SLOT request.
+
+        The PulseDocument's frozen table is the only slot-value truth.  This
+        first vertical slice deliberately has no API-slot or host-stepped
+        fallback.
+        """
+
+        with _service_guard(self._token) as services:
+            document = (
+                pulse
+                if isinstance(pulse, PulseDocument)
+                else load_pulse_document(pulse)
+            )
+            camera_role = self._resolve_camera_role(services, camera_role)
+            return ScanRequest(
+                document,
+                services.catalog.require(camera_role).ref,
+                services.catalog.require(
+                    _resolve_role(
+                        services.catalog,
+                        sequencer_role,
+                        "sequencer",
+                        ("sequencer",),
+                    )
+                ).ref,
+                trigger_channel,
+                output_transform_spec,
+                transport_memory_limit_bytes,
+                pipeline_memory_limit_bytes,
+                timeout_seconds,
+            )
+
+    def scan(self, pulse: PulseDocument | str | Path, **kwargs) -> ScanArtifactRef:
+        return _run_scan(self._token, self.scan_request(pulse, **kwargs))
+
+    def load_scan(self, reference: ScanArtifactRef) -> "ScanArtifact":
+        with _service_guard(self._token) as services:
+            return services.scan_repository.admit(
+                reference,
+                services.capture_repository,
+            )
+
+    def promote_scan(
+        self,
+        source_capture_ref: CaptureArtifactRef,
+    ) -> ScanArtifactRef:
+        """Resume a scan promotion from the raw capture's durable intent."""
+
+        if not isinstance(source_capture_ref, CaptureArtifactRef):
+            raise TypeError("source_capture_ref must be CaptureArtifactRef")
+        try:
+            with _service_guard(self._token) as services:
+                source = services.capture_repository.admit(source_capture_ref)
+                return services.scan_repository.promote(source)
+        except KeyboardInterrupt as exc:
+            raise ScanPromotionInterrupted(source_capture_ref) from exc
+        except Exception as exc:
+            from zlc_neutral_atom.scan.repository import (
+                ScanCommitVisibilityUnknown,
+            )
+
+            if isinstance(exc, ScanCommitVisibilityUnknown):
+                raise ScanPromotionReconciliationRequired(
+                    source_capture_ref,
+                    exc.reference,
+                ) from exc
+            raise ScanPromotionFailed(source_capture_ref) from exc
+
+    def materialize_scan(
+        self,
+        reference: ScanArtifactRef,
+        *,
+        capture_memory_limit_bytes: int = (
+            _DEFAULT_SCAN_MATERIALIZATION_MEMORY_LIMIT_BYTES
+        ),
+    ) -> MaterializedScanData:
+        """Load scan y while bounding raw-capture materialization and preserving axes."""
+
+        with _service_guard(self._token) as services:
+            return services.scan_repository.materialize(
+                reference,
+                services.capture_repository,
+                capture_memory_limit_bytes=_positive_int(
+                    capture_memory_limit_bytes,
+                    "capture_memory_limit_bytes",
+                ),
+            )
 
     def sitemap(
         self,
@@ -813,6 +1032,18 @@ class Experiment:
         _plan, descriptor = _compile(self._authority_token, request)
         return descriptor
 
+    def scan(self, request: ScanRequest) -> ScanArtifactRef:
+        return _run_scan(self._authority_token, request)
+
+    def inspect_scan(self, request: ScanRequest) -> PlanDescriptor:
+        with _service_guard(self._authority_token) as services:
+            _plan, descriptor = _compile_scan_for_services(
+                services,
+                request,
+                persist_intent=False,
+            )
+            return descriptor
+
     def fit(
         self,
         source: CaptureArtifactRef,
@@ -895,6 +1126,7 @@ class Experiment:
                     if services.calibration_repository is None
                     else services.calibration_repository.close
                 ),
+                services.scan_repository.close,
                 services.capture_repository.close,
             )
             if failures:
@@ -947,34 +1179,93 @@ def _compile_for_services(
     # is compiled.  Importing the notebook value/facade surface never constructs
     # adapters or advertises a drive-capable Port.
     from zlc_neutral_atom.bootstrap._triggered_capture import (
-        bind_triggered_camera_acquisition,
         TriggeredCameraLayout,
     )
 
     if not isinstance(request, CaptureRequest):
         raise TypeError("Experiment only accepts declarative CaptureRequest values")
-    binding = bind_triggered_camera_acquisition(
+    binding = _bind_triggered_capture(
         services.runtime.pulse_port(request.sequencer_ref),
         services.runtime.camera_port(request.camera_ref),
         pulse_document=request.pulse_document,
         execution_form=request.execution_form,
         trigger_channel=request.trigger_channel,
         layout=TriggeredCameraLayout(
-            _CAPTURE_REPEAT_AXIS_ID,
-            _CAPTURE_SCAN_AXIS_ID,
-            _CAPTURE_READOUT_EVENT_AXIS_ID,
-            request.repeat_count,
-            request.readout_events_per_repeat,
-            request.within_point_grouping,
+            repeat_axis=AxisSpec(
+                _CAPTURE_REPEAT_AXIS_ID,
+                "repeat",
+                REPEAT,
+                request.repeat_count,
+                tuple(range(request.repeat_count)),
+            ),
+            readout_event_axis_id=_CAPTURE_READOUT_EVENT_AXIS_ID,
+            ordinal_scan_axis_id=_CAPTURE_SCAN_AXIS_ID,
+            readout_events_per_repeat=request.readout_events_per_repeat,
+            within_point_grouping=request.within_point_grouping,
         ),
         transport_memory_limit_bytes=request.transport_memory_limit_bytes,
     )
-    pipeline = MinimalPipelineSpec(
-        f"Capture {binding.pulse_request.document.name}",
-        binding.measurement,
-        BlockId(f"capture-{binding.compiled_artifact.fingerprint[:20]}"),
-        request.pipeline_memory_limit_bytes,
+    plan, descriptor = _build_capture_plan_for_services(
+        services,
+        binding=binding,
+        block_id=BlockId(f"capture-{binding.compiled_artifact.fingerprint[:20]}"),
+        camera_ref=request.camera_ref,
+        sequencer_ref=request.sequencer_ref,
+        execution_form=request.execution_form,
+        pipeline_memory_limit_bytes=request.pipeline_memory_limit_bytes,
         timeout_seconds=request.timeout_seconds,
+        name_prefix="Capture",
+    )
+    return plan, descriptor
+
+
+def _bind_triggered_capture(
+    pulse_port,
+    camera_port,
+    *,
+    pulse_document: PulseDocument,
+    execution_form: PulseExecutionForm,
+    trigger_channel: str | None,
+    layout,
+    transport_memory_limit_bytes: int,
+):
+    """Bind the shared exact pulse/camera path without constructing a RunPlan."""
+
+    from zlc_neutral_atom.bootstrap._triggered_capture import (
+        bind_triggered_camera_acquisition,
+    )
+
+    return bind_triggered_camera_acquisition(
+        pulse_port,
+        camera_port,
+        pulse_document=pulse_document,
+        execution_form=execution_form,
+        trigger_channel=trigger_channel,
+        layout=layout,
+        transport_memory_limit_bytes=transport_memory_limit_bytes,
+    )
+
+
+def _build_capture_plan_for_services(
+    services: _ExperimentServices,
+    *,
+    binding,
+    block_id: BlockId,
+    camera_ref: DeviceRef,
+    sequencer_ref: DeviceRef,
+    execution_form: PulseExecutionForm,
+    pipeline_memory_limit_bytes: int,
+    timeout_seconds: float,
+    name_prefix: str,
+):
+    """Build one exact plan after every use-case-specific intent is frozen."""
+
+    pipeline = MinimalPipelineSpec(
+        f"{name_prefix} {binding.pulse_request.document.name}",
+        binding.measurement,
+        block_id,
+        pipeline_memory_limit_bytes,
+        timeout_seconds=timeout_seconds,
     )
     triggered = TriggeredCaptureSpec(
         pipeline,
@@ -989,9 +1280,9 @@ def _compile_for_services(
     )
     descriptor = PlanDescriptor(
         plan.name,
-        request.camera_ref.role,
-        request.sequencer_ref.role,
-        request.execution_form,
+        camera_ref.role,
+        sequencer_ref.role,
+        execution_form,
         binding.trigger_channel,
         binding.expected_frames,
         binding.measurement.capture_contract.dataset_schema.physical_shape,
@@ -1020,6 +1311,141 @@ def _run(token: object, request: CaptureRequest) -> CaptureArtifactRef:
         handle = services.runtime.start(plan)
         runtime = services.runtime
     return runtime.wait(handle)
+
+
+def _compile_scan_for_services(
+    services: _ExperimentServices,
+    request: ScanRequest,
+    *,
+    persist_intent: bool,
+):
+    from zlc_neutral_atom.bootstrap._triggered_capture import TriggeredCameraLayout
+
+    if not isinstance(request, ScanRequest):
+        raise TypeError("request must be ScanRequest")
+    if not isinstance(persist_intent, bool):
+        raise TypeError("persist_intent must be bool")
+    pulse_port = services.runtime.pulse_port(request.sequencer_ref)
+    camera_port = services.runtime.camera_port(request.camera_ref)
+    logical_document = bind_pulse_document_target(
+        request.pulse_document,
+        pulse_port.capability.target,
+    )
+    require_autonomous_scan_resident_capacity(
+        logical_document,
+        pulse_port.capability.resident_scan_point_capacity,
+    )
+    execution_document = expand_autonomous_scan_repeats(logical_document)
+    point_table = ScanPointTable.from_pulse_document(logical_document)
+    repeat_count = (
+        1 if logical_document.repeat is None else logical_document.repeat.count
+    )
+    repeat_axis = AxisSpec(
+        _SCAN_REPEAT_AXIS_ID,
+        "repeat",
+        REPEAT,
+        repeat_count,
+        tuple(range(repeat_count)),
+    )
+    scan_axes = point_table.point_axes
+    binding = _bind_triggered_capture(
+        pulse_port,
+        camera_port,
+        pulse_document=execution_document,
+        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
+        trigger_channel=request.trigger_channel,
+        layout=TriggeredCameraLayout(
+            repeat_axis=repeat_axis,
+            readout_event_axis_id=_SCAN_READOUT_EVENT_AXIS_ID,
+            readout_events_per_repeat=1,
+            scan_axes=scan_axes,
+            scan_point_layout=point_table.point_layout,
+        ),
+        transport_memory_limit_bytes=request.transport_memory_limit_bytes,
+    )
+    if (
+        binding.compiled_artifact.source_document_digest
+        != execution_document.fingerprint
+    ):
+        raise RuntimeError(
+            "compiled scan pulse differs from the repeat-major execution document"
+        )
+    raw_schema = binding.measurement.capture_contract.dataset_schema
+    requested_operations = (
+        ()
+        if request.output_transform_spec is None
+        else request.output_transform_spec.operations
+    )
+    committed = commit_transform(
+        raw_schema,
+        DataTransformSpec(
+            (
+                Selection.index(_SCAN_READOUT_EVENT_AXIS_ID, 0),
+                *requested_operations,
+            )
+        ),
+    )
+    output_contract = bind_scan_output_contract(
+        raw_schema,
+        point_table,
+        committed,
+    )
+    intent_operation = (
+        services.scan_repository.prepare
+        if persist_intent
+        else services.scan_repository.identify_intent
+    )
+    capture_block_id = intent_operation(
+        logical_document,
+        output_contract,
+        capture_repository_id=services.capture_repository.repository_id,
+    )
+    plan, descriptor = _build_capture_plan_for_services(
+        services,
+        binding=binding,
+        block_id=capture_block_id,
+        camera_ref=request.camera_ref,
+        sequencer_ref=request.sequencer_ref,
+        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
+        pipeline_memory_limit_bytes=request.pipeline_memory_limit_bytes,
+        timeout_seconds=request.timeout_seconds,
+        name_prefix="Scan capture",
+    )
+    descriptor = replace(
+        descriptor,
+        output_shape=output_contract.output_dataset_schema.physical_shape,
+        output_schema_fingerprint=output_contract.output_schema_fingerprint,
+    )
+    return plan, descriptor
+
+
+def _run_scan(token: object, request: ScanRequest) -> ScanArtifactRef:
+    with _service_guard(token) as services:
+        plan, _descriptor = _compile_scan_for_services(
+            services,
+            request,
+            persist_intent=True,
+        )
+        handle = services.runtime.start(plan)
+        runtime = services.runtime
+    source_ref = runtime.wait(handle)
+    if not isinstance(source_ref, CaptureArtifactRef):
+        raise TypeError("scan capture run returned a non-capture artifact ref")
+    try:
+        with _service_guard(token) as services:
+            source = services.capture_repository.admit(source_ref)
+            return services.scan_repository.promote(source)
+    except KeyboardInterrupt as exc:
+        raise ScanPromotionInterrupted(source_ref) from exc
+    except Exception as exc:
+        from zlc_neutral_atom.scan.repository import ScanCommitVisibilityUnknown
+
+        if isinstance(exc, ScanCommitVisibilityUnknown):
+            raise ScanPromotionReconciliationRequired(
+                source_ref,
+                exc.reference,
+            ) from exc
+        raise ScanPromotionFailed(source_ref) from exc
 
 
 def _compile_calibration_for_services(
@@ -1128,10 +1554,14 @@ def connect(
     # exactly one child beneath it and never guesses missing ancestors.
     durable_mkdir(repository_root)
     capture_repository = None
+    scan_repository = None
     fit_repository = None
     runtime = None
     try:
         capture_repository = CaptureRepository(repository_root / "captures")
+        from zlc_neutral_atom.scan.repository import ScanRepository
+
+        scan_repository = ScanRepository(repository_root / "scans")
         fit_repository = CaptureFitResultRepository(repository_root / "fits")
         from zlc_neutral_atom.bootstrap._installation import (
             create_virtual_installation,
@@ -1147,6 +1577,7 @@ def connect(
         services = _ExperimentServices(
             runtime=runtime,
             capture_repository=capture_repository,
+            scan_repository=scan_repository,
             calibration_repository_path=repository_root / "calibrations",
             calibration_repository=None,
             occupancy_repository_path=repository_root / "occupancy",
@@ -1167,6 +1598,7 @@ def connect(
                 else lambda: _require_runtime_shutdown(runtime, timeout=2.0)
             ),
             None if fit_repository is None else fit_repository.close,
+            None if scan_repository is None else scan_repository.close,
             None if capture_repository is None else capture_repository.close,
         )
         if failures and isinstance(error, Exception):
@@ -1193,10 +1625,17 @@ __all__ = [
     "Experiment",
     "FitExecution",
     "GridOrder",
+    "MaterializedScanData",
     "OccupancyArtifactRef",
     "PlanDescriptor",
     "ReadoutFacade",
     "ReadoutModelKind",
+    "ScanArtifactRef",
+    "ScanPointTable",
+    "ScanPromotionFailed",
+    "ScanPromotionInterrupted",
+    "ScanPromotionReconciliationRequired",
+    "ScanRequest",
     "SitemapCalibrationFailed",
     "SitemapCalibrationInterrupted",
     "TimingFacade",

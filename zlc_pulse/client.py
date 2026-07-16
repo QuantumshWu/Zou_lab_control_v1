@@ -27,6 +27,7 @@ class PulseServerSnapshot:
     target: PulseTarget
     clock_hz: float
     geometry_fingerprint: int
+    resident_scan_point_capacity: int
     state: str
     prepared_ref: PreparedPulseRef | None
     backend: dict[str, object]
@@ -39,6 +40,7 @@ def pulse_server_snapshot_from_tree(tree: object) -> PulseServerSnapshot:
         "target",
         "clock_hz",
         "geometry_fingerprint",
+        "resident_scan_point_capacity",
         "state",
         "prepared_ref",
         "backend",
@@ -55,6 +57,7 @@ def pulse_server_snapshot_from_tree(tree: object) -> PulseServerSnapshot:
         raise ValueError("PulseExecutionSnapshot state is invalid")
     clock = tree["clock_hz"]
     geometry = tree["geometry_fingerprint"]
+    resident_capacity = tree["resident_scan_point_capacity"]
     if (
         isinstance(clock, bool)
         or not isinstance(clock, (int, float))
@@ -64,6 +67,12 @@ def pulse_server_snapshot_from_tree(tree: object) -> PulseServerSnapshot:
         raise ValueError("PulseExecutionSnapshot clock is invalid")
     if isinstance(geometry, bool) or not isinstance(geometry, int) or not 0 <= geometry <= 0xFFFFFFFF:
         raise ValueError("PulseExecutionSnapshot geometry fingerprint is invalid")
+    if (
+        isinstance(resident_capacity, bool)
+        or not isinstance(resident_capacity, int)
+        or resident_capacity < 1
+    ):
+        raise ValueError("PulseExecutionSnapshot resident scan capacity is invalid")
     backend = tree["backend"]
     if not isinstance(backend, dict):
         raise TypeError("PulseExecutionSnapshot backend must be a map")
@@ -73,6 +82,7 @@ def pulse_server_snapshot_from_tree(tree: object) -> PulseServerSnapshot:
         pulse_target_from_tree(tree["target"]),
         float(clock),
         geometry,
+        resident_capacity,
         state,
         None if raw_ref is None else prepared_pulse_ref_from_tree(raw_ref),
         dict(backend),

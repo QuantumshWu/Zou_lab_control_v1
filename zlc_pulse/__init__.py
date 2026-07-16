@@ -61,6 +61,9 @@ from .validation import (
 )
 from .deployment import (
     APPROVED_DEPLOYED_TARGET_ABI,
+    expand_autonomous_scan_repeats,
+    resident_scan_point_capacity,
+    require_autonomous_scan_resident_capacity,
     require_approved_target_abi,
     validate_artifact_for_deployment,
     validate_deployed_target,
@@ -296,6 +299,9 @@ __all__ = [
     "replace_pulse_field",
     "resolve_api_parameters",
     "require_approved_target_abi",
+    "expand_autonomous_scan_repeats",
+    "resident_scan_point_capacity",
+    "require_autonomous_scan_resident_capacity",
     "serve_pulse_execution_service",
     "target_ir_from_tree",
     "target_ir_to_tree",
