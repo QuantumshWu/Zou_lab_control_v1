@@ -20,7 +20,7 @@ def open_pulse_workbench(experiment, document=None, *, path=None):
 
 
 def open_scan_workbench(experiment, request):
-    """Open the current final-only autonomous scan panel lazily."""
+    """Open the current typed autonomous scan panel lazily."""
 
     from ._scan import open_scan_workbench as _open
 

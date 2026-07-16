@@ -45,6 +45,7 @@ from .dataset import (
     DatasetBuilder,
     DatasetCellSchedule,
     FrozenDatasetEdge,
+    ExactDatasetPreviewReader,
     MonitorDataset,
     SealedDatasetArtifact,
     dataset_storage_nbytes,
@@ -234,6 +235,54 @@ class CapturePreviewPort(Protocol):
     ) -> None: ...
 
     def updated(self) -> None: ...
+
+    def fail(self, message: str) -> None: ...
+
+    def source_terminal(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class ExactDatasetPreviewSpec:
+    """Bounded display branch over the exact builder's current revision.
+
+    ``downstream_peak_bytes`` is the complete peak beyond DatasetBuilder:
+    one frozen source snapshot, committed-transform scratch/output, view
+    evaluation, worker raster scratch/result, and queued/visible fronts.  The
+    exact source owner independently verifies that the declaration can at
+    least hold one frozen source snapshot.
+    """
+
+    source_schema_fingerprint: str
+    downstream_peak_bytes: int
+
+    def __post_init__(self) -> None:
+        sha256_text(self.source_schema_fingerprint, "source_schema_fingerprint")
+        object.__setattr__(
+            self,
+            "downstream_peak_bytes",
+            _positive_int(
+                self.downstream_peak_bytes,
+                "downstream_peak_bytes",
+            ),
+        )
+
+
+class ExactDatasetPreviewPort(Protocol):
+    """Workbench-owned provisional reader attachment; never artifact authority."""
+
+    @property
+    def spec(self) -> ExactDatasetPreviewSpec: ...
+
+    @property
+    def terminal(self) -> bool: ...
+
+    def bind(
+        self,
+        reader: ExactDatasetPreviewReader,
+        *,
+        run_id: str,
+        causation_domain_id: str,
+    ) -> None: ...
 
     def fail(self, message: str) -> None: ...
 
@@ -444,10 +493,16 @@ def estimate_pipeline_peak_bytes(
 def _require_pipeline_memory_budget(
     spec: MinimalPipelineSpec,
     preview_spec: CapturePreviewSpec | None = None,
+    *,
+    retained_overhead_bytes: int = 0,
 ) -> None:
     """Compute the owner-derived peak and reject it before any allocation."""
 
-    peak = estimate_pipeline_peak_bytes(spec, preview_spec=preview_spec)
+    overhead = _nonnegative_int(
+        retained_overhead_bytes,
+        "retained_overhead_bytes",
+    )
+    peak = estimate_pipeline_peak_bytes(spec, preview_spec=preview_spec) + overhead
     limit = spec.memory_limit_bytes
     if peak > limit:
         raise MemoryError(f"pipeline peak budget {peak} exceeds limit {limit}")
@@ -657,7 +712,7 @@ def _capture_preview_spec(
 
 
 def _notify_preview_failure(
-    preview: CapturePreviewPort | None,
+    preview: CapturePreviewPort | ExactDatasetPreviewPort | None,
     error: BaseException,
 ) -> None:
     if preview is None:
@@ -693,12 +748,18 @@ def _settle_unbound_preview(
 def _admit_capture_preview(
     spec: MinimalPipelineSpec,
     preview: CapturePreviewPort | None,
+    *,
+    retained_overhead_bytes: int = 0,
 ) -> CapturePreviewSpec | None:
     """Validate one attached preview and its static memory budget exactly once."""
 
     try:
         preview_spec = _capture_preview_spec(preview, spec)
-        _require_pipeline_memory_budget(spec, preview_spec)
+        _require_pipeline_memory_budget(
+            spec,
+            preview_spec,
+            retained_overhead_bytes=retained_overhead_bytes,
+        )
         return preview_spec
     except BaseException as error:
         _notify_preview_failure(preview, error)
@@ -899,6 +960,8 @@ __all__ = [
     "BoundMeasurement",
     "CapturePreviewPort",
     "CapturePreviewSpec",
+    "ExactDatasetPreviewPort",
+    "ExactDatasetPreviewSpec",
     "compile_pipeline",
     "ExactCaptureTransaction",
     "estimate_pipeline_peak_bytes",

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import gc
 import math
+import threading
 from dataclasses import fields, is_dataclass
 from numbers import Number
 
 import numpy as np
 
 from zlc_data import FitBatchStatus, FitResultBatch
+from zlc_storage import nonnegative_integer, positive_integer
 
 from .figure import (
     AxisAddress,
@@ -20,11 +23,12 @@ from .figure import (
     EvaluatedMeter,
     FigureDocument,
 )
+from .render import PixelFormat, RasterBuffer
 
 
 _RASTER_FIXED_BYTES = 8 << 20
 _RASTER_BUFFER_MULTIPLIER = 8
-_ARTIST_ARRAY_MULTIPLIER = 4
+_ARTIST_ARRAY_MULTIPLIER = 8
 
 
 def _array_nbytes(value: object) -> int:
@@ -63,6 +67,33 @@ def estimate_render_peak_nbytes(
         _RASTER_FIXED_BYTES
         + _RASTER_BUFFER_MULTIPLIER * rgba_bytes
         + _ARTIST_ARRAY_MULTIPLIER * _array_nbytes(evaluated)
+    )
+
+
+def estimate_single_curve_raster_peak_nbytes(
+    width: int,
+    height: int,
+    *,
+    evaluated_data_upper_bound_bytes: int = 0,
+) -> int:
+    """Static preflight bound for one coalesced Agg curve front.
+
+    The caller supplies a schema-derived upper bound for evaluator-owned data;
+    A live renderer retains the previous artist arrays while Matplotlib copies
+    the next evaluated revision into those artists.  The bound also covers the
+    persistent Agg canvas plus queued/visible immutable raster fronts.
+    """
+
+    width = positive_integer(width, "width")
+    height = positive_integer(height, "height")
+    data_bytes = nonnegative_integer(
+        evaluated_data_upper_bound_bytes,
+        "evaluated_data_upper_bound_bytes",
+    )
+    return (
+        _RASTER_FIXED_BYTES
+        + _RASTER_BUFFER_MULTIPLIER * width * height * 4
+        + _ARTIST_ARRAY_MULTIPLIER * data_bytes
     )
 
 
@@ -186,15 +217,23 @@ def _fit_status(axis, result: FitResultBatch, index: int | None) -> bool:
     return False
 
 
+def _curve_values(series):
+    data = series.data
+    assert isinstance(data, EvaluatedCurve)
+    if np.iscomplexobj(data.values):
+        raise ValueError(
+            "complex curves require an explicit real-valued display transform"
+        )
+    return np.ma.array(data.values, mask=~data.validity)
+
+
 def _curve(axis, layer, cell, series_group, fit_result):
     multiple_series = len(series_group) > 1
     for series in series_group:
         data = series.data
         assert isinstance(data, EvaluatedCurve)
-        if np.iscomplexobj(data.values):
-            raise ValueError("complex curves require an explicit real-valued display transform")
         x = np.asarray(data.x_axis.coordinates)
-        values = np.ma.array(data.values, mask=~data.validity)
+        values = _curve_values(series)
         label = _series_label(series, include_reductions=multiple_series)
         axis.plot(x, values, marker="o", linestyle="-", label=label)
         if fit_result is not None:
@@ -282,6 +321,39 @@ def _panels(evaluated: EvaluatedFigureData):
     return panels
 
 
+def _panel_title(document, layer, cell, series_group) -> str:
+    title = document.descriptor(layer.dataset_id).label
+    addresses = cell.facet_address
+    if len(series_group) == 1:
+        addresses = (*addresses, *series_group[0].batch_address)
+    details = _address_label(addresses)
+    resolved = _address_label(layer.resolutions)
+    if details:
+        title = f"{title} — {details}"
+    if resolved:
+        title = f"{title}\nview: {resolved}"
+    if len(series_group) == 1:
+        reduced = _reduction_label(series_group[0].reductions)
+        if reduced:
+            title = f"{title}\nreduce: {reduced}"
+    return title
+
+
+def _require_evaluated_identity(
+    document: FigureDocument,
+    evaluated: EvaluatedFigureData,
+) -> None:
+    if not isinstance(document, FigureDocument):
+        raise TypeError("document must be FigureDocument")
+    if not isinstance(evaluated, EvaluatedFigureData):
+        raise TypeError("evaluated must be EvaluatedFigureData")
+    if (
+        document.document_id != evaluated.document_id
+        or document.revision != evaluated.document_revision
+    ):
+        raise ValueError("document and evaluated data identities differ")
+
+
 def render_evaluated_figure(
     document: FigureDocument,
     evaluated: EvaluatedFigureData,
@@ -292,13 +364,7 @@ def render_evaluated_figure(
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
-    if (
-        document.document_id != evaluated.document_id
-        or document.revision != evaluated.document_revision
-    ):
-        raise ValueError("document and evaluated data identities differ")
-    layer_docs = {layer.layer_id: layer for layer in document.layers}
-    descriptors = {item.dataset_id: item for item in document.datasets}
+    _require_evaluated_identity(document, evaluated)
     panels = _panels(evaluated)
     columns = min(3, max(1, len(panels)))
     rows = math.ceil(len(panels) / columns)
@@ -307,7 +373,6 @@ def render_evaluated_figure(
     axes = figure.subplots(rows, columns, squeeze=False).reshape(-1)
 
     for target, (layer, cell, series_group) in zip(axes, panels):
-        layer_doc = layer_docs[layer.layer_id]
         fit_result = fit_results.get(layer.layer_id)
         kind = series_group[0].data
         if isinstance(kind, EvaluatedCurve):
@@ -324,26 +389,167 @@ def render_evaluated_figure(
             _meter(target, series_group)
         else:  # pragma: no cover - closed EvaluatedLayerData union
             raise TypeError(f"unsupported evaluated data {type(kind).__name__}")
-        title = descriptors[layer.dataset_id].label
-        # A multi-series curve is already labelled per batch in its legend;
-        # naming the whole panel after the first series would misdescribe it.
-        addresses = cell.facet_address
-        if len(series_group) == 1:
-            addresses = (*addresses, *series_group[0].batch_address)
-        details = _address_label(addresses)
-        resolved = _address_label(layer.resolutions)
-        if details:
-            title = f"{title} — {details}"
-        if resolved:
-            title = f"{title}\nview: {resolved}"
-        if len(series_group) == 1:
-            reduced = _reduction_label(series_group[0].reductions)
-            if reduced:
-                title = f"{title}\nreduce: {reduced}"
-        target.set_title(title)
+        target.set_title(_panel_title(document, layer, cell, series_group))
     for unused in axes[len(panels):]:
         unused.set_visible(False)
     return figure
 
 
-__all__ = ["estimate_render_peak_nbytes", "render_evaluated_figure"]
+class SingleCurveAggRenderer:
+    """Worker-affine live Agg surface for one frozen curve topology."""
+
+    __slots__ = (
+        "_axis",
+        "_document",
+        "_figure",
+        "_lines",
+        "_owner_thread",
+        "_topology",
+    )
+
+    def __init__(
+        self,
+        document: FigureDocument,
+        *,
+        width: int,
+        height: int,
+        dpi: float = 100.0,
+    ) -> None:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        if not isinstance(document, FigureDocument):
+            raise TypeError("document must be FigureDocument")
+        width = positive_integer(width, "width")
+        height = positive_integer(height, "height")
+        if (
+            isinstance(dpi, bool)
+            or not isinstance(dpi, Number)
+            or not math.isfinite(float(dpi))
+            or float(dpi) <= 0
+        ):
+            raise ValueError("dpi must be a finite positive number")
+        dpi = float(dpi)
+        figure = Figure(
+            figsize=(width / dpi, height / dpi),
+            dpi=dpi,
+            constrained_layout=True,
+        )
+        FigureCanvasAgg(figure)
+        self._owner_thread = threading.get_ident()
+        self._document = document
+        self._figure = figure
+        self._axis = figure.subplots()
+        self._lines = ()
+        self._topology = None
+
+    def render(self, evaluated: EvaluatedFigureData) -> RasterBuffer:
+        self._require_owner()
+        figure = self._figure
+        axis = self._axis
+        if figure is None or axis is None:
+            raise RuntimeError("single-curve renderer is closed")
+        layer, cell, series_group = self._one_curve_panel(evaluated)
+        topology = (
+            layer.layer_id,
+            layer.dataset_id,
+            layer.resolutions,
+            cell.facet_address,
+            tuple(
+                (series.batch_address, series.data.x_axis)
+                for series in series_group
+            ),
+        )
+        if self._topology is None:
+            _curve(axis, layer, cell, series_group, None)
+            self._lines = tuple(axis.lines)
+            if len(self._lines) != len(series_group):
+                raise RuntimeError("single-curve renderer created another artist topology")
+            self._topology = topology
+        else:
+            if topology != self._topology or len(self._lines) != len(series_group):
+                raise RuntimeError("progressive curve topology changed between revisions")
+            for line, series in zip(self._lines, series_group, strict=True):
+                data = series.data
+                assert isinstance(data, EvaluatedCurve)
+                line.set_data(
+                    np.asarray(data.x_axis.coordinates),
+                    _curve_values(series),
+                )
+
+        multiple_series = len(series_group) > 1
+        for line, series in zip(self._lines, series_group, strict=True):
+            line.set_label(
+                _series_label(series, include_reductions=multiple_series)
+            )
+        first = series_group[0].data
+        assert isinstance(first, EvaluatedCurve)
+        axis.set_xlabel(_axis_label(first.x_axis))
+        axis.set_title(_panel_title(self._document, layer, cell, series_group))
+        if multiple_series or any(series.batch_address for series in series_group):
+            legend = axis.get_legend()
+            if legend is None:
+                legend = axis.legend(fontsize="small")
+            else:
+                texts = legend.get_texts()
+                if len(texts) != len(self._lines):
+                    raise RuntimeError("progressive curve legend topology changed")
+                for text, line in zip(texts, self._lines, strict=True):
+                    text.set_text(line.get_label())
+        axis.relim(visible_only=True)
+        axis.autoscale_view()
+        figure.canvas.draw()
+        actual_width, actual_height = figure.canvas.get_width_height()
+        return RasterBuffer(
+            actual_width,
+            actual_height,
+            actual_width * 4,
+            PixelFormat.RGBA8888,
+            bytes(figure.canvas.buffer_rgba()),
+        )
+
+    def close(self) -> None:
+        self._require_owner()
+        figure = self._figure
+        if figure is None:
+            return
+        canvas = figure.canvas
+        try:
+            figure.clear()
+        finally:
+            try:
+                figure.set_canvas(None)
+                if getattr(canvas, "figure", None) is figure:
+                    canvas.figure = None
+            finally:
+                self._figure = None
+                self._axis = None
+                self._lines = ()
+                self._topology = None
+                figure = canvas = None
+                # Matplotlib's artist tree contains parent cycles even after
+                # clear().  Collect them before the worker reports done so the
+                # FINAL renderer cannot overlap a provisional Agg surface.
+                gc.collect()
+
+    def _one_curve_panel(self, evaluated: EvaluatedFigureData):
+        _require_evaluated_identity(self._document, evaluated)
+        panels = _panels(evaluated)
+        if len(panels) != 1 or any(
+            not isinstance(series.data, EvaluatedCurve)
+            for series in panels[0][2]
+        ):
+            raise ValueError("progressive raster requires exactly one curve panel")
+        return panels[0]
+
+    def _require_owner(self) -> None:
+        if threading.get_ident() != self._owner_thread:
+            raise RuntimeError("single-curve Agg renderer used from another thread")
+
+
+__all__ = [
+    "estimate_render_peak_nbytes",
+    "estimate_single_curve_raster_peak_nbytes",
+    "render_evaluated_figure",
+    "SingleCurveAggRenderer",
+]

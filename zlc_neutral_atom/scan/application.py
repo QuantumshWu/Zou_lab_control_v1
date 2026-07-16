@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Callable
 
 from zlc_data import (
@@ -12,9 +13,20 @@ from zlc_data import (
 )
 from zlc_neutral_atom.readout.calibration import calibration_retained_array_nbytes
 from zlc_neutral_atom.readout.occupancy import resolve_occupancy_stream_schema
+from zlc_neutral_atom.readout.occupancy_pipeline import _occupancy_preview_spec
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.dataset import DatasetSealProvenance
-from zlc_neutral_atom.runtime.run import PostSafetyContext, RunContext, RunPlan
+from zlc_neutral_atom.runtime.pipeline import (
+    ExactDatasetPreviewPort,
+    ExactDatasetPreviewSpec,
+    _notify_preview_failure,
+)
+from zlc_neutral_atom.runtime.run import (
+    PostSafetyContext,
+    RunContext,
+    RunHandle,
+    RunPlan,
+)
 from zlc_neutral_atom.timing.capture import (
     TriggeredCaptureSpec,
     TriggeredPipelineResult,
@@ -54,6 +66,64 @@ _ResultAdapter = Callable[
     [object],
     tuple[str, OwnedSnapshot, DatasetSealProvenance, PulseCaptureEvidence],
 ]
+
+
+class PreparedOccupancyScan:
+    """One-shot command exposing only the typed progressive preview seam."""
+
+    __slots__ = (
+        "_lock",
+        "_output_contract",
+        "_source_schema",
+        "_start",
+        "_started",
+    )
+
+    def __init__(
+        self,
+        *,
+        source_schema: DatasetSchema,
+        output_contract: ScanOutputContract,
+        start: Callable[[ExactDatasetPreviewPort | None], RunHandle],
+    ) -> None:
+        if not isinstance(source_schema, DatasetSchema):
+            raise TypeError("source_schema must be DatasetSchema")
+        if not isinstance(output_contract, ScanOutputContract):
+            raise TypeError("output_contract must be ScanOutputContract")
+        if not callable(start):
+            raise TypeError("start must be callable")
+        self._source_schema = source_schema
+        self._output_contract = output_contract
+        self._start = start
+        self._lock = threading.Lock()
+        self._started = False
+
+    @property
+    def source_schema(self) -> DatasetSchema:
+        return self._source_schema
+
+    @property
+    def output_contract(self) -> ScanOutputContract:
+        return self._output_contract
+
+    def start(
+        self,
+        preview: ExactDatasetPreviewPort | None = None,
+    ) -> RunHandle:
+        """Start once, optionally attaching one already-budgeted display port."""
+
+        try:
+            self._claim_start()
+            return self._start(preview)
+        except BaseException as error:
+            _notify_preview_failure(preview, error)
+            raise
+
+    def _claim_start(self) -> None:
+        with self._lock:
+            if self._started:
+                raise RuntimeError("PreparedOccupancyScan is one-shot")
+            self._started = True
 
 
 def _require_compile_binding(
@@ -368,7 +438,10 @@ def compile_direct_scan_artifact_plan(
             value.lineage.evidence(),
         )
 
-    base = compile_triggered_pipeline(spec)
+    base = compile_triggered_pipeline(
+        spec,
+        _retained_overhead_bytes=static_lineage.retained_upper_bound_bytes,
+    )
     return _compile_scan_artifact_plan(
         base,
         repository,
@@ -388,6 +461,32 @@ def compile_occupancy_scan_artifact_plan(
     document: PulseDocument,
     output_contract: ScanOutputContract,
     memory_limit_bytes: int,
+    preview: ExactDatasetPreviewPort | None = None,
+) -> RunPlan:
+    """Compile one occupancy scan and terminalize any rejected preview port."""
+
+    try:
+        return _compile_occupancy_scan_artifact_plan(
+            spec,
+            repository,
+            document=document,
+            output_contract=output_contract,
+            memory_limit_bytes=memory_limit_bytes,
+            preview=preview,
+        )
+    except BaseException as error:
+        _notify_preview_failure(preview, error)
+        raise
+
+
+def _compile_occupancy_scan_artifact_plan(
+    spec: TriggeredOccupancySpec,
+    repository: ScanRepository,
+    *,
+    document: PulseDocument,
+    output_contract: ScanOutputContract,
+    memory_limit_bytes: int,
+    preview: ExactDatasetPreviewPort | None = None,
 ) -> RunPlan:
     """Compile camera→occupancy counts y into one canonical FINAL scan Run."""
 
@@ -397,6 +496,10 @@ def compile_occupancy_scan_artifact_plan(
     resolved = resolve_occupancy_stream_schema(
         spec.occupancy.processor,
         camera_schema,
+    )
+    preview_spec = _occupancy_preview_spec(spec.occupancy, preview)
+    preview_bytes = (
+        0 if preview_spec is None else preview_spec.downstream_peak_bytes
     )
     _require_compile_binding(
         document=document,
@@ -411,7 +514,7 @@ def compile_occupancy_scan_artifact_plan(
         resolved.counts_schema,
         output_contract,
         memory_limit_bytes=memory_limit_bytes,
-        retained_overhead_bytes=0,
+        retained_overhead_bytes=preview_bytes,
     )
     static_lineage = repository._admit_static_lineage(
         document,
@@ -427,6 +530,7 @@ def compile_occupancy_scan_artifact_plan(
             + calibration_retained_array_nbytes(
                 spec.occupancy.processor.calibration.artifact
             )
+            + preview_bytes
         ),
     )
 
@@ -443,7 +547,12 @@ def compile_occupancy_scan_artifact_plan(
             value.lineage.evidence(),
         )
 
-    base = compile_triggered_occupancy_pipeline(spec)
+    base = compile_triggered_occupancy_pipeline(
+        spec,
+        preview=preview,
+        _admitted_preview_spec=preview_spec,
+        _retained_overhead_bytes=static_lineage.retained_upper_bound_bytes,
+    )
     return _compile_scan_artifact_plan(
         base,
         repository,
@@ -459,4 +568,5 @@ def compile_occupancy_scan_artifact_plan(
 __all__ = [
     "compile_direct_scan_artifact_plan",
     "compile_occupancy_scan_artifact_plan",
+    "PreparedOccupancyScan",
 ]

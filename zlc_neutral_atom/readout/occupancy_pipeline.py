@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from zlc_data import BlockId, ComponentValidity, DataBlock, DatasetSchema, OwnedSnapshot
-from zlc_storage import canonical_text, positive_real
+from zlc_storage import canonical_text, nonnegative_integer, positive_real
 
 from zlc_neutral_atom.acquisition.camera import (
     CameraFrameMetadata,
@@ -29,7 +29,10 @@ from zlc_neutral_atom.runtime.dataset import (
 )
 from zlc_neutral_atom.runtime.pipeline import (
     BoundMeasurement,
+    ExactDatasetPreviewPort,
+    ExactDatasetPreviewSpec,
     PipelineResult,
+    _notify_preview_failure,
     _require_direct_capture,
     finalize_pipeline_result,
 )
@@ -54,6 +57,7 @@ from .occupancy import (
     OccupancyDatasetMetadata,
     OccupancyStreamProcessorSpec,
     bind_occupancy_stream_processor,
+    resolve_occupancy_stream_schema,
 )
 
 
@@ -145,6 +149,7 @@ class ExactOccupancyTransaction:
     session: CaptureSession
     bound: BoundOccupancyStreamProcessor
     worker: ExactStreamProcessorWorker | None
+    preview: ExactDatasetPreviewPort | None = None
 
     def start(self, context: RunContext) -> None:
         self.session.prepare(context)
@@ -183,6 +188,7 @@ class ExactOccupancyTransaction:
         )
 
     def fail(self, error: BaseException) -> None:
+        self._fail_preview(error)
         if self.session.state is CaptureSessionState.COMPLETED:
             return
         try:
@@ -213,6 +219,30 @@ class ExactOccupancyTransaction:
         if not errors:
             return report
         return CleanupReport(report.safety_proofs, report.decisions, (*report.errors, *errors))
+
+    def _fail_preview(self, error: BaseException) -> None:
+        preview, self.preview = self.preview, None
+        _notify_preview_failure(preview, error)
+
+    def settle_preview_after_cleanup(
+        self,
+        report: CleanupReport,
+        primary: BaseException | None,
+    ) -> None:
+        """Cleanup may reject preview; only post-safety may complete it."""
+
+        if primary is not None:
+            self._fail_preview(primary)
+        elif report.errors:
+            self._fail_preview(report.errors[0])
+        elif report.decisions:
+            decision = report.decisions[0]
+            self._fail_preview(
+                RuntimeError(
+                    "occupancy cleanup reported an unsafe terminal state: "
+                    f"{decision.reason}"
+                )
+            )
 
 
 
@@ -246,7 +276,6 @@ class ExecutedOccupancy:
         self.cell_schedule.validate_schema(self.pipeline.dataset.block.schema)
         self.cell_schedule.validate_schema(self.occupied_schema)
 
-
 def _remaining_seconds(context: RunContext) -> float:
     context.checkpoint()
     if context.deadline is None:
@@ -265,17 +294,101 @@ def _occupied_schema(bound: BoundOccupancyStreamProcessor) -> DatasetSchema:
     )
 
 
-def _estimate_peak_bytes(spec: OccupancyPipelineSpec, bound: BoundOccupancyStreamProcessor) -> int:
+def _estimate_peak_bytes(
+    spec: OccupancyPipelineSpec,
+    bound: BoundOccupancyStreamProcessor,
+    preview_spec: ExactDatasetPreviewSpec | None = None,
+    *,
+    retained_overhead_bytes: int = 0,
+) -> int:
     contract, output = spec.measurement.capture_contract, bound.output_payload_contract
     events = contract.total_events
     counts_bytes, occupied_bytes = dataset_storage_nbytes(bound.output_schema), dataset_storage_nbytes(_occupied_schema(bound))
     metadata_bytes = events * bound.output_edge.metadata_max_retained_nbytes
     artifact = spec.processor.calibration.artifact
     calibration_bytes = calibration_retained_array_nbytes(artifact)
-    common = contract.estimated_transport_bytes + metadata_bytes + calibration_bytes
-    execution = common + output.max_retained_nbytes + 2 * counts_bytes + readout_runtime_scratch_nbytes(artifact, bound.model_kind)
-    finalization = common + output.max_retained_nbytes + 2 * counts_bytes + 2 * occupied_bytes + output.finalization_scratch_nbytes
+    preview_bytes = 0 if preview_spec is None else preview_spec.downstream_peak_bytes
+    common = (
+        contract.estimated_transport_bytes
+        + metadata_bytes
+        + calibration_bytes
+        + nonnegative_integer(
+            retained_overhead_bytes,
+            "retained_overhead_bytes",
+        )
+    )
+    execution = common + output.max_retained_nbytes + 2 * counts_bytes + preview_bytes + readout_runtime_scratch_nbytes(artifact, bound.model_kind)
+    finalization = common + output.max_retained_nbytes + 2 * counts_bytes + 2 * occupied_bytes + preview_bytes + output.finalization_scratch_nbytes
     return max(execution, finalization)
+
+
+def _occupancy_preview_spec(
+    spec: OccupancyPipelineSpec,
+    preview: ExactDatasetPreviewPort | None,
+) -> ExactDatasetPreviewSpec | None:
+    if preview is None:
+        return None
+    try:
+        preview_spec = getattr(preview, "spec", None)
+        if not isinstance(preview_spec, ExactDatasetPreviewSpec):
+            raise TypeError("preview.spec must be ExactDatasetPreviewSpec")
+        terminal = getattr(preview, "terminal", None)
+        if not isinstance(terminal, bool):
+            raise TypeError("preview.terminal must be bool")
+        if terminal:
+            raise RuntimeError("occupancy preview is already terminal")
+        source_schema = resolve_occupancy_stream_schema(
+            spec.processor,
+            spec.measurement.capture_contract.dataset_schema,
+        ).counts_schema
+        if preview_spec.source_schema_fingerprint != source_schema.fingerprint:
+            raise ValueError(
+                "occupancy preview schema differs from exact counts output"
+            )
+        minimum = dataset_storage_nbytes(source_schema)
+        if preview_spec.downstream_peak_bytes < minimum:
+            raise MemoryError(
+                "occupancy preview downstream peak cannot hold one frozen "
+                f"source snapshot: required {minimum}, declared "
+                f"{preview_spec.downstream_peak_bytes}"
+            )
+        return preview_spec
+    except BaseException as error:
+        _notify_preview_failure(preview, error)
+        raise
+
+
+def _settle_unbound_preview(
+    preview: ExactDatasetPreviewPort | None,
+    report: CleanupReport,
+    primary: BaseException | None,
+) -> CleanupReport:
+    failure = primary
+    if failure is None and report.errors:
+        failure = report.errors[0]
+    if failure is None and report.decisions:
+        failure = RuntimeError(
+            "occupancy cleanup reported an unsafe terminal state: "
+            f"{report.decisions[0].reason}"
+        )
+    if failure is None:
+        failure = RuntimeError("occupancy preview never reached an exact source")
+    if failure is not None:
+        _notify_preview_failure(preview, failure)
+    return report
+
+
+def _finish_preview_after_post_safety(
+    preview: ExactDatasetPreviewPort | None,
+) -> None:
+    if preview is None:
+        return
+    try:
+        if preview.terminal:
+            return
+        preview.source_terminal()
+    except BaseException as error:
+        _notify_preview_failure(preview, error)
 
 
 def _release(reservation: ExactReservation | None) -> None:
@@ -313,7 +426,14 @@ def _failed_open(session: CaptureSession, worker: ExactStreamProcessorWorker | N
         record_secondary_failure(primary, "preflight teardown also failed", error)
 
 
-def _open_exact_occupancy(spec: OccupancyPipelineSpec, context: RunContext) -> ExactOccupancyTransaction:
+def _open_exact_occupancy(
+    spec: OccupancyPipelineSpec,
+    context: RunContext,
+    *,
+    preview: ExactDatasetPreviewPort | None = None,
+    preview_spec: ExactDatasetPreviewSpec | None = None,
+    retained_overhead_bytes: int = 0,
+) -> ExactOccupancyTransaction:
     """Allocate the complete software chain without touching hardware."""
 
     if not isinstance(spec, OccupancyPipelineSpec):
@@ -326,7 +446,20 @@ def _open_exact_occupancy(spec: OccupancyPipelineSpec, context: RunContext) -> E
     try:
         capture_input = session.processor_input_binding
         bound = bind_occupancy_stream_processor(spec.processor, capture_input)
-        peak = _estimate_peak_bytes(spec, bound)
+        if (
+            preview_spec is not None
+            and preview_spec.source_schema_fingerprint
+            != bound.output_schema.fingerprint
+        ):
+            raise ValueError(
+                "occupancy preview schema differs from bound counts output"
+            )
+        peak = _estimate_peak_bytes(
+            spec,
+            bound,
+            preview_spec,
+            retained_overhead_bytes=retained_overhead_bytes,
+        )
         if peak > spec.memory_limit_bytes:
             raise MemoryError(
                 f"occupancy pipeline owned-buffer peak {peak} exceeds "
@@ -348,6 +481,18 @@ def _open_exact_occupancy(spec: OccupancyPipelineSpec, context: RunContext) -> E
         )
         output_cursor = output_reservation.activate()
         builder = DatasetBuilder(spec.counts_block_id, output_reservation, bound.output_edge)
+        bound_preview = preview
+        if bound_preview is not None:
+            assert preview_spec is not None
+            try:
+                bound_preview.bind(
+                    builder.open_preview_reader(),
+                    run_id=context.run_id.value,
+                    causation_domain_id=output_stream.generation.value,
+                )
+            except BaseException as preview_error:
+                _notify_preview_failure(bound_preview, preview_error)
+                bound_preview = None
         _remaining_seconds(context)
         assert context.deadline is not None
         worker = bound.create_exact_worker(
@@ -358,9 +503,16 @@ def _open_exact_occupancy(spec: OccupancyPipelineSpec, context: RunContext) -> E
         worker.start()
         readiness = worker.exact_readiness()
         session.bind_exact_consumer(readiness)
-        return ExactOccupancyTransaction(spec, session, bound, worker)
+        return ExactOccupancyTransaction(
+            spec,
+            session,
+            bound,
+            worker,
+            bound_preview,
+        )
     except BaseException as error:
         _failed_open(session, worker, builder, source, output_reservation, error)
+        _notify_preview_failure(preview, error)
         raise
 
 
@@ -435,7 +587,10 @@ def compile_occupancy_pipeline(spec: OccupancyPipelineSpec) -> RunPlan:
                 _primary: BaseException | None) -> CleanupReport:
         return port.verify_idle(context) if prepared is None else prepared.cleanup(context)
 
-    def finalize(context: PostSafetyContext, executed: ExecutedOccupancy) -> OccupancyPipelineResult:
+    def finalize(
+        context: PostSafetyContext,
+        executed: ExecutedOccupancy,
+    ) -> OccupancyPipelineResult:
         if not isinstance(executed, ExecutedOccupancy):
             raise TypeError("occupancy finalize requires executed occupancy facts")
         if executed.pipeline.run_id != context.run_id.value:

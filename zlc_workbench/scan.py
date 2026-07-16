@@ -1,10 +1,9 @@
-"""Headless lifecycle owner for one final-only scan panel.
+"""Headless lifecycle owner for one typed autonomous scan panel.
 
 The controller deliberately knows neither how a scan is compiled nor where its
-artifact is stored.  A composition-owned application freezes those decisions,
-starts one Run, and projects an already FINAL artifact into immutable display
-bytes.  Qt is only expected to provide a no-payload owner wake and to paint the
-returned view model.
+artifact is stored.  A composition-owned application prepares one frozen Run,
+then the controller may attach one display-only exact reader before admission.
+Qt only receives immutable raster fronts and a no-payload owner wake.
 """
 
 from __future__ import annotations
@@ -12,7 +11,8 @@ from __future__ import annotations
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import threading
-from typing import Protocol, runtime_checkable
+import time
+from typing import Callable, Protocol, runtime_checkable
 
 from zlc_neutral_atom.runtime.run import (
     CancelOutcome,
@@ -22,9 +22,18 @@ from zlc_neutral_atom.runtime.run import (
     RunState,
 )
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
+from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewPort
+from zlc_frontend.render import BoardPresenter
+
+from .progressive_scan import (
+    ExactDatasetLiveSlot,
+    ProgressiveScanPreview,
+    ProgressiveScanSpec,
+)
 
 
 _DEFAULT_PROJECTION_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024
+_PREVIEW_CLOSE_RETRY_SECONDS = 0.1
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
@@ -80,11 +89,34 @@ class FinalScanPresentation:
         return len(self.png_bytes) + 2 * width * height * 4
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedScanPanelRun:
+    """Composition command pairing an optional display plan with Run start."""
+
+    progressive_spec: ProgressiveScanSpec | None
+    _start: Callable[[ExactDatasetPreviewPort | None], RunHandle[ScanArtifactRef]]
+
+    def __post_init__(self) -> None:
+        if self.progressive_spec is not None and not isinstance(
+            self.progressive_spec,
+            ProgressiveScanSpec,
+        ):
+            raise TypeError("progressive_spec must be ProgressiveScanSpec or None")
+        if not callable(self._start):
+            raise TypeError("start must be callable")
+
+    def start(
+        self,
+        preview: ExactDatasetPreviewPort | None,
+    ) -> RunHandle[ScanArtifactRef]:
+        return self._start(preview)
+
+
 @runtime_checkable
 class ScanPanelApplication(Protocol):
     """Narrow application port over one already-frozen scan request."""
 
-    def start(self) -> RunHandle[ScanArtifactRef]: ...
+    def prepare(self) -> PreparedScanPanelRun: ...
 
     def project_final(
         self,
@@ -109,6 +141,8 @@ class ScanPanelViewModel:
     worker_idle: bool
     closing: bool
     closed: bool
+    display_phase: str = "EMPTY"
+    projection_summary: str | None = None
     final_only: bool = True
 
 
@@ -136,6 +170,7 @@ class ScanPanelController:
         *,
         projection_memory_limit_bytes: int = _DEFAULT_PROJECTION_MEMORY_LIMIT_BYTES,
         executor: Executor | None = None,
+        preview_presenter: BoardPresenter | None = None,
     ) -> None:
         if not isinstance(application, ScanPanelApplication):
             raise TypeError("application must implement ScanPanelApplication")
@@ -143,6 +178,11 @@ class ScanPanelController:
             raise TypeError("request_owner_wake must be callable")
         if executor is not None and not isinstance(executor, Executor):
             raise TypeError("executor must implement concurrent.futures.Executor")
+        if preview_presenter is not None and not isinstance(
+            preview_presenter,
+            BoardPresenter,
+        ):
+            raise TypeError("preview_presenter must implement BoardPresenter")
 
         self._owner_thread = threading.get_ident()
         self._application: ScanPanelApplication | None = application
@@ -158,6 +198,7 @@ class ScanPanelController:
         )
         self._owns_executor = executor is None
         self._executor_closed = False
+        self._preview_presenter = preview_presenter
 
         self._lock = threading.Lock()
         self._tracked: set[Future] = set()
@@ -165,14 +206,20 @@ class ScanPanelController:
         self._wake_failure: str | None = None
 
         self._generation = 0
+        self._preparing = False
         self._starting = False
         self._cancel_when_started = False
         self._handle: RunHandle[ScanArtifactRef] | None = None
         self._terminal_work_inflight = False
         self._owner_reaped = True
         self._projection_inflight = False
+        self._pending_projection: _WorkToken | None = None
         self._artifact_ref: ScanArtifactRef | None = None
         self._presentation: FinalScanPresentation | None = None
+        self._progressive_summary: str | None = None
+        self._preview: ProgressiveScanPreview | None = None
+        self._preview_close_retry_at = 0.0
+        self._preview_fault_seen: str | None = None
         self._diagnostic: str | None = None
         self._status = "IDLE · FINAL-ONLY"
         self._closing = False
@@ -195,27 +242,33 @@ class ScanPanelController:
         return self._closed
 
     def start(self) -> int:
-        """Start the frozen request without blocking the owner thread."""
+        """Prepare, attach any preview, then start without blocking the owner."""
 
         self._require_owner()
         if not self._can_start():
             raise RuntimeError("scan panel is not ready to start another Run")
+        self._retire_preview()
         self._generation += 1
         token = _WorkToken(self._generation)
-        self._starting = True
+        self._preparing = True
+        self._starting = False
         self._cancel_when_started = False
         self._handle = None
         self._terminal_work_inflight = False
         self._owner_reaped = False
         self._projection_inflight = False
+        self._pending_projection = None
         self._artifact_ref = None
         self._presentation = None
+        self._progressive_summary = None
+        self._preview_fault_seen = None
+        self._preview_close_retry_at = 0.0
         self._diagnostic = None
-        self._status = "STARTING · NOT FINAL"
+        self._status = "PREPARING · NOT FINAL"
         application = self._application
         if application is None:
             raise RuntimeError("scan panel application is detached")
-        self._submit("start", token, application.start)
+        self._submit("prepare", token, application.prepare)
         self._publish_model()
         return token.generation
 
@@ -225,11 +278,15 @@ class ScanPanelController:
         self._require_owner()
         if self._closing or self._closed:
             return None
-        if self._starting and self._handle is None:
+        if (self._preparing or self._starting) and self._handle is None:
             if self._cancel_when_started:
                 return CancelOutcome.ALREADY_REQUESTED
             self._cancel_when_started = True
-            self._status = "CANCELLING BEFORE ADMISSION · NOT FINAL"
+            self._status = (
+                "CANCELLING BEFORE ADMISSION · NOT FINAL"
+                if self._preparing
+                else "CANCELLATION PENDING HANDLE · NOT FINAL"
+            )
             self._publish_model()
             return CancelOutcome.REQUESTED
         handle = self._handle
@@ -253,8 +310,27 @@ class ScanPanelController:
         if self._closed:
             return self._view_model
         self._drain_mailbox()
+        preview = self._preview
+        if preview is not None and not preview.closed:
+            try:
+                preview.owner_cycle()
+                fault = preview.fault
+                if fault is not None:
+                    summary = _error_summary(fault)
+                    if summary != self._preview_fault_seen:
+                        self._preview_fault_seen = summary
+                        self._record_diagnostic(
+                            f"progressive display failed: {summary}"
+                        )
+                        self._retire_preview()
+            except BaseException as error:
+                self._record_diagnostic(
+                    f"progressive display failed: {_error_summary(error)}"
+                )
+                self._retire_preview()
         if not self._closing:
             self._poll_active_handle()
+        self._advance_preview_retirement()
         self._maybe_finish_close()
         self._publish_model()
         return self._view_model
@@ -269,6 +345,8 @@ class ScanPanelController:
         self._generation += 1  # revoke every current completion token
         self._cancel_when_started = True
         self._status = "CLOSING"
+        self._pending_projection = None
+        self._retire_preview()
 
         handle = self._handle
         terminal_inflight = self._terminal_work_inflight
@@ -294,9 +372,17 @@ class ScanPanelController:
         self._maybe_finish_close()
 
     def _submit(self, kind: str, token: _WorkToken, work: object) -> Future:
-        if self._executor_closed or not callable(work):
-            raise RuntimeError("scan panel worker is unavailable")
-        future = self._executor.submit(work)
+        try:
+            if self._executor_closed or not callable(work):
+                raise RuntimeError("scan panel worker is unavailable")
+            future = self._executor.submit(work)
+        except BaseException as error:
+            future = Future()
+            future.set_exception(error)
+            with self._lock:
+                self._mailbox.append((kind, token, future))
+            self._request_wake()
+            return future
         with self._lock:
             self._tracked.add(future)
 
@@ -326,8 +412,12 @@ class ScanPanelController:
         if wake_failure is not None:
             self._record_diagnostic(f"owner wake failed: {wake_failure}")
         for kind, token, future in pending:
-            if kind == "start":
+            if kind == "prepare":
+                self._accept_prepare(token, future)
+            elif kind == "start":
                 self._accept_start(token, future)
+            elif kind == "preview-worker":
+                self._accept_preview_worker(token, future)
             elif kind == "terminal-result":
                 self._accept_terminal_result(token, future)
             elif kind == "terminal-reap":
@@ -339,6 +429,77 @@ class ScanPanelController:
             else:
                 self._record_diagnostic(f"unknown worker completion kind {kind!r}")
 
+    def _accept_prepare(self, token: _WorkToken, future: Future) -> None:
+        try:
+            prepared = future.result()
+            if not isinstance(prepared, PreparedScanPanelRun):
+                raise TypeError("prepared scan run has the wrong type")
+            progressive = prepared.progressive_spec
+        except BaseException as error:
+            if token.generation == self._generation and not self._closing:
+                self._preparing = False
+                self._owner_reaped = True
+                self._status = "PREPARATION FAILED · NOT FINAL"
+                self._record_diagnostic(
+                    f"scan preparation failed: {_error_summary(error)}"
+                )
+            return
+        if token.generation != self._generation or self._closing:
+            return
+
+        self._preparing = False
+        if self._cancel_when_started:
+            # No Run exists yet, so cancellation is strongest here: discard
+            # the pure prepared command instead of opening an admission race.
+            self._cancel_when_started = False
+            self._owner_reaped = True
+            self._status = "CANCELLED BEFORE ADMISSION · NOT FINAL"
+            return
+        self._progressive_summary = None
+        preview_port: ExactDatasetPreviewPort | None = None
+        presenter = self._preview_presenter
+        if progressive is not None and presenter is not None:
+            try:
+                slot = ExactDatasetLiveSlot(progressive.preview_spec)
+                self._preview = ProgressiveScanPreview(
+                    slot,
+                    progressive,
+                    presenter,
+                    submit_worker=lambda work: self._submit(
+                        "preview-worker",
+                        token,
+                        work,
+                    ),
+                    request_owner_wake=self._request_wake,
+                )
+                preview_port = slot
+                self._progressive_summary = progressive.projection_summary
+            except BaseException as error:
+                self._record_diagnostic(
+                    f"progressive attachment failed: {_error_summary(error)}"
+                )
+                self._retire_preview()
+        self._starting = True
+        self._status = (
+            "STARTING · PROVISIONAL"
+            if preview_port is not None
+            else "STARTING · FINAL-ONLY"
+        )
+        self._submit(
+            "start",
+            token,
+            lambda: prepared.start(preview_port),
+        )
+
+    def _accept_preview_worker(self, token: _WorkToken, future: Future) -> None:
+        try:
+            future.result()
+        except BaseException as error:
+            if token.generation == self._generation and not self._closing:
+                self._record_diagnostic(
+                    f"progressive worker failed: {_error_summary(error)}"
+                )
+
     def _accept_start(self, token: _WorkToken, future: Future) -> None:
         try:
             handle = future.result()
@@ -349,6 +510,7 @@ class ScanPanelController:
                 self._owner_reaped = True
                 self._status = "FAILED BEFORE ADMISSION · NOT FINAL"
                 self._record_diagnostic(f"scan start failed: {_error_summary(error)}")
+                self._retire_preview()
             return
 
         if token.generation != self._generation or self._closing:
@@ -369,7 +531,7 @@ class ScanPanelController:
             handle.cancel("scan panel stop requested before admission returned")
             snapshot = handle.snapshot()
             self._validate_snapshot(handle, snapshot)
-        self._status = f"{snapshot.state.value} / {snapshot.phase} · NOT FINAL"
+        self._status = self._running_status(snapshot)
 
     def _poll_active_handle(self) -> None:
         handle = self._handle
@@ -378,7 +540,7 @@ class ScanPanelController:
         snapshot = handle.snapshot()
         self._validate_snapshot(handle, snapshot)
         if not snapshot.state.terminal:
-            self._status = f"{snapshot.state.value} / {snapshot.phase} · NOT FINAL"
+            self._status = self._running_status(snapshot)
             return
         if self._terminal_work_inflight:
             return
@@ -404,6 +566,7 @@ class ScanPanelController:
                 self._record_diagnostic(
                     f"final result retrieval failed: {_error_summary(error)}"
                 )
+                self._retire_preview()
             return
         if not self._matches_active(token):
             return
@@ -412,23 +575,14 @@ class ScanPanelController:
         self._owner_reaped = True
         self._artifact_ref = reference
         self._presentation = None
-        self._projection_inflight = True
-        self._status = "FINAL · BUILDING DISPLAY"
-        application = self._application
-        if application is None:
-            self._projection_inflight = False
-            self._status = "FINAL · DISPLAY FAILED"
-            self._record_diagnostic("final display application is detached")
-            return
-        project_token = _WorkToken(token.generation, token.run_id, reference)
-        self._submit(
-            "project-final",
-            project_token,
-            lambda: application.project_final(
-                reference,
-                memory_limit_bytes=self._projection_memory_limit_bytes,
-            ),
+        self._pending_projection = _WorkToken(
+            token.generation,
+            token.run_id,
+            reference,
         )
+        self._status = "FINAL · RETIRING PROVISIONAL DISPLAY"
+        self._retire_preview()
+        self._advance_preview_retirement()
 
     def _accept_terminal_reap(self, token: _WorkToken, future: Future) -> None:
         error: BaseException | None = None
@@ -443,6 +597,7 @@ class ScanPanelController:
             return
         self._terminal_work_inflight = False
         self._owner_reaped = True
+        self._retire_preview()
         if error is not None:
             self._status = "RUN REAP FAILED · NOT FINAL"
             self._record_diagnostic(f"Run reap failed: {_error_summary(error)}")
@@ -484,6 +639,79 @@ class ScanPanelController:
             return
         self._presentation = presentation
         self._status = "FINAL"
+
+    def _running_status(self, snapshot: RunSnapshot) -> str:
+        preview = self._preview
+        if preview is None or preview.closed:
+            return f"{snapshot.state.value} / {snapshot.phase} · FINAL-ONLY"
+        if preview.fault is not None:
+            return f"DISPLAY FAILED · {snapshot.state.value} / {snapshot.phase}"
+        if preview.terminal:
+            return (
+                f"PROVISIONAL · {preview.coverage} · SOURCE COMPLETE · "
+                "AWAITING FINAL"
+            )
+        return (
+            f"PROVISIONAL · {preview.coverage} · "
+            f"{snapshot.state.value} / {snapshot.phase}"
+        )
+
+    def _retire_preview(self) -> None:
+        preview = self._preview
+        if preview is None:
+            return
+        now = time.monotonic()
+        if preview.closed and now < self._preview_close_retry_at:
+            return
+        try:
+            preview.close()
+        except BaseException as error:
+            self._preview_close_retry_at = now + _PREVIEW_CLOSE_RETRY_SECONDS
+            self._record_diagnostic(
+                f"progressive close failed: {_error_summary(error)}"
+            )
+        else:
+            self._preview_close_retry_at = 0.0
+
+    def _advance_preview_retirement(self) -> None:
+        preview = self._preview
+        if preview is not None and preview.fault is not None:
+            summary = _error_summary(preview.fault)
+            if summary != self._preview_fault_seen:
+                self._preview_fault_seen = summary
+                self._record_diagnostic(
+                    f"progressive display cleanup failed: {summary}"
+                )
+        if preview is not None and preview.closed and not preview.retired:
+            self._retire_preview()
+        preview = self._preview
+        if preview is not None and preview.retired and preview.worker_done:
+            self._preview = None
+        token = self._pending_projection
+        if token is None or self._preview is not None or self._projection_inflight:
+            return
+        if not self._matches_active(token, require_artifact=True):
+            self._pending_projection = None
+            return
+        application = self._application
+        if application is None:
+            self._pending_projection = None
+            self._status = "FINAL · DISPLAY FAILED"
+            self._record_diagnostic("final display application is detached")
+            return
+        reference = token.artifact_ref
+        assert reference is not None
+        self._pending_projection = None
+        self._projection_inflight = True
+        self._status = "FINAL · BUILDING DISPLAY"
+        self._submit(
+            "project-final",
+            token,
+            lambda: application.project_final(
+                reference,
+                memory_limit_bytes=self._projection_memory_limit_bytes,
+            ),
+        )
 
     def _submit_stale_reap(self, handle: RunHandle) -> None:
         token = _WorkToken(self._generation)
@@ -545,6 +773,8 @@ class ScanPanelController:
         message = str(message).strip()
         if not message:
             return
+        if self._diagnostic is not None and self._diagnostic.rsplit("\n", 1)[-1] == message:
+            return
         self._diagnostic = (
             message
             if self._diagnostic is None
@@ -555,16 +785,19 @@ class ScanPanelController:
         return (
             not self._closing
             and not self._closed
+            and not self._preparing
             and not self._starting
             and not self._terminal_work_inflight
             and not self._projection_inflight
+            and self._pending_projection is None
+            and self._preview is None
             and (self._handle is None or self._owner_reaped)
         )
 
     def _can_stop(self) -> bool:
         if self._closing or self._closed:
             return False
-        if self._starting and self._handle is None:
+        if (self._preparing or self._starting) and self._handle is None:
             return not self._cancel_when_started
         handle = self._handle
         if handle is None or self._owner_reaped:
@@ -574,6 +807,24 @@ class ScanPanelController:
     def _build_view_model(self) -> ScanPanelViewModel:
         with self._lock:
             worker_idle = not self._tracked and not self._mailbox
+        preview = self._preview
+        provisional = (
+            preview is not None and not preview.closed and preview.presented
+        )
+        display_phase = (
+            "FINAL"
+            if self._presentation is not None
+            else "PROVISIONAL"
+            if provisional
+            else "EMPTY"
+        )
+        projection_summary = (
+            self._presentation.projection_summary
+            if self._presentation is not None
+            else None
+            if self._progressive_summary is None
+            else self._progressive_summary
+        )
         return ScanPanelViewModel(
             generation=self._generation,
             status=self._status,
@@ -586,6 +837,9 @@ class ScanPanelController:
             worker_idle=worker_idle,
             closing=self._closing,
             closed=self._closed,
+            display_phase=display_phase,
+            projection_summary=projection_summary,
+            final_only=self._progressive_summary is None,
         )
 
     def _publish_model(self) -> None:
@@ -594,6 +848,8 @@ class ScanPanelController:
     def _maybe_finish_close(self) -> None:
         if not self._closing or self._closed:
             return
+        if self._preview is not None:
+            return
         with self._lock:
             if self._tracked or self._mailbox:
                 return
@@ -601,6 +857,7 @@ class ScanPanelController:
             self._executor.shutdown(wait=False, cancel_futures=False)
         self._executor_closed = True
         self._application = None
+        self._preview_presenter = None
         self._request_owner_wake = None
         self._closed = True
         self._status = "CLOSED"
@@ -613,6 +870,7 @@ class ScanPanelController:
 
 __all__ = [
     "FinalScanPresentation",
+    "PreparedScanPanelRun",
     "ScanPanelApplication",
     "ScanPanelController",
     "ScanPanelViewModel",

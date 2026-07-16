@@ -1449,6 +1449,8 @@ class DatasetBuilder(Generic[PayloadT]):
             self._metadata_contract_fingerprint
         )
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._preview_reader_minted = False
         self._values = np.zeros(
             self.schema.physical_shape,
             dtype=self.schema.cell_schema.dtype,
@@ -1543,6 +1545,7 @@ class DatasetBuilder(Generic[PayloadT]):
                 + address.point_storage_index
             )
             self._cell_metadata[flat_cell] = metadata
+            self._condition.notify_all()
 
     def materialize(self, ref: DatasetRevisionRef | None = None) -> DatasetPreviewSnapshot:
         with self._lock:
@@ -1591,6 +1594,7 @@ class DatasetBuilder(Generic[PayloadT]):
             if not self._coverage_locked().complete:
                 raise DatasetError("formal dataset coverage is incomplete")
             self._sealed = True
+            self._condition.notify_all()
 
     def abort(self) -> None:
         self._source._abort_consumer(
@@ -1605,6 +1609,16 @@ class DatasetBuilder(Generic[PayloadT]):
             readiness = self._exact_readiness
         readiness._validate_terminal_sink()
         return readiness
+
+    def open_preview_reader(self) -> "ExactDatasetPreviewReader":
+        """Mint a read-only progressive view without exposing write authority."""
+
+        with self._lock:
+            self._ensure_writable_locked()
+            if self._preview_reader_minted:
+                raise RuntimeError("exact dataset already has a preview reader")
+            self._preview_reader_minted = True
+        return ExactDatasetPreviewReader(_PREVIEW_READER_TOKEN, self)
 
     def close(self) -> None:
         """Idempotently abort if needed and release the exact reservation."""
@@ -1634,6 +1648,7 @@ class DatasetBuilder(Generic[PayloadT]):
             if self._sealed:
                 raise DatasetError("sealed dataset cannot be aborted")
             self._aborted = True
+            self._condition.notify_all()
 
     def _ensure_writable_locked(self) -> None:
         if self._sealed:
@@ -1672,6 +1687,95 @@ class DatasetBuilder(Generic[PayloadT]):
                 "materializers retain only the current revision; callers retain snapshots"
             )
         return selected
+
+
+_PREVIEW_READER_TOKEN = object()
+
+
+class ExactDatasetPreviewReader:
+    """Process-local read-only revision surface over one exact materializer.
+
+    Presentation code can wait for a newer revision and freeze an immutable
+    snapshot.  It cannot consume, seal, abort, release, or obtain the exact
+    reservation/cursor, so DatasetBuilder remains the sole authority.
+    """
+
+    __slots__ = ("__builder",)
+
+    def __init_subclass__(cls, **_kwargs) -> None:
+        raise TypeError("ExactDatasetPreviewReader is final")
+
+    def __init__(self, authority: object, builder: DatasetBuilder) -> None:
+        if authority is not _PREVIEW_READER_TOKEN:
+            raise PermissionError(
+                "ExactDatasetPreviewReader can only be minted by DatasetBuilder"
+            )
+        if not isinstance(builder, DatasetBuilder):
+            raise TypeError("builder must be DatasetBuilder")
+        self.__builder = builder
+
+    def __reduce__(self):
+        raise TypeError("ExactDatasetPreviewReader is process-local")
+
+    def __reduce_ex__(self, _protocol: int):
+        raise TypeError("ExactDatasetPreviewReader is process-local")
+
+    @property
+    def schema(self) -> DatasetSchema:
+        return self.__builder.schema
+
+    @property
+    def stream_generation(self) -> StreamGenerationId:
+        return self.__builder.generation
+
+    @property
+    def terminal(self) -> bool:
+        builder = self.__builder
+        with builder._lock:
+            return builder._sealed or builder._aborted
+
+    @property
+    def failed(self) -> bool:
+        builder = self.__builder
+        with builder._lock:
+            return builder._aborted
+
+    def wait_for_change(
+        self,
+        after: DatasetRevision,
+        timeout: float | None = None,
+    ) -> DatasetRevision | None:
+        if not isinstance(after, DatasetRevision):
+            raise TypeError("after must be DatasetRevision")
+        if timeout is not None:
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not math.isfinite(float(timeout))
+                or float(timeout) < 0
+            ):
+                raise ValueError("timeout must be finite and non-negative or None")
+            timeout = float(timeout)
+        builder = self.__builder
+        with builder._condition:
+            builder._condition.wait_for(
+                lambda: (
+                    builder._revision > after.value
+                    or builder._sealed
+                    or builder._aborted
+                ),
+                timeout,
+            )
+            if builder._revision <= after.value:
+                return None
+            return DatasetRevision(builder._revision)
+
+    def freeze_current(self) -> DatasetPreviewSnapshot:
+        builder = self.__builder
+        with builder._lock:
+            if builder._aborted:
+                raise DatasetError("aborted exact dataset cannot be previewed")
+            return builder.materialize()
 
 
 class MonitorDataset(Generic[PayloadT]):
@@ -1994,6 +2098,7 @@ __all__ = [
     "DatasetError",
     "DatasetPreviewSnapshot",
     "DatasetSealProvenance",
+    "ExactDatasetPreviewReader",
     "FrozenDatasetEdge",
     "MissingDatasetCells",
     "MonitorCoverage",

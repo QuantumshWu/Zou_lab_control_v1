@@ -9,13 +9,22 @@ from zlc_neutral_atom.readout.occupancy_pipeline import (
     ExactOccupancyTransaction,
     OccupancyPipelineResult,
     OccupancyPipelineSpec,
+    _finish_preview_after_post_safety,
+    _occupancy_preview_spec,
     _open_exact_occupancy,
+    _settle_unbound_preview,
     finalize_occupancy_result,
 )
 from zlc_neutral_atom.readout.physical_context import (
     derive_readout_physical_context,
 )
+from zlc_neutral_atom.runtime._failure import record_secondary_failure
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
+from zlc_neutral_atom.runtime.pipeline import (
+    ExactDatasetPreviewPort,
+    ExactDatasetPreviewSpec,
+    _notify_preview_failure,
+)
 from zlc_neutral_atom.runtime.run import (
     PostSafetyContext,
     RunContext,
@@ -147,9 +156,28 @@ class _PreparedTriggeredOccupancy:
 class _ExecutedTriggeredOccupancy:
     occupancy: ExecutedOccupancy
     lineage: PulseCaptureLineage
+    preview: ExactDatasetPreviewPort | None
 
 
-def compile_triggered_occupancy_pipeline(spec: TriggeredOccupancySpec) -> RunPlan:
+def _dispose_triggered_preview(value: _ExecutedTriggeredOccupancy) -> None:
+    if type(value) is not _ExecutedTriggeredOccupancy:
+        raise TypeError("unfinalized triggered occupancy has another type")
+    _notify_preview_failure(
+        value.preview,
+        RuntimeError(
+            "triggered occupancy preview rejected before post-safety "
+            "finalization"
+        ),
+    )
+
+
+def compile_triggered_occupancy_pipeline(
+    spec: TriggeredOccupancySpec,
+    *,
+    preview: ExactDatasetPreviewPort | None = None,
+    _admitted_preview_spec: ExactDatasetPreviewSpec | None = None,
+    _retained_overhead_bytes: int = 0,
+) -> RunPlan:
     """Compile ready-all -> arm camera -> one FIRE -> drain -> attest."""
 
     if not isinstance(spec, TriggeredOccupancySpec):
@@ -158,14 +186,57 @@ def compile_triggered_occupancy_pipeline(spec: TriggeredOccupancySpec) -> RunPla
     pulse_port = spec.pulse_port
     pulse_binding = spec.pulse_binding
     if camera_port.device.key == pulse_port.device.key:
-        raise ValueError("camera and sequencer must be distinct physical resources")
+        error = ValueError(
+            "camera and sequencer must be distinct physical resources"
+        )
+        _notify_preview_failure(preview, error)
+        raise error
+    if _admitted_preview_spec is None:
+        try:
+            preview_spec = _occupancy_preview_spec(spec.occupancy, preview)
+        except BaseException as error:
+            _notify_preview_failure(preview, error)
+            raise
+    else:
+        try:
+            if preview is None:
+                raise ValueError(
+                    "an admitted preview spec requires its preview port"
+                )
+            if not isinstance(_admitted_preview_spec, ExactDatasetPreviewSpec):
+                raise TypeError("_admitted_preview_spec has the wrong type")
+            preview_spec = _occupancy_preview_spec(spec.occupancy, preview)
+            if preview_spec != _admitted_preview_spec:
+                raise ValueError(
+                    "occupancy preview budget changed after scan admission"
+                )
+        except BaseException as error:
+            _notify_preview_failure(preview, error)
+            raise
 
     def preflight(context: RunContext) -> _PreparedTriggeredOccupancy:
-        pulse = pulse_port.open_session(spec.pulse_request)
         try:
-            occupancy = _open_exact_occupancy(spec.occupancy, context)
-        except BaseException:
-            pulse.fail()
+            pulse = pulse_port.open_session(spec.pulse_request)
+        except BaseException as error:
+            _notify_preview_failure(preview, error)
+            raise
+        try:
+            occupancy = _open_exact_occupancy(
+                spec.occupancy,
+                context,
+                preview=preview,
+                preview_spec=preview_spec,
+                retained_overhead_bytes=_retained_overhead_bytes,
+            )
+        except BaseException as primary:
+            try:
+                pulse.fail()
+            except BaseException as secondary:
+                record_secondary_failure(
+                    primary,
+                    "pulse preflight poison also failed",
+                    secondary,
+                )
             raise
         return _PreparedTriggeredOccupancy(occupancy, pulse)
 
@@ -183,22 +254,26 @@ def compile_triggered_occupancy_pipeline(spec: TriggeredOccupancySpec) -> RunPla
         return _ExecutedTriggeredOccupancy(
             completed,
             PulseCaptureLineage(pulse_binding, terminal),
+            prepared.occupancy.preview,
         )
 
     def cleanup(
         context: RunContext,
         prepared: _PreparedTriggeredOccupancy | None,
-        _primary: BaseException | None,
+        primary: BaseException | None,
     ) -> CleanupReport:
         if prepared is not None:
-            return run_cleanup_steps(
+            report = run_cleanup_steps(
                 lambda: prepared.pulse.cleanup(context),
                 lambda: prepared.occupancy.cleanup(context),
             )
-        return run_cleanup_steps(
+            prepared.occupancy.settle_preview_after_cleanup(report, primary)
+            return report
+        report = run_cleanup_steps(
             lambda: pulse_port.verify_idle(context),
             lambda: camera_port.verify_idle(context),
         )
+        return _settle_unbound_preview(preview, report, primary)
 
     def finalize(
         context: PostSafetyContext,
@@ -207,11 +282,17 @@ def compile_triggered_occupancy_pipeline(spec: TriggeredOccupancySpec) -> RunPla
         if type(executed) is not _ExecutedTriggeredOccupancy:
             raise TypeError("triggered occupancy finalize received another value")
         pipeline = executed.occupancy.pipeline
-        if pipeline.run_id != context.run_id.value:
-            raise ValueError("triggered occupancy result belongs to another Run")
-        occupancy = finalize_occupancy_result(context, executed.occupancy)
-        context.checkpoint()
-        return TriggeredOccupancyPipelineResult(occupancy, executed.lineage)
+        try:
+            if pipeline.run_id != context.run_id.value:
+                raise ValueError("triggered occupancy result belongs to another Run")
+            occupancy = finalize_occupancy_result(context, executed.occupancy)
+            context.checkpoint()
+            result = TriggeredOccupancyPipelineResult(occupancy, executed.lineage)
+        except BaseException as error:
+            _notify_preview_failure(executed.preview, error)
+            raise
+        _finish_preview_after_post_safety(executed.preview)
+        return result
 
     return RunPlan(
         name=spec.occupancy.name,
@@ -227,6 +308,7 @@ def compile_triggered_occupancy_pipeline(spec: TriggeredOccupancySpec) -> RunPla
         ),
         timeout_seconds=spec.occupancy.timeout_seconds,
         requires_final_commit=False,
+        dispose_unfinalized=_dispose_triggered_preview,
     )
 
 

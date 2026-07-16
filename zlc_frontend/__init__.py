@@ -1,6 +1,10 @@
 """Target frontend public values with no implicit renderer or Qt import."""
 
 from .data_figure import DataFigure
+from ._matplotlib_render import (
+    estimate_single_curve_raster_peak_nbytes,
+    SingleCurveAggRenderer,
+)
 from .render import (
     AtomicBoardFront,
     BoardFrame,
@@ -97,6 +101,7 @@ __all__ = [
     "RasterBuffer",
     "RenderSurface",
     "SourceIdentity",
+    "SingleCurveAggRenderer",
     "RepeatViewMode",
     "ResolvedDataset",
     "ResolvedDatasetMap",
@@ -113,6 +118,7 @@ __all__ = [
     "encode_figure_document",
     "encode_view_spec",
     "estimate_view_evaluation_peak_nbytes",
+    "estimate_single_curve_raster_peak_nbytes",
     "suggest_view",
     "suggest_fit_view",
     "validate_view_spec",

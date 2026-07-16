@@ -77,17 +77,20 @@ class QtImageBoard(QtWidgets.QWidget):
         if len(frame.panels) != 1 or frame.panels[0].panel_id != self._panel_id:
             raise ValueError("QtImageBoard requires its one configured panel")
         raster = frame.panels[0].raster
-        if raster.pixel_format is not PixelFormat.GRAY8:
-            raise ValueError("QtImageBoard currently accepts only GRAY8")
+        formats = {
+            PixelFormat.GRAY8: QtGui.QImage.Format_Grayscale8,
+            PixelFormat.RGB888: QtGui.QImage.Format_RGB888,
+            PixelFormat.RGBA8888: QtGui.QImage.Format_RGBA8888,
+        }
         image = QtGui.QImage(
             raster.pixels,
             raster.width,
             raster.height,
             raster.stride_bytes,
-            QtGui.QImage.Format_Grayscale8,
+            formats[raster.pixel_format],
         )
         if image.isNull():
-            raise RuntimeError("Qt rejected the prepared GRAY8 front")
+            raise RuntimeError("Qt rejected the prepared immutable raster front")
         prepared = (raster.pixels, image)
         self._front = prepared
         self.update()

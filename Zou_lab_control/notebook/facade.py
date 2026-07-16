@@ -7,7 +7,7 @@ import math
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterator, TYPE_CHECKING
+from typing import Iterator, Mapping, TYPE_CHECKING
 from uuid import uuid4
 
 from zlc_neutral_atom.installation import (
@@ -84,6 +84,7 @@ from zlc_neutral_atom.scan import (
 )
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_neutral_atom.scan.application import (
+    PreparedOccupancyScan,
     compile_direct_scan_artifact_plan,
     compile_occupancy_scan_artifact_plan,
 )
@@ -102,6 +103,7 @@ from zlc_pulse import (
     bind_pulse_document_target,
     expand_autonomous_scan_repeats,
     require_autonomous_scan_resident_capacity,
+    resolve_api_parameters,
     load_pulse_document,
 )
 from zlc_storage import canonical_digest
@@ -180,6 +182,11 @@ def _validate_scan_request_fields(
         raise TypeError("pulse_document must be PulseDocument")
     if pulse_document.scan_table is None:
         raise ValueError("scan request requires a frozen PulseDocument scan table")
+    if pulse_document.api_parameters:
+        raise ValueError(
+            "scan request requires a PulseDocument with every whole-run API "
+            "parameter explicitly resolved"
+        )
     if not isinstance(camera_ref, DeviceRef):
         raise TypeError("camera_ref must be DeviceRef")
     if not isinstance(sequencer_ref, DeviceRef):
@@ -199,6 +206,28 @@ def _validate_scan_request_fields(
         _positive_int(memory_limit_bytes, "memory_limit_bytes"),
         _positive_real(timeout_seconds, "timeout_seconds"),
     )
+
+
+def _resolve_scan_fixed_api(
+    document: PulseDocument,
+    values: Mapping[str, int | float] | None,
+) -> PulseDocument:
+    """Freeze whole-run API constants before a SCAN_SLOT request exists.
+
+    These values are constants for the complete autonomous table.  They are
+    deliberately resolved out of the PulseDocument here; a future API-slot
+    segmented sweep is a different request and cannot reuse this path.
+    """
+
+    supplied = {} if values is None else dict(values)
+    resolved = resolve_api_parameters(document, supplied)
+    if resolved.api_parameters:
+        missing = tuple(item.parameter_id for item in resolved.api_parameters)
+        raise ValueError(
+            "SCAN_SLOT requires explicit whole-run values for every API parameter; "
+            f"missing={missing}"
+        )
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -613,6 +642,7 @@ class ReadoutFacade:
         camera_role: str | None = None,
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
+        api_values: Mapping[str, int | float] | None = None,
         output_transform_spec: DataTransformSpec | None = None,
         transport_memory_limit_bytes: int = 64 << 20,
         memory_limit_bytes: int = 512 << 20,
@@ -631,6 +661,7 @@ class ReadoutFacade:
                 if isinstance(pulse, PulseDocument)
                 else load_pulse_document(pulse)
             )
+            document = _resolve_scan_fixed_api(document, api_values)
             camera_role = self._resolve_camera_role(services, camera_role)
             return ScanRequest(
                 pulse_document=document,
@@ -665,6 +696,7 @@ class ReadoutFacade:
         camera_role: str | None = None,
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
+        api_values: Mapping[str, int | float] | None = None,
         output_transform_spec: DataTransformSpec | None = None,
         transport_memory_limit_bytes: int = 64 << 20,
         memory_limit_bytes: int = 512 << 20,
@@ -678,6 +710,7 @@ class ReadoutFacade:
                 if isinstance(pulse, PulseDocument)
                 else load_pulse_document(pulse)
             )
+            document = _resolve_scan_fixed_api(document, api_values)
             camera_role = self._resolve_camera_role(services, camera_role)
             sequencer_role = _resolve_role(
                 services.catalog,
@@ -1164,7 +1197,7 @@ class Experiment:
         return open_pulse_workbench(self, document, path=path)
 
     def scan_gui(self, request: ScanRequest | OccupancyScanRequest):
-        """Open the current final-only SCAN_SLOT panel for a frozen request."""
+        """Open the current typed SCAN_SLOT panel for a frozen request."""
 
         from Zou_lab_control.workbench import open_scan_workbench
 
@@ -1576,7 +1609,7 @@ def _compile_direct_scan_for_services(
     return plan, descriptor
 
 
-def _compile_occupancy_scan_for_services(
+def _bind_occupancy_scan_for_services(
     services: _ExperimentServices,
     request: OccupancyScanRequest,
 ):
@@ -1629,12 +1662,56 @@ def _compile_occupancy_scan_for_services(
         binding.trigger_channel,
         binding.cell_plan,
     )
+    return triggered, logical_document, output_contract, source_schema
+
+
+def _compile_occupancy_scan_for_services(
+    services: _ExperimentServices,
+    request: OccupancyScanRequest,
+):
+    triggered, logical_document, output_contract, _source_schema = (
+        _bind_occupancy_scan_for_services(services, request)
+    )
     return compile_occupancy_scan_artifact_plan(
         triggered,
         services.scan_repository,
         document=logical_document,
         output_contract=output_contract,
         memory_limit_bytes=request.memory_limit_bytes,
+    )
+
+
+def _prepare_occupancy_scan_for_workbench(
+    experiment: Experiment,
+    request: OccupancyScanRequest,
+) -> PreparedOccupancyScan:
+    """Private friend seam for the typed occupancy progressive panel."""
+
+    if not isinstance(experiment, Experiment):
+        raise TypeError("experiment must be Experiment")
+    if not isinstance(request, OccupancyScanRequest):
+        raise TypeError("request must be OccupancyScanRequest")
+    with _service_guard(experiment._authority_token) as services:
+        triggered, logical_document, output_contract, source_schema = (
+            _bind_occupancy_scan_for_services(services, request)
+        )
+
+    def start(preview):
+        with _service_guard(experiment._authority_token) as services:
+            plan = compile_occupancy_scan_artifact_plan(
+                triggered,
+                services.scan_repository,
+                document=logical_document,
+                output_contract=output_contract,
+                memory_limit_bytes=request.memory_limit_bytes,
+                preview=preview,
+            )
+            return services.runtime.start(plan)
+
+    return PreparedOccupancyScan(
+        source_schema=source_schema,
+        output_contract=output_contract,
+        start=start,
     )
 
 

@@ -1,4 +1,4 @@
-"""Thin Qt shell for one final-only autonomous SCAN_SLOT request."""
+"""Thin Qt shell for one autonomous SCAN_SLOT request."""
 
 from __future__ import annotations
 
@@ -8,11 +8,18 @@ from Zou_lab_control.notebook.facade import (
     Experiment,
     OccupancyScanRequest,
     ScanRequest,
+    _prepare_occupancy_scan_for_workbench,
 )
-from zlc_frontend.qt_board import QtOwnerWake
+from zlc_frontend.qt_board import QtImageBoard, QtOwnerWake
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
+from zlc_storage import canonical_digest
+from zlc_workbench.progressive_scan import (
+    ProgressiveScanSpec,
+    build_occupancy_progressive_spec,
+)
 from zlc_workbench.scan import (
     FinalScanPresentation,
+    PreparedScanPanelRun,
     ScanPanelController,
     ScanPanelViewModel,
 )
@@ -31,8 +38,41 @@ class _FrozenScanApplication:
         self._experiment = experiment
         self._request = request
 
-    def start(self):
-        return self._experiment.start_scan(self._request)
+    def prepare(self):
+        if isinstance(self._request, ScanRequest):
+            def start_direct(preview):
+                if preview is not None:
+                    raise ValueError(
+                        "direct camera scan has no progressive counts port"
+                    )
+                return self._experiment.start_scan(self._request)
+
+            return PreparedScanPanelRun(None, start_direct)
+        command = _prepare_occupancy_scan_for_workbench(
+            self._experiment,
+            self._request,
+        )
+        identity = canonical_digest(
+            {
+                "owner": "Zou_lab_control.workbench.occupancy-scan",
+                "pulse_document": self._request.pulse_document.fingerprint,
+                "source_schema": command.source_schema.fingerprint,
+                "output_contract": command.output_contract.fingerprint,
+            }
+        )[:20]
+        progressive = build_occupancy_progressive_spec(
+            command.source_schema,
+            command.output_contract,
+            identity=identity,
+        )
+        def start_occupancy(preview):
+            if preview is not None and preview.spec != progressive.preview_spec:
+                raise ValueError(
+                    "prepared progressive preview budget changed before start"
+                )
+            return command.start(preview)
+
+        return PreparedScanPanelRun(progressive, start_occupancy)
 
     def project_final(
         self,
@@ -62,7 +102,7 @@ class _FrozenScanApplication:
 
 
 class ScanWorkbenchWindow(QtWidgets.QWidget):
-    """Static final-result panel; acquisition and rendering never block Qt."""
+    """Progressive occupancy/final scan panel; rendering never blocks Qt."""
 
     def __init__(
         self,
@@ -75,17 +115,28 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         if not isinstance(request, (ScanRequest, OccupancyScanRequest)):
             raise TypeError("request must be a current scan request")
 
-        self.setWindowTitle("Autonomous Scan · Final Result")
+        self.setWindowTitle("Autonomous Scan")
         self.resize(900, 680)
         self._allow_close = False
         self._shown_presentation: FinalScanPresentation | None = None
         self._source_pixmap: QtGui.QPixmap | None = None
 
+        progressive = isinstance(request, OccupancyScanRequest)
+        self._progressive_requested = progressive
+        self._final_mode_text = (
+            "OCCUPANCY · CANONICAL FINAL-ONLY"
+            if progressive
+            else "DIRECT CAMERA · CANONICAL FINAL-ONLY"
+        )
         self._mode = QtWidgets.QLabel(
-            "FINAL-ONLY · no progressive curve in this migration slice",
+            (
+                "PROVISIONAL OCCUPANCY CURVE → CANONICAL FINAL"
+                if progressive
+                else self._final_mode_text
+            ),
             self,
         )
-        self._mode.setObjectName("finalOnlyMode")
+        self._mode.setObjectName("scanMode")
         self._status = QtWidgets.QLabel("IDLE · FINAL-ONLY", self)
         self._status.setObjectName("scanStatus")
         self._artifact = QtWidgets.QLabel("Artifact: —", self)
@@ -99,6 +150,12 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._raster.setAlignment(QtCore.Qt.AlignCenter)
         self._raster.setMinimumSize(320, 240)
         self._raster.setStyleSheet("background: #111; color: #bbb;")
+        self._provisional_board = QtImageBoard("scan-curve", self)
+        self._provisional_board.setObjectName("scanProvisionalBoard")
+        self._display_stack = QtWidgets.QStackedWidget(self)
+        self._display_stack.addWidget(self._provisional_board)
+        self._display_stack.addWidget(self._raster)
+        self._display_stack.setCurrentWidget(self._raster)
         self._diagnostics = QtWidgets.QLabel("", self)
         self._diagnostics.setObjectName("scanDiagnostics")
         self._diagnostics.setWordWrap(True)
@@ -117,7 +174,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         layout.addWidget(self._status)
         layout.addWidget(self._artifact)
         layout.addWidget(self._projection)
-        layout.addWidget(self._raster, 1)
+        layout.addWidget(self._display_stack, 1)
         layout.addWidget(self._diagnostics)
         layout.addLayout(controls)
 
@@ -126,6 +183,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._controller = ScanPanelController(
             self._application,
             self._wake.request_owner_wake,
+            preview_presenter=self._provisional_board,
         )
         self._wake.bind(self._owner_cycle)
         self._timer = QtCore.QTimer(self)
@@ -173,6 +231,16 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(0, self.close)
 
     def _apply_model(self, model: ScanPanelViewModel) -> None:
+        progressive_mode = self._progressive_requested and (
+            model.generation == 0 or not model.final_only
+        )
+        self._mode.setText(
+            (
+                "PROVISIONAL OCCUPANCY CURVE → CANONICAL FINAL"
+                if progressive_mode
+                else self._final_mode_text
+            )
+        )
         self._status.setText(model.status)
         self._artifact.setText(
             "Artifact: —"
@@ -182,6 +250,17 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._diagnostics.setText(model.diagnostic or "")
         self._start.setEnabled(model.can_start)
         self._stop.setEnabled(model.can_stop)
+        if model.display_phase == "PROVISIONAL":
+            self._display_stack.setCurrentWidget(self._provisional_board)
+        else:
+            self._display_stack.setCurrentWidget(self._raster)
+        if model.projection_summary is not None:
+            prefix = (
+                "Display (PROVISIONAL): "
+                if model.display_phase == "PROVISIONAL"
+                else "Display: "
+            )
+            self._projection.setText(prefix + model.projection_summary)
         presentation = model.presentation
         if presentation is None:
             if model.artifact_ref is None:
@@ -190,7 +269,8 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
                     self._source_pixmap = None
                     self._raster.clear()
                     self._raster.setText("No FINAL result")
-                self._projection.setText("Display: waiting for FINAL artifact")
+                if model.projection_summary is None:
+                    self._projection.setText("Display: waiting for scan preparation")
             else:
                 self._projection.setText("Display: FINAL artifact retained; raster unavailable")
             return

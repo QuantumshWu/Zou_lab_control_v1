@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Executor, Future
+import time
 
 import pytest
 
@@ -14,6 +15,7 @@ from zlc_neutral_atom.runtime.run import (
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_workbench.scan import (
     FinalScanPresentation,
+    PreparedScanPanelRun,
     ScanPanelController,
 )
 
@@ -74,6 +76,35 @@ class _ManualExecutor(Executor):
         self.shutdown_called = True
 
 
+class _RejectingExecutor(_ManualExecutor):
+    def __init__(self, reject_at: int) -> None:
+        super().__init__()
+        self._reject_at = reject_at
+        self._submissions = 0
+
+    def submit(self, fn, /, *args, **kwargs):
+        self._submissions += 1
+        if self._submissions == self._reject_at:
+            raise RuntimeError(f"submission {self._submissions} rejected")
+        return super().submit(fn, *args, **kwargs)
+
+
+class _FlakyClosingPreview:
+    def __init__(self) -> None:
+        self.closed = False
+        self.retired = False
+        self.worker_done = True
+        self.fault = None
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.closed = True
+        if self.close_calls == 1:
+            raise RuntimeError("presenter clear failed once")
+        self.retired = True
+
+
 class _FakeHandle:
     def __init__(self, run_id: str, reference: ScanArtifactRef) -> None:
         self.run_id = RunId(run_id)
@@ -119,13 +150,19 @@ class _FakeHandle:
 class _Application:
     def __init__(self, handle: _FakeHandle) -> None:
         self.handle = handle
+        self.prepare_calls = 0
         self.start_calls = 0
         self.project_calls: list[tuple[ScanArtifactRef, int]] = []
         self.project_error: BaseException | None = None
         self.presentation_ref: ScanArtifactRef | None = None
         self.png_bytes = _PNG
 
-    def start(self):
+    def prepare(self):
+        self.prepare_calls += 1
+        return PreparedScanPanelRun(None, self._start)
+
+    def _start(self, preview):
+        assert preview is None
         self.start_calls += 1
         return self.handle
 
@@ -157,7 +194,9 @@ def _controller(*, digest: str = "a"):
 
 def _reach_committed_reference(controller, handle, executor):
     controller.start()
-    executor.run_next()  # application.start
+    executor.run_next()  # application.prepare
+    controller.owner_cycle()
+    executor.run_next()  # prepared.start
     controller.owner_cycle()
     handle.finish(RunState.SUCCEEDED, final_committed=True)
     controller.owner_cycle()  # observes terminal, schedules result
@@ -193,7 +232,7 @@ def test_final_only_controller_reaps_terminal_before_projecting() -> None:
     assert wakes
 
 
-def test_stop_before_admission_latches_and_cancels_the_returned_handle() -> None:
+def test_stop_while_preparing_discards_command_before_admission() -> None:
     controller, _, handle, executor, _ = _controller(digest="b")
 
     controller.start()
@@ -202,6 +241,22 @@ def test_stop_before_admission_latches_and_cancels_the_returned_handle() -> None
     assert handle.cancel_reasons == []
 
     executor.run_next()
+    model = controller.owner_cycle()
+    assert not executor.pending
+    assert model.status == "CANCELLED BEFORE ADMISSION · NOT FINAL"
+    assert model.can_start is True
+    assert handle.cancel_reasons == []
+
+
+def test_stop_while_start_is_inflight_cancels_returned_handle() -> None:
+    controller, _, handle, executor, _ = _controller(digest="b")
+
+    controller.start()
+    executor.run_next()  # prepare
+    controller.owner_cycle()  # submits start
+    assert controller.stop() is CancelOutcome.REQUESTED
+    assert controller.view_model.status == "CANCELLATION PENDING HANDLE · NOT FINAL"
+    executor.run_next()  # start returns handle
     controller.owner_cycle()
     assert handle.cancel_reasons == [
         "scan panel stop requested before admission returned"
@@ -217,6 +272,39 @@ def test_stop_before_admission_latches_and_cancels_the_returned_handle() -> None
     assert final.status == "CANCELLED · NOT FINAL"
     assert final.artifact_ref is None
     assert final.can_start is True
+
+
+@pytest.mark.parametrize(
+    ("reject_at", "expected_status"),
+    (
+        (1, "PREPARATION FAILED · NOT FINAL"),
+        (2, "FAILED BEFORE ADMISSION · NOT FINAL"),
+    ),
+)
+def test_executor_submission_failure_cannot_stick_scan_state(
+    reject_at: int,
+    expected_status: str,
+) -> None:
+    reference = _ref("9")
+    handle = _FakeHandle("run-9", reference)
+    application = _Application(handle)
+    executor = _RejectingExecutor(reject_at)
+    controller = ScanPanelController(
+        application,
+        lambda: None,
+        executor=executor,
+    )
+
+    controller.start()
+    if reject_at == 2:
+        executor.run_next()
+    controller.owner_cycle()
+    model = controller.owner_cycle()
+
+    assert model.status == expected_status
+    assert model.can_start is True
+    assert model.worker_idle is True
+    assert application.start_calls == 0
 
 
 def test_projection_failure_cannot_erase_the_final_artifact_reference() -> None:
@@ -273,6 +361,8 @@ def test_close_during_start_revokes_generation_cancels_and_reaps_stale_handle() 
     controller, _, handle, executor, _ = _controller(digest="f")
 
     controller.start()
+    executor.run_next()
+    controller.owner_cycle()
     controller.close()
     assert controller.closed is False
     assert controller.view_model.closing is True
@@ -298,6 +388,8 @@ def test_close_of_admitted_run_is_nonblocking_and_drains_its_reap_future() -> No
     controller.start()
     executor.run_next()
     controller.owner_cycle()
+    executor.run_next()
+    controller.owner_cycle()
 
     controller.close()
     assert handle.cancel_reasons == ["scan panel is closing"]
@@ -310,6 +402,23 @@ def test_close_of_admitted_run_is_nonblocking_and_drains_its_reap_future() -> No
     assert handle.wait_calls == 1
     assert model.closed is True
     assert model.worker_idle is True
+
+
+def test_close_waits_for_failed_preview_clear_retry() -> None:
+    controller, _, _, _, _ = _controller(digest="3")
+    preview = _FlakyClosingPreview()
+    controller._preview = preview
+
+    controller.close()
+    assert controller.closed is False
+    assert controller.view_model.closing is True
+    assert preview.close_calls == 1
+
+    time.sleep(0.11)
+    model = controller.owner_cycle()
+    assert preview.close_calls == 2
+    assert model.closed is True
+    assert model.status == "CLOSED"
 
 
 def test_final_presentation_rejects_mutable_or_non_png_payloads() -> None:

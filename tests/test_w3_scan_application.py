@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
+import gc
 import hashlib
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
+import weakref
 
 import numpy as np
 import pytest
 
 import Zou_lab_control.notebook as zlc
+from Zou_lab_control.notebook.facade import _prepare_occupancy_scan_for_workbench
 from zlc_data import (
     READOUT_EVENT,
     REPEAT,
@@ -41,8 +46,18 @@ from zlc_data import (
     commit_transform,
     materialize_transformed_snapshot,
 )
-from zlc_frontend.figure import ViewIntent
-from zlc_neutral_atom.scan import ScanPointTable
+from zlc_frontend import SingleCurveAggRenderer
+from zlc_frontend.figure import (
+    AxisViewRole,
+    FigureEvaluationPolicy,
+    FigureEvaluator,
+    ResolvedDataset,
+    ResolvedDatasetMap,
+    ViewIntent,
+)
+from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewSpec
+from zlc_neutral_atom.runtime.run import RunFailed
+from zlc_neutral_atom.scan import ScanOutputContract, ScanPointTable
 from zlc_neutral_atom.scan.repository import ScanRepository
 from zlc_neutral_atom.readout.calibration_reference import (
     calibration_artifact_input_ref,
@@ -54,9 +69,23 @@ from zlc_pulse import (
     ScanParameter,
     load_pulse_document,
 )
+from zlc_workbench.progressive_scan import (
+    ExactDatasetLiveSlot,
+    build_occupancy_progressive_spec,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class _CountingExactDatasetLiveSlot(ExactDatasetLiveSlot):
+    def __init__(self, spec: ExactDatasetPreviewSpec) -> None:
+        super().__init__(spec)
+        self.source_terminal_calls = 0
+
+    def source_terminal(self) -> None:
+        self.source_terminal_calls += 1
+        super().source_terminal()
 
 
 def _axis(name, role, size, coordinates):
@@ -206,6 +235,13 @@ def _occupancy_scan_document():
     )
 
 
+def _fixed_api_values(document):
+    return {
+        parameter.parameter_id: document.field_value(parameter.field)[0]
+        for parameter in document.api_parameters
+    }
+
+
 def test_transform_owner_freezes_once_and_preserves_component_validity(monkeypatch):
     source, transform, schema, output_ref, values, valid = _component_snapshot_case()
     output = materialize_transformed_snapshot(
@@ -242,6 +278,91 @@ def test_transform_owner_freezes_once_and_preserves_component_validity(monkeypat
             memory_limit_bytes=1,
         )
     assert not executed
+
+
+def test_progressive_renderer_reuses_artists_and_updates_component_validity():
+    source, transform, schema, output_ref, _values, valid = (
+        _component_snapshot_case()
+    )
+    output = materialize_transformed_snapshot(
+        source,
+        transform,
+        output_ref=output_ref,
+        output_schema=schema,
+        memory_limit_bytes=64 << 20,
+    )
+    contract = ScanOutputContract(transform, schema)
+    progressive = build_occupancy_progressive_spec(
+        source.block.schema,
+        contract,
+        identity="renderer-update",
+    )
+
+    def revision(number, mask):
+        block = DataBlock(
+            output.block.block_id,
+            DatasetRevision(number),
+            output.block.values,
+            ComponentValidity((AxisId("site"),), mask),
+            output.block.schema,
+        )
+        return OwnedSnapshot(block.ref(output.ref.stream_generation), block)
+
+    partial_valid = valid.copy()
+    partial_valid[1, :, :] = False
+    snapshots = (
+        revision(1, partial_valid),
+        revision(2, valid),
+    )
+    evaluator = FigureEvaluator(
+        FigureEvaluationPolicy(max_live_nbytes=progressive.evaluation_peak_bytes)
+    )
+
+    def evaluate(snapshot):
+        return evaluator.evaluate(
+            progressive.document,
+            ResolvedDatasetMap(
+                (ResolvedDataset(progressive.dataset_id, snapshot),)
+            ),
+        )
+
+    renderer = SingleCurveAggRenderer(
+        progressive.document,
+        width=360,
+        height=240,
+    )
+    first = renderer.render(evaluate(snapshots[0]))
+    figure_id = id(renderer._figure)
+    axis_id = id(renderer._axis)
+    line_ids = tuple(map(id, renderer._lines))
+    first_legend = tuple(
+        text.get_text() for text in renderer._axis.get_legend().get_texts()
+    )
+
+    second = renderer.render(evaluate(snapshots[1]))
+    assert id(renderer._figure) == figure_id
+    assert id(renderer._axis) == axis_id
+    assert tuple(map(id, renderer._lines)) == line_ids
+    second_legend = tuple(
+        text.get_text() for text in renderer._axis.get_legend().get_texts()
+    )
+    assert second_legend != first_legend
+    assert second.pixels != first.pixels
+
+    figure_ref = weakref.ref(renderer._figure)
+    canvas_ref = weakref.ref(renderer._figure.canvas)
+    collection_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        renderer.close()
+        assert figure_ref() is None
+        assert canvas_ref() is None
+        renderer.close()
+    finally:
+        if collection_was_enabled:
+            gc.enable()
+    with pytest.raises(RuntimeError, match="closed"):
+        renderer.render(evaluate(snapshots[1]))
 
 
 def test_bounded_snapshot_rejects_cell_reduction():
@@ -447,7 +568,7 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
         with pytest.raises(TypeError, match="CaptureArtifactRef"):
             exp.fit(scan_ref, model="gaussian_offset")
 
-        _assert_public_occupancy_scan(exp)
+        _assert_public_occupancy_scan(exp, monkeypatch)
         _assert_scan_window(exp, document, monkeypatch)
 
     digest = hashlib.sha256(data.values.tobytes()).hexdigest()
@@ -482,16 +603,122 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
     )
 
 
-def _assert_public_occupancy_scan(exp):
+def _assert_public_occupancy_scan(exp, monkeypatch):
     document = _occupancy_scan_document()
     points = ScanPointTable.from_pulse_document(document)
+    values = _fixed_api_values(document)
+    original_parameters = document.api_parameters
+    original_table = document.scan_table
+    with pytest.raises(ValueError, match="missing"):
+        exp.readout.scan_request(document)
+    with pytest.raises(KeyError, match="unknown pulse API"):
+        exp.readout.scan_request(document, api_values={"not-an-api": 1})
+    direct_request = exp.readout.scan_request(document, api_values=values)
+    assert direct_request.pulse_document.api_parameters == ()
+    assert direct_request.pulse_document.scan_parameters == document.scan_parameters
+    assert direct_request.pulse_document.scan_table == original_table
+    assert document.api_parameters == original_parameters
+    with pytest.raises(ValueError, match="explicitly resolved"):
+        replace(direct_request, pulse_document=document)
+    with pytest.raises(KeyError, match="unknown pulse API"):
+        exp.readout.scan_request(
+            _sparse_scan_document(),
+            api_values={"da_x": 0},
+        )
     calibration_ref = exp.readout.sitemap(frames=6)
     request = exp.readout.occupancy_scan_request(
         document,
         calibration_ref=calibration_ref,
+        api_values=values,
         timeout_seconds=20.0,
     )
-    scan_ref = exp.scan(request)
+    assert request.pulse_document.api_parameters == ()
+    guarded = _prepare_occupancy_scan_for_workbench(exp, request)
+
+    @contextmanager
+    def closed_guard(_token):
+        raise RuntimeError("Experiment is closed")
+        yield
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "Zou_lab_control.notebook.facade._service_guard",
+            closed_guard,
+        )
+        with pytest.raises(RuntimeError, match="Experiment is closed"):
+            guarded.start()
+
+    rejected = _prepare_occupancy_scan_for_workbench(exp, request)
+    undersized = ExactDatasetLiveSlot(
+        ExactDatasetPreviewSpec(rejected.source_schema.fingerprint, 1)
+    )
+    with pytest.raises(MemoryError, match="frozen source snapshot"):
+        rejected.start(undersized)
+    assert undersized.terminal
+    assert "frozen source snapshot" in (undersized.failure or "")
+    second_start = ExactDatasetLiveSlot(undersized.spec)
+    with pytest.raises(RuntimeError, match="one-shot"):
+        rejected.start(second_start)
+    assert second_start.terminal
+    assert "one-shot" in (second_start.failure or "")
+
+    import zlc_neutral_atom.timing.occupancy as timing_occupancy
+
+    failed_prepared = _prepare_occupancy_scan_for_workbench(exp, request)
+    failed_progressive = build_occupancy_progressive_spec(
+        failed_prepared.source_schema,
+        failed_prepared.output_contract,
+        identity="w3-post-safety-failure",
+    )
+    failed_slot = ExactDatasetLiveSlot(failed_progressive.preview_spec)
+
+    def reject_post_safety(*_args, **_kwargs):
+        raise RuntimeError("post-safety occupancy finalization rejected")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            timing_occupancy,
+            "finalize_occupancy_result",
+            reject_post_safety,
+        )
+        failed_handle = failed_prepared.start(failed_slot)
+        with pytest.raises(RunFailed, match="post-safety occupancy finalization"):
+            failed_handle.result(timeout=30.0)
+    assert failed_slot.terminal
+    assert "post-safety occupancy finalization" in (failed_slot.failure or "")
+
+    prepared = _prepare_occupancy_scan_for_workbench(exp, request)
+    progressive = build_occupancy_progressive_spec(
+        prepared.source_schema,
+        prepared.output_contract,
+        identity="w3-occupancy",
+    )
+    site_axis = prepared.output_contract.output_dataset_schema.cell_schema.data_axes[0]
+    site_binding = next(
+        binding
+        for binding in progressive.document.layers[0].view.axis_bindings
+        if binding.axis_id == site_axis.axis_id
+    )
+    if 1 < site_axis.size <= 32:
+        assert site_binding.role is AxisViewRole.BATCH
+        assert f"batch/{site_axis.size}" in progressive.projection_summary
+    else:
+        assert site_binding.role is AxisViewRole.SELECTED
+        assert f"{site_axis.name}={site_axis.coordinate_at(0)}" in (
+            progressive.projection_summary
+        )
+    slot = _CountingExactDatasetLiveSlot(progressive.preview_spec)
+    handle = prepared.start(slot)
+    scan_ref = handle.result(timeout=30.0)
+    assert slot.terminal
+    assert slot.failure is None
+    assert slot.source_terminal_calls == 1
+    provisional = slot.wait_and_freeze(DatasetRevision(0), timeout=0)
+    assert provisional is not None
+    _run_id, _causation, preview = provisional
+    assert preview.coverage.complete
+    assert preview.block.schema.fingerprint == prepared.source_schema.fingerprint
+    slot.close()
     artifact = exp.readout.load_scan(scan_ref)
     data = exp.readout.materialize_scan(scan_ref)
 
@@ -522,6 +749,96 @@ def _assert_public_occupancy_scan(exp):
     )
     assert all(axis.role != READOUT_EVENT for axis in data.schema.point_axes)
     assert artifact.pulse_evidence.expected_trigger_count == 4
+    _assert_occupancy_scan_window(exp, request, monkeypatch)
+
+
+def _assert_occupancy_scan_window(exp, request, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from zlc_frontend.qt_board import QtImageBoard
+    import zlc_workbench.progressive_scan as progressive_scan
+
+    owner_thread = threading.get_ident()
+    renderer_construct_threads = []
+    raster_threads = []
+    renderer_ids = []
+    renderer_close_threads = []
+    present_threads = []
+    original_init = progressive_scan.SingleCurveAggRenderer.__init__
+    original_render = progressive_scan.SingleCurveAggRenderer.render
+    original_close = progressive_scan.SingleCurveAggRenderer.close
+    original_present = QtImageBoard.present
+
+    def record_init(renderer, *args, **kwargs):
+        renderer_construct_threads.append(threading.get_ident())
+        return original_init(renderer, *args, **kwargs)
+
+    def record_render(renderer, evaluated):
+        raster_threads.append(threading.get_ident())
+        renderer_ids.append(id(renderer))
+        return original_render(renderer, evaluated)
+
+    def record_close(renderer):
+        renderer_close_threads.append(threading.get_ident())
+        return original_close(renderer)
+
+    def record_present(board, frame):
+        present_threads.append(threading.get_ident())
+        return original_present(board, frame)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            progressive_scan.SingleCurveAggRenderer,
+            "__init__",
+            record_init,
+        )
+        patch.setattr(
+            progressive_scan.SingleCurveAggRenderer,
+            "render",
+            record_render,
+        )
+        patch.setattr(
+            progressive_scan.SingleCurveAggRenderer,
+            "close",
+            record_close,
+        )
+        patch.setattr(QtImageBoard, "present", record_present)
+        window = exp.scan_gui(request)
+        application = QtWidgets.QApplication.instance()
+        assert application is not None
+        assert "PROVISIONAL OCCUPANCY" in window.findChild(
+            QtWidgets.QLabel,
+            "scanMode",
+        ).text()
+        start = window.findChild(QtWidgets.QPushButton, "startScanButton")
+        assert start is not None and start.isEnabled()
+        start.click()
+
+        deadline = time.monotonic() + 20.0
+        while (
+            (window.final_reference is None or not raster_threads or not present_threads)
+            and time.monotonic() < deadline
+        ):
+            application.processEvents()
+            time.sleep(0.01)
+        assert window.final_reference is not None
+        assert raster_threads
+        assert renderer_construct_threads
+        assert len(set(renderer_ids)) == 1
+        assert renderer_close_threads
+        assert present_threads
+        assert all(thread != owner_thread for thread in raster_threads)
+        assert set(renderer_construct_threads) == set(raster_threads)
+        assert set(renderer_close_threads) == set(raster_threads)
+        assert set(present_threads) == {owner_thread}
+
+        window.close()
+        deadline = time.monotonic() + 5.0
+        while window.isVisible() and time.monotonic() < deadline:
+            application.processEvents()
+            time.sleep(0.01)
+        assert not window.isVisible()
+        assert window.worker_idle
 
 
 def _assert_scan_window(exp, document, monkeypatch):
@@ -534,7 +851,7 @@ def _assert_scan_window(exp, document, monkeypatch):
     assert application is not None
     assert "FINAL-ONLY" in window.findChild(
         QtWidgets.QLabel,
-        "finalOnlyMode",
+        "scanMode",
     ).text()
     start = window.findChild(QtWidgets.QPushButton, "startScanButton")
     assert start is not None and start.isEnabled()
