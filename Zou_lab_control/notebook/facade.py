@@ -958,6 +958,18 @@ class Experiment:
         self.readout = ReadoutFacade(authority_token)
         self.pulse = PulseFacade(authority_token)
 
+    def pulse_gui(
+        self,
+        document: PulseDocument | None = None,
+        *,
+        path: str | Path | None = None,
+    ):
+        """Lazily open the current PulseWorkbench on this Experiment authority."""
+
+        from Zou_lab_control.workbench import open_pulse_workbench
+
+        return open_pulse_workbench(self, document, path=path)
+
     def start(self, request: CaptureRequest) -> RunHandle:
         return _start(self._authority_token, request)
 
@@ -1141,18 +1153,6 @@ def _prepare_pulse_for_services(
         pulse_port=services.runtime.pulse_port(request.sequencer_ref),
         start_run=services.runtime.start,
     )
-
-
-def _prepare_pulse_for_workbench(
-    experiment: Experiment,
-    request: PulseRunRequest,
-) -> PreparedPulseExecution:
-    """Private friend seam; Workbench receives no notebook authority or raw Port."""
-
-    if not isinstance(experiment, Experiment):
-        raise TypeError("experiment must be Experiment")
-    with _service_guard(experiment._authority_token) as services:
-        return _prepare_pulse_for_services(services, request)
 
 
 def _start_pulse(token: object, request: PulseRunRequest) -> RunHandle:

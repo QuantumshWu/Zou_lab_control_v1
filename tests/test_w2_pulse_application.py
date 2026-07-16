@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import threading
 import time
 
 import pytest
 
 from Zou_lab_control.notebook import PulseRunResult, connect
 from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.pulse_application import PulseRunRequest, PulseTargetDescriptor
+from zlc_neutral_atom.pulse_application import PulseRunRequest
 from zlc_neutral_atom.runtime.run import CancelOutcome, RunState
 from zlc_pulse import (
     DAC_OFFSET_BINARY,
@@ -106,22 +107,27 @@ def _document() -> PulseDocument:
     )
 
 
-def _descriptor(target: PulseTarget) -> PulseTargetDescriptor:
-    return PulseTargetDescriptor(
-        DeviceRef("installation", "runtime", "sequencer"),
-        target,
-        100e6,
-        0,
-        16,
+def _rekeyed_target(target: PulseTarget) -> PulseTarget:
+    keys = {port.key: f"online_{port.key}" for port in target.ports}
+    return PulseTarget(
+        target.raw_lanes,
+        tuple(
+            replace(
+                port,
+                key=keys[port.key],
+                label=f"Online {port.label}",
+                latch_clock=(
+                    None if port.latch_clock is None else keys[port.latch_clock]
+                ),
+            )
+            for port in target.ports
+        ),
     )
 
 
 def test_preview_is_exact_for_delayed_digital_repeat_and_dac_ramp():
     document = _document()
-    _revision, timeline = PulseEditorSession(
-        _descriptor(document.target),
-        document,
-    ).preview()
+    _revision, timeline = PulseEditorSession(document).preview()
 
     assert timeline.logical_duration_ticks == 40
     assert timeline.duration_ticks == 40
@@ -171,10 +177,7 @@ def test_scan_preview_uses_visible_nominal_values_not_the_first_scan_row():
         scan_table=FrozenScanTable(("on_duration",), ((200,),)),
     )
 
-    _revision, timeline = PulseEditorSession(
-        _descriptor(document.target),
-        document,
-    ).preview()
+    _revision, timeline = PulseEditorSession(document).preview()
 
     assert timeline.reference_label == "nominal scan/API reference"
     assert timeline.logical_duration_ticks == 40
@@ -227,7 +230,7 @@ def test_hardware_run_requires_api_values_to_be_explicitly_resolved():
 
 def test_editor_save_detects_an_external_current_document_change(tmp_path):
     document = _document()
-    session = PulseEditorSession(_descriptor(document.target), document)
+    session = PulseEditorSession(document)
     path = session.save(tmp_path / "pulse.json")
     session.replace_document(replace(document, name="local edit"))
     save_pulse_document(replace(document, name="external edit"), path)
@@ -237,6 +240,120 @@ def test_editor_save_detects_an_external_current_document_change(tmp_path):
     path.unlink()
     with pytest.raises(RuntimeError, match="changed on disk"):
         session.save()
+
+
+def test_editor_normalizes_the_checked_and_written_save_path(tmp_path):
+    original = _document()
+    path = save_pulse_document(original, tmp_path / "collision")
+    before = path.read_bytes()
+    session = PulseEditorSession(replace(original, name="must not overwrite"))
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        session.save(tmp_path / "collision")
+
+    assert path.read_bytes() == before
+
+
+def test_online_target_rebind_is_dirty_against_the_real_disk_baseline(tmp_path):
+    path = save_pulse_document(_document(), tmp_path / "rebind")
+    session = PulseEditorSession.load(path)
+    assert not session.dirty
+
+    session.bind_target(_rekeyed_target(session.document.target))
+    assert session.dirty
+    session.save()
+
+    assert not session.dirty
+    assert PulseEditorSession.load(path).document.target == session.document.target
+
+
+def test_editor_serializes_concurrent_saves(
+    tmp_path,
+    monkeypatch,
+):
+    import zlc_workbench.pulse as pulse_module
+
+    session = PulseEditorSession(_document())
+    entered = threading.Event()
+    release = threading.Event()
+    counter_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+    calls = 0
+    original_save = pulse_module.save_pulse_document
+
+    def blocking_save(document, path):
+        nonlocal active, maximum_active, calls
+        with counter_lock:
+            active += 1
+            calls += 1
+            maximum_active = max(maximum_active, active)
+            call = calls
+        try:
+            if call == 1:
+                entered.set()
+                assert release.wait(2.0)
+            return original_save(document, path)
+        finally:
+            with counter_lock:
+                active -= 1
+
+    monkeypatch.setattr(pulse_module, "save_pulse_document", blocking_save)
+    errors = []
+
+    def save():
+        try:
+            session.save(tmp_path / "serialized", overwrite=True)
+        except BaseException as error:
+            errors.append(error)
+
+    first = threading.Thread(target=save)
+    second = threading.Thread(target=save)
+    first.start()
+    assert entered.wait(2.0)
+    second.start()
+    time.sleep(0.05)
+    assert calls == 1 and maximum_active == 1
+    release.set()
+    first.join(2.0)
+    second.join(2.0)
+
+    assert not first.is_alive() and not second.is_alive() and not errors
+    assert maximum_active == 1
+    assert not session.dirty
+
+
+def test_edit_during_save_remains_dirty(tmp_path, monkeypatch):
+    import zlc_workbench.pulse as pulse_module
+
+    session = PulseEditorSession(_document())
+    entered = threading.Event()
+    release = threading.Event()
+    original_save = pulse_module.save_pulse_document
+
+    def blocking_save(document, path):
+        entered.set()
+        assert release.wait(2.0)
+        return original_save(document, path)
+
+    monkeypatch.setattr(pulse_module, "save_pulse_document", blocking_save)
+    errors = []
+
+    def save():
+        try:
+            session.save(tmp_path / "mid-edit")
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=save)
+    worker.start()
+    assert entered.wait(2.0)
+    session.replace_document(replace(session.document, name="edited during save"))
+    release.set()
+    worker.join(2.0)
+
+    assert not worker.is_alive() and not errors
+    assert session.dirty
 
 
 def test_notebook_pulse_run_and_cancelled_hold_share_the_runtime_safe_path(tmp_path):

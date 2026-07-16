@@ -185,9 +185,15 @@ def build_pulse_timeline(
 
     bus_actions = _bus_actions(target_ir, budget)
     physical_duration = max(
-        logical_duration,
-        *(stop for values in high_by_output.values() for _start, stop in values),
-        *(stop for values in bus_actions.values() for _start, stop, _mode, _value in values),
+        (
+            logical_duration,
+            *(stop for values in high_by_output.values() for _start, stop in values),
+            *(
+                stop
+                for values in bus_actions.values()
+                for _start, stop, _mode, _value in values
+            ),
+        )
     )
     visible = document.visible_ports or tuple(
         port.key

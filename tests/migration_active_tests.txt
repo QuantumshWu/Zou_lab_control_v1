@@ -34,6 +34,7 @@ tests/test_workbench_host_contract.py
 tests/test_w1_capture_workbench.py
 tests/test_w2_pulse_authoring.py
 tests/test_w2_pulse_application.py
+tests/test_w2_pulse_workbench.py
 tests/test_zlc_calibration_commit.py
 tests/test_zlc_calibration_stream_contracts.py
 tests/test_zlc_camera_adapter_sdk.py

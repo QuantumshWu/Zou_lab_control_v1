@@ -695,12 +695,21 @@ def pulse_document_from_tree(tree: object) -> PulseDocument:
     )
 
 
+def pulse_document_path(path: str | Path) -> Path:
+    """Return the sole canonical path used by PulseDocument load and save."""
+
+    destination = Path(path).expanduser().resolve()
+    return (
+        destination
+        if destination.suffix.lower() == ".json"
+        else destination.with_suffix(".json")
+    )
+
+
 def save_pulse_document(document: PulseDocument, path: str | Path) -> Path:
     if not isinstance(document, PulseDocument):
         raise TypeError("document must be PulseDocument")
-    destination = Path(path)
-    if destination.suffix.lower() != ".json":
-        destination = destination.with_suffix(".json")
+    destination = pulse_document_path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
         json.dumps(
@@ -716,7 +725,8 @@ def save_pulse_document(document: PulseDocument, path: str | Path) -> Path:
 
 
 def load_pulse_document(path: str | Path) -> PulseDocument:
-    return pulse_document_from_tree(json.loads(Path(path).read_text(encoding="utf-8")))
+    source = pulse_document_path(path)
+    return pulse_document_from_tree(json.loads(source.read_text(encoding="utf-8")))
 
 
 def _field_ref_to_tree(value: PulseFieldRef) -> dict[str, object]:
@@ -887,6 +897,7 @@ __all__ = [
     "frozen_scan_table_to_tree",
     "load_pulse_document",
     "pulse_document_from_tree",
+    "pulse_document_path",
     "pulse_document_to_tree",
     "save_pulse_document",
 ]
