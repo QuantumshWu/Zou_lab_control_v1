@@ -13,11 +13,19 @@ from pathlib import Path
 import threading
 from typing import Any
 
+import numpy as np
+
 from zlc_data import (
     BlockId,
+    CellValidity,
+    ComponentValidity,
     READOUT_EVENT,
+    DatasetRevisionRef,
     DatasetSchema,
-    apply_transform,
+    Invalid,
+    OwnedSnapshot,
+    Valid,
+    materialize_transformed_snapshot,
 )
 from zlc_neutral_atom.artifacts.capture import (
     AdmittedCapture,
@@ -61,7 +69,6 @@ from zlc_storage import (
 )
 
 from .contracts import (
-    MaterializedScanData,
     ScanOutputContract,
     ScanPointTable,
     scan_capture_block_id,
@@ -157,6 +164,58 @@ class ScanArtifact:
             raise TypeError("pulse_document must be PulseDocument")
         if not isinstance(self.output_contract, ScanOutputContract):
             raise TypeError("output_contract must be ScanOutputContract")
+
+
+_SCAN_OUTPUT_BLOCK_PREFIX = "scan-output-"
+
+
+def _scan_output_dataset_ref(
+    artifact_ref: ScanArtifactRef,
+    source_ref: DatasetRevisionRef,
+    schema: DatasetSchema,
+) -> DatasetRevisionRef:
+    return DatasetRevisionRef(
+        BlockId(f"{_SCAN_OUTPUT_BLOCK_PREFIX}{artifact_ref.manifest_digest}"),
+        source_ref.stream_generation,
+        schema.fingerprint,
+        source_ref.revision,
+    )
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class MaterializedScanData:
+    """One admitted scan lineage and its canonical output dataset snapshot."""
+
+    artifact_ref: ScanArtifactRef
+    source_dataset_ref: DatasetRevisionRef
+    snapshot: OwnedSnapshot
+    __hash__ = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.artifact_ref, ScanArtifactRef):
+            raise TypeError("artifact_ref must be ScanArtifactRef")
+        if not isinstance(self.source_dataset_ref, DatasetRevisionRef):
+            raise TypeError("source_dataset_ref must be DatasetRevisionRef")
+        if not isinstance(self.snapshot, OwnedSnapshot):
+            raise TypeError("snapshot must be OwnedSnapshot")
+        if self.snapshot.ref != _scan_output_dataset_ref(
+            self.artifact_ref,
+            self.source_dataset_ref,
+            self.snapshot.block.schema,
+        ):
+            raise ValueError("scan output snapshot identity differs from its lineage")
+
+    @property
+    def schema(self) -> DatasetSchema:
+        return self.snapshot.block.schema
+
+    @property
+    def values(self) -> np.ndarray:
+        return self.snapshot.block.values
+
+    @property
+    def validity(self) -> Valid | Invalid | CellValidity | ComponentValidity:
+        return self.snapshot.block.validity
 
 def _reject_arrays(events) -> None:
     if any(isinstance(event, CanonicalArrayEvent) for event in events):
@@ -633,22 +692,32 @@ class ScanRepository:
         reference: ScanArtifactRef,
         capture_repository: CaptureRepository,
         *,
-        capture_memory_limit_bytes: int,
+        memory_limit_bytes: int,
     ) -> MaterializedScanData:
-        """Apply the frozen authority transform without collapsing named axes."""
+        """Materialize the exact source and canonical scan output under one cap."""
 
         limit = positive_integer(
-            capture_memory_limit_bytes,
-            "capture_memory_limit_bytes",
+            memory_limit_bytes,
+            "memory_limit_bytes",
         )
         artifact, source = self._admit_with_source(reference, capture_repository)
-        snapshot = source.materialize_snapshot(memory_limit_bytes=limit)
-        return MaterializedScanData(
-            apply_transform(
-                snapshot,
-                artifact.output_contract.committed_transform,
+        source_snapshot = source.materialize_snapshot(memory_limit_bytes=limit)
+        output_schema = artifact.output_contract.output_dataset_schema
+        output_snapshot = materialize_transformed_snapshot(
+            source_snapshot,
+            artifact.output_contract.committed_transform,
+            output_ref=_scan_output_dataset_ref(
+                artifact.ref,
+                source_snapshot.ref,
+                output_schema,
             ),
-            artifact.output_contract,
+            output_schema=output_schema,
+            memory_limit_bytes=limit,
+        )
+        return MaterializedScanData(
+            artifact.ref,
+            source_snapshot.ref,
+            output_snapshot,
         )
 
     def _admit_with_source(
@@ -851,6 +920,7 @@ __all__ = [
     "SCAN_ARTIFACT_SCHEMA",
     "ScanCommitVisibilityUnknown",
     "ScanArtifact",
+    "MaterializedScanData",
     "ScanRepository",
     "ScanRepositoryResourcePolicy",
     "ScanResourceExceeded",

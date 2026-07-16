@@ -31,6 +31,18 @@ def canonical_sum_dtype(dtype: np.dtype) -> np.dtype:
     raise TypeError(f"unsupported reduction dtype {normalized}")  # pragma: no cover
 
 
+def _integer_sum_requires_object(dtype: np.dtype, contributors: int) -> bool:
+    normalized = canonical_dtype(dtype)
+    if normalized.kind == "b":
+        return False
+    limits = np.iinfo(normalized)
+    output = np.iinfo(canonical_sum_dtype(normalized))
+    return (
+        limits.max * contributors > output.max
+        or (normalized.kind == "i" and limits.min * contributors < output.min)
+    )
+
+
 def checked_numeric_sum(
     values: np.ndarray,
     axes: tuple[int, ...],
@@ -66,17 +78,7 @@ def checked_numeric_sum(
 
     if input_dtype.kind in "biu":
         contributor_bound = math.prod(array.shape[axis] for axis in normalized_axes)
-        input_info = np.iinfo(input_dtype) if input_dtype.kind != "b" else None
-        output_info = np.iinfo(target)
-        statically_safe = input_dtype.kind == "b" or (
-            input_info is not None
-            and input_info.max * contributor_bound <= output_info.max
-            and (
-                input_dtype.kind != "i"
-                or input_info.min * contributor_bound >= output_info.min
-            )
-        )
-        if statically_safe:
+        if not _integer_sum_requires_object(input_dtype, contributor_bound):
             return np.asarray(
                 np.sum(array, axis=normalized_axes, dtype=target),
                 dtype=target,
@@ -85,6 +87,7 @@ def checked_numeric_sum(
         for axis in sorted(normalized_axes, reverse=True):
             exact = np.sum(exact, axis=axis, dtype=object)
         flat = np.asarray(exact, dtype=object).reshape(-1)
+        output_info = np.iinfo(target)
         if any(value < output_info.min or value > output_info.max for value in flat):
             raise OverflowError("integer SUM exceeds its canonical output dtype")
         return np.asarray(exact, dtype=target)

@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
-
 from zlc_data import (
     SCAN_POINT,
     AxisId,
@@ -16,11 +14,7 @@ from zlc_data import (
     CommittedTransform,
     DatasetSchema,
     PointLayout,
-    RowComponentValidity,
-    TransformedData,
     TransformedSchema,
-    Invalid,
-    Valid,
     ValidityContract,
     ValueSchema,
     committed_transform_from_tree,
@@ -174,66 +168,6 @@ class ScanOutputContract:
     def output_schema_fingerprint(self) -> str:
         return self.output_dataset_schema.fingerprint
 
-@dataclass(frozen=True, eq=False)
-class MaterializedScanData:
-    """No-copy `(R, Pstorage, *data_shape)` view of transformed scan data."""
-
-    transformed: TransformedData
-    output_contract: ScanOutputContract
-    __hash__ = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.transformed, TransformedData):
-            raise TypeError("transformed must be TransformedData")
-        if not isinstance(self.output_contract, ScanOutputContract):
-            raise TypeError("output_contract must be ScanOutputContract")
-        if self.transformed.transform != self.output_contract.committed_transform:
-            raise ValueError("transformed data belongs to another scan contract")
-        schema = self.output_contract.output_dataset_schema
-        transformed_schema = self.transformed.schema
-        if (
-            transformed_schema.cell_axes
-            != (schema.repeat_axis, *schema.point_axes)
-            or transformed_schema.cell_layout != schema.cell_layout
-            or transformed_schema.data_axes != schema.cell_schema.data_axes
-            or transformed_schema.dtype != schema.cell_schema.dtype
-            or transformed_schema.value_unit != schema.cell_schema.value_unit
-        ):
-            raise ValueError(
-                "transformed schema differs from the authoritative scan dataset"
-            )
-        expected_validity_axes = (
-            schema.cell_schema.validity_contract.component_axis_ids
-        )
-        if transformed_schema.validity_axis_ids != expected_validity_axes:
-            raise ValueError(
-                "transformed validity axes differ from the scan dataset"
-            )
-
-    @property
-    def schema(self) -> DatasetSchema:
-        return self.output_contract.output_dataset_schema
-
-    @property
-    def values(self) -> np.ndarray:
-        """Read-only reshape view; every trailing data axis remains distinct."""
-
-        return self.transformed.values.reshape(self.schema.physical_shape)
-
-    @property
-    def validity(self) -> Valid | Invalid | RowComponentValidity:
-        """Return the transform owner's compact row/component validity."""
-
-        return self.transformed.validity
-
-    def expanded_validity(self) -> np.ndarray:
-        """Return a read-only validity view with the same named physical shape."""
-
-        return self.transformed.expanded_validity().reshape(
-            self.schema.physical_shape
-        )
-
-
 def bind_scan_output_contract(
     input_schema: DatasetSchema,
     scan_points: ScanPointTable,
@@ -366,7 +300,6 @@ def scan_intent_digest_from_block_id(block_id: BlockId) -> str:
 __all__ = [
     "ScanOutputContract",
     "ScanPointTable",
-    "MaterializedScanData",
     "bind_scan_output_contract",
     "scan_capture_block_id",
     "scan_intent_digest_from_block_id",

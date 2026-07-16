@@ -1,12 +1,12 @@
 """Neutral-atom scan authority values."""
 
 from .contracts import (
-    MaterializedScanData,
     ScanOutputContract,
     ScanPointTable,
     bind_scan_output_contract,
 )
 from .reference import ScanArtifactRef
+from .repository import MaterializedScanData
 
 __all__ = [
     "MaterializedScanData",

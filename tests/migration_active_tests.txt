@@ -36,6 +36,7 @@ tests/test_w2_pulse_authoring.py
 tests/test_w2_pulse_application.py
 tests/test_w2_pulse_workbench.py
 tests/test_w3_data_figure.py
+tests/test_w3_scan_application.py
 tests/test_zlc_calibration_commit.py
 tests/test_zlc_calibration_stream_contracts.py
 tests/test_zlc_camera_adapter_sdk.py

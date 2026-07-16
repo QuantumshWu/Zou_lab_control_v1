@@ -79,6 +79,7 @@ from .transform import (
     ValidityPolicy,
     apply_transform,
     commit_transform,
+    materialize_transformed_snapshot,
     resolve_transformed_schema,
 )
 from .transform_codec import (
@@ -196,6 +197,7 @@ __all__ = [
     "encode_fit_result_batch",
     "encode_fit_spec",
     "resolve_transformed_schema",
+    "materialize_transformed_snapshot",
     "resolve_selection_indices",
     "canonical_value_array",
     "expand_dataset_validity",

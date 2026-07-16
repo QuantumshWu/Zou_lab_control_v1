@@ -14,9 +14,20 @@ from zlc_storage.canonical import canonical_digest, canonical_text, sha256_text
 from ._arrays import canonical_dtype, immutable_array
 from .axis import AxisId, AxisSpec
 from .layout import AxisLayout, AxisLayoutMode
-from .numeric import canonical_mean_dtype, canonical_sum_dtype, checked_numeric_sum
+from .numeric import (
+    _integer_sum_requires_object,
+    canonical_mean_dtype,
+    canonical_sum_dtype,
+    checked_numeric_sum,
+)
 from .schema import DatasetSchema
-from .selection import Selection, resolve_selection_indices
+from .selection import (
+    CoordinateRangeSelection,
+    IndexRangeSelection,
+    IndexSelection,
+    Selection,
+    resolve_selection_indices,
+)
 from .validity import (
     INVALID,
     VALID,
@@ -421,6 +432,202 @@ def apply_transform(
         state.validity,
         state.schema,
     )
+
+
+def _schema_value_nbytes(schema: TransformedSchema) -> int:
+    return int(math.prod(schema.physical_shape) * schema.dtype.itemsize)
+
+
+def _schema_row_validity_nbytes(schema: TransformedSchema) -> int:
+    sizes = tuple(schema.axis(axis_id).size for axis_id in schema.validity_axis_ids)
+    return int(schema.cell_layout.storage_size * math.prod(sizes or (1,)))
+
+
+def _require_bounded_snapshot_step(schema: TransformedSchema, step) -> None:
+    """Keep this bounded DatasetSchema bridge within its earned cell semantics."""
+
+    cell_axes = {axis.axis_id: axis for axis in schema.cell_axes}
+    if isinstance(step, ReductionSpec):
+        if any(axis_id in cell_axes for axis_id in step.axis_ids):
+            raise ValueError(
+                "bounded dataset snapshots do not reduce repeat/point axes"
+            )
+        return
+    term = step.terms[0]
+    axis = cell_axes.get(term.axis_id)
+    if axis is None:
+        return
+    singleton_drop = (
+        isinstance(term, IndexSelection) and axis.size == 1 and term.index == 0
+    )
+    full_noop = (
+        isinstance(term, IndexRangeSelection)
+        and term.start == 0
+        and term.stop == axis.size
+    )
+    if not (singleton_drop or full_noop):
+        raise ValueError(
+            "bounded dataset snapshots only select a singleton cell axis or "
+            "retain its full index range"
+        )
+
+
+def _transformed_snapshot_data_peak_nbytes(
+    snapshot: OwnedSnapshot,
+    transform: CommittedTransform,
+) -> int:
+    """Conservative data-plane peak for a cell-preserving dataset snapshot.
+
+    The bound includes the retained source snapshot, every possibly retained
+    selection view base, reduction scratch, compact validity and the immutable
+    output copy.  The reduction allowance also includes exact integer SUM
+    object-array pointers and Python-integer heap, rather than ndarrays alone.
+    Generic repeat/point selection and reduction remain available through
+    :func:`apply_transform`; this bounded bridge admits only the scan consumer's
+    singleton cell drop plus trailing-data selection/reduction contract.
+    Immutable schema/layout/coordinate metadata is admitted by its caller's
+    separate metadata policy, matching raw Capture materialization semantics.
+    """
+
+    if not isinstance(snapshot, OwnedSnapshot):
+        raise TypeError("snapshot must be OwnedSnapshot")
+    if not isinstance(transform, CommittedTransform):
+        raise TypeError("transform must be CommittedTransform")
+    block = snapshot.block
+    if transform.input_schema_fingerprint != block.schema.fingerprint:
+        raise ValueError("CommittedTransform input schema fingerprint is stale")
+    state = _State(_source_transformed_schema(block.schema), None, None)
+    validity_nbytes = (
+        block.validity.mask.nbytes
+        if isinstance(block.validity, (CellValidity, ComponentValidity))
+        else 0
+    )
+    retained = block.values.nbytes + 2 * validity_nbytes
+    peak = retained
+    for operation in transform.spec.operations:
+        steps = (
+            tuple(Selection((term,)) for term in operation.terms)
+            if isinstance(operation, Selection)
+            else (operation,)
+        )
+        for step in steps:
+            previous_state = state
+            before = state.schema
+            _require_bounded_snapshot_step(before, step)
+            state = (
+                _apply_selection(state, step)
+                if isinstance(step, Selection)
+                else _apply_reduction(state, step)
+            )
+            if state is previous_state:
+                continue
+            after = state.schema
+            after_value = _schema_value_nbytes(after)
+            after_validity = _schema_row_validity_nbytes(after)
+            if isinstance(step, Selection):
+                term = step.terms[0]
+                coordinate_index_heap = (
+                    64 * after.axis(term.axis_id).size
+                    if isinstance(term, CoordinateRangeSelection)
+                    else 0
+                )
+                scratch = (
+                    after_value
+                    + 2 * after_validity
+                    + 9 * before.cell_layout.storage_size
+                    + coordinate_index_heap
+                )
+            else:
+                before_elements = math.prod(before.physical_shape)
+                after_elements = math.prod(after.physical_shape)
+                scratch = (
+                    2 * _schema_value_nbytes(before)
+                    + 2 * before_elements
+                    + 6 * after_value
+                    + (5 + len(after.data_axes)) * after_elements
+                    + 8 * after_elements
+                    + 16 * before.cell_layout.storage_size
+                )
+                contributors = math.prod(
+                    before.axis(axis_id).size for axis_id in step.axis_ids
+                )
+                if (
+                    step.method is ReductionMethod.SUM
+                    and before.dtype.kind in "biu"
+                    and _integer_sum_requires_object(before.dtype, contributors)
+                ):
+                    scratch = max(scratch, 192 * before_elements)
+            peak = max(peak, retained + scratch)
+            retained += after_value + after_validity
+    output = state.schema
+    if output.fingerprint != transform.output_schema_fingerprint:
+        raise RuntimeError("transform memory plan disagrees with committed output schema")
+    final_freeze = _schema_value_nbytes(output) + _schema_row_validity_nbytes(output)
+    return int(max(peak, retained + final_freeze))
+
+
+def materialize_transformed_snapshot(
+    snapshot: OwnedSnapshot,
+    transform: CommittedTransform,
+    *,
+    output_ref: DatasetRevisionRef,
+    output_schema: DatasetSchema,
+    memory_limit_bytes: int,
+) -> OwnedSnapshot:
+    """Execute one data-plane-bounded transform into its final DataBlock."""
+
+    if not isinstance(output_ref, DatasetRevisionRef):
+        raise TypeError("output_ref must be DatasetRevisionRef")
+    if not isinstance(output_schema, DatasetSchema):
+        raise TypeError("output_schema must be DatasetSchema")
+    if output_ref.block_id == snapshot.ref.block_id:
+        raise ValueError("a transformed snapshot cannot reuse its source BlockId")
+    if output_ref.schema_fingerprint != output_schema.fingerprint:
+        raise ValueError("output_ref schema fingerprint differs from output_schema")
+    if _source_transformed_schema(output_schema).fingerprint != transform.output_schema_fingerprint:
+        raise ValueError("output_schema differs from the committed transform")
+    if (
+        isinstance(memory_limit_bytes, bool)
+        or not isinstance(memory_limit_bytes, Integral)
+        or memory_limit_bytes <= 0
+    ):
+        raise ValueError("memory_limit_bytes must be a positive integer")
+    required = _transformed_snapshot_data_peak_nbytes(snapshot, transform)
+    if required > memory_limit_bytes:
+        raise MemoryError(
+            f"transformed snapshot peak {required} exceeds limit {memory_limit_bytes}"
+        )
+    state = _execute_transform(snapshot.block, transform.spec)
+    if state.schema.fingerprint != transform.output_schema_fingerprint:
+        raise RuntimeError("transform execution disagrees with its committed output schema")
+    assert state.values is not None and state.validity is not None
+    validity: Valid | Invalid | CellValidity | ComponentValidity
+    if isinstance(state.validity, (Valid, Invalid)):
+        validity = state.validity
+    elif state.validity.axis_ids:
+        validity = ComponentValidity(
+            state.validity.axis_ids,
+            state.validity.mask.reshape(
+                output_schema.repeat_axis.size,
+                output_schema.point_layout.storage_size,
+                *state.validity.mask.shape[1:],
+            ),
+        )
+    else:
+        validity = CellValidity(
+            state.validity.mask.reshape(
+                output_schema.repeat_axis.size,
+                output_schema.point_layout.storage_size,
+            )
+        )
+    block = DataBlock(
+        output_ref.block_id,
+        output_ref.revision,
+        state.values.reshape(output_schema.physical_shape),
+        validity,
+        output_schema,
+    )
+    return OwnedSnapshot(output_ref, block)
 
 
 def _execute_transform(block: DataBlock, spec: DataTransformSpec) -> _State:

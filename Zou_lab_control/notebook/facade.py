@@ -673,19 +673,19 @@ class ReadoutFacade:
         self,
         reference: ScanArtifactRef,
         *,
-        capture_memory_limit_bytes: int = (
+        memory_limit_bytes: int = (
             _DEFAULT_SCAN_MATERIALIZATION_MEMORY_LIMIT_BYTES
         ),
     ) -> MaterializedScanData:
-        """Load scan y while bounding raw-capture materialization and preserving axes."""
+        """Load the canonical scan dataset under one source/transform peak cap."""
 
         with _service_guard(self._token) as services:
             return services.scan_repository.materialize(
                 reference,
                 services.capture_repository,
-                capture_memory_limit_bytes=_positive_int(
-                    capture_memory_limit_bytes,
-                    "capture_memory_limit_bytes",
+                memory_limit_bytes=_positive_int(
+                    memory_limit_bytes,
+                    "memory_limit_bytes",
                 ),
             )
 
@@ -980,7 +980,27 @@ def _project_notebook_figure(
         raise TypeError("preferences must be ViewPreferences or None")
 
     fit_result = None
-    if isinstance(source, CaptureArtifactRef):
+    snapshot = None
+    admitted = None
+    source_label = "capture"
+    if isinstance(source, ScanArtifactRef):
+        source_label = "scan"
+        if memory_limit_bytes is None:
+            scan = services.scan_repository.admit(
+                source,
+                services.capture_repository,
+            )
+            schema = scan.output_contract.output_dataset_schema
+        else:
+            materialized = services.scan_repository.materialize(
+                source,
+                services.capture_repository,
+                memory_limit_bytes=memory_limit_bytes,
+            )
+            schema = materialized.schema
+            snapshot = materialized.snapshot
+        source_ref = None
+    elif isinstance(source, CaptureArtifactRef):
         source_ref = source
     elif isinstance(source, FitExecution):
         source_ref = source.source_capture_ref
@@ -997,12 +1017,14 @@ def _project_notebook_figure(
         fit_result = source.result
     else:
         raise TypeError(
-            "figure source must be CaptureArtifactRef, FitExecution, "
-            "CaptureFitResultArtifactRef, or AdmittedCaptureFitResult"
+            "figure source must be ScanArtifactRef, CaptureArtifactRef, "
+            "FitExecution, CaptureFitResultArtifactRef, or "
+            "AdmittedCaptureFitResult"
         )
 
-    admitted = services.capture_repository.admit(source_ref)
-    schema = admitted.artifact.frame_source.schema
+    if source_ref is not None:
+        admitted = services.capture_repository.admit(source_ref)
+        schema = admitted.artifact.frame_source.schema
     if fit_result is None:
         if intent is None:
             roles = {
@@ -1027,7 +1049,7 @@ def _project_notebook_figure(
             selection,
             preferences,
         )
-        label = "capture"
+        label = source_label
     else:
         suggestion = suggest_fit_view(
             schema,
@@ -1052,7 +1074,9 @@ def _project_notebook_figure(
     )
     if memory_limit_bytes is None:
         return document, None, fit_result
-    snapshot = admitted.materialize_snapshot(memory_limit_bytes=memory_limit_bytes)
+    if snapshot is None:
+        assert admitted is not None
+        snapshot = admitted.materialize_snapshot(memory_limit_bytes=memory_limit_bytes)
     return (
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
@@ -1173,7 +1197,8 @@ class Experiment:
     def figure_document(
         self,
         source: (
-            CaptureArtifactRef
+            ScanArtifactRef
+            | CaptureArtifactRef
             | FitExecution
             | CaptureFitResultArtifactRef
             | AdmittedCaptureFitResult
@@ -1183,7 +1208,7 @@ class Experiment:
         selection: Selection | None = None,
         preferences: "ViewPreferences | None" = None,
     ) -> "FigureDocument":
-        """Project one committed capture/result into a renderer-free document."""
+        """Project one committed scan/capture/result into a renderer-free document."""
 
         with _service_guard(self._authority_token) as services:
             document, _datasets, _fit = _project_notebook_figure(
@@ -1199,7 +1224,8 @@ class Experiment:
     def figure(
         self,
         source: (
-            CaptureArtifactRef
+            ScanArtifactRef
+            | CaptureArtifactRef
             | FitExecution
             | CaptureFitResultArtifactRef
             | AdmittedCaptureFitResult
