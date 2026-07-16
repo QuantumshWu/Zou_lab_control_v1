@@ -11,6 +11,17 @@ from typing import Mapping
 
 from fpga.pulse_streamer.host.image import DEFAULT_CONFIG_PATH, default_clock_hz
 from zlc_neutral_atom.installation import DeviceCatalogView, DeviceInfo, DeviceRef
+from zlc_neutral_atom.readout.calibration import GridOrder
+from zlc_neutral_atom.readout.contracts import (
+    ReadoutBindingKey,
+    camera_roi_local_spatial_identity,
+)
+from zlc_neutral_atom.readout.sitemap import (
+    ReadoutGridGeometry,
+    SitemapAcquisitionProfile,
+    load_packaged_sitemap_pulse,
+)
+from zlc_pulse import bind_pulse_document_target
 from zlc_neutral_atom.runtime.capture import BoundCapturePort
 from zlc_neutral_atom.runtime.ports import BoundDevice, DeviceBroker, SafetyOperation
 from zlc_neutral_atom.runtime.resources import (
@@ -40,6 +51,34 @@ _COOLING_CHANNELS = ("ch00", "ch01")
 _PROBE_CHANNELS = ("ch03",)
 _TRAP_CHANNELS = ("ch09",)
 _CAMERA_TRIGGER_CHANNELS = ("ch11",)
+
+
+def _virtual_readout_geometry() -> ReadoutGridGeometry:
+    """The one installation source for simulator and calibration site geometry."""
+
+    grid_shape_yx = (5, 7)
+    frame_shape_yx = (96, 128)
+    spacing_px = 9.0
+    rows, columns = grid_shape_yx
+    height, width = frame_shape_yx
+    origin_x = (width - (columns - 1) * spacing_px) / 2.0
+    origin_y = (height - (rows - 1) * spacing_px) / 2.0
+    y_axis_id, x_axis_id, coordinate_frame = camera_roi_local_spatial_identity(
+        "camera"
+    )
+    return ReadoutGridGeometry(
+        frame_shape_yx,
+        y_axis_id,
+        x_axis_id,
+        coordinate_frame,
+        grid_shape_yx,
+        GridOrder.ROW_MAJOR,
+        tuple(
+            (origin_x + column * spacing_px, origin_y + row * spacing_px)
+            for row in range(rows)
+            for column in range(columns)
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -251,6 +290,7 @@ class _VirtualInstallationRuntime:
         "_controller",
         "_camera_ports",
         "_pulse_ports",
+        "_sitemap_profiles",
         "_raw_graph",
         "_close_order",
         "_closed_roles",
@@ -267,6 +307,7 @@ class _VirtualInstallationRuntime:
         controller: RunController,
         camera_ports: Mapping[str, BoundCapturePort],
         pulse_ports: Mapping[str, BoundPulsePort],
+        sitemap_profiles: Mapping[str, SitemapAcquisitionProfile],
         raw_graph: Mapping[str, object],
         close_order: tuple[str, ...],
     ) -> None:
@@ -281,6 +322,7 @@ class _VirtualInstallationRuntime:
         self._controller = controller
         camera_ports = dict(camera_ports)
         pulse_ports = dict(pulse_ports)
+        sitemap_profiles = dict(sitemap_profiles)
         raw_graph = dict(raw_graph)
         close_order = tuple(close_order)
         if len(close_order) != len(set(close_order)):
@@ -300,8 +342,30 @@ class _VirtualInstallationRuntime:
             catalog.require(role).domain != "sequencer" for role in pulse_ports
         ):
             raise ValueError("pulse port roles differ from catalog domains")
+        if not set(sitemap_profiles).issubset(camera_ports):
+            raise ValueError("sitemap profiles reference roles without camera ports")
+        for role, profile in sitemap_profiles.items():
+            if not isinstance(profile, SitemapAcquisitionProfile):
+                raise TypeError("sitemap profile mapping has the wrong value type")
+            if profile.readout_binding != ReadoutBindingKey(role):
+                raise ValueError("sitemap profile binding differs from its camera role")
+            if profile.sequencer_role not in pulse_ports:
+                raise ValueError(
+                    "sitemap profile references a role without a sequencer port"
+                )
+            if (
+                profile.camera_facts
+                != camera_ports[role].capability.camera_physical_facts
+            ):
+                raise ValueError(
+                    "sitemap profile camera facts differ from the bound capability"
+                )
+            live_target = pulse_ports[profile.sequencer_role].capability.target
+            if profile.pulse_document.target is not live_target:
+                raise ValueError("sitemap pulse is not bound to the exact live target")
         self._camera_ports = camera_ports
         self._pulse_ports = pulse_ports
+        self._sitemap_profiles = sitemap_profiles
         self._raw_graph = raw_graph
         self._close_order = close_order
         self._closed_roles: set[str] = set()
@@ -333,6 +397,20 @@ class _VirtualInstallationRuntime:
                 return self._pulse_ports[reference.role]
             except KeyError as exc:
                 raise ValueError(f"role {reference.role!r} is not a sequencer") from exc
+
+    def sitemap_profile(self, reference: DeviceRef) -> SitemapAcquisitionProfile:
+        """Return one immutable domain descriptor, never the private camera/trap."""
+
+        with self._lock:
+            if self._state != "RUNNING":
+                raise RuntimeError("installation runtime is not accepting operations")
+            self._require_current_reference(reference, "camera")
+            try:
+                return self._sitemap_profiles[reference.role]
+            except KeyError as exc:
+                raise ValueError(
+                    f"camera role {reference.role!r} has no sitemap profile"
+                ) from exc
 
     def start(self, plan: RunPlan) -> RunHandle:
         with self._lock:
@@ -402,6 +480,7 @@ class _VirtualInstallationRuntime:
             self._raw_graph.clear()
             self._camera_ports.clear()
             self._pulse_ports.clear()
+            self._sitemap_profiles.clear()
             return True
 
 
@@ -453,7 +532,9 @@ def create_virtual_installation(
     broker: DeviceBroker | None = None
     try:
         target = _deployed_target()
+        readout_geometry = _virtual_readout_geometry()
         trap = VirtualAtomArray(
+            geometry=readout_geometry,
             seed=seed,
             cooling_channels=_COOLING_CHANNELS,
             probe_channels=_PROBE_CHANNELS,
@@ -498,6 +579,18 @@ def create_virtual_installation(
             assets.revision,
             sequencer,
         )
+        sitemap_profile = SitemapAcquisitionProfile(
+            readout_binding=ReadoutBindingKey("camera"),
+            sequencer_role="sequencer",
+            camera_facts=camera_port.capability.camera_physical_facts,
+            geometry=readout_geometry,
+            maximum_site_residual_px=2.0,
+            pulse_document=bind_pulse_document_target(
+                load_packaged_sitemap_pulse(),
+                pulse_port.capability.target,
+            ),
+            trigger_channel=_CAMERA_TRIGGER_CHANNELS[0],
+        )
         catalog = _catalog(
             installation_id,
             runtime_instance_id,
@@ -518,6 +611,7 @@ def create_virtual_installation(
             controller=controller,
             camera_ports={"camera": camera_port},
             pulse_ports={"sequencer": pulse_port},
+            sitemap_profiles={"camera": sitemap_profile},
             raw_graph=devices,
             close_order=("camera", "sequencer", "trap"),
         )

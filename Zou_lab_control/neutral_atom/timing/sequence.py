@@ -339,9 +339,9 @@ class PulseReport:
 
 # The trap-held gap between consecutive emCCD frames of a long-short-long reference bracket.
 # The camera trigger drops during this gap so the next exposure registers as a DISTINCT trigger.
-# Single source for the gap: ``reference_bracket_sequence`` builds a bracket from scratch, and the
-# current ``pulses/imaging_template.json`` document puts a trap-held gap of this
-# length between its image frames.
+# Single source for this legacy builder's gap is ``reference_bracket_sequence``.
+# The current packaged sitemap recipe owns a different, camera-qualified dark
+# hold and must not be inferred from this legacy constant.
 READOUT_GAP_SECONDS = 100e-6
 
 #: The default readout exposure -- the qCMOS ~20 ms working point where single-shot bright/dark counts

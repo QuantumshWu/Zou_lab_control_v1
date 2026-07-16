@@ -31,7 +31,7 @@ RESULTS_DIR = f"{OUTPUT_ROOT}/results"
 
 def project_path(*parts: str) -> Path:
     """Absolute path under the project root for ``parts`` -- e.g.
-    ``project_path("pulses", "imaging_template.json")``."""
+    ``project_path("pulses", "mot_field_template.json")``."""
     return PROJECT_ROOT.joinpath(*[str(p) for p in parts])
 
 

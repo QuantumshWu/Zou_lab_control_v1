@@ -134,6 +134,18 @@ def estimate_calibration_analysis_peak_bytes(
     )
     if len(schema.cell_schema.data_shape) != 2:
         raise CalibrationAnalysisError("calibration source cells must be 2D frames")
+    expected_centers = request.expected_centers_xy
+    if expected_centers is not None:
+        height, width = schema.cell_schema.data_shape
+        if (
+            np.any(expected_centers[:, 0] < 0.0)
+            or np.any(expected_centers[:, 0] >= width)
+            or np.any(expected_centers[:, 1] < 0.0)
+            or np.any(expected_centers[:, 1] >= height)
+        ):
+            raise CalibrationAnalysisError(
+                "expected_centers_xy lies outside the captured output-pixel frame"
+            )
     group_count, join_build_peak, join_retained = (
         request.layout._memory_upper_bounds(schema)
     )
@@ -2072,6 +2084,9 @@ def _calibrate_readout_source(
         ordering=request.ordering,
         refine_half=request.detector_refine_half,
     )
+    # Reject an installation/profile mismatch before PSF fitting, feature
+    # extraction, or threshold training consumes the wrong spatial intent.
+    _validate_site_center_admission(centers, request)
     site_axis = AxisSpec(
         AxisId("readout-site"),
         "readout site",

@@ -17,6 +17,7 @@ from typing import Iterator, Sequence
 
 import numpy as np
 
+from zlc_neutral_atom.readout.sitemap import ReadoutGridGeometry
 from zlc_pulse import CompiledPulseArtifact, PulsePlayback, PulseTarget
 
 
@@ -184,7 +185,14 @@ def _frame_timing(
     probe_channels: tuple[str, ...],
     trap_channels: tuple[str, ...],
     default_exposure: float,
-) -> tuple[list[float], list[float], list[float], list[float], list[float]]:
+) -> tuple[
+    list[float],
+    list[float],
+    list[float],
+    list[float],
+    list[float],
+    list[float],
+]:
     triggers = _trigger_starts(playback, trigger_channels)
     if len(triggers) != frames:
         raise RuntimeError(
@@ -193,16 +201,15 @@ def _frame_timing(
     cooling = _merged(_pulse_intervals(playback, cooling_channels))
     probe = _pulse_intervals(playback, probe_channels)
     trap = _merged(_pulse_intervals(playback, trap_channels))
-    exposures = [float(default_exposure)] * frames
+    camera_exposures = [float(default_exposure)] * frames
+    probe_exposures = [0.0] * frames
     cooling_times = [0.0] * frames
     trap_off_times = [0.0] * frames
     trap_hold_times = [0.0] * frames
     for index, trigger in enumerate(triggers):
         before = 0.0 if index == 0 else triggers[index - 1]
-        after = triggers[index + 1] if index + 1 < frames else playback.duration
-        probe_time = _overlap(probe, trigger, after)
-        if probe_time > 0.0:
-            exposures[index] = probe_time
+        integration_stop = trigger + float(default_exposure)
+        probe_exposures[index] = _overlap(probe, trigger, integration_stop)
         cooling_times[index] = _overlap(cooling, before, trigger)
         if index:
             cursor = before
@@ -218,7 +225,14 @@ def _frame_timing(
             0.0,
             _overlap(trap, before, trigger) - _overlap(probe, before, trigger),
         )
-    return triggers, exposures, cooling_times, trap_off_times, trap_hold_times
+    return (
+        triggers,
+        camera_exposures,
+        probe_exposures,
+        cooling_times,
+        trap_off_times,
+        trap_hold_times,
+    )
 
 
 class VirtualAtomArray:
@@ -227,23 +241,20 @@ class VirtualAtomArray:
     def __init__(
         self,
         *,
+        geometry: ReadoutGridGeometry,
         seed: int | None,
         cooling_channels: Sequence[str],
         probe_channels: Sequence[str],
         trap_channels: Sequence[str],
     ) -> None:
-        self.grid_shape = (5, 7)
-        self.image_shape = (96, 128)
+        if not isinstance(geometry, ReadoutGridGeometry):
+            raise TypeError("geometry must be ReadoutGridGeometry")
+        self.geometry = geometry
+        self.grid_shape = geometry.grid_shape_yx
+        self.image_shape = geometry.frame_shape_yx
         self.cooling_channels = _channel_tuple(cooling_channels, "cooling_channels")
         self.probe_channels = _channel_tuple(probe_channels, "probe_channels")
         self.trap_channels = _channel_tuple(trap_channels, "trap_channels")
-        self.spacing_px = 9.0
-        ny, nx = self.grid_shape
-        height, width = self.image_shape
-        self.origin_px = (
-            (width - (nx - 1) * self.spacing_px) / 2.0,
-            (height - (ny - 1) * self.spacing_px) / 2.0,
-        )
         self.loading_probability = 0.5
         self.load_time_constant_s = 0.5e-3
         self.atom_rate = 1_100.0
@@ -277,16 +288,7 @@ class VirtualAtomArray:
         return self.grid_shape[0] * self.grid_shape[1]
 
     def _site_centers(self) -> np.ndarray:
-        ny, nx = self.grid_shape
-        x0, y0 = self.origin_px
-        return np.asarray(
-            [
-                (x0 + column * self.spacing_px, y0 + row * self.spacing_px)
-                for row in range(ny)
-                for column in range(nx)
-            ],
-            dtype=float,
-        )
+        return self.geometry.expected_centers_xy
 
     def _site_efficiency(self) -> np.ndarray:
         if self._site_efficiency_cache is None:
@@ -378,21 +380,41 @@ class VirtualAtomArray:
         )
         return np.clip(counts, 0, np.iinfo(np.uint16).max).astype(np.uint16)
 
-    def render_image(self, exposure: float) -> np.ndarray:
-        exposure = _positive(exposure, "exposure")
+    def render_image(
+        self,
+        camera_exposure: float,
+        probe_exposure: float,
+    ) -> np.ndarray:
+        camera_exposure = _positive(camera_exposure, "camera_exposure")
+        if (
+            isinstance(probe_exposure, bool)
+            or not isinstance(probe_exposure, (int, float))
+            or not math.isfinite(float(probe_exposure))
+            or float(probe_exposure) < 0.0
+        ):
+            raise ValueError("probe_exposure must be finite and non-negative")
+        probe_exposure = float(probe_exposure)
+        if probe_exposure > camera_exposure and not math.isclose(
+            probe_exposure,
+            camera_exposure,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        ):
+            raise ValueError("probe exposure cannot exceed camera integration")
+        probe_exposure = min(probe_exposure, camera_exposure)
         current = self.occupancy.copy()
         signal_time = np.zeros(self.n_sites)
         next_occupancy = current.copy()
         for index, occupied in enumerate(current):
             if occupied:
                 lifetime = self.rng.exponential(self.detection_lifetime)
-                signal_time[index] = min(exposure, lifetime)
-                if lifetime < exposure:
+                signal_time[index] = min(probe_exposure, lifetime)
+                if lifetime < probe_exposure:
                     next_occupancy[index] = False
-        image = self._render(current, signal_time, exposure)
+        image = self._render(current, signal_time, camera_exposure)
         self.occupancy = next_occupancy
         if self.probe_heating_K_per_s > 0.0:
-            self.temperature_K += self.probe_heating_K_per_s * exposure
+            self.temperature_K += self.probe_heating_K_per_s * probe_exposure
         return image
 
     def apply_recapture_loss(self, duration: float) -> None:
@@ -427,7 +449,8 @@ class VirtualAtomArray:
     ) -> Iterator[np.ndarray]:
         (
             _triggers,
-            exposures,
+            camera_exposures,
+            probe_exposures,
             cooling,
             trap_off,
             trap_hold,
@@ -457,7 +480,10 @@ class VirtualAtomArray:
             self.apply_recapture_loss(trap_off[index])
             if not group_start:
                 self.apply_trap_loss(trap_hold[index])
-            yield self.render_image(exposures[index])
+            yield self.render_image(
+                camera_exposures[index],
+                probe_exposures[index],
+            )
 
 class VirtualSequencer:
     """Finite target-IR player and the sole owner of the virtual trigger wire."""
@@ -731,10 +757,16 @@ class VirtualCamera:
                         trigger_channels=self.capture_trigger_channels,
                         default_exposure=self.exposure,
                     )
-                    for ordinal, (offset, image) in enumerate(
-                        zip(trigger_offsets, frames, strict=True)
-                    ):
-                        deadline = fired_at + offset * self.sequencer.sleep_scale
+                    frame_iterator = iter(frames)
+                    for ordinal, offset in enumerate(trigger_offsets):
+                        # A frame becomes available only after its fixed sensor
+                        # integration.  Waiting merely for the trigger edge made
+                        # persisted host-receipt timing precede the exposure it
+                        # claimed to contain, and advancing the generator before
+                        # that wait mutated atom state too early.
+                        deadline = fired_at + (
+                            offset + self.exposure
+                        ) * self.sequencer.sleep_scale
                         while not stop.is_set():
                             remaining = deadline - time.monotonic()
                             if remaining <= 0.0:
@@ -742,6 +774,12 @@ class VirtualCamera:
                             stop.wait(remaining)
                         if stop.is_set():
                             return
+                        try:
+                            image = next(frame_iterator)
+                        except StopIteration as exc:
+                            raise RuntimeError(
+                                "virtual atom source ended before the trigger budget"
+                            ) from exc
                         record = CameraFrameRecord(
                             image,
                             ordinal,
@@ -762,6 +800,11 @@ class VirtualCamera:
                             self._pending.append(record)
                             self._produced = ordinal + 1
                             self._condition.notify_all()
+                    sentinel = object()
+                    if next(frame_iterator, sentinel) is not sentinel:
+                        raise RuntimeError(
+                            "virtual atom source exceeded the trigger budget"
+                        )
                 except BaseException as error:
                     with self._condition:
                         self._worker_error = error

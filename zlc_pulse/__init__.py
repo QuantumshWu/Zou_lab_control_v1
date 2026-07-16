@@ -68,6 +68,7 @@ from .deployment import (
 )
 from .schedule import (
     DigitalTriggerSchedule,
+    MAX_MATERIALIZED_TRIGGER_EDGES,
     TriggerEdge,
     build_digital_trigger_schedules,
     digital_trigger_schedule_from_tree,
@@ -169,6 +170,7 @@ from .target import (
 __all__ = [
     "COMPILED_PULSE_ARTIFACT_SCHEMA",
     "MAX_COMPILED_PULSE_ARTIFACT_BYTES",
+    "MAX_MATERIALIZED_TRIGGER_EDGES",
     "MAX_MATERIALIZED_PLAYBACK_PULSES",
     "APPROVED_DEPLOYED_TARGET_ABI",
     "AUTONOMOUS_TABLE_READ_RECIPE",

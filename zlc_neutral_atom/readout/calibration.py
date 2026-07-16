@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 from enum import Enum
+import math
 from typing import TypeAlias
 
 import numpy as np
@@ -48,6 +49,7 @@ from .contracts import (
     CameraCaptureDescriptor,
     FrameContract,
     ReadoutBindingKey,
+    _minimum_coordinate_separation,
     _CalibrationCaptureJoin,
 )
 
@@ -235,6 +237,18 @@ class CalibrationAnalysisRequest:
             )
             if maximum_residual <= 0.0:
                 raise ValueError("maximum_site_residual_px must be positive")
+            minimum_separation = _minimum_coordinate_separation(expected_centers)
+            if site_count > 1:
+                if (
+                    not math.isfinite(minimum_separation)
+                    or minimum_separation <= 0.0
+                ):
+                    raise ValueError("expected_centers_xy must contain unique sites")
+                if 2.0 * maximum_residual >= minimum_separation:
+                    raise ValueError(
+                        "maximum_site_residual_px must be less than half the minimum "
+                        "expected site-center separation"
+                    )
         object.__setattr__(self, "grid_shape_yx", grid)
         object.__setattr__(self, "box_radius", radius)
         object.__setattr__(self, "psf_half_width", psf_half)

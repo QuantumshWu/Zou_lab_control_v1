@@ -733,7 +733,7 @@
     },
     {
       "period_id": "p5",
-      "duration": 0.0001,
+      "duration": 0.0151,
       "unit": "s",
       "name": "gap_1",
       "states": [
@@ -879,7 +879,7 @@
   "scan_recipe": null,
   "api_parameters": [
     {
-      "parameter_id": "reference_exposure_before",
+      "parameter_id": "reference_probe_duration_before",
       "field": {
         "kind": "duration",
         "period_id": "p2",
@@ -888,7 +888,7 @@
       "unit": "s"
     },
     {
-      "parameter_id": "readout_exposure",
+      "parameter_id": "readout_probe_duration",
       "field": {
         "kind": "duration",
         "period_id": "p4",
@@ -897,7 +897,7 @@
       "unit": "s"
     },
     {
-      "parameter_id": "reference_exposure_after",
+      "parameter_id": "reference_probe_duration_after",
       "field": {
         "kind": "duration",
         "period_id": "p6",

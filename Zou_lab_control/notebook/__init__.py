@@ -20,6 +20,8 @@ from .facade import (
     PlanDescriptor,
     ReadoutFacade,
     ReadoutModelKind,
+    SitemapCalibrationFailed,
+    SitemapCalibrationInterrupted,
     TimingFacade,
     TimingTargetDescriptor,
 )
@@ -44,6 +46,8 @@ __all__ = [
     "PlanDescriptor",
     "ReadoutFacade",
     "ReadoutModelKind",
+    "SitemapCalibrationFailed",
+    "SitemapCalibrationInterrupted",
     "TimingFacade",
     "TimingTargetDescriptor",
 ]

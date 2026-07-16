@@ -47,6 +47,7 @@ from zlc_neutral_atom.readout.contracts import (
     CalibrationCaptureLayout,
     ReadoutBindingKey,
 )
+from zlc_neutral_atom.readout.sitemap import SitemapAcquisitionProfile
 from zlc_neutral_atom.runtime.pipeline import (
     estimate_pipeline_peak_bytes,
     MinimalPipelineSpec,
@@ -77,6 +78,9 @@ _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_CALIBRATION_TIMEOUT_SECONDS = 300.0
 _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_OCCUPANCY_TIMEOUT_SECONDS = 300.0
+_CAPTURE_REPEAT_AXIS_ID = AxisId("capture.repeat")
+_CAPTURE_SCAN_AXIS_ID = AxisId("capture.scan_row_ordinal")
+_CAPTURE_READOUT_EVENT_AXIS_ID = AxisId("capture.readout_event")
 
 
 class _ResourceCleanupError(RuntimeError):
@@ -213,6 +217,36 @@ class CalibrationArtifactRequest:
             self,
             "timeout_seconds",
             _positive_real(self.timeout_seconds, "timeout_seconds"),
+        )
+
+
+class SitemapCalibrationFailed(RuntimeError):
+    """Calibration failed after its diagnostic raw capture became FINAL."""
+
+    __slots__ = ("source_capture_ref",)
+
+    def __init__(self, source_capture_ref: CaptureArtifactRef) -> None:
+        if not isinstance(source_capture_ref, CaptureArtifactRef):
+            raise TypeError("source_capture_ref must be CaptureArtifactRef")
+        self.source_capture_ref = source_capture_ref
+        super().__init__(
+            "sitemap calibration failed; the committed raw capture remains "
+            f"available as {source_capture_ref!r}"
+        )
+
+
+class SitemapCalibrationInterrupted(KeyboardInterrupt):
+    """Notebook interrupt after the sitemap raw capture became FINAL."""
+
+    __slots__ = ("source_capture_ref",)
+
+    def __init__(self, source_capture_ref: CaptureArtifactRef) -> None:
+        if not isinstance(source_capture_ref, CaptureArtifactRef):
+            raise TypeError("source_capture_ref must be CaptureArtifactRef")
+        self.source_capture_ref = source_capture_ref
+        super().__init__(
+            "sitemap calibration interrupted; the committed raw capture remains "
+            f"available as {source_capture_ref!r}"
         )
 
 
@@ -420,6 +454,22 @@ class ReadoutFacade:
                 f"not {actual.value!r}"
             )
 
+    def _resolve_camera_role(
+        self,
+        services: _ExperimentServices,
+        requested: str | None,
+    ) -> str:
+        if self._binding is not None:
+            if requested is not None and requested != self._binding.value:
+                raise ValueError("bound readout facade cannot target another camera")
+            requested = self._binding.value
+        return _resolve_role(
+            services.catalog,
+            requested,
+            "camera",
+            ("readout", "camera"),
+        )
+
     def capture_request(
         self,
         pulse: PulseDocument | str | Path,
@@ -441,20 +491,12 @@ class ReadoutFacade:
                 if isinstance(pulse, PulseDocument)
                 else load_pulse_document(pulse)
             )
-            if self._binding is not None:
-                if camera_role is not None and camera_role != self._binding.value:
-                    raise ValueError("bound readout facade cannot target another camera")
-                camera_role = self._binding.value
+            camera_role = self._resolve_camera_role(services, camera_role)
             return CaptureRequest(
                 document,
                 execution_form,
                 services.catalog.require(
-                    _resolve_role(
-                        services.catalog,
-                        camera_role,
-                        "camera",
-                        ("readout", "camera"),
-                    )
+                    camera_role
                 ).ref,
                 services.catalog.require(
                     _resolve_role(
@@ -482,6 +524,87 @@ class ReadoutFacade:
     def load_capture(self, reference: CaptureArtifactRef) -> CaptureArtifact:
         with _service_guard(self._token) as services:
             return services.capture_repository.load(reference)
+
+    def sitemap(
+        self,
+        *,
+        frames: int = 20,
+        camera_role: str | None = None,
+        transport_memory_limit_bytes: int = 64 << 20,
+        capture_pipeline_memory_limit_bytes: int = 256 << 20,
+        calibration_memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
+        capture_timeout_seconds: float = 30.0,
+        calibration_timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS,
+    ) -> CalibrationArtifactRef:
+        """Capture and commit one installation-qualified site-map calibration.
+
+        ``frames`` is the number of complete reference/readout/reference groups,
+        not the total camera-frame count.  The hardware repeats each complete
+        group.  This method composes two ordinary Runs in order; it is not a
+        child-plan engine or hidden current-calibration slot.  Advanced/custom
+        calibration remains available through ``calibration_request``.
+        """
+
+        repeat_groups = _positive_int(frames, "frames")
+        transport_memory = _positive_int(
+            transport_memory_limit_bytes,
+            "transport_memory_limit_bytes",
+        )
+        capture_pipeline_memory = _positive_int(
+            capture_pipeline_memory_limit_bytes,
+            "capture_pipeline_memory_limit_bytes",
+        )
+        calibration_memory = _positive_int(
+            calibration_memory_limit_bytes,
+            "calibration_memory_limit_bytes",
+        )
+        capture_timeout = _positive_real(
+            capture_timeout_seconds,
+            "capture_timeout_seconds",
+        )
+        calibration_timeout = _positive_real(
+            calibration_timeout_seconds,
+            "calibration_timeout_seconds",
+        )
+        with _service_guard(self._token) as services:
+            selected_camera = self._resolve_camera_role(services, camera_role)
+            camera_ref = services.catalog.require(selected_camera).ref
+            profile = services.runtime.sitemap_profile(camera_ref)
+            if not isinstance(profile, SitemapAcquisitionProfile):
+                raise TypeError("installation returned an invalid sitemap profile")
+            if profile.readout_binding != ReadoutBindingKey(selected_camera):
+                raise ValueError(
+                    "installation sitemap profile differs from the selected camera"
+                )
+        document = profile.document_for_repeats(repeat_groups)
+        grouping = profile.repeat_major_grouping(repeat_groups)
+        analysis = profile.analysis_request(_CAPTURE_READOUT_EVENT_AXIS_ID)
+        capture_request = self.capture_request(
+            document,
+            execution_form=PulseExecutionForm.STATIC_ONCE,
+            camera_role=selected_camera,
+            sequencer_role=profile.sequencer_role,
+            trigger_channel=profile.trigger_channel,
+            repeat_count=repeat_groups,
+            readout_events_per_repeat=profile.event_count,
+            within_point_grouping=grouping,
+            transport_memory_limit_bytes=transport_memory,
+            pipeline_memory_limit_bytes=capture_pipeline_memory,
+            timeout_seconds=capture_timeout,
+        )
+        source = _run(self._token, capture_request)
+        try:
+            request = self.calibration_request(
+                source,
+                analysis,
+                memory_limit_bytes=calibration_memory,
+                timeout_seconds=calibration_timeout,
+            )
+            return self.calibrate(request)
+        except KeyboardInterrupt as error:
+            raise SitemapCalibrationInterrupted(source) from error
+        except Exception as error:
+            raise SitemapCalibrationFailed(source) from error
 
     def calibration_request(
         self,
@@ -837,9 +960,9 @@ def _compile_for_services(
         execution_form=request.execution_form,
         trigger_channel=request.trigger_channel,
         layout=TriggeredCameraLayout(
-            AxisId("capture.repeat"),
-            AxisId("capture.scan_row_ordinal"),
-            AxisId("capture.readout_event"),
+            _CAPTURE_REPEAT_AXIS_ID,
+            _CAPTURE_SCAN_AXIS_ID,
+            _CAPTURE_READOUT_EVENT_AXIS_ID,
             request.repeat_count,
             request.readout_events_per_repeat,
             request.within_point_grouping,
@@ -1074,6 +1197,8 @@ __all__ = [
     "PlanDescriptor",
     "ReadoutFacade",
     "ReadoutModelKind",
+    "SitemapCalibrationFailed",
+    "SitemapCalibrationInterrupted",
     "TimingFacade",
     "TimingTargetDescriptor",
 ]

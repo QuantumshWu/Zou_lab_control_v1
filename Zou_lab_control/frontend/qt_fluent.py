@@ -1309,7 +1309,7 @@ class FluentPathEdit(QtWidgets.QWidget):
     def _dialog_start(self) -> str:
         """Where the Browse dialog opens: the current path if it's a real file/dir or sits in
         a real directory the user typed; otherwise ``base_dir`` (the folder these files live
-        in, created if needed) so a BARE default like ``imaging_template.json`` still lands in
+        in, created if needed) so a BARE default like ``mot_field_template.json`` still lands in
         ``pulses/`` rather than the CWD; otherwise the CWD."""
         import os
         cur = self.edit.text().strip()

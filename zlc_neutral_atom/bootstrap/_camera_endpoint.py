@@ -9,9 +9,7 @@ from numbers import Integral
 
 import numpy as np
 from zlc_data import (
-    AxisId,
     AxisSpec,
-    CoordinateFrameId,
     DatasetSchema,
     PointLayout,
     READOUT_EVENT,
@@ -38,6 +36,7 @@ from zlc_neutral_atom.readout.contracts import (
     CameraCaptureDescriptor,
     CameraEventReadoutSetting,
     ReadoutBindingKey,
+    camera_roi_local_spatial_identity,
 )
 from zlc_neutral_atom.runtime.capture import (
     BoundCapturePort,
@@ -128,10 +127,14 @@ def _settings_tree(camera: VirtualCamera) -> dict[str, object]:
             "effective_trigger_channels": tuple(camera.effective_trigger_channels),
         }
     )
-    # The in-process wire is deterministic and has no independent sensor-rate
-    # limit.  Real adapters live behind separate, evidence-qualified endpoints.
+    # The virtual sensor has no readout overhead, but it still integrates for
+    # its frozen exposure after every rising edge.  Advertising zero here used
+    # to admit overlapping triggers while the renderer silently substituted a
+    # pulse-window duration for the camera exposure.
     snapshot["applied_exposure_seconds"] = float(snapshot["exposure"])
-    snapshot["required_external_trigger_interval_seconds"] = 0.0
+    snapshot["required_external_trigger_interval_seconds"] = float(
+        snapshot["exposure"]
+    )
     snapshot["external_trigger_integration_start_offset_seconds"] = 0.0
     return snapshot
 
@@ -208,27 +211,26 @@ def _value_schema(camera: VirtualCamera, source_id: str) -> ValueSchema:
     if shape is None:
         raise RuntimeError("camera frame shape is unavailable")
     height, width = (int(size) for size in shape)
+    y_axis_id, x_axis_id, coordinate_frame = camera_roi_local_spatial_identity(
+        source_id
+    )
     y = AxisSpec(
-        AxisId(f"{source_id}.y"),
+        y_axis_id,
         "ROI-local output y",
         SPATIAL_Y,
         height,
         tuple(range(height)),
         unit="pixel",
-        coordinate_frame=CoordinateFrameId(
-            f"{source_id}.roi-local-output-pixels"
-        ),
+        coordinate_frame=coordinate_frame,
     )
     x = AxisSpec(
-        AxisId(f"{source_id}.x"),
+        x_axis_id,
         "ROI-local output x",
         SPATIAL_X,
         width,
         tuple(range(width)),
         unit="pixel",
-        coordinate_frame=CoordinateFrameId(
-            f"{source_id}.roi-local-output-pixels"
-        ),
+        coordinate_frame=coordinate_frame,
     )
     return ValueSchema(
         (y, x),

@@ -84,6 +84,20 @@ def normalize_camera_geometry(
     return sensor, origin, roi, binning
 
 
+def _minimum_coordinate_separation(coordinates_xy: np.ndarray) -> float:
+    """Return the nearest 2D coordinate separation with only O(site) scratch."""
+
+    site_count = len(coordinates_xy)
+    if site_count < 2:
+        return math.inf
+    minimum = math.inf
+    for site in range(site_count - 1):
+        deltas = coordinates_xy[site + 1 :] - coordinates_xy[site]
+        distances = np.hypot(deltas[:, 0], deltas[:, 1])
+        minimum = min(minimum, float(np.min(distances)))
+    return minimum
+
+
 def validate_camera_spatial_axes(
     spatial_y_axis_id: object,
     spatial_x_axis_id: object,
@@ -99,6 +113,19 @@ def validate_camera_spatial_axes(
         raise ValueError("spatial Y and X axes must have different identities")
     if not isinstance(coordinate_frame, CoordinateFrameId):
         raise TypeError("coordinate_frame must be CoordinateFrameId")
+
+
+def camera_roi_local_spatial_identity(
+    source_id: object,
+) -> tuple[AxisId, AxisId, CoordinateFrameId]:
+    """Derive the one canonical ROI-local output-pixel identity for a camera."""
+
+    source = _canonical_text(source_id, "camera source_id")
+    return (
+        AxisId(f"{source}.y"),
+        AxisId(f"{source}.x"),
+        CoordinateFrameId(f"{source}.roi-local-output-pixels"),
+    )
 
 
 def camera_output_shape_yx(
@@ -697,6 +724,7 @@ __all__ = [
     "CameraEventReadoutSetting",
     "FrameContract",
     "ReadoutBindingKey",
+    "camera_roi_local_spatial_identity",
     "camera_output_shape_yx",
     "normalize_camera_count_dtype",
     "normalize_camera_geometry",
