@@ -33,6 +33,7 @@ tests/test_workbench_endpoint_binding.py
 tests/test_workbench_host_contract.py
 tests/test_zlc_calibration_commit.py
 tests/test_zlc_calibration_stream_contracts.py
+tests/test_zlc_camera_adapter_sdk.py
 tests/test_zlc_data_fit.py
 tests/test_zlc_data_kernel.py
 tests/test_zlc_data_transform.py

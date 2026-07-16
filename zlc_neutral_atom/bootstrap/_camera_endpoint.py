@@ -21,6 +21,12 @@ from zlc_data import (
     Value,
     ValueSchema,
 )
+from zlc_neutral_atom.adapter_sdk import (
+    CameraAdapter,
+    CameraCaptureTerminalRecord,
+    CameraFrameRecord,
+    CameraWorkingPoint,
+)
 from zlc_neutral_atom.acquisition import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
     CameraAcquisitionMode,
@@ -80,124 +86,43 @@ from zlc_storage import (
 )
 
 from ._endpoint_binding import require_current_endpoint_binding as _require_binding
-from ._virtual_hardware import (
-    CameraCaptureTerminalRecord,
-    CameraFrameRecord,
-    VirtualCamera,
-)
 
 
-_CAMERA_DTYPE = np.dtype("<u2")
 _CAMERA_MODE = CameraAcquisitionMode.EXTERNAL_TRIGGERED
 
 
-def _settings_tree(camera: VirtualCamera) -> dict[str, object]:
-    shape = camera.frame_shape
-    if shape is None or len(shape) != 2 or any(int(size) < 1 for size in shape):
-        raise RuntimeError("camera frame shape is unavailable after connection handshake")
-    snapshot = dict(camera.snapshot())
-    # Snapshot methods also expose live observations for UI.  Only frozen
-    # acquisition settings belong in the settings fingerprint: a pulse may
-    # legitimately change these observations while the camera configuration
-    # remains identical.
-    for presentation_or_state_field in ("open", "last_sequence", "last_levels"):
-        snapshot.pop(presentation_or_state_field, None)
-    # Requested intent remains available on the adapter snapshot for UI and
-    # diagnostics, but capability authority is minted only from hardware-applied
-    # readback.  Never let a requested mirror self-attest a physical setting.
-    for requested_field in tuple(
-        key for key in snapshot if str(key).startswith("requested_")
-    ):
-        snapshot.pop(requested_field, None)
-    snapshot.update(
-        {
-            "adapter_type": f"{type(camera).__module__}.{type(camera).__qualname__}",
-            "frame_shape": tuple(int(size) for size in shape),
-            "sensor_shape": (
-                None
-                if camera.sensor_shape is None
-                else tuple(int(size) for size in camera.sensor_shape)
-            ),
-            "frame_dtype": _CAMERA_DTYPE.str,
-            "acquisition_mode": _CAMERA_MODE.value,
-            # Passive installation wiring remains authoritative even while a
-            # camera is temporarily free-running and therefore has no active
-            # trigger channel.
-            "capture_trigger_channels": tuple(camera.capture_trigger_channels),
-            "effective_trigger_channels": tuple(camera.effective_trigger_channels),
-        }
-    )
-    # The virtual sensor has no readout overhead, but it still integrates for
-    # its frozen exposure after every rising edge.  Advertising zero here used
-    # to admit overlapping triggers while the renderer silently substituted a
-    # pulse-window duration for the camera exposure.
-    snapshot["applied_exposure_seconds"] = float(snapshot["exposure"])
-    snapshot["required_external_trigger_interval_seconds"] = float(
-        snapshot["exposure"]
-    )
-    snapshot["external_trigger_integration_start_offset_seconds"] = 0.0
-    return snapshot
-
-
-def _readout_mode_from_settings(
-    camera: VirtualCamera,
-    settings: dict[str, object],
-) -> str:
-    return f"target-virtual:mode={settings['acquisition_mode']}"
-
-
 def _physical_facts(
-    camera: VirtualCamera,
+    working_point: CameraWorkingPoint,
     binding: BoundDevice,
     source_id: str,
     payload_contract: CameraSampleContract,
-    settings_tree: dict[str, object],
-    settings_fingerprint: str,
 ) -> CameraPhysicalFacts:
-    sensor = settings_tree.get("sensor_shape")
-    if sensor is None:
-        raise RuntimeError(
-            "camera sensor geometry is unavailable during capability probe"
-        )
-    sensor_y, sensor_x = (int(size) for size in sensor)
-    roi = settings_tree.get("roi")
-    if roi is None:
-        origin_yx = (0, 0)
-        roi_shape_yx = (sensor_y, sensor_x)
-    else:
-        x, width, y, height = (int(value) for value in roi)
-        origin_yx = (y, x)
-        roi_shape_yx = (height, width)
     y_axis, x_axis = payload_contract.value_schema.data_axes
-    gain_value = settings_tree.get("gain", 1.0)
-    gain = float(gain_value)
     stable_identity = binding.binding_stamp.physical_identity.stable_device_identity
     facts = CameraPhysicalFacts(
         camera_identity=stable_identity,
         sensor_identity=f"{stable_identity}/sensor",
         optical_path=f"installation-role/{source_id}",
-        capture_trigger_channels=settings_tree["capture_trigger_channels"],
-        sensor_shape_yx=(sensor_y, sensor_x),
-        roi_origin_yx=origin_yx,
-        roi_shape_yx=roi_shape_yx,
-        binning_yx=(1, 1),
+        capture_trigger_channels=working_point.capture_trigger_channels,
+        sensor_shape_yx=working_point.sensor_shape_yx,
+        roi_origin_yx=working_point.roi_origin_yx,
+        roi_shape_yx=working_point.roi_shape_yx,
+        binning_yx=working_point.binning_yx,
         spatial_y_axis_id=y_axis.axis_id,
         spatial_x_axis_id=x_axis.axis_id,
         coordinate_frame=y_axis.coordinate_frame,
         dtype=payload_contract.value_schema.dtype,
         count_unit=payload_contract.value_schema.value_unit,
-        exposure_seconds=float(settings_tree["applied_exposure_seconds"]),
-        required_external_trigger_interval_seconds=settings_tree[
-            "required_external_trigger_interval_seconds"
-        ],
-        external_trigger_integration_start_offset_seconds=settings_tree[
-            "external_trigger_integration_start_offset_seconds"
-        ],
-        # These adapters expose no independent gain control; unity is their
-        # explicit digital-count gain policy, frozen into the same snapshot.
-        gain=gain,
-        readout_mode=_readout_mode_from_settings(camera, settings_tree),
-        opaque_frame_settings_fingerprint=settings_fingerprint,
+        exposure_seconds=working_point.exposure_seconds,
+        required_external_trigger_interval_seconds=(
+            working_point.required_external_trigger_interval_seconds
+        ),
+        external_trigger_integration_start_offset_seconds=(
+            working_point.external_trigger_integration_start_offset_seconds
+        ),
+        gain=working_point.gain,
+        readout_mode=working_point.readout_mode,
+        opaque_frame_settings_fingerprint=working_point.settings_fingerprint,
     )
     if facts.output_shape_yx != payload_contract.value_schema.data_shape:
         raise RuntimeError(
@@ -206,11 +131,11 @@ def _physical_facts(
     return facts
 
 
-def _value_schema(camera: VirtualCamera, source_id: str) -> ValueSchema:
-    shape = camera.frame_shape
-    if shape is None:
-        raise RuntimeError("camera frame shape is unavailable")
-    height, width = (int(size) for size in shape)
+def _value_schema(working_point: CameraWorkingPoint, source_id: str) -> ValueSchema:
+    try:
+        height, width = (int(size) for size in working_point.frame_shape_yx)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("camera frame shape is unavailable") from exc
     y_axis_id, x_axis_id, coordinate_frame = camera_roi_local_spatial_identity(
         source_id
     )
@@ -235,8 +160,8 @@ def _value_schema(camera: VirtualCamera, source_id: str) -> ValueSchema:
     return ValueSchema(
         (y, x),
         ValidityContract.value(),
-        _CAMERA_DTYPE,
-        "count",
+        working_point.dtype,
+        working_point.count_unit,
     )
 
 
@@ -345,27 +270,35 @@ class CameraCaptureEndpoint:
 
     def __init__(
         self,
-        camera: VirtualCamera,
+        camera: CameraAdapter,
         source_id: str,
         *,
         max_source_burst_events: int | None = None,
         max_blocking_call_seconds: float | None = None,
         max_capture_spec_bytes: int = 4096,
+        exact_external_trigger_qualification_digest: str | None = None,
     ) -> None:
-        if type(camera) is not VirtualCamera:
-            raise TypeError(
-                "target virtual endpoint accepts only the target-owned VirtualCamera"
-            )
+        if not isinstance(camera, CameraAdapter):
+            raise TypeError("camera must implement the adapter_sdk CameraAdapter contract")
         self._camera = camera
         self._source_id = _canonical_text(source_id, "source_id")
+        adapter_capacity = _positive_int(
+            camera.max_pending_records,
+            "camera max_pending_records",
+        )
+        self._adapter_record_capacity = adapter_capacity
         self._max_source_burst_events = _positive_int(
-            camera.recent_capacity
+            adapter_capacity
             if max_source_burst_events is None
             else max_source_burst_events,
             "max_source_burst_events",
         )
+        if self._max_source_burst_events > adapter_capacity:
+            raise ValueError(
+                "max_source_burst_events exceeds camera max_pending_records"
+            )
         timeout = (
-            self._default_timeout(camera)
+            float(camera.timeout)
             if max_blocking_call_seconds is None
             else float(max_blocking_call_seconds)
         )
@@ -376,13 +309,13 @@ class CameraCaptureEndpoint:
             max_capture_spec_bytes,
             "max_capture_spec_bytes",
         )
-        self._exact_external_trigger_qualification_digest = canonical_digest(
-            {
-                "evidence": "target-owned deterministic in-process trigger wire",
-                "adapter_type": (
-                    f"{type(camera).__module__}.{type(camera).__qualname__}"
-                ),
-            }
+        if exact_external_trigger_qualification_digest is not None:
+            _sha256(
+                exact_external_trigger_qualification_digest,
+                "exact_external_trigger_qualification_digest",
+            )
+        self._exact_external_trigger_qualification_digest = (
+            exact_external_trigger_qualification_digest
         )
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -392,10 +325,6 @@ class CameraCaptureEndpoint:
         self._command_operation_token: object | None = None
         self._physical_operations_inflight = 0
         self._session: _EndpointSession | None = None
-
-    @staticmethod
-    def _default_timeout(camera: VirtualCamera) -> float:
-        return float(camera.timeout)
 
     def payload_contract(self, binding: BoundDevice) -> CameraSampleContract:
         with self._lock:
@@ -428,10 +357,9 @@ class CameraCaptureEndpoint:
             driver_ring_bytes = (
                 self._max_source_burst_events * retained_frame_bytes
             )
-            adapter_record_retention_bytes = max(
-                self._max_source_burst_events,
-                int(self._camera.recent_capacity),
-            ) * retained_frame_bytes
+            adapter_record_retention_bytes = (
+                self._adapter_record_capacity * retained_frame_bytes
+            )
             capability_evidence = CameraCapabilityEvidence(
                 adapter_type=(
                     f"{type(self._camera).__module__}."
@@ -979,21 +907,24 @@ class CameraCaptureEndpoint:
         self,
         binding: BoundDevice,
     ) -> _AppliedCameraWorkingPoint:
-        settings_tree = _settings_tree(self._camera)
-        settings_fingerprint = canonical_digest(settings_tree)
+        working_point = self._camera.capture_working_point()
+        if not isinstance(working_point, CameraWorkingPoint):
+            raise TypeError("camera adapter returned a non-working-point value")
+        if working_point.acquisition_mode != _CAMERA_MODE.value:
+            raise RuntimeError(
+                "finite exact endpoint requires an external-triggered working point"
+            )
         payload_contract = CameraSampleContract(
-            _value_schema(self._camera, self._source_id)
+            _value_schema(working_point, self._source_id)
         )
         physical_facts = _physical_facts(
-            self._camera,
+            working_point,
             binding,
             self._source_id,
             payload_contract,
-            settings_tree,
-            settings_fingerprint,
         )
         return _AppliedCameraWorkingPoint(
-            settings_fingerprint,
+            working_point.settings_fingerprint,
             payload_contract,
             physical_facts,
         )

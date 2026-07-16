@@ -205,7 +205,18 @@ def _bind_camera(
     asset_map_revision: str,
     camera: VirtualCamera,
 ) -> BoundCapturePort:
-    endpoint = CameraCaptureEndpoint(camera, asset.role)
+    endpoint = CameraCaptureEndpoint(
+        camera,
+        asset.role,
+        exact_external_trigger_qualification_digest=canonical_digest(
+            {
+                "evidence": "target-owned deterministic in-process trigger wire",
+                "adapter_type": (
+                    f"{type(camera).__module__}.{type(camera).__qualname__}"
+                ),
+            }
+        ),
+    )
     binding: BoundDevice | None = None
 
     def current_binding() -> BoundDevice:

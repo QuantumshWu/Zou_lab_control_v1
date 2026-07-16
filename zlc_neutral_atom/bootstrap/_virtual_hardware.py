@@ -17,8 +17,14 @@ from typing import Iterator, Sequence
 
 import numpy as np
 
+from zlc_neutral_atom.adapter_sdk import (
+    CameraCaptureTerminalRecord,
+    CameraFrameRecord,
+    CameraWorkingPoint,
+)
 from zlc_neutral_atom.readout.sitemap import ReadoutGridGeometry
 from zlc_pulse import CompiledPulseArtifact, PulsePlayback, PulseTarget
+from zlc_storage import canonical_digest
 
 
 _K_B = 1.380649e-23
@@ -52,84 +58,6 @@ def _channel_tuple(value: Sequence[str], name: str) -> tuple[str, ...]:
     if len(result) != len(set(result)):
         raise ValueError(f"{name} must contain unique channel names")
     return result
-
-
-@dataclass(frozen=True, eq=False)
-class CameraFrameRecord:
-    """One immutable virtual frame with the same metadata shape as capture input."""
-
-    image: np.ndarray
-    source_ordinal: int
-    produced_count: int | None
-    frame_stamp: int | None
-    camera_stamp: int | None
-    timestamp_seconds: int | None
-    timestamp_microseconds: int | None
-    host_received_at_ns: int
-    driver_buffer_index: int | None = None
-    __hash__ = None
-
-    def __post_init__(self) -> None:
-        if (
-            isinstance(self.source_ordinal, bool)
-            or not isinstance(self.source_ordinal, (int, np.integer))
-            or int(self.source_ordinal) < 0
-        ):
-            raise ValueError("source_ordinal must be a non-negative integer")
-        ordinal = int(self.source_ordinal)
-        object.__setattr__(self, "source_ordinal", ordinal)
-        for name in (
-            "produced_count",
-            "frame_stamp",
-            "camera_stamp",
-            "timestamp_seconds",
-            "timestamp_microseconds",
-            "driver_buffer_index",
-        ):
-            value = getattr(self, name)
-            if value is None:
-                continue
-            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-                raise TypeError(f"{name} must be an integer or None")
-            object.__setattr__(self, name, int(value))
-        if (
-            isinstance(self.host_received_at_ns, bool)
-            or not isinstance(self.host_received_at_ns, (int, np.integer))
-            or int(self.host_received_at_ns) <= 0
-        ):
-            raise ValueError("host_received_at_ns must be a positive integer")
-        object.__setattr__(self, "host_received_at_ns", int(self.host_received_at_ns))
-        image = np.array(self.image, copy=True, order="C")
-        image.setflags(write=False)
-        object.__setattr__(self, "image", image)
-
-    @property
-    def captured_at(self) -> float:
-        if self.timestamp_seconds is not None and self.timestamp_microseconds is not None:
-            return float(self.timestamp_seconds) + float(self.timestamp_microseconds) * 1e-6
-        return float(self.host_received_at_ns) * 1e-9
-
-
-@dataclass(frozen=True)
-class CameraCaptureTerminalRecord:
-    produced_count: int
-    source_stopped: bool
-    no_more_frames: bool
-    joined: bool
-
-    def __post_init__(self) -> None:
-        if (
-            isinstance(self.produced_count, bool)
-            or not isinstance(self.produced_count, (int, np.integer))
-            or int(self.produced_count) < 0
-        ):
-            raise ValueError("produced_count must be a non-negative integer")
-        object.__setattr__(self, "produced_count", int(self.produced_count))
-        if any(
-            type(getattr(self, name)) is not bool
-            for name in ("source_stopped", "no_more_frames", "joined")
-        ):
-            raise TypeError("terminal proof flags must be bool")
 
 
 def _pulse_intervals(
@@ -629,7 +557,7 @@ class VirtualSequencer:
 class VirtualCamera:
     """Finite externally-triggered camera with one bounded producer queue."""
 
-    recent_capacity = 16
+    max_pending_records = 16
 
     def __init__(
         self,
@@ -658,7 +586,7 @@ class VirtualCamera:
         self._armed = False
         self._accepting = False
         self._expected = 0
-        self._capacity = self.recent_capacity
+        self._capacity = self.max_pending_records
         self._produced = 0
         self._worker: threading.Thread | None = None
         self._worker_stop: threading.Event | None = None
@@ -692,6 +620,52 @@ class VirtualCamera:
             "timeout": self.timeout,
         }
 
+    def capture_working_point(self) -> CameraWorkingPoint:
+        """Freeze the same deterministic readback used by exact capability minting."""
+
+        self.ensure_open()
+        shape = tuple(int(size) for size in self.frame_shape)
+        sensor = tuple(int(size) for size in self.sensor_shape)
+        settings = dict(self.snapshot())
+        settings.update(
+            {
+                "adapter_type": f"{type(self).__module__}.{type(self).__qualname__}",
+                "frame_shape": shape,
+                "sensor_shape": sensor,
+                "frame_dtype": np.dtype("<u2").str,
+                "acquisition_mode": "EXTERNAL_TRIGGERED",
+                "capture_trigger_channels": tuple(self.capture_trigger_channels),
+                "effective_trigger_channels": tuple(self.effective_trigger_channels),
+                "applied_exposure_seconds": float(self.exposure),
+                "required_external_trigger_interval_seconds": float(self.exposure),
+                "external_trigger_integration_start_offset_seconds": 0.0,
+            }
+        )
+        if self.roi is None:
+            origin_yx = (0, 0)
+            roi_shape_yx = sensor
+        else:
+            x, width, y, height = (int(value) for value in self.roi)
+            origin_yx = (y, x)
+            roi_shape_yx = (height, width)
+        return CameraWorkingPoint(
+            settings_fingerprint=canonical_digest(settings),
+            acquisition_mode="EXTERNAL_TRIGGERED",
+            frame_shape_yx=shape,
+            sensor_shape_yx=sensor,
+            roi_origin_yx=origin_yx,
+            roi_shape_yx=roi_shape_yx,
+            binning_yx=(1, 1),
+            dtype=np.dtype("<u2"),
+            count_unit="count",
+            capture_trigger_channels=tuple(self.capture_trigger_channels),
+            exposure_seconds=float(self.exposure),
+            required_external_trigger_interval_seconds=float(self.exposure),
+            external_trigger_integration_start_offset_seconds=0.0,
+            gain=1.0,
+            readout_mode="target-virtual:mode=EXTERNAL_TRIGGERED",
+        )
+
     def arm(
         self,
         frames: int,
@@ -710,6 +684,8 @@ class VirtualCamera:
         )
         if capacity > expected:
             raise ValueError("max_inflight_frames cannot exceed frame budget")
+        if capacity > self.max_pending_records:
+            raise ValueError("max_inflight_frames exceeds camera max_pending_records")
         with self._condition:
             if self._armed:
                 raise RuntimeError("virtual camera already owns an armed capture")
