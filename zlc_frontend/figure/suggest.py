@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from math import prod
 
 from zlc_data import (
     DatasetSchema,
+    FitResultBatch,
     REPEAT,
     Selection,
 )
@@ -475,4 +477,102 @@ def suggest_view(
     )
 
 
-__all__ = ["suggest_view"]
+def suggest_fit_view(
+    schema: DatasetSchema,
+    result: FitResultBatch,
+    selection: Selection | None = None,
+    preferences: ViewPreferences | None = None,
+) -> ViewSuggestion:
+    """Suggest a display that identifies one exact batch cell per fit overlay.
+
+    This is authority-to-presentation projection only: it never creates or
+    modifies a ``FitSpec``.  The current evaluator consumes raw
+    ``DatasetSchema`` snapshots, so a fit over transformed data is rejected
+    instead of being overlaid on different observations.
+    """
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("result must be FitResultBatch")
+    if result.source_ref.schema_fingerprint != schema.fingerprint:
+        return _needs(
+            "FIT_SOURCE_SCHEMA_MISMATCH",
+            "fit result and displayed source use different schemas",
+        )
+    if result.spec.committed_transform is not None:
+        return _needs(
+            "TRANSFORMED_FIT_DISPLAY_UNAVAILABLE",
+            "a transformed fit cannot be overlaid on the raw source view",
+        )
+    arity = len(result.fit_axis_specs)
+    if arity not in (1, 2):
+        return _needs(
+            "FIT_ARITY_UNSUPPORTED",
+            "the current figure surface supports one- and two-axis fit models",
+        )
+    preferences = ViewPreferences() if preferences is None else preferences
+    if not isinstance(preferences, ViewPreferences):
+        raise TypeError("preferences must be ViewPreferences or None")
+
+    repeat_axis = schema.repeat_axis
+    batch_ids = {axis.axis_id for axis in result.batch_axis_specs}
+    selected = selection
+    if repeat_axis.axis_id in batch_ids and preferences.repeat_mode is None:
+        terms = () if selection is None else selection.terms
+        if all(term.axis_id != repeat_axis.axis_id for term in terms):
+            selected = Selection((*terms, *Selection.index(repeat_axis.axis_id, 0).terms))
+        preferences = replace(preferences, repeat_mode=RepeatViewMode.LATEST)
+
+    if arity == 1:
+        fit_axis_id = result.fit_axis_specs[0].axis_id
+        if preferences.x_axis_id not in (None, fit_axis_id):
+            return _needs(
+                "FIT_AXIS_VIEW_MISMATCH",
+                "the requested x axis differs from the fitted axis",
+                axis_id=preferences.x_axis_id,
+            )
+        preferences = replace(preferences, x_axis_id=fit_axis_id)
+        intent = ViewIntent.CURVE
+    else:
+        x_axis_id = result.fit_axis_specs[0].axis_id
+        y_axis_id = result.fit_axis_specs[1].axis_id
+        if preferences.image_x_axis_id not in (None, x_axis_id):
+            return _needs(
+                "FIT_X_AXIS_VIEW_MISMATCH",
+                "the requested image x axis differs from the first fitted axis",
+                axis_id=preferences.image_x_axis_id,
+            )
+        if preferences.image_y_axis_id not in (None, y_axis_id):
+            return _needs(
+                "FIT_Y_AXIS_VIEW_MISMATCH",
+                "the requested image y axis differs from the second fitted axis",
+                axis_id=preferences.image_y_axis_id,
+            )
+        preferences = replace(
+            preferences,
+            image_x_axis_id=x_axis_id,
+            image_y_axis_id=y_axis_id,
+        )
+        intent = ViewIntent.IMAGE
+
+    suggestion = suggest_view(schema, intent, selected, preferences)
+    if suggestion.spec is None:
+        return suggestion
+    allowed_batch_roles = {
+        AxisViewRole.BATCH,
+        AxisViewRole.FACET,
+        AxisViewRole.SELECTED,
+        AxisViewRole.SLIDER,
+    }
+    for axis in result.batch_axis_specs:
+        if suggestion.spec.binding(axis.axis_id).role not in allowed_batch_roles:
+            return _needs(
+                "FIT_BATCH_AXIS_NOT_IDENTIFIED",
+                f"fit batch axis {axis.name} is not visible or explicitly selected",
+                axis_id=axis.axis_id,
+            )
+    return suggestion
+
+
+__all__ = ["suggest_fit_view", "suggest_view"]

@@ -70,7 +70,7 @@ from .model import (
     ViewSpec,
     ViewSuggestion,
 )
-from .suggest import suggest_view
+from .suggest import suggest_fit_view, suggest_view
 
 
 __all__ = [
@@ -89,7 +89,7 @@ __all__ = [
     "ViewAlternative", "ViewContract", "ViewIntent", "ViewPreferences", "ViewSpec",
     "ViewSuggestion", "contract_for", "dataset_axes", "display_axis_indices", "decode_figure_document",
     "decode_view_spec", "encode_figure_document", "encode_view_spec",
-    "figure_document_from_tree", "figure_document_to_tree", "suggest_view",
+    "figure_document_from_tree", "figure_document_to_tree", "suggest_fit_view", "suggest_view",
     "estimate_view_evaluation_peak_nbytes",
     "validate_view_spec", "view_spec_from_tree", "view_spec_to_tree",
 ]

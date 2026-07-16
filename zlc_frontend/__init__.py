@@ -1,5 +1,6 @@
 """Target frontend public values with no implicit renderer or Qt import."""
 
+from .data_figure import DataFigure
 from .render import (
     AtomicBoardFront,
     BoardFrame,
@@ -55,6 +56,7 @@ from .figure import (
     encode_view_spec,
     estimate_view_evaluation_peak_nbytes,
     suggest_view,
+    suggest_fit_view,
     validate_view_spec,
 )
 
@@ -69,6 +71,7 @@ __all__ = [
     "CoherenceStamp",
     "DatasetDescriptor",
     "DatasetId",
+    "DataFigure",
     "DisplayReduction",
     "DisplayReductionMethod",
     "EvaluatedCurve",
@@ -111,5 +114,6 @@ __all__ = [
     "encode_view_spec",
     "estimate_view_evaluation_peak_nbytes",
     "suggest_view",
+    "suggest_fit_view",
     "validate_view_spec",
 ]

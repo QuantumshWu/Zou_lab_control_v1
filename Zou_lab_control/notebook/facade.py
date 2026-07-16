@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, TYPE_CHECKING
+from uuid import uuid4
 
 from zlc_neutral_atom.installation import (
     DeviceRef,
@@ -16,6 +17,11 @@ from zlc_neutral_atom.installation import (
 from zlc_data import (
     READOUT_EVENT,
     REPEAT,
+    MONITOR_HISTORY,
+    SCAN_POINT,
+    SPATIAL_X,
+    SPATIAL_Y,
+    SPECTRAL,
     AxisId,
     AxisSpec,
     BlockId,
@@ -89,6 +95,8 @@ from zlc_storage import positive_integer as _positive_int
 from zlc_storage import positive_real as _positive_real
 
 if TYPE_CHECKING:
+    from zlc_frontend import DataFigure
+    from zlc_frontend.figure import FigureDocument, ViewIntent, ViewPreferences
     from zlc_neutral_atom.readout.analysis import CalibrationReport
     from zlc_neutral_atom.readout.calibration_repository import (
         CalibrationRepository,
@@ -103,6 +111,7 @@ _DEFAULT_CALIBRATION_TIMEOUT_SECONDS = 300.0
 _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_OCCUPANCY_TIMEOUT_SECONDS = 300.0
 _DEFAULT_SCAN_MATERIALIZATION_MEMORY_LIMIT_BYTES = 512 << 20
+_DEFAULT_FIGURE_MEMORY_LIMIT_BYTES = 512 << 20
 _SCAN_REPEAT_AXIS_ID = AxisId("scan.repeat")
 _SCAN_READOUT_EVENT_AXIS_ID = AxisId("scan.readout_event")
 
@@ -938,6 +947,119 @@ class ReadoutFacade:
             return resolved
 
 
+def _project_notebook_figure(
+    services,
+    source,
+    *,
+    intent,
+    selection,
+    preferences,
+    memory_limit_bytes: int | None,
+):
+    """Composition-only ref dispatch; frontend never sees a neutral repository."""
+
+    from zlc_frontend.figure import (
+        DatasetDescriptor,
+        DatasetId,
+        FigureDocument,
+        FigureLayer,
+        ResolvedDataset,
+        ResolvedDatasetMap,
+        SuggestionStatus,
+        ViewIntent,
+        ViewPreferences,
+        suggest_fit_view,
+        suggest_view,
+    )
+
+    if selection is not None and not isinstance(selection, Selection):
+        raise TypeError("selection must be Selection or None")
+    if intent is not None and not isinstance(intent, ViewIntent):
+        raise TypeError("intent must be ViewIntent or None")
+    if preferences is not None and not isinstance(preferences, ViewPreferences):
+        raise TypeError("preferences must be ViewPreferences or None")
+
+    fit_result = None
+    if isinstance(source, CaptureArtifactRef):
+        source_ref = source
+    elif isinstance(source, FitExecution):
+        source_ref = source.source_capture_ref
+        fit_result = source.result
+    elif isinstance(source, CaptureFitResultArtifactRef):
+        admitted_fit = services.fit_repository.load(
+            source,
+            services.capture_repository,
+        )
+        source_ref = admitted_fit.source_capture_ref
+        fit_result = admitted_fit.result
+    elif isinstance(source, AdmittedCaptureFitResult):
+        source_ref = source.source_capture_ref
+        fit_result = source.result
+    else:
+        raise TypeError(
+            "figure source must be CaptureArtifactRef, FitExecution, "
+            "CaptureFitResultArtifactRef, or AdmittedCaptureFitResult"
+        )
+
+    admitted = services.capture_repository.admit(source_ref)
+    schema = admitted.artifact.frame_source.schema
+    if fit_result is None:
+        if intent is None:
+            roles = {
+                axis.role
+                for axis in (
+                    schema.repeat_axis,
+                    *schema.point_axes,
+                    *schema.cell_schema.data_axes,
+                )
+            }
+            if SPATIAL_X in roles and SPATIAL_Y in roles:
+                resolved_intent = ViewIntent.IMAGE
+            elif roles.intersection((SCAN_POINT, SPECTRAL, MONITOR_HISTORY)):
+                resolved_intent = ViewIntent.CURVE
+            else:
+                resolved_intent = ViewIntent.HISTOGRAM
+        else:
+            resolved_intent = intent
+        suggestion = suggest_view(
+            schema,
+            resolved_intent,
+            selection,
+            preferences,
+        )
+        label = "capture"
+    else:
+        suggestion = suggest_fit_view(
+            schema,
+            fit_result,
+            selection,
+            preferences,
+        )
+        if suggestion.spec is not None and intent not in (None, suggestion.spec.intent):
+            raise ValueError("requested figure intent is incompatible with the fitted axes")
+        label = f"fit: {fit_result.spec.model_id}"
+    if suggestion.status is SuggestionStatus.NEEDS_INPUT:
+        details = "; ".join(reason.message for reason in suggestion.reasons)
+        raise ValueError(f"figure view needs explicit input: {details}")
+    assert suggestion.spec is not None
+
+    dataset_id = DatasetId("source")
+    document = FigureDocument(
+        document_id=f"notebook-{uuid4().hex}",
+        revision=0,
+        datasets=(DatasetDescriptor(dataset_id, label, schema.fingerprint),),
+        layers=(FigureLayer("data", dataset_id, suggestion.spec),),
+    )
+    if memory_limit_bytes is None:
+        return document, None, fit_result
+    snapshot = admitted.materialize_snapshot(memory_limit_bytes=memory_limit_bytes)
+    return (
+        document,
+        ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
+        fit_result,
+    )
+
+
 class Experiment:
     """Public notebook root containing values, requests, and narrow facades only."""
 
@@ -1047,6 +1169,67 @@ class Experiment:
                 reference,
                 services.capture_repository,
             )
+
+    def figure_document(
+        self,
+        source: (
+            CaptureArtifactRef
+            | FitExecution
+            | CaptureFitResultArtifactRef
+            | AdmittedCaptureFitResult
+        ),
+        *,
+        intent: "ViewIntent | None" = None,
+        selection: Selection | None = None,
+        preferences: "ViewPreferences | None" = None,
+    ) -> "FigureDocument":
+        """Project one committed capture/result into a renderer-free document."""
+
+        with _service_guard(self._authority_token) as services:
+            document, _datasets, _fit = _project_notebook_figure(
+                services,
+                source,
+                intent=intent,
+                selection=selection,
+                preferences=preferences,
+                memory_limit_bytes=None,
+            )
+        return document
+
+    def figure(
+        self,
+        source: (
+            CaptureArtifactRef
+            | FitExecution
+            | CaptureFitResultArtifactRef
+            | AdmittedCaptureFitResult
+        ),
+        *,
+        intent: "ViewIntent | None" = None,
+        selection: Selection | None = None,
+        preferences: "ViewPreferences | None" = None,
+        memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
+    ) -> "DataFigure":
+        """Resolve one frozen source and return its optional-render DataFigure."""
+
+        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        with _service_guard(self._authority_token) as services:
+            document, datasets, fit_result = _project_notebook_figure(
+                services,
+                source,
+                intent=intent,
+                selection=selection,
+                preferences=preferences,
+                memory_limit_bytes=limit,
+            )
+        assert datasets is not None
+        from zlc_frontend import DataFigure
+
+        return DataFigure(
+            document,
+            datasets,
+            fit_results=({"data": fit_result} if fit_result is not None else None),
+        )
 
     def close(self) -> None:
         with _AUTHORITY_LOCK:
