@@ -97,6 +97,10 @@ class QtImageBoard(QtWidgets.QWidget):
         self._front = None
         self.update()
 
+    @property
+    def has_front(self) -> bool:
+        return self._front is not None
+
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         del event
         painter = QtGui.QPainter(self)

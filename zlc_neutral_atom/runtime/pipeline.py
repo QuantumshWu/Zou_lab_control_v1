@@ -179,15 +179,11 @@ class CapturePreviewSpec:
             ),
         )
 
-    @classmethod
-    def for_capture(
-        cls,
+    @staticmethod
+    def dataset_edge_for_capture(
         capture: MinimalPipelineSpec,
-        *,
-        block_id: BlockId,
-        downstream_peak_bytes: int,
-    ) -> "CapturePreviewSpec":
-        """Derive the only admitted preview schema without changing cell data axes."""
+    ) -> FrozenDatasetEdge:
+        """Derive the safe preview edge without exposing the bound capture Port."""
 
         if not isinstance(capture, MinimalPipelineSpec):
             raise TypeError("capture must be MinimalPipelineSpec")
@@ -212,23 +208,22 @@ class CapturePreviewSpec:
             PointLayout.rect_c((1,)),
             contract.dataset_schema.cell_schema,
         )
-        return cls(
-            block_id,
-            FrozenDatasetEdge(schema, contract.dataset_edge.event_adapter),
-            downstream_peak_bytes,
-        )
-
+        return FrozenDatasetEdge(schema, contract.dataset_edge.event_adapter)
 
 class CapturePreviewPort(Protocol):
     """Workbench-owned display attachment; ``bind`` transfers dataset lifetime.
 
-    ``fail`` is the terminal release operation after a successful bind.  The
-    capture transaction retains only a non-owning ingest handle and falls back
-    to closing it itself only when the port cannot accept that terminal call.
+    ``fail`` is legal before or after ``bind`` and is thread-safe, idempotent,
+    and first-failure-wins.  The capture transaction retains only a non-owning
+    ingest handle and falls back to closing it itself only when the port cannot
+    accept that terminal call.
     """
 
     @property
     def spec(self) -> CapturePreviewSpec: ...
+
+    @property
+    def terminal(self) -> bool: ...
 
     def bind(
         self,
@@ -648,6 +643,8 @@ def _capture_preview_spec(
     spec = getattr(preview, "spec", None)
     if not isinstance(spec, CapturePreviewSpec):
         raise TypeError("preview.spec must be CapturePreviewSpec")
+    if not isinstance(getattr(preview, "terminal", None), bool):
+        raise TypeError("preview.terminal must be bool")
     exact_edge = capture.measurement.capture_contract.dataset_edge
     if (
         spec.dataset_edge.schema.cell_schema is not exact_edge.schema.cell_schema
@@ -666,19 +663,43 @@ def _notify_preview_failure(
     if preview is None:
         return
     try:
+        if preview.terminal:
+            return
         preview.fail(safe_error_summary(error))
     except BaseException:
         pass
 
 
-def _prepare_exact_capture(
-    spec: MinimalPipelineSpec,
-    context: RunContext,
+def _settle_unbound_preview(
     preview: CapturePreviewPort | None,
-    preview_spec: CapturePreviewSpec | None,
-) -> ExactCaptureTransaction:
+    report: CleanupReport,
+    primary: BaseException | None,
+) -> CleanupReport:
+    """Terminate a preview when Run cleanup has no prepared transaction."""
+
+    failure: BaseException | None = primary
+    if failure is None and report.errors:
+        failure = report.errors[0]
+    if failure is None and report.decisions:
+        failure = RuntimeError(
+            "capture cleanup reported an unsafe terminal state: "
+            f"{report.decisions[0].reason}"
+        )
+    if failure is not None:
+        _notify_preview_failure(preview, failure)
+    return report
+
+
+def _admit_capture_preview(
+    spec: MinimalPipelineSpec,
+    preview: CapturePreviewPort | None,
+) -> CapturePreviewSpec | None:
+    """Validate one attached preview and its static memory budget exactly once."""
+
     try:
-        return _allocate_exact_capture(spec, context, preview, preview_spec)
+        preview_spec = _capture_preview_spec(preview, spec)
+        _require_pipeline_memory_budget(spec, preview_spec)
+        return preview_spec
     except BaseException as error:
         _notify_preview_failure(preview, error)
         raise
@@ -695,8 +716,11 @@ def _open_exact_capture_transaction(
 
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
-    _require_pipeline_memory_budget(spec, preview_spec)
-    return _prepare_exact_capture(spec, context, preview, preview_spec)
+    try:
+        return _allocate_exact_capture(spec, context, preview, preview_spec)
+    except BaseException as error:
+        _notify_preview_failure(preview, error)
+        raise
 
 
 def _allocate_exact_capture(
@@ -792,13 +816,21 @@ def compile_pipeline(
 
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
-    _require_direct_capture(spec.measurement)
-    preview_spec = _capture_preview_spec(preview, spec)
-    _require_pipeline_memory_budget(spec, preview_spec)
+    preview_spec = _admit_capture_preview(spec, preview)
+    try:
+        _require_direct_capture(spec.measurement)
+    except BaseException as error:
+        _notify_preview_failure(preview, error)
+        raise
     port = spec.measurement.capture_port
 
     def preflight(context: RunContext) -> ExactCaptureTransaction:
-        return _prepare_exact_capture(spec, context, preview, preview_spec)
+        return _open_exact_capture_transaction(
+            spec,
+            context,
+            preview=preview,
+            preview_spec=preview_spec,
+        )
 
     def execute(context: RunContext, prepared: ExactCaptureTransaction) -> PipelineResult:
         try:
@@ -815,7 +847,12 @@ def compile_pipeline(
         primary: BaseException | None,
     ) -> CleanupReport:
         if prepared is None:
-            return port.verify_idle(context)
+            try:
+                report = port.verify_idle(context)
+            except BaseException as error:
+                _notify_preview_failure(preview, error)
+                raise
+            return _settle_unbound_preview(preview, report, primary)
         try:
             report = prepared.cleanup(context)
         except BaseException as error:

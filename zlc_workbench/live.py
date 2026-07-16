@@ -5,7 +5,6 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
-from zlc_data import BlockId, SPATIAL_X, SPATIAL_Y
 from zlc_frontend.figure import (
     DatasetId,
     EvaluatedImage,
@@ -18,10 +17,7 @@ from zlc_frontend.figure import (
     ViewIntent,
     validate_view_spec,
 )
-from zlc_frontend.image_raster import (
-    estimate_gray8_raster_peak_nbytes,
-    rasterize_image_gray8,
-)
+from zlc_frontend.image_raster import rasterize_image_gray8
 from zlc_frontend.render import (
     BoardFrame,
     CoherenceStamp,
@@ -31,10 +27,7 @@ from zlc_frontend.render import (
     detached_render_fault,
 )
 from zlc_neutral_atom.runtime.dataset import MonitorDataset, MonitorDatasetSnapshot
-from zlc_neutral_atom.runtime.pipeline import (
-    CapturePreviewSpec,
-    MinimalPipelineSpec,
-)
+from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
 from zlc_storage import canonical_text
 
 from .workspace import BoardController, BoardPublishPort, PanelSourceBinding
@@ -42,44 +35,6 @@ from .workspace import BoardController, BoardPublishPort, PanelSourceBinding
 
 class LiveDatasetSlot:
     """One capacity-one materializer handle plus coalesced revision notices."""
-
-    @classmethod
-    def for_capture_image(
-        cls,
-        capture: MinimalPipelineSpec,
-        *,
-        block_id: BlockId,
-        dataset_id: DatasetId,
-        evaluation_policy: FigureEvaluationPolicy | None = None,
-    ) -> "LiveDatasetSlot":
-        if not isinstance(capture, MinimalPipelineSpec):
-            raise TypeError("capture must be MinimalPipelineSpec")
-        schema = capture.measurement.capture_contract.dataset_schema.cell_schema
-        if (
-            len(schema.data_axes) != 2
-            or schema.data_axes[0].role != SPATIAL_Y
-            or schema.data_axes[1].role != SPATIAL_X
-        ):
-            raise ValueError(
-                "first live-image slice requires declared (SPATIAL_Y, SPATIAL_X) data axes"
-            )
-        policy = FigureEvaluationPolicy() if evaluation_policy is None else evaluation_policy
-        if not isinstance(policy, FigureEvaluationPolicy):
-            raise TypeError("evaluation_policy must be FigureEvaluationPolicy or None")
-        height, width = (axis.size for axis in schema.data_axes)
-        downstream_peak = policy.max_live_nbytes + estimate_gray8_raster_peak_nbytes(
-            height,
-            width,
-        )
-        return cls(
-            CapturePreviewSpec.for_capture(
-                capture,
-                block_id=block_id,
-                downstream_peak_bytes=downstream_peak,
-            ),
-            dataset_id=dataset_id,
-            evaluation_policy=policy,
-        )
 
     def __init__(
         self,
@@ -102,6 +57,8 @@ class LiveDatasetSlot:
         self._run_id: str | None = None
         self._causation_domain_id: str | None = None
         self._listener: Callable[[], None] | None = None
+        self._listener_claimed = False
+        self._pending_change = False
         self._failure: str | None = None
         self._terminal = False
         self._closed = False
@@ -119,12 +76,17 @@ class LiveDatasetSlot:
     def set_change_listener(self, listener: Callable[[], None]) -> None:
         if not callable(listener):
             raise TypeError("listener must be callable")
+        replay = False
         with self._lock:
-            if self._listener is not None:
+            if self._listener_claimed:
                 raise RuntimeError("live slot already has a change listener")
             if self._closed:
                 raise RuntimeError("live slot is closed")
+            self._listener_claimed = True
             self._listener = listener
+            replay, self._pending_change = self._pending_change, False
+        if replay:
+            listener()
 
     def bind(
         self,
@@ -143,6 +105,8 @@ class LiveDatasetSlot:
         with self._lock:
             if self._closed:
                 raise RuntimeError("live slot is closed")
+            if self._terminal:
+                raise RuntimeError("live slot is terminal")
             if self._dataset is not None:
                 raise RuntimeError("live slot already owns a materializer")
             self._dataset = dataset
@@ -154,6 +118,9 @@ class LiveDatasetSlot:
             if self._closed or self._dataset is None:
                 raise RuntimeError("live slot has no active materializer")
             listener = self._listener
+            if listener is None:
+                self._pending_change = True
+                return
         if listener is not None:
             listener()
 
@@ -204,12 +171,16 @@ class LiveDatasetSlot:
         closed: bool = False,
     ) -> tuple[MonitorDataset | None, Callable[[], None] | None]:
         with self._lock:
+            if failure is not None and self._failure is not None:
+                return None, None
             dataset, self._dataset = self._dataset, None
             if failure is not None and self._failure is None:
                 self._failure = failure
             self._terminal = True
             self._closed = self._closed or closed
             listener, self._listener = self._listener, None
+            if failure is not None and listener is None and not self._listener_claimed:
+                self._pending_change = True
             return dataset, listener
 
 

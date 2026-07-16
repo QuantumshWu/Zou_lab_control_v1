@@ -11,8 +11,10 @@ from zlc_neutral_atom.runtime.pipeline import (
     ExactCaptureTransaction,
     MinimalPipelineSpec,
     PipelineResult,
-    _capture_preview_spec,
+    _admit_capture_preview,
     _open_exact_capture_transaction,
+    _notify_preview_failure,
+    _settle_unbound_preview,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.run import (
@@ -154,9 +156,11 @@ def compile_triggered_pipeline(
         raise TypeError("spec must be TriggeredCaptureSpec")
     camera_port = spec.capture.measurement.capture_port
     pulse_port = spec.pulse_port
+    preview_spec = _admit_capture_preview(spec.capture, preview)
     if camera_port.device.key == pulse_port.device.key:
-        raise ValueError("camera and sequencer must be distinct physical resources")
-    preview_spec = _capture_preview_spec(preview, spec.capture)
+        error = ValueError("camera and sequencer must be distinct physical resources")
+        _notify_preview_failure(preview, error)
+        raise error
 
     def preflight(
         context: RunContext,
@@ -196,10 +200,15 @@ def compile_triggered_pipeline(
         primary: BaseException | None,
     ) -> CleanupReport:
         if prepared is None:
-            return run_cleanup_steps(
-                lambda: pulse_port.verify_idle(context),
-                lambda: camera_port.verify_idle(context),
-            )
+            try:
+                report = run_cleanup_steps(
+                    lambda: pulse_port.verify_idle(context),
+                    lambda: camera_port.verify_idle(context),
+                )
+            except BaseException as error:
+                _notify_preview_failure(preview, error)
+                raise
+            return _settle_unbound_preview(preview, report, primary)
         # On failure/cancel, stop new hardware edges before terminating the
         # camera session.  On success both calls are idempotent terminal checks.
         capture, pulse = prepared

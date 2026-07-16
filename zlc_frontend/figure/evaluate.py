@@ -18,6 +18,7 @@ from zlc_data import (
     CellValidity,
     ComponentValidity,
     DataBlock,
+    DatasetSchema,
     Invalid,
     OwnedSnapshot,
     REPEAT,
@@ -52,6 +53,7 @@ from .model import (
     ReductionResolution,
     SampleCoordinates,
     ViewIntent,
+    ViewSpec,
 )
 
 
@@ -227,10 +229,13 @@ def _evaluated_axis(axis: AxisSpec, indices: tuple[int, ...]) -> EvaluatedAxis:
     )
 
 
-def _selection_index_sets(block: DataBlock, view) -> dict[AxisId, Sequence[int]]:
+def _selection_index_sets(
+    schema: DatasetSchema,
+    view: ViewSpec,
+) -> dict[AxisId, Sequence[int]]:
     return {
         axis.axis_id: display_axis_indices(axis, view.display_selections)
-        for axis in dataset_axes(block.schema)
+        for axis in dataset_axes(schema)
     }
 
 
@@ -600,10 +605,10 @@ def _single_contributor_reduction_dtype(
 
 
 def _layer_resource_upper_bound(
-    block: DataBlock,
+    schema: DatasetSchema,
     allowed,
     fixed_indices: dict[AxisId, int],
-    view,
+    view: ViewSpec,
 ) -> tuple[int, int, int, int]:
     """Bound evaluator-owned live arrays/bytes before materialization.
 
@@ -612,15 +617,14 @@ def _layer_resource_upper_bound(
     array scratch, and explicit grouping/coordinate-object allowances.
     """
 
-    physical_rows = (
-        block.schema.repeat_axis.size * block.schema.point_layout.storage_size
-    )
-    value_bytes = block.values.dtype.itemsize
+    physical_rows = schema.repeat_axis.size * schema.point_layout.storage_size
+    value_dtype = schema.cell_schema.dtype
+    value_bytes = value_dtype.itemsize
     bool_bytes = np.dtype(bool).itemsize
     int64_bytes = np.dtype(np.int64).itemsize
     intp_bytes = np.dtype(np.intp).itemsize
     coordinate_entry_bytes = 128
-    cell_axis_count = 1 + len(block.schema.point_axes)
+    cell_axis_count = 1 + len(schema.point_axes)
 
     # Coordinate/filter arrays are always materialized.  Full/contiguous value
     # selections remain views; a true gather may coexist with its source once.
@@ -629,7 +633,7 @@ def _layer_resource_upper_bound(
         + ((1 + cell_axis_count) * bool_bytes)
         + intp_bytes
     )
-    cell_axes = (block.schema.repeat_axis, *block.schema.point_axes)
+    cell_axes = (schema.repeat_axis, *schema.point_axes)
     row_gather = any(
         (axis.axis_id in fixed_indices and axis.size > 1)
         or not _is_full_selection(allowed[axis.axis_id], axis.size)
@@ -641,12 +645,12 @@ def _layer_resource_upper_bound(
             if axis.axis_id in fixed_indices
             else allowed[axis.axis_id]
         )
-        for axis in block.schema.cell_schema.data_axes
+        for axis in schema.cell_schema.data_axes
     }
     extraction_workspace = _selection_peak_elements(
         physical_rows,
         row_gather,
-        block.schema.cell_schema.data_axes,
+        schema.cell_schema.data_axes,
         data_choices,
     ) * (value_bytes + bool_bytes)
     selection_index_workspace = max(
@@ -717,20 +721,20 @@ def _layer_resource_upper_bound(
         if reductions
         else 0
     )
-    axis_by_id = {axis.axis_id: axis for axis in dataset_axes(block.schema)}
+    axis_by_id = {axis.axis_id: axis for axis in dataset_axes(schema)}
     singleton_dtype = _single_contributor_reduction_dtype(
-        block.values.dtype,
+        value_dtype,
         reductions,
         axis_by_id,
         reduced_contributors_per_output,
     )
     output_dtype = (
-        block.values.dtype
+        value_dtype
         if method is None
         else (
             singleton_dtype
             if singleton_dtype is not None
-            else _reduction_output_dtype(block.values.dtype, method)
+            else _reduction_output_dtype(value_dtype, method)
         )
     )
     output_bytes = output_dtype.itemsize
@@ -786,7 +790,7 @@ def _layer_resource_upper_bound(
             )
             if (
                 method is DisplayReductionMethod.SUM
-                and block.values.dtype.kind in "iu"
+                and value_dtype.kind in "iu"
                 and reduced_contributors_per_output > 1
             ):
                 # checked_numeric_sum may promote every contribution to a Python
@@ -795,7 +799,7 @@ def _layer_resource_upper_bound(
                 peak_live_nbytes += 64 * series_elements
 
     data_axis_ids = {
-        axis.axis_id for axis in block.schema.cell_schema.data_axes
+        axis.axis_id for axis in schema.cell_schema.data_axes
     }
     display_axis_ids = {
         binding.axis_id
@@ -818,6 +822,26 @@ def _layer_resource_upper_bound(
         retained_nbytes,
         peak_live_nbytes,
     )
+
+
+def estimate_view_evaluation_peak_nbytes(
+    schema: DatasetSchema,
+    view: ViewSpec,
+) -> int:
+    """Bound one view's evaluator-owned peak from frozen metadata only."""
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(view, ViewSpec):
+        raise TypeError("view must be ViewSpec")
+    validate_view_spec(schema, view)
+    allowed = _selection_index_sets(schema, view)
+    fixed = {
+        binding.axis_id: binding.selector.index
+        for binding in view.axis_bindings
+        if isinstance(binding.selector, FixedIndex)
+    }
+    return _layer_resource_upper_bound(schema, allowed, fixed, view)[3]
 
 
 def _reduce(
@@ -1273,7 +1297,7 @@ class FigureEvaluator:
         view = layer.view
         axes = dataset_axes(block.schema)
         axis_by_id = {axis.axis_id: axis for axis in axes}
-        allowed = _selection_index_sets(block, view)
+        allowed = _selection_index_sets(block.schema, view)
         fixed = {
             binding.axis_id: binding.selector.index
             for binding in view.axis_bindings
@@ -1295,7 +1319,7 @@ class FigureEvaluator:
             reduction_contributions,
             retained_nbytes,
             peak_live_nbytes,
-        ) = _layer_resource_upper_bound(block, allowed, fixed, view)
+        ) = _layer_resource_upper_bound(block.schema, allowed, fixed, view)
         guard.reserve_layer(
             cells=cells,
             series=series_count,
@@ -1417,4 +1441,5 @@ __all__ = [
     "FigureEvaluator",
     "ResolvedDataset",
     "ResolvedDatasetMap",
+    "estimate_view_evaluation_peak_nbytes",
 ]

@@ -36,7 +36,14 @@ from zlc_neutral_atom.artifacts import (
     CaptureFitResultArtifactRef,
     CaptureRepository,
     FitExecution,
-    compile_capture_artifact_pipeline,
+)
+from zlc_neutral_atom.capture_application import (
+    CAPTURE_READOUT_EVENT_AXIS_ID,
+    CaptureRequest,
+    PlanDescriptor,
+    PreparedFiniteCapture,
+    compile_bound_capture_plan,
+    prepare_finite_capture,
 )
 from zlc_neutral_atom.readout.calibration import (
     BackgroundMode,
@@ -59,12 +66,7 @@ from zlc_neutral_atom.scan import (
     bind_scan_output_contract,
 )
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
-from zlc_neutral_atom.runtime.pipeline import (
-    estimate_pipeline_peak_bytes,
-    MinimalPipelineSpec,
-)
 from zlc_neutral_atom.runtime.run import RunHandle
-from zlc_neutral_atom.timing.capture import TriggeredCaptureSpec
 from zlc_pulse import (
     PulseDocument,
     PulseExecutionForm,
@@ -94,9 +96,6 @@ _DEFAULT_CALIBRATION_TIMEOUT_SECONDS = 300.0
 _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_OCCUPANCY_TIMEOUT_SECONDS = 300.0
 _DEFAULT_SCAN_MATERIALIZATION_MEMORY_LIMIT_BYTES = 512 << 20
-_CAPTURE_REPEAT_AXIS_ID = AxisId("capture.repeat")
-_CAPTURE_SCAN_AXIS_ID = AxisId("capture.scan_row_ordinal")
-_CAPTURE_READOUT_EVENT_AXIS_ID = AxisId("capture.readout_event")
 _SCAN_REPEAT_AXIS_ID = AxisId("scan.repeat")
 _SCAN_READOUT_EVENT_AXIS_ID = AxisId("scan.readout_event")
 
@@ -133,80 +132,6 @@ def _cleanup_failures(*actions) -> list[Exception]:
 def _require_runtime_shutdown(runtime, *, timeout: float) -> None:
     if not runtime.shutdown(timeout=timeout):
         raise RuntimeError("runtime did not terminate within the cleanup deadline")
-
-
-@dataclass(frozen=True)
-class CaptureRequest:
-    pulse_document: PulseDocument
-    execution_form: PulseExecutionForm
-    camera_ref: DeviceRef
-    sequencer_ref: DeviceRef
-    trigger_channel: str | None = None
-    repeat_count: int = 1
-    readout_events_per_repeat: int | None = None
-    within_point_grouping: tuple[tuple[int, int], ...] | None = None
-    transport_memory_limit_bytes: int = 64 << 20
-    pipeline_memory_limit_bytes: int = 256 << 20
-    timeout_seconds: float = 30.0
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.pulse_document, PulseDocument):
-            raise TypeError("pulse_document must be PulseDocument")
-        if not isinstance(self.execution_form, PulseExecutionForm):
-            raise TypeError("execution_form must be PulseExecutionForm")
-        if self.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
-            raise ValueError("CaptureRequest requires a finite pulse execution form")
-        if not isinstance(self.camera_ref, DeviceRef):
-            raise TypeError("camera_ref must be DeviceRef")
-        if not isinstance(self.sequencer_ref, DeviceRef):
-            raise TypeError("sequencer_ref must be DeviceRef")
-        if self.trigger_channel is not None:
-            _text(self.trigger_channel, "trigger_channel")
-        object.__setattr__(
-            self,
-            "repeat_count",
-            _positive_int(self.repeat_count, "repeat_count"),
-        )
-        if self.readout_events_per_repeat is not None:
-            object.__setattr__(
-                self,
-                "readout_events_per_repeat",
-                _positive_int(
-                    self.readout_events_per_repeat,
-                    "readout_events_per_repeat",
-                ),
-            )
-        if self.within_point_grouping is not None:
-            try:
-                grouping = tuple(
-                    tuple(pair) for pair in self.within_point_grouping
-                )
-            except TypeError as exc:
-                raise TypeError(
-                    "within_point_grouping must be an iterable of pairs"
-                ) from exc
-            object.__setattr__(self, "within_point_grouping", grouping)
-        object.__setattr__(
-            self,
-            "transport_memory_limit_bytes",
-            _positive_int(
-                self.transport_memory_limit_bytes,
-                "transport_memory_limit_bytes",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "pipeline_memory_limit_bytes",
-            _positive_int(
-                self.pipeline_memory_limit_bytes,
-                "pipeline_memory_limit_bytes",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "timeout_seconds",
-            _positive_real(self.timeout_seconds, "timeout_seconds"),
-        )
 
 
 @dataclass(frozen=True)
@@ -425,21 +350,6 @@ class TimingTargetDescriptor:
     @property
     def time_step_ns(self) -> float:
         return 1e9 / self.clock_hz
-
-
-@dataclass(frozen=True)
-class PlanDescriptor:
-    name: str
-    camera_role: str
-    sequencer_role: str
-    execution_form: PulseExecutionForm
-    trigger_channel: str
-    expected_frames: int
-    output_shape: tuple[int, ...]
-    output_schema_fingerprint: str
-    compiled_pulse_digest: str
-    resource_claims: tuple[str, ...]
-    estimated_peak_bytes: int
 
 
 @dataclass
@@ -797,7 +707,7 @@ class ReadoutFacade:
                 )
         document = profile.document_for_repeats(repeat_groups)
         grouping = profile.repeat_major_grouping(repeat_groups)
-        analysis = profile.analysis_request(_CAPTURE_READOUT_EVENT_AXIS_ID)
+        analysis = profile.analysis_request(CAPTURE_READOUT_EVENT_AXIS_ID)
         capture_request = self.capture_request(
             document,
             execution_form=PulseExecutionForm.STATIC_ONCE,
@@ -1029,8 +939,8 @@ class Experiment:
         return _run(self._authority_token, request)
 
     def inspect(self, request: CaptureRequest) -> PlanDescriptor:
-        _plan, descriptor = _compile(self._authority_token, request)
-        return descriptor
+        with _service_guard(self._authority_token) as services:
+            return _prepare_capture_for_services(services, request).descriptor
 
     def scan(self, request: ScanRequest) -> ScanArtifactRef:
         return _run_scan(self._authority_token, request)
@@ -1171,144 +1081,39 @@ def _resolve_role(
     return candidates[0]
 
 
-def _compile_for_services(
+def _prepare_capture_for_services(
     services: _ExperimentServices,
     request: CaptureRequest,
-):
-    # Concrete binding is composition-private and imported only when a request
-    # is compiled.  Importing the notebook value/facade surface never constructs
-    # adapters or advertises a drive-capable Port.
-    from zlc_neutral_atom.bootstrap._triggered_capture import (
-        TriggeredCameraLayout,
-    )
-
-    if not isinstance(request, CaptureRequest):
-        raise TypeError("Experiment only accepts declarative CaptureRequest values")
-    binding = _bind_triggered_capture(
-        services.runtime.pulse_port(request.sequencer_ref),
-        services.runtime.camera_port(request.camera_ref),
-        pulse_document=request.pulse_document,
-        execution_form=request.execution_form,
-        trigger_channel=request.trigger_channel,
-        layout=TriggeredCameraLayout(
-            repeat_axis=AxisSpec(
-                _CAPTURE_REPEAT_AXIS_ID,
-                "repeat",
-                REPEAT,
-                request.repeat_count,
-                tuple(range(request.repeat_count)),
-            ),
-            readout_event_axis_id=_CAPTURE_READOUT_EVENT_AXIS_ID,
-            ordinal_scan_axis_id=_CAPTURE_SCAN_AXIS_ID,
-            readout_events_per_repeat=request.readout_events_per_repeat,
-            within_point_grouping=request.within_point_grouping,
-        ),
-        transport_memory_limit_bytes=request.transport_memory_limit_bytes,
-    )
-    plan, descriptor = _build_capture_plan_for_services(
-        services,
-        binding=binding,
-        block_id=BlockId(f"capture-{binding.compiled_artifact.fingerprint[:20]}"),
-        camera_ref=request.camera_ref,
-        sequencer_ref=request.sequencer_ref,
-        execution_form=request.execution_form,
-        pipeline_memory_limit_bytes=request.pipeline_memory_limit_bytes,
-        timeout_seconds=request.timeout_seconds,
-        name_prefix="Capture",
-    )
-    return plan, descriptor
-
-
-def _bind_triggered_capture(
-    pulse_port,
-    camera_port,
-    *,
-    pulse_document: PulseDocument,
-    execution_form: PulseExecutionForm,
-    trigger_channel: str | None,
-    layout,
-    transport_memory_limit_bytes: int,
-):
-    """Bind the shared exact pulse/camera path without constructing a RunPlan."""
-
-    from zlc_neutral_atom.bootstrap._triggered_capture import (
-        bind_triggered_camera_acquisition,
-    )
-
-    return bind_triggered_camera_acquisition(
-        pulse_port,
-        camera_port,
-        pulse_document=pulse_document,
-        execution_form=execution_form,
-        trigger_channel=trigger_channel,
-        layout=layout,
-        transport_memory_limit_bytes=transport_memory_limit_bytes,
+) -> PreparedFiniteCapture:
+    return prepare_finite_capture(
+        request,
+        pulse_port=services.runtime.pulse_port(request.sequencer_ref),
+        camera_port=services.runtime.camera_port(request.camera_ref),
+        repository=services.capture_repository,
+        start_run=services.runtime.start,
     )
 
 
-def _build_capture_plan_for_services(
-    services: _ExperimentServices,
-    *,
-    binding,
-    block_id: BlockId,
-    camera_ref: DeviceRef,
-    sequencer_ref: DeviceRef,
-    execution_form: PulseExecutionForm,
-    pipeline_memory_limit_bytes: int,
-    timeout_seconds: float,
-    name_prefix: str,
-):
-    """Build one exact plan after every use-case-specific intent is frozen."""
+def _prepare_capture_for_workbench(
+    experiment: Experiment,
+    request: CaptureRequest,
+) -> PreparedFiniteCapture:
+    """Private friend seam; no notebook authority escapes to the Workbench."""
 
-    pipeline = MinimalPipelineSpec(
-        f"{name_prefix} {binding.pulse_request.document.name}",
-        binding.measurement,
-        block_id,
-        pipeline_memory_limit_bytes,
-        timeout_seconds=timeout_seconds,
-    )
-    triggered = TriggeredCaptureSpec(
-        pipeline,
-        binding.pulse_port,
-        binding.pulse_request,
-        binding.trigger_channel,
-        binding.cell_plan,
-    )
-    plan = compile_capture_artifact_pipeline(
-        triggered,
-        services.capture_repository,
-    )
-    descriptor = PlanDescriptor(
-        plan.name,
-        camera_ref.role,
-        sequencer_ref.role,
-        execution_form,
-        binding.trigger_channel,
-        binding.expected_frames,
-        binding.measurement.capture_contract.dataset_schema.physical_shape,
-        binding.measurement.capture_contract.dataset_schema.fingerprint,
-        binding.compiled_artifact.fingerprint,
-        tuple(str(claim.key) for claim in plan.resource_claims),
-        estimate_pipeline_peak_bytes(pipeline),
-    )
-    return plan, descriptor
-
-
-def _compile(token: object, request: CaptureRequest):
-    with _service_guard(token) as services:
-        return _compile_for_services(services, request)
+    if not isinstance(experiment, Experiment):
+        raise TypeError("experiment must be Experiment")
+    with _service_guard(experiment._authority_token) as services:
+        return _prepare_capture_for_services(services, request)
 
 
 def _start(token: object, request: CaptureRequest) -> RunHandle:
     with _service_guard(token) as services:
-        plan, _descriptor = _compile_for_services(services, request)
-        return services.runtime.start(plan)
+        return _prepare_capture_for_services(services, request).start()
 
 
 def _run(token: object, request: CaptureRequest) -> CaptureArtifactRef:
     with _service_guard(token) as services:
-        plan, _descriptor = _compile_for_services(services, request)
-        handle = services.runtime.start(plan)
+        handle = _prepare_capture_for_services(services, request).start()
         runtime = services.runtime
     return runtime.wait(handle)
 
@@ -1319,7 +1124,10 @@ def _compile_scan_for_services(
     *,
     persist_intent: bool,
 ):
-    from zlc_neutral_atom.bootstrap._triggered_capture import TriggeredCameraLayout
+    from zlc_neutral_atom.bootstrap._triggered_capture import (
+        TriggeredCameraLayout,
+        bind_triggered_camera_acquisition,
+    )
 
     if not isinstance(request, ScanRequest):
         raise TypeError("request must be ScanRequest")
@@ -1348,7 +1156,7 @@ def _compile_scan_for_services(
         tuple(range(repeat_count)),
     )
     scan_axes = point_table.point_axes
-    binding = _bind_triggered_capture(
+    binding = bind_triggered_camera_acquisition(
         pulse_port,
         camera_port,
         pulse_document=execution_document,
@@ -1400,9 +1208,9 @@ def _compile_scan_for_services(
         output_contract,
         capture_repository_id=services.capture_repository.repository_id,
     )
-    plan, descriptor = _build_capture_plan_for_services(
-        services,
+    plan, descriptor = compile_bound_capture_plan(
         binding=binding,
+        repository=services.capture_repository,
         block_id=capture_block_id,
         camera_ref=request.camera_ref,
         sequencer_ref=request.sequencer_ref,

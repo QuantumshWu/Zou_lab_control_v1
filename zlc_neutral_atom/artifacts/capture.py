@@ -70,6 +70,7 @@ from zlc_neutral_atom.runtime.pipeline import (
     CapturePreviewPort,
     MinimalPipelineSpec,
     PipelineResult,
+    _notify_preview_failure,
     compile_pipeline,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
@@ -1302,12 +1303,16 @@ def compile_capture_artifact_pipeline(
 ) -> RunPlan:
     """Add one post-safety CaptureArtifact commit to the exact pipeline."""
 
-    if type(repository) is not CaptureRepository:
-        raise TypeError("repository must be CaptureRepository")
-    capture_spec = spec.capture if isinstance(spec, TriggeredCaptureSpec) else spec
-    if not isinstance(capture_spec, MinimalPipelineSpec):
-        raise TypeError("capture artifact pipeline requires MinimalPipelineSpec")
-    repository._require_active()
+    try:
+        if type(repository) is not CaptureRepository:
+            raise TypeError("repository must be CaptureRepository")
+        capture_spec = spec.capture if isinstance(spec, TriggeredCaptureSpec) else spec
+        if not isinstance(capture_spec, MinimalPipelineSpec):
+            raise TypeError("capture artifact pipeline requires MinimalPipelineSpec")
+        repository._require_active()
+    except BaseException as error:
+        _notify_preview_failure(preview, error)
+        raise
     base = (
         compile_triggered_pipeline(spec, preview=preview)
         if isinstance(spec, TriggeredCaptureSpec)
@@ -1333,13 +1338,25 @@ def compile_capture_artifact_pipeline(
         # admission, or this run wins and close cannot invalidate its sink
         # mid-capture.  Run binding may already have performed read-only identity
         # probes before this plan preflight begins.
-        repository._require_active()
-        borrow = repository._root_lease.borrow()
+        borrow = None
         try:
+            repository._require_active()
+            borrow = repository._root_lease.borrow()
             pulse_ref = _stage_compiled_pulse(spec, repository)
             return base_preflight(context), borrow, pulse_ref
-        except BaseException:
-            borrow.close()
+        except BaseException as error:
+            _notify_preview_failure(preview, error)
+            if borrow is not None:
+                try:
+                    borrow.close()
+                except BaseException as close_error:
+                    try:
+                        error.add_note(
+                            "repository borrow close also failed: "
+                            f"{type(close_error).__name__}: {close_error}"
+                        )
+                    except BaseException:
+                        pass
             raise
 
     def execute(

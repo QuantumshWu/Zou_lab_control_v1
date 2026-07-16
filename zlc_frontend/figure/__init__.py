@@ -30,6 +30,7 @@ from .evaluate import (
     FigureEvaluator,
     ResolvedDataset,
     ResolvedDatasetMap,
+    estimate_view_evaluation_peak_nbytes,
 )
 from .model import (
     AxisAddress,
@@ -89,5 +90,6 @@ __all__ = [
     "ViewSuggestion", "contract_for", "dataset_axes", "display_axis_indices", "decode_figure_document",
     "decode_view_spec", "encode_figure_document", "encode_view_spec",
     "figure_document_from_tree", "figure_document_to_tree", "suggest_view",
+    "estimate_view_evaluation_peak_nbytes",
     "validate_view_spec", "view_spec_from_tree", "view_spec_to_tree",
 ]

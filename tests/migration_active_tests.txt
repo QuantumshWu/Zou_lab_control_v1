@@ -31,6 +31,7 @@ tests/test_stream_processor_worker.py
 tests/test_triggered_capture_pipeline.py
 tests/test_workbench_endpoint_binding.py
 tests/test_workbench_host_contract.py
+tests/test_w1_capture_workbench.py
 tests/test_zlc_calibration_commit.py
 tests/test_zlc_calibration_stream_contracts.py
 tests/test_zlc_camera_adapter_sdk.py

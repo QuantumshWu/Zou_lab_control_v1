@@ -53,6 +53,7 @@ from .figure import (
     decode_view_spec,
     encode_figure_document,
     encode_view_spec,
+    estimate_view_evaluation_peak_nbytes,
     suggest_view,
     validate_view_spec,
 )
@@ -108,6 +109,7 @@ __all__ = [
     "decode_view_spec",
     "encode_figure_document",
     "encode_view_spec",
+    "estimate_view_evaluation_peak_nbytes",
     "suggest_view",
     "validate_view_spec",
 ]
