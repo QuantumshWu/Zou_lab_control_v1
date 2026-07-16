@@ -10,7 +10,6 @@ from zlc_data import (
     AxisId,
     AxisLayout,
     AxisSpec,
-    BlockId,
     CommittedTransform,
     DatasetSchema,
     PointLayout,
@@ -19,10 +18,12 @@ from zlc_data import (
     ValueSchema,
     committed_transform_from_tree,
     committed_transform_to_tree,
+    dataset_schema_from_tree,
+    dataset_schema_to_tree,
     resolve_transformed_schema,
 )
 from zlc_pulse import PulseDocument
-from zlc_storage import exact_mapping, sha256_text
+from zlc_storage import canonical_digest, exact_mapping
 
 
 SCAN_OUTPUT_CONTRACT_SCHEMA = "zlc_neutral_atom.ScanOutputContract"
@@ -132,7 +133,7 @@ class ScanPointTable:
 
 @dataclass(frozen=True)
 class ScanOutputContract:
-    """Lossless direct-camera output semantics over one source schema.
+    """Lossless authoritative scan-output semantics over one exact source.
 
     The current slice preserves every surviving trailing axis as a batch axis
     and preserves declared component validity.  Additional acceptance policies
@@ -167,6 +168,11 @@ class ScanOutputContract:
     @property
     def output_schema_fingerprint(self) -> str:
         return self.output_dataset_schema.fingerprint
+
+    @property
+    def fingerprint(self) -> str:
+        return canonical_digest(scan_output_contract_to_tree(self))
+
 
 def bind_scan_output_contract(
     input_schema: DatasetSchema,
@@ -251,56 +257,35 @@ def scan_output_contract_to_tree(value: ScanOutputContract) -> dict[str, Any]:
         "committed_transform": committed_transform_to_tree(
             value.committed_transform
         ),
+        "output_dataset_schema": dataset_schema_to_tree(
+            value.output_dataset_schema
+        ),
     }
 
 
 def scan_output_contract_from_tree(
     tree: Any,
-    *,
-    input_schema: DatasetSchema,
-    scan_points: ScanPointTable,
 ) -> ScanOutputContract:
     data = exact_mapping(
         tree,
         {
             "schema",
             "committed_transform",
+            "output_dataset_schema",
         },
         SCAN_OUTPUT_CONTRACT_SCHEMA,
     )
-    return bind_scan_output_contract(
-        input_schema,
-        scan_points,
+    value = ScanOutputContract(
         committed_transform_from_tree(data["committed_transform"]),
+        dataset_schema_from_tree(data["output_dataset_schema"]),
     )
-
-
-_SCAN_CAPTURE_BLOCK_PREFIX = "scan-capture-"
-
-
-def scan_capture_block_id(intent_manifest_digest: str) -> BlockId:
-    """Bind one raw Capture identity to its durable pre-FIRE scan intent."""
-
-    sha256_text(intent_manifest_digest, "intent_manifest_digest")
-    return BlockId(f"{_SCAN_CAPTURE_BLOCK_PREFIX}{intent_manifest_digest}")
-
-
-def scan_intent_digest_from_block_id(block_id: BlockId) -> str:
-    """Recover the durable intent identity carried by a scan raw-capture id."""
-
-    if not isinstance(block_id, BlockId):
-        raise TypeError("block_id must be BlockId")
-    if not block_id.value.startswith(_SCAN_CAPTURE_BLOCK_PREFIX):
-        raise ValueError("raw Capture BlockId is not bound to a scan intent")
-    digest = block_id.value[len(_SCAN_CAPTURE_BLOCK_PREFIX) :]
-    sha256_text(digest, "scan intent digest")
-    return digest
+    if scan_output_contract_to_tree(value) != tree:
+        raise ValueError("ScanOutputContract tree is typed but non-canonical")
+    return value
 
 
 __all__ = [
     "ScanOutputContract",
     "ScanPointTable",
     "bind_scan_output_contract",
-    "scan_capture_block_id",
-    "scan_intent_digest_from_block_id",
 ]

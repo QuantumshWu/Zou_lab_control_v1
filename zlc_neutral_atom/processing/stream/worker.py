@@ -19,6 +19,7 @@ from zlc_neutral_atom.runtime.cancellation import (
 )
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
+    DatasetCellSchedule,
     DatasetCellKeyContract,
     FrozenDatasetEdge,
     SealedDatasetArtifact,
@@ -239,9 +240,11 @@ class ExactStreamProcessorWorker:
             raise ValueError("input join-key domain differs from input_edge")
         schedule = input_edge.cell_schedule
         assert schedule is not None
+        if not isinstance(schedule, DatasetCellSchedule):
+            raise TypeError("exact processor input schedule must be DatasetCellSchedule")
         total = input_reservation.end_sequence - input_reservation.start_sequence
         if len(schedule) != total:
-            raise ValueError("expected_keys length differs from exact reservation")
+            raise ValueError("input schedule length differs from exact reservation")
         if not isinstance(output_producer, AcquisitionProducer):
             raise TypeError("output_producer must be AcquisitionProducer")
         output_stream = output_producer._stream
@@ -289,7 +292,7 @@ class ExactStreamProcessorWorker:
                     "output reservation TraceBinding differs from processor lineage"
                 )
             if not output_builder._cell_schedule.same_order_as(schedule):
-                raise ValueError("output builder schedule differs from expected_keys")
+                raise ValueError("output builder schedule differs from input schedule")
             if (
                 output_builder.edge.exact_key_sequence_digest
                 != input_edge.exact_key_sequence_digest
@@ -333,6 +336,7 @@ class ExactStreamProcessorWorker:
         # construction steps left that could strand a half-built owner.
         self._bound = bound
         self._input_edge = input_edge
+        self._cell_schedule = schedule
         self._input_reservation = input_reservation
         self._input_cursor = input_cursor
         self._input_stream = input_stream
@@ -578,7 +582,7 @@ class ExactStreamProcessorWorker:
         succeeded = False
         cancelled = False
         try:
-            for index, expected_key in enumerate(self._expected_keys):
+            for index, expected_key in enumerate(self._cell_schedule):
                 self._checkpoint()
                 delivery = self._next_input()
                 self._process_one(index, expected_key, delivery)

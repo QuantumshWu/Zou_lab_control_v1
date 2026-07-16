@@ -15,6 +15,7 @@ from zlc_storage.canonical import (
 from .axis import AxisId, AxisRoleId, AxisSpec, CoordinateFrameId
 from .layout import AxisLayout, AxisLayoutMode, PointLayout
 from .schema import DatasetSchema, ValueSchema
+from .value import BlockId, DatasetRevision, DatasetRevisionRef, StreamGenerationId
 from .validity import (
     INVALID,
     VALID,
@@ -30,10 +31,50 @@ from .validity import (
 AXIS_SCHEMA = "zlc_data.AxisSpec"
 VALUE_SCHEMA = "zlc_data.ValueSchema"
 DATASET_SCHEMA = "zlc_data.DatasetSchema"
+DATASET_REVISION_REF_SCHEMA = "zlc_data.DatasetRevisionRef"
 
 
 class TypedCodecError(ValueError):
     """Raised when primitive bytes do not have one unique typed representation."""
+
+
+def dataset_revision_ref_to_tree(value: DatasetRevisionRef) -> dict[str, Any]:
+    """Project one revision identity through its data-owner field model."""
+
+    if not isinstance(value, DatasetRevisionRef):
+        raise TypeError("value must be DatasetRevisionRef")
+    return {
+        "schema": DATASET_REVISION_REF_SCHEMA,
+        "block_id": value.block_id.value,
+        "stream_generation": value.stream_generation.value,
+        "schema_fingerprint": value.schema_fingerprint,
+        "revision": value.revision.value,
+    }
+
+
+def dataset_revision_ref_from_tree(tree: Any) -> DatasetRevisionRef:
+    """Decode only the current exact DatasetRevisionRef representation."""
+
+    data = _exact_map(
+        tree,
+        {
+            "schema",
+            "block_id",
+            "stream_generation",
+            "schema_fingerprint",
+            "revision",
+        },
+        DATASET_REVISION_REF_SCHEMA,
+    )
+    value = DatasetRevisionRef(
+        block_id=BlockId(data["block_id"]),
+        stream_generation=StreamGenerationId(data["stream_generation"]),
+        schema_fingerprint=data["schema_fingerprint"],
+        revision=DatasetRevision(data["revision"]),
+    )
+    if dataset_revision_ref_to_tree(value) != tree:
+        raise ValueError("DatasetRevisionRef tree is typed but non-canonical")
+    return value
 
 
 def axis_to_tree(axis: AxisSpec) -> dict[str, Any]:

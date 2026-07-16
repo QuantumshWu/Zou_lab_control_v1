@@ -57,18 +57,29 @@ from .streams import (
     Envelope,
     EventRef,
     EventSpanRef,
+    event_span_ref_from_tree,
+    event_span_ref_to_tree,
     ExactConsumerReadiness,
     ExactReservation,
     MonitorTap,
     MonitorUpdate,
     ReservationState,
     ProcessorStageProvenance,
+    processor_stage_provenance_from_tree,
+    processor_stage_provenance_to_tree,
     StreamId,
     TraceBinding,
+    trace_binding_from_tree,
+    trace_binding_to_tree,
+    _validated_processor_stage_chain,
 )
 
 
 PayloadT = TypeVar("PayloadT")
+_DATASET_DERIVATION_PROVENANCE_SCHEMA = (
+    "zlc_neutral_atom.DatasetDerivationProvenance"
+)
+_DATASET_SEAL_PROVENANCE_SCHEMA = "zlc_neutral_atom.DatasetSealProvenance"
 
 
 def dataset_storage_nbytes(schema: DatasetSchema) -> int:
@@ -956,10 +967,8 @@ class DatasetDerivationProvenance:
         _sha256_digest(self.chain_contract_digest, "chain_contract_digest")
         if not isinstance(self.root_input_span, EventSpanRef):
             raise TypeError("root_input_span must be EventSpanRef")
-        stages = tuple(self.stages)
-        if not stages or any(
-            not isinstance(stage, ProcessorStageProvenance) for stage in stages
-        ):
+        stages = _validated_processor_stage_chain(tuple(self.stages))
+        if not stages:
             raise TypeError("stages must contain ProcessorStageProvenance values")
         object.__setattr__(self, "stages", stages)
 
@@ -1014,6 +1023,115 @@ class DatasetSealProvenance:
             raise TypeError("derivation must be DatasetDerivationProvenance or None")
 
 
+def dataset_derivation_provenance_to_tree(
+    value: DatasetDerivationProvenance,
+) -> dict[str, object]:
+    """Project one complete exact processor-chain derivation."""
+
+    if not isinstance(value, DatasetDerivationProvenance):
+        raise TypeError("value must be DatasetDerivationProvenance")
+    return {
+        "schema": _DATASET_DERIVATION_PROVENANCE_SCHEMA,
+        "chain_contract_digest": value.chain_contract_digest,
+        "root_input_span": event_span_ref_to_tree(value.root_input_span),
+        "stages": [
+            processor_stage_provenance_to_tree(stage) for stage in value.stages
+        ],
+    }
+
+
+def dataset_derivation_provenance_from_tree(
+    tree: object,
+) -> DatasetDerivationProvenance:
+    """Decode only the current exact derivation representation."""
+
+    data = _exact_mapping(
+        tree,
+        {"schema", "chain_contract_digest", "root_input_span", "stages"},
+        _DATASET_DERIVATION_PROVENANCE_SCHEMA,
+    )
+    stages = data["stages"]
+    if not isinstance(stages, list):
+        raise ValueError("dataset derivation stages must be a list")
+    value = DatasetDerivationProvenance(
+        chain_contract_digest=data["chain_contract_digest"],
+        root_input_span=event_span_ref_from_tree(data["root_input_span"]),
+        stages=tuple(
+            processor_stage_provenance_from_tree(stage) for stage in stages
+        ),
+    )
+    if dataset_derivation_provenance_to_tree(value) != tree:
+        raise ValueError(
+            "DatasetDerivationProvenance tree is typed but non-canonical"
+        )
+    return value
+
+
+def dataset_seal_provenance_to_tree(
+    value: DatasetSealProvenance,
+) -> dict[str, object]:
+    """Project raw or processed exact-dataset provenance without information loss."""
+
+    if not isinstance(value, DatasetSealProvenance):
+        raise TypeError("value must be DatasetSealProvenance")
+    return {
+        "schema": _DATASET_SEAL_PROVENANCE_SCHEMA,
+        "stream_id": value.stream_id.value,
+        "generation": value.generation.value,
+        "start_sequence": value.start_sequence,
+        "end_sequence": value.end_sequence,
+        "join_plan_digest": value.join_plan_digest,
+        "ordered_metadata_digest": value.ordered_metadata_digest,
+        "metadata_contract_fingerprint": value.metadata_contract_fingerprint,
+        "trace_binding": trace_binding_to_tree(value.trace_binding),
+        "derivation": (
+            None
+            if value.derivation is None
+            else dataset_derivation_provenance_to_tree(value.derivation)
+        ),
+    }
+
+
+def dataset_seal_provenance_from_tree(tree: object) -> DatasetSealProvenance:
+    """Decode only the current complete DatasetSealProvenance representation."""
+
+    data = _exact_mapping(
+        tree,
+        {
+            "schema",
+            "stream_id",
+            "generation",
+            "start_sequence",
+            "end_sequence",
+            "join_plan_digest",
+            "ordered_metadata_digest",
+            "metadata_contract_fingerprint",
+            "trace_binding",
+            "derivation",
+        },
+        _DATASET_SEAL_PROVENANCE_SCHEMA,
+    )
+    derivation = data["derivation"]
+    value = DatasetSealProvenance(
+        stream_id=StreamId(data["stream_id"]),
+        generation=StreamGenerationId(data["generation"]),
+        start_sequence=data["start_sequence"],
+        end_sequence=data["end_sequence"],
+        join_plan_digest=data["join_plan_digest"],
+        ordered_metadata_digest=data["ordered_metadata_digest"],
+        metadata_contract_fingerprint=data["metadata_contract_fingerprint"],
+        trace_binding=trace_binding_from_tree(data["trace_binding"]),
+        derivation=(
+            None
+            if derivation is None
+            else dataset_derivation_provenance_from_tree(derivation)
+        ),
+    )
+    if dataset_seal_provenance_to_tree(value) != tree:
+        raise ValueError("DatasetSealProvenance tree is typed but non-canonical")
+    return value
+
+
 def raw_dataset_seal_provenance_to_tree(
     value: DatasetSealProvenance,
 ) -> dict[str, object]:
@@ -1031,10 +1149,7 @@ def raw_dataset_seal_provenance_to_tree(
         "join_plan_digest": value.join_plan_digest,
         "ordered_metadata_digest": value.ordered_metadata_digest,
         "metadata_contract_fingerprint": value.metadata_contract_fingerprint,
-        "trace_binding": {
-            "run_id": value.trace_binding.run_id,
-            "source_id": value.trace_binding.source_id,
-        },
+        "trace_binding": trace_binding_to_tree(value.trace_binding),
     }
 
 
@@ -1054,13 +1169,7 @@ def raw_dataset_seal_provenance_from_tree(tree: object) -> DatasetSealProvenance
         "raw dataset seal provenance",
         discriminator=None,
     )
-    trace = _exact_mapping(
-        data["trace_binding"],
-        {"run_id", "source_id"},
-        "trace binding",
-        discriminator=None,
-    )
-    return DatasetSealProvenance(
+    value = DatasetSealProvenance(
         StreamId(data["stream_id"]),
         StreamGenerationId(data["generation"]),
         data["start_sequence"],
@@ -1068,8 +1177,11 @@ def raw_dataset_seal_provenance_from_tree(tree: object) -> DatasetSealProvenance
         data["join_plan_digest"],
         data["ordered_metadata_digest"],
         data["metadata_contract_fingerprint"],
-        TraceBinding(trace["run_id"], trace["source_id"]),
+        trace_binding_from_tree(data["trace_binding"]),
     )
+    if raw_dataset_seal_provenance_to_tree(value) != tree:
+        raise ValueError("raw DatasetSealProvenance tree is non-canonical")
+    return value
 
 
 class SealedDatasetArtifact:
@@ -1891,6 +2003,10 @@ __all__ = [
     "SnapshotExpired",
     "SealedDatasetArtifact",
     "dataset_cell_permutation_digest",
+    "dataset_derivation_provenance_from_tree",
+    "dataset_derivation_provenance_to_tree",
+    "dataset_seal_provenance_from_tree",
+    "dataset_seal_provenance_to_tree",
     "dataset_storage_nbytes",
     "mutable_dataset_storage_nbytes",
     "raw_dataset_seal_provenance_from_tree",

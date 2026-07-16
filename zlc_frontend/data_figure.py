@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from io import BytesIO
+from numbers import Integral
 from pathlib import Path
 
 from zlc_data import FitResultBatch, validate_fit_result_source_binding
@@ -12,6 +14,7 @@ from .figure import (
     AxisViewRole,
     FigureDocument,
     FigureEvaluator,
+    FigureEvaluationPolicy,
     ResolvedDatasetMap,
     ViewIntent,
 )
@@ -33,6 +36,7 @@ class DataFigure:
         datasets: ResolvedDatasetMap,
         *,
         fit_results: Mapping[str, FitResultBatch] | None = None,
+        evaluation_memory_limit_bytes: int | None = None,
     ) -> None:
         if not isinstance(document, FigureDocument):
             raise TypeError("document must be FigureDocument")
@@ -61,7 +65,22 @@ class DataFigure:
             validate_fit_result_source_binding(result, snapshot.ref, snapshot.block.schema)
             fit_layers[layer_id] = (layer, result)
 
-        evaluated = FigureEvaluator().evaluate(document, datasets)
+        if evaluation_memory_limit_bytes is None:
+            policy = FigureEvaluationPolicy()
+        else:
+            if (
+                isinstance(evaluation_memory_limit_bytes, bool)
+                or not isinstance(evaluation_memory_limit_bytes, Integral)
+                or evaluation_memory_limit_bytes <= 0
+            ):
+                raise ValueError(
+                    "evaluation_memory_limit_bytes must be a positive integer or None"
+                )
+            policy = replace(
+                FigureEvaluationPolicy(),
+                max_live_nbytes=int(evaluation_memory_limit_bytes),
+            )
+        evaluated = FigureEvaluator(policy).evaluate(document, datasets)
         allowed_batch_roles = {
             AxisViewRole.BATCH,
             AxisViewRole.FACET,
@@ -107,10 +126,31 @@ class DataFigure:
     def evaluated(self):
         return self._evaluated
 
-    def render(self):
+    def render(
+        self,
+        *,
+        dpi: float = 100.0,
+        memory_limit_bytes: int | None = None,
+    ):
         """Create a new caller-owned Matplotlib Figure using the OO Agg path."""
 
-        from ._matplotlib_render import render_evaluated_figure
+        from ._matplotlib_render import (
+            estimate_render_peak_nbytes,
+            render_evaluated_figure,
+        )
+
+        if memory_limit_bytes is not None:
+            if (
+                isinstance(memory_limit_bytes, bool)
+                or not isinstance(memory_limit_bytes, Integral)
+                or memory_limit_bytes <= 0
+            ):
+                raise ValueError("memory_limit_bytes must be a positive integer or None")
+            required = estimate_render_peak_nbytes(self._evaluated, dpi=dpi)
+            if required > memory_limit_bytes:
+                raise MemoryError(
+                    f"figure render peak {required} exceeds limit {memory_limit_bytes}"
+                )
 
         return render_evaluated_figure(
             self._document,
@@ -118,10 +158,22 @@ class DataFigure:
             dict(self._fit_results),
         )
 
-    def to_png_bytes(self, *, dpi: float = 100.0) -> bytes:
+    def to_png_bytes(
+        self,
+        *,
+        dpi: float = 100.0,
+        memory_limit_bytes: int | None = None,
+    ) -> bytes:
         output = BytesIO()
-        self.render().savefig(output, format="png", dpi=dpi)
-        return output.getvalue()
+        figure = self.render(dpi=dpi, memory_limit_bytes=memory_limit_bytes)
+        try:
+            figure.savefig(output, format="png", dpi=dpi)
+            payload = output.getvalue()
+        finally:
+            figure.clear()
+        if memory_limit_bytes is not None and len(payload) > memory_limit_bytes:
+            raise MemoryError("PNG payload exceeds figure render memory limit")
+        return payload
 
     def _repr_png_(self) -> bytes:
         return self.to_png_bytes()

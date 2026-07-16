@@ -473,8 +473,10 @@ def _require_bounded_snapshot_step(schema: TransformedSchema, step) -> None:
 
 
 def _transformed_snapshot_data_peak_nbytes(
-    snapshot: OwnedSnapshot,
+    source_schema: DatasetSchema,
     transform: CommittedTransform,
+    *,
+    source_validity_nbytes: int,
 ) -> int:
     """Conservative data-plane peak for a cell-preserving dataset snapshot.
 
@@ -489,20 +491,22 @@ def _transformed_snapshot_data_peak_nbytes(
     separate metadata policy, matching raw Capture materialization semantics.
     """
 
-    if not isinstance(snapshot, OwnedSnapshot):
-        raise TypeError("snapshot must be OwnedSnapshot")
+    if not isinstance(source_schema, DatasetSchema):
+        raise TypeError("source_schema must be DatasetSchema")
     if not isinstance(transform, CommittedTransform):
         raise TypeError("transform must be CommittedTransform")
-    block = snapshot.block
-    if transform.input_schema_fingerprint != block.schema.fingerprint:
+    if (
+        isinstance(source_validity_nbytes, bool)
+        or not isinstance(source_validity_nbytes, Integral)
+        or source_validity_nbytes < 0
+    ):
+        raise ValueError("source_validity_nbytes must be a nonnegative integer")
+    if transform.input_schema_fingerprint != source_schema.fingerprint:
         raise ValueError("CommittedTransform input schema fingerprint is stale")
-    state = _State(_source_transformed_schema(block.schema), None, None)
-    validity_nbytes = (
-        block.validity.mask.nbytes
-        if isinstance(block.validity, (CellValidity, ComponentValidity))
-        else 0
+    state = _State(_source_transformed_schema(source_schema), None, None)
+    retained = _schema_value_nbytes(state.schema) + 2 * int(
+        source_validity_nbytes
     )
-    retained = block.values.nbytes + 2 * validity_nbytes
     peak = retained
     for operation in transform.spec.operations:
         steps = (
@@ -566,6 +570,22 @@ def _transformed_snapshot_data_peak_nbytes(
     return int(max(peak, retained + final_freeze))
 
 
+def transformed_snapshot_peak_nbytes(
+    source_schema: DatasetSchema,
+    transform: CommittedTransform,
+) -> int:
+    """Worst-case owned data-plane peak available before acquisition starts."""
+
+    if not isinstance(source_schema, DatasetSchema):
+        raise TypeError("source_schema must be DatasetSchema")
+    source = _source_transformed_schema(source_schema)
+    return _transformed_snapshot_data_peak_nbytes(
+        source_schema,
+        transform,
+        source_validity_nbytes=_schema_row_validity_nbytes(source),
+    )
+
+
 def materialize_transformed_snapshot(
     snapshot: OwnedSnapshot,
     transform: CommittedTransform,
@@ -592,7 +612,16 @@ def materialize_transformed_snapshot(
         or memory_limit_bytes <= 0
     ):
         raise ValueError("memory_limit_bytes must be a positive integer")
-    required = _transformed_snapshot_data_peak_nbytes(snapshot, transform)
+    validity_nbytes = (
+        snapshot.block.validity.mask.nbytes
+        if isinstance(snapshot.block.validity, (CellValidity, ComponentValidity))
+        else 0
+    )
+    required = _transformed_snapshot_data_peak_nbytes(
+        snapshot.block.schema,
+        transform,
+        source_validity_nbytes=validity_nbytes,
+    )
     if required > memory_limit_bytes:
         raise MemoryError(
             f"transformed snapshot peak {required} exceeds limit {memory_limit_bytes}"
@@ -1263,5 +1292,7 @@ __all__ = [
     "ValidityPolicy",
     "apply_transform",
     "commit_transform",
+    "materialize_transformed_snapshot",
     "resolve_transformed_schema",
+    "transformed_snapshot_peak_nbytes",
 ]

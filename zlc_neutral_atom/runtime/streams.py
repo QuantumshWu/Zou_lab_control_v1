@@ -18,6 +18,7 @@ from zlc_storage import (
     canonical_text as _canonical_text,
     decode,
     encode,
+    exact_mapping as _exact_mapping,
     finite_real,
     nonnegative_integer as _nonnegative_int,
     positive_integer as _positive_int,
@@ -42,6 +43,11 @@ _MAX_EXACT_PROCESSOR_STAGES = 64
 _MAX_CHAIN_ARTIFACT_INPUT_OCCURRENCES = 256
 _MAX_CHAIN_ARTIFACT_INPUT_BYTES = 4 * 1024 * 1024
 _MAX_TRACE_CAUSATION_REFS = 1 + _MAX_DIRECT_ARTIFACT_INPUTS
+_EVENT_SPAN_REF_SCHEMA = "zlc_neutral_atom.EventSpanRef"
+_ARTIFACT_INPUT_REF_SCHEMA = "zlc_neutral_atom.ArtifactInputRef"
+_PROCESSOR_STAGE_PROVENANCE_SCHEMA = (
+    "zlc_neutral_atom.ProcessorStageProvenance"
+)
 
 
 class PayloadContract(Protocol[PayloadT]):
@@ -349,6 +355,155 @@ class ProcessorStageProvenance:
         )
 
 
+def _validated_processor_stage_chain(
+    processor_stages: tuple[ProcessorStageProvenance, ...],
+) -> tuple[ProcessorStageProvenance, ...]:
+    """Apply the one resource boundary shared by live and durable lineage."""
+
+    stages = tuple(processor_stages)
+    if any(not isinstance(stage, ProcessorStageProvenance) for stage in stages):
+        raise TypeError("processor_stages contains an unsupported value")
+    if len(stages) > _MAX_EXACT_PROCESSOR_STAGES:
+        raise ValueError("exact processor chain exceeds the stage budget")
+    chain_inputs = tuple(
+        reference
+        for stage in stages
+        for reference in stage.direct_artifact_inputs
+    )
+    if len(chain_inputs) > _MAX_CHAIN_ARTIFACT_INPUT_OCCURRENCES:
+        raise ValueError("exact processor chain has too many artifact input edges")
+    if (
+        sum(len(reference.canonical_reference) for reference in chain_inputs)
+        > _MAX_CHAIN_ARTIFACT_INPUT_BYTES
+    ):
+        raise ValueError("exact processor chain artifact inputs exceed the byte budget")
+    return stages
+
+
+def event_span_ref_to_tree(value: EventSpanRef) -> dict[str, object]:
+    """Project one contiguous source interval through its owner codec."""
+
+    if not isinstance(value, EventSpanRef):
+        raise TypeError("value must be EventSpanRef")
+    return {
+        "schema": _EVENT_SPAN_REF_SCHEMA,
+        "stream_id": value.stream_id.value,
+        "generation": value.generation.value,
+        "start_sequence": value.start_sequence,
+        "end_sequence": value.end_sequence,
+        "count": value.count,
+        "ordered_digest": value.ordered_digest,
+    }
+
+
+def event_span_ref_from_tree(tree: object) -> EventSpanRef:
+    """Decode only the current exact EventSpanRef representation."""
+
+    data = _exact_mapping(
+        tree,
+        {
+            "schema",
+            "stream_id",
+            "generation",
+            "start_sequence",
+            "end_sequence",
+            "count",
+            "ordered_digest",
+        },
+        _EVENT_SPAN_REF_SCHEMA,
+    )
+    value = EventSpanRef(
+        stream_id=StreamId(data["stream_id"]),
+        generation=StreamGenerationId(data["generation"]),
+        start_sequence=data["start_sequence"],
+        end_sequence=data["end_sequence"],
+        count=data["count"],
+        ordered_digest=data["ordered_digest"],
+    )
+    if event_span_ref_to_tree(value) != tree:
+        raise ValueError("EventSpanRef tree is typed but non-canonical")
+    return value
+
+
+def artifact_input_ref_to_tree(value: ArtifactInputRef) -> dict[str, object]:
+    """Project one opaque direct artifact dependency without interpreting it."""
+
+    if not isinstance(value, ArtifactInputRef):
+        raise TypeError("value must be ArtifactInputRef")
+    return {
+        "schema": _ARTIFACT_INPUT_REF_SCHEMA,
+        "reference_schema_id": value.reference_schema_id,
+        "canonical_reference": value.canonical_reference,
+        "content_digest": value.content_digest,
+    }
+
+
+def artifact_input_ref_from_tree(tree: object) -> ArtifactInputRef:
+    """Decode only the current exact ArtifactInputRef representation."""
+
+    data = _exact_mapping(
+        tree,
+        {
+            "schema",
+            "reference_schema_id",
+            "canonical_reference",
+            "content_digest",
+        },
+        _ARTIFACT_INPUT_REF_SCHEMA,
+    )
+    value = ArtifactInputRef(
+        reference_schema_id=data["reference_schema_id"],
+        canonical_reference=data["canonical_reference"],
+        content_digest=data["content_digest"],
+    )
+    if artifact_input_ref_to_tree(value) != tree:
+        raise ValueError("ArtifactInputRef tree is typed but non-canonical")
+    return value
+
+
+def processor_stage_provenance_to_tree(
+    value: ProcessorStageProvenance,
+) -> dict[str, object]:
+    """Project one processor stage and its direct artifact dependencies."""
+
+    if not isinstance(value, ProcessorStageProvenance):
+        raise TypeError("value must be ProcessorStageProvenance")
+    return {
+        "schema": _PROCESSOR_STAGE_PROVENANCE_SCHEMA,
+        "processor_binding_digest": value.processor_binding_digest,
+        "direct_artifact_inputs": [
+            artifact_input_ref_to_tree(reference)
+            for reference in value.direct_artifact_inputs
+        ],
+    }
+
+
+def processor_stage_provenance_from_tree(
+    tree: object,
+) -> ProcessorStageProvenance:
+    """Decode only the current exact ProcessorStageProvenance representation."""
+
+    data = _exact_mapping(
+        tree,
+        {"schema", "processor_binding_digest", "direct_artifact_inputs"},
+        _PROCESSOR_STAGE_PROVENANCE_SCHEMA,
+    )
+    inputs = data["direct_artifact_inputs"]
+    if not isinstance(inputs, list):
+        raise ValueError("direct_artifact_inputs must be a list")
+    value = ProcessorStageProvenance(
+        processor_binding_digest=data["processor_binding_digest"],
+        direct_artifact_inputs=tuple(
+            artifact_input_ref_from_tree(reference) for reference in inputs
+        ),
+    )
+    if processor_stage_provenance_to_tree(value) != tree:
+        raise ValueError(
+            "ProcessorStageProvenance tree is typed but non-canonical"
+        )
+    return value
+
+
 CausationRef = EventRef | EventSpanRef | ArtifactInputRef
 
 
@@ -394,6 +549,27 @@ class TraceBinding:
             raise TypeError("trace must be TraceContext")
         if trace.run_id != self.run_id or trace.source_id != self.source_id:
             raise StreamError("event trace differs from the reserved formal run/source")
+
+
+def trace_binding_to_tree(value: TraceBinding) -> dict[str, object]:
+    """Project the embedded run/source identity through its stream owner."""
+
+    if not isinstance(value, TraceBinding):
+        raise TypeError("value must be TraceBinding")
+    return {"run_id": value.run_id, "source_id": value.source_id}
+
+
+def trace_binding_from_tree(tree: object) -> TraceBinding:
+    data = _exact_mapping(
+        tree,
+        {"run_id", "source_id"},
+        "trace binding",
+        discriminator=None,
+    )
+    value = TraceBinding(data["run_id"], data["source_id"])
+    if trace_binding_to_tree(value) != tree:
+        raise ValueError("TraceBinding tree is typed but non-canonical")
+    return value
 
 
 @dataclass(frozen=True)
@@ -862,24 +1038,11 @@ class ExactConsumerReadiness:
             "_owner_cancel",
             None if owner_cancel is None else _CallbackReference(owner_cancel),
         )
-        stages = tuple(processor_stages)
-        if any(not isinstance(stage, ProcessorStageProvenance) for stage in stages):
-            raise TypeError("processor_stages contains an unsupported value")
-        if len(stages) > _MAX_EXACT_PROCESSOR_STAGES:
-            raise ValueError("exact processor chain exceeds the stage budget")
-        chain_inputs = tuple(
-            reference
-            for stage in stages
-            for reference in stage.direct_artifact_inputs
+        object.__setattr__(
+            self,
+            "_processor_stages",
+            _validated_processor_stage_chain(processor_stages),
         )
-        if len(chain_inputs) > _MAX_CHAIN_ARTIFACT_INPUT_OCCURRENCES:
-            raise ValueError("exact processor chain has too many artifact input edges")
-        if (
-            sum(len(reference.canonical_reference) for reference in chain_inputs)
-            > _MAX_CHAIN_ARTIFACT_INPUT_BYTES
-        ):
-            raise ValueError("exact processor chain artifact inputs exceed the byte budget")
-        object.__setattr__(self, "_processor_stages", stages)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("ExactConsumerReadiness is immutable")
@@ -2240,12 +2403,16 @@ __all__ = [
     "AcquisitionProducer",
     "AcquisitionStream",
     "ArtifactInputRef",
+    "artifact_input_ref_from_tree",
+    "artifact_input_ref_to_tree",
     "Delivery",
     "Envelope",
     "EndOfStream",
     "EventId",
     "EventRef",
     "EventSpanRef",
+    "event_span_ref_from_tree",
+    "event_span_ref_to_tree",
     "event_id_for_sequence",
     "event_ref_to_tree",
     "ExactConsumerReadiness",
@@ -2257,6 +2424,8 @@ __all__ = [
     "PayloadContract",
     "ProducerFlowControl",
     "ProcessorStageProvenance",
+    "processor_stage_provenance_from_tree",
+    "processor_stage_provenance_to_tree",
     "ReservationCapacityExceeded",
     "RetentionOverrun",
     "ReservationState",
@@ -2270,4 +2439,6 @@ __all__ = [
     "StreamId",
     "TraceContext",
     "TraceBinding",
+    "trace_binding_from_tree",
+    "trace_binding_to_tree",
 ]

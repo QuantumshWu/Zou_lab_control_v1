@@ -19,6 +19,14 @@ def open_pulse_workbench(experiment, document=None, *, path=None):
     return _open(experiment, document, path=path)
 
 
+def open_scan_workbench(experiment, request):
+    """Open the current final-only autonomous scan panel lazily."""
+
+    from ._scan import open_scan_workbench as _open
+
+    return _open(experiment, request)
+
+
 def open_offline_pulse_workbench(
     target,
     *,
@@ -42,4 +50,5 @@ __all__ = [
     "open_capture_workbench",
     "open_offline_pulse_workbench",
     "open_pulse_workbench",
+    "open_scan_workbench",
 ]

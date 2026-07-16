@@ -19,6 +19,8 @@ from .codec import (
     axis_layout_from_tree,
     axis_layout_to_tree,
     axis_to_tree,
+    dataset_revision_ref_from_tree,
+    dataset_revision_ref_to_tree,
 )
 from .fit_contract import (
     FitBatchStatus,
@@ -28,12 +30,10 @@ from .fit_contract import (
     FitSpec,
 )
 from .transform_codec import committed_transform_from_tree, committed_transform_to_tree
-from .value import BlockId, DatasetRevision, DatasetRevisionRef, StreamGenerationId
 
 
 FIT_SPEC_SCHEMA = "zlc_data.FitSpec"
 FIT_RESULT_BATCH_SCHEMA = "zlc_data.FitResultBatch"
-DATASET_REVISION_REF_SCHEMA = "zlc_data.DatasetRevisionRef"
 
 
 def fit_spec_to_tree(spec: FitSpec) -> dict[str, Any]:
@@ -102,7 +102,7 @@ def _fit_result_batch_to_tree(result: FitResultBatch) -> dict[str, Any]:
         raise TypeError("result must be FitResultBatch")
     return {
         "schema": FIT_RESULT_BATCH_SCHEMA,
-        "source_ref": _revision_ref_to_tree(result.source_ref),
+        "source_ref": dataset_revision_ref_to_tree(result.source_ref),
         "fit_spec": fit_spec_to_tree(result.spec),
         "fit_axis_specs": [axis_to_tree(axis) for axis in result.fit_axis_specs],
         "batch_axis_specs": [axis_to_tree(axis) for axis in result.batch_axis_specs],
@@ -171,7 +171,7 @@ def _fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
     if any(not isinstance(data[field], np.ndarray) for field in arrays):
         raise ValueError("FitResultBatch numeric fields must be ndarrays")
     return FitResultBatch(
-        source_ref=_revision_ref_from_tree(data["source_ref"]),
+        source_ref=dataset_revision_ref_from_tree(data["source_ref"]),
         spec=fit_spec_from_tree(data["fit_spec"]),
         fit_axis_specs=tuple(axis_from_tree(value) for value in data["fit_axis_specs"]),
         batch_axis_specs=tuple(axis_from_tree(value) for value in data["batch_axis_specs"]),
@@ -263,30 +263,6 @@ def _numeric_policy_from_tree(tree: Any) -> FitNumericPolicy:
         sample_budget_per_batch=data["sample_budget_per_batch"],
         max_packed_observations=data["max_packed_observations"],
         covariance_rcond=data["covariance_rcond"],
-    )
-
-
-def _revision_ref_to_tree(value: DatasetRevisionRef) -> dict[str, Any]:
-    return {
-        "schema": DATASET_REVISION_REF_SCHEMA,
-        "block_id": value.block_id.value,
-        "stream_generation": value.stream_generation.value,
-        "schema_fingerprint": value.schema_fingerprint,
-        "revision": value.revision.value,
-    }
-
-
-def _revision_ref_from_tree(tree: Any) -> DatasetRevisionRef:
-    data = _exact_map(
-        tree,
-        {"schema", "block_id", "stream_generation", "schema_fingerprint", "revision"},
-        DATASET_REVISION_REF_SCHEMA,
-    )
-    return DatasetRevisionRef(
-        BlockId(data["block_id"]),
-        StreamGenerationId(data["stream_generation"]),
-        data["schema_fingerprint"],
-        DatasetRevision(data["revision"]),
     )
 
 

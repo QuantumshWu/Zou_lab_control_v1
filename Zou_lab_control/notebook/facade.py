@@ -48,7 +48,7 @@ from zlc_neutral_atom.capture_application import (
     CaptureRequest,
     PlanDescriptor,
     PreparedFiniteCapture,
-    compile_bound_capture_plan,
+    bind_finite_capture_spec,
     prepare_finite_capture,
 )
 from zlc_neutral_atom.pulse_application import (
@@ -67,7 +67,10 @@ from zlc_neutral_atom.readout.calibration import (
     ReadoutModelKind,
     ResolvedCalibration,
 )
-from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
+from zlc_neutral_atom.readout.calibration_reference import (
+    CalibrationArtifactRef,
+    calibration_artifact_ref_to_tree,
+)
 from zlc_neutral_atom.readout.occupancy_reference import OccupancyArtifactRef
 from zlc_neutral_atom.readout.contracts import (
     CalibrationCaptureLayout,
@@ -80,6 +83,18 @@ from zlc_neutral_atom.scan import (
     bind_scan_output_contract,
 )
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
+from zlc_neutral_atom.scan.application import (
+    compile_direct_scan_artifact_plan,
+    compile_occupancy_scan_artifact_plan,
+)
+from zlc_neutral_atom.readout.occupancy import (
+    OccupancyStreamProcessorSpec,
+    resolve_occupancy_stream_schema,
+)
+from zlc_neutral_atom.readout.occupancy_pipeline import OccupancyPipelineSpec
+from zlc_neutral_atom.runtime.streams import StreamId
+from zlc_neutral_atom.runtime.dataset import dataset_storage_nbytes
+from zlc_neutral_atom.timing.occupancy import TriggeredOccupancySpec
 from zlc_neutral_atom.runtime.run import RunHandle
 from zlc_pulse import (
     PulseDocument,
@@ -89,6 +104,7 @@ from zlc_pulse import (
     require_autonomous_scan_resident_capacity,
     load_pulse_document,
 )
+from zlc_storage import canonical_digest
 from zlc_storage import canonical_text as _text
 from zlc_storage import durable_mkdir
 from zlc_storage import positive_integer as _positive_int
@@ -150,9 +166,44 @@ def _require_runtime_shutdown(runtime, *, timeout: float) -> None:
         raise RuntimeError("runtime did not terminate within the cleanup deadline")
 
 
+def _validate_scan_request_fields(
+    pulse_document: PulseDocument,
+    camera_ref: DeviceRef,
+    sequencer_ref: DeviceRef,
+    trigger_channel: str | None,
+    output_transform_spec: DataTransformSpec | None,
+    transport_memory_limit_bytes: int,
+    memory_limit_bytes: int,
+    timeout_seconds: float,
+) -> tuple[int, int, float]:
+    if not isinstance(pulse_document, PulseDocument):
+        raise TypeError("pulse_document must be PulseDocument")
+    if pulse_document.scan_table is None:
+        raise ValueError("scan request requires a frozen PulseDocument scan table")
+    if not isinstance(camera_ref, DeviceRef):
+        raise TypeError("camera_ref must be DeviceRef")
+    if not isinstance(sequencer_ref, DeviceRef):
+        raise TypeError("sequencer_ref must be DeviceRef")
+    if trigger_channel is not None:
+        _text(trigger_channel, "trigger_channel")
+    if output_transform_spec is not None:
+        if not isinstance(output_transform_spec, DataTransformSpec):
+            raise TypeError("output_transform_spec must be DataTransformSpec or None")
+        if not output_transform_spec.operations:
+            raise ValueError("empty output_transform_spec must be None")
+    return (
+        _positive_int(
+            transport_memory_limit_bytes,
+            "transport_memory_limit_bytes",
+        ),
+        _positive_int(memory_limit_bytes, "memory_limit_bytes"),
+        _positive_real(timeout_seconds, "timeout_seconds"),
+    )
+
+
 @dataclass(frozen=True)
 class ScanRequest:
-    """Freeze one autonomous SCAN_SLOT table and its direct-camera intent."""
+    """Freeze one autonomous SCAN_SLOT table and its direct-camera y intent."""
 
     pulse_document: PulseDocument
     camera_ref: DeviceRef
@@ -160,42 +211,61 @@ class ScanRequest:
     trigger_channel: str | None = None
     output_transform_spec: DataTransformSpec | None = None
     transport_memory_limit_bytes: int = 64 << 20
-    pipeline_memory_limit_bytes: int = 256 << 20
+    memory_limit_bytes: int = 512 << 20
     timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
-        if not isinstance(self.pulse_document, PulseDocument):
-            raise TypeError("pulse_document must be PulseDocument")
-        if self.pulse_document.scan_table is None:
-            raise ValueError("scan request requires a frozen PulseDocument scan table")
-        if not isinstance(self.camera_ref, DeviceRef):
-            raise TypeError("camera_ref must be DeviceRef")
-        if not isinstance(self.sequencer_ref, DeviceRef):
-            raise TypeError("sequencer_ref must be DeviceRef")
-        if self.trigger_channel is not None:
-            _text(self.trigger_channel, "trigger_channel")
-        transform = self.output_transform_spec
-        if transform is not None:
-            if not isinstance(transform, DataTransformSpec):
-                raise TypeError(
-                    "output_transform_spec must be DataTransformSpec or None"
-                )
-            if not transform.operations:
-                raise ValueError("empty output_transform_spec must be None")
-        for field in (
-            "transport_memory_limit_bytes",
-            "pipeline_memory_limit_bytes",
-        ):
-            object.__setattr__(
-                self,
-                field,
-                _positive_int(getattr(self, field), field),
-            )
-        object.__setattr__(
-            self,
-            "timeout_seconds",
-            _positive_real(self.timeout_seconds, "timeout_seconds"),
+        transport, memory, timeout = _validate_scan_request_fields(
+            self.pulse_document,
+            self.camera_ref,
+            self.sequencer_ref,
+            self.trigger_channel,
+            self.output_transform_spec,
+            self.transport_memory_limit_bytes,
+            self.memory_limit_bytes,
+            self.timeout_seconds,
         )
+        object.__setattr__(self, "transport_memory_limit_bytes", transport)
+        object.__setattr__(self, "memory_limit_bytes", memory)
+        object.__setattr__(self, "timeout_seconds", timeout)
+
+
+@dataclass(frozen=True)
+class OccupancyScanRequest:
+    """Freeze one camera→occupancy exact processor as multidimensional scan y."""
+
+    pulse_document: PulseDocument
+    camera_ref: DeviceRef
+    sequencer_ref: DeviceRef
+    calibration_ref: CalibrationArtifactRef
+    model_kind: ReadoutModelKind | None = None
+    trigger_channel: str | None = None
+    output_transform_spec: DataTransformSpec | None = None
+    transport_memory_limit_bytes: int = 64 << 20
+    memory_limit_bytes: int = 512 << 20
+    timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.calibration_ref, CalibrationArtifactRef):
+            raise TypeError("calibration_ref must be CalibrationArtifactRef")
+        if self.model_kind is not None and not isinstance(
+            self.model_kind,
+            ReadoutModelKind,
+        ):
+            raise TypeError("model_kind must be ReadoutModelKind or None")
+        transport, memory, timeout = _validate_scan_request_fields(
+            self.pulse_document,
+            self.camera_ref,
+            self.sequencer_ref,
+            self.trigger_channel,
+            self.output_transform_spec,
+            self.transport_memory_limit_bytes,
+            self.memory_limit_bytes,
+            self.timeout_seconds,
+        )
+        object.__setattr__(self, "transport_memory_limit_bytes", transport)
+        object.__setattr__(self, "memory_limit_bytes", memory)
+        object.__setattr__(self, "timeout_seconds", timeout)
 
 @dataclass(frozen=True)
 class CalibrationArtifactRequest:
@@ -253,59 +323,6 @@ class SitemapCalibrationInterrupted(KeyboardInterrupt):
         super().__init__(
             "sitemap calibration interrupted; the committed raw capture remains "
             f"available as {source_capture_ref!r}"
-        )
-
-
-class ScanPromotionFailed(RuntimeError):
-    """Scan semantics failed after its exact raw capture became FINAL."""
-
-    __slots__ = ("source_capture_ref",)
-
-    def __init__(self, source_capture_ref: CaptureArtifactRef) -> None:
-        if not isinstance(source_capture_ref, CaptureArtifactRef):
-            raise TypeError("source_capture_ref must be CaptureArtifactRef")
-        self.source_capture_ref = source_capture_ref
-        super().__init__(
-            "scan promotion failed; the committed raw capture and its durable "
-            f"intent remain recoverable via promote_scan({source_capture_ref!r})"
-        )
-
-
-class ScanPromotionInterrupted(KeyboardInterrupt):
-    """Notebook interrupt after the exact raw capture became FINAL."""
-
-    __slots__ = ("source_capture_ref",)
-
-    def __init__(self, source_capture_ref: CaptureArtifactRef) -> None:
-        if not isinstance(source_capture_ref, CaptureArtifactRef):
-            raise TypeError("source_capture_ref must be CaptureArtifactRef")
-        self.source_capture_ref = source_capture_ref
-        super().__init__(
-            "scan promotion was interrupted before a confirmed final manifest; "
-            "the committed raw capture and durable intent remain recoverable via "
-            f"promote_scan({source_capture_ref!r})"
-        )
-
-
-class ScanPromotionReconciliationRequired(RuntimeError):
-    """The final scan manifest may be visible and must not be called failed."""
-
-    __slots__ = ("source_capture_ref", "expected_scan_ref")
-
-    def __init__(
-        self,
-        source_capture_ref: CaptureArtifactRef,
-        expected_scan_ref: ScanArtifactRef,
-    ) -> None:
-        if not isinstance(source_capture_ref, CaptureArtifactRef):
-            raise TypeError("source_capture_ref must be CaptureArtifactRef")
-        if not isinstance(expected_scan_ref, ScanArtifactRef):
-            raise TypeError("expected_scan_ref must be ScanArtifactRef")
-        self.source_capture_ref = source_capture_ref
-        self.expected_scan_ref = expected_scan_ref
-        super().__init__(
-            "scan manifest visibility is unknown; retain the raw capture and "
-            f"retry promotion or inspect {expected_scan_ref!r}"
         )
 
 
@@ -598,7 +615,7 @@ class ReadoutFacade:
         trigger_channel: str | None = None,
         output_transform_spec: DataTransformSpec | None = None,
         transport_memory_limit_bytes: int = 64 << 20,
-        pipeline_memory_limit_bytes: int = 256 << 20,
+        memory_limit_bytes: int = 512 << 20,
         timeout_seconds: float = 30.0,
     ) -> ScanRequest:
         """Build one direct-camera autonomous SCAN_SLOT request.
@@ -616,9 +633,9 @@ class ReadoutFacade:
             )
             camera_role = self._resolve_camera_role(services, camera_role)
             return ScanRequest(
-                document,
-                services.catalog.require(camera_role).ref,
-                services.catalog.require(
+                pulse_document=document,
+                camera_ref=services.catalog.require(camera_role).ref,
+                sequencer_ref=services.catalog.require(
                     _resolve_role(
                         services.catalog,
                         sequencer_role,
@@ -626,48 +643,84 @@ class ReadoutFacade:
                         ("sequencer",),
                     )
                 ).ref,
-                trigger_channel,
-                output_transform_spec,
-                transport_memory_limit_bytes,
-                pipeline_memory_limit_bytes,
-                timeout_seconds,
+                trigger_channel=trigger_channel,
+                output_transform_spec=output_transform_spec,
+                transport_memory_limit_bytes=transport_memory_limit_bytes,
+                memory_limit_bytes=memory_limit_bytes,
+                timeout_seconds=timeout_seconds,
             )
 
     def scan(self, pulse: PulseDocument | str | Path, **kwargs) -> ScanArtifactRef:
         return _run_scan(self._token, self.scan_request(pulse, **kwargs))
 
+    def start_scan(self, pulse: PulseDocument | str | Path, **kwargs) -> RunHandle:
+        return _start_scan(self._token, self.scan_request(pulse, **kwargs))
+
+    def occupancy_scan_request(
+        self,
+        pulse: PulseDocument | str | Path,
+        *,
+        calibration_ref: CalibrationArtifactRef,
+        model_kind: ReadoutModelKind | None = None,
+        camera_role: str | None = None,
+        sequencer_role: str | None = None,
+        trigger_channel: str | None = None,
+        output_transform_spec: DataTransformSpec | None = None,
+        transport_memory_limit_bytes: int = 64 << 20,
+        memory_limit_bytes: int = 512 << 20,
+        timeout_seconds: float = 30.0,
+    ) -> OccupancyScanRequest:
+        """Build the first external Measurement→Processor SCAN_SLOT request."""
+
+        with _service_guard(self._token) as services:
+            document = (
+                pulse
+                if isinstance(pulse, PulseDocument)
+                else load_pulse_document(pulse)
+            )
+            camera_role = self._resolve_camera_role(services, camera_role)
+            sequencer_role = _resolve_role(
+                services.catalog,
+                sequencer_role,
+                "sequencer",
+                ("sequencer",),
+            )
+            return OccupancyScanRequest(
+                pulse_document=document,
+                camera_ref=services.catalog.require(camera_role).ref,
+                sequencer_ref=services.catalog.require(sequencer_role).ref,
+                calibration_ref=calibration_ref,
+                model_kind=model_kind,
+                trigger_channel=trigger_channel,
+                output_transform_spec=output_transform_spec,
+                transport_memory_limit_bytes=transport_memory_limit_bytes,
+                memory_limit_bytes=memory_limit_bytes,
+                timeout_seconds=timeout_seconds,
+            )
+
+    def occupancy_scan(
+        self,
+        pulse: PulseDocument | str | Path,
+        **kwargs,
+    ) -> ScanArtifactRef:
+        return _run_scan(
+            self._token,
+            self.occupancy_scan_request(pulse, **kwargs),
+        )
+
+    def start_occupancy_scan(
+        self,
+        pulse: PulseDocument | str | Path,
+        **kwargs,
+    ) -> RunHandle:
+        return _start_scan(
+            self._token,
+            self.occupancy_scan_request(pulse, **kwargs),
+        )
+
     def load_scan(self, reference: ScanArtifactRef) -> "ScanArtifact":
         with _service_guard(self._token) as services:
-            return services.scan_repository.admit(
-                reference,
-                services.capture_repository,
-            )
-
-    def promote_scan(
-        self,
-        source_capture_ref: CaptureArtifactRef,
-    ) -> ScanArtifactRef:
-        """Resume a scan promotion from the raw capture's durable intent."""
-
-        if not isinstance(source_capture_ref, CaptureArtifactRef):
-            raise TypeError("source_capture_ref must be CaptureArtifactRef")
-        try:
-            with _service_guard(self._token) as services:
-                source = services.capture_repository.admit(source_capture_ref)
-                return services.scan_repository.promote(source)
-        except KeyboardInterrupt as exc:
-            raise ScanPromotionInterrupted(source_capture_ref) from exc
-        except Exception as exc:
-            from zlc_neutral_atom.scan.repository import (
-                ScanCommitVisibilityUnknown,
-            )
-
-            if isinstance(exc, ScanCommitVisibilityUnknown):
-                raise ScanPromotionReconciliationRequired(
-                    source_capture_ref,
-                    exc.reference,
-                ) from exc
-            raise ScanPromotionFailed(source_capture_ref) from exc
+            return services.scan_repository.admit(reference)
 
     def materialize_scan(
         self,
@@ -682,7 +735,6 @@ class ReadoutFacade:
         with _service_guard(self._token) as services:
             return services.scan_repository.materialize(
                 reference,
-                services.capture_repository,
                 memory_limit_bytes=_positive_int(
                     memory_limit_bytes,
                     "memory_limit_bytes",
@@ -986,15 +1038,10 @@ def _project_notebook_figure(
     if isinstance(source, ScanArtifactRef):
         source_label = "scan"
         if memory_limit_bytes is None:
-            scan = services.scan_repository.admit(
-                source,
-                services.capture_repository,
-            )
-            schema = scan.output_contract.output_dataset_schema
+            schema = services.scan_repository.inspect_final(source).output_schema
         else:
             materialized = services.scan_repository.materialize(
                 source,
-                services.capture_repository,
                 memory_limit_bytes=memory_limit_bytes,
             )
             schema = materialized.schema
@@ -1116,6 +1163,13 @@ class Experiment:
 
         return open_pulse_workbench(self, document, path=path)
 
+    def scan_gui(self, request: ScanRequest | OccupancyScanRequest):
+        """Open the current final-only SCAN_SLOT panel for a frozen request."""
+
+        from Zou_lab_control.workbench import open_scan_workbench
+
+        return open_scan_workbench(self, request)
+
     def start(self, request: CaptureRequest) -> RunHandle:
         return _start(self._authority_token, request)
 
@@ -1126,16 +1180,21 @@ class Experiment:
         with _service_guard(self._authority_token) as services:
             return _prepare_capture_for_services(services, request).descriptor
 
-    def scan(self, request: ScanRequest) -> ScanArtifactRef:
+    def start_scan(
+        self,
+        request: ScanRequest | OccupancyScanRequest,
+    ) -> RunHandle:
+        return _start_scan(self._authority_token, request)
+
+    def scan(
+        self,
+        request: ScanRequest | OccupancyScanRequest,
+    ) -> ScanArtifactRef:
         return _run_scan(self._authority_token, request)
 
     def inspect_scan(self, request: ScanRequest) -> PlanDescriptor:
         with _service_guard(self._authority_token) as services:
-            _plan, descriptor = _compile_scan_for_services(
-                services,
-                request,
-                persist_intent=False,
-            )
+            _plan, descriptor = _compile_direct_scan_for_services(services, request)
             return descriptor
 
     def fit(
@@ -1251,10 +1310,21 @@ class Experiment:
         assert datasets is not None
         from zlc_frontend import DataFigure
 
+        retained_input_bytes = sum(
+            dataset_storage_nbytes(entry.snapshot.block.schema)
+            for entry in datasets.entries
+        )
+        evaluation_limit = limit - retained_input_bytes
+        if evaluation_limit <= 0:
+            raise MemoryError(
+                "figure input snapshot leaves no memory for view evaluation"
+            )
+
         return DataFigure(
             document,
             datasets,
             fit_results=({"data": fit_result} if fit_result is not None else None),
+            evaluation_memory_limit_bytes=evaluation_limit,
         )
 
     def close(self) -> None:
@@ -1391,21 +1461,17 @@ def _run(token: object, request: CaptureRequest) -> CaptureArtifactRef:
     return runtime.wait(handle)
 
 
-def _compile_scan_for_services(
+def _bind_scan_camera(
     services: _ExperimentServices,
-    request: ScanRequest,
-    *,
-    persist_intent: bool,
+    request: ScanRequest | OccupancyScanRequest,
 ):
     from zlc_neutral_atom.bootstrap._triggered_capture import (
         TriggeredCameraLayout,
         bind_triggered_camera_acquisition,
     )
 
-    if not isinstance(request, ScanRequest):
-        raise TypeError("request must be ScanRequest")
-    if not isinstance(persist_intent, bool):
-        raise TypeError("persist_intent must be bool")
+    if not isinstance(request, (ScanRequest, OccupancyScanRequest)):
+        raise TypeError("request must be a current scan request")
     pulse_port = services.runtime.pulse_port(request.sequencer_ref)
     camera_port = services.runtime.camera_port(request.camera_ref)
     logical_document = bind_pulse_document_target(
@@ -1451,14 +1517,17 @@ def _compile_scan_for_services(
         raise RuntimeError(
             "compiled scan pulse differs from the repeat-major execution document"
         )
-    raw_schema = binding.measurement.capture_contract.dataset_schema
-    requested_operations = (
-        ()
-        if request.output_transform_spec is None
-        else request.output_transform_spec.operations
-    )
+    return logical_document, point_table, binding
+
+
+def _scan_transform(
+    source_schema,
+    point_table: ScanPointTable,
+    requested: DataTransformSpec | None,
+):
+    requested_operations = () if requested is None else requested.operations
     committed = commit_transform(
-        raw_schema,
+        source_schema,
         DataTransformSpec(
             (
                 Selection.index(_SCAN_READOUT_EVENT_AXIS_ID, 0),
@@ -1466,31 +1535,38 @@ def _compile_scan_for_services(
             )
         ),
     )
-    output_contract = bind_scan_output_contract(
+    return bind_scan_output_contract(source_schema, point_table, committed)
+
+
+def _compile_direct_scan_for_services(
+    services: _ExperimentServices,
+    request: ScanRequest,
+):
+    logical_document, point_table, binding = _bind_scan_camera(services, request)
+    raw_schema = binding.measurement.capture_contract.dataset_schema
+    output_contract = _scan_transform(
         raw_schema,
         point_table,
-        committed,
+        request.output_transform_spec,
     )
-    intent_operation = (
-        services.scan_repository.prepare
-        if persist_intent
-        else services.scan_repository.identify_intent
-    )
-    capture_block_id = intent_operation(
-        logical_document,
-        output_contract,
-        capture_repository_id=services.capture_repository.repository_id,
-    )
-    plan, descriptor = compile_bound_capture_plan(
+    triggered, descriptor = bind_finite_capture_spec(
         binding=binding,
-        repository=services.capture_repository,
-        block_id=capture_block_id,
+        block_id=BlockId(
+            f"scan-camera-{binding.compiled_artifact.fingerprint[:20]}"
+        ),
         camera_ref=request.camera_ref,
         sequencer_ref=request.sequencer_ref,
         execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
-        pipeline_memory_limit_bytes=request.pipeline_memory_limit_bytes,
+        pipeline_memory_limit_bytes=request.memory_limit_bytes,
         timeout_seconds=request.timeout_seconds,
-        name_prefix="Scan capture",
+        name_prefix="Direct scan",
+    )
+    plan = compile_direct_scan_artifact_plan(
+        triggered,
+        services.scan_repository,
+        document=logical_document,
+        output_contract=output_contract,
+        memory_limit_bytes=request.memory_limit_bytes,
     )
     descriptor = replace(
         descriptor,
@@ -1500,33 +1576,98 @@ def _compile_scan_for_services(
     return plan, descriptor
 
 
-def _run_scan(token: object, request: ScanRequest) -> ScanArtifactRef:
-    with _service_guard(token) as services:
-        plan, _descriptor = _compile_scan_for_services(
-            services,
-            request,
-            persist_intent=True,
-        )
-        handle = services.runtime.start(plan)
-        runtime = services.runtime
-    source_ref = runtime.wait(handle)
-    if not isinstance(source_ref, CaptureArtifactRef):
-        raise TypeError("scan capture run returned a non-capture artifact ref")
-    try:
-        with _service_guard(token) as services:
-            source = services.capture_repository.admit(source_ref)
-            return services.scan_repository.promote(source)
-    except KeyboardInterrupt as exc:
-        raise ScanPromotionInterrupted(source_ref) from exc
-    except Exception as exc:
-        from zlc_neutral_atom.scan.repository import ScanCommitVisibilityUnknown
+def _compile_occupancy_scan_for_services(
+    services: _ExperimentServices,
+    request: OccupancyScanRequest,
+):
+    logical_document, point_table, binding = _bind_scan_camera(services, request)
+    calibration = _calibration_repository(services).admit(
+        request.calibration_ref,
+        services.capture_repository,
+        memory_limit_bytes=request.memory_limit_bytes,
+    )
+    selected_kind = calibration.artifact.select_model(request.model_kind).kind
+    identity = canonical_digest(
+        {
+            "owner": "Zou_lab_control.notebook.occupancy-scan",
+            "pulse_document": logical_document.fingerprint,
+            "compiled_pulse": binding.compiled_artifact.fingerprint,
+            "calibration": calibration_artifact_ref_to_tree(
+                request.calibration_ref
+            ),
+            "model_kind": selected_kind.value,
+        }
+    )
+    processor = OccupancyStreamProcessorSpec(
+        calibration,
+        StreamId(f"scan-occupancy-{identity}"),
+        f"scan-occupancy-{identity}",
+        selected_kind,
+    )
+    source_schema = resolve_occupancy_stream_schema(
+        processor,
+        binding.measurement.capture_contract.dataset_schema,
+    ).counts_schema
+    output_contract = _scan_transform(
+        source_schema,
+        point_table,
+        request.output_transform_spec,
+    )
+    occupancy = OccupancyPipelineSpec(
+        f"Occupancy scan {logical_document.name}",
+        binding.measurement,
+        processor,
+        BlockId(f"scan-counts-{identity}"),
+        BlockId(f"scan-occupied-{identity}"),
+        request.memory_limit_bytes,
+        request.timeout_seconds,
+    )
+    triggered = TriggeredOccupancySpec(
+        occupancy,
+        binding.pulse_port,
+        binding.pulse_request,
+        binding.trigger_channel,
+        binding.cell_plan,
+    )
+    return compile_occupancy_scan_artifact_plan(
+        triggered,
+        services.scan_repository,
+        document=logical_document,
+        output_contract=output_contract,
+        memory_limit_bytes=request.memory_limit_bytes,
+    )
 
-        if isinstance(exc, ScanCommitVisibilityUnknown):
-            raise ScanPromotionReconciliationRequired(
-                source_ref,
-                exc.reference,
-            ) from exc
-        raise ScanPromotionFailed(source_ref) from exc
+
+def _compile_scan_for_services(
+    services: _ExperimentServices,
+    request: ScanRequest | OccupancyScanRequest,
+):
+    if isinstance(request, ScanRequest):
+        return _compile_direct_scan_for_services(services, request)[0]
+    if isinstance(request, OccupancyScanRequest):
+        return _compile_occupancy_scan_for_services(services, request)
+    raise TypeError("request must be a current scan request")
+
+
+def _start_scan(
+    token: object,
+    request: ScanRequest | OccupancyScanRequest,
+) -> RunHandle:
+    with _service_guard(token) as services:
+        return services.runtime.start(_compile_scan_for_services(services, request))
+
+
+def _run_scan(
+    token: object,
+    request: ScanRequest | OccupancyScanRequest,
+) -> ScanArtifactRef:
+    with _service_guard(token) as services:
+        handle = services.runtime.start(_compile_scan_for_services(services, request))
+        runtime = services.runtime
+    result = runtime.wait(handle)
+    if not isinstance(result, ScanArtifactRef):
+        raise TypeError("scan Run returned a non-scan artifact ref")
+    return result
 
 
 def _compile_calibration_for_services(
@@ -1707,6 +1848,7 @@ __all__ = [
     "FitExecution",
     "GridOrder",
     "MaterializedScanData",
+    "OccupancyScanRequest",
     "OccupancyArtifactRef",
     "PlanDescriptor",
     "PreparedPulseExecution",
@@ -1719,9 +1861,6 @@ __all__ = [
     "ReadoutModelKind",
     "ScanArtifactRef",
     "ScanPointTable",
-    "ScanPromotionFailed",
-    "ScanPromotionInterrupted",
-    "ScanPromotionReconciliationRequired",
     "ScanRequest",
     "SitemapCalibrationFailed",
     "SitemapCalibrationInterrupted",

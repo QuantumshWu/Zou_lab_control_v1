@@ -6,10 +6,11 @@ from .contracts import (
     bind_scan_output_contract,
 )
 from .reference import ScanArtifactRef
-from .repository import MaterializedScanData
+from .repository import MaterializedScanData, ScanArtifactInspection
 
 __all__ = [
     "MaterializedScanData",
+    "ScanArtifactInspection",
     "ScanOutputContract",
     "ScanPointTable",
     "ScanArtifactRef",

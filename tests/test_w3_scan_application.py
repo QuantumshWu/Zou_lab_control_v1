@@ -7,6 +7,7 @@ import hashlib
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -43,7 +44,16 @@ from zlc_data import (
 from zlc_frontend.figure import ViewIntent
 from zlc_neutral_atom.scan import ScanPointTable
 from zlc_neutral_atom.scan.repository import ScanRepository
-from zlc_pulse import FrozenScanTable, RepeatRegion, load_pulse_document
+from zlc_neutral_atom.readout.calibration_reference import (
+    calibration_artifact_input_ref,
+)
+from zlc_neutral_atom.readout.sitemap import load_packaged_sitemap_pulse
+from zlc_pulse import (
+    FrozenScanTable,
+    RepeatRegion,
+    ScanParameter,
+    load_pulse_document,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,6 +143,64 @@ def _sparse_scan_document():
         repeat=RepeatRegion(
             document.periods[0].period_id,
             document.periods[-1].period_id,
+            2,
+        ),
+    )
+
+
+def _occupancy_scan_document():
+    """Turn the proven sitemap readout event into a two-point SCAN_SLOT."""
+
+    document = load_packaged_sitemap_pulse()
+    camera_port = next(
+        port for port in document.target.ports if port.label == "emCCD"
+    )
+    assert len(camera_port.lanes) == 1
+    trigger_index = document.target.raw_lanes.index(camera_port.lanes[0])
+
+    segment = -1
+    previous = 0
+    periods = []
+    for period in document.periods:
+        states = list(period.states)
+        current = int(states[trigger_index])
+        if current and not previous:
+            segment += 1
+        states[trigger_index] = int(bool(current and segment == 1))
+        periods.append(replace(period, states=tuple(states)))
+        previous = current
+
+    scanned_api = document.api_parameters[0]
+    scanned_period = next(
+        period
+        for period in periods
+        if period.period_id == scanned_api.field.period_id
+    )
+    scan_parameter = ScanParameter(
+        "reference_settle",
+        scanned_api.field,
+        "reference settle",
+        scanned_api.unit,
+    )
+    start = scanned_period.duration
+    step = 1 if isinstance(start, int) else 1e-6
+    return replace(
+        document,
+        name="occupancy-scan-slot",
+        periods=tuple(periods),
+        api_parameters=tuple(
+            parameter
+            for parameter in document.api_parameters
+            if parameter is not scanned_api
+        ),
+        scan_parameters=(scan_parameter,),
+        scan_table=FrozenScanTable(
+            (scan_parameter.parameter_id,),
+            ((start,), (start + step,)),
+        ),
+        repeat=RepeatRegion(
+            periods[0].period_id,
+            periods[-1].period_id,
             2,
         ),
     )
@@ -277,6 +345,51 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
     expected_points = ScanPointTable.from_pulse_document(document)
 
     with zlc.connect("virtual", repository=workspace) as exp:
+        request = exp.readout.scan_request(document, timeout_seconds=15.0)
+
+        def forbidden_stage(*_args, **_kwargs):
+            raise AssertionError("inspect_scan must not stage repository blobs")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                ScanRepository,
+                "_stage_static_lineage",
+                forbidden_stage,
+            )
+            descriptor = exp.inspect_scan(request)
+        assert descriptor.expected_frames == 6
+        with pytest.raises(MemoryError, match="scan final data-plane peak"):
+            exp.scan(
+                exp.readout.scan_request(
+                    document,
+                    memory_limit_bytes=1,
+                    timeout_seconds=15.0,
+                )
+            )
+        import zlc_neutral_atom.scan.application as scan_application
+
+        base_compiled = False
+
+        def forbidden_base_compile(*_args, **_kwargs):
+            nonlocal base_compiled
+            base_compiled = True
+            raise AssertionError("hardware plan compiled below static-lineage admission")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                scan_application,
+                "compile_triggered_pipeline",
+                forbidden_base_compile,
+            )
+            with pytest.raises(MemoryError, match="scan static-lineage peak"):
+                exp.scan(
+                    exp.readout.scan_request(
+                        document,
+                        memory_limit_bytes=1 << 20,
+                        timeout_seconds=15.0,
+                    )
+                )
+        assert not base_compiled
         scan_ref = exp.scan(
             exp.readout.scan_request(document, timeout_seconds=15.0)
         )
@@ -284,40 +397,58 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
             exp.readout.materialize_scan(scan_ref, memory_limit_bytes=1)
         data = exp.readout.materialize_scan(scan_ref)
         artifact = exp.readout.load_scan(scan_ref)
-        raw = exp.readout.load_capture(artifact.source_capture_ref)
-        raw_block = raw.frame_source.materialize(memory_limit_bytes=512 << 20)
-        raw_ref = raw_block.ref(raw.provenance.generation)
 
         assert data.artifact_ref == artifact.ref
-        assert data.source_dataset_ref == raw_ref
-        assert data.snapshot.ref != raw_ref
-        assert data.snapshot.ref.block_id.value == (
-            f"scan-output-{scan_ref.manifest_digest}"
-        )
+        assert data.source_dataset_ref == artifact.source_dataset_ref
+        assert data.snapshot.ref == artifact.output_dataset_ref
+        assert data.snapshot.ref != artifact.source_dataset_ref
+        assert data.snapshot.ref.block_id.value.startswith("scan-output-")
         assert data.values.shape == (2, 3, 96, 128)
         assert data.schema.repeat_axis.size == 2
         assert data.schema.point_axes == expected_points.point_axes
         assert data.schema.point_layout == expected_points.point_layout
-        assert data.schema.cell_schema.data_axes == raw_block.schema.cell_schema.data_axes
-        assert any(axis.role == READOUT_EVENT for axis in raw_block.schema.point_axes)
+        assert (
+            data.schema.cell_schema.data_axes
+            == artifact.source_dataset_schema.cell_schema.data_axes
+        )
+        assert any(
+            axis.role == READOUT_EVENT
+            for axis in artifact.source_dataset_schema.point_axes
+        )
         assert all(axis.role != READOUT_EVENT for axis in data.schema.point_axes)
-        np.testing.assert_array_equal(data.values, raw_block.values)
+        assert artifact.provenance.derivation is None
+        assert artifact.pulse_evidence.expected_trigger_count == 6
+        assert np.all(np.isfinite(data.values))
+        assert not data.values.flags.writeable
         assert exp.readout.materialize_scan(scan_ref).snapshot.ref == data.snapshot.ref
 
-        def forbidden_materialize(*_args, **_kwargs):
-            raise AssertionError("figure_document must remain metadata-only")
+        def forbidden_heavy_read(*_args, **_kwargs):
+            raise AssertionError("metadata-only inspection decoded heavy lineage/data")
 
         with monkeypatch.context() as patch:
-            patch.setattr(ScanRepository, "materialize", forbidden_materialize)
+            patch.setattr(ScanRepository, "materialize", forbidden_heavy_read)
+            patch.setattr(
+                "zlc_neutral_atom.scan.repository.decode_compiled_pulse_artifact",
+                forbidden_heavy_read,
+            )
+            patch.setattr(
+                "zlc_neutral_atom.scan.repository._decode_document",
+                forbidden_heavy_read,
+            )
             figure_document = exp.figure_document(scan_ref)
         assert figure_document.datasets[0].schema_fingerprint == data.schema.fingerprint
         assert figure_document.layers[0].view.intent is ViewIntent.IMAGE
 
         figure = exp.figure(scan_ref)
         assert figure.document.datasets == figure_document.datasets
+        with pytest.raises(MemoryError, match="figure render peak"):
+            figure.to_png_bytes(memory_limit_bytes=1)
         assert figure.to_png_bytes().startswith(b"\x89PNG\r\n\x1a\n")
         with pytest.raises(TypeError, match="CaptureArtifactRef"):
             exp.fit(scan_ref, model="gaussian_offset")
+
+        _assert_public_occupancy_scan(exp)
+        _assert_scan_window(exp, document, monkeypatch)
 
     digest = hashlib.sha256(data.values.tobytes()).hexdigest()
     subprocess.run(
@@ -349,3 +480,92 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
         check=True,
         timeout=30,
     )
+
+
+def _assert_public_occupancy_scan(exp):
+    document = _occupancy_scan_document()
+    points = ScanPointTable.from_pulse_document(document)
+    calibration_ref = exp.readout.sitemap(frames=6)
+    request = exp.readout.occupancy_scan_request(
+        document,
+        calibration_ref=calibration_ref,
+        timeout_seconds=20.0,
+    )
+    scan_ref = exp.scan(request)
+    artifact = exp.readout.load_scan(scan_ref)
+    data = exp.readout.materialize_scan(scan_ref)
+
+    assert data.schema.repeat_axis.size == 2
+    assert data.schema.point_axes == points.point_axes
+    assert data.schema.point_layout == points.point_layout
+    assert data.values.shape[:2] == (2, 2)
+    assert len(data.values.shape) == 3
+    assert len(data.schema.cell_schema.data_axes) == 1
+    site_axis = data.schema.cell_schema.data_axes[0]
+    assert site_axis.role == SITE
+    assert data.values.shape[2] == site_axis.size
+    assert isinstance(data.validity, ComponentValidity)
+    assert data.validity.axis_ids == (site_axis.axis_id,)
+    assert data.validity.mask.shape == data.values.shape
+
+    derivation = artifact.provenance.derivation
+    assert derivation is not None
+    assert len(derivation.stages) == 1
+    assert calibration_artifact_input_ref(calibration_ref) in (
+        derivation.artifact_inputs
+    )
+    assert artifact.source_dataset_ref == data.source_dataset_ref
+    assert artifact.output_dataset_ref == data.snapshot.ref
+    assert any(
+        axis.role == READOUT_EVENT
+        for axis in artifact.source_dataset_schema.point_axes
+    )
+    assert all(axis.role != READOUT_EVENT for axis in data.schema.point_axes)
+    assert artifact.pulse_evidence.expected_trigger_count == 4
+
+
+def _assert_scan_window(exp, document, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+
+    request = exp.readout.scan_request(document, timeout_seconds=15.0)
+    window = exp.scan_gui(request)
+    application = QtWidgets.QApplication.instance()
+    assert application is not None
+    assert "FINAL-ONLY" in window.findChild(
+        QtWidgets.QLabel,
+        "finalOnlyMode",
+    ).text()
+    start = window.findChild(QtWidgets.QPushButton, "startScanButton")
+    assert start is not None and start.isEnabled()
+    start.click()
+
+    raster = window.findChild(QtWidgets.QLabel, "scanRaster")
+    assert raster is not None
+    deadline = time.monotonic() + 15.0
+    while (
+        (
+            window.final_reference is None
+            or raster.pixmap() is None
+            or raster.pixmap().isNull()
+        )
+        and time.monotonic() < deadline
+    ):
+        application.processEvents()
+        time.sleep(0.01)
+    assert window.final_reference is not None
+    assert raster.pixmap() is not None
+    assert not raster.pixmap().isNull()
+
+    assert start.isEnabled()
+    start.click()
+    cleared = raster.pixmap()
+    assert cleared is None or cleared.isNull()
+
+    window.close()
+    deadline = time.monotonic() + 5.0
+    while window.isVisible() and time.monotonic() < deadline:
+        application.processEvents()
+        time.sleep(0.01)
+    assert not window.isVisible()
+    assert window.worker_idle

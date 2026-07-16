@@ -25,11 +25,15 @@ from .codec import (
     dataset_schema_fingerprint,
     dataset_schema_from_tree,
     dataset_schema_to_tree,
+    dataset_revision_ref_from_tree,
+    dataset_revision_ref_to_tree,
     point_layout_from_tree,
     point_layout_to_tree,
     value_schema_fingerprint,
     value_schema_from_tree,
     value_schema_to_tree,
+    validity_from_tree,
+    validity_to_tree,
     TypedCodecError,
 )
 from .layout import AxisLayout, AxisLayoutMode, PointLayout
@@ -81,6 +85,7 @@ from .transform import (
     commit_transform,
     materialize_transformed_snapshot,
     resolve_transformed_schema,
+    transformed_snapshot_peak_nbytes,
 )
 from .transform_codec import (
     committed_transform_from_tree,
@@ -192,12 +197,15 @@ __all__ = [
     "dataset_schema_fingerprint",
     "dataset_schema_from_tree",
     "dataset_schema_to_tree",
+    "dataset_revision_ref_from_tree",
+    "dataset_revision_ref_to_tree",
     "decode_fit_result_batch",
     "decode_fit_spec",
     "encode_fit_result_batch",
     "encode_fit_spec",
     "resolve_transformed_schema",
     "materialize_transformed_snapshot",
+    "transformed_snapshot_peak_nbytes",
     "resolve_selection_indices",
     "canonical_value_array",
     "expand_dataset_validity",
@@ -217,5 +225,7 @@ __all__ = [
     "value_schema_fingerprint",
     "value_schema_from_tree",
     "value_schema_to_tree",
+    "validity_from_tree",
+    "validity_to_tree",
     "validate_fit_result_source_binding",
 ]

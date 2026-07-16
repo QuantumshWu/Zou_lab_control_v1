@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from zlc_storage import (
-    canonical_text,
-    sha256_text,
-)
+from zlc_storage import canonical_text, sha256_text
 
 
 SCAN_ARTIFACT_NAMESPACE = "scan"
@@ -24,6 +21,9 @@ class ScanArtifactRef:
         canonical_text(self.repository_id, "repository_id")
         sha256_text(self.manifest_digest, "manifest_digest")
 
+    @property
+    def target_ref(self) -> str:
+        return f"{SCAN_ARTIFACT_NAMESPACE}/{self.manifest_digest}"
 
 __all__ = [
     "SCAN_ARTIFACT_NAMESPACE",

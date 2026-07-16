@@ -124,6 +124,38 @@ class _CommittedOccupancyBinding:
     occupied_schema: DatasetSchema
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedOccupancyStreamSchema:
+    """Pure pre-FIRE occupancy model and output-schema resolution."""
+
+    selected_model: ReadoutModel
+    counts_schema: DatasetSchema
+    occupied_schema: DatasetSchema
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.selected_model, ReadoutModel):
+            raise TypeError("selected_model must be ReadoutModel")
+        if not isinstance(self.counts_schema, DatasetSchema):
+            raise TypeError("counts_schema must be DatasetSchema")
+        if not isinstance(self.occupied_schema, DatasetSchema):
+            raise TypeError("occupied_schema must be DatasetSchema")
+        if (
+            self.counts_schema.repeat_axis is not self.occupied_schema.repeat_axis
+            or self.counts_schema.point_axes != self.occupied_schema.point_axes
+            or self.counts_schema.point_layout is not self.occupied_schema.point_layout
+        ):
+            raise ValueError("occupancy output schemas must share one outer axis domain")
+        site_axis = self.selected_model.feature.site_axis
+        if self.counts_schema.cell_schema.data_axes != (site_axis,) or (
+            self.occupied_schema.cell_schema.data_axes != (site_axis,)
+        ):
+            raise ValueError("occupancy output schemas differ from the selected model")
+
+    @property
+    def model_kind(self) -> ReadoutModelKind:
+        return self.selected_model.kind
+
+
 _RESOLVED_COMMITTED_OCCUPANCY_TOKEN = object()
 
 
@@ -248,37 +280,16 @@ def _resolve_committed_occupancy_structure(
         schema,
         readout_event_index=0,
     )
-    model = artifact.select_model(model_kind)
-    if model.kind is not model_kind:
-        raise ValueError("selected model differs from the frozen request")
-    site_axis = artifact.site_map.site_axis
-    if model.feature.site_axis != site_axis:
-        raise ValueError("selected model and SiteMap use different site axes")
-    outer_axis_ids = {
-        schema.repeat_axis.axis_id,
-        *(axis.axis_id for axis in schema.point_axes),
-    }
-    if site_axis.axis_id in outer_axis_ids:
-        raise ValueError("site AxisId collides with a capture repeat/point AxisId")
-    counts_value, occupied_value = _output_schemas(
-        artifact.frame_contract,
-        site_axis,
+    resolved = _resolve_occupancy_stream_schema_parts(
+        calibration,
+        schema,
+        model_kind,
     )
     return _CommittedOccupancyBinding(
         event_axis.axis_id,
-        model,
-        DatasetSchema(
-            schema.repeat_axis,
-            schema.point_axes,
-            schema.point_layout,
-            counts_value,
-        ),
-        DatasetSchema(
-            schema.repeat_axis,
-            schema.point_axes,
-            schema.point_layout,
-            occupied_value,
-        ),
+        resolved.selected_model,
+        resolved.counts_schema,
+        resolved.occupied_schema,
     )
 
 
@@ -1191,6 +1202,75 @@ def _output_schemas(
     )
 
 
+def _resolve_occupancy_stream_schema_parts(
+    calibration: ResolvedCalibration,
+    source_schema: DatasetSchema,
+    model_kind: ReadoutModelKind,
+) -> ResolvedOccupancyStreamSchema:
+    if type(calibration) is not ResolvedCalibration:
+        raise TypeError("calibration must be an exact ResolvedCalibration")
+    calibration._require_authority()
+    if not isinstance(source_schema, DatasetSchema):
+        raise TypeError("source_schema must be DatasetSchema")
+    if not isinstance(model_kind, ReadoutModelKind):
+        raise TypeError("model_kind must be a concrete ReadoutModelKind")
+
+    artifact = calibration.artifact
+    frame_contract = artifact.frame_contract
+    if (
+        source_schema.cell_schema.fingerprint
+        != frame_contract.frame_schema.fingerprint
+    ):
+        raise ValueError("source schema differs from the calibration FrameContract")
+    model = artifact.select_model(model_kind)
+    if model.kind is not model_kind:
+        raise ValueError("selected model differs from the frozen processor spec")
+    site_axis = artifact.site_map.site_axis
+    if model.feature.site_axis != site_axis:
+        raise ValueError("selected model and SiteMap use different site axes")
+    outer_axis_ids = {
+        source_schema.repeat_axis.axis_id,
+        *(axis.axis_id for axis in source_schema.point_axes),
+    }
+    if site_axis.axis_id in outer_axis_ids:
+        raise ValueError("site AxisId collides with a capture repeat/point AxisId")
+
+    counts_value, occupied_value = _output_schemas(frame_contract, site_axis)
+    return ResolvedOccupancyStreamSchema(
+        model,
+        DatasetSchema(
+            source_schema.repeat_axis,
+            source_schema.point_axes,
+            source_schema.point_layout,
+            counts_value,
+        ),
+        DatasetSchema(
+            source_schema.repeat_axis,
+            source_schema.point_axes,
+            source_schema.point_layout,
+            occupied_value,
+        ),
+    )
+
+
+def resolve_occupancy_stream_schema(
+    spec: OccupancyStreamProcessorSpec,
+    source_schema: DatasetSchema,
+) -> ResolvedOccupancyStreamSchema:
+    """Freeze occupancy outputs before any camera session or hardware prepare."""
+
+    if not isinstance(spec, OccupancyStreamProcessorSpec):
+        raise TypeError("spec must be OccupancyStreamProcessorSpec")
+    model_kind = spec.model_kind
+    if not isinstance(model_kind, ReadoutModelKind):
+        raise TypeError("processor spec has no concrete model_kind")
+    return _resolve_occupancy_stream_schema_parts(
+        spec.calibration,
+        source_schema,
+        model_kind,
+    )
+
+
 def bind_occupancy_stream_processor(
     spec: OccupancyStreamProcessorSpec,
     capture_input: CaptureProcessorInputBinding,
@@ -1212,37 +1292,18 @@ def bind_occupancy_stream_processor(
         capture_input,
         artifact.frame_contract,
     )
-    model = artifact.select_model(spec.model_kind)
-    if model.kind is not spec.model_kind:
-        raise ValueError("selected model differs from the frozen processor spec")
-    site_axis = artifact.site_map.site_axis
-    if model.feature.site_axis != site_axis:
-        raise ValueError("selected model and SiteMap use different site axes")
-    outer_axis_ids = {
-        source.dataset_schema.repeat_axis.axis_id,
-        *(axis.axis_id for axis in source.dataset_schema.point_axes),
-    }
-    if site_axis.axis_id in outer_axis_ids:
-        raise ValueError("site AxisId collides with a capture repeat/point AxisId")
-
-    counts_schema, occupied_schema = _output_schemas(
-        artifact.frame_contract,
-        site_axis,
+    resolved_schema = resolve_occupancy_stream_schema(
+        spec,
+        source.dataset_schema,
     )
     candidate_contract = OccupancySampleContract(
-        counts_schema,
-        occupied_schema,
+        resolved_schema.counts_schema.cell_schema,
+        resolved_schema.occupied_schema.cell_schema,
         input_contract.metadata_contract,
     )
     candidate_adapter = OccupancyDatasetEventAdapter(candidate_contract)
-    output_schema = DatasetSchema(
-        source.dataset_schema.repeat_axis,
-        source.dataset_schema.point_axes,
-        source.dataset_schema.point_layout,
-        candidate_adapter.value_schema,
-    )
     output_edge = FrozenDatasetEdge(
-        output_schema,
+        resolved_schema.counts_schema,
         candidate_adapter,
         source.cell_schedule,
     )
@@ -1250,7 +1311,7 @@ def bind_occupancy_stream_processor(
     if not isinstance(output_contract, OccupancySampleContract):
         raise TypeError("occupancy edge reconstructed another payload contract")
     config = _OccupancyConfig(
-        model,
+        resolved_schema.selected_model,
         input_contract.value_schema,
         output_contract.counts_schema,
         output_contract.occupied_schema,
@@ -1281,7 +1342,7 @@ def bind_occupancy_stream_processor(
         capture_input,
         output_edge,
         spec.calibration.reference,
-        model.kind,
+        resolved_schema.model_kind,
     )
 
 
@@ -1296,6 +1357,8 @@ __all__ = [
     "OccupancySample",
     "OccupancySampleContract",
     "OccupancyStreamProcessorSpec",
+    "ResolvedOccupancyStreamSchema",
     "ResolvedOccupancy",
     "bind_occupancy_stream_processor",
+    "resolve_occupancy_stream_schema",
 ]

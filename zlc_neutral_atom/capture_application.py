@@ -231,7 +231,7 @@ class PreparedFiniteCapture:
             self._started = True
 
 
-def _freeze_bound_capture(
+def bind_finite_capture_spec(
     *,
     binding: TriggeredCameraBinding,
     block_id: BlockId,
@@ -310,7 +310,7 @@ def prepare_finite_capture(
         ),
         transport_memory_limit_bytes=request.transport_memory_limit_bytes,
     )
-    triggered, descriptor = _freeze_bound_capture(
+    triggered, descriptor = bind_finite_capture_spec(
         binding=binding,
         block_id=BlockId(f"capture-{binding.compiled_artifact.fingerprint[:20]}"),
         camera_ref=request.camera_ref,
@@ -323,36 +323,10 @@ def prepare_finite_capture(
     return PreparedFiniteCapture(triggered, repository, start_run, descriptor)
 
 
-def compile_bound_capture_plan(
-    *,
-    binding: TriggeredCameraBinding,
-    repository: CaptureRepository,
-    block_id: BlockId,
-    camera_ref: DeviceRef,
-    sequencer_ref: DeviceRef,
-    execution_form: PulseExecutionForm,
-    pipeline_memory_limit_bytes: int,
-    timeout_seconds: float,
-    name_prefix: str,
-) -> tuple[RunPlan, PlanDescriptor]:
-    """Lower-level owner used by finite scan after its intent is frozen."""
-
-    triggered, descriptor = _freeze_bound_capture(
-        binding=binding,
-        block_id=block_id,
-        camera_ref=camera_ref,
-        sequencer_ref=sequencer_ref,
-        execution_form=execution_form,
-        pipeline_memory_limit_bytes=pipeline_memory_limit_bytes,
-        timeout_seconds=timeout_seconds,
-        name_prefix=name_prefix,
-    )
-    return compile_capture_artifact_pipeline(triggered, repository), descriptor
-
-
 __all__ = [
     "CAPTURE_READOUT_EVENT_AXIS_ID",
     "CaptureRequest",
     "PlanDescriptor",
     "PreparedFiniteCapture",
+    "bind_finite_capture_spec",
 ]

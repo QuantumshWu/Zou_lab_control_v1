@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import fields, is_dataclass
 from numbers import Number
 
 import numpy as np
@@ -19,6 +20,50 @@ from .figure import (
     EvaluatedMeter,
     FigureDocument,
 )
+
+
+_RASTER_FIXED_BYTES = 8 << 20
+_RASTER_BUFFER_MULTIPLIER = 8
+_ARTIST_ARRAY_MULTIPLIER = 4
+
+
+def _array_nbytes(value: object) -> int:
+    if isinstance(value, np.ndarray):
+        return int(value.nbytes)
+    if is_dataclass(value) and not isinstance(value, type):
+        return sum(_array_nbytes(getattr(value, item.name)) for item in fields(value))
+    if isinstance(value, dict):
+        return sum(_array_nbytes(item) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return sum(_array_nbytes(item) for item in value)
+    return 0
+
+
+def estimate_render_peak_nbytes(
+    evaluated: EvaluatedFigureData,
+    *,
+    dpi: float,
+) -> int:
+    """Conservative Agg/PNG peak from immutable evaluated data and canvas size."""
+
+    if not isinstance(evaluated, EvaluatedFigureData):
+        raise TypeError("evaluated must be EvaluatedFigureData")
+    if isinstance(dpi, bool) or not isinstance(dpi, Number) or not math.isfinite(dpi):
+        raise ValueError("dpi must be a finite positive number")
+    dpi = float(dpi)
+    if dpi <= 0:
+        raise ValueError("dpi must be a finite positive number")
+    panels = _panels(evaluated)
+    columns = min(3, max(1, len(panels)))
+    rows = math.ceil(len(panels) / columns)
+    width = math.ceil(5.0 * columns * dpi)
+    height = math.ceil(4.0 * rows * dpi)
+    rgba_bytes = width * height * 4
+    return int(
+        _RASTER_FIXED_BYTES
+        + _RASTER_BUFFER_MULTIPLIER * rgba_bytes
+        + _ARTIST_ARRAY_MULTIPLIER * _array_nbytes(evaluated)
+    )
 
 
 def _address_label(items: tuple[AxisAddress, ...] | tuple[AxisResolution, ...]) -> str:
@@ -301,4 +346,4 @@ def render_evaluated_figure(
     return figure
 
 
-__all__ = ["render_evaluated_figure"]
+__all__ = ["estimate_render_peak_nbytes", "render_evaluated_figure"]
