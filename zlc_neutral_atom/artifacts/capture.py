@@ -67,6 +67,7 @@ from zlc_neutral_atom.runtime.dataset import (
     raw_dataset_seal_provenance_to_tree,
 )
 from zlc_neutral_atom.runtime.pipeline import (
+    CapturePreviewPort,
     MinimalPipelineSpec,
     PipelineResult,
     compile_pipeline,
@@ -1296,6 +1297,8 @@ def _stage_compiled_pulse(
 def compile_capture_artifact_pipeline(
     spec: MinimalPipelineSpec | TriggeredCaptureSpec,
     repository: CaptureRepository,
+    *,
+    preview: CapturePreviewPort | None = None,
 ) -> RunPlan:
     """Add one post-safety CaptureArtifact commit to the exact pipeline."""
 
@@ -1306,9 +1309,9 @@ def compile_capture_artifact_pipeline(
         raise TypeError("capture artifact pipeline requires MinimalPipelineSpec")
     repository._require_active()
     base = (
-        compile_triggered_pipeline(spec)
+        compile_triggered_pipeline(spec, preview=preview)
         if isinstance(spec, TriggeredCaptureSpec)
-        else compile_pipeline(spec)
+        else compile_pipeline(spec, preview=preview)
     )
     base_name = base.name
     base_resource_claims = base.resource_claims

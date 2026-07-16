@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
+from typing import Protocol
 
-from zlc_data import BlockId, DatasetSchema, ValidityMode
+from zlc_data import (
+    AxisId,
+    AxisSpec,
+    BlockId,
+    DatasetSchema,
+    MONITOR_HISTORY,
+    PointLayout,
+    REPEAT,
+)
 from zlc_storage import (
     canonical_text as _canonical_text,
+    nonnegative_integer as _nonnegative_int,
     positive_integer as _positive_int,
     sha256_text,
 )
@@ -21,7 +30,7 @@ from zlc_neutral_atom.acquisition.camera import (
     decode_camera_capture_spec,
 )
 
-from ._failure import record_secondary_failure
+from ._failure import record_secondary_failure, safe_error_summary
 from .capture import (
     BoundCapturePort,
     CameraCapabilityEvidence,
@@ -35,7 +44,11 @@ from .capture import (
 from .dataset import (
     DatasetBuilder,
     DatasetCellSchedule,
+    FrozenDatasetEdge,
+    MonitorDataset,
     SealedDatasetArtifact,
+    dataset_storage_nbytes,
+    mutable_dataset_storage_nbytes,
 )
 from .cleanup import CleanupReport
 from .run import RunContext, RunPlan
@@ -129,6 +142,107 @@ class MinimalPipelineSpec:
             "memory_limit_bytes",
             _positive_int(self.memory_limit_bytes, "memory_limit_bytes"),
         )
+
+
+@dataclass(frozen=True)
+class CapturePreviewSpec:
+    """Process-local capacity-one live view attached to an exact capture."""
+
+    block_id: BlockId
+    dataset_edge: FrozenDatasetEdge
+    downstream_peak_bytes: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.block_id, BlockId):
+            raise TypeError("block_id must be BlockId")
+        if not isinstance(self.dataset_edge, FrozenDatasetEdge):
+            raise TypeError("dataset_edge must be FrozenDatasetEdge")
+        if self.dataset_edge.cell_schedule is not None:
+            raise ValueError("capture preview requires a schedule-free dataset edge")
+        schema = self.dataset_edge.schema
+        if (
+            schema.repeat_axis.size != 1
+            or len(schema.point_axes) != 1
+            or schema.point_axes[0].role != MONITOR_HISTORY
+            or schema.point_axes[0].size != 1
+            or schema.point_layout != PointLayout.rect_c((1,))
+        ):
+            raise ValueError(
+                "capture preview requires capacity-one (R=1, MONITOR_HISTORY=1) storage"
+            )
+        object.__setattr__(
+            self,
+            "downstream_peak_bytes",
+            _nonnegative_int(
+                self.downstream_peak_bytes,
+                "downstream_peak_bytes",
+            ),
+        )
+
+    @classmethod
+    def for_capture(
+        cls,
+        capture: MinimalPipelineSpec,
+        *,
+        block_id: BlockId,
+        downstream_peak_bytes: int,
+    ) -> "CapturePreviewSpec":
+        """Derive the only admitted preview schema without changing cell data axes."""
+
+        if not isinstance(capture, MinimalPipelineSpec):
+            raise TypeError("capture must be MinimalPipelineSpec")
+        contract = capture.measurement.capture_contract
+        schema = DatasetSchema(
+            AxisSpec(
+                AxisId("live-preview.repeat"),
+                "Live preview repeat storage",
+                REPEAT,
+                1,
+                (0,),
+            ),
+            (
+                AxisSpec(
+                    AxisId("live-preview.history"),
+                    "Live preview history",
+                    MONITOR_HISTORY,
+                    1,
+                    (0,),
+                ),
+            ),
+            PointLayout.rect_c((1,)),
+            contract.dataset_schema.cell_schema,
+        )
+        return cls(
+            block_id,
+            FrozenDatasetEdge(schema, contract.dataset_edge.event_adapter),
+            downstream_peak_bytes,
+        )
+
+
+class CapturePreviewPort(Protocol):
+    """Workbench-owned display attachment; ``bind`` transfers dataset lifetime.
+
+    ``fail`` is the terminal release operation after a successful bind.  The
+    capture transaction retains only a non-owning ingest handle and falls back
+    to closing it itself only when the port cannot accept that terminal call.
+    """
+
+    @property
+    def spec(self) -> CapturePreviewSpec: ...
+
+    def bind(
+        self,
+        dataset: MonitorDataset,
+        *,
+        run_id: str,
+        causation_domain_id: str,
+    ) -> None: ...
+
+    def updated(self) -> None: ...
+
+    def fail(self, message: str) -> None: ...
+
+    def source_terminal(self) -> None: ...
 
 
 _PIPELINE_RESULT_TOKEN = object()
@@ -280,29 +394,27 @@ class PipelineResult:
     def is_direct_raw_capture(self) -> bool:
         return self._direct_raw_capture
 
-def dataset_storage_nbytes(schema: DatasetSchema) -> int:
-    """Return exact value-plus-validity bytes for one materialized DataBlock."""
+def _estimate_capture_preview_peak_bytes(spec: CapturePreviewSpec) -> int:
+    """Peak increment owned by the capacity-one monitor/display attachment."""
 
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    value_bytes = math.prod(schema.physical_shape) * int(schema.cell_schema.dtype.itemsize)
-    leading = (
-        schema.repeat_axis.size,
-        schema.point_layout.storage_size,
+    if not isinstance(spec, CapturePreviewSpec):
+        raise TypeError("spec must be CapturePreviewSpec")
+    edge = spec.dataset_edge
+    schema = edge.schema
+    return (
+        edge.payload_max_retained_nbytes
+        + mutable_dataset_storage_nbytes(schema)
+        + dataset_storage_nbytes(schema)
+        + edge.metadata_max_retained_nbytes
+        + spec.downstream_peak_bytes
     )
-    validity = schema.cell_schema.validity_contract
-    if validity.mode is ValidityMode.VALUE:
-        validity_bytes = math.prod(leading)
-    else:
-        component_shape = tuple(
-            schema.cell_schema.axis(axis_id).size
-            for axis_id in validity.component_axis_ids
-        )
-        validity_bytes = math.prod((*leading, *component_shape))
-    return value_bytes + validity_bytes
 
 
-def estimate_pipeline_peak_bytes(spec: MinimalPipelineSpec) -> int:
+def estimate_pipeline_peak_bytes(
+    spec: MinimalPipelineSpec,
+    *,
+    preview_spec: CapturePreviewSpec | None = None,
+) -> int:
     """Conservative peak of buffers whose sizes are owned by this pipeline.
 
     This is not a claim about interpreter or third-party allocator overhead.
@@ -315,20 +427,32 @@ def estimate_pipeline_peak_bytes(spec: MinimalPipelineSpec) -> int:
     contract = spec.measurement.capture_contract
     events = contract.total_events
     dataset_bytes = dataset_storage_nbytes(contract.dataset_schema)
+    mutable_dataset_bytes = mutable_dataset_storage_nbytes(
+        contract.dataset_schema
+    )
     metadata_bytes = (
         events * contract.dataset_edge.metadata_max_retained_nbytes
     )
-    return (
+    exact_peak = (
         contract.estimated_transport_bytes
-        + 2 * dataset_bytes
+        + mutable_dataset_bytes
+        + dataset_bytes
         + metadata_bytes
+    )
+    return (
+        exact_peak
+        if preview_spec is None
+        else exact_peak + _estimate_capture_preview_peak_bytes(preview_spec)
     )
 
 
-def _require_pipeline_memory_budget(spec: MinimalPipelineSpec) -> None:
+def _require_pipeline_memory_budget(
+    spec: MinimalPipelineSpec,
+    preview_spec: CapturePreviewSpec | None = None,
+) -> None:
     """Compute the owner-derived peak and reject it before any allocation."""
 
-    peak = estimate_pipeline_peak_bytes(spec)
+    peak = estimate_pipeline_peak_bytes(spec, preview_spec=preview_spec)
     limit = spec.memory_limit_bytes
     if peak > limit:
         raise MemoryError(f"pipeline peak budget {peak} exceeds limit {limit}")
@@ -379,6 +503,8 @@ class ExactCaptureTransaction:
     builder: DatasetBuilder
     port: BoundCapturePort
     contract: CameraCaptureContract
+    preview_dataset: MonitorDataset | None = None
+    preview_port: CapturePreviewPort | None = None
 
     def start(self, context: RunContext) -> None:
         self.session.prepare(context)
@@ -393,6 +519,16 @@ class ExactCaptureTransaction:
                     timeout=self.port.capability.max_blocking_call_seconds
                 )
             )
+            preview = self.preview_dataset
+            if preview is not None:
+                try:
+                    preview.ingest_latest()
+                    port = self.preview_port
+                    if port is None:
+                        raise RuntimeError("capture preview port disappeared")
+                    port.updated()
+                except BaseException as error:
+                    self._detach_preview(error)
 
     def complete(self, context: RunContext) -> PipelineResult:
         completion: CaptureCompletion = self.session.complete(context)
@@ -416,6 +552,7 @@ class ExactCaptureTransaction:
         )
 
     def fail(self, error: BaseException) -> None:
+        self._detach_preview(error)
         try:
             self.session.fail(error)
         except BaseException as failure_error:
@@ -428,6 +565,7 @@ class ExactCaptureTransaction:
     def abort_preflight(self, error: BaseException) -> None:
         """Release software-only authority before any capture command was attempted."""
 
+        self._detach_preview(error)
         _release_preflight_software(
             self.session,
             self.reservation,
@@ -450,22 +588,122 @@ class ExactCaptureTransaction:
             errors=(*report.errors, *software_errors),
         )
 
+    def _detach_preview(self, error: BaseException) -> None:
+        dataset, self.preview_dataset = self.preview_dataset, None
+        port, self.preview_port = self.preview_port, None
+        if port is not None:
+            try:
+                port.fail(safe_error_summary(error))
+                # bind() transferred lifetime ownership to the preview port.
+                dataset = None
+            except BaseException:
+                pass
+        if dataset is not None:
+            try:
+                dataset.close()
+            except BaseException:
+                pass
+
+    def _finish_preview_source(self) -> None:
+        # bind() transfers dataset lifetime to the Workbench slot.  A normal
+        # terminal therefore drops only this transaction's non-owning handle;
+        # the last visible snapshot remains available until the panel closes.
+        self.preview_dataset = None
+        port, self.preview_port = self.preview_port, None
+        if port is not None:
+            try:
+                port.source_terminal()
+            except BaseException:
+                pass
+
+    def settle_preview_after_cleanup(
+        self,
+        report: CleanupReport,
+        primary: BaseException | None,
+    ) -> None:
+        """Publish a normal terminal only after aggregate cleanup succeeded."""
+
+        if primary is not None:
+            self._detach_preview(primary)
+        elif report.errors:
+            self._detach_preview(report.errors[0])
+        elif report.decisions:
+            decision = report.decisions[0]
+            self._detach_preview(
+                RuntimeError(
+                    "capture cleanup reported an unsafe terminal state: "
+                    f"{decision.reason}"
+                )
+            )
+        else:
+            self._finish_preview_source()
+
+
+def _capture_preview_spec(
+    preview: CapturePreviewPort | None,
+    capture: MinimalPipelineSpec,
+) -> CapturePreviewSpec | None:
+    if preview is None:
+        return None
+    spec = getattr(preview, "spec", None)
+    if not isinstance(spec, CapturePreviewSpec):
+        raise TypeError("preview.spec must be CapturePreviewSpec")
+    exact_edge = capture.measurement.capture_contract.dataset_edge
+    if (
+        spec.dataset_edge.schema.cell_schema is not exact_edge.schema.cell_schema
+        or spec.dataset_edge.event_adapter is not exact_edge.event_adapter
+    ):
+        raise ValueError(
+            "capture preview must share the exact capture cell schema and event adapter"
+        )
+    return spec
+
+
+def _notify_preview_failure(
+    preview: CapturePreviewPort | None,
+    error: BaseException,
+) -> None:
+    if preview is None:
+        return
+    try:
+        preview.fail(safe_error_summary(error))
+    except BaseException:
+        pass
+
+
+def _prepare_exact_capture(
+    spec: MinimalPipelineSpec,
+    context: RunContext,
+    preview: CapturePreviewPort | None,
+    preview_spec: CapturePreviewSpec | None,
+) -> ExactCaptureTransaction:
+    try:
+        return _allocate_exact_capture(spec, context, preview, preview_spec)
+    except BaseException as error:
+        _notify_preview_failure(preview, error)
+        raise
+
 
 def _open_exact_capture_transaction(
     spec: MinimalPipelineSpec,
     context: RunContext,
+    *,
+    preview: CapturePreviewPort | None,
+    preview_spec: CapturePreviewSpec | None,
 ) -> ExactCaptureTransaction:
     """Allocate the single reservation/materializer transaction without touching hardware."""
 
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
-    _require_pipeline_memory_budget(spec)
-    return _allocate_exact_capture(spec, context)
+    _require_pipeline_memory_budget(spec, preview_spec)
+    return _prepare_exact_capture(spec, context, preview, preview_spec)
 
 
 def _allocate_exact_capture(
     spec: MinimalPipelineSpec,
     context: RunContext,
+    preview: CapturePreviewPort | None = None,
+    preview_spec: CapturePreviewSpec | None = None,
 ) -> ExactCaptureTransaction:
     measurement = spec.measurement
     port = measurement.capture_port
@@ -487,6 +725,39 @@ def _allocate_exact_capture(
         )
         readiness = builder.exact_readiness()
         session.bind_exact_consumer(readiness)
+        preview_dataset = None
+        if preview is not None:
+            assert preview_spec is not None
+            tap = None
+            try:
+                tap = session.stream.monitor(
+                    max_events=1,
+                    max_bytes=preview_spec.dataset_edge.payload_max_retained_nbytes,
+                )
+                preview_dataset = MonitorDataset.append_window(
+                    preview_spec.block_id,
+                    tap,
+                    preview_spec.dataset_edge,
+                )
+                preview.bind(
+                    preview_dataset,
+                    run_id=context.run_id.value,
+                    causation_domain_id=session.stream.generation.value,
+                )
+            except BaseException as preview_error:
+                if preview_dataset is not None:
+                    try:
+                        preview_dataset.close()
+                    except BaseException:
+                        pass
+                elif tap is not None:
+                    try:
+                        tap.close()
+                    except BaseException:
+                        pass
+                preview_dataset = None
+                _notify_preview_failure(preview, preview_error)
+                preview = None
         return ExactCaptureTransaction(
             session,
             reservation,
@@ -494,6 +765,8 @@ def _allocate_exact_capture(
             builder,
             port,
             contract,
+            preview_dataset,
+            preview,
         )
     except BaseException as error:
         _release_preflight_software(session, reservation, builder, error)
@@ -510,17 +783,22 @@ def _require_direct_capture(measurement: BoundMeasurement) -> None:
         )
 
 
-def compile_pipeline(spec: MinimalPipelineSpec) -> RunPlan:
+def compile_pipeline(
+    spec: MinimalPipelineSpec,
+    *,
+    preview: CapturePreviewPort | None = None,
+) -> RunPlan:
     """Compile the one supported finite exact path into one flat RunPlan."""
 
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
     _require_direct_capture(spec.measurement)
-    _require_pipeline_memory_budget(spec)
+    preview_spec = _capture_preview_spec(preview, spec)
+    _require_pipeline_memory_budget(spec, preview_spec)
     port = spec.measurement.capture_port
 
     def preflight(context: RunContext) -> ExactCaptureTransaction:
-        return _allocate_exact_capture(spec, context)
+        return _prepare_exact_capture(spec, context, preview, preview_spec)
 
     def execute(context: RunContext, prepared: ExactCaptureTransaction) -> PipelineResult:
         try:
@@ -534,11 +812,17 @@ def compile_pipeline(spec: MinimalPipelineSpec) -> RunPlan:
     def cleanup(
         context: RunContext,
         prepared: ExactCaptureTransaction | None,
-        _primary: BaseException | None,
+        primary: BaseException | None,
     ) -> CleanupReport:
         if prepared is None:
             return port.verify_idle(context)
-        return prepared.cleanup(context)
+        try:
+            report = prepared.cleanup(context)
+        except BaseException as error:
+            prepared._detach_preview(error)
+            raise
+        prepared.settle_preview_after_cleanup(report, primary)
+        return report
 
     return RunPlan(
         name=spec.name,
@@ -576,8 +860,9 @@ def finalize_pipeline_result(
 
 __all__ = [
     "BoundMeasurement",
+    "CapturePreviewPort",
+    "CapturePreviewSpec",
     "compile_pipeline",
-    "dataset_storage_nbytes",
     "ExactCaptureTransaction",
     "estimate_pipeline_peak_bytes",
     "finalize_pipeline_result",

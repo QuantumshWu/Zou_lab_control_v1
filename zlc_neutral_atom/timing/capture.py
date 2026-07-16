@@ -7,9 +7,11 @@ from dataclasses import InitVar, dataclass, field
 from zlc_storage import canonical_text
 
 from zlc_neutral_atom.runtime.pipeline import (
+    CapturePreviewPort,
     ExactCaptureTransaction,
     MinimalPipelineSpec,
     PipelineResult,
+    _capture_preview_spec,
     _open_exact_capture_transaction,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
@@ -141,7 +143,11 @@ class TriggeredPipelineResult:
         return self._lineage
 
 
-def compile_triggered_pipeline(spec: TriggeredCaptureSpec) -> RunPlan:
+def compile_triggered_pipeline(
+    spec: TriggeredCaptureSpec,
+    *,
+    preview: CapturePreviewPort | None = None,
+) -> RunPlan:
     """Compile prepare→camera arm→one FPGA FIRE→drain→terminal into one Run."""
 
     if not isinstance(spec, TriggeredCaptureSpec):
@@ -150,11 +156,17 @@ def compile_triggered_pipeline(spec: TriggeredCaptureSpec) -> RunPlan:
     pulse_port = spec.pulse_port
     if camera_port.device.key == pulse_port.device.key:
         raise ValueError("camera and sequencer must be distinct physical resources")
+    preview_spec = _capture_preview_spec(preview, spec.capture)
 
     def preflight(
         context: RunContext,
     ) -> tuple[ExactCaptureTransaction, PulseSession]:
-        capture = _open_exact_capture_transaction(spec.capture, context)
+        capture = _open_exact_capture_transaction(
+            spec.capture,
+            context,
+            preview=preview,
+            preview_spec=preview_spec,
+        )
         try:
             pulse = pulse_port.open_session(spec.pulse_request)
             return capture, pulse
@@ -181,7 +193,7 @@ def compile_triggered_pipeline(spec: TriggeredCaptureSpec) -> RunPlan:
     def cleanup(
         context: RunContext,
         prepared: tuple[ExactCaptureTransaction, PulseSession] | None,
-        _primary: BaseException | None,
+        primary: BaseException | None,
     ) -> CleanupReport:
         if prepared is None:
             return run_cleanup_steps(
@@ -191,10 +203,12 @@ def compile_triggered_pipeline(spec: TriggeredCaptureSpec) -> RunPlan:
         # On failure/cancel, stop new hardware edges before terminating the
         # camera session.  On success both calls are idempotent terminal checks.
         capture, pulse = prepared
-        return run_cleanup_steps(
+        report = run_cleanup_steps(
             lambda: pulse.cleanup(context),
             lambda: capture.cleanup(context),
         )
+        capture.settle_preview_after_cleanup(report, primary)
+        return report
 
     def finalize(
         context: PostSafetyContext,

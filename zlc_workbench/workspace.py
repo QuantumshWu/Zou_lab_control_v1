@@ -15,6 +15,7 @@ from zlc_frontend import (
     RenderSurface,
     SourceIdentity,
 )
+from zlc_frontend.render import detached_render_fault
 from zlc_storage import (
     canonical_text as _text,
     nonnegative_integer,
@@ -196,19 +197,19 @@ class BoardController:
         self,
         model: BoardModel,
         presenter: BoardPresenter,
-        post_to_owner: object,
+        request_owner_wake: object,
     ) -> None:
         if not isinstance(model, BoardModel):
             raise TypeError("model must be BoardModel")
         if not isinstance(presenter, BoardPresenter):
             raise TypeError("presenter must implement BoardPresenter")
-        if not callable(post_to_owner):
-            raise TypeError("post_to_owner must be callable")
+        if not callable(request_owner_wake):
+            raise TypeError("request_owner_wake must be callable")
         self._owner_thread = threading.get_ident()
         self._lock = threading.Lock()
         self._model = model
         self._presenter: BoardPresenter | None = presenter
-        self._post_to_owner = post_to_owner
+        self._request_owner_wake = request_owner_wake
         self._pending: BoardFrame | None = None
         self._requested_sequence = -1
         self._work_token: object | None = None
@@ -240,13 +241,7 @@ class BoardController:
         with self._lock:
             self._ensure_usable()
             self._model = model
-            self._pending = None
-            self._requested_sequence = -1
-            self._work_token = None
-            self._expected_stamps = {}
-            self._wake_queued = False
-            self._publish_token = None
-            self._source_bindings = {}
+            self._revoke_source_locked()
         self._clear_presenter()
 
     def open_publish_port(
@@ -266,15 +261,21 @@ class BoardController:
         token = object()
         with self._lock:
             self._ensure_usable()
+            self._revoke_source_locked()
             self._publish_token = token
             self._source_bindings = by_panel
-            self._pending = None
-            self._requested_sequence = -1
-            self._work_token = None
-            self._expected_stamps = {}
-            self._wake_queued = False
         self._clear_presenter()
         return BoardPublishPort(self, token)
+
+    def invalidate(self) -> None:
+        """Owner-thread revocation for a source that can no longer justify its front."""
+
+        self._require_owner()
+        with self._lock:
+            if self._closed:
+                return
+            self._revoke_source_locked()
+        self._clear_presenter()
 
     def _admit_work(
         self,
@@ -408,14 +409,14 @@ class BoardController:
                 schedule = True
         if schedule:
             try:
-                post_to_owner = self._post_to_owner
-                if post_to_owner is None:
+                request_owner_wake = self._request_owner_wake
+                if request_owner_wake is None:
                     return False
-                post_to_owner(self.present_pending)
+                request_owner_wake()
             except BaseException as exc:
                 with self._lock:
                     if token is self._publish_token:
-                        self._fault = exc
+                        self._fault = detached_render_fault(exc)
                         self._pending = None
                         self._publish_token = None
                 raise
@@ -440,7 +441,7 @@ class BoardController:
             presenter.present(frame)
         except BaseException as exc:
             with self._lock:
-                self._fault = exc
+                self._fault = detached_render_fault(exc)
                 self._pending = None
             raise
         return True
@@ -459,7 +460,7 @@ class BoardController:
             self._wake_queued = False
             self._closed = True
             presenter = self._presenter
-            self._post_to_owner = None
+            self._request_owner_wake = None
         if presenter is None:
             with self._lock:
                 self._fault = None
@@ -469,7 +470,7 @@ class BoardController:
         except BaseException as exc:
             with self._lock:
                 if self._presenter is presenter:
-                    self._fault = exc
+                    self._fault = detached_render_fault(exc)
                     self._closed = False
             raise
         with self._lock:
@@ -485,10 +486,19 @@ class BoardController:
             presenter.clear()
         except BaseException as exc:
             with self._lock:
-                self._fault = exc
+                self._fault = detached_render_fault(exc)
                 self._pending = None
                 self._publish_token = None
             raise
+
+    def _revoke_source_locked(self) -> None:
+        self._pending = None
+        self._requested_sequence = -1
+        self._work_token = None
+        self._expected_stamps = {}
+        self._wake_queued = False
+        self._publish_token = None
+        self._source_bindings = {}
 
     def _require_owner(self) -> None:
         if threading.get_ident() != self._owner_thread:

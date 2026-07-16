@@ -22,6 +22,12 @@ from zlc_storage import (
 from .figure import DatasetId, EvaluatedInput
 
 
+def detached_render_fault(error: BaseException) -> RuntimeError:
+    """Return string-only diagnostics without retaining a failed render stack."""
+
+    return RuntimeError(f"{type(error).__name__}: {error}")
+
+
 class RenderSurface(Enum):
     """The three deliberately supported rendering ownership modes."""
 
@@ -328,6 +334,7 @@ __all__ = [
     "BoardPresenter",
     "AtomicBoardFront",
     "CoherenceStamp",
+    "detached_render_fault",
     "PanelPresentationIdentity",
     "SourceIdentity",
     "PanelFrame",

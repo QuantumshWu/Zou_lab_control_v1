@@ -71,6 +71,36 @@ from .streams import (
 PayloadT = TypeVar("PayloadT")
 
 
+def dataset_storage_nbytes(schema: DatasetSchema) -> int:
+    """Exact value-plus-validity bytes of one immutable materialization."""
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    value_bytes = math.prod(schema.physical_shape) * int(
+        schema.cell_schema.dtype.itemsize
+    )
+    cells = schema.repeat_axis.size * schema.point_layout.storage_size
+    validity = schema.cell_schema.validity_contract
+    if validity.mode is ValidityMode.VALUE:
+        validity_bytes = cells
+    else:
+        component_shape = tuple(
+            schema.cell_schema.axis(axis_id).size
+            for axis_id in validity.component_axis_ids
+        )
+        validity_bytes = math.prod((cells, *component_shape))
+    return value_bytes + validity_bytes
+
+
+def mutable_dataset_storage_nbytes(schema: DatasetSchema) -> int:
+    """Bytes owned by a mutable materializer, including its written-cell mask."""
+
+    return (
+        dataset_storage_nbytes(schema)
+        + schema.repeat_axis.size * schema.point_layout.storage_size
+    )
+
+
 class DatasetEventAdapter(Protocol[PayloadT]):
     """Typed projection from one immutable stream payload into one dataset cell."""
 
@@ -1697,9 +1727,15 @@ class MonitorDataset(Generic[PayloadT]):
             selected = self._select_current_ref_locked(ref)
             if self._cycle_schedule is None:
                 order = self._append_order_locked()
-                values = self._values[:, order, ...]
-                written = self._written[:, order]
-                validity = self._validity[:, order, ...]
+                canonical = tuple(range(self.schema.point_layout.storage_size))
+                if order == canonical:
+                    values = self._values
+                    written = self._written
+                    validity = self._validity
+                else:
+                    values = self._values[:, order, ...]
+                    written = self._written[:, order]
+                    validity = self._validity[:, order, ...]
                 metadata = tuple(self._cell_metadata[index] for index in order)
                 event_refs = tuple(self._event_refs[index] for index in order)
             else:
@@ -1855,6 +1891,8 @@ __all__ = [
     "SnapshotExpired",
     "SealedDatasetArtifact",
     "dataset_cell_permutation_digest",
+    "dataset_storage_nbytes",
+    "mutable_dataset_storage_nbytes",
     "raw_dataset_seal_provenance_from_tree",
     "raw_dataset_seal_provenance_to_tree",
 ]
