@@ -40,6 +40,23 @@ def open_data_figure_workbench(figure, *, memory_limit_bytes=None):
     return _open(figure, memory_limit_bytes=memory_limit_bytes)
 
 
+def open_occupancy_cell_workbench(
+    cell_loader,
+    reference,
+    *,
+    selection=None,
+    memory_limit_bytes=None,
+):
+    """Open one exact same-shot occupancy map without eager Qt imports."""
+
+    from ._occupancy import open_occupancy_cell_workbench as _open
+
+    options = {"selection": selection}
+    if memory_limit_bytes is not None:
+        options["memory_limit_bytes"] = memory_limit_bytes
+    return _open(cell_loader, reference, **options)
+
+
 def open_figure_workbench(
     figure_factory,
     source,
@@ -114,6 +131,7 @@ __all__ = [
     "open_capture_workbench",
     "open_data_figure_workbench",
     "open_figure_workbench",
+    "open_occupancy_cell_workbench",
     "open_offline_pulse_workbench",
     "open_pulse_workbench",
     "open_scan_workbench",

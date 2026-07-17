@@ -179,22 +179,50 @@ class _StoredOccupancy:
 
 @dataclass(frozen=True, slots=True)
 class OccupancyArtifactInspection:
-    """FINAL occupancy schemas obtained without materializing result arrays."""
+    """FINAL occupancy facts obtained without materializing result arrays."""
 
     reference: OccupancyArtifactRef
+    source_capture_ref: CaptureArtifactRef
+    calibration_reference: CalibrationArtifactRef
+    readout_event_axis_id: AxisId
     model_kind: ReadoutModelKind
+    generation: StreamGenerationId
     counts_schema: DatasetSchema
     occupied_schema: DatasetSchema
+    inspection_retained_upper_bound_bytes: int
+    materialization_peak_upper_bound_bytes: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
+        if not isinstance(self.source_capture_ref, CaptureArtifactRef):
+            raise TypeError("source_capture_ref must be CaptureArtifactRef")
+        if not isinstance(self.calibration_reference, CalibrationArtifactRef):
+            raise TypeError("calibration_reference must be CalibrationArtifactRef")
+        if not isinstance(self.readout_event_axis_id, AxisId):
+            raise TypeError("readout_event_axis_id must be AxisId")
         if not isinstance(self.model_kind, ReadoutModelKind):
             raise TypeError("model_kind must be ReadoutModelKind")
+        if not isinstance(self.generation, StreamGenerationId):
+            raise TypeError("generation must be StreamGenerationId")
         _require_occupancy_output_schemas(
             self.counts_schema,
             self.occupied_schema,
         )
+        for field in (
+            "inspection_retained_upper_bound_bytes",
+            "materialization_peak_upper_bound_bytes",
+        ):
+            value = getattr(self, field)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{field} must be a positive integer")
+        if (
+            self.materialization_peak_upper_bound_bytes
+            < self.inspection_retained_upper_bound_bytes
+        ):
+            raise ValueError(
+                "occupancy materialization bound is smaller than its inspection"
+            )
 
 
 def _artifact_to_tree(value: _StoredOccupancy) -> dict[str, object]:
@@ -760,16 +788,31 @@ class OccupancyRepository:
         with self._root_lease.borrow() as read_borrow:
             read_borrow.require_active()
             intent = self._require_final_commit(reference)
-            stored, _metadata_bytes = self._stored(
+            stored, metadata_bytes = self._stored(
                 reference,
                 memory_limit_bytes=memory_limit_bytes,
             )
             self._require_run_generation(stored, intent)
+            raw_bytes = (
+                stored.counts_blob.size
+                + stored.occupied_blob.size
+                + stored.validity_blob.size
+            )
+            inspection_retained = (
+                _REPOSITORY_FIXED_BYTES
+                + _METADATA_MATERIALIZATION_MULTIPLIER * metadata_bytes
+            )
             return OccupancyArtifactInspection(
                 reference,
+                stored.source_capture_ref,
+                stored.calibration_reference,
+                stored.readout_event_axis_id,
                 stored.model_kind,
+                stored.generation,
                 stored.counts_schema,
                 stored.occupied_schema,
+                inspection_retained,
+                _storage_peak_bytes(raw_bytes, metadata_bytes),
             )
 
     def admit(

@@ -39,6 +39,48 @@ from .render_style import (
 _RASTER_FIXED_BYTES = 8 << 20
 _RASTER_BUFFER_MULTIPLIER = 8
 _ARTIST_ARRAY_MULTIPLIER = 8
+_SITE_RADIUS_BLOCK = 128
+
+
+def site_ring_radius(centers_xy: np.ndarray) -> float:
+    """Return the established 30%-nearest-neighbour site-ring radius.
+
+    The old vectorized expression allocated an ``S x S x 2`` temporary.  This
+    exact block traversal preserves its duplicate-center behavior while fixing
+    scratch space at three float blocks plus one boolean mask.
+    """
+
+    centers = np.asarray(centers_xy, dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[1:] != (2,):
+        raise ValueError("centers_xy must have shape (sites, 2)")
+    if len(centers) < 2 or not np.all(np.isfinite(centers)):
+        return 1.5
+    block = min(_SITE_RADIUS_BLOCK, len(centers))
+    dx = np.empty((block, block), dtype=np.float64)
+    dy = np.empty((block, block), dtype=np.float64)
+    squared = np.empty((block, block), dtype=np.float64)
+    nonpositive = np.empty((block, block), dtype=bool)
+    nearest_squared = math.inf
+    for left_start in range(0, len(centers), block):
+        left = centers[left_start : left_start + block]
+        rows = len(left)
+        for right_start in range(left_start, len(centers), block):
+            right = centers[right_start : right_start + block]
+            columns = len(right)
+            current_dx = dx[:rows, :columns]
+            current_dy = dy[:rows, :columns]
+            current_squared = squared[:rows, :columns]
+            current_nonpositive = nonpositive[:rows, :columns]
+            np.subtract(left[:, None, 0], right[None, :, 0], out=current_dx)
+            np.square(current_dx, out=current_squared)
+            np.subtract(left[:, None, 1], right[None, :, 1], out=current_dy)
+            np.square(current_dy, out=current_dy)
+            np.add(current_squared, current_dy, out=current_squared)
+            np.less_equal(current_squared, 0.0, out=current_nonpositive)
+            current_squared[current_nonpositive] = math.inf
+            nearest_squared = min(nearest_squared, float(np.min(current_squared)))
+    nearest = math.sqrt(nearest_squared)
+    return max(1.5, 0.3 * nearest) if math.isfinite(nearest) else 1.5
 
 
 def _render_dpi(value: float) -> float:
@@ -677,5 +719,6 @@ __all__ = [
     "render_evaluated_figure",
     "release_agg_figure",
     "save_evaluated_figure",
+    "site_ring_radius",
     "SingleCurveAggRenderer",
 ]

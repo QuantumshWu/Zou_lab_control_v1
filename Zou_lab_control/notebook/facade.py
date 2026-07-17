@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Iterator, Mapping, TYPE_CHECKING
 from uuid import uuid4
 
+import numpy as np
+
 from zlc_neutral_atom.installation import (
     DeviceRef,
     DeviceCatalogView,
@@ -26,13 +28,17 @@ from zlc_data import (
     AxisSpec,
     BlockId,
     CommittedTransform,
+    ComponentValidity,
     DataTransformSpec,
     FitNumericPolicy,
     FitParameterConstraint,
     FitSpec,
+    IndexSelection,
     Selection,
     commit_transform,
+    expand_value_validity,
     fit_spec_for,
+    resolve_selection_indices,
 )
 from zlc_neutral_atom.artifacts import (
     AdmittedCaptureFitResult,
@@ -473,6 +479,64 @@ def _occupancy_repository(
         repository = OccupancyRepository(services.occupancy_repository_path)
         services.occupancy_repository = repository
     return repository
+
+
+def _resolve_exact_occupancy_cell(schema, selection: Selection | None):
+    """Resolve one complete physical cell without first/latest/reduce fallbacks."""
+
+    from zlc_data import DatasetSchema
+    from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if selection is not None and not isinstance(selection, Selection):
+        raise TypeError("selection must be Selection or None")
+    axes = (schema.repeat_axis, *schema.point_axes)
+    by_axis = {} if selection is None else {
+        term.axis_id: term for term in selection.terms
+    }
+    known = {axis.axis_id for axis in axes}
+    unknown = tuple(axis_id for axis_id in by_axis if axis_id not in known)
+    if unknown:
+        raise ValueError(
+            "occupancy cell selection may name only repeat and point axes"
+        )
+    indices = []
+    labels = []
+    for axis in axes:
+        term = by_axis.get(axis.axis_id)
+        if term is None:
+            if axis.size != 1:
+                raise ValueError(
+                    f"occupancy cell requires an explicit index for axis {axis.axis_id}"
+                )
+            index = 0
+        else:
+            if not isinstance(term, IndexSelection):
+                raise TypeError(
+                    "occupancy cell selection accepts only exact IndexSelection terms"
+                )
+            resolved, drop = resolve_selection_indices(axis, term)
+            if not drop or len(resolved) != 1:
+                raise ValueError("occupancy cell selection must resolve one exact index")
+            index = resolved.start
+        coordinate = axis.coordinate_at(index)
+        unit = "" if axis.unit is None else f" {axis.unit}"
+        labels.append(f"{axis.name}={coordinate}{unit} [index {index}]")
+        indices.append(index)
+    repeat_index = indices[0]
+    point_multi = tuple(indices[1:])
+    try:
+        point_storage_index = schema.point_layout.storage_index(point_multi)
+    except KeyError as error:
+        raise ValueError(
+            f"selected logical point {point_multi} is absent from PointLayout"
+        ) from error
+    return (
+        DatasetCellAddress(repeat_index, point_storage_index),
+        point_multi,
+        " | ".join(labels),
+    )
 
 
 class PulseFacade:
@@ -1217,6 +1281,221 @@ class ReadoutFacade:
             )
             self._require_binding(resolved.readout_binding)
             return resolved
+
+    def _load_occupancy_cell_source(
+        self,
+        reference: OccupancyArtifactRef,
+        selection: Selection | None,
+        *,
+        memory_limit_bytes: int,
+    ):
+        """Compose one self-contained exact-cell view under one aggregate cap."""
+
+        if not isinstance(reference, OccupancyArtifactRef):
+            raise TypeError("reference must be OccupancyArtifactRef")
+        if selection is not None and not isinstance(selection, Selection):
+            raise TypeError("selection must be Selection or None")
+        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        from zlc_frontend.occupancy_render import (
+            OccupancyCellView,
+            estimate_occupancy_cell_view_retained_nbytes,
+        )
+
+        with _service_guard(self._token) as services:
+            occupancy_repository = _occupancy_repository(services)
+            calibration_repository = _calibration_repository(services)
+            inspected = occupancy_repository.inspect_final(
+                reference,
+                memory_limit_bytes=limit,
+            )
+            inspection_headroom = inspected.inspection_retained_upper_bound_bytes
+            if inspection_headroom >= limit:
+                raise MemoryError(
+                    "occupancy inspection leaves no display budget"
+                )
+            address, logical_point, cell_label = _resolve_exact_occupancy_cell(
+                inspected.occupied_schema,
+                selection,
+            )
+            source_info = services.capture_repository.inspect_final(
+                inspected.source_capture_ref,
+                memory_limit_bytes=limit - inspection_headroom,
+            )
+            inspection_headroom += source_info.inspection_retained_upper_bound_bytes
+            if inspection_headroom >= limit:
+                raise MemoryError(
+                    "occupancy and capture inspections leave no display budget"
+                )
+            calibration_info = calibration_repository.inspect_final(
+                inspected.calibration_reference,
+                memory_limit_bytes=limit - inspection_headroom,
+            )
+            inspection_headroom += (
+                calibration_info.inspection_retained_upper_bound_bytes
+            )
+            if inspection_headroom >= limit:
+                raise MemoryError(
+                    "occupancy dependency inspections leave no display budget"
+                )
+            self._require_binding(source_info.readout_binding)
+            if calibration_info.readout_binding != source_info.readout_binding:
+                raise ValueError("occupancy source and calibration bindings differ")
+            frame_schema = source_info.dataset_schema.cell_schema
+            if len(frame_schema.data_shape) != 2:
+                raise ValueError("physical occupancy map requires a two-dimensional camera frame")
+            site_axis = inspected.occupied_schema.cell_schema.data_axes[0]
+            view_bound = estimate_occupancy_cell_view_retained_nbytes(
+                frame_schema.data_shape,
+                frame_schema.dtype,
+                site_axis.size,
+            )
+            available = limit - inspection_headroom - view_bound
+            if available <= 0 or (
+                inspected.materialization_peak_upper_bound_bytes > available
+            ):
+                raise MemoryError(
+                    "occupancy inspections, exact-cell projection, and materialization "
+                    "exceed the display budget"
+                )
+
+            resolved = occupancy_repository.admit(
+                reference,
+                services.capture_repository,
+                calibration_repository,
+                memory_limit_bytes=available,
+            )
+            artifact = resolved.artifact
+            if (
+                artifact.source_capture_ref != inspected.source_capture_ref
+                or artifact.calibration_reference != inspected.calibration_reference
+                or artifact.readout_event_axis_id != inspected.readout_event_axis_id
+                or artifact.model_kind is not inspected.model_kind
+                or artifact.generation != inspected.generation
+                or artifact.counts.schema != inspected.counts_schema
+                or artifact.occupied.schema != inspected.occupied_schema
+            ):
+                raise ValueError("materialized occupancy differs from FINAL inspection")
+            r = address.repeat_index
+            p = address.point_storage_index
+            occupied = np.array(
+                artifact.occupied.values[r, p, :],
+                copy=True,
+                order="C",
+            )
+            validity = artifact.occupied.validity
+            if not isinstance(validity, ComponentValidity):
+                raise TypeError("occupancy artifact lacks component validity")
+            site_validity = np.array(validity.mask[r, p, :], copy=True, order="C")
+            revision = artifact.occupied.revision
+            generation = artifact.generation
+            model_kind = artifact.model_kind
+            source_ref = artifact.source_capture_ref
+            calibration_ref = artifact.calibration_reference
+            del artifact, resolved, validity
+
+            if calibration_info.artifact_decode_peak_upper_bound_bytes > available:
+                raise MemoryError(
+                    "dependency inspections, calibration artifact, and occupancy cell "
+                    "view exceed the display budget"
+                )
+            calibration = calibration_repository.load(
+                calibration_ref,
+                memory_limit_bytes=available,
+            )
+            calibration_site_axis = calibration.site_map.site_axis
+            if calibration_site_axis != site_axis:
+                raise ValueError("occupancy SITE axis differs from its calibration")
+            if np.any(site_validity & ~calibration.site_map.validity.mask):
+                raise ValueError("occupancy marks a calibration-invalid site as valid")
+            centers_xy = np.array(
+                calibration.site_map.coordinates_xy,
+                copy=True,
+                order="C",
+            )
+            del calibration, calibration_site_axis
+
+            if source_info.dataset_schema.repeat_axis != inspected.occupied_schema.repeat_axis or (
+                source_info.dataset_schema.point_axes != inspected.occupied_schema.point_axes
+                or source_info.dataset_schema.point_layout
+                != inspected.occupied_schema.point_layout
+            ):
+                raise ValueError("occupancy outer axes differ from the source capture")
+            if source_info.admission_decode_peak_upper_bound_bytes > available:
+                raise MemoryError(
+                    "dependency inspections, capture admission, and occupancy cell view "
+                    "exceed the display budget"
+                )
+            if (
+                source_info.admission_retained_upper_bound_bytes
+                + source_info.max_read_scratch_bytes
+                > available
+            ):
+                raise MemoryError(
+                    "dependency inspections, exact source-frame read, and occupancy cell "
+                    "view exceed the display budget"
+                )
+            source = services.capture_repository.admit(source_ref)
+            frame_source = source.artifact.frame_source
+            if frame_source.schema != source_info.dataset_schema:
+                raise ValueError("admitted capture differs from its FINAL inspection")
+            if frame_source.revision != revision:
+                raise ValueError("occupancy revision differs from its source frame revision")
+            sample = frame_source.read(address)
+            if sample.image.schema != frame_schema:
+                raise ValueError("exact source frame differs from the inspected frame schema")
+            frame_validity = expand_value_validity(
+                sample.image.validity,
+                sample.image.schema,
+            )
+            metadata = sample.metadata
+            timestamp = f"{metadata.captured_at:.9f}s"
+            summary = (
+                f"{reference.target_ref} | source={source_ref.target_ref} | "
+                f"calibration={calibration_ref.target_ref}\n"
+                f"model={model_kind.value} | revision={revision.value} | "
+                f"generation={generation.value} | address=({r}, {p}) | "
+                f"logical_point={logical_point}\n"
+                f"frame ordinal={metadata.source_ordinal} | frame_stamp={metadata.frame_stamp} | "
+                f"camera_stamp={metadata.camera_stamp} | captured_at={timestamp} | "
+                f"correlation={metadata.correlation_id}"
+            )
+            view = OccupancyCellView(
+                frame=sample.image.values,
+                frame_validity=frame_validity,
+                centers_xy=centers_xy,
+                occupied=occupied,
+                site_validity=site_validity,
+                cell_label=f"Exact occupancy cell | {cell_label}",
+                summary=summary,
+                value_unit=frame_schema.value_unit,
+            )
+            if view.array_nbytes > view_bound:
+                raise MemoryError("occupancy cell projection exceeded its owner bound")
+            del source, frame_source, sample, frame_validity
+            return view, view_bound
+
+    def occupancy_cell_gui(
+        self,
+        reference: OccupancyArtifactRef,
+        *,
+        selection: Selection | None = None,
+        memory_limit_bytes: int = _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES,
+    ):
+        """Open one exact same-shot camera/occupancy physical map."""
+
+        if not isinstance(reference, OccupancyArtifactRef):
+            raise TypeError("reference must be OccupancyArtifactRef")
+        if selection is not None and not isinstance(selection, Selection):
+            raise TypeError("selection must be Selection or None")
+        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        from Zou_lab_control.workbench import open_occupancy_cell_workbench
+
+        return open_occupancy_cell_workbench(
+            self._load_occupancy_cell_source,
+            reference,
+            selection=selection,
+            memory_limit_bytes=limit,
+        )
 
 
 def _project_notebook_figure(

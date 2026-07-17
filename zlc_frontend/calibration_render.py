@@ -18,7 +18,7 @@ from zlc_storage import canonical_text, positive_integer
 
 from .encoded_raster import EncodedRasterDocument, EncodedRasterPage
 from .image_raster import png_raster_size
-from .matplotlib_render import release_agg_figure
+from .matplotlib_render import release_agg_figure, site_ring_radius
 from .render_style import (
     FIT_FAILURE_COLOR,
     HIST_FILL_ALPHA,
@@ -309,16 +309,6 @@ def _format_metric(value: float) -> str:
     return "N/A" if not math.isfinite(value) else f"{value:.4f}"
 
 
-def _site_ring_radius(centers: np.ndarray) -> float:
-    if len(centers) < 2:
-        return 1.5
-    delta = centers[:, None, :] - centers[None, :, :]
-    distances = np.sqrt(np.sum(delta * delta, axis=2))
-    distances[distances == 0.0] = np.inf
-    nearest = float(np.min(distances))
-    return max(1.5, 0.3 * nearest) if math.isfinite(nearest) else 1.5
-
-
 def _new_figure(width: int, height: int) -> Figure:
     figure = Figure(
         figsize=(width / _SCREEN_DPI, height / _SCREEN_DPI),
@@ -384,7 +374,7 @@ def _build_overview(view: CalibrationReportView, figure: Figure) -> None:
         mask=~view.reference_average_validity,
     )
     site_axis.imshow(image, cmap=cmap, origin="upper", interpolation="nearest")
-    radius = _site_ring_radius(view.actual_centers_xy)
+    radius = site_ring_radius(view.actual_centers_xy)
     valid_color = SITE_OCCUPANCY_STYLE["empty"]["color"]
     for site, ((x, y), valid, box) in enumerate(
         zip(

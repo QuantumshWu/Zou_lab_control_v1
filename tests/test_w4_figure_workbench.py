@@ -19,6 +19,7 @@ import pytest
 import Zou_lab_control.notebook as zlc
 from Zou_lab_control.workbench import open_data_figure_workbench
 from zlc_data import (
+    READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
     SITE,
@@ -29,6 +30,7 @@ from zlc_data import (
     DataBlock,
     DatasetRevision,
     DatasetSchema,
+    IndexSelection,
     OwnedSnapshot,
     PointLayout,
     Selection,
@@ -971,6 +973,247 @@ def test_public_occupancy_figure_gui_forwards_selected_output_off_qt_owner(
             QtWidgets.QLabel,
             "figureViewerSummary",
         ).text()
+        _close(application, window)
+        assert experiment.figure_document(reference).layers
+    finally:
+        if window.isVisible():
+            _close(application, window)
+
+
+def test_exact_occupancy_cell_selection_uses_named_axes_and_sparse_layout():
+    from Zou_lab_control.notebook.facade import _resolve_exact_occupancy_cell
+
+    repeat = _axis("exact.repeat", REPEAT, 2, ("r0", "r1"))
+    scan = _axis("exact.scan", SCAN_POINT, 3, (-2.0, 0.0, 4.0))
+    event = _axis("exact.event", READOUT_EVENT, 1, ("readout",))
+    site = _axis("exact.site", SITE, 2, ("left", "right"))
+    schema = DatasetSchema(
+        repeat,
+        (scan, event),
+        PointLayout.explicit((3, 1), ((2, 0), (0, 0))),
+        ValueSchema(
+            (site,),
+            ValidityContract.components(site.axis_id),
+            np.dtype(bool),
+        ),
+    )
+    selection = Selection(
+        (
+            IndexSelection(repeat.axis_id, 1),
+            IndexSelection(scan.axis_id, 2),
+        )
+    )
+    address, logical, label = _resolve_exact_occupancy_cell(schema, selection)
+    assert (address.repeat_index, address.point_storage_index) == (1, 0)
+    assert logical == (2, 0)
+    assert "exact.repeat=r1" in label and "exact.scan=4" in label
+
+    with pytest.raises(ValueError, match="explicit index"):
+        _resolve_exact_occupancy_cell(schema, None)
+    with pytest.raises(ValueError, match="absent from PointLayout"):
+        _resolve_exact_occupancy_cell(
+            schema,
+            Selection(
+                (
+                    IndexSelection(repeat.axis_id, 0),
+                    IndexSelection(scan.axis_id, 1),
+                )
+            ),
+        )
+    with pytest.raises(TypeError, match="only exact IndexSelection"):
+        _resolve_exact_occupancy_cell(
+            schema,
+            Selection(
+                (
+                    IndexSelection(repeat.axis_id, 0),
+                    Selection.index_range(scan.axis_id, 0, 1).terms[0],
+                )
+            ),
+        )
+
+
+def test_exact_occupancy_cell_loader_reads_one_same_address_without_full_capture(
+    occupancy_product,
+    monkeypatch,
+):
+    from zlc_neutral_atom.artifacts.capture import AdmittedCapture
+    from zlc_neutral_atom.artifacts.capture_frames import CaptureFrameSource
+
+    experiment, reference, resolved = occupancy_product
+    calls = []
+    original_read = CaptureFrameSource.read
+
+    def traced_read(self, address):
+        sample = original_read(self, address)
+        calls.append((address, sample))
+        return sample
+
+    def forbidden_materialize(*_args, **_kwargs):
+        raise AssertionError("exact-cell display must not materialize the full capture")
+
+    monkeypatch.setattr(CaptureFrameSource, "read", traced_read)
+    monkeypatch.setattr(CaptureFrameSource, "materialize", forbidden_materialize)
+    monkeypatch.setattr(AdmittedCapture, "materialize_snapshot", forbidden_materialize)
+    view, retained = experiment.readout._load_occupancy_cell_source(
+        reference,
+        None,
+        memory_limit_bytes=512 << 20,
+    )
+    assert len(calls) == 1
+    address, sample = calls[0]
+    assert (address.repeat_index, address.point_storage_index) == (0, 0)
+    np.testing.assert_array_equal(view.frame, sample.image.values)
+    np.testing.assert_array_equal(
+        view.occupied,
+        resolved.artifact.occupied.values[0, 0, :],
+    )
+    np.testing.assert_array_equal(
+        view.site_validity,
+        resolved.artifact.occupied.validity.mask[0, 0, :],
+    )
+    assert retained >= view.array_nbytes
+    assert "address=(0, 0)" in view.summary
+    assert resolved.artifact.source_capture_ref.target_ref in view.summary
+    assert resolved.artifact.calibration_reference.target_ref in view.summary
+
+
+def test_exact_occupancy_cell_invalid_site_is_not_drawn_as_empty():
+    from matplotlib.collections import EllipseCollection
+    from matplotlib.colors import to_rgba
+    from matplotlib.figure import Figure
+    from zlc_frontend.occupancy_render import OccupancyCellView, _build_site_map
+    from zlc_frontend.render_style import (
+        FIT_FAILURE_COLOR,
+        SITE_OCCUPANCY_STYLE,
+        render_style_context,
+    )
+
+    view = OccupancyCellView(
+        frame=np.arange(36, dtype=np.uint16).reshape(6, 6),
+        frame_validity=np.ones((6, 6), dtype=bool),
+        centers_xy=np.asarray(((1.0, 1.0), (3.0, 1.0), (5.0, 1.0))),
+        occupied=np.asarray((False, True, False)),
+        site_validity=np.asarray((True, True, False)),
+        cell_label="exact cell",
+        summary="three-state oracle",
+    )
+    figure = Figure()
+    with render_style_context():
+        _build_site_map(view, figure)
+    rings = tuple(
+        item
+        for item in figure.axes[0].collections
+        if isinstance(item, EllipseCollection)
+    )
+    assert len(rings) == 3
+    assert rings[0].get_edgecolors()[0] == pytest.approx(
+        to_rgba(
+            SITE_OCCUPANCY_STYLE["empty"]["color"],
+            SITE_OCCUPANCY_STYLE["empty"]["alpha"],
+        )
+    )
+    assert rings[1].get_edgecolors()[0] == pytest.approx(
+        to_rgba(
+            SITE_OCCUPANCY_STYLE["occupied"]["color"],
+            SITE_OCCUPANCY_STYLE["occupied"]["alpha"],
+        )
+    )
+    assert rings[2].get_edgecolors()[0] == pytest.approx(
+        to_rgba(FIT_FAILURE_COLOR, 0.95)
+    )
+    assert rings[2].get_linestyles()[0][1] is not None
+
+
+def test_site_ring_radius_finds_a_pair_across_fixed_workspace_blocks():
+    from zlc_frontend.matplotlib_render import site_ring_radius
+
+    centers = np.column_stack(
+        (np.arange(260, dtype=np.float64) * 100.0, np.zeros(260))
+    )
+    centers[128, 0] = centers[127, 0] + 10.0
+    assert site_ring_radius(centers) == pytest.approx(3.0)
+
+
+def test_occupancy_cell_budget_includes_all_retained_inspections(
+    occupancy_product,
+    monkeypatch,
+):
+    from zlc_frontend.occupancy_render import (
+        estimate_occupancy_cell_view_retained_nbytes,
+    )
+    from zlc_neutral_atom.readout.occupancy_repository import OccupancyRepository
+
+    experiment, reference, _resolved = occupancy_product
+    from Zou_lab_control.notebook.facade import _service_guard, _occupancy_repository
+
+    with _service_guard(experiment.readout._token) as app_services:
+        inspected = _occupancy_repository(app_services).inspect_final(reference)
+        source = app_services.capture_repository.inspect_final(
+            inspected.source_capture_ref,
+        )
+        calibration = app_services.calibration_repository.inspect_final(
+            inspected.calibration_reference,
+        )
+    frame = source.dataset_schema.cell_schema
+    sites = inspected.occupied_schema.cell_schema.data_axes[0].size
+    view_bound = estimate_occupancy_cell_view_retained_nbytes(
+        frame.data_shape,
+        frame.dtype,
+        sites,
+    )
+    inspection_headroom = (
+        inspected.inspection_retained_upper_bound_bytes
+        + source.inspection_retained_upper_bound_bytes
+        + calibration.inspection_retained_upper_bound_bytes
+    )
+    limit = (
+        inspected.materialization_peak_upper_bound_bytes
+        + view_bound
+        + inspection_headroom
+        - 1
+    )
+    assert inspected.materialization_peak_upper_bound_bytes + view_bound <= limit
+    calls = []
+
+    def forbidden_admit(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("aggregate-over-budget display must reject before admission")
+
+    monkeypatch.setattr(OccupancyRepository, "admit", forbidden_admit)
+    with pytest.raises(MemoryError, match="inspections, exact-cell projection"):
+        experiment.readout._load_occupancy_cell_source(
+            reference,
+            None,
+            memory_limit_bytes=limit,
+        )
+    assert calls == []
+
+
+def test_public_exact_occupancy_cell_gui_stays_off_qt_owner(
+    application,
+    occupancy_product,
+    monkeypatch,
+):
+    experiment, reference, _resolved = occupancy_product
+    owner_thread = threading.get_ident()
+    calls = []
+    original = type(experiment.readout)._load_occupancy_cell_source
+
+    def traced(self, *args, **kwargs):
+        calls.append(threading.get_ident())
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(experiment.readout), "_load_occupancy_cell_source", traced)
+    window = experiment.readout.occupancy_cell_gui(reference)
+    try:
+        _until(application, lambda: window.raster_ready, timeout=45.0)
+        assert calls and calls == [calls[0]] and calls[0] != owner_thread
+        assert "address=(0, 0)" in window.findChild(
+            QtWidgets.QLabel,
+            "occupancyCellSummary",
+        ).text()
+        mode = window.findChild(QtWidgets.QLabel, "occupancyCellMode")
+        assert "SAME-SHOT FRAME" in mode.text()
         _close(application, window)
         assert experiment.figure_document(reference).layers
     finally:
