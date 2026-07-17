@@ -41,6 +41,7 @@ def open_data_figure_workbench(figure, *, memory_limit_bytes=None):
 
 
 def open_occupancy_cell_workbench(
+    navigation_loader,
     cell_loader,
     reference,
     *,
@@ -54,7 +55,7 @@ def open_occupancy_cell_workbench(
     options = {"selection": selection}
     if memory_limit_bytes is not None:
         options["memory_limit_bytes"] = memory_limit_bytes
-    return _open(cell_loader, reference, **options)
+    return _open(navigation_loader, cell_loader, reference, **options)
 
 
 def open_figure_workbench(

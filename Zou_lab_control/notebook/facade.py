@@ -33,12 +33,10 @@ from zlc_data import (
     FitNumericPolicy,
     FitParameterConstraint,
     FitSpec,
-    IndexSelection,
     Selection,
     commit_transform,
     expand_value_validity,
     fit_spec_for,
-    resolve_selection_indices,
 )
 from zlc_neutral_atom.artifacts import (
     AdmittedCaptureFitResult,
@@ -481,61 +479,28 @@ def _occupancy_repository(
     return repository
 
 
-def _resolve_exact_occupancy_cell(schema, selection: Selection | None):
-    """Resolve one complete physical cell without first/latest/reduce fallbacks."""
+def _occupancy_cell_navigation(reference, inspected):
+    """Project neutral FINAL metadata into the frontend-owned navigation value."""
 
-    from zlc_data import DatasetSchema
-    from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
+    from zlc_frontend.occupancy_render import (
+        OccupancyCellNavigation,
+        estimate_occupancy_navigation_retained_nbytes,
+    )
 
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    if selection is not None and not isinstance(selection, Selection):
-        raise TypeError("selection must be Selection or None")
+    schema = inspected.occupied_schema
     axes = (schema.repeat_axis, *schema.point_axes)
-    by_axis = {} if selection is None else {
-        term.axis_id: term for term in selection.terms
-    }
-    known = {axis.axis_id for axis in axes}
-    unknown = tuple(axis_id for axis_id in by_axis if axis_id not in known)
-    if unknown:
-        raise ValueError(
-            "occupancy cell selection may name only repeat and point axes"
-        )
-    indices = []
-    labels = []
-    for axis in axes:
-        term = by_axis.get(axis.axis_id)
-        if term is None:
-            if axis.size != 1:
-                raise ValueError(
-                    f"occupancy cell requires an explicit index for axis {axis.axis_id}"
-                )
-            index = 0
-        else:
-            if not isinstance(term, IndexSelection):
-                raise TypeError(
-                    "occupancy cell selection accepts only exact IndexSelection terms"
-                )
-            resolved, drop = resolve_selection_indices(axis, term)
-            if not drop or len(resolved) != 1:
-                raise ValueError("occupancy cell selection must resolve one exact index")
-            index = resolved.start
-        coordinate = axis.coordinate_at(index)
-        unit = "" if axis.unit is None else f" {axis.unit}"
-        labels.append(f"{axis.name}={coordinate}{unit} [index {index}]")
-        indices.append(index)
-    repeat_index = indices[0]
-    point_multi = tuple(indices[1:])
-    try:
-        point_storage_index = schema.point_layout.storage_index(point_multi)
-    except KeyError as error:
-        raise ValueError(
-            f"selected logical point {point_multi} is absent from PointLayout"
-        ) from error
-    return (
-        DatasetCellAddress(repeat_index, point_storage_index),
-        point_multi,
-        " | ".join(labels),
+    return OccupancyCellNavigation(
+        artifact_identity=reference.target_ref,
+        schema_fingerprint=schema.fingerprint,
+        generation=inspected.generation,
+        repeat_axis=schema.repeat_axis,
+        point_axes=schema.point_axes,
+        point_layout=schema.point_layout,
+        cell_layout=schema.cell_layout,
+        retained_upper_bound_bytes=estimate_occupancy_navigation_retained_nbytes(
+            inspected.inspection_retained_upper_bound_bytes,
+            len(axes),
+        ),
     )
 
 
@@ -1282,12 +1247,36 @@ class ReadoutFacade:
             self._require_binding(resolved.readout_binding)
             return resolved
 
+    def _inspect_occupancy_cell_navigation(
+        self,
+        reference: OccupancyArtifactRef,
+        *,
+        memory_limit_bytes: int,
+    ):
+        """Read only the committed outer-axis metadata needed by the navigator."""
+
+        if not isinstance(reference, OccupancyArtifactRef):
+            raise TypeError("reference must be OccupancyArtifactRef")
+        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        with _service_guard(self._token) as services:
+            inspected = _occupancy_repository(services).inspect_final(
+                reference,
+                memory_limit_bytes=limit,
+            )
+            navigation = _occupancy_cell_navigation(reference, inspected)
+            if navigation.retained_upper_bound_bytes >= limit:
+                raise MemoryError(
+                    "occupancy navigation metadata leaves no exact-cell display budget"
+                )
+            return navigation
+
     def _load_occupancy_cell_source(
         self,
         reference: OccupancyArtifactRef,
         selection: Selection | None,
         *,
         memory_limit_bytes: int,
+        expected_navigation=None,
     ):
         """Compose one self-contained exact-cell view under one aggregate cap."""
 
@@ -1297,9 +1286,17 @@ class ReadoutFacade:
             raise TypeError("selection must be Selection or None")
         limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         from zlc_frontend.occupancy_render import (
+            OccupancyCellNavigation,
             OccupancyCellView,
             estimate_occupancy_cell_view_retained_nbytes,
         )
+        from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
+
+        if expected_navigation is not None and not isinstance(
+            expected_navigation,
+            OccupancyCellNavigation,
+        ):
+            raise TypeError("expected_navigation must be OccupancyCellNavigation or None")
 
         with _service_guard(self._token) as services:
             occupancy_repository = _occupancy_repository(services)
@@ -1313,9 +1310,23 @@ class ReadoutFacade:
                 raise MemoryError(
                     "occupancy inspection leaves no display budget"
                 )
-            address, logical_point, cell_label = _resolve_exact_occupancy_cell(
-                inspected.occupied_schema,
-                selection,
+            current_navigation = _occupancy_cell_navigation(reference, inspected)
+            if (
+                expected_navigation is not None
+                and current_navigation.identity != expected_navigation.identity
+            ):
+                raise ValueError("occupancy artifact changed after navigation inspection")
+            navigation = (
+                current_navigation
+                if expected_navigation is None
+                else expected_navigation
+            )
+            repeat_index, point_storage_index, logical_point, cell_label = (
+                navigation.resolve_selection(selection)
+            )
+            address = DatasetCellAddress(
+                repeat_index,
+                point_storage_index,
             )
             source_info = services.capture_repository.inspect_final(
                 inspected.source_capture_ref,
@@ -1491,6 +1502,7 @@ class ReadoutFacade:
         from Zou_lab_control.workbench import open_occupancy_cell_workbench
 
         return open_occupancy_cell_workbench(
+            self._inspect_occupancy_cell_navigation,
             self._load_occupancy_cell_source,
             reference,
             selection=selection,

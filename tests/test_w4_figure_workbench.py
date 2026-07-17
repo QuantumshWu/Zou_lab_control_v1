@@ -154,6 +154,51 @@ def _axis(name, role, size, coordinates) -> AxisSpec:
     )
 
 
+def _frozen_occupancy_navigation(*, repeat_size=1, point_size=3, sparse=False):
+    from zlc_frontend.occupancy_render import OccupancyCellNavigation
+    from zlc_neutral_atom.readout.occupancy_reference import OccupancyArtifactRef
+
+    repeat = _axis(
+        "navigation.repeat",
+        REPEAT,
+        repeat_size,
+        tuple(f"r{index}" for index in range(repeat_size)),
+    )
+    point = _axis(
+        "navigation.point",
+        SCAN_POINT,
+        point_size,
+        tuple(float(index) for index in range(point_size)),
+    )
+    site = _axis("navigation.site", SITE, 2, ("left", "right"))
+    layout = (
+        PointLayout.explicit((point_size,), ((point_size - 1,), (0,)))
+        if sparse
+        else PointLayout.rect_c((point_size,))
+    )
+    schema = DatasetSchema(
+        repeat,
+        (point,),
+        layout,
+        ValueSchema(
+            (site,),
+            ValidityContract.components(site.axis_id),
+            np.dtype(bool),
+        ),
+    )
+    reference = OccupancyArtifactRef("test-navigation", "f" * 64)
+    return reference, OccupancyCellNavigation(
+        reference.target_ref,
+        schema.fingerprint,
+        StreamGenerationId("frozen-navigation"),
+        schema.repeat_axis,
+        schema.point_axes,
+        schema.point_layout,
+        schema.cell_layout,
+        2 << 20,
+    )
+
+
 def _faceted_curve_figure() -> DataFigure:
     repeat = _axis("repeat", REPEAT, 1, (0,))
     scan = _axis("detuning", SCAN_POINT, 4, (-2.0, -0.5, 1.0, 3.0))
@@ -981,7 +1026,7 @@ def test_public_occupancy_figure_gui_forwards_selected_output_off_qt_owner(
 
 
 def test_exact_occupancy_cell_selection_uses_named_axes_and_sparse_layout():
-    from Zou_lab_control.notebook.facade import _resolve_exact_occupancy_cell
+    from zlc_frontend.occupancy_render import OccupancyCellNavigation
 
     repeat = _axis("exact.repeat", REPEAT, 2, ("r0", "r1"))
     scan = _axis("exact.scan", SCAN_POINT, 3, (-2.0, 0.0, 4.0))
@@ -1003,16 +1048,35 @@ def test_exact_occupancy_cell_selection_uses_named_axes_and_sparse_layout():
             IndexSelection(scan.axis_id, 2),
         )
     )
-    address, logical, label = _resolve_exact_occupancy_cell(schema, selection)
-    assert (address.repeat_index, address.point_storage_index) == (1, 0)
+    navigation = OccupancyCellNavigation(
+        "occupancy/" + "0" * 64,
+        schema.fingerprint,
+        StreamGenerationId("exact-navigation"),
+        schema.repeat_axis,
+        schema.point_axes,
+        schema.point_layout,
+        schema.cell_layout,
+        1 << 20,
+    )
+    repeat_index, point_storage_index, logical, label = navigation.resolve_selection(
+        selection
+    )
+    assert (repeat_index, point_storage_index) == (1, 0)
     assert logical == (2, 0)
     assert "exact.repeat=r1" in label and "exact.scan=4" in label
+    assert navigation.selection_at_linear(1) == navigation.selection_for_indices(
+        0,
+        (0, 0),
+    )
+    assert navigation.selection_at_linear(2) == navigation.selection_for_indices(
+        1,
+        (2, 0),
+    )
 
     with pytest.raises(ValueError, match="explicit index"):
-        _resolve_exact_occupancy_cell(schema, None)
+        navigation.resolve_selection(None)
     with pytest.raises(ValueError, match="absent from PointLayout"):
-        _resolve_exact_occupancy_cell(
-            schema,
+        navigation.resolve_selection(
             Selection(
                 (
                     IndexSelection(repeat.axis_id, 0),
@@ -1021,8 +1085,7 @@ def test_exact_occupancy_cell_selection_uses_named_axes_and_sparse_layout():
             ),
         )
     with pytest.raises(TypeError, match="only exact IndexSelection"):
-        _resolve_exact_occupancy_cell(
-            schema,
+        navigation.resolve_selection(
             Selection(
                 (
                     IndexSelection(repeat.axis_id, 0),
@@ -1217,5 +1280,252 @@ def test_public_exact_occupancy_cell_gui_stays_off_qt_owner(
         _close(application, window)
         assert experiment.figure_document(reference).layers
     finally:
+        if window.isVisible():
+            _close(application, window)
+
+
+def test_occupancy_navigation_inspection_reads_metadata_without_admission(
+    occupancy_product,
+    monkeypatch,
+):
+    from zlc_neutral_atom.readout.occupancy_repository import OccupancyRepository
+
+    experiment, reference, resolved = occupancy_product
+    calls = []
+
+    def forbidden_admit(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("navigation metadata must not materialize occupancy arrays")
+
+    monkeypatch.setattr(OccupancyRepository, "admit", forbidden_admit)
+    navigation = experiment.readout._inspect_occupancy_cell_navigation(
+        reference,
+        memory_limit_bytes=512 << 20,
+    )
+    assert calls == []
+    assert navigation.artifact_identity == reference.target_ref
+    assert navigation.repeat_axis == resolved.artifact.occupied.schema.repeat_axis
+    assert navigation.point_axes == resolved.artifact.occupied.schema.point_axes
+    assert navigation.point_layout == resolved.artifact.occupied.schema.point_layout
+    assert navigation.retained_upper_bound_bytes > 0
+    with pytest.raises(ValueError, match="changed after navigation inspection"):
+        experiment.readout._load_occupancy_cell_source(
+            reference,
+            None,
+            memory_limit_bytes=512 << 20,
+            expected_navigation=replace(
+                navigation,
+                generation=StreamGenerationId("stale-navigation"),
+            ),
+        )
+    assert calls == []
+
+
+def test_frozen_occupancy_navigator_never_chooses_a_non_singleton_first_cell(
+    application,
+    monkeypatch,
+):
+    import Zou_lab_control.workbench._occupancy as occupancy_workbench
+    from zlc_frontend.encoded_raster import EncodedRasterDocument, EncodedRasterPage
+
+    reference, navigation = _frozen_occupancy_navigation(
+        repeat_size=2,
+        point_size=3,
+        sparse=True,
+    )
+    owner_thread = threading.get_ident()
+    navigation_threads = []
+    rendered = []
+    one_pixel_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    def navigation_loader(*_args, **_kwargs):
+        navigation_threads.append(threading.get_ident())
+        return navigation
+
+    def fake_render(_loader, _reference, selection, nav, _limit, _cancelled):
+        linear = nav.linear_index(selection)
+        rendered.append((threading.get_ident(), linear))
+        return EncodedRasterDocument(
+            f"cell={linear}",
+            (EncodedRasterPage("exact-cell", "Exact cell", one_pixel_png),),
+        )
+
+    monkeypatch.setattr(occupancy_workbench, "_render_occupancy_cell", fake_render)
+    window = occupancy_workbench.open_occupancy_cell_workbench(
+        navigation_loader,
+        lambda *_args, **_kwargs: None,
+        reference,
+        memory_limit_bytes=64 << 20,
+    )
+    try:
+        _until(application, lambda: window.navigation_ready and window.worker_idle)
+        assert navigation_threads and navigation_threads[0] != owner_thread
+        assert rendered == []
+        assert not window.raster_ready
+        assert window.findChild(
+            QtWidgets.QLabel,
+            "occupancyCellStatus",
+        ).text() == "NEEDS CELL SELECTION"
+
+        spins = {
+            spin.property("axisId"): spin
+            for spin in window.findChildren(QtWidgets.QSpinBox)
+        }
+        spins["navigation.repeat"].setValue(0)
+        spins["navigation.point"].setValue(2)
+        window.findChild(QtWidgets.QPushButton, "occupancyCellLoad").click()
+        _until(application, lambda: window.raster_ready)
+        assert rendered == [(rendered[0][0], 0)]
+        assert rendered[0][0] != owner_thread
+        assert window.findChild(
+            QtWidgets.QLabel,
+            "occupancyCellSummary",
+        ).text() == "cell=0"
+        _close(application, window)
+    finally:
+        if window.isVisible():
+            _close(application, window)
+
+
+def test_frozen_occupancy_navigation_coalesces_to_latest_exact_cell(
+    application,
+    monkeypatch,
+):
+    import Zou_lab_control.workbench._occupancy as occupancy_workbench
+    from zlc_frontend.encoded_raster import EncodedRasterDocument, EncodedRasterPage
+
+    reference, navigation = _frozen_occupancy_navigation(
+        repeat_size=1,
+        point_size=3,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    one_pixel_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    def fake_render(_loader, _reference, selection, nav, _limit, _cancelled):
+        linear = nav.linear_index(selection)
+        calls.append(linear)
+        if linear == 0:
+            started.set()
+            if not release.wait(5.0):
+                raise TimeoutError("test did not release the first cell")
+            raise RuntimeError("stale first-cell failure must not replace the latest request")
+        return EncodedRasterDocument(
+            f"cell={linear}",
+            (EncodedRasterPage("exact-cell", "Exact cell", one_pixel_png),),
+        )
+
+    monkeypatch.setattr(occupancy_workbench, "_render_occupancy_cell", fake_render)
+    initial = navigation.selection_for_indices(0, (0,))
+    window = occupancy_workbench.open_occupancy_cell_workbench(
+        lambda *_args, **_kwargs: navigation,
+        lambda *_args, **_kwargs: None,
+        reference,
+        selection=initial,
+        memory_limit_bytes=64 << 20,
+    )
+    try:
+        _until(application, started.is_set)
+        point_spin = next(
+            spin
+            for spin in window.findChildren(QtWidgets.QSpinBox)
+            if spin.property("axisId") == "navigation.point"
+        )
+        load = window.findChild(QtWidgets.QPushButton, "occupancyCellLoad")
+        point_spin.setValue(1)
+        load.click()
+        point_spin.setValue(2)
+        load.click()
+        assert calls == [0]
+        release.set()
+        _until(application, lambda: window.raster_ready)
+        assert calls == [0, 2]
+        assert window.findChild(
+            QtWidgets.QLabel,
+            "occupancyCellSummary",
+        ).text() == "cell=2"
+        board = window.findChild(QtImageBoard, "occupancyCellBoard")
+        point_spin.setValue(1)
+        load.click()
+        _until(
+            application,
+            lambda: window.raster_ready
+            and window.findChild(
+                QtWidgets.QLabel,
+                "occupancyCellSummary",
+            ).text()
+            == "cell=1",
+        )
+        assert calls == [0, 2, 1]
+        assert window.findChild(QtImageBoard, "occupancyCellBoard") is board
+        assert window.findChild(QtWidgets.QTabWidget, "occupancyCellTabs").count() == 1
+        _close(application, window)
+    finally:
+        release.set()
+        if window.isVisible():
+            _close(application, window)
+
+
+def test_frozen_occupancy_close_is_nonblocking_and_drops_inflight_front(
+    application,
+    monkeypatch,
+):
+    import Zou_lab_control.workbench._occupancy as occupancy_workbench
+    from zlc_frontend.encoded_raster import EncodedRasterDocument, EncodedRasterPage
+
+    reference, navigation = _frozen_occupancy_navigation(
+        repeat_size=1,
+        point_size=1,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    present_calls = []
+    one_pixel_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    def fake_render(*_args):
+        started.set()
+        if not release.wait(5.0):
+            raise TimeoutError("test did not release the closing cell")
+        return EncodedRasterDocument(
+            "must-not-present",
+            (EncodedRasterPage("exact-cell", "Exact cell", one_pixel_png),),
+        )
+
+    original_present = QtImageBoard.present_encoded
+
+    def traced_present(self, payload, *, image_format="PNG"):
+        present_calls.append(payload)
+        return original_present(self, payload, image_format=image_format)
+
+    monkeypatch.setattr(occupancy_workbench, "_render_occupancy_cell", fake_render)
+    monkeypatch.setattr(QtImageBoard, "present_encoded", traced_present)
+    window = occupancy_workbench.open_occupancy_cell_workbench(
+        lambda *_args, **_kwargs: navigation,
+        lambda *_args, **_kwargs: None,
+        reference,
+        memory_limit_bytes=64 << 20,
+    )
+    try:
+        _until(application, started.is_set)
+        before = time.monotonic()
+        window.close()
+        assert time.monotonic() - before < 0.1
+        assert not window.closed
+        release.set()
+        _until(application, lambda: window.closed and not window.isVisible())
+        assert present_calls == []
+        assert not window.raster_ready
+    finally:
+        release.set()
         if window.isVisible():
             _close(application, window)
