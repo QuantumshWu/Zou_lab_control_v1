@@ -1,4 +1,4 @@
-"""Qt composition for one free-running raw camera monitor."""
+"""Qt composition for one free-running camera and typed ROI monitor."""
 
 from __future__ import annotations
 
@@ -29,7 +29,10 @@ from zlc_frontend.figure import (
     validate_view_spec,
 )
 from zlc_frontend.image_raster import estimate_gray8_raster_peak_nbytes
-from zlc_frontend.matplotlib_render import estimate_single_curve_raster_peak_nbytes
+from zlc_frontend.matplotlib_render import (
+    DEFAULT_HISTOGRAM_BINS,
+    estimate_live_panel_raster_peak_nbytes,
+)
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentLabel,
@@ -60,27 +63,60 @@ from zlc_workbench.workspace import BoardController, BoardModel, PanelSlot
 
 _IMAGE_PANEL_ID = "camera-monitor-image"
 _CURVE_PANEL_ID = "camera-monitor-roi-curve"
-_CURVE_RASTER_SIZE = (800, 520)
+_HISTOGRAM_PANEL_ID = "camera-monitor-roi-histogram"
+_METER_PANEL_ID = "camera-monitor-roi-meter"
+_SCALAR_PANEL_IDS = (
+    _CURVE_PANEL_ID,
+    _HISTOGRAM_PANEL_ID,
+    _METER_PANEL_ID,
+)
+_SCALAR_RASTER_SIZE = (800, 520)
 _RAW_PROJECTION_TEXT = "latest raw frame · history slot 0 · DISPLAY ONLY"
 
 
-def _roi_scalar_curve_view(schema, binding):
+def _roi_scalar_views(schema, binding):
     axes = (schema.repeat_axis, *schema.point_axes, *schema.cell_schema.data_axes)
     history = tuple(axis for axis in schema.point_axes if axis.role == MONITOR_HISTORY)
     if len(history) != 1 or schema.cell_schema.data_axes:
-        raise ValueError("ROI scalar curve requires one scalar MONITOR_HISTORY axis")
-    bindings = [
-        AxisViewBinding(history[0].axis_id, AxisViewRole.X),
-        AxisViewBinding(
-            schema.repeat_axis.axis_id,
-            AxisViewRole.SELECTED,
-            selector=FixedIndex(0),
+        raise ValueError("ROI scalar views require one scalar MONITOR_HISTORY axis")
+    repeat_binding = AxisViewBinding(
+        schema.repeat_axis.axis_id,
+        AxisViewRole.SELECTED,
+        selector=FixedIndex(0),
+    )
+    curve = ViewSpec(
+        schema.fingerprint,
+        ViewIntent.CURVE,
+        (
+            AxisViewBinding(history[0].axis_id, AxisViewRole.X),
+            repeat_binding,
         ),
-    ]
-    if len(bindings) != len(axes):
-        raise ValueError("ROI scalar curve refuses undeclared extra axes")
-    view = ViewSpec(schema.fingerprint, ViewIntent.CURVE, tuple(bindings))
-    validate_view_spec(schema, view)
+    )
+    histogram = ViewSpec(
+        schema.fingerprint,
+        ViewIntent.HISTOGRAM,
+        (
+            AxisViewBinding(history[0].axis_id, AxisViewRole.SAMPLE),
+            repeat_binding,
+        ),
+    )
+    meter = ViewSpec(
+        schema.fingerprint,
+        ViewIntent.METER,
+        (
+            AxisViewBinding(
+                history[0].axis_id,
+                AxisViewRole.SELECTED,
+                selector=FixedIndex(0),
+            ),
+            repeat_binding,
+        ),
+    )
+    views = (curve, histogram, meter)
+    if any(len(view.axis_bindings) != len(axes) for view in views):
+        raise ValueError("ROI scalar views refuse undeclared extra axes")
+    for view in views:
+        validate_view_spec(schema, view)
     input_axes = {axis.axis_id: axis for axis in binding.input_contract.value_schema.data_axes}
     terms = {term.axis_id: term for term in binding.selection.terms}
     description = ", ".join(
@@ -92,9 +128,10 @@ def _roi_scalar_curve_view(schema, binding):
         f"[{description}] · control revision {binding.control_revision} · "
         f"validity {binding.validity_policy.value.lower()} · "
         f"scalar history 0..{history[0].size - 1} (0 newest) · "
-        "MONITOR DERIVED / DISPLAY VIEW"
+        f"curve + {DEFAULT_HISTOGRAM_BINS}-bin histogram + latest meter · "
+        "MONITOR DERIVED / DISPLAY ONLY"
     )
-    return view, summary
+    return views, summary
 
 
 class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
@@ -200,7 +237,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             current.deleteLater()
         widget = (
             QtRasterBoard(
-                (_IMAGE_PANEL_ID, _CURVE_PANEL_ID),
+                (_IMAGE_PANEL_ID, *_SCALAR_PANEL_IDS),
                 self._board_container,
                 columns=2,
                 empty_text="Monitor stopped",
@@ -275,28 +312,54 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 y_axes[0].size,
                 x_axes[0].size,
             )
-            curve_view = None
-            curve_evaluation_peak = 0
+            scalar_views: tuple[ViewSpec, ...] = ()
+            scalar_evaluation_peaks: tuple[int, ...] = ()
             if scalar_schema is not None:
                 if roi_binding is None:
                     raise RuntimeError("ROI scalar schema has no admitted binding")
-                curve_view, self._projection_text = _roi_scalar_curve_view(
+                scalar_views, self._projection_text = _roi_scalar_views(
                     scalar_schema,
                     roi_binding,
                 )
-                curve_evaluation_peak = estimate_view_evaluation_peak_nbytes(
-                    scalar_schema,
-                    curve_view,
+                default_policy = FigureEvaluationPolicy()
+                scalar_history = tuple(
+                    axis
+                    for axis in scalar_schema.point_axes
+                    if axis.role == MONITOR_HISTORY
                 )
-                downstream_peak += (
-                    curve_evaluation_peak
-                    + estimate_single_curve_raster_peak_nbytes(
-                        *_CURVE_RASTER_SIZE,
-                        evaluated_data_upper_bound_bytes=curve_evaluation_peak,
+                if (
+                    len(scalar_history) != 1
+                    or scalar_history[0].size > default_policy.max_histogram_samples
+                ):
+                    raise ValueError(
+                        "ROI scalar history exceeds the live histogram sample limit "
+                        f"{default_policy.max_histogram_samples}"
                     )
+                scalar_evaluation_peaks = tuple(
+                    estimate_view_evaluation_peak_nbytes(scalar_schema, view)
+                    for view in scalar_views
                 )
+                for view, evaluation_peak in zip(
+                    scalar_views,
+                    scalar_evaluation_peaks,
+                    strict=True,
+                ):
+                    downstream_peak += (
+                        evaluation_peak
+                        + estimate_live_panel_raster_peak_nbytes(
+                            *_SCALAR_RASTER_SIZE,
+                            evaluated_data_upper_bound_bytes=evaluation_peak,
+                            histogram_bins=(
+                                DEFAULT_HISTOGRAM_BINS
+                                if view.intent is ViewIntent.HISTOGRAM
+                                else None
+                            ),
+                        )
+                    )
             policy = FigureEvaluationPolicy(
-                max_live_nbytes=max(image_evaluation_peak, curve_evaluation_peak)
+                max_live_nbytes=max(
+                    (image_evaluation_peak, *scalar_evaluation_peaks)
+                )
             )
         except BaseException as error:
             self._record_local_failure(
@@ -334,21 +397,27 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             ),
             (FigureLayer(_IMAGE_PANEL_ID, dataset_id, image_view),),
         )
-        curve_document = None
-        if curve_view is not None:
+        scalar_documents: tuple[FigureDocument, ...] = ()
+        if scalar_views:
             assert scalar_schema is not None and scalar_dataset_id is not None
             assert roi_binding is not None
-            curve_document = FigureDocument(
-                f"camera-monitor-roi-curve-{generation}",
-                0,
-                (
-                    DatasetDescriptor(
-                        scalar_dataset_id,
-                        f"ROI {roi_binding.reduction.value.lower()} scalar monitor",
-                        scalar_schema.fingerprint,
-                    ),
-                ),
-                (FigureLayer(_CURVE_PANEL_ID, scalar_dataset_id, curve_view),),
+            descriptor = DatasetDescriptor(
+                scalar_dataset_id,
+                f"ROI {roi_binding.reduction.value.lower()} scalar monitor",
+                scalar_schema.fingerprint,
+            )
+            scalar_documents = tuple(
+                FigureDocument(
+                    f"{panel_id}-{generation}",
+                    0,
+                    (descriptor,),
+                    (FigureLayer(panel_id, scalar_dataset_id, view),),
+                )
+                for panel_id, view in zip(
+                    _SCALAR_PANEL_IDS,
+                    scalar_views,
+                    strict=True,
+                )
             )
 
         def factory(spec: CameraMonitorViewSpec):
@@ -362,7 +431,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             attached = threading.Event()
             response: dict[str, object] = {}
             self._run_owner.post_attachment(
-                (slot, image_document, curve_document, attached, response),
+                (slot, image_document, scalar_documents, attached, response),
                 generation=generation,
             )
             if not attached.wait(5.0):
@@ -407,10 +476,10 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             self._drain_attachments()
             live = self._live
             board = self._board
-            if live is not None:
-                live.admit_pending()
             if board is not None and board.fault is None:
                 board.present_pending()
+            if live is not None:
+                live.admit_pending()
             pending = self._run_owner.take_pending_snapshot()
             if pending is not None:
                 generation, snapshot = pending
@@ -471,7 +540,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                             raise RuntimeError(
                                 "prepared ROI scalar schema has no binding"
                             )
-                        _view, self._projection_text = _roi_scalar_curve_view(
+                        _views, self._projection_text = _roi_scalar_views(
                             scalar_schema,
                             binding,
                         )
@@ -539,12 +608,16 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
 
     def _drain_attachments(self) -> None:
         for generation, payload in self._run_owner.drain_attachments():
-            slot, image_document, curve_document, attached, response = payload
+            slot, image_document, scalar_documents, attached, response = payload
             try:
                 if self._closing or generation != self._run_owner.generation:
                     raise RuntimeError("Workbench no longer accepts this monitor")
                 if slot.terminal:
                     raise RuntimeError("monitor slot became terminal before attachment")
+                if scalar_documents and len(scalar_documents) != len(_SCALAR_PANEL_IDS):
+                    raise RuntimeError(
+                        "ROI monitor attachment requires its closed three-panel scalar set"
+                    )
                 self._close_live()
                 panels = [
                     PanelSlot(
@@ -553,14 +626,14 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                         "monitor-camera",
                     )
                 ]
-                if curve_document is not None:
-                    panels.append(
-                        PanelSlot(
-                            _CURVE_PANEL_ID,
-                            "camera-monitor",
-                            "monitor-camera",
-                        )
+                panels.extend(
+                    PanelSlot(
+                        panel_id,
+                        "camera-monitor",
+                        "monitor-camera",
                     )
+                    for panel_id in _SCALAR_PANEL_IDS[: len(scalar_documents)]
+                )
                 model = BoardModel(
                     "camera-monitor-board",
                     generation,
@@ -581,8 +654,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     board,
                     submit_worker=self._submit_worker,
                     request_owner_wake=self._wake.request_owner_wake,
-                    companion_curve_document=curve_document,
-                    companion_curve_size=_CURVE_RASTER_SIZE,
+                    scalar_documents=scalar_documents,
+                    scalar_raster_size=_SCALAR_RASTER_SIZE,
                     worker_thread_affine=self._run_owner.worker_thread_affine,
                 )
                 self._slot = slot
@@ -630,25 +703,59 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             return
         board_widget = self._board_widget
         if live is not None and board_widget is not None and board_widget.has_front:
-            coverage = live.coverage
-            scalar_coverage = live.scalar_coverage
-            suffix = (
-                "coverage pending"
-                if coverage is None
-                else (
-                    f"raw missed={coverage.missed_events} · "
-                    f"raw current_gap={'yes' if coverage.current_gap else 'no'}"
-                    + (
-                        ""
-                        if scalar_coverage is None
-                        else (
-                            f" · scalar={scalar_coverage.written_cells}/"
-                            f"{scalar_coverage.total_cells} · "
-                            f"scalar missed={scalar_coverage.missed_events} · "
-                            f"scalar current_gap={'yes' if scalar_coverage.current_gap else 'no'}"
-                        )
-                    )
+            front = board_widget.front_frame
+            status = live.front_status
+            if (
+                front is None
+                or status is None
+                or status.sequence != front.sequence
+            ):
+                self._view_status.setText(
+                    f"View: LIVE · {self._projection_text} · diagnostics pending"
                 )
+                return
+            coverage = status.raw_coverage
+            scalar_coverage = status.scalar_coverage
+            histogram_valid = status.histogram_valid_samples
+            histogram_dropped = status.histogram_dropped_samples
+            latest_valid = status.latest_scalar_valid
+            source_missed = status.scalar_source_missed
+            scalar_suffix = ""
+            if scalar_coverage is not None:
+                if histogram_valid is None or histogram_dropped is None:
+                    scalar_counts = "scalar counts pending"
+                else:
+                    invalid_retained = (
+                        scalar_coverage.written_cells - histogram_valid
+                    )
+                    unfilled = (
+                        scalar_coverage.total_cells
+                        - scalar_coverage.written_cells
+                    )
+                    scalar_counts = (
+                        f"scalar valid/retained/capacity={histogram_valid}/"
+                        f"{scalar_coverage.written_cells}/"
+                        f"{scalar_coverage.total_cells} · "
+                        f"hist dropped={histogram_dropped} "
+                        f"(invalid={invalid_retained}, unfilled={unfilled})"
+                    )
+                latest_text = (
+                    "pending"
+                    if latest_valid is None
+                    else ("valid" if latest_valid else "invalid")
+                )
+                source_text = "pending" if source_missed is None else str(source_missed)
+                scalar_suffix = (
+                    f" · {scalar_counts} · latest={latest_text} · "
+                    f"scalar stream missed={scalar_coverage.missed_events} · "
+                    "scalar current_gap="
+                    f"{'yes' if scalar_coverage.current_gap else 'no'} · "
+                    f"upstream before latest={source_text}"
+                )
+            suffix = (
+                f"raw missed={coverage.missed_events} · "
+                f"raw current_gap={'yes' if coverage.current_gap else 'no'}"
+                + scalar_suffix
             )
             self._view_status.setText(
                 f"View: LIVE · {self._projection_text} · {suffix}"

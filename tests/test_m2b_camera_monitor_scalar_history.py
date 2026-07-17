@@ -134,19 +134,28 @@ def test_roi_scalar_history_is_independent_and_board_join_is_source_exact(
             lambda: (
                 board.has_front
                 and window._live is not None
-                and window._live.scalar_coverage is not None
-                and window._live.scalar_coverage.written_cells >= 4
+                and window._live.front_status is not None
+                and window._live.front_status.sequence
+                == board.front_frame.sequence
+                and window._live.front_status.scalar_coverage is not None
+                and window._live.front_status.scalar_coverage.written_cells >= 4
             ),
         )
 
         frame = board.front_frame
-        assert frame is not None and len(frame.panels) == 2
-        image_panel, curve_panel = frame.panels
+        assert frame is not None and len(frame.panels) == 4
+        image_panel, curve_panel, histogram_panel, meter_panel = frame.panels
         assert image_panel.source_identity != curve_panel.source_identity
-        assert image_panel.coherence_stamp == curve_panel.coherence_stamp
+        assert curve_panel.source_identity == histogram_panel.source_identity
+        assert curve_panel.source_identity == meter_panel.source_identity
+        assert all(
+            panel.coherence_stamp == image_panel.coherence_stamp
+            for panel in frame.panels
+        )
         stamp = image_panel.coherence_stamp
         assert stamp.join_key_type == "camera-roi-source-event-control"
         assert len(stamp.inputs) == 2
+        assert len(stamp.presentations) == 4
 
         _run, _epoch, joined = window._slot.freeze_camera_current()
         raw = joined.raw

@@ -1,15 +1,18 @@
-"""Finite exact-capture live preview composition for the target Workbench."""
+"""Bounded live-dataset and coherent-board composition for the Workbench."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import threading
 from typing import TYPE_CHECKING, Callable
 
 from zlc_frontend.figure import (
     DatasetId,
     EvaluatedCurve,
+    EvaluatedHistogram,
     EvaluatedImage,
     EvaluatedInput,
+    EvaluatedMeter,
     FigureDocument,
     FigureEvaluationPolicy,
     FigureEvaluator,
@@ -45,7 +48,7 @@ from .workspace import BoardController, BoardPublishPort, PanelSourceBinding
 
 
 if TYPE_CHECKING:
-    from zlc_frontend.matplotlib_render import SingleCurveAggRenderer
+    from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
 
 
 _ROI_JOIN_KEY_SCHEMA_FINGERPRINT = canonical_digest(
@@ -54,6 +57,19 @@ _ROI_JOIN_KEY_SCHEMA_FINGERPRINT = canonical_digest(
         "fields": ("source_event_ref", "control_revision", "control_fingerprint"),
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class LiveFrontStatus:
+    """One board sequence and the diagnostics derived from that exact front."""
+
+    sequence: int
+    raw_coverage: MonitorCoverage
+    scalar_coverage: MonitorCoverage | None = None
+    histogram_valid_samples: int | None = None
+    histogram_dropped_samples: int | None = None
+    latest_scalar_valid: bool | None = None
+    scalar_source_missed: int | None = None
 
 
 class LiveDatasetSlot:
@@ -284,7 +300,7 @@ class LiveDatasetSlot:
 
 
 class LiveImageBoardController:
-    """One-snapshot coalescer for an image and optional coherent ROI curve."""
+    """One-snapshot coalescer for IMAGE plus a closed scalar companion set."""
 
     def __init__(
         self,
@@ -294,8 +310,8 @@ class LiveImageBoardController:
         *,
         submit_worker: Callable[[Callable[[], None]], object],
         request_owner_wake: Callable[[], None],
-        companion_curve_document: FigureDocument | None = None,
-        companion_curve_size: tuple[int, int] = (800, 520),
+        scalar_documents: tuple[FigureDocument, ...] = (),
+        scalar_raster_size: tuple[int, int] = (800, 520),
         worker_thread_affine: bool = False,
     ) -> None:
         if not isinstance(slot, LiveDatasetSlot):
@@ -306,26 +322,25 @@ class LiveImageBoardController:
             raise TypeError("board must be BoardController")
         if not callable(submit_worker) or not callable(request_owner_wake):
             raise TypeError("worker submission and owner wake must be callable")
-        if companion_curve_document is not None and not isinstance(
-            companion_curve_document, FigureDocument
-        ):
-            raise TypeError("companion_curve_document must be FigureDocument or None")
+        scalar_documents = tuple(scalar_documents)
+        if any(not isinstance(item, FigureDocument) for item in scalar_documents):
+            raise TypeError("scalar_documents must contain FigureDocument values")
         if not isinstance(worker_thread_affine, bool):
             raise TypeError("worker_thread_affine must be bool")
-        if companion_curve_document is not None and not worker_thread_affine:
-            raise ValueError("live Agg curve requires a thread-affine worker lane")
+        if scalar_documents and not worker_thread_affine:
+            raise ValueError("live scalar Agg panels require a thread-affine worker lane")
         if (
-            not isinstance(companion_curve_size, tuple)
-            or len(companion_curve_size) != 2
+            not isinstance(scalar_raster_size, tuple)
+            or len(scalar_raster_size) != 2
             or any(
                 isinstance(value, bool) or not isinstance(value, int) or value <= 0
-                for value in companion_curve_size
+                for value in scalar_raster_size
             )
         ):
-            raise ValueError("companion_curve_size must contain two positive integers")
-        _validate_live_documents(slot, document, companion_curve_document)
+            raise ValueError("scalar_raster_size must contain two positive integers")
+        _validate_live_documents(slot, document, scalar_documents)
         model = board.model
-        expected_panels = 1 if companion_curve_document is None else 2
+        expected_panels = 1 + len(scalar_documents)
         if len(model.panels) != expected_panels:
             raise ValueError("live board panel count does not match its frozen documents")
         coherence_groups = {panel.coherence_group for panel in model.panels}
@@ -333,15 +348,17 @@ class LiveImageBoardController:
             raise ValueError("one live snapshot board requires one coherence group")
         self._slot = slot
         self._document = document
-        self._curve_document = companion_curve_document
+        self._scalar_documents = scalar_documents
         self._board = board
         self._panels = model.panels
         self._coherence_group = next(iter(coherence_groups))
-        documents = (
-            (document,)
-            if companion_curve_document is None
-            else (document, companion_curve_document)
-        )
+        documents = (document, *scalar_documents)
+        if tuple(panel.panel_id for panel in model.panels) != tuple(
+            panel_document.layers[0].layer_id for panel_document in documents
+        ):
+            raise ValueError(
+                "live board panels must match frozen document layers in order"
+            )
         self._presentations = tuple(
             PanelPresentationIdentity(
                 panel.panel_id,
@@ -353,8 +370,10 @@ class LiveImageBoardController:
             for panel, panel_document in zip(model.panels, documents, strict=True)
         )
         self._evaluator = FigureEvaluator(slot.evaluation_policy)
-        self._curve_size = companion_curve_size
-        self._curve_renderer: SingleCurveAggRenderer | None = None
+        self._scalar_size = scalar_raster_size
+        self._scalar_renderers: list[SinglePanelAggRenderer | None] = [
+            None for _document in scalar_documents
+        ]
         self._submit_worker = submit_worker
         self._request_owner_wake = request_owner_wake
         self._lock = threading.Lock()
@@ -370,8 +389,7 @@ class LiveImageBoardController:
         self._sources: tuple[SourceIdentity, ...] | None = None
         self._sequence = 0
         self._fault: BaseException | None = None
-        self._coverage: MonitorCoverage | None = None
-        self._scalar_coverage: MonitorCoverage | None = None
+        self._front_status: LiveFrontStatus | None = None
         self._front_invalidated = False
         self._closed = False
         self._close_complete = False
@@ -383,18 +401,11 @@ class LiveImageBoardController:
             return self._fault
 
     @property
-    def coverage(self) -> MonitorCoverage | None:
-        """Coverage paired with the latest accepted immutable board front."""
+    def front_status(self) -> LiveFrontStatus | None:
+        """Atomically return diagnostics for one successfully published sequence."""
 
         with self._lock:
-            return self._coverage
-
-    @property
-    def scalar_coverage(self) -> MonitorCoverage | None:
-        """Scalar history coverage paired with the accepted board front."""
-
-        with self._lock:
-            return self._scalar_coverage
+            return self._front_status
 
     def _source_changed(self) -> None:
         if self._slot.failure is not None or self._slot.withdrawn:
@@ -453,8 +464,7 @@ class LiveImageBoardController:
                 self._active = False
                 self._port = None
                 self._sources = None
-                self._coverage = None
-                self._scalar_coverage = None
+                self._front_status = None
             if invalidate:
                 try:
                     self._board.invalidate()
@@ -510,7 +520,10 @@ class LiveImageBoardController:
                     EvaluatedInput(self._slot.dataset_id, ref),
                     EvaluatedInput(scalar_dataset_id, scalar_ref),
                 )
-                panel_sources = (raw_source, scalar_source)
+                panel_sources = (
+                    raw_source,
+                    *(scalar_source for _document in self._scalar_documents),
+                )
                 join_key_type = "camera-roi-source-event-control"
                 join_schema = _ROI_JOIN_KEY_SCHEMA_FINGERPRINT
                 join_digest = canonical_digest(
@@ -581,9 +594,11 @@ class LiveImageBoardController:
             if isinstance(frozen, CameraMonitorSnapshot):
                 raw_snapshot = frozen.raw
                 scalar_snapshot = frozen.scalar
+                scalar_metadata = frozen.scalar_metadata
             else:
                 raw_snapshot = frozen
                 scalar_snapshot = None
+                scalar_metadata = None
             snapshot = raw_snapshot.snapshot
             raw_input = (EvaluatedInput(self._slot.dataset_id, snapshot.ref),)
             image_evaluated = self._evaluator.evaluate(
@@ -606,45 +621,70 @@ class LiveImageBoardController:
             if not isinstance(data, EvaluatedImage):
                 raise RuntimeError("live IMAGE document did not evaluate to an image")
             rasters = [rasterize_image_gray8(data)]
-            curve_document = self._curve_document
-            if curve_document is not None:
-                curve_dataset_id = (
-                    self._slot.dataset_id
-                    if scalar_snapshot is None
-                    else self._slot.scalar_dataset_id
+            histogram_valid_samples = None
+            histogram_dropped_samples = None
+            latest_scalar_valid = None
+            if self._scalar_documents:
+                if scalar_snapshot is None or self._slot.scalar_dataset_id is None:
+                    raise RuntimeError("live scalar panels have no scalar snapshot identity")
+                scalar_dataset_id = self._slot.scalar_dataset_id
+                scalar_owned = scalar_snapshot.snapshot
+                scalar_input = (EvaluatedInput(scalar_dataset_id, scalar_owned.ref),)
+                resolved_scalar = ResolvedDatasetMap(
+                    (ResolvedDataset(scalar_dataset_id, scalar_owned),)
                 )
-                if curve_dataset_id is None:
-                    raise RuntimeError("ROI curve has no scalar DatasetId")
-                curve_snapshot = (
-                    snapshot
-                    if scalar_snapshot is None
-                    else scalar_snapshot.snapshot
-                )
-                curve_input = (EvaluatedInput(curve_dataset_id, curve_snapshot.ref),)
-                curve_evaluated = self._evaluator.evaluate(
-                    curve_document,
-                    ResolvedDatasetMap(
-                        (ResolvedDataset(curve_dataset_id, curve_snapshot),)
-                    ),
+            for index, scalar_document in enumerate(self._scalar_documents):
+                scalar_evaluated = self._evaluator.evaluate(
+                    scalar_document,
+                    resolved_scalar,
                     cancel_requested=lambda: self._closed,
                 )
-                if curve_evaluated.inputs != curve_input:
-                    raise RuntimeError("ROI curve evaluation changed the admitted input revision")
-                curve_layer = curve_evaluated.layers[0]
-                curve_data = curve_layer.cells[0].series[0].data
-                if not isinstance(curve_data, EvaluatedCurve):
-                    raise RuntimeError("live companion document did not evaluate to a curve")
-                renderer = self._curve_renderer
-                if renderer is None:
-                    from zlc_frontend.matplotlib_render import SingleCurveAggRenderer
-
-                    renderer = SingleCurveAggRenderer(
-                        curve_document,
-                        width=self._curve_size[0],
-                        height=self._curve_size[1],
+                if scalar_evaluated.inputs != scalar_input:
+                    raise RuntimeError(
+                        "scalar panel evaluation changed the admitted input revision"
                     )
-                    self._curve_renderer = renderer
-                rasters.append(renderer.render(curve_evaluated))
+                if (
+                    len(scalar_evaluated.layers) != 1
+                    or len(scalar_evaluated.layers[0].cells) != 1
+                    or len(scalar_evaluated.layers[0].cells[0].series) != 1
+                ):
+                    raise RuntimeError("live scalar document must evaluate to one series")
+                scalar_data = scalar_evaluated.layers[0].cells[0].series[0].data
+                intent = scalar_document.layers[0].view.intent
+                expected_type = {
+                    ViewIntent.CURVE: EvaluatedCurve,
+                    ViewIntent.HISTOGRAM: EvaluatedHistogram,
+                    ViewIntent.METER: EvaluatedMeter,
+                }[intent]
+                if not isinstance(scalar_data, expected_type):
+                    raise RuntimeError(
+                        f"live {intent.value} document evaluated to another data kind"
+                    )
+                if isinstance(scalar_data, EvaluatedHistogram):
+                    histogram_valid_samples = len(scalar_data.samples)
+                    histogram_dropped_samples = scalar_data.dropped_count
+                    scalar_coverage = scalar_snapshot.coverage
+                    if (
+                        histogram_valid_samples > scalar_coverage.written_cells
+                        or histogram_valid_samples + histogram_dropped_samples
+                        != scalar_coverage.total_cells
+                    ):
+                        raise RuntimeError(
+                            "scalar histogram validity counts disagree with its snapshot"
+                        )
+                elif isinstance(scalar_data, EvaluatedMeter):
+                    latest_scalar_valid = scalar_data.valid
+                renderer = self._scalar_renderers[index]
+                if renderer is None:
+                    from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
+
+                    renderer = SinglePanelAggRenderer(
+                        scalar_document,
+                        width=self._scalar_size[0],
+                        height=self._scalar_size[1],
+                    )
+                    self._scalar_renderers[index] = renderer
+                rasters.append(renderer.render(scalar_evaluated))
             frame = BoardFrame(
                 self._board.model.board_id,
                 self._board.model.layout_generation,
@@ -667,16 +707,32 @@ class LiveImageBoardController:
             )
             port = self._port
             if port is not None:
+                front_status = LiveFrontStatus(
+                    sequence,
+                    raw_snapshot.coverage,
+                    None if scalar_snapshot is None else scalar_snapshot.coverage,
+                    histogram_valid_samples,
+                    histogram_dropped_samples,
+                    latest_scalar_valid,
+                    (
+                        None
+                        if scalar_metadata is None
+                        else scalar_metadata.source_missed
+                    ),
+                )
                 published = port.publish(token, frame)
                 if published:
+                    accepted_status = False
                     with self._lock:
                         if not self._closed and self._port is port:
-                            self._coverage = raw_snapshot.coverage
-                            self._scalar_coverage = (
-                                None
-                                if scalar_snapshot is None
-                                else scalar_snapshot.coverage
-                            )
+                            self._front_status = front_status
+                            accepted_status = True
+                    if accepted_status:
+                        # BoardController may have queued its wake before this
+                        # status record was installed.  A second coalesced wake
+                        # makes the matching sequence observable without ever
+                        # attaching newer diagnostics to an older visible front.
+                        self._request_owner_wake()
         except BaseException as error:
             self._set_fault(error)
             return
@@ -734,8 +790,7 @@ class LiveImageBoardController:
                 self._fault = detached_render_fault(error)
             self._candidate = None
             self._active = False
-            self._coverage = None
-            self._scalar_coverage = None
+            self._front_status = None
         try:
             self._slot.fail(f"{type(error).__name__}: {error}")
         except BaseException:
@@ -750,10 +805,9 @@ class LiveImageBoardController:
             self._active = False
             self._dirty = False
             self._candidate = None
-            self._coverage = None
-            self._scalar_coverage = None
+            self._front_status = None
             self._front_invalidated = True
-            schedule_renderer_close = self._curve_document is not None
+            schedule_renderer_close = bool(self._scalar_documents)
         try:
             self._slot.close()
         finally:
@@ -763,24 +817,32 @@ class LiveImageBoardController:
             # affine lane; close can neither race nor change OS thread.
             def close_renderer() -> None:
                 with self._worker_gate:
-                    self._close_curve_renderer()
+                    self._close_scalar_renderers()
 
             self._submit_worker(close_renderer)
         with self._lock:
             self._fault = None
             self._close_complete = True
 
-    def _close_curve_renderer(self) -> None:
-        renderer = self._curve_renderer
-        self._curve_renderer = None
-        if renderer is not None:
-            renderer.close()
+    def _close_scalar_renderers(self) -> None:
+        errors: list[BaseException] = []
+        renderers = tuple(self._scalar_renderers)
+        self._scalar_renderers = [None for _renderer in renderers]
+        for renderer in renderers:
+            if renderer is None:
+                continue
+            try:
+                renderer.close()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
 
 
 def _validate_live_documents(
     slot: LiveDatasetSlot,
     document: FigureDocument,
-    curve_document: FigureDocument | None,
+    scalar_documents: tuple[FigureDocument, ...],
 ) -> None:
     schema = slot.spec.dataset_edge.schema
     if (
@@ -795,35 +857,48 @@ def _validate_live_documents(
     validate_view_spec(schema, view)
     if view.intent is not ViewIntent.IMAGE:
         raise ValueError("live image controller requires IMAGE intent")
-    if curve_document is None:
-        if isinstance(slot.spec, CameraMonitorViewSpec) and (
-            slot.spec.scalar_dataset_edge is not None
-        ):
-            raise ValueError("admitted ROI scalar source requires a curve document")
-        return
     scalar_edge = (
         slot.spec.scalar_dataset_edge
         if isinstance(slot.spec, CameraMonitorViewSpec)
         else None
     )
-    curve_schema = schema if scalar_edge is None else scalar_edge.schema
-    curve_dataset_id = (
-        slot.dataset_id if scalar_edge is None else slot.scalar_dataset_id
+    if scalar_edge is None:
+        if scalar_documents:
+            raise ValueError("a source without ROI scalar data cannot have scalar panels")
+        return
+    if slot.scalar_dataset_id is None:
+        raise ValueError("admitted ROI scalar source has no DatasetId")
+    expected_intents = (
+        ViewIntent.CURVE,
+        ViewIntent.HISTOGRAM,
+        ViewIntent.METER,
     )
-    if curve_dataset_id is None:
-        raise ValueError("live curve has no admitted DatasetId")
-    if (
-        len(curve_document.datasets) != 1
-        or curve_document.datasets[0].dataset_id != curve_dataset_id
-        or curve_document.datasets[0].schema_fingerprint != curve_schema.fingerprint
-        or len(curve_document.layers) != 1
-        or curve_document.layers[0].dataset_id != curve_dataset_id
+    if len(scalar_documents) != len(expected_intents):
+        raise ValueError(
+            "admitted ROI scalar source requires CURVE, HISTOGRAM, and METER documents"
+        )
+    for scalar_document, expected_intent in zip(
+        scalar_documents,
+        expected_intents,
+        strict=True,
     ):
-        raise ValueError("live curve document must contain its admitted dataset and layer")
-    curve_view = curve_document.layers[0].view
-    validate_view_spec(curve_schema, curve_view)
-    if curve_view.intent is not ViewIntent.CURVE:
-        raise ValueError("live companion document requires CURVE intent")
+        if (
+            len(scalar_document.datasets) != 1
+            or scalar_document.datasets[0].dataset_id != slot.scalar_dataset_id
+            or scalar_document.datasets[0].schema_fingerprint
+            != scalar_edge.schema.fingerprint
+            or len(scalar_document.layers) != 1
+            or scalar_document.layers[0].dataset_id != slot.scalar_dataset_id
+        ):
+            raise ValueError(
+                "live scalar document must contain its admitted dataset and layer"
+            )
+        scalar_view = scalar_document.layers[0].view
+        validate_view_spec(scalar_edge.schema, scalar_view)
+        if scalar_view.intent is not expected_intent:
+            raise ValueError(
+                "live scalar documents must be ordered CURVE, HISTOGRAM, METER"
+            )
 
 
-__all__ = ["LiveDatasetSlot", "LiveImageBoardController"]
+__all__ = ["LiveDatasetSlot", "LiveFrontStatus", "LiveImageBoardController"]

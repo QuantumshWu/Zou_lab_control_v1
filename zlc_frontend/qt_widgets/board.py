@@ -102,6 +102,7 @@ class QtImageBoard(QtWidgets.QWidget):
         self._panel_id = canonical_text(panel_id, "panel_id")
         self._empty_text = str(empty_text)
         self._front: tuple[bytes, QtGui.QImage] | None = None
+        self._front_frame: BoardFrame | None = None
         self.setMinimumSize(64, 64)
 
     def present(self, frame: BoardFrame) -> None:
@@ -111,6 +112,7 @@ class QtImageBoard(QtWidgets.QWidget):
         if len(frame.panels) != 1 or frame.panels[0].panel_id != self._panel_id:
             raise ValueError("QtImageBoard requires its one configured panel")
         self._front = _prepared_qimage(frame.panels[0].raster)
+        self._front_frame = frame
         self.update()
 
     def present_encoded(self, payload: bytes, *, image_format: str = "PNG") -> None:
@@ -123,16 +125,22 @@ class QtImageBoard(QtWidgets.QWidget):
         if image.isNull():
             raise RuntimeError("Qt rejected the encoded immutable raster")
         self._front = (payload, image)
+        self._front_frame = None
         self.update()
 
     def clear(self) -> None:
         self._require_owner()
         self._front = None
+        self._front_frame = None
         self.update()
 
     @property
     def has_front(self) -> bool:
         return self._front is not None
+
+    @property
+    def front_frame(self) -> BoardFrame | None:
+        return self._front_frame
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         del event

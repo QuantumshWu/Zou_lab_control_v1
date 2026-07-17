@@ -283,12 +283,12 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             self._drain_worker_results()
             self._drain_attachments()
             try:
-                live = self._live
-                if live is not None:
-                    live.admit_pending()
                 board = self._board
                 if board is not None and board.fault is None:
                     board.present_pending()
+                live = self._live
+                if live is not None:
+                    live.admit_pending()
             except BaseException as error:
                 message = f"Preview failed: {type(error).__name__}: {error}"
                 slot = self._slot

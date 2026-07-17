@@ -121,24 +121,37 @@ def test_typed_roi_curve_preserves_raw_axes_and_presents_one_coherent_board(
             lambda: (
                 board.has_front
                 and window._live is not None
-                and window._live.coverage is not None
-                and window._live.coverage.written_cells >= 2
+                and window._live.front_status is not None
+                and window._live.front_status.sequence
+                == board.front_frame.sequence
+                and window._live.front_status.raw_coverage.written_cells >= 2
             ),
         )
 
         frame = board.front_frame
-        assert frame is not None and len(frame.panels) == 2
+        assert frame is not None and len(frame.panels) == 4
         assert tuple(panel.panel_id for panel in frame.panels) == (
             "camera-monitor-image",
             "camera-monitor-roi-curve",
+            "camera-monitor-roi-histogram",
+            "camera-monitor-roi-meter",
         )
-        assert frame.panels[0].coherence_stamp == frame.panels[1].coherence_stamp
+        assert all(
+            panel.coherence_stamp == frame.panels[0].coherence_stamp
+            for panel in frame.panels
+        )
         stamp = frame.panels[0].coherence_stamp
         assert len(stamp.inputs) == 2
         assert frame.panels[0].source_identity != frame.panels[1].source_identity
+        assert all(
+            panel.source_identity == frame.panels[1].source_identity
+            for panel in frame.panels[1:]
+        )
         assert tuple(value.panel_id for value in stamp.presentations) == (
             "camera-monitor-image",
             "camera-monitor-roi-curve",
+            "camera-monitor-roi-histogram",
+            "camera-monitor-roi-meter",
         )
         assert "ROI sum" in projection.text()
         assert "MONITOR DERIVED" in projection.text()
@@ -153,8 +166,7 @@ def test_typed_roi_curve_preserves_raw_axes_and_presents_one_coherent_board(
         assert current.head is not None and current.event_refs[0] == current.head
         assert len(current.event_refs) == request.history_capacity
 
-        curve_document = window._live._curve_document
-        assert curve_document is not None
+        curve_document = window._live._scalar_documents[0]
         bindings = {
             binding.axis_id: binding
             for binding in curve_document.layers[0].view.axis_bindings

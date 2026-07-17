@@ -39,6 +39,7 @@ from .render_style import (
 _RASTER_FIXED_BYTES = 8 << 20
 _RASTER_BUFFER_MULTIPLIER = 8
 _ARTIST_ARRAY_MULTIPLIER = 8
+DEFAULT_HISTOGRAM_BINS = 60
 _SITE_RADIUS_BLOCK = 128
 
 
@@ -129,18 +130,21 @@ def estimate_render_peak_nbytes(
     )
 
 
-def estimate_single_curve_raster_peak_nbytes(
+def estimate_live_panel_raster_peak_nbytes(
     width: int,
     height: int,
     *,
     evaluated_data_upper_bound_bytes: int = 0,
+    histogram_bins: int | None = None,
 ) -> int:
-    """Static preflight bound for one coalesced Agg curve front.
+    """Static preflight bound for one coalesced single-panel Agg front.
 
     The caller supplies a schema-derived upper bound for evaluator-owned data;
     A live renderer retains the previous artist arrays while Matplotlib copies
     the next evaluated revision into those artists.  The bound also covers the
-    persistent Agg canvas plus queued/visible immutable raster fronts.
+    persistent Agg canvas plus queued/visible immutable raster fronts.  A live
+    histogram additionally admits its bounded counts, edges, and closed-step
+    vertices; ``None`` means that the panel is a curve or meter.
     """
 
     width = positive_integer(width, "width")
@@ -149,10 +153,20 @@ def estimate_single_curve_raster_peak_nbytes(
         evaluated_data_upper_bound_bytes,
         "evaluated_data_upper_bound_bytes",
     )
+    histogram_geometry_bytes = 0
+    if histogram_bins is not None:
+        bins = positive_integer(histogram_bins, "histogram_bins")
+        counts_bytes = bins * np.dtype(np.intp).itemsize
+        edges_bytes = (bins + 1) * np.dtype(np.float64).itemsize
+        vertices_bytes = 2 * (2 * bins + 2) * np.dtype(np.float64).itemsize
+        histogram_geometry_bytes = (
+            counts_bytes + edges_bytes + vertices_bytes
+        )
     return (
         _RASTER_FIXED_BYTES
         + _RASTER_BUFFER_MULTIPLIER * width * height * 4
-        + _ARTIST_ARRAY_MULTIPLIER * data_bytes
+        + _ARTIST_ARRAY_MULTIPLIER
+        * (data_bytes + histogram_geometry_bytes)
     )
 
 
@@ -283,6 +297,9 @@ def _curve_values(series):
         raise ValueError(
             "complex curves require an explicit real-valued display transform"
         )
+    valid_values = np.asarray(data.values)[np.asarray(data.validity, dtype=bool)]
+    if valid_values.size and not bool(np.all(np.isfinite(valid_values))):
+        raise ValueError("valid curve values must all be finite")
     return np.ma.array(data.values, mask=~data.validity)
 
 
@@ -357,6 +374,59 @@ def _image(axis, figure, layer, cell, series, fit_result):
                 )
 
 
+def histogram_bin_counts(
+    samples: np.ndarray,
+    bins: int = DEFAULT_HISTOGRAM_BINS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return deterministic NumPy histogram counts and edges for one sample set.
+
+    Boolean samples are the two categorical states regardless of ``bins``.
+    Numeric samples use ``numpy.histogram`` directly, including its final-bin
+    right-edge rule.  Empty numeric input therefore has ``bins`` zero counts on
+    NumPy's canonical ``[0, 1]`` range.  Non-finite values are rejected rather
+    than silently changing automatically inferred bounds.
+    """
+
+    values = np.asarray(samples)
+    if values.ndim != 1:
+        raise ValueError("histogram samples must be one-dimensional")
+    bins = positive_integer(bins, "histogram bins")
+    if values.dtype.kind not in "biuf":
+        raise TypeError("histogram samples must have a real numeric or boolean dtype")
+    if values.dtype.kind == "b":
+        counts, edges = np.histogram(
+            values.astype(np.uint8, copy=False),
+            bins=np.asarray((-0.5, 0.5, 1.5), dtype=np.float64),
+        )
+    else:
+        if values.size and not bool(np.all(np.isfinite(values))):
+            raise ValueError("valid histogram samples must all be finite")
+        counts, edges = np.histogram(values, bins=bins)
+    return (
+        np.asarray(counts, dtype=np.intp),
+        np.asarray(edges, dtype=np.float64),
+    )
+
+
+def _histogram_step_vertices(
+    counts: np.ndarray,
+    edges: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build one closed step outline without changing NumPy bin semantics."""
+
+    counts = np.asarray(counts, dtype=np.float64)
+    edges = np.asarray(edges, dtype=np.float64)
+    if counts.ndim != 1 or edges.shape != (len(counts) + 1,):
+        raise ValueError("histogram counts and edges do not align")
+    x = np.repeat(edges, 2)
+    y = np.empty(2 * len(counts) + 2, dtype=np.float64)
+    y[0] = 0.0
+    y[-1] = 0.0
+    y[1:-1:2] = counts
+    y[2:-1:2] = counts
+    return x, y
+
+
 def _histogram(axis, series_group):
     multiple_series = len(series_group) > 1
     all_boolean = all(
@@ -368,32 +438,42 @@ def _histogram(axis, series_group):
         data = series.data
         assert isinstance(data, EvaluatedHistogram)
         label = _series_label(series, include_reductions=multiple_series)
-        samples = data.samples
-        if np.issubdtype(samples.dtype, np.bool_):
-            # NumPy's automatic binning collapses False and True into one
-            # [0, 1] bin.  Preserve the two categorical states explicitly.
-            samples = samples.astype(np.uint8, copy=False)
-            bins = (-0.5, 0.5, 1.5)
-        else:
-            bins = "auto"
-        axis.hist(samples, bins=bins, histtype="step", label=label)
+        counts, edges = histogram_bin_counts(data.samples)
+        x, y = _histogram_step_vertices(counts, edges)
+        axis.plot(x, y, label=label)
     if all_boolean:
         axis.set_xticks((0, 1), ("false", "true"))
     if len(series_group) > 1 or any(series.batch_address for series in series_group):
         axis.legend(fontsize=ANNOTATION_FONT_SIZE)
 
 
-def _meter(axis, series_group):
-    axis.set_axis_off()
+def _meter_text(series_group) -> str:
     lines = []
     multiple_series = len(series_group) > 1
     for series in series_group:
         data = series.data
         assert isinstance(data, EvaluatedMeter)
         label = _series_label(series, include_reductions=multiple_series) or ""
+        if data.valid and not _finite_numeric_scalar(data.value):
+            raise ValueError("valid meter values must be finite")
         value = str(data.value) if data.valid else "invalid"
         lines.append(f"{label}: {value}" if label else value)
-    axis.text(0.5, 0.5, "\n".join(lines), ha="center", va="center")
+    return "\n".join(lines)
+
+
+def _finite_numeric_scalar(value: Number) -> bool:
+    try:
+        return bool(np.isfinite(value))
+    except TypeError:
+        predicate = getattr(value, "is_finite", None)
+        if callable(predicate):
+            return bool(predicate())
+        return bool(math.isfinite(value))
+
+
+def _meter(axis, series_group):
+    axis.set_axis_off()
+    axis.text(0.5, 0.5, _meter_text(series_group), ha="center", va="center")
 
 
 def _panels(evaluated: EvaluatedFigureData):
@@ -558,14 +638,14 @@ def _render_evaluated_figure(
         raise
 
 
-class SingleCurveAggRenderer:
-    """Worker-affine live Agg surface for one frozen curve topology."""
+class SinglePanelAggRenderer:
+    """Worker-affine live Agg surface for one curve/histogram/meter panel."""
 
     __slots__ = (
         "_axis",
         "_document",
         "_figure",
-        "_lines",
+        "_artists",
         "_owner_thread",
         "_topology",
     )
@@ -607,7 +687,7 @@ class SingleCurveAggRenderer:
         self._document = document
         self._figure = figure
         self._axis = axis
-        self._lines = ()
+        self._artists = ()
         self._topology = None
 
     def render(self, evaluated: EvaluatedFigureData) -> RasterBuffer:
@@ -619,56 +699,91 @@ class SingleCurveAggRenderer:
         figure = self._figure
         axis = self._axis
         if figure is None or axis is None:
-            raise RuntimeError("single-curve renderer is closed")
-        layer, cell, series_group = self._one_curve_panel(evaluated)
+            raise RuntimeError("single-panel renderer is closed")
+        layer, cell, series_group = self._one_panel(evaluated)
+        first = series_group[0].data
+        kind = type(first)
+        if isinstance(first, EvaluatedCurve):
+            series_topology = tuple(
+                (series.batch_address, series.data.x_axis)
+                for series in series_group
+            )
+        elif isinstance(first, EvaluatedHistogram):
+            series_topology = tuple(
+                (series.batch_address, series.data.samples.dtype.str)
+                for series in series_group
+            )
+        else:
+            assert isinstance(first, EvaluatedMeter)
+            series_topology = tuple(series.batch_address for series in series_group)
         topology = (
             layer.layer_id,
             layer.dataset_id,
             layer.resolutions,
             cell.facet_address,
-            tuple(
-                (series.batch_address, series.data.x_axis)
-                for series in series_group
-            ),
+            kind,
+            series_topology,
         )
         if self._topology is None:
-            _curve(axis, layer, cell, series_group, None)
-            self._lines = tuple(axis.lines)
-            if len(self._lines) != len(series_group):
-                raise RuntimeError("single-curve renderer created another artist topology")
+            if isinstance(first, EvaluatedCurve):
+                _curve(axis, layer, cell, series_group, None)
+                self._artists = tuple(axis.lines)
+            elif isinstance(first, EvaluatedHistogram):
+                _histogram(axis, series_group)
+                self._artists = tuple(axis.lines)
+            else:
+                _meter(axis, series_group)
+                self._artists = tuple(axis.texts)
+            expected_artists = 1 if isinstance(first, EvaluatedMeter) else len(series_group)
+            if len(self._artists) != expected_artists:
+                raise RuntimeError("single-panel renderer created another artist topology")
             self._topology = topology
         else:
-            if topology != self._topology or len(self._lines) != len(series_group):
-                raise RuntimeError("progressive curve topology changed between revisions")
-            for line, series in zip(self._lines, series_group, strict=True):
-                data = series.data
-                assert isinstance(data, EvaluatedCurve)
-                line.set_data(
-                    np.asarray(data.x_axis.coordinates),
-                    _curve_values(series),
-                )
+            expected_artists = 1 if isinstance(first, EvaluatedMeter) else len(series_group)
+            if topology != self._topology or len(self._artists) != expected_artists:
+                raise RuntimeError("progressive panel topology changed between revisions")
+            if isinstance(first, EvaluatedCurve):
+                for line, series in zip(self._artists, series_group, strict=True):
+                    data = series.data
+                    assert isinstance(data, EvaluatedCurve)
+                    line.set_data(
+                        np.asarray(data.x_axis.coordinates),
+                        _curve_values(series),
+                    )
+            elif isinstance(first, EvaluatedHistogram):
+                for line, series in zip(self._artists, series_group, strict=True):
+                    data = series.data
+                    assert isinstance(data, EvaluatedHistogram)
+                    counts, edges = histogram_bin_counts(data.samples)
+                    line.set_data(*_histogram_step_vertices(counts, edges))
+            else:
+                assert isinstance(first, EvaluatedMeter)
+                self._artists[0].set_text(_meter_text(series_group))
 
         multiple_series = len(series_group) > 1
-        for line, series in zip(self._lines, series_group, strict=True):
-            line.set_label(
-                _series_label(series, include_reductions=multiple_series)
-            )
-        first = series_group[0].data
-        assert isinstance(first, EvaluatedCurve)
-        axis.set_xlabel(_axis_label(first.x_axis))
+        if isinstance(first, (EvaluatedCurve, EvaluatedHistogram)):
+            for line, series in zip(self._artists, series_group, strict=True):
+                line.set_label(
+                    _series_label(series, include_reductions=multiple_series)
+                )
+        if isinstance(first, EvaluatedCurve):
+            axis.set_xlabel(_axis_label(first.x_axis))
         axis.set_title(_panel_title(self._document, layer, cell, series_group))
-        if multiple_series or any(series.batch_address for series in series_group):
+        if isinstance(first, (EvaluatedCurve, EvaluatedHistogram)) and (
+            multiple_series or any(series.batch_address for series in series_group)
+        ):
             legend = axis.get_legend()
             if legend is None:
                 legend = axis.legend(fontsize=ANNOTATION_FONT_SIZE)
             else:
                 texts = legend.get_texts()
-                if len(texts) != len(self._lines):
-                    raise RuntimeError("progressive curve legend topology changed")
-                for text, line in zip(texts, self._lines, strict=True):
+                if len(texts) != len(self._artists):
+                    raise RuntimeError("progressive panel legend topology changed")
+                for text, line in zip(texts, self._artists, strict=True):
                     text.set_text(line.get_label())
-        axis.relim(visible_only=True)
-        axis.autoscale_view()
+        if isinstance(first, (EvaluatedCurve, EvaluatedHistogram)):
+            axis.relim(visible_only=True)
+            axis.autoscale_view()
         figure.canvas.draw()
         actual_width, actual_height = figure.canvas.get_width_height()
         return RasterBuffer(
@@ -690,7 +805,7 @@ class SingleCurveAggRenderer:
             return
         self._figure = None
         self._axis = None
-        self._lines = ()
+        self._artists = ()
         self._topology = None
         # Collect before the worker reports done so the FINAL renderer cannot
         # overlap a provisional Agg surface.
@@ -698,27 +813,36 @@ class SingleCurveAggRenderer:
         figure = None
         gc.collect()
 
-    def _one_curve_panel(self, evaluated: EvaluatedFigureData):
+    def _one_panel(self, evaluated: EvaluatedFigureData):
         _require_evaluated_identity(self._document, evaluated)
         panels = _panels(evaluated)
-        if len(panels) != 1 or any(
-            not isinstance(series.data, EvaluatedCurve)
-            for series in panels[0][2]
+        if len(panels) != 1:
+            raise ValueError("progressive raster requires exactly one panel")
+        series_group = panels[0][2]
+        if not series_group:
+            raise ValueError("progressive raster panel has no series")
+        kind = type(series_group[0].data)
+        if kind not in (EvaluatedCurve, EvaluatedHistogram, EvaluatedMeter) or any(
+            type(series.data) is not kind for series in series_group
         ):
-            raise ValueError("progressive raster requires exactly one curve panel")
+            raise ValueError(
+                "progressive raster requires one homogeneous curve, histogram, or meter panel"
+            )
         return panels[0]
 
     def _require_owner(self) -> None:
         if threading.get_ident() != self._owner_thread:
-            raise RuntimeError("single-curve Agg renderer used from another thread")
+            raise RuntimeError("single-panel Agg renderer used from another thread")
 
 
 __all__ = [
+    "DEFAULT_HISTOGRAM_BINS",
+    "estimate_live_panel_raster_peak_nbytes",
     "estimate_render_peak_nbytes",
-    "estimate_single_curve_raster_peak_nbytes",
+    "histogram_bin_counts",
     "render_evaluated_figure",
     "release_agg_figure",
     "save_evaluated_figure",
     "site_ring_radius",
-    "SingleCurveAggRenderer",
+    "SinglePanelAggRenderer",
 ]

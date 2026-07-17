@@ -47,7 +47,7 @@ from zlc_data import (
     commit_transform,
     materialize_transformed_snapshot,
 )
-from zlc_frontend.matplotlib_render import SingleCurveAggRenderer
+from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
 from zlc_frontend.figure import (
     AxisViewRole,
     FigureEvaluationPolicy,
@@ -332,7 +332,7 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity(monk
             ),
         )
 
-    renderer = SingleCurveAggRenderer(
+    renderer = SinglePanelAggRenderer(
         progressive.document,
         width=360,
         height=240,
@@ -340,7 +340,7 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity(monk
     first = renderer.render(evaluate(snapshots[0]))
     figure_id = id(renderer._figure)
     axis_id = id(renderer._axis)
-    line_ids = tuple(map(id, renderer._lines))
+    line_ids = tuple(map(id, renderer._artists))
     first_legend = tuple(
         text.get_text() for text in renderer._axis.get_legend().get_texts()
     )
@@ -348,7 +348,7 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity(monk
     second = renderer.render(evaluate(snapshots[1]))
     assert id(renderer._figure) == figure_id
     assert id(renderer._axis) == axis_id
-    assert tuple(map(id, renderer._lines)) == line_ids
+    assert tuple(map(id, renderer._artists)) == line_ids
     second_legend = tuple(
         text.get_text() for text in renderer._axis.get_legend().get_texts()
     )
@@ -387,7 +387,7 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity(monk
                 RuntimeError,
                 match="injected renderer construction failure",
             ):
-                SingleCurveAggRenderer(
+                SinglePanelAggRenderer(
                     progressive.document,
                     width=360,
                     height=240,
@@ -846,9 +846,9 @@ def _assert_occupancy_scan_window(exp, request, monkeypatch):
     renderer_ids = []
     renderer_close_threads = []
     present_threads = []
-    original_init = progressive_scan.SingleCurveAggRenderer.__init__
-    original_render = progressive_scan.SingleCurveAggRenderer.render
-    original_close = progressive_scan.SingleCurveAggRenderer.close
+    original_init = progressive_scan.SinglePanelAggRenderer.__init__
+    original_render = progressive_scan.SinglePanelAggRenderer.render
+    original_close = progressive_scan.SinglePanelAggRenderer.close
     original_present = QtImageBoard.present
 
     def record_init(renderer, *args, **kwargs):
@@ -870,17 +870,17 @@ def _assert_occupancy_scan_window(exp, request, monkeypatch):
 
     with monkeypatch.context() as patch:
         patch.setattr(
-            progressive_scan.SingleCurveAggRenderer,
+            progressive_scan.SinglePanelAggRenderer,
             "__init__",
             record_init,
         )
         patch.setattr(
-            progressive_scan.SingleCurveAggRenderer,
+            progressive_scan.SinglePanelAggRenderer,
             "render",
             record_render,
         )
         patch.setattr(
-            progressive_scan.SingleCurveAggRenderer,
+            progressive_scan.SinglePanelAggRenderer,
             "close",
             record_close,
         )

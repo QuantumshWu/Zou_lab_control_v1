@@ -22,8 +22,8 @@ from zlc_data import (
     transformed_snapshot_peak_nbytes,
 )
 from zlc_frontend.matplotlib_render import (
-    SingleCurveAggRenderer,
-    estimate_single_curve_raster_peak_nbytes,
+    SinglePanelAggRenderer,
+    estimate_live_panel_raster_peak_nbytes,
 )
 from zlc_frontend.figure import (
     DatasetDescriptor,
@@ -277,7 +277,7 @@ def build_occupancy_progressive_spec(
         output_contract.committed_transform,
     )
     evaluation_peak = estimate_view_evaluation_peak_nbytes(output_schema, view)
-    raster_peak = estimate_single_curve_raster_peak_nbytes(
+    raster_peak = estimate_live_panel_raster_peak_nbytes(
         _RASTER_WIDTH,
         _RASTER_HEIGHT,
         evaluated_data_upper_bound_bytes=evaluation_peak,
@@ -690,7 +690,7 @@ class ProgressiveScanPreview:
                     max_live_nbytes=self._spec.evaluation_peak_bytes,
                 )
             )
-            renderer = SingleCurveAggRenderer(
+            renderer = SinglePanelAggRenderer(
                 self._spec.document,
                 width=_RASTER_WIDTH,
                 height=_RASTER_HEIGHT,
