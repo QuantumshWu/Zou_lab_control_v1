@@ -30,6 +30,7 @@ from zlc_storage import (
     sha256_text as _sha256,
 )
 
+from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
 from zlc_neutral_atom.runtime.capture import FrozenCaptureSpec
 from zlc_neutral_atom.camera_operator import (
     CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
@@ -43,6 +44,20 @@ CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT = canonical_digest(
         "schema": _CAMERA_CAPTURE_SPEC_SCHEMA,
     }
 )
+CAMERA_MEASUREMENT_KEY = DefinitionKey(
+    "zlc_neutral_atom.acquisition",
+    "camera-capture",
+)
+CAMERA_MEASUREMENT_DEFINITION = MeasurementDefinition(
+    CAMERA_MEASUREMENT_KEY,
+    "Camera capture",
+    "zlc.camera-capture-request",
+    "zlc.camera-capture-binding",
+    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+)
+CAMERA_MEASUREMENT_DEFINITIONS = (CAMERA_MEASUREMENT_DEFINITION,)
+
+
 class CameraAcquisitionMode(str, Enum):
     EXTERNAL_TRIGGERED = "EXTERNAL_TRIGGERED"
     FREE_RUNNING = "FREE_RUNNING"
@@ -395,6 +410,9 @@ class CameraDatasetEventAdapter:
 __all__ = [
     "CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT",
     "CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT",
+    "CAMERA_MEASUREMENT_DEFINITION",
+    "CAMERA_MEASUREMENT_DEFINITIONS",
+    "CAMERA_MEASUREMENT_KEY",
     "CameraAcquisitionMode",
     "CameraCaptureSpec",
     "CameraDatasetEventAdapter",

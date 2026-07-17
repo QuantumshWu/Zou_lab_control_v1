@@ -237,9 +237,43 @@ class ScanPanelController:
             return not self._tracked and not self._mailbox
 
     @property
+    def can_reconfigure(self) -> bool:
+        """Whether a new immutable panel application may replace the old one."""
+
+        self._require_owner()
+        return self._can_start() and self.worker_idle
+
+    @property
     def closed(self) -> bool:
         self._require_owner()
         return self._closed
+
+    def reconfigure(self, application: ScanPanelApplication) -> int:
+        """Atomically replace an idle panel configuration and clear stale output.
+
+        The caller must first build and validate the complete replacement
+        application.  A failed build therefore leaves the currently applied
+        configuration untouched.  Reconfiguration never cancels a Run or races
+        a worker completion; those cases are rejected explicitly.
+        """
+
+        self._require_owner()
+        if not isinstance(application, ScanPanelApplication):
+            raise TypeError("application must implement ScanPanelApplication")
+        if not self.can_reconfigure:
+            raise RuntimeError("scan panel must be fully idle before reconfiguration")
+        self._generation += 1
+        self._application = application
+        self._handle = None
+        self._owner_reaped = True
+        self._artifact_ref = None
+        self._presentation = None
+        self._progressive_summary = None
+        self._pending_projection = None
+        self._diagnostic = None
+        self._status = "IDLE · FINAL-ONLY"
+        self._publish_model()
+        return self._generation
 
     def start(self) -> int:
         """Prepare, attach any preview, then start without blocking the owner."""

@@ -79,6 +79,27 @@ _RASTER_HEIGHT = 520
 
 
 @dataclass(frozen=True, slots=True)
+class ScanDisplayIntent:
+    """Visible, non-authoritative site presentation choice for a scan panel."""
+
+    site_mode: str = "auto"
+    site_index: int = 0
+
+    def __post_init__(self) -> None:
+        mode = canonical_text(self.site_mode, "site_mode")
+        if mode not in {"auto", "batch", "select"}:
+            raise ValueError("site_mode must be 'auto', 'batch', or 'select'")
+        if (
+            isinstance(self.site_index, bool)
+            or not isinstance(self.site_index, int)
+            or self.site_index < 0
+        ):
+            raise ValueError("site_index must be a nonnegative integer")
+        if mode != "select" and self.site_index != 0:
+            raise ValueError("site_index is meaningful only when site_mode='select'")
+
+
+@dataclass(frozen=True, slots=True)
 class ProgressiveScanSpec:
     """Frozen display-only plan paired with one authoritative output contract."""
 
@@ -89,6 +110,8 @@ class ProgressiveScanSpec:
     transform_peak_bytes: int
     evaluation_peak_bytes: int
     preview_spec: ExactDatasetPreviewSpec
+    display_selection: Selection | None
+    display_preferences: ViewPreferences
 
     def __post_init__(self) -> None:
         if not isinstance(self.output_contract, ScanOutputContract):
@@ -104,6 +127,13 @@ class ProgressiveScanSpec:
             raise TypeError("output_block_id must be BlockId")
         if not isinstance(self.document, FigureDocument):
             raise TypeError("document must be FigureDocument")
+        if self.display_selection is not None and not isinstance(
+            self.display_selection,
+            Selection,
+        ):
+            raise TypeError("display_selection must be Selection or None")
+        if not isinstance(self.display_preferences, ViewPreferences):
+            raise TypeError("display_preferences must be ViewPreferences")
         dataset_id = self.document.datasets[0].dataset_id if self.document.datasets else None
         if (
             len(self.document.datasets) != 1
@@ -143,6 +173,7 @@ def build_occupancy_progressive_spec(
     output_contract: ScanOutputContract,
     *,
     identity: str,
+    display_intent: ScanDisplayIntent = ScanDisplayIntent(),
 ) -> ProgressiveScanSpec:
     """Derive one visible, non-authoritative curve view from declared axes."""
 
@@ -150,6 +181,8 @@ def build_occupancy_progressive_spec(
         raise TypeError("source_schema must be DatasetSchema")
     if not isinstance(output_contract, ScanOutputContract):
         raise TypeError("output_contract must be ScanOutputContract")
+    if not isinstance(display_intent, ScanDisplayIntent):
+        raise TypeError("display_intent must be ScanDisplayIntent")
     identity = canonical_text(identity, "identity")
     output_schema = output_contract.output_dataset_schema
     if not output_schema.point_axes:
@@ -164,31 +197,43 @@ def build_occupancy_progressive_spec(
     # Information-bearing trailing axes are selected, never averaged.  The
     # exact coordinate is kept in ViewSpec and in the visible summary.
     data_axes = output_schema.cell_schema.data_axes
-    batch_axis = next(
-        (
-            axis
-            for axis in data_axes
-            if axis.role == SITE and 1 < axis.size <= 32
-        ),
-        None,
-    )
+    site_axes = tuple(axis for axis in data_axes if axis.role == SITE)
+    if len(site_axes) != 1:
+        raise ValueError("occupancy output must declare exactly one SITE axis")
+    site_axis = site_axes[0]
+    if display_intent.site_mode == "batch":
+        if not 1 < site_axis.size <= 32:
+            raise ValueError("site batch display requires between 2 and 32 sites")
+        batch_axis = site_axis
+    elif display_intent.site_mode == "select":
+        if display_intent.site_index >= site_axis.size:
+            raise ValueError("selected site index exceeds the declared SITE axis")
+        batch_axis = None
+    else:
+        batch_axis = site_axis if 1 < site_axis.size <= 32 else None
     terms.extend(
-        IndexSelection(axis.axis_id, 0)
+        IndexSelection(
+            axis.axis_id,
+            display_intent.site_index
+            if axis is site_axis and display_intent.site_mode == "select"
+            else 0,
+        )
         for axis in data_axes
         if axis is not batch_axis
     )
     selection = None if not terms else Selection(tuple(terms))
+    preferences = ViewPreferences(
+        repeat_mode=RepeatViewMode.MEAN,
+        x_axis_id=x_axis.axis_id,
+        batch_axis_ids=(
+            () if batch_axis is None else (batch_axis.axis_id,)
+        ),
+    )
     suggestion = suggest_view(
         output_schema,
         ViewIntent.CURVE,
         selection,
-        ViewPreferences(
-            repeat_mode=RepeatViewMode.MEAN,
-            x_axis_id=x_axis.axis_id,
-            batch_axis_ids=(
-                () if batch_axis is None else (batch_axis.axis_id,)
-            ),
-        ),
+        preferences,
     )
     if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
         detail = " · ".join(reason.message for reason in suggestion.reasons)
@@ -254,6 +299,8 @@ def build_occupancy_progressive_spec(
         transform_peak,
         evaluation_peak,
         ExactDatasetPreviewSpec(source_schema.fingerprint, downstream_peak),
+        selection,
+        preferences,
     )
 
 
@@ -808,4 +855,5 @@ __all__ = [
     "ExactDatasetLiveSlot",
     "ProgressiveScanPreview",
     "ProgressiveScanSpec",
+    "ScanDisplayIntent",
 ]

@@ -38,12 +38,11 @@ from zlc_neutral_atom.acquisition.camera import (
     CameraSample,
     CameraSampleContract,
 )
-from zlc_neutral_atom.catalog import DefinitionKey
+from zlc_neutral_atom.catalog import DefinitionKey, StreamProcessorDefinition
 from zlc_neutral_atom.capture_reference import CaptureArtifactRef
 from zlc_neutral_atom.processing.stream import (
     BoundStreamProcessor,
     ExactStreamProcessorWorker,
-    StreamProcessorDefinition,
 )
 from zlc_neutral_atom.runtime.cancellation import CancellationToken
 from zlc_neutral_atom.runtime.capture import CaptureProcessorInputBinding
@@ -82,6 +81,14 @@ OCCUPANCY_STREAM_PROCESSOR_KEY = DefinitionKey(
     "occupancy-stream",
 )
 _OCCUPANCY_CONFIG_FORMAT = "zlc_neutral_atom.occupancy-stream-config"
+OCCUPANCY_STREAM_PROCESSOR_DEFINITION = StreamProcessorDefinition(
+    OCCUPANCY_STREAM_PROCESSOR_KEY,
+    "Classify one camera frame into atomic site counts and occupancy",
+    _OCCUPANCY_CONFIG_FORMAT,
+)
+OCCUPANCY_STREAM_PROCESSOR_DEFINITIONS = (
+    OCCUPANCY_STREAM_PROCESSOR_DEFINITION,
+)
 _RECORD_BYTES = 128
 _COMMITTED_OCCUPANCY_FIXED_BYTES = 4 << 20
 OCCUPANCY_COUNTS_BLOCK_ID = BlockId("occupancy-counts")
@@ -1316,18 +1323,8 @@ def bind_occupancy_stream_processor(
         output_contract.counts_schema,
         output_contract.occupied_schema,
     )
-    definition = StreamProcessorDefinition(
-        OCCUPANCY_STREAM_PROCESSOR_KEY,
-        "Classify one camera frame into atomic site counts and occupancy",
-        _OCCUPANCY_CONFIG_FORMAT,
-        input_contract.fingerprint,
-        output_contract.fingerprint,
-        capture_input.join_key_contract.fingerprint,
-        spec.operator_deadline_seconds,
-        spec.terminal_wait_seconds,
-    )
     processor = BoundStreamProcessor(
-        definition,
+        OCCUPANCY_STREAM_PROCESSOR_DEFINITION,
         config,
         input_contract,
         output_contract,
@@ -1335,6 +1332,8 @@ def bind_occupancy_stream_processor(
         spec.output_stream_id,
         spec.output_source_id,
         _occupancy_operator,
+        spec.operator_deadline_seconds,
+        spec.terminal_wait_seconds,
         (calibration_artifact_input_ref(spec.calibration.reference),),
     )
     return BoundOccupancyStreamProcessor(
@@ -1349,6 +1348,8 @@ def bind_occupancy_stream_processor(
 __all__ = [
     "OCCUPANCY_COUNTS_BLOCK_ID",
     "OCCUPANCY_OCCUPIED_BLOCK_ID",
+    "OCCUPANCY_STREAM_PROCESSOR_DEFINITION",
+    "OCCUPANCY_STREAM_PROCESSOR_DEFINITIONS",
     "OCCUPANCY_STREAM_PROCESSOR_KEY",
     "BoundOccupancyStreamProcessor",
     "OccupancyArtifact",

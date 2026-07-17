@@ -21,7 +21,7 @@ from zlc_storage import (
     sha256_text,
 )
 
-from zlc_neutral_atom.catalog import DefinitionKey
+from zlc_neutral_atom.catalog import MeasurementDefinition as _MeasurementDefinition
 from zlc_neutral_atom.camera_operator import (
     CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
 )
@@ -64,37 +64,14 @@ from .streams import (
 
 
 @dataclass(frozen=True)
-class MeasurementDefinition:
-    """Pure catalog metadata; domain composition constructs BoundMeasurement."""
-
-    key: DefinitionKey
-    title: str
-    request_schema_id: str
-    binding_schema_id: str
-    capture_spec_owner_fingerprint: str
-    output_schema_fingerprint: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.key, DefinitionKey):
-            raise TypeError("key must be DefinitionKey")
-        for field in ("title", "request_schema_id", "binding_schema_id"):
-            _canonical_text(getattr(self, field), field)
-        for field in (
-            "capture_spec_owner_fingerprint",
-            "output_schema_fingerprint",
-        ):
-            sha256_text(getattr(self, field), field)
-
-
-@dataclass(frozen=True)
 class BoundMeasurement:
-    definition: MeasurementDefinition
+    definition: _MeasurementDefinition
     capture_port: BoundCapturePort
     capture_contract: CameraCaptureContract
     capture_spec: FrozenCaptureSpec
 
     def __post_init__(self) -> None:
-        if not isinstance(self.definition, MeasurementDefinition):
+        if not isinstance(self.definition, _MeasurementDefinition):
             raise TypeError("definition must be MeasurementDefinition")
         if not isinstance(self.capture_port, BoundCapturePort):
             raise TypeError("capture_port must be BoundCapturePort")
@@ -111,11 +88,6 @@ class BoundMeasurement:
             != self.capture_contract.capture_spec_owner_fingerprint
         ):
             raise ValueError("measurement definition/spec/contract owner differs")
-        if (
-            self.definition.output_schema_fingerprint
-            != self.capture_contract.dataset_schema.fingerprint
-        ):
-            raise ValueError("measurement definition output schema differs")
         if (
             self.capture_contract.camera_provenance.camera_arm_spec_fingerprint
             != self.capture_spec.digest
@@ -966,7 +938,6 @@ __all__ = [
     "ExactCaptureTransaction",
     "estimate_pipeline_peak_bytes",
     "finalize_pipeline_result",
-    "MeasurementDefinition",
     "MinimalPipelineSpec",
     "PipelineResult",
 ]

@@ -11,10 +11,12 @@ from Zou_lab_control.notebook.facade import (
     _prepare_occupancy_scan_for_workbench,
 )
 from zlc_frontend.qt_board import QtImageBoard, QtOwnerWake
+from zlc_frontend.figure import ViewIntent
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_storage import canonical_digest
 from zlc_workbench.progressive_scan import (
     ProgressiveScanSpec,
+    ScanDisplayIntent,
     build_occupancy_progressive_spec,
 )
 from zlc_workbench.scan import (
@@ -28,15 +30,29 @@ from zlc_workbench.scan import (
 class _FrozenScanApplication:
     """Composition-owned bridge from a frozen public request to the controller."""
 
-    __slots__ = ("_experiment", "_request")
+    __slots__ = (
+        "_experiment",
+        "_request",
+        "_display_intent",
+        "_final_selection",
+        "_final_preferences",
+    )
 
     def __init__(
         self,
         experiment: Experiment,
         request: ScanRequest | OccupancyScanRequest,
+        display_intent: ScanDisplayIntent = ScanDisplayIntent(),
     ) -> None:
+        if not isinstance(display_intent, ScanDisplayIntent):
+            raise TypeError("display_intent must be ScanDisplayIntent")
+        if isinstance(request, ScanRequest) and display_intent != ScanDisplayIntent():
+            raise ValueError("direct-camera scan has no site display setting")
         self._experiment = experiment
         self._request = request
+        self._display_intent = display_intent
+        self._final_selection = None
+        self._final_preferences = None
 
     def prepare(self):
         if isinstance(self._request, ScanRequest):
@@ -64,7 +80,10 @@ class _FrozenScanApplication:
             command.source_schema,
             command.output_contract,
             identity=identity,
+            display_intent=self._display_intent,
         )
+        self._final_selection = progressive.display_selection
+        self._final_preferences = progressive.display_preferences
         def start_occupancy(preview):
             if preview is not None and preview.spec != progressive.preview_spec:
                 raise ValueError(
@@ -80,10 +99,16 @@ class _FrozenScanApplication:
         *,
         memory_limit_bytes: int,
     ) -> FinalScanPresentation:
-        figure = self._experiment.figure(
-            source_ref,
-            memory_limit_bytes=memory_limit_bytes,
-        )
+        figure_options = {"memory_limit_bytes": memory_limit_bytes}
+        if isinstance(self._request, OccupancyScanRequest):
+            if self._final_preferences is None:
+                raise RuntimeError("occupancy display was not prepared")
+            figure_options.update(
+                intent=ViewIntent.CURVE,
+                selection=self._final_selection,
+                preferences=self._final_preferences,
+            )
+        figure = self._experiment.figure(source_ref, **figure_options)
         layer = figure.document.layers[0]
         bindings = " · ".join(
             f"{binding.axis_id.value}={binding.role.value.lower()}"
@@ -108,6 +133,8 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self,
         experiment: Experiment,
         request: ScanRequest | OccupancyScanRequest,
+        *,
+        display_intent: ScanDisplayIntent = ScanDisplayIntent(),
     ) -> None:
         super().__init__()
         if not isinstance(experiment, Experiment):
@@ -179,7 +206,12 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         layout.addLayout(controls)
 
         self._wake = QtOwnerWake(self)
-        self._application = _FrozenScanApplication(experiment, request)
+        self._experiment = experiment
+        self._application = _FrozenScanApplication(
+            experiment,
+            request,
+            display_intent,
+        )
         self._controller = ScanPanelController(
             self._application,
             self._wake.request_owner_wake,
@@ -201,6 +233,49 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
     @property
     def worker_idle(self) -> bool:
         return self._controller.worker_idle
+
+    @property
+    def can_reconfigure(self) -> bool:
+        return self._controller.can_reconfigure
+
+    @property
+    def closed(self) -> bool:
+        return self._controller.closed
+
+    def reconfigure(
+        self,
+        request: ScanRequest | OccupancyScanRequest,
+        *,
+        display_intent: ScanDisplayIntent = ScanDisplayIntent(),
+    ) -> None:
+        """Apply one validated immutable request while the panel is fully idle."""
+
+        if not isinstance(request, (ScanRequest, OccupancyScanRequest)):
+            raise TypeError("request must be a current scan request")
+        replacement = _FrozenScanApplication(
+            self._experiment,
+            request,
+            display_intent,
+        )
+        self._controller.reconfigure(replacement)
+        self._application = replacement
+        self._progressive_requested = isinstance(request, OccupancyScanRequest)
+        self._final_mode_text = (
+            "OCCUPANCY · CANONICAL FINAL-ONLY"
+            if self._progressive_requested
+            else "DIRECT CAMERA · CANONICAL FINAL-ONLY"
+        )
+        self._shown_presentation = None
+        self._source_pixmap = None
+        self._raster.clear()
+        self._raster.setText("No FINAL result")
+        self._apply_model(self._controller.view_model)
+
+    def shutdown(self) -> None:
+        """Begin the same nonblocking close path used by the standalone window."""
+
+        self._controller.close()
+        self._owner_cycle()
 
     def _start_scan(self) -> None:
         try:

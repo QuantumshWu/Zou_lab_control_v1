@@ -226,7 +226,7 @@ class ExactStreamProcessorWorker:
         if input_stream._payload_contract is not bound.input_payload_contract:
             raise ValueError("processor must share the input stream PayloadContract owner")
         if input_stream.payload_contract_fingerprint != (
-            bound.definition.input_payload_contract_fingerprint
+            bound.input_payload_contract.fingerprint
         ):
             raise ValueError("input stream payload contract differs from processor")
         input_key_contract = input_stream._join_key_contract
@@ -234,7 +234,7 @@ class ExactStreamProcessorWorker:
             raise TypeError("exact dataset processor requires DatasetCellKeyContract")
         if input_key_contract is not bound.join_key_contract:
             raise ValueError("processor must share the input join-key contract owner")
-        if input_key_contract.fingerprint != bound.definition.join_key_contract_fingerprint:
+        if input_key_contract.fingerprint != bound.join_key_contract.fingerprint:
             raise ValueError("input stream join-key contract differs from processor")
         if input_key_contract.fingerprint != input_edge.key_contract_fingerprint:
             raise ValueError("input join-key domain differs from input_edge")
@@ -253,7 +253,7 @@ class ExactStreamProcessorWorker:
         if output_stream.stream_id != bound.output_stream_id:
             raise ValueError("output stream id differs from processor binding")
         if output_stream.payload_contract_fingerprint != (
-            bound.definition.output_payload_contract_fingerprint
+            bound.output_payload_contract.fingerprint
         ):
             raise ValueError("output stream payload contract differs from processor")
         output_key_contract = output_stream._join_key_contract
@@ -658,7 +658,7 @@ class ExactStreamProcessorWorker:
         started = time.monotonic()
         output_payload = self._bound.operator(invocation_payload, self._bound.config)
         elapsed = time.monotonic() - started
-        if elapsed > self._bound.definition.operator_deadline_seconds:
+        if elapsed > self._bound.operator_deadline_seconds:
             raise TimeoutError(
                 "trusted synchronous processor exceeded operator_deadline_seconds"
             )
@@ -683,7 +683,7 @@ class ExactStreamProcessorWorker:
         if emitted.join_key != expected_key:
             raise StreamProcessorError("PASS_THROUGH output join key changed during emit")
         if emitted.join_key_schema_fingerprint != (
-            self._bound.definition.join_key_contract_fingerprint
+            self._bound.join_key_contract.fingerprint
         ):
             raise StreamProcessorError("PASS_THROUGH output join-key fingerprint changed")
         self._output_sink.acknowledge(
@@ -701,7 +701,7 @@ class ExactStreamProcessorWorker:
     def _wait_for_eos(self) -> EndOfStream:
         deadline = min(
             self._deadline_monotonic,
-            time.monotonic() + self._bound.definition.terminal_wait_seconds,
+            time.monotonic() + self._bound.terminal_wait_seconds,
         )
         while True:
             self._checkpoint()

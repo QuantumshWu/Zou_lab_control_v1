@@ -1203,6 +1203,13 @@ class Experiment:
 
         return open_scan_workbench(self, request)
 
+    def task_console(self, initial_intent=None):
+        """Lazily open the current SCAN_SLOT TaskConsole."""
+
+        from Zou_lab_control.workbench import open_task_console
+
+        return open_task_console(self, initial_intent)
+
     def start(self, request: CaptureRequest) -> RunHandle:
         return _start(self._authority_token, request)
 

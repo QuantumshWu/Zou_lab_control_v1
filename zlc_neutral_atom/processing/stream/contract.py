@@ -19,7 +19,9 @@ from zlc_storage import (
     sha256_text as _digest,
 )
 
-from zlc_neutral_atom.catalog import DefinitionKey
+from zlc_neutral_atom.catalog import (
+    StreamProcessorDefinition as _StreamProcessorDefinition,
+)
 from zlc_neutral_atom.runtime.streams import (
     ArtifactInputRef,
     JoinKeyContract,
@@ -388,40 +390,6 @@ def _generation_owner_graph(*roots: object) -> dict[int, object]:
 
 
 @dataclass(frozen=True)
-class StreamProcessorDefinition:
-    """Catalog-safe declaration; it deliberately contains no Python callable."""
-
-    key: DefinitionKey
-    title: str
-    config_schema_id: str
-    input_payload_contract_fingerprint: str
-    output_payload_contract_fingerprint: str
-    join_key_contract_fingerprint: str
-    operator_deadline_seconds: float = 1.0
-    terminal_wait_seconds: float = 1.0
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.key, DefinitionKey):
-            raise TypeError("key must be DefinitionKey")
-        _text(self.title, "title")
-        _text(self.config_schema_id, "config_schema_id")
-        for field in (
-            "input_payload_contract_fingerprint",
-            "output_payload_contract_fingerprint",
-            "join_key_contract_fingerprint",
-        ):
-            _digest(getattr(self, field), field)
-        for field in ("operator_deadline_seconds", "terminal_wait_seconds"):
-            value = getattr(self, field)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or float(value) <= 0
-            ):
-                raise ValueError(f"{field} must be finite and positive")
-            object.__setattr__(self, field, float(value))
-@dataclass(frozen=True)
 class BoundStreamProcessor:
     """Runtime binding of one definition to one trusted synchronous operator.
 
@@ -436,7 +404,7 @@ class BoundStreamProcessor:
     composition root must not expose reflective mutation of those owners.
     """
 
-    definition: StreamProcessorDefinition
+    definition: _StreamProcessorDefinition
     config: object
     input_payload_contract: PayloadContract
     output_payload_contract: PayloadContract
@@ -444,14 +412,16 @@ class BoundStreamProcessor:
     output_stream_id: StreamId
     output_source_id: str
     operator: Callable[[object, object], object]
+    operator_deadline_seconds: float
+    terminal_wait_seconds: float
     artifact_inputs: tuple[ArtifactInputRef, ...] = ()
     _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.definition, StreamProcessorDefinition):
+        if not isinstance(self.definition, _StreamProcessorDefinition):
             raise TypeError("definition must be StreamProcessorDefinition")
         definition = _snapshot_binding_value(self.definition)
-        if not isinstance(definition, StreamProcessorDefinition):
+        if not isinstance(definition, _StreamProcessorDefinition):
             raise TypeError("definition snapshot changed its declared type")
         definition_tree = _tree(definition)
         object.__setattr__(self, "definition", definition)
@@ -474,28 +444,31 @@ class BoundStreamProcessor:
         )
         config_tree = _tree(config)
         object.__setattr__(self, "config", config)
-        for name, contract, expected in (
-            (
-                "input_payload_contract",
-                self.input_payload_contract,
-                self.definition.input_payload_contract_fingerprint,
-            ),
-            (
-                "output_payload_contract",
-                self.output_payload_contract,
-                self.definition.output_payload_contract_fingerprint,
-            ),
+        for field_name in (
+            "operator_deadline_seconds",
+            "terminal_wait_seconds",
         ):
-            if getattr(contract, "fingerprint", None) != expected:
-                raise ValueError(f"{name} fingerprint differs from definition")
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+            ):
+                raise ValueError(f"{field_name} must be finite and positive")
+            object.__setattr__(self, field_name, float(value))
+        for name, contract in (
+            ("input_payload_contract", self.input_payload_contract),
+            ("output_payload_contract", self.output_payload_contract),
+        ):
+            _digest(getattr(contract, "fingerprint", None), f"{name}.fingerprint")
             for member in ("snapshot", "retained_nbytes", "digest"):
                 if not callable(getattr(contract, member, None)):
                     raise TypeError(f"{name}.{member} must be callable")
-        if (
-            getattr(self.join_key_contract, "fingerprint", None)
-            != self.definition.join_key_contract_fingerprint
-        ):
-            raise ValueError("join_key_contract fingerprint differs from definition")
+        _digest(
+            getattr(self.join_key_contract, "fingerprint", None),
+            "join_key_contract.fingerprint",
+        )
         if not callable(getattr(self.join_key_contract, "snapshot", None)):
             raise TypeError("join_key_contract.snapshot must be callable")
         if not isinstance(self.artifact_inputs, tuple):
@@ -554,9 +527,20 @@ class BoundStreamProcessor:
                     "definition_key": str(definition.key),
                     "definition": definition_tree,
                     "config": config_tree,
+                    "input_payload_contract_fingerprint": (
+                        self.input_payload_contract.fingerprint
+                    ),
+                    "output_payload_contract_fingerprint": (
+                        self.output_payload_contract.fingerprint
+                    ),
+                    "join_key_contract_fingerprint": (
+                        self.join_key_contract.fingerprint
+                    ),
                     "output_stream_id": output_stream_id.value,
                     "output_source_id": self.output_source_id,
                     "operator": f"{operator.__module__}.{operator.__qualname__}",
+                    "operator_deadline_seconds": self.operator_deadline_seconds,
+                    "terminal_wait_seconds": self.terminal_wait_seconds,
                     "artifact_inputs": [
                         item.fingerprint for item in self.artifact_inputs
                     ],
@@ -571,5 +555,4 @@ class BoundStreamProcessor:
 
 __all__ = [
     "BoundStreamProcessor",
-    "StreamProcessorDefinition",
 ]

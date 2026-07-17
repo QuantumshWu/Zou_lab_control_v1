@@ -29,6 +29,7 @@ from zlc_neutral_atom.adapter_sdk import (
 )
 from zlc_neutral_atom.acquisition import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+    CAMERA_MEASUREMENT_DEFINITION,
     CameraAcquisitionMode,
     CameraCaptureSpec,
     CameraDatasetEventAdapter,
@@ -62,7 +63,7 @@ from zlc_neutral_atom.runtime.dataset import (
     FrozenDatasetEdge,
     OrderedDatasetMetadataHasher,
 )
-from zlc_neutral_atom.runtime.pipeline import BoundMeasurement, MeasurementDefinition
+from zlc_neutral_atom.runtime.pipeline import BoundMeasurement
 from zlc_neutral_atom.runtime.ports import (
     BoundDevice,
     CleanupStepAck,
@@ -72,7 +73,6 @@ from zlc_neutral_atom.runtime.ports import (
     SessionCloseCommand,
 )
 from zlc_neutral_atom.runtime.streams import ProducerFlowControl, StreamId
-from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.runtime.capture import (
     CameraCapabilityEvidence,
     CameraCaptureProvenance,
@@ -1121,19 +1121,8 @@ def bind_camera_measurement(
         transport_memory_limit_bytes=request.transport_memory_limit_bytes,
         camera_provenance=camera_provenance,
     )
-    definition = MeasurementDefinition(
-        DefinitionKey(
-            "zlc_neutral_atom",
-            f"camera-{request.role}",
-        ),
-        f"Camera {request.role}",
-        "zlc.camera-capture-request",
-        "zlc.camera-capture-binding",
-        CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
-        dataset_schema.fingerprint,
-    )
     return BoundMeasurement(
-        definition,
+        CAMERA_MEASUREMENT_DEFINITION,
         port,
         capture_contract,
         capture_spec,

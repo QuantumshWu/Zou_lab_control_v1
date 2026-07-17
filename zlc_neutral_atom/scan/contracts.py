@@ -24,9 +24,20 @@ from zlc_data import (
 )
 from zlc_pulse import PulseDocument
 from zlc_storage import canonical_digest, exact_mapping
+from zlc_neutral_atom.catalog import DefinitionKey, TaskDefinition
 
 
 SCAN_OUTPUT_CONTRACT_SCHEMA = "zlc_neutral_atom.ScanOutputContract"
+AUTONOMOUS_SCAN_SLOT_TASK_KEY = DefinitionKey(
+    "zlc_neutral_atom.scan",
+    "autonomous-scan-slot",
+)
+AUTONOMOUS_SCAN_SLOT_DEFINITION = TaskDefinition(
+    AUTONOMOUS_SCAN_SLOT_TASK_KEY,
+    "Autonomous SCAN_SLOT",
+    "zlc_neutral_atom.autonomous-scan-slot-request",
+)
+SCAN_TASK_DEFINITIONS = (AUTONOMOUS_SCAN_SLOT_DEFINITION,)
 
 
 def _scan_axis_id(parameter_id: str) -> AxisId:
@@ -285,6 +296,9 @@ def scan_output_contract_from_tree(
 
 
 __all__ = [
+    "AUTONOMOUS_SCAN_SLOT_DEFINITION",
+    "AUTONOMOUS_SCAN_SLOT_TASK_KEY",
+    "SCAN_TASK_DEFINITIONS",
     "ScanOutputContract",
     "ScanPointTable",
     "bind_scan_output_contract",

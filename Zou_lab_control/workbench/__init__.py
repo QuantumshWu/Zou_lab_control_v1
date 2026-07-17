@@ -27,6 +27,14 @@ def open_scan_workbench(experiment, request):
     return _open(experiment, request)
 
 
+def open_task_console(experiment, initial_intent=None):
+    """Open the current single-card SCAN_SLOT TaskConsole lazily."""
+
+    from ._task_console import open_task_console as _open
+
+    return _open(experiment, initial_intent)
+
+
 def open_offline_pulse_workbench(
     target,
     *,
@@ -51,4 +59,5 @@ __all__ = [
     "open_offline_pulse_workbench",
     "open_pulse_workbench",
     "open_scan_workbench",
+    "open_task_console",
 ]
