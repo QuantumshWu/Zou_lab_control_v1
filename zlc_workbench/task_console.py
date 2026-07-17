@@ -1,4 +1,4 @@
-"""Current TaskConsole values for one autonomous SCAN_SLOT product slice.
+"""Current TaskConsole values for one typed pulse-scan product slice.
 
 This module owns authored UI intent, optimistic edit revisioning, and its strict
 current-only workspace codec.  It deliberately does not own device resolution,
@@ -24,6 +24,7 @@ from zlc_data import (
     data_transform_spec_from_tree,
     data_transform_spec_to_tree,
 )
+from zlc_frontend import FormChoice, FormFieldProps, FormSpec
 from zlc_neutral_atom.catalog import (
     DefinitionCatalog,
     DefinitionKey,
@@ -48,15 +49,12 @@ from zlc_neutral_atom.readout.occupancy import (
     OCCUPANCY_STREAM_PROCESSOR_KEY,
 )
 from zlc_neutral_atom.scan.contracts import (
-    AUTONOMOUS_SCAN_SLOT_TASK_KEY,
+    PULSE_SCAN_TASK_KEY,
     SCAN_TASK_DEFINITIONS,
-    ScanPointTable,
-)
-from zlc_pulse import (
-    PulseDocument,
-    pulse_document_from_tree,
-    pulse_document_to_tree,
-    resolve_api_parameters,
+    ApiSlotSegmentedProgram,
+    AutonomousScanSlotProgram,
+    pulse_scan_program_from_tree,
+    pulse_scan_program_to_tree,
 )
 from zlc_storage import (
     canonical_text,
@@ -71,6 +69,11 @@ from .progressive_scan import ScanDisplayIntent
 
 
 TASK_CONSOLE_SCAN_INTENT_FORMAT = "zlc_workbench.TaskConsoleScanIntent"
+SCAN_INTENT_DEFAULT_CAMERA_ROLE = "camera"
+SCAN_INTENT_DEFAULT_SEQUENCER_ROLE = "sequencer"
+SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES = 64 << 20
+SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES = 512 << 20
+SCAN_INTENT_DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +109,7 @@ def task_console_catalog_items(
     if not isinstance(catalog, DefinitionCatalog):
         raise TypeError("catalog must be DefinitionCatalog")
     expected = {
-        AUTONOMOUS_SCAN_SLOT_TASK_KEY,
+        PULSE_SCAN_TASK_KEY,
         CAMERA_MEASUREMENT_KEY,
         OCCUPANCY_STREAM_PROCESSOR_KEY,
     }
@@ -117,7 +120,7 @@ def task_console_catalog_items(
             f"missing={sorted(map(str, expected - actual))}, "
             f"unexpected={sorted(map(str, actual - expected))}"
         )
-    task = catalog.resolve(AUTONOMOUS_SCAN_SLOT_TASK_KEY, TaskDefinition)
+    task = catalog.resolve(PULSE_SCAN_TASK_KEY, TaskDefinition)
     measurement = catalog.resolve(CAMERA_MEASUREMENT_KEY, MeasurementDefinition)
     processor = catalog.resolve(
         OCCUPANCY_STREAM_PROCESSOR_KEY,
@@ -130,12 +133,100 @@ def task_console_catalog_items(
     )
 
 
-def _number(value: object, field: str) -> int | float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{field} must be an int or float")
-    if not math.isfinite(float(value)):
-        raise ValueError(f"{field} must be finite")
-    return value
+def _role_form_field(
+    roles: tuple[str, ...],
+    *,
+    key: str,
+    label: str,
+    domain: str,
+    preferred: str,
+) -> FormFieldProps:
+    values = tuple(roles)
+    if not values:
+        raise ValueError(f"{domain} roles must not be empty")
+    if len(set(values)) != len(values):
+        raise ValueError(f"{domain} roles must be unique")
+    for role in values:
+        canonical_text(role, f"{domain} role")
+    default = preferred if preferred in values else values[0]
+    return FormFieldProps(
+        key,
+        "choice",
+        label,
+        default=default,
+        required=True,
+        choices=tuple(FormChoice(role, role) for role in values),
+        description=f"Frozen {domain} role resolved by the current installation",
+    )
+
+
+def task_console_scan_binding_form_spec(
+    camera_roles: tuple[str, ...],
+    sequencer_roles: tuple[str, ...],
+) -> FormSpec:
+    """Project owner facts plus one frozen installation role snapshot."""
+
+    return FormSpec(
+        (
+            _role_form_field(
+                camera_roles,
+                key="camera_role",
+                label="Camera role",
+                domain="camera",
+                preferred=SCAN_INTENT_DEFAULT_CAMERA_ROLE,
+            ),
+            _role_form_field(
+                sequencer_roles,
+                key="sequencer_role",
+                label="Sequencer role",
+                domain="sequencer",
+                preferred=SCAN_INTENT_DEFAULT_SEQUENCER_ROLE,
+            ),
+            FormFieldProps(
+                "trigger_channel",
+                "text",
+                "Trigger channel",
+                default=None,
+                description="Optional explicit camera-trigger channel",
+            ),
+        )
+    )
+
+
+def task_console_scan_budget_form_spec() -> FormSpec:
+    """Single UI projection of TaskConsoleScanIntent resource constraints."""
+
+    return FormSpec(
+        (
+            FormFieldProps(
+                "transport_memory_limit_bytes",
+                "int",
+                "Transport bytes",
+                default=SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES,
+                required=True,
+                minimum=1,
+                description="Maximum admitted camera transport memory",
+            ),
+            FormFieldProps(
+                "memory_limit_bytes",
+                "int",
+                "Pipeline bytes",
+                default=SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES,
+                required=True,
+                minimum=1,
+                description="Maximum admitted pipeline and artifact memory",
+            ),
+            FormFieldProps(
+                "timeout_seconds",
+                "float",
+                "Timeout seconds",
+                default=SCAN_INTENT_DEFAULT_TIMEOUT_SECONDS,
+                required=True,
+                minimum=math.nextafter(0.0, math.inf),
+                description="Positive whole-run deadline",
+            ),
+        )
+    )
 
 
 def _optional_text(value: object, field: str) -> str | None:
@@ -195,23 +286,22 @@ def describe_authoritative_transform(
 
 @dataclass(frozen=True, slots=True)
 class TaskConsoleScanIntent:
-    """Authored SCAN_SLOT intent; runtime DeviceRefs never enter this value."""
+    """Authored pulse-scan intent; runtime DeviceRefs never enter this value."""
 
     task_key: DefinitionKey
     measurement_key: DefinitionKey
     processor_key: DefinitionKey | None
-    pulse_document: PulseDocument
-    api_values: tuple[tuple[str, int | float], ...]
-    camera_role: str
-    sequencer_role: str
+    program: AutonomousScanSlotProgram | ApiSlotSegmentedProgram
+    camera_role: str = SCAN_INTENT_DEFAULT_CAMERA_ROLE
+    sequencer_role: str = SCAN_INTENT_DEFAULT_SEQUENCER_ROLE
     trigger_channel: str | None = None
     calibration_ref: CalibrationArtifactRef | None = None
     model_kind: ReadoutModelKind | None = None
     output_transform_spec: DataTransformSpec | None = None
     display_intent: ScanDisplayIntent = ScanDisplayIntent()
-    transport_memory_limit_bytes: int = 64 << 20
-    memory_limit_bytes: int = 512 << 20
-    timeout_seconds: float = 30.0
+    transport_memory_limit_bytes: int = SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES
+    memory_limit_bytes: int = SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES
+    timeout_seconds: float = SCAN_INTENT_DEFAULT_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_key, DefinitionKey):
@@ -223,49 +313,17 @@ class TaskConsoleScanIntent:
             DefinitionKey,
         ):
             raise TypeError("processor_key must be DefinitionKey or None")
-        if self.task_key != AUTONOMOUS_SCAN_SLOT_TASK_KEY:
-            raise ValueError("TaskConsole currently supports only Autonomous SCAN_SLOT")
+        if self.task_key != PULSE_SCAN_TASK_KEY:
+            raise ValueError("TaskConsole currently supports only the Pulse scan Task")
         if self.measurement_key != CAMERA_MEASUREMENT_KEY:
             raise ValueError("TaskConsole scan source must be the camera measurement")
         if self.processor_key not in (None, OCCUPANCY_STREAM_PROCESSOR_KEY):
             raise ValueError("TaskConsole scan processor must be occupancy or absent")
-        if not isinstance(self.pulse_document, PulseDocument):
-            raise TypeError("pulse_document must be PulseDocument")
-        # This validates the complete named point layout without flattening it.
-        ScanPointTable.from_pulse_document(self.pulse_document)
-
-        supplied = tuple(self.api_values)
-        if any(
-            not isinstance(item, tuple)
-            or len(item) != 2
-            or not isinstance(item[0], str)
-            for item in supplied
+        if not isinstance(
+            self.program,
+            (AutonomousScanSlotProgram, ApiSlotSegmentedProgram),
         ):
-            raise TypeError("api_values must contain (parameter_id, value) tuples")
-        supplied_map: dict[str, int | float] = {}
-        for parameter_id, value in supplied:
-            key = canonical_text(parameter_id, "API parameter_id")
-            if key in supplied_map:
-                raise ValueError(f"duplicate API value {key!r}")
-            supplied_map[key] = _number(value, f"API value {key!r}")
-        expected = tuple(
-            parameter.parameter_id for parameter in self.pulse_document.api_parameters
-        )
-        if set(supplied_map) != set(expected):
-            missing = tuple(key for key in expected if key not in supplied_map)
-            extra = tuple(key for key in supplied_map if key not in set(expected))
-            raise ValueError(
-                "SCAN_SLOT requires exactly one whole-run value for every API "
-                f"parameter; missing={missing}, extra={extra}"
-            )
-        resolved = resolve_api_parameters(self.pulse_document, supplied_map)
-        if resolved.api_parameters:
-            raise AssertionError("pulse owner left declared API parameters unresolved")
-        object.__setattr__(
-            self,
-            "api_values",
-            tuple((key, supplied_map[key]) for key in expected),
-        )
+            raise TypeError("program must be a current pulse-scan program")
 
         object.__setattr__(
             self,
@@ -326,11 +384,6 @@ class TaskConsoleScanIntent:
             "timeout_seconds",
             positive_real(self.timeout_seconds, "timeout_seconds"),
         )
-
-    @property
-    def fixed_api_values(self) -> dict[str, int | float]:
-        return dict(self.api_values)
-
 
 @dataclass(frozen=True, slots=True)
 class ScanEditSnapshot:
@@ -425,11 +478,7 @@ def task_console_scan_intent_to_tree(
             if intent.processor_key is None
             else definition_key_to_tree(intent.processor_key)
         ),
-        "pulse_document": pulse_document_to_tree(intent.pulse_document),
-        "api_values": [
-            {"parameter_id": key, "value": value}
-            for key, value in intent.api_values
-        ],
+        "program": pulse_scan_program_to_tree(intent.program),
         "camera_role": intent.camera_role,
         "sequencer_role": intent.sequencer_role,
         "trigger_channel": intent.trigger_channel,
@@ -464,8 +513,7 @@ def task_console_scan_intent_from_tree(tree: object) -> TaskConsoleScanIntent:
             "task_key",
             "measurement_key",
             "processor_key",
-            "pulse_document",
-            "api_values",
+            "program",
             "camera_role",
             "sequencer_role",
             "trigger_channel",
@@ -479,17 +527,6 @@ def task_console_scan_intent_from_tree(tree: object) -> TaskConsoleScanIntent:
         },
         TASK_CONSOLE_SCAN_INTENT_FORMAT,
     )
-    if not isinstance(data["api_values"], list):
-        raise TypeError("api_values must be a list")
-    api_values: list[tuple[str, int | float]] = []
-    for raw in data["api_values"]:
-        item = exact_mapping(
-            raw,
-            {"parameter_id", "value"},
-            "API value",
-            discriminator=None,
-        )
-        api_values.append((item["parameter_id"], item["value"]))
     display = exact_mapping(
         data["display_intent"],
         {"site_mode", "site_index"},
@@ -504,8 +541,7 @@ def task_console_scan_intent_from_tree(tree: object) -> TaskConsoleScanIntent:
             if data["processor_key"] is None
             else definition_key_from_tree(data["processor_key"])
         ),
-        pulse_document=pulse_document_from_tree(data["pulse_document"]),
-        api_values=tuple(api_values),
+        program=pulse_scan_program_from_tree(data["program"]),
         camera_role=data["camera_role"],
         sequencer_role=data["sequencer_role"],
         trigger_channel=data["trigger_channel"],
@@ -573,6 +609,11 @@ def load_task_console_scan_intent(path: str | Path) -> TaskConsoleScanIntent:
 
 
 __all__ = [
+    "SCAN_INTENT_DEFAULT_CAMERA_ROLE",
+    "SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES",
+    "SCAN_INTENT_DEFAULT_SEQUENCER_ROLE",
+    "SCAN_INTENT_DEFAULT_TIMEOUT_SECONDS",
+    "SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES",
     "ScanDisplayIntent",
     "ScanEditConflict",
     "ScanEditDraft",
@@ -587,6 +628,8 @@ __all__ = [
     "encode_task_console_scan_intent",
     "load_task_console_scan_intent",
     "save_task_console_scan_intent",
+    "task_console_scan_binding_form_spec",
+    "task_console_scan_budget_form_spec",
     "task_console_catalog_items",
     "task_console_scan_intent_from_tree",
     "task_console_scan_intent_to_tree",

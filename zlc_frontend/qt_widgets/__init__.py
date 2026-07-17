@@ -5,6 +5,7 @@ not re-export it and therefore never loads PyQt as a side effect.
 """
 
 from .board import QtImageBoard, QtOwnerWake
+from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
 from .fluent import (
     ElidedLabel,
     FluentButton,
@@ -138,6 +139,7 @@ __all__ = [
     "FLUENT_SCALE_MIN",
     "FONT",
     "FONT_SIZE",
+    "FORM_WIDGET_HANDLERS",
     "FluentButton",
     "FluentCheckBox",
     "FluentCodeEdit",
@@ -152,6 +154,7 @@ __all__ = [
     "FluentLabeledField",
     "FluentLineEdit",
     "FluentPathEdit",
+    "FluentParameterForm",
     "FluentPopup",
     "FluentReadoutEdit",
     "FluentReadoutMultiline",
@@ -168,6 +171,7 @@ __all__ = [
     "FluentTreeComboBox",
     "FluentTriStateToggle",
     "FluentWindow",
+    "FormWidgetHandler",
     "GREEN",
     "GREY",
     "HINT",

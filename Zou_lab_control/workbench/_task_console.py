@@ -1,4 +1,4 @@
-"""Qt composition for the current single-card SCAN_SLOT TaskConsole.
+"""Qt composition for the current single-card pulse-scan TaskConsole.
 
 The domain values, edit revision, catalog projection, and persistence codec live
 in :mod:`zlc_workbench.task_console`.  This module only owns Qt widgets and the
@@ -7,19 +7,20 @@ composition seam from one validated intent to the existing scan panel.
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
-import re
 
 from PyQt5 import QtCore, QtWidgets
 
+from zlc_frontend import FormFieldProps, FormSpec, parse_number_text
 from zlc_frontend.qt_widgets import (
     FluentButton,
+    FluentCheckBox,
     FluentComboBox,
     FluentGroupBox,
     FluentLabel,
     FluentLineEdit,
     FluentPathEdit,
+    FluentParameterForm,
     FluentScrollArea,
     FluentSettingRow,
     FluentSpinBox,
@@ -28,6 +29,7 @@ from zlc_frontend.qt_widgets import (
     GREY,
     ORANGE,
     WINDOW_SCREEN_FRACTION,
+    apply_fluent_scrollbars,
     center_window_on_primary_screen,
     ensure_qt_app,
     release_window,
@@ -42,8 +44,13 @@ from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_KEY
 from zlc_neutral_atom.readout.calibration import ReadoutModelKind
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
 from zlc_neutral_atom.readout.occupancy import OCCUPANCY_STREAM_PROCESSOR_KEY
-from zlc_neutral_atom.scan.contracts import AUTONOMOUS_SCAN_SLOT_TASK_KEY
-from zlc_pulse import PulseDocument, load_pulse_document
+from zlc_neutral_atom.scan.contracts import (
+    PULSE_SCAN_TASK_KEY,
+    ApiSegmentTable,
+    ApiSlotSegmentedProgram,
+    AutonomousScanSlotProgram,
+)
+from zlc_pulse import FIELD_DAC, PulseDocument, load_pulse_document
 from zlc_workbench.task_console import (
     ScanDisplayIntent,
     ScanEditConflict,
@@ -55,6 +62,8 @@ from zlc_workbench.task_console import (
     load_task_console_scan_intent,
     save_task_console_scan_intent,
     task_console_catalog_items,
+    task_console_scan_binding_form_spec,
+    task_console_scan_budget_form_spec,
 )
 
 from ._scan import ScanWorkbenchWindow
@@ -62,6 +71,8 @@ from ._scan import ScanWorkbenchWindow
 
 _DIRECT_SOURCE = "direct"
 _OCCUPANCY_SOURCE = "occupancy"
+_SCAN_SLOT_MODE = "scan-slot"
+_API_SLOT_MODE = "api-slot-segmented"
 _EMBEDDED_DOCUMENT = "(embedded PulseDocument)"
 
 
@@ -82,35 +93,45 @@ def _settings_card(
     return box
 
 
-def _parse_number(text: str, field: str) -> int | float:
-    value = text.strip()
-    if not value:
-        raise ValueError(f"{field} is required")
-    try:
-        parsed: int | float
-        if re.fullmatch(r"[+-]?\d+", value):
-            parsed = int(value)
-        else:
-            parsed = float(value)
-    except ValueError as error:
-        raise ValueError(f"{field} must be numeric") from error
-    if not math.isfinite(float(parsed)):
-        raise ValueError(f"{field} must be finite")
-    return parsed
+def _form_card(
+    title: str,
+    form: FluentParameterForm,
+    parent: QtWidgets.QWidget,
+) -> FluentGroupBox:
+    box = FluentGroupBox(title, parent)
+    layout = QtWidgets.QVBoxLayout(box)
+    layout.addWidget(form)
+    return box
 
 
-def _parse_positive_integer(text: str, field: str) -> int:
-    parsed = _parse_number(text, field)
-    if not isinstance(parsed, int) or parsed <= 0:
-        raise ValueError(f"{field} must be a positive integer")
-    return parsed
+def _api_constant_form_spec(document: PulseDocument) -> FormSpec:
+    """Project declared API leaves; PulseDocument remains the value authority."""
 
-
-def _parse_positive_real(text: str, field: str) -> float:
-    parsed = float(_parse_number(text, field))
-    if parsed <= 0:
-        raise ValueError(f"{field} must be positive")
-    return parsed
+    fields = []
+    for parameter in document.api_parameters:
+        value, _unit = document.field_value(parameter.field)
+        minimum = None
+        maximum = None
+        kind = "number"
+        if parameter.field.kind == FIELD_DAC:
+            port = document.target.by_key[parameter.field.port]
+            assert port.signed_range is not None
+            minimum, maximum = port.signed_range
+            kind = "int"
+        fields.append(
+            FormFieldProps(
+                parameter.parameter_id,
+                kind,
+                parameter.parameter_id,
+                default=value,
+                required=True,
+                unit=parameter.unit,
+                minimum=minimum,
+                maximum=maximum,
+                description="Whole-run PulseDocument API constant",
+            )
+        )
+    return FormSpec(tuple(fields))
 
 
 def _intent_request(experiment: Experiment, intent: TaskConsoleScanIntent):
@@ -118,17 +139,34 @@ def _intent_request(experiment: Experiment, intent: TaskConsoleScanIntent):
         camera_role=intent.camera_role,
         sequencer_role=intent.sequencer_role,
         trigger_channel=intent.trigger_channel,
-        api_values=intent.fixed_api_values,
         output_transform_spec=intent.output_transform_spec,
         transport_memory_limit_bytes=intent.transport_memory_limit_bytes,
         memory_limit_bytes=intent.memory_limit_bytes,
         timeout_seconds=intent.timeout_seconds,
     )
+    program = intent.program
+    if isinstance(program, AutonomousScanSlotProgram):
+        common["api_values"] = dict(program.api_values)
+        if intent.processor_key is None:
+            return experiment.readout.scan_request(program.document, **common)
+        assert intent.calibration_ref is not None
+        return experiment.readout.occupancy_scan_request(
+            program.document,
+            calibration_ref=intent.calibration_ref,
+            model_kind=intent.model_kind,
+            **common,
+        )
+    if not isinstance(program, ApiSlotSegmentedProgram):
+        raise TypeError("TaskConsole intent carries another scan program")
+    common.update(
+        api_table=program.table,
+        segmentation_rationale=program.segmentation_rationale,
+    )
     if intent.processor_key is None:
-        return experiment.readout.scan_request(intent.pulse_document, **common)
+        return experiment.readout.api_scan_request(program.document, **common)
     assert intent.calibration_ref is not None
-    return experiment.readout.occupancy_scan_request(
-        intent.pulse_document,
+    return experiment.readout.api_occupancy_scan_request(
+        program.document,
         calibration_ref=intent.calibration_ref,
         model_kind=intent.model_kind,
         **common,
@@ -152,7 +190,7 @@ class ScanIntentForm(QtWidgets.QWidget):
         self._base_revision: int | None = None
         self._document: PulseDocument | None = None
         self._document_source: str | None = None
-        self._api_edits: dict[str, QtWidgets.QLineEdit] = {}
+        self._api_form: FluentParameterForm | None = None
         self._output_transform_spec = None
         self.setObjectName(f"{object_prefix}ScanIntentForm")
 
@@ -175,21 +213,81 @@ class ScanIntentForm(QtWidgets.QWidget):
         self._fingerprint = FluentLabel("Fingerprint: —", self)
         self._fingerprint.setObjectName(f"{object_prefix}PulseFingerprint")
         self._fingerprint.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self._scan_summary = FluentLabel("SCAN_SLOT: no document", self)
+        self._slot_mode = FluentComboBox(self)
+        self._slot_mode.setObjectName(f"{object_prefix}PulseScanSlotMode")
+        self._scan_summary = FluentLabel("Pulse scan: no document", self)
         self._scan_summary.setObjectName(f"{object_prefix}ScanTableSummary")
         self._scan_summary.setWordWrap(True)
 
-        pulse_box = FluentGroupBox("PulseDocument · SCAN_SLOT", self)
+        pulse_box = FluentGroupBox("PulseDocument · scan program", self)
         pulse_layout = QtWidgets.QVBoxLayout(pulse_box)
         pulse_layout.addLayout(pulse_row)
         pulse_layout.addWidget(self._fingerprint)
+        pulse_layout.addWidget(
+            FluentSettingRow(
+                "Execution",
+                self._slot_mode,
+                label_width=setting_label_width(("Execution",)),
+                parent=pulse_box,
+            )
+        )
         pulse_layout.addWidget(self._scan_summary)
 
-        self._api_box = FluentGroupBox("Whole-run API constants", self)
-        self._api_layout = QtWidgets.QVBoxLayout(self._api_box)
-        self._api_empty = FluentLabel("Load a PulseDocument", self._api_box)
+        self._api_box = FluentGroupBox("Slot values", self)
+        api_box_layout = QtWidgets.QVBoxLayout(self._api_box)
+        self._slot_stack = QtWidgets.QStackedWidget(self._api_box)
+        api_box_layout.addWidget(self._slot_stack)
+
+        self._fixed_api_page = QtWidgets.QWidget(self._slot_stack)
+        self._api_layout = QtWidgets.QVBoxLayout(self._fixed_api_page)
+        self._api_empty = FluentLabel("Load a PulseDocument", self._fixed_api_page)
         self._api_empty.setObjectName(f"{object_prefix}ApiConstantsState")
         self._api_layout.addWidget(self._api_empty)
+        self._slot_stack.addWidget(self._fixed_api_page)
+
+        self._segmented_api_page = QtWidgets.QWidget(self._slot_stack)
+        segmented_layout = QtWidgets.QVBoxLayout(self._segmented_api_page)
+        self._api_table = QtWidgets.QTableWidget(0, 0, self._segmented_api_page)
+        self._api_table.setObjectName(f"{object_prefix}ApiSegmentTable")
+        self._api_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._api_table.horizontalHeader().setStretchLastSection(True)
+        apply_fluent_scrollbars(self._api_table)
+        segmented_layout.addWidget(self._api_table)
+        row_buttons = QtWidgets.QHBoxLayout()
+        self._add_api_row = FluentButton("Add row", self._segmented_api_page)
+        self._add_api_row.setObjectName(f"{object_prefix}AddApiSegmentRow")
+        self._remove_api_row = FluentButton(
+            "Remove row",
+            self._segmented_api_page,
+            color=GREY,
+        )
+        self._remove_api_row.setObjectName(f"{object_prefix}RemoveApiSegmentRow")
+        row_buttons.addWidget(self._add_api_row)
+        row_buttons.addWidget(self._remove_api_row)
+        row_buttons.addStretch(1)
+        segmented_layout.addLayout(row_buttons)
+        self._allow_host_gaps = FluentCheckBox(
+            "Each API point is independent; variable host gaps are allowed",
+            self._segmented_api_page,
+        )
+        self._allow_host_gaps.setObjectName(f"{object_prefix}AllowApiHostGaps")
+        self._segmentation_rationale = FluentLineEdit(parent=self._segmented_api_page)
+        self._segmentation_rationale.setObjectName(
+            f"{object_prefix}ApiSegmentationRationale"
+        )
+        self._segmentation_rationale.setPlaceholderText(
+            "Why independent finite segments preserve this experiment"
+        )
+        segmented_layout.addWidget(self._allow_host_gaps)
+        segmented_layout.addWidget(
+            FluentSettingRow(
+                "Rationale",
+                self._segmentation_rationale,
+                label_width=setting_label_width(("Rationale",)),
+                parent=self._segmented_api_page,
+            )
+        )
+        self._slot_stack.addWidget(self._segmented_api_page)
 
         self._authority_summary = FluentLabel(parent=self)
         self._authority_summary.setObjectName(
@@ -245,36 +343,42 @@ class ScanIntentForm(QtWidgets.QWidget):
             self,
         )
 
-        self._camera_role = FluentLineEdit("camera", self)
-        self._camera_role.setObjectName(f"{object_prefix}CameraRole")
-        self._sequencer_role = FluentLineEdit("sequencer", self)
-        self._sequencer_role.setObjectName(f"{object_prefix}SequencerRole")
-        self._trigger_channel = FluentLineEdit(parent=self)
-        self._trigger_channel.setObjectName(f"{object_prefix}TriggerChannel")
-        self._trigger_channel.setPlaceholderText("optional")
-        binding_box = _settings_card(
-            "Device binding",
-            (
-                ("Camera role", self._camera_role),
-                ("Sequencer role", self._sequencer_role),
-                ("Trigger channel", self._trigger_channel),
+        self._binding_form = FluentParameterForm(
+            task_console_scan_binding_form_spec(
+                card.device_catalog.roles("camera"),
+                card.device_catalog.roles("sequencer"),
             ),
-            self,
+            parent=self,
         )
+        self._binding_form.setObjectName(f"{object_prefix}DeviceBindingForm")
+        self._binding_form.widget_for("camera_role").setObjectName(
+            f"{object_prefix}CameraRole"
+        )
+        self._binding_form.widget_for("sequencer_role").setObjectName(
+            f"{object_prefix}SequencerRole"
+        )
+        self._binding_form.widget_for("trigger_channel").setObjectName(
+            f"{object_prefix}TriggerChannel"
+        )
+        binding_box = _form_card("Device binding", self._binding_form, self)
 
-        self._transport_budget = FluentLineEdit(str(64 << 20), self)
-        self._transport_budget.setObjectName(f"{object_prefix}TransportBudgetBytes")
-        self._memory_budget = FluentLineEdit(str(512 << 20), self)
-        self._memory_budget.setObjectName(f"{object_prefix}MemoryBudgetBytes")
-        self._deadline = FluentLineEdit("30.0", self)
-        self._deadline.setObjectName(f"{object_prefix}DeadlineSeconds")
-        budget_box = _settings_card(
+        self._budget_form = FluentParameterForm(
+            task_console_scan_budget_form_spec(),
+            parent=self,
+        )
+        self._budget_form.setObjectName(f"{object_prefix}RunBudgetForm")
+        self._budget_form.widget_for(
+            "transport_memory_limit_bytes"
+        ).setObjectName(f"{object_prefix}TransportBudgetBytes")
+        self._budget_form.widget_for("memory_limit_bytes").setObjectName(
+            f"{object_prefix}MemoryBudgetBytes"
+        )
+        self._budget_form.widget_for("timeout_seconds").setObjectName(
+            f"{object_prefix}DeadlineSeconds"
+        )
+        budget_box = _form_card(
             "Budgets and deadline",
-            (
-                ("Transport bytes", self._transport_budget),
-                ("Pipeline bytes", self._memory_budget),
-                ("Timeout seconds", self._deadline),
-            ),
+            self._budget_form,
             self,
         )
 
@@ -334,11 +438,17 @@ class ScanIntentForm(QtWidgets.QWidget):
 
         self._pulse_path.selected.connect(self._load_selected_pulse)
         self._load_pulse.clicked.connect(self._load_path_from_edit)
+        self._slot_mode.currentIndexChanged.connect(self._slot_mode_changed)
+        self._add_api_row.clicked.connect(lambda: self._append_api_row())
+        self._remove_api_row.clicked.connect(
+            lambda: self._remove_selected_api_rows()
+        )
         self._source.currentIndexChanged.connect(self._update_enabled_state)
         self._site_mode.currentIndexChanged.connect(self._update_enabled_state)
         self._clear_authority.clicked.connect(self._clear_authoritative_transform)
         self._apply.clicked.connect(self._apply_clicked)
         self._cancel.clicked.connect(self.cancel_edit)
+        self._slot_stack.setCurrentWidget(self._fixed_api_page)
         self._update_enabled_state()
         self._refresh_authority_summary()
 
@@ -391,31 +501,69 @@ class ScanIntentForm(QtWidgets.QWidget):
         """Load through the PulseDocument owner's strict current loader."""
 
         document = load_pulse_document(path)
-        # Reject non-SCAN_SLOT documents before disturbing the current draft.
-        if document.scan_table is None or not document.scan_parameters:
-            raise ValueError("PulseDocument has no frozen SCAN_SLOT table")
+        if (
+            (document.scan_table is None or not document.scan_parameters)
+            and not document.api_parameters
+        ):
+            raise ValueError("PulseDocument declares neither SCAN_SLOT nor API_SLOT")
         self._document = document
         self._document_source = str(Path(path).expanduser().resolve())
         self._pulse_path.setText(self._document_source)
         self._output_transform_spec = None
         self._refresh_authority_summary()
-        self._show_document(document, {})
+        self._show_document(document, None)
         self._diagnostics.clear()
 
     def build_intent(self) -> TaskConsoleScanIntent:
         document = self._document
         if document is None:
             raise ValueError("a current PulseDocument JSON must be loaded")
-        api_values = tuple(
-            (
-                parameter.parameter_id,
-                _parse_number(
-                    self._api_edits[parameter.parameter_id].text(),
-                    f"API constant {parameter.parameter_id!r}",
+        mode = self._slot_mode.currentData()
+        if mode == _SCAN_SLOT_MODE:
+            api_values = (
+                {}
+                if self._api_form is None
+                else self._api_form.read_all()
+            )
+            program = AutonomousScanSlotProgram(
+                document,
+                tuple(
+                    (
+                        parameter.parameter_id,
+                        api_values[parameter.parameter_id],
+                    )
+                    for parameter in document.api_parameters
                 ),
             )
-            for parameter in document.api_parameters
-        )
+        elif mode == _API_SLOT_MODE:
+            if not self._allow_host_gaps.isChecked():
+                raise ValueError(
+                    "API_SLOT segmented execution requires explicit confirmation "
+                    "that points are independent and host gaps are allowed"
+                )
+            columns = tuple(
+                parameter.parameter_id for parameter in document.api_parameters
+            )
+            rows = tuple(
+                tuple(
+                    parse_number_text(
+                        "" if self._api_table.item(row, column) is None else
+                        self._api_table.item(row, column).text(),
+                        f"API row {row} value {parameter_id!r}",
+                    )
+                    for column, parameter_id in enumerate(columns)
+                )
+                for row in range(self._api_table.rowCount())
+            )
+            program = ApiSlotSegmentedProgram(
+                document,
+                ApiSegmentTable(columns, rows),
+                self._segmentation_rationale.text().strip(),
+            )
+        else:
+            raise ValueError("select SCAN_SLOT or API_SLOT segmented execution")
+        binding = self._binding_form.read_all()
+        budgets = self._budget_form.read_all()
         occupancy = self._source.currentData() == _OCCUPANCY_SOURCE
         calibration_ref = None
         model_kind = None
@@ -433,53 +581,57 @@ class ScanIntentForm(QtWidgets.QWidget):
                 else 0,
             )
         return TaskConsoleScanIntent(
-            task_key=AUTONOMOUS_SCAN_SLOT_TASK_KEY,
+            task_key=PULSE_SCAN_TASK_KEY,
             measurement_key=CAMERA_MEASUREMENT_KEY,
             processor_key=(OCCUPANCY_STREAM_PROCESSOR_KEY if occupancy else None),
-            pulse_document=document,
-            api_values=api_values,
-            camera_role=self._camera_role.text().strip(),
-            sequencer_role=self._sequencer_role.text().strip(),
-            trigger_channel=self._trigger_channel.text().strip() or None,
+            program=program,
+            camera_role=binding["camera_role"],
+            sequencer_role=binding["sequencer_role"],
+            trigger_channel=binding["trigger_channel"].strip() or None,
             calibration_ref=calibration_ref,
             model_kind=model_kind,
             output_transform_spec=self._output_transform_spec,
             display_intent=display,
-            transport_memory_limit_bytes=_parse_positive_integer(
-                self._transport_budget.text(),
-                "transport memory budget",
-            ),
-            memory_limit_bytes=_parse_positive_integer(
-                self._memory_budget.text(),
-                "pipeline memory budget",
-            ),
-            timeout_seconds=_parse_positive_real(
-                self._deadline.text(),
-                "timeout",
-            ),
+            transport_memory_limit_bytes=budgets[
+                "transport_memory_limit_bytes"
+            ],
+            memory_limit_bytes=budgets["memory_limit_bytes"],
+            timeout_seconds=budgets["timeout_seconds"],
         )
 
     def _populate(self, intent: TaskConsoleScanIntent) -> None:
+        program = intent.program
+        document = program.document
         previous_document = self._document
-        self._document = intent.pulse_document
+        self._document = document
         if (
             self._document_source is None
             or previous_document is None
-            or previous_document.fingerprint != intent.pulse_document.fingerprint
+            or previous_document.fingerprint != document.fingerprint
         ):
             self._document_source = None
         self._pulse_path.setText(self._document_source or _EMBEDDED_DOCUMENT)
         self._output_transform_spec = intent.output_transform_spec
         self._refresh_authority_summary()
-        self._show_document(intent.pulse_document, intent.fixed_api_values)
+        self._show_document(document, program)
         occupancy = intent.processor_key is not None
         self._source.setCurrentIndex(1 if occupancy else 0)
-        self._camera_role.setText(intent.camera_role)
-        self._sequencer_role.setText(intent.sequencer_role)
-        self._trigger_channel.setText(intent.trigger_channel or "")
-        self._transport_budget.setText(str(intent.transport_memory_limit_bytes))
-        self._memory_budget.setText(str(intent.memory_limit_bytes))
-        self._deadline.setText(str(intent.timeout_seconds))
+        self._binding_form.populate(
+            {
+                "camera_role": intent.camera_role,
+                "sequencer_role": intent.sequencer_role,
+                "trigger_channel": intent.trigger_channel or "",
+            }
+        )
+        self._budget_form.populate(
+            {
+                "transport_memory_limit_bytes": (
+                    intent.transport_memory_limit_bytes
+                ),
+                "memory_limit_bytes": intent.memory_limit_bytes,
+                "timeout_seconds": intent.timeout_seconds,
+            }
+        )
         if occupancy:
             assert intent.calibration_ref is not None
             self._calibration_repository.setText(intent.calibration_ref.repository_id)
@@ -500,46 +652,162 @@ class ScanIntentForm(QtWidgets.QWidget):
     def _show_document(
         self,
         document: PulseDocument,
-        api_values: dict[str, int | float],
+        program: AutonomousScanSlotProgram | ApiSlotSegmentedProgram | None,
     ) -> None:
-        table = document.scan_table
-        assert table is not None
         self._fingerprint.setText(f"Fingerprint: {document.fingerprint}")
-        self._scan_summary.setText(
-            "SCAN_SLOT: columns="
-            + ", ".join(table.columns)
-            + f" · rows={len(table.rows)}"
+        selected = (
+            _API_SLOT_MODE
+            if isinstance(program, ApiSlotSegmentedProgram)
+            else _SCAN_SLOT_MODE
+            if isinstance(program, AutonomousScanSlotProgram)
+            else _SCAN_SLOT_MODE
+            if document.scan_table is not None and document.scan_parameters
+            else _API_SLOT_MODE
         )
+        self._slot_mode.blockSignals(True)
+        self._slot_mode.clear()
+        if document.scan_table is not None and document.scan_parameters:
+            self._slot_mode.addItem("Autonomous SCAN_SLOT", _SCAN_SLOT_MODE)
+        if document.api_parameters:
+            self._slot_mode.addItem(
+                "API_SLOT · segmented existing",
+                _API_SLOT_MODE,
+            )
+        index = self._slot_mode.findData(selected)
+        if index < 0:
+            raise ValueError("saved scan program is incompatible with PulseDocument")
+        self._slot_mode.setCurrentIndex(index)
+        self._slot_mode.blockSignals(False)
+        self._reset_slot_values(selected, program)
+        self._refresh_slot_summary()
+
+    def _reset_slot_values(
+        self,
+        mode: str,
+        program: AutonomousScanSlotProgram | ApiSlotSegmentedProgram | None = None,
+    ) -> None:
+        document = self._document
+        if document is None:
+            return
         self._clear_api_rows()
+        api_values = (
+            dict(program.api_values)
+            if isinstance(program, AutonomousScanSlotProgram)
+            else {
+                parameter.parameter_id: document.field_value(parameter.field)[0]
+                for parameter in document.api_parameters
+            }
+        )
         if not document.api_parameters:
             self._api_empty = FluentLabel(
                 "No whole-run API constants declared",
-                self._api_box,
+                self._fixed_api_page,
             )
             self._api_empty.setObjectName(f"{self._prefix}ApiConstantsState")
             self._api_layout.addWidget(self._api_empty)
-            return
-        labels = tuple(
-            f"{parameter.parameter_id} ({parameter.unit})"
-            for parameter in document.api_parameters
-        )
-        label_width = setting_label_width(labels)
-        for parameter, label in zip(document.api_parameters, labels, strict=True):
-            edit = FluentLineEdit(parent=self._api_box)
-            edit.setObjectName(
-                f"{self._prefix}ApiValue_{parameter.parameter_id}"
+        else:
+            self._api_form = FluentParameterForm(
+                _api_constant_form_spec(document),
+                api_values,
+                parent=self._fixed_api_page,
             )
-            if parameter.parameter_id in api_values:
-                edit.setText(str(api_values[parameter.parameter_id]))
-            self._api_edits[parameter.parameter_id] = edit
-            self._api_layout.addWidget(
-                FluentSettingRow(
-                    label,
-                    edit,
-                    label_width=label_width,
-                    parent=self._api_box,
+            self._api_form.setObjectName(f"{self._prefix}ApiConstantForm")
+            for parameter in document.api_parameters:
+                self._api_form.widget_for(parameter.parameter_id).setObjectName(
+                    f"{self._prefix}ApiValue_{parameter.parameter_id}"
                 )
+            self._api_layout.addWidget(self._api_form)
+        columns = tuple(
+            parameter.parameter_id for parameter in document.api_parameters
+        )
+        self._api_table.clear()
+        self._api_table.setColumnCount(len(columns))
+        self._api_table.setHorizontalHeaderLabels(list(columns))
+        rows = (
+            program.table.rows
+            if isinstance(program, ApiSlotSegmentedProgram)
+            else (tuple(api_values[column] for column in columns),)
+            if columns
+            else ()
+        )
+        self._api_table.setRowCount(0)
+        for row in rows:
+            self._append_api_row(row)
+        self._allow_host_gaps.setChecked(
+            isinstance(program, ApiSlotSegmentedProgram)
+        )
+        self._segmentation_rationale.setText(
+            program.segmentation_rationale
+            if isinstance(program, ApiSlotSegmentedProgram)
+            else ""
+        )
+        self._slot_stack.setCurrentWidget(
+            self._segmented_api_page
+            if mode == _API_SLOT_MODE
+            else self._fixed_api_page
+        )
+
+    def _refresh_slot_summary(self) -> None:
+        document = self._document
+        if document is None:
+            self._scan_summary.setText("Pulse scan: no document")
+            return
+        mode = self._slot_mode.currentData()
+        if mode == _SCAN_SLOT_MODE:
+            table = document.scan_table
+            if table is None:
+                self._scan_summary.setText("SCAN_SLOT: unavailable")
+            else:
+                self._scan_summary.setText(
+                    "SCAN_SLOT · one autonomous FIRE · columns="
+                    + ", ".join(table.columns)
+                    + f" · points={len(table.rows)}"
+                )
+        else:
+            self._scan_summary.setText(
+                "API_SLOT_SEGMENTED_EXISTING · one finite hardware segment per "
+                f"(repeat, point) · points={self._api_table.rowCount()}"
             )
+
+    def _slot_mode_changed(self, _index: int = -1) -> None:
+        mode = self._slot_mode.currentData()
+        if mode not in (_SCAN_SLOT_MODE, _API_SLOT_MODE):
+            return
+        self._reset_slot_values(mode)
+        self._refresh_slot_summary()
+
+    def _append_api_row(self, values=None) -> None:
+        document = self._document
+        if document is None:
+            return
+        if values is None:
+            values = tuple(
+                document.field_value(parameter.field)[0]
+                for parameter in document.api_parameters
+            )
+        values = tuple(values)
+        if len(values) != self._api_table.columnCount():
+            raise ValueError("API row width differs from declared parameters")
+        row = self._api_table.rowCount()
+        self._api_table.insertRow(row)
+        for column, value in enumerate(values):
+            self._api_table.setItem(
+                row,
+                column,
+                QtWidgets.QTableWidgetItem(str(value)),
+            )
+        self._refresh_slot_summary()
+
+    def _remove_selected_api_rows(self) -> None:
+        selected = sorted(
+            {index.row() for index in self._api_table.selectedIndexes()},
+            reverse=True,
+        )
+        if not selected and self._api_table.rowCount():
+            selected = [self._api_table.rowCount() - 1]
+        for row in selected:
+            self._api_table.removeRow(row)
+        self._refresh_slot_summary()
 
     def _clear_api_rows(self) -> None:
         while self._api_layout.count():
@@ -547,7 +815,7 @@ class ScanIntentForm(QtWidgets.QWidget):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        self._api_edits.clear()
+        self._api_form = None
 
     def _clear_unapplied(self) -> None:
         self._document = None
@@ -557,20 +825,25 @@ class ScanIntentForm(QtWidgets.QWidget):
         self._base_revision = None
         self._pulse_path.clear()
         self._fingerprint.setText("Fingerprint: —")
-        self._scan_summary.setText("SCAN_SLOT: no document")
+        self._scan_summary.setText("Pulse scan: no document")
+        self._slot_mode.blockSignals(True)
+        self._slot_mode.clear()
+        self._slot_mode.blockSignals(False)
         self._clear_api_rows()
-        self._api_empty = FluentLabel("Load a PulseDocument", self._api_box)
+        self._api_empty = FluentLabel("Load a PulseDocument", self._fixed_api_page)
         self._api_layout.addWidget(self._api_empty)
+        self._api_table.clear()
+        self._api_table.setRowCount(0)
+        self._api_table.setColumnCount(0)
+        self._allow_host_gaps.setChecked(False)
+        self._segmentation_rationale.clear()
+        self._slot_stack.setCurrentWidget(self._fixed_api_page)
         self._source.setCurrentIndex(0)
         self._calibration_repository.clear()
         self._calibration_digest.clear()
         self._model_kind.setCurrentIndex(0)
-        self._camera_role.setText("camera")
-        self._sequencer_role.setText("sequencer")
-        self._trigger_channel.clear()
-        self._transport_budget.setText(str(64 << 20))
-        self._memory_budget.setText(str(512 << 20))
-        self._deadline.setText("30.0")
+        self._binding_form.populate(self._binding_form.spec.default_values())
+        self._budget_form.populate(self._budget_form.spec.default_values())
         self._site_mode.setCurrentIndex(0)
         self._site_index.setValue(0)
         self._update_enabled_state()
@@ -645,7 +918,7 @@ class TaskScanCard(QtWidgets.QWidget):
         self._session: ScanEditorSession | None = None
         self._panel: ScanWorkbenchWindow | None = None
 
-        title = FluentLabel("Task: Autonomous SCAN_SLOT", self)
+        title = FluentLabel("Task: Pulse scan", self)
         title.setObjectName("taskCardTitle")
         self._state = FluentLabel("STOPPED · CONFIGURATION REQUIRED", self)
         self._state.setObjectName("taskCardState")
@@ -675,7 +948,7 @@ class TaskScanCard(QtWidgets.QWidget):
 
         self._settings_dialog = QtWidgets.QDialog(self)
         self._settings_dialog.setObjectName("taskSettingsDialog")
-        self._settings_dialog.setWindowTitle("Autonomous SCAN_SLOT Setting")
+        self._settings_dialog.setWindowTitle("Pulse scan Setting")
         settings_layout = QtWidgets.QVBoxLayout(self._settings_dialog)
         self._settings_form = ScanIntentForm(self, object_prefix="setting")
         settings_layout.addWidget(self._settings_form)
@@ -700,6 +973,10 @@ class TaskScanCard(QtWidgets.QWidget):
             self.load_intent(initial_intent)
         else:
             self._tabs.setCurrentWidget(self._edit_form)
+
+    @property
+    def device_catalog(self):
+        return self._experiment.device_catalog
 
     @property
     def editor_session(self) -> ScanEditorSession | None:
@@ -869,7 +1146,7 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         self._card_host = QtWidgets.QWidget(self)
         self._card_host.setObjectName("taskCardHost")
         self._card_layout = QtWidgets.QVBoxLayout(self._card_host)
-        self._empty = FluentLabel("Add the Autonomous SCAN_SLOT task", self._card_host)
+        self._empty = FluentLabel("Add the Pulse scan task", self._card_host)
         self._empty.setObjectName("taskConsoleEmptyState")
         self._empty.setAlignment(QtCore.Qt.AlignCenter)
         self._card_layout.addWidget(self._empty, 1)
@@ -919,8 +1196,8 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         return intent
 
     def _add_card(self) -> None:
-        if self._catalog.currentData() != AUTONOMOUS_SCAN_SLOT_TASK_KEY:
-            self._status.setText("Only Autonomous SCAN_SLOT is available")
+        if self._catalog.currentData() != PULSE_SCAN_TASK_KEY:
+            self._status.setText("Only Pulse scan is available")
             return
         self._create_card(None)
 

@@ -1,4 +1,4 @@
-"""Current SCAN_SLOT TaskConsole intent, catalog, and edit authority."""
+"""Current Pulse scan TaskConsole intent, catalog, and edit authority."""
 
 from dataclasses import replace
 import os
@@ -32,7 +32,10 @@ from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRe
 from zlc_neutral_atom.readout.occupancy import OCCUPANCY_STREAM_PROCESSOR_KEY
 from zlc_neutral_atom.readout.sitemap import load_packaged_sitemap_pulse
 from zlc_neutral_atom.scan import (
-    AUTONOMOUS_SCAN_SLOT_TASK_KEY,
+    ApiSegmentTable,
+    ApiSlotSegmentedProgram,
+    AutonomousScanSlotProgram,
+    PULSE_SCAN_TASK_KEY,
     ScanPointTable,
     bind_scan_output_contract,
 )
@@ -40,9 +43,16 @@ from zlc_pulse import (
     FrozenScanTable,
     RepeatRegion,
     ScanParameter,
+    TIME_UNIT_TO_NS,
     load_pulse_document,
+    replace_pulse_field,
 )
 from zlc_workbench.task_console import (
+    SCAN_INTENT_DEFAULT_CAMERA_ROLE,
+    SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES,
+    SCAN_INTENT_DEFAULT_SEQUENCER_ROLE,
+    SCAN_INTENT_DEFAULT_TIMEOUT_SECONDS,
+    SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES,
     ScanDisplayIntent,
     ScanEditConflict,
     ScanEditDraft,
@@ -55,6 +65,8 @@ from zlc_workbench.task_console import (
     load_task_console_scan_intent,
     save_task_console_scan_intent,
     task_console_catalog_items,
+    task_console_scan_binding_form_spec,
+    task_console_scan_budget_form_spec,
 )
 from zlc_workbench.progressive_scan import build_occupancy_progressive_spec
 
@@ -79,11 +91,10 @@ def _api_values(document):
 def _intent(*, occupancy: bool = False):
     document = _document()
     return TaskConsoleScanIntent(
-        task_key=AUTONOMOUS_SCAN_SLOT_TASK_KEY,
+        task_key=PULSE_SCAN_TASK_KEY,
         measurement_key=CAMERA_MEASUREMENT_KEY,
         processor_key=(OCCUPANCY_STREAM_PROCESSOR_KEY if occupancy else None),
-        pulse_document=document,
-        api_values=_api_values(document),
+        program=AutonomousScanSlotProgram(document, _api_values(document)),
         camera_role="camera",
         sequencer_role="sequencer",
         calibration_ref=(
@@ -154,6 +165,42 @@ def _occupancy_document():
     )
 
 
+def _api_program():
+    document = _occupancy_document()
+    columns = tuple(item.parameter_id for item in document.api_parameters)
+    baseline = tuple(
+        document.field_value(parameter.field)[0]
+        for parameter in document.api_parameters
+    )
+    varied = list(baseline)
+    parameter = document.api_parameters[-1]
+    one_tick = document.time_step_ns / TIME_UNIT_TO_NS[parameter.unit]
+    varied_document = replace_pulse_field(
+        document,
+        parameter.field,
+        float(varied[-1]) + one_tick,
+        unit=parameter.unit,
+    )
+    varied[-1] = varied_document.field_value(parameter.field)[0]
+    return ApiSlotSegmentedProgram(
+        document,
+        ApiSegmentTable(columns, (baseline, tuple(varied))),
+        "Each readout is independent and permits an explicit host gap.",
+    )
+
+
+def _api_intent():
+    return TaskConsoleScanIntent(
+        task_key=PULSE_SCAN_TASK_KEY,
+        measurement_key=CAMERA_MEASUREMENT_KEY,
+        processor_key=None,
+        program=_api_program(),
+        camera_role="camera",
+        sequencer_role="sequencer",
+        timeout_seconds=20.0,
+    )
+
+
 def test_task_console_catalog_projects_every_static_definition_once():
     import zlc_neutral_atom.processing as processing_api
     import zlc_neutral_atom.processing.stream as stream_api
@@ -175,12 +222,41 @@ def test_task_console_catalog_projects_every_static_definition_once():
     assert not hasattr(stream_api, "StreamProcessorDefinition")
 
 
+def test_scan_scalar_form_specs_project_owner_defaults_and_strict_bounds_once():
+    binding = task_console_scan_binding_form_spec(
+        ("camera", "camera-secondary"),
+        ("sequencer",),
+    )
+    budgets = task_console_scan_budget_form_spec()
+
+    assert binding.keys == ("camera_role", "sequencer_role", "trigger_channel")
+    assert binding.default_values() == {
+        "camera_role": SCAN_INTENT_DEFAULT_CAMERA_ROLE,
+        "sequencer_role": SCAN_INTENT_DEFAULT_SEQUENCER_ROLE,
+        "trigger_channel": None,
+    }
+    assert tuple(choice.value for choice in binding.fields[0].choices) == (
+        "camera",
+        "camera-secondary",
+    )
+    assert budgets.default_values() == {
+        "transport_memory_limit_bytes": (
+            SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES
+        ),
+        "memory_limit_bytes": SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES,
+        "timeout_seconds": SCAN_INTENT_DEFAULT_TIMEOUT_SECONDS,
+    }
+    assert budgets.fields[0].minimum == 1
+    assert budgets.fields[1].minimum == 1
+    assert budgets.fields[2].minimum > 0.0
+
+
 def test_scan_intent_round_trip_preserves_named_axes_and_display_authority(tmp_path):
     intent = _intent(occupancy=True)
-    point_table = ScanPointTable.from_pulse_document(intent.pulse_document)
+    point_table = intent.program.point_table
 
     assert len(point_table.point_axes) == 3
-    assert point_table.rows == intent.pulse_document.scan_table.rows
+    assert point_table.rows == intent.program.document.scan_table.rows
     assert decode_task_console_scan_intent(encode_task_console_scan_intent(intent)) == intent
 
     target = tmp_path / "scan-task.zlc"
@@ -188,6 +264,19 @@ def test_scan_intent_round_trip_preserves_named_axes_and_display_authority(tmp_p
     assert load_task_console_scan_intent(target) == intent
     assert intent.output_transform_spec is None
     assert intent.display_intent == ScanDisplayIntent("select", 1)
+
+
+def test_api_scan_intent_save_load_uses_only_the_current_program_union(tmp_path):
+    intent = _api_intent()
+    assert decode_task_console_scan_intent(
+        encode_task_console_scan_intent(intent)
+    ) == intent
+    target = tmp_path / "api-scan-task.zlc"
+    save_task_console_scan_intent(intent, target)
+    loaded = load_task_console_scan_intent(target)
+    assert loaded == intent
+    assert isinstance(loaded.program, ApiSlotSegmentedProgram)
+    assert loaded.program.table.rows == intent.program.table.rows
 
 
 def test_authoritative_transform_summary_is_visible_and_axis_named():
@@ -206,12 +295,17 @@ def test_scan_intent_requires_exact_whole_run_api_values_and_typed_source_chain(
     document = _occupancy_document()
     direct = replace(
         _intent(),
-        pulse_document=document,
-        api_values=_api_values(document),
+        program=AutonomousScanSlotProgram(document, _api_values(document)),
     )
-    assert direct.api_values
-    with pytest.raises(ValueError, match="exactly one whole-run value"):
-        replace(direct, api_values=direct.api_values[:-1])
+    assert direct.program.api_values
+    with pytest.raises(ValueError, match="exactly cover declared parameters"):
+        replace(
+            direct,
+            program=replace(
+                direct.program,
+                api_values=direct.program.api_values[:-1],
+            ),
+        )
     with pytest.raises(ValueError, match="no SITE display choice"):
         replace(direct, display_intent=ScanDisplayIntent("batch"))
     with pytest.raises(ValueError, match="processor must be occupancy or absent"):
@@ -345,7 +439,11 @@ def _run_task_console_product_e2e(tmp_path: Path):
             "editCalibrationManifestDigest",
         )
         model = blank.findChild(QtWidgets.QComboBox, "editReadoutModelKind")
-        camera_role = blank.findChild(QtWidgets.QLineEdit, "editCameraRole")
+        camera_role = blank.findChild(QtWidgets.QComboBox, "editCameraRole")
+        trigger_channel = blank.findChild(
+            QtWidgets.QLineEdit,
+            "editTriggerChannel",
+        )
         site_mode = blank.findChild(QtWidgets.QComboBox, "editSiteDisplayMode")
         assert all(
             widget is not None
@@ -355,6 +453,7 @@ def _run_task_console_product_e2e(tmp_path: Path):
                 calibration_digest,
                 model,
                 camera_role,
+                trigger_channel,
                 site_mode,
             )
         )
@@ -362,14 +461,15 @@ def _run_task_console_product_e2e(tmp_path: Path):
         calibration_repository.setText("cancelled-repository")
         calibration_digest.setText("c" * 64)
         model.setCurrentIndex(model.findData(ReadoutModelKind.PER_SITE_PSF))
-        camera_role.setText("cancelled-camera")
+        trigger_channel.setText("cancelled-trigger")
         site_mode.setCurrentIndex(site_mode.findData("select"))
         blank_edit.cancel_edit()
         assert source.currentData() == "direct"
         assert not calibration_repository.text()
         assert not calibration_digest.text()
         assert model.currentData() is None
-        assert camera_role.text() == "camera"
+        assert camera_role.currentData() == "camera"
+        assert not trigger_channel.text()
         assert site_mode.currentData() == "auto"
 
         blank.scan_card.load_intent(_intent(occupancy=True))
@@ -382,13 +482,59 @@ def _run_task_console_product_e2e(tmp_path: Path):
         assert not calibration_digest.text()
         assert model.currentData() is None
 
+        api_intent = _api_intent()
+        blank.scan_card.load_intent(api_intent)
+        slot_mode = blank.findChild(
+            QtWidgets.QComboBox,
+            "editPulseScanSlotMode",
+        )
+        api_table = blank.findChild(
+            QtWidgets.QTableWidget,
+            "editApiSegmentTable",
+        )
+        allow_gaps = blank.findChild(
+            QtWidgets.QCheckBox,
+            "editAllowApiHostGaps",
+        )
+        rationale = blank.findChild(
+            QtWidgets.QLineEdit,
+            "editApiSegmentationRationale",
+        )
+        assert slot_mode.currentData() == "api-slot-segmented"
+        assert api_table.rowCount() == len(api_intent.program.table.rows)
+        assert allow_gaps.isChecked()
+        assert rationale.text() == api_intent.program.segmentation_rationale
+        api_table.item(0, 0).setText("999")
+        allow_gaps.setChecked(False)
+        rationale.setText("unapplied")
+        blank_edit.cancel_edit()
+        assert slot_mode.currentData() == "api-slot-segmented"
+        assert api_table.item(0, 0).text() == str(api_intent.program.table.rows[0][0])
+        assert allow_gaps.isChecked()
+        assert rationale.text() == api_intent.program.segmentation_rationale
+
+        api_panel = blank.scan_card.panel
+        assert api_panel is not None
+        assert "FINAL-ONLY" in api_panel.findChild(
+            QtWidgets.QLabel,
+            "scanMode",
+        ).text()
+        api_start = api_panel.findChild(QtWidgets.QPushButton, "startScanButton")
+        QtTest.QTest.mouseClick(api_start, QtCore.Qt.LeftButton)
+        until(lambda: api_panel.final_reference is not None)
+        api_result = exp.readout.materialize_scan(api_panel.final_reference)
+        assert api_result.values.shape[:2] == (2, 2)
+        until(lambda: api_panel.worker_idle)
+
         direct_document = _occupancy_document()
         direct_intent = TaskConsoleScanIntent(
-            task_key=AUTONOMOUS_SCAN_SLOT_TASK_KEY,
+            task_key=PULSE_SCAN_TASK_KEY,
             measurement_key=CAMERA_MEASUREMENT_KEY,
             processor_key=None,
-            pulse_document=direct_document,
-            api_values=_api_values(direct_document),
+            program=AutonomousScanSlotProgram(
+                direct_document,
+                _api_values(direct_document),
+            ),
             camera_role="camera",
             sequencer_role="sequencer",
         )
@@ -418,11 +564,10 @@ def _run_task_console_product_e2e(tmp_path: Path):
         document = _occupancy_document()
         calibration_ref = exp.readout.sitemap(frames=6)
         intent = TaskConsoleScanIntent(
-            task_key=AUTONOMOUS_SCAN_SLOT_TASK_KEY,
+            task_key=PULSE_SCAN_TASK_KEY,
             measurement_key=CAMERA_MEASUREMENT_KEY,
             processor_key=OCCUPANCY_STREAM_PROCESSOR_KEY,
-            pulse_document=document,
-            api_values=_api_values(document),
+            program=AutonomousScanSlotProgram(document, _api_values(document)),
             camera_role="camera",
             sequencer_role="sequencer",
             calibration_ref=calibration_ref,
@@ -473,13 +618,13 @@ def _run_task_console_product_e2e(tmp_path: Path):
         edit.begin_edit()
         assert edit.build_intent().model_kind is None
         committed_path_text = edit._pulse_path.text()
-        committed_fingerprint = edit.build_intent().pulse_document.fingerprint
+        committed_fingerprint = edit.build_intent().program.document.fingerprint
         invalid_pulse = tmp_path / "not-a-pulse.json"
         invalid_pulse.write_text("{}", encoding="utf-8")
         edit._pulse_path.setText(str(invalid_pulse))
         edit._load_pulse.click()
         assert edit._pulse_path.text() == committed_path_text
-        assert edit.build_intent().pulse_document.fingerprint == committed_fingerprint
+        assert edit.build_intent().program.document.fingerprint == committed_fingerprint
         setting.begin_edit()
         card.apply_form(edit)
         with pytest.raises(ScanEditConflict, match="stale"):

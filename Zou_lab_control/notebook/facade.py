@@ -78,13 +78,19 @@ from zlc_neutral_atom.readout.contracts import (
 )
 from zlc_neutral_atom.readout.sitemap import SitemapAcquisitionProfile
 from zlc_neutral_atom.scan import (
+    ApiSegmentTable,
+    ApiSlotSegmentedProgram,
+    AutonomousScanSlotProgram,
     MaterializedScanData,
+    PulseScanProgram,
     ScanPointTable,
     bind_scan_output_contract,
 )
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_neutral_atom.scan.application import (
     PreparedOccupancyScan,
+    compile_api_direct_scan_artifact_plan,
+    compile_api_occupancy_scan_artifact_plan,
     compile_direct_scan_artifact_plan,
     compile_occupancy_scan_artifact_plan,
 )
@@ -95,7 +101,14 @@ from zlc_neutral_atom.readout.occupancy import (
 from zlc_neutral_atom.readout.occupancy_pipeline import OccupancyPipelineSpec
 from zlc_neutral_atom.runtime.streams import StreamId
 from zlc_neutral_atom.runtime.dataset import dataset_storage_nbytes
+from zlc_neutral_atom.runtime.pipeline import (
+    MinimalPipelineSpec,
+    estimate_pipeline_peak_bytes,
+)
 from zlc_neutral_atom.timing.occupancy import TriggeredOccupancySpec
+from zlc_neutral_atom.timing.segmented import (
+    ApiSlotSegmentedSpec,
+)
 from zlc_neutral_atom.runtime.run import RunHandle
 from zlc_pulse import (
     PulseDocument,
@@ -103,7 +116,6 @@ from zlc_pulse import (
     bind_pulse_document_target,
     expand_autonomous_scan_repeats,
     require_autonomous_scan_resident_capacity,
-    resolve_api_parameters,
     load_pulse_document,
 )
 from zlc_storage import canonical_digest
@@ -169,7 +181,7 @@ def _require_runtime_shutdown(runtime, *, timeout: float) -> None:
 
 
 def _validate_scan_request_fields(
-    pulse_document: PulseDocument,
+    program: PulseScanProgram,
     camera_ref: DeviceRef,
     sequencer_ref: DeviceRef,
     trigger_channel: str | None,
@@ -178,15 +190,11 @@ def _validate_scan_request_fields(
     memory_limit_bytes: int,
     timeout_seconds: float,
 ) -> tuple[int, int, float]:
-    if not isinstance(pulse_document, PulseDocument):
-        raise TypeError("pulse_document must be PulseDocument")
-    if pulse_document.scan_table is None:
-        raise ValueError("scan request requires a frozen PulseDocument scan table")
-    if pulse_document.api_parameters:
-        raise ValueError(
-            "scan request requires a PulseDocument with every whole-run API "
-            "parameter explicitly resolved"
-        )
+    if not isinstance(
+        program,
+        (AutonomousScanSlotProgram, ApiSlotSegmentedProgram),
+    ):
+        raise TypeError("program must be a current pulse-scan program")
     if not isinstance(camera_ref, DeviceRef):
         raise TypeError("camera_ref must be DeviceRef")
     if not isinstance(sequencer_ref, DeviceRef):
@@ -211,7 +219,7 @@ def _validate_scan_request_fields(
 def _resolve_scan_fixed_api(
     document: PulseDocument,
     values: Mapping[str, int | float] | None,
-) -> PulseDocument:
+) -> AutonomousScanSlotProgram:
     """Freeze whole-run API constants before a SCAN_SLOT request exists.
 
     These values are constants for the complete autonomous table.  They are
@@ -220,21 +228,27 @@ def _resolve_scan_fixed_api(
     """
 
     supplied = {} if values is None else dict(values)
-    resolved = resolve_api_parameters(document, supplied)
-    if resolved.api_parameters:
-        missing = tuple(item.parameter_id for item in resolved.api_parameters)
+    expected = tuple(
+        parameter.parameter_id for parameter in document.api_parameters
+    )
+    if set(supplied) != set(expected):
+        missing = tuple(key for key in expected if key not in supplied)
+        extra = tuple(key for key in supplied if key not in set(expected))
         raise ValueError(
             "SCAN_SLOT requires explicit whole-run values for every API parameter; "
-            f"missing={missing}"
+            f"missing={missing}, extra={extra}"
         )
-    return resolved
+    return AutonomousScanSlotProgram(
+        document,
+        tuple((key, supplied[key]) for key in expected),
+    )
 
 
 @dataclass(frozen=True)
 class ScanRequest:
-    """Freeze one autonomous SCAN_SLOT table and its direct-camera y intent."""
+    """Freeze one typed pulse-scan program and its direct-camera y intent."""
 
-    pulse_document: PulseDocument
+    program: PulseScanProgram
     camera_ref: DeviceRef
     sequencer_ref: DeviceRef
     trigger_channel: str | None = None
@@ -245,7 +259,7 @@ class ScanRequest:
 
     def __post_init__(self) -> None:
         transport, memory, timeout = _validate_scan_request_fields(
-            self.pulse_document,
+            self.program,
             self.camera_ref,
             self.sequencer_ref,
             self.trigger_channel,
@@ -263,7 +277,7 @@ class ScanRequest:
 class OccupancyScanRequest:
     """Freeze one camera→occupancy exact processor as multidimensional scan y."""
 
-    pulse_document: PulseDocument
+    program: PulseScanProgram
     camera_ref: DeviceRef
     sequencer_ref: DeviceRef
     calibration_ref: CalibrationArtifactRef
@@ -283,7 +297,7 @@ class OccupancyScanRequest:
         ):
             raise TypeError("model_kind must be ReadoutModelKind or None")
         transport, memory, timeout = _validate_scan_request_fields(
-            self.pulse_document,
+            self.program,
             self.camera_ref,
             self.sequencer_ref,
             self.trigger_channel,
@@ -661,10 +675,10 @@ class ReadoutFacade:
                 if isinstance(pulse, PulseDocument)
                 else load_pulse_document(pulse)
             )
-            document = _resolve_scan_fixed_api(document, api_values)
+            program = _resolve_scan_fixed_api(document, api_values)
             camera_role = self._resolve_camera_role(services, camera_role)
             return ScanRequest(
-                pulse_document=document,
+                program=program,
                 camera_ref=services.catalog.require(camera_role).ref,
                 sequencer_ref=services.catalog.require(
                     _resolve_role(
@@ -686,6 +700,61 @@ class ReadoutFacade:
 
     def start_scan(self, pulse: PulseDocument | str | Path, **kwargs) -> RunHandle:
         return _start_scan(self._token, self.scan_request(pulse, **kwargs))
+
+    def api_scan_request(
+        self,
+        pulse: PulseDocument | str | Path,
+        *,
+        api_table: ApiSegmentTable,
+        segmentation_rationale: str,
+        camera_role: str | None = None,
+        sequencer_role: str | None = None,
+        trigger_channel: str | None = None,
+        output_transform_spec: DataTransformSpec | None = None,
+        transport_memory_limit_bytes: int = 64 << 20,
+        memory_limit_bytes: int = 512 << 20,
+        timeout_seconds: float = 30.0,
+    ) -> ScanRequest:
+        """Build the accepted finite API_SLOT segmented exception explicitly."""
+
+        with _service_guard(self._token) as services:
+            document = (
+                pulse
+                if isinstance(pulse, PulseDocument)
+                else load_pulse_document(pulse)
+            )
+            program = ApiSlotSegmentedProgram(
+                document,
+                api_table,
+                segmentation_rationale,
+            )
+            camera_role = self._resolve_camera_role(services, camera_role)
+            sequencer_role = _resolve_role(
+                services.catalog,
+                sequencer_role,
+                "sequencer",
+                ("sequencer",),
+            )
+            return ScanRequest(
+                program=program,
+                camera_ref=services.catalog.require(camera_role).ref,
+                sequencer_ref=services.catalog.require(sequencer_role).ref,
+                trigger_channel=trigger_channel,
+                output_transform_spec=output_transform_spec,
+                transport_memory_limit_bytes=transport_memory_limit_bytes,
+                memory_limit_bytes=memory_limit_bytes,
+                timeout_seconds=timeout_seconds,
+            )
+
+    def api_scan(self, pulse: PulseDocument | str | Path, **kwargs) -> ScanArtifactRef:
+        return _run_scan(self._token, self.api_scan_request(pulse, **kwargs))
+
+    def start_api_scan(
+        self,
+        pulse: PulseDocument | str | Path,
+        **kwargs,
+    ) -> RunHandle:
+        return _start_scan(self._token, self.api_scan_request(pulse, **kwargs))
 
     def occupancy_scan_request(
         self,
@@ -710,7 +779,7 @@ class ReadoutFacade:
                 if isinstance(pulse, PulseDocument)
                 else load_pulse_document(pulse)
             )
-            document = _resolve_scan_fixed_api(document, api_values)
+            program = _resolve_scan_fixed_api(document, api_values)
             camera_role = self._resolve_camera_role(services, camera_role)
             sequencer_role = _resolve_role(
                 services.catalog,
@@ -719,7 +788,7 @@ class ReadoutFacade:
                 ("sequencer",),
             )
             return OccupancyScanRequest(
-                pulse_document=document,
+                program=program,
                 camera_ref=services.catalog.require(camera_role).ref,
                 sequencer_ref=services.catalog.require(sequencer_role).ref,
                 calibration_ref=calibration_ref,
@@ -749,6 +818,73 @@ class ReadoutFacade:
         return _start_scan(
             self._token,
             self.occupancy_scan_request(pulse, **kwargs),
+        )
+
+    def api_occupancy_scan_request(
+        self,
+        pulse: PulseDocument | str | Path,
+        *,
+        api_table: ApiSegmentTable,
+        segmentation_rationale: str,
+        calibration_ref: CalibrationArtifactRef,
+        model_kind: ReadoutModelKind | None = None,
+        camera_role: str | None = None,
+        sequencer_role: str | None = None,
+        trigger_channel: str | None = None,
+        output_transform_spec: DataTransformSpec | None = None,
+        transport_memory_limit_bytes: int = 64 << 20,
+        memory_limit_bytes: int = 512 << 20,
+        timeout_seconds: float = 30.0,
+    ) -> OccupancyScanRequest:
+        with _service_guard(self._token) as services:
+            document = (
+                pulse
+                if isinstance(pulse, PulseDocument)
+                else load_pulse_document(pulse)
+            )
+            program = ApiSlotSegmentedProgram(
+                document,
+                api_table,
+                segmentation_rationale,
+            )
+            camera_role = self._resolve_camera_role(services, camera_role)
+            sequencer_role = _resolve_role(
+                services.catalog,
+                sequencer_role,
+                "sequencer",
+                ("sequencer",),
+            )
+            return OccupancyScanRequest(
+                program=program,
+                camera_ref=services.catalog.require(camera_role).ref,
+                sequencer_ref=services.catalog.require(sequencer_role).ref,
+                calibration_ref=calibration_ref,
+                model_kind=model_kind,
+                trigger_channel=trigger_channel,
+                output_transform_spec=output_transform_spec,
+                transport_memory_limit_bytes=transport_memory_limit_bytes,
+                memory_limit_bytes=memory_limit_bytes,
+                timeout_seconds=timeout_seconds,
+            )
+
+    def api_occupancy_scan(
+        self,
+        pulse: PulseDocument | str | Path,
+        **kwargs,
+    ) -> ScanArtifactRef:
+        return _run_scan(
+            self._token,
+            self.api_occupancy_scan_request(pulse, **kwargs),
+        )
+
+    def start_api_occupancy_scan(
+        self,
+        pulse: PulseDocument | str | Path,
+        **kwargs,
+    ) -> RunHandle:
+        return _start_scan(
+            self._token,
+            self.api_occupancy_scan_request(pulse, **kwargs),
         )
 
     def load_scan(self, reference: ScanArtifactRef) -> "ScanArtifact":
@@ -1502,7 +1638,7 @@ def _run(token: object, request: CaptureRequest) -> CaptureArtifactRef:
     return runtime.wait(handle)
 
 
-def _bind_scan_camera(
+def _bind_autonomous_scan_camera(
     services: _ExperimentServices,
     request: ScanRequest | OccupancyScanRequest,
 ):
@@ -1513,18 +1649,24 @@ def _bind_scan_camera(
 
     if not isinstance(request, (ScanRequest, OccupancyScanRequest)):
         raise TypeError("request must be a current scan request")
+    if not isinstance(request.program, AutonomousScanSlotProgram):
+        raise TypeError("autonomous scan binding requires AutonomousScanSlotProgram")
     pulse_port = services.runtime.pulse_port(request.sequencer_ref)
     camera_port = services.runtime.camera_port(request.camera_ref)
-    logical_document = bind_pulse_document_target(
-        request.pulse_document,
-        pulse_port.capability.target,
+    program = AutonomousScanSlotProgram(
+        bind_pulse_document_target(
+            request.program.document,
+            pulse_port.capability.target,
+        ),
+        request.program.api_values,
     )
+    logical_document = program.execution_document
     require_autonomous_scan_resident_capacity(
         logical_document,
         pulse_port.capability.resident_scan_point_capacity,
     )
     execution_document = expand_autonomous_scan_repeats(logical_document)
-    point_table = ScanPointTable.from_pulse_document(logical_document)
+    point_table = program.point_table
     repeat_count = (
         1 if logical_document.repeat is None else logical_document.repeat.count
     )
@@ -1558,7 +1700,45 @@ def _bind_scan_camera(
         raise RuntimeError(
             "compiled scan pulse differs from the repeat-major execution document"
         )
-    return logical_document, point_table, binding
+    return program, point_table, binding
+
+
+def _bind_api_scan_camera(
+    services: _ExperimentServices,
+    request: ScanRequest | OccupancyScanRequest,
+):
+    from zlc_neutral_atom.bootstrap._triggered_capture import (
+        bind_api_slot_segmented_camera_acquisition,
+    )
+
+    if not isinstance(request, (ScanRequest, OccupancyScanRequest)):
+        raise TypeError("request must be a current scan request")
+    if not isinstance(request.program, ApiSlotSegmentedProgram):
+        raise TypeError("API scan binding requires ApiSlotSegmentedProgram")
+    services.scan_repository.admit_api_execution_cardinality(
+        request.program.point_count,
+        request.program.repeat_count,
+    )
+    binding = bind_api_slot_segmented_camera_acquisition(
+        services.runtime.pulse_port(request.sequencer_ref),
+        services.runtime.camera_port(request.camera_ref),
+        program=request.program,
+        trigger_channel=request.trigger_channel,
+        repeat_axis_id=_SCAN_REPEAT_AXIS_ID,
+        readout_event_axis_id=_SCAN_READOUT_EVENT_AXIS_ID,
+        transport_memory_limit_bytes=request.transport_memory_limit_bytes,
+        memory_limit_bytes=request.memory_limit_bytes,
+    )
+    return binding.program, binding.point_table, binding
+
+
+def _compiled_scan_artifacts_digest(artifacts) -> str:
+    return canonical_digest(
+        {
+            "owner": "Zou_lab_control.notebook.api-scan-compiled-lineage",
+            "artifacts": [artifact.fingerprint for artifact in artifacts],
+        }
+    )
 
 
 def _scan_transform(
@@ -1583,36 +1763,84 @@ def _compile_direct_scan_for_services(
     services: _ExperimentServices,
     request: ScanRequest,
 ):
-    logical_document, point_table, binding = _bind_scan_camera(services, request)
+    if isinstance(request.program, AutonomousScanSlotProgram):
+        program, point_table, binding = _bind_autonomous_scan_camera(
+            services,
+            request,
+        )
+    elif isinstance(request.program, ApiSlotSegmentedProgram):
+        program, point_table, binding = _bind_api_scan_camera(services, request)
+    else:
+        raise TypeError("request has an unknown pulse-scan program")
     raw_schema = binding.measurement.capture_contract.dataset_schema
     output_contract = _scan_transform(
         raw_schema,
         point_table,
         request.output_transform_spec,
     )
-    triggered, descriptor = bind_finite_capture_spec(
-        binding=binding,
-        block_id=BlockId(
-            f"scan-camera-{binding.compiled_artifact.fingerprint[:20]}"
-        ),
-        camera_ref=request.camera_ref,
-        sequencer_ref=request.sequencer_ref,
-        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
-        pipeline_memory_limit_bytes=request.memory_limit_bytes,
+    if isinstance(program, AutonomousScanSlotProgram):
+        triggered, descriptor = bind_finite_capture_spec(
+            binding=binding,
+            block_id=BlockId(
+                f"scan-camera-{binding.compiled_artifact.fingerprint[:20]}"
+            ),
+            camera_ref=request.camera_ref,
+            sequencer_ref=request.sequencer_ref,
+            execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
+            pipeline_memory_limit_bytes=request.memory_limit_bytes,
+            timeout_seconds=request.timeout_seconds,
+            name_prefix="Direct scan",
+        )
+        plan = compile_direct_scan_artifact_plan(
+            triggered,
+            services.scan_repository,
+            program=program,
+            output_contract=output_contract,
+            memory_limit_bytes=request.memory_limit_bytes,
+        )
+        descriptor = replace(
+            descriptor,
+            output_shape=output_contract.output_dataset_schema.physical_shape,
+            output_schema_fingerprint=output_contract.output_schema_fingerprint,
+        )
+        return plan, descriptor
+
+    compiled_digest = _compiled_scan_artifacts_digest(binding.compiled_artifacts)
+    capture = MinimalPipelineSpec(
+        f"API segmented scan {program.document.name}",
+        binding.measurement,
+        BlockId(f"api-scan-camera-{compiled_digest[:20]}"),
+        request.memory_limit_bytes,
         timeout_seconds=request.timeout_seconds,
-        name_prefix="Direct scan",
     )
-    plan = compile_direct_scan_artifact_plan(
-        triggered,
+    segmented = ApiSlotSegmentedSpec(
+        capture,
+        binding.pulse_port,
+        binding.point_descriptors,
+        program.repeat_count,
+    )
+    plan = compile_api_direct_scan_artifact_plan(
+        segmented,
         services.scan_repository,
-        document=logical_document,
+        program=program,
         output_contract=output_contract,
         memory_limit_bytes=request.memory_limit_bytes,
     )
-    descriptor = replace(
-        descriptor,
-        output_shape=output_contract.output_dataset_schema.physical_shape,
-        output_schema_fingerprint=output_contract.output_schema_fingerprint,
+    descriptor = PlanDescriptor(
+        capture.name,
+        request.camera_ref.role,
+        request.sequencer_ref.role,
+        PulseExecutionForm.STATIC_ONCE,
+        binding.trigger_channel,
+        binding.expected_frames,
+        output_contract.output_dataset_schema.physical_shape,
+        output_contract.output_schema_fingerprint,
+        compiled_digest,
+        (
+            str(binding.pulse_port.resource_claim.key),
+            str(binding.measurement.capture_port.resource_claim.key),
+        ),
+        estimate_pipeline_peak_bytes(capture),
     )
     return plan, descriptor
 
@@ -1621,7 +1849,19 @@ def _bind_occupancy_scan_for_services(
     services: _ExperimentServices,
     request: OccupancyScanRequest,
 ):
-    logical_document, point_table, binding = _bind_scan_camera(services, request)
+    if isinstance(request.program, AutonomousScanSlotProgram):
+        program, point_table, binding = _bind_autonomous_scan_camera(
+            services,
+            request,
+        )
+        compiled_digest = binding.compiled_artifact.fingerprint
+    elif isinstance(request.program, ApiSlotSegmentedProgram):
+        program, point_table, binding = _bind_api_scan_camera(services, request)
+        compiled_digest = _compiled_scan_artifacts_digest(
+            binding.compiled_artifacts
+        )
+    else:
+        raise TypeError("request has an unknown pulse-scan program")
     calibration = _calibration_repository(services).admit(
         request.calibration_ref,
         services.capture_repository,
@@ -1631,8 +1871,8 @@ def _bind_occupancy_scan_for_services(
     identity = canonical_digest(
         {
             "owner": "Zou_lab_control.notebook.occupancy-scan",
-            "pulse_document": logical_document.fingerprint,
-            "compiled_pulse": binding.compiled_artifact.fingerprint,
+            "pulse_scan_program": program.fingerprint,
+            "compiled_pulse_lineage": compiled_digest,
             "calibration": calibration_artifact_ref_to_tree(
                 request.calibration_ref
             ),
@@ -1655,7 +1895,7 @@ def _bind_occupancy_scan_for_services(
         request.output_transform_spec,
     )
     occupancy = OccupancyPipelineSpec(
-        f"Occupancy scan {logical_document.name}",
+        f"Occupancy scan {program.document.name}",
         binding.measurement,
         processor,
         BlockId(f"scan-counts-{identity}"),
@@ -1663,27 +1903,43 @@ def _bind_occupancy_scan_for_services(
         request.memory_limit_bytes,
         request.timeout_seconds,
     )
-    triggered = TriggeredOccupancySpec(
-        occupancy,
-        binding.pulse_port,
-        binding.pulse_request,
-        binding.trigger_channel,
-        binding.cell_plan,
-    )
-    return triggered, logical_document, output_contract, source_schema
+    if isinstance(program, AutonomousScanSlotProgram):
+        scan_spec = TriggeredOccupancySpec(
+            occupancy,
+            binding.pulse_port,
+            binding.pulse_request,
+            binding.trigger_channel,
+            binding.cell_plan,
+        )
+    else:
+        scan_spec = ApiSlotSegmentedSpec(
+            occupancy,
+            binding.pulse_port,
+            binding.point_descriptors,
+            program.repeat_count,
+        )
+    return scan_spec, program, output_contract, source_schema
 
 
 def _compile_occupancy_scan_for_services(
     services: _ExperimentServices,
     request: OccupancyScanRequest,
 ):
-    triggered, logical_document, output_contract, _source_schema = (
+    scan_spec, program, output_contract, _source_schema = (
         _bind_occupancy_scan_for_services(services, request)
     )
-    return compile_occupancy_scan_artifact_plan(
-        triggered,
+    if isinstance(program, AutonomousScanSlotProgram):
+        return compile_occupancy_scan_artifact_plan(
+            scan_spec,
+            services.scan_repository,
+            program=program,
+            output_contract=output_contract,
+            memory_limit_bytes=request.memory_limit_bytes,
+        )
+    return compile_api_occupancy_scan_artifact_plan(
+        scan_spec,
         services.scan_repository,
-        document=logical_document,
+        program=program,
         output_contract=output_contract,
         memory_limit_bytes=request.memory_limit_bytes,
     )
@@ -1700,20 +1956,33 @@ def _prepare_occupancy_scan_for_workbench(
     if not isinstance(request, OccupancyScanRequest):
         raise TypeError("request must be OccupancyScanRequest")
     with _service_guard(experiment._authority_token) as services:
-        triggered, logical_document, output_contract, source_schema = (
+        scan_spec, program, output_contract, source_schema = (
             _bind_occupancy_scan_for_services(services, request)
         )
 
     def start(preview):
         with _service_guard(experiment._authority_token) as services:
-            plan = compile_occupancy_scan_artifact_plan(
-                triggered,
-                services.scan_repository,
-                document=logical_document,
-                output_contract=output_contract,
-                memory_limit_bytes=request.memory_limit_bytes,
-                preview=preview,
-            )
+            if isinstance(program, AutonomousScanSlotProgram):
+                plan = compile_occupancy_scan_artifact_plan(
+                    scan_spec,
+                    services.scan_repository,
+                    program=program,
+                    output_contract=output_contract,
+                    memory_limit_bytes=request.memory_limit_bytes,
+                    preview=preview,
+                )
+            else:
+                if preview is not None:
+                    raise ValueError(
+                        "API segmented occupancy is FINAL-only; preview is unsupported"
+                    )
+                plan = compile_api_occupancy_scan_artifact_plan(
+                    scan_spec,
+                    services.scan_repository,
+                    program=program,
+                    output_contract=output_contract,
+                    memory_limit_bytes=request.memory_limit_bytes,
+                )
             return services.runtime.start(plan)
 
     return PreparedOccupancyScan(

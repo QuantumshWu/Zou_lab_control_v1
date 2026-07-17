@@ -1,4 +1,4 @@
-"""Canonical FINAL dataset authority for autonomous pulse scans.
+"""Canonical FINAL dataset authority for exact pulse scans.
 
 The repository owns one current format.  Direct-camera and processed exact
 sources are normalized by scan application adapters before this boundary; the
@@ -37,22 +37,25 @@ from zlc_neutral_atom.runtime.commit import (
     RepositoryCommitCoordinator,
     publish_manifest_with_visibility_reconciliation,
 )
+from zlc_neutral_atom.runtime.capture import (
+    MAX_CAPTURE_TERMINAL_ACK_CANONICAL_BYTES,
+    MAX_CAPTURE_TERMINAL_ACK_CANONICAL_NODES,
+)
 from zlc_neutral_atom.runtime.dataset import (
+    DatasetCellSchedule,
     DatasetSealProvenance,
     dataset_seal_provenance_from_tree,
     dataset_seal_provenance_to_tree,
 )
 from zlc_neutral_atom.runtime.run import PostSafetyContext
-from zlc_neutral_atom.timing.lineage import (
-    PulseCaptureEvidence,
-    pulse_capture_evidence_from_tree,
-    pulse_capture_evidence_to_tree,
+from zlc_neutral_atom.timing.pulse import (
+    MAX_PULSE_TERMINAL_ACK_CANONICAL_BYTES,
+    MAX_PULSE_TERMINAL_ACK_CANONICAL_NODES,
 )
 from zlc_pulse import (
     CompiledPulseArtifact,
     CompiledPulseRuntimeSummary,
     MAX_COMPILED_PULSE_ARTIFACT_BYTES,
-    PulseDocument,
     PulseExecutionForm,
     compiled_pulse_runtime_summary,
     compiled_pulse_runtime_summary_from_tree,
@@ -60,8 +63,6 @@ from zlc_pulse import (
     decode_compiled_pulse_artifact,
     encode_compiled_pulse_artifact,
     expand_autonomous_scan_repeats,
-    pulse_document_from_tree,
-    pulse_document_to_tree,
 )
 from zlc_storage import (
     CanonicalArrayEvent,
@@ -85,11 +86,25 @@ from zlc_storage import (
 )
 
 from .contracts import (
+    ApiSlotSegmentedProgram,
+    AutonomousScanSlotProgram,
+    PulseScanProgram,
     ScanOutputContract,
-    ScanPointTable,
     bind_scan_output_contract,
+    pulse_scan_program_from_tree,
+    pulse_scan_program_to_tree,
     scan_output_contract_from_tree,
     scan_output_contract_to_tree,
+)
+from .lineage import (
+    ApiSegmentedScanExecution,
+    AutonomousScanExecution,
+    PulseScanExecution,
+    api_segmented_cell_schedule,
+    api_segmented_metadata_static_shape_from_execution,
+    execution_compiled_artifacts,
+    pulse_scan_execution_from_tree,
+    pulse_scan_execution_to_tree,
 )
 from .reference import SCAN_ARTIFACT_NAMESPACE, ScanArtifactRef
 
@@ -101,10 +116,10 @@ _MANIFEST_FIELDS = frozenset({"schema", "repository_id", "metadata_blob"})
 _ARTIFACT_FIELDS = frozenset(
     {
         "schema",
-        "pulse_document_blob",
-        "compiled_pulse_blob",
-        "compiled_pulse_runtime_summary",
-        "pulse_evidence",
+        "pulse_program_blob",
+        "compiled_pulse_blobs",
+        "compiled_pulse_runtime_summaries",
+        "execution",
         "source_dataset_ref",
         "source_dataset_schema",
         "output_contract",
@@ -124,20 +139,49 @@ _METADATA_LIMITS = CanonicalDecodeLimits(
 )
 _FIXED_MATERIALIZATION_BYTES = 4 << 20
 _CANONICAL_DECODE_MULTIPLIER = 8
-_DOCUMENT_DECODE_MULTIPLIER = 16
+_PROGRAM_DECODE_MULTIPLIER = 16
 _STATIC_LINEAGE_FIXED_BYTES = 1 << 20
+_API_METADATA_DYNAMIC_FIXED_BYTES = (
+    (1 << 20) + MAX_CAPTURE_TERMINAL_ACK_CANONICAL_BYTES
+)
+_API_METADATA_DYNAMIC_BYTES_PER_SEGMENT = (
+    (4 << 10) + MAX_PULSE_TERMINAL_ACK_CANONICAL_BYTES
+)
+_API_METADATA_DYNAMIC_FIXED_NODES = (
+    (4 << 10) + MAX_CAPTURE_TERMINAL_ACK_CANONICAL_NODES
+)
+_API_METADATA_DYNAMIC_NODES_PER_SEGMENT = (
+    128 + MAX_PULSE_TERMINAL_ACK_CANONICAL_NODES
+)
 
 
 class ScanResourceExceeded(RuntimeError):
     """One canonical scan exceeds an explicit storage/admission budget."""
 
 
+def _api_segmented_metadata_cardinality_floor(
+    point_count: int,
+    repeat_count: int,
+) -> tuple[int, int]:
+    """Cheap R*P-only floor; actual static metadata is admitted after binding."""
+
+    points = positive_integer(point_count, "point_count")
+    repeats = positive_integer(repeat_count, "repeat_count")
+    segments = points * repeats
+    return (
+        _API_METADATA_DYNAMIC_FIXED_BYTES
+        + segments * _API_METADATA_DYNAMIC_BYTES_PER_SEGMENT,
+        _API_METADATA_DYNAMIC_FIXED_NODES
+        + segments * _API_METADATA_DYNAMIC_NODES_PER_SEGMENT,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ScanRepositoryResourcePolicy:
     max_manifest_bytes: int = 1 << 20
     max_metadata_blob_bytes: int = 16 << 20
-    max_pulse_document_blob_bytes: int = 16 << 20
-    max_compiled_pulse_blob_bytes: int = MAX_COMPILED_PULSE_ARTIFACT_BYTES
+    max_pulse_program_blob_bytes: int = 16 << 20
+    max_total_compiled_pulse_blob_bytes: int = 8 << 30
     max_output_values_blob_bytes: int = 8 << 30
     max_output_validity_blob_bytes: int = 2 << 30
 
@@ -146,10 +190,6 @@ class ScanRepositoryResourcePolicy:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        if self.max_compiled_pulse_blob_bytes > MAX_COMPILED_PULSE_ARTIFACT_BYTES:
-            raise ValueError(
-                "scan compiled-pulse budget cannot exceed the pulse owner limit"
-            )
 
 
 DEFAULT_SCAN_REPOSITORY_RESOURCE_POLICY = ScanRepositoryResourcePolicy()
@@ -157,10 +197,10 @@ DEFAULT_SCAN_REPOSITORY_RESOURCE_POLICY = ScanRepositoryResourcePolicy()
 
 @dataclass(frozen=True, slots=True)
 class _StoredScan:
-    pulse_document_blob: ContentRef
-    compiled_pulse_blob: ContentRef
-    compiled_pulse_runtime_summary: CompiledPulseRuntimeSummary
-    pulse_evidence: PulseCaptureEvidence
+    pulse_program_blob: ContentRef
+    compiled_pulse_blobs: tuple[ContentRef, ...]
+    compiled_pulse_runtime_summaries: tuple[CompiledPulseRuntimeSummary, ...]
+    execution: PulseScanExecution
     source_dataset_ref: DatasetRevisionRef
     source_dataset_schema: DatasetSchema
     output_contract: ScanOutputContract
@@ -171,19 +211,30 @@ class _StoredScan:
     safety_bundle_id: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.pulse_document_blob, ContentRef) or not isinstance(
-            self.compiled_pulse_blob, ContentRef
+        if not isinstance(self.pulse_program_blob, ContentRef):
+            raise TypeError("pulse_program_blob must be ContentRef")
+        blobs = tuple(self.compiled_pulse_blobs)
+        summaries = tuple(self.compiled_pulse_runtime_summaries)
+        if not blobs or any(not isinstance(item, ContentRef) for item in blobs):
+            raise TypeError("compiled_pulse_blobs must contain ContentRef values")
+        if len(summaries) != len(blobs) or any(
+            not isinstance(item, CompiledPulseRuntimeSummary) for item in summaries
         ):
-            raise TypeError("scan lineage blobs must be ContentRef")
-        if not isinstance(self.pulse_evidence, PulseCaptureEvidence):
-            raise TypeError("pulse_evidence must be PulseCaptureEvidence")
+            raise TypeError("compiled pulse summaries must align with their blobs")
         if not isinstance(
-            self.compiled_pulse_runtime_summary,
-            CompiledPulseRuntimeSummary,
+            self.execution,
+            (AutonomousScanExecution, ApiSegmentedScanExecution),
         ):
-            raise TypeError(
-                "compiled_pulse_runtime_summary must be CompiledPulseRuntimeSummary"
-            )
+            raise TypeError("execution must be a PulseScanExecution")
+        artifacts = execution_compiled_artifacts(self.execution)
+        if tuple(item.digest for item in blobs) != tuple(
+            item.fingerprint for item in artifacts
+        ):
+            raise ValueError("stored compiled blobs differ from execution evidence")
+        if self.pulse_program_blob.digest != self.execution.program.fingerprint:
+            raise ValueError("stored program blob differs from execution program")
+        object.__setattr__(self, "compiled_pulse_blobs", blobs)
+        object.__setattr__(self, "compiled_pulse_runtime_summaries", summaries)
         if not isinstance(self.source_dataset_ref, DatasetRevisionRef) or not isinstance(
             self.output_dataset_ref, DatasetRevisionRef
         ):
@@ -203,12 +254,12 @@ class _StoredScan:
 
 @dataclass(frozen=True, slots=True)
 class _StoredScanIndex:
-    """Small current-format index decoded without PulseDocument or pulse IR."""
+    """Small current-format index decoded without program or pulse IR."""
 
-    pulse_document_blob: ContentRef
-    compiled_pulse_blob: ContentRef
-    compiled_pulse_runtime_summary: CompiledPulseRuntimeSummary
-    pulse_evidence_tree: object
+    pulse_program_blob: ContentRef
+    compiled_pulse_blobs: tuple[ContentRef, ...]
+    compiled_pulse_runtime_summaries: tuple[CompiledPulseRuntimeSummary, ...]
+    execution_tree: object
     source_dataset_ref: DatasetRevisionRef
     source_dataset_schema: DatasetSchema
     output_contract: ScanOutputContract
@@ -221,24 +272,26 @@ class _StoredScanIndex:
 
 @dataclass(frozen=True, slots=True)
 class _StaticScanLineageAdmission:
-    """Pure pre-Run resource proof for immutable pulse/document lineage."""
+    """Pure pre-Run resource proof for immutable scan-program lineage."""
 
-    pulse_document_blob: ContentRef
-    compiled_pulse_blob: ContentRef
-    compiled_pulse_runtime_summary: CompiledPulseRuntimeSummary
+    pulse_program_blob: ContentRef
+    compiled_pulse_blobs: tuple[ContentRef, ...]
+    compiled_pulse_runtime_summaries: tuple[CompiledPulseRuntimeSummary, ...]
     retained_upper_bound_bytes: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.pulse_document_blob, ContentRef) or not isinstance(
-            self.compiled_pulse_blob,
-            ContentRef,
+        if not isinstance(self.pulse_program_blob, ContentRef):
+            raise TypeError("staged scan program blob must be ContentRef")
+        blobs = tuple(self.compiled_pulse_blobs)
+        summaries = tuple(self.compiled_pulse_runtime_summaries)
+        if not blobs or any(not isinstance(item, ContentRef) for item in blobs):
+            raise TypeError("staged compiled pulse blobs must contain ContentRef")
+        if len(summaries) != len(blobs) or any(
+            not isinstance(item, CompiledPulseRuntimeSummary) for item in summaries
         ):
-            raise TypeError("staged scan lineage blobs must be ContentRef")
-        if not isinstance(
-            self.compiled_pulse_runtime_summary,
-            CompiledPulseRuntimeSummary,
-        ):
-            raise TypeError("staged pulse summary must be CompiledPulseRuntimeSummary")
+            raise TypeError("staged summaries must align with compiled pulse blobs")
+        object.__setattr__(self, "compiled_pulse_blobs", blobs)
+        object.__setattr__(self, "compiled_pulse_runtime_summaries", summaries)
         positive_integer(
             self.retained_upper_bound_bytes,
             "retained_upper_bound_bytes",
@@ -249,9 +302,160 @@ class _StaticScanLineageAdmission:
 class _StagedScanLineage:
     """Pre-FIRE CAS references verified against one static admission."""
 
-    pulse_document_blob: ContentRef
-    compiled_pulse_blob: ContentRef
-    compiled_pulse_runtime_summary: CompiledPulseRuntimeSummary
+    pulse_program_blob: ContentRef
+    compiled_pulse_blobs: tuple[ContentRef, ...]
+    compiled_pulse_runtime_summaries: tuple[CompiledPulseRuntimeSummary, ...]
+
+
+_API_FINAL_METADATA_ADMISSION_SCHEMA = (
+    "zlc_neutral_atom.ApiFinalMetadataAdmission"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ApiFinalMetadataAdmission:
+    """Process-local proof binding one API FINAL tree to pre-FIRE static facts."""
+
+    issuer_token: object
+    artifact_schema: str
+    policy_max_bytes: int
+    program_fingerprint: str
+    source_block_id: BlockId
+    source_schema_fingerprint: str
+    output_contract_fingerprint: str
+    static_lineage_fingerprint: str
+    execution_shape_fingerprint: str
+    static_charge_fingerprint: str
+    point_count: int
+    repeat_count: int
+    admitted_max_bytes: int
+    admitted_structure_limit: int
+
+    def __post_init__(self) -> None:
+        if self.artifact_schema != SCAN_ARTIFACT_SCHEMA:
+            raise ValueError("API metadata admission targets another artifact schema")
+        if not isinstance(self.source_block_id, BlockId):
+            raise TypeError("source_block_id must be BlockId")
+        for field in (
+            "program_fingerprint",
+            "source_schema_fingerprint",
+            "output_contract_fingerprint",
+            "static_lineage_fingerprint",
+            "execution_shape_fingerprint",
+            "static_charge_fingerprint",
+        ):
+            sha256_text(getattr(self, field), field)
+        for field in (
+            "policy_max_bytes",
+            "point_count",
+            "repeat_count",
+            "admitted_max_bytes",
+            "admitted_structure_limit",
+        ):
+            positive_integer(getattr(self, field), field)
+        if self.admitted_max_bytes > self.policy_max_bytes:
+            raise ValueError("API metadata admission exceeds repository policy")
+        if self.admitted_structure_limit > min(
+            _METADATA_LIMITS.max_nodes,
+            _METADATA_LIMITS.max_container_entries,
+        ):
+            raise ValueError("API metadata admission exceeds canonical policy")
+
+
+def _static_lineage_metadata_tree(
+    value: _StaticScanLineageAdmission | _StagedScanLineage,
+) -> dict[str, object]:
+    if not isinstance(value, (_StaticScanLineageAdmission, _StagedScanLineage)):
+        raise TypeError("value must be admitted or staged scan lineage")
+    return {
+        "pulse_program_blob": content_ref_to_tree(value.pulse_program_blob),
+        "compiled_pulse_blobs": [
+            content_ref_to_tree(item) for item in value.compiled_pulse_blobs
+        ],
+        "compiled_pulse_runtime_summaries": [
+            compiled_pulse_runtime_summary_to_tree(item)
+            for item in value.compiled_pulse_runtime_summaries
+        ],
+    }
+
+
+def _api_metadata_static_charge_tree(
+    program: ApiSlotSegmentedProgram,
+    static_lineage: _StaticScanLineageAdmission | _StagedScanLineage,
+    source_block_id: BlockId,
+    source_schema: DatasetSchema,
+    output_contract: ScanOutputContract,
+    execution_shape_tree: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "schema": _API_FINAL_METADATA_ADMISSION_SCHEMA,
+        "artifact_schema": SCAN_ARTIFACT_SCHEMA,
+        "program_fingerprint": program.fingerprint,
+        "static_lineage": _static_lineage_metadata_tree(static_lineage),
+        "source_block_id": source_block_id.value,
+        "source_dataset_schema": dataset_schema_to_tree(source_schema),
+        "output_contract": scan_output_contract_to_tree(output_contract),
+        "execution_static_shape": execution_shape_tree,
+    }
+
+
+def _encode_static_metadata_charge(
+    tree: dict[str, object],
+) -> tuple[bytes, int]:
+    """Encode once and derive the exact encoder-owned structural charge.
+
+    The binary search deliberately delegates node/container accounting to the
+    canonical owner instead of copying its traversal rules into the repository.
+    """
+
+    try:
+        payload = encode(tree, limits=_METADATA_LIMITS)
+    except CanonicalEncodingError as exc:
+        raise ScanResourceExceeded(
+            "API segmented static metadata exceeds canonical policy"
+        ) from exc
+    low = 1
+    high = min(
+        _METADATA_LIMITS.max_nodes,
+        _METADATA_LIMITS.max_container_entries,
+    )
+    while low < high:
+        middle = (low + high) // 2
+        limits = CanonicalDecodeLimits(
+            max_depth=_METADATA_LIMITS.max_depth,
+            max_nodes=middle,
+            max_container_entries=middle,
+            max_arrays=0,
+            max_total_array_bytes=0,
+        )
+        try:
+            encode(tree, limits=limits)
+        except CanonicalEncodingError:
+            low = middle + 1
+        else:
+            high = middle
+    return payload, low
+
+
+def _api_repeated_point_shape_charge(
+    execution_shape_tree: dict[str, object],
+    repeat_count: int,
+) -> tuple[int, int]:
+    """Charge point-owned trigger/join text each time FINAL repeats it."""
+
+    points = execution_shape_tree.get("points")
+    if not isinstance(points, list) or not points or any(
+        not isinstance(item, dict) for item in points
+    ):
+        raise ValueError("API execution static shape omits point mappings")
+    bytes_per_repeat = 0
+    structure_per_repeat = 0
+    for point in points:
+        payload, structure = _encode_static_metadata_charge({"point": point})
+        bytes_per_repeat += len(payload)
+        structure_per_repeat += structure
+    repeats = positive_integer(repeat_count, "repeat_count")
+    return bytes_per_repeat * repeats, structure_per_repeat * repeats
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,20 +463,22 @@ class ScanArtifact:
     """Admitted metadata for one canonical FINAL scan dataset."""
 
     ref: ScanArtifactRef
-    pulse_document: PulseDocument
+    execution: PulseScanExecution
     source_dataset_ref: DatasetRevisionRef
     source_dataset_schema: DatasetSchema
     output_contract: ScanOutputContract
     output_dataset_ref: DatasetRevisionRef
     provenance: DatasetSealProvenance
-    pulse_evidence: PulseCaptureEvidence
     safety_bundle_id: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.ref, ScanArtifactRef):
             raise TypeError("ref must be ScanArtifactRef")
-        if not isinstance(self.pulse_document, PulseDocument):
-            raise TypeError("pulse_document must be PulseDocument")
+        if not isinstance(
+            self.execution,
+            (AutonomousScanExecution, ApiSegmentedScanExecution),
+        ):
+            raise TypeError("execution must be a PulseScanExecution")
         if not isinstance(self.source_dataset_ref, DatasetRevisionRef) or not isinstance(
             self.output_dataset_ref, DatasetRevisionRef
         ):
@@ -283,8 +489,6 @@ class ScanArtifact:
             raise TypeError("output_contract must be ScanOutputContract")
         if not isinstance(self.provenance, DatasetSealProvenance):
             raise TypeError("provenance must be DatasetSealProvenance")
-        if not isinstance(self.pulse_evidence, PulseCaptureEvidence):
-            raise TypeError("pulse_evidence must be PulseCaptureEvidence")
         canonical_text(self.safety_bundle_id, "safety_bundle_id")
 
     @property
@@ -294,7 +498,7 @@ class ScanArtifact:
 
 @dataclass(frozen=True, slots=True)
 class ScanArtifactInspection:
-    """FINAL dataset facts obtained without decoding pulse IR or document."""
+    """FINAL dataset facts obtained without decoding pulse IR or scan program."""
 
     ref: ScanArtifactRef
     source_dataset_ref: DatasetRevisionRef
@@ -302,7 +506,7 @@ class ScanArtifactInspection:
     output_contract: ScanOutputContract
     output_dataset_ref: DatasetRevisionRef
     provenance: DatasetSealProvenance
-    pulse_runtime_summary: CompiledPulseRuntimeSummary
+    pulse_runtime_summaries: tuple[CompiledPulseRuntimeSummary, ...]
     safety_bundle_id: str
     materialization_peak_upper_bound_bytes: int
 
@@ -320,8 +524,14 @@ class ScanArtifactInspection:
             raise TypeError("output_contract must be ScanOutputContract")
         if not isinstance(self.provenance, DatasetSealProvenance):
             raise TypeError("provenance must be DatasetSealProvenance")
-        if not isinstance(self.pulse_runtime_summary, CompiledPulseRuntimeSummary):
-            raise TypeError("pulse_runtime_summary must be CompiledPulseRuntimeSummary")
+        summaries = tuple(self.pulse_runtime_summaries)
+        if not summaries or any(
+            not isinstance(item, CompiledPulseRuntimeSummary) for item in summaries
+        ):
+            raise TypeError(
+                "pulse_runtime_summaries must contain CompiledPulseRuntimeSummary values"
+            )
+        object.__setattr__(self, "pulse_runtime_summaries", summaries)
         canonical_text(self.safety_bundle_id, "safety_bundle_id")
         positive_integer(
             self.materialization_peak_upper_bound_bytes,
@@ -364,18 +574,72 @@ class MaterializedScanData:
 _SCAN_APPLICATION_TOKEN = object()
 
 
+def _require_api_metadata_admission_facts(
+    admission: _ApiFinalMetadataAdmission,
+    *,
+    execution: ApiSegmentedScanExecution,
+    source_ref: DatasetRevisionRef,
+    source_schema: DatasetSchema,
+    output_contract: ScanOutputContract,
+    provenance: DatasetSealProvenance,
+    staged_lineage: _StagedScanLineage,
+) -> None:
+    if not isinstance(admission, _ApiFinalMetadataAdmission):
+        raise TypeError("API execution requires a FINAL metadata admission")
+    if admission.artifact_schema != SCAN_ARTIFACT_SCHEMA:
+        raise RuntimeError("API metadata admission artifact schema drifted")
+    program = execution.program
+    if (
+        admission.program_fingerprint != program.fingerprint
+        or admission.point_count != program.point_count
+        or admission.repeat_count != program.repeat_count
+    ):
+        raise RuntimeError("API metadata admission belongs to another program")
+    if admission.source_schema_fingerprint != source_schema.fingerprint:
+        raise RuntimeError("API metadata admission source schema drifted")
+    if admission.source_block_id != source_ref.block_id:
+        raise RuntimeError("API metadata admission source block identity drifted")
+    if admission.output_contract_fingerprint != output_contract.fingerprint:
+        raise RuntimeError("API metadata admission output contract drifted")
+    lineage_tree = _static_lineage_metadata_tree(staged_lineage)
+    if admission.static_lineage_fingerprint != canonical_digest(lineage_tree):
+        raise RuntimeError("API metadata admission static lineage drifted")
+    execution_shape = api_segmented_metadata_static_shape_from_execution(
+        execution,
+        provenance,
+    )
+    if admission.execution_shape_fingerprint != canonical_digest(execution_shape):
+        raise RuntimeError("API metadata admission execution shape drifted")
+    static_tree = _api_metadata_static_charge_tree(
+        program,
+        staged_lineage,
+        source_ref.block_id,
+        source_schema,
+        output_contract,
+        execution_shape,
+    )
+    try:
+        static_payload = encode(static_tree, limits=_METADATA_LIMITS)
+    except CanonicalEncodingError as exc:
+        raise RuntimeError(
+            "API metadata pre-FIRE admission invariant was violated"
+        ) from exc
+    if admission.static_charge_fingerprint != sha256_digest(static_payload):
+        raise RuntimeError("API metadata admission static charge drifted")
+
+
 class _PreparedScanDataset:
     """Process-local output minted only from one opaque joint pipeline result."""
 
     __slots__ = (
         "run_id",
-        "pulse_document",
+        "execution",
         "source_snapshot",
         "output_contract",
         "output_snapshot",
         "provenance",
-        "pulse_evidence",
         "staged_lineage",
+        "api_metadata_admission",
         "memory_limit_bytes",
     )
 
@@ -384,20 +648,23 @@ class _PreparedScanDataset:
         token: object,
         *,
         run_id: str,
-        pulse_document: PulseDocument,
+        execution: PulseScanExecution,
         source_snapshot: OwnedSnapshot,
         output_contract: ScanOutputContract,
         output_snapshot: OwnedSnapshot,
         provenance: DatasetSealProvenance,
-        pulse_evidence: PulseCaptureEvidence,
         staged_lineage: _StagedScanLineage,
+        api_metadata_admission: _ApiFinalMetadataAdmission | None,
         memory_limit_bytes: int,
     ) -> None:
         if token is not _SCAN_APPLICATION_TOKEN:
             raise PermissionError("prepared scan datasets are minted by scan application")
         canonical_text(run_id, "run_id")
-        if not isinstance(pulse_document, PulseDocument):
-            raise TypeError("pulse_document must be PulseDocument")
+        if not isinstance(
+            execution,
+            (AutonomousScanExecution, ApiSegmentedScanExecution),
+        ):
+            raise TypeError("execution must be a PulseScanExecution")
         if not isinstance(source_snapshot, OwnedSnapshot):
             raise TypeError("source_snapshot must be OwnedSnapshot")
         if not isinstance(output_contract, ScanOutputContract):
@@ -406,41 +673,56 @@ class _PreparedScanDataset:
             raise TypeError("output_snapshot must be OwnedSnapshot")
         if not isinstance(provenance, DatasetSealProvenance):
             raise TypeError("provenance must be DatasetSealProvenance")
-        if not isinstance(pulse_evidence, PulseCaptureEvidence):
-            raise TypeError("pulse_evidence must be PulseCaptureEvidence")
         if not isinstance(staged_lineage, _StagedScanLineage):
             raise TypeError("staged_lineage must be pre-FIRE scan lineage")
-        if staged_lineage.pulse_document_blob.digest != pulse_document.fingerprint:
-            raise ValueError("staged PulseDocument identity changed")
-        if (
-            staged_lineage.compiled_pulse_blob.digest
-            != pulse_evidence.compiled_artifact.fingerprint
+        if staged_lineage.pulse_program_blob.digest != execution.program.fingerprint:
+            raise ValueError("staged scan-program identity changed")
+        artifacts = execution_compiled_artifacts(execution)
+        if tuple(item.digest for item in staged_lineage.compiled_pulse_blobs) != tuple(
+            item.fingerprint for item in artifacts
         ):
-            raise ValueError("staged compiled pulse identity changed")
-        staged_lineage.compiled_pulse_runtime_summary.require_encoded_size(
-            staged_lineage.compiled_pulse_blob.size
-        )
+            raise ValueError("staged compiled pulse identities changed")
+        if len(staged_lineage.compiled_pulse_runtime_summaries) != len(artifacts):
+            raise ValueError("staged pulse summaries differ from execution")
+        for summary, blob in zip(
+            staged_lineage.compiled_pulse_runtime_summaries,
+            staged_lineage.compiled_pulse_blobs,
+        ):
+            summary.require_encoded_size(blob.size)
+        if isinstance(execution, ApiSegmentedScanExecution):
+            if not isinstance(api_metadata_admission, _ApiFinalMetadataAdmission):
+                raise TypeError("API prepared scan requires metadata admission")
+            _require_api_metadata_admission_facts(
+                api_metadata_admission,
+                execution=execution,
+                source_ref=source_snapshot.ref,
+                source_schema=source_snapshot.block.schema,
+                output_contract=output_contract,
+                provenance=provenance,
+                staged_lineage=staged_lineage,
+            )
+        elif api_metadata_admission is not None:
+            raise ValueError("autonomous scan cannot carry API metadata admission")
         limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
         _require_scan_facts(
             run_id=run_id,
-            document=pulse_document,
+            execution=execution,
             source_ref=source_snapshot.ref,
             source_schema=source_snapshot.block.schema,
             output_contract=output_contract,
             output_ref=output_snapshot.ref,
             provenance=provenance,
-            pulse_evidence=pulse_evidence,
         )
         if output_snapshot.block.schema != output_contract.output_dataset_schema:
             raise ValueError("prepared output snapshot has another ScanOutputContract")
         object.__setattr__(self, "run_id", run_id)
-        object.__setattr__(self, "pulse_document", pulse_document)
+        object.__setattr__(self, "execution", execution)
         object.__setattr__(self, "source_snapshot", source_snapshot)
         object.__setattr__(self, "output_contract", output_contract)
         object.__setattr__(self, "output_snapshot", output_snapshot)
         object.__setattr__(self, "provenance", provenance)
-        object.__setattr__(self, "pulse_evidence", pulse_evidence)
         object.__setattr__(self, "staged_lineage", staged_lineage)
+        object.__setattr__(self, "api_metadata_admission", api_metadata_admission)
         object.__setattr__(self, "memory_limit_bytes", limit)
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -462,31 +744,34 @@ class _PreparedScanDataset:
 
 
 def _scan_output_dataset_ref(
-    document: PulseDocument,
+    program: PulseScanProgram,
     source_ref: DatasetRevisionRef,
     output_contract: ScanOutputContract,
 ) -> DatasetRevisionRef:
-    if not isinstance(document, PulseDocument):
-        raise TypeError("document must be PulseDocument")
+    if not isinstance(
+        program,
+        (AutonomousScanSlotProgram, ApiSlotSegmentedProgram),
+    ):
+        raise TypeError("program must be a PulseScanProgram")
     if not isinstance(source_ref, DatasetRevisionRef):
         raise TypeError("source_ref must be DatasetRevisionRef")
     if not isinstance(output_contract, ScanOutputContract):
         raise TypeError("output_contract must be ScanOutputContract")
-    return _scan_output_dataset_ref_for_document_digest(
-        document.fingerprint,
+    return _scan_output_dataset_ref_for_program_digest(
+        program.fingerprint,
         source_ref,
         output_contract,
     )
 
 
-def _scan_output_dataset_ref_for_document_digest(
-    document_digest: str,
+def _scan_output_dataset_ref_for_program_digest(
+    program_digest: str,
     source_ref: DatasetRevisionRef,
     output_contract: ScanOutputContract,
 ) -> DatasetRevisionRef:
-    if not isinstance(document_digest, str):
-        raise TypeError("document_digest must be str")
-    sha256_text(document_digest, "document_digest")
+    if not isinstance(program_digest, str):
+        raise TypeError("program_digest must be str")
+    sha256_text(program_digest, "program_digest")
     if not isinstance(source_ref, DatasetRevisionRef):
         raise TypeError("source_ref must be DatasetRevisionRef")
     if not isinstance(output_contract, ScanOutputContract):
@@ -494,7 +779,7 @@ def _scan_output_dataset_ref_for_document_digest(
     identity = canonical_digest(
         {
             "owner": "zlc_neutral_atom.scan-output",
-            "pulse_document": document_digest,
+            "pulse_scan_program": program_digest,
             "source_dataset_ref": dataset_revision_ref_to_tree(source_ref),
             "output_contract": output_contract.fingerprint,
         }
@@ -510,38 +795,25 @@ def _scan_output_dataset_ref_for_document_digest(
 def _require_scan_facts(
     *,
     run_id: str,
-    document: PulseDocument,
+    execution: PulseScanExecution,
     source_ref: DatasetRevisionRef,
     source_schema: DatasetSchema,
     output_contract: ScanOutputContract,
     output_ref: DatasetRevisionRef,
     provenance: DatasetSealProvenance,
-    pulse_evidence: PulseCaptureEvidence,
 ) -> None:
     canonical_text(run_id, "run_id")
     _require_scan_dataset_facts(
-        document_digest=document.fingerprint,
+        program_digest=execution.program.fingerprint,
         source_ref=source_ref,
         source_schema=source_schema,
         output_contract=output_contract,
         output_ref=output_ref,
         provenance=provenance,
     )
-    point_table = ScanPointTable.from_pulse_document(document)
-    compiled = pulse_evidence.compiled_artifact
-    if compiled.execution_form is not PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
-        raise ValueError("scan artifact requires AUTONOMOUS_SCAN_ONCE evidence")
-    expanded = expand_autonomous_scan_repeats(document)
-    if compiled.source_document_digest != expanded.fingerprint:
-        raise ValueError("compiled scan differs from repeat-expanded logical document")
-    repeat_count = 1 if document.repeat is None else document.repeat.count
-    schedule = pulse_evidence.trigger_schedule
-    if (
-        schedule.point_count != repeat_count * point_table.point_layout.storage_size
-        or schedule.loop_count != 1
-        or not schedule.full_point_loop
-    ):
-        raise ValueError("pulse evidence is not one complete repeat-major scan")
+    program = execution.program
+    point_table = program.point_table
+    repeat_count = program.repeat_count
     if source_schema.repeat_axis.size != repeat_count:
         raise ValueError("source repeat axis differs from logical scan repeats")
     event_axes = tuple(
@@ -554,16 +826,37 @@ def _require_scan_facts(
         raise ValueError("current exact scan source requires one singleton READOUT_EVENT")
     if scan_axes != point_table.point_axes:
         raise ValueError("source scan axes differ from the logical ScanPointTable")
-    if pulse_evidence.join_contract.scan_point_layout != point_table.point_layout:
-        raise ValueError("pulse join layout differs from the logical ScanPointTable")
-    expected_join = pulse_evidence.expected_cell_schedule_digest(source_schema)
+    camera_schema = execution.camera.validate_source_schema(source_schema)
+    if isinstance(execution, AutonomousScanExecution):
+        if execution.evidence.join_contract.scan_point_layout != point_table.point_layout:
+            raise ValueError("pulse join layout differs from the logical ScanPointTable")
+        expected_schedule = DatasetCellSchedule.from_cells(
+            source_schema,
+            execution.evidence.join_contract.iter_cell_schedule(
+                execution.evidence.trigger_schedule,
+                source_schema,
+            ),
+        )
+        expected_join = expected_schedule.digest_for_schema(source_schema)
+        expected_events = execution.evidence.expected_trigger_count
+    elif isinstance(execution, ApiSegmentedScanExecution):
+        expected_schedule = api_segmented_cell_schedule(
+            program,
+            source_schema,
+        )
+        expected_join = expected_schedule.digest_for_schema(source_schema)
+        expected_events = repeat_count * point_table.point_layout.storage_size
+    else:
+        raise TypeError("execution must be a PulseScanExecution")
     if provenance.join_plan_digest != expected_join:
         raise ValueError("source dataset schedule differs from pulse evidence")
     event_count = provenance.end_sequence - provenance.start_sequence
-    if event_count != pulse_evidence.expected_trigger_count:
+    if event_count != expected_events:
         raise ValueError("source provenance count differs from pulse triggers")
     if provenance.trace_binding.run_id != run_id:
         raise ValueError("source provenance belongs to another Run")
+    execution.camera.require_schedule(expected_schedule, camera_schema)
+    execution.camera.validate_dataset_provenance(provenance)
     resolved = bind_scan_output_contract(
         source_schema,
         point_table,
@@ -575,26 +868,59 @@ def _require_scan_facts(
 
 def _require_scan_dataset_facts(
     *,
-    document_digest: str,
+    program_digest: str,
     source_ref: DatasetRevisionRef,
     source_schema: DatasetSchema,
     output_contract: ScanOutputContract,
     output_ref: DatasetRevisionRef,
     provenance: DatasetSealProvenance,
 ) -> None:
-    sha256_text(document_digest, "document_digest")
+    sha256_text(program_digest, "program_digest")
     if source_ref.stream_generation != provenance.generation:
         raise ValueError("source dataset generation differs from its provenance")
     if source_ref.schema_fingerprint != source_schema.fingerprint:
         raise ValueError("source dataset ref differs from its source schema")
     if output_ref.schema_fingerprint != output_contract.output_schema_fingerprint:
         raise ValueError("scan output ref differs from its output schema")
-    if output_ref != _scan_output_dataset_ref_for_document_digest(
-        document_digest,
+    if output_ref != _scan_output_dataset_ref_for_program_digest(
+        program_digest,
         source_ref,
         output_contract,
     ):
         raise ValueError("scan output dataset identity differs from frozen inputs")
+
+
+def _require_program_artifacts(
+    program: PulseScanProgram,
+    compiled_pulses: tuple[CompiledPulseArtifact, ...],
+) -> tuple[CompiledPulseArtifact, ...]:
+    """Fail before staging when compiled pulses do not implement the program."""
+
+    pulses = tuple(compiled_pulses)
+    if any(not isinstance(item, CompiledPulseArtifact) for item in pulses):
+        raise TypeError("compiled_pulses must contain CompiledPulseArtifact values")
+    if isinstance(program, AutonomousScanSlotProgram):
+        if len(pulses) != 1:
+            raise ValueError("autonomous scan requires exactly one compiled artifact")
+        artifact = pulses[0]
+        if artifact.execution_form is not PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
+            raise ValueError("autonomous scan requires AUTONOMOUS_SCAN_ONCE")
+        expected = expand_autonomous_scan_repeats(program.execution_document)
+        if artifact.source_document_digest != expected.fingerprint:
+            raise ValueError("autonomous compiled pulse differs from its program")
+    elif isinstance(program, ApiSlotSegmentedProgram):
+        documents = program.resolved_point_documents
+        if len(pulses) != len(documents):
+            raise ValueError("API scan requires one compiled artifact per point")
+        if any(
+            artifact.execution_form is not PulseExecutionForm.STATIC_ONCE
+            or artifact.source_document_digest != document.fingerprint
+            for artifact, document in zip(pulses, documents)
+        ):
+            raise ValueError("API compiled pulses differ from resolved point documents")
+    else:
+        raise TypeError("program must be a PulseScanProgram")
+    return pulses
 
 
 def _reject_arrays(events) -> None:
@@ -605,21 +931,22 @@ def _reject_arrays(events) -> None:
 def _metadata_tree(
     value: _StoredScan | _StoredScanIndex,
 ) -> dict[str, object]:
-    evidence_tree = (
-        pulse_capture_evidence_to_tree(value.pulse_evidence)
+    execution_tree = (
+        pulse_scan_execution_to_tree(value.execution)
         if isinstance(value, _StoredScan)
-        else value.pulse_evidence_tree
+        else value.execution_tree
     )
     return {
         "schema": SCAN_ARTIFACT_SCHEMA,
-        "pulse_document_blob": content_ref_to_tree(value.pulse_document_blob),
-        "compiled_pulse_blob": content_ref_to_tree(value.compiled_pulse_blob),
-        "compiled_pulse_runtime_summary": (
-            compiled_pulse_runtime_summary_to_tree(
-                value.compiled_pulse_runtime_summary
-            )
-        ),
-        "pulse_evidence": evidence_tree,
+        "pulse_program_blob": content_ref_to_tree(value.pulse_program_blob),
+        "compiled_pulse_blobs": [
+            content_ref_to_tree(item) for item in value.compiled_pulse_blobs
+        ],
+        "compiled_pulse_runtime_summaries": [
+            compiled_pulse_runtime_summary_to_tree(item)
+            for item in value.compiled_pulse_runtime_summaries
+        ],
+        "execution": execution_tree,
         "source_dataset_ref": dataset_revision_ref_to_tree(
             value.source_dataset_ref
         ),
@@ -637,9 +964,13 @@ def _metadata_tree(
     }
 
 
-def _encode_metadata(value: _StoredScan | _StoredScanIndex) -> bytes:
+def _encode_metadata(
+    value: _StoredScan | _StoredScanIndex,
+    *,
+    limits: CanonicalDecodeLimits = _METADATA_LIMITS,
+) -> bytes:
     try:
-        return encode(_metadata_tree(value), limits=_METADATA_LIMITS)
+        return encode(_metadata_tree(value), limits=limits)
     except CanonicalEncodingError as exc:
         raise ScanResourceExceeded("scan metadata exceeds canonical limits") from exc
 
@@ -654,13 +985,21 @@ def _decode_metadata_index(payload: bytes) -> _StoredScanIndex:
         _ARTIFACT_FIELDS,
         SCAN_ARTIFACT_SCHEMA,
     )
+    blob_trees = data["compiled_pulse_blobs"]
+    summary_trees = data["compiled_pulse_runtime_summaries"]
+    if not isinstance(blob_trees, list) or not isinstance(summary_trees, list):
+        raise TypeError("compiled pulse blobs and summaries must be lists")
+    blobs = tuple(content_ref_from_tree(item) for item in blob_trees)
+    summaries = tuple(
+        compiled_pulse_runtime_summary_from_tree(item) for item in summary_trees
+    )
+    if not blobs or len(blobs) != len(summaries):
+        raise ValueError("compiled pulse blobs and summaries must align")
     value = _StoredScanIndex(
-        content_ref_from_tree(data["pulse_document_blob"]),
-        content_ref_from_tree(data["compiled_pulse_blob"]),
-        compiled_pulse_runtime_summary_from_tree(
-            data["compiled_pulse_runtime_summary"]
-        ),
-        data["pulse_evidence"],
+        content_ref_from_tree(data["pulse_program_blob"]),
+        blobs,
+        summaries,
+        data["execution"],
         dataset_revision_ref_from_tree(data["source_dataset_ref"]),
         dataset_schema_from_tree(data["source_dataset_schema"]),
         scan_output_contract_from_tree(data["output_contract"]),
@@ -677,16 +1016,13 @@ def _decode_metadata_index(payload: bytes) -> _StoredScanIndex:
 
 def _stored_scan_from_index(
     index: _StoredScanIndex,
-    compiled_pulse: CompiledPulseArtifact,
+    execution: PulseScanExecution,
 ) -> _StoredScan:
     return _StoredScan(
-        index.pulse_document_blob,
-        index.compiled_pulse_blob,
-        index.compiled_pulse_runtime_summary,
-        pulse_capture_evidence_from_tree(
-            index.pulse_evidence_tree,
-            compiled_pulse,
-        ),
+        index.pulse_program_blob,
+        index.compiled_pulse_blobs,
+        index.compiled_pulse_runtime_summaries,
+        execution,
         index.source_dataset_ref,
         index.source_dataset_schema,
         index.output_contract,
@@ -723,17 +1059,17 @@ def _decode_manifest(payload: bytes) -> tuple[str, ContentRef]:
     return value
 
 
-def _encode_document(document: PulseDocument) -> bytes:
-    return encode(pulse_document_to_tree(document), limits=_METADATA_LIMITS)
+def _encode_program(program: PulseScanProgram) -> bytes:
+    return encode(pulse_scan_program_to_tree(program), limits=_METADATA_LIMITS)
 
 
-def _decode_document(payload: bytes) -> PulseDocument:
-    document = pulse_document_from_tree(
+def _decode_program(payload: bytes) -> PulseScanProgram:
+    program = pulse_scan_program_from_tree(
         decode(payload, admit_structure=_reject_arrays, limits=_METADATA_LIMITS)
     )
-    if _encode_document(document) != payload:
-        raise ValueError("PulseDocument blob is typed but non-canonical")
-    return document
+    if _encode_program(program) != payload:
+        raise ValueError("PulseScanProgram blob is typed but non-canonical")
+    return program
 
 
 def _encode_validity(validity: object) -> bytes:
@@ -800,9 +1136,10 @@ class ScanRepository:
         self.repository_id = canonical_text(repository_id, "repository_id")
         if not isinstance(resource_policy, ScanRepositoryResourcePolicy):
             raise TypeError("resource_policy must be ScanRepositoryResourcePolicy")
-        self.resource_policy = resource_policy
+        self._resource_policy = resource_policy
         self._lock = threading.RLock()
         self._closed = False
+        self._api_metadata_admission_token = object()
         self._root_lease = RepositoryRootLease(self.root)
         journal = None
         try:
@@ -825,6 +1162,12 @@ class ScanRepository:
             self._root_lease.close()
             raise
 
+    @property
+    def resource_policy(self) -> ScanRepositoryResourcePolicy:
+        """Return the immutable policy frozen when this repository was opened."""
+
+        return self._resource_policy
+
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("scan repository is closed")
@@ -835,6 +1178,121 @@ class ScanRepository:
 
         with self._lock:
             self._require_open()
+
+    def admit_api_execution_cardinality(
+        self,
+        point_count: int,
+        repeat_count: int,
+    ) -> int:
+        """Reject an impossible R*P floor before resolving any API point."""
+
+        projected_bytes, projected_nodes = _api_segmented_metadata_cardinality_floor(
+            point_count,
+            repeat_count,
+        )
+        with self._lock:
+            self._require_open()
+            maximum_bytes = self.resource_policy.max_metadata_blob_bytes
+        if projected_bytes > maximum_bytes:
+            raise ScanResourceExceeded(
+                "API segmented FINAL metadata requires "
+                f"{projected_bytes} admitted bytes; repository limit is "
+                f"{maximum_bytes}"
+            )
+        if (
+            projected_nodes > _METADATA_LIMITS.max_nodes
+            or projected_nodes > _METADATA_LIMITS.max_container_entries
+        ):
+            raise ScanResourceExceeded(
+                "API segmented FINAL metadata requires "
+                f"{projected_nodes} admitted canonical nodes; repository limit is "
+                f"{min(_METADATA_LIMITS.max_nodes, _METADATA_LIMITS.max_container_entries)}"
+            )
+        return projected_bytes
+
+    def _admit_api_final_metadata(
+        self,
+        program: ApiSlotSegmentedProgram,
+        static_lineage: _StaticScanLineageAdmission,
+        source_block_id: BlockId,
+        source_schema: DatasetSchema,
+        output_contract: ScanOutputContract,
+        execution_shape_tree: dict[str, object],
+    ) -> _ApiFinalMetadataAdmission:
+        """Bind actual frozen metadata facts before a Run can reach FIRE."""
+
+        if not isinstance(program, ApiSlotSegmentedProgram):
+            raise TypeError("program must be ApiSlotSegmentedProgram")
+        if not isinstance(static_lineage, _StaticScanLineageAdmission):
+            raise TypeError("static_lineage must be admitted scan lineage")
+        if not isinstance(source_block_id, BlockId):
+            raise TypeError("source_block_id must be BlockId")
+        if not isinstance(source_schema, DatasetSchema):
+            raise TypeError("source_schema must be DatasetSchema")
+        if not isinstance(output_contract, ScanOutputContract):
+            raise TypeError("output_contract must be ScanOutputContract")
+        if not isinstance(execution_shape_tree, dict):
+            raise TypeError("execution_shape_tree must be a canonical mapping")
+        floor_bytes, floor_nodes = _api_segmented_metadata_cardinality_floor(
+            program.point_count,
+            program.repeat_count,
+        )
+        static_tree = _api_metadata_static_charge_tree(
+            program,
+            static_lineage,
+            source_block_id,
+            source_schema,
+            output_contract,
+            execution_shape_tree,
+        )
+        static_payload, static_structure = _encode_static_metadata_charge(static_tree)
+        repeated_point_bytes, repeated_point_structure = (
+            _api_repeated_point_shape_charge(
+                execution_shape_tree,
+                program.repeat_count,
+            )
+        )
+        projected_bytes = len(static_payload) + floor_bytes + repeated_point_bytes
+        projected_structure = (
+            static_structure + floor_nodes + repeated_point_structure
+        )
+        with self._lock:
+            self._require_open()
+            policy_max_bytes = self.resource_policy.max_metadata_blob_bytes
+            issuer_token = self._api_metadata_admission_token
+        if projected_bytes > policy_max_bytes:
+            raise ScanResourceExceeded(
+                "API segmented FINAL metadata requires "
+                f"{projected_bytes} admitted bytes after static binding; "
+                f"repository limit is {policy_max_bytes}"
+            )
+        canonical_limit = min(
+            _METADATA_LIMITS.max_nodes,
+            _METADATA_LIMITS.max_container_entries,
+        )
+        if projected_structure > canonical_limit:
+            raise ScanResourceExceeded(
+                "API segmented FINAL metadata requires "
+                f"{projected_structure} admitted canonical nodes after static binding; "
+                f"repository limit is {canonical_limit}"
+            )
+        lineage_tree = _static_lineage_metadata_tree(static_lineage)
+        return _ApiFinalMetadataAdmission(
+            issuer_token,
+            SCAN_ARTIFACT_SCHEMA,
+            policy_max_bytes,
+            program.fingerprint,
+            source_block_id,
+            source_schema.fingerprint,
+            output_contract.fingerprint,
+            canonical_digest(lineage_tree),
+            canonical_digest(execution_shape_tree),
+            sha256_digest(static_payload),
+            program.point_count,
+            program.repeat_count,
+            projected_bytes,
+            projected_structure,
+        )
 
     def _content_authority(self) -> ContentStoreAuthority:
         with self._lock:
@@ -870,85 +1328,113 @@ class ScanRepository:
 
     def _admit_static_lineage(
         self,
-        document: PulseDocument,
-        compiled_pulse: CompiledPulseArtifact,
+        program: PulseScanProgram,
+        compiled_pulses: tuple[CompiledPulseArtifact, ...],
         *,
         memory_limit_bytes: int,
     ) -> _StaticScanLineageAdmission:
         """Prove immutable lineage policy/peak without writing repository state."""
 
-        if not isinstance(document, PulseDocument):
-            raise TypeError("document must be PulseDocument")
-        if not isinstance(compiled_pulse, CompiledPulseArtifact):
-            raise TypeError("compiled_pulse must be CompiledPulseArtifact")
+        if not isinstance(
+            program,
+            (AutonomousScanSlotProgram, ApiSlotSegmentedProgram),
+        ):
+            raise TypeError("program must be a PulseScanProgram")
+        if isinstance(program, ApiSlotSegmentedProgram):
+            self.admit_api_execution_cardinality(
+                program.point_count,
+                program.repeat_count,
+            )
+        pulses = _require_program_artifacts(program, compiled_pulses)
         limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
         policy = self.resource_policy
-        document_payload = _encode_document(document)
-        compiled_payload = encode_compiled_pulse_artifact(compiled_pulse)
-        if len(document_payload) > policy.max_pulse_document_blob_bytes:
-            raise ScanResourceExceeded("scan PulseDocument exceeds repository policy")
-        if len(compiled_payload) > policy.max_compiled_pulse_blob_bytes:
-            raise ScanResourceExceeded("scan compiled pulse exceeds repository policy")
-        summary = compiled_pulse_runtime_summary(
-            compiled_pulse,
-            encoded_size=len(compiled_payload),
+        program_payload = _encode_program(program)
+        compiled_payloads = tuple(
+            encode_compiled_pulse_artifact(item) for item in pulses
+        )
+        if len(program_payload) > policy.max_pulse_program_blob_bytes:
+            raise ScanResourceExceeded("scan program exceeds repository policy")
+        total_compiled_size = sum(len(item) for item in compiled_payloads)
+        if total_compiled_size > policy.max_total_compiled_pulse_blob_bytes:
+            raise ScanResourceExceeded(
+                "scan compiled pulses exceed total repository policy"
+            )
+        summaries = tuple(
+            compiled_pulse_runtime_summary(pulse, encoded_size=len(payload))
+            for pulse, payload in zip(pulses, compiled_payloads)
         )
         retained = (
             _STATIC_LINEAGE_FIXED_BYTES
-            + _DOCUMENT_DECODE_MULTIPLIER * len(document_payload)
-            + summary.retained_upper_bound_bytes
+            + _PROGRAM_DECODE_MULTIPLIER * len(program_payload)
+            + sum(item.retained_upper_bound_bytes for item in summaries)
         )
-        staging_peak = retained + len(document_payload) + len(compiled_payload)
+        staging_peak = retained + len(program_payload) + total_compiled_size
         if staging_peak > limit:
             raise MemoryError(
                 f"scan static-lineage peak {staging_peak} exceeds limit {limit}"
             )
         authority = self._content_authority()
-        document_ref = authority.identify_blob(document_payload)
-        compiled_ref = authority.identify_blob(compiled_payload)
-        if document_ref.digest != document.fingerprint:
-            raise RuntimeError("PulseDocument CAS identity differs from pulse owner")
-        if compiled_ref.digest != compiled_pulse.fingerprint:
+        program_ref = authority.identify_blob(program_payload)
+        compiled_refs = tuple(
+            authority.identify_blob(item) for item in compiled_payloads
+        )
+        if program_ref.digest != program.fingerprint:
+            raise RuntimeError("scan-program CAS identity differs from its owner")
+        if tuple(item.digest for item in compiled_refs) != tuple(
+            item.fingerprint for item in pulses
+        ):
             raise RuntimeError("compiled-pulse CAS identity differs from pulse owner")
         return _StaticScanLineageAdmission(
-            document_ref,
-            compiled_ref,
-            summary,
+            program_ref,
+            compiled_refs,
+            summaries,
             retained,
         )
 
     def _stage_static_lineage(
         self,
         admission: _StaticScanLineageAdmission,
-        document: PulseDocument,
-        compiled_pulse: CompiledPulseArtifact,
+        program: PulseScanProgram,
+        compiled_pulses: tuple[CompiledPulseArtifact, ...],
     ) -> _StagedScanLineage:
         """Persist admitted lineage before delegating to hardware preflight."""
 
         if not isinstance(admission, _StaticScanLineageAdmission):
             raise TypeError("admission must be static scan lineage admission")
-        document_payload = _encode_document(document)
-        compiled_payload = encode_compiled_pulse_artifact(compiled_pulse)
+        pulses = _require_program_artifacts(program, compiled_pulses)
+        program_payload = _encode_program(program)
+        compiled_payloads = tuple(
+            encode_compiled_pulse_artifact(item) for item in pulses
+        )
         authority = self._content_authority()
-        if authority.identify_blob(document_payload) != admission.pulse_document_blob:
-            raise RuntimeError("PulseDocument changed after static-lineage admission")
-        if authority.identify_blob(compiled_payload) != admission.compiled_pulse_blob:
-            raise RuntimeError("compiled pulse changed after static-lineage admission")
-        if compiled_pulse_runtime_summary(
-            compiled_pulse,
-            encoded_size=len(compiled_payload),
-        ) != admission.compiled_pulse_runtime_summary:
-            raise RuntimeError("compiled pulse resource summary changed after admission")
-        for expected, actual in (
-            (admission.pulse_document_blob, authority.put_blob(document_payload)),
-            (admission.compiled_pulse_blob, authority.put_blob(compiled_payload)),
-        ):
+        if authority.identify_blob(program_payload) != admission.pulse_program_blob:
+            raise RuntimeError("scan program changed after static-lineage admission")
+        identified = tuple(authority.identify_blob(item) for item in compiled_payloads)
+        if identified != admission.compiled_pulse_blobs:
+            raise RuntimeError("compiled pulses changed after static-lineage admission")
+        summaries = tuple(
+            compiled_pulse_runtime_summary(pulse, encoded_size=len(payload))
+            for pulse, payload in zip(pulses, compiled_payloads)
+        )
+        if summaries != admission.compiled_pulse_runtime_summaries:
+            raise RuntimeError("compiled pulse resource summaries changed after admission")
+        pairs = (
+            (admission.pulse_program_blob, authority.put_blob(program_payload)),
+            *tuple(
+                (expected, authority.put_blob(payload))
+                for expected, payload in zip(
+                    admission.compiled_pulse_blobs,
+                    compiled_payloads,
+                )
+            ),
+        )
+        for expected, actual in pairs:
             if actual != expected:
                 raise RuntimeError("content store changed admitted static lineage identity")
         return _StagedScanLineage(
-            admission.pulse_document_blob,
-            admission.compiled_pulse_blob,
-            admission.compiled_pulse_runtime_summary,
+            admission.pulse_program_blob,
+            admission.compiled_pulse_blobs,
+            admission.compiled_pulse_runtime_summaries,
         )
 
     def _require_final_commit(self, reference: ScanArtifactRef) -> CommitIntent:
@@ -1022,15 +1508,20 @@ class ScanRepository:
             raise MemoryError("scan metadata inspection exceeds caller memory limit")
         metadata = authority.read_blob(metadata_ref, max_bytes=metadata_ref.size)
         index = _decode_metadata_index(metadata)
-        compiled_ref = index.compiled_pulse_blob
-        if compiled_ref.size > policy.max_compiled_pulse_blob_bytes:
-            raise ScanResourceExceeded("compiled pulse blob exceeds policy")
-        index.compiled_pulse_runtime_summary.require_encoded_size(
-            compiled_ref.size
-        )
-        document_ref = index.pulse_document_blob
-        if document_ref.size > policy.max_pulse_document_blob_bytes:
-            raise ScanResourceExceeded("pulse document blob exceeds policy")
+        if sum(item.size for item in index.compiled_pulse_blobs) > (
+            policy.max_total_compiled_pulse_blob_bytes
+        ):
+            raise ScanResourceExceeded("compiled pulse blobs exceed total policy")
+        for compiled_ref, summary in zip(
+            index.compiled_pulse_blobs,
+            index.compiled_pulse_runtime_summaries,
+        ):
+            if compiled_ref.size > MAX_COMPILED_PULSE_ARTIFACT_BYTES:
+                raise ScanResourceExceeded("one compiled pulse exceeds pulse-owner policy")
+            summary.require_encoded_size(compiled_ref.size)
+        program_ref = index.pulse_program_blob
+        if program_ref.size > policy.max_pulse_program_blob_bytes:
+            raise ScanResourceExceeded("pulse program blob exceeds policy")
         if index.values_blob.size > policy.max_output_values_blob_bytes:
             raise ScanResourceExceeded("scan values blob exceeds policy")
         if index.validity_blob.size > policy.max_output_validity_blob_bytes:
@@ -1041,7 +1532,7 @@ class ScanRepository:
         if index.values_blob.size != expected_values:
             raise ValueError("scan values blob size differs from output schema")
         _require_scan_dataset_facts(
-            document_digest=index.pulse_document_blob.digest,
+            program_digest=index.pulse_program_blob.digest,
             source_ref=index.source_dataset_ref,
             source_schema=index.source_dataset_schema,
             output_contract=index.output_contract,
@@ -1058,7 +1549,7 @@ class ScanRepository:
         *,
         manifest_payload: bytes | None = None,
         memory_limit_bytes: int | None = None,
-    ) -> tuple[_StoredScan, PulseDocument, int]:
+    ) -> tuple[_StoredScan, int]:
         index, metadata_size, inspection_peak = self._load_index(
             reference,
             manifest_payload=manifest_payload,
@@ -1066,44 +1557,57 @@ class ScanRepository:
         )
         lineage_peak = (
             inspection_peak
-            + index.compiled_pulse_runtime_summary.decode_peak_upper_bound_bytes
-            + _DOCUMENT_DECODE_MULTIPLIER * index.pulse_document_blob.size
+            + sum(
+                item.decode_peak_upper_bound_bytes
+                for item in index.compiled_pulse_runtime_summaries
+            )
+            + _PROGRAM_DECODE_MULTIPLIER * index.pulse_program_blob.size
         )
         if memory_limit_bytes is not None and lineage_peak > memory_limit_bytes:
             raise MemoryError("scan lineage decode exceeds caller memory limit")
         authority = self._content_authority()
-        compiled_payload = authority.read_blob(
-            index.compiled_pulse_blob,
-            max_bytes=index.compiled_pulse_blob.size,
-        )
-        compiled = decode_compiled_pulse_artifact(compiled_payload)
-        if index.compiled_pulse_blob.digest != compiled.fingerprint:
-            raise ValueError("compiled pulse blob identity differs from fingerprint")
-        if compiled_pulse_runtime_summary(
-            compiled,
-            encoded_size=index.compiled_pulse_blob.size,
-        ) != index.compiled_pulse_runtime_summary:
-            raise ValueError("compiled pulse runtime summary differs from lineage")
-        document = _decode_document(
+        compiled: list[CompiledPulseArtifact] = []
+        for compiled_ref, expected_summary in zip(
+            index.compiled_pulse_blobs,
+            index.compiled_pulse_runtime_summaries,
+        ):
+            compiled_payload = authority.read_blob(
+                compiled_ref,
+                max_bytes=compiled_ref.size,
+            )
+            artifact = decode_compiled_pulse_artifact(compiled_payload)
+            if compiled_ref.digest != artifact.fingerprint:
+                raise ValueError("compiled pulse blob identity differs from fingerprint")
+            if compiled_pulse_runtime_summary(
+                artifact,
+                encoded_size=compiled_ref.size,
+            ) != expected_summary:
+                raise ValueError("compiled pulse runtime summary differs from lineage")
+            compiled.append(artifact)
+        program = _decode_program(
             authority.read_blob(
-                index.pulse_document_blob,
-                max_bytes=index.pulse_document_blob.size,
+                index.pulse_program_blob,
+                max_bytes=index.pulse_program_blob.size,
             )
         )
-        if index.pulse_document_blob.digest != document.fingerprint:
-            raise ValueError("PulseDocument blob identity differs from fingerprint")
-        stored = _stored_scan_from_index(index, compiled)
+        if index.pulse_program_blob.digest != program.fingerprint:
+            raise ValueError("PulseScanProgram blob identity differs from fingerprint")
+        execution = pulse_scan_execution_from_tree(
+            index.execution_tree,
+            program,
+            tuple(compiled),
+        )
+        stored = _stored_scan_from_index(index, execution)
         _require_scan_facts(
             run_id=stored.provenance.trace_binding.run_id,
-            document=document,
+            execution=stored.execution,
             source_ref=stored.source_dataset_ref,
             source_schema=stored.source_dataset_schema,
             output_contract=stored.output_contract,
             output_ref=stored.output_dataset_ref,
             provenance=stored.provenance,
-            pulse_evidence=stored.pulse_evidence,
         )
-        return stored, document, metadata_size
+        return stored, metadata_size
 
     @staticmethod
     def _inspection_from_index(
@@ -1130,7 +1634,7 @@ class ScanRepository:
             index.output_contract,
             index.output_dataset_ref,
             index.provenance,
-            index.compiled_pulse_runtime_summary,
+            index.compiled_pulse_runtime_summaries,
             index.safety_bundle_id,
             peak,
         )
@@ -1141,7 +1645,7 @@ class ScanRepository:
         *,
         memory_limit_bytes: int | None = None,
     ) -> ScanArtifactInspection:
-        """Read FINAL schema/resource facts without pulse IR or document decode."""
+        """Read FINAL schema/resource facts without pulse IR or program decode."""
 
         with self._root_lease.borrow() as borrow:
             borrow.require_active()
@@ -1161,11 +1665,10 @@ class ScanRepository:
         with self._root_lease.borrow() as borrow:
             borrow.require_active()
             intent = self._require_final_commit(reference)
-            stored, document, _metadata_size = self._load_stored(reference)
+            stored, _metadata_size = self._load_stored(reference)
             return self._artifact_from_stored(
                 reference,
                 stored,
-                document,
                 intent,
             )
 
@@ -1173,7 +1676,6 @@ class ScanRepository:
     def _artifact_from_stored(
         reference: ScanArtifactRef,
         stored: _StoredScan,
-        document: PulseDocument,
         intent: CommitIntent,
     ) -> ScanArtifact:
         if stored.provenance.trace_binding.run_id != intent.run_id or (
@@ -1182,13 +1684,12 @@ class ScanRepository:
             raise ValueError("scan artifact differs from its FINAL commit intent")
         return ScanArtifact(
             reference,
-            document,
+            stored.execution,
             stored.source_dataset_ref,
             stored.source_dataset_schema,
             stored.output_contract,
             stored.output_dataset_ref,
             stored.provenance,
-            stored.pulse_evidence,
             stored.safety_bundle_id,
         )
 
@@ -1286,10 +1787,10 @@ class ScanRepository:
         values_ref = authority.identify_blob(values_payload)
         validity_ref = authority.identify_blob(validity_payload)
         stored = _StoredScan(
-            lineage.pulse_document_blob,
-            lineage.compiled_pulse_blob,
-            lineage.compiled_pulse_runtime_summary,
-            prepared.pulse_evidence,
+            lineage.pulse_program_blob,
+            lineage.compiled_pulse_blobs,
+            lineage.compiled_pulse_runtime_summaries,
+            prepared.execution,
             prepared.source_dataset_ref,
             prepared.source_dataset_schema,
             prepared.output_contract,
@@ -1299,9 +1800,50 @@ class ScanRepository:
             validity_ref,
             safety_bundle_id,
         )
-        metadata = _encode_metadata(stored)
-        if len(metadata) > policy.max_metadata_blob_bytes:
-            raise ScanResourceExceeded("scan metadata blob exceeds repository policy")
+        admission = prepared.api_metadata_admission
+        if isinstance(prepared.execution, ApiSegmentedScanExecution):
+            if not isinstance(admission, _ApiFinalMetadataAdmission):
+                raise RuntimeError("API FINAL lost its pre-FIRE metadata admission")
+            if admission.issuer_token is not self._api_metadata_admission_token:
+                raise PermissionError("API metadata admission belongs to another repository")
+            if admission.policy_max_bytes != policy.max_metadata_blob_bytes:
+                raise RuntimeError("API metadata repository policy changed after admission")
+            _require_api_metadata_admission_facts(
+                admission,
+                execution=prepared.execution,
+                source_ref=prepared.source_dataset_ref,
+                source_schema=prepared.source_dataset_schema,
+                output_contract=prepared.output_contract,
+                provenance=prepared.provenance,
+                staged_lineage=lineage,
+            )
+            metadata_limits = CanonicalDecodeLimits(
+                max_depth=_METADATA_LIMITS.max_depth,
+                max_nodes=admission.admitted_structure_limit,
+                max_container_entries=admission.admitted_structure_limit,
+                max_arrays=0,
+                max_total_array_bytes=0,
+            )
+            try:
+                metadata = encode(_metadata_tree(stored), limits=metadata_limits)
+            except CanonicalEncodingError as exc:
+                raise RuntimeError(
+                    "API metadata pre-FIRE admission invariant was violated"
+                ) from exc
+            if len(metadata) > admission.admitted_max_bytes:
+                raise RuntimeError(
+                    "API metadata pre-FIRE admission byte invariant was violated"
+                )
+            if len(metadata) > policy.max_metadata_blob_bytes:
+                raise RuntimeError(
+                    "API metadata exceeded repository policy after pre-FIRE admission"
+                )
+        else:
+            if admission is not None:
+                raise RuntimeError("autonomous FINAL unexpectedly carries API admission")
+            metadata = _encode_metadata(stored)
+            if len(metadata) > policy.max_metadata_blob_bytes:
+                raise ScanResourceExceeded("scan metadata blob exceeds repository policy")
         retained = _snapshot_retained_bytes(prepared.output_snapshot)
         staging_peak = (
             _snapshot_retained_bytes(prepared.source_snapshot)
@@ -1413,7 +1955,7 @@ class ScanRepository:
             )
         except FileNotFoundError:
             return None
-        stored, _document, _metadata_size = self._load_stored(
+        stored, _metadata_size = self._load_stored(
             reference,
             manifest_payload=payload,
         )
@@ -1422,8 +1964,8 @@ class ScanRepository:
         ):
             raise ValueError("visible scan differs from pending commit intent")
         for blob in (
-            stored.pulse_document_blob,
-            stored.compiled_pulse_blob,
+            stored.pulse_program_blob,
+            *stored.compiled_pulse_blobs,
             stored.values_blob,
             stored.validity_blob,
         ):

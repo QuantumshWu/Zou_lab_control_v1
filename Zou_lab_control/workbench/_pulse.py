@@ -10,6 +10,7 @@ import threading
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Zou_lab_control.notebook.facade import Experiment, PulseFacade
+from zlc_frontend import parse_number_text
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentCheckBox,
@@ -1507,7 +1508,10 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
         try:
             rows = tuple(
                 tuple(
-                    float(self._scan_table.item(row, column).text())
+                    parse_number_text(
+                        self._scan_table.item(row, column).text(),
+                        f"scan row {row} column {columns[column]!r}",
+                    )
                     for column in range(len(columns))
                 )
                 for row in range(self._scan_table.rowCount())
@@ -1551,14 +1555,17 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
                 self._refreshing = False
         self._update_controls()
 
-    def _api_values(self) -> dict[str, float]:
-        values: dict[str, float] = {}
+    def _api_values(self) -> dict[str, int | float]:
+        values: dict[str, int | float] = {}
         for row in range(self._api_table.rowCount()):
             parameter_id = self._api_table.item(row, 0).text()
             confirmed = self._api_table.item(row, 4)
             if confirmed.checkState() != QtCore.Qt.Checked:
                 raise ValueError(f"API parameter {parameter_id!r} is not confirmed")
-            values[parameter_id] = float(self._api_table.item(row, 3).text())
+            values[parameter_id] = parse_number_text(
+                self._api_table.item(row, 3).text(),
+                f"API parameter {parameter_id!r}",
+            )
         return values
 
     def _api_ready(self) -> bool:

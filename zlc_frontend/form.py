@@ -1,0 +1,247 @@
+"""Headless, immutable presentation contracts for simple parameter forms.
+
+The domain owner remains the sole source of value semantics and validation.  A
+``FormSpec`` is only its ordered presentation projection; it is neither a saved
+schema nor a generic request builder.  Qt consumes this module, while importing
+it never loads Qt.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+import re
+from typing import Literal, TypeAlias
+
+
+FormFieldKind: TypeAlias = Literal[
+    "text",
+    "int",
+    "float",
+    "number",
+    "choice",
+    "bool",
+]
+_FORM_FIELD_KINDS = frozenset(
+    {"text", "int", "float", "number", "choice", "bool"}
+)
+_INT_TEXT = re.compile(r"[+-]?\d+")
+_NUMBER_TEXT = re.compile(
+    r"[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?"
+)
+
+
+def parse_number_text(text: str, field: str = "number") -> int | float:
+    """Parse one finite decimal leaf, preserving authored int-vs-float type."""
+
+    if not isinstance(text, str):
+        raise TypeError(f"{field} text must be str")
+    value = text.strip()
+    if not value:
+        raise ValueError(f"{field} is required")
+    if _INT_TEXT.fullmatch(value) is not None:
+        return int(value, 10)
+    if _NUMBER_TEXT.fullmatch(value) is None:
+        raise ValueError(f"{field} must be a finite decimal number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{field} must be finite")
+    return result
+
+
+def _typed_equal(left: object, right: object) -> bool:
+    """Compare choice values without conflating ``1``, ``1.0`` and ``True``."""
+
+    return type(left) is type(right) and bool(left == right)
+
+
+def _require_immutable_scalar(value: object, *, where: str) -> None:
+    if value is None:
+        return
+    try:
+        hash(value)
+    except TypeError as exc:
+        raise TypeError(f"{where} must be an immutable scalar value") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class FormChoice:
+    """One display label paired with its unchanged typed value."""
+
+    label: str
+    value: object
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError("choice label must be a non-empty string")
+        if self.value is None:
+            raise ValueError("None represents no selection and cannot be a choice value")
+        if isinstance(self.value, float) and not math.isfinite(self.value):
+            raise ValueError("choice values cannot contain non-finite floats")
+        _require_immutable_scalar(self.value, where=f"choice {self.label!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class FormFieldProps:
+    """Presentation-only properties for one simple scalar field.
+
+    ``minimum`` and ``maximum`` are real owner-declared bounds.  ``None`` means
+    unbounded; the Qt layer must not invent a widget limit in its place.
+    """
+
+    key: str
+    kind: FormFieldKind
+    label: str
+    default: object = None
+    required: bool = False
+    unit: str = ""
+    description: str = ""
+    minimum: int | float | None = None
+    maximum: int | float | None = None
+    choices: tuple[FormChoice, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, str) or not self.key.strip():
+            raise ValueError("form field key must be a non-empty string")
+        if self.key != self.key.strip():
+            raise ValueError("form field key cannot have surrounding whitespace")
+        if self.kind not in _FORM_FIELD_KINDS:
+            raise ValueError(f"unsupported form field kind: {self.kind!r}")
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError(f"field {self.key!r} label must be non-empty")
+        if not isinstance(self.required, bool):
+            raise TypeError(f"field {self.key!r} required must be bool")
+        if not isinstance(self.unit, str) or not isinstance(self.description, str):
+            raise TypeError(f"field {self.key!r} unit/description must be strings")
+
+        choices = tuple(self.choices)
+        object.__setattr__(self, "choices", choices)
+        for choice in choices:
+            if not isinstance(choice, FormChoice):
+                raise TypeError(f"field {self.key!r} choices must contain FormChoice")
+        for index, choice in enumerate(choices):
+            if any(_typed_equal(choice.value, prior.value) for prior in choices[:index]):
+                raise ValueError(f"field {self.key!r} has duplicate typed choice values")
+
+        if self.kind == "choice":
+            if not choices:
+                raise ValueError(f"choice field {self.key!r} needs at least one choice")
+            if self.minimum is not None or self.maximum is not None:
+                raise ValueError(f"choice field {self.key!r} cannot declare numeric bounds")
+            if self.default is not None and not any(
+                _typed_equal(self.default, choice.value) for choice in choices
+            ):
+                raise ValueError(f"field {self.key!r} default is not a typed choice value")
+        elif choices:
+            raise ValueError(f"non-choice field {self.key!r} cannot declare choices")
+
+        if self.kind not in {"int", "float", "number"} and (
+            self.minimum is not None or self.maximum is not None
+        ):
+            raise ValueError(f"non-numeric field {self.key!r} cannot declare bounds")
+
+        if self.kind == "int":
+            for name, value in (("minimum", self.minimum), ("maximum", self.maximum)):
+                if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+                    raise TypeError(f"int field {self.key!r} {name} must be int")
+            if self.default is not None and (
+                not isinstance(self.default, int) or isinstance(self.default, bool)
+            ):
+                raise TypeError(f"int field {self.key!r} default must be int or None")
+        elif self.kind == "float":
+            for name, value in (
+                ("minimum", self.minimum),
+                ("maximum", self.maximum),
+                ("default", self.default),
+            ):
+                if value is None:
+                    continue
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise TypeError(f"float field {self.key!r} {name} must be numeric")
+                if not math.isfinite(float(value)):
+                    raise ValueError(f"float field {self.key!r} {name} must be finite")
+            if self.default is not None:
+                object.__setattr__(self, "default", float(self.default))
+        elif self.kind == "number":
+            for name, value in (
+                ("minimum", self.minimum),
+                ("maximum", self.maximum),
+                ("default", self.default),
+            ):
+                if value is None:
+                    continue
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise TypeError(f"number field {self.key!r} {name} must be numeric")
+                if not math.isfinite(float(value)):
+                    raise ValueError(f"number field {self.key!r} {name} must be finite")
+        elif self.kind == "text":
+            if self.default is not None and not isinstance(self.default, str):
+                raise TypeError(f"text field {self.key!r} default must be str or None")
+        elif self.kind == "bool":
+            if not isinstance(self.default, bool):
+                raise TypeError(f"bool field {self.key!r} default must be bool")
+
+        if self.minimum is not None and self.maximum is not None:
+            if self.minimum > self.maximum:
+                raise ValueError(f"field {self.key!r} minimum exceeds maximum")
+        if self.default is not None and self.kind in {"int", "float", "number"}:
+            numeric = float(self.default) if self.kind == "float" else self.default
+            if self.minimum is not None and numeric < self.minimum:
+                raise ValueError(f"field {self.key!r} default is below minimum")
+            if self.maximum is not None and numeric > self.maximum:
+                raise ValueError(f"field {self.key!r} default is above maximum")
+
+        _require_immutable_scalar(self.default, where=f"field {self.key!r} default")
+
+    @property
+    def row_label(self) -> str:
+        label = self.label.strip()
+        if self.unit:
+            label = f"{label} ({self.unit})"
+        if self.required:
+            label = f"{label} *"
+        return label
+
+    def choice_for(self, value: object) -> FormChoice | None:
+        """Return the canonical typed choice matching ``value``, if any."""
+
+        if self.kind != "choice":
+            return None
+        return next(
+            (choice for choice in self.choices if _typed_equal(value, choice.value)),
+            None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FormSpec:
+    """An ordered, exact-key collection of simple form fields."""
+
+    fields: tuple[FormFieldProps, ...]
+
+    def __post_init__(self) -> None:
+        fields = tuple(self.fields)
+        object.__setattr__(self, "fields", fields)
+        if not fields:
+            raise ValueError("form spec must contain at least one field")
+        if any(not isinstance(field, FormFieldProps) for field in fields):
+            raise TypeError("form spec fields must contain FormFieldProps")
+        keys = tuple(field.key for field in fields)
+        if len(keys) != len(set(keys)):
+            raise ValueError("form spec field keys must be unique")
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return tuple(field.key for field in self.fields)
+
+    def default_values(self) -> dict[str, object]:
+        return {field.key: field.default for field in self.fields}
+
+
+__all__ = [
+    "FormChoice",
+    "FormFieldKind",
+    "FormFieldProps",
+    "FormSpec",
+    "parse_number_text",
+]

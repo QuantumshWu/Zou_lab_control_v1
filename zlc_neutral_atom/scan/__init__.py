@@ -1,24 +1,50 @@
 """Neutral-atom scan authority values."""
 
 from .contracts import (
-    AUTONOMOUS_SCAN_SLOT_DEFINITION,
-    AUTONOMOUS_SCAN_SLOT_TASK_KEY,
+    ApiSegmentTable,
+    ApiSlotSegmentedProgram,
+    AutonomousScanSlotProgram,
+    PULSE_SCAN_DEFINITION,
+    PULSE_SCAN_PROGRAM_SCHEMA,
+    PULSE_SCAN_TASK_KEY,
+    PulseScanProgram,
     SCAN_TASK_DEFINITIONS,
     ScanOutputContract,
     ScanPointTable,
     bind_scan_output_contract,
+    pulse_scan_program_from_tree,
+    pulse_scan_program_to_tree,
 )
 from .reference import ScanArtifactRef
+from .lineage import (
+    ApiSegmentEvidence,
+    ApiSegmentedScanExecution,
+    AutonomousScanExecution,
+    CameraRunEvidence,
+    PulseScanExecution,
+)
 from .repository import MaterializedScanData, ScanArtifactInspection
 
 __all__ = [
-    "AUTONOMOUS_SCAN_SLOT_DEFINITION",
-    "AUTONOMOUS_SCAN_SLOT_TASK_KEY",
+    "ApiSegmentTable",
+    "ApiSegmentEvidence",
+    "ApiSegmentedScanExecution",
+    "ApiSlotSegmentedProgram",
+    "AutonomousScanExecution",
+    "AutonomousScanSlotProgram",
+    "CameraRunEvidence",
     "MaterializedScanData",
+    "PULSE_SCAN_DEFINITION",
+    "PULSE_SCAN_PROGRAM_SCHEMA",
+    "PULSE_SCAN_TASK_KEY",
+    "PulseScanExecution",
+    "PulseScanProgram",
     "SCAN_TASK_DEFINITIONS",
     "ScanArtifactInspection",
     "ScanOutputContract",
     "ScanPointTable",
     "ScanArtifactRef",
     "bind_scan_output_contract",
+    "pulse_scan_program_from_tree",
+    "pulse_scan_program_to_tree",
 ]

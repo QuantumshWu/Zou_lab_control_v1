@@ -155,10 +155,15 @@ class ExactOccupancyTransaction:
         self.session.prepare(context)
         self.session.start(context)
 
+    def capture_next(self, context: RunContext) -> None:
+        """Request exactly one frame from the armed camera/processor chain."""
+
+        context.checkpoint()
+        self.session.capture_next(context)
+
     def capture_all(self, context: RunContext) -> None:
         for _ordinal in range(self.spec.measurement.capture_contract.total_events):
-            context.checkpoint()
-            self.session.capture_next(context)
+            self.capture_next(context)
 
     def complete(self, context: RunContext) -> "ExecutedOccupancy":
         if self.worker is None:

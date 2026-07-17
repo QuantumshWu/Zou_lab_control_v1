@@ -12,8 +12,11 @@ from typing import Protocol, TypeVar
 
 import numpy as np
 from zlc_storage import (
+    CanonicalDecodeLimits,
+    CanonicalEncodingError,
     canonical_digest,
     canonical_text as _canonical_text,
+    encode,
     exact_mapping as _exact_tree,
     nonnegative_integer as _nonnegative_int,
     positive_integer as _positive_int,
@@ -36,6 +39,31 @@ from zlc_neutral_atom.readout.contracts import (
     normalize_camera_geometry,
     validate_camera_spatial_axes,
 )
+
+
+MAX_CAPTURE_TERMINAL_ACK_CANONICAL_BYTES = 4 << 10
+MAX_CAPTURE_TERMINAL_ACK_CANONICAL_NODES = 128
+_CAPTURE_TERMINAL_ACK_LIMITS = CanonicalDecodeLimits(
+    max_depth=16,
+    max_nodes=MAX_CAPTURE_TERMINAL_ACK_CANONICAL_NODES,
+    max_container_entries=MAX_CAPTURE_TERMINAL_ACK_CANONICAL_NODES,
+    max_arrays=0,
+    max_total_array_bytes=0,
+)
+
+
+def _require_capture_terminal_ack_canonical_budget(
+    value: "CaptureTerminalAck",
+) -> None:
+    try:
+        payload = encode(
+            capture_terminal_ack_to_tree(value),
+            limits=_CAPTURE_TERMINAL_ACK_LIMITS,
+        )
+    except CanonicalEncodingError as exc:
+        raise ValueError("capture terminal acknowledgement exceeds its schema budget") from exc
+    if len(payload) > MAX_CAPTURE_TERMINAL_ACK_CANONICAL_BYTES:
+        raise ValueError("capture terminal acknowledgement exceeds its byte budget")
 from zlc_neutral_atom.readout.codec import (
     camera_capture_descriptor_from_tree,
     camera_capture_descriptor_to_tree,
@@ -1041,6 +1069,7 @@ class CaptureTerminalAck:
         _sha256(self.settings_fingerprint, "settings_fingerprint")
         _sha256(self.capability_fingerprint, "capability_fingerprint")
         _sha256(self.capture_spec_fingerprint, "capture_spec_fingerprint")
+        _require_capture_terminal_ack_canonical_budget(self)
 
 
 def capture_terminal_ack_to_tree(value: CaptureTerminalAck) -> dict[str, object]:
@@ -2046,6 +2075,8 @@ __all__ = [
     "CapturePreparedAck",
     "CaptureProcessorInputBinding",
     "FrozenCaptureSpec",
+    "MAX_CAPTURE_TERMINAL_ACK_CANONICAL_BYTES",
+    "MAX_CAPTURE_TERMINAL_ACK_CANONICAL_NODES",
     "frozen_capture_spec_from_tree",
     "frozen_capture_spec_to_tree",
     "CaptureSession",

@@ -590,6 +590,7 @@ class VirtualCamera:
         self._produced = 0
         self._worker: threading.Thread | None = None
         self._worker_stop: threading.Event | None = None
+        self._active_fire_end_ordinal = 0
         self._worker_error: BaseException | None = None
         self._terminal: CameraCaptureTerminalRecord | None = None
         self._open = True
@@ -699,6 +700,7 @@ class VirtualCamera:
             self._produced = 0
             self._worker = None
             self._worker_stop = None
+            self._active_fire_end_ordinal = 0
             self._worker_error = None
             self._terminal = None
 
@@ -706,21 +708,47 @@ class VirtualCamera:
         if playback.repeat_forever:
             return
         with self._condition:
-            if not self._armed or not self._accepting:
+            if not self._armed:
                 return
-            if self._worker is not None:
+            if self._worker_error is not None:
+                raise RuntimeError(
+                    "virtual camera rejects FIRE after a source failure"
+                ) from self._worker_error
+            if not self._accepting:
+                if self._produced >= self._expected:
+                    raise RuntimeError(
+                        "virtual camera received FIRE after its arm budget was complete"
+                    )
+                return
+            if self._worker is not None and self._worker.is_alive():
                 raise RuntimeError("virtual camera received overlapping finite FIRE")
+            self._worker = None
+            self._worker_stop = None
             trigger_offsets = _trigger_starts(
                 playback,
                 self.capture_trigger_channels,
             )
-            if len(trigger_offsets) != self._expected:
-                self._worker_error = RuntimeError(
-                    f"virtual pulse emitted {len(trigger_offsets)} camera edges for "
-                    f"an arm budget of {self._expected}"
+            trigger_count = len(trigger_offsets)
+            remaining = self._expected - self._produced
+            if trigger_count < 1:
+                error = RuntimeError(
+                    "finite FIRE emitted no camera trigger while an exact arm was active"
                 )
+                self._worker_error = error
+                self._accepting = False
                 self._condition.notify_all()
-                return
+                raise error
+            if trigger_count > remaining:
+                error = RuntimeError(
+                    f"virtual pulse emitted {trigger_count} camera edges with only "
+                    f"{remaining} remaining in the arm budget"
+                )
+                self._worker_error = error
+                self._accepting = False
+                self._condition.notify_all()
+                raise error
+            start_ordinal = self._produced
+            self._active_fire_end_ordinal = start_ordinal + trigger_count
             stop = threading.Event()
             self._worker_stop = stop
             fired_at = time.monotonic()
@@ -729,12 +757,12 @@ class VirtualCamera:
                 try:
                     frames = self.atoms.iter_frames(
                         playback,
-                        self._expected,
+                        trigger_count,
                         trigger_channels=self.capture_trigger_channels,
                         default_exposure=self.exposure,
                     )
                     frame_iterator = iter(frames)
-                    for ordinal, offset in enumerate(trigger_offsets):
+                    for local_ordinal, offset in enumerate(trigger_offsets):
                         # A frame becomes available only after its fixed sensor
                         # integration.  Waiting merely for the trigger edge made
                         # persisted host-receipt timing precede the exposure it
@@ -756,12 +784,14 @@ class VirtualCamera:
                             raise RuntimeError(
                                 "virtual atom source ended before the trigger budget"
                             ) from exc
+                        source_ordinal = start_ordinal + local_ordinal
+                        produced_count = source_ordinal + 1
                         record = CameraFrameRecord(
                             image,
-                            ordinal,
-                            ordinal + 1,
-                            None,
-                            None,
+                            source_ordinal,
+                            produced_count,
+                            produced_count,
+                            produced_count,
                             None,
                             None,
                             time.time_ns(),
@@ -774,7 +804,7 @@ class VirtualCamera:
                                     "virtual camera retention exhausted before host drain"
                                 )
                             self._pending.append(record)
-                            self._produced = ordinal + 1
+                            self._produced = produced_count
                             self._condition.notify_all()
                     sentinel = object()
                     if next(frame_iterator, sentinel) is not sentinel:
@@ -784,9 +814,15 @@ class VirtualCamera:
                 except BaseException as error:
                     with self._condition:
                         self._worker_error = error
+                        self._accepting = False
                         self._condition.notify_all()
                 finally:
                     with self._condition:
+                        if self._produced >= self._expected:
+                            self._accepting = False
+                        if self._worker is threading.current_thread():
+                            self._worker = None
+                            self._worker_stop = None
                         self._condition.notify_all()
 
             worker = threading.Thread(
@@ -826,6 +862,41 @@ class VirtualCamera:
                     result.append(self._pending.popleft())
                     self._condition.notify_all()
                 if len(result) == wanted:
+                    # The final frame of one FIRE is not authoritative until the
+                    # producer has advanced the source once more and proved EOF.
+                    # That post-frame probe detects both an extra frame and a
+                    # source exception raised after the expected final yield.
+                    # Keep the proof on the caller's original blocking budget:
+                    # an ill-behaved iterator must not turn an exact read into an
+                    # unbounded join, and cancellation must not return a frame
+                    # whose finite-source cardinality was never established.
+                    while (
+                        self._worker is not None
+                        and self._worker.is_alive()
+                        and self._produced >= self._active_fire_end_ordinal
+                    ):
+                        if self._worker_error is not None:
+                            raise RuntimeError(
+                                "virtual camera source failed"
+                            ) from self._worker_error
+                        if stop is not None and getattr(
+                            stop,
+                            "is_set",
+                            lambda: False,
+                        )():
+                            raise TimeoutError(
+                                "virtual camera exact source validation was cancelled"
+                            )
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0.0:
+                            raise TimeoutError(
+                                "virtual camera exact source validation timed out"
+                            )
+                        self._condition.wait(min(0.05, remaining))
+                    if self._worker_error is not None:
+                        raise RuntimeError(
+                            "virtual camera source failed"
+                        ) from self._worker_error
                     break
                 if self._worker_error is not None:
                     raise RuntimeError("virtual camera source failed") from self._worker_error

@@ -1,6 +1,13 @@
 """Target frontend public values with no implicit renderer or Qt import."""
 
 from .data_figure import DataFigure
+from .form import (
+    FormChoice,
+    FormFieldKind,
+    FormFieldProps,
+    FormSpec,
+    parse_number_text,
+)
 from .render import (
     AtomicBoardFront,
     BoardFrame,
@@ -90,6 +97,10 @@ __all__ = [
     "FigureLayer",
     "FigureSelection",
     "FixedIndex",
+    "FormChoice",
+    "FormFieldKind",
+    "FormFieldProps",
+    "FormSpec",
     "LatestNonempty",
     "PanelFrame",
     "PanelPresentationIdentity",
@@ -116,4 +127,5 @@ __all__ = [
     "suggest_view",
     "suggest_fit_view",
     "validate_view_spec",
+    "parse_number_text",
 ]

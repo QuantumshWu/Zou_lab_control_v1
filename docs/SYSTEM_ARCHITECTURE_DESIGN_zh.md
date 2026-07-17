@@ -19,7 +19,7 @@
 11. 精密 pulse/trigger 时序始终由现有 FPGA/qCMOS 等硬件执行；软件不得用 host sleep 调度微秒/纳秒事件。与此同时，bitstream/RTL 是冻结部署资产：架构不得为了获得更强证明而要求重烧；只有 E0a/Q0/真机证据发现现有 RTL bug、与既定设计不符或在已批准工作区间确实无法正确运行时，才单独评估硬件修复。
 12. raw hardware graph 只存在于 installation composition/runtime owner 的封闭内部；普通 Experiment、领域对象、frontend、教程和公共 umbrella 只能取得 immutable observation、typed descriptor 与经 authority 的窄 command facade，不能反向找回 adapter 或旧 `DeviceSet`。
 
-本文同时区分三种东西：终态不变量、当前冻结硬件上的 baseline capability、以及有明确删除点的迁移脚手架。正常 PulseScan 的执行方式族是现有 bitstream 的 `AUTONOMOUS_STREAMED`，其装载方式分为 fire前全部rows resident的`AUTONOMOUS_RESIDENT`与条件性的`AUTONOMOUS_REFILLED`；近期baseline只开放resident，refilled默认拒绝，只有§15.4强证明后才成为条件capability。Formal资格不是装载方式名称的一部分，而是 execution mode、有效Q0 qualification、association proof、软件exact链和本run EndAttestation共同评估的结果。唯一允许的非自主执行例外是 API-slot 无法在运行中无缝更新时已经存在并被接受的 `API_SLOT_SEGMENTED_EXISTING` 路径；segment之间的host gap属于该历史API语义，必须显式记录且不能称为连续或autonomous。除该例外外，`HOST_STEPPED_GROUP`/逐 cell fire-and-wait 不属于设计。逐沿 stamp、额外 ROM attestation、trigger-return 或新 watchdog 等需要重烧的增强只可在§1.1/H2的证据条件、因果证明与独立批准全部满足后作为硬件修复候选，不能成为软件架构的前置要求。
+本文同时区分三种东西：终态不变量、当前冻结硬件上的 baseline capability、以及有明确删除点的迁移脚手架。正常 PulseScan 的执行方式族是现有 bitstream 的 `AUTONOMOUS_STREAMED`，其装载方式分为 fire前全部rows resident的`AUTONOMOUS_RESIDENT`与条件性的`AUTONOMOUS_REFILLED`；近期baseline只开放resident，refilled默认拒绝，只有§15.4强证明后才成为条件capability。Formal资格不是装载方式名称的一部分，而是 execution mode、有效Q0 qualification、association proof、软件exact链和本run EndAttestation共同评估的结果。唯一允许的非自主执行例外是 API-slot 值无法在一次自主sweep中无缝更新时已经存在并被接受的 `API_SLOT_SEGMENTED_EXISTING` 路径：整run只建立一次camera arm/exact capture transaction，R-major/P-fast地执行R×P个独立`STATIC_ONCE` pulse session，每个session取得自己的physical pulse terminal后才进入下一cell；segment之间必然存在的host gap由execution mode、canonical `segmentation_rationale`与有序pulse evidence显式表明，不能称为连续或autonomous。它不是通用`HOST_STEPPED_GROUP`，也绝不能成为SCAN_SLOT/MOT的逐cell fallback。逐沿 stamp、额外 ROM attestation、trigger-return 或新 watchdog 等需要重烧的增强只可在§1.1/H2的证据条件、因果证明与独立批准全部满足后作为硬件修复候选，不能成为软件架构的前置要求。
 
 这里的“硬件时序优先”不是把领域 key、工作流或新观测电路塞进 FPGA。当前 baseline 使用现有硬件已经提供的 pulse execution、mode-specific raw terminal/build fingerprint回读，以及 qCMOS 外触发、frame counter/stamp/timestamp；neutral runtime 用冻结计划、Q0资格化的经验性ordered-trigger合同、preflight时序余量和整 run末端对账映射 TriggerKey/ScanCellKey。它明确弱于逐沿硬件证明，但在 PI 接受的风险边界内 fail closed：任何可见不一致使整个 run INVALID并按显式有限策略重跑，不能提交部分或猜测性结果。
 
@@ -29,9 +29,9 @@
 
 1. **现有 RTL/bitstream 冻结。** baseline 不生成、不修改、不重烧 bitstream；默认实现、迁移脚本和 CI 也不得隐式调用 Vivado synthesis/implementation/programming。只有 E0a/Q0 在已批准工作余量内实测到真实 loss/reorder 且软件、相机配置和时序余量无法解决，或 golden/model/真机证据证明现有 RTL 有 bug、偏离既定设计时，才允许进入单独的 H2 硬件修复评审；架构想获得更漂亮或更强的证明，不构成改硬件理由。H2 只是新提案的准入门，不自动授权修改、构建或烧录，仍需 PI/硬件 owner 单独批准。
 2. **正常 PulseScan 只使用现有 FPGA 的无缝自主执行。** `AUTONOMOUS_STREAMED` 是正常执行方式族，近期装载方式基线是 fire 前全部物理 rows resident 的 `AUTONOMOUS_RESIDENT`。对 SCAN_SLOT/MOT，`HOST_STEPPED_GROUP`、逐 cell fire-and-wait、single-cell gate 和 host sleep edge scheduling 不得作为 baseline、首光方案、容量 fallback 或更强关联证明的替代品。
-3. **唯一已接受的非无缝例外是 API-slot 既有 segmented 路径。** 它只适用于 adapter 已证明一次自主 sweep 中无法更新的 API_SLOT 值；其 host 按 point/segment 发有限 pulse 并等待完成的事实必须如实标记为 `API_SLOT_SEGMENTED_EXISTING`，不得包装成 autonomous execution。SCAN_SLOT/MOT 不得借此退化为 host stepping。
+3. **唯一已接受的非无缝例外是 API-slot 既有 segmented 路径。** 它只适用于 adapter 已证明一次自主 sweep 中无法更新的 API_SLOT 值。整run一次arm相机并冻结R×P总frame预算；host只在显式segment boundary依次prepare/fire一个由硬件执行全部edge的`STATIC_ONCE` pulse session，并等该session的physical terminal与对应camera event后再进入下一cell。这个事实必须如实标记为 `API_SLOT_SEGMENTED_EXISTING`，不得包装成 autonomous execution，也不得伪造每段camera arm、camera terminal或camera EndAttestation。SCAN_SLOT/MOT 不得借此退化为 host stepping。
 4. **能由现有硬件确定的精密时序必须由硬件确定。** FPGA 决定 pulse/trigger edge schedule，qCMOS 决定 exposure/readout/frame production；host 只冻结计划、验证工作 envelope、供应已冻结的获准 refill chunk、排空数据并做末端验证，不参与微秒/纳秒时序调度。
-5. **当前物理关联保证诚实降级而不伪装。** 没有现存逐沿 emitted/accepted-trigger 回读时，baseline 使用有效 Q0 empirical ordered-trigger qualification、冻结 schedule、模式专用terminal evidence和整 run EndAttestation；任何可见不一致整 run INVALID。它不是 per-cell hardware receipt，并接受有限样本资格化无法绝对排除等量 loss+extra 的剩余风险。
+5. **当前物理关联保证诚实降级而不伪装。** 没有现存逐沿 emitted/accepted-trigger 回读时，baseline 使用有效 Q0 empirical ordered-trigger qualification、冻结 schedule、模式专用pulse terminal evidence和整 run EndAttestation；任何可见不一致整 run INVALID。API的per-cell PulseTerminalAck只证明有限pulse session物理终止，不是camera accepted-trigger/frame receipt；整个关联合同仍接受有限样本资格化无法绝对排除等量 loss+extra 的剩余风险。
 6. **需要新 RTL 的观测增强默认不存在。** HardwareTriggerStamp/FIFO、trigger-return、per-fire counter、`PHYSICAL_DONE`、RTL CRC/`BANK_VERIFIED`、新 watchdog、`design_build_id` 与 timing-signoff ROM 都是证据触发后的可选修复候选，不是当前合同、测试假能力或迁移 gate。
 7. **INVALID attempt 不可修补或续跑。** count/stamp/timestamp/coverage/EOS 任一对账失败后，不得丢掉“多余帧”、移动 ordinal、从某个 point 继续、复用该 attempt 的 provisional 数据或把已有行补成成功结果。显式重跑必须重新 arm、建立新的 session counter baseline、run_id/attempt_id、reservation、qualification authorization 与 lineage；失败 attempt 永久作为诊断事实保留，但不能成为成功 artifact 的数据来源。
 
@@ -40,9 +40,9 @@
 | 事实 | 当前权威来源 | host 的合法职责 |
 |---|---|---|
 | pulse/trigger edge 的相对时序 | 冻结 bitstream 上的 FPGA scan engine 与 compiled table | 编译、冻结、preflight；不得逐 edge 调度 |
-| qCMOS exposure/readout 与 frame production | 冻结 camera settings 下的 qCMOS/driver | autonomous run一次arm；API segmented每段一次arm；持续drain并保存原始counter/stamp/timestamp |
+| qCMOS exposure/readout 与 frame production | 冻结 camera settings 下的 qCMOS/driver | autonomous与API segmented均为整run一次arm；API的R×P host boundary期间保持同一个capture session持续drain，并只在整run末端形成一次camera terminal及原始counter/stamp/timestamp对账 |
 | 逻辑 TriggerKey/ScanCellKey 顺序 | 冻结 CompiledPulse schedule/PointLayout | 在有效 Q0 qualification envelope 内按序建立 provisional mapping |
-| 完整 run 是否可成为权威 artifact | execution-mode-specific terminal evidence + compiled/H1/deployment-bound post-terminal tail evidence + source-specific evidence + exact pipeline coverage 的 EndAttestation | 由唯一I/O owner读取现有原始事实、保守等待已验证tail bound并比对；autonomous用STATUS/CURSOR，API segment用stable DONE/STATUS且CURSOR=N/A；不得把raw DONE当tail-idle、使用UI progress镜像、补点或猜点 |
+| 完整 run 是否可成为权威 artifact | execution-mode-specific pulse evidence + 一个run级CameraRunEvidence + source-specific evidence + exact pipeline coverage 的aggregate EndAttestation | 由唯一I/O owner读取现有原始事实并比对；autonomous使用单个完整table terminal，API使用R-major/P-fast且session-id唯一的R×P个physical pulse terminal；相机两者都只在整run末端terminalize一次。不得把raw DONE当tail-idle、把per-cell pulse receipt伪装成camera attestation、使用UI progress镜像、补点或猜点 |
 | 部署身份 | 现有 `image.build_fingerprint`/geometry/ABI 握手 + neutral installation-owned ProgrammedImageDeploymentRecordRef | fingerprint mismatch时所有真实upload/fire均拒绝；record inactive时只拒绝Formal upload/fire，H1前E0a诊断例外见§19；record只断言endpoint到冻结`.bit`/release的SOP映射，不得声称运行时验证旧bitstream未暴露的content/timing digest |
 
 为避免实现者从分散章节拼出不同结论，baseline 的四个判定只有以下一套：
@@ -53,8 +53,10 @@ execution_allowed :=
   or (AUTONOMOUS_REFILLED and §15.4 capability 已真实发布)
   or (API_SLOT_SEGMENTED_EXISTING and 该既有路径已被接受
       and adapter 已证明 API value 无法无缝更新
-      and bound SegmentationSemantics 明确允许 host segment boundary
-      and 所需 settle/re-equilibration 条件可在preflight与每段FIRE前判定)
+      and canonical非空segmentation_rationale明确说明为何物理实验允许host segment boundary
+      and 完整R×P顺序、P个STATIC_ONCE artifacts、整runcamera settings/frame budget已冻结
+      and 当前use case物理上接受任意、可变、非负host gap，
+          不依赖连续演化、最大gap、精确settle时间或gap-dependent physics)
 
 formal_fire_allowed :=
   execution_allowed
@@ -66,15 +68,24 @@ formal_fire_allowed :=
       （若 source 是 qCMOS：active Q0 还必须覆盖 camera settings 与 trigger interval margin）
   and source-specific inflight buffer、host exact retention、consumer 与 artifact sink 预算通过
       （若 source 是 qCMOS：driver ring 必须按 max-inflight 而非 total frames 定容）
+      （若为API_SLOT_SEGMENTED_EXISTING：先以R×P cardinality floor在point resolve/compile前快速拒绝
+          明显不可提交规模；随后在真实program、source block identity/schema、output contract、compiled refs/summaries、
+          camera静态事实与逐point trigger/join shape全部冻结后、Run/arm/FIRE前，由具体ScanRepository
+          mint一个绑定repository实例、构造期write-once metadata policy、artifact schema及上述fingerprints的process-local admission receipt。
+          pulse/camera terminal canonical byte/node上界由各自owner强制；FINAL只能消费该receipt，实际encoder
+          超过receipt或任何绑定事实漂移均是pre-FIRE证明被破坏的RuntimeError，不得伪装成跑完后的普通资源拒绝）
   and exact reservation/cursor/owner claims 已建立
-  and（若为API_SLOT_SEGMENTED_EXISTING：首段或下一段所需settle/re-equilibration条件已满足）
+  and（若为API_SLOT_SEGMENTED_EXISTING：整run camera authorization已在首次FIRE前固定，
+      首cell已满足arm-ready/first-edge margin；后续cell的上一camera event与physical pulse terminal已完成，
+      且camera required_external_trigger_interval的保守最小等待已deadline/cancel-aware完成）
 
 formal_commit_allowed :=
-  FIRE 线性化点为本 run/segment 生成的 authorization 仍可追溯
+  FIRE authority仍可追溯（autonomous为单次FIRE；API为一个run级camera authorization
+      加R-major/P-fast的R×P个唯一PulseSession terminal lineage）
   and execution-mode-specific terminal evidence 与冻结 schedule 一致
-      （autonomous table使用raw STATUS+final CURSOR；API segment使用stable raw DONE/STATUS，CURSOR=N/A）
+      （autonomous table使用完整table terminal；API每cell使用独立STATIC_ONCE physical pulse terminal，CURSOR=N/A）
   and compiled/H1 post-terminal output-tail bound 已保守等待并记录
-  and 每个 formal source 的 produced/drained/terminal evidence 与冻结计划一致
+  and 每个 formal source 的run级produced/drained/terminal evidence与冻结计划一致
       （若 source 是 qCMOS：camera_produced_delta、frame/camera stamp、timestamp 容差全部通过）
   and processor/DatasetBuilder/coverage/EOS、source termination/join 与 safety disposition 全部通过
 
@@ -103,7 +114,7 @@ hardware_change_review_allowed :=
 - 非标量数据会自动得到一个可见、可改的默认视图；当选择或降维要进入 fit、scan y 或派生 artifact 等权威结果时，必须冻结为 CommittedTransform，不再暗中取第 0 项；
 - history gap、schema change、缺帧和硬件 mismatch 会明确失败，不再显示拼接结果；
 - qCMOS只有在当前adapter版本的Q0 qualification对目标工作点有效、preflight trigger余量通过且整run EndAttestation一致时才可产出Formal ScanArtifact；否则只能monitor或整run INVALID；
-- qCMOS autonomous正式扫描一次arm整个run session、用按max-inflight定容的driver ring持续排空全部帧；完整逻辑scan table在fire前冻结，resident能力在fire前上传全部物理rows，条件refilled能力只供应冻结chunk，二者都由FPGA自主执行微观时序；仅 API-slot 无法无缝更新时沿用既有 segmented 路径并逐segment独立arm/FIRE/attest，SCAN_SLOT/MOT 不允许退化为逐 cell host stepping；
+- qCMOS autonomous与API segmented正式扫描都一次arm整个run session、用按max-inflight定容的driver ring持续排空全部帧；正常SCAN_SLOT把完整逻辑scan table在fire前冻结，resident能力在fire前上传全部物理rows，条件refilled能力只供应冻结chunk，二者都由FPGA自主执行微观时序；仅API-slot值无法无缝更新时沿用既有segmented路径，按R-major/P-fast执行独立`STATIC_ONCE` pulse session并在segment间保留显式host gap，但相机不重复arm/stop且只做整run aggregate attestation；SCAN_SLOT/MOT不允许退化为逐cell host stepping；
 - Stop 后若设备尚未确认退出，UI 显示 `CANCELLING`，不会提前宣称已停止；
 - 设备冲突会提示并等待原 owner 真正退出，而不是静默抢占；
 - 保存文件只接受当前 artifact schema；历史数据通过独立离线转换工具处理；
@@ -186,7 +197,7 @@ validity 不能只停在 `(R,P)`：readout fidelity 已经产生 `(group,site)` 
 
 真 qCMOS 的 capture `nFrameCount` 是产出帧累计数；仓库 DCAM wrapper 还暴露 `nNewestFrameIndex`、framestamp/camerastamp/timestamp。当前 adapter 已完成一块正确的迁移首付：exact 路径中 `cap_transferinfo()` 失败、负数或计数倒退均立即失败；每次先读累计 count，有已存在 backlog 就直接排空，只有 count 与 drained cursor 相等才等待新的 ready event；ring 槽位由同一次 snapshot 的 `nNewestFrameIndex` 反推，不能再假设 `source_ordinal % ring_size`；每帧复制后重新读取 count，若复制期间 ring 已可能覆盖当前 ordinal 则整次采集失败；wait 与 backlog copy 共用同一总 deadline，并在帧间检查 Stop。已报告的一批 frame 全部进入同一个有界 pending record queue，`CameraFrameRecord` 保留 produced count、frame/camera stamp、timestamp 与实际 driver ring index。driver ring只按capability中声明的max-inflight burst定容，完整run保留属于host exact stream/dataset，不再按`total_frames`重复分配同样大的相机ring。
 
-这些整改只关闭host retention、槽位映射和已观察overrun的静默错位，并不自动证明max-inflight数值或外触发工作区间内“一触发一帧、按序、无漏帧”。当前真实 qCMOS 的 qualification 仍为 `None`，所以target exact prepare在arm前明确拒绝；只有virtual deterministic source被放行。旧 `read_frames()/acquire()` array-only consumer仍会在record边界后丢掉metadata；若旧上层继续取latest或累计重发布，软件仍可能形成第二套真相源。近期完成路径不改变冻结bitstream：E0a先用现有系统探索目标 exposure/ROI/readout/触发间距，S1/H1稳定后Q0再用最终adapter、CaptureSession与buffer/drain policy建立可发布的经验性ordered-trigger qualification，并把worst-case outstanding、单帧复制/排空延迟、ring覆盖余量与完整call bound写进同一个envelope；preflight用编译后trigger schedule与该qualification envelope的最小帧间隔+安全余量拒绝过快scan。autonomous运行一次arm整个run session，API segmented则每段独立arm/FIRE/attest。对应autonomous run结束后由唯一I/O owner读取现有raw FPGA STATUS/CURSOR证明冻结table logical terminal；API segment则读取其stable raw DONE/STATUS且CURSOR明确N/A。两者都保持camera/drain运行并形成compiled/H1 `PostTerminalTailEvidence`，再把各自terminal evidence推导的expected trigger total与按Q0 reset/rollover语义计算的本session相机产出增量及frame/camera stamp/timestamp连续性对账。任一不符使整个run INVALID，重跑只能由用户或显式有限RetryPolicy发起。该合同不能像逐沿硬件tag那样定位具体错误，也不能绝对排除漏一帧同时多一帧的等量抵消；这是冻结硬件约束下明确接受的剩余风险，不能在文档中伪装成同等证明强度。
+这些整改只关闭host retention、槽位映射和已观察overrun的静默错位，并不自动证明max-inflight数值或外触发工作区间内“一触发一帧、按序、无漏帧”。当前真实 qCMOS 的 qualification 仍为 `None`，所以target exact prepare在arm前明确拒绝；只有virtual deterministic source被放行。旧 `read_frames()/acquire()` array-only consumer仍会在record边界后丢掉metadata；若旧上层继续取latest或累计重发布，软件仍可能形成第二套真相源。近期完成路径不改变冻结bitstream：E0a先用现有系统探索目标 exposure/ROI/readout/触发间距，S1/H1稳定后Q0再用最终adapter、CaptureSession与buffer/drain policy建立可发布的经验性ordered-trigger qualification，并把worst-case outstanding、单帧复制/排空延迟、ring覆盖余量与完整call bound写进同一个envelope；preflight用编译后trigger schedule与该qualification envelope的最小帧间隔+安全余量拒绝过快scan。autonomous与API segmented都只arm一次完整run camera session。autonomous由唯一I/O owner读取现有raw FPGA STATUS/CURSOR证明冻结table logical terminal；API则按R-major/P-fast保存每个独立STATIC_ONCE PulseSession的physical terminal，只有全部R×P cell完成后才terminalize同一个camera capture。两者最终都用一个run级CameraRunEvidence，把expected trigger total与按Q0 reset/rollover语义计算的本session相机产出增量、完整frame/camera stamp/timestamp连续性及exact coverage一次对账。任一不符使整个run INVALID，重跑只能由用户或显式有限RetryPolicy发起。该合同不能像逐沿硬件tag那样定位具体错误，也不能绝对排除漏一帧同时多一帧的等量抵消；这是冻结硬件约束下明确接受的剩余风险，不能在文档中伪装成同等证明强度。
 
 ### 3.6 UI 与 render 所有权不清
 
@@ -458,6 +469,65 @@ neutral_atom 只依赖 `zlc_data`，不依赖 frontend 的任何层。
 | 批更新与 Qt hygiene | `batched_updates/signals_blocked/apply_fluent_scrollbars` | 禁止每个窗口复制 signal blocking/scrollbar QSS |
 
 **Legacy abstraction salvage gate（每个后续W纵切写代码前必过）：** `qt_fluent.py`不是旧树里唯一已经解决DRY的地方。切片必须先列出相关旧模块的等价物、真实consumer、依赖与行为合同，再分三类处理：dependency-closed且presentation-only的实现整体move到`qt_widgets`或对应frontend owner；绑定旧`ParamDecl/Hub/LogicNode`等领域对象的composite随其current Definition/intent纵切解依赖并迁到领域composition owner；确认无current语义且最后consumer已迁走的才删除。禁止current反向import legacy，也禁止跳过审计后凭外形重写一份。已知但仍须按真实consumer逐切片核验的库存包括`frontend/param_widgets.py`的`ParamWidgetHandler` registry（build/read/write/is_empty/refresh）、`RateLimitedApply`、`RefreshProviders`、signal picker helpers，以及旧Pulse/TaskConsole中的领域composite；列名不是原样保留承诺，行为合同与单一owner才是保留对象。
+
+这里的复用有严格优先级：**MOVE旧实现源码 > 从旧源码做最小ADAPT > RETIRE；从空白重新实现是例外，不是默认。** 只要旧实现的依赖可以通过参数/typed snapshot切断，就必须以旧源码为基线搬迁并在review中展示语义差异；不能因为current类型改名、包名不同或想写得“更干净”就平行造一份。只有旧实现把领域authority、全局状态或已废弃语义焊进控制本身，且机械矩阵逐项说明为何无法dependency-close时，才允许保留行为oracle后重写接缝；新实现还必须列出旧源码中每项已挣得行为是保留、强化还是明确退役。过渡期也不得让legacy与current各自长期拥有一套通用handler：能切断依赖的公共实现迁入current owner后，尚未迁走的legacy consumer应直接调用这个owner或留在明确、有删除切片的adapter island；不得用re-export/shim伪装完成搬迁。
+
+这道门必须产生一张随切片提交的机械矩阵，而不是只写“已参考旧实现”：`legacy symbol -> 当前全部consumer -> import/状态依赖 -> 保留的行为合同 -> MOVE/ADAPT/RETIRE -> current owner -> last-consumer删除切片`。只要一个consumer、依赖或删除切片未知，就不能重写或删除。尤其“新窗口已经能显示”不能证明旧composite可删；必须证明它的参数域、动态刷新、commit/rollback、精度、快捷键、生命周期和全部产品面都已有current替代。
+
+首轮库存不是只有基础控件，后续纵切至少要逐项核验以下已挣得结构：Pulse侧的`PulseStateUIManager/PeriodCard/PulseDragContainer/RepeatBracket/ChannelNamesPanel/ChannelPanel`；TaskConsole侧的`MeasurementPanel` form loop、`LogicNodeEditor`的Setting/Edit同源、`AnalysisControls/_FitFixSeedEditor`、grouped signal tree helpers、`PanelConfig + pack/drop_index + _PanelBoard`以及`PanelCard/PanelEditor`的单writer同步；figure侧的`BaseLivePlot/GridPlot/GridCell`增量artist与grid focus、`selectors.py`的ROI/cross/zoom/disconnect、`DataFigure/SavedFigure`交互与重放、`calibration_report.py`的site histogram/PSF/site-map布局、`figure_viewer.py`的artifact浏览壳，以及DeviceManager的统一handler/readback/限流。这个清单是salvage入口，不是要求整类照搬：纯presentation或纯layout算法优先MOVE；携带旧Hub、LogicNode、mutable config、raw hardware或旧artifact状态的类必须拆出已验证的view/interaction算法，再接到current typed owner与EditorSession。每个未来monitor/rolling/calibration/fit/selector窗口在写新widget前都要先给这张库存追加真实consumer和裁决，不能等窗口写完再做“复用清理”。
+
+**W-UI1声明式表单抢救是后续窗口按consumer分段通过的硬前置，不是末尾清理，也不是一次预造旧全集。** W-UI0只完成Fluent primitive、style、render与window lifecycle owner；它没有完成旧树早已存在的“字段声明 -> 单一handler registry -> Setting/Edit共用”机制。W-UI1a先交付W3已经消费的static scalar/typed choice/exact populate；W-UI1b必须在monitor/Measurement/Processor出现动态stream/device选项前交付typed option snapshot + revision + stale-draft拒绝；W-UI1c必须在DeviceManager或明确live-control出现前原源码迁入`RateLimitedApply`与teardown flush。某一段没有真实current consumer时不得为“完整”提前搬JSON、Hub expression或万能schema，但对应产品纵切也不得先写一份临时控件绕过门。
+
+旧`frontend/param_widgets.py`中已经由多个真consumer挣得的通用内核必须以现有源码和行为oracle为迁移输入：`ParamWidgetHandler`的`build/read/write/is_empty/refresh`五操作封闭合同、统一change wiring、no-`eval` coercion、label/unit/required组合、choice/path/scalar读写、selection-preserving refresh、exception-safe signal blocking，以及`RateLimitedApply`的per-key leading+trailing与teardown flush。current为了保证full-state populate真正原子，在这五项上只允许增加一个公开且abstract的`normalize(field,value)`预变更操作；所有字段先normalize成功才可开始写Qt，不能把它藏成可忘记override的私有helper。禁止在W窗口里重新建立按字段类型分支、独立number parser、第二套populate/reset或逐字段Setting/Edit接线。
+
+终态数据流固定为：
+
+```text
+typed Request/Config schema owner
+  （唯一拥有value type/default/unit/range/required/static choices/description）
+        |
+        | Workbench中的use-case显式projector；普通import，不按schema-id动态dispatch
+        v
+zlc_frontend.form.FormSpec / FormFieldProps
+  （headless、immutable、仅presentation projection；增加label/group/order/widget hint）
+        |
+        v
+zlc_frontend.qt_widgets.FluentParameterForm + closed handler mapping
+  （build/read/write/is_empty/refresh/full-state populate；不Apply、不持有领域对象）
+        |
+        | keyed draft values
+        v
+Workbench EditorSession -> typed Request/Intent constructor -> owner validator
+  -> base_revision检查 -> atomic Apply
+```
+
+这里以§10的轻量Definition规则为准：`TaskDefinition/MeasurementDefinition/StreamProcessorDefinition`只保存catalog identity与`request/config_schema_id`等稳定身份，不复制字段默认值或GUI schema。字段语义在对应typed Request/Config owner旁边有且只有一份声明；Workbench通过显式owner函数取得并投影，不能凭dataclass signature/AST反射，也不能把schema-id变成service locator。`FormSpec`是一次界面投影，不持久化、不参与artifact/config fingerprint、不成为第二validator；projector必须机械证明key全集、默认值、range和choices与owner声明逐项相等。
+
+旧`ParamDecl`本身不作为跨包终态公共基类，因为它混合了领域语义、`display/segmented/path dialog/depends_on`等presentation选择，以及`$device:`、全局Hub signal、`signal_expr`、旧`pulse_slots`等legacy专用种类。复用按下表裁决：
+
+| 旧能力 | 处理 | current边界 |
+|---|---|---|
+| scalar `Float/Int/Bool/Choice/Text/Json` handler、五操作ABC、统一wiring/form loop | MOVE/ADAPT，尽量保留既有实现 | current formal数值默认non-quantizing；非法populate必须fail-closed，不能沿用“异常就忽略” |
+| `PathHandler` | ADAPT | 复用`FluentPathEdit`，但资源解析、base dir与filter由Workbench注入；Qt owner不导入旧`_paths` |
+| `RateLimitedApply` | MOVE，按真实consumer使用 | 只用于preview/display或明确的live-control presenter；正式Task/Scan/fit authority仍经draft+Apply，绝不把它当硬件时序或Run提交 |
+| `RefreshProviders`/signal tree交互 | ADAPT到immutable typed option snapshot+revision | 未来由Workbench把`StreamId/generation/schema/label`投影成choice；不恢复全局Hub裸字符串authority |
+| `AxisRangeHandler` | 暂留legacy island，出现current同义consumer再迁 | Formal scan继续使用具名`ScanPointTable`，不得退回匿名`(min,max,points)` |
+| `DeviceRefHandler`/`$device:` | RETIRE | current设备选择只经typed `DeviceBindingResolver`/role projection，GUI不保存DeviceRef或service locator |
+| `SignalExprHandler/_SignalExprWidget` | 不进入formal current y | monitor/display若有真实需求另做typed presenter；scan/fit/存档禁止任意全局Hub表达式 |
+| `PulseSlotsHandler/_PulseSlotsWidget` | 不再是generic param kind | PulseDocument、W2 Scan/API authoring与W3 program presenter各自使用current owner contract |
+| `MeasurementPanel/PanelCard/PanelEditor/AnalysisControls` | 类不整体搬；提取已验证的form loop/state合同 | 领域Run/Hub依赖留在相应纵切；fit/selector分别适配current `FitSpec/Selection` |
+
+迁移期间为了不复制实现，通用handler内核只允许有一个current owner；尚有真实consumer的legacy专用handler可留在明确的legacy adapter island并依赖该内核，但不得从旧路径re-export形成shim。最后consumer迁走时连adapter island与旧symbol一起物理删除。`zlc_frontend.form`和`qt_widgets`都不得导入neutral/workbench/旧`Zou_lab_control`；Workbench作为唯一双向composition层完成投影。
+
+`FluentParameterForm`只是一层薄的字段集合：按有序`FormSpec`构造现有`FluentSettingRow`，保存`key -> (handler, widget)`，提供exact-key `read_all/write_all/is_empty/refresh`和原子、signal-blocked的full-state populate。它不拥有section workflow、visibility状态机、EditorSession、RunHandle、repository、Definition、artifact或硬件写，也不递归解释任意nested schema。Pulse editor、PulseDocument/API segment table、CalibrationArtifactRef、DataTransform、ROI/selector、fit axis/batch/reduction、device connection、resource conflict和安全确认继续由显式presenter组合；不得为了提高“自动生成率”把它们塞进JSON schema或万能widget plugin。
+
+“显式table/grid presenter”只豁免行列结构、增删、selection与整表commit，不豁免普通叶值。W2 Pulse scan/API table、W3 segmented API table以及form的`number` kind必须共同调用`zlc_frontend.form.parse_number_text`，保留作者输入的`int | float`类型并统一拒绝表达式、NaN与Infinity；不得各自`float(text)`或复制regex。类似地，未来日期、unit value或StreamId一旦有第二个table/form consumer，应抽叶coercion/delegate，而不是抽generic table framework。
+
+W1没有request editor，不强套表单；W2的period/DAC/delay/repeat/scan-table是显式Pulse presenter，只在单字段行为相同时取handler，duration/delay保持non-quantizing；W3保留一个scan-specific `ScanIntentForm`、两个surface实例和同一个card-owned `ScanEditorSession`，但role、budget、deadline、普通choice/text以及PulseDocument动态API常量必须经同一FormSpec/handler路径。Pulse load/mode、segmented table、calibration ref、authoritative transform和SITE axis/display presenter继续显式。Setting/Edit两实例必须消费同一个FormSpec，populate覆盖全部exact keys（包括disabled/hidden），并从同一committed snapshot回填；不能只因复用了同一个Python类就宣称DRY完成。
+
+W1/W2/W3及后续所有current Workbench只能消费current owner：基础Qt行为来自`zlc_frontend.qt_widgets`，字段语义来自typed Request/Config owner，标量叶coercion/handler来自`zlc_frontend.form`与`FluentParameterForm`。legacy adapter只服务尚未迁走且已登记删除切片的旧consumer，不能被current窗口导入；一旦某个current窗口又出现本地scalar parser、默认值/range/choice副本、第二套Setting/Edit wiring或从legacy路径取件，该纵切即未通过复用门，不能以“UI已经可用”宣称闭包。
+
+W-UI1a机械ratchet至少验证：每个closed scalar kind恰有一个完整`normalize/build/read/write/is_empty/refresh` handler；每个owner auto-field恰好投影一次，未知/遗漏/重复key失败；Setting/Edit字段key集合一致且刷新不触发Apply；typed value、required、bounds、static choices、unit与非量化float round-trip；current W form和table cell对已覆盖kind不存在独立parser/default/range/choice literal；`qt_widgets`无neutral/workbench/legacy import。W-UI1b另加：option snapshot带owner revision/generation，仍合法选择被保留，已失效的committed值可见但不可提交，旧revision draft明确stale而不是静默选first。W-UI1c另加per-key leading+trailing与close/Apply flush。旧通用scalar handler在过渡期只能是调用current内核的有删除切片adapter，不能长期保留第二套实现。复杂显式presenter要逐项登记豁免原因，不能用“custom UI”一句话逃过审查。
 
 复用顺序是硬约束：
 
@@ -1843,28 +1913,13 @@ baseline 的 `LiveFigureBinding.resolve(DatasetRevisionRef, SnapshotQuery) -> Ow
 
 ### 12.3 Setting 与 Edit
 
-统一的是：
+统一的是四条互不混名的边界，而不是一个万能SettingsEngine：typed Request/Config owner的字段语义、§4.3.1的headless FormSpec与closed Qt handler、Workbench EditorSession的`base_revision + draft/apply/cancel`、以及最终领域validator/typed command。普通scalar、bool、enum、bounded number、unit value、简单path和静态list可由FormSpec自动生成；Setting与Edit必须消费同一个FormSpec和同一个committed state，但拥有各自widget instance与开始编辑时的base revision。
 
-- EditorSession；
-- base_revision + draft/apply/cancel；
-- validator；
-- 基础控件；
-- typed command。
+Definition只标识catalog项及其request/config schema identity；它不复制字段默认值，也不携带FormSpec、Qt hint或projector callback。字段的type、required、default、unit、range、static choices和semantic description属于typed Request/Config schema owner。Workbench为已知use case通过普通import调用明确的schema projector，把这些事实逐项投影成`zlc_frontend.form.FormSpec`，并只在这里增加group/order/label/widget/layout/file-dialog/dynamic-enable等presentation信息。frontend不认识Definition，领域包也不导入frontend；schema-id不用于动态查找builder。
 
-普通 scalar、bool、enum、bounded number、unit value、简单 path/list 可以 schema-driven 自动生成。
+以下继续使用显式presenter/view，不强行自动生成：Pulse editor与PulseDocument/API table、ROI/selector、fit axis/batch/reduction、CalibrationArtifactRef与calibration workflow、device connection、authoritative DataTransform、resource conflict和安全确认。显式presenter内部的普通叶字段仍优先取公共handler，但复杂对象的commit、rollback、validation和lifecycle不能交给generic form。`FluentParameterForm`不递归、不持久化、不做domain validation，也不拥有Apply按钮。
 
-以下使用显式 presenter/view，不强行自动生成：
-
-- Pulse editor；
-- ROI/selector；
-- fit axis/batch/reduction；
-- calibration workflow；
-- device connection；
-- resource conflict 和安全确认。
-
-领域 Definition 只拥有 type、required、default、unit、range、choices 和 semantic description。group/order/widget/layout/file-dialog/dynamic-enable 属于 workbench/frontend。
-
-Apply 时必须同时通过领域 request validator 与 `base_revision == current_revision` 检查；后台或其它 editor 已更新配置时返回 typed EditConflict，不能 last-write-wins。Cancel 只丢弃 draft。UI 的 enable/disable 是提示，RunPlan.bind/preflight 仍执行同一个权威 validator，不能信任界面已经挡住非法输入。
+Apply必须先由field handler无损读出完整draft，再构造typed Request/Intent并通过领域validator，最后检查`base_revision == current_revision`后原子提交；后台或其它editor已更新配置时返回typed EditConflict，不能last-write-wins。Cancel只丢弃draft并从当前exact snapshot做full-state回填。UI的enable/disable只是提示，hidden/disabled字段仍必须在populate/reset中被覆盖；RunPlan.bind/preflight继续执行同一个权威validator，不能信任界面已经挡住非法输入。refresh或programmatic populate必须exception-safe block signals，既不能重新触发Apply，也不能吞掉非法saved value后保留旧widget状态。
 
 axis 编辑器读取 ViewSuggestion，并只从其中的 ViewSpec 派生 display/x/sample/batch/select/reduce/facet 摘要，不让 image、rolling、histogram 和 fit 各自实现一套 shape 猜测。`RESOLVED` 建议无需弹窗；`REVIEW_REQUIRED` 在 panel 摘要中持续突出有损步骤；`NEEDS_INPUT` 才展开最小必要编辑器。
 
@@ -2153,7 +2208,7 @@ LiveSweepMonitor     非权威、可跳帧、只用于显示
 
 它们不是 fallback 或兼容双轨，而是两个不同 use case。LiveSweepMonitor 不能保存为成功 ScanArtifact。
 
-PulseScan 的精密时序由冻结bitstream上的FPGA scan engine与qCMOS外触发硬件执行；host只在run前冻结配置/计划并在run后验证。当前近期qCMOS autonomous baseline使用唯一I/O owner读取的现有FPGA raw STATUS/final CURSOR、build fingerprint和qCMOS sensor/capture counter、framestamp/camerastamp/timestamp；API segmented则逐段使用PreparedProgramRef+compiled segment schedule+stable raw DONE/STATUS，CURSOR=N/A。两者都不假定逐沿counter、delay-idle或PHYSICAL_DONE。当前RTL的logical DONE可能早于内部delay scheduler排空，CURSOR也不可见该队列，因此mode-specific raw readback只证明对应logical table/segment terminal；host随后按CompiledPulseArtifact给出的最大物理output-tail bound与H1真机验证余量做保守monotonic wait。该wait发生在硬件已经决定并执行全部edge之后，只防止过早关闭camera，不选择、移动或调度任何pulse edge，不能被宣传成硬件tail-idle receipt。Q0 qualification中的camera drain bound再作为其后的末端等待上界，并必须与硬件counter/metadata对账共同使用。
+PulseScan 的精密时序由冻结bitstream上的FPGA scan engine与qCMOS外触发硬件执行。正常qCMOS autonomous baseline由host在run前冻结完整配置/计划并在一次FIRE后只做排空与末端验证；API segmented是唯一例外，host在显式segment boundary选择下一个已冻结API point，但每个`STATIC_ONCE` segment内部的全部edge仍由硬件决定。两种模式都为整run建立一次camera arm/exact capture transaction。autonomous保存一个完整table pulse terminal；API保存R-major/P-fast的R×P个独立、session-id唯一的physical pulse terminal，再在全部segment完成后形成唯一aggregate CameraRunEvidence/EndAttestation。两者都不假定逐沿counter、delay-idle或PHYSICAL_DONE，也不为API伪造per-segment camera terminal。当前RTL的logical DONE可能早于内部delay scheduler排空，CURSOR也不可见该队列，因此raw readback必须经H1定义的mode-specific terminal recipe提升为pulse terminal；任何保守monotonic tail wait都只防止过早进入下一API segment或关闭camera，不选择、移动或调度segment内部的pulse edge，不能被宣传成硬件tail-idle receipt。Q0 qualification中的camera drain bound只在整run末端用于aggregate camera terminal，并必须与完整counter/metadata对账共同使用。
 
 ### 14.2 Request 与 ScanPlan
 
@@ -2179,8 +2234,9 @@ ScanPlan:
   resolved ScanOutputContract
   execution_mode = AUTONOMOUS_RESIDENT | AUTONOMOUS_REFILLED |
                    API_SLOT_SEGMENTED_EXISTING
-  terminal_evidence_contract = AutonomousTableTerminalContract |
-                               SegmentedProgramTerminalContract
+  pulse_evidence_contract = AutonomousTableTerminalContract |
+                            ApiSegmentedPulseEvidenceContract
+  camera_evidence_contract = one run-level CameraRunEvidenceContract
   required_association_proof = ORDERED_END_ATTESTED_RUN
   formal_requirements digest
   total event/byte/cardinality budgets
@@ -2188,7 +2244,7 @@ ScanPlan:
 
 `BoundSourceAssociationContract`逐source冻结`source_id`、expected input/output keys与grouping、qualification或capability ref、terminal recipe id/version、required proof class和source-specific budget；它不是插件registry，也不把qCMOS字段强塞给其它Measurement。scan owner 的具名 builder 以静态 TaskDefinition key、typed request和bindings构造`RunPlan[ScanArtifactRef]`，完成纯 request/port/claim 绑定；preflight 在正确 I/O lanes 解析硬件 capability、schema、counter mode、compiled pulse compatibility 与全部预算，返回领域私有的 ScanPlan 作为该RunPlan的prepared value。ScanPlan 一旦生成不可被 GUI/ControlTopic 修改，也不包含 child RunPlan。
 
-point_axes/PointLayout 决定 logical cell 顺序，trigger schedule 明确每个 ScanCellKey 期望的 TriggerKeys。`slot_binding` 是用户/模板的参数语义；`execution_mode` 只描述物理装载/执行方式。`AUTONOMOUS_RESIDENT`和`AUTONOMOUS_REFILLED`共同属于现有bitstream的`AUTONOMOUS_STREAMED`方式族：SCAN_SLOT/MOT 的**完整逻辑 finite table**必须在fire前冻结、编译并digest，FPGA在一次fire后自主决定微观时序。resident模式在fire前上传全部物理table；只有显式通过§15.4强证明的refilled capability才预装初始banks并在运行中按已冻结table的immutable chunks补充，host不得选择下一point或调度edge。只有 selected=API_SLOT 且 adapter明确证明该 API值无法在一次自主 sweep中更新时，才允许既有 `API_SLOT_SEGMENTED_EXISTING` 路径；它不能反向成为 SCAN_SLOT fallback。任一数量、slot、所需source qualification/capability、schema或 output contract无法在 fire前解析，preflight失败且不 arm。类型模型允许未来多个source-specific合同，但近期S4 Formal enablement只开放**恰好一个Q0-qualified qCMOS physical source**；多physical source或非camera source在其association/terminal contract、contract kit和真实用例完成前typed NO-GO，不能借source-neutral接口自动获得Formal资格。
+point_axes/PointLayout 决定 logical cell 顺序，trigger schedule 明确每个 ScanCellKey 期望的 TriggerKeys。`slot_binding` 是用户/模板的参数语义；`execution_mode` 只描述物理装载/执行方式。`AUTONOMOUS_RESIDENT`和`AUTONOMOUS_REFILLED`共同属于现有bitstream的`AUTONOMOUS_STREAMED`方式族：SCAN_SLOT/MOT 的**完整逻辑 finite table**必须在fire前冻结、编译并digest，FPGA在一次fire后自主决定微观时序。resident模式在fire前上传全部物理table；只有显式通过§15.4强证明的refilled capability才预装初始banks并在运行中按已冻结table的immutable chunks补充，host不得选择下一point或调度edge。只有 selected=API_SLOT 且 adapter明确证明该 API值无法在一次自主 sweep中更新时，才允许既有 `API_SLOT_SEGMENTED_EXISTING` 路径；它在preflight先冻结P个唯一point document/STATIC_ONCE artifact、R×P的R-major/P-fast cell schedule和整runcamera frame budget，只在显式host boundary按该冻结顺序执行，不能反向成为 SCAN_SLOT fallback。任一数量、slot、所需source qualification/capability、schema或 output contract无法在第一次arm前解析，preflight失败且不 arm；R×P control/terminal memory也必须在解析或编译P个point前先准入，不能先构造R×P份document/artifact再事后检查。类型模型允许未来多个source-specific合同，但近期S4 Formal enablement只开放**恰好一个Q0-qualified qCMOS physical source**；多physical source或非camera source在其association/terminal contract、contract kit和真实用例完成前typed NO-GO，不能借source-neutral接口自动获得Formal资格。
 
 `execution_mode`不包含`FORMAL`或`END_ATTESTED`字样，因为装载方式本身不能授予权威资格。ScanPlan中的`required_association_proof`只是本run必须达到的目标等级，不是已获得证明；PROVISIONAL epoch、UI草稿和中间dataset不得把它显示或序列化为achieved。只有EndAttestation成功后，immutable EpochValidationRecord才写入`achieved_association_proof=ORDERED_END_ATTESTED_RUN`。Formal eligibility 由FIRE线性化点有效的Q0 qualification authorization、achieved proof、exact pipeline合同、authority transform与本run成功EndAttestation共同决定；ScanArtifact逐项保存这些事实和最终eligibility record，不能压成一个mode字符串。
 
@@ -2287,14 +2343,14 @@ AutonomousTableTerminalEvidence:
   H1 read-recipe revision
   stable raw STATUS + final CURSOR
 
-SegmentTerminalEvidence:
-  segment id + PreparedProgramRef + compiled segment schedule digest
-  H1 segment read-recipe revision
-  stable raw DONE/STATUS
-  cursor = N/A                     # 不伪造scan table cursor
+ApiSegmentEvidence:
+  repeat_index + point_storage_index
+  point-indexed compiled STATIC_ONCE artifact + one-trigger schedule digest
+  unique PulseSession/PulseTerminalAck lineage
+  H1 physical-terminal recipe result（若底层raw事实为DONE/STATUS则CURSOR=N/A）
 ```
 
-`AUTONOMOUS_RESIDENT/AUTONOMOUS_REFILLED`只接受前者；`API_SLOT_SEGMENTED_EXISTING`每段只接受后者，aggregate EndAttestation再验证有序segment集合、TriggerKey/count coverage、settle/re-equilibration evidence和lineage。两者都只消费现有寄存器/transport事实，不新增RTL；`scan_progress()`镜像、缺失字段的默认值或人为构造的cursor都不能成为terminal evidence。
+`AUTONOMOUS_RESIDENT/AUTONOMOUS_REFILLED`只接受前者；`API_SLOT_SEGMENTED_EXISTING`接受恰好R×P个后者，并要求它们按R-major/P-fast完整覆盖cell schedule、pulse terminal session id互异、同一point跨repeat复用同一compiled artifact identity。两者都只消费现有寄存器/transport事实，不新增RTL；`scan_progress()`镜像、缺失字段的默认值或人为构造的cursor都不能成为terminal evidence。`ApiSegmentEvidence`只证明对应有限pulse session物理终止，不是camera terminal。整个API run另有且只有一个`CameraRunEvidence`，它绑定整run唯一arm spec、source schema/schedule digest、R×P event span和aggregate `CaptureTerminalAck`；只有run级EndAttestation验证二者完全一致后才可VALID。
 
 近期 baseline 的关联模式是 `ORDERED_END_ATTESTED_RUN`，不是逐 cell handshake，也不要求逐沿 FPGA tag：
 
@@ -2338,11 +2394,13 @@ Autonomous Run
   所有数据在末端验证前均为 PROVISIONAL
 
 EndAttestation
-  single I/O owner按ScanPlan选择并验证mode-specific terminal evidence：
-    autonomous table = raw STATUS + final CURSOR；API segment = stable raw DONE/STATUS、CURSOR=N/A
-  terminal evidence无歧义证明对应完整run/segment schedule完成，且
-  expected_trigger_total_from_completed_schedule == camera_produced_delta
+  single I/O owner按ScanPlan选择并验证mode-specific pulse evidence：
+    autonomous table = 一个完整table terminal；
+    API segmented = R-major/P-fast的R×P个独立STATIC_ONCE physical pulse terminal
+  pulse evidence无歧义证明对应完整run schedule完成，且
+  expected_trigger_total_from_completed_schedule == run级camera_produced_delta
   frame/camera stamp按Q0语义连续，timestamp间隔在Q0容差内
+  唯一CameraRunEvidence证明一次arm、aggregate stop/drain/no-more-frames/join，且
   每个BoundSourceAssociationContract的terminal recipe、DatasetBuilder/processor/EOS coverage完整
   任一不符 -> 本 attempt 整体 INVALID并丢弃；是否重跑只由用户或显式有限RetryPolicy决定；全部通过才提交
 ```
@@ -2361,13 +2419,13 @@ qualification authority与camera运行入口必须加入同一个installation au
 
 历史加载验证artifact保存的`QualificationFireAuthorization`在该run的FIRE linearization point是否有效，而不是要求该qualification今天仍ACTIVE。revocation record的`effective_scope`必须明确为`FUTURE_ONLY | FROM_FIRE_SEQUENCE | ALL_USES_OF_REVISION`：普通现场违例通常从incident run起生效，之前artifact保持“当时有效、后来撤销”的provenance；若发现qualification证据本身无效，可显式追溯覆盖整个revision，旧artifact仍可读取但不再具备authority eligibility。不能用当前index状态无差别洗白或否定全部历史结果。
 
-当前baseline不定义`emitted_total`字段，artifact/UI使用`expected_trigger_total_from_completed_schedule`。自主table模式只有唯一I/O owner按H1冻结的读序/稳定规则直接读取现有raw `STATUS/CURSOR`并无歧义证明完整table到达正常terminal时，才可由compiled schedule的有效camera-trigger数得到；API segmented每段则必须用`SegmentTerminalEvidence`的PreparedProgramRef、compiled segment schedule与stable raw DONE/STATUS证明本段完成，CURSOR明确N/A，再由该段schedule推导。当前高层`scan_progress()`及其后台轮询维护的`_scan_point/_scan_sweep`只是UI诊断镜像，Formal EndAttestation禁止消费；它可能滞后、漏掉最后跃迁，也不能替代原始寄存器证据。`expected_trigger_total_from_completed_schedule`是“对应run/segment完整schedule已完成”条件下的推导值，不是逐沿硬件实测counter；任何early stop、raw状态组合歧义、自主模式cursor未达终点、segment DONE不稳定或transport error都使EndAttestation失败。
+当前baseline不定义`emitted_total`字段，artifact/UI使用`expected_trigger_total_from_completed_schedule`。自主table模式只有唯一I/O owner按H1冻结的读序/稳定规则取得无歧义的完整table physical terminal时，才可由compiled schedule的有效camera-trigger数得到；API segmented则必须由R-major/P-fast的完整R×P个`ApiSegmentEvidence`证明每个STATIC_ONCE pulse session均取得独立physical terminal，再把每cell one-trigger schedule求和。当前高层`scan_progress()`及其后台轮询维护的`_scan_point/_scan_sweep`只是UI诊断镜像，Formal EndAttestation禁止消费；它可能滞后、漏掉最后跃迁，也不能替代原始寄存器证据。`expected_trigger_total_from_completed_schedule`是“整个run的全部pulse schedule已完成”条件下的推导值，不是逐沿硬件实测counter；任何early stop、raw状态组合歧义、自主模式cursor未达终点、API cell terminal缺失/重复、session id复用、顺序不完整或transport error都使EndAttestation失败。
 
 raw terminal也不能证明内部delay scheduler已经排空。`CompiledPulseArtifact`必须根据冻结channel delay、最后有效edge与当前RTL tick/quantization语义给出`max_physical_output_tail_after_logical_done`；H1 contract kit用golden/xsim/真机观测验证该上界及safe/abort变体，并给出保守余量。唯一I/O owner在观察到mode-specific raw logical terminal/safe ack后记录monotonic起点，camera与dedicated drain保持运行，直到`elapsed >= compiled_tail_bound + h1_margin`才生成`PostTerminalTailEvidence(compiled_digest, h1_contract_revision, programmed_image_deployment_revision, terminal_evidence, required_bound, elapsed)`。该evidence只证明host在对应installation deployment/H1上界之后才继续termination，不是当前硬件不存在的tail-idle receipt或runtime bitstream content attestation；monotonic wait可以保守超时，不能提前返回，也不能用于安排实验edge。用户cancel只能把run置为INVALID，不能取消这段cleanup wait；bound/deployment revision缺失、版本不匹配、进程/transport/时钟异常导致tail recipe无法完成时，Formal epoch INVALID且设备claim保持到quarantine/recovery裁决。
 
 `camera_produced_delta`也不是累计counter的裸绝对值，而是adapter按Q0冻结的位宽、signedness、modulus、reset epoch与rollover语义，从`cap_start`/arm-ready后且FIRE前建立的`session_counter_baseline`到terminal drain后的最终counter计算出的本session增量；禁止跨`cap_start` reset epoch使用`pre_arm_residual_observation`的绝对值。per-frame `framestamp/camerastamp`逐帧验证modular successor并做唯一可逆的unwrap；`nFrameCount`来自`cap_transferinfo()`累计快照，只按Q0语义验证session baseline/final delta，可选中间快照只要求modular monotonic并允许batch jump，不能错误要求每个交付frame对应counter恰好+1。预期范围、完整per-frame metadata序列和起止值必须使wrap次数唯一；若stamp只在首帧出现，则首帧必须满足Q0定义的initial/successor rule。最终counter delta还必须与本session实际保留的frame metadata条数和首末stamp关系交叉一致；任何多解、未声明reset、stamp duplicate/gap、counter倒退、rollover歧义或delta/metadata不符都使epoch INVALID。timestamp检查按Q0实测的“相机timestamp事件定义 + 非均匀trigger schedule + readout容差”比较，不能简单要求固定间隔或拿host wall clock替代。
 
-对 SCAN_SLOT/MOT，`HOST_STEPPED_GROUP`、逐 cell arm/fire/wait、single-cell fire gate、per-cell `PHYSICAL_DONE` receipt 均不属于 baseline，也不能作为 qCMOS 首光、容量或证明 fallback。SCAN_SLOT/MOT 必须使用现有 FPGA 的完整逻辑table自主执行：近期无缝装载方式baseline为`AUTONOMOUS_RESIDENT`全量预装，`AUTONOMOUS_REFILLED`只有经§15.4强证明后才可成为条件execution capability。唯一非自主例外是既有adapter确实不能在一次自主sweep中更新API值时的`API_SLOT_SEGMENTED_EXISTING`；它必须按host point/segment execution如实记录、逐段attest，不能称为autonomous。Formal eligibility仍由Q0、exact链、association proof与EndAttestation联合决定。架构不得为了获得逐cell证明而要求新bitstream。
+对 SCAN_SLOT/MOT，`HOST_STEPPED_GROUP`、逐 cell arm/fire/wait、single-cell fire gate、per-cell `PHYSICAL_DONE` receipt 均不属于 baseline，也不能作为 qCMOS 首光、容量或证明 fallback。SCAN_SLOT/MOT 必须使用现有 FPGA 的完整逻辑table自主执行：近期无缝装载方式baseline为`AUTONOMOUS_RESIDENT`全量预装，`AUTONOMOUS_REFILLED`只有经§15.4强证明后才可成为条件execution capability。唯一非自主例外是既有adapter确实不能在一次自主sweep中更新API值时的`API_SLOT_SEGMENTED_EXISTING`；它必须以execution mode、canonical rationale与冻结cell schedule如实表明显式host boundary，且每cell只等待pulse physical terminal与同一armed camera transaction中的下一个exact event，不能称为autonomous，也不能泛化成可供SCAN_SLOT复用的host-stepped mode。Formal eligibility仍由Q0、exact链、association proof与整runaggregate EndAttestation联合决定。架构不得为了获得逐cell证明而要求新bitstream。
 
 `AUTONOMOUS_STREAMED` 是当前冻结bitstream的正式执行方式族，`AUTONOMOUS_RESIDENT`是不依赖下述增强的近期装载方式baseline；refilled的条件门见§15.4。只有 E0a/Q0 在批准工作余量内、正确camera配置和充分软件reservation下仍实测发现丢帧/乱序，且已经证明camera设置、软件保留/排空策略、降低trigger rate与扩大margin均不能修正；或发现现有 RTL 真 bug/与既定设计不符时，才可提出证据驱动的 bitstream变更。仅仅metadata语义不清、样本量不足、一次未归因异常或无法建立qualification时，结果是不开启Formal capability，不构成硬件修改授权。届时可选增强之一是在真正 camera-trigger输出沿记录：
 
@@ -2388,13 +2446,13 @@ HardwareTriggerStamp:
 
 每个run的camera start boundary也是关联合同的一部分：adapter必须在arm前排空/拒绝旧software pending与driver residual并保存`pre_arm_residual_observation`；随后在`cap_start`/arm-ready后、FIRE前按Q0 reset epoch建立`session_counter_baseline`。若counter或stamp只在首帧存在，Q0必须定义implicit initial、first-snapshot与first-frame successor rule，否则该工作点不具备Formal capability。必须证明arm本身是否可能产生frame，禁止跨cap_start reset把旧epoch绝对值带入delta。任何未声明的pre-fire frame、reset epoch不符、首帧不满足规则或stop后late frame都使整个epoch INVALID；不能只依赖“最终总数恰好相等”来掩盖开头混入旧帧、末尾少一帧的错位。
 
-ScanArtifact 的 provenance manifest 分别保存 `execution_mode`（`AUTONOMOUS_RESIDENT`/`AUTONOMOUS_REFILLED`/`API_SLOT_SEGMENTED_EXISTING`）、EpochValidationRecord的`achieved_association_proof=ORDERED_END_ATTESTED_RUN`、ProgrammedImageDeploymentRecordRef revision/digest、全部BoundSourceAssociationContracts及其qualification/capability refs、formal eligibility record、冻结source settings readback、compiled trigger schedule/tail-bound digest、mode-specific terminal evidence与H1稳定读规则版本、完整`PostTerminalTailEvidence`、`expected_trigger_total_from_completed_schedule`、camera pre-arm observation、session baseline/final、counter/stamp width/signedness/modulus/reset/rollover语义与`camera_produced_delta`、完整 frame/camera stamp与timestamp range/digest、frame-index -> TriggerKey mapping digest，以及 end-attestation结果。autonomous mode保存单个run级`QualificationFireAuthorization`与`AutonomousTableTerminalEvidence`；API segmented保存有序`segment_authorizations[]`、每段settings/TriggerKeys/`SegmentTerminalEvidence`/EndAttestation和aggregate attestation。加载时这些记录与ScanPlan的required proof、TriggerKey coverage、deployment revision和revocation effective scope一起验证；不能只保存 `mode="ordered"`、计划要求值或一个混合Formal资格的执行字符串。
+ScanArtifact 的 provenance manifest 分别保存 `execution_mode`（`AUTONOMOUS_RESIDENT`/`AUTONOMOUS_REFILLED`/`API_SLOT_SEGMENTED_EXISTING`）、EpochValidationRecord的`achieved_association_proof=ORDERED_END_ATTESTED_RUN`、ProgrammedImageDeploymentRecordRef revision/digest、全部BoundSourceAssociationContracts及其qualification/capability refs、formal eligibility record、冻结source settings readback、compiled trigger schedule/tail-bound digest、mode-specific pulse evidence与H1 terminal recipe版本、`expected_trigger_total_from_completed_schedule`、camera pre-arm observation、session baseline/final、counter/stamp width/signedness/modulus/reset/rollover语义与`camera_produced_delta`、owner-minted ordered-metadata digest、source event span、source schedule/frame-index -> TriggerKey mapping digest，以及aggregate end-attestation结果。逐帧metadata与frame payload仍由source DatasetArtifact拥有，ScanArtifact不复制第二份列表。两种模式都只保存一个绑定整run唯一arm spec、source event span、schedule digest与aggregate CaptureTerminalAck的`CameraRunEvidence`。autonomous mode另保存单个run级`QualificationFireAuthorization`与`AutonomousTableTerminalEvidence`；API segmented保存同一个run级camera authorization、canonical `segmentation_rationale`、P个point-indexed compiled artifact identities、R-major/P-fast的R×P个`ApiSegmentEvidence`；execution mode+rationale+有序evidence已经显式表达host boundary，不另存逐boundary时刻，也不保存逐segment camera authorization、camera settings副本、camera EndAttestation或伪造的camera terminal。加载时这些记录与ScanPlan的required proof、TriggerKey coverage、deployment revision和revocation effective scope一起验证；不能只保存 `mode="ordered"`、计划要求值或一个混合Formal资格的执行字符串。
 
 `AUTONOMOUS_RESIDENT/AUTONOMOUS_REFILLED`的正常运行闭环是：camera一次arm整个session并冻结expected total（driver ring仍只按max-inflight定容）-> 等待Q0声明的arm-ready/status ack并验证first-edge margin -> 建立本session counter baseline/first-frame rule -> FPGA一次fire完整逻辑scan table -> exact queue按序保存所有frame+metadata -> 唯一I/O owner读取raw FPGA terminal/cursor并按H1规则确认完整logical table terminal -> **camera仍保持capturing且dedicated drain继续运行**，从观察terminal的monotonic起点完整等待CompiledPulseArtifact/H1给出的保守physical output-tail bound并生成`PostTerminalTailEvidence` -> 再持续到expected metadata齐全并经历Q0-qualified terminal quiet-window -> 冻结final counter/stamps -> `cap_stop` -> 复核capture/transfer状态稳定 -> 最后才release driver buffer -> 完成processor/DatasetBuilder最终EOS -> 执行EndAttestation -> VALID后才commit。raw STATUS/CURSOR自身不证明delayed-output tail settle；这里“停止/disable trigger”只指logical engine已经terminal/safe并且后续tail recipe完成，绝不指在drain前调用camera `cap_stop/disarm`。现有`_disarm()`中`cap_stop`后立即`buf_release`的路径不能复用于Formal CaptureSession termination。H1 output-tail bound和Q0 camera tail latency/drain deadline/quiet-window都是经contract/qualification获得的有限运行合同，不伪装成数学上的逐沿no-more-frame证明，§14.5声明的剩余风险仍然存在。abort路径先用现有abort/safe阻止新logical edge入队，再按H1 safe/abort tail bound保持camera capturing并drain，随后才final metadata -> cap_stop -> stable check -> release；无法确认logical terminal、tail evidence或camera终态时整run INVALID并quarantine。
 
-API segmented不使用上述“一次arm/一次FIRE”描述，而按§14.7逐segment执行相同边界与末端验证。未验证前每个Envelope携带run-scoped provenance_epoch_id且formal sink只暂存；任一count、stamp、timestamp、coverage、timeout或hardware error不符使整个epoch INVALID并丢弃，不能提交前半段。
+API segmented不使用上述“一次FIRE完整table”描述，但**仍使用一次arm完整camera run**。它按§14.7逐cell执行独立STATIC_ONCE pulse session，在每个physical pulse terminal后才进入下一segment；camera与dedicated drain从首次FIRE前一直保持同一session，全部R×P完成后才aggregate complete/stop/join并执行一次EndAttestation。未验证前每个Envelope携带run-scoped provenance_epoch_id且formal sink只暂存；任一pulse terminal、count、stamp、timestamp、coverage、timeout或hardware error不符使整个epoch INVALID并丢弃，不能提交前半段。
 
-明确接受的取舍：这是“preflight余量 + per-run末端对账 + reject-and-redo”，不是“per-cell当场fail-closed”。它通常能发现漏帧、乱序、未完成和大间隔异常，但不能定位具体point，也不能数学上排除漏一个触发/帧同时出现一个额外触发/帧且metadata仍落在容差内的等量抵消。PI接受这一剩余风险以换取冻结RTL和无缝扫描；文档、UI和artifact provenance必须如实标记 `ORDERED_END_ATTESTED_RUN`，不得声称拥有逐沿accepted-trigger证明。
+明确接受的取舍：这是“preflight余量 + per-run末端对账 + reject-and-redo”，不是“per-cell当场fail-closed”。它通常能发现漏帧、乱序、未完成和大间隔异常，但不能定位具体point，也不能数学上排除漏一个触发/帧同时出现一个额外触发/帧且metadata仍落在容差内的等量抵消。PI接受这一剩余风险以保持RTL冻结；自主模式仍保持无缝硬件扫描，API模式则明确接受非连续host boundary。文档、UI和artifact provenance必须如实标记 `ORDERED_END_ATTESTED_RUN`，不得声称拥有逐沿accepted-trigger证明。
 
 INVALID必须形成可查询的RunFailureRecord，保存失败原因、工作点、counter/stamp摘要和累计失败率。系统不得无限或静默自动重试直到“碰巧成功”；重试只能由用户发起，或由request中显式、有限、可审计的RetryPolicy发起，每次attempt具有独立run_id/provenance，最终artifact记录失败attempt refs。这样reject-and-redo不会掩盖硬件不稳定或造成不可见的选择偏差。
 
@@ -2438,11 +2496,44 @@ allowed = {SCAN_SLOT}
 slots = da_x, da_y, da_z
 ```
 
-正常执行策略固定为 `AUTONOMOUS_STREAMED`，不改变模板语义；MOT/SCAN_SLOT 把 `da_x/da_y/da_z` 等完整逻辑slot table在run前冻结、编译并digest。resident模式一次上传全部物理rows；条件refilled模式只按冻结顺序补immutable chunks，不能把它解释成host逐point调度。禁止逐cell host mutation或API fallback。`API_SLOT_SEGMENTED_EXISTING`只在selected=API_SLOT且设备API无法无缝更新时使用既有路径，并在artifact中显式记录segment边界；不得为了统一实现把SCAN_SLOT也切段。
+正常执行策略固定为 `AUTONOMOUS_STREAMED`，不改变模板语义；MOT/SCAN_SLOT 把 `da_x/da_y/da_z` 等完整逻辑slot table在run前冻结、编译并digest。resident模式一次上传全部物理rows；条件refilled模式只按冻结顺序补immutable chunks，不能把它解释成host逐point调度。禁止逐cell host mutation或API fallback。`API_SLOT_SEGMENTED_EXISTING`只在selected=API_SLOT且设备API无法无缝更新时使用既有路径；artifact以该execution mode、canonical `segmentation_rationale`及R-major/P-fast的有序cell pulse evidence表达“这里存在host boundary”，不要求或伪造每个boundary的计时记录。它是一个具名、封闭的API物理执行器，不是可被其它scan复用的execution policy。不得为了统一实现把SCAN_SLOT也切段。
 
-API segmented模式不是任意API scan的自动fallback。request/template必须先携带显式`SegmentationSemantics`，声明该实验允许host segment boundary，并在需要时给出具名settle/re-equilibration条件；依赖连续时间演化、无缝扫参或段间状态不可重建的实验必须在preflight拒绝`API_SLOT_SEGMENTED_EXISTING`。这项门只判断物理实验语义是否允许分段，不能用“每段数据exact”代替。
+API segmented模式不是任意API scan的自动fallback。`ApiSlotSegmentedProgram`必须直接携带canonical、trimmed、非空的`segmentation_rationale: str`，明确说明该实验为何允许host segment boundary。这个字符串是可审计的物理理由，不是新的policy类型、插件或可执行DSL；program/template owner对这个理由负责，preflight只验证它存在、与API-slot执行选择一起冻结且未被篡改，不尝试从自然语言推导物理真值。baseline只允许物理上接受**任意、可变、非负host gap**的实验；依赖连续时间演化、无缝扫参、段间状态不可重建、最大允许gap、精确settle/re-equilibration时间或任何gap-dependent physics的实验一律typed NO-GO。等真实第二种分段语义出现后再为那个具体request增加typed字段，不能提前恢复一个万能Segmentation对象。这项门只判断物理实验语义是否允许现有分段，不能用“每段数据exact”代替。
 
-获准分段后，每个segment分别冻结camera/API settings、frame budget、TriggerKeys，并在自己的arm/FIRE前重新通过`pin_for_fire`取得独立`QualificationFireAuthorization`；每段完成自己的EndAttestation。段与段之间若qualification被suspend/revoke、revision/settings不再匹配、settle/re-equilibration条件失败或下一次gate失败，后续segment不得FIRE，整个run INVALID。全部segment完成后再做aggregate count/coverage/lineage attestation；只有aggregate通过，run级EpochValidationRecord才写唯一`achieved_association_proof`。ScanArtifact保存有序`segment_authorizations[]`、每段proof、segment boundary、声明的settle条件与可观察gap；host monotonic时间只作provenance，camera timestamp只按Q0定义提供观测，二者都不能冒充段间精密硬件时序。不能把第一段authorization扩展到后续段。任一segment INVALID使整个Formal Run失败，不能只丢坏segment、拼接其余segment或自动重试后隐藏失败。
+获准分段后的唯一执行模型如下，不能再派生“每段相机run”变体：
+
+```text
+Preflight
+  先以R×P cardinality准入control/terminal lineage memory；不解析或编译R×P份对象
+  冻结P个唯一API point documents与P个STATIC_ONCE artifacts，每个恰好一个camera trigger
+  冻结全局R-major/P-fast DatasetCellSchedule、同一trigger channel、camera settings与R×P frame budget
+  取得覆盖整个冻结run的一个camera qualification/authority；未通过则不arm
+
+Execute
+  建立一个external-triggered exact camera transaction；只在首个segment FIRE前start/arm一次
+  for repeat in R:
+    for point in P:
+      为该cell打开新的PulseSession，prepare对应point-indexed STATIC_ONCE artifact
+      确认上一cell的camera event/physical terminal及run authority
+      以deadline/cancel-aware monotonic wait保守满足camera required external-trigger interval
+      由硬件执行该segment全部edge
+      exact capture_next取得同一camera transaction中的下一个有序event
+      PulseSession.complete取得session-id唯一的physical pulse terminal
+      终结并撤销该PulseSession的mutable authority，只保留immutable evidence
+      记录ApiSegmentEvidence(repeat_index, point_storage_index, pulse evidence)
+  全部R×P完成后才camera complete/stop/drain/no-more-frames/join一次
+
+Aggregate
+  CameraRunEvidence绑定唯一arm spec、完整source schema/schedule、R×P event span与aggregate terminal
+  验证R×P pulse receipts、camera count/metadata、DatasetBuilder/processor/EOS与lineage全部一致
+  只执行一次run级EndAttestation；成功后才发布唯一VALID EpochValidationRecord
+```
+
+host gap是`segmentation_rationale`明确接受并由program owner承担的API物理语义，不是精密延时工具。相邻segment之间仍必须按camera capability的`required_external_trigger_interval`执行保守的deadline/cancel-aware最小等待；它只保证下一外触发不会早于相机安全下限，可以更长且不承诺上限，绝不承担实验精确settle或edge timing。baseline不持久化每个boundary的host monotonic时刻，也不从相机timestamp反推segment gap；execution mode、rationale与有序pulse/camera aggregate evidence已经足以诚实声明“非连续”，但不能量化或冒充段间精密硬件时序。需要测量gap、限制最大gap或让结果依赖gap的实验当前直接NO-GO，而不是偷偷把这个安全wait升级成权威时间轴。下一segment只可在上一segment的camera event与physical pulse terminal都完成后开始；host不得在segment内部sleep排edge。相机在边界间保持armed/draining，不能stop/re-arm、清空counter或建立新capture epoch。任一pulse terminal、capture event、count/metadata或aggregate terminal失败都会poison同一个capture transaction并使整个run INVALID；不能只丢坏segment、拼接其余segment或自动重试后隐藏失败。
+
+camera qualification/deployment authority同样是run级而不是segment级：首次FIRE前的线性化gate一次固定完整R×P schedule所用revision/digest。每个后续boundary可以对这个已固定authority做side-effect-free的仍有效检查，并在qualification被suspend/revoke或binding generation变化时阻止下一FIRE；它不能mint新authorization、重新pin另一revision或改变相机epoch。已完成segment的PulseTerminalAck仍作为失败run诊断事实保留，但不能因为前半段有效就部分提交。
+
+这套模型有意只缓存P个resolved point documents/compiled artifacts，repeat只复用point-indexed identity；R×P只保留有界cell schedule和terminal lineage。preflight必须在解析P或调用compiler前先完成R×P control-memory admission，编译再按P渐进完成；禁止先构造`resolved_segment_documents[R*P]`、R×P份artifact或R×P个camera session。per-cell pulse terminal是必须的物理证据，但per-segment camera authorization、camera terminal、CameraRunEvidence或EndAttestation全都不存在；若实现为了接口方便制造这些对象，即是在复制同一事实owner。
 
 compiler/preflight 必须基于现有 bitstream 支持的 scan table 和实际有效 camera-trigger schedule 工作；不能要求 SINGLE_CELL_SCAN_SLOT、one-shot cell token 或新 RTL 寄存器。若现有实现对合法 SCAN_SLOT table 有 bug，先由 golden/model/真机证据确认，再按“修复既定设计”流程决定是否动 RTL。
 
@@ -2550,35 +2641,41 @@ COMPLETE_AUTONOMOUS
   mint AutonomousTableTerminalEvidence(PreparedProgramRef, table/schedule digest,
                                        stable raw STATUS, final CURSOR)
 
-PREPARE_API_SEGMENT(run_id, segment_id, frozen API values,
-                    compiled finite program + segment trigger schedule + lineage)
-  validate segment settings、schedule、budget、settle/re-equilibration preconditions
-  upload/prepare this finite program through the existing API-slot path
-  server records PreparedProgramRef(
-    server_connection_generation, run_id, segment_id, artifact_digest, segment_schedule_digest
-  ) in software
+PREPARE_API_RUN(run_id, P frozen API point values/artifacts,
+                R-major/P-fast cell schedule, R*P camera budget)
+  admit R*P control/terminal memory before resolving or compiling P
+  validate all point settings、one-trigger STATIC_ONCE schedules、single trigger channel、
+    total budget与canonical non-empty segmentation_rationale；freeze one camera arm spec/authorization
+  arm/start one exact camera transaction before the first segment FIRE only
 
-FIRE_API_SEGMENT(PreparedProgramRef)
-  camera session is armed for this segment's frozen expected_total
-  existing hardware executes this already-prepared finite segment once
+FOR_EACH_API_CELL(repeat_index, point_storage_index)
+  open a new PulseSession for the already-frozen point-indexed artifact
+  prepare through the existing API-slot path and verify prior cell terminal + run authority
+  if not first cell: wait at least the camera required external-trigger interval
+                     with deadline/cancel awareness
+  FIRE_API_SEGMENT(PreparedProgramRef)；hardware executes every edge in this finite segment
+  capture_next from the same armed camera transaction
+  COMPLETE_API_SEGMENT -> unique PulseTerminalAck/ApiSegmentEvidence(CURSOR=N/A)
+  do not stop/re-arm camera and do not mint camera terminal/EndAttestation here
 
-COMPLETE_API_SEGMENT
-  single I/O owner reads stable raw DONE/STATUS/error under H1 segment read recipe
-  mint SegmentTerminalEvidence(PreparedProgramRef, segment_schedule_digest,
-                               stable raw DONE/STATUS, CURSOR=N/A)
+COMPLETE_API_RUN
+  after exactly R*P pulse terminals/events, complete the one camera transaction once
+  mint one aggregate CameraRunEvidence and run-level EndAttestation
+  verify complete R-major/P-fast pulse lineage、camera count/metadata、coverage/EOS
 
-COMMON_TAIL_AND_ATTEST(mode-specific terminal evidence)
+COMMON_PULSE_TERMINAL(mode-specific pulse evidence)
   raw terminal state proves logical terminal only；camera/drain remain active while host waits
-  use deployment-bound CompiledPulseArtifact tail bound + H1 margin
-  mint PostTerminalTailEvidence；then apply Q0 camera quiet-window/drain contract
-  feed source-specific evidence and exact coverage into EndAttestation
-  no per-cell receipt is claimed；API aggregate rules remain in §14.7
+  use deployment-bound CompiledPulseArtifact tail bound + H1 margin where required
+  autonomous records one table terminal；API records one physical pulse terminal per cell
+  Q0 camera quiet-window/drain and CameraRunEvidence occur only once at whole-run completion
+  feed source-specific evidence and exact coverage into one aggregate EndAttestation
+  no emitted-edge/per-cell camera receipt is claimed；API aggregate rules remain in §14.7
 
 SAFE/RESET/connection loss
   software invalidates PreparedProgramRef and follows current safe/reset path
 ```
 
-这里的`NEUTRAL_COMMON_FORMAL_PREPARE`只描述S4 Formal路径；H1前E0a诊断characterization不伪造deployment ref、不进入这条authority路径。deployment active/suspend/revoke与FIRE线性化复核始终属于neutral installation authority；pulse server只消费pulse-owned refs/bytes和既有transport状态，不认识neutral record。PreparedProgramRef 是 host/server软件 guard，不伪装成硬件 one-shot token。它防止明显的旧连接、旧artifact和GUI状态漂移；deployment revision由外层QualificationFireAuthorization固定，两者都不能证明每个物理trigger沿。物理归属仍按§14.5的有效Q0 qualification + frozen schedule + EndAttestation。FIRE前，autonomous模式冻结完整logical table；API segmented模式逐段冻结本段API values、compiled finite program、trigger schedule与lineage。两者运行中都不从mutable GUI state读取，也不能互相伪造table/cursor语义。
+这里的`NEUTRAL_COMMON_FORMAL_PREPARE`只描述S4 Formal路径；H1前E0a诊断characterization不伪造deployment ref、不进入这条authority路径。deployment active/suspend/revoke与run authority线性化复核始终属于neutral installation authority；pulse server只消费pulse-owned refs/bytes和既有transport状态，不认识neutral record。PreparedProgramRef 是 host/server软件 guard，不伪装成硬件 one-shot token。它防止明显的旧连接、旧artifact和GUI状态漂移；deployment revision由外层run级QualificationFireAuthorization固定，两者都不能证明每个物理trigger沿。物理归属仍按§14.5的有效Q0 qualification + frozen schedule + EndAttestation。首次arm前，autonomous模式冻结完整logical table；API segmented模式冻结P个唯一API point program、R-major/P-fast的R×P schedule、整runcamera settings/budget与lineage。API每cell只新建pulse session/PreparedProgramRef，不重新冻结camera事实。两者运行中都不从mutable GUI state读取，也不能互相伪造table/cursor语义。
 
 expected trigger count/schedule 来自compiler对实际配置的唯一camera output channel、active polarity、clock mux、相邻高段合并、channel delay和全部合法slot values的确定性展开；camera channel不能同时配置为clk_enable。该schedule用于preflight间距与末端映射，不声称是运行时逐沿回读。
 
@@ -2586,7 +2683,7 @@ expected trigger count/schedule 来自compiler对实际配置的唯一camera out
 
 只有contract kit证明所有潜在bank seam均有足够分辨率、语义明确且覆盖stall影响区间的硬件时间观测，并能把每个seam与完整compiled schedule做residual attestation，同时证明refill transaction的保守硬上界时，才可为该设备/transport/workload发布`AUTONOMOUS_REFILLED` execution capability。没有camera edge的区段、最后一个trigger后的seam或任何不可观察stall都会使该能力不可发布；preflight返回`FormalScanCapacityExceeded(resident_limit, capability_unavailable_reason)`并拒绝大表。软件记录chunk seq/count/digest并在现有可读状态范围内fail closed，但不得把非sticky UNDERFLOW、DONE、camera局部timestamp或尚不存在的CRC verifier/BANK_VERIFIED当作“从未stall”的证明。真实实验对更大容量或更高性能的需求本身不构成H2解锁条件；仍必须命中E0a/Q0在批准工作余量内发现无法由软件、相机配置和margin修正的真实loss/reorder，或证明现有RTL bug/既定设计偏离，才可按H2评估最小硬件修复。
 
-任何prepare/upload/identity validation失败都不得调用FIRE。Pulse RPC server 重启或重连会改变`server_connection_generation`，旧PreparedProgramRef在软件侧失效；即使设备仍保留旧active image也不能由正式路径误触发。API-slot segmented路径每段同样冻结自己的values与artifact lineage。
+任何prepare/upload/identity validation失败都不得调用FIRE。Pulse RPC server 重启或重连会改变`server_connection_generation`，旧PreparedProgramRef在软件侧失效；即使设备仍保留旧active image也不能由正式路径误触发。API-slot segmented在run前只冻结P个point-indexed values/artifacts并跨repeat复用其identity；每个R×P cell取得新的PreparedProgramRef/PulseSession terminal lineage，但不复制point document、camera arm或camera terminal。
 
 ### 15.5 硬件安全
 
@@ -2871,7 +2968,7 @@ Stream：
 - Q0 artifact保存样本量、观察loss/reorder率与统计上界；未达到PI批准的样本量/上界/margin不能activate qualification；版本/设置变化、显式revocation、重启恢复和并发preflight pin均有contract test；
 - preflight对compiler展开delay、polarity与相邻高段merge后的完整物理waveform验证arm-ready、first-edge margin、active/inactive width和所有相邻trigger间距，要求`interval >= camera minimum + configured margin`；边界内/外、过窄pulse、过早首沿、delay/polarity、merge与重复trigger edge均有测试；
 - repeat axis确定性展开进finite table；Formal program强制`repeat_forever=False, scan_repeats=0`，任何`scan_repeats>0`/cursor-wrap stop在compile/preflight被拒绝；repeat/point/TriggerKey round-trip覆盖多repeat；
-- qCMOS autonomous mode一次arm整个scan session；API segmented每segment独立arm/FIRE；driver ring按max-inflight定容并由dedicated drain持续排空，`total_frames/bytes`通过host exact retention与artifact预算；超容量在arm/fire前拒绝；frame[i]只在匹配active Q0 qualification envelope时映射frozen TriggerKey[i]；
+- qCMOS autonomous与API segmented都一次arm整个scan session；API按R-major/P-fast执行R×P个独立STATIC_ONCE pulse session，segment boundary期间camera保持同一armed/draining transaction，全部cell后只生成一个aggregate camera terminal；driver ring按max-inflight定容，`total_frames/bytes`通过host exact retention与artifact预算；超容量在arm/fire前拒绝；frame[i]只在匹配active Q0 qualification envelope时映射frozen TriggerKey[i]；
 - qCMOS stream声明NON_BACKPRESSURE_CAPTURED；故障注入证明物理帧B publish失败后generation立即RetentionOverrun，物理帧C不能占B的sequence，任何capture后的decode/copy/schema/trace/key/publish异常统一SourceFailed且不可继续formal collection；
 - BoundCapturePort拒绝普通/伪造/stale capability值，只接受DeviceBroker对同一BoundDevice generation mint的attestation；prepare/terminal必须回显并匹配spec/settings/capability digests；
 - MeasurementDefinition/catalog fields递归只允许declarative values，runtime不执行Definition.bind或spec codec；FrozenCaptureSpec payload/digest篡改、owner/schema mismatch在claim前拒绝；
@@ -2884,13 +2981,14 @@ Stream：
 - minimal pipeline在software preflight完成、prepare前被cancel时只走verify-idle，不发送unknown-session close且不quarantine；同一compiled plan可顺序复用并为每run mint新generation，同时并发run在ResourceClaim处拒绝；builder.close与session cleanup双故障仍分别尝试；
 - PipelineMemoryProfile只允许调用者选择总上限，固定/per-event overhead不能低报；process-local admission绑定exact chain，PipelineResult与持久artifact只记录`aggregate_peak_bytes`，不记录无裁决作用的runtime profile指纹；调用方不能把dataset A与terminal B拼成新的PipelineResult；
 - resident table走`AUTONOMOUS_RESIDENT`；超resident table默认拒绝，只有单I/O owner、保守refill硬上界以及对**每个潜在seam**的足分辨率硬件时间观测/全schedule residual均通过时才发布`AUTONOMOUS_REFILLED`；无camera edge区段、tail seam或非sticky underflow无法证明时必须在fire前拒绝；
-- EndAttestation按execution mode验证`AutonomousTableTerminalEvidence(raw STATUS+final CURSOR)`或每段`SegmentTerminalEvidence(PreparedProgramRef+compiled segment schedule+stable raw DONE/STATUS, CURSOR=N/A)`，再比较与compiled/H1/deployment revisions绑定且`elapsed >= required_bound`的`PostTerminalTailEvidence`、`expected_trigger_total_from_completed_schedule`推导值、每个BoundSourceAssociationContract的terminal recipe、按Q0 modulus/reset语义唯一unwrap的`camera_produced_delta`、frame/camera stamp、timestamp容差、DatasetBuilder coverage和EOS；测试/manifest不得消费`scan_progress()`镜像、不得把raw DONE当tail-idle、不得为API segment伪造cursor，也不得命名成硬件measured emitted count；任一不符整run INVALID且无ScanArtifact；
+- EndAttestation按execution mode验证`AutonomousTableTerminalEvidence`或完整R-major/P-fast、session-id唯一的R×P个`ApiSegmentEvidence(PulseTerminalAck)`，再比较唯一run级`CameraRunEvidence`、`expected_trigger_total_from_completed_schedule`推导值、每个BoundSourceAssociationContract的terminal recipe、按Q0 modulus/reset语义唯一unwrap的`camera_produced_delta`、frame/camera stamp、timestamp容差、DatasetBuilder coverage和EOS；测试/manifest不得消费`scan_progress()`镜像、不得把raw DONE当physical terminal、不得为API segment伪造cursor/camera terminal/CameraRunEvidence，也不得命名成硬件measured emitted count；任一不符整run INVALID且无ScanArtifact；
 - 注入drop/reorder/duplicate/counter reset/metadata gap/short read使整epoch失败；系统不声称能定位具体point，也不声称能检测metadata仍合法的等量loss+extra抵消；该剩余风险在artifact proof_class中可见；
 - 所有scan数据在EndAttestation前为PROVISIONAL；只有`ORDERED_END_ATTESTED_RUN` VALID后才能commit；
 - PROVISIONAL可带永久可见徽标显示，但普通Figure Save、source-specific authoritative fit artifact、CommittedTransform authority input和其它derived artifact均拒绝；显式诊断保存只能产生不可冒充权威结果的`DIAGNOSTIC_PROVISIONAL`；INVALID使queued BoardFrame/fit/save按epoch lifetime token stale；
 - ScanOutputContract的validity_acceptance_policy区分cell/transport完整性与component invalidity；dead site在PRESERVE_DECLARED下随ComponentValidity成功保存，在ALL_COMPONENTS_REQUIRED/MIN_VALID_FRACTION不满足时按声明失败；
 - INVALID attempt保存RunFailureRecord且默认不自动重试；显式RetryPolicy有有限次数、独立run_id/lineage，最终artifact引用所有失败attempt；
-- API_SLOT_SEGMENTED_EXISTING每segment在arm/FIRE前重新取得QualificationFireAuthorization并生成自己的SegmentTerminalEvidence/EndAttestation，段间suspension/revocation阻止下一段；全局aggregate验证ordered segments、count/key coverage、settle/re-equilibration evidence与lineage后才产生run级achieved proof，任一segment失败整run不提交；
+- API_SLOT_SEGMENTED_EXISTING在首次arm/FIRE前取得覆盖完整冻结R×P schedule的一个run级camera authority；每cell只生成独立pulse-session terminal lineage，不重新arm/stop camera、不重取camera authorization、不生成per-segment EndAttestation。相邻segment的deadline/cancel-aware conservative wait不得短于camera required external-trigger interval，但允许任意更长gap；最大gap/精确settle/gap-dependent use case在bind时typed拒绝。全局aggregate验证canonical segmentation_rationale、ordered segments、一个CameraRunEvidence、count/key coverage与lineage后才产生run级achieved proof，任一segment失败整run不提交；
+- API segmented故障注入覆盖第N个`capture_next()`阻塞时cancel、跨segment全局deadline、pulse cleanup失败后camera cleanup仍继续、terminal后sequencer SAFE/camera idle，以及任一失败均无FINAL repository commit；测试使用deterministic clock/interrupt，不用真实sleep制造偶然通过；
 - source-neutral ScanPlan对每个physical source要求具名BoundSourceAssociationContract；近期S4只允许恰好一个Q0-qualified qCMOS source，额外/非camera source在专用contract kit发布前bind时typed拒绝；
 - ProgrammedImageDeploymentRecordRef缺失、非active、endpoint/fingerprint/.bit/release mapping变化，或Q0/FIRE authorization/tail evidence/artifact pin的revision不一致时Formal拒绝；测试明确证明该record只是installation assertion，不能冒充runtime content attestation；
 - TAGGED/TIMELINE若相机现有metadata经Q0资格化可作为更强软件关联能力可使用，但不要求FPGA逐沿FIFO；HardwareTriggerStamp只在证据触发未来RTL修复后测试。
@@ -3004,7 +3102,7 @@ Pulse/FPGA：
 - host encoder/coalescer 不生成超过当前 `FRAME_WORDS` 能力的 UART frame，server/upload/PreparedProgramRef guard 对 partial/oversized payload 在发送前拒绝并禁止 FIRE；contract kit如实记录当前RTL收到合法CRC oversized frame时缺少硬件零提交保证的已知边界，测试不得为满足目标合同而假设或要求新RTL。只有golden/真机证据确认该行为是既定RTL设计偏离并经H2批准后，才增加“硬件收到oversized也零提交”的bitstream gate；
 - qCMOS contract kit分别保存nFrameCount累计快照与per-frame framestamp/camerastamp/timestamp的位宽、signedness、modulus、reset epoch、rollover语义：stamps逐frame modular successor，nFrameCount只做session baseline/final delta与允许batch jump的中间monotonic检查；以及工作余量内长时间零丢帧/乱序证据和可复现报告。任何unwrap多解、未声明reset、stamp duplicate/gap或counter倒退都INVALID；
 - qCMOS Formal preflight readback/freeze trigger source/polarity、sensor/global exposure、ROI/binning、exposure/readout mode、arm-ready/status ack、arm-to-first-edge余量、最小active/inactive pulse width与last-edge-to-driver tail bound，并对delay/polarity/merge后的完整物理waveform验证；整run drain后的pending/late/extra frame阻止commit；
-- current DONE/tail行为按现有contract测试；Formal EndAttestation由唯一I/O owner按H1冻结的mode-specific读序取得AutonomousTableTerminalEvidence或SegmentTerminalEvidence，高层`scan_progress()`镜像只供UI；raw state只证明对应logical terminal，camera/drain继续运行并从terminal observation保守等待deployment-bound compiled/H1 physical output-tail bound，`PostTerminalTailEvidence`通过后才进入Q0 quiet-window、冻结final metadata、cap_stop、stable复核与buffer release，不把DONE重新定义成不存在的PHYSICAL_DONE；
+- current DONE/tail行为按现有contract测试；Formal EndAttestation由唯一I/O owner按H1冻结的mode-specific recipe取得AutonomousTableTerminalEvidence或R×P个ApiSegmentEvidence/PulseTerminalAck，高层`scan_progress()`镜像只供UI；raw state只证明logical terminal，必须经对应recipe成为physical pulse terminal。API每cell terminal后camera继续armed/draining，只有整run全部cell完成才进入一次Q0 quiet-window、冻结final metadata、cap_stop、stable复核与buffer release；不把DONE重新定义成不存在的PHYSICAL_DONE，也不伪造per-segment camera tail/terminal；
 - 当前`scan_repeats=K`可能多发下一sweep point的路径有回归测试并被Formal compiler明确拒绝；finite single-pass大表走现有同步refill后到STATUS_DONE只作为transport/RTL完成性回归，不授予Formal capability，也不证明从未发生不可见stall；`AUTONOMOUS_REFILLED`仍必须独立通过§15.4强gate；
 - HardwareTriggerStamp/FIFO/trigger-return/新ROM测试默认不存在；只有证据批准RTL变更后才加入对应package+真机gate；
 - Measurement/StreamProcessor/DatasetBuilder 全链传播 provenance_epoch_id；EpochIntegrityState 未 VALID 时 formal sink 即使已有全部 y 也不能 terminal success/commit。
@@ -3067,7 +3165,7 @@ S1/S2/S3/S4 -> S5 remaining use cases -> Z0 zero-residual audit
 - **GO NOW**：E0a中的代码/metadata只读探测、离线分析与profile、import-DAG ratchet、F0绿地data/storage/stream/catalog、S0.5 Workbench三surface与三个legacy containment bridge可立即开始。E0a主动真机触发实验不是“只读”，只能通过已批准的现有实验SOP与唯一设备owner执行，或等待F0最小safety spine后执行。
 - **GO PER DEPENDENCY-CLOSED SLICE**：S1/S2/S3 只有在 LegacyRuntimeFence 生效、consumer matrix确认且每个切片不提前删除共享 producer时开始。
 - **GO FOR S4 IMPLEMENTATION**：H1 current-bitstream合同、S1 exact acquisition与S3 processor/materializer接口稳定后可以实现S4；这不等于用户可启用Formal。
-- **GO FOR FORMAL ENABLEMENT**：必须再有当前最终adapter/driver/buffer policy上的active Q0 qualification、active ProgrammedImageDeploymentRecordRef、compiled physical waveform/arm/edge/camera-tail margin、对应execution mode的现有bitstream raw terminal语义与稳定读规则、adapter-specific SafeStateContract、deployment-bound compiled/H1 post-terminal output-tail bound和`PostTerminalTailEvidence`、全部BoundSourceAssociationContracts、exact链与EndAttestation E2E。近期只评估恰好一个Q0-qualified qCMOS source，并先开放`AUTONOMOUS_STREAMED`方式族中的`AUTONOMOUS_RESIDENT`装载形态；refilled仅在§15.4条件能力发布后评估，API segmented按§14.7另行逐段资格化。contract kit、deployment record与qualification本身不要求新RTL，但若冻结硬件证据不能通过任一gate，Formal capability继续NO-GO，不能以软件state补证，也不因此自动授权重烧。
+- **GO FOR FORMAL ENABLEMENT**：必须再有当前最终adapter/driver/buffer policy上的active Q0 qualification、active ProgrammedImageDeploymentRecordRef、compiled physical waveform/arm/edge/camera-tail margin、对应execution mode的现有bitstream terminal语义与稳定读规则、adapter-specific SafeStateContract、deployment-bound compiled/H1 physical-terminal recipe及所需`PostTerminalTailEvidence`、全部BoundSourceAssociationContracts、exact链与EndAttestation E2E。近期只评估恰好一个Q0-qualified qCMOS source，并先开放`AUTONOMOUS_STREAMED`方式族中的`AUTONOMOUS_RESIDENT`装载形态；refilled仅在§15.4条件能力发布后评估。API segmented按§14.7单独资格化“整run一次camera arm/aggregate terminal + R×P个STATIC_ONCE physical pulse terminal”的组合合同，而不是逐段camera qualification。contract kit、deployment record与qualification本身不要求新RTL，但若冻结硬件证据不能通过任一gate，Formal capability继续NO-GO，不能以软件state补证，也不因此自动授权重烧。
 - **HARDWARE CHANGE NO-GO BY DEFAULT**：HardwareTriggerStamp、新ROM attestation、per-fire counter/PHYSICAL_DONE、trigger-return、watchdog或RTL CRC均不得由路线图自动启动。只有E0a/Q0在已批准工作余量、正确camera配置和充分软件reservation下仍测得真实丢帧/乱序，且已经证明无法通过camera设置、软件保留/排空策略、降低trigger rate或扩大时序margin修正；或现有RTL bug/设计偏离被证实，才进入H2评审。发现一次异常、qualification证据不足或架构希望获得更强证明，都不满足该条件。
 
 ### E0a：迁移前 characterization，不授予发布资格
@@ -3153,7 +3251,7 @@ S0.6完成时目标composition已经只使用InstallationDeviceGraph。旧`Devic
 
 H1完成现有`image.build_fingerprint`/几何/ABI握手、PreparedProgramRef软件guard、repeat轴展开的finite autonomous table与camera-trigger schedule digest、当前UART/AXI/JTAG容量/错误行为，以及raw STATUS/CURSOR的组合读序、logical终态值和双读稳定规则的contract kit。H1同时根据当前RTL delay scheduler语义与CompiledPulseArtifact的冻结channel delay/最后edge推导`max_physical_output_tail_after_logical_done`，用golden/xsim/真机观测验证正常与safe/abort变体并给出保守margin；raw DONE/CURSOR本身不算tail-idle证据。高层`scan_progress()`镜像只供UI，不进入Formal proof。Formal compiler明确强制`repeat_forever=False, scan_repeats=0`并拒绝host wrap-stop；`AUTONOMOUS_RESIDENT`形成近期装载方式基线。超过resident window默认明确拒绝；只有单一I/O owner、保守refill硬上界以及覆盖每个潜在seam的硬件时间观测/完整schedule residual均由contract kit证明，才发布`AUTONOMOUS_REFILLED`条件execution capability。只测试现有RTL实际提供的能力，不增加ProgramToken/CellFireToken、ROM attestation、CRC verifier、PHYSICAL_DONE或telemetry。preview 使用 pulse-owned immutable `PulseTimelineDocument`，不制造 frontend -> pulse 反向边，也不让 generic Figure codec 承担 pulse authoring replay。
 
-H1同时建立当前endpoint的installation-owned `ProgrammedImageDeploymentRecordRef`，把冻结`.bit` content digest、release/timing records、现有fingerprint和owner批准对应起来；这一步只登记并复核现有部署，不调用Vivado、不program硬件。autonomous table与API segment分别发布各自H1 terminal read recipe；后者明确只用PreparedProgramRef+compiled segment schedule+stable raw DONE/STATUS，CURSOR=N/A。
+H1同时建立当前endpoint的installation-owned `ProgrammedImageDeploymentRecordRef`，把冻结`.bit` content digest、release/timing records、现有fingerprint和owner批准对应起来；这一步只登记并复核现有部署，不调用Vivado、不program硬件。autonomous table与API STATIC_ONCE pulse session分别发布各自H1 physical-terminal recipe；API底层若只有PreparedProgramRef+compiled segment schedule+stable raw DONE/STATUS，则recipe必须把必要的output-tail处理纳入唯一PulseTerminalAck，CURSOR=N/A。它只产生per-cell pulse evidence；camera仍由整run唯一CameraRunEvidence terminalize。
 
 H1与S1的最终adapter contract kit共同发布`SafeStateContract`矩阵，不用generic `getattr`猜测。InstallationDeviceGraph中的每个adapter owner必须在composition阶段被exact adapter table显式分类为`MANAGED_HAZARDOUS`、`MANAGED_NONHAZARDOUS`或具名`PASSIVE_OUT_OF_SCOPE`；未知类型、未知subclass或默认`continue`一律拒绝，避免新Laser/RF/Camera只因尚未被某LogicNode引用就绕过authority。
 
@@ -3203,7 +3301,7 @@ S4代码实现可在H1冻结bitstream合同、S1 exact acquisition与S3 StreamPr
 1. bind declared ExactSourcePipeline，fire 前建立全链 reservation/cursor/budget/ack；不得借用 monitor worker。
 2. repeat轴展开进`repeat_forever=False, scan_repeats=0`的finite logical table；preflight冻结camera readback与compiled physical trigger waveform/tail bound，验证Q0 arm/edge/pulse-width/interval/tail envelope、host total frame/byte retention与camera max-inflight ring。近期默认只启用`AUTONOMOUS_RESIDENT`；大表仅在§15.4的单I/O owner、refill硬上界和每seam硬件时间观测/完整schedule residual capability全部发布后使用`AUTONOMOUS_REFILLED`，否则typed拒绝。autonomous mode下camera一次arm整个run session、FPGA一次fire并自主执行；获准refill的host只供应冻结chunk，不逐point调度。
 3. autonomous mode的preflight pin active Q0 qualification revision/digest与ProgrammedImageDeploymentRecordRef，单次FIRE通过与qualification/deployment mutation串行的`pin_for_fire` gate取得run级QualificationFireAuthorization；adapter按Q0-qualified delivery-order contract将frame[i]映射为frozen TriggerKey[i]，全链数据保持PROVISIONAL。ScanPlan只声明`required_association_proof`；run末端用唯一I/O owner按H1规则读取的AutonomousTableTerminalEvidence、绑定compiled/H1/deployment revisions的`PostTerminalTailEvidence`、`expected_trigger_total_from_completed_schedule`、按Q0 reset/rollover语义唯一unwrap的`camera_produced_delta`、frame/camera stamps、timestamp容差、coverage/EOS完成EndAttestation后，EpochValidationRecord才写`achieved_association_proof`。
-4. 迁scan-slot/API-slot request、ScanOutputContract、multidimensional y和ScanArtifact Repository；MOT只允许SCAN_SLOT/AUTONOMOUS_STREAMED，不加API或host-stepped fallback。API_SLOT无法无缝更新时仅沿用`API_SLOT_SEGMENTED_EXISTING`，且request/template必须显式声明`SegmentationSemantics`允许段间host gap及所需settle/re-equilibration；要求连续物理演化的实验拒绝分段。每segment重新pin/gate并生成独立authorization，逐段EndAttestation后再做aggregate；任何段间qualification/settle失效阻止下一次FIRE并使整run INVALID。artifact分别记录execution_mode、segment boundary/可观察gap、required/achieved proof、run级或有序segment qualification authorizations和formal eligibility。
+4. 迁scan-slot/API-slot request、ScanOutputContract、multidimensional y和ScanArtifact Repository；MOT只允许SCAN_SLOT/AUTONOMOUS_STREAMED，不加API或host-stepped fallback。API_SLOT无法无缝更新时仅沿用`API_SLOT_SEGMENTED_EXISTING`，且program必须直接保存canonical非空`segmentation_rationale`说明为何允许段间host gap；只有接受任意可变非负gap的实验可用，连续物理演化、段间状态不可重建、最大gap、精确settle/re-equilibration或gap-dependent physics一律typed拒绝，不建立单字段policy wrapper。API在解析/编译前先准入R×P control memory，只解析/编译P个唯一point artifacts；整run一次arm camera并冻结aggregate frame budget，按R-major/P-fast为每cell建立独立STATIC_ONCE PulseSession/physical terminal，相邻segment只做camera required interval的deadline/cancel-aware保守最小等待，全部cell后才做一次camera complete和aggregate EndAttestation。任何pulse terminal或aggregate camera evidence失效都阻止下一次FIRE并使整run INVALID。artifact记录execution_mode、一个run级camera authority/CameraRunEvidence、有序ApiSegmentEvidence、segmentation_rationale、required/achieved proof和formal eligibility；baseline不保存per-boundary timing，也不保存per-segment camera authorization/terminal/attestation。
 5. 对drop/reorder/duplicate/short read/counter reset/timestamp gap、pre-arm/session-baseline混用、camera max-inflight ring不足、host total retention不足、raw DONE早于delay tail、tail bound/version/evidence缺失、refill证明缺失、旧`scan_repeats`多发point、schema generation、component invalidity、RemoteSequencer abort与provisional epoch做整runreject-and-redo真机测试；重试默认手动，自动策略必须显式有界并保存失败attempt。
 6. E2E 后删除 positional zip、latest fallback、旧 PulseScan 与 neutral key 泄漏进 FPGA 的类型。
 
@@ -3642,23 +3740,31 @@ Rule-6仍以既有scan package加integration owner为同一归因口径。W3b的
 | current `ScanArtifact -> DataFigure/typed scan panel/TaskConsole SCAN_SLOT` | notebook direct/occupancy scan inspect/render、direct FINAL-only Qt、occupancy PROVISIONAL→FINAL Qt、TaskConsole Add/Setting/Edit/Start/Stop/Save/Load 与 camera→occupancy-counts y；后续API_SLOT、scan-fit及其余panel | W3d已交付source-neutral exact pipeline、processor y、stable output和exact progressive occupancy panel；W3e复用该产品接入静态catalog与单revision编辑，不复制Run/render状态机 | API_SLOT、scan-fit及最后legacy panel consumer各自交付后，才dependency-closed删除对应旧路 |
 | legacy PulseTableState readers | 尚未迁完的 Camera/PulseScan/PulseGUI 岛 | 先迁每个保留 consumer 到 current PulseDocument/compiler | 最后 consumer 迁走的 H1/S3/S5 dependency-closed commit |
 
-规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`。§22.1固定的11个互斥production owner闭包已经逐一完成，规则1–8的**existing-code追溯审查轴全部COMPLETE**，所以“完成1–7前不得继续迁移”的冻结已经解除；这不等于implementation全部READY。当前明确为GO的是virtual finite capture/pulse owner、BoardController coherence foundation、W1 single-event finite exact capture的public virtual/offscreen Qt产品、S3a“committed capture -> calibration ref -> artifact/report reopen”、S3b“committed capture + calibration ref -> occupancy ref -> reopen”、S3c“installation-qualified short sitemap -> raw FINAL -> calibration FINAL/recoverable failure”以及W3e TaskConsole SCAN_SLOT的virtual/offline纵切。既有结案证据包括完整preflight→execute→FINAL→admit current-format手工oracle、1-byte预算与raw recovery、fresh-process notebook不加载SciPy/Qt/Matplotlib、exact `(R,P,*data_shape)`/`(R,P,site)`/component-validity检查、repository close与run borrow生命周期、static DAG/shape/旧Registry扫描，以及每个切片的有界独立对抗审查均`P0=0/P1=0/GO`；W1/W3e另有tracked白名单Qt E2E、snapshot/source invalidation、preview故障隔离、generation/run-id或editor-revision生命周期。没有运行清单外历史pytest。remote/real qCMOS、正式scan物理资格、完整GUI scheduler、API_SLOT、rolling/overlay、其它panel的Save/Setting/Edit、GUI site-map/gridplot和普通用户真实设备入口仍分别NO-GO。每个后续dependency-closed切片仍须按规则1–8做增量审查，完整迁移结束后还必须对最终分支做一次独立对抗验收；局部GO或owner audit COMPLETE都不能改写成全局实现完成。
+规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`。§22.1固定的11个互斥production owner闭包已经逐一完成，规则1–8的**existing-code追溯审查轴全部COMPLETE**，所以“完成1–7前不得继续迁移”的冻结已经解除；这不等于implementation全部READY。当前明确为GO的是virtual finite capture/pulse owner、BoardController coherence foundation、W1 single-event finite exact capture的public virtual/offscreen Qt产品、S3a“committed capture -> calibration ref -> artifact/report reopen”、S3b“committed capture + calibration ref -> occupancy ref -> reopen”、S3c“installation-qualified short sitemap -> raw FINAL -> calibration FINAL/recoverable failure”、W3e TaskConsole SCAN_SLOT，以及W3f `API_SLOT_SEGMENTED_EXISTING` direct/occupancy的virtual/offline纵切；W-UI1a静态表单owner同样COMPLETE，W-UI1b/W-UI1c仍未开始。既有结案证据包括完整preflight→execute→FINAL→admit current-format手工oracle、1-byte预算与raw recovery、fresh-process notebook不加载SciPy/Qt/Matplotlib、exact `(R,P,*data_shape)`/`(R,P,site)`/component-validity检查、repository close与run borrow生命周期、static DAG/shape/旧Registry扫描，以及每个切片的有界独立对抗审查均`P0=0/P1=0/GO`；W1/W3e/W3f另有tracked白名单Qt E2E、snapshot/source invalidation、preview故障隔离、generation/run-id/editor-revision或metadata-receipt生命周期。没有运行清单外历史pytest。remote/real qCMOS、正式scan物理资格、完整GUI scheduler、rolling/overlay、其它panel的Save/Setting/Edit、GUI site-map/gridplot和普通用户真实设备入口仍分别NO-GO；virtual/offline API segmented不能倒写成真实qCMOS Formal资格。每个后续dependency-closed切片仍须按规则1–8做增量审查，完整迁移结束后还必须对最终分支做一次独立对抗验收；局部GO或owner audit COMPLETE都不能改写成全局实现完成。
 
-最新实现 checkpoint：W3e current TaskConsole SCAN_SLOT 纵切已经完成，本段、代码与白名单测试由同一显式提交冻结。`Experiment.task_console()` 现在打开一个 current one-card product：Catalog composition 显式包含 Autonomous SCAN_SLOT Task、camera Measurement 与 occupancy StreamProcessor 三项静态 Definition；每项都必须被投影，Definition 不含 callable 或本次绑定的 schema/deadline，旧 runtime/processing 模块也不再转出口冒充第二 owner。Add Panel、Setting、Edit、Run Scan、Stop、Save/Load 都只操作 typed `TaskConsoleScanIntent`，并复用 W3d 的同一个 `ScanWorkbenchWindow/ScanPanelController`、exact camera→occupancy pipeline、progressive worker raster 与 FINAL artifact projection；没有第二套 Run 状态机、signal hub、renderer、raw device 或 generic workflow graph。
+实现 checkpoint：W3e current TaskConsole SCAN_SLOT 纵切已经完成，本段、代码与白名单测试由同一显式提交冻结。`Experiment.task_console()` 现在打开一个 current one-card product：Catalog composition 显式包含 Autonomous SCAN_SLOT Task、camera Measurement 与 occupancy StreamProcessor 三项静态 Definition；每项都必须被投影，Definition 不含 callable 或本次绑定的 schema/deadline，旧 runtime/processing 模块也不再转出口冒充第二 owner。Add Panel、Setting、Edit、Run Scan、Stop、Save/Load 都只操作 typed `TaskConsoleScanIntent`，并复用 W3d 的同一个 `ScanWorkbenchWindow/ScanPanelController`、exact camera→occupancy pipeline、progressive worker raster 与 FINAL artifact projection；没有第二套 Run 状态机、signal hub、renderer、raw device 或 generic workflow graph。
 
 SCAN_SLOT intent 在 request 存在前必须冻结 owner PulseDocument、完整具名 ScanPointTable 与全部 whole-run API 常量；未知/缺失/重复 API、非 SCAN_SLOT pulse、未知 DefinitionKey、direct-camera 携带 SITE display、occupancy 缺 calibration 或任意 raw runtime state 均拒绝。camera→occupancy counts 是本切片唯一真实 external Measurement→Processor y；legacy arbitrary `signal_expr`、latest/history helper、monitor worker output 与 scalar-only data contract不迁入target。occupancy source的`DatasetBuilder`仍是exact reservation/cursor/append/seal唯一authority，底层始终保留`(repeat, point, *data_shape)`、具名axes、ComponentValidity、revision、source generation与artifact lineage；repeat mean、SITE auto/batch/select及其它显式选择只属于View，权威`ScanOutputContract/DataTransformSpec`不从当前画面派生。Calibration default 作为artifact-owned默认模型语义保存，UI不把它静默改成BOX。
 
 Setting/Edit 共享一个 owner-thread revision session；stale draft返回typed conflict，Apply只在既有panel完全idle时原子reconfigure并清除旧FINAL，不取消active run。成功Apply后当前form从exact session snapshot全量重填，Cancel/Load/direct-source normalization同样清空所有不属于当前intent的隐藏字段，避免stale calibration/model复活。Start的既有worker才执行依赖calibration/device/schema的完整bind/preflight；失败保持NOT FINAL。Save/Load只接受一个current canonical tree，嵌套值委托DefinitionKey、PulseDocument、CalibrationArtifactRef与DataTransformSpec owner codec；没有版本链、升级器、compatibility alias、DeviceRef、RunHandle、reader/front buffer或provisional state。加载的权威transform在两个editor中都以精确AxisId摘要可见且可清除，不能被display intent覆盖。Stop/close继续由嵌入panel唯一owner完成cancel、terminal reap、preview退休与renderer释放。正常硬件执行仍是现有bitstream上的一次camera arm、一次`AUTONOMOUS_SCAN_ONCE` FIRE和完整resident table；没有HOST_STEPPED_GROUP、software timing、逐cell handshake、RTL或bitstream修改。
 
-W3e Rule-6按19个受影响production文件相对parent `e77b0559`机械计数：`9813 -> 11599 physical`、`8821 -> 10408 token-NCLOC`，净`+1786/+1587`；classes `68 -> 79`、dataclasses `45 -> 51`、enums `1 -> 1`、functions/methods `441 -> 523`。两个新文件为headless intent/catalog/editor/codec `593/531` 与Qt composition `943/841`，其余静态Definition拆分、scan reconfigure和public lazy seam净`+250/+215`；其中相对初版新增的123/117行专门关闭“隐藏权威transform”“取消的hidden calibration/model复活”与未配置card timer未停三个具体漏洞，不是通用transform editor。main中不重复计算W3d执行/render，只取旧TaskConsole的PulseSlots、MeasurementPanel、LogicNodeEditor、LogicNodeConfig/TaskConsoleState及同壳内catalog/edit/build/save/load/shutdown方法，机械并集为`1705 physical / 1283 token-NCLOC`；本轮比为`1.048x / 1.237x`，没有超过约3倍。新增9个真实产品类加静态Definition/display边界的净2类均有当前consumer；没有新增enum、manager、plugin、通用pipeline DSL或单层compat wrapper。focused Definition/scan/TaskConsole联合测试为29 passed，另有compileall、diff-check、target import-DAG、旧Definition转出口、shape-loss、raw-runtime persistence与execution-mode机械扫描；独立对抗终审P0=0/P1=0后本纵切GO。下一 checkpoint 是只为已接受例外语义建立 `API_SLOT_SEGMENTED_EXISTING` current纵切；在其余 Measurement/Processor、rolling/gridplot/selector/calibration/temperature/MOT 与旧GUI consumer迁走前，不提前删除legacy TaskConsole/PulseScan宿主。真实qCMOS Formal仍因Q0/EndAttestation保持typed NO-GO，RTL/bitstream冻结。
+W3e Rule-6按19个受影响production文件相对parent `e77b0559`机械计数：`9813 -> 11599 physical`、`8821 -> 10408 token-NCLOC`，净`+1786/+1587`；classes `68 -> 79`、dataclasses `45 -> 51`、enums `1 -> 1`、functions/methods `441 -> 523`。两个新文件为headless intent/catalog/editor/codec `593/531` 与Qt composition `943/841`，其余静态Definition拆分、scan reconfigure和public lazy seam净`+250/+215`；其中相对初版新增的123/117行专门关闭“隐藏权威transform”“取消的hidden calibration/model复活”与未配置card timer未停三个具体漏洞，不是通用transform editor。main中不重复计算W3d执行/render，只取旧TaskConsole的PulseSlots、MeasurementPanel、LogicNodeEditor、LogicNodeConfig/TaskConsoleState及同壳内catalog/edit/build/save/load/shutdown方法，机械并集为`1705 physical / 1283 token-NCLOC`；本轮比为`1.048x / 1.237x`，没有超过约3倍。新增9个真实产品类加静态Definition/display边界的净2类均有当前consumer；没有新增enum、manager、plugin、通用pipeline DSL或单层compat wrapper。focused Definition/scan/TaskConsole联合测试为29 passed，另有compileall、diff-check、target import-DAG、旧Definition转出口、shape-loss、raw-runtime persistence与execution-mode机械扫描；独立对抗终审P0=0/P1=0后本纵切GO。该切片当时的下一 checkpoint 是只为已接受例外语义建立 `API_SLOT_SEGMENTED_EXISTING` current纵切，现已由W3f完成；在其余 Measurement/Processor、rolling/gridplot/selector/calibration/temperature/MOT 与旧GUI consumer迁走前，仍不提前删除legacy TaskConsole/PulseScan宿主。真实qCMOS Formal仍因Q0/EndAttestation保持typed NO-GO，RTL/bitstream冻结。
 
-**最新实现 checkpoint：W-UI0 current Qt/render owner与复用前置切片完成。** 经逐项对照旧实现确认，旧`frontend/qt_fluent.py`不是参考样本而是成熟组件authority：其完整widget/lifecycle/layout实现整体迁入`zlc_frontend.qt_widgets`，Qt palette/QSS/QPainter/window metric进入同leaf的style owner，`QtImageBoard/QtOwnerWake`一并收口；旧文件、旧`zlc_frontend.qt_board`、production旧import/deep import与current手册旧路径物理消失，不留alias/shim。W1 capture、W2 PulseWorkbench、W3 scan与TaskConsole直接取用既有Fluent button/label/input/combo/spin/group/tab/scroll/path/setting-row；W2 finite-repeat表单改取`FluentFormGrid`，三处文本请求和两处确认统一经`fluent_text_prompt/fluent_confirm`，不再漏回native chrome；W3 FINAL raster复用`QtImageBoard.present_encoded`，artifact id用既有`ElidedLabel`保留full tooltip，不再让`QLabel`的pixmap或长文本sizeHint把窗口撑出屏幕；W3仍只有一个`ScanIntentForm`类型服务Setting/Edit，其大内容区可滚动而validation/status和Apply/Cancel footer固定可达。四个Workbench launcher在构造widget前统一auto scale，show后按真实frame统一center，repo-root三个current launcher也统一`ensure_qt_app`；真实offscreen `800×600`在READY/FINAL后仍完整可达。Start/Run/Apply、Stop/Hold/Load、Cancel/Remove/Clear恢复旧GUI的GREEN/ORANGE/GREY动作语义。raw Qt只剩layout/container/table/file-dialog与领域QPainter，不增加GenericRunPanel、SettingsEngine、RunControlStrip、dialog或table framework。
+**实现 checkpoint：W-UI0 current Qt/render owner与复用前置切片完成。** 经逐项对照旧实现确认，旧`frontend/qt_fluent.py`不是参考样本而是成熟组件authority：其完整widget/lifecycle/layout实现整体迁入`zlc_frontend.qt_widgets`，Qt palette/QSS/QPainter/window metric进入同leaf的style owner，`QtImageBoard/QtOwnerWake`一并收口；旧文件、旧`zlc_frontend.qt_board`、production旧import/deep import与current手册旧路径物理消失，不留alias/shim。W1 capture、W2 PulseWorkbench、W3 scan与TaskConsole直接取用既有Fluent button/label/input/combo/spin/group/tab/scroll/path/setting-row；W2 finite-repeat表单改取`FluentFormGrid`，三处文本请求和两处确认统一经`fluent_text_prompt/fluent_confirm`，不再漏回native chrome；W3 FINAL raster复用`QtImageBoard.present_encoded`，artifact id用既有`ElidedLabel`保留full tooltip，不再让`QLabel`的pixmap或长文本sizeHint把窗口撑出屏幕；W3仍只有一个`ScanIntentForm`类型服务Setting/Edit，其大内容区可滚动而validation/status和Apply/Cancel footer固定可达。四个Workbench launcher在构造widget前统一auto scale，show后按真实frame统一center，repo-root三个current launcher也统一`ensure_qt_app`；真实offscreen `800×600`在READY/FINAL后仍完整可达。Start/Run/Apply、Stop/Hold/Load、Cancel/Remove/Clear恢复旧GUI的GREEN/ORANGE/GREY动作语义。raw Qt只剩layout/container/table/file-dialog与领域QPainter，不增加GenericRunPanel、SettingsEngine、RunControlStrip、dialog或table framework。
 
 复用审查没有把“换成公共类”误当行为等价：`FluentDoubleSpinBox`原先按显示字符量化，W2 pulse duration/delay改用同组件的non-quantizing合同，真实clock-grid大值round-trip不变；`FluentPathEdit`选择坏PulseDocument会先显示坏路径，现validation失败恢复最后committed path且document fingerprint不动。首次从Python worker打开GUI会在worker创建QApplication并让后续Qt线程比较恒真，现`ensure_qt_app`在首建前fail-closed；`retain_window`既会把W3布尔`closed`误当signal，也不能依赖普通`QWidget.close()`发`destroyed`，现公共owner只连接真实signal并提供幂等`release_window`，四个异步窗口只在cancel/reap/worker shutdown完成后的committed close释放，真实launcher测试均确认registry回到基线，且没有用`WA_DeleteOnClose`破坏对象生命周期。
 
 旧`frontend/style.py`及其Helvetica资产同样是成熟render style authority，已整体迁入唯一`zlc_frontend.render_style`并删除旧owner；新增FigureDocument artist token只扩展该palette，不另造第二套series/rcParams。公开nested style值改成tuple/只读mapping，font package-data随新owner进wheel；IPython/widget hook拆到lazy `notebook_integration`，render leaf不探测notebook环境。因为`matplotlib.rc_context`修改进程全局状态，current FigureDocument/Agg产品的构造/draw/save/clear现由同一RLock串行；`DataFigure.to_png_bytes/export`把实际Agg draw收回render owner，caller-owned`render()`不冒充后续draw隔离。current Figure显式接收DPI并使canvas allocation与memory preflight一致，关闭了继承旧`figure.dpi=300`后预算按100dpi低估约9倍的洞；产品save与live renderer复用同一Figure/Canvas释放owner，GC-disabled连续PNG/SVG也不保留上一块Agg资源。notebook façade冻结调用者的总render预算到`DataFigure`，所以隐式`_repr_png_`与后续export不能绕过准入。旧live pulse scan也不再反向读取Qt颜色/字体。尚未迁出的共享-Figure RenderLoop仍只属于`SerializedLegacyAggBridge`隔离岛，本checkpoint不把它冒充为current compose lane完成。
 
-W-UI0按36个production Python union path（parent存在29、current存在32）相对`db2dc408`机械计数为`40361 -> 41167 physical`、`36507 -> 37257 nonblank`，净`+806/+750`，比为`1.0200x/1.0205x`；classes`139 -> 139`、dataclasses`12 -> 12`、enums`0 -> 0`、functions/methods`1878 -> 1895`，无新增产品class或超过约3倍项。第35条是为冻结端到端render预算而实际修改的notebook façade，第36条是被机械审查抓出的current root`pulse_gui.py`，都不能藏在原34-path账外；其余增量来自curated Qt facade、两个style owner leaf、薄文本/确认helper、复用immutable image board、串行compose/save/release边界、显式precision/lifecycle/layout合同与机械ratchet，不是新的GUI framework。focused tests按process-lifetime installation边界分进程运行共90 passed（Qt/render owner 12、W1 7、W2 9、W3 application 5、panel controller 12、TaskConsole 7、frontend figure/render 38），另有target compile、diff-check、fresh import、并发rc恢复、DPI canvas、GC-disabled连续export与fault injection、端到端budget、READY/FINAL frame containment、old/deep owner、raw-control/modal/QApplication alias、font package-data、style literal与extras ratchet。下一产品纵切仍是`API_SLOT_SEGMENTED_EXISTING`；任何后续W窗口必须先通过§4.3.1的salvage/reuse门。
+W-UI0按36个production Python union path（parent存在29、current存在32）相对`db2dc408`机械计数为`40361 -> 41167 physical`、`36507 -> 37257 nonblank`，净`+806/+750`，比为`1.0200x/1.0205x`；classes`139 -> 139`、dataclasses`12 -> 12`、enums`0 -> 0`、functions/methods`1878 -> 1895`，无新增产品class或超过约3倍项。第35条是为冻结端到端render预算而实际修改的notebook façade，第36条是被机械审查抓出的current root`pulse_gui.py`，都不能藏在原34-path账外；其余增量来自curated Qt facade、两个style owner leaf、薄文本/确认helper、复用immutable image board、串行compose/save/release边界、显式precision/lifecycle/layout合同与机械ratchet，不是新的GUI framework。focused tests按process-lifetime installation边界分进程运行共90 passed（Qt/render owner 12、W1 7、W2 9、W3 application 5、panel controller 12、TaskConsole 7、frontend figure/render 38），另有target compile、diff-check、fresh import、并发rc恢复、DPI canvas、GC-disabled连续export与fault injection、端到端budget、READY/FINAL frame containment、old/deep owner、raw-control/modal/QApplication alias、font package-data、style literal与extras ratchet。该切片当时的下一产品纵切`API_SLOT_SEGMENTED_EXISTING`现已由W3f完成；任何后续W窗口仍必须先通过§4.3.1的salvage/reuse门。
+
+**最新实现 checkpoint：W3f `API_SLOT_SEGMENTED_EXISTING` virtual/offline纵切与W-UI1a静态表单owner已由当前提交完成。** W3f保持整run一次camera arm/exact capture transaction，R-major/P-fast执行R×P个独立`STATIC_ONCE` pulse session并持久化唯一aggregate camera evidence；W-UI1a把W1/W2/W3已用的静态scalar/typed choice/atomic populate收口到current唯一form owner。W-UI1b/W-UI1c尚未开始，rolling/overlay与真实qCMOS Formal仍NO-GO。
+
+W3f/API segmented与同一提交交付的W-UI1a按24个实际受影响production Python文件相对parent `37c7893`机械计数：`16775 -> 21528 physical`、`15174 -> 19506 nonblank`，净`+4753/+4332`；classes `115 -> 140`、dataclasses `64 -> 81`、enums `3 -> 3`、functions/methods `785 -> 963`。main没有“一次camera arm + R×P独立STATIC_ONCE terminal + canonical reopen”的等价API实现，因此不伪造窄算法倍率；只把main的`pulse_scan.py + task_console.py + pulse_gui.py = 14450/13319 physical/nonblank`作为广义迁移包络，本提交全部production净增量是其`0.329x/0.325x`，而不是声称职责一一等价。W-UI1a两个current owner的独立倍率见下段；W3f新增量集中在typed program/lineage、one-arm segmented runtime、direct/occupancy共用application接缝和canonical repository reopen，不另造并行GUI或旧signal graph。四类durable execution/camera evidence、runtime binding/result/spec、一个RunPlan prepared state和一个窄capture protocol分别承担persisted-vs-live authority、one-arm lifecycle或direct/occupancy共用接缝。已删除只有一个字符串字段的`SegmentationSemantics`，没有新增enum、workflow engine、generic scheduler、per-segment camera wrapper或host-stepped fallback。Repository metadata准入不是R×P固定公式冒充完整证明：cardinality floor只负责早拒绝；真实静态事实冻结后由repository私有receipt绑定actual source block/schema、lineage、camera/result stream-source topology与execution shape，terminal byte/node上限仍归pulse/camera owner，FINAL发生任何事实、codec或容量漂移都是内部不变量错误。`ScanRepository.resource_policy`在构造期冻结为write-once；需要换policy就建立新repository/generation，不能在已mint receipt与FINAL之间热改。该receipt只证明metadata canonical边界，不替代values/validity/manifest的一般sink准入，也不落盘、不公开或扩成通用预算框架；camera interval函数只补硬件terminal/tail与下段prefix未覆盖的余量，不成为edge scheduler。对应focused oracle为API 9、W3/Form 37、W2 authoring/application 15、W2 Qt 9项全部通过；其中600k合法camera/result stream/source标识同时覆盖direct与occupancy topology，不再在FIRE后late-fail。真实qCMOS仍受Q0/H1门禁，不得把virtual通过倒写为Formal资格。
+
+**W-UI1a静态声明式表单门已经由current实现兑现；W-UI1b/W-UI1c仍按consumer保持NOT STARTED，不得混成“全部UI迁移完成”。** `zlc_frontend.form`现拥有headless immutable FormSpec与共享number leaf coercion，`zlc_frontend.qt_widgets.FluentParameterForm`拥有closed `normalize/build/read/write/is_empty/refresh` handler mapping、typed choice、non-quantizing number与exact-key原子populate；W3 role/budget/deadline及PulseDocument API常量从typed owner经Workbench projector进入同一路径，W2/W3复杂table的普通number leaf也委托共享parser。旧`frontend/param_widgets.py`中float/int/bool/text/ordinary choice/device choice的五操作门面已改为调用current handler owner，只为尚未迁走的legacy consumer保留instant-apply facade；segmented toggle及json/path/axis/signal/pulse_slots等真正legacy专用分支留在各自有最后consumer删除点的岛，不得被current窗口使用。动态stream/device option snapshot+revision仍必须在monitor/Measurement/Processor纵切前完成W-UI1b；`RateLimitedApply`原源码迁移与teardown flush仍必须在DeviceManager/live-control纵切前完成W-UI1c。Pulse/API table、calibration/transform/ROI/fit等复杂presenter继续显式，但其普通scalar leaf不得再分叉。W-UI1a的两个current owner文件为`807/676 physical/nonblank`，对main旧`param_widgets.py`的`922/752`是`0.875x/0.899x`；迁移期再加仍有最后consumer的旧adapter岛合计约`1.90x`，但机械ratchet证明普通scalar只委托current handler而不保留第二份控件/解析实现，最后legacy consumer迁走时整岛删除。
+
+QApplication事实也在本轮校正：current production只有`zlc_frontend.qt_widgets`中的`ensure_qt_app()`拥有构造权，W1/W2/W3调用同一个singleton，不存在三份QApplication authority。剩余重复只是少量`owner-thread -> scale -> factory -> screen-fit -> show -> center -> retain` launcher choreography；只有在不包裹原窗口、不接管close、不持有Run且四个真consumer合同一致时，才可提取薄`launch_owned_top_level(factory, size_ratio)`。不得为了消除这几行重新引入`FluentWindow` wrapper或GenericRunPanel，从而破坏各窗口自己的cancel/reap/committed-close owner。
 
 ### 22.2 终态验收清单
 
@@ -3690,7 +3796,7 @@ W-UI0按36个production Python union path（parent存在29、current存在32）�
 - exact source/reservation/Delivery/EOS authority、single materializer、TraceBinding、frozen cell schedule、pin/ack、broker-minted generation 与真实 byte budget 正确；
 - CaptureCapability由broker endpoint probe attestation绑定device generation；FrozenCaptureSpec只含owner canonical bytes/digest且prepare无替换/codec回调入口；CaptureSession所有device operation保持同一owner I/O lane；
 - BACKPRESSURE_CAPABLE 可零副作用拒绝后重试；NON_BACKPRESSURE_CAPTURED 首次 overrun 或 capture 后处理失败永久 poison epoch，后续 frame 不得补占旧 sequence；
-- qCMOS AUTONOMOUS_STREAMED只在active Q0 CameraExternalTriggerQualification与preflight margin内运行；qualification mutation与每次FIRE共用跨进程线性化gate，suspension/revocation写失败保持claim并fail closed；所有数据在EndAttestation前provisional，不一致整run拒绝；artifact分别记录execution_mode、run级authorization或有序segment_authorizations、required/achieved association proof与formal eligibility及其非逐沿剩余风险；
+- qCMOS正式scan只在active Q0 CameraExternalTriggerQualification与preflight margin内运行；autonomous单次FIRE或API整run首次FIRE的camera authority与qualification mutation共用跨进程线性化gate，suspension/revocation写失败保持claim并fail closed；所有数据在EndAttestation前provisional，不一致整run拒绝；artifact记录execution_mode、一个run级camera authorization/CameraRunEvidence、API模式下另有R-major/P-fast的有序pulse segment evidence、required/achieved association proof与formal eligibility及其非逐沿剩余风险；
 - formal epoch的PROVISIONAL/VALID/INVALID由独立immutable validation record解析；PROVISIONAL只可带徽标显示，不能经普通Figure/Fit/derived save逃逸为成功权威artifact；
 - repeat轴已展开进finite single-pass table，Formal路径不存在`scan_repeats>0` host wrap-stop；
 - coherent monitor 不混 shot；
@@ -3741,7 +3847,7 @@ Pulse/FPGA：
 - raw STATUS/CURSOR只证明logical table terminal；camera/drain必须保持运行到compiled/H1 post-terminal tail bound完整经过并形成`PostTerminalTailEvidence`，再执行Q0 quiet-window/final metadata/cap_stop/release；host wait只防过早termination，不调度edge；
 - camera max-inflight ring与host total frame/byte retention分别在fire前证明；近期Formal强基线为resident，超resident默认拒绝，只有单I/O owner、保守refill硬上界和每个潜在seam均有足分辨率硬件时间观测/全schedule residual时才开放条件能力；非sticky underflow、DONE或局部timestamp不算无缝证明；
 - MOT只使用SCAN_SLOT + AUTONOMOUS_STREAMED；无API或host-stepped fallback；
-- API segmented只有在bound `SegmentationSemantics`允许host boundary且settle/re-equilibration可判定时运行；每segment使用PreparedProgramRef+compiled schedule+stable raw DONE/STATUS的SegmentTerminalEvidence（CURSOR=N/A），并与aggregate组成双层EndAttestation；INVALID attempt可见且不会被无限自动重试隐藏；
+- API segmented只有在program的canonical非空`segmentation_rationale`说明host boundary物理可接受，且use case接受任意可变非负gap、不依赖最大gap/精确settle/连续时间或gap-dependent physics时运行；不建立单字段policy wrapper。整run一次camera arm/aggregate terminal，按R-major/P-fast为每cell使用独立STATIC_ONCE PreparedProgramRef/PulseSession并取得physical pulse terminal（CURSOR=N/A）；相邻segment把前段trigger→physical terminal/tail与后段硬件trigger prefix计入硬件已保证区间，host只deadline/cancel-aware等待camera required interval尚未覆盖的安全余量，不承担精密edge调度。ScanRepository先在point resolve/compile前执行R×P cardinality floor，再在真实program/source/output/compiled/camera/point-shape冻结后且Run/arm/FIRE前mint实例绑定的metadata admission receipt；FINAL canonical encoder只能在该receipt的byte/node上界内运行，codec或事实漂移按内部不变量失败。全部R×P evidence与唯一CameraRunEvidence只进入一次aggregate EndAttestation；INVALID attempt可见且不会被无限自动重试隐藏；
 - build/target digest在compiler、repository与发布记录之间形成可追溯闭环；installation-owned ProgrammedImageDeploymentRecordRef把endpoint、冻结`.bit` digest、release/timing records和现有fingerprint绑定进H1/Q0/FIRE/tail/artifact lineage；
 - runtime现有`image.build_fingerprint`/几何/ABI握手闭环；新ROM attestation不是baseline；
 - runtime不声称验证当前bitstream content digest、implementation seed或timing-signoff token；

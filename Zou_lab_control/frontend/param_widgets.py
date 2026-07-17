@@ -1,4 +1,4 @@
-"""ONE param-kind -> Qt-widget registry, shared by EVERY param form.
+"""Legacy five-operation parameter facade over the current frontend owners.
 
 The knowledge "a :class:`ParamDecl` of kind ``K`` is built / read / seeded /
 validated / refreshed as widget ``W``" used to live in 5-7 parallel ladders inside
@@ -7,8 +7,13 @@ refresh / set_running loops) PLUS a SECOND, smaller ladder behind a parallel
 ``ParamSpec`` declaration class for plot-panel params.  Adding a kind meant editing
 every ladder; forgetting one was a silent bug.
 
-This module collapses all of that to ONE handler per kind.  A handler implements
-the five operations every form needs:
+This module originally collapsed all of that to one handler per kind.  During
+migration, ordinary ``float``/``int``/``bool``/``text``/``choice`` rows now project
+to :class:`zlc_frontend.form.FormFieldProps` and delegate to
+``zlc_frontend.qt_widgets.FORM_WIDGET_HANDLERS``.  Therefore bounds, parsing,
+typed choices, and non-quantizing float edits have one current owner.  This file
+retains the old five-operation call surface while unported consumers still exist,
+plus genuinely legacy composite/dynamic controls.  Those five operations are:
 
   * ``build(decl, value, ctx)``  -- construct the Qt widget, seed it with ``value``,
     and wire ``ctx.on_change`` (re-validation) + ``ctx.instant_apply`` (the Setting /
@@ -23,11 +28,11 @@ the five operations every form needs:
   * ``refresh(widget, providers)`` -- repopulate a DYNAMIC control (a signal /
     pulse-template combo) from live providers; a no-op for a static kind.
 
-Adding a new ParamDecl kind is now: add it to ``ParamDecl``'s whitelist, add ONE
-handler here, register it in :data:`PARAM_WIDGETS`.  ``tests/
-test_param_widget_registry.py`` mechanically enforces that the registry covers
-every whitelisted kind and that a handler missing any of the five ops cannot
-instantiate.
+Do not add an ordinary scalar widget implementation here.  Add it to the current
+headless/Qt form owners, then add only a projection entry while legacy consumers
+remain.  A legacy-only composite kind still needs one local handler registered in
+:data:`PARAM_WIDGETS`.  ``tests/test_param_widget_registry.py`` mechanically
+enforces coverage and the five-op facade.
 
 This is a FRONTEND module: it may import Qt and the frontend's own fluent widgets.
 ``ParamDecl`` itself stays dependency-free in ``operations`` -- this registry is the
@@ -46,14 +51,14 @@ from PyQt5 import QtCore, QtWidgets
 
 from Zou_lab_control._paths import display_path
 
+from zlc_frontend.form import FormChoice, FormFieldProps
 from zlc_frontend.qt_widgets import (
+    FORM_WIDGET_HANDLERS,
     GREY,
-    FluentComboBox,
     FluentDoubleSpinBox,
     FluentLabel,
     FluentLineEdit,
     FluentPathEdit,
-    FluentSwitch,
     FluentTreeComboBox,
     FluentTriStateToggle,
     eng_mantissa_prefix,
@@ -268,166 +273,199 @@ def _wire(widget_signal, ctx: ParamWidgetContext, decl, reader: Callable[[], Any
 # ------------------------------------------------------------------------------- scalars
 
 
-def _make_spin(decl, *, integer: bool, value=None) -> FluentDoubleSpinBox:
-    """A bounded spin box for a float / int param (range + width from the decl) -- the
-    SAME construction the measurement form's ``_spin`` used."""
-    digits = max(5, len(str(int(abs(decl.hi) + 1))) + (0 if integer else 4))
-    spin = FluentDoubleSpinBox(length=digits, allow_minus=float(decl.lo) < 0)
-    if integer:
-        spin.setDecimals(0)
-    spin.setRange(float(decl.lo), float(decl.hi))
-    if value is None:
-        value = decl.default
-    if value is not None:
-        spin.setValue(int(value) if integer else float(value))
-    spin.setToolTip(decl.tooltip)
-    return spin
+_CURRENT_FIELD_ATTR = "_zlc_current_form_field"
 
 
-class FloatHandler(_StaticMixin, ParamWidgetHandler):
-    """A bounded float.  A BLANK-ABLE float (``decl.blank_allowed``) renders as a line edit so
-    "leave blank = use the library / device default" stays expressible (mirrors :class:`IntHandler`);
-    otherwise -- a defaulted / required param, and EVERY device runtime control (pinned
-    ``optional=False``) -- it uses a scrollable spin box.  ``read`` / ``write`` / ``is_empty`` branch
-    on which one was built (the line edit can be blank -> ``None``).  The blank-vs-spin decision is the
-    declaration's (``ParamDecl.blank_allowed``), never hard-coded here."""
+def _integral_bound(value, *, key: str, name: str) -> int:
+    """Translate a legacy numeric bound without silently truncating it."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"legacy int field {key!r} {name} must be numeric")
+    result = int(value)
+    if result != value:
+        raise ValueError(f"legacy int field {key!r} {name} must be integral")
+    return result
+
+
+def _legacy_scalar_projection(decl, *, value=None, current_kind=None) -> FormFieldProps:
+    """Losslessly project an old scalar declaration into the current form owner.
+
+    This is deliberately an adapter, not a second widget registry.  The current
+    :mod:`zlc_frontend` field and handler contracts perform all scalar typing,
+    bounds checking, non-quantizing float editing, and ordinary-choice identity.
+    Legacy-only render facts that the current scalar contract cannot express must
+    either be handled explicitly (the segmented choice below) or fail here.
+    """
+    kind = str(current_kind or decl.kind)
+    if kind not in FORM_WIDGET_HANDLERS:
+        raise ValueError(f"legacy scalar adapter cannot project kind {kind!r}")
+
+    default = decl.default
+    minimum = maximum = None
+    choices = ()
+    if kind == "int":
+        minimum = _integral_bound(decl.lo, key=decl.key, name="minimum")
+        maximum = _integral_bound(decl.hi, key=decl.key, name="maximum")
+    elif kind == "float":
+        minimum = decl.lo
+        maximum = decl.hi
+    elif kind == "choice":
+        choices = tuple(
+            FormChoice(
+                label="(none)" if decl.kind == "device" and item == "" else str(item),
+                value=item,
+            )
+            for item in decl.choices
+        )
+        if decl.kind == "device" and default is None and any(
+            choice.value == "" for choice in choices
+        ):
+            default = ""
+    elif kind == "bool" and default is None:
+        # The old BoolHandler's declared no-default state was concretely False.
+        default = False
+
+    if kind in {"int", "float"}:
+        if decl.blank_allowed and default is not None:
+            raise ValueError(
+                f"legacy field {decl.key!r} requests a blank-able editor but has a "
+                "concrete default; current FormFieldProps cannot express both facts"
+            )
+        if not decl.blank_allowed and default is None:
+            # Current scalar handlers select a bounded spin only for a concrete
+            # initial value.  Runtime controls historically carry that value in
+            # ``build(..., value, ...)`` rather than ParamDecl.default.  Preserve
+            # the spin contract without inventing a new legacy widget owner.
+            candidate = value
+            if candidate is None:
+                candidate = min(max(0, minimum), maximum)
+            default = candidate
+
+    return FormFieldProps(
+        key=str(decl.key),
+        kind=kind,
+        label=str(decl.label or decl.key),
+        default=default,
+        required=bool(decl.required),
+        unit=str(decl.unit),
+        description=str(decl.tooltip),
+        minimum=minimum,
+        maximum=maximum,
+        choices=choices,
+    )
+
+
+class _CurrentScalarAdapter(ParamWidgetHandler):
+    """Keep the old five-op call surface while delegating scalar truth to current."""
+
+    def __init__(self, kind: str, *, legacy_kind: str | None = None) -> None:
+        if kind not in FORM_WIDGET_HANDLERS:
+            raise ValueError(f"unknown current form kind: {kind!r}")
+        self._kind = kind
+        self._legacy_kind = legacy_kind or kind
+        self._handler = FORM_WIDGET_HANDLERS[kind]
 
     def build(self, decl, value, ctx):
-        if decl.blank_allowed:
-            edit = FluentLineEdit("" if value is None else f"{float(value):g}")
-            edit.setMinimumWidth(scaled_px(96, minimum=80))
-            edit.setPlaceholderText("(default)")
-            edit.setToolTip(decl.tooltip)
+        if decl.kind != self._legacy_kind:
+            raise TypeError(
+                f"{self._legacy_kind} adapter cannot build legacy kind {decl.kind!r}"
+            )
+        field = _legacy_scalar_projection(
+            decl, value=value, current_kind=self._kind
+        )
+        initial = field.default if value is None else value
+        holder: dict[str, QtWidgets.QWidget] = {}
 
-            def _read_opt():
-                text = edit.text().strip()
-                return float(text) if text else None
+        def _on_change() -> None:
+            widget = holder.get("widget")
+            if widget is None:
+                raise RuntimeError("current form handler emitted while still building")
+            if ctx.instant_apply is not None:
+                ctx.instant_apply(decl.key, self._handler.read(field, widget))
+            ctx.on_change()
 
-            _wire(edit.textChanged, ctx, decl, _read_opt)
-            return edit
-        spin = _make_spin(decl, integer=False, value=value)
-        _wire(spin.valueChanged, ctx, decl, lambda: float(spin.value()))
-        return spin
+        widget = self._handler.build(field, initial, _on_change)
+        setattr(widget, _CURRENT_FIELD_ATTR, field)
+        holder["widget"] = widget
+        return widget
+
+    def _field(self, widget) -> FormFieldProps:
+        field = getattr(widget, _CURRENT_FIELD_ATTR, None)
+        if not isinstance(field, FormFieldProps) or field.kind != self._kind:
+            raise TypeError(
+                f"widget was not built by the legacy {self._kind} scalar adapter"
+            )
+        return field
 
     def read(self, widget):
-        if isinstance(widget, FluentLineEdit):
-            text = widget.text().strip()
-            return float(text) if text else None
-        return float(widget.value())
+        field = self._field(widget)
+        return self._handler.read(field, widget)
 
     def write(self, widget, value):
-        if isinstance(widget, FluentLineEdit):
-            widget.setText("" if value is None else f"{float(value):g}")
-        else:
-            widget.setValue(float(value))
+        field = self._field(widget)
+        self._handler.write(field, widget, value)
 
     def is_empty(self, widget) -> bool:
-        # only the optional-float line edit can be blank; a spin box always has a number
-        return isinstance(widget, FluentLineEdit) and not widget.text().strip()
+        field = self._field(widget)
+        return self._handler.is_empty(field, widget)
+
+    def refresh(self, widget, providers: RefreshProviders) -> None:
+        del providers
+        field = self._field(widget)
+        self._handler.refresh(field, widget)
 
 
-class IntHandler(_StaticMixin, ParamWidgetHandler):
-    """A bounded int.  A BLANK-ABLE int (``decl.blank_allowed``) renders as a line edit so "leave
-    blank = all" stays expressible; otherwise -- a defaulted / required param, and every device
-    runtime control -- it uses a scrollable spin box.  ``read`` / ``write`` / ``is_empty`` branch on
-    which one was built (the line edit can be blank; the spin box always holds a number).  The
-    blank-vs-spin decision is the declaration's (``ParamDecl.blank_allowed``), never hard-coded here."""
+class ChoiceHandler(ParamWidgetHandler):
+    """Current typed combo by default; one explicit legacy segmented render adapter."""
 
-    def build(self, decl, value, ctx):
-        if decl.blank_allowed:
-            edit = FluentLineEdit("" if value is None else str(int(value)))
-            edit.setMinimumWidth(scaled_px(96, minimum=80))
-            edit.setPlaceholderText("(all)")
-            edit.setToolTip(decl.tooltip)
-
-            def _read_opt():
-                text = edit.text().strip()
-                return int(text) if text else None
-
-            _wire(edit.textChanged, ctx, decl, _read_opt)
-            return edit
-        spin = _make_spin(decl, integer=True, value=value)
-        _wire(spin.valueChanged, ctx, decl, lambda: int(spin.value()))
-        return spin
-
-    def read(self, widget):
-        if isinstance(widget, FluentLineEdit):
-            text = widget.text().strip()
-            return int(text) if text else None
-        return int(widget.value())
-
-    def write(self, widget, value):
-        if isinstance(widget, FluentLineEdit):
-            widget.setText("" if value is None else str(int(value)))
-        else:
-            widget.setValue(int(value))
-
-    def is_empty(self, widget) -> bool:
-        # only the optional-int line edit can be blank; a spin box always has a number
-        return isinstance(widget, FluentLineEdit) and not widget.text().strip()
-
-
-class BoolHandler(_StaticMixin, ParamWidgetHandler):
-    def build(self, decl, value, ctx):
-        sw = FluentSwitch("")
-        sw.setChecked(bool(decl.default if value is None else value))
-        sw.setToolTip(decl.tooltip)
-        _wire(sw.toggled, ctx, decl, lambda: bool(sw.isChecked()))
-        return sw
-
-    def read(self, widget):
-        return bool(widget.isChecked())
-
-    def write(self, widget, value):
-        widget.setChecked(bool(value))
-
-
-class ChoiceHandler(_StaticMixin, ParamWidgetHandler):
-    """One of ``decl.choices``.  ``decl.segmented`` renders a confocal-style capsule multi-state toggle
-    (:class:`FluentTriStateToggle`) instead of a combo box -- both expose ``currentText`` /
-    ``setCurrentText`` / ``activated``, so ``read`` / ``write`` / wiring stay widget-agnostic (only
-    ``build`` decides which control to construct)."""
+    def __init__(self) -> None:
+        self._ordinary = _CurrentScalarAdapter("choice")
 
     def build(self, decl, value, ctx):
-        choices = [str(c) for c in decl.choices]
-        segmented = bool(getattr(decl, "segmented", False))
-        widget = FluentTriStateToggle(choices) if segmented else FluentComboBox()
-        if not segmented:
-            widget.addItems(choices)
-        cur = decl.default if value is None else value
-        if cur is not None and str(cur) in choices:
-            widget.setCurrentText(str(cur))
+        if not bool(getattr(decl, "segmented", False)):
+            return self._ordinary.build(decl, value, ctx)
+        choices = tuple(str(choice) for choice in decl.choices)
+        if not choices or len(set(choices)) != len(choices):
+            raise ValueError(
+                f"legacy segmented choice {decl.key!r} needs unique choices"
+            )
+        widget = FluentTriStateToggle(choices)
+        widget._zlc_legacy_segmented_choices = choices
+        current = decl.default if value is None else value
+        if current is not None:
+            text = str(current)
+            if text not in choices:
+                raise ValueError(
+                    f"legacy segmented choice {decl.key!r} value is not declared"
+                )
+            widget.setCurrentText(text)
         widget.setToolTip(decl.tooltip)
         _wire(widget.activated, ctx, decl, lambda: widget.currentText())
         return widget
 
     def read(self, widget):
-        return widget.currentText()
+        if isinstance(widget, FluentTriStateToggle):
+            return widget.currentText()
+        return self._ordinary.read(widget)
 
     def write(self, widget, value):
-        widget.setCurrentText(str(value))
-
-
-class TextHandler(_StaticMixin, ParamWidgetHandler):
-    """A free string (line edit).  Taken VERBATIM, never eval'd."""
-
-    def build(self, decl, value, ctx):
-        seed = "" if value is None else str(value)
-        edit = FluentLineEdit(seed)
-        edit.setMinimumWidth(scaled_px(160, minimum=120))
-        edit.setPlaceholderText(decl.tooltip[:48] if decl.tooltip else "")
-        edit.setToolTip(decl.tooltip)
-        _wire(edit.textChanged, ctx, decl, lambda: edit.text().strip())
-        return edit
-
-    def read(self, widget):
-        return widget.text()
-
-    def write(self, widget, value):
-        widget.setText("" if value is None else str(value))
+        if isinstance(widget, FluentTriStateToggle):
+            text = str(value)
+            choices = getattr(widget, "_zlc_legacy_segmented_choices", ())
+            if text not in choices:
+                raise ValueError("value is not a declared legacy segmented choice")
+            widget.setCurrentText(text)
+            return
+        self._ordinary.write(widget, value)
 
     def is_empty(self, widget) -> bool:
-        return not widget.text().strip()
+        if isinstance(widget, FluentTriStateToggle):
+            return not widget.currentText()
+        return self._ordinary.is_empty(widget)
+
+    def refresh(self, widget, providers: RefreshProviders) -> None:
+        if isinstance(widget, FluentTriStateToggle):
+            return None
+        self._ordinary.refresh(widget, providers)
 
 
 class JsonHandler(ParamWidgetHandler):
@@ -479,15 +517,18 @@ class JsonHandler(ParamWidgetHandler):
         return None
 
 
-class DeviceRefHandler(ChoiceHandler):
+class DeviceRefHandler(_CurrentScalarAdapter):
     """A ``$device:<entry>`` cross-reference to another entry of the SAME device config (a
     constructor arg that takes a built device).  Same combo semantics as ``choice`` -- the
     CONFIG EDITOR fills ``choices`` from the working config's other entry names (the decl
     itself may carry none; only the editor knows the live config) -- but an unset required
     reference counts as MISSING (a choice is never empty)."""
 
+    def __init__(self) -> None:
+        super().__init__("choice", legacy_kind="device")
+
     def is_empty(self, widget) -> bool:
-        return not str(widget.currentText()).strip()
+        return not str(self.read(widget) or "").strip()
 
 
 class PathHandler(_StaticMixin, ParamWidgetHandler):
@@ -519,6 +560,17 @@ class PathHandler(_StaticMixin, ParamWidgetHandler):
 # ----------------------------------------------------------------------- axis_range
 
 
+def _make_axis_spin(decl, value=None) -> FluentDoubleSpinBox:
+    """Build one coordinate editor for the legacy three-part axis-range control."""
+    digits = max(5, len(str(int(abs(decl.hi) + 1))) + 4)
+    spin = FluentDoubleSpinBox(length=digits, allow_minus=float(decl.lo) < 0)
+    spin.setRange(float(decl.lo), float(decl.hi))
+    if value is not None:
+        spin.setValue(float(value))
+    spin.setToolTip(decl.tooltip)
+    return spin
+
+
 class AxisRangeHandler(_StaticMixin, ParamWidgetHandler):
     """A swept range rendered as three boxes ``[min] to [max] / [points] pts``.  The
     widget is a container whose ``min_spin`` / ``max_spin`` / ``pts_spin`` attributes
@@ -532,8 +584,8 @@ class AxisRangeHandler(_StaticMixin, ParamWidgetHandler):
             lo, hi, points = seed
         except (TypeError, ValueError):
             lo, hi, points = default
-        lo_spin = _make_spin(decl, integer=False, value=lo)
-        hi_spin = _make_spin(decl, integer=False, value=hi)
+        lo_spin = _make_axis_spin(decl, value=lo)
+        hi_spin = _make_axis_spin(decl, value=hi)
         pts_spin = FluentDoubleSpinBox(length=5, allow_minus=False)
         pts_spin.setDecimals(0)
         pts_spin.setRange(2, 100000)
@@ -863,12 +915,12 @@ class PulseSlotsHandler(ParamWidgetHandler):
 
 
 PARAM_WIDGETS: dict[str, ParamWidgetHandler] = {
-    "float": FloatHandler(),
-    "int": IntHandler(),
+    "float": _CurrentScalarAdapter("float"),
+    "int": _CurrentScalarAdapter("int"),
     "axis_range": AxisRangeHandler(),
-    "bool": BoolHandler(),
+    "bool": _CurrentScalarAdapter("bool"),
     "choice": ChoiceHandler(),
-    "text": TextHandler(),
+    "text": _CurrentScalarAdapter("text"),
     "json": JsonHandler(),
     "device": DeviceRefHandler(),
     "path": PathHandler(),

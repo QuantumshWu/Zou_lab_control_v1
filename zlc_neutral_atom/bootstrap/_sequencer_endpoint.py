@@ -48,6 +48,7 @@ from ._virtual_hardware import VirtualSequencer
 @dataclass
 class _EndpointSession:
     session_id: str
+    run_id: str
     artifact_digest: str
     request: object
     operation_epoch: int
@@ -122,9 +123,21 @@ class _SequencerSessionOwner:
                     raise RuntimeError(
                         "sequencer endpoint still has a physical operation in flight"
                     )
-                if not current.closed or not current.close_acknowledged:
+                previously_cleaned = (
+                    current.closed and current.close_acknowledged
+                )
+                same_run_completed_segment = (
+                    current.completed
+                    and not current.closed
+                    and current.run_id == command.run_id
+                )
+                if not (previously_cleaned or same_run_completed_segment):
+                    if current.run_id != command.run_id and not previously_cleaned:
+                        raise RuntimeError(
+                            "sequencer endpoint cannot cross runs before cleanup"
+                        )
                     raise RuntimeError(
-                        "sequencer endpoint previous session is not terminally closed"
+                        "sequencer endpoint previous segment is not completed"
                     )
             self._last_prepare_session_id = command.session_id
             if command.capability_fingerprint != self._capability_fingerprint:
@@ -134,6 +147,7 @@ class _SequencerSessionOwner:
             operation_epoch = self._operation_epoch
             provisional = _EndpointSession(
                 command.session_id,
+                command.run_id,
                 command.request.artifact_digest,
                 command.request,
                 operation_epoch,

@@ -532,25 +532,30 @@ class ExactCaptureTransaction:
         self.session.prepare(context)
         self.session.start(context)
 
+    def capture_next(self, context: RunContext) -> None:
+        """Consume exactly one already-budgeted physical capture event."""
+
+        context.checkpoint()
+        self.session.capture_next(context)
+        self.builder.consume(
+            self.cursor.next(
+                timeout=self.port.capability.max_blocking_call_seconds
+            )
+        )
+        preview = self.preview_dataset
+        if preview is not None:
+            try:
+                preview.ingest_latest()
+                port = self.preview_port
+                if port is None:
+                    raise RuntimeError("capture preview port disappeared")
+                port.updated()
+            except BaseException as error:
+                self._detach_preview(error)
+
     def capture_all(self, context: RunContext) -> None:
         for _ordinal in range(self.contract.total_events):
-            context.checkpoint()
-            self.session.capture_next(context)
-            self.builder.consume(
-                self.cursor.next(
-                    timeout=self.port.capability.max_blocking_call_seconds
-                )
-            )
-            preview = self.preview_dataset
-            if preview is not None:
-                try:
-                    preview.ingest_latest()
-                    port = self.preview_port
-                    if port is None:
-                        raise RuntimeError("capture preview port disappeared")
-                    port.updated()
-                except BaseException as error:
-                    self._detach_preview(error)
+            self.capture_next(context)
 
     def complete(self, context: RunContext) -> PipelineResult:
         completion: CaptureCompletion = self.session.complete(context)

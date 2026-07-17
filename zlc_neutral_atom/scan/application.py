@@ -1,4 +1,4 @@
-"""One-Run application boundary for canonical autonomous scan artifacts."""
+"""One-Run application boundary for canonical pulse-scan artifacts."""
 
 from __future__ import annotations
 
@@ -13,12 +13,18 @@ from zlc_data import (
 )
 from zlc_neutral_atom.readout.calibration import calibration_retained_array_nbytes
 from zlc_neutral_atom.readout.occupancy import resolve_occupancy_stream_schema
-from zlc_neutral_atom.readout.occupancy_pipeline import _occupancy_preview_spec
+from zlc_neutral_atom.readout.occupancy_pipeline import (
+    OccupancyPipelineResult,
+    OccupancyPipelineSpec,
+    _occupancy_preview_spec,
+)
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.dataset import DatasetSealProvenance
 from zlc_neutral_atom.runtime.pipeline import (
     ExactDatasetPreviewPort,
     ExactDatasetPreviewSpec,
+    MinimalPipelineSpec,
+    PipelineResult,
     _notify_preview_failure,
 )
 from zlc_neutral_atom.runtime.run import (
@@ -37,23 +43,39 @@ from zlc_neutral_atom.timing.occupancy import (
     TriggeredOccupancySpec,
     compile_triggered_occupancy_pipeline,
 )
-from zlc_neutral_atom.timing.lineage import PulseCaptureEvidence
-from zlc_pulse import (
-    CompiledPulseArtifact,
-    PulseDocument,
-    PulseExecutionForm,
-    expand_autonomous_scan_repeats,
+from zlc_neutral_atom.timing.segmented import (
+    ApiSlotSegmentedResult,
+    ApiSlotSegmentedSpec,
+    api_slot_segmented_control_retained_upper_bound_bytes,
+    compile_api_slot_segmented_occupancy_pipeline,
+    compile_api_slot_segmented_pipeline,
 )
+from zlc_pulse import CompiledPulseArtifact
 from zlc_storage import (
     RepositoryRootLeaseBorrow,
     nonnegative_integer,
     positive_integer,
 )
 
-from .contracts import ScanOutputContract, ScanPointTable, bind_scan_output_contract
+from .contracts import (
+    ApiSlotSegmentedProgram,
+    AutonomousScanSlotProgram,
+    PulseScanProgram,
+    ScanOutputContract,
+    bind_scan_output_contract,
+)
+from .lineage import (
+    ApiSegmentEvidence,
+    ApiSegmentedScanExecution,
+    AutonomousScanExecution,
+    PulseScanExecution,
+    api_segmented_metadata_static_shape_to_tree,
+    camera_run_evidence_from_pipeline,
+)
 from .reference import ScanArtifactRef
 from .repository import (
     ScanRepository,
+    _ApiFinalMetadataAdmission,
     _PreparedScanDataset,
     _SCAN_APPLICATION_TOKEN,
     _StaticScanLineageAdmission,
@@ -64,7 +86,7 @@ from .repository import (
 
 _ResultAdapter = Callable[
     [object],
-    tuple[str, OwnedSnapshot, DatasetSealProvenance, PulseCaptureEvidence],
+    tuple[str, OwnedSnapshot, DatasetSealProvenance, PulseScanExecution],
 ]
 
 
@@ -126,26 +148,22 @@ class PreparedOccupancyScan:
             self._started = True
 
 
-def _require_compile_binding(
+def _require_output_binding(
     *,
-    document: PulseDocument,
+    program: PulseScanProgram,
     source_schema: DatasetSchema,
     output_contract: ScanOutputContract,
-    execution_form: PulseExecutionForm,
-    compiled_source_document_digest: str,
 ) -> None:
-    if not isinstance(document, PulseDocument):
-        raise TypeError("document must be PulseDocument")
+    if not isinstance(
+        program,
+        (AutonomousScanSlotProgram, ApiSlotSegmentedProgram),
+    ):
+        raise TypeError("program must be a current pulse-scan program")
     if not isinstance(source_schema, DatasetSchema):
         raise TypeError("source_schema must be DatasetSchema")
     if not isinstance(output_contract, ScanOutputContract):
         raise TypeError("output_contract must be ScanOutputContract")
-    if execution_form is not PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
-        raise ValueError("formal SCAN_SLOT requires AUTONOMOUS_SCAN_ONCE")
-    expanded = expand_autonomous_scan_repeats(document)
-    if compiled_source_document_digest != expanded.fingerprint:
-        raise ValueError("compiled pulse differs from the frozen repeat-major scan")
-    point_table = ScanPointTable.from_pulse_document(document)
+    point_table = program.point_table
     rebound = bind_scan_output_contract(
         source_schema,
         point_table,
@@ -159,16 +177,20 @@ def _prepare_dataset(
     context: PostSafetyContext,
     *,
     run_id: str,
-    document: PulseDocument,
+    execution: PulseScanExecution,
     source: OwnedSnapshot,
     output_contract: ScanOutputContract,
     provenance,
-    pulse_evidence,
     staged_lineage: _StagedScanLineage,
+    api_metadata_admission: _ApiFinalMetadataAdmission | None,
     memory_limit_bytes: int,
 ) -> _PreparedScanDataset:
     context.checkpoint()
-    output_ref = _scan_output_dataset_ref(document, source.ref, output_contract)
+    output_ref = _scan_output_dataset_ref(
+        execution.program,
+        source.ref,
+        output_contract,
+    )
     output = materialize_transformed_snapshot(
         source,
         output_contract.committed_transform,
@@ -180,13 +202,13 @@ def _prepare_dataset(
     return _PreparedScanDataset(
         _SCAN_APPLICATION_TOKEN,
         run_id=run_id,
-        pulse_document=document,
+        execution=execution,
         source_snapshot=source,
         output_contract=output_contract,
         output_snapshot=output,
         provenance=provenance,
-        pulse_evidence=pulse_evidence,
         staged_lineage=staged_lineage,
+        api_metadata_admission=api_metadata_admission,
         memory_limit_bytes=memory_limit_bytes,
     )
 
@@ -230,11 +252,12 @@ def _compile_scan_artifact_plan(
     base: RunPlan,
     repository: ScanRepository,
     *,
-    document: PulseDocument,
+    program: PulseScanProgram,
     output_contract: ScanOutputContract,
     final_data_limit_bytes: int,
     static_lineage: _StaticScanLineageAdmission,
-    compiled_pulse: CompiledPulseArtifact,
+    api_metadata_admission: _ApiFinalMetadataAdmission | None,
+    compiled_pulses: tuple[CompiledPulseArtifact, ...],
     adapt: _ResultAdapter,
 ) -> RunPlan:
     """Keep the durable sink admitted from preflight through FINAL commit."""
@@ -243,14 +266,25 @@ def _compile_scan_artifact_plan(
         raise TypeError("base must be RunPlan")
     if type(repository) is not ScanRepository:
         raise TypeError("repository must be ScanRepository")
-    if not isinstance(document, PulseDocument):
-        raise TypeError("document must be PulseDocument")
+    if not isinstance(
+        program,
+        (AutonomousScanSlotProgram, ApiSlotSegmentedProgram),
+    ):
+        raise TypeError("program must be a current pulse-scan program")
     if not isinstance(output_contract, ScanOutputContract):
         raise TypeError("output_contract must be ScanOutputContract")
     if not isinstance(static_lineage, _StaticScanLineageAdmission):
         raise TypeError("static_lineage must be admitted scan lineage")
-    if not isinstance(compiled_pulse, CompiledPulseArtifact):
-        raise TypeError("compiled_pulse must be CompiledPulseArtifact")
+    if isinstance(program, ApiSlotSegmentedProgram):
+        if not isinstance(api_metadata_admission, _ApiFinalMetadataAdmission):
+            raise TypeError("API scan requires FINAL metadata admission")
+    elif api_metadata_admission is not None:
+        raise ValueError("autonomous scan cannot carry API metadata admission")
+    compiled_pulses = tuple(compiled_pulses)
+    if not compiled_pulses or any(
+        not isinstance(item, CompiledPulseArtifact) for item in compiled_pulses
+    ):
+        raise TypeError("compiled_pulses must contain CompiledPulseArtifact values")
     final_data_limit = positive_integer(
         final_data_limit_bytes,
         "final_data_limit_bytes",
@@ -273,8 +307,8 @@ def _compile_scan_artifact_plan(
             borrow.require_active()
             staged = repository._stage_static_lineage(
                 static_lineage,
-                document,
-                compiled_pulse,
+                program,
+                compiled_pulses,
             )
             return base_preflight(context), borrow, staged
         except BaseException:
@@ -330,16 +364,16 @@ def _compile_scan_artifact_plan(
             # ``final_data_limit`` before the base hardware plan was compiled.
             base_result = None
             finalized = None
-            run_id, source, provenance, pulse_evidence = adapted
+            run_id, source, provenance, execution = adapted
             prepared = _prepare_dataset(
                 context,
                 run_id=run_id,
-                document=document,
+                execution=execution,
                 source=source,
                 output_contract=output_contract,
                 provenance=provenance,
-                pulse_evidence=pulse_evidence,
                 staged_lineage=staged_lineage,
+                api_metadata_admission=api_metadata_admission,
                 memory_limit_bytes=final_data_limit,
             )
             operation = repository.final_commit(context, prepared)
@@ -389,7 +423,7 @@ def compile_direct_scan_artifact_plan(
     spec: TriggeredCaptureSpec,
     repository: ScanRepository,
     *,
-    document: PulseDocument,
+    program: AutonomousScanSlotProgram,
     output_contract: ScanOutputContract,
     memory_limit_bytes: int,
 ) -> RunPlan:
@@ -398,14 +432,10 @@ def compile_direct_scan_artifact_plan(
     if not isinstance(spec, TriggeredCaptureSpec):
         raise TypeError("spec must be TriggeredCaptureSpec")
     source_schema = spec.capture.measurement.capture_contract.dataset_schema
-    _require_compile_binding(
-        document=document,
+    _require_output_binding(
+        program=program,
         source_schema=source_schema,
         output_contract=output_contract,
-        execution_form=spec.pulse_request.artifact.execution_form,
-        compiled_source_document_digest=(
-            spec.pulse_request.artifact.source_document_digest
-        ),
     )
     _admit_final_data_limit(
         source_schema,
@@ -414,8 +444,8 @@ def compile_direct_scan_artifact_plan(
         retained_overhead_bytes=0,
     )
     static_lineage = repository._admit_static_lineage(
-        document,
-        spec.pulse_request.artifact,
+        program,
+        (spec.pulse_request.artifact,),
         memory_limit_bytes=memory_limit_bytes,
     )
     final_data_limit = _admit_final_data_limit(
@@ -427,7 +457,7 @@ def compile_direct_scan_artifact_plan(
 
     def adapt(
         value: object,
-    ) -> tuple[str, OwnedSnapshot, DatasetSealProvenance, PulseCaptureEvidence]:
+    ) -> tuple[str, OwnedSnapshot, DatasetSealProvenance, PulseScanExecution]:
         if type(value) is not TriggeredPipelineResult:
             raise TypeError("direct scan base plan returned another result")
         pipeline = value.capture
@@ -435,7 +465,11 @@ def compile_direct_scan_artifact_plan(
             pipeline.run_id,
             pipeline.dataset.snapshot,
             pipeline.dataset.provenance,
-            value.lineage.evidence(),
+            AutonomousScanExecution(
+                program,
+                value.lineage.evidence(),
+                camera_run_evidence_from_pipeline(pipeline),
+            ),
         )
 
     base = compile_triggered_pipeline(
@@ -445,11 +479,12 @@ def compile_direct_scan_artifact_plan(
     return _compile_scan_artifact_plan(
         base,
         repository,
-        document=document,
+        program=program,
         output_contract=output_contract,
         final_data_limit_bytes=final_data_limit,
         static_lineage=static_lineage,
-        compiled_pulse=spec.pulse_request.artifact,
+        api_metadata_admission=None,
+        compiled_pulses=(spec.pulse_request.artifact,),
         adapt=adapt,
     )
 
@@ -458,7 +493,7 @@ def compile_occupancy_scan_artifact_plan(
     spec: TriggeredOccupancySpec,
     repository: ScanRepository,
     *,
-    document: PulseDocument,
+    program: AutonomousScanSlotProgram,
     output_contract: ScanOutputContract,
     memory_limit_bytes: int,
     preview: ExactDatasetPreviewPort | None = None,
@@ -469,7 +504,7 @@ def compile_occupancy_scan_artifact_plan(
         return _compile_occupancy_scan_artifact_plan(
             spec,
             repository,
-            document=document,
+            program=program,
             output_contract=output_contract,
             memory_limit_bytes=memory_limit_bytes,
             preview=preview,
@@ -483,7 +518,7 @@ def _compile_occupancy_scan_artifact_plan(
     spec: TriggeredOccupancySpec,
     repository: ScanRepository,
     *,
-    document: PulseDocument,
+    program: AutonomousScanSlotProgram,
     output_contract: ScanOutputContract,
     memory_limit_bytes: int,
     preview: ExactDatasetPreviewPort | None = None,
@@ -501,14 +536,10 @@ def _compile_occupancy_scan_artifact_plan(
     preview_bytes = (
         0 if preview_spec is None else preview_spec.downstream_peak_bytes
     )
-    _require_compile_binding(
-        document=document,
+    _require_output_binding(
+        program=program,
         source_schema=resolved.counts_schema,
         output_contract=output_contract,
-        execution_form=spec.pulse_request.artifact.execution_form,
-        compiled_source_document_digest=(
-            spec.pulse_request.artifact.source_document_digest
-        ),
     )
     _admit_final_data_limit(
         resolved.counts_schema,
@@ -517,8 +548,8 @@ def _compile_occupancy_scan_artifact_plan(
         retained_overhead_bytes=preview_bytes,
     )
     static_lineage = repository._admit_static_lineage(
-        document,
-        spec.pulse_request.artifact,
+        program,
+        (spec.pulse_request.artifact,),
         memory_limit_bytes=memory_limit_bytes,
     )
     final_data_limit = _admit_final_data_limit(
@@ -536,7 +567,7 @@ def _compile_occupancy_scan_artifact_plan(
 
     def adapt(
         value: object,
-    ) -> tuple[str, OwnedSnapshot, DatasetSealProvenance, PulseCaptureEvidence]:
+    ) -> tuple[str, OwnedSnapshot, DatasetSealProvenance, PulseScanExecution]:
         if type(value) is not TriggeredOccupancyPipelineResult:
             raise TypeError("occupancy scan base plan returned another result")
         pipeline = value.occupancy.pipeline
@@ -544,7 +575,11 @@ def _compile_occupancy_scan_artifact_plan(
             pipeline.run_id,
             value.occupancy.dataset.counts,
             pipeline.dataset.provenance,
-            value.lineage.evidence(),
+            AutonomousScanExecution(
+                program,
+                value.lineage.evidence(),
+                camera_run_evidence_from_pipeline(pipeline),
+            ),
         )
 
     base = compile_triggered_occupancy_pipeline(
@@ -556,16 +591,273 @@ def _compile_occupancy_scan_artifact_plan(
     return _compile_scan_artifact_plan(
         base,
         repository,
-        document=document,
+        program=program,
         output_contract=output_contract,
         final_data_limit_bytes=final_data_limit,
         static_lineage=static_lineage,
-        compiled_pulse=spec.pulse_request.artifact,
+        api_metadata_admission=None,
+        compiled_pulses=(spec.pulse_request.artifact,),
+        adapt=adapt,
+    )
+
+
+def _segmented_compiled_pulses(
+    program: ApiSlotSegmentedProgram,
+    point_descriptors,
+) -> tuple[CompiledPulseArtifact, ...]:
+    point_count = program.point_count
+    values = tuple(point_descriptors)
+    if len(values) != point_count or tuple(
+        value.point_ordinal for value in values
+    ) != tuple(range(point_count)):
+        raise ValueError("API point descriptors do not cover P in row order")
+    return tuple(value.pulse_request.artifact for value in values)
+
+
+def _api_execution_static_shape(
+    spec: ApiSlotSegmentedSpec,
+    program: ApiSlotSegmentedProgram,
+) -> dict[str, object]:
+    measurement = spec.pipeline.measurement
+    contract = measurement.capture_contract
+    camera_schema = contract.dataset_schema
+    if isinstance(spec.pipeline, MinimalPipelineSpec):
+        result_stream_id = contract.stream_id
+        result_source_id = contract.source_id
+        derivation_root_stream_id = None
+    else:
+        result_stream_id = spec.pipeline.processor.output_stream_id
+        result_source_id = spec.pipeline.processor.output_source_id
+        derivation_root_stream_id = contract.stream_id
+    return api_segmented_metadata_static_shape_to_tree(
+        program,
+        tuple(value.pulse_binding for value in spec.point_descriptors),
+        camera_source_stream_id=contract.stream_id,
+        result_stream_id=result_stream_id,
+        result_source_id=result_source_id,
+        derivation_root_stream_id=derivation_root_stream_id,
+        camera_provenance=contract.camera_provenance,
+        camera_capability=contract.capability.camera_capability_evidence,
+        camera_arm_spec=measurement.capture_spec,
+        camera_source_value_schema=camera_schema.cell_schema,
+        camera_source_schema_fingerprint=camera_schema.fingerprint,
+    )
+
+
+def _api_execution(
+    program: ApiSlotSegmentedProgram,
+    segments,
+    pipeline: PipelineResult,
+) -> ApiSegmentedScanExecution:
+    return ApiSegmentedScanExecution(
+        program,
+        tuple(
+            ApiSegmentEvidence(
+                value.address.repeat_index,
+                value.address.point_storage_index,
+                value.evidence,
+            )
+            for value in segments
+        ),
+        camera_run_evidence_from_pipeline(pipeline),
+    )
+
+
+def compile_api_direct_scan_artifact_plan(
+    spec: ApiSlotSegmentedSpec,
+    repository: ScanRepository,
+    *,
+    program: ApiSlotSegmentedProgram,
+    output_contract: ScanOutputContract,
+    memory_limit_bytes: int,
+) -> RunPlan:
+    """Commit direct camera y from the accepted API segmented exception."""
+
+    if not isinstance(spec, ApiSlotSegmentedSpec) or not isinstance(
+        spec.pipeline,
+        MinimalPipelineSpec,
+    ):
+        raise TypeError("spec must contain a direct capture pipeline")
+    if spec.repeat_count != program.repeat_count:
+        raise ValueError("API segmented spec repeat count differs from its program")
+    source_schema = spec.pipeline.measurement.capture_contract.dataset_schema
+    control_retained = api_slot_segmented_control_retained_upper_bound_bytes(
+        program.point_count,
+        program.repeat_count,
+    )
+    compiled_pulses = _segmented_compiled_pulses(
+        program,
+        spec.point_descriptors,
+    )
+    _require_output_binding(
+        program=program,
+        source_schema=source_schema,
+        output_contract=output_contract,
+    )
+    _admit_final_data_limit(
+        source_schema,
+        output_contract,
+        memory_limit_bytes=memory_limit_bytes,
+        retained_overhead_bytes=control_retained,
+    )
+    static_lineage = repository._admit_static_lineage(
+        program,
+        compiled_pulses,
+        memory_limit_bytes=memory_limit_bytes,
+    )
+    api_metadata_admission = repository._admit_api_final_metadata(
+        program,
+        static_lineage,
+        spec.pipeline.block_id,
+        source_schema,
+        output_contract,
+        _api_execution_static_shape(spec, program),
+    )
+    final_data_limit = _admit_final_data_limit(
+        source_schema,
+        output_contract,
+        memory_limit_bytes=memory_limit_bytes,
+        retained_overhead_bytes=(
+            static_lineage.retained_upper_bound_bytes + control_retained
+        ),
+    )
+
+    def adapt(value: object):
+        if type(value) is not ApiSlotSegmentedResult:
+            raise TypeError("segmented direct scan returned another result")
+        pipeline = value.payload
+        if not isinstance(pipeline, PipelineResult):
+            raise TypeError("segmented direct scan returned occupancy data")
+        return (
+            pipeline.run_id,
+            pipeline.dataset.snapshot,
+            pipeline.dataset.provenance,
+            _api_execution(program, value.segments, pipeline),
+        )
+
+    base = compile_api_slot_segmented_pipeline(
+        spec,
+        _retained_overhead_bytes=(
+            static_lineage.retained_upper_bound_bytes + control_retained
+        ),
+    )
+    return _compile_scan_artifact_plan(
+        base,
+        repository,
+        program=program,
+        output_contract=output_contract,
+        final_data_limit_bytes=final_data_limit,
+        static_lineage=static_lineage,
+        api_metadata_admission=api_metadata_admission,
+        compiled_pulses=compiled_pulses,
+        adapt=adapt,
+    )
+
+
+def compile_api_occupancy_scan_artifact_plan(
+    spec: ApiSlotSegmentedSpec,
+    repository: ScanRepository,
+    *,
+    program: ApiSlotSegmentedProgram,
+    output_contract: ScanOutputContract,
+    memory_limit_bytes: int,
+) -> RunPlan:
+    """Commit FINAL-only occupancy counts from finite API segments."""
+
+    if not isinstance(spec, ApiSlotSegmentedSpec) or not isinstance(
+        spec.pipeline,
+        OccupancyPipelineSpec,
+    ):
+        raise TypeError("spec must contain an occupancy pipeline")
+    if spec.repeat_count != program.repeat_count:
+        raise ValueError("API segmented spec repeat count differs from its program")
+    occupancy_spec = spec.pipeline
+    camera_schema = occupancy_spec.measurement.capture_contract.dataset_schema
+    source_schema = resolve_occupancy_stream_schema(
+        occupancy_spec.processor,
+        camera_schema,
+    ).counts_schema
+    control_retained = api_slot_segmented_control_retained_upper_bound_bytes(
+        program.point_count,
+        program.repeat_count,
+    )
+    compiled_pulses = _segmented_compiled_pulses(
+        program,
+        spec.point_descriptors,
+    )
+    _require_output_binding(
+        program=program,
+        source_schema=source_schema,
+        output_contract=output_contract,
+    )
+    _admit_final_data_limit(
+        source_schema,
+        output_contract,
+        memory_limit_bytes=memory_limit_bytes,
+        retained_overhead_bytes=control_retained,
+    )
+    static_lineage = repository._admit_static_lineage(
+        program,
+        compiled_pulses,
+        memory_limit_bytes=memory_limit_bytes,
+    )
+    api_metadata_admission = repository._admit_api_final_metadata(
+        program,
+        static_lineage,
+        occupancy_spec.counts_block_id,
+        source_schema,
+        output_contract,
+        _api_execution_static_shape(spec, program),
+    )
+    final_data_limit = _admit_final_data_limit(
+        source_schema,
+        output_contract,
+        memory_limit_bytes=memory_limit_bytes,
+        retained_overhead_bytes=(
+            static_lineage.retained_upper_bound_bytes
+            + control_retained
+            + calibration_retained_array_nbytes(
+                occupancy_spec.processor.calibration.artifact
+            )
+        ),
+    )
+
+    def adapt(value: object):
+        if type(value) is not ApiSlotSegmentedResult:
+            raise TypeError("segmented occupancy scan returned another result")
+        occupancy = value.payload
+        if not isinstance(occupancy, OccupancyPipelineResult):
+            raise TypeError("segmented occupancy scan returned direct data")
+        pipeline = occupancy.pipeline
+        return (
+            pipeline.run_id,
+            occupancy.dataset.counts,
+            pipeline.dataset.provenance,
+            _api_execution(program, value.segments, pipeline),
+        )
+
+    base = compile_api_slot_segmented_occupancy_pipeline(
+        spec,
+        _retained_overhead_bytes=(
+            static_lineage.retained_upper_bound_bytes + control_retained
+        ),
+    )
+    return _compile_scan_artifact_plan(
+        base,
+        repository,
+        program=program,
+        output_contract=output_contract,
+        final_data_limit_bytes=final_data_limit,
+        static_lineage=static_lineage,
+        api_metadata_admission=api_metadata_admission,
+        compiled_pulses=compiled_pulses,
         adapt=adapt,
     )
 
 
 __all__ = [
+    "compile_api_direct_scan_artifact_plan",
+    "compile_api_occupancy_scan_artifact_plan",
     "compile_direct_scan_artifact_plan",
     "compile_occupancy_scan_artifact_plan",
     "PreparedOccupancyScan",

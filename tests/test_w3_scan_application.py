@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import copy
 import gc
 import hashlib
 from pathlib import Path
@@ -57,7 +58,12 @@ from zlc_frontend.figure import (
 )
 from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewSpec
 from zlc_neutral_atom.runtime.run import RunFailed
-from zlc_neutral_atom.scan import ScanOutputContract, ScanPointTable
+from zlc_neutral_atom.scan import (
+    AutonomousScanExecution,
+    AutonomousScanSlotProgram,
+    ScanOutputContract,
+    ScanPointTable,
+)
 from zlc_neutral_atom.scan.repository import ScanRepository
 from zlc_neutral_atom.readout.calibration_reference import (
     calibration_artifact_input_ref,
@@ -565,7 +571,47 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
         )
         assert all(axis.role != READOUT_EVENT for axis in data.schema.point_axes)
         assert artifact.provenance.derivation is None
-        assert artifact.pulse_evidence.expected_trigger_count == 6
+        assert isinstance(artifact.execution, AutonomousScanExecution)
+        assert artifact.execution.evidence.expected_trigger_count == 6
+        camera = artifact.execution.camera
+        assert camera.event_count == 6
+        assert camera.terminal.session_id
+        assert camera.terminal.produced_count == 6
+        assert camera.terminal.drained_count == 6
+        assert camera.arm_spec.digest == camera.terminal.capture_spec_fingerprint
+        assert camera.capability.fingerprint == camera.terminal.capability_fingerprint
+        assert (
+            camera.source_schema_fingerprint
+            == artifact.source_dataset_schema.fingerprint
+        )
+        camera.validate_dataset_provenance(artifact.provenance)
+
+        # Exercise the durable reload boundary, not just the live PipelineResult:
+        # a well-typed forged aggregate digest must still be rejected against
+        # the independently persisted DatasetSealProvenance.
+        import zlc_neutral_atom.scan.repository as scan_repository
+
+        decode_index = scan_repository._decode_metadata_index
+
+        def forged_camera_metadata(payload):
+            index = decode_index(payload)
+            execution_tree = copy.deepcopy(index.execution_tree)
+            execution_tree["camera"]["terminal"][
+                "ordered_metadata_digest"
+            ] = "0" * 64
+            return replace(index, execution_tree=execution_tree)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                scan_repository,
+                "_decode_metadata_index",
+                forged_camera_metadata,
+            )
+            with pytest.raises(
+                ValueError,
+                match="raw dataset provenance differs from camera aggregate evidence",
+            ):
+                exp.readout.load_scan(scan_ref)
         assert np.all(np.isfinite(data.values))
         assert not data.values.flags.writeable
         assert exp.readout.materialize_scan(scan_ref).snapshot.ref == data.snapshot.ref
@@ -580,7 +626,7 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
                 forbidden_heavy_read,
             )
             patch.setattr(
-                "zlc_neutral_atom.scan.repository._decode_document",
+                "zlc_neutral_atom.scan.repository._decode_program",
                 forbidden_heavy_read,
             )
             figure_document = exp.figure_document(scan_ref)
@@ -608,6 +654,10 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
                 "ref=zlc.ScanArtifactRef(sys.argv[2],sys.argv[3]); "
                 "exp=zlc.connect('virtual',repository=sys.argv[1]); "
                 "data=exp.readout.materialize_scan(ref); "
+                "artifact=exp.readout.load_scan(ref); "
+                "assert artifact.execution.camera.terminal.produced_count==6; "
+                "assert artifact.execution.camera.terminal.drained_count==6; "
+                "artifact.execution.camera.validate_dataset_provenance(artifact.provenance); "
                 "assert data.snapshot.ref.block_id.value==sys.argv[4]; "
                 "assert data.snapshot.ref.schema_fingerprint==sys.argv[5]; "
                 "assert data.snapshot.ref.stream_generation.value==sys.argv[6]; "
@@ -638,16 +688,19 @@ def _assert_public_occupancy_scan(exp, monkeypatch):
     original_table = document.scan_table
     with pytest.raises(ValueError, match="missing"):
         exp.readout.scan_request(document)
-    with pytest.raises(KeyError, match="unknown pulse API"):
+    with pytest.raises(ValueError, match="missing=.*extra=.*not-an-api"):
         exp.readout.scan_request(document, api_values={"not-an-api": 1})
     direct_request = exp.readout.scan_request(document, api_values=values)
-    assert direct_request.pulse_document.api_parameters == ()
-    assert direct_request.pulse_document.scan_parameters == document.scan_parameters
-    assert direct_request.pulse_document.scan_table == original_table
+    assert isinstance(direct_request.program, AutonomousScanSlotProgram)
+    assert direct_request.program.document == document
+    assert direct_request.program.execution_document.api_parameters == ()
+    assert (
+        direct_request.program.execution_document.scan_parameters
+        == document.scan_parameters
+    )
+    assert direct_request.program.execution_document.scan_table == original_table
     assert document.api_parameters == original_parameters
-    with pytest.raises(ValueError, match="explicitly resolved"):
-        replace(direct_request, pulse_document=document)
-    with pytest.raises(KeyError, match="unknown pulse API"):
+    with pytest.raises(ValueError, match="missing=.*extra=.*da_x"):
         exp.readout.scan_request(
             _sparse_scan_document(),
             api_values={"da_x": 0},
@@ -659,7 +712,8 @@ def _assert_public_occupancy_scan(exp, monkeypatch):
         api_values=values,
         timeout_seconds=20.0,
     )
-    assert request.pulse_document.api_parameters == ()
+    assert isinstance(request.program, AutonomousScanSlotProgram)
+    assert request.program.execution_document.api_parameters == ()
     guarded = _prepare_occupancy_scan_for_workbench(exp, request)
 
     @contextmanager
@@ -775,7 +829,8 @@ def _assert_public_occupancy_scan(exp, monkeypatch):
         for axis in artifact.source_dataset_schema.point_axes
     )
     assert all(axis.role != READOUT_EVENT for axis in data.schema.point_axes)
-    assert artifact.pulse_evidence.expected_trigger_count == 4
+    assert isinstance(artifact.execution, AutonomousScanExecution)
+    assert artifact.execution.evidence.expected_trigger_count == 4
     _assert_occupancy_scan_window(exp, request, monkeypatch)
 
 
