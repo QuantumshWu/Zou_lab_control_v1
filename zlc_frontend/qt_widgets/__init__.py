@@ -4,7 +4,7 @@ Import this leaf explicitly.  The headless :mod:`zlc_frontend` package root does
 not re-export it and therefore never loads PyQt as a side effect.
 """
 
-from .board import QtImageBoard, QtOwnerWake
+from .board import QtImageBoard, QtOwnerWake, QtRasterBoard
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
 from .fluent import (
     ElidedLabel,
@@ -186,6 +186,7 @@ __all__ = [
     "PLACEHOLDER",
     "QtImageBoard",
     "QtOwnerWake",
+    "QtRasterBoard",
     "RADIUS",
     "RED",
     "STEP_WIDTH",

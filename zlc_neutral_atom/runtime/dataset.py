@@ -1825,12 +1825,34 @@ class MonitorDataset(Generic[PayloadT]):
             edge.validate_payload_stream(self._source)
             if self.schema.repeat_axis.size != 1:
                 raise DatasetError("append_window requires a single repeat storage row")
+            history_axis = (
+                self.schema.point_axes[0]
+                if len(self.schema.point_axes) == 1
+                else None
+            )
+            history_coordinates_are_slots = (
+                history_axis is not None
+                and (
+                    (
+                        history_axis.coordinates is None
+                        and history_axis.index_origin == 0
+                    )
+                    or (
+                        history_axis.coordinates is not None
+                        and all(
+                            coordinate == index
+                            for index, coordinate in enumerate(
+                                history_axis.coordinates
+                            )
+                        )
+                    )
+                )
+            )
             if (
-                len(self.schema.point_axes) != 1
-                or self.schema.point_axes[0].role != MONITOR_HISTORY
+                history_axis is None
+                or history_axis.role != MONITOR_HISTORY
                 or self.schema.point_layout.mode is not AxisLayoutMode.RECT_C
-                or self.schema.point_axes[0].coordinates
-                != tuple(range(self.schema.point_axes[0].size))
+                or not history_coordinates_are_slots
             ):
                 raise DatasetError(
                     "append_window requires one dense MONITOR_HISTORY axis with "

@@ -30,6 +30,7 @@ class QtRunOwnerMailbox:
             max_workers=max_workers,
             thread_name_prefix=thread_name_prefix,
         )
+        self._worker_thread_affine = max_workers == 1
         self._lock = threading.Lock()
         self._tracked: set[Future] = set()
         self._completions: list[OwnerCompletion] = []
@@ -56,6 +57,12 @@ class QtRunOwnerMailbox:
     def worker_idle(self) -> bool:
         with self._lock:
             return not self._tracked and not self._completions
+
+    @property
+    def worker_thread_affine(self) -> bool:
+        """Whether every submitted job is guaranteed one stable OS thread."""
+
+        return self._worker_thread_affine
 
     @property
     def has_pending_owner_work(self) -> bool:

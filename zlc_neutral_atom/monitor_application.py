@@ -54,13 +54,11 @@ from zlc_storage import (
     nonnegative_integer,
     positive_integer,
     positive_real,
-    sha256_text,
 )
 
 
 _MONITOR_REPEAT_AXIS_ID = AxisId("camera-monitor.repeat")
 _MONITOR_HISTORY_AXIS_ID = AxisId("camera-monitor.history")
-_VISIBLE_HISTORY = 1
 _STREAM_RETENTION_EVENTS = 1
 _TAP_BACKLOG_EVENTS = 1
 
@@ -72,6 +70,7 @@ class CameraMonitorRequest:
     camera_ref: DeviceRef
     memory_limit_bytes: int = 256 << 20
     io_timeout_seconds: float = 2.0
+    history_capacity: int = 8
 
     def __post_init__(self) -> None:
         if not isinstance(self.camera_ref, DeviceRef):
@@ -86,29 +85,26 @@ class CameraMonitorRequest:
             "io_timeout_seconds",
             positive_real(self.io_timeout_seconds, "io_timeout_seconds"),
         )
+        object.__setattr__(
+            self,
+            "history_capacity",
+            positive_integer(self.history_capacity, "history_capacity"),
+        )
 
 
 @dataclass(frozen=True)
 class CameraMonitorDescriptor:
     name: str
     camera_role: str
-    output_shape: tuple[int, ...]
-    output_schema_fingerprint: str
+    output_schema: DatasetSchema
     resource_claim: str
     base_peak_bytes: int
 
     def __post_init__(self) -> None:
         canonical_text(self.name, "camera monitor name")
         canonical_text(self.camera_role, "camera monitor role")
-        if not self.output_shape or any(
-            isinstance(size, bool) or not isinstance(size, int) or size <= 0
-            for size in self.output_shape
-        ):
-            raise ValueError("camera monitor output_shape must be positive")
-        sha256_text(
-            self.output_schema_fingerprint,
-            "output_schema_fingerprint",
-        )
+        if not isinstance(self.output_schema, DatasetSchema):
+            raise TypeError("camera monitor output_schema must be DatasetSchema")
         canonical_text(self.resource_claim, "resource_claim")
         object.__setattr__(
             self,
@@ -116,10 +112,18 @@ class CameraMonitorDescriptor:
             positive_integer(self.base_peak_bytes, "base_peak_bytes"),
         )
 
+    @property
+    def output_shape(self) -> tuple[int, ...]:
+        return self.output_schema.physical_shape
+
+    @property
+    def output_schema_fingerprint(self) -> str:
+        return self.output_schema.fingerprint
+
 
 @dataclass(frozen=True)
 class CameraMonitorViewSpec:
-    """One admitted capacity-one rolling image slot; it can never be sealed."""
+    """One admitted bounded rolling image window; it can never be sealed."""
 
     block_id: BlockId
     dataset_edge: FrozenDatasetEdge[CameraSample]
@@ -137,11 +141,10 @@ class CameraMonitorViewSpec:
             schema.repeat_axis.size != 1
             or len(schema.point_axes) != 1
             or schema.point_axes[0].role != MONITOR_HISTORY
-            or schema.point_axes[0].size != _VISIBLE_HISTORY
-            or schema.point_layout != PointLayout.rect_c((_VISIBLE_HISTORY,))
+            or schema.point_layout != PointLayout.rect_c((schema.point_axes[0].size,))
         ):
             raise ValueError(
-                "M1 camera monitor requires (R=1, MONITOR_HISTORY=1) storage"
+                "camera monitor requires (R=1, dense MONITOR_HISTORY) storage"
             )
         object.__setattr__(
             self,
@@ -366,11 +369,10 @@ class PreparedCameraMonitor:
                     _MONITOR_HISTORY_AXIS_ID,
                     "newest-first monitor history",
                     MONITOR_HISTORY,
-                    _VISIBLE_HISTORY,
-                    tuple(range(_VISIBLE_HISTORY)),
+                    request.history_capacity,
                 ),
             ),
-            PointLayout.rect_c((_VISIBLE_HISTORY,)),
+            PointLayout.rect_c((request.history_capacity,)),
             capability.payload_contract.value_schema,
         )
         self._edge = FrozenDatasetEdge(
@@ -386,8 +388,7 @@ class PreparedCameraMonitor:
         self._descriptor = CameraMonitorDescriptor(
             "Camera monitor",
             request.camera_ref.role,
-            schema.physical_shape,
-            schema.fingerprint,
+            schema,
             str(port.resource_claim.key),
             base_peak,
         )
@@ -465,14 +466,23 @@ def _base_monitor_peak_bytes(
     capability = port.capability
     payload = capability.payload_contract.max_retained_nbytes
     schema = edge.schema
+    history_cells = schema.repeat_axis.size * schema.point_layout.storage_size
+    immutable_snapshot = dataset_storage_nbytes(schema)
+    mutable_materializer = mutable_dataset_storage_nbytes(schema)
+    # A non-trivial append window is presented newest-first.  Once its ring has
+    # advanced, NumPy gathers values, validity, and the written mask before the
+    # immutable DataBlock makes its own owner copy.  Admission must cover that
+    # worst case rather than only the canonical first frame.
+    reorder_scratch = mutable_materializer if history_cells > 1 else 0
     return (
         capability.driver_ring_bytes
         + capability.adapter_record_retention_bytes
         + (_STREAM_RETENTION_EVENTS * payload)
         + (_TAP_BACKLOG_EVENTS * payload)
-        + mutable_dataset_storage_nbytes(schema)
-        + dataset_storage_nbytes(schema)
-        + edge.metadata_max_retained_nbytes
+        + mutable_materializer
+        + immutable_snapshot
+        + reorder_scratch
+        + (history_cells * edge.metadata_max_retained_nbytes)
     )
 
 

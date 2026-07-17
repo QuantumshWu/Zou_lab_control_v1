@@ -33,6 +33,7 @@ from zlc_data import (
     FitNumericPolicy,
     FitParameterConstraint,
     FitSpec,
+    ReductionMethod,
     Selection,
     commit_transform,
     expand_value_validity,
@@ -654,15 +655,17 @@ class ReadoutFacade:
         camera_role: str | None = None,
         memory_limit_bytes: int = 256 << 20,
         io_timeout_seconds: float = 2.0,
+        history_capacity: int = 8,
     ) -> CameraMonitorRequest:
         """Freeze one free-running monitor request without starting hardware."""
 
         with _service_guard(self._token) as services:
             role = self._resolve_monitor_camera_role(services, camera_role)
             return CameraMonitorRequest(
-                services.catalog.require(role).ref,
-                memory_limit_bytes,
-                io_timeout_seconds,
+                camera_ref=services.catalog.require(role).ref,
+                memory_limit_bytes=memory_limit_bytes,
+                io_timeout_seconds=io_timeout_seconds,
+                history_capacity=history_capacity,
             )
 
     def inspect_camera_monitor(
@@ -678,9 +681,12 @@ class ReadoutFacade:
     def camera_monitor_gui(
         self,
         request: CameraMonitorRequest | None = None,
+        *,
+        roi: Selection | None = None,
+        roi_reduction: ReductionMethod = ReductionMethod.MEAN,
         **request_options,
     ):
-        """Open the current rolling raw-image monitor on the Qt owner thread."""
+        """Open a raw image monitor and optional display-only typed ROI curve."""
 
         if request is None:
             request = self.camera_monitor_request(**request_options)
@@ -690,6 +696,12 @@ class ReadoutFacade:
             )
         if not isinstance(request, CameraMonitorRequest):
             raise TypeError("request must be CameraMonitorRequest")
+        if roi is not None and not isinstance(roi, Selection):
+            raise TypeError("roi must be zlc_data.Selection or None")
+        if not isinstance(roi_reduction, ReductionMethod):
+            raise TypeError("roi_reduction must be zlc_data.ReductionMethod")
+        if roi_reduction not in (ReductionMethod.MEAN, ReductionMethod.SUM):
+            raise ValueError("camera monitor ROI reduction must be MEAN or SUM")
         self._require_binding(ReadoutBindingKey(request.camera_ref.role))
 
         def prepare() -> PreparedCameraMonitor:
@@ -698,7 +710,11 @@ class ReadoutFacade:
 
         from Zou_lab_control.workbench import open_camera_monitor_workbench
 
-        return open_camera_monitor_workbench(prepare)
+        return open_camera_monitor_workbench(
+            prepare,
+            roi=roi,
+            roi_reduction=roi_reduction,
+        )
 
     def capture_request(
         self,

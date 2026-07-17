@@ -77,7 +77,7 @@ def test_public_monitor_preserves_axes_restarts_with_fresh_identity_and_clears_f
     request = experiment.readout.camera_monitor_request()
     descriptor = experiment.readout.inspect_camera_monitor(request)
     assert descriptor.camera_role == "monitor_camera"
-    assert descriptor.output_shape == (1, 1, 1200, 1920)
+    assert descriptor.output_shape == (1, 8, 1200, 1920)
 
     window = experiment.readout.camera_monitor_gui(request)
     first_handle = None
@@ -90,15 +90,16 @@ def test_public_monitor_preserves_axes_restarts_with_fresh_identity_and_clears_f
         first_handle = window._handle
         first = window._slot.freeze_current()[2]
         schema = first.snapshot.block.schema
-        assert schema.physical_shape == (1, 1, 1200, 1920)
+        assert schema.physical_shape == (1, 8, 1200, 1920)
         assert tuple(axis.role for axis in schema.point_axes) == (MONITOR_HISTORY,)
         assert tuple(axis.role for axis in schema.cell_schema.data_axes) == (
             SPATIAL_Y,
             SPATIAL_X,
         )
-        assert first.head is not None and first.event_refs == (first.head,)
-        assert first.coverage.written_cells == 1
-        assert first.coverage.total_cells == 1
+        assert first.head is not None and first.event_refs[0] == first.head
+        assert len(first.event_refs) == 8
+        assert 1 <= first.coverage.written_cells <= 8
+        assert first.coverage.total_cells == 8
         assert not window._slot._dataset._source._reservations
         first_identity = (
             first.snapshot.ref.block_id,
@@ -124,7 +125,7 @@ def test_public_monitor_preserves_axes_restarts_with_fresh_identity_and_clears_f
             second.snapshot.ref.stream_generation,
         )
         assert second_identity != first_identity
-        assert second.head is not None and second.event_refs == (second.head,)
+        assert second.head is not None and second.event_refs[0] == second.head
         assert "missed=" in view.text() and "current_gap=" in view.text()
     finally:
         if window.isVisible():
@@ -133,7 +134,7 @@ def test_public_monitor_preserves_axes_restarts_with_fresh_identity_and_clears_f
     assert second_handle is not None and second_handle.snapshot().state is RunState.CANCELLED
     assert experiment.readout.inspect_camera_monitor(request).output_shape == (
         1,
-        1,
+        8,
         1200,
         1920,
     )

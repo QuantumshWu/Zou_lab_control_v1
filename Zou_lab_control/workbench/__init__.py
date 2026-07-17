@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 
-def open_camera_monitor_workbench(prepare):
+def open_camera_monitor_workbench(prepare, *, roi=None, roi_reduction=None):
     """Open one free-running camera monitor without eager Qt imports."""
 
     from ._camera_monitor import open_camera_monitor_workbench as _open
 
-    return _open(prepare)
+    options = {"roi": roi}
+    if roi_reduction is not None:
+        options["roi_reduction"] = roi_reduction
+    return _open(prepare, **options)
 
 
 def open_capture_workbench(experiment, request):

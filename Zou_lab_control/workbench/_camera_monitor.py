@@ -6,19 +6,34 @@ import threading
 
 from PyQt5 import QtCore, QtWidgets
 
-from zlc_data import MONITOR_HISTORY, SPATIAL_X, SPATIAL_Y, Selection
+from zlc_data import (
+    MONITOR_HISTORY,
+    SPATIAL_X,
+    SPATIAL_Y,
+    CoordinateRangeSelection,
+    ReductionMethod,
+    Selection,
+)
 from zlc_frontend.figure import (
+    AxisViewBinding,
+    AxisViewRole,
     DatasetDescriptor,
     DatasetId,
+    DisplayReduction,
+    DisplayReductionMethod,
     FigureDocument,
     FigureEvaluationPolicy,
     FigureLayer,
+    FixedIndex,
     SuggestionStatus,
     ViewIntent,
+    ViewSpec,
     estimate_view_evaluation_peak_nbytes,
     suggest_view,
+    validate_view_spec,
 )
 from zlc_frontend.image_raster import estimate_gray8_raster_peak_nbytes
+from zlc_frontend.matplotlib_render import estimate_single_curve_raster_peak_nbytes
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentLabel,
@@ -26,6 +41,7 @@ from zlc_frontend.qt_widgets import (
     ORANGE,
     QtImageBoard,
     QtOwnerWake,
+    QtRasterBoard,
     WINDOW_SCREEN_FRACTION,
     center_window_on_primary_screen,
     ensure_qt_app,
@@ -45,17 +61,99 @@ from zlc_workbench.run_owner import QtRunOwnerMailbox
 from zlc_workbench.workspace import BoardController, BoardModel, PanelSlot
 
 
-_PROJECTION_TEXT = "latest raw frame · history slot 0 · DISPLAY ONLY"
+_IMAGE_PANEL_ID = "camera-monitor-image"
+_CURVE_PANEL_ID = "camera-monitor-roi-curve"
+_CURVE_RASTER_SIZE = (800, 520)
+_RAW_PROJECTION_TEXT = "latest raw frame · history slot 0 · DISPLAY ONLY"
+
+
+def _roi_curve_view(schema, roi: Selection, reduction: ReductionMethod):
+    if not isinstance(reduction, ReductionMethod):
+        raise TypeError("camera monitor ROI reduction must be ReductionMethod")
+    axes = (
+        schema.repeat_axis,
+        *schema.point_axes,
+        *schema.cell_schema.data_axes,
+    )
+    history = tuple(axis for axis in schema.point_axes if axis.role == MONITOR_HISTORY)
+    x_axes = tuple(axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_X)
+    y_axes = tuple(axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_Y)
+    if len(history) != 1 or len(x_axes) != 1 or len(y_axes) != 1:
+        raise ValueError("ROI curve requires one history and one spatial x/y axis")
+    if (
+        len(roi.terms) != 2
+        or any(not isinstance(term, CoordinateRangeSelection) for term in roi.terms)
+        or {term.axis_id for term in roi.terms}
+        != {x_axes[0].axis_id, y_axes[0].axis_id}
+    ):
+        raise ValueError("camera monitor ROI must be one typed spatial rectangle")
+    if reduction is ReductionMethod.MEAN:
+        display_method = DisplayReductionMethod.MEAN
+    elif reduction is ReductionMethod.SUM:
+        display_method = DisplayReductionMethod.SUM
+    else:
+        raise ValueError("camera monitor ROI reduction must be MEAN or SUM")
+    bindings = [
+        AxisViewBinding(history[0].axis_id, AxisViewRole.X),
+        AxisViewBinding(
+            schema.repeat_axis.axis_id,
+            AxisViewRole.SELECTED,
+            selector=FixedIndex(0),
+        ),
+        AxisViewBinding(
+            x_axes[0].axis_id,
+            AxisViewRole.REDUCED,
+            reduction=DisplayReduction(display_method),
+        ),
+        AxisViewBinding(
+            y_axes[0].axis_id,
+            AxisViewRole.REDUCED,
+            reduction=DisplayReduction(display_method),
+        ),
+    ]
+    if len(bindings) != len(axes):
+        raise ValueError("camera monitor ROI curve refuses undeclared extra axes")
+    view = ViewSpec(schema.fingerprint, ViewIntent.CURVE, tuple(bindings), (roi,))
+    validate_view_spec(schema, view)
+    terms = {term.axis_id: term for term in roi.terms}
+    x_term = terms[x_axes[0].axis_id]
+    y_term = terms[y_axes[0].axis_id]
+    summary = (
+        f"latest raw frame + ROI {reduction.value.lower()} "
+        f"[{x_axes[0].name}={x_term.lower}..{x_term.upper}, "
+        f"{y_axes[0].name}={y_term.lower}..{y_term.upper}] · "
+        f"history 0..{history[0].size - 1} (0 newest) · DISPLAY ONLY"
+    )
+    return view, summary
 
 
 class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
     """Nonblocking owner of one continuous monitor Run and immutable front."""
 
-    def __init__(self, prepare) -> None:
+    def __init__(
+        self,
+        prepare,
+        *,
+        roi: Selection | None = None,
+        roi_reduction: ReductionMethod = ReductionMethod.MEAN,
+    ) -> None:
         super().__init__()
         if not callable(prepare):
             raise TypeError("camera monitor prepare must be callable")
+        if roi is not None and not isinstance(roi, Selection):
+            raise TypeError("roi must be zlc_data.Selection or None")
+        if not isinstance(roi_reduction, ReductionMethod):
+            raise TypeError("roi_reduction must be zlc_data.ReductionMethod")
+        if roi_reduction not in (ReductionMethod.MEAN, ReductionMethod.SUM):
+            raise ValueError("camera monitor ROI reduction must be MEAN or SUM")
         self._prepare = prepare
+        self._roi = roi
+        self._roi_reduction = roi_reduction
+        self._projection_text = (
+            _RAW_PROJECTION_TEXT
+            if roi is None
+            else f"latest raw frame + typed ROI {roi_reduction.value.lower()} history · DISPLAY ONLY"
+        )
         self._prepared: PreparedCameraMonitor | None = None
         self._slot: LiveDatasetSlot | None = None
         self._live: LiveImageBoardController | None = None
@@ -69,19 +167,24 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self.setWindowTitle("Camera Monitor")
         self._run_status = FluentLabel("Monitor: PREPARING")
         self._run_status.setObjectName("monitorStatus")
-        self._view_status = FluentLabel(f"View: WAITING · {_PROJECTION_TEXT}")
+        self._view_status = FluentLabel(f"View: WAITING · {self._projection_text}")
         self._view_status.setObjectName("monitorViewStatus")
         self._view_status.setWordWrap(True)
-        self._projection_status = FluentLabel(f"Display: {_PROJECTION_TEXT}")
+        self._projection_status = FluentLabel(f"Display: {self._projection_text}")
         self._projection_status.setObjectName("projectionStatus")
         self._projection_status.setWordWrap(True)
         self._diagnostics = FluentLabel("")
         self._diagnostics.setObjectName("diagnostics")
         self._diagnostics.setWordWrap(True)
-        self._board_widget = QtImageBoard(
-            "camera-monitor-image",
-            self,
-            empty_text="Monitor stopped",
+        self._board_widget = (
+            QtImageBoard(_IMAGE_PANEL_ID, self, empty_text="Monitor stopped")
+            if roi is None
+            else QtRasterBoard(
+                (_IMAGE_PANEL_ID, _CURVE_PANEL_ID),
+                self,
+                columns=2,
+                empty_text="Monitor stopped",
+            )
         )
         self._board_widget.setObjectName("cameraMonitorImageBoard")
         self._start_button = FluentButton("Start", self, color=GREEN)
@@ -107,6 +210,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._run_owner = QtRunOwnerMailbox(
             self._wake.request_owner_wake,
             thread_name_prefix="zlc-camera-monitor-workbench",
+            max_workers=1,
         )
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(40)
@@ -163,26 +267,51 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             )
             if (
                 len(history) != 1
-                or history[0].size != 1
                 or len(y_axes) != 1
                 or len(x_axes) != 1
                 or len(schema.cell_schema.data_axes) != 2
             ):
                 raise ValueError(
-                    "camera monitor requires one history slot and declared "
+                    "camera monitor requires one history axis and declared "
                     "SPATIAL_Y/SPATIAL_X image axes"
                 )
+            if self._roi is not None and history[0].size < 2:
+                raise ValueError("ROI curve requires history_capacity >= 2")
             selection = Selection.index(history[0].axis_id, 0)
             suggestion = suggest_view(schema, ViewIntent.IMAGE, selection)
             if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
                 raise ValueError("camera monitor IMAGE view needs an explicit axis choice")
-            view = suggestion.spec
-            evaluation_peak = estimate_view_evaluation_peak_nbytes(schema, view)
-            downstream_peak = evaluation_peak + estimate_gray8_raster_peak_nbytes(
+            image_view = suggestion.spec
+            image_evaluation_peak = estimate_view_evaluation_peak_nbytes(
+                schema,
+                image_view,
+            )
+            downstream_peak = image_evaluation_peak + estimate_gray8_raster_peak_nbytes(
                 y_axes[0].size,
                 x_axes[0].size,
             )
-            policy = FigureEvaluationPolicy(max_live_nbytes=evaluation_peak)
+            curve_view = None
+            curve_evaluation_peak = 0
+            if self._roi is not None:
+                curve_view, self._projection_text = _roi_curve_view(
+                    schema,
+                    self._roi,
+                    self._roi_reduction,
+                )
+                curve_evaluation_peak = estimate_view_evaluation_peak_nbytes(
+                    schema,
+                    curve_view,
+                )
+                downstream_peak += (
+                    curve_evaluation_peak
+                    + estimate_single_curve_raster_peak_nbytes(
+                        *_CURVE_RASTER_SIZE,
+                        evaluated_data_upper_bound_bytes=curve_evaluation_peak,
+                    )
+                )
+            policy = FigureEvaluationPolicy(
+                max_live_nbytes=max(image_evaluation_peak, curve_evaluation_peak)
+            )
         except BaseException as error:
             self._record_local_failure(
                 f"View preparation failed: {type(error).__name__}: {error}"
@@ -196,13 +325,14 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._local_diagnostic = ""
         self._refresh_diagnostics(None)
         self._run_status.setText("Monitor: STARTING")
-        self._view_status.setText(f"View: WAITING · {_PROJECTION_TEXT}")
+        self._view_status.setText(f"View: WAITING · {self._projection_text}")
+        self._projection_status.setText(f"Display: {self._projection_text}")
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(False)
 
         dataset_id = DatasetId(f"camera-monitor-{generation}")
-        document = FigureDocument(
-            f"camera-monitor-{generation}",
+        image_document = FigureDocument(
+            f"camera-monitor-image-{generation}",
             0,
             (
                 DatasetDescriptor(
@@ -211,8 +341,22 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     schema.fingerprint,
                 ),
             ),
-            (FigureLayer("camera-monitor-image", dataset_id, view),),
+            (FigureLayer(_IMAGE_PANEL_ID, dataset_id, image_view),),
         )
+        curve_document = None
+        if curve_view is not None:
+            curve_document = FigureDocument(
+                f"camera-monitor-roi-curve-{generation}",
+                0,
+                (
+                    DatasetDescriptor(
+                        dataset_id,
+                        f"ROI {self._roi_reduction.value.lower()} (DISPLAY ONLY)",
+                        schema.fingerprint,
+                    ),
+                ),
+                (FigureLayer(_CURVE_PANEL_ID, dataset_id, curve_view),),
+            )
 
         def factory(spec: CameraMonitorViewSpec):
             slot = LiveDatasetSlot(
@@ -224,7 +368,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             attached = threading.Event()
             response: dict[str, object] = {}
             self._run_owner.post_attachment(
-                (slot, document, attached, response),
+                (slot, image_document, curve_document, attached, response),
                 generation=generation,
             )
             if not attached.wait(5.0):
@@ -381,24 +525,33 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
 
     def _drain_attachments(self) -> None:
         for generation, payload in self._run_owner.drain_attachments():
-            slot, document, attached, response = payload
+            slot, image_document, curve_document, attached, response = payload
             try:
                 if self._closing or generation != self._run_owner.generation:
                     raise RuntimeError("Workbench no longer accepts this monitor")
                 if slot.terminal:
                     raise RuntimeError("monitor slot became terminal before attachment")
                 self._close_live()
+                panels = [
+                    PanelSlot(
+                        _IMAGE_PANEL_ID,
+                        "camera-monitor",
+                        "monitor-camera",
+                    )
+                ]
+                if curve_document is not None:
+                    panels.append(
+                        PanelSlot(
+                            _CURVE_PANEL_ID,
+                            "camera-monitor",
+                            "monitor-camera",
+                        )
+                    )
                 model = BoardModel(
                     "camera-monitor-board",
                     generation,
                     RenderSurface.WORKER_RASTER_LIVE,
-                    (
-                        PanelSlot(
-                            "camera-monitor-image",
-                            "camera-monitor",
-                            "monitor-camera",
-                        ),
-                    ),
+                    tuple(panels),
                 )
                 board = BoardController(
                     model,
@@ -407,10 +560,13 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 )
                 live = LiveImageBoardController(
                     slot,
-                    document,
+                    image_document,
                     board,
                     submit_worker=self._submit_worker,
                     request_owner_wake=self._wake.request_owner_wake,
+                    companion_curve_document=curve_document,
+                    companion_curve_size=_CURVE_RASTER_SIZE,
+                    worker_thread_affine=self._run_owner.worker_thread_affine,
                 )
                 self._slot = slot
                 self._board = board
@@ -466,12 +622,12 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 )
             )
             self._view_status.setText(
-                f"View: LIVE · {_PROJECTION_TEXT} · {suffix}"
+                f"View: LIVE · {self._projection_text} · {suffix}"
             )
         elif self._handle is not None and not self._handle.snapshot().state.terminal:
-            self._view_status.setText(f"View: WAITING · {_PROJECTION_TEXT}")
+            self._view_status.setText(f"View: WAITING · {self._projection_text}")
         else:
-            self._view_status.setText(f"View: STOPPED · {_PROJECTION_TEXT}")
+            self._view_status.setText(f"View: STOPPED · {self._projection_text}")
 
     def _refresh_diagnostics(self, snapshot: RunSnapshot | None) -> None:
         parts = [self._local_diagnostic] if self._local_diagnostic else []
@@ -538,6 +694,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 f"Monitor view close failed: {type(error).__name__}: {error}"
             )
             return
+        if self._run_owner.has_pending_owner_work:
+            return
         self._run_owner.shutdown()
         self._timer.stop()
         self._wake.detach()
@@ -545,12 +703,21 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, self.close)
 
 
-def open_camera_monitor_workbench(prepare) -> CameraMonitorWorkbenchWindow:
+def open_camera_monitor_workbench(
+    prepare,
+    *,
+    roi: Selection | None = None,
+    roi_reduction: ReductionMethod = ReductionMethod.MEAN,
+) -> CameraMonitorWorkbenchWindow:
     application = ensure_qt_app()
     if QtCore.QThread.currentThread() != application.thread():
         raise RuntimeError("camera monitor Workbench must open on the Qt GUI thread")
     set_fluent_scale(None)
-    window = CameraMonitorWorkbenchWindow(prepare)
+    window = CameraMonitorWorkbenchWindow(
+        prepare,
+        roi=roi,
+        roi_reduction=roi_reduction,
+    )
     window.resize(screen_fit_window_size(WINDOW_SCREEN_FRACTION))
     retain_window(window)
     window.show()

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import threading
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from zlc_frontend.figure import (
     DatasetId,
+    EvaluatedCurve,
     EvaluatedImage,
     EvaluatedInput,
     FigureDocument,
@@ -36,6 +37,10 @@ from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
 from zlc_storage import canonical_text
 
 from .workspace import BoardController, BoardPublishPort, PanelSourceBinding
+
+
+if TYPE_CHECKING:
+    from zlc_frontend.matplotlib_render import SingleCurveAggRenderer
 
 
 class LiveDatasetSlot:
@@ -220,7 +225,7 @@ class LiveDatasetSlot:
 
 
 class LiveImageBoardController:
-    """One-snapshot coalescer: worker freeze, owner admit, worker render."""
+    """One-snapshot coalescer for an image and optional coherent ROI curve."""
 
     def __init__(
         self,
@@ -230,6 +235,9 @@ class LiveImageBoardController:
         *,
         submit_worker: Callable[[Callable[[], None]], object],
         request_owner_wake: Callable[[], None],
+        companion_curve_document: FigureDocument | None = None,
+        companion_curve_size: tuple[int, int] = (800, 520),
+        worker_thread_affine: bool = False,
     ) -> None:
         if not isinstance(slot, LiveDatasetSlot):
             raise TypeError("slot must be LiveDatasetSlot")
@@ -239,23 +247,55 @@ class LiveImageBoardController:
             raise TypeError("board must be BoardController")
         if not callable(submit_worker) or not callable(request_owner_wake):
             raise TypeError("worker submission and owner wake must be callable")
-        _validate_single_image_document(slot, document)
+        if companion_curve_document is not None and not isinstance(
+            companion_curve_document, FigureDocument
+        ):
+            raise TypeError("companion_curve_document must be FigureDocument or None")
+        if not isinstance(worker_thread_affine, bool):
+            raise TypeError("worker_thread_affine must be bool")
+        if companion_curve_document is not None and not worker_thread_affine:
+            raise ValueError("live Agg curve requires a thread-affine worker lane")
+        if (
+            not isinstance(companion_curve_size, tuple)
+            or len(companion_curve_size) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in companion_curve_size
+            )
+        ):
+            raise ValueError("companion_curve_size must contain two positive integers")
+        _validate_live_documents(slot, document, companion_curve_document)
         model = board.model
-        if len(model.panels) != 1:
-            raise ValueError("first live-image controller requires one board panel")
-        panel = model.panels[0]
+        expected_panels = 1 if companion_curve_document is None else 2
+        if len(model.panels) != expected_panels:
+            raise ValueError("live board panel count does not match its frozen documents")
+        coherence_groups = {panel.coherence_group for panel in model.panels}
+        if len(coherence_groups) != 1:
+            raise ValueError("one live snapshot board requires one coherence group")
         self._slot = slot
         self._document = document
+        self._curve_document = companion_curve_document
         self._board = board
-        self._panel = panel
-        self._presentation = PanelPresentationIdentity(
-            panel.panel_id,
-            document.document_id,
-            document.revision,
-            0,
-            0,
+        self._panels = model.panels
+        self._coherence_group = next(iter(coherence_groups))
+        documents = (
+            (document,)
+            if companion_curve_document is None
+            else (document, companion_curve_document)
+        )
+        self._presentations = tuple(
+            PanelPresentationIdentity(
+                panel.panel_id,
+                panel_document.document_id,
+                panel_document.revision,
+                0,
+                0,
+            )
+            for panel, panel_document in zip(model.panels, documents, strict=True)
         )
         self._evaluator = FigureEvaluator(slot.evaluation_policy)
+        self._curve_size = companion_curve_size
+        self._curve_renderer: SingleCurveAggRenderer | None = None
         self._submit_worker = submit_worker
         self._request_owner_wake = request_owner_wake
         self._lock = threading.Lock()
@@ -372,18 +412,21 @@ class LiveImageBoardController:
                 ref.schema_fingerprint,
                 head.payload_digest,
                 (EvaluatedInput(self._slot.dataset_id, ref),),
-                (self._presentation,),
+                self._presentations,
             )
             if self._port is None or source != self._source:
                 self._port = self._board.open_publish_port(
-                    (PanelSourceBinding(source, self._presentation),)
+                    tuple(
+                        PanelSourceBinding(source, presentation)
+                        for presentation in self._presentations
+                    )
                 )
                 self._source = source
             sequence = self._sequence
             self._sequence += 1
             token = self._port.admit(
                 sequence,
-                ((self._panel.coherence_group, stamp),),
+                ((self._coherence_group, stamp),),
             )
             self._submit(
                 lambda: self._render(candidate, source, stamp, sequence, token),
@@ -404,37 +447,65 @@ class LiveImageBoardController:
     ) -> None:
         try:
             snapshot = candidate[2].snapshot
-            evaluated = self._evaluator.evaluate(
+            image_evaluated = self._evaluator.evaluate(
                 self._document,
                 ResolvedDatasetMap(
                     (ResolvedDataset(self._slot.dataset_id, snapshot),)
                 ),
                 cancel_requested=lambda: self._closed,
             )
-            if evaluated.inputs != stamp.inputs:
+            if image_evaluated.inputs != stamp.inputs:
                 raise RuntimeError("figure evaluation changed the admitted input revision")
             if (
-                len(evaluated.layers) != 1
-                or len(evaluated.layers[0].cells) != 1
-                or len(evaluated.layers[0].cells[0].series) != 1
+                len(image_evaluated.layers) != 1
+                or len(image_evaluated.layers[0].cells) != 1
+                or len(image_evaluated.layers[0].cells[0].series) != 1
             ):
                 raise RuntimeError("live IMAGE document must evaluate to one image")
-            layer = evaluated.layers[0]
+            layer = image_evaluated.layers[0]
             data = layer.cells[0].series[0].data
             if not isinstance(data, EvaluatedImage):
                 raise RuntimeError("live IMAGE document did not evaluate to an image")
+            rasters = [rasterize_image_gray8(data)]
+            curve_document = self._curve_document
+            if curve_document is not None:
+                curve_evaluated = self._evaluator.evaluate(
+                    curve_document,
+                    ResolvedDatasetMap(
+                        (ResolvedDataset(self._slot.dataset_id, snapshot),)
+                    ),
+                    cancel_requested=lambda: self._closed,
+                )
+                if curve_evaluated.inputs != stamp.inputs:
+                    raise RuntimeError("ROI curve evaluation changed the admitted input revision")
+                curve_layer = curve_evaluated.layers[0]
+                curve_data = curve_layer.cells[0].series[0].data
+                if not isinstance(curve_data, EvaluatedCurve):
+                    raise RuntimeError("live companion document did not evaluate to a curve")
+                renderer = self._curve_renderer
+                if renderer is None:
+                    from zlc_frontend.matplotlib_render import SingleCurveAggRenderer
+
+                    renderer = SingleCurveAggRenderer(
+                        curve_document,
+                        width=self._curve_size[0],
+                        height=self._curve_size[1],
+                    )
+                    self._curve_renderer = renderer
+                rasters.append(renderer.render(curve_evaluated))
             frame = BoardFrame(
                 self._board.model.board_id,
                 self._board.model.layout_generation,
                 sequence,
-                (
+                tuple(
                     PanelFrame(
-                        self._panel.panel_id,
-                        self._panel.coherence_group,
+                        panel.panel_id,
+                        panel.coherence_group,
                         source,
                         stamp,
-                        rasterize_image_gray8(data),
-                    ),
+                        raster,
+                    )
+                    for panel, raster in zip(self._panels, rasters, strict=True)
                 ),
             )
             port = self._port
@@ -447,6 +518,7 @@ class LiveImageBoardController:
         except BaseException as error:
             self._set_fault(error)
             return
+
     def _submit(
         self,
         work: Callable[[], None],
@@ -507,6 +579,7 @@ class LiveImageBoardController:
             pass
 
     def close(self) -> None:
+        schedule_renderer_close = False
         with self._lock:
             if self._close_complete:
                 return
@@ -516,18 +589,34 @@ class LiveImageBoardController:
             self._candidate = None
             self._coverage = None
             self._front_invalidated = True
+            schedule_renderer_close = self._curve_document is not None
         try:
             self._slot.close()
         finally:
             self._board.close()
+        if schedule_renderer_close:
+            # Use the same serialization gate and the construction-time proven
+            # affine lane; close can neither race nor change OS thread.
+            def close_renderer() -> None:
+                with self._worker_gate:
+                    self._close_curve_renderer()
+
+            self._submit_worker(close_renderer)
         with self._lock:
             self._fault = None
             self._close_complete = True
 
+    def _close_curve_renderer(self) -> None:
+        renderer = self._curve_renderer
+        self._curve_renderer = None
+        if renderer is not None:
+            renderer.close()
 
-def _validate_single_image_document(
+
+def _validate_live_documents(
     slot: LiveDatasetSlot,
     document: FigureDocument,
+    curve_document: FigureDocument | None,
 ) -> None:
     schema = slot.spec.dataset_edge.schema
     if (
@@ -542,6 +631,20 @@ def _validate_single_image_document(
     validate_view_spec(schema, view)
     if view.intent is not ViewIntent.IMAGE:
         raise ValueError("live image controller requires IMAGE intent")
+    if curve_document is None:
+        return
+    if (
+        len(curve_document.datasets) != 1
+        or curve_document.datasets[0].dataset_id != slot.dataset_id
+        or curve_document.datasets[0].schema_fingerprint != schema.fingerprint
+        or len(curve_document.layers) != 1
+        or curve_document.layers[0].dataset_id != slot.dataset_id
+    ):
+        raise ValueError("live curve document must contain the slot's one dataset and layer")
+    curve_view = curve_document.layers[0].view
+    validate_view_spec(schema, curve_view)
+    if curve_view.intent is not ViewIntent.CURVE:
+        raise ValueError("live companion document requires CURVE intent")
 
 
 __all__ = ["LiveDatasetSlot", "LiveImageBoardController"]
