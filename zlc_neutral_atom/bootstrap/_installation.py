@@ -23,6 +23,7 @@ from zlc_neutral_atom.readout.sitemap import (
 )
 from zlc_pulse import bind_pulse_document_target
 from zlc_neutral_atom.runtime.capture import BoundCapturePort
+from zlc_neutral_atom.runtime.monitor import BoundCameraMonitorPort
 from zlc_neutral_atom.runtime.ports import BoundDevice, DeviceBroker, SafetyOperation
 from zlc_neutral_atom.runtime.resources import (
     DeviceIdentityEvidenceKind,
@@ -36,11 +37,12 @@ from zlc_pulse import PORT_DIGITAL, PulseTarget, load_deployed_pulse_target
 from zlc_storage import canonical_digest, durable_mkdir
 
 from ._asset_map import InstallationAsset, InstallationAssetMap
-from ._camera_endpoint import CameraCaptureEndpoint
+from ._camera_endpoint import CameraCaptureEndpoint, CameraMonitorEndpoint
 from ._sequencer_endpoint import VirtualSequencerExecutionEndpoint
 from ._virtual_hardware import (
     VirtualAtomArray,
     VirtualCamera,
+    VirtualMonitorCamera,
     VirtualSequencer,
 )
 
@@ -217,6 +219,25 @@ def _bind_camera(
             }
         ),
     )
+    return BoundCapturePort(
+        _bind_camera_endpoint(
+            broker,
+            asset,
+            asset_map_revision,
+            endpoint,
+        ),
+        (SafetyOperation.DISARM,),
+    )
+
+
+def _bind_camera_endpoint(
+    broker: DeviceBroker,
+    asset: InstallationAsset,
+    asset_map_revision: str,
+    endpoint: CameraCaptureEndpoint | CameraMonitorEndpoint,
+):
+    """Bind the one shared camera command/cleanup/safe-state surface."""
+
     binding: BoundDevice | None = None
 
     def current_binding() -> BoundDevice:
@@ -242,8 +263,23 @@ def _bind_camera(
         ),
         interrupt_operations={SafetyOperation.DISARM: endpoint.interrupt},
     )
-    return BoundCapturePort(
-        broker.verify_capability(binding),
+    return broker.verify_capability(binding)
+
+
+def _bind_monitor_camera(
+    broker: DeviceBroker,
+    asset: InstallationAsset,
+    asset_map_revision: str,
+    camera: VirtualMonitorCamera,
+) -> BoundCameraMonitorPort:
+    endpoint = CameraMonitorEndpoint(camera, asset.role)
+    return BoundCameraMonitorPort(
+        _bind_camera_endpoint(
+            broker,
+            asset,
+            asset_map_revision,
+            endpoint,
+        ),
         (SafetyOperation.DISARM,),
     )
 
@@ -300,6 +336,7 @@ class _VirtualInstallationRuntime:
         "_broker",
         "_controller",
         "_camera_ports",
+        "_camera_monitor_ports",
         "_pulse_ports",
         "_sitemap_profiles",
         "_raw_graph",
@@ -317,6 +354,7 @@ class _VirtualInstallationRuntime:
         broker: DeviceBroker,
         controller: RunController,
         camera_ports: Mapping[str, BoundCapturePort],
+        camera_monitor_ports: Mapping[str, BoundCameraMonitorPort],
         pulse_ports: Mapping[str, BoundPulsePort],
         sitemap_profiles: Mapping[str, SitemapAcquisitionProfile],
         raw_graph: Mapping[str, object],
@@ -332,6 +370,7 @@ class _VirtualInstallationRuntime:
         self._broker = broker
         self._controller = controller
         camera_ports = dict(camera_ports)
+        camera_monitor_ports = dict(camera_monitor_ports)
         pulse_ports = dict(pulse_ports)
         sitemap_profiles = dict(sitemap_profiles)
         raw_graph = dict(raw_graph)
@@ -342,13 +381,17 @@ class _VirtualInstallationRuntime:
             raise ValueError(
                 "installation close order must cover the raw graph exactly"
             )
-        public_roles = set(camera_ports) | set(pulse_ports)
+        public_roles = set(camera_ports) | set(camera_monitor_ports) | set(pulse_ports)
         if not public_roles.issubset(raw_graph):
             raise ValueError("installation ports reference roles outside the raw graph")
         if not public_roles.issubset(set(catalog)):
             raise ValueError("installation ports reference roles outside the catalog")
         if any(catalog.require(role).domain != "camera" for role in camera_ports):
             raise ValueError("camera port roles differ from catalog domains")
+        if any(
+            catalog.require(role).domain != "camera" for role in camera_monitor_ports
+        ):
+            raise ValueError("camera monitor port roles differ from catalog domains")
         if any(
             catalog.require(role).domain != "sequencer" for role in pulse_ports
         ):
@@ -375,6 +418,7 @@ class _VirtualInstallationRuntime:
             if profile.pulse_document.target is not live_target:
                 raise ValueError("sitemap pulse is not bound to the exact live target")
         self._camera_ports = camera_ports
+        self._camera_monitor_ports = camera_monitor_ports
         self._pulse_ports = pulse_ports
         self._sitemap_profiles = sitemap_profiles
         self._raw_graph = raw_graph
@@ -398,6 +442,18 @@ class _VirtualInstallationRuntime:
                 return self._camera_ports[reference.role]
             except KeyError as exc:
                 raise ValueError(f"role {reference.role!r} is not a camera") from exc
+
+    def camera_monitor_port(self, reference: DeviceRef) -> BoundCameraMonitorPort:
+        with self._lock:
+            if self._state != "RUNNING":
+                raise RuntimeError("installation runtime is not accepting operations")
+            self._require_current_reference(reference, "camera")
+            try:
+                return self._camera_monitor_ports[reference.role]
+            except KeyError as exc:
+                raise ValueError(
+                    f"camera role {reference.role!r} is not free-running monitor capable"
+                ) from exc
 
     def pulse_port(self, reference: DeviceRef) -> BoundPulsePort:
         with self._lock:
@@ -490,6 +546,7 @@ class _VirtualInstallationRuntime:
             self._state = "CLOSED"
             self._raw_graph.clear()
             self._camera_ports.clear()
+            self._camera_monitor_ports.clear()
             self._pulse_ports.clear()
             self._sitemap_profiles.clear()
             return True
@@ -501,7 +558,12 @@ def _catalog(
     assets: InstallationAssetMap,
     devices: Mapping[str, object],
 ) -> DeviceCatalogView:
-    domains = {"camera": "camera", "sequencer": "sequencer", "trap": "trap"}
+    domains = {
+        "camera": "camera",
+        "monitor_camera": "camera",
+        "sequencer": "sequencer",
+        "trap": "trap",
+    }
     return DeviceCatalogView(
         installation_id,
         runtime_instance_id,
@@ -514,7 +576,8 @@ def _catalog(
                 str(asset.resource_key),
             )
             for asset in assets.assets
-            if asset.role in devices and asset.role in {"camera", "sequencer"}
+            if asset.role in devices
+            and asset.role in {"camera", "monitor_camera", "sequencer"}
         ),
     )
 
@@ -537,6 +600,7 @@ def create_virtual_installation(
     trap: VirtualAtomArray | None = None
     sequencer: VirtualSequencer | None = None
     camera: VirtualCamera | None = None
+    monitor_camera: VirtualMonitorCamera | None = None
     devices: dict[str, object] = {}
     journal: PersistentSafetyJournal | None = None
     resources: ResourceArbiter | None = None
@@ -566,15 +630,21 @@ def create_virtual_installation(
             capture_trigger_channels=_CAMERA_TRIGGER_CHANNELS,
         )
         devices["camera"] = camera
+        monitor_camera = VirtualMonitorCamera(sequencer)
+        devices["monitor_camera"] = monitor_camera
         # The trap is a private simulator model behind the camera, not an unbound
         # public physical-device role.  It remains in the exact reverse-close graph.
         assets = InstallationAssetMap.ephemeral(
-            {"sequencer": sequencer, "camera": camera}
+            {
+                "sequencer": sequencer,
+                "camera": camera,
+                "monitor_camera": monitor_camera,
+            }
         )
         installation_id = f"installation-{assets.revision[:20]}"
         runtime_instance_id = uuid.uuid4().hex
         durable_mkdir(journal_path.parent)
-        for role in ("sequencer", "camera"):
+        for role in ("sequencer", "camera", "monitor_camera"):
             devices[role].ensure_open()
         sequencer.set_safe_state()
         broker = DeviceBroker()
@@ -583,6 +653,12 @@ def create_virtual_installation(
             assets.require("camera", camera),
             assets.revision,
             camera,
+        )
+        camera_monitor_port = _bind_monitor_camera(
+            broker,
+            assets.require("monitor_camera", monitor_camera),
+            assets.revision,
+            monitor_camera,
         )
         pulse_port = _bind_sequencer(
             broker,
@@ -621,10 +697,11 @@ def create_virtual_installation(
             broker=broker,
             controller=controller,
             camera_ports={"camera": camera_port},
+            camera_monitor_ports={"monitor_camera": camera_monitor_port},
             pulse_ports={"sequencer": pulse_port},
             sitemap_profiles={"camera": sitemap_profile},
             raw_graph=devices,
-            close_order=("camera", "sequencer", "trap"),
+            close_order=("monitor_camera", "camera", "sequencer", "trap"),
         )
         _retain_process_runtime(runtime)
         return runtime
@@ -632,6 +709,7 @@ def create_virtual_installation(
         cleanup_errors: list[BaseException] = []
         authority_actions = (
             None if broker is None else broker.shutdown,
+            None if monitor_camera is None else monitor_camera.close,
             None if camera is None else camera.close,
             None if sequencer is None else sequencer.close,
             None if trap is None else trap.close,

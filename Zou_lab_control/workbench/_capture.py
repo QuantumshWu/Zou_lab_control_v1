@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
 import threading
 import uuid
 
@@ -46,6 +45,7 @@ from zlc_neutral_atom.capture_application import PreparedFiniteCapture
 from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
 from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot, RunState
 from zlc_workbench.live import LiveDatasetSlot, LiveImageBoardController
+from zlc_workbench.run_owner import QtRunOwnerMailbox
 from zlc_workbench.workspace import BoardController, BoardModel, PanelSlot
 
 
@@ -67,31 +67,17 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             raise TypeError("request must be CaptureRequest")
         self._experiment = experiment
         self._request = request
-        self._pool = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="zlc-capture-workbench",
-        )
-        self._lock = threading.Lock()
-        self._tracked: set[Future] = set()
-        self._pending_results: list[tuple[str, int, Future]] = []
-        self._pending_attachments: list[tuple] = []
-        self._pending_snapshot: tuple[int, RunSnapshot] | None = None
         self._prepared: PreparedFiniteCapture | None = None
-        self._handle: RunHandle | None = None
         self._slot: LiveDatasetSlot | None = None
         self._live: LiveImageBoardController | None = None
         self._board: BoardController | None = None
         self._last_snapshot: RunSnapshot | None = None
         self._final_reference = None
-        self._generation = 0
         self._attempt_failed = False
         self._prepare_inflight = False
-        self._result_inflight = False
-        self._owner_reaped = False
         self._local_diagnostic = ""
         self._closing = False
         self._allow_close = False
-        self._pool_closed = False
 
         self.setWindowTitle("Finite Camera Capture")
         self._capture_status = FluentLabel("Capture: PREPARING")
@@ -131,6 +117,10 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
 
         self._wake = QtOwnerWake(self)
         self._wake.bind(self._owner_cycle)
+        self._run_owner = QtRunOwnerMailbox(
+            self._wake.request_owner_wake,
+            thread_name_prefix="zlc-capture-workbench",
+        )
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(40)
         self._timer.timeout.connect(self._poll_run_snapshot)
@@ -144,32 +134,23 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         return self._final_reference
 
     @property
+    def _handle(self) -> RunHandle | None:
+        """Read-only product view of the shared Run owner."""
+
+        return self._run_owner.handle
+
+    @property
     def worker_idle(self) -> bool:
-        with self._lock:
-            return not self._tracked and not self._pending_results
+        return self._run_owner.worker_idle
 
-    def _submit(self, kind: str, generation: int, work) -> Future:
-        future = self._pool.submit(work)
-        with self._lock:
-            self._tracked.add(future)
-
-        def done(completed: Future) -> None:
-            with self._lock:
-                self._tracked.discard(completed)
-                self._pending_results.append((kind, generation, completed))
-            self._wake.request_owner_wake()
-
-        future.add_done_callback(done)
-        return future
-
-    def _submit_worker(self, work) -> Future:
-        return self._submit("render", self._generation, work)
+    def _submit_worker(self, work):
+        return self._run_owner.submit_render(work)
 
     def _submit_prepare(self) -> None:
         if self._closing or self._prepare_inflight or self._prepared is not None:
             return
         self._prepare_inflight = True
-        generation = self._generation
+        generation = self._run_owner.generation
 
         def prepare() -> PreparedFiniteCapture:
             command = _prepare_capture_for_workbench(
@@ -179,7 +160,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             command.preview_schema
             return command
 
-        self._submit("prepare", generation, prepare)
+        self._run_owner.submit("prepare", prepare, generation=generation)
 
     def _start_capture(self) -> None:
         if self._closing or self._prepared is None:
@@ -193,20 +174,14 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                 f"Previous preview close failed: {type(error).__name__}: {error}"
             )
             return
-        self._generation += 1
-        generation = self._generation
+        generation = self._run_owner.begin_generation()
         command, self._prepared = self._prepared, None
-        self._handle = None
         self._last_snapshot = None
-        with self._lock:
-            self._pending_snapshot = None
         self._final_reference = None
         self._local_diagnostic = ""
         self._attempt_failed = False
         self._refresh_diagnostics(None)
         self._prepare_inflight = False
-        self._result_inflight = False
-        self._owner_reaped = False
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(False)
         self._capture_status.setText("Capture: STARTING · NOT FINAL")
@@ -252,11 +227,10 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             )
             attached = threading.Event()
             response: dict[str, object] = {}
-            with self._lock:
-                self._pending_attachments.append(
-                    (generation, slot, document, attached, response)
-                )
-            self._wake.request_owner_wake()
+            self._run_owner.post_attachment(
+                (slot, document, attached, response),
+                generation=generation,
+            )
             if not attached.wait(5.0):
                 slot.fail("GUI preview attachment timed out")
                 raise TimeoutError("GUI preview attachment timed out")
@@ -266,14 +240,14 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                 raise RuntimeError(reason)
             return slot
 
-        self._submit(
+        self._run_owner.submit(
             "start",
-            generation,
             lambda: command.start_with_preview(
                 block_id=block_id,
                 downstream_peak_bytes=downstream_peak,
                 factory=factory,
             ),
+            generation=generation,
         )
 
     def _cancel_capture(self) -> None:
@@ -290,17 +264,8 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             if self._closing:
                 self._wake.request_owner_wake()
             return
-        snapshot = handle.snapshot()
-        duplicate = False
-        with self._lock:
-            pending = self._pending_snapshot
-            if snapshot == self._last_snapshot or (
-                pending is not None and pending[1] == snapshot
-            ):
-                duplicate = True
-            else:
-                self._pending_snapshot = (self._generation, snapshot)
-        if duplicate:
+        queued = self._run_owner.poll_snapshot(self._last_snapshot)
+        if not queued:
             last = self._last_snapshot
             retry_preview_close = (
                 self._live is not None
@@ -333,13 +298,12 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                     except BaseException:
                         pass
                 self._record_local_failure(message)
-            with self._lock:
-                pending, self._pending_snapshot = self._pending_snapshot, None
+            pending = self._run_owner.take_pending_snapshot()
             if pending is not None:
                 generation, snapshot = pending
                 handle = self._handle
                 if (
-                    generation == self._generation
+                    generation == self._run_owner.generation
                     and handle is not None
                     and snapshot.run_id == handle.run_id
                 ):
@@ -352,9 +316,10 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             self._maybe_finish_close()
 
     def _drain_worker_results(self) -> None:
-        with self._lock:
-            pending, self._pending_results = self._pending_results, []
-        for kind, generation, future in pending:
+        for completion in self._run_owner.drain_completions():
+            kind = completion.kind
+            generation = completion.generation
+            future = completion.future
             if kind == "render":
                 try:
                     future.result()
@@ -364,7 +329,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                     )
                 continue
             if kind == "prepare":
-                if generation != self._generation:
+                if generation != self._run_owner.generation:
                     continue
                 self._prepare_inflight = False
                 try:
@@ -397,7 +362,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                             f"{prefix}: {type(error).__name__}: {error}"
                         )
                     continue
-                if self._closing or generation != self._generation:
+                if self._closing or generation != self._run_owner.generation:
                     continue
                 self._prepared = prepared
                 snapshot = self._last_snapshot
@@ -418,7 +383,8 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                 try:
                     handle = future.result()
                 except BaseException as error:
-                    if generation == self._generation:
+                    if generation == self._run_owner.generation:
+                        self._run_owner.mark_owner_reaped()
                         self._attempt_failed = True
                         self._capture_status.setText("Capture: FAILED · NOT FINAL")
                         self._record_local_failure(
@@ -426,48 +392,61 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                         )
                         self._submit_prepare()
                     continue
-                if self._closing or generation != self._generation:
+                if self._closing or generation != self._run_owner.generation:
                     if self._closing:
-                        self._handle = handle
+                        self._run_owner.set_handle(handle)
                     handle.cancel("Workbench closed before Run admission returned")
                 else:
-                    self._handle = handle
+                    self._run_owner.set_handle(handle)
                     self._stop_button.setEnabled(True)
-                    with self._lock:
-                        self._pending_snapshot = (generation, handle.snapshot())
+                    self._run_owner.enqueue_snapshot(
+                        handle.snapshot(),
+                        generation=generation,
+                    )
                 continue
             if kind == "result":
-                self._result_inflight = False
                 try:
                     reference = future.result()
                 except BaseException as error:
+                    self._run_owner.finish_terminal_job(
+                        generation,
+                        owner_reaped=False,
+                    )
                     self._record_local_failure(
                         f"Final result retrieval failed: {type(error).__name__}: {error}"
                     )
                     continue
-                self._owner_reaped = True
-                if generation == self._generation:
+                self._run_owner.finish_terminal_job(
+                    generation,
+                    owner_reaped=True,
+                )
+                if generation == self._run_owner.generation:
                     self._final_reference = reference
                     self._update_start_button()
                 continue
             if kind == "reap":
-                self._result_inflight = False
                 try:
                     future.result()
                 except BaseException as error:
+                    self._run_owner.finish_terminal_job(
+                        generation,
+                        owner_reaped=False,
+                    )
                     self._record_local_failure(
                         f"Run owner reap failed: {type(error).__name__}: {error}"
                     )
                 else:
-                    self._owner_reaped = True
+                    self._run_owner.finish_terminal_job(
+                        generation,
+                        owner_reaped=True,
+                    )
                     self._update_start_button()
 
     def _drain_attachments(self) -> None:
-        with self._lock:
-            pending, self._pending_attachments = self._pending_attachments, []
-        for generation, slot, document, attached, response in pending:
+        for generation, payload in self._run_owner.drain_attachments():
+            slot, document, attached, response = payload
             try:
-                if self._closing or generation != self._generation:
+                if self._closing or generation != self._run_owner.generation:
                     raise RuntimeError("Workbench no longer accepts this preview")
                 if slot.terminal:
                     raise RuntimeError("preview became terminal before GUI attachment")
@@ -515,11 +494,9 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         elif state is RunState.SUCCEEDED and snapshot.final_committed:
             self._capture_status.setText("Capture: FINAL")
             self._stop_button.setEnabled(False)
-            if not self._result_inflight and not self._owner_reaped:
-                self._result_inflight = True
-                handle = self._handle
-                assert handle is not None
-                self._submit("result", self._generation, handle.result)
+            handle = self._handle
+            assert handle is not None
+            self._run_owner.begin_terminal_job("result", handle.result)
             self._submit_prepare()
         else:
             self._capture_status.setText(f"Capture: {state.value} · NOT FINAL")
@@ -527,11 +504,9 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                 f"Preview: NOT FINAL · capture {state.value}"
             )
             self._stop_button.setEnabled(False)
-            if not self._result_inflight and not self._owner_reaped:
-                self._result_inflight = True
-                handle = self._handle
-                assert handle is not None
-                self._submit("reap", self._generation, handle.wait)
+            handle = self._handle
+            assert handle is not None
+            self._run_owner.begin_terminal_job("reap", handle.wait)
             self._submit_prepare()
         self._refresh_diagnostics(snapshot)
 
@@ -604,7 +579,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
     def _update_start_button(self) -> None:
         handle = self._handle
         previous_settled = handle is None or (
-            handle.snapshot().state.terminal and self._owner_reaped
+            handle.snapshot().state.terminal and self._run_owner.owner_reaped
         )
         self._start_button.setEnabled(
             not self._closing
@@ -651,13 +626,10 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             snapshot = handle.snapshot()
             if not snapshot.state.terminal:
                 return
-            if not self._result_inflight and not self._owner_reaped:
-                self._result_inflight = True
-                self._submit("reap", self._generation, handle.wait)
+            if self._run_owner.begin_terminal_job("reap", handle.wait):
                 return
-        with self._lock:
-            if self._tracked or self._pending_results or self._pending_attachments:
-                return
+        if self._run_owner.has_pending_owner_work:
+            return
         try:
             self._close_live()
         except BaseException as error:
@@ -665,9 +637,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                 f"Preview close failed: {type(error).__name__}: {error}"
             )
             return
-        if not self._pool_closed:
-            self._pool.shutdown(wait=False)
-            self._pool_closed = True
+        self._run_owner.shutdown()
         self._timer.stop()
         self._wake.detach()
         self._allow_close = True

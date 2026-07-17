@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 
 from .artifact import CompiledPulseArtifact
+from .ir import evaluate_affine_tick
 from .physical import (
     iter_physical_digital_high_intervals,
     physical_digital_playback_terminal_tick,
@@ -187,6 +188,99 @@ class PulsePlayback:
         )
 
 
+def sample_compiled_bus_codes(
+    artifact: CompiledPulseArtifact,
+    *,
+    point_index: int = 0,
+    phase: float = 0.5,
+) -> tuple[tuple[str, int], ...]:
+    """Sample held DAC output codes from one compiled base-cycle/scan point.
+
+    This is the pulse-owned virtual-hardware projection of the waveform the
+    FPGA plays.  It deliberately consumes the compiled TargetIR rather than
+    notebook parameters.  A sample that lands inside a live ramp is rejected:
+    the compact IR does not expose a second approximate ramp evaluator, and a
+    virtual sensor must not silently invent a different physical waveform.
+    """
+
+    if not isinstance(artifact, CompiledPulseArtifact):
+        raise TypeError("artifact must be CompiledPulseArtifact")
+    if isinstance(point_index, bool) or not isinstance(point_index, int):
+        raise TypeError("point_index must be an integer")
+    if isinstance(phase, bool) or not isinstance(phase, (int, float)):
+        raise TypeError("phase must be a number")
+    fraction = float(phase)
+    if not math.isfinite(fraction) or not 0.0 <= fraction < 1.0:
+        raise ValueError("phase must be finite in [0, 1)")
+
+    ir = artifact.target_ir
+    points = ir.scan_points or ((),)
+    if not 0 <= point_index < len(points):
+        raise IndexError("point_index is outside the compiled scan table")
+    point = points[point_index]
+    terminal_tick = evaluate_affine_tick(
+        ir.ticks[-1],
+        ir.tick_slot_coeffs[-1],
+        point,
+        ir.scan_coeff_frac_bits,
+    )
+    sample_tick = fraction * terminal_tick
+    delays = {item.bus_index: item.delay_ticks for item in ir.bus_delays}
+    sampled: list[tuple[str, int]] = []
+    for bus_index, bus_name in enumerate(ir.bus_names):
+        current = int(ir.bus_safe_values[bus_index])
+        delay = delays.get(bus_index, 0)
+        segments = sorted(
+            (
+                item
+                for item in ir.bus_segments
+                if item.bus_index == bus_index
+            ),
+            key=lambda item: (
+                evaluate_affine_tick(
+                    item.start_tick,
+                    item.start_tick_coeffs,
+                    point,
+                    ir.scan_coeff_frac_bits,
+                ),
+                item.stop_tick,
+            ),
+        )
+        for segment in segments:
+            source_start = evaluate_affine_tick(
+                segment.start_tick,
+                segment.start_tick_coeffs,
+                point,
+                ir.scan_coeff_frac_bits,
+            )
+            source_stop = evaluate_affine_tick(
+                segment.stop_tick,
+                segment.stop_tick_coeffs,
+                point,
+                ir.scan_coeff_frac_bits,
+            )
+            visible_start = source_start + delay + (1 if source_start else 0)
+            if sample_tick < visible_start:
+                continue
+            stop_selector = segment.stop_value_select
+            stop_value = (
+                int(point[stop_selector - 1])
+                if stop_selector
+                else int(segment.stop_value)
+            )
+            if segment.mode == "edge" or source_stop <= source_start:
+                current = stop_value
+                continue
+            visible_stop = source_stop + delay + (1 if source_stop else 0)
+            if sample_tick < visible_stop:
+                raise ValueError(
+                    f"cannot sample DAC bus {bus_name!r} inside a live ramp"
+                )
+            current = stop_value
+        sampled.append((bus_name, current))
+    return tuple(sampled)
+
+
 def build_pulse_playback(
     artifact: CompiledPulseArtifact,
     *,
@@ -267,4 +361,5 @@ __all__ = [
     "PlaybackTriggerGroup",
     "PulsePlayback",
     "build_pulse_playback",
+    "sample_compiled_bus_codes",
 ]

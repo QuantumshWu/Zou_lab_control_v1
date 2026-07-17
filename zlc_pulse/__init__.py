@@ -91,6 +91,7 @@ from .simulation import (
     PlaybackTriggerGroup,
     PulsePlayback,
     build_pulse_playback,
+    sample_compiled_bus_codes,
 )
 from .physical import (
     PhysicalBusWindow,
@@ -263,6 +264,7 @@ __all__ = [
     "admit_compiled_pulse_payload_size",
     "build_digital_trigger_schedules",
     "build_pulse_playback",
+    "sample_compiled_bus_codes",
     "build_pulse_timeline",
     "build_physical_waveform_index",
     "estimate_physical_waveform_index_peak_bytes",

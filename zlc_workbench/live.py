@@ -26,7 +26,12 @@ from zlc_frontend.render import (
     SourceIdentity,
     detached_render_fault,
 )
-from zlc_neutral_atom.runtime.dataset import MonitorDataset, MonitorDatasetSnapshot
+from zlc_neutral_atom.monitor_application import CameraMonitorViewSpec
+from zlc_neutral_atom.runtime.dataset import (
+    MonitorCoverage,
+    MonitorDataset,
+    MonitorDatasetSnapshot,
+)
 from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
 from zlc_storage import canonical_text
 
@@ -38,20 +43,24 @@ class LiveDatasetSlot:
 
     def __init__(
         self,
-        spec: CapturePreviewSpec,
+        spec: CapturePreviewSpec | CameraMonitorViewSpec,
         *,
         dataset_id: DatasetId,
         evaluation_policy: FigureEvaluationPolicy,
+        retain_on_terminal: bool = True,
     ) -> None:
-        if not isinstance(spec, CapturePreviewSpec):
-            raise TypeError("spec must be CapturePreviewSpec")
+        if not isinstance(spec, (CapturePreviewSpec, CameraMonitorViewSpec)):
+            raise TypeError("spec must be a supported live dataset spec")
         if not isinstance(dataset_id, DatasetId):
             raise TypeError("dataset_id must be DatasetId")
         if not isinstance(evaluation_policy, FigureEvaluationPolicy):
             raise TypeError("evaluation_policy must be FigureEvaluationPolicy")
+        if not isinstance(retain_on_terminal, bool):
+            raise TypeError("retain_on_terminal must be bool")
         self.spec = spec
         self.dataset_id = dataset_id
         self.evaluation_policy = evaluation_policy
+        self._retain_on_terminal = retain_on_terminal
         self._lock = threading.Lock()
         self._dataset: MonitorDataset | None = None
         self._run_id: str | None = None
@@ -61,6 +70,7 @@ class LiveDatasetSlot:
         self._pending_change = False
         self._failure: str | None = None
         self._terminal = False
+        self._withdrawn = False
         self._closed = False
 
     @property
@@ -72,6 +82,13 @@ class LiveDatasetSlot:
     def terminal(self) -> bool:
         with self._lock:
             return self._terminal
+
+    @property
+    def withdrawn(self) -> bool:
+        """Whether the source revoked its last displayable snapshot."""
+
+        with self._lock:
+            return self._withdrawn
 
     def set_change_listener(self, listener: Callable[[], None]) -> None:
         if not callable(listener):
@@ -156,8 +173,20 @@ class LiveDatasetSlot:
                     pass
 
     def source_terminal(self) -> None:
-        with self._lock:
-            self._terminal = True
+        if self._retain_on_terminal:
+            with self._lock:
+                self._terminal = True
+            return
+        dataset, listener = self._detach(None, withdrawn=True)
+        try:
+            if dataset is not None:
+                dataset.close()
+        finally:
+            if listener is not None:
+                try:
+                    listener()
+                except BaseException:
+                    pass
 
     def close(self) -> None:
         dataset, _listener = self._detach(None, closed=True)
@@ -169,6 +198,7 @@ class LiveDatasetSlot:
         failure: str | None,
         *,
         closed: bool = False,
+        withdrawn: bool = False,
     ) -> tuple[MonitorDataset | None, Callable[[], None] | None]:
         with self._lock:
             if failure is not None and self._failure is not None:
@@ -177,9 +207,14 @@ class LiveDatasetSlot:
             if failure is not None and self._failure is None:
                 self._failure = failure
             self._terminal = True
+            self._withdrawn = self._withdrawn or withdrawn
             self._closed = self._closed or closed
             listener, self._listener = self._listener, None
-            if failure is not None and listener is None and not self._listener_claimed:
+            if (
+                (failure is not None or withdrawn)
+                and listener is None
+                and not self._listener_claimed
+            ):
                 self._pending_change = True
             return dataset, listener
 
@@ -232,6 +267,7 @@ class LiveImageBoardController:
         self._source: SourceIdentity | None = None
         self._sequence = 0
         self._fault: BaseException | None = None
+        self._coverage: MonitorCoverage | None = None
         self._front_invalidated = False
         self._closed = False
         self._close_complete = False
@@ -242,8 +278,15 @@ class LiveImageBoardController:
         with self._lock:
             return self._fault
 
+    @property
+    def coverage(self) -> MonitorCoverage | None:
+        """Coverage paired with the latest accepted immutable board front."""
+
+        with self._lock:
+            return self._coverage
+
     def _source_changed(self) -> None:
-        if self._slot.failure is not None:
+        if self._slot.failure is not None or self._slot.withdrawn:
             self._request_owner_wake()
         else:
             self._request_snapshot()
@@ -269,11 +312,21 @@ class LiveImageBoardController:
                 self._candidate = candidate
             self._request_owner_wake()
         except BaseException as error:
+            # A clean source withdrawal can race a worker that was just about
+            # to freeze the former live dataset.  It is a stale render request,
+            # not a source or renderer failure.
+            if self._slot.withdrawn and self._slot.failure is None:
+                with self._lock:
+                    self._candidate = None
+                    self._active = False
+                self._request_owner_wake()
+                return
             self._set_fault(error)
 
     def admit_pending(self) -> bool:
         failure = self._slot.failure
-        if failure is not None:
+        withdrawn = self._slot.withdrawn
+        if failure is not None or withdrawn:
             with self._lock:
                 if self._closed:
                     return False
@@ -285,6 +338,7 @@ class LiveImageBoardController:
                 self._active = False
                 self._port = None
                 self._source = None
+                self._coverage = None
             if invalidate:
                 try:
                     self._board.invalidate()
@@ -385,7 +439,11 @@ class LiveImageBoardController:
             )
             port = self._port
             if port is not None:
-                port.publish(token, frame)
+                published = port.publish(token, frame)
+                if published:
+                    with self._lock:
+                        if not self._closed and self._port is port:
+                            self._coverage = candidate[2].coverage
         except BaseException as error:
             self._set_fault(error)
             return
@@ -442,6 +500,7 @@ class LiveImageBoardController:
                 self._fault = detached_render_fault(error)
             self._candidate = None
             self._active = False
+            self._coverage = None
         try:
             self._slot.fail(f"{type(error).__name__}: {error}")
         except BaseException:
@@ -455,6 +514,7 @@ class LiveImageBoardController:
             self._active = False
             self._dirty = False
             self._candidate = None
+            self._coverage = None
             self._front_invalidated = True
         try:
             self._slot.close()

@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 
+def open_camera_monitor_workbench(prepare):
+    """Open one free-running camera monitor without eager Qt imports."""
+
+    from ._camera_monitor import open_camera_monitor_workbench as _open
+
+    return _open(prepare)
+
+
 def open_capture_workbench(experiment, request):
     """Open the finite exact-capture Workbench without owning the Experiment."""
 
@@ -129,6 +137,7 @@ def open_offline_pulse_workbench(
 
 __all__ = [
     "open_calibration_report_workbench",
+    "open_camera_monitor_workbench",
     "open_capture_workbench",
     "open_data_figure_workbench",
     "open_figure_workbench",

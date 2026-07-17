@@ -55,6 +55,12 @@ from zlc_neutral_atom.capture_application import (
     bind_finite_capture_spec,
     prepare_finite_capture,
 )
+from zlc_neutral_atom.monitor_application import (
+    CameraMonitorDescriptor,
+    CameraMonitorRequest,
+    PreparedCameraMonitor,
+    prepare_camera_monitor,
+)
 from zlc_neutral_atom.pulse_application import (
     PreparedPulseExecution,
     PulseRunDescriptor,
@@ -625,6 +631,74 @@ class ReadoutFacade:
             "camera",
             ("readout", "camera"),
         )
+
+    def _resolve_monitor_camera_role(
+        self,
+        services: _ExperimentServices,
+        requested: str | None,
+    ) -> str:
+        if self._binding is not None:
+            if requested is not None and requested != self._binding.value:
+                raise ValueError("bound readout facade cannot target another camera")
+            requested = self._binding.value
+        return _resolve_role(
+            services.catalog,
+            requested,
+            "camera",
+            ("monitor_camera",),
+        )
+
+    def camera_monitor_request(
+        self,
+        *,
+        camera_role: str | None = None,
+        memory_limit_bytes: int = 256 << 20,
+        io_timeout_seconds: float = 2.0,
+    ) -> CameraMonitorRequest:
+        """Freeze one free-running monitor request without starting hardware."""
+
+        with _service_guard(self._token) as services:
+            role = self._resolve_monitor_camera_role(services, camera_role)
+            return CameraMonitorRequest(
+                services.catalog.require(role).ref,
+                memory_limit_bytes,
+                io_timeout_seconds,
+            )
+
+    def inspect_camera_monitor(
+        self,
+        request: CameraMonitorRequest,
+    ) -> CameraMonitorDescriptor:
+        if not isinstance(request, CameraMonitorRequest):
+            raise TypeError("request must be CameraMonitorRequest")
+        self._require_binding(ReadoutBindingKey(request.camera_ref.role))
+        with _service_guard(self._token) as services:
+            return _prepare_camera_monitor_for_services(services, request).descriptor
+
+    def camera_monitor_gui(
+        self,
+        request: CameraMonitorRequest | None = None,
+        **request_options,
+    ):
+        """Open the current rolling raw-image monitor on the Qt owner thread."""
+
+        if request is None:
+            request = self.camera_monitor_request(**request_options)
+        elif request_options:
+            raise TypeError(
+                "camera_monitor_gui request options are only valid without a request"
+            )
+        if not isinstance(request, CameraMonitorRequest):
+            raise TypeError("request must be CameraMonitorRequest")
+        self._require_binding(ReadoutBindingKey(request.camera_ref.role))
+
+        def prepare() -> PreparedCameraMonitor:
+            with _service_guard(self._token) as services:
+                return _prepare_camera_monitor_for_services(services, request)
+
+        from Zou_lab_control.workbench import open_camera_monitor_workbench
+
+        return open_camera_monitor_workbench(prepare)
 
     def capture_request(
         self,
@@ -2042,6 +2116,19 @@ def _prepare_capture_for_workbench(
         return _prepare_capture_for_services(services, request)
 
 
+def _prepare_camera_monitor_for_services(
+    services: _ExperimentServices,
+    request: CameraMonitorRequest,
+) -> PreparedCameraMonitor:
+    if not isinstance(request, CameraMonitorRequest):
+        raise TypeError("request must be CameraMonitorRequest")
+    return prepare_camera_monitor(
+        request,
+        monitor_port=services.runtime.camera_monitor_port(request.camera_ref),
+        start_run=services.runtime.start,
+    )
+
+
 def _prepare_pulse_for_services(
     services: _ExperimentServices,
     request: PulseRunRequest,
@@ -2635,6 +2722,8 @@ __all__ = [
     "CalibrationArtifactRequest",
     "CalibrationArtifactRef",
     "CalibrationCaptureLayout",
+    "CameraMonitorDescriptor",
+    "CameraMonitorRequest",
     "CaptureArtifactRef",
     "CaptureFitResultArtifactRef",
     "CaptureRequest",

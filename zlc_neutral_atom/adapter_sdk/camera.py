@@ -1,4 +1,4 @@
-"""Record-preserving contract for finite camera acquisition adapters."""
+"""Record-preserving contract for finite and free-running camera adapters."""
 
 from __future__ import annotations
 
@@ -150,7 +150,7 @@ class CameraWorkingPoint:
 
 @runtime_checkable
 class CameraAdapter(Protocol):
-    """Finite-record interface consumed by ``CameraCaptureEndpoint``.
+    """Record interface consumed by the composition-owned camera endpoint.
 
     Runtime structural checks only reject missing members; they do not prove
     thread safety, hardware identity, or exact-trigger qualification.  Each
@@ -171,12 +171,12 @@ class CameraAdapter(Protocol):
 
     def arm(
         self,
-        frames: int,
+        frames: int | None,
         *,
         max_inflight_frames: int,
         timeout: float,
     ) -> None:
-        """Arm with retention no larger than ``max_pending_records``."""
+        """Arm with bounded retention; ``None`` means hardware-paced monitor."""
 
         ...
 
