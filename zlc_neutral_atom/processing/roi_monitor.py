@@ -4,7 +4,7 @@ The pure reduction owns the physical meaning of one explicit spatial ROI.  The
 small runtime projection consumes an ordered monitor tap and publishes a new
 event with direct source-event causation.  It is intentionally not a generic
 live workflow engine: the current product has one input, one output, and one
-immutable control revision for the lifetime of a run.
+immutable binding for the lifetime of a monitor run.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from zlc_data.numeric import (
     canonical_sum_dtype,
     checked_numeric_sum,
 )
-from zlc_storage import canonical_digest, encode, nonnegative_integer, sha256_text
+from zlc_storage import canonical_digest, encode, sha256_text
 
 from zlc_neutral_atom.acquisition.camera import (
     CameraFrameMetadata,
@@ -59,10 +59,6 @@ _REFERENCE_MAX_BYTES = 2048
 _RECORD_BYTES = 128
 
 
-def _revision(value: object, field_name: str) -> int:
-    return nonnegative_integer(value, field_name)
-
-
 @dataclass(frozen=True)
 class RoiScalarBinding:
     """One admitted ROI/reducer and its fixed output contract."""
@@ -71,8 +67,6 @@ class RoiScalarBinding:
     selection: Selection
     reduction: ReductionMethod
     validity_policy: ValidityPolicy = ValidityPolicy.REQUIRE_ALL
-    config_revision: int = 0
-    control_revision: int = 0
     output_schema: ValueSchema = field(init=False)
     fingerprint: str = field(init=False)
     reduction_scratch_nbytes: int = field(init=False)
@@ -86,22 +80,16 @@ class RoiScalarBinding:
             raise TypeError("selection must be zlc_data.Selection")
         if not isinstance(self.reduction, ReductionMethod):
             raise TypeError("reduction must be zlc_data.ReductionMethod")
-        if self.reduction not in (ReductionMethod.MEAN, ReductionMethod.SUM):
-            raise ValueError("ROI scalar reduction must be MEAN or SUM")
+        if self.reduction not in (
+            ReductionMethod.MEAN,
+            ReductionMethod.SUM,
+            ReductionMethod.MAX,
+        ):
+            raise ValueError("ROI scalar reduction must be MEAN, SUM, or MAX")
         if not isinstance(self.validity_policy, ValidityPolicy):
             raise TypeError("validity_policy must be zlc_data.ValidityPolicy")
         if self.validity_policy is ValidityPolicy.MIN_COUNT:
             raise ValueError("ROI scalar MIN_COUNT is not implemented")
-        object.__setattr__(
-            self,
-            "config_revision",
-            _revision(self.config_revision, "config_revision"),
-        )
-        object.__setattr__(
-            self,
-            "control_revision",
-            _revision(self.control_revision, "control_revision"),
-        )
         schema = self.input_contract.value_schema
         axes = schema.data_axes
         x_axes = tuple(axis for axis in axes if axis.role == SPATIAL_X)
@@ -125,11 +113,14 @@ class RoiScalarBinding:
             raise ValueError("ROI scalar ranges must use unit stride")
         object.__setattr__(self, "_x_range", (x_indices.start, x_indices.stop))
         object.__setattr__(self, "_y_range", (y_indices.start, y_indices.stop))
-        output_dtype = (
-            canonical_mean_dtype(schema.dtype)
-            if self.reduction is ReductionMethod.MEAN
-            else canonical_sum_dtype(schema.dtype)
-        )
+        if self.reduction is ReductionMethod.MEAN:
+            output_dtype = canonical_mean_dtype(schema.dtype)
+        elif self.reduction is ReductionMethod.SUM:
+            output_dtype = canonical_sum_dtype(schema.dtype)
+        else:
+            if schema.dtype.kind == "c":
+                raise TypeError("ROI MAX is undefined for complex camera values")
+            output_dtype = schema.dtype
         output_schema = ValueSchema(
             (),
             ValidityContract.value(),
@@ -181,8 +172,6 @@ class RoiScalarBinding:
                     "selection": selection_to_tree(self.selection),
                     "reduction": self.reduction.value,
                     "validity_policy": self.validity_policy.value,
-                    "config_revision": self.config_revision,
-                    "control_revision": self.control_revision,
                     "output_schema": output_schema.fingerprint,
                 }
             ),
@@ -221,21 +210,33 @@ def reduce_camera_roi(sample: CameraSample, binding: RoiScalarBinding) -> Value:
             binding.output_schema,
         )
     axes = tuple(range(selected.ndim))
-    safe = selected if valid_count == selected.size else np.where(validity, selected, 0)
-    if binding.reduction is ReductionMethod.SUM:
-        reduced = checked_numeric_sum(
-            safe,
-            axes,
-            output_dtype=binding.output_schema.dtype,
+    if binding.reduction in (ReductionMethod.SUM, ReductionMethod.MEAN):
+        safe = (
+            selected
+            if valid_count == selected.size
+            else np.where(validity, selected, 0)
         )
+        if safe.dtype.kind in "fc" and not np.all(np.isfinite(safe)):
+            raise ValueError("ROI reduction received a valid non-finite camera value")
+        if binding.reduction is ReductionMethod.SUM:
+            reduced = checked_numeric_sum(
+                safe,
+                axes,
+                output_dtype=binding.output_schema.dtype,
+            )
+        else:
+            widened = safe.astype(binding.output_schema.dtype, copy=False)
+            summed = checked_numeric_sum(
+                widened,
+                axes,
+                output_dtype=binding.output_schema.dtype,
+            )
+            reduced = np.asarray(summed, dtype=binding.output_schema.dtype) / valid_count
     else:
-        widened = safe.astype(binding.output_schema.dtype, copy=False)
-        summed = checked_numeric_sum(
-            widened,
-            axes,
-            output_dtype=binding.output_schema.dtype,
-        )
-        reduced = np.asarray(summed, dtype=binding.output_schema.dtype) / valid_count
+        valid_values = selected if valid_count == selected.size else selected[validity]
+        if valid_values.dtype.kind in "fc" and not np.all(np.isfinite(valid_values)):
+            raise ValueError("ROI MAX received a valid non-finite camera value")
+        reduced = np.max(valid_values)
     return Value(
         np.asarray(reduced, dtype=binding.output_schema.dtype).reshape(()),
         VALID if output_valid else INVALID,
@@ -247,8 +248,7 @@ def reduce_camera_roi(sample: CameraSample, binding: RoiScalarBinding) -> Value:
 class RoiScalarMetadata:
     source_event_ref: EventRef
     source_metadata: CameraFrameMetadata
-    control_revision: int
-    control_fingerprint: str
+    binding_fingerprint: str
     source_missed: int
 
     def __post_init__(self) -> None:
@@ -256,16 +256,17 @@ class RoiScalarMetadata:
             raise TypeError("source_event_ref must be EventRef")
         if not isinstance(self.source_metadata, CameraFrameMetadata):
             raise TypeError("source_metadata must be CameraFrameMetadata")
-        object.__setattr__(
-            self,
-            "control_revision",
-            _revision(self.control_revision, "control_revision"),
-        )
-        sha256_text(self.control_fingerprint, "control_fingerprint")
+        sha256_text(self.binding_fingerprint, "binding_fingerprint")
+        if (
+            isinstance(self.source_missed, bool)
+            or not isinstance(self.source_missed, Integral)
+            or self.source_missed < 0
+        ):
+            raise ValueError("source_missed must be a non-negative integer")
         object.__setattr__(
             self,
             "source_missed",
-            _revision(self.source_missed, "source_missed"),
+            int(self.source_missed),
         )
 
 
@@ -300,7 +301,7 @@ class RoiScalarMetadataContract:
     def fingerprint(self) -> str:
         return canonical_digest(
             {
-                "contract": "zlc_neutral_atom.RoiScalarMetadata",
+                "contract": "zlc_neutral_atom.RoiScalarBindingMetadata",
                 "source_metadata": self.source_metadata_contract.fingerprint,
                 "source_reference_max_bytes": self.source_reference_max_bytes,
             }
@@ -342,13 +343,12 @@ class RoiScalarMetadataContract:
         assert isinstance(metadata, RoiScalarMetadata)
         return canonical_digest(
             {
-                "contract": "zlc_neutral_atom.RoiScalarMetadataContent",
+                "contract": "zlc_neutral_atom.RoiScalarBindingMetadataContent",
                 "source_event_ref": event_ref_to_tree(metadata.source_event_ref),
                 "source_metadata": self.source_metadata_contract.digest(
                     metadata.source_metadata
                 ),
-                "control_revision": metadata.control_revision,
-                "control_fingerprint": metadata.control_fingerprint,
+                "binding_fingerprint": metadata.binding_fingerprint,
                 "source_missed": metadata.source_missed,
             }
         )
@@ -398,10 +398,8 @@ class RoiScalarSampleContract:
         self.value_contract.validate(payload.value)
         metadata = payload.metadata
         self.metadata_contract.validate(metadata)
-        if metadata.control_revision != self.binding.control_revision:
-            raise ValueError("ROI scalar payload control revision differs from binding")
-        if metadata.control_fingerprint != self.binding.fingerprint:
-            raise ValueError("ROI scalar payload control fingerprint differs from binding")
+        if metadata.binding_fingerprint != self.binding.fingerprint:
+            raise ValueError("ROI scalar payload fingerprint differs from binding")
 
     def retained_nbytes(self, payload: RoiScalarSample) -> int:
         self.validate(payload)
@@ -484,7 +482,6 @@ class RoiScalarStreamProjection:
             RoiScalarMetadata(
                 source.ref,
                 source.payload.metadata,
-                self.binding.control_revision,
                 self.binding.fingerprint,
                 update.missed,
             ),
@@ -497,8 +494,6 @@ class RoiScalarStreamProjection:
                 f"{source.trace.source_id}.roi-scalar",
                 source.trace.correlation_id,
                 (source.ref,),
-                self.binding.config_revision,
-                self.binding.control_revision,
             ),
         )
         return output

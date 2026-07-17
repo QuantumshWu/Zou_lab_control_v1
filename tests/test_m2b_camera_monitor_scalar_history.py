@@ -153,7 +153,7 @@ def test_roi_scalar_history_is_independent_and_board_join_is_source_exact(
             for panel in frame.panels
         )
         stamp = image_panel.coherence_stamp
-        assert stamp.join_key_type == "camera-roi-source-event-control"
+        assert stamp.join_key_type == "camera-roi-source-event-binding"
         assert len(stamp.inputs) == 2
         assert len(stamp.presentations) == 4
 
@@ -167,8 +167,7 @@ def test_roi_scalar_history_is_independent_and_board_join_is_source_exact(
         assert len(raw.event_refs) == request.history_capacity
         assert len(scalar.event_refs) == request.scalar_history_capacity
         assert metadata.source_event_ref == raw.head
-        assert metadata.control_revision == 0
-        assert metadata.control_fingerprint == window._slot.spec.roi_binding.fingerprint
+        assert metadata.binding_fingerprint == window._slot.spec.roi_binding.fingerprint
         assert metadata.source_missed == 0
 
         terms = {term.axis_id: term for term in roi.terms}
@@ -279,8 +278,8 @@ def test_roi_scalar_projection_omits_invalid_components_and_carries_lineage():
     )
     derived = projection.process_next(timeout=0.0)
     assert derived.trace.causation_refs == (source_envelope.ref,)
-    assert derived.trace.control_revision == 0
-    assert derived.trace.config_revision == 0
+    assert derived.trace.control_revision is None
+    assert derived.trace.config_revision is None
     assert derived.payload.metadata.source_event_ref == source_envelope.ref
     assert derived.payload.value.validity is VALID
     expected = values[valid].astype(np.float64).mean()

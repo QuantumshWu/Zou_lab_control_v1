@@ -374,9 +374,8 @@ def test_scalar_display_budget_rejects_before_monitor_arm(experiment, applicatio
     window = experiment.readout.camera_monitor_gui(request)
     try:
         start = window.findChild(QtWidgets.QPushButton, "startButton")
-        _until(application, start.isEnabled)
-        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
         _until(application, lambda: "peak budget" in window._local_diagnostic)
+        assert not start.isEnabled()
         assert window._handle is None
         assert window._slot is None
     finally:
@@ -392,9 +391,11 @@ def test_scalar_display_budget_rejects_before_monitor_arm(experiment, applicatio
     window = experiment.readout.camera_monitor_gui(oversized)
     try:
         start = window.findChild(QtWidgets.QPushButton, "startButton")
-        _until(application, start.isEnabled)
-        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
-        assert "histogram sample limit" in window._local_diagnostic
+        _until(
+            application,
+            lambda: "histogram sample limit" in window._local_diagnostic,
+        )
+        assert not start.isEnabled()
         assert window._handle is None
         assert window._slot is None
     finally:
@@ -435,6 +436,9 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
         _drain_attachments=lambda: None,
         _live=Live(),
         _board=board,
+        _selector_interacting=False,
+        _apply_phase=None,
+        _slot=None,
         _run_owner=SimpleNamespace(take_pending_snapshot=lambda: None),
         _refresh_view_status=lambda: events.append("status"),
         _maybe_finish_close=lambda: None,
@@ -460,6 +464,8 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
         _projection_text="projection",
         _view_status=label,
         _handle=None,
+        _reconcile_visible_roi=lambda _status: None,
+        _update_roi_controls=lambda: None,
     )
     CameraMonitorWorkbenchWindow._refresh_view_status(status_harness)
     assert label.text.endswith("diagnostics pending")

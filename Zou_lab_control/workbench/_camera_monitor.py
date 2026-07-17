@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 import threading
 
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_data import (
     MONITOR_HISTORY,
+    ReductionMethod,
     SPATIAL_X,
     SPATIAL_Y,
     Selection,
@@ -35,12 +37,16 @@ from zlc_frontend.matplotlib_render import (
 )
 from zlc_frontend.qt_widgets import (
     FluentButton,
+    FluentComboBox,
     FluentLabel,
+    FluentSwitch,
     GREEN,
+    ImageViewportTransform,
     ORANGE,
     QtImageBoard,
     QtOwnerWake,
     QtRasterBoard,
+    RectangleGesture,
     WINDOW_SCREEN_FRACTION,
     center_window_on_primary_screen,
     ensure_qt_app,
@@ -55,7 +61,7 @@ from zlc_neutral_atom.monitor_application import (
     CameraMonitorViewSpec,
     PreparedCameraMonitor,
 )
-from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot, RunState
+from zlc_neutral_atom.runtime.run import CancelOutcome, RunHandle, RunSnapshot, RunState
 from zlc_workbench.live import LiveDatasetSlot, LiveImageBoardController
 from zlc_workbench.run_owner import QtRunOwnerMailbox
 from zlc_workbench.workspace import BoardController, BoardModel, PanelSlot
@@ -125,13 +131,188 @@ def _roi_scalar_views(schema, binding):
     )
     summary = (
         f"latest raw frame + ROI {binding.reduction.value.lower()} scalar "
-        f"[{description}] · control revision {binding.control_revision} · "
+        f"[{description}] · binding {binding.fingerprint[:12]} · "
         f"validity {binding.validity_policy.value.lower()} · "
         f"scalar history 0..{history[0].size - 1} (0 newest) · "
         f"curve + {DEFAULT_HISTOGRAM_BINS}-bin histogram + latest meter · "
         "MONITOR DERIVED / DISPLAY ONLY"
     )
     return views, summary
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedMonitorView:
+    """One fully checked headless view product awaiting a single Run start."""
+
+    command: PreparedCameraMonitor
+    generation: int
+    dataset_id: DatasetId
+    scalar_dataset_id: DatasetId | None
+    image_document: FigureDocument
+    scalar_documents: tuple[FigureDocument, ...]
+    evaluation_policy: FigureEvaluationPolicy
+    downstream_peak_bytes: int
+    viewport: ImageViewportTransform | None
+    projection_text: str
+
+
+def _prepare_monitor_view(
+    command: PreparedCameraMonitor,
+    generation: int,
+) -> _PreparedMonitorView:
+    """Finish every pure display check before an existing Run is replaced."""
+
+    if not isinstance(command, PreparedCameraMonitor):
+        raise TypeError("command must be PreparedCameraMonitor")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+        raise ValueError("monitor view generation must be a positive integer")
+    schema = command.view_schema
+    scalar_schema = command.scalar_view_schema
+    roi_binding = command.roi_binding
+    history = tuple(axis for axis in schema.point_axes if axis.role == MONITOR_HISTORY)
+    y_axes = tuple(
+        axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_Y
+    )
+    x_axes = tuple(
+        axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_X
+    )
+    if (
+        len(history) != 1
+        or len(y_axes) != 1
+        or len(x_axes) != 1
+        or len(schema.cell_schema.data_axes) != 2
+    ):
+        raise ValueError(
+            "camera monitor requires one history axis and declared "
+            "SPATIAL_Y/SPATIAL_X image axes"
+        )
+    selection = Selection.index(history[0].axis_id, 0)
+    suggestion = suggest_view(schema, ViewIntent.IMAGE, selection)
+    if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
+        raise ValueError("camera monitor IMAGE view needs an explicit axis choice")
+    image_view = suggestion.spec
+    image_evaluation_peak = estimate_view_evaluation_peak_nbytes(schema, image_view)
+    downstream_peak = image_evaluation_peak + estimate_gray8_raster_peak_nbytes(
+        y_axes[0].size,
+        x_axes[0].size,
+    )
+
+    scalar_views: tuple[ViewSpec, ...] = ()
+    scalar_evaluation_peaks: tuple[int, ...] = ()
+    projection_text = _RAW_PROJECTION_TEXT
+    viewport = None
+    if scalar_schema is None:
+        if roi_binding is not None or command.request.roi is not None:
+            raise RuntimeError("ROI request has no scalar view product")
+    else:
+        if roi_binding is None or command.request.roi is None:
+            raise RuntimeError("scalar view product has no admitted ROI binding")
+        if (
+            roi_binding.selection != command.request.roi
+            or roi_binding.reduction is not command.request.roi_reduction
+        ):
+            raise RuntimeError("prepared ROI binding differs from its immutable request")
+        scalar_views, projection_text = _roi_scalar_views(scalar_schema, roi_binding)
+        default_policy = FigureEvaluationPolicy()
+        scalar_history = tuple(
+            axis for axis in scalar_schema.point_axes if axis.role == MONITOR_HISTORY
+        )
+        if (
+            len(scalar_history) != 1
+            or scalar_history[0].size > default_policy.max_histogram_samples
+        ):
+            raise ValueError(
+                "ROI scalar history exceeds the live histogram sample limit "
+                f"{default_policy.max_histogram_samples}"
+            )
+        scalar_evaluation_peaks = tuple(
+            estimate_view_evaluation_peak_nbytes(scalar_schema, view)
+            for view in scalar_views
+        )
+        for view, evaluation_peak in zip(
+            scalar_views,
+            scalar_evaluation_peaks,
+            strict=True,
+        ):
+            downstream_peak += evaluation_peak + estimate_live_panel_raster_peak_nbytes(
+                *_SCALAR_RASTER_SIZE,
+                evaluated_data_upper_bound_bytes=evaluation_peak,
+                histogram_bins=(
+                    DEFAULT_HISTOGRAM_BINS
+                    if view.intent is ViewIntent.HISTOGRAM
+                    else None
+                ),
+            )
+        viewport = ImageViewportTransform(
+            (y_axes[0], x_axes[0]),
+            viewport_revision=generation,
+        )
+        # Resolve once during preparation so binding the GUI overlay after the
+        # old Run is gone cannot discover a coordinate/selection mismatch.
+        viewport.normalized_bounds_for_selection(roi_binding.selection)
+
+    policy = FigureEvaluationPolicy(
+        max_live_nbytes=max((image_evaluation_peak, *scalar_evaluation_peaks))
+    )
+    required_peak = command.descriptor.base_peak_bytes + downstream_peak
+    if required_peak > command.request.memory_limit_bytes:
+        raise MemoryError(
+            f"camera monitor peak budget {required_peak} exceeds limit "
+            f"{command.request.memory_limit_bytes}"
+        )
+
+    dataset_id = DatasetId(f"camera-monitor-{generation}")
+    scalar_dataset_id = (
+        None
+        if scalar_schema is None
+        else DatasetId(f"camera-monitor-roi-scalar-{generation}")
+    )
+    image_document = FigureDocument(
+        f"camera-monitor-image-{generation}",
+        0,
+        (
+            DatasetDescriptor(
+                dataset_id,
+                "Raw monitor camera frame",
+                schema.fingerprint,
+            ),
+        ),
+        (FigureLayer(_IMAGE_PANEL_ID, dataset_id, image_view),),
+    )
+    scalar_documents: tuple[FigureDocument, ...] = ()
+    if scalar_views:
+        assert scalar_schema is not None and scalar_dataset_id is not None
+        assert roi_binding is not None
+        descriptor = DatasetDescriptor(
+            scalar_dataset_id,
+            f"ROI {roi_binding.reduction.value.lower()} scalar monitor",
+            scalar_schema.fingerprint,
+        )
+        scalar_documents = tuple(
+            FigureDocument(
+                f"{panel_id}-{generation}",
+                0,
+                (descriptor,),
+                (FigureLayer(panel_id, scalar_dataset_id, view),),
+            )
+            for panel_id, view in zip(
+                _SCALAR_PANEL_IDS,
+                scalar_views,
+                strict=True,
+            )
+        )
+    return _PreparedMonitorView(
+        command,
+        generation,
+        dataset_id,
+        scalar_dataset_id,
+        image_document,
+        scalar_documents,
+        policy,
+        downstream_peak,
+        viewport,
+        projection_text,
+    )
 
 
 class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
@@ -153,13 +334,23 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 f"history {request.scalar_history_capacity} · PREPARING"
             )
         )
-        self._prepared: PreparedCameraMonitor | None = None
+        self._prepared: _PreparedMonitorView | None = None
+        self._prepared_apply: _PreparedMonitorView | None = None
+        self._pending_request: CameraMonitorRequest | None = None
+        self._applied_request = request
+        self._running_binding = None
+        self._visible_binding_fingerprint: str | None = None
+        self._draft_selection: Selection | None = None
+        self._viewport_transform = None
+        self._selector_interacting = False
+        self._apply_phase: str | None = None
         self._slot: LiveDatasetSlot | None = None
         self._live: LiveImageBoardController | None = None
         self._board: BoardController | None = None
         self._last_snapshot: RunSnapshot | None = None
         self._prepare_inflight = False
         self._local_diagnostic = ""
+        self._manual_stop_requested = False
         self._closing = False
         self._allow_close = False
 
@@ -180,6 +371,30 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._board_layout = QtWidgets.QVBoxLayout(self._board_container)
         self._board_layout.setContentsMargins(0, 0, 0, 0)
         self._configure_board_widget(scalar=request.roi is not None)
+        self._selector_switch = FluentSwitch("ROI selector", self)
+        self._selector_switch.setObjectName("roiSelectorSwitch")
+        self._selector_switch.setChecked(False)
+        self._selector_switch.setEnabled(request.roi is not None)
+        self._reducer_combo = FluentComboBox(self)
+        self._reducer_combo.setObjectName("roiReducerCombo")
+        for label, reduction in (
+            ("Mean", ReductionMethod.MEAN),
+            ("Sum", ReductionMethod.SUM),
+            ("Max", ReductionMethod.MAX),
+        ):
+            self._reducer_combo.addItem(label, reduction)
+        initial_reducer = self._reducer_combo.findData(request.roi_reduction)
+        if initial_reducer >= 0:
+            self._reducer_combo.setCurrentIndex(initial_reducer)
+        self._reducer_combo.setEnabled(request.roi is not None)
+        self._apply_roi_button = FluentButton("Apply ROI", self, color=ORANGE)
+        self._apply_roi_button.setObjectName("applyRoiButton")
+        self._apply_roi_button.setEnabled(False)
+        self._roi_status = FluentLabel(
+            "ROI: unavailable" if request.roi is None else "ROI: fixed request"
+        )
+        self._roi_status.setObjectName("roiStatus")
+        self._roi_status.setWordWrap(True)
         self._start_button = FluentButton("Start", self, color=GREEN)
         self._start_button.setObjectName("startButton")
         self._start_button.setEnabled(False)
@@ -187,6 +402,9 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._stop_button.setObjectName("stopButton")
         self._stop_button.setEnabled(False)
         controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(self._selector_switch)
+        controls.addWidget(self._reducer_combo)
+        controls.addWidget(self._apply_roi_button)
         controls.addWidget(self._start_button)
         controls.addWidget(self._stop_button)
         controls.addStretch(1)
@@ -194,6 +412,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         layout.addWidget(self._run_status)
         layout.addWidget(self._view_status)
         layout.addWidget(self._projection_status)
+        layout.addWidget(self._roi_status)
         layout.addWidget(self._board_container, 1)
         layout.addWidget(self._diagnostics)
         layout.addLayout(controls)
@@ -211,6 +430,9 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._timer.start()
         self._start_button.clicked.connect(self._start_monitor)
         self._stop_button.clicked.connect(self._cancel_monitor)
+        self._selector_switch.toggled.connect(self._set_selector_enabled)
+        self._reducer_combo.currentIndexChanged.connect(self._update_roi_controls)
+        self._apply_roi_button.clicked.connect(self._apply_roi_draft)
         self._submit_prepare()
 
     @property
@@ -225,6 +447,153 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
 
     def _submit_worker(self, work):
         return self._run_owner.submit_render(work)
+
+    def _sync_live_pause(self) -> None:
+        live = self._live
+        if live is None:
+            return
+        if self._selector_interacting or self._apply_phase in {
+            "PREPARING",
+            "REPLACING",
+        }:
+            live.pause()
+        else:
+            live.resume()
+
+    def _set_selector_enabled(self, enabled: bool) -> None:
+        board = self._board_widget
+        setter = getattr(board, "set_rectangle_selector_enabled", None)
+        if callable(setter):
+            setter(bool(enabled))
+
+    def _set_selector_interacting(self, active: bool) -> None:
+        if not isinstance(active, bool):
+            raise TypeError("selector interaction state must be bool")
+        self._selector_interacting = active
+        self._sync_live_pause()
+        self._wake.request_owner_wake()
+
+    def _accept_rectangle_gesture(self, gesture: RectangleGesture) -> None:
+        if not isinstance(gesture, RectangleGesture):
+            raise TypeError("selector callback requires RectangleGesture")
+        board = self._board_widget
+        viewport = self._viewport_transform
+        if not isinstance(board, QtRasterBoard) or viewport is None:
+            raise RuntimeError("ROI selector has no active raster viewport")
+        front = board.front_frame
+        if (
+            front is None
+            or gesture.panel_id != _IMAGE_PANEL_ID
+            or gesture.board_id != front.board_id
+            or gesture.layout_generation != front.layout_generation
+            or gesture.sequence != front.sequence
+            or gesture.viewport_revision != viewport.viewport_revision
+        ):
+            raise RuntimeError("ROI gesture is stale relative to the visible front")
+        image_panel = next(
+            (panel for panel in front.panels if panel.panel_id == _IMAGE_PANEL_ID),
+            None,
+        )
+        if image_panel is None or image_panel.source_identity != gesture.source_identity:
+            raise RuntimeError("ROI gesture source differs from the visible image")
+        selection = viewport.selection_for_normalized_bounds(
+            gesture.normalized_bounds
+        )
+        if selection == self._applied_request.roi:
+            selection = None
+        self._draft_selection = selection
+        board.set_selector_draft_selection(selection)
+        if selection is None:
+            self._roi_status.setText("ROI: no unapplied rectangle change")
+        else:
+            terms = sorted(selection.terms, key=lambda term: term.axis_id.value)
+            coordinates = ", ".join(
+                f"{term.axis_id.value}={term.lower}..{term.upper}"
+                for term in terms
+            )
+            self._roi_status.setText(
+                f"ROI: DRAFT · {coordinates} · click Apply ROI"
+            )
+        self._update_roi_controls()
+
+    def _selected_reducer(self) -> ReductionMethod:
+        value = self._reducer_combo.currentData()
+        if not isinstance(value, ReductionMethod):
+            raise TypeError("ROI reducer control contains an invalid value")
+        return value
+
+    def _update_roi_controls(self, *_args) -> None:
+        roi_available = self._applied_request.roi is not None
+        busy = (
+            self._closing
+            or self._manual_stop_requested
+            or self._apply_phase is not None
+        )
+        active = (
+            self._handle is not None
+            and not self._handle.snapshot().state.terminal
+            and self._board_widget is not None
+            and self._board_widget.has_front
+        )
+        changed = (
+            (
+                self._draft_selection is not None
+                and self._draft_selection != self._applied_request.roi
+            )
+            or (
+                roi_available
+                and self._selected_reducer() is not self._applied_request.roi_reduction
+            )
+        )
+        self._selector_switch.setEnabled(roi_available and not busy and active)
+        self._reducer_combo.setEnabled(roi_available and not busy and active)
+        self._apply_roi_button.setEnabled(
+            roi_available and not busy and active and changed
+        )
+        self._set_selector_enabled(
+            self._selector_switch.isChecked() and roi_available and not busy and active
+        )
+
+    def _apply_roi_draft(self) -> None:
+        if (
+            self._closing
+            or self._manual_stop_requested
+            or self._apply_phase is not None
+        ):
+            return
+        handle = self._handle
+        if handle is None or handle.snapshot().state.terminal:
+            return
+        selection = self._draft_selection or self._applied_request.roi
+        if selection is None:
+            return
+        candidate = replace(
+            self._applied_request,
+            roi=selection,
+            roi_reduction=self._selected_reducer(),
+        )
+        if candidate == self._applied_request:
+            return
+        generation = self._run_owner.generation
+        view_generation = generation + 1
+        self._pending_request = candidate
+        self._apply_phase = "PREPARING"
+        self._roi_status.setText("ROI: validating replacement request")
+        self._stop_button.setEnabled(False)
+        self._sync_live_pause()
+        self._update_roi_controls()
+
+        def prepare() -> _PreparedMonitorView:
+            command = self._prepare(candidate)
+            if not isinstance(command, PreparedCameraMonitor):
+                raise TypeError("ROI apply prepare returned an unexpected command")
+            if command.request != candidate:
+                raise ValueError("ROI apply prepare changed the immutable request")
+            if command.roi_binding is None:
+                raise ValueError("ROI apply prepare produced no scalar binding")
+            return _prepare_monitor_view(command, view_generation)
+
+        self._run_owner.submit("apply_prepare", prepare, generation=generation)
 
     def _configure_board_widget(self, *, scalar: bool) -> None:
         expected = QtRasterBoard if scalar else QtImageBoard
@@ -258,15 +627,16 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             return
         self._prepare_inflight = True
         generation = self._run_owner.generation
+        view_generation = generation + 1
+        request = self._request
 
-        def prepare() -> PreparedCameraMonitor:
-            command = self._prepare()
+        def prepare() -> _PreparedMonitorView:
+            command = self._prepare(request)
             if not isinstance(command, PreparedCameraMonitor):
                 raise TypeError("camera monitor prepare returned an unexpected command")
-            if command.request != self._request:
+            if command.request != request:
                 raise ValueError("prepared camera monitor differs from the frozen UI request")
-            command.view_schema
-            return command
+            return _prepare_monitor_view(command, view_generation)
 
         self._run_owner.submit("prepare", prepare, generation=generation)
 
@@ -277,155 +647,93 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             return
         if not self._run_owner.owner_reaped:
             return
-        command = self._prepared
-        try:
-            schema = command.view_schema
-            scalar_schema = command.scalar_view_schema
-            roi_binding = command.roi_binding
-            history = tuple(axis for axis in schema.point_axes if axis.role == MONITOR_HISTORY)
-            y_axes = tuple(
-                axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_Y
-            )
-            x_axes = tuple(
-                axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_X
-            )
-            if (
-                len(history) != 1
-                or len(y_axes) != 1
-                or len(x_axes) != 1
-                or len(schema.cell_schema.data_axes) != 2
-            ):
-                raise ValueError(
-                    "camera monitor requires one history axis and declared "
-                    "SPATIAL_Y/SPATIAL_X image axes"
+        prepared_view = self._prepared
+        command = prepared_view.command
+        if prepared_view.generation != self._run_owner.generation + 1:
+            self._prepared = None
+            if self._apply_phase == "WAITING_FRONT":
+                self._apply_phase = None
+                self._roi_status.setText(
+                    "ROI: replacement view became stale · preparing retry"
                 )
-            selection = Selection.index(history[0].axis_id, 0)
-            suggestion = suggest_view(schema, ViewIntent.IMAGE, selection)
-            if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
-                raise ValueError("camera monitor IMAGE view needs an explicit axis choice")
-            image_view = suggestion.spec
-            image_evaluation_peak = estimate_view_evaluation_peak_nbytes(
-                schema,
-                image_view,
-            )
-            downstream_peak = image_evaluation_peak + estimate_gray8_raster_peak_nbytes(
-                y_axes[0].size,
-                x_axes[0].size,
-            )
-            scalar_views: tuple[ViewSpec, ...] = ()
-            scalar_evaluation_peaks: tuple[int, ...] = ()
-            if scalar_schema is not None:
-                if roi_binding is None:
-                    raise RuntimeError("ROI scalar schema has no admitted binding")
-                scalar_views, self._projection_text = _roi_scalar_views(
-                    scalar_schema,
-                    roi_binding,
-                )
-                default_policy = FigureEvaluationPolicy()
-                scalar_history = tuple(
-                    axis
-                    for axis in scalar_schema.point_axes
-                    if axis.role == MONITOR_HISTORY
-                )
-                if (
-                    len(scalar_history) != 1
-                    or scalar_history[0].size > default_policy.max_histogram_samples
-                ):
-                    raise ValueError(
-                        "ROI scalar history exceeds the live histogram sample limit "
-                        f"{default_policy.max_histogram_samples}"
-                    )
-                scalar_evaluation_peaks = tuple(
-                    estimate_view_evaluation_peak_nbytes(scalar_schema, view)
-                    for view in scalar_views
-                )
-                for view, evaluation_peak in zip(
-                    scalar_views,
-                    scalar_evaluation_peaks,
-                    strict=True,
-                ):
-                    downstream_peak += (
-                        evaluation_peak
-                        + estimate_live_panel_raster_peak_nbytes(
-                            *_SCALAR_RASTER_SIZE,
-                            evaluated_data_upper_bound_bytes=evaluation_peak,
-                            histogram_bins=(
-                                DEFAULT_HISTOGRAM_BINS
-                                if view.intent is ViewIntent.HISTOGRAM
-                                else None
-                            ),
-                        )
-                    )
-            policy = FigureEvaluationPolicy(
-                max_live_nbytes=max(
-                    (image_evaluation_peak, *scalar_evaluation_peaks)
-                )
-            )
-        except BaseException as error:
             self._record_local_failure(
-                f"View preparation failed: {type(error).__name__}: {error}"
+                "Prepared monitor view is stale relative to the next Run generation"
             )
+            self._submit_prepare()
             return
-
+        roi_binding = command.roi_binding
+        self._running_binding = roi_binding
+        self._visible_binding_fingerprint = None
+        if self._apply_phase != "WAITING_FRONT":
+            self._draft_selection = None
         self._close_live()
         generation = self._run_owner.begin_generation()
+        try:
+            if roi_binding is None:
+                self._viewport_transform = None
+            else:
+                selector_board = self._board_widget
+                selector_viewport = prepared_view.viewport
+                if not isinstance(selector_board, QtRasterBoard):
+                    raise RuntimeError("ROI selector host changed after preparation")
+                if (
+                    selector_viewport is None
+                    or selector_viewport.viewport_revision != generation
+                ):
+                    raise RuntimeError("selector viewport generation prediction changed")
+                selector_board.bind_rectangle_selector(
+                    _IMAGE_PANEL_ID,
+                    selector_viewport,
+                    self._accept_rectangle_gesture,
+                    interaction_callback=self._set_selector_interacting,
+                    enabled=False,
+                )
+                selector_board.set_selector_applied_selection(roi_binding.selection)
+                selector_board.set_selector_draft_selection(None)
+                self._viewport_transform = selector_viewport
+        except BaseException as error:
+            self._run_owner.mark_owner_reaped()
+            self._running_binding = None
+            self._prepared = None
+            if self._apply_phase == "WAITING_FRONT":
+                self._apply_phase = None
+                self._roi_status.setText(
+                    "ROI: replacement selector setup failed · preparing retry"
+                )
+            self._record_local_failure(
+                f"ROI selector setup failed: {type(error).__name__}: {error}"
+            )
+            self._submit_prepare()
+            return
         self._prepared = None
         self._last_snapshot = None
+        self._manual_stop_requested = False
         self._local_diagnostic = ""
+        self._projection_text = prepared_view.projection_text
         self._refresh_diagnostics(None)
         self._run_status.setText("Monitor: STARTING")
         self._view_status.setText(f"View: WAITING · {self._projection_text}")
         self._projection_status.setText(f"Display: {self._projection_text}")
+        if roi_binding is not None:
+            self._roi_status.setText(
+                "ROI: waiting for first coherent front · binding "
+                f"{roi_binding.fingerprint[:12]}"
+            )
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(False)
+        self._update_roi_controls()
 
-        dataset_id = DatasetId(f"camera-monitor-{generation}")
-        scalar_dataset_id = (
-            None
-            if scalar_schema is None
-            else DatasetId(f"camera-monitor-roi-scalar-{generation}")
-        )
-        image_document = FigureDocument(
-            f"camera-monitor-image-{generation}",
-            0,
-            (
-                DatasetDescriptor(
-                    dataset_id,
-                    "Raw monitor camera frame",
-                    schema.fingerprint,
-                ),
-            ),
-            (FigureLayer(_IMAGE_PANEL_ID, dataset_id, image_view),),
-        )
-        scalar_documents: tuple[FigureDocument, ...] = ()
-        if scalar_views:
-            assert scalar_schema is not None and scalar_dataset_id is not None
-            assert roi_binding is not None
-            descriptor = DatasetDescriptor(
-                scalar_dataset_id,
-                f"ROI {roi_binding.reduction.value.lower()} scalar monitor",
-                scalar_schema.fingerprint,
-            )
-            scalar_documents = tuple(
-                FigureDocument(
-                    f"{panel_id}-{generation}",
-                    0,
-                    (descriptor,),
-                    (FigureLayer(panel_id, scalar_dataset_id, view),),
-                )
-                for panel_id, view in zip(
-                    _SCALAR_PANEL_IDS,
-                    scalar_views,
-                    strict=True,
-                )
-            )
+        dataset_id = prepared_view.dataset_id
+        scalar_dataset_id = prepared_view.scalar_dataset_id
+        image_document = prepared_view.image_document
+        scalar_documents = prepared_view.scalar_documents
 
         def factory(spec: CameraMonitorViewSpec):
             slot = LiveDatasetSlot(
                 spec,
                 dataset_id=dataset_id,
                 scalar_dataset_id=scalar_dataset_id,
-                evaluation_policy=policy,
+                evaluation_policy=prepared_view.evaluation_policy,
                 retain_on_terminal=False,
             )
             attached = threading.Event()
@@ -446,7 +754,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._run_owner.submit(
             "start",
             lambda: command.start_with_view(
-                downstream_peak_bytes=downstream_peak,
+                downstream_peak_bytes=prepared_view.downstream_peak_bytes,
                 factory=factory,
             ),
             generation=generation,
@@ -457,9 +765,11 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         if handle is None or handle.snapshot().state.terminal:
             return
         outcome = handle.cancel("Workbench user requested monitor stop")
+        self._manual_stop_requested = True
         self._stop_button.setEnabled(False)
         self._local_diagnostic = f"Stop: {outcome.value}"
         self._refresh_diagnostics(self._last_snapshot)
+        self._update_roi_controls()
 
     def _poll_run_snapshot(self) -> None:
         handle = self._handle
@@ -476,9 +786,13 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             self._drain_attachments()
             live = self._live
             board = self._board
-            if board is not None and board.fault is None:
+            view_frozen = self._selector_interacting or self._apply_phase in {
+                "PREPARING",
+                "REPLACING",
+            }
+            if board is not None and board.fault is None and not view_frozen:
                 board.present_pending()
-            if live is not None:
+            if live is not None and not view_frozen:
                 live.admit_pending()
             pending = self._run_owner.take_pending_snapshot()
             if pending is not None:
@@ -516,11 +830,88 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                         f"Render worker failed: {type(error).__name__}: {error}"
                     )
                 continue
+            if kind == "apply_prepare":
+                try:
+                    prepared = future.result()
+                    if not isinstance(prepared, _PreparedMonitorView):
+                        raise TypeError("ROI apply returned an invalid view product")
+                except BaseException as error:
+                    if (
+                        not self._closing
+                        and generation == self._run_owner.generation
+                        and self._apply_phase == "PREPARING"
+                    ):
+                        self._prepared_apply = None
+                        self._pending_request = None
+                        self._apply_phase = None
+                        self._roi_status.setText(
+                            "ROI: rejected before restart · "
+                            f"{type(error).__name__}: {error}"
+                        )
+                        self._stop_button.setEnabled(True)
+                        self._sync_live_pause()
+                        self._update_roi_controls()
+                    continue
+                if (
+                    self._closing
+                    or generation != self._run_owner.generation
+                    or self._apply_phase != "PREPARING"
+                ):
+                    continue
+                candidate = self._pending_request
+                if (
+                    candidate is None
+                    or prepared.command.request != candidate
+                    or prepared.generation != generation + 1
+                ):
+                    self._prepared_apply = None
+                    self._pending_request = None
+                    self._apply_phase = None
+                    self._roi_status.setText("ROI: rejected · staged request identity changed")
+                    self._stop_button.setEnabled(True)
+                    self._sync_live_pause()
+                    self._update_roi_controls()
+                    continue
+                handle = self._handle
+                if handle is None or handle.snapshot().state.terminal:
+                    self._prepared_apply = None
+                    self._pending_request = None
+                    self._apply_phase = None
+                    self._roi_status.setText("ROI: rejected · monitor is no longer running")
+                    self._sync_live_pause()
+                    self._update_roi_controls()
+                    continue
+                self._prepared_apply = prepared
+                outcome = handle.cancel(
+                    "Workbench is applying a new immutable ROI request"
+                )
+                if outcome is not CancelOutcome.REQUESTED:
+                    self._prepared_apply = None
+                    self._pending_request = None
+                    self._apply_phase = None
+                    self._roi_status.setText(
+                        "ROI: not applied · monitor was already stopping "
+                        f"({outcome.value})"
+                    )
+                    self._sync_live_pause()
+                    self._update_roi_controls()
+                    continue
+                self._apply_phase = "REPLACING"
+                self._roi_status.setText(
+                    "ROI: request valid · stopping old monitor generation"
+                )
+                self._stop_button.setEnabled(False)
+                self._update_roi_controls()
+                continue
             if kind == "prepare":
                 if generation == self._run_owner.generation:
                     self._prepare_inflight = False
                 try:
                     prepared = future.result()
+                    if not isinstance(prepared, _PreparedMonitorView):
+                        raise TypeError("camera prepare returned an invalid view product")
+                    if prepared.generation != generation + 1:
+                        raise RuntimeError("prepared camera view generation changed")
                 except BaseException as error:
                     if not self._closing and generation == self._run_owner.generation:
                         self._run_status.setText("Monitor: NOT READY")
@@ -530,20 +921,12 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     continue
                 if not self._closing and generation == self._run_owner.generation:
                     self._prepared = prepared
-                    scalar_schema = prepared.scalar_view_schema
-                    binding = prepared.roi_binding
+                    scalar_schema = prepared.command.scalar_view_schema
+                    binding = prepared.command.roi_binding
                     self._configure_board_widget(scalar=scalar_schema is not None)
-                    if scalar_schema is None:
-                        self._projection_text = _RAW_PROJECTION_TEXT
-                    else:
-                        if binding is None:
-                            raise RuntimeError(
-                                "prepared ROI scalar schema has no binding"
-                            )
-                        _views, self._projection_text = _roi_scalar_views(
-                            scalar_schema,
-                            binding,
-                        )
+                    if scalar_schema is not None and binding is None:
+                        raise RuntimeError("prepared ROI scalar schema has no binding")
+                    self._projection_text = prepared.projection_text
                     self._projection_status.setText(
                         f"Display: {self._projection_text}"
                     )
@@ -558,6 +941,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     else:
                         self._run_status.setText("Monitor: READY")
                     self._update_start_button()
+                    self._update_roi_controls()
                 continue
             if kind == "start":
                 try:
@@ -570,7 +954,13 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                             f"Start failed: {type(error).__name__}: {error}"
                         )
                         self._close_live()
+                        if self._apply_phase == "WAITING_FRONT":
+                            self._apply_phase = None
+                            self._roi_status.setText(
+                                "ROI: replacement start failed · use Start to retry"
+                            )
                         self._submit_prepare()
+                        self._update_roi_controls()
                     continue
                 if self._closing or generation != self._run_owner.generation:
                     if self._closing:
@@ -584,6 +974,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                         handle.snapshot(),
                         generation=generation,
                     )
+                    self._update_roi_controls()
                 continue
             if kind == "reap":
                 try:
@@ -603,7 +994,45 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     )
                     self._close_live()
                     if not self._closing:
-                        self._submit_prepare()
+                        if (
+                            self._apply_phase == "REPLACING"
+                            and self._prepared_apply is not None
+                            and self._pending_request is not None
+                        ):
+                            if self._manual_stop_requested:
+                                self._prepared_apply = None
+                                self._pending_request = None
+                                self._apply_phase = None
+                                self._request = self._applied_request
+                                self._roi_status.setText(
+                                    "ROI: not applied · monitor stopped by user"
+                                )
+                                self._submit_prepare()
+                            elif (
+                                self._last_snapshot is None
+                                or self._last_snapshot.state is not RunState.CANCELLED
+                            ):
+                                self._prepared_apply = None
+                                self._pending_request = None
+                                self._apply_phase = None
+                                self._request = self._applied_request
+                                self._roi_status.setText(
+                                    "ROI: replacement aborted · old monitor did not "
+                                    "terminate by the requested cancellation"
+                                )
+                                self._submit_prepare()
+                            else:
+                                self._request = self._pending_request
+                                self._pending_request = None
+                                self._prepared = self._prepared_apply
+                                self._prepared_apply = None
+                                self._apply_phase = "WAITING_FRONT"
+                                self._roi_status.setText(
+                                    "ROI: old generation terminal · starting replacement"
+                                )
+                                self._start_monitor()
+                        else:
+                            self._submit_prepare()
                 continue
 
     def _drain_attachments(self) -> None:
@@ -677,7 +1106,10 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         state = snapshot.state
         if not state.terminal:
             self._run_status.setText(f"Monitor: {state.value} / {snapshot.phase}")
-            self._stop_button.setEnabled(True)
+            self._stop_button.setEnabled(
+                not self._manual_stop_requested
+                and self._apply_phase not in {"PREPARING", "REPLACING"}
+            )
         else:
             self._stop_button.setEnabled(False)
             if state is RunState.CANCELLED:
@@ -702,6 +1134,13 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             self._view_status.setText(f"View: FAILED · {detail}")
             return
         board_widget = self._board_widget
+        if isinstance(board_widget, QtRasterBoard):
+            selector_fault = board_widget.selector_fault
+            if selector_fault is not None:
+                self._selector_switch.setChecked(False)
+                self._roi_status.setText(
+                    f"ROI selector disabled: {selector_fault}"
+                )
         if live is not None and board_widget is not None and board_widget.has_front:
             front = board_widget.front_frame
             status = live.front_status
@@ -714,6 +1153,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     f"View: LIVE · {self._projection_text} · diagnostics pending"
                 )
                 return
+            self._reconcile_visible_roi(status)
             coverage = status.raw_coverage
             scalar_coverage = status.scalar_coverage
             histogram_valid = status.histogram_valid_samples
@@ -764,6 +1204,49 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             self._view_status.setText(f"View: WAITING · {self._projection_text}")
         else:
             self._view_status.setText(f"View: STOPPED · {self._projection_text}")
+        self._update_roi_controls()
+
+    def _reconcile_visible_roi(self, status) -> None:
+        binding = self._running_binding
+        if binding is None:
+            return
+        if status.scalar_binding_fingerprint != binding.fingerprint:
+            raise RuntimeError(
+                "visible scalar front differs from the running ROI binding"
+            )
+        board_widget = self._board_widget
+        if (
+            isinstance(board_widget, QtRasterBoard)
+            and self._visible_binding_fingerprint != binding.fingerprint
+        ):
+            board_widget.set_selector_applied_selection(binding.selection)
+            self._visible_binding_fingerprint = binding.fingerprint
+        if self._request != self._applied_request:
+            self._applied_request = self._request
+            self._draft_selection = None
+            if isinstance(board_widget, QtRasterBoard):
+                board_widget.set_selector_draft_selection(None)
+            self._apply_phase = None
+            self._roi_status.setText(
+                "ROI: APPLIED · monitor generation "
+                f"{self._run_owner.generation} · binding {binding.fingerprint[:12]}"
+            )
+            slot = self._slot
+            if slot is None or slot.spec.scalar_dataset_edge is None:
+                raise RuntimeError("visible ROI front has no scalar dataset edge")
+            self._projection_text = _roi_scalar_views(
+                slot.spec.scalar_dataset_edge.schema,
+                binding,
+            )[1]
+            self._projection_status.setText(f"Display: {self._projection_text}")
+            self._sync_live_pause()
+        elif self._roi_status.text() == "ROI: fixed request" or self._roi_status.text().startswith(
+            "ROI: waiting for first coherent front"
+        ):
+            self._roi_status.setText(
+                "ROI: visible · monitor generation "
+                f"{self._run_owner.generation} · binding {binding.fingerprint[:12]}"
+            )
 
     def _refresh_diagnostics(self, snapshot: RunSnapshot | None) -> None:
         parts = [self._local_diagnostic] if self._local_diagnostic else []

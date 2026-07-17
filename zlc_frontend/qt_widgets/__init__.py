@@ -4,6 +4,7 @@ Import this leaf explicitly.  The headless :mod:`zlc_frontend` package root does
 not re-export it and therefore never loads PyQt as a side effect.
 """
 
+from ..selector import ImageViewportTransform, RectangleGesture
 from .board import QtImageBoard, QtOwnerWake, QtRasterBoard
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
 from .fluent import (
@@ -176,6 +177,7 @@ __all__ = [
     "GREY",
     "HINT",
     "HOVER",
+    "ImageViewportTransform",
     "MUTED_LABEL_STYLE",
     "Metrics",
     "ORANGE",
@@ -188,6 +190,7 @@ __all__ = [
     "QtOwnerWake",
     "QtRasterBoard",
     "RADIUS",
+    "RectangleGesture",
     "RED",
     "STEP_WIDTH",
     "TEXT",

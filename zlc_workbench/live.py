@@ -53,8 +53,8 @@ if TYPE_CHECKING:
 
 _ROI_JOIN_KEY_SCHEMA_FINGERPRINT = canonical_digest(
     {
-        "type": "camera-roi-source-event-control",
-        "fields": ("source_event_ref", "control_revision", "control_fingerprint"),
+        "type": "camera-roi-source-event-binding",
+        "fields": ("source_event_ref", "binding_fingerprint"),
     }
 )
 
@@ -70,6 +70,7 @@ class LiveFrontStatus:
     histogram_dropped_samples: int | None = None
     latest_scalar_valid: bool | None = None
     scalar_source_missed: int | None = None
+    scalar_binding_fingerprint: str | None = None
 
 
 class LiveDatasetSlot:
@@ -391,6 +392,7 @@ class LiveImageBoardController:
         self._fault: BaseException | None = None
         self._front_status: LiveFrontStatus | None = None
         self._front_invalidated = False
+        self._paused = False
         self._closed = False
         self._close_complete = False
         slot.set_change_listener(self._source_changed)
@@ -413,9 +415,34 @@ class LiveImageBoardController:
         else:
             self._request_snapshot()
 
+    def pause(self) -> None:
+        """Stop admitting new snapshots while one visible front remains frozen."""
+
+        with self._lock:
+            if self._closed:
+                return
+            self._paused = True
+            self._dirty = False
+            # A frozen candidate waits for the GUI owner rather than for a
+            # worker completion.  Dropping it must also end that admission
+            # cycle; otherwise resume() observes ``_active`` forever and never
+            # schedules the latest replacement snapshot.
+            if self._candidate is not None:
+                self._active = False
+            self._candidate = None
+
+    def resume(self) -> None:
+        """Resume latest-only evaluation after a GUI interaction or staged replace."""
+
+        with self._lock:
+            if self._closed or not self._paused:
+                return
+            self._paused = False
+        self._request_snapshot()
+
     def _request_snapshot(self) -> None:
         with self._lock:
-            if self._closed or self._fault is not None:
+            if self._closed or self._paused or self._fault is not None:
                 return
             self._dirty = True
             if self._active:
@@ -432,7 +459,7 @@ class LiveImageBoardController:
                 else self._slot.freeze_current()
             )
             with self._lock:
-                if self._closed:
+                if self._closed or self._paused:
                     self._active = False
                     return
                 self._candidate = candidate
@@ -474,7 +501,7 @@ class LiveImageBoardController:
                     raise
             return False
         with self._lock:
-            if self._closed or self._fault is not None:
+            if self._closed or self._paused or self._fault is not None:
                 return False
             candidate, self._candidate = self._candidate, None
         if candidate is None:
@@ -524,15 +551,14 @@ class LiveImageBoardController:
                     raw_source,
                     *(scalar_source for _document in self._scalar_documents),
                 )
-                join_key_type = "camera-roi-source-event-control"
+                join_key_type = "camera-roi-source-event-binding"
                 join_schema = _ROI_JOIN_KEY_SCHEMA_FINGERPRINT
                 join_digest = canonical_digest(
                     {
                         "source_event_ref": event_ref_to_tree(
                             scalar_metadata.source_event_ref
                         ),
-                        "control_revision": scalar_metadata.control_revision,
-                        "control_fingerprint": scalar_metadata.control_fingerprint,
+                        "binding_fingerprint": scalar_metadata.binding_fingerprint,
                     }
                 )
             stamp = CoherenceStamp(
@@ -719,6 +745,11 @@ class LiveImageBoardController:
                         if scalar_metadata is None
                         else scalar_metadata.source_missed
                     ),
+                    (
+                        None
+                        if scalar_metadata is None
+                        else scalar_metadata.binding_fingerprint
+                    ),
                 )
                 published = port.publish(token, frame)
                 if published:
@@ -766,6 +797,7 @@ class LiveImageBoardController:
                         restart = (
                             self._dirty
                             and not self._closed
+                            and not self._paused
                             and self._fault is None
                         )
                         if restart:
@@ -805,6 +837,7 @@ class LiveImageBoardController:
             self._active = False
             self._dirty = False
             self._candidate = None
+            self._paused = False
             self._front_status = None
             self._front_invalidated = True
             schedule_renderer_close = bool(self._scalar_documents)

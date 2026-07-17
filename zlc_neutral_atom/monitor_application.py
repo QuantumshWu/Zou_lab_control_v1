@@ -121,8 +121,12 @@ class CameraMonitorRequest:
             )
         if not isinstance(self.roi_reduction, ReductionMethod):
             raise TypeError("roi_reduction must be zlc_data.ReductionMethod")
-        if self.roi_reduction not in (ReductionMethod.MEAN, ReductionMethod.SUM):
-            raise ValueError("camera monitor ROI reduction must be MEAN or SUM")
+        if self.roi_reduction not in (
+            ReductionMethod.MEAN,
+            ReductionMethod.SUM,
+            ReductionMethod.MAX,
+        ):
+            raise ValueError("camera monitor ROI reduction must be MEAN, SUM, or MAX")
         if not isinstance(self.roi_validity_policy, ValidityPolicy):
             raise TypeError("roi_validity_policy must be zlc_data.ValidityPolicy")
         if self.roi_validity_policy is ValidityPolicy.MIN_COUNT:
@@ -371,11 +375,8 @@ class CameraMonitorLiveDataset:
             raise TypeError("ROI scalar dataset head metadata has another type")
         projection = self.projection
         assert projection is not None
-        if (
-            metadata.control_revision != projection.binding.control_revision
-            or metadata.control_fingerprint != projection.binding.fingerprint
-        ):
-            raise RuntimeError("ROI scalar metadata differs from the admitted control")
+        if metadata.binding_fingerprint != projection.binding.fingerprint:
+            raise RuntimeError("ROI scalar metadata differs from the admitted binding")
         return CameraMonitorSnapshot(raw, scalar, metadata)
 
     def _ensure_open(self) -> None:
@@ -602,8 +603,6 @@ class PreparedCameraMonitor:
                 request.roi,
                 request.roi_reduction,
                 request.roi_validity_policy,
-                config_revision=0,
-                control_revision=0,
             )
         )
         if self._roi_binding is None:

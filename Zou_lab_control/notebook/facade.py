@@ -704,9 +704,11 @@ class ReadoutFacade:
             raise TypeError("request must be CameraMonitorRequest")
         self._require_binding(ReadoutBindingKey(request.camera_ref.role))
 
-        def prepare() -> PreparedCameraMonitor:
+        def prepare(candidate: CameraMonitorRequest) -> PreparedCameraMonitor:
+            if not isinstance(candidate, CameraMonitorRequest):
+                raise TypeError("camera monitor prepare requires CameraMonitorRequest")
             with _service_guard(self._token) as services:
-                return _prepare_camera_monitor_for_services(services, request)
+                return _prepare_camera_monitor_for_services(services, candidate)
 
         from Zou_lab_control.workbench import open_camera_monitor_workbench
 
