@@ -24,6 +24,10 @@ from zlc_neutral_atom.runtime.run import (
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewPort
 from zlc_frontend.render import BoardPresenter
+from zlc_frontend.image_raster import (
+    estimate_encoded_png_front_peak_nbytes,
+    png_raster_size,
+)
 
 from .progressive_scan import (
     ExactDatasetLiveSlot,
@@ -34,9 +38,6 @@ from .progressive_scan import (
 
 _DEFAULT_PROJECTION_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024
 _PREVIEW_CLOSE_RETRY_SECONDS = 0.1
-_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-
-
 def _positive_integer(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
@@ -61,13 +62,7 @@ class FinalScanPresentation:
             raise TypeError("source_ref must be ScanArtifactRef")
         if not isinstance(self.png_bytes, bytes):
             raise TypeError("png_bytes must be immutable bytes")
-        if not self.png_bytes.startswith(_PNG_SIGNATURE):
-            raise ValueError("png_bytes must contain a PNG raster")
-        if len(self.png_bytes) < 24 or self.png_bytes[12:16] != b"IHDR":
-            raise ValueError("png_bytes must contain a canonical PNG IHDR")
-        width, height = self.raster_size
-        if width <= 0 or height <= 0:
-            raise ValueError("PNG raster dimensions must be positive")
+        png_raster_size(self.png_bytes)
         if not isinstance(self.projection_summary, str):
             raise TypeError("projection_summary must be str")
         summary = self.projection_summary.strip()
@@ -77,16 +72,11 @@ class FinalScanPresentation:
 
     @property
     def raster_size(self) -> tuple[int, int]:
-        return (
-            int.from_bytes(self.png_bytes[16:20], "big"),
-            int.from_bytes(self.png_bytes[20:24], "big"),
-        )
+        return png_raster_size(self.png_bytes)
 
     @property
     def gui_decode_peak_nbytes(self) -> int:
-        width, height = self.raster_size
-        # One decoded source pixmap plus one no-upscale presentation pixmap.
-        return len(self.png_bytes) + 2 * width * height * 4
+        return estimate_encoded_png_front_peak_nbytes(self.png_bytes)
 
 
 @dataclass(frozen=True, slots=True)

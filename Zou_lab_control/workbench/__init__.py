@@ -11,6 +11,39 @@ def open_capture_workbench(experiment, request):
     return _open(experiment, request)
 
 
+def open_data_figure_workbench(figure, *, memory_limit_bytes=None):
+    """Open one already-resolved DataFigure without eager Qt imports."""
+
+    from ._figure import open_data_figure_workbench as _open
+
+    if memory_limit_bytes is None:
+        return _open(figure)
+    return _open(figure, memory_limit_bytes=memory_limit_bytes)
+
+
+def open_figure_workbench(
+    figure_factory,
+    source,
+    *,
+    intent=None,
+    selection=None,
+    preferences=None,
+    memory_limit_bytes=None,
+):
+    """Resolve and display one frozen artifact without blocking the Qt owner."""
+
+    from ._figure import open_figure_workbench as _open
+
+    options = {
+        "intent": intent,
+        "selection": selection,
+        "preferences": preferences,
+    }
+    if memory_limit_bytes is not None:
+        options["memory_limit_bytes"] = memory_limit_bytes
+    return _open(figure_factory, source, **options)
+
+
 def open_pulse_workbench(experiment, document=None, *, path=None):
     """Open the current PulseWorkbench without loading Qt at package import."""
 
@@ -56,6 +89,8 @@ def open_offline_pulse_workbench(
 
 __all__ = [
     "open_capture_workbench",
+    "open_data_figure_workbench",
+    "open_figure_workbench",
     "open_offline_pulse_workbench",
     "open_pulse_workbench",
     "open_scan_workbench",

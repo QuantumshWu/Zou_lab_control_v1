@@ -1504,6 +1504,34 @@ class Experiment:
             render_memory_limit_bytes=limit,
         )
 
+    def figure_gui(
+        self,
+        source: (
+            ScanArtifactRef
+            | CaptureArtifactRef
+            | FitExecution
+            | CaptureFitResultArtifactRef
+            | AdmittedCaptureFitResult
+        ),
+        *,
+        intent: "ViewIntent | None" = None,
+        selection: Selection | None = None,
+        preferences: "ViewPreferences | None" = None,
+        memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
+    ):
+        """Resolve and show one frozen figure without blocking the notebook GUI."""
+
+        from Zou_lab_control.workbench import open_figure_workbench
+
+        return open_figure_workbench(
+            self.figure,
+            source,
+            intent=intent,
+            selection=selection,
+            preferences=preferences,
+            memory_limit_bytes=memory_limit_bytes,
+        )
+
     def close(self) -> None:
         with _AUTHORITY_LOCK:
             services = _AUTHORITIES.get(self._authority_token)
