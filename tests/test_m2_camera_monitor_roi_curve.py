@@ -18,11 +18,9 @@ from zlc_data import (
     SPATIAL_Y,
     ReductionMethod,
     Selection,
-    resolve_selection_indices,
 )
 from zlc_frontend.figure import (
     AxisViewRole,
-    DisplayReductionMethod,
     EvaluatedCurve,
     FigureEvaluator,
     ResolvedDataset,
@@ -102,11 +100,14 @@ def test_typed_roi_curve_preserves_raw_axes_and_presents_one_coherent_board(
         y_coordinates[min(31, y_axis.size - 1)],
         coordinate_frame=x_axis.coordinate_frame,
     )
-    window = experiment.readout.camera_monitor_gui(
-        request,
+    request = experiment.readout.camera_monitor_request(
+        history_capacity=4,
         roi=roi,
         roi_reduction=ReductionMethod.SUM,
     )
+    with pytest.raises(TypeError, match="request options"):
+        experiment.readout.camera_monitor_gui(request, roi=roi)
+    window = experiment.readout.camera_monitor_gui(request)
     try:
         start = window.findChild(QtWidgets.QPushButton, "startButton")
         projection = window.findChild(QtWidgets.QLabel, "projectionStatus")
@@ -133,15 +134,19 @@ def test_typed_roi_curve_preserves_raw_axes_and_presents_one_coherent_board(
         )
         assert frame.panels[0].coherence_stamp == frame.panels[1].coherence_stamp
         stamp = frame.panels[0].coherence_stamp
-        assert len(stamp.inputs) == 1
+        assert len(stamp.inputs) == 2
+        assert frame.panels[0].source_identity != frame.panels[1].source_identity
         assert tuple(value.panel_id for value in stamp.presentations) == (
             "camera-monitor-image",
             "camera-monitor-roi-curve",
         )
         assert "ROI sum" in projection.text()
-        assert "DISPLAY ONLY" in projection.text()
+        assert "MONITOR DERIVED" in projection.text()
 
-        _run_id, _causation, current = window._slot.freeze_current()
+        _run_id, _causation, joined = window._slot.freeze_camera_current()
+        current = joined.raw
+        scalar_current = joined.scalar
+        assert scalar_current is not None
         block = current.snapshot.block
         assert block.values.shape == schema.physical_shape
         assert block.values.ndim == 4
@@ -154,32 +159,30 @@ def test_typed_roi_curve_preserves_raw_axes_and_presents_one_coherent_board(
             binding.axis_id: binding
             for binding in curve_document.layers[0].view.axis_bindings
         }
-        assert bindings[history.axis_id].role is AxisViewRole.X
-        assert bindings[schema.repeat_axis.axis_id].role is AxisViewRole.SELECTED
-        for axis in (x_axis, y_axis):
-            assert bindings[axis.axis_id].role is AxisViewRole.REDUCED
-            assert (
-                bindings[axis.axis_id].reduction.method
-                is DisplayReductionMethod.SUM
-            )
-        assert curve_document.layers[0].view.display_selections == (roi,)
+        scalar_schema = scalar_current.block.schema
+        scalar_history = scalar_schema.point_axes[0]
+        assert bindings[scalar_history.axis_id].role is AxisViewRole.X
+        assert bindings[scalar_schema.repeat_axis.axis_id].role is AxisViewRole.SELECTED
+        assert curve_document.layers[0].view.display_selections == ()
 
         evaluated = FigureEvaluator(window._slot.evaluation_policy).evaluate(
             curve_document,
             ResolvedDatasetMap(
-                (ResolvedDataset(window._slot.dataset_id, current.snapshot),)
+                (
+                    ResolvedDataset(
+                        window._slot.scalar_dataset_id,
+                        scalar_current.snapshot,
+                    ),
+                )
             ),
         )
         curve = evaluated.layers[0].cells[0].series[0].data
         assert isinstance(curve, EvaluatedCurve)
-        x_term = next(term for term in roi.terms if term.axis_id == x_axis.axis_id)
-        y_term = next(term for term in roi.terms if term.axis_id == y_axis.axis_id)
-        x_indices, _ = resolve_selection_indices(x_axis, x_term)
-        y_indices, _ = resolve_selection_indices(y_axis, y_term)
-        selected = np.take(block.values[0], tuple(y_indices), axis=1)
-        selected = np.take(selected, tuple(x_indices), axis=2)
-        expected = selected.sum(axis=(1, 2), dtype=np.float64)
-        np.testing.assert_allclose(curve.values[curve.validity], expected[curve.validity])
+        expected = scalar_current.block.values[0]
+        np.testing.assert_allclose(
+            curve.values[curve.validity],
+            expected[curve.validity],
+        )
 
     finally:
         if window.isVisible():
@@ -214,7 +217,7 @@ def test_history_admission_counts_reorder_scratch_and_every_metadata_record(
         experiment.readout.inspect_camera_monitor(oversized)
 
 
-def test_roi_curve_rejects_untyped_or_single_slot_inputs_before_arm(
+def test_roi_curve_rejects_untyped_reducer_but_accepts_one_raw_history_slot(
     experiment,
     application,
 ):
@@ -240,12 +243,15 @@ def test_roi_curve_rejects_untyped_or_single_slot_inputs_before_arm(
     )
     try:
         start = window.findChild(QtWidgets.QPushButton, "startButton")
-        diagnostics = window.findChild(QtWidgets.QLabel, "diagnostics")
+        board = window.findChild(QtRasterBoard, "cameraMonitorImageBoard")
         _until(application, start.isEnabled)
         QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
-        _until(application, lambda: "history_capacity >= 2" in diagnostics.text())
-        assert window._handle is None
-        assert not window.findChild(QtRasterBoard, "cameraMonitorImageBoard").has_front
+        _until(application, lambda: board.has_front)
+        assert window._handle is not None
+        _run, _epoch, joined = window._slot.freeze_camera_current()
+        assert joined.raw.block.values.shape[1] == 1
+        assert joined.scalar is not None
+        assert joined.scalar.block.values.shape[1] == 300
     finally:
         if window.isVisible():
             _close_window(application, window)

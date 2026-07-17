@@ -10,8 +10,6 @@ from zlc_data import (
     MONITOR_HISTORY,
     SPATIAL_X,
     SPATIAL_Y,
-    CoordinateRangeSelection,
-    ReductionMethod,
     Selection,
 )
 from zlc_frontend.figure import (
@@ -19,8 +17,6 @@ from zlc_frontend.figure import (
     AxisViewRole,
     DatasetDescriptor,
     DatasetId,
-    DisplayReduction,
-    DisplayReductionMethod,
     FigureDocument,
     FigureEvaluationPolicy,
     FigureLayer,
@@ -52,6 +48,7 @@ from zlc_frontend.qt_widgets import (
 )
 from zlc_frontend.render import RenderSurface
 from zlc_neutral_atom.monitor_application import (
+    CameraMonitorRequest,
     CameraMonitorViewSpec,
     PreparedCameraMonitor,
 )
@@ -67,32 +64,11 @@ _CURVE_RASTER_SIZE = (800, 520)
 _RAW_PROJECTION_TEXT = "latest raw frame · history slot 0 · DISPLAY ONLY"
 
 
-def _roi_curve_view(schema, roi: Selection, reduction: ReductionMethod):
-    if not isinstance(reduction, ReductionMethod):
-        raise TypeError("camera monitor ROI reduction must be ReductionMethod")
-    axes = (
-        schema.repeat_axis,
-        *schema.point_axes,
-        *schema.cell_schema.data_axes,
-    )
+def _roi_scalar_curve_view(schema, binding):
+    axes = (schema.repeat_axis, *schema.point_axes, *schema.cell_schema.data_axes)
     history = tuple(axis for axis in schema.point_axes if axis.role == MONITOR_HISTORY)
-    x_axes = tuple(axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_X)
-    y_axes = tuple(axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_Y)
-    if len(history) != 1 or len(x_axes) != 1 or len(y_axes) != 1:
-        raise ValueError("ROI curve requires one history and one spatial x/y axis")
-    if (
-        len(roi.terms) != 2
-        or any(not isinstance(term, CoordinateRangeSelection) for term in roi.terms)
-        or {term.axis_id for term in roi.terms}
-        != {x_axes[0].axis_id, y_axes[0].axis_id}
-    ):
-        raise ValueError("camera monitor ROI must be one typed spatial rectangle")
-    if reduction is ReductionMethod.MEAN:
-        display_method = DisplayReductionMethod.MEAN
-    elif reduction is ReductionMethod.SUM:
-        display_method = DisplayReductionMethod.SUM
-    else:
-        raise ValueError("camera monitor ROI reduction must be MEAN or SUM")
+    if len(history) != 1 or schema.cell_schema.data_axes:
+        raise ValueError("ROI scalar curve requires one scalar MONITOR_HISTORY axis")
     bindings = [
         AxisViewBinding(history[0].axis_id, AxisViewRole.X),
         AxisViewBinding(
@@ -100,29 +76,23 @@ def _roi_curve_view(schema, roi: Selection, reduction: ReductionMethod):
             AxisViewRole.SELECTED,
             selector=FixedIndex(0),
         ),
-        AxisViewBinding(
-            x_axes[0].axis_id,
-            AxisViewRole.REDUCED,
-            reduction=DisplayReduction(display_method),
-        ),
-        AxisViewBinding(
-            y_axes[0].axis_id,
-            AxisViewRole.REDUCED,
-            reduction=DisplayReduction(display_method),
-        ),
     ]
     if len(bindings) != len(axes):
-        raise ValueError("camera monitor ROI curve refuses undeclared extra axes")
-    view = ViewSpec(schema.fingerprint, ViewIntent.CURVE, tuple(bindings), (roi,))
+        raise ValueError("ROI scalar curve refuses undeclared extra axes")
+    view = ViewSpec(schema.fingerprint, ViewIntent.CURVE, tuple(bindings))
     validate_view_spec(schema, view)
-    terms = {term.axis_id: term for term in roi.terms}
-    x_term = terms[x_axes[0].axis_id]
-    y_term = terms[y_axes[0].axis_id]
+    input_axes = {axis.axis_id: axis for axis in binding.input_contract.value_schema.data_axes}
+    terms = {term.axis_id: term for term in binding.selection.terms}
+    description = ", ".join(
+        f"{input_axes[axis_id].name}={term.lower}..{term.upper}"
+        for axis_id, term in sorted(terms.items(), key=lambda item: item[0].value)
+    )
     summary = (
-        f"latest raw frame + ROI {reduction.value.lower()} "
-        f"[{x_axes[0].name}={x_term.lower}..{x_term.upper}, "
-        f"{y_axes[0].name}={y_term.lower}..{y_term.upper}] · "
-        f"history 0..{history[0].size - 1} (0 newest) · DISPLAY ONLY"
+        f"latest raw frame + ROI {binding.reduction.value.lower()} scalar "
+        f"[{description}] · control revision {binding.control_revision} · "
+        f"validity {binding.validity_policy.value.lower()} · "
+        f"scalar history 0..{history[0].size - 1} (0 newest) · "
+        "MONITOR DERIVED / DISPLAY VIEW"
     )
     return view, summary
 
@@ -130,29 +100,21 @@ def _roi_curve_view(schema, roi: Selection, reduction: ReductionMethod):
 class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
     """Nonblocking owner of one continuous monitor Run and immutable front."""
 
-    def __init__(
-        self,
-        prepare,
-        *,
-        roi: Selection | None = None,
-        roi_reduction: ReductionMethod = ReductionMethod.MEAN,
-    ) -> None:
+    def __init__(self, prepare, request: CameraMonitorRequest) -> None:
         super().__init__()
         if not callable(prepare):
             raise TypeError("camera monitor prepare must be callable")
-        if roi is not None and not isinstance(roi, Selection):
-            raise TypeError("roi must be zlc_data.Selection or None")
-        if not isinstance(roi_reduction, ReductionMethod):
-            raise TypeError("roi_reduction must be zlc_data.ReductionMethod")
-        if roi_reduction not in (ReductionMethod.MEAN, ReductionMethod.SUM):
-            raise ValueError("camera monitor ROI reduction must be MEAN or SUM")
+        if not isinstance(request, CameraMonitorRequest):
+            raise TypeError("request must be CameraMonitorRequest")
         self._prepare = prepare
-        self._roi = roi
-        self._roi_reduction = roi_reduction
+        self._request = request
         self._projection_text = (
             _RAW_PROJECTION_TEXT
-            if roi is None
-            else f"latest raw frame + typed ROI {roi_reduction.value.lower()} history · DISPLAY ONLY"
+            if request.roi is None
+            else (
+                f"typed ROI {request.roi_reduction.value.lower()} scalar · "
+                f"history {request.scalar_history_capacity} · PREPARING"
+            )
         )
         self._prepared: PreparedCameraMonitor | None = None
         self._slot: LiveDatasetSlot | None = None
@@ -176,17 +138,11 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._diagnostics = FluentLabel("")
         self._diagnostics.setObjectName("diagnostics")
         self._diagnostics.setWordWrap(True)
-        self._board_widget = (
-            QtImageBoard(_IMAGE_PANEL_ID, self, empty_text="Monitor stopped")
-            if roi is None
-            else QtRasterBoard(
-                (_IMAGE_PANEL_ID, _CURVE_PANEL_ID),
-                self,
-                columns=2,
-                empty_text="Monitor stopped",
-            )
-        )
-        self._board_widget.setObjectName("cameraMonitorImageBoard")
+        self._board_widget: QtImageBoard | QtRasterBoard | None = None
+        self._board_container = QtWidgets.QWidget(self)
+        self._board_layout = QtWidgets.QVBoxLayout(self._board_container)
+        self._board_layout.setContentsMargins(0, 0, 0, 0)
+        self._configure_board_widget(scalar=request.roi is not None)
         self._start_button = FluentButton("Start", self, color=GREEN)
         self._start_button.setObjectName("startButton")
         self._start_button.setEnabled(False)
@@ -201,7 +157,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         layout.addWidget(self._run_status)
         layout.addWidget(self._view_status)
         layout.addWidget(self._projection_status)
-        layout.addWidget(self._board_widget, 1)
+        layout.addWidget(self._board_container, 1)
         layout.addWidget(self._diagnostics)
         layout.addLayout(controls)
 
@@ -233,6 +189,33 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
     def _submit_worker(self, work):
         return self._run_owner.submit_render(work)
 
+    def _configure_board_widget(self, *, scalar: bool) -> None:
+        expected = QtRasterBoard if scalar else QtImageBoard
+        current = self._board_widget
+        if isinstance(current, expected):
+            return
+        if current is not None:
+            self._board_layout.removeWidget(current)
+            current.setParent(None)
+            current.deleteLater()
+        widget = (
+            QtRasterBoard(
+                (_IMAGE_PANEL_ID, _CURVE_PANEL_ID),
+                self._board_container,
+                columns=2,
+                empty_text="Monitor stopped",
+            )
+            if scalar
+            else QtImageBoard(
+                _IMAGE_PANEL_ID,
+                self._board_container,
+                empty_text="Monitor stopped",
+            )
+        )
+        widget.setObjectName("cameraMonitorImageBoard")
+        self._board_layout.addWidget(widget)
+        self._board_widget = widget
+
     def _submit_prepare(self) -> None:
         if self._closing or self._prepare_inflight or self._prepared is not None:
             return
@@ -243,6 +226,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             command = self._prepare()
             if not isinstance(command, PreparedCameraMonitor):
                 raise TypeError("camera monitor prepare returned an unexpected command")
+            if command.request != self._request:
+                raise ValueError("prepared camera monitor differs from the frozen UI request")
             command.view_schema
             return command
 
@@ -258,6 +243,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         command = self._prepared
         try:
             schema = command.view_schema
+            scalar_schema = command.scalar_view_schema
+            roi_binding = command.roi_binding
             history = tuple(axis for axis in schema.point_axes if axis.role == MONITOR_HISTORY)
             y_axes = tuple(
                 axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_Y
@@ -275,8 +262,6 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     "camera monitor requires one history axis and declared "
                     "SPATIAL_Y/SPATIAL_X image axes"
                 )
-            if self._roi is not None and history[0].size < 2:
-                raise ValueError("ROI curve requires history_capacity >= 2")
             selection = Selection.index(history[0].axis_id, 0)
             suggestion = suggest_view(schema, ViewIntent.IMAGE, selection)
             if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
@@ -292,14 +277,15 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             )
             curve_view = None
             curve_evaluation_peak = 0
-            if self._roi is not None:
-                curve_view, self._projection_text = _roi_curve_view(
-                    schema,
-                    self._roi,
-                    self._roi_reduction,
+            if scalar_schema is not None:
+                if roi_binding is None:
+                    raise RuntimeError("ROI scalar schema has no admitted binding")
+                curve_view, self._projection_text = _roi_scalar_curve_view(
+                    scalar_schema,
+                    roi_binding,
                 )
                 curve_evaluation_peak = estimate_view_evaluation_peak_nbytes(
-                    schema,
+                    scalar_schema,
                     curve_view,
                 )
                 downstream_peak += (
@@ -331,6 +317,11 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._stop_button.setEnabled(False)
 
         dataset_id = DatasetId(f"camera-monitor-{generation}")
+        scalar_dataset_id = (
+            None
+            if scalar_schema is None
+            else DatasetId(f"camera-monitor-roi-scalar-{generation}")
+        )
         image_document = FigureDocument(
             f"camera-monitor-image-{generation}",
             0,
@@ -345,23 +336,26 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         )
         curve_document = None
         if curve_view is not None:
+            assert scalar_schema is not None and scalar_dataset_id is not None
+            assert roi_binding is not None
             curve_document = FigureDocument(
                 f"camera-monitor-roi-curve-{generation}",
                 0,
                 (
                     DatasetDescriptor(
-                        dataset_id,
-                        f"ROI {self._roi_reduction.value.lower()} (DISPLAY ONLY)",
-                        schema.fingerprint,
+                        scalar_dataset_id,
+                        f"ROI {roi_binding.reduction.value.lower()} scalar monitor",
+                        scalar_schema.fingerprint,
                     ),
                 ),
-                (FigureLayer(_CURVE_PANEL_ID, dataset_id, curve_view),),
+                (FigureLayer(_CURVE_PANEL_ID, scalar_dataset_id, curve_view),),
             )
 
         def factory(spec: CameraMonitorViewSpec):
             slot = LiveDatasetSlot(
                 spec,
                 dataset_id=dataset_id,
+                scalar_dataset_id=scalar_dataset_id,
                 evaluation_policy=policy,
                 retain_on_terminal=False,
             )
@@ -467,6 +461,26 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     continue
                 if not self._closing and generation == self._run_owner.generation:
                     self._prepared = prepared
+                    scalar_schema = prepared.scalar_view_schema
+                    binding = prepared.roi_binding
+                    self._configure_board_widget(scalar=scalar_schema is not None)
+                    if scalar_schema is None:
+                        self._projection_text = _RAW_PROJECTION_TEXT
+                    else:
+                        if binding is None:
+                            raise RuntimeError(
+                                "prepared ROI scalar schema has no binding"
+                            )
+                        _view, self._projection_text = _roi_scalar_curve_view(
+                            scalar_schema,
+                            binding,
+                        )
+                    self._projection_status.setText(
+                        f"Display: {self._projection_text}"
+                    )
+                    self._view_status.setText(
+                        f"View: WAITING · {self._projection_text}"
+                    )
                     if (
                         self._last_snapshot is not None
                         and self._last_snapshot.state is RunState.CANCELLED
@@ -553,9 +567,12 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     RenderSurface.WORKER_RASTER_LIVE,
                     tuple(panels),
                 )
+                board_widget = self._board_widget
+                if board_widget is None:
+                    raise RuntimeError("camera monitor board was not configured")
                 board = BoardController(
                     model,
-                    self._board_widget,
+                    board_widget,
                     self._wake.request_owner_wake,
                 )
                 live = LiveImageBoardController(
@@ -611,14 +628,26 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             detail = failure if failure is not None else str(fault)
             self._view_status.setText(f"View: FAILED · {detail}")
             return
-        if live is not None and self._board_widget.has_front:
+        board_widget = self._board_widget
+        if live is not None and board_widget is not None and board_widget.has_front:
             coverage = live.coverage
+            scalar_coverage = live.scalar_coverage
             suffix = (
                 "coverage pending"
                 if coverage is None
                 else (
-                    f"missed={coverage.missed_events} · "
-                    f"current_gap={'yes' if coverage.current_gap else 'no'}"
+                    f"raw missed={coverage.missed_events} · "
+                    f"raw current_gap={'yes' if coverage.current_gap else 'no'}"
+                    + (
+                        ""
+                        if scalar_coverage is None
+                        else (
+                            f" · scalar={scalar_coverage.written_cells}/"
+                            f"{scalar_coverage.total_cells} · "
+                            f"scalar missed={scalar_coverage.missed_events} · "
+                            f"scalar current_gap={'yes' if scalar_coverage.current_gap else 'no'}"
+                        )
+                    )
                 )
             )
             self._view_status.setText(
@@ -705,19 +734,13 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
 
 def open_camera_monitor_workbench(
     prepare,
-    *,
-    roi: Selection | None = None,
-    roi_reduction: ReductionMethod = ReductionMethod.MEAN,
+    request: CameraMonitorRequest,
 ) -> CameraMonitorWorkbenchWindow:
     application = ensure_qt_app()
     if QtCore.QThread.currentThread() != application.thread():
         raise RuntimeError("camera monitor Workbench must open on the Qt GUI thread")
     set_fluent_scale(None)
-    window = CameraMonitorWorkbenchWindow(
-        prepare,
-        roi=roi,
-        roi_reduction=roi_reduction,
-    )
+    window = CameraMonitorWorkbenchWindow(prepare, request)
     window.resize(screen_fit_window_size(WINDOW_SCREEN_FRACTION))
     retain_window(window)
     window.show()

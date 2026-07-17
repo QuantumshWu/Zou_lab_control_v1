@@ -43,6 +43,7 @@ tests/test_w3_task_console.py
 tests/test_w4_figure_workbench.py
 tests/test_m1_camera_monitor.py
 tests/test_m2_camera_monitor_roi_curve.py
+tests/test_m2b_camera_monitor_scalar_history.py
 tests/test_zlc_calibration_commit.py
 tests/test_zlc_calibration_stream_contracts.py
 tests/test_zlc_camera_adapter_sdk.py

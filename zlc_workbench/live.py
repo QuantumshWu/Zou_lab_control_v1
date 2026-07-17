@@ -27,20 +27,33 @@ from zlc_frontend.render import (
     SourceIdentity,
     detached_render_fault,
 )
-from zlc_neutral_atom.monitor_application import CameraMonitorViewSpec
+from zlc_neutral_atom.monitor_application import (
+    CameraMonitorLiveDataset,
+    CameraMonitorSnapshot,
+    CameraMonitorViewSpec,
+)
 from zlc_neutral_atom.runtime.dataset import (
     MonitorCoverage,
     MonitorDataset,
     MonitorDatasetSnapshot,
 )
 from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
-from zlc_storage import canonical_text
+from zlc_storage import canonical_digest, canonical_text
+from zlc_neutral_atom.runtime.streams import event_ref_to_tree
 
 from .workspace import BoardController, BoardPublishPort, PanelSourceBinding
 
 
 if TYPE_CHECKING:
     from zlc_frontend.matplotlib_render import SingleCurveAggRenderer
+
+
+_ROI_JOIN_KEY_SCHEMA_FINGERPRINT = canonical_digest(
+    {
+        "type": "camera-roi-source-event-control",
+        "fields": ("source_event_ref", "control_revision", "control_fingerprint"),
+    }
+)
 
 
 class LiveDatasetSlot:
@@ -51,6 +64,7 @@ class LiveDatasetSlot:
         spec: CapturePreviewSpec | CameraMonitorViewSpec,
         *,
         dataset_id: DatasetId,
+        scalar_dataset_id: DatasetId | None = None,
         evaluation_policy: FigureEvaluationPolicy,
         retain_on_terminal: bool = True,
     ) -> None:
@@ -58,16 +72,28 @@ class LiveDatasetSlot:
             raise TypeError("spec must be a supported live dataset spec")
         if not isinstance(dataset_id, DatasetId):
             raise TypeError("dataset_id must be DatasetId")
+        if scalar_dataset_id is not None and not isinstance(
+            scalar_dataset_id,
+            DatasetId,
+        ):
+            raise TypeError("scalar_dataset_id must be DatasetId or None")
+        expects_scalar = (
+            isinstance(spec, CameraMonitorViewSpec)
+            and spec.scalar_dataset_edge is not None
+        )
+        if expects_scalar != (scalar_dataset_id is not None):
+            raise ValueError("scalar DatasetId must match the admitted camera view spec")
         if not isinstance(evaluation_policy, FigureEvaluationPolicy):
             raise TypeError("evaluation_policy must be FigureEvaluationPolicy")
         if not isinstance(retain_on_terminal, bool):
             raise TypeError("retain_on_terminal must be bool")
         self.spec = spec
         self.dataset_id = dataset_id
+        self.scalar_dataset_id = scalar_dataset_id
         self.evaluation_policy = evaluation_policy
         self._retain_on_terminal = retain_on_terminal
         self._lock = threading.Lock()
-        self._dataset: MonitorDataset | None = None
+        self._dataset: MonitorDataset | CameraMonitorLiveDataset | None = None
         self._run_id: str | None = None
         self._causation_domain_id: str | None = None
         self._listener: Callable[[], None] | None = None
@@ -112,13 +138,18 @@ class LiveDatasetSlot:
 
     def bind(
         self,
-        dataset: MonitorDataset,
+        dataset: MonitorDataset | CameraMonitorLiveDataset,
         *,
         run_id: str,
         causation_domain_id: str,
     ) -> None:
-        if not isinstance(dataset, MonitorDataset):
-            raise TypeError("dataset must be MonitorDataset")
+        expected = (
+            CameraMonitorLiveDataset
+            if isinstance(self.spec, CameraMonitorViewSpec)
+            else MonitorDataset
+        )
+        if not isinstance(dataset, expected):
+            raise TypeError(f"dataset must be {expected.__name__}")
         run_id = canonical_text(run_id, "run_id")
         causation_domain_id = canonical_text(
             causation_domain_id,
@@ -157,10 +188,35 @@ class LiveDatasetSlot:
             dataset = self._dataset
             run_id = self._run_id
             causation = self._causation_domain_id
-        snapshot = dataset.materialize(None)
+        snapshot = (
+            dataset.materialize().raw
+            if isinstance(dataset, CameraMonitorLiveDataset)
+            else dataset.materialize(None)
+        )
         with self._lock:
             if self._closed or self._dataset is not dataset:
                 raise RuntimeError("live slot lifetime ended while freezing a snapshot")
+        assert run_id is not None and causation is not None
+        return run_id, causation, snapshot
+
+    def freeze_camera_current(
+        self,
+    ) -> tuple[str, str, CameraMonitorSnapshot]:
+        """Freeze one application-owned raw/scalar transaction atomically."""
+
+        with self._lock:
+            if self._closed or not isinstance(
+                self._dataset,
+                CameraMonitorLiveDataset,
+            ):
+                raise RuntimeError("live slot has no active camera monitor dataset")
+            dataset = self._dataset
+            run_id = self._run_id
+            causation = self._causation_domain_id
+        snapshot = dataset.materialize()
+        with self._lock:
+            if self._closed or self._dataset is not dataset:
+                raise RuntimeError("live slot lifetime ended while freezing camera data")
         assert run_id is not None and causation is not None
         return run_id, causation, snapshot
 
@@ -204,7 +260,10 @@ class LiveDatasetSlot:
         *,
         closed: bool = False,
         withdrawn: bool = False,
-    ) -> tuple[MonitorDataset | None, Callable[[], None] | None]:
+    ) -> tuple[
+        MonitorDataset | CameraMonitorLiveDataset | None,
+        Callable[[], None] | None,
+    ]:
         with self._lock:
             if failure is not None and self._failure is not None:
                 return None, None
@@ -302,12 +361,17 @@ class LiveImageBoardController:
         self._worker_gate = threading.Lock()
         self._dirty = False
         self._active = False
-        self._candidate: tuple[str, str, MonitorDatasetSnapshot] | None = None
+        self._candidate: tuple[
+            str,
+            str,
+            MonitorDatasetSnapshot | CameraMonitorSnapshot,
+        ] | None = None
         self._port: BoardPublishPort | None = None
-        self._source: SourceIdentity | None = None
+        self._sources: tuple[SourceIdentity, ...] | None = None
         self._sequence = 0
         self._fault: BaseException | None = None
         self._coverage: MonitorCoverage | None = None
+        self._scalar_coverage: MonitorCoverage | None = None
         self._front_invalidated = False
         self._closed = False
         self._close_complete = False
@@ -324,6 +388,13 @@ class LiveImageBoardController:
 
         with self._lock:
             return self._coverage
+
+    @property
+    def scalar_coverage(self) -> MonitorCoverage | None:
+        """Scalar history coverage paired with the accepted board front."""
+
+        with self._lock:
+            return self._scalar_coverage
 
     def _source_changed(self) -> None:
         if self._slot.failure is not None or self._slot.withdrawn:
@@ -344,7 +415,11 @@ class LiveImageBoardController:
 
     def _freeze_latest(self) -> None:
         try:
-            candidate = self._slot.freeze_current()
+            candidate = (
+                self._slot.freeze_camera_current()
+                if isinstance(self._slot.spec, CameraMonitorViewSpec)
+                else self._slot.freeze_current()
+            )
             with self._lock:
                 if self._closed:
                     self._active = False
@@ -372,13 +447,14 @@ class LiveImageBoardController:
                     return False
                 invalidate = not self._front_invalidated
                 self._front_invalidated = True
-                if self._fault is None:
+                if failure is not None and self._fault is None:
                     self._fault = RuntimeError(failure)
                 self._candidate = None
                 self._active = False
                 self._port = None
-                self._source = None
+                self._sources = None
                 self._coverage = None
+                self._scalar_coverage = None
             if invalidate:
                 try:
                     self._board.invalidate()
@@ -394,34 +470,79 @@ class LiveImageBoardController:
         if candidate is None:
             return False
         try:
-            run_id, causation, snapshot = candidate
-            ref = snapshot.snapshot.ref
-            head = snapshot.head
+            run_id, causation, frozen = candidate
+            if isinstance(frozen, CameraMonitorSnapshot):
+                raw_snapshot = frozen.raw
+                scalar_snapshot = frozen.scalar
+                scalar_metadata = frozen.scalar_metadata
+            else:
+                raw_snapshot = frozen
+                scalar_snapshot = None
+                scalar_metadata = None
+            ref = raw_snapshot.snapshot.ref
+            head = raw_snapshot.head
             if head is None:
                 raise RuntimeError("live snapshot has no head event")
-            source = SourceIdentity(
+            raw_source = SourceIdentity(
                 self._slot.dataset_id,
                 ref.block_id,
                 ref.stream_generation,
                 ref.schema_fingerprint,
             )
+            if scalar_snapshot is None:
+                inputs = (EvaluatedInput(self._slot.dataset_id, ref),)
+                panel_sources = tuple(raw_source for _panel in self._panels)
+                join_key_type = "single-source-event-payload"
+                join_schema = ref.schema_fingerprint
+                join_digest = head.payload_digest
+            else:
+                scalar_dataset_id = self._slot.scalar_dataset_id
+                if scalar_dataset_id is None or scalar_metadata is None:
+                    raise RuntimeError("ROI scalar snapshot lacks its admitted identity")
+                scalar_ref = scalar_snapshot.snapshot.ref
+                scalar_source = SourceIdentity(
+                    scalar_dataset_id,
+                    scalar_ref.block_id,
+                    scalar_ref.stream_generation,
+                    scalar_ref.schema_fingerprint,
+                )
+                inputs = (
+                    EvaluatedInput(self._slot.dataset_id, ref),
+                    EvaluatedInput(scalar_dataset_id, scalar_ref),
+                )
+                panel_sources = (raw_source, scalar_source)
+                join_key_type = "camera-roi-source-event-control"
+                join_schema = _ROI_JOIN_KEY_SCHEMA_FINGERPRINT
+                join_digest = canonical_digest(
+                    {
+                        "source_event_ref": event_ref_to_tree(
+                            scalar_metadata.source_event_ref
+                        ),
+                        "control_revision": scalar_metadata.control_revision,
+                        "control_fingerprint": scalar_metadata.control_fingerprint,
+                    }
+                )
             stamp = CoherenceStamp(
                 run_id,
                 causation,
-                "single-source-event-payload",
-                ref.schema_fingerprint,
-                head.payload_digest,
-                (EvaluatedInput(self._slot.dataset_id, ref),),
+                join_key_type,
+                join_schema,
+                join_digest,
+                inputs,
                 self._presentations,
             )
-            if self._port is None or source != self._source:
+            if self._port is None or panel_sources != self._sources:
                 self._port = self._board.open_publish_port(
                     tuple(
                         PanelSourceBinding(source, presentation)
-                        for presentation in self._presentations
+                        for source, presentation in zip(
+                            panel_sources,
+                            self._presentations,
+                            strict=True,
+                        )
                     )
                 )
-                self._source = source
+                self._sources = panel_sources
             sequence = self._sequence
             self._sequence += 1
             token = self._port.admit(
@@ -429,7 +550,13 @@ class LiveImageBoardController:
                 ((self._coherence_group, stamp),),
             )
             self._submit(
-                lambda: self._render(candidate, source, stamp, sequence, token),
+                lambda: self._render(
+                    candidate,
+                    panel_sources,
+                    stamp,
+                    sequence,
+                    token,
+                ),
                 ends_cycle=True,
             )
             return True
@@ -439,14 +566,26 @@ class LiveImageBoardController:
 
     def _render(
         self,
-        candidate: tuple[str, str, MonitorDatasetSnapshot],
-        source: SourceIdentity,
+        candidate: tuple[
+            str,
+            str,
+            MonitorDatasetSnapshot | CameraMonitorSnapshot,
+        ],
+        sources: tuple[SourceIdentity, ...],
         stamp: CoherenceStamp,
         sequence: int,
         token: object,
     ) -> None:
         try:
-            snapshot = candidate[2].snapshot
+            frozen = candidate[2]
+            if isinstance(frozen, CameraMonitorSnapshot):
+                raw_snapshot = frozen.raw
+                scalar_snapshot = frozen.scalar
+            else:
+                raw_snapshot = frozen
+                scalar_snapshot = None
+            snapshot = raw_snapshot.snapshot
+            raw_input = (EvaluatedInput(self._slot.dataset_id, snapshot.ref),)
             image_evaluated = self._evaluator.evaluate(
                 self._document,
                 ResolvedDatasetMap(
@@ -454,7 +593,7 @@ class LiveImageBoardController:
                 ),
                 cancel_requested=lambda: self._closed,
             )
-            if image_evaluated.inputs != stamp.inputs:
+            if image_evaluated.inputs != raw_input:
                 raise RuntimeError("figure evaluation changed the admitted input revision")
             if (
                 len(image_evaluated.layers) != 1
@@ -469,14 +608,27 @@ class LiveImageBoardController:
             rasters = [rasterize_image_gray8(data)]
             curve_document = self._curve_document
             if curve_document is not None:
+                curve_dataset_id = (
+                    self._slot.dataset_id
+                    if scalar_snapshot is None
+                    else self._slot.scalar_dataset_id
+                )
+                if curve_dataset_id is None:
+                    raise RuntimeError("ROI curve has no scalar DatasetId")
+                curve_snapshot = (
+                    snapshot
+                    if scalar_snapshot is None
+                    else scalar_snapshot.snapshot
+                )
+                curve_input = (EvaluatedInput(curve_dataset_id, curve_snapshot.ref),)
                 curve_evaluated = self._evaluator.evaluate(
                     curve_document,
                     ResolvedDatasetMap(
-                        (ResolvedDataset(self._slot.dataset_id, snapshot),)
+                        (ResolvedDataset(curve_dataset_id, curve_snapshot),)
                     ),
                     cancel_requested=lambda: self._closed,
                 )
-                if curve_evaluated.inputs != stamp.inputs:
+                if curve_evaluated.inputs != curve_input:
                     raise RuntimeError("ROI curve evaluation changed the admitted input revision")
                 curve_layer = curve_evaluated.layers[0]
                 curve_data = curve_layer.cells[0].series[0].data
@@ -505,7 +657,12 @@ class LiveImageBoardController:
                         stamp,
                         raster,
                     )
-                    for panel, raster in zip(self._panels, rasters, strict=True)
+                    for panel, source, raster in zip(
+                        self._panels,
+                        sources,
+                        rasters,
+                        strict=True,
+                    )
                 ),
             )
             port = self._port
@@ -514,7 +671,12 @@ class LiveImageBoardController:
                 if published:
                     with self._lock:
                         if not self._closed and self._port is port:
-                            self._coverage = candidate[2].coverage
+                            self._coverage = raw_snapshot.coverage
+                            self._scalar_coverage = (
+                                None
+                                if scalar_snapshot is None
+                                else scalar_snapshot.coverage
+                            )
         except BaseException as error:
             self._set_fault(error)
             return
@@ -573,6 +735,7 @@ class LiveImageBoardController:
             self._candidate = None
             self._active = False
             self._coverage = None
+            self._scalar_coverage = None
         try:
             self._slot.fail(f"{type(error).__name__}: {error}")
         except BaseException:
@@ -588,6 +751,7 @@ class LiveImageBoardController:
             self._dirty = False
             self._candidate = None
             self._coverage = None
+            self._scalar_coverage = None
             self._front_invalidated = True
             schedule_renderer_close = self._curve_document is not None
         try:
@@ -632,17 +796,32 @@ def _validate_live_documents(
     if view.intent is not ViewIntent.IMAGE:
         raise ValueError("live image controller requires IMAGE intent")
     if curve_document is None:
+        if isinstance(slot.spec, CameraMonitorViewSpec) and (
+            slot.spec.scalar_dataset_edge is not None
+        ):
+            raise ValueError("admitted ROI scalar source requires a curve document")
         return
+    scalar_edge = (
+        slot.spec.scalar_dataset_edge
+        if isinstance(slot.spec, CameraMonitorViewSpec)
+        else None
+    )
+    curve_schema = schema if scalar_edge is None else scalar_edge.schema
+    curve_dataset_id = (
+        slot.dataset_id if scalar_edge is None else slot.scalar_dataset_id
+    )
+    if curve_dataset_id is None:
+        raise ValueError("live curve has no admitted DatasetId")
     if (
         len(curve_document.datasets) != 1
-        or curve_document.datasets[0].dataset_id != slot.dataset_id
-        or curve_document.datasets[0].schema_fingerprint != schema.fingerprint
+        or curve_document.datasets[0].dataset_id != curve_dataset_id
+        or curve_document.datasets[0].schema_fingerprint != curve_schema.fingerprint
         or len(curve_document.layers) != 1
-        or curve_document.layers[0].dataset_id != slot.dataset_id
+        or curve_document.layers[0].dataset_id != curve_dataset_id
     ):
-        raise ValueError("live curve document must contain the slot's one dataset and layer")
+        raise ValueError("live curve document must contain its admitted dataset and layer")
     curve_view = curve_document.layers[0].view
-    validate_view_spec(schema, curve_view)
+    validate_view_spec(curve_schema, curve_view)
     if curve_view.intent is not ViewIntent.CURVE:
         raise ValueError("live companion document requires CURVE intent")
 

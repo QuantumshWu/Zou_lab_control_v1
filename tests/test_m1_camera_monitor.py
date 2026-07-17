@@ -100,7 +100,7 @@ def test_public_monitor_preserves_axes_restarts_with_fresh_identity_and_clears_f
         assert len(first.event_refs) == 8
         assert 1 <= first.coverage.written_cells <= 8
         assert first.coverage.total_cells == 8
-        assert not window._slot._dataset._source._reservations
+        assert not window._slot._dataset.raw._source._reservations
         first_identity = (
             first.snapshot.ref.block_id,
             first.snapshot.ref.stream_generation,
@@ -114,6 +114,7 @@ def test_public_monitor_preserves_axes_restarts_with_fresh_identity_and_clears_f
         _until(application, lambda: "STOPPED" in status.text())
         _until(application, lambda: not board.has_front)
         _until(application, start.isEnabled)
+        assert not view.text().startswith("View: FAILED")
         assert diagnostics.text().startswith("Stop: REQUESTED")
 
         QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
