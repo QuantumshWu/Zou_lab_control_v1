@@ -49,7 +49,7 @@ from .live import (
     bus_signed_bounds as _bus_signed_bounds,
     bus_display_label as _bus_display_label,
 )
-from .qt_fluent import (
+from zlc_frontend.qt_widgets import (
     ACCENT,
     BG,
     FONT,
@@ -160,7 +160,7 @@ HIDE_BUTTON_WIDTH = 26
 PANEL_TOP_HEIGHT = 178   # name row + Duration label + value + unit (all four panels share it)
 CHANNEL_ROW_SPACING = 4
 PERIOD_CARD_WIDTH = 158
-DEFAULT_WINDOW_RATIO = WINDOW_SCREEN_FRACTION   # the ONE shared screen-fraction (qt_fluent), == task console
+DEFAULT_WINDOW_RATIO = WINDOW_SCREEN_FRACTION   # the ONE shared screen-fraction (qt_widgets), == task console
 DEFAULT_HARDWARE_CLOCK_HZ = _default_hardware_clock_hz()  # single source: streamer_config.json (via the dependency-free _clock seam)
 DEFAULT_TIME_STEP_NS = 1_000_000_000.0 / DEFAULT_HARDWARE_CLOCK_HZ
 SUMMARY_DEBOUNCE_MS = 90
@@ -2092,7 +2092,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self._sync_dataset_geometry()
 
     def _target_editor_size(self) -> QtCore.QSize:
-        # The shared screen-fit rule (qt_fluent.screen_fit_window_size) -- identical
+        # The shared screen-fit rule (qt_widgets.screen_fit_window_size) -- identical
         # to the task console's, so the two GUIs never diverge on window sizing.
         return screen_fit_window_size(self.window_ratio)
 
@@ -4463,7 +4463,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
     @staticmethod
     def _resolve_scale(scale: float | None, *, app: QtWidgets.QApplication) -> float:
-        # None -> the SHARED automatic rule in qt_fluent (resolve_fluent_auto_scale):
+        # None -> the SHARED automatic rule in qt_widgets (resolve_fluent_auto_scale):
         # every GUI window must agree on the control size for a given screen.
         return set_fluent_scale(scale)
 

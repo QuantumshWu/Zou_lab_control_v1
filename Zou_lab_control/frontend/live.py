@@ -16,38 +16,40 @@ from matplotlib.patches import Rectangle
 from matplotlib.ticker import FixedLocator, Formatter, FuncFormatter, LogLocator, MaxNLocator, NullLocator, ScalarFormatter
 import numpy as np
 
+from zlc_frontend.render_style import (
+    DESIGN_DPI,
+    FIT_DIM_ALPHA,
+    HIST_FILL_ALPHA,
+    PALETTE,
+    PANEL_DISPLAY_SCALE,
+    PULSE_SCAN_ANNOTATION_COLOR,
+    PULSE_SCAN_ANNOTATION_FONT_SIZE,
+    PULSE_SCAN_REGION_COLOR,
+    SITE_OCCUPANCY_STYLE,
+    STOCK_MARGINS_PX,
+    apply_style,
+    apply_title,
+    axis_label_fontsize,
+    bimodal_fit_line_specs,
+    small_fontsize,
+    smaller_fontsize,
+    threshold_line_kwargs,
+    tick_fontsize,
+)
+
 from ._validate import _positive_float
 from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, display_figure, fit_grid_shape_for_aspect, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
 from Zou_lab_control._readout_math import confidence_weighted_fidelity, finite_mean
 from ..neutral_atom.core.fitting import fit_histogram
 from ..neutral_atom.core.signal_tensor import canonical_physical_shape
-from .style import (
-    DESIGN_DPI,
-    FIT_DIM_ALPHA,
-    HIST_FILL_ALPHA,
-    bimodal_fit_line_specs,
-    PALETTE,
-    PANEL_DISPLAY_SCALE,
-    SITE_OCCUPANCY_STYLE,
-    STOCK_MARGINS_PX,
-    apply_style,
-    apply_title,
-    axis_label_fontsize,
-    small_fontsize,
-    smaller_fontsize,
-    threshold_line_kwargs,
-    tick_fontsize,
-)
 from .ticks import apply_smart_ticks
 # The pulse RENDER lives here (the plot layer owns every plot kind's rendering): building the timeline
 # figure from a PulseTableState, folding the analog DAC buses into their own rows and shading the scanned
-# regions.  ORANGE / fluent_font_size are the two GUI tokens the scan-region highlight reuses (imported
-# here, not re-declared -- single source); qt_fluent does not import live, so there is no cycle.
-from .qt_fluent import ORANGE, fluent_font_size
+# regions.  Its palette and typography belong to the renderer and never depend on Qt display scale.
 
 
-# Colours/sizes come from the one owned source in style.py (style.PALETTE / the
+# Colours/sizes come from the one owned source in zlc_frontend.render_style (PALETTE / the
 # fontsize accessors); these module names stay as convenience aliases.
 DEFAULT_COLORS = list(PALETTE["series"])
 PULSE_COLORS = list(PALETTE["pulse_cycle"])
@@ -2222,7 +2224,7 @@ PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 96, 80, TITLE_SLOT_PX)   # stock margin
 # Panels are DISPLAYED scaled through the standard high-DPI canvas path
 # (qt_canvas.panel_canvas): on screen their text sits at PANEL_DISPLAY_SCALE (~70%) of a
 # notebook/pulse-preview figure while the figure stays an ordinary 300 dpi frontend figure.
-# PANEL_DISPLAY_SCALE is the frontend's ONE display-scale source of truth in style.py (imported
+# PANEL_DISPLAY_SCALE is the frontend's ONE display-scale source of truth in render_style.py (imported
 # at the top of this module, re-exported below); panel_display_size reads it -- never re-typed here.
 
 
@@ -2906,7 +2908,7 @@ def annotate_pulse_variable_regions(plotter, state, channels=None, *, bus_rows=N
             x0, x1 = x1, x0
         if x1 - x0 < min_width:
             x1 = x0 + min_width
-        patch = Rectangle((x0, y0), x1 - x0, y1 - y0, facecolor=ORANGE, edgecolor="none",
+        patch = Rectangle((x0, y0), x1 - x0, y1 - y0, facecolor=PULSE_SCAN_REGION_COLOR, edgecolor="none",
                           alpha=alpha, linewidth=0.0, zorder=6, transform=ax.transData)
         ax.add_patch(patch)
         plotter.variable_region_artists.append(patch)
@@ -2917,9 +2919,10 @@ def annotate_pulse_variable_regions(plotter, state, channels=None, *, bus_rows=N
         # Mimic the bound scan-dot badge: a filled orange circle with a white digit (same look as
         # FluentScanDot), keeping the small font size.
         text = ax.text(xc, yc, tag, transform=ax.transData, ha="center", va=va,
-                       color="white", fontsize=max(2.6, float(fluent_font_size()) * 0.28),
+                       color=PULSE_SCAN_ANNOTATION_COLOR,
+                       fontsize=max(2.6, PULSE_SCAN_ANNOTATION_FONT_SIZE),
                        fontweight="bold", clip_on=False, zorder=12,
-                       bbox=dict(boxstyle="circle,pad=0.3", facecolor=ORANGE, edgecolor="none"))
+                       bbox=dict(boxstyle="circle,pad=0.3", facecolor=PULSE_SCAN_REGION_COLOR, edgecolor="none"))
         plotter.variable_region_labels.append(text)
 
     # Unified tint; the value highlight (DAC) is a touch stronger but same hue.
@@ -2957,7 +2960,7 @@ def annotate_pulse_variable_regions(plotter, state, channels=None, *, bus_rows=N
             vy = analog_y[bus] + row_h * min(1.0, max(0.0, (value - lo_v) / span_v))
             if x1 - x0 < min_width:
                 x1 = x0 + min_width
-            seg = ax.plot([x0, x1], [vy, vy], color=ORANGE, linewidth=3.0, alpha=0.9,
+            seg = ax.plot([x0, x1], [vy, vy], color=PULSE_SCAN_REGION_COLOR, linewidth=3.0, alpha=0.9,
                           solid_capstyle="butt", zorder=8)[0]
             plotter.variable_region_artists.append(seg)
             # Number centred vertically in the bus row (only *duration* labels sit above the band;

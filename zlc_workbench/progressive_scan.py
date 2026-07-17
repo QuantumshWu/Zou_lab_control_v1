@@ -21,9 +21,9 @@ from zlc_data import (
     materialize_transformed_snapshot,
     transformed_snapshot_peak_nbytes,
 )
-from zlc_frontend import (
-    estimate_single_curve_raster_peak_nbytes,
+from zlc_frontend.matplotlib_render import (
     SingleCurveAggRenderer,
+    estimate_single_curve_raster_peak_nbytes,
 )
 from zlc_frontend.figure import (
     DatasetDescriptor,

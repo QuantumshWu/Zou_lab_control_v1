@@ -99,7 +99,8 @@ second detector or calibration workflow in the GUI/demo.
 
 ### Fluent tab bar (frontend): water-fill, no scroll arrows
 
-`FluentTabWidget` (`frontend/qt_fluent._FluentTabBar`) is a pivot-underline tab bar. When the
+`zlc_frontend.qt_widgets.FluentTabWidget` (implemented by the private `_FluentTabBar` in
+`qt_widgets/fluent.py`) is a pivot-underline tab bar. When the
 tabs overflow the bar it WATER-FILLS: only the widest tabs are capped to a shared width and
 their labels elide with `...`, while short tabs (Monitor / Logic) keep their natural width;
 every tab — including its right-side close `x` — stays inside the bar, so no native scroll
@@ -247,7 +248,7 @@ which share the `quantized_time_steps` floor/round-to-nearest logic in
 
 ## 5. Frontend Fluent Rules
 
-The single source of truth is `Zou_lab_control/frontend/qt_fluent.py`; do not
+The single source of truth is `zlc_frontend/qt_widgets`; do not
 create one-off Qt styles per GUI.
 
 Layout primitives that structurally prevent cutoff/overlap (use these instead of
@@ -1494,7 +1495,7 @@ propagates and nothing drifts. Where they live: `style.py` owns the stock figure
 `figure.figsize` and `canvas.FigureSpec` defaults derive from these). `live.py` owns the
 panel/pulse/site geometry plus `TITLE_SLOT_PX = 70` (the title-slot floor used by BOTH
 `PANEL_MARGINS_PX[3]` and `_with_title_margin`, so they can never disagree) and the named
-axes splits `_DIST_SPLIT` / `_IMAGE_SPLIT`. `qt_fluent.py` owns `FLUENT_SCALE_MIN/MAX`
+axes splits `_DIST_SPLIT` / `_IMAGE_SPLIT`. `zlc_frontend.qt_widgets` owns `FLUENT_SCALE_MIN/MAX`
 (the scale clamp band) and `screen_fit_window_size(window_ratio)` — the ONE screen-fit
 window rule the task console AND the pulse editor both call (it was duplicated verbatim in
 both, the same drift class as the shared scale rule). The contract tests in
@@ -1708,7 +1709,7 @@ contract test — the single mechanical guard. Change the framework = change the
   - **Row label + unit are one source.** `ParamDecl.row_label()` = `"<label> (<unit>) *"` — the ONE
     thing the config editor, device viewer, measurement Edit, Setting popup, and signal-expr title read
     (no re-typed idiom). A live READ-BACK is engineering-scaled with its unit SI-prefixed via the ONE
-    `param_widgets.format_reading` (`6.8e9 Hz -> "6.8 GHz"`, using `qt_fluent.eng_mantissa_prefix`); the
+    `param_widgets.format_reading` (`6.8e9 Hz -> "6.8 GHz"`, using `zlc_frontend.qt_widgets.eng_mantissa_prefix`); the
     editable spin box stays plain decimal (confocal never SI-scales its editor).
   - **Wiring rule is one helper.** Every handler routes its change signal through `param_widgets._wire`
     (re-validate + optional instant-apply); the composite `signal_expr`/`pulse_slots` handlers were the
@@ -1782,7 +1783,7 @@ Behaviour-neutral throughout. The single sources added/relocated, by layer:
   hard-codes no ring colours.
 - `frontend.data_figure.resolve_save_base(path, stem)` — the ONE figure+npz save-path resolver
   (`DataFigure.save` + the grid `_GridData.save`).
-- `frontend.qt_fluent._bound_field_style(*, selector, text, border, fill)` — the ONE scan/api
+- `zlc_frontend.qt_widgets.fluent._bound_field_style(*, selector, text, border, fill)` — the private scan/api
   bound-field stylesheet recipe (`mark_scan_field` / `set_scan_bound` orange + `set_api_bound`
   violet).
 - `task_console`: `_new_panel_card` (the ONE PanelCard provider block), `_repeat_mode_value` (the ONE
@@ -2060,7 +2061,7 @@ an overlay adapter and `FitProcessor` is the hub adapter. The image processor pu
 scalar result tensors (`fit_x0`, `fit_y0`, amplitude, size, offset, validity and quality) and keeps
 status text on the result envelope rather than inventing a second frontend solver.
 
-**Persistent status strip**: `qt_fluent.FluentStatusStrip` (severity dot + eliding message +
+**Persistent status strip**: `zlc_frontend.qt_widgets.FluentStatusStrip` (severity dot + eliding message +
 optional action) replaces both the header summary label an error used to overwrite and the
 transient orange task banner whose show/hide shifted the layout.  One priority ladder in
 `_update_summary`: node error > running task (+Stop action) > display-behind advisory > idle

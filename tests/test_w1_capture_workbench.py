@@ -11,7 +11,7 @@ import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5 import QtCore, QtTest, QtWidgets
+from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 import pytest
 
 import Zou_lab_control.notebook as zlc
@@ -19,7 +19,7 @@ from Zou_lab_control.notebook.facade import _prepare_capture_for_workbench
 from Zou_lab_control.workbench import open_capture_workbench
 from zlc_data import BlockId, SPATIAL_X, SPATIAL_Y
 from zlc_frontend.figure import DatasetId, FigureEvaluationPolicy
-from zlc_frontend.qt_board import QtImageBoard
+from zlc_frontend.qt_widgets import GREEN, ORANGE, QtImageBoard
 from zlc_workbench.live import LiveDatasetSlot
 
 
@@ -64,6 +64,7 @@ def _widgets(window):
 def _close_window(application, window) -> None:
     window.close()
     _until(application, lambda: not window.isVisible(), timeout=5.0)
+    assert window not in getattr(application, "_zlc_retained_windows", ())
 
 
 def test_public_workbench_repeats_with_new_preview_and_loads_exact_artifact(
@@ -77,6 +78,13 @@ def test_public_workbench_repeats_with_new_preview_and_loads_exact_artifact(
         request = experiment.readout.capture_request(SINGLE_EVENT_PULSE)
         window = open_capture_workbench(experiment, request)
         start, capture, preview, diagnostics, board = _widgets(window)
+        stop = window.findChild(QtWidgets.QPushButton, "stopButton")
+        assert start._base_color == QtGui.QColor(GREEN).name(QtGui.QColor.HexRgb)
+        assert stop._base_color == QtGui.QColor(ORANGE).name(QtGui.QColor.HexRgb)
+        available = application.primaryScreen().availableGeometry()
+        assert window.width() <= available.width()
+        assert window.height() <= available.height()
+        assert available.contains(window.frameGeometry())
         _until(application, start.isEnabled)
 
         QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
@@ -85,6 +93,7 @@ def test_public_workbench_repeats_with_new_preview_and_loads_exact_artifact(
         assert capture.text().startswith("Capture: FINAL")
         assert preview.text().startswith("Preview: DISPLAY ONLY · capture FINAL")
         assert board.has_front and diagnostics.text() == ""
+        assert available.contains(window.frameGeometry())
         _until(application, start.isEnabled)
 
         QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)

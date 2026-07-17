@@ -46,7 +46,7 @@ from zlc_data import (
     commit_transform,
     materialize_transformed_snapshot,
 )
-from zlc_frontend import SingleCurveAggRenderer
+from zlc_frontend.matplotlib_render import SingleCurveAggRenderer
 from zlc_frontend.figure import (
     AxisViewRole,
     FigureEvaluationPolicy,
@@ -280,7 +280,7 @@ def test_transform_owner_freezes_once_and_preserves_component_validity(monkeypat
     assert not executed
 
 
-def test_progressive_renderer_reuses_artists_and_updates_component_validity():
+def test_progressive_renderer_reuses_artists_and_updates_component_validity(monkeypatch):
     source, transform, schema, output_ref, _values, valid = (
         _component_snapshot_case()
     )
@@ -363,6 +363,33 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity():
             gc.enable()
     with pytest.raises(RuntimeError, match="closed"):
         renderer.render(evaluate(snapshots[1]))
+
+    from matplotlib.figure import Figure
+
+    partial_canvases = []
+
+    def failed_subplots(self, *_args, **_kwargs):
+        partial_canvases.append(weakref.ref(self.canvas))
+        raise RuntimeError("injected renderer construction failure")
+
+    collection_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with monkeypatch.context() as failure_patch:
+            failure_patch.setattr(Figure, "subplots", failed_subplots)
+            with pytest.raises(
+                RuntimeError,
+                match="injected renderer construction failure",
+            ):
+                SingleCurveAggRenderer(
+                    progressive.document,
+                    width=360,
+                    height=240,
+                )
+        assert partial_canvases and all(ref() is None for ref in partial_canvases)
+    finally:
+        if collection_was_enabled:
+            gc.enable()
 
 
 def test_bounded_snapshot_rejects_cell_reduction():
@@ -755,7 +782,7 @@ def _assert_public_occupancy_scan(exp, monkeypatch):
 def _assert_occupancy_scan_window(exp, request, monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
-    from zlc_frontend.qt_board import QtImageBoard
+    from zlc_frontend.qt_widgets import QtImageBoard
     import zlc_workbench.progressive_scan as progressive_scan
 
     owner_thread = threading.get_ident()
@@ -839,16 +866,21 @@ def _assert_occupancy_scan_window(exp, request, monkeypatch):
             time.sleep(0.01)
         assert not window.isVisible()
         assert window.worker_idle
+        assert window not in getattr(application, "_zlc_retained_windows", ())
 
 
 def _assert_scan_window(exp, document, monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
+    from zlc_frontend.qt_widgets import QtImageBoard
 
     request = exp.readout.scan_request(document, timeout_seconds=15.0)
     window = exp.scan_gui(request)
     application = QtWidgets.QApplication.instance()
     assert application is not None
+    assert application.primaryScreen().availableGeometry().contains(
+        window.frameGeometry()
+    )
     assert "FINAL-ONLY" in window.findChild(
         QtWidgets.QLabel,
         "scanMode",
@@ -857,27 +889,27 @@ def _assert_scan_window(exp, document, monkeypatch):
     assert start is not None and start.isEnabled()
     start.click()
 
-    raster = window.findChild(QtWidgets.QLabel, "scanRaster")
+    raster = window.findChild(QtImageBoard, "scanRaster")
     assert raster is not None
     deadline = time.monotonic() + 15.0
     while (
         (
             window.final_reference is None
-            or raster.pixmap() is None
-            or raster.pixmap().isNull()
+            or not raster.has_front
         )
         and time.monotonic() < deadline
     ):
         application.processEvents()
         time.sleep(0.01)
     assert window.final_reference is not None
-    assert raster.pixmap() is not None
-    assert not raster.pixmap().isNull()
+    assert raster.has_front
+    assert application.primaryScreen().availableGeometry().contains(
+        window.frameGeometry()
+    )
 
     assert start.isEnabled()
     start.click()
-    cleared = raster.pixmap()
-    assert cleared is None or cleared.isNull()
+    assert not raster.has_front
 
     window.close()
     deadline = time.monotonic() + 5.0
@@ -886,3 +918,4 @@ def _assert_scan_window(exp, document, monkeypatch):
         time.sleep(0.01)
     assert not window.isVisible()
     assert window.worker_idle
+    assert window not in getattr(application, "_zlc_retained_windows", ())

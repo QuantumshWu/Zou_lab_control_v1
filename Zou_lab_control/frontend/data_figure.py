@@ -22,7 +22,7 @@ from ..neutral_atom.core.raster import RegularRaster
 from ..neutral_atom.core.selection import Selection, SelectedData, select_rows
 from ..neutral_atom.core.signal_tensor import canonical_physical_shape
 
-from .style import FIT_DIM_ALPHA, PALETTE, small_fontsize
+from zlc_frontend.render_style import FIT_DIM_ALPHA, PALETTE, small_fontsize
 
 # 2D "center" fit overlay sizing (a centre DOT + the fitted-radius RING -- the pairing is fixed).  The
 # dot is an ABSOLUTE-size locator (scatter ``s`` is points^2, independent of the axes scale), so it must

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import gc
 from pathlib import Path
 import subprocess
 import sys
+import weakref
 
 import numpy as np
 import pytest
@@ -286,6 +288,67 @@ def test_import_is_lazy_and_invalid_curve_is_masked_in_png_and_svg(tmp_path):
     assert svg.read_text(encoding="utf-8").lstrip().startswith("<?xml")
 
 
+def test_product_render_dpi_and_save_draw_use_the_render_owner_context(
+    monkeypatch,
+    tmp_path,
+):
+    import matplotlib
+    from matplotlib.figure import Figure
+
+    from zlc_frontend.render_style import RENDER_TEXT
+
+    data_figure = _curve_figure()
+    rendered = data_figure.render(dpi=80.0)
+    assert rendered.canvas.get_width_height() == (400, 320)
+    rendered.clear()
+
+    observed = []
+    released_figures = []
+    original_savefig = Figure.savefig
+
+    def checked_savefig(self, *args, **kwargs):
+        observed.append(matplotlib.rcParams["axes.edgecolor"])
+        released_figures.append(weakref.ref(self))
+        return original_savefig(self, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", checked_savefig)
+    original_edge = matplotlib.rcParams["axes.edgecolor"]
+    matplotlib.rcParams["axes.edgecolor"] = "magenta"
+    collection_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(3):
+            assert data_figure.to_png_bytes(dpi=80.0).startswith(b"\x89PNG")
+        data_figure.export(tmp_path / "owned.svg", dpi=80.0)
+        assert observed == [RENDER_TEXT] * 4
+        assert released_figures and all(ref() is None for ref in released_figures)
+        assert matplotlib.rcParams["axes.edgecolor"] == "magenta"
+    finally:
+        if collection_was_enabled:
+            gc.enable()
+        matplotlib.rcParams["axes.edgecolor"] = original_edge
+
+    import zlc_frontend.matplotlib_render as render_module
+
+    partial_canvases = []
+
+    def failed_curve(axis, *_args, **_kwargs):
+        partial_canvases.append(weakref.ref(axis.figure.canvas))
+        raise RuntimeError("injected artist compose failure")
+
+    collection_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with monkeypatch.context() as failure_patch:
+            failure_patch.setattr(render_module, "_curve", failed_curve)
+            with pytest.raises(RuntimeError, match="injected artist compose failure"):
+                data_figure.to_png_bytes(dpi=80.0)
+        assert partial_canvases and all(ref() is None for ref in partial_canvases)
+    finally:
+        if collection_was_enabled:
+            gc.enable()
+
+
 def test_notebook_fit_figure_maps_each_visible_batch_and_skips_failure(monkeypatch, tmp_path):
     with zlc.connect("virtual", repository=tmp_path / "workspace") as exp:
         capture_ref = exp.readout.capture(
@@ -313,7 +376,31 @@ def test_notebook_fit_figure_maps_each_visible_batch_and_skips_failure(monkeypat
             AxisViewRole.SLIDER,
         }
 
-        data_figure = exp.figure(execution)
+        render_limit = 512 << 20
+        data_figure = exp.figure(execution, memory_limit_bytes=render_limit)
+        assert data_figure.render_memory_limit_bytes == render_limit
+        import zlc_frontend.matplotlib_render as render_module
+
+        with monkeypatch.context() as budget_patch:
+            budget_patch.setattr(
+                render_module,
+                "estimate_render_peak_nbytes",
+                lambda _evaluated, *, dpi: render_limit + 1,
+            )
+            with pytest.raises(MemoryError, match="render peak"):
+                data_figure._repr_png_()
+            blocked_export = tmp_path / "frozen-budget-blocked.png"
+            with pytest.raises(MemoryError, match="render peak"):
+                data_figure.export(blocked_export)
+            assert not blocked_export.exists()
+            with pytest.raises(ValueError, match="cannot weaken"):
+                data_figure.export(
+                    tmp_path / "must-not-export.png",
+                    memory_limit_bytes=render_limit + 1,
+                )
+        assert data_figure.to_png_bytes(
+            memory_limit_bytes=render_limit // 2
+        ).startswith(b"\x89PNG")
         expected = _displayed_batch_indices(data_figure, execution.result)
         calls = []
         original = type(execution.result).evaluate_batch

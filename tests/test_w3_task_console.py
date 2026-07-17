@@ -295,8 +295,9 @@ def test_site_display_choice_changes_only_view_and_never_authoritative_axes():
 
 
 def _run_task_console_product_e2e(tmp_path: Path):
-    from PyQt5 import QtCore, QtTest, QtWidgets
+    from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
     from Zou_lab_control.workbench._task_console import ScanIntentForm
+    from zlc_frontend.qt_widgets import GREEN, ORANGE
 
     application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
@@ -324,6 +325,7 @@ def _run_task_console_product_e2e(tmp_path: Path):
         )
         unconfigured.close()
         until(lambda: not unconfigured.isVisible(), timeout=5.0)
+        assert unconfigured not in application._zlc_retained_windows
         assert all(not timer.isActive() for timer in unconfigured_timers)
         unconfigured = None
 
@@ -410,6 +412,7 @@ def _run_task_console_product_e2e(tmp_path: Path):
         assert model.currentData() is None
         blank.close()
         until(lambda: not blank.isVisible(), timeout=5.0)
+        assert blank not in application._zlc_retained_windows
         blank = None
 
         document = _occupancy_document()
@@ -433,6 +436,30 @@ def _run_task_console_product_e2e(tmp_path: Path):
         edit = window.findChild(ScanIntentForm, "editScanIntentForm")
         setting = window.findChild(ScanIntentForm, "settingScanIntentForm")
         assert edit is not None and setting is not None
+        available = application.primaryScreen().availableGeometry()
+        assert window.width() <= available.width()
+        assert window.height() <= available.height()
+        assert available.contains(window.frameGeometry())
+        edit_scroll = window.findChild(
+            QtWidgets.QScrollArea,
+            "editScanIntentScroll",
+        )
+        apply_button = window.findChild(
+            QtWidgets.QPushButton,
+            "editApplyScanIntentButton",
+        )
+        load_button = window.findChild(
+            QtWidgets.QPushButton,
+            "editLoadPulseDocumentButton",
+        )
+        assert edit_scroll is not None and apply_button is not None
+        assert not edit_scroll.isAncestorOf(apply_button)
+        assert apply_button._base_color == QtGui.QColor(GREEN).name(
+            QtGui.QColor.HexRgb
+        )
+        assert load_button._base_color == QtGui.QColor(ORANGE).name(
+            QtGui.QColor.HexRgb
+        )
         summary = window.findChild(
             QtWidgets.QLabel,
             "editAuthoritativeTransformSummary",
@@ -445,6 +472,14 @@ def _run_task_console_product_e2e(tmp_path: Path):
         assert clear_transform is not None and not clear_transform.isEnabled()
         edit.begin_edit()
         assert edit.build_intent().model_kind is None
+        committed_path_text = edit._pulse_path.text()
+        committed_fingerprint = edit.build_intent().pulse_document.fingerprint
+        invalid_pulse = tmp_path / "not-a-pulse.json"
+        invalid_pulse.write_text("{}", encoding="utf-8")
+        edit._pulse_path.setText(str(invalid_pulse))
+        edit._load_pulse.click()
+        assert edit._pulse_path.text() == committed_path_text
+        assert edit.build_intent().pulse_document.fingerprint == committed_fingerprint
         setting.begin_edit()
         card.apply_form(edit)
         with pytest.raises(ScanEditConflict, match="stale"):
@@ -472,6 +507,7 @@ def _run_task_console_product_e2e(tmp_path: Path):
 
         window.close()
         until(lambda: panel.closed and not window.isVisible(), timeout=10.0)
+        assert window not in application._zlc_retained_windows
         window = None
     finally:
         if unconfigured is not None and unconfigured.isVisible():

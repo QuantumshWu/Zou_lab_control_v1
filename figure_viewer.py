@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from PyQt5 import QtCore
 
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from zlc_frontend.qt_widgets import ensure_qt_app
     from Zou_lab_control.frontend import show_figure_viewer
 
     app = ensure_qt_app()

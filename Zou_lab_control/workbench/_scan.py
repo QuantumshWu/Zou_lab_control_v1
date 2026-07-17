@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 from Zou_lab_control.notebook.facade import (
     Experiment,
@@ -10,7 +10,22 @@ from Zou_lab_control.notebook.facade import (
     ScanRequest,
     _prepare_occupancy_scan_for_workbench,
 )
-from zlc_frontend.qt_board import QtImageBoard, QtOwnerWake
+from zlc_frontend.qt_widgets import (
+    ElidedLabel,
+    FluentButton,
+    FluentLabel,
+    GREEN,
+    ORANGE,
+    QtImageBoard,
+    QtOwnerWake,
+    WINDOW_SCREEN_FRACTION,
+    center_window_on_primary_screen,
+    ensure_qt_app,
+    release_window,
+    retain_window,
+    screen_fit_window_size,
+    set_fluent_scale,
+)
 from zlc_frontend.figure import ViewIntent
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_storage import canonical_digest
@@ -143,10 +158,8 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             raise TypeError("request must be a current scan request")
 
         self.setWindowTitle("Autonomous Scan")
-        self.resize(900, 680)
         self._allow_close = False
         self._shown_presentation: FinalScanPresentation | None = None
-        self._source_pixmap: QtGui.QPixmap | None = None
 
         progressive = isinstance(request, OccupancyScanRequest)
         self._progressive_requested = progressive
@@ -155,7 +168,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             if progressive
             else "DIRECT CAMERA · CANONICAL FINAL-ONLY"
         )
-        self._mode = QtWidgets.QLabel(
+        self._mode = FluentLabel(
             (
                 "PROVISIONAL OCCUPANCY CURVE → CANONICAL FINAL"
                 if progressive
@@ -164,32 +177,33 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             self,
         )
         self._mode.setObjectName("scanMode")
-        self._status = QtWidgets.QLabel("IDLE · FINAL-ONLY", self)
+        self._status = FluentLabel("IDLE · FINAL-ONLY", self)
         self._status.setObjectName("scanStatus")
-        self._artifact = QtWidgets.QLabel("Artifact: —", self)
+        self._artifact = ElidedLabel("Artifact: —", self)
         self._artifact.setObjectName("scanArtifact")
-        self._artifact.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self._projection = QtWidgets.QLabel("Display: waiting for FINAL artifact", self)
+        self._projection = FluentLabel("Display: waiting for FINAL artifact", self)
         self._projection.setObjectName("projectionSummary")
         self._projection.setWordWrap(True)
-        self._raster = QtWidgets.QLabel("No FINAL result", self)
+        self._raster = QtImageBoard(
+            "scan-final",
+            self,
+            empty_text="No FINAL result",
+        )
         self._raster.setObjectName("scanRaster")
-        self._raster.setAlignment(QtCore.Qt.AlignCenter)
         self._raster.setMinimumSize(320, 240)
-        self._raster.setStyleSheet("background: #111; color: #bbb;")
         self._provisional_board = QtImageBoard("scan-curve", self)
         self._provisional_board.setObjectName("scanProvisionalBoard")
         self._display_stack = QtWidgets.QStackedWidget(self)
         self._display_stack.addWidget(self._provisional_board)
         self._display_stack.addWidget(self._raster)
         self._display_stack.setCurrentWidget(self._raster)
-        self._diagnostics = QtWidgets.QLabel("", self)
+        self._diagnostics = FluentLabel("", self)
         self._diagnostics.setObjectName("scanDiagnostics")
         self._diagnostics.setWordWrap(True)
         self._diagnostics.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self._start = QtWidgets.QPushButton("Run Scan", self)
+        self._start = FluentButton("Run Scan", self, color=GREEN)
         self._start.setObjectName("startScanButton")
-        self._stop = QtWidgets.QPushButton("Stop", self)
+        self._stop = FluentButton("Stop", self, color=ORANGE)
         self._stop.setObjectName("stopScanButton")
 
         controls = QtWidgets.QHBoxLayout()
@@ -266,9 +280,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             else "DIRECT CAMERA · CANONICAL FINAL-ONLY"
         )
         self._shown_presentation = None
-        self._source_pixmap = None
         self._raster.clear()
-        self._raster.setText("No FINAL result")
         self._apply_model(self._controller.view_model)
 
     def shutdown(self) -> None:
@@ -341,9 +353,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             if model.artifact_ref is None:
                 if self._shown_presentation is not None:
                     self._shown_presentation = None
-                    self._source_pixmap = None
                     self._raster.clear()
-                    self._raster.setText("No FINAL result")
                 if model.projection_summary is None:
                     self._projection.setText("Display: waiting for scan preparation")
             else:
@@ -352,40 +362,21 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._projection.setText(f"Display: {presentation.projection_summary}")
         if presentation is self._shown_presentation:
             return
-        pixmap = QtGui.QPixmap()
-        if not pixmap.loadFromData(presentation.png_bytes, "PNG"):
-            self._diagnostics.setText("Qt rejected the worker-produced PNG raster")
+        try:
+            self._raster.present_encoded(
+                presentation.png_bytes,
+                image_format="PNG",
+            )
+        except BaseException as error:
+            self._diagnostics.setText(
+                f"Qt rejected the worker-produced PNG raster: {error}"
+            )
             return
         self._shown_presentation = presentation
-        self._source_pixmap = pixmap
-        self._scale_pixmap()
-
-    def _scale_pixmap(self) -> None:
-        if self._source_pixmap is None:
-            return
-        target = self._raster.size()
-        if (
-            target.width() > self._source_pixmap.width()
-            or target.height() > self._source_pixmap.height()
-        ):
-            target = QtCore.QSize(
-                min(target.width(), self._source_pixmap.width()),
-                min(target.height(), self._source_pixmap.height()),
-            )
-        self._raster.setPixmap(
-            self._source_pixmap.scaled(
-                target,
-                QtCore.Qt.KeepAspectRatio,
-                QtCore.Qt.SmoothTransformation,
-            )
-        )
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._scale_pixmap()
 
     def closeEvent(self, event) -> None:
         if self._allow_close:
+            release_window(self)
             event.accept()
             return
         event.ignore()
@@ -397,16 +388,15 @@ def open_scan_workbench(
     experiment: Experiment,
     request: ScanRequest | OccupancyScanRequest,
 ) -> ScanWorkbenchWindow:
-    application = QtWidgets.QApplication.instance()
-    owns_application = application is None
-    if application is None:
-        application = QtWidgets.QApplication([])
+    application = ensure_qt_app()
     if QtCore.QThread.currentThread() != application.thread():
         raise RuntimeError("scan Workbench must be opened on the Qt GUI thread")
+    set_fluent_scale(None)
     window = ScanWorkbenchWindow(experiment, request)
-    if owns_application:
-        window._application_owner = application
+    window.resize(screen_fit_window_size(WINDOW_SCREEN_FRACTION))
+    retain_window(window)
     window.show()
+    center_window_on_primary_screen(window, application)
     return window
 
 

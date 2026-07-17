@@ -37,7 +37,7 @@ from PyQt5 import QtCore, QtWidgets
 
 from ..neutral_atom.core.params import DEVICE_REF_PREFIX
 from .param_widgets import PARAM_WIDGETS, ParamWidgetContext, RateLimitedApply, format_reading
-from .qt_fluent import (
+from zlc_frontend.qt_widgets import (
     ACCENT,
     GREEN,
     GREY,
@@ -61,7 +61,7 @@ from .qt_fluent import (
     FluentSwitch,
     FluentTabWidget,
     batched_updates,
-    _popup_gap,
+    popup_gap,
     ensure_qt_app,
     launch_fluent_window,
     MUTED_LABEL_STYLE,
@@ -76,14 +76,14 @@ from .qt_fluent import (
 )
 
 #: The device manager + viewer open at the SAME screen fraction as the pulse editor and task
-#: console (``qt_fluent.WINDOW_SCREEN_FRACTION``) -- one shared screen-fit rule, not a cramped
+#: console (``qt_widgets.WINDOW_SCREEN_FRACTION``) -- one shared screen-fit rule, not a cramped
 #: fixed box.  ``_fluent_window_size()`` resolves it to a (w, h) tuple for ``launch_fluent_window``.
 WINDOW_RATIO = WINDOW_SCREEN_FRACTION
 
 
 def _fluent_window_size() -> tuple:
     """Screen-fit initial size for the manager + viewer windows, via the ONE shared
-    ``qt_fluent.screen_fit_window_size`` rule (the pulse editor / task console use the same), so
+    ``qt_widgets.screen_fit_window_size`` rule (the pulse editor / task console use the same), so
     the config editor opens as large as those GUIs.  Returned as a (w, h) tuple because
     ``launch_fluent_window(size=...)`` indexes it."""
     size = screen_fit_window_size(WINDOW_RATIO)
@@ -991,7 +991,7 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         scroll.setWidgetResizable(True)
         v.addWidget(scroll, 1)
         popup.setFixedSize(scaled_px(340), scaled_px(360))
-        popup.move(anchor.mapToGlobal(QtCore.QPoint(0, anchor.height() + _popup_gap())))
+        popup.move(anchor.mapToGlobal(QtCore.QPoint(0, anchor.height() + popup_gap())))
         popup.show()
 
     # ------------------------------------------------------------------ config file actions

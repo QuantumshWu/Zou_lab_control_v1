@@ -1,23 +1,15 @@
-"""Notebook plotting style for Zou lab front-end figures."""
+"""The sole Matplotlib/render style owner for current and migrating frontends."""
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+import threading
 from types import MappingProxyType
 from typing import Any, Iterator, Mapping
 
 import matplotlib
 from matplotlib import font_manager as fm
-
-try:
-    from IPython import get_ipython
-    from IPython.display import HTML, display
-except Exception:  # pragma: no cover - only absent outside IPython.
-    get_ipython = None
-    HTML = None
-    display = None
-
 
 NEW_BLACK = "black"
 FONT_PATH = Path(__file__).resolve().parent / "assets" / "helvetica-light-587ebe5a59211.ttf"
@@ -30,10 +22,10 @@ if FONT_PATH.exists():
     except Exception:
         _FONT_NAME = None
 
-SANS_SERIF = ([_FONT_NAME] if _FONT_NAME else []) + ["Arial"]
+SANS_SERIF = ((_FONT_NAME,) if _FONT_NAME else ()) + ("Arial",)
 
 # --------------------------------------------------------------------------- #
-# Geometry design tokens.  style.py is the lowest-level frontend module (no
+# Geometry design tokens.  render_style.py is the lowest-level Matplotlib module (no
 # internal imports), so the ONE stock-figure geometry + the ONE design dpi live
 # here and every other module (canvas.FigureSpec, live's panel/pulse specs) reads
 # them -- a value is written ONCE and never re-typed, so nothing can drift.
@@ -53,10 +45,10 @@ STOCK_MARGINS_PX = (110, 110, 100, 40)    # confocal stock margins (L, R, B, T)
 
 # Stock figure size in inches = (data + L + R, data + B + T) / dpi.  Derived, so
 # it can never disagree with FigureSpec's defaults (which read the same tokens).
-_STOCK_FIGSIZE = [
+_STOCK_FIGSIZE = (
     (STOCK_DATA_PX[0] + STOCK_MARGINS_PX[0] + STOCK_MARGINS_PX[1]) / DESIGN_DPI,
     (STOCK_DATA_PX[1] + STOCK_MARGINS_PX[2] + STOCK_MARGINS_PX[3]) / DESIGN_DPI,
-]
+)
 
 # The ONE typography/dpi system.  The mutable dict is PRIVATE so the owned
 # defaults can never be mutated in place from outside (the public name below is
@@ -113,34 +105,7 @@ _DEFAULT_STYLE: dict[str, Any] = {
 
 # Public, READ-ONLY view of the owned style (mutating it raises TypeError).
 DEFAULT_STYLE: Mapping[str, Any] = MappingProxyType(_DEFAULT_STYLE)
-
-
-def use_widget_backend() -> None:
-    """Switch Matplotlib to the Jupyter widget backend."""
-    if get_ipython is None:
-        raise RuntimeError("IPython is not available.")
-    ip = get_ipython()
-    if ip is None:
-        raise RuntimeError("No active IPython shell is available.")
-    ip.run_line_magic("matplotlib", "widget")
-
-
-def enable_long_output() -> None:
-    """Remove notebook output scroll boxes when the frontend supports it."""
-    if display is None or HTML is None:
-        return
-    display(
-        HTML(
-            """
-            <style>
-            .output_scroll {
-                height: auto !important;
-                max-height: none !important;
-            }
-            </style>
-            """
-        )
-    )
+_MATPLOTLIB_COMPOSE_LOCK = threading.RLock()
 
 
 def apply_style(overrides: Mapping[str, Any] | None = None) -> None:
@@ -148,17 +113,25 @@ def apply_style(overrides: Mapping[str, Any] | None = None) -> None:
     style = dict(_DEFAULT_STYLE)
     if overrides:
         style.update(dict(overrides))
-    matplotlib.rcParams.update(style)
+    with _MATPLOTLIB_COMPOSE_LOCK:
+        matplotlib.rcParams.update(style)
 
 
 @contextmanager
 def style_context(overrides: Mapping[str, Any] | None = None) -> Iterator[None]:
-    """Temporarily apply the front-end plotting style."""
+    """Temporarily apply the style on the single product Matplotlib compose lane.
+
+    ``matplotlib.rc_context`` mutates process-global rcParams and is not thread-local.  Holding
+    this re-entrant lock for the complete context prevents two product render workers from
+    restoring each other's snapshots out of order.  Direct third-party Matplotlib calls remain
+    outside this product-owned lane and must not mutate rcParams concurrently with a render.
+    """
     style = dict(_DEFAULT_STYLE)
     if overrides:
         style.update(dict(overrides))
-    with matplotlib.rc_context(style):
-        yield
+    with _MATPLOTLIB_COMPOSE_LOCK:
+        with matplotlib.rc_context(style):
+            yield
 
 
 # --------------------------------------------------------------------------- #
@@ -205,7 +178,7 @@ def apply_title(target, title: str, *, pad: float | None = None, size: float | N
 
     One title mechanism, so single-axes plots and figure-level grids never drift
     on title size/position.  Returns the artist, or ``None`` for an empty title.
-    ``size`` overrides the title point size (still read from style.py, never a raw
+    ``size`` overrides the title point size (still read from render_style.py, never a raw
     literal) -- a grid CELL identifies itself with a small ``small_fontsize()`` title
     ABOVE its axes through this SAME mechanism, just smaller, so the site index never
     sits inside the cell's data area.
@@ -229,13 +202,13 @@ _PALETTE: dict[str, Any] = {
     # common 2-5 curve case gets maximally different HUES (blue / orange / green / purple / red ...)
     # -- never two near-identical colours (the old grey + sky-blue + tab:blue were indistinguishable).
     # Guarded by tests/test_series_palette_distinct.py (>=8 colours, pairwise perceptually distinct).
-    "series": ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9", "#666666", "#F0E442"],
+    "series": ("#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9", "#666666", "#F0E442"),
     "line_single": "#808080",  # a lone 1-D curve / rolling trace -- matplotlib 'grey', EXACTLY confocal's repeat=1 line
-    "pulse_cycle": [
+    "pulse_cycle": (
         "#5D7583", "#C37D5A", "#6F8D73", "#A66E87", "#7A6FA4", "#B5A262",
         "#5E9A9A", "#9A765E", "#7890B5", "#8B8B8B", "#B97878", "#679174",
-    ],
-    "bracket_cycle": ["#6A6A6A", "#C96F3D", "#4F7EA8", "#8B6BB8"],
+    ),
+    "bracket_cycle": ("#6A6A6A", "#C96F3D", "#4F7EA8", "#8B6BB8"),
     "hist_fill": "grey",     # histogram / side-distribution bar fill
     "dark": "grey",          # dark population
     "bright": "skyblue",     # bright population
@@ -258,6 +231,34 @@ _PALETTE: dict[str, Any] = {
     "cmap_camera": "gray",
 }
 PALETTE: Mapping[str, Any] = MappingProxyType(_PALETTE)
+
+# Current headless FigureDocument/Agg tokens extend the mature plotting system above; they do
+# not establish a second palette or rcParams owner.  Every renderer imports from this module.
+RENDER_TEXT = NEW_BLACK
+RENDER_BACKGROUND = "#FFFFFF"
+RENDER_GRID = _PALETTE["pulse_grid"]
+FIT_FAILURE_COLOR = "#CD7380"
+FIT_CONTOUR_COLOR = "#FFFFFF"
+FIT_CONTOUR_LINEWIDTH = 0.8
+FIT_LINESTYLE = "--"
+CURVE_LINESTYLE = "-"
+CURVE_MARKER = "o"
+ANNOTATION_FONT_SIZE = "small"
+PULSE_SCAN_REGION_COLOR = "#D69A6E"
+PULSE_SCAN_ANNOTATION_COLOR = "#FFFFFF"
+PULSE_SCAN_ANNOTATION_FONT_SIZE = 3.36
+SERIES_COLORS = tuple(_PALETTE["series"])
+RENDER_RCPARAMS: Mapping[str, Any] = MappingProxyType(dict(_DEFAULT_STYLE))
+
+
+@contextmanager
+def render_style_context() -> Iterator[None]:
+    """Apply the canonical series cycle on the serialized Matplotlib compose lane."""
+
+    from cycler import cycler
+
+    with style_context({"axes.prop_cycle": cycler(color=SERIES_COLORS)}):
+        yield
 
 # Occupancy overlay on a site map: a 2D camera frame with one hollow ring per
 # tweezer -- WHITE/grey for an EMPTY site, a bold warm ring for an OCCUPIED one (the
@@ -304,28 +305,42 @@ def bimodal_fit_line_specs() -> tuple[dict[str, Any], dict[str, Any], dict[str, 
 
 
 __all__ = [
+    "ANNOTATION_FONT_SIZE",
     "bimodal_fit_line_specs",
+    "CURVE_LINESTYLE",
+    "CURVE_MARKER",
     "DEFAULT_STYLE",
     "DESIGN_DPI",
+    "FIT_CONTOUR_COLOR",
+    "FIT_CONTOUR_LINEWIDTH",
     "HIST_FILL_ALPHA",
+    "FIT_FAILURE_COLOR",
+    "FIT_LINESTYLE",
     "FONT_PATH",
     "NEW_BLACK",
     "PALETTE",
     "PANEL_DISPLAY_SCALE",
+    "PULSE_SCAN_ANNOTATION_COLOR",
+    "PULSE_SCAN_ANNOTATION_FONT_SIZE",
+    "PULSE_SCAN_REGION_COLOR",
+    "RENDER_BACKGROUND",
+    "RENDER_GRID",
+    "RENDER_RCPARAMS",
+    "RENDER_TEXT",
     "SANS_SERIF",
+    "SERIES_COLORS",
     "SITE_OCCUPANCY_STYLE",
     "STOCK_DATA_PX",
     "STOCK_MARGINS_PX",
     "apply_style",
     "apply_title",
     "axis_label_fontsize",
-    "enable_long_output",
     "small_fontsize",
     "smaller_fontsize",
+    "render_style_context",
     "style_context",
     "threshold_line_kwargs",
     "tick_fontsize",
     "title_fontsize",
-    "use_widget_backend",
 ]
 

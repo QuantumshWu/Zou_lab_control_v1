@@ -13,7 +13,7 @@
 
 \begin{description}
   \item[main（本手册）] 系统架构、neutral\_atom 的 session/devices/timing 分层、\pyapi{PulseSequence} 与 \pyapi{PulseTableState} 的区别、sequencer 生命周期、真实硬件 runbook，以及全新的 N-slot 扫描模型。
-  \item[frontend] GUI 与绘图：\pyapi{qt_fluent} 控件库、脉冲编辑器三个标签页、按字段扫描点工作流、绘图 API 与 PDF 渲染。见 \filepath{docs/frontend_manual/}。
+  \item[frontend] GUI 与绘图：\pyapi{zlc_frontend.qt_widgets} 控件库、脉冲编辑器三个标签页、按字段扫描点工作流、绘图 API 与 PDF 渲染。见 \filepath{docs/frontend_manual/}。
   \item[fpga] pulse-streamer 硬件：Artix-7 35T 上的 edge-table RTL、1-tick FIFO 预取流水线、2-bank 流式扫描窗口、N-slot 仿射扫描引擎、模拟总线 DAC 引擎、JTAG-to-AXI 上传流程与资源预算。见 \filepath{docs/fpga_manual/}。
   \item[device] 设备与实验：设备配置/加载、相机采集、相机读出原理（sitemap/thresholds/detect）、标定与结果对象、完整实验流程。见 \filepath{docs/device_manual/}。
 \end{description}

@@ -1,4 +1,4 @@
-"""Reusable PyQt Fluent-style widgets for Zou_lab_control frontends.
+"""Reusable PyQt Fluent-style widgets for the current frontend.
 
 The visual constants and widget shapes follow the original Confocal_GUIv2
 Fluent layer: pale blue accent, Segoe UI text, white cards, small radii, and
@@ -13,8 +13,56 @@ import math
 import os
 import re
 import sys
+import threading
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+from .style import (
+    ACCENT,
+    API_VIOLET,
+    API_VIOLET_DARK,
+    AUTO_SCALE_BASIS,
+    AUTO_SCALE_MARGIN,
+    BG,
+    CARD_PAD,
+    CARD_TITLE_PX,
+    COMBO_TRI_SIZE,
+    COMBO_WIDTH,
+    DIVIDER,
+    EDIT_PADDING_H,
+    FLUENT_SCALE_MAX,
+    FLUENT_SCALE_MIN,
+    FONT,
+    FONT_SIZE,
+    GREEN,
+    GREY,
+    HINT,
+    HOVER,
+    MUTED_LABEL_STYLE,
+    ORANGE,
+    ORANGE_DARK,
+    ORANGE_TINT,
+    PADDING_H,
+    PADDING_V,
+    PLACEHOLDER,
+    RADIUS,
+    RED,
+    STEP_WIDTH,
+    TEXT,
+    TITLE_LEFT_INSET,
+    WINDOW_FALLBACK_MIN_PX,
+    WINDOW_FALLBACK_PX,
+    WINDOW_MARGIN_FLOOR_PX,
+    WINDOW_MARGIN_PX,
+    WINDOW_MAX_FLOOR_PX,
+    WINDOW_MIN_FLOOR_PX,
+    WINDOW_MIN_PX,
+    WINDOW_PAD,
+    WINDOW_SCREEN_FRACTION,
+    WINDOW_TITLEBAR_FLOOR_PX,
+    WINDOW_TITLEBAR_PX,
+    YELLOW,
+)
 
 try:  # Provided by the PyQt5-Frameless-Window distribution (module qframelesswindow).
     from qframelesswindow import FramelessWindow, StandardTitleBar
@@ -35,74 +83,14 @@ except ImportError:  # pragma: no cover - depends on the desktop package.
     StandardTitleBar = None
 
 
-ACCENT = "#77AADD"
-HOVER = "#004578"
-BG = "#F3F3F3"
-TEXT = "#323130"
-HINT = "#F0a150"
-PLACEHOLDER = "#A19F9D"
-# Light neutral hairline that delineates every flat fluent card (a painted 1 px border, no drop
-# shadow -- shadows were costly to re-rasterise + blur on every repaint; see stroke_card_border).
-DIVIDER = "#E1DFDD"
-GREEN = "#7FC2AD"
-RED = "#CD7380"
-ORANGE = "#D69A6E"
-# A scan-bound field is painted a pale orange so the saturated-orange scan dot
-# (the inline spinbox-style button) stands out against it instead of vanishing.
-ORANGE_TINT = "#F6E3D4"
-ORANGE_DARK = "#8A4B1F"
-# API-slot (a1/a2...) marker palette -- a VIOLET distinct from the orange scan colour, so
-# the two slot kinds never read alike.  Unlike a scan slot, an API slot does NOT hide the
-# field value, so there is no tint/fill: only a violet dot + a thin violet border mark it.
-API_VIOLET = "#9B86C9"
-API_VIOLET_DARK = "#5A4A8A"
-YELLOW = "#E5C85B"
-GREY = "#A2A2A2"
-#: The muted-note stylesheet fragment (grey text, no fill, no border) shared by every greyed status /
-#: note label -- the ONE spelling so the muted look can never drift.  ``muted_note_label`` extends it
-#: with the body font; a font-less status line applies it bare.
-MUTED_LABEL_STYLE = f"color: {GREY}; background: transparent; border: none;"
-RADIUS = 4
-# A "card" = FluentGroupBox: it reserves a CARD_TITLE_PX-tall strip at the top for the grey
-# QGroupBox::title chip, and insets its content by CARD_PAD on the L / R / bottom edges.  These
-# are the card's FORMAT and live HERE in the component library (the single source) -- callers
-# place content in a card and read these tokens; they never hand-pick card padding themselves.
-CARD_TITLE_PX = 32
-CARD_PAD = 10
-FONT = "Segoe UI"
-FONT_SIZE = 12
-PADDING_V = 1
-PADDING_H = 1
-EDIT_PADDING_H = 4
-# WINDOW_PAD: the ONE window content-padding / spacing unit.  EVERY GUI insets its window body by
-# ``window_pad(1)`` on all FOUR sides (so the padding to every window edge is identical and equal
-# left/right/top/bottom), and inter-card gaps are ``window_pad`` multiples (0.5x / 1x / 2x) -- so all
-# GUIs share one rhythm.  A card's left edge therefore lines up with the window-title text, because
-# FluentWindow pins the title to this same column (see ``_position_window_title``).  Change the rhythm
-# in ONE place here; never hand-pick a window margin or a top-level card gap in a GUI module.
-WINDOW_PAD = 14
-
-
 def window_pad(mult: float = 1.0) -> int:
     """The window padding / card-gap at ``mult`` x the single :data:`WINDOW_PAD` unit, display-scaled."""
     return scaled_px(round(WINDOW_PAD * mult))
 
 
-# The window title pins to the same left column as the body content (one shared left edge).
-TITLE_LEFT_INSET = WINDOW_PAD
-COMBO_WIDTH = 16
-COMBO_TRI_SIZE = 8
-STEP_WIDTH = 6
-
 _QT_APP = None
 _QT_LOOP_ENABLED = False
 _FLUENT_SCALE = 1.0
-# The fluent scale is clamped to a usable band: below the min the controls become
-# unreadable, above the max they waste space.  ONE source -- set_fluent_scale and
-# the scale-sharing contract test both read these (the test must not re-type the
-# band, or the two could silently disagree).
-FLUENT_SCALE_MIN = 0.72
-FLUENT_SCALE_MAX = 1.25
 # Matches one float token; used by align_to_resolution to snap numbers inside a value.
 _FLOAT_TOKEN_RE = re.compile(r"(?<![A-Za-z_])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 
@@ -115,31 +103,6 @@ def fluent_scale() -> float:
 # into the primary screen's available geometry.  EVERY GUI window must resolve
 # its automatic scale through this ONE rule -- two windows on the same screen
 # must end up with identical control sizes (pulse editor == task console).
-_AUTO_SCALE_BASIS = (1280, 790)
-_AUTO_SCALE_MARGIN = (48, 88)
-
-# Initial-window sizing for the two top-level GUIs (task console + pulse editor).
-# Both windows fit themselves to the screen with the SAME rule; it used to be
-# copied verbatim into each file (every literal duplicated), so a tweak in one
-# silently diverged the other.  These are the ONE source -- see
-# screen_fit_window_size below.  (height, width) where a pair is (w, h).
-_WINDOW_FALLBACK_PX = (1280, 760)       # size when no screen can be queried
-_WINDOW_FALLBACK_MIN_PX = (960, 620)    # scaled_px floor for the fallback
-_WINDOW_MIN_PX = (980, 640)             # minimum window before clamping to screen
-_WINDOW_MIN_FLOOR_PX = (820, 560)       # scaled_px floor for that minimum
-_WINDOW_MARGIN_PX = (40, 48)            # (w, h) breathing room left around the screen
-_WINDOW_MARGIN_FLOOR_PX = (28, 32)      # scaled_px floor for those margins
-_WINDOW_TITLEBAR_PX = 36                # title-bar height allowance
-_WINDOW_TITLEBAR_FLOOR_PX = 28          # scaled_px floor for the title bar
-_WINDOW_MAX_FLOOR_PX = (360, 320)       # absolute (w, h) floor for the screen-fit max
-
-#: The fraction of the primary screen each top-level GUI (task console + pulse editor) opens at.
-#: ONE editable knob both windows read through ``screen_fit_window_size``, so they open the SAME
-#: size on the same screen (it used to be 0.90 in the pulse editor but a stray 0.84 in the console).
-#: User-tunable, like the other uppercase constants in this module.
-WINDOW_SCREEN_FRACTION = 0.90
-
-
 def resolve_fluent_auto_scale(app: QtWidgets.QApplication | None = None) -> float:
     """The shared automatic fluent scale for the current primary screen."""
 
@@ -148,8 +111,8 @@ def resolve_fluent_auto_scale(app: QtWidgets.QApplication | None = None) -> floa
     if screen is None:
         return 1.0
     available = screen.availableGeometry()
-    basis_w, basis_h = _AUTO_SCALE_BASIS
-    margin_w, margin_h = _AUTO_SCALE_MARGIN
+    basis_w, basis_h = AUTO_SCALE_BASIS
+    margin_w, margin_h = AUTO_SCALE_MARGIN
     return min(
         1.0,
         max(0.1, (available.width() - margin_w) / basis_w),
@@ -209,16 +172,16 @@ def screen_fit_window_size(window_ratio: float) -> QtCore.QSize:
     screen = app.primaryScreen() if app is not None else None
     if screen is None:
         return QtCore.QSize(
-            scaled_px(_WINDOW_FALLBACK_PX[0], minimum=_WINDOW_FALLBACK_MIN_PX[0]),
-            scaled_px(_WINDOW_FALLBACK_PX[1], minimum=_WINDOW_FALLBACK_MIN_PX[1]))
+            scaled_px(WINDOW_FALLBACK_PX[0], minimum=WINDOW_FALLBACK_MIN_PX[0]),
+            scaled_px(WINDOW_FALLBACK_PX[1], minimum=WINDOW_FALLBACK_MIN_PX[1]))
     available = screen.availableGeometry()
-    titlebar_allowance = scaled_px(_WINDOW_TITLEBAR_PX, minimum=_WINDOW_TITLEBAR_FLOOR_PX)
-    margin_w = scaled_px(_WINDOW_MARGIN_PX[0], minimum=_WINDOW_MARGIN_FLOOR_PX[0])
-    margin_h = scaled_px(_WINDOW_MARGIN_PX[1], minimum=_WINDOW_MARGIN_FLOOR_PX[1])
-    max_w = max(_WINDOW_MAX_FLOOR_PX[0], available.width() - margin_w)
-    max_h = max(_WINDOW_MAX_FLOOR_PX[1], available.height() - titlebar_allowance - margin_h)
-    min_w = min(scaled_px(_WINDOW_MIN_PX[0], minimum=_WINDOW_MIN_FLOOR_PX[0]), max_w)
-    min_h = min(scaled_px(_WINDOW_MIN_PX[1], minimum=_WINDOW_MIN_FLOOR_PX[1]), max_h)
+    titlebar_allowance = scaled_px(WINDOW_TITLEBAR_PX, minimum=WINDOW_TITLEBAR_FLOOR_PX)
+    margin_w = scaled_px(WINDOW_MARGIN_PX[0], minimum=WINDOW_MARGIN_FLOOR_PX[0])
+    margin_h = scaled_px(WINDOW_MARGIN_PX[1], minimum=WINDOW_MARGIN_FLOOR_PX[1])
+    max_w = max(WINDOW_MAX_FLOOR_PX[0], available.width() - margin_w)
+    max_h = max(WINDOW_MAX_FLOOR_PX[1], available.height() - titlebar_allowance - margin_h)
+    min_w = min(scaled_px(WINDOW_MIN_PX[0], minimum=WINDOW_MIN_FLOOR_PX[0]), max_w)
+    min_h = min(scaled_px(WINDOW_MIN_PX[1], minimum=WINDOW_MIN_FLOOR_PX[1]), max_h)
     desired_w = min(max_w, int(available.width() * window_ratio))
     desired_h = min(max_h, int(available.height() * window_ratio) - titlebar_allowance)
     return QtCore.QSize(max(min_w, desired_w), max(min_h, desired_h))
@@ -241,8 +204,29 @@ def center_window_on_primary_screen(window: QtWidgets.QWidget, app: QtWidgets.QA
     window.move(frame.topLeft())
 
 
+def release_window(window: QtWidgets.QWidget) -> None:
+    """Release one top-level window from the shared application retention registry.
+
+    Current workbench windows close asynchronously and intentionally remain ordinary
+    ``QWidget`` instances (they do not opt into ``WA_DeleteOnClose``).  Consequently a
+    successful ``close()`` can hide a window without emitting ``destroyed``.  Their committed
+    close path must call this function after worker/resource shutdown so the application does
+    not retain an otherwise dead board forever.  The operation is idempotent.
+    """
+
+    app = QtWidgets.QApplication.instance()
+    registry = None if app is None else getattr(app, "_zlc_retained_windows", None)
+    if registry is None:
+        return
+    while True:
+        try:
+            registry.remove(window)
+        except ValueError:
+            return
+
+
 def retain_window(window: QtWidgets.QWidget, *extras) -> None:
-    """Keep a launched top-level GUI ``window`` alive on the QApplication, pruned when it dies.
+    """Keep a launched top-level GUI ``window`` alive until its committed close.
 
     The ``show_*`` launchers (task console / pulse editor / figure viewer) must hold a Python
     reference to the window they open -- a notebook cell often drops the return value, and with
@@ -256,6 +240,8 @@ def retain_window(window: QtWidgets.QWidget, *extras) -> None:
     * a genuine close (the ``closed`` signal, when the window has one) also removes it -- but
       ONLY for windows that really close on X.  ``hide_on_close`` windows hide instead and MUST
       stay retained, so a later session call restores the SAME interface.
+    * asynchronous workbench windows explicitly call :func:`release_window` only after their
+      cancellation/reap/worker shutdown protocol has reached its committed close.
 
     ``extras`` are for objects the caller needs kept alive that the window does NOT own; they
     ride the window's lifetime.  A widget the window parents (``FluentWindow(widget=...)``
@@ -270,22 +256,21 @@ def retain_window(window: QtWidgets.QWidget, *extras) -> None:
         app._zlc_retained_windows = registry
     if extras:
         window._zlc_retained_extras = tuple(extras)   # live and die with the window
-    registry.append(window)
+    if window not in registry:
+        registry.append(window)
 
     def _prune(*_args) -> None:
-        try:
-            registry.remove(window)
-        except ValueError:
-            pass  # already pruned (e.g. destroyed after a genuine close)
+        release_window(window)
 
     window.destroyed.connect(_prune)
     closed = getattr(window, "closed", None)
-    if closed is not None and not getattr(window, "_hide_on_close", False):
+    connect_closed = getattr(closed, "connect", None)
+    if callable(connect_closed) and not getattr(window, "_hide_on_close", False):
         def _prune_committed_close(*_args) -> None:
             if getattr(window, "_zlc_close_committed", True):
                 _prune()
 
-        closed.connect(_prune_committed_close)
+        connect_closed(_prune_committed_close)
 
 
 def fluent_font_size() -> int:
@@ -304,7 +289,7 @@ def _radius() -> int:
     return scaled_px(RADIUS)
 
 
-def _popup_gap() -> int:
+def popup_gap() -> int:
     """The few-px OUTER gap a Fluent popup sits OFF the control that anchored it -- the ONE source for
     every below-the-anchor Fluent surface: the FluentComboBox drop-down, the Setting FluentPopup, the
     FluentTabWidget overflow menu, the FluentLineEdit context menu.  Sharing this is what makes the
@@ -339,17 +324,23 @@ def _enable_ipython_qt_loop() -> None:
 
 
 def ensure_qt_app() -> QtWidgets.QApplication:
-    """Return a QApplication, creating and keeping one alive when needed.
+    """Return the owner-thread QApplication, creating it only on Python's main thread.
 
     Also enables the IPython Qt event loop (``%gui qt``) when running in a notebook, so a window
-    opened from a cell stays live instead of hanging blank."""
+    opened from a cell stays live instead of hanging blank.  The thread check happens *before*
+    first creation: otherwise a worker can create the application itself and a later
+    ``currentThread() == app.thread()`` check falsely declares that worker to be the GUI owner."""
 
     global _QT_APP
     app = QtWidgets.QApplication.instance()
     if app is not None:
+        if QtCore.QThread.currentThread() != app.thread():
+            raise RuntimeError("Qt UI operations must run on the QApplication owner thread")
         _QT_APP = app
         _enable_ipython_qt_loop()
         return app
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("QApplication must be created on the Python main thread")
     if hasattr(QtCore.Qt, "AA_EnableHighDpiScaling"):
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     if hasattr(QtCore.Qt, "AA_UseHighDpiPixmaps"):
@@ -1267,6 +1258,7 @@ class FluentPathEdit(QtWidgets.QWidget):
     treat it exactly like a ``FluentLineEdit``."""
 
     changed = QtCore.pyqtSignal(str)
+    selected = QtCore.pyqtSignal(str)
 
     def __init__(self, text: str = "", *, mode: str = "file", caption: str = "Choose",
                  file_filter: str = "All files (*)", base_dir: str = "", parent=None):
@@ -1305,6 +1297,7 @@ class FluentPathEdit(QtWidgets.QWidget):
             picked, _ = QtWidgets.QFileDialog.getOpenFileName(self, self._caption, start, self._filter)
         if picked:
             self.edit.setText(picked)   # fires textChanged -> changed
+            self.selected.emit(picked)
 
     def _dialog_start(self) -> str:
         """Where the Browse dialog opens: the current path if it's a real file/dir or sits in
@@ -1333,6 +1326,9 @@ class FluentPathEdit(QtWidgets.QWidget):
 
     def setText(self, text: str) -> None:  # noqa: N802 - Qt API name
         self.edit.setText("" if text is None else str(text))
+
+    def clear(self) -> None:
+        self.edit.clear()
 
     def setPlaceholderText(self, text: str) -> None:  # noqa: N802 - Qt API name
         self.edit.setPlaceholderText(str(text))
@@ -1540,7 +1536,17 @@ class _FluentMessageDialog(QtWidgets.QDialog):
     and centres on its parent.  ``fluent_message`` is the ONE entry point -- use it in place of
     ``QMessageBox.information`` / ``.warning``."""
 
-    def __init__(self, parent, title: str, text: str, *, kind: str = "info"):
+    def __init__(
+        self,
+        parent,
+        title: str,
+        text: str,
+        *,
+        kind: str = "info",
+        confirm: bool = False,
+        confirm_text: str = "Confirm",
+        cancel_text: str = "Cancel",
+    ):
         super().__init__(parent, QtCore.Qt.FramelessWindowHint | QtCore.Qt.Dialog)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
         self.setModal(True)
@@ -1562,11 +1568,22 @@ class _FluentMessageDialog(QtWidgets.QDialog):
         outer.addWidget(body)
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
-        # A warning wears the ORANGE accent (the same destructive/attention hue Remove uses); a plain
-        # info uses the resting ACCENT -- the ONE palette, never a new colour.
-        ok = FluentButton("OK", color=(ORANGE if str(kind) == "warning" else ACCENT))
-        ok.clicked.connect(self.accept)
-        row.addWidget(ok)
+        if confirm:
+            cancel = FluentButton(str(cancel_text), color=GREY)
+            cancel.clicked.connect(self.reject)
+            row.addWidget(cancel)
+            accept = FluentButton(
+                str(confirm_text),
+                color=(ORANGE if str(kind) == "warning" else ACCENT),
+            )
+            accept.clicked.connect(self.accept)
+            row.addWidget(accept)
+        else:
+            # A warning wears the ORANGE accent (the same destructive/attention hue Remove uses); a
+            # plain info uses the resting ACCENT -- the ONE palette, never a new colour.
+            ok = FluentButton("OK", color=(ORANGE if str(kind) == "warning" else ACCENT))
+            ok.clicked.connect(self.accept)
+            row.addWidget(ok)
         outer.addLayout(row)
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
@@ -1580,16 +1597,45 @@ class _FluentMessageDialog(QtWidgets.QDialog):
         painter.drawRoundedRect(rect, self._radius, self._radius)
 
 
+def _exec_centered_dialog(dialog: QtWidgets.QDialog, parent) -> int:
+    dialog.adjustSize()
+    if parent is not None:
+        centre = parent.mapToGlobal(parent.rect().center())
+        dialog.move(
+            centre.x() - dialog.width() // 2,
+            centre.y() - dialog.height() // 2,
+        )
+    return dialog.exec_()
+
+
 def fluent_message(parent, title: str, text: str, *, kind: str = "info") -> None:
     """Show a modal Fluent message dialog (``kind`` = ``"info"`` | ``"warning"``) -- the ONE on-brand
     replacement for ``QMessageBox.information`` / ``.warning`` (no native frame, no stray app icon).
     Centres on ``parent``.  Blocks until the user clicks OK (or presses Escape)."""
     dlg = _FluentMessageDialog(parent, title, text, kind=kind)
-    dlg.adjustSize()
-    if parent is not None:
-        centre = parent.mapToGlobal(parent.rect().center())
-        dlg.move(centre.x() - dlg.width() // 2, centre.y() - dlg.height() // 2)
-    dlg.exec_()
+    _exec_centered_dialog(dlg, parent)
+
+
+def fluent_confirm(
+    parent,
+    title: str,
+    text: str,
+    *,
+    confirm_text: str = "Confirm",
+    cancel_text: str = "Cancel",
+    kind: str = "warning",
+) -> bool:
+    """Ask one modal yes/no question with the shared Fluent chrome."""
+    dlg = _FluentMessageDialog(
+        parent,
+        title,
+        text,
+        kind=kind,
+        confirm=True,
+        confirm_text=confirm_text,
+        cancel_text=cancel_text,
+    )
+    return _exec_centered_dialog(dlg, parent) == QtWidgets.QDialog.Accepted
 
 
 #: Max rows a Fluent drop-down shows before it SCROLLS (the shared fluent scrollbar) -- one source for
@@ -1638,7 +1684,7 @@ class FluentComboBox(QtWidgets.QComboBox):
         view_palette.setColor(QtGui.QPalette.Window, QtCore.Qt.transparent)
         view.setPalette(view_palette)
         self.setView(view)
-        self._gap = _popup_gap()   # the ONE Fluent popup outer-gap (shared with the overflow menu, etc.)
+        self._gap = popup_gap()   # the ONE Fluent popup outer-gap (shared with the overflow menu, etc.)
         # Configure the drop-down's top-level container NOW (setView created it but it
         # is not shown yet) -- WA_TranslucentBackground only takes effect if it is set
         # BEFORE the native window is created, so this cannot wait until showPopup.
@@ -2331,14 +2377,14 @@ class FluentTabWidget(QtWidgets.QTabWidget):
 
     def _show_overflow_menu(self) -> None:
         """Pop the overflow list below the ``...`` button -- the single overflow navigation,
-        in place of left/right scroll arrows.  It sits the SAME few-px ``_popup_gap`` off the button
+        in place of left/right scroll arrows.  It sits the SAME few-px ``popup_gap`` off the button
         that the combo drop-down / Setting popup use below THEIR anchor, so the overflow list reads as
         one of the family instead of flush against the tab strip.  (A ``QMenu.exec_`` position is the
         top-left Qt honours as-is -- unlike a combo popup, it is NOT re-flushed -- so the gap goes
         straight into the anchor point; no Move-event filter is needed here.)"""
         menu = self._overflow_menu()
         btn = self._overflow_btn
-        menu.exec_(btn.mapToGlobal(QtCore.QPoint(0, btn.height() + _popup_gap())))
+        menu.exec_(btn.mapToGlobal(QtCore.QPoint(0, btn.height() + popup_gap())))
 
     def resizeEvent(self, event):  # noqa: N802 - Qt naming
         super().resizeEvent(event)
@@ -2548,10 +2594,12 @@ class FluentSpinBox(_WheelFocusGuardMixin, QtWidgets.QSpinBox):
 
 
 class FluentInputDialog(QtWidgets.QDialog):
-    """Small Confocal-style numeric input dialog used by step editors."""
+    """Small Fluent input dialog; the historical numeric API remains intact."""
 
-    def __init__(self, prompt: str, default: float, parent=None):
+    def __init__(self, prompt: str, default: float | str, parent=None, *, title: str = ""):
         super().__init__(parent, QtCore.Qt.WindowTitleHint | QtCore.Qt.WindowCloseButtonHint)
+        if title:
+            self.setWindowTitle(str(title))
         self.setFont(QtGui.QFont(FONT, fluent_font_size()))
         self.setStyleSheet("QDialog { background: white; }")
         layout = QtWidgets.QVBoxLayout(self)
@@ -2565,7 +2613,7 @@ class FluentInputDialog(QtWidgets.QDialog):
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addStretch()
         ok = FluentButton("OK", self)
-        cancel = FluentButton("Cancel", self)
+        cancel = FluentButton("Cancel", self, color=GREY)
         ok.clicked.connect(self.accept)
         cancel.clicked.connect(self.reject)
         btn_row.addWidget(ok)
@@ -2579,6 +2627,23 @@ class FluentInputDialog(QtWidgets.QDialog):
             except ValueError:
                 return None, False
         return None, False
+
+    def getText(self) -> tuple[str, bool]:
+        """Return the unmodified edit buffer and whether the user committed it."""
+        if self.exec_() == QtWidgets.QDialog.Accepted:
+            return self._edit.text(), True
+        return "", False
+
+
+def fluent_text_prompt(
+    parent,
+    title: str,
+    prompt: str,
+    *,
+    text: str = "",
+) -> tuple[str, bool]:
+    """Request one line of text through the shared Fluent input surface."""
+    return FluentInputDialog(prompt, text, parent, title=title).getText()
 
 
 class FluentCodeEdit(QtWidgets.QPlainTextEdit):
@@ -2655,10 +2720,26 @@ class FluentFloatingEditor(QtWidgets.QDialog):
 
 
 class FluentDoubleSpinBox(_WheelFocusGuardMixin, QtWidgets.QDoubleSpinBox):
-    """Confocal_GUIv2-style double spinbox with an inline step editor."""
+    """Confocal_GUIv2-style double spinbox with an inline step editor.
 
-    def __init__(self, length=5, allow_minus: bool = False, parent=None):
+    The historical control intentionally rounds values to ``length`` significant display
+    characters.  That remains the default for presentation-oriented settings.  Physical pulse
+    values must instead pass ``quantize_to_display=False``: the same Fluent styling and step
+    editor are retained, while Qt's full stored ``double`` is never replaced by a shortened
+    display string.  Visual reuse must not become an authority-changing numeric transform.
+    """
+
+    def __init__(
+        self,
+        length=5,
+        allow_minus: bool = False,
+        parent=None,
+        *,
+        quantize_to_display: bool = True,
+    ):
+        self._quantize_to_display = True
         super().__init__(parent)
+        self._quantize_to_display = bool(quantize_to_display)
         self._install_wheel_focus_guard()
         self.setButtonSymbols(QtWidgets.QAbstractSpinBox.PlusMinus)
         self.setMinimumHeight(scaled_px(30, minimum=22))
@@ -2693,17 +2774,23 @@ class FluentDoubleSpinBox(_WheelFocusGuardMixin, QtWidgets.QDoubleSpinBox):
             self.setRange(10 ** -(self.length - 2), 10**self.length - 1)
         self.setSingleStep(1)
         self.setDecimals(self.length - 2)
-        self.lineEdit().setMaxLength(self.length)
+        if self._quantize_to_display:
+            self.lineEdit().setMaxLength(self.length)
 
     def setValue(self, value: float) -> None:
-        rounded = float(_confocal_float2str(value, length=self.length))
-        super().setValue(rounded)
+        if self._quantize_to_display:
+            value = float(_confocal_float2str(value, length=self.length))
+        super().setValue(value)
 
     def setSingleStep(self, step: float) -> None:
-        rounded = float(_confocal_float2str(step, length=self.length))
-        super().setSingleStep(rounded)
+        if self._quantize_to_display:
+            step = float(_confocal_float2str(step, length=self.length))
+        super().setSingleStep(step)
 
     def stepBy(self, steps: int) -> None:
+        if not self._quantize_to_display:
+            super().stepBy(steps)
+            return
         current = self.value()
         step = self.singleStep()
         target = float(_confocal_float2str(current + steps * step, length=self.length))
@@ -2711,6 +2798,8 @@ class FluentDoubleSpinBox(_WheelFocusGuardMixin, QtWidgets.QDoubleSpinBox):
             super(FluentDoubleSpinBox, self).setValue(target)
 
     def textFromValue(self, value: float) -> str:
+        if not self._quantize_to_display:
+            return super().textFromValue(value)
         return _confocal_float2str(value, length=self.length)
 
     def resizeEvent(self, event) -> None:
@@ -3435,62 +3524,3 @@ class FluentFormGrid(QtWidgets.QWidget):
             self.grid.addWidget(widget, self._rows, column)
         self._rows += 1
         return cell
-
-
-__all__ = [
-    "ACCENT",
-    "BG",
-    "FONT",
-    "FONT_SIZE",
-    "GREEN",
-    "GREY",
-    "HINT",
-    "HOVER",
-    "ORANGE",
-    "PLACEHOLDER",
-    "RADIUS",
-    "RED",
-    "TEXT",
-    "YELLOW",
-    "FluentButton",
-    "FluentCheckBox",
-    "FluentComboBox",
-    "FluentDoubleSpinBox",
-    "FluentFrame",
-    "FluentGroupBox",
-    "FluentInputDialog",
-    "FluentLabel",
-    "FluentLineEdit",
-    "FluentSpinBox",
-    "FluentSwitch",
-    "FluentTabWidget",
-    "FluentScrollArea",
-    "FluentStatusDot",
-    "FluentWindow",
-    "align_to_resolution",
-    "ensure_qt_app",
-    "fluent_font_size",
-    "fluent_scale",
-    "fluent_scrollbar_stylesheet",
-    "apply_fluent_scrollbars",
-    "fluent_spinbox_stylesheet",
-    "fluent_text_width",
-    "fluent_widget_stylesheet",
-    "format_compact_number",
-    "launch_fluent_window",
-    "retain_window",
-    "resolve_fluent_auto_scale",
-    "scaled_px",
-    "window_pad",
-    "WINDOW_PAD",
-    "set_fluent_scale",
-    "status_dot_stylesheet",
-    "Metrics",
-    "ElidedLabel",
-    "FluentScanDot",
-    "FluentScanLineEdit",
-    "FluentLabeledField",
-    "FluentFormGrid",
-    "measure_text_width",
-    "mark_scan_field",
-]

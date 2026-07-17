@@ -68,7 +68,7 @@ from .task_console import (
     TaskConsoleState,
 )
 
-from .qt_fluent import (
+from zlc_frontend.qt_widgets import (
     CARD_PAD,
     GREY,
     FluentCodeEdit,

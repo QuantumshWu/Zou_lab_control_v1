@@ -133,7 +133,13 @@ def _scan_dot_figure(path: Path) -> Path:
         from PyQt5 import QtWidgets
 
         from .. import devtools as dt
-        from ..qt_fluent import FluentScanLineEdit, Metrics, ensure_qt_app, fluent_scale, set_fluent_scale
+        from zlc_frontend.qt_widgets import (
+            FluentScanLineEdit,
+            Metrics,
+            ensure_qt_app,
+            fluent_scale,
+            set_fluent_scale,
+        )
 
         ensure_qt_app()
         dt.install_screenshot_font()
@@ -168,7 +174,7 @@ def _schematic_axes(figsize):
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
-    from .. import style as S
+    import zlc_frontend.render_style as S
     from ..devtools import install_screenshot_font
 
     install_screenshot_font()

@@ -51,14 +51,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(sys.argv[1:] if argv is None else list(argv))
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
 
-    from PyQt5 import QtCore, QtWidgets
+    from PyQt5 import QtCore
 
     from Zou_lab_control.workbench import (
         open_offline_pulse_workbench,
         open_pulse_workbench,
     )
+    from zlc_frontend.qt_widgets import ensure_qt_app
 
-    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    application = ensure_qt_app()
     experiment = None
     if args.offline:
         from zlc_pulse import load_deployed_pulse_target

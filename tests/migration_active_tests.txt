@@ -47,6 +47,7 @@ tests/test_zlc_data_kernel.py
 tests/test_zlc_data_transform.py
 tests/test_zlc_fit_convenience.py
 tests/test_zlc_frontend_figure.py
+tests/test_zlc_frontend_qt_widgets.py
 tests/test_zlc_occupancy_processor.py
 tests/test_zlc_pulse_authoring.py
 tests/test_zlc_pulse_client.py

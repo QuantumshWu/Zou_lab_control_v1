@@ -46,7 +46,7 @@ from PyQt5 import QtCore, QtWidgets
 
 from Zou_lab_control._paths import display_path
 
-from .qt_fluent import (
+from zlc_frontend.qt_widgets import (
     GREY,
     FluentComboBox,
     FluentDoubleSpinBox,
@@ -579,7 +579,7 @@ def _grey_label(text: str) -> FluentLabel:
 # The grouped-signal-picker helper cluster LIVES HERE (the leaf every form module depends on;
 # task_console / figure_viewer forward-import it).  It used to live in task_console with lazy
 # back-imports from this module -- a cycle that contradicted this file's leaf contract.  Pure
-# Qt-combo utilities: only qt_fluent (FluentTreeComboBox, signals_blocked) + plain data.
+# Qt-combo utilities: only qt_widgets (FluentTreeComboBox, signals_blocked) + plain data.
 
 
 def _common_token_prefix(names) -> str:

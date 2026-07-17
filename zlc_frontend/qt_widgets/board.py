@@ -1,4 +1,4 @@
-"""Optional Qt leaf for one immutable live-image board front."""
+"""Qt widgets for one immutable live-image board front."""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from zlc_storage import canonical_text
 
-from .render import BoardFrame, PixelFormat, detached_render_fault
+from ..render import BoardFrame, PixelFormat, detached_render_fault
+from .style import BG
 
 
 class QtOwnerWake(QtCore.QObject):
@@ -64,9 +65,12 @@ class QtImageBoard(QtWidgets.QWidget):
         self,
         panel_id: str,
         parent: QtWidgets.QWidget | None = None,
+        *,
+        empty_text: str = "",
     ) -> None:
         super().__init__(parent)
         self._panel_id = canonical_text(panel_id, "panel_id")
+        self._empty_text = str(empty_text)
         self._front: tuple[bytes, QtGui.QImage] | None = None
         self.setMinimumSize(64, 64)
 
@@ -95,6 +99,18 @@ class QtImageBoard(QtWidgets.QWidget):
         self._front = prepared
         self.update()
 
+    def present_encoded(self, payload: bytes, *, image_format: str = "PNG") -> None:
+        """Decode one owned display artifact without changing board geometry."""
+        self._require_owner()
+        if not isinstance(payload, bytes):
+            raise TypeError("payload must be owned immutable bytes")
+        image_format = canonical_text(image_format, "image_format")
+        image = QtGui.QImage.fromData(payload, image_format.encode("ascii"))
+        if image.isNull():
+            raise RuntimeError("Qt rejected the encoded immutable raster")
+        self._front = (payload, image)
+        self.update()
+
     def clear(self) -> None:
         self._require_owner()
         self._front = None
@@ -110,6 +126,9 @@ class QtImageBoard(QtWidgets.QWidget):
         painter.fillRect(self.rect(), QtCore.Qt.black)
         front = self._front
         if front is None:
+            if self._empty_text:
+                painter.setPen(QtGui.QColor(BG))
+                painter.drawText(self.rect(), QtCore.Qt.AlignCenter, self._empty_text)
             return
         image = front[1]
         scaled = image.size()

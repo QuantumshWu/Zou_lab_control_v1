@@ -1365,6 +1365,7 @@ class Experiment:
             datasets,
             fit_results=({"data": fit_result} if fit_result is not None else None),
             evaluation_memory_limit_bytes=evaluation_limit,
+            render_memory_limit_bytes=limit,
         )
 
     def close(self) -> None:

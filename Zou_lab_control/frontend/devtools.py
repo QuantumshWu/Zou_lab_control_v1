@@ -170,7 +170,7 @@ def demo_editor(*, scale: float = 1.0, size=(1440, 880), bind_scans: bool = True
     """Return a shown :class:`PulseSequenceEditor` with optional scan bindings."""
 
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from zlc_frontend.qt_widgets import ensure_qt_app
 
     ensure_qt_app()
     install_screenshot_font()  # before building so build-time text metrics match the render font
@@ -270,7 +270,7 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
     """
 
     import Zou_lab_control.neutral_atom as na
-    from Zou_lab_control.frontend.qt_fluent import (
+    from zlc_frontend.qt_widgets import (
         WINDOW_SCREEN_FRACTION,
         ensure_qt_app,
         screen_fit_window_size,
@@ -346,7 +346,7 @@ def demo_console_measurements(*, scale: float = 1.0, size=(1480, 980), grid=(5, 
     on the Monitor board pointed at them.
     """
 
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from zlc_frontend.qt_widgets import ensure_qt_app
     from Zou_lab_control.frontend.task_console import TaskConsole, TaskConsoleState
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     import Zou_lab_control.neutral_atom as na
@@ -435,13 +435,13 @@ def _capture_main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     width, height = (int(v) for v in args.size.lower().split("x"))
-    from Zou_lab_control.frontend.qt_fluent import FluentWindow
+    from zlc_frontend.qt_widgets import FluentWindow
 
     if args.capture == "parity":
         # BOTH GUIs, REAL automatic scale, ONE (offscreen) screen: their fluent
         # controls must be pixel-identical or the capture fails.
         from PyQt5 import QtGui
-        from Zou_lab_control.frontend.qt_fluent import FluentLineEdit
+        from zlc_frontend.qt_widgets import FluentLineEdit
 
         editor = demo_editor(scale=None, size=(width, height))
         console = demo_console(scale=None, shots=args.shots, size=(width, height))

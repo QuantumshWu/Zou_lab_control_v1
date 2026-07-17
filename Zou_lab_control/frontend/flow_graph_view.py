@@ -21,7 +21,7 @@ CONVERGE (one source feeding two processors that both feed the plot).  This widg
   (a plate that had to slide off its edge keeps a thin leader line back to the edge).
 
 Everything -- geometry, colours, fonts -- comes from the frontend's OWN tokens (``style.PALETTE``,
-``qt_fluent`` colours + ``scaled_px``), never a per-call art knob, so it obeys the sealed-API contract and
+``qt_widgets`` colours + ``scaled_px``), never a per-call art knob, so it obeys the sealed-API contract and
 scales with the display like every other Fluent control.  The widget is a plain ``QWidget`` that paints
 itself and reports its natural size, so a caller drops it inside a ``FluentScrollArea`` (the Flow tab does)
 and a large graph simply scrolls.
@@ -33,7 +33,7 @@ from typing import Mapping, Sequence
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from .qt_fluent import (
+from zlc_frontend.qt_widgets import (
     ACCENT,
     DIVIDER,
     FONT,

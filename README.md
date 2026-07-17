@@ -67,7 +67,7 @@ first-day checklist, and one maintainer note:
 | Manual | Source dir | Covers |
 | --- | --- | --- |
 | Main | `docs/main_manual/` | System architecture, neutral-atom session/devices/timing, `PulseSequence` vs `PulseTableState`, the sequencer lifecycle (prepare/fire/wait_done/safe_state), the real-hardware runbook, and the N-slot scan model end to end |
-| Frontend | `docs/frontend_manual/` | The `qt_fluent` widget library and layout primitives, the pulse GUI (Edit/Preview/Scan tabs), the per-field scan-dot workflow, the plotting API, and PDF rendering |
+| Frontend | `docs/frontend_manual/` | The `zlc_frontend.qt_widgets` widget library and layout primitives, the pulse GUI (Edit/Preview/Scan tabs), the per-field scan-dot workflow, the plotting API, and PDF rendering |
 | FPGA | `docs/fpga_manual/` | The Artix-7 35T edge-table pulse-streamer RTL, the 1-tick FIFO prefetch pipeline, the 2-bank streaming scan window, the affine N-slot scan engine, the analog-bus DAC engine, the event-scheduler output delays, the JTAG-to-AXI host upload flow, and the resource budget |
 | Device | `docs/device_manual/` | Device configuration/contracts, `load_devices`, camera acquisition, the readout pipeline (sitemap/thresholds/detect), trap calibration, and the virtual backends |
 

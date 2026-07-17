@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from PyQt5 import QtCore
 
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from zlc_frontend.qt_widgets import ensure_qt_app
     from Zou_lab_control.frontend.task_console import (
         TaskConsoleState, default_console_state, resolve_task_state, show_task_console)
     from Zou_lab_control.neutral_atom.core.signals import SignalHub

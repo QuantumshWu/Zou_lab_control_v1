@@ -9,7 +9,12 @@ import matplotlib
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import Divider, Size
 
-from .style import DESIGN_DPI, STOCK_DATA_PX, STOCK_MARGINS_PX, apply_style
+from zlc_frontend.render_style import (
+    DESIGN_DPI,
+    STOCK_DATA_PX,
+    STOCK_MARGINS_PX,
+    apply_style,
+)
 
 try:
     from IPython import get_ipython
@@ -24,7 +29,7 @@ class FigureSpec:
     """Fixed logical-pixel layout for a notebook figure.
 
     The defaults ARE the stock confocal single-axes region; they read the geometry
-    tokens in ``style.py`` (the single source) so this and ``style.figure.figsize``
+    tokens in ``zlc_frontend.render_style`` so this and the default figure size
     can never drift apart."""
 
     data_px: tuple[int, int] = STOCK_DATA_PX
@@ -216,7 +221,7 @@ def create_axes_fixed(
     margins_px: tuple[int, int, int, int] = STOCK_MARGINS_PX,
 ) -> plt.Axes:
     """Create one axes with a fixed logical-pixel data box and margins (the stock confocal
-    single-axes geometry -- the SAME style.py tokens FigureSpec reads, never a hand-typed copy)."""
+    single-axes geometry -- the SAME render-style tokens FigureSpec reads, never a hand-typed copy)."""
     dpi = design_dpi(fig)
     w_in = data_px[0] / dpi
     h_in = data_px[1] / dpi

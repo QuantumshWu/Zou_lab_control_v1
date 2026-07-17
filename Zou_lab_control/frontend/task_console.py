@@ -66,9 +66,9 @@ from .live import (
     region_binding,
     site_ring_radius,
 )
-from .style import PALETTE          # the ONE colour source -- panel cmap DEFAULTS reference it (never a literal)
+from zlc_frontend.render_style import PALETTE  # the ONE render colour owner
 from .pulse_gui import slot_label   # the ONE human slot-label formatter (period/channel, #H3s-F2)
-from .qt_fluent import (
+from zlc_frontend.qt_widgets import (
     ACCENT,
     CARD_PAD,
     CARD_TITLE_PX,
@@ -79,7 +79,7 @@ from .qt_fluent import (
     TEXT,
     WINDOW_SCREEN_FRACTION,
     YELLOW,
-    _popup_gap,
+    popup_gap,
     fluent_message,
     fluent_scrollbar_thickness,
     FluentButton,
@@ -1288,7 +1288,7 @@ def _text_to_py(text: str):
 # padding below (every size hugs like 1x2, #H3i-3).  ``PanelConfig.col`` is the card's pixel X and
 # ``row`` is the card's pixel Y; :func:`pack` is the order-driven TOP-LEFT GRAVITY packer that places
 # every card at the first free NW slot in list order.  The CARD'S FORMAT (rounded corners, shadow, grey title strip,
-# content padding) belongs to the FluentGroupBox COMPONENT (qt_fluent.CARD_PAD / CARD_TITLE_PX,
+# content padding) belongs to the FluentGroupBox COMPONENT (qt_widgets.CARD_PAD / CARD_TITLE_PX,
 # the single source); this module only lays cards out.
 GRID_UNIT = 8
 # The ONE spacing setting (#H3s-F8).  GAP is the UNIFORM clear distance between any two cards on
@@ -2058,7 +2058,7 @@ class PanelCard(FluentGroupBox):
         Every edit is LIVE-applied -- there is no global ``Apply`` button for
         the popup itself (Source has its own Apply because the expression is
         validated separately).  Lifted helpers ``FluentSectionLabel`` and
-        ``FluentSettingRow`` (in ``qt_fluent.py``) own the visual rhythm so
+        ``FluentSettingRow`` (in ``zlc_frontend.qt_widgets``) own the visual rhythm so
         future settings popups stay identical."""
 
         # The rounded card is painted by FluentPopup (translucent, frameless),
@@ -2569,7 +2569,7 @@ class PanelCard(FluentGroupBox):
         self._size_settings_popup()                        # height: show-all, grow-not-shrink (#H3i-2)
         screen = QtWidgets.QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen is not None else None
-        top_y = anchor.y() + _popup_gap()   # the ONE below-anchor Fluent popup gap (combo / overflow share it)
+        top_y = anchor.y() + popup_gap()   # the ONE below-anchor Fluent popup gap (combo / overflow share it)
         x = anchor.x() - popup.width()
         if avail is not None:
             x = max(avail.left(), min(x, avail.right() - popup.width()))
@@ -2590,7 +2590,7 @@ class PanelCard(FluentGroupBox):
         screen = QtWidgets.QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen is not None else None
         anchor_y = self.setting_button.mapToGlobal(QtCore.QPoint(0, self.setting_button.height())).y()
-        top_y = anchor_y + _popup_gap()      # match the same gap the open path (above) uses to place it
+        top_y = anchor_y + popup_gap()      # match the same gap the open path (above) uses to place it
         content = self._settings_scroll.widget()
         content_h = (content.sizeHint().height() if content is not None else popup.height()) + 2 * scaled_px(10)
         # The cap is the PLOT PANEL's own bottom edge (the popup opens just below the gear near the
@@ -6688,7 +6688,7 @@ class TaskConsole(QtWidgets.QWidget):
             self.setFixedSize(self._target_console_size())
         root = QtWidgets.QVBoxLayout(self)
         # SINGLE SOURCE for every window-edge inset: ``window_pad(1)`` (== ``scaled_px(WINDOW_PAD)``).
-        # The window title (qt_fluent draws it at ``scaled_px(TITLE_LEFT_INSET)`` == ``scaled_px(WINDOW_PAD)``)
+        # The window title (qt_widgets draws it at ``scaled_px(TITLE_LEFT_INSET)`` == ``scaled_px(WINDOW_PAD)``)
         # pins to this SAME left column, so the body's left edge lines up under the "task_console@zoulab"
         # title text -- one shared left edge.
         margin = window_pad(1)

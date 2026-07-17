@@ -28,7 +28,12 @@ class DataFigure:
     releases them; later renders consume only immutable presentation DTOs.
     """
 
-    __slots__ = ("_document", "_evaluated", "_fit_results")
+    __slots__ = (
+        "_document",
+        "_evaluated",
+        "_fit_results",
+        "_render_memory_limit_bytes",
+    )
 
     def __init__(
         self,
@@ -37,6 +42,7 @@ class DataFigure:
         *,
         fit_results: Mapping[str, FitResultBatch] | None = None,
         evaluation_memory_limit_bytes: int | None = None,
+        render_memory_limit_bytes: int | None = None,
     ) -> None:
         if not isinstance(document, FigureDocument):
             raise TypeError("document must be FigureDocument")
@@ -47,6 +53,10 @@ class DataFigure:
             raise TypeError("fit_results keys must be non-empty layer ids")
         if any(not isinstance(value, FitResultBatch) for value in supplied.values()):
             raise TypeError("fit_results values must be FitResultBatch")
+        render_limit = self._validated_memory_limit(
+            render_memory_limit_bytes,
+            "render_memory_limit_bytes",
+        )
 
         layers = {layer.layer_id: layer for layer in document.layers}
         fit_layers = {}
@@ -117,6 +127,7 @@ class DataFigure:
         self._document = document
         self._evaluated = evaluated
         self._fit_results = tuple(sorted(supplied.items()))
+        self._render_memory_limit_bytes = render_limit
 
     @property
     def document(self) -> FigureDocument:
@@ -126,36 +137,34 @@ class DataFigure:
     def evaluated(self):
         return self._evaluated
 
+    @property
+    def render_memory_limit_bytes(self) -> int | None:
+        """Frozen default admission limit for every later render/export."""
+        return self._render_memory_limit_bytes
+
     def render(
         self,
         *,
         dpi: float = 100.0,
         memory_limit_bytes: int | None = None,
     ):
-        """Create a new caller-owned Matplotlib Figure using the OO Agg path."""
+        """Create a caller-owned Figure with canonical artist styles frozen in.
 
-        from ._matplotlib_render import (
-            estimate_render_peak_nbytes,
+        The caller owns later Matplotlib mutations and draws.  Product-controlled PNG/export
+        paths use the render owner's serialized compose API instead.
+        """
+
+        from .matplotlib_render import (
             render_evaluated_figure,
         )
 
-        if memory_limit_bytes is not None:
-            if (
-                isinstance(memory_limit_bytes, bool)
-                or not isinstance(memory_limit_bytes, Integral)
-                or memory_limit_bytes <= 0
-            ):
-                raise ValueError("memory_limit_bytes must be a positive integer or None")
-            required = estimate_render_peak_nbytes(self._evaluated, dpi=dpi)
-            if required > memory_limit_bytes:
-                raise MemoryError(
-                    f"figure render peak {required} exceeds limit {memory_limit_bytes}"
-                )
+        self._check_render_budget(dpi, memory_limit_bytes)
 
         return render_evaluated_figure(
             self._document,
             self._evaluated,
             dict(self._fit_results),
+            dpi=dpi,
         )
 
     def to_png_bytes(
@@ -164,14 +173,20 @@ class DataFigure:
         dpi: float = 100.0,
         memory_limit_bytes: int | None = None,
     ) -> bytes:
+        from .matplotlib_render import save_evaluated_figure
+
+        effective_limit = self._check_render_budget(dpi, memory_limit_bytes)
         output = BytesIO()
-        figure = self.render(dpi=dpi, memory_limit_bytes=memory_limit_bytes)
-        try:
-            figure.savefig(output, format="png", dpi=dpi)
-            payload = output.getvalue()
-        finally:
-            figure.clear()
-        if memory_limit_bytes is not None and len(payload) > memory_limit_bytes:
+        save_evaluated_figure(
+            self._document,
+            self._evaluated,
+            dict(self._fit_results),
+            output,
+            image_format="png",
+            dpi=dpi,
+        )
+        payload = output.getvalue()
+        if effective_limit is not None and len(payload) > effective_limit:
             raise MemoryError("PNG payload exceeds figure render memory limit")
         return payload
 
@@ -184,14 +199,59 @@ class DataFigure:
         *,
         image_format: str | None = None,
         dpi: float = 100.0,
+        memory_limit_bytes: int | None = None,
     ) -> Path:
         target = Path(path)
         if image_format is None:
             image_format = target.suffix.lstrip(".") or "png"
         if not target.suffix:
             target = target.with_suffix(f".{image_format}")
-        self.render().savefig(target, format=image_format, dpi=dpi)
+        from .matplotlib_render import save_evaluated_figure
+
+        self._check_render_budget(dpi, memory_limit_bytes)
+        save_evaluated_figure(
+            self._document,
+            self._evaluated,
+            dict(self._fit_results),
+            target,
+            image_format=image_format,
+            dpi=dpi,
+        )
         return target
+
+    def _check_render_budget(
+        self,
+        dpi: float,
+        memory_limit_bytes: int | None,
+    ) -> int | None:
+        requested = self._validated_memory_limit(
+            memory_limit_bytes,
+            "memory_limit_bytes",
+        )
+        frozen = self._render_memory_limit_bytes
+        if frozen is not None and requested is not None and requested > frozen:
+            raise ValueError(
+                "memory_limit_bytes cannot weaken the DataFigure render limit"
+            )
+        effective = frozen if requested is None else requested
+        if effective is None:
+            return None
+        from .matplotlib_render import estimate_render_peak_nbytes
+
+        required = estimate_render_peak_nbytes(self._evaluated, dpi=dpi)
+        if required > effective:
+            raise MemoryError(
+                f"figure render peak {required} exceeds limit {effective}"
+            )
+        return effective
+
+    @staticmethod
+    def _validated_memory_limit(value: int | None, name: str) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer or None")
+        return int(value)
 
 
 __all__ = ["DataFigure"]

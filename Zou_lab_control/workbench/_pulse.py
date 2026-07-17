@@ -10,7 +10,47 @@ import threading
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Zou_lab_control.notebook.facade import Experiment, PulseFacade
-from zlc_frontend.qt_board import QtOwnerWake
+from zlc_frontend.qt_widgets import (
+    FluentButton,
+    FluentCheckBox,
+    FluentComboBox,
+    FluentDoubleSpinBox,
+    FluentFormGrid,
+    FluentGroupBox,
+    FluentLabel,
+    FluentLineEdit,
+    FluentScrollArea,
+    FluentSectionLabel,
+    FluentSettingRow,
+    FluentSpinBox,
+    FluentTabWidget,
+    GREEN,
+    GREY,
+    ORANGE,
+    QtOwnerWake,
+    TIMELINE_ACTIVE_FILL_RGBA,
+    TIMELINE_AXIS_TEXT,
+    TIMELINE_BACKGROUND,
+    TIMELINE_EMPTY_TEXT,
+    TIMELINE_GRID,
+    TIMELINE_PERIOD_BACKGROUNDS,
+    TIMELINE_PERIOD_TEXT,
+    TIMELINE_REPEAT,
+    TIMELINE_ROW_TEXT,
+    TIMELINE_TITLE_TEXT,
+    TIMELINE_TRACE,
+    WINDOW_SCREEN_FRACTION,
+    apply_fluent_scrollbars,
+    center_window_on_primary_screen,
+    ensure_qt_app,
+    fluent_confirm,
+    fluent_text_prompt,
+    release_window,
+    retain_window,
+    screen_fit_window_size,
+    set_fluent_scale,
+    setting_label_width,
+)
 from zlc_neutral_atom.pulse_application import PulseTargetDescriptor
 from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot, RunState
 from zlc_pulse import (
@@ -88,10 +128,10 @@ class PulseTimelineWidget(QtWidgets.QWidget):
     def paintEvent(self, _event) -> None:
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        painter.fillRect(self.rect(), QtGui.QColor("#fcfcfd"))
+        painter.fillRect(self.rect(), QtGui.QColor(TIMELINE_BACKGROUND))
         timeline = self._timeline
         if timeline is None:
-            painter.setPen(QtGui.QColor("#657080"))
+            painter.setPen(QtGui.QColor(TIMELINE_EMPTY_TEXT))
             painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "No current preview")
             return
 
@@ -104,10 +144,10 @@ class PulseTimelineWidget(QtWidgets.QWidget):
         def x(tick: int) -> float:
             return left + (right - left) * float(tick) / duration
 
-        painter.setPen(QtGui.QColor("#354052"))
+        painter.setPen(QtGui.QColor(TIMELINE_TITLE_TEXT))
         title = f"{timeline.title} · {timeline.reference_label}"
         painter.drawText(12, 22, title)
-        painter.setPen(QtGui.QColor("#7a8494"))
+        painter.setPen(QtGui.QColor(TIMELINE_AXIS_TEXT))
         painter.drawText(int(left), 43, "0")
         painter.drawText(
             QtCore.QRectF(left, 28, right - left, 18),
@@ -115,7 +155,7 @@ class PulseTimelineWidget(QtWidgets.QWidget):
             f"{timeline.duration_ticks} ticks",
         )
 
-        period_colors = (QtGui.QColor("#edf3ff"), QtGui.QColor("#f4f7fb"))
+        period_colors = tuple(QtGui.QColor(value) for value in TIMELINE_PERIOD_BACKGROUNDS)
         period_index = 0
         for annotation in timeline.annotations:
             if annotation.kind != "period":
@@ -126,7 +166,7 @@ class PulseTimelineWidget(QtWidgets.QWidget):
                 period_colors[period_index % 2],
             )
             if x1 - x0 >= 30:
-                painter.setPen(QtGui.QColor("#536078"))
+                painter.setPen(QtGui.QColor(TIMELINE_PERIOD_TEXT))
                 painter.drawText(
                     QtCore.QRectF(x0 + 2, top - 18, x1 - x0 - 4, 16),
                     QtCore.Qt.AlignCenter,
@@ -136,9 +176,9 @@ class PulseTimelineWidget(QtWidgets.QWidget):
 
         for row_index, row in enumerate(timeline.rows):
             y0 = top + row_index * row_height
-            painter.setPen(QtGui.QColor("#d8dde6"))
+            painter.setPen(QtGui.QColor(TIMELINE_GRID))
             painter.drawLine(int(left), int(y0 + row_height - 5), int(right), int(y0 + row_height - 5))
-            painter.setPen(QtGui.QColor("#253047"))
+            painter.setPen(QtGui.QColor(TIMELINE_ROW_TEXT))
             painter.drawText(
                 QtCore.QRectF(8, y0, left - 18, row_height - 7),
                 QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
@@ -162,7 +202,7 @@ class PulseTimelineWidget(QtWidgets.QWidget):
                 if row.unit == "logic" and segment.start_value:
                     painter.fillRect(
                         QtCore.QRectF(x0, y0 + 5, max(1.0, x1 - x0), row_height - 17),
-                        QtGui.QColor(72, 128, 232, 34),
+                        QtGui.QColor(*TIMELINE_ACTIVE_FILL_RGBA),
                     )
                 if first:
                     path.moveTo(x0, start_y)
@@ -172,10 +212,10 @@ class PulseTimelineWidget(QtWidgets.QWidget):
                 path.lineTo(x1, stop_y)
                 previous_stop = x1
                 previous_value = segment.stop_value
-            painter.setPen(QtGui.QPen(QtGui.QColor("#2867c7"), 2.0))
+            painter.setPen(QtGui.QPen(QtGui.QColor(TIMELINE_TRACE), 2.0))
             painter.drawPath(path)
 
-        painter.setPen(QtGui.QPen(QtGui.QColor("#8b5cf6"), 1.2, QtCore.Qt.DashLine))
+        painter.setPen(QtGui.QPen(QtGui.QColor(TIMELINE_REPEAT), 1.2, QtCore.Qt.DashLine))
         for annotation in timeline.annotations:
             if annotation.kind != "repeat":
                 continue
@@ -240,7 +280,6 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
         self._delay_rows: dict[str, tuple[QtWidgets.QTableWidgetItem, QtWidgets.QDoubleSpinBox, QtWidgets.QComboBox]] = {}
 
         self.setWindowTitle("Pulse Workbench")
-        self.resize(1180, 760)
         self._build_ui()
         self._wake = QtOwnerWake(self)
         self._wake.bind(self._owner_cycle)
@@ -327,46 +366,54 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget(self)
         outer = QtWidgets.QVBoxLayout(central)
         identity = QtWidgets.QHBoxLayout()
-        identity.addWidget(QtWidgets.QLabel("Pulse name"))
-        self._document_name = QtWidgets.QLineEdit()
+        identity.addWidget(FluentLabel("Pulse name"))
+        self._document_name = FluentLineEdit()
         self._document_name.setObjectName("pulseDocumentName")
         identity.addWidget(self._document_name, 1)
-        self._target_label = QtWidgets.QLabel()
+        self._target_label = FluentLabel()
         self._target_label.setObjectName("pulseTargetSummary")
         identity.addWidget(self._target_label)
         outer.addLayout(identity)
 
-        run_bar = QtWidgets.QHBoxLayout()
-        self._run_once = QtWidgets.QPushButton("Run Once")
+        run_bar = QtWidgets.QGridLayout()
+        self._run_once = FluentButton("Run Once", color=GREEN)
         self._run_once.setObjectName("runOnceButton")
-        self._run_scan = QtWidgets.QPushButton("Run Scan")
+        self._run_scan = FluentButton("Run Scan", color=GREEN)
         self._run_scan.setObjectName("runScanButton")
-        self._hold = QtWidgets.QPushButton("On Pulse (HOLD)")
+        self._hold = FluentButton("On Pulse (HOLD)", color=ORANGE)
         self._hold.setObjectName("holdButton")
-        self._stop = QtWidgets.QPushButton("Stop")
+        self._stop = FluentButton("Stop", color=ORANGE)
         self._stop.setObjectName("stopButton")
-        self._nominal_reference = QtWidgets.QCheckBox(
-            "Use nominal reference for Run Once / HOLD when scan-authored"
+        self._nominal_reference = FluentCheckBox(
+            "Use nominal scan/API reference"
+        )
+        self._nominal_reference.setToolTip(
+            "Use the authored nominal reference for Run Once / HOLD when the pulse contains "
+            "Scan or API fields."
         )
         self._nominal_reference.setObjectName("nominalReferenceCheck")
-        for widget in (self._run_once, self._run_scan, self._hold, self._stop):
-            run_bar.addWidget(widget)
-        run_bar.addWidget(self._nominal_reference)
-        run_bar.addStretch(1)
+        for column, widget in enumerate(
+            (self._run_once, self._run_scan, self._hold, self._stop)
+        ):
+            run_bar.addWidget(widget, 0, column)
+        run_bar.addWidget(self._nominal_reference, 1, 0, 1, 4)
+        run_bar.setColumnStretch(4, 1)
         outer.addLayout(run_bar)
 
-        self._tabs = QtWidgets.QTabWidget()
+        self._tabs = FluentTabWidget()
         self._tabs.setObjectName("pulseTabs")
         self._tabs.addTab(self._build_edit_tab(), "Edit")
         self._tabs.addTab(self._build_preview_tab(), "Preview")
         self._tabs.addTab(self._build_scan_tab(), "Scan")
         outer.addWidget(self._tabs, 1)
 
-        self._pulse_status = QtWidgets.QLabel()
+        self._pulse_status = FluentLabel()
         self._pulse_status.setObjectName("pulseStatus")
-        self._preview_status = QtWidgets.QLabel()
+        self._pulse_status.setWordWrap(True)
+        self._preview_status = FluentLabel()
         self._preview_status.setObjectName("pulsePreviewStatus")
-        self._diagnostics = QtWidgets.QLabel()
+        self._preview_status.setWordWrap(True)
+        self._diagnostics = FluentLabel()
         self._diagnostics.setObjectName("pulseDiagnostics")
         self._diagnostics.setWordWrap(True)
         outer.addWidget(self._pulse_status)
@@ -399,12 +446,13 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
         period_layout = QtWidgets.QVBoxLayout(period_side)
         self._periods = QtWidgets.QListWidget()
         self._periods.setObjectName("pulsePeriodList")
+        apply_fluent_scrollbars(self._periods)
         period_layout.addWidget(self._periods, 1)
         buttons = QtWidgets.QHBoxLayout()
-        self._period_add = QtWidgets.QPushButton("Add")
-        self._period_remove = QtWidgets.QPushButton("Remove")
-        self._period_up = QtWidgets.QPushButton("←")
-        self._period_down = QtWidgets.QPushButton("→")
+        self._period_add = FluentButton("Add")
+        self._period_remove = FluentButton("Remove", color=GREY)
+        self._period_up = FluentButton("←", color=GREY)
+        self._period_down = FluentButton("→", color=GREY)
         for button in (
             self._period_add,
             self._period_remove,
@@ -415,18 +463,20 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
         period_layout.addLayout(buttons)
         layout.addWidget(period_side, 0)
 
-        details_scroll = QtWidgets.QScrollArea()
+        details_scroll = FluentScrollArea()
         details_scroll.setWidgetResizable(True)
         details = QtWidgets.QWidget()
         details_layout = QtWidgets.QVBoxLayout(details)
-        form = QtWidgets.QFormLayout()
-        self._period_name = QtWidgets.QLineEdit()
+        self._period_name = FluentLineEdit()
         self._period_name.setObjectName("pulsePeriodName")
-        self._period_duration = QtWidgets.QDoubleSpinBox()
+        self._period_duration = FluentDoubleSpinBox(
+            length=18,
+            quantize_to_display=False,
+        )
         self._period_duration.setObjectName("pulsePeriodDuration")
         self._period_duration.setDecimals(9)
         self._period_duration.setRange(1e-9, 1e15)
-        self._period_unit = QtWidgets.QComboBox()
+        self._period_unit = FluentComboBox()
         self._period_unit.setObjectName("pulsePeriodUnit")
         self._period_unit.addItems(_TIME_UNITS)
         duration_row = QtWidgets.QHBoxLayout()
@@ -434,50 +484,66 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
         duration_row.addWidget(self._period_unit)
         duration_widget = QtWidgets.QWidget()
         duration_widget.setLayout(duration_row)
-        form.addRow("Period name", self._period_name)
-        form.addRow("Duration", duration_widget)
-        details_layout.addLayout(form)
+        label_width = setting_label_width(("Period name", "Duration"))
+        details_layout.addWidget(
+            FluentSettingRow(
+                "Period name",
+                self._period_name,
+                label_width=label_width,
+            )
+        )
+        details_layout.addWidget(
+            FluentSettingRow(
+                "Duration",
+                duration_widget,
+                label_width=label_width,
+            )
+        )
 
         self._digital_table = QtWidgets.QTableWidget(0, 2)
         self._digital_table.setObjectName("pulseDigitalTable")
+        apply_fluent_scrollbars(self._digital_table)
         self._digital_table.setHorizontalHeaderLabels(("Digital output", "On"))
         self._digital_table.horizontalHeader().setStretchLastSection(True)
-        details_layout.addWidget(QtWidgets.QLabel("Digital outputs"))
+        details_layout.addWidget(FluentSectionLabel("Digital outputs"))
         details_layout.addWidget(self._digital_table)
 
         self._dac_table = QtWidgets.QTableWidget(0, 3)
         self._dac_table.setObjectName("pulseDacTable")
+        apply_fluent_scrollbars(self._dac_table)
         self._dac_table.setHorizontalHeaderLabels(("DAC output", "Action", "Target"))
         self._dac_table.horizontalHeader().setStretchLastSection(True)
-        details_layout.addWidget(QtWidgets.QLabel("DAC actions (Hold preserves carried value)"))
+        details_layout.addWidget(FluentSectionLabel("DAC actions (Hold preserves carried value)"))
         details_layout.addWidget(self._dac_table)
 
         self._visible_outputs = QtWidgets.QListWidget()
         self._visible_outputs.setObjectName("pulseVisibleOutputs")
-        details_layout.addWidget(QtWidgets.QLabel("Preview rows"))
+        apply_fluent_scrollbars(self._visible_outputs)
+        details_layout.addWidget(FluentSectionLabel("Preview rows"))
         details_layout.addWidget(self._visible_outputs)
 
         self._delay_table = QtWidgets.QTableWidget(0, 4)
         self._delay_table.setObjectName("pulseDelayTable")
+        apply_fluent_scrollbars(self._delay_table)
         self._delay_table.setHorizontalHeaderLabels(("Use", "Output", "Delay", "Unit"))
         self._delay_table.horizontalHeader().setStretchLastSection(True)
-        details_layout.addWidget(QtWidgets.QLabel("Physical output delays"))
+        details_layout.addWidget(FluentSectionLabel("Physical output delays"))
         details_layout.addWidget(self._delay_table)
 
-        repeat_box = QtWidgets.QGroupBox("Finite repeat region")
-        repeat_layout = QtWidgets.QGridLayout(repeat_box)
-        self._repeat_enabled = QtWidgets.QCheckBox("Repeat")
-        self._repeat_start = QtWidgets.QComboBox()
-        self._repeat_end = QtWidgets.QComboBox()
-        self._repeat_count = QtWidgets.QSpinBox()
+        repeat_box = FluentGroupBox("Finite repeat region")
+        repeat_layout = QtWidgets.QVBoxLayout(repeat_box)
+        self._repeat_enabled = FluentCheckBox("Repeat")
+        self._repeat_start = FluentComboBox()
+        self._repeat_end = FluentComboBox()
+        self._repeat_count = FluentSpinBox()
         self._repeat_count.setRange(2, 1_000_000)
-        repeat_layout.addWidget(self._repeat_enabled, 0, 0)
-        repeat_layout.addWidget(QtWidgets.QLabel("Start"), 0, 1)
-        repeat_layout.addWidget(self._repeat_start, 0, 2)
-        repeat_layout.addWidget(QtWidgets.QLabel("End"), 1, 1)
-        repeat_layout.addWidget(self._repeat_end, 1, 2)
-        repeat_layout.addWidget(QtWidgets.QLabel("Count"), 2, 1)
-        repeat_layout.addWidget(self._repeat_count, 2, 2)
+        repeat_layout.addWidget(self._repeat_enabled)
+        self._repeat_form = FluentFormGrid(repeat_box)
+        self._repeat_form.setObjectName("pulseRepeatForm")
+        self._repeat_form.add_row("Start", self._repeat_start)
+        self._repeat_form.add_row("End", self._repeat_end)
+        self._repeat_form.add_row("Count", self._repeat_count)
+        repeat_layout.addWidget(self._repeat_form)
         details_layout.addWidget(repeat_box)
         details_layout.addStretch(1)
         details_scroll.setWidget(details)
@@ -503,13 +569,13 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
     def _build_preview_tab(self) -> QtWidgets.QWidget:
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(tab)
-        note = QtWidgets.QLabel(
+        note = FluentLabel(
             "Preview is compiler-derived. Scan/API documents show the authored nominal reference; "
             "hardware execution never silently uses API nominal values."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
-        scroll = QtWidgets.QScrollArea()
+        scroll = FluentScrollArea()
         scroll.setWidgetResizable(True)
         self._timeline = PulseTimelineWidget()
         scroll.setWidget(self._timeline)
@@ -519,14 +585,14 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
     def _build_scan_tab(self) -> QtWidgets.QWidget:
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(tab)
-        binding_box = QtWidgets.QGroupBox("Literal / Scan / API field intent")
+        binding_box = FluentGroupBox("Literal / Scan / API field intent")
         binding_layout = QtWidgets.QGridLayout(binding_box)
-        self._field_selector = QtWidgets.QComboBox()
+        self._field_selector = FluentComboBox()
         self._field_selector.setObjectName("pulseFieldSelector")
-        self._binding_status = QtWidgets.QLabel()
-        self._bind_scan = QtWidgets.QPushButton("Bind as Scan")
-        self._bind_api = QtWidgets.QPushButton("Bind as API")
-        self._unbind = QtWidgets.QPushButton("Set Literal")
+        self._binding_status = FluentLabel()
+        self._bind_scan = FluentButton("Bind as Scan")
+        self._bind_api = FluentButton("Bind as API")
+        self._unbind = FluentButton("Set Literal", color=GREY)
         binding_layout.addWidget(self._field_selector, 0, 0, 1, 3)
         binding_layout.addWidget(self._binding_status, 1, 0, 1, 3)
         binding_layout.addWidget(self._bind_scan, 2, 0)
@@ -534,34 +600,36 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
         binding_layout.addWidget(self._unbind, 2, 2)
         layout.addWidget(binding_box)
 
-        scan_box = QtWidgets.QGroupBox("Frozen autonomous scan table")
+        scan_box = FluentGroupBox("Frozen autonomous scan table")
         scan_layout = QtWidgets.QVBoxLayout(scan_box)
         self._scan_table = QtWidgets.QTableWidget()
         self._scan_table.setObjectName("pulseScanTable")
+        apply_fluent_scrollbars(self._scan_table)
         scan_layout.addWidget(self._scan_table)
-        scan_buttons = QtWidgets.QHBoxLayout()
-        self._scan_add_row = QtWidgets.QPushButton("Add row")
-        self._scan_remove_rows = QtWidgets.QPushButton("Remove selected")
-        self._scan_paste = QtWidgets.QPushButton("Paste TSV")
-        self._scan_apply = QtWidgets.QPushButton("Apply frozen table")
-        self._scan_discard = QtWidgets.QPushButton("Discard table edits")
+        scan_buttons = QtWidgets.QGridLayout()
+        self._scan_add_row = FluentButton("Add row")
+        self._scan_remove_rows = FluentButton("Remove selected", color=GREY)
+        self._scan_paste = FluentButton("Paste TSV", color=ORANGE)
+        self._scan_apply = FluentButton("Apply frozen table", color=GREEN)
+        self._scan_discard = FluentButton("Discard table edits", color=GREY)
         self._scan_apply.setObjectName("applyScanTableButton")
-        for button in (
-            self._scan_add_row,
-            self._scan_remove_rows,
-            self._scan_paste,
-            self._scan_apply,
-            self._scan_discard,
+        for row, column, button in (
+            (0, 0, self._scan_add_row),
+            (0, 1, self._scan_remove_rows),
+            (0, 2, self._scan_paste),
+            (1, 0, self._scan_apply),
+            (1, 1, self._scan_discard),
         ):
-            scan_buttons.addWidget(button)
-        scan_buttons.addStretch(1)
+            scan_buttons.addWidget(button, row, column)
+        scan_buttons.setColumnStretch(3, 1)
         scan_layout.addLayout(scan_buttons)
         layout.addWidget(scan_box, 1)
 
-        api_box = QtWidgets.QGroupBox("Explicit API values for the next hardware Run")
+        api_box = FluentGroupBox("Explicit API values for the next hardware Run")
         api_layout = QtWidgets.QVBoxLayout(api_box)
         self._api_table = QtWidgets.QTableWidget(0, 5)
         self._api_table.setObjectName("pulseApiTable")
+        apply_fluent_scrollbars(self._api_table)
         self._api_table.setHorizontalHeaderLabels(
             ("ParameterId", "Field", "Unit", "Run value", "Use")
         )
@@ -803,11 +871,11 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
             name.setData(QtCore.Qt.UserRole, port.key)
             name.setFlags(name.flags() & ~QtCore.Qt.ItemIsEditable)
             self._dac_table.setItem(row, 0, name)
-            mode = QtWidgets.QComboBox()
+            mode = FluentComboBox()
             mode.addItems(("Hold", "Edge", "Ramp"))
             step = steps.get(port.key)
             mode.setCurrentText("Hold" if step is None else step.mode.title())
-            value = QtWidgets.QSpinBox()
+            value = FluentSpinBox()
             assert port.signed_range is not None
             value.setRange(*port.signed_range)
             value.setValue(port.safe_value if step is None else step.value)
@@ -858,11 +926,15 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
             )
             name = QtWidgets.QTableWidgetItem(port.label)
             name.setFlags(name.flags() & ~QtCore.Qt.ItemIsEditable)
-            value = QtWidgets.QDoubleSpinBox()
+            value = FluentDoubleSpinBox(
+                length=18,
+                allow_minus=True,
+                quantize_to_display=False,
+            )
             value.setDecimals(9)
             value.setRange(-1e15, 1e15)
             value.setValue(0.0 if delay is None else float(delay.value))
-            unit = QtWidgets.QComboBox()
+            unit = FluentComboBox()
             unit.addItems(_TIME_UNITS)
             unit.setCurrentText("ns" if delay is None else delay.unit)
             self._delay_table.setItem(row, 0, enabled)
@@ -1010,14 +1082,15 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
         try:
             result = operation(False)
         except DestructivePulseEditError as error:
-            answer = QtWidgets.QMessageBox.question(
+            accepted = fluent_confirm(
                 self,
                 "Confirm pulse edit",
                 f"{description} also changes scan/API/repeat intent. Apply the complete change?\n\n"
                 f"Removed scan: {', '.join(error.impact.removed_scan_parameters) or 'none'}\n"
                 f"Removed API: {', '.join(error.impact.removed_api_parameters) or 'none'}",
+                confirm_text="Apply complete change",
             )
-            if answer != QtWidgets.QMessageBox.Yes:
+            if not accepted:
                 return
             result = operation(True)
         except BaseException as error:
@@ -1290,7 +1363,7 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
             if field.kind == FIELD_DURATION
             else f"{field.period_id}_{field.port}"
         )
-        parameter_id, accepted = QtWidgets.QInputDialog.getText(
+        parameter_id, accepted = fluent_text_prompt(
             self,
             "Scan ParameterId",
             "Stable ParameterId",
@@ -1298,7 +1371,7 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
         )
         if not accepted:
             return
-        label, accepted = QtWidgets.QInputDialog.getText(
+        label, accepted = fluent_text_prompt(
             self,
             "Scan label",
             "Display label",
@@ -1331,7 +1404,7 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
         default_id = "_".join(
             value for value in (field.period_id, field.port, field.kind) if value
         )
-        parameter_id, accepted = QtWidgets.QInputDialog.getText(
+        parameter_id, accepted = fluent_text_prompt(
             self,
             "API ParameterId",
             "Stable ParameterId",
@@ -1662,13 +1735,11 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
     def _confirm_discard(self) -> bool:
         if not self._editor.dirty and not self._scan_dirty:
             return True
-        return (
-            QtWidgets.QMessageBox.question(
-                self,
-                "Discard unsaved pulse?",
-                "The current PulseDocument has unsaved changes. Discard them?",
-            )
-            == QtWidgets.QMessageBox.Yes
+        return fluent_confirm(
+            self,
+            "Discard unsaved pulse?",
+            "The current PulseDocument has unsaved changes. Discard them?",
+            confirm_text="Discard",
         )
 
     def _new_document(self) -> None:
@@ -1748,6 +1819,7 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._allow_close:
+            release_window(self)
             event.accept()
             return
         event.ignore()
@@ -1799,24 +1871,22 @@ class PulseWorkbenchWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self.close)
 
 
-def _qt_application() -> tuple[QtWidgets.QApplication, bool]:
-    application = QtWidgets.QApplication.instance()
-    owns_application = application is None
-    if application is None:
-        application = QtWidgets.QApplication([])
+def _qt_application() -> QtWidgets.QApplication:
+    application = ensure_qt_app()
     if QtCore.QThread.currentThread() != application.thread():
         raise RuntimeError("PulseWorkbench must be opened on the Qt GUI thread")
-    return application, owns_application
+    set_fluent_scale(None)
+    return application
 
 
 def _show_window(
     window: PulseWorkbenchWindow,
-    application: QtWidgets.QApplication,
-    owns_application: bool,
 ) -> PulseWorkbenchWindow:
-    if owns_application:
-        window._application_owner = application
+    application = QtWidgets.QApplication.instance()
+    window.resize(screen_fit_window_size(WINDOW_SCREEN_FRACTION))
+    retain_window(window)
     window.show()
+    center_window_on_primary_screen(window, application)
     return window
 
 
@@ -1832,7 +1902,7 @@ def open_pulse_workbench(
         raise TypeError("experiment must be Experiment")
     if document is not None and path is not None:
         raise ValueError("provide document or path, not both")
-    application, owns_application = _qt_application()
+    _qt_application()
     descriptor = experiment.pulse.target
     editor = (
         PulseEditorSession.new(
@@ -1845,8 +1915,6 @@ def open_pulse_workbench(
     editor.bind_target(descriptor.target)
     window = _show_window(
         PulseWorkbenchWindow(experiment.pulse, descriptor, editor),
-        application,
-        owns_application,
     )
     if path is not None:
         window.open_path(path)
@@ -1866,7 +1934,7 @@ def open_offline_pulse_workbench(
         raise TypeError("target must be PulseTarget")
     if document is not None and path is not None:
         raise ValueError("provide document or path, not both")
-    application, owns_application = _qt_application()
+    _qt_application()
     editor = (
         PulseEditorSession.new(target, time_step_ns=time_step_ns)
         if document is None
@@ -1874,8 +1942,6 @@ def open_offline_pulse_workbench(
     )
     window = _show_window(
         PulseWorkbenchWindow(None, None, editor),
-        application,
-        owns_application,
     )
     if path is not None:
         window.open_path(path)

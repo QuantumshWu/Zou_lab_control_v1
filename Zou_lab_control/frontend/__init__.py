@@ -81,7 +81,13 @@ from .notes import (
 )
 from .session import RunSession, run
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
-from .style import DEFAULT_STYLE, FONT_PATH, apply_style, enable_long_output, style_context, use_widget_backend
+from zlc_frontend.render_style import (
+    DEFAULT_STYLE,
+    FONT_PATH,
+    apply_style,
+    style_context,
+)
+from zlc_frontend.notebook_integration import enable_long_output, use_widget_backend
 from .ticks import SmartOffsetFormatter, SmartOffsetLocator, apply_smart_ticks
 
 

@@ -415,22 +415,64 @@ baseline 没有进程内 config/device/virtual-real hot swap，也没有 `Instal
 ### 4.3 Data 与 Frontend 内部层次
 
 ```text
-zlc_data
-   ^
-   |
-frontend.figure <- frontend.render <- frontend.qt
+zlc_data <- zlc_frontend.figure
+                  |          \
+                  v           v
+      zlc_frontend.render   zlc_frontend.matplotlib_render + render_style [render]
+                  ^
+                  |
+      zlc_frontend.qt_widgets [qt]
+
+      zlc_frontend.notebook_integration [notebook, lazy IPython leaf]
 ```
 
 所有权：
 
 - `zlc_data`：Axis、Value/DataBlock、Selection、DataTransform、Reduction、Fit；
 - `frontend.figure`：ViewIntent、ViewSpec、FigureDocument、FigureEvaluator、FigureArtifactRef、codec；
-- `render`：renderer、Matplotlib layer、interaction controller、DataFigure public facade；
-- `qt`：Canvas、Qt event adapter、通用 widgets。
+- `zlc_frontend.render`：immutable raster/presentation DTO 与并发中立的 front/presenter 合同，不加载 Matplotlib/Qt；
+- `zlc_frontend.matplotlib_render` + `render_style`：Agg renderer、从旧 frontend 完整迁入的字体/几何/palette/publication style、串行 Matplotlib compose lane 与 DataFigure 的可选 render backend；
+- `zlc_frontend.qt_widgets`：Qt application/window lifetime、Qt event adapter、immutable raster board、Qt/QPainter style token 与通用 widgets。
+- `zlc_frontend.notebook_integration`：`%matplotlib widget`与IPython display hook的惰性adapter；render owner不探测IPython。Qt leaf另可在显式`ensure_qt_app()`时惰性执行`%gui qt`以维持notebook事件循环，但导入`qt_widgets`本身不加载IPython。
 
 neutral_atom 只依赖 `zlc_data`，不依赖 frontend 的任何层。
 
-`zlc_data` base 只依赖 NumPy/必要 solver与 `zlc_storage.canonical`，不加载 repository I/O、Matplotlib/PyQt。`zlc_frontend` 的 headless figure 层依赖 data+storage；Matplotlib backend 放在 `[render]` optional extra，PyQt/Fluent 及 Qt canvas 放在 `[qt]` extra（`qt` 可依赖 `render`）。`zlc_neutral_atom` 依赖 data、storage 与必要的 pulse public API；notebook 的显示 extra 依赖 `zlc_frontend[render]`，其可选 `[workbench]` extra 才懒加载 `zlc_workbench` GUI launcher，workbench 显式依赖 `zlc_frontend[qt,render]`。模块顶层 import 不能让 data/neutral 间接加载 repository backend、Matplotlib backend 或 PyQt。
+`zlc_data` base 只依赖 NumPy/必要 solver与 `zlc_storage.canonical`，不加载 repository I/O、Matplotlib/PyQt。`zlc_frontend` 的 headless figure 与 raster/presentation DTO 层依赖 data+storage；Matplotlib backend/style/font 放在 `[render]` optional extra，PyQt/Fluent/Qt board 放在独立 `[qt]` extra，Matplotlib-widget/display类IPython hook只在惰性notebook integration leaf。Qt leaf 可以消费 base `render` DTO，但不得导入 Matplotlib implementation；仅在调用`ensure_qt_app()`时才允许惰性探测IPython的Qt事件循环。完整 Workbench 同时安装 `[analysis]+[render]+[qt]`。`zlc_neutral_atom` 依赖 data、storage 与必要的 pulse public API；notebook 的显示 extra 依赖 `zlc_frontend[render]`，其可选 `[workbench]` extra 才懒加载 `zlc_workbench` GUI launcher。`zlc_frontend`、`zlc_frontend.figure`、`zlc_workbench`、`Zou_lab_control.workbench` 与各 application package root 顶层 import 都不能加载 Matplotlib backend、PyQt/qframelesswindow、repository backend 或真实 hardware adapter；调用者必须显式进入 `zlc_frontend.matplotlib_render`、`zlc_frontend.qt_widgets` 或 notebook integration leaf。
+
+#### 4.3.1 Qt 组件单一 owner 与迁移复用契约
+
+旧 `frontend/qt_fluent.py` 已经是经过真 GUI 使用的完整组件层，不是待重写的样式草稿。迁移必须把它的保留行为整体移入 `zlc_frontend.qt_widgets`，删除旧文件且不留 shim/re-export；application/Workbench 只从 `zlc_frontend.qt_widgets` 的 curated public facade 取件，禁止 deep import 或从 `zlc_frontend` 根重导出 Qt symbol。`QtImageBoard/QtOwnerWake` 同属这个 Qt leaf，不能继续平铺在 headless frontend 根。
+
+先取件表不是新的 widget taxonomy，而是把旧组件已经承担的语义写清：
+
+| 需求 | 先使用 | 边界 |
+|---|---|---|
+| QApplication、缩放、窗口可达性、保活 | `ensure_qt_app/set_fluent_scale/screen_fit_window_size/center_window_on_primary_screen/retain_window/release_window` | 首次 app 只能在 Python main thread 创建；异步窗口只在 committed close 释放 |
+| 普通 Setting/Edit 行 | `FluentSectionLabel + FluentSettingRow + setting_label_width` | 一列标签+一列控件；不得退回 `QFormLayout` 另造风格 |
+| 稠密 authoring grid | `FluentFormGrid/FluentLabeledField/Metrics` | 多列、跨行或需要统一 row metric 时使用；不能拿它替代简单 SettingRow |
+| 路径、只读值、scan binding | `FluentPathEdit/ReadoutEdit/ScanLineEdit/TreeComboBox/TriStateToggle` | edit buffer 与 committed resource 分离，验证成功才提交 |
+| 状态与提示 | `FluentStatusStrip/StatusDot/ScanDot/muted_note_label` | presentation-only，不持有 Run/领域状态机 |
+| 模态消息、确认、单行文本 | `fluent_message/fluent_confirm/fluent_text_prompt` | 只返回用户的临时选择/文本；不得直接提交领域对象或替代 validation |
+| 容器与滚动 | `FluentGroupBox/TabWidget/ScrollArea/Frame/Popup/Window` | 按真实 lifecycle 组合，不因外形相似强套同一个顶层 Window |
+| raster/owner wake | `QtImageBoard/QtOwnerWake` | GUI 只消费 immutable front，不拥有 renderer/Run |
+| 批更新与 Qt hygiene | `batched_updates/signals_blocked/apply_fluent_scrollbars` | 禁止每个窗口复制 signal blocking/scrollbar QSS |
+
+**Legacy abstraction salvage gate（每个后续W纵切写代码前必过）：** `qt_fluent.py`不是旧树里唯一已经解决DRY的地方。切片必须先列出相关旧模块的等价物、真实consumer、依赖与行为合同，再分三类处理：dependency-closed且presentation-only的实现整体move到`qt_widgets`或对应frontend owner；绑定旧`ParamDecl/Hub/LogicNode`等领域对象的composite随其current Definition/intent纵切解依赖并迁到领域composition owner；确认无current语义且最后consumer已迁走的才删除。禁止current反向import legacy，也禁止跳过审计后凭外形重写一份。已知但仍须按真实consumer逐切片核验的库存包括`frontend/param_widgets.py`的`ParamWidgetHandler` registry（build/read/write/is_empty/refresh）、`RateLimitedApply`、`RefreshProviders`、signal picker helpers，以及旧Pulse/TaskConsole中的领域composite；列名不是原样保留承诺，行为合同与单一owner才是保留对象。
+
+复用顺序是硬约束：
+
+1. 先使用上表与基础 Fluent controls；Setting/Edit 能由 `FluentSettingRow + setting_label_width` 表达时禁止另起 `QFormLayout` 风格，需要共享label列的稠密表单（如finite repeat的Start/End/Count）直接用`FluentFormGrid`。
+2. **可替换性以行为合同为准，不以长相为准。** 控件替换必须保持 value range、float precision、commit/rollback、signal ordering、keyboard/wheel 与 enabled semantics。presentation-oriented `FluentDoubleSpinBox` 默认可按显示长度量化；pulse duration/delay 等权威值必须用其 non-quantizing 模式。若现有组件确实不能保持合同，raw Qt complex table/value editor 可暂留并登记真实缺口，不能为了复用率改变物理值；OS resource picker可继续用`QFileDialog`，普通文本/确认不得退回`QInputDialog/QMessageBox`。
+3. `FluentPathEdit` 的 typed/selected path 是 edit buffer，不是已提交的 PulseDocument/calibration/resource。选择后 validation 失败必须恢复最后 committed path 与原 artifact/document；不得显示“坏路径+旧权威对象”。
+4. 没有合适组件时，先证明至少两个真实 consumer 与一致的交互/视觉语义，才把新的 presentation-only 高层 widget 加入 `qt_widgets`；W2的三处文本请求与两处确认因此只补了两个薄helper，而不是dialog framework。一个 widget 不得持有 RunHandle、repository、Definition、scan/calibration intent 或领域 revision。
+5. 相似外形不等于相同 lifecycle。W1/W2/W3 的 cancel/reap/close 协议仍由各自 application shell 拥有，不能为了统一外壳强套 `FluentWindow` 或抽 `GenericRunPanel/RunControlStrip`；launcher 保活，只有各窗口完成自己的 cancel/reap/worker shutdown 后才在 committed close 释放；不得把普通 `QWidget.close()`（可能只隐藏、不触发 `destroyed`）误当成保活表已经清理。
+6. 所有顶层 W launcher 在构造 widget **之前**统一解析 process-wide Fluent scale，构造后先`screen_fit_window_size`，`show()`取得真实native frame后再`center_window_on_primary_screen`；首次 QApplication 创建若不在 Python main thread直接拒绝。Setting/Edit 的大内容区必须使用 `FluentScrollArea`，validation/status与 Apply/Cancel footer留在滚动区外，保证最小支持视口 `800×600` 与 Windows 125% DPI 下动作始终可达；验收看`availableGeometry.contains(frameGeometry)`而不是只看client width/height，fixed `resize(...)` 不是可用性证明。
+7. 动作颜色沿用成熟语义，不新增 role enum：`Start/Run/Apply=GREEN`、`Stop/Hold/Load/Paste=ORANGE`、`Cancel/Remove/Clear/secondary navigation=GREY`、普通非危险主操作=`ACCENT`。颜色只是可辨提示，enabled/Run state仍由领域 owner决定。
+8. Qt chrome/QSS/window metrics/QPainter token 只在 `[qt]` owner。旧 `frontend/style.py` 的字体资产、geometry、palette与publication defaults整体迁入唯一 `[render]` owner并物理删除旧文件；所有公开 nested token必须 immutable（tuple/mapping proxy），不得只做外层只读。Agg不能从Qt读取颜色或`fluent_scale`，Qt也不能用Matplotlib rcParams决定控件视觉。
+9. Matplotlib `rc_context` 修改的是进程全局状态，不是线程局部变量；所有迁入current render owner的Figure construction/draw/save/clear必须持有同一个re-entrant compose lock，DPI必须显式传入Figure且与memory preflight一致。`DataFigure.render()`返回caller-owned Figure后，后续第三方draw/mutation不再宣称受产品lane隔离；产品PNG/export必须回到render owner完成构造+draw，并经同一个release owner断开Figure/Canvas/artist循环。`Experiment.figure(memory_limit_bytes=...)`必须把总render预算冻结进返回的`DataFigure`，`_repr_png_`、默认render/PNG/export都消费该预算；逐次override只能收紧、不能取消或放宽。尚未迁出的旧共享-Figure RenderLoop只允许留在§12.5的`SerializedLegacyAggBridge`隔离岛，不能据此宣称已满足current lane合同；最后consumer迁走时连岛删除。直接第三方Matplotlib在产品draw期间并发修改rcParams不属于支持合同。
+10. W/application module 禁止散落 hex、局部公共控件 stylesheet 或复制 QApplication retention。若领域 QPainter 需要新颜色，先给 Qt style 增加语义 token；Agg艺术值进入唯一 render style。
+
+机械 ratchet 同时验证：旧 `qt_fluent.py`、旧 `frontend/style.py`、旧 `_matplotlib_render.py` 与旧 `qt_board.py` 不存在且 production 旧 import 为零；production只能从curated `zlc_frontend.qt_widgets` facade取件，禁止deep import；`zlc_frontend`内PyQt/qframelesswindow import只在`qt_widgets/**`；`qt_widgets/**`不导入Matplotlib、neutral/pulse/workbench或旧`Zou_lab_control`；render backend/style不导入Qt/IPython，notebook integration import本身也不加载IPython；fresh import的所有package roots不加载optional backend。所有现在及未来的`Zou_lab_control/workbench/_*.py` Qt shell对已有Fluent等价控件不得重新构造raw Qt或`QInputDialog/QMessageBox`，必须使用scale/screen-fit/center与retain/release；repo-root current `figure_viewer.py/pulse_gui.py/task_console.py`同样禁止自行构造`QApplication`。真实W launcher关闭后retention registry回到基线。当前用户/维护者手册同样扫描旧owner名，不能让文档继续教人走已删除路径。style并发恢复、明确DPI canvas尺寸、font package-data、权威float round-trip、路径失败回滚、sticky footer、动作颜色、端到端render预算与GC-disabled连续export/compose/renderer-construction fault资源释放都有current focused oracle。历史测试不因迁移旧路径而维护。
 
 `zlc_pulse` 的 model/compiler/host/server base import 不探测 Vivado、不导入 Qt；build/sim 工具只在明确命令入口检查外部工具。neutral_atom 导入 Sequencer adapter 所需 public API 时不能触发 build environment 初始化。
 
@@ -3609,6 +3651,14 @@ SCAN_SLOT intent 在 request 存在前必须冻结 owner PulseDocument、完整�
 Setting/Edit 共享一个 owner-thread revision session；stale draft返回typed conflict，Apply只在既有panel完全idle时原子reconfigure并清除旧FINAL，不取消active run。成功Apply后当前form从exact session snapshot全量重填，Cancel/Load/direct-source normalization同样清空所有不属于当前intent的隐藏字段，避免stale calibration/model复活。Start的既有worker才执行依赖calibration/device/schema的完整bind/preflight；失败保持NOT FINAL。Save/Load只接受一个current canonical tree，嵌套值委托DefinitionKey、PulseDocument、CalibrationArtifactRef与DataTransformSpec owner codec；没有版本链、升级器、compatibility alias、DeviceRef、RunHandle、reader/front buffer或provisional state。加载的权威transform在两个editor中都以精确AxisId摘要可见且可清除，不能被display intent覆盖。Stop/close继续由嵌入panel唯一owner完成cancel、terminal reap、preview退休与renderer释放。正常硬件执行仍是现有bitstream上的一次camera arm、一次`AUTONOMOUS_SCAN_ONCE` FIRE和完整resident table；没有HOST_STEPPED_GROUP、software timing、逐cell handshake、RTL或bitstream修改。
 
 W3e Rule-6按19个受影响production文件相对parent `e77b0559`机械计数：`9813 -> 11599 physical`、`8821 -> 10408 token-NCLOC`，净`+1786/+1587`；classes `68 -> 79`、dataclasses `45 -> 51`、enums `1 -> 1`、functions/methods `441 -> 523`。两个新文件为headless intent/catalog/editor/codec `593/531` 与Qt composition `943/841`，其余静态Definition拆分、scan reconfigure和public lazy seam净`+250/+215`；其中相对初版新增的123/117行专门关闭“隐藏权威transform”“取消的hidden calibration/model复活”与未配置card timer未停三个具体漏洞，不是通用transform editor。main中不重复计算W3d执行/render，只取旧TaskConsole的PulseSlots、MeasurementPanel、LogicNodeEditor、LogicNodeConfig/TaskConsoleState及同壳内catalog/edit/build/save/load/shutdown方法，机械并集为`1705 physical / 1283 token-NCLOC`；本轮比为`1.048x / 1.237x`，没有超过约3倍。新增9个真实产品类加静态Definition/display边界的净2类均有当前consumer；没有新增enum、manager、plugin、通用pipeline DSL或单层compat wrapper。focused Definition/scan/TaskConsole联合测试为29 passed，另有compileall、diff-check、target import-DAG、旧Definition转出口、shape-loss、raw-runtime persistence与execution-mode机械扫描；独立对抗终审P0=0/P1=0后本纵切GO。下一 checkpoint 是只为已接受例外语义建立 `API_SLOT_SEGMENTED_EXISTING` current纵切；在其余 Measurement/Processor、rolling/gridplot/selector/calibration/temperature/MOT 与旧GUI consumer迁走前，不提前删除legacy TaskConsole/PulseScan宿主。真实qCMOS Formal仍因Q0/EndAttestation保持typed NO-GO，RTL/bitstream冻结。
+
+**最新实现 checkpoint：W-UI0 current Qt/render owner与复用前置切片完成。** 经逐项对照旧实现确认，旧`frontend/qt_fluent.py`不是参考样本而是成熟组件authority：其完整widget/lifecycle/layout实现整体迁入`zlc_frontend.qt_widgets`，Qt palette/QSS/QPainter/window metric进入同leaf的style owner，`QtImageBoard/QtOwnerWake`一并收口；旧文件、旧`zlc_frontend.qt_board`、production旧import/deep import与current手册旧路径物理消失，不留alias/shim。W1 capture、W2 PulseWorkbench、W3 scan与TaskConsole直接取用既有Fluent button/label/input/combo/spin/group/tab/scroll/path/setting-row；W2 finite-repeat表单改取`FluentFormGrid`，三处文本请求和两处确认统一经`fluent_text_prompt/fluent_confirm`，不再漏回native chrome；W3 FINAL raster复用`QtImageBoard.present_encoded`，artifact id用既有`ElidedLabel`保留full tooltip，不再让`QLabel`的pixmap或长文本sizeHint把窗口撑出屏幕；W3仍只有一个`ScanIntentForm`类型服务Setting/Edit，其大内容区可滚动而validation/status和Apply/Cancel footer固定可达。四个Workbench launcher在构造widget前统一auto scale，show后按真实frame统一center，repo-root三个current launcher也统一`ensure_qt_app`；真实offscreen `800×600`在READY/FINAL后仍完整可达。Start/Run/Apply、Stop/Hold/Load、Cancel/Remove/Clear恢复旧GUI的GREEN/ORANGE/GREY动作语义。raw Qt只剩layout/container/table/file-dialog与领域QPainter，不增加GenericRunPanel、SettingsEngine、RunControlStrip、dialog或table framework。
+
+复用审查没有把“换成公共类”误当行为等价：`FluentDoubleSpinBox`原先按显示字符量化，W2 pulse duration/delay改用同组件的non-quantizing合同，真实clock-grid大值round-trip不变；`FluentPathEdit`选择坏PulseDocument会先显示坏路径，现validation失败恢复最后committed path且document fingerprint不动。首次从Python worker打开GUI会在worker创建QApplication并让后续Qt线程比较恒真，现`ensure_qt_app`在首建前fail-closed；`retain_window`既会把W3布尔`closed`误当signal，也不能依赖普通`QWidget.close()`发`destroyed`，现公共owner只连接真实signal并提供幂等`release_window`，四个异步窗口只在cancel/reap/worker shutdown完成后的committed close释放，真实launcher测试均确认registry回到基线，且没有用`WA_DeleteOnClose`破坏对象生命周期。
+
+旧`frontend/style.py`及其Helvetica资产同样是成熟render style authority，已整体迁入唯一`zlc_frontend.render_style`并删除旧owner；新增FigureDocument artist token只扩展该palette，不另造第二套series/rcParams。公开nested style值改成tuple/只读mapping，font package-data随新owner进wheel；IPython/widget hook拆到lazy `notebook_integration`，render leaf不探测notebook环境。因为`matplotlib.rc_context`修改进程全局状态，current FigureDocument/Agg产品的构造/draw/save/clear现由同一RLock串行；`DataFigure.to_png_bytes/export`把实际Agg draw收回render owner，caller-owned`render()`不冒充后续draw隔离。current Figure显式接收DPI并使canvas allocation与memory preflight一致，关闭了继承旧`figure.dpi=300`后预算按100dpi低估约9倍的洞；产品save与live renderer复用同一Figure/Canvas释放owner，GC-disabled连续PNG/SVG也不保留上一块Agg资源。notebook façade冻结调用者的总render预算到`DataFigure`，所以隐式`_repr_png_`与后续export不能绕过准入。旧live pulse scan也不再反向读取Qt颜色/字体。尚未迁出的共享-Figure RenderLoop仍只属于`SerializedLegacyAggBridge`隔离岛，本checkpoint不把它冒充为current compose lane完成。
+
+W-UI0按36个production Python union path（parent存在29、current存在32）相对`db2dc408`机械计数为`40361 -> 41167 physical`、`36507 -> 37257 nonblank`，净`+806/+750`，比为`1.0200x/1.0205x`；classes`139 -> 139`、dataclasses`12 -> 12`、enums`0 -> 0`、functions/methods`1878 -> 1895`，无新增产品class或超过约3倍项。第35条是为冻结端到端render预算而实际修改的notebook façade，第36条是被机械审查抓出的current root`pulse_gui.py`，都不能藏在原34-path账外；其余增量来自curated Qt facade、两个style owner leaf、薄文本/确认helper、复用immutable image board、串行compose/save/release边界、显式precision/lifecycle/layout合同与机械ratchet，不是新的GUI framework。focused tests按process-lifetime installation边界分进程运行共90 passed（Qt/render owner 12、W1 7、W2 9、W3 application 5、panel controller 12、TaskConsole 7、frontend figure/render 38），另有target compile、diff-check、fresh import、并发rc恢复、DPI canvas、GC-disabled连续export与fault injection、端到端budget、READY/FINAL frame containment、old/deep owner、raw-control/modal/QApplication alias、font package-data、style literal与extras ratchet。下一产品纵切仍是`API_SLOT_SEGMENTED_EXISTING`；任何后续W窗口必须先通过§4.3.1的salvage/reuse门。
 
 ### 22.2 终态验收清单
 

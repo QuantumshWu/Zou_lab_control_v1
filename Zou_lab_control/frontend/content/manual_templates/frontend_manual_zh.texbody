@@ -6,17 +6,17 @@
 主要文件：
 
 \begin{description}
-  \item[\filepath{qt_fluent.py}] 可复用的 Fluent/Confocal 风格与控件，以及结构上防止裁切/重叠的布局原语。
+  \item[\pyapi{zlc_frontend.qt_widgets}] 可复用的 Fluent/Confocal 风格与控件，以及结构上防止裁切/重叠的布局原语。
   \item[\filepath{pulse_gui.py}] Confocal 风格脉冲编辑器，编辑 \pyapi{PulseTableState} 并调用传入的 \pyapi{SequencerDevice}。
   \item[\filepath{live.py}, \filepath{data_figure.py}, \filepath{canvas.py}] 绘图与实时刷新层。
   \item[\filepath{notes.py}] PDF/手册渲染（\pyapi{render_tex_pdf} 等）。
 \end{description}
 
 \begin{notebox}[一条总规则]
-PyQt 前端应复用 \filepath{qt_fluent.py}，不要在每个 GUI 里手写一套 Qt 样式。布局应使用本章介绍的原语，而不是逐行硬编码像素几何——这是“对齐契约”能在不同 Windows DPI 下稳定成立的原因。
+PyQt 前端应复用 \pyapi{zlc_frontend.qt_widgets}，不要在每个 GUI 里手写一套 Qt 样式。布局应使用本章介绍的原语，而不是逐行硬编码像素几何——这是“对齐契约”能在不同 Windows DPI 下稳定成立的原因。
 \end{notebox}
 
-\chapter{qt\_fluent 控件库}
+\chapter{zlc\_frontend.qt\_widgets 控件库}
 
 \section{视觉基调}
 统一用 Segoe UI、12 pt、背景 \pyapi{#F3F3F3}、文字 \pyapi{#323130}、强调色 \pyapi{#77AADD}、圆角 4 px、扁平 1 px 卡片边框。\pyapi{FluentGroupBox} 是带灰色标题胶囊的白色卡片，用一条 1 px \pyapi{DIVIDER} 细边框勾勒（不是软阴影——软阴影每帧都要把整张卡重新栅格化再高斯模糊，35 站点大网格卡冷载入实测多花 ~250 ms，扁平边框零开销且同样清晰地界定卡片边界）；这条边框是密封的构造细节，不要把它暴露成按调用可配的开关，也不要把编辑器换成普通表格。用 \pyapi{FluentComboBox}/\pyapi{FluentSpinBox}/\pyapi{FluentScrollArea} 让弹出列表、计数器、细滚动条共享同一套样式。
@@ -53,7 +53,7 @@ PyQt 前端应复用 \filepath{qt_fluent.py}，不要在每个 GUI 里手写一�
 一个稳健、对齐的 Fluent 页面的骨架：
 
 \begin{codeblock}[Python]
-from Zou_lab_control.frontend import qt_fluent as qf
+import zlc_frontend.qt_widgets as qf
 
 label_w = qf.measure_text_width(["Clock:", "Delay:", "Total:"])  # 由内容决定列宽
 form = qf.FluentFormGrid(label_width=label_w)
@@ -782,7 +782,7 @@ DAC 值与 duration 可在同一张表里联动（delay 不参与扫描）。硬
 
 \begin{codeblock}[Python]
 from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
-from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+from zlc_frontend.qt_widgets import ensure_qt_app
 app = ensure_qt_app()
 ed = PulseSequenceEditor()        # 空白脉冲表
 ed.show(); app.exec_()
@@ -896,7 +896,7 @@ Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_cons
 \caption{\tfocus{2D live 图像的显示链}。满分辨率数组留在内存；显示层按当前视野裁剪 + 块平均到 axes 像素预算（\tfocus{面积平均，提信噪}），\pyapi{imshow(interpolation="antialiased")} 渲染，Agg 缓冲\tfocus{等于屏幕设备像素}做 1:1 贴图。整条链\tfocus{只一次重采样}；放大重新切片、细节渐进回归到 1:1。这就是为什么 monitor 相机既不卡、又不比原图糊。}
 \end{figure}
 \begin{notebox}
-弹窗用 \pyapi{FluentPopup}（\filepath{qt\_fluent.py}）：\tfocus{半透明、无边框}的顶层 \pyapi{Qt.Popup}，圆角白卡由 \pyapi{paintEvent} 抗锯齿描一笔（填充 + 1px 边框）。两条教训：① 不可在\tfocus{不透明}顶层弹窗上用样式表 \pyapi{border-radius}——方形窗体留在圆弧外，右下角露出方角白块（那条"奇怪的线"），Windows 还叠一层原生阴影；② 光加 \pyapi{WA\_TranslucentBackground} 不够，它会让样式表背景\tfocus{整块不画}（弹窗变透明）。所以圆角卡\tfocus{自己画}。边框是画出来的、不是样式表规则，因此也\tfocus{绝不会级联}到 QLabel/QComboBox 等子控件。
+弹窗用 \pyapi{zlc\_frontend.qt\_widgets.FluentPopup}：\tfocus{半透明、无边框}的顶层 \pyapi{Qt.Popup}，圆角白卡由 \pyapi{paintEvent} 抗锯齿描一笔（填充 + 1px 边框）。两条教训：① 不可在\tfocus{不透明}顶层弹窗上用样式表 \pyapi{border-radius}——方形窗体留在圆弧外，右下角露出方角白块（那条"奇怪的线"），Windows 还叠一层原生阴影；② 光加 \pyapi{WA\_TranslucentBackground} 不够，它会让样式表背景\tfocus{整块不画}（弹窗变透明）。所以圆角卡\tfocus{自己画}。边框是画出来的、不是样式表规则，因此也\tfocus{绝不会级联}到 QLabel/QComboBox 等子控件。
 \end{notebox}
 常用表达式示例：
 \begin{codeblock}[Python]
@@ -1352,7 +1352,7 @@ render_tex_pdf("docs/main_manual/main_manual_zh.tex",
 \chapter{修改指南}
 
 \section{我要加一个新 Fluent 控件}
-扩展 \filepath{qt_fluent.py}，复用 \pyapi{Metrics} token 和 \pyapi{scaled_px()}，不要在 GUI 模块里另造样式或缩放。新控件应能在 \pyapi{FluentFormGrid} 里以 \pyapi{Metrics.row_h()} 高度对齐。
+扩展 \pyapi{zlc_frontend.qt_widgets}，复用 \pyapi{Metrics} token 和 \pyapi{scaled_px()}，不要在 GUI 模块里另造样式或缩放。新控件应能在 \pyapi{FluentFormGrid} 里以 \pyapi{Metrics.row_h()} 高度对齐。
 
 \section{我要给脉冲 GUI 加一行}
 任何新行、spacer、标题、开关文字或局部 margin，都必须保证 \pyapi{Port Catalog}、\pyapi{Delay \& Scan}、period 卡片、repeat bracket 的顶部控制行仍然对齐。

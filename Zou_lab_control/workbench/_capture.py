@@ -26,7 +26,21 @@ from zlc_frontend.figure import (
     suggest_view,
 )
 from zlc_frontend.image_raster import estimate_gray8_raster_peak_nbytes
-from zlc_frontend.qt_board import QtImageBoard, QtOwnerWake
+from zlc_frontend.qt_widgets import (
+    FluentButton,
+    FluentLabel,
+    GREEN,
+    ORANGE,
+    QtImageBoard,
+    QtOwnerWake,
+    WINDOW_SCREEN_FRACTION,
+    center_window_on_primary_screen,
+    ensure_qt_app,
+    release_window,
+    retain_window,
+    screen_fit_window_size,
+    set_fluent_scale,
+)
 from zlc_frontend.render import RenderSurface
 from zlc_neutral_atom.capture_application import PreparedFiniteCapture
 from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
@@ -80,26 +94,27 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         self._pool_closed = False
 
         self.setWindowTitle("Finite Camera Capture")
-        self.resize(760, 620)
-        self._capture_status = QtWidgets.QLabel("Capture: PREPARING")
+        self._capture_status = FluentLabel("Capture: PREPARING")
         self._capture_status.setObjectName("captureStatus")
-        self._preview_status = QtWidgets.QLabel(
+        self._preview_status = FluentLabel(
             f"Preview: PROVISIONAL · {_PROJECTION_TEXT}"
         )
         self._preview_status.setObjectName("previewStatus")
-        self._projection_status = QtWidgets.QLabel(
+        self._preview_status.setWordWrap(True)
+        self._projection_status = FluentLabel(
             f"Display: {_PROJECTION_TEXT}"
         )
         self._projection_status.setObjectName("projectionStatus")
-        self._diagnostics = QtWidgets.QLabel("")
+        self._projection_status.setWordWrap(True)
+        self._diagnostics = FluentLabel("")
         self._diagnostics.setObjectName("diagnostics")
         self._diagnostics.setWordWrap(True)
         self._board_widget = QtImageBoard("capture-image", self)
         self._board_widget.setObjectName("captureImageBoard")
-        self._start_button = QtWidgets.QPushButton("Start", self)
+        self._start_button = FluentButton("Start", self, color=GREEN)
         self._start_button.setObjectName("startButton")
         self._start_button.setEnabled(False)
-        self._stop_button = QtWidgets.QPushButton("Stop", self)
+        self._stop_button = FluentButton("Stop", self, color=ORANGE)
         self._stop_button.setObjectName("stopButton")
         self._stop_button.setEnabled(False)
         controls = QtWidgets.QHBoxLayout()
@@ -608,6 +623,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
 
     def closeEvent(self, event) -> None:
         if self._allow_close:
+            release_window(self)
             event.accept()
             return
         event.ignore()
@@ -662,16 +678,15 @@ def open_capture_workbench(
     experiment: Experiment,
     request: CaptureRequest,
 ) -> CaptureWorkbenchWindow:
-    application = QtWidgets.QApplication.instance()
-    owns_application = application is None
-    if application is None:
-        application = QtWidgets.QApplication([])
+    application = ensure_qt_app()
     if QtCore.QThread.currentThread() != application.thread():
         raise RuntimeError("capture Workbench must be opened on the Qt GUI thread")
+    set_fluent_scale(None)
     window = CaptureWorkbenchWindow(experiment, request)
-    if owns_application:
-        window._application_owner = application
+    window.resize(screen_fit_window_size(WINDOW_SCREEN_FRACTION))
+    retain_window(window)
     window.show()
+    center_window_on_primary_screen(window, application)
     return window
 
 

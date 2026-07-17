@@ -1,6 +1,6 @@
 """Embedding matplotlib figures in Qt windows: the ONE display-scale wrapper.
 
-Figures keep the single frontend font/geometry system (style.DEFAULT_STYLE,
+Figures keep the single frontend font/geometry system (render_style.DEFAULT_STYLE,
 dpi=300) -- font sizes are NEVER forked per host.  How large a figure APPEARS in
 a Qt window is a display concern, handled here.
 
@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from .style import DESIGN_DPI
+from zlc_frontend.render_style import DESIGN_DPI
 from .render_loop import RENDER_THREAD_NAME
 
 try:
@@ -363,7 +363,7 @@ def panel_canvas(figure, *, isolate_wheel: bool = True):
 
     if EmbeddedFigureCanvas is None:  # pragma: no cover - matplotlib-qt missing
         raise RuntimeError("matplotlib Qt canvas is not available")
-    from .style import PANEL_DISPLAY_SCALE
+    from zlc_frontend.render_style import PANEL_DISPLAY_SCALE
     # The ONE display knob: the Agg buffer is rendered at exactly the widget's on-screen
     # device pixels (figure.dpi carries display_scale), so the blit is 1:1 -- no softness.
     # Saved figures use savefig.dpi, independently of this.

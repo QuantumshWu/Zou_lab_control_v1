@@ -185,7 +185,7 @@ def make_console(exp, *, running_nodes=None, window_px=(900, 600)):
     drives the same specs + hub wiring the GUI entry point does.  The background tick timer
     is stopped for determinism: tests drive frames themselves -- use :func:`tick` when the
     test asserts RENDERED state (``con._tick()`` alone only submits to the render worker)."""
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from zlc_frontend.qt_widgets import ensure_qt_app
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 

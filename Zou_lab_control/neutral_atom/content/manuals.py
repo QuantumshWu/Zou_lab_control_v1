@@ -66,7 +66,7 @@ def _render_grabber_timing(path: Path) -> Path:
         import matplotlib.pyplot as plt
         from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
-        from Zou_lab_control.frontend import style as S
+        import zlc_frontend.render_style as S
         from Zou_lab_control.frontend.devtools import install_screenshot_font
 
         install_screenshot_font()
@@ -140,7 +140,7 @@ def _render_trigger_cable(path: Path) -> Path:
         import matplotlib.pyplot as plt
         from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
-        from Zou_lab_control.frontend import style as S
+        import zlc_frontend.render_style as S
         from Zou_lab_control.frontend.devtools import install_screenshot_font
 
         install_screenshot_font()
@@ -282,7 +282,7 @@ def _render_device_manager_shot(path: Path) -> Path:
         from Zou_lab_control.frontend import devtools as dt
         from Zou_lab_control.frontend.device_manager import DeviceManagerPanel
         from Zou_lab_control.frontend.devtools import install_screenshot_font
-        from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+        from zlc_frontend.qt_widgets import ensure_qt_app
         from Zou_lab_control.neutral_atom.devices.registry import device_config_dir
 
         ensure_qt_app()

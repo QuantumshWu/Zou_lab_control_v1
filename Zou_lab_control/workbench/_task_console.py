@@ -13,6 +13,30 @@ import re
 
 from PyQt5 import QtCore, QtWidgets
 
+from zlc_frontend.qt_widgets import (
+    FluentButton,
+    FluentComboBox,
+    FluentGroupBox,
+    FluentLabel,
+    FluentLineEdit,
+    FluentPathEdit,
+    FluentScrollArea,
+    FluentSettingRow,
+    FluentSpinBox,
+    FluentTabWidget,
+    GREEN,
+    GREY,
+    ORANGE,
+    WINDOW_SCREEN_FRACTION,
+    center_window_on_primary_screen,
+    ensure_qt_app,
+    release_window,
+    retain_window,
+    screen_fit_window_size,
+    set_fluent_scale,
+    setting_label_width,
+)
+
 from Zou_lab_control.notebook.facade import Experiment
 from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_KEY
 from zlc_neutral_atom.readout.calibration import ReadoutModelKind
@@ -39,6 +63,23 @@ from ._scan import ScanWorkbenchWindow
 _DIRECT_SOURCE = "direct"
 _OCCUPANCY_SOURCE = "occupancy"
 _EMBEDDED_DOCUMENT = "(embedded PulseDocument)"
+
+
+def _settings_card(
+    title: str,
+    rows: tuple[tuple[str, QtWidgets.QWidget], ...],
+    parent: QtWidgets.QWidget,
+) -> FluentGroupBox:
+    """Compose one card from the shared setting-row design system."""
+
+    box = FluentGroupBox(title, parent)
+    layout = QtWidgets.QVBoxLayout(box)
+    label_width = setting_label_width(label for label, _control in rows)
+    for label, control in rows:
+        layout.addWidget(
+            FluentSettingRow(label, control, label_width=label_width, parent=box)
+        )
+    return box
 
 
 def _parse_number(text: str, field: str) -> int | float:
@@ -115,37 +156,42 @@ class ScanIntentForm(QtWidgets.QWidget):
         self._output_transform_spec = None
         self.setObjectName(f"{object_prefix}ScanIntentForm")
 
-        self._pulse_path = QtWidgets.QLineEdit(self)
-        self._pulse_path.setObjectName(f"{object_prefix}PulseDocumentPath")
+        self._pulse_path = FluentPathEdit(
+            mode="file",
+            caption="Select current PulseDocument",
+            file_filter="PulseDocument JSON (*.json);;All files (*)",
+            parent=self,
+        )
+        self._pulse_path.setObjectName(f"{object_prefix}PulseDocumentPathField")
+        self._pulse_path.edit.setObjectName(f"{object_prefix}PulseDocumentPath")
         self._pulse_path.setPlaceholderText("Current PulseDocument JSON")
-        self._load_pulse = QtWidgets.QPushButton("Load JSON", self)
+        self._load_pulse = FluentButton("Load JSON", self, color=ORANGE)
         self._load_pulse.setObjectName(f"{object_prefix}LoadPulseDocumentButton")
-        self._browse_pulse = QtWidgets.QPushButton("Browse…", self)
+        self._browse_pulse = self._pulse_path.browse
         self._browse_pulse.setObjectName(f"{object_prefix}BrowsePulseDocumentButton")
         pulse_row = QtWidgets.QHBoxLayout()
         pulse_row.addWidget(self._pulse_path, 1)
         pulse_row.addWidget(self._load_pulse)
-        pulse_row.addWidget(self._browse_pulse)
-        self._fingerprint = QtWidgets.QLabel("Fingerprint: —", self)
+        self._fingerprint = FluentLabel("Fingerprint: —", self)
         self._fingerprint.setObjectName(f"{object_prefix}PulseFingerprint")
         self._fingerprint.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self._scan_summary = QtWidgets.QLabel("SCAN_SLOT: no document", self)
+        self._scan_summary = FluentLabel("SCAN_SLOT: no document", self)
         self._scan_summary.setObjectName(f"{object_prefix}ScanTableSummary")
         self._scan_summary.setWordWrap(True)
 
-        pulse_box = QtWidgets.QGroupBox("PulseDocument · SCAN_SLOT", self)
+        pulse_box = FluentGroupBox("PulseDocument · SCAN_SLOT", self)
         pulse_layout = QtWidgets.QVBoxLayout(pulse_box)
         pulse_layout.addLayout(pulse_row)
         pulse_layout.addWidget(self._fingerprint)
         pulse_layout.addWidget(self._scan_summary)
 
-        self._api_box = QtWidgets.QGroupBox("Whole-run API constants", self)
-        self._api_layout = QtWidgets.QFormLayout(self._api_box)
-        self._api_empty = QtWidgets.QLabel("Load a PulseDocument", self._api_box)
+        self._api_box = FluentGroupBox("Whole-run API constants", self)
+        self._api_layout = QtWidgets.QVBoxLayout(self._api_box)
+        self._api_empty = FluentLabel("Load a PulseDocument", self._api_box)
         self._api_empty.setObjectName(f"{object_prefix}ApiConstantsState")
-        self._api_layout.addRow(self._api_empty)
+        self._api_layout.addWidget(self._api_empty)
 
-        self._authority_summary = QtWidgets.QLabel(self)
+        self._authority_summary = FluentLabel(parent=self)
         self._authority_summary.setObjectName(
             f"{object_prefix}AuthoritativeTransformSummary"
         )
@@ -153,14 +199,15 @@ class ScanIntentForm(QtWidgets.QWidget):
         self._authority_summary.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
-        self._clear_authority = QtWidgets.QPushButton(
+        self._clear_authority = FluentButton(
             "Clear user transform",
             self,
+            color=GREY,
         )
         self._clear_authority.setObjectName(
             f"{object_prefix}ClearAuthoritativeTransformButton"
         )
-        authority_box = QtWidgets.QGroupBox(
+        authority_box = FluentGroupBox(
             "Authoritative output transform",
             self,
         )
@@ -168,77 +215,90 @@ class ScanIntentForm(QtWidgets.QWidget):
         authority_layout.addWidget(self._authority_summary)
         authority_layout.addWidget(self._clear_authority)
 
-        self._source = QtWidgets.QComboBox(self)
+        self._source = FluentComboBox(self)
         self._source.setObjectName(f"{object_prefix}ScanSource")
         self._source.addItem("Direct camera", _DIRECT_SOURCE)
         self._source.addItem("Camera → Occupancy counts", _OCCUPANCY_SOURCE)
-        self._calibration_repository = QtWidgets.QLineEdit(self)
+        self._calibration_repository = FluentLineEdit(parent=self)
         self._calibration_repository.setObjectName(
             f"{object_prefix}CalibrationRepositoryId"
         )
         self._calibration_repository.setPlaceholderText("repository_id")
-        self._calibration_digest = QtWidgets.QLineEdit(self)
+        self._calibration_digest = FluentLineEdit(parent=self)
         self._calibration_digest.setObjectName(
             f"{object_prefix}CalibrationManifestDigest"
         )
         self._calibration_digest.setPlaceholderText("64-character manifest digest")
-        self._model_kind = QtWidgets.QComboBox(self)
+        self._model_kind = FluentComboBox(self)
         self._model_kind.setObjectName(f"{object_prefix}ReadoutModelKind")
         self._model_kind.addItem("Calibration default", None)
         for kind in ReadoutModelKind:
             self._model_kind.addItem(kind.value, kind)
-        source_box = QtWidgets.QGroupBox("Source", self)
-        source_layout = QtWidgets.QFormLayout(source_box)
-        source_layout.addRow("Pipeline", self._source)
-        source_layout.addRow("Calibration repository", self._calibration_repository)
-        source_layout.addRow("Calibration digest", self._calibration_digest)
-        source_layout.addRow("Readout model", self._model_kind)
+        source_box = _settings_card(
+            "Source",
+            (
+                ("Pipeline", self._source),
+                ("Calibration repository", self._calibration_repository),
+                ("Calibration digest", self._calibration_digest),
+                ("Readout model", self._model_kind),
+            ),
+            self,
+        )
 
-        self._camera_role = QtWidgets.QLineEdit("camera", self)
+        self._camera_role = FluentLineEdit("camera", self)
         self._camera_role.setObjectName(f"{object_prefix}CameraRole")
-        self._sequencer_role = QtWidgets.QLineEdit("sequencer", self)
+        self._sequencer_role = FluentLineEdit("sequencer", self)
         self._sequencer_role.setObjectName(f"{object_prefix}SequencerRole")
-        self._trigger_channel = QtWidgets.QLineEdit(self)
+        self._trigger_channel = FluentLineEdit(parent=self)
         self._trigger_channel.setObjectName(f"{object_prefix}TriggerChannel")
         self._trigger_channel.setPlaceholderText("optional")
-        binding_box = QtWidgets.QGroupBox("Device binding", self)
-        binding_layout = QtWidgets.QFormLayout(binding_box)
-        binding_layout.addRow("Camera role", self._camera_role)
-        binding_layout.addRow("Sequencer role", self._sequencer_role)
-        binding_layout.addRow("Trigger channel", self._trigger_channel)
+        binding_box = _settings_card(
+            "Device binding",
+            (
+                ("Camera role", self._camera_role),
+                ("Sequencer role", self._sequencer_role),
+                ("Trigger channel", self._trigger_channel),
+            ),
+            self,
+        )
 
-        self._transport_budget = QtWidgets.QLineEdit(str(64 << 20), self)
+        self._transport_budget = FluentLineEdit(str(64 << 20), self)
         self._transport_budget.setObjectName(f"{object_prefix}TransportBudgetBytes")
-        self._memory_budget = QtWidgets.QLineEdit(str(512 << 20), self)
+        self._memory_budget = FluentLineEdit(str(512 << 20), self)
         self._memory_budget.setObjectName(f"{object_prefix}MemoryBudgetBytes")
-        self._deadline = QtWidgets.QLineEdit("30.0", self)
+        self._deadline = FluentLineEdit("30.0", self)
         self._deadline.setObjectName(f"{object_prefix}DeadlineSeconds")
-        budget_box = QtWidgets.QGroupBox("Budgets and deadline", self)
-        budget_layout = QtWidgets.QFormLayout(budget_box)
-        budget_layout.addRow("Transport bytes", self._transport_budget)
-        budget_layout.addRow("Pipeline bytes", self._memory_budget)
-        budget_layout.addRow("Timeout seconds", self._deadline)
+        budget_box = _settings_card(
+            "Budgets and deadline",
+            (
+                ("Transport bytes", self._transport_budget),
+                ("Pipeline bytes", self._memory_budget),
+                ("Timeout seconds", self._deadline),
+            ),
+            self,
+        )
 
-        self._site_mode = QtWidgets.QComboBox(self)
+        self._site_mode = FluentComboBox(self)
         self._site_mode.setObjectName(f"{object_prefix}SiteDisplayMode")
         self._site_mode.addItem("Auto", "auto")
         self._site_mode.addItem("Batch", "batch")
         self._site_mode.addItem("Select", "select")
-        self._site_index = QtWidgets.QSpinBox(self)
+        self._site_index = FluentSpinBox(self)
         self._site_index.setObjectName(f"{object_prefix}SiteDisplayIndex")
         self._site_index.setRange(0, 2_147_483_647)
-        display_box = QtWidgets.QGroupBox("Display only · SITE", self)
-        display_layout = QtWidgets.QFormLayout(display_box)
-        display_layout.addRow("Mode", self._site_mode)
-        display_layout.addRow("Index", self._site_index)
+        display_box = _settings_card(
+            "Display only · SITE",
+            (("Mode", self._site_mode), ("Index", self._site_index)),
+            self,
+        )
 
-        self._diagnostics = QtWidgets.QLabel("", self)
+        self._diagnostics = FluentLabel("", self)
         self._diagnostics.setObjectName(f"{object_prefix}ScanEditorDiagnostics")
         self._diagnostics.setWordWrap(True)
         self._diagnostics.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self._apply = QtWidgets.QPushButton("Apply", self)
+        self._apply = FluentButton("Apply", self, color=GREEN)
         self._apply.setObjectName(f"{object_prefix}ApplyScanIntentButton")
-        self._cancel = QtWidgets.QPushButton("Cancel", self)
+        self._cancel = FluentButton("Cancel", self, color=GREY)
         self._cancel.setObjectName(f"{object_prefix}CancelScanIntentButton")
         buttons = QtWidgets.QHBoxLayout()
         buttons.addStretch(1)
@@ -255,16 +315,24 @@ class ScanIntentForm(QtWidgets.QWidget):
         columns.addLayout(left, 1)
         columns.addLayout(right, 1)
 
+        content = QtWidgets.QWidget(self)
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.addWidget(pulse_box)
+        content_layout.addWidget(self._api_box)
+        content_layout.addWidget(authority_box)
+        content_layout.addLayout(columns)
+        content_layout.addStretch(1)
+        self._scroll = FluentScrollArea(self)
+        self._scroll.setObjectName(f"{object_prefix}ScanIntentScroll")
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setWidget(content)
+
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(pulse_box)
-        layout.addWidget(self._api_box)
-        layout.addWidget(authority_box)
-        layout.addLayout(columns)
+        layout.addWidget(self._scroll, 1)
         layout.addWidget(self._diagnostics)
         layout.addLayout(buttons)
-        layout.addStretch(1)
 
-        self._browse_pulse.clicked.connect(self._browse_for_pulse)
+        self._pulse_path.selected.connect(self._load_selected_pulse)
         self._load_pulse.clicked.connect(self._load_path_from_edit)
         self._source.currentIndexChanged.connect(self._update_enabled_state)
         self._site_mode.currentIndexChanged.connect(self._update_enabled_state)
@@ -444,24 +512,33 @@ class ScanIntentForm(QtWidgets.QWidget):
         )
         self._clear_api_rows()
         if not document.api_parameters:
-            self._api_empty = QtWidgets.QLabel(
+            self._api_empty = FluentLabel(
                 "No whole-run API constants declared",
                 self._api_box,
             )
             self._api_empty.setObjectName(f"{self._prefix}ApiConstantsState")
-            self._api_layout.addRow(self._api_empty)
+            self._api_layout.addWidget(self._api_empty)
             return
-        for parameter in document.api_parameters:
-            edit = QtWidgets.QLineEdit(self._api_box)
+        labels = tuple(
+            f"{parameter.parameter_id} ({parameter.unit})"
+            for parameter in document.api_parameters
+        )
+        label_width = setting_label_width(labels)
+        for parameter, label in zip(document.api_parameters, labels, strict=True):
+            edit = FluentLineEdit(parent=self._api_box)
             edit.setObjectName(
                 f"{self._prefix}ApiValue_{parameter.parameter_id}"
             )
             if parameter.parameter_id in api_values:
                 edit.setText(str(api_values[parameter.parameter_id]))
             self._api_edits[parameter.parameter_id] = edit
-            self._api_layout.addRow(
-                f"{parameter.parameter_id} ({parameter.unit})",
-                edit,
+            self._api_layout.addWidget(
+                FluentSettingRow(
+                    label,
+                    edit,
+                    label_width=label_width,
+                    parent=self._api_box,
+                )
             )
 
     def _clear_api_rows(self) -> None:
@@ -482,8 +559,8 @@ class ScanIntentForm(QtWidgets.QWidget):
         self._fingerprint.setText("Fingerprint: —")
         self._scan_summary.setText("SCAN_SLOT: no document")
         self._clear_api_rows()
-        self._api_empty = QtWidgets.QLabel("Load a PulseDocument", self._api_box)
-        self._api_layout.addRow(self._api_empty)
+        self._api_empty = FluentLabel("Load a PulseDocument", self._api_box)
+        self._api_layout.addWidget(self._api_empty)
         self._source.setCurrentIndex(0)
         self._calibration_repository.clear()
         self._calibration_digest.clear()
@@ -512,18 +589,15 @@ class ScanIntentForm(QtWidgets.QWidget):
         )
         self._clear_authority.setEnabled(self._output_transform_spec is not None)
 
-    def _browse_for_pulse(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select current PulseDocument",
-            "",
-            "PulseDocument JSON (*.json);;All files (*)",
-        )
-        if not path:
-            return
+    def _load_selected_pulse(self, path: str) -> None:
         try:
             self.load_pulse_path(path)
         except BaseException as error:
+            self._pulse_path.setText(
+                ""
+                if self._document is None
+                else self._document_source or _EMBEDDED_DOCUMENT
+            )
             self.show_error(error)
 
     def _load_path_from_edit(self) -> None:
@@ -531,10 +605,7 @@ class ScanIntentForm(QtWidgets.QWidget):
         if not path or path == _EMBEDDED_DOCUMENT:
             self.show_error(ValueError("choose a PulseDocument JSON path"))
             return
-        try:
-            self.load_pulse_path(path)
-        except BaseException as error:
-            self.show_error(error)
+        self._load_selected_pulse(path)
 
     def _apply_clicked(self) -> None:
         try:
@@ -574,11 +645,11 @@ class TaskScanCard(QtWidgets.QWidget):
         self._session: ScanEditorSession | None = None
         self._panel: ScanWorkbenchWindow | None = None
 
-        title = QtWidgets.QLabel("Task: Autonomous SCAN_SLOT", self)
+        title = FluentLabel("Task: Autonomous SCAN_SLOT", self)
         title.setObjectName("taskCardTitle")
-        self._state = QtWidgets.QLabel("STOPPED · CONFIGURATION REQUIRED", self)
+        self._state = FluentLabel("STOPPED · CONFIGURATION REQUIRED", self)
         self._state.setObjectName("taskCardState")
-        self._settings = QtWidgets.QPushButton("Setting…", self)
+        self._settings = FluentButton("Setting…", self, color=GREY)
         self._settings.setObjectName("taskSettingsButton")
         header = QtWidgets.QHBoxLayout()
         header.addWidget(title)
@@ -586,12 +657,12 @@ class TaskScanCard(QtWidgets.QWidget):
         header.addStretch(1)
         header.addWidget(self._settings)
 
-        self._tabs = QtWidgets.QTabWidget(self)
+        self._tabs = FluentTabWidget(self)
         self._tabs.setObjectName("taskCardTabs")
         self._run_page = QtWidgets.QWidget(self._tabs)
         self._run_page.setObjectName("taskRunTab")
         self._run_layout = QtWidgets.QVBoxLayout(self._run_page)
-        self._placeholder = QtWidgets.QLabel(
+        self._placeholder = FluentLabel(
             "Stopped. Configure this card in Edit or Setting.",
             self._run_page,
         )
@@ -610,7 +681,7 @@ class TaskScanCard(QtWidgets.QWidget):
         settings_layout.addWidget(self._settings_form)
         self._settings_form.applied.connect(self._settings_dialog.accept)
 
-        self._diagnostics = QtWidgets.QLabel("", self)
+        self._diagnostics = FluentLabel("", self)
         self._diagnostics.setObjectName("taskCardDiagnostics")
         self._diagnostics.setWordWrap(True)
         layout = QtWidgets.QVBoxLayout(self)
@@ -729,7 +800,11 @@ class TaskScanCard(QtWidgets.QWidget):
 
     def _open_settings(self) -> None:
         self._settings_form.begin_edit()
+        self._settings_dialog.resize(
+            screen_fit_window_size(WINDOW_SCREEN_FRACTION)
+        )
         self._settings_dialog.show()
+        center_window_on_primary_screen(self._settings_dialog)
         self._settings_dialog.raise_()
         self._settings_dialog.activateWindow()
 
@@ -766,12 +841,11 @@ class TaskConsoleWindow(QtWidgets.QWidget):
             raise TypeError("initial_intent must be TaskConsoleScanIntent or None")
         self.setObjectName("taskConsoleWindow")
         self.setWindowTitle("Task Console")
-        self.resize(1120, 820)
         self._experiment = experiment
         self._card: TaskScanCard | None = None
         self._closing = False
 
-        self._catalog = QtWidgets.QComboBox(self)
+        self._catalog = FluentComboBox(self)
         self._catalog.setObjectName("taskCatalogCombo")
         items = task_console_catalog_items(compose_task_console_catalog())
         task_items = tuple(item for item in items if item.group == "Task")
@@ -779,11 +853,11 @@ class TaskConsoleWindow(QtWidgets.QWidget):
             raise RuntimeError("TaskConsole requires exactly one current Task")
         for item in task_items:
             self._catalog.addItem(f"{item.group}: {item.title}", item.key)
-        self._add = QtWidgets.QPushButton("Add Panel", self)
+        self._add = FluentButton("Add Panel", self)
         self._add.setObjectName("addTaskPanelButton")
-        self._save = QtWidgets.QPushButton("Save", self)
+        self._save = FluentButton("Save", self)
         self._save.setObjectName("saveTaskIntentButton")
-        self._load = QtWidgets.QPushButton("Load", self)
+        self._load = FluentButton("Load", self, color=ORANGE)
         self._load.setObjectName("loadTaskIntentButton")
         controls = QtWidgets.QHBoxLayout()
         controls.addWidget(self._catalog, 1)
@@ -795,11 +869,11 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         self._card_host = QtWidgets.QWidget(self)
         self._card_host.setObjectName("taskCardHost")
         self._card_layout = QtWidgets.QVBoxLayout(self._card_host)
-        self._empty = QtWidgets.QLabel("Add the Autonomous SCAN_SLOT task", self._card_host)
+        self._empty = FluentLabel("Add the Autonomous SCAN_SLOT task", self._card_host)
         self._empty.setObjectName("taskConsoleEmptyState")
         self._empty.setAlignment(QtCore.Qt.AlignCenter)
         self._card_layout.addWidget(self._empty, 1)
-        self._status = QtWidgets.QLabel("", self)
+        self._status = FluentLabel("", self)
         self._status.setObjectName("taskConsoleDiagnostics")
         self._status.setWordWrap(True)
         layout = QtWidgets.QVBoxLayout(self)
@@ -901,6 +975,7 @@ class TaskConsoleWindow(QtWidgets.QWidget):
                 self._card.shutdown()
         if panel is None or panel.closed:
             self._close_timer.stop()
+            release_window(self)
             event.accept()
             return
         event.ignore()
@@ -922,16 +997,15 @@ def open_task_console(
 ) -> TaskConsoleWindow:
     """Lazily open the current TaskConsole on the Qt owner thread."""
 
-    application = QtWidgets.QApplication.instance()
-    owns_application = application is None
-    if application is None:
-        application = QtWidgets.QApplication([])
+    application = ensure_qt_app()
     if QtCore.QThread.currentThread() != application.thread():
         raise RuntimeError("TaskConsole must be opened on the Qt GUI thread")
+    set_fluent_scale(None)
     window = TaskConsoleWindow(experiment, initial_intent)
-    if owns_application:
-        window._application_owner = application
+    window.resize(screen_fit_window_size(WINDOW_SCREEN_FRACTION))
+    retain_window(window)
     window.show()
+    center_window_on_primary_screen(window, application)
     return window
 
 

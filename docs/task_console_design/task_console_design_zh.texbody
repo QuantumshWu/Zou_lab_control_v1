@@ -38,7 +38,7 @@
   \item[\filepath{neutral\_atom/subsystems/readout.py}] \pyapi{exp.readout}：\pyapi{temperature}/\pyapi{readout\_duration\_fidelity}/\pyapi{build\_*\_scan}（单一真相源建器）/\pyapi{camera\_measurement}/\pyapi{calibrate\_task}/\pyapi{measurement\_specs}/\pyapi{processor\_specs}/\pyapi{task\_specs}（GUI 三份目录）。
   \item[\filepath{frontend/live.py}] 绘图工厂 \pyapi{plot}/\pyapi{panel\_plot}、五个 live 绘图类、\pyapi{FigureSpec} 几何、\pyapi{panel\_plot\_spec}、\pyapi{PANEL\_MARGINS\_PX}。
   \item[\filepath{frontend/qt\_canvas.py}] \pyapi{EmbeddedFigureCanvas}/\pyapi{panel\_canvas}：高 DPI 嵌入封装。
-  \item[\filepath{frontend/qt\_fluent.py}] Fluent 控件库 + \pyapi{resolve\_fluent\_auto\_scale} + \pyapi{FluentTabWidget}。
+  \item[\filepath{zlc\_frontend/qt\_widgets}] 唯一 Fluent/Qt 控件 owner + \pyapi{resolve\_fluent\_auto\_scale} + \pyapi{FluentTabWidget}。
   \item[\filepath{frontend/data\_figure.py}] \pyapi{DataFigure}：拟合 / 存图 / 单位换算（每面板 Edit 标签复用）。
   \item[\filepath{task\_console.py} / \filepath{task\_console.bat}] 根启动器。
 \end{description}
@@ -324,7 +324,7 @@ Setting 弹窗按 confocal\_gui 的竖排范式排布。source/display/unit/limi
 \end{description}
 
 \begin{notebox}
-\textbf{坑（已修）}：弹窗用 \pyapi{FluentPopup}（\filepath{qt\_fluent.py}）——\tfocus{半透明 + 无边框}的顶层 \pyapi{Qt.Popup}，圆角白卡由 \pyapi{paintEvent} 抗锯齿描一笔。两条教训：① 不可在\tfocus{不透明}顶层弹窗上用样式表 \pyapi{border-radius}——方角白块会露在圆弧外（右下角那条"奇怪的线"）+ Windows 原生阴影；② 光加 \pyapi{WA\_TranslucentBackground} 又会让样式表背景\tfocus{整块不画}（弹窗变透明）。所以圆角卡自己画；边框是画出来的、不是样式表规则，因此也绝不会级联到子控件。
+\textbf{坑（已修）}：弹窗用 \pyapi{FluentPopup}（\filepath{zlc\_frontend/qt\_widgets/fluent.py}）——\tfocus{半透明 + 无边框}的顶层 \pyapi{Qt.Popup}，圆角白卡由 \pyapi{paintEvent} 抗锯齿描一笔。两条教训：① 不可在\tfocus{不透明}顶层弹窗上用样式表 \pyapi{border-radius}——方角白块会露在圆弧外（右下角那条"奇怪的线"）+ Windows 原生阴影；② 光加 \pyapi{WA\_TranslucentBackground} 又会让样式表背景\tfocus{整块不画}（弹窗变透明）。所以圆角卡自己画；边框是画出来的、不是样式表规则，因此也绝不会级联到子控件。
 \end{notebox}
 
 \section{持久化:Setting 的每一项都进 PanelConfig.params}
@@ -357,7 +357,7 @@ Setting 改的每一项——\pyapi{size}、\pyapi{colormap}、声明式参数�
 \end{figure}
 
 \section{task 运行接管控制台(confocal 式)}
-Start 一个 task 时，console 在 Monitor 开一张\tfocus{固定}面板显示它的中途输出（从 \pyapi{node.output} 读，保留键 \pyapi{\_\_task\_frame\_\_}，\tfocus{不经 hub}）：\pyapi{TaskSpec.mid\_run\_key} 选缓冲键（如 \pyapi{frame}），\pyapi{\_refresh\_task\_panel} 在 \pyapi{\_tick} 的 version-gate 之前刷（因为 task 输出不 bump hub version）。同时\tfocus{常驻状态条}（\pyapi{qt\_fluent.FluentStatusStrip}：严重级色点 + 省略式消息行 + 右侧动作按钮）切到橙色 task 级显示 “Task running …\%” 并亮出 \pyapi{Stop task} 按钮——状态条\tfocus{始终在场}、按优先级换内容（节点错误 > 运行中 task > display-behind 提示 > 空闲摘要），不是旧的瞬态横幅那样 show/hide 抖动布局；并\tfocus{禁用其他一切操作}（Add/Save/Load/Edit/其他节点 Start），只留 Stop（\pyapi{console.\_task\_locked} 把所有入口 short-circuit 掉）。task 完成或 Stop 后\tfocus{解锁}、状态条落回空闲摘要并撤掉该瞬态面板。这样一次性标定/采集流程跑时，操作者只盯它的进度、不会误触别的节点；它的瞬态帧也永不混进 live 读出信号。
+Start 一个 task 时，console 在 Monitor 开一张\tfocus{固定}面板显示它的中途输出（从 \pyapi{node.output} 读，保留键 \pyapi{\_\_task\_frame\_\_}，\tfocus{不经 hub}）：\pyapi{TaskSpec.mid\_run\_key} 选缓冲键（如 \pyapi{frame}），\pyapi{\_refresh\_task\_panel} 在 \pyapi{\_tick} 的 version-gate 之前刷（因为 task 输出不 bump hub version）。同时\tfocus{常驻状态条}（\pyapi{zlc\_frontend.qt\_widgets.FluentStatusStrip}：严重级色点 + 省略式消息行 + 右侧动作按钮）切到橙色 task 级显示 “Task running …\%” 并亮出 \pyapi{Stop task} 按钮——状态条\tfocus{始终在场}、按优先级换内容（节点错误 > 运行中 task > display-behind 提示 > 空闲摘要），不是旧的瞬态横幅那样 show/hide 抖动布局；并\tfocus{禁用其他一切操作}（Add/Save/Load/Edit/其他节点 Start），只留 Stop（\pyapi{console.\_task\_locked} 把所有入口 short-circuit 掉）。task 完成或 Stop 后\tfocus{解锁}、状态条落回空闲摘要并撤掉该瞬态面板。这样一次性标定/采集流程跑时，操作者只盯它的进度、不会误触别的节点；它的瞬态帧也永不混进 live 读出信号。
 
 \section{每面板 Edit:冻结快照模型(关键设计)}
 点面板 \pyapi{Edit…} 打开它的 Edit 标签时，\pyapi{PanelEditor} \tfocus{绑定该面板当前数据的一份快照}——用 \pyapi{panel\_plot} \tfocus{照搬 Monitor 那张卡的 size}（\pyapi{size=card.config.size}，与活面板\tfocus{同尺寸}）重建一个\tfocus{独立的 plotter}（不是 Monitor 卡那个），整页放进 \pyapi{FluentScrollArea}，所以快照再大也不会把底部控件挤出可视区，且快照与活面板尺寸一致。快照画布\tfocus{钉成固定大小}（\pyapi{EmbeddedFigureCanvas.pin\_size}：\pyapi{min==max}=图的设计尺寸，连画布自己 deferred 的 resync 也守住），所以\tfocus{改一个参数重抓快照时它既不会胀大、也不会缩没}（页面只在图比视区高时滚动）。重抓走\tfocus{先建后换}：新 plotter 建成功才拆旧装新，建图中途报错就\tfocus{保留上一张好图、绝不留空白}。\tfocus{选择器分工}：Edit 快照始终带完整选择器（缩放 / 拖阈值线 / \pyapi{AreaSelector} 框选）；Monitor 卡把选择器\tfocus{建好但默认停用}（\pyapi{BaseLivePlot.set\_selectors\_active(False)} + \pyapi{isolate\_wheel=False}，滚轮滚仪表盘、不被框选吞），表头 \tfocus{Selectors} 开关可就地武装全部卡片（零重建，滚轮随之转图内缩放）。理由：
@@ -573,9 +573,9 @@ frontend 对外暴露一个\tfocus{小而密封}的接口:外部只传数据+少
 \begin{enumerate}
   \item 几何被拥有、永不外传:\pyapi{plot()}/\pyapi{panel\_plot()} 拒绝 \pyapi{spec}/\pyapi{data\_px}/\pyapi{margins\_px}/\pyapi{dpi}/\pyapi{bad\_color}/\pyapi{colors}(内部几何走私有 \pyapi{plot(\_spec=)})。
   \item 尺寸/cmap 是 curated 且入口校验(\pyapi{PANEL\_SIZES}/\pyapi{panel\_size\_cells});pulse 几何常量私有化。
-  \item 一套排版一个 dpi:\pyapi{style.DEFAULT\_STYLE} 是只读 \pyapi{MappingProxyType}。
-  \item 一条缩放规则:\pyapi{resolve\_fluent\_auto\_scale}(GUI)+\pyapi{panel\_canvas}/\pyapi{PANEL\_DISPLAY\_SCALE}(嵌入图);\pyapi{show\_*} 默认 \pyapi{scale=None}。
-  \item 带美术的 fluent 控件保持内部:\pyapi{qt\_fluent.*}/\pyapi{qt\_canvas.*} 不进 \pyapi{\_\_all\_\_}(阴影/边框/圆角是构造细节)。
+  \item 一套排版一个 dpi:\pyapi{zlc\_frontend.render\_style.DEFAULT\_STYLE} 是只读 \pyapi{MappingProxyType}。
+  \item 一条缩放规则:\pyapi{zlc\_frontend.qt\_widgets.resolve\_fluent\_auto\_scale}(GUI)+\pyapi{panel\_canvas}/\pyapi{PANEL\_DISPLAY\_SCALE}(嵌入图);\pyapi{show\_*} 默认 \pyapi{scale=None}。
+  \item 带美术的 Fluent 控件只从 curated \pyapi{zlc\_frontend.qt\_widgets} facade 取用；\pyapi{qt\_widgets.fluent}/\pyapi{qt\_widgets.style} 等内部 leaf 不允许 production deep import（阴影/边框/圆角仍是 owner 内构造细节）。
   \item 加公共参数前先分类:DATA(labels/title/bins/thresholds/relim/cmap-from-list)允许;ART/GEOMETRY/TYPOGRAPHY 只能在内部类上。sequencer port topology 由 \pyapi{PortCatalog} 注入，不是 frontend 可编辑参数。
 \end{enumerate}
 Task 控制台严格遵守:面板只通过 \pyapi{panel\_plot}+size 预设作图,拟合只经 \pyapi{DataFigure(card.plotter)},改图只改 \pyapi{config}+重建——从不戳 figure inches/边距。

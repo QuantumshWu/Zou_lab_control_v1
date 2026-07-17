@@ -18,6 +18,10 @@ analysis = [
 render = [
     "matplotlib",
 ]
+qt = [
+    "PyQt5",
+    "PyQt5-Frameless-Window",
+]
 notebook = [
     "ipython",
     "ipykernel",
@@ -29,8 +33,8 @@ notebook = [
 ]
 workbench = [
     "matplotlib",
-    "PyQt5-Frameless-Window",
     "PyQt5",
+    "PyQt5-Frameless-Window",
     "scipy",
 ]
 hardware = [
@@ -48,8 +52,9 @@ include = ["Zou_lab_control*", "zlc_data*", "zlc_storage*", "zlc_pulse*", "zlc_n
 [tool.setuptools.package-data]
 "zlc_pulse" = ["assets/*.json"]
 "zlc_neutral_atom" = ["assets/*.json"]
+"zlc_frontend" = ["assets/*.ttf"]
 "fpga" = ["board_config/*.json"]
-"Zou_lab_control.frontend" = ["assets/*.ttf", "templates/*.sty", "content/notebook_templates/*.cells.md", "content/manual_templates/*.texbody"]
+"Zou_lab_control.frontend" = ["templates/*.sty", "content/notebook_templates/*.cells.md", "content/manual_templates/*.texbody"]
 "Zou_lab_control.neutral_atom" = ["configs/*.json", "content/manual_templates/*.texbody"]
 
 [tool.pytest.ini_options]

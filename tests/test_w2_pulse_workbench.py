@@ -12,7 +12,7 @@ import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5 import QtCore, QtTest, QtWidgets
+from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 import pytest
 
 import Zou_lab_control.notebook as zlc
@@ -21,6 +21,7 @@ from Zou_lab_control.workbench import (
     open_offline_pulse_workbench,
     open_pulse_workbench,
 )
+from zlc_frontend.qt_widgets import FluentFormGrid, GREEN, ORANGE
 from zlc_neutral_atom.runtime.run import RunState
 from zlc_pulse import (
     FIELD_DELAY,
@@ -68,6 +69,7 @@ def _close(application, window) -> None:
     window.request_close(discard_unsaved=True)
     _until(application, lambda: not window.isVisible(), timeout=5.0)
     assert window.worker_idle
+    assert window not in getattr(application, "_zlc_retained_windows", ())
 
 
 def _document(experiment) -> PulseDocument:
@@ -106,6 +108,15 @@ def test_edit_preview_run_hold_stop_and_experiment_survives_window(
         run_once = window.findChild(QtWidgets.QPushButton, "runOnceButton")
         hold = window.findChild(QtWidgets.QPushButton, "holdButton")
         stop = window.findChild(QtWidgets.QPushButton, "stopButton")
+        assert run_once._base_color == QtGui.QColor(GREEN).name(QtGui.QColor.HexRgb)
+        assert stop._base_color == QtGui.QColor(ORANGE).name(QtGui.QColor.HexRgb)
+        repeat_form = window.findChild(FluentFormGrid, "pulseRepeatForm")
+        assert repeat_form is window._repeat_form
+        assert repeat_form.grid.rowCount() == 3
+        available = application.primaryScreen().availableGeometry()
+        assert window.width() <= available.width()
+        assert window.height() <= available.height()
+        assert available.contains(window.frameGeometry())
         _until(application, lambda: preview.text().startswith("Preview: READY"))
         assert window.timeline is not None
 
@@ -123,6 +134,7 @@ def test_edit_preview_run_hold_stop_and_experiment_survives_window(
         )
         assert "SUCCEEDED" in status.text() and "SAFE" in status.text()
         assert not window.active_snapshot.final_committed
+        assert available.contains(window.frameGeometry())
 
         QtTest.QTest.mouseClick(hold, QtCore.Qt.LeftButton)
         _until(application, lambda: "HOLDING" in status.text())
@@ -192,6 +204,27 @@ def test_scan_and_api_values_are_explicit_without_mutating_editor_intent(
         )
         assert window.current_document.api_parameters == document.api_parameters
         assert window.current_document.scan_table == document.scan_table
+    finally:
+        _close(application, window)
+
+
+def test_authoritative_delay_editor_preserves_the_full_stored_float(
+    experiment,
+    application,
+):
+    document = _document(experiment)
+    digital = next(
+        port.key for port in document.target.ports if port.kind == PORT_DIGITAL
+    )
+    exact_value = -123456789012340.12
+    document = replace(
+        document,
+        delays=(OutputDelay(digital, exact_value, "us"),),
+    )
+    window = open_pulse_workbench(experiment, document)
+    try:
+        field = window._delay_rows[digital][1]
+        assert field.value() == exact_value
     finally:
         _close(application, window)
 

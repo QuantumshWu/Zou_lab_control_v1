@@ -1,4 +1,4 @@
-"""Lazy Matplotlib/Agg rendering for frozen :mod:`zlc_frontend` values."""
+"""Optional Matplotlib/Agg rendering for frozen :mod:`zlc_frontend` values."""
 
 from __future__ import annotations
 
@@ -24,11 +24,32 @@ from .figure import (
     FigureDocument,
 )
 from .render import PixelFormat, RasterBuffer
+from .render_style import (
+    ANNOTATION_FONT_SIZE,
+    CURVE_LINESTYLE,
+    CURVE_MARKER,
+    FIT_CONTOUR_COLOR,
+    FIT_CONTOUR_LINEWIDTH,
+    FIT_FAILURE_COLOR,
+    FIT_LINESTYLE,
+    render_style_context,
+)
 
 
 _RASTER_FIXED_BYTES = 8 << 20
 _RASTER_BUFFER_MULTIPLIER = 8
 _ARTIST_ARRAY_MULTIPLIER = 8
+
+
+def _render_dpi(value: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Number)
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        raise ValueError("dpi must be a finite positive number")
+    return float(value)
 
 
 def _array_nbytes(value: object) -> int:
@@ -52,11 +73,7 @@ def estimate_render_peak_nbytes(
 
     if not isinstance(evaluated, EvaluatedFigureData):
         raise TypeError("evaluated must be EvaluatedFigureData")
-    if isinstance(dpi, bool) or not isinstance(dpi, Number) or not math.isfinite(dpi):
-        raise ValueError("dpi must be a finite positive number")
-    dpi = float(dpi)
-    if dpi <= 0:
-        raise ValueError("dpi must be a finite positive number")
+    dpi = _render_dpi(dpi)
     panels = _panels(evaluated)
     columns = min(3, max(1, len(panels)))
     rows = math.ceil(len(panels) / columns)
@@ -120,7 +137,7 @@ def _series_label(series, *, include_reductions: bool) -> str | None:
     parts = [_address_label(series.batch_address)]
     if include_reductions:
         parts.append(_reduction_label(series.reductions))
-    label = " · ".join(part for part in parts if part)
+    label = " | ".join(part for part in parts if part)
     return label or None
 
 
@@ -211,8 +228,8 @@ def _fit_status(axis, result: FitResultBatch, index: int | None) -> bool:
         f"fit {message}",
         transform=axis.transAxes,
         va="top",
-        color="crimson",
-        fontsize="small",
+        color=FIT_FAILURE_COLOR,
+        fontsize=ANNOTATION_FONT_SIZE,
     )
     return False
 
@@ -235,7 +252,13 @@ def _curve(axis, layer, cell, series_group, fit_result):
         x = np.asarray(data.x_axis.coordinates)
         values = _curve_values(series)
         label = _series_label(series, include_reductions=multiple_series)
-        axis.plot(x, values, marker="o", linestyle="-", label=label)
+        axis.plot(
+            x,
+            values,
+            marker=CURVE_MARKER,
+            linestyle=CURVE_LINESTYLE,
+            label=label,
+        )
         if fit_result is not None:
             index = _batch_storage_index(fit_result, layer, cell, series)
             if _fit_status(axis, fit_result, index):
@@ -244,13 +267,13 @@ def _curve(axis, layer, cell, series_group, fit_result):
                 axis.plot(
                     coordinates,
                     predicted,
-                    linestyle="--",
+                    linestyle=FIT_LINESTYLE,
                     label=("fit" if label is None else f"fit {label}"),
                 )
     data = series_group[0].data
     axis.set_xlabel(_axis_label(data.x_axis))
     if len(series_group) > 1 or any(series.batch_address for series in series_group):
-        axis.legend(fontsize="small")
+        axis.legend(fontsize=ANNOTATION_FONT_SIZE)
 
 
 def _image(axis, figure, layer, cell, series, fit_result):
@@ -283,7 +306,13 @@ def _image(axis, figure, layer, cell, series, fit_result):
             coordinates = tuple(grids[item.axis_id] for item in fit_result.fit_axis_specs)
             predicted = fit_result.evaluate_batch(index, coordinates)
             if np.ptp(predicted) > 0:
-                axis.contour(x_grid, y_grid, predicted, colors="white", linewidths=0.8)
+                axis.contour(
+                    x_grid,
+                    y_grid,
+                    predicted,
+                    colors=FIT_CONTOUR_COLOR,
+                    linewidths=FIT_CONTOUR_LINEWIDTH,
+                )
 
 
 def _histogram(axis, series_group):
@@ -294,7 +323,7 @@ def _histogram(axis, series_group):
         label = _series_label(series, include_reductions=multiple_series)
         axis.hist(data.samples, bins="auto", histtype="step", label=label)
     if len(series_group) > 1 or any(series.batch_address for series in series_group):
-        axis.legend(fontsize="small")
+        axis.legend(fontsize=ANNOTATION_FONT_SIZE)
 
 
 def _meter(axis, series_group):
@@ -358,8 +387,74 @@ def render_evaluated_figure(
     document: FigureDocument,
     evaluated: EvaluatedFigureData,
     fit_results: dict[str, FitResultBatch],
+    *,
+    dpi: float = 100.0,
 ):
-    """Render immutable DTOs without pyplot, rcParams, or shared Figures."""
+    """Construct a caller-owned Figure with canonical artist styles frozen in.
+
+    Later caller-driven draw/save operations are outside the product compose lane.  Product PNG
+    and file export must use :func:`save_evaluated_figure`, which keeps construction *and* Agg
+    draw under the serialized style context.
+    """
+
+    dpi = _render_dpi(dpi)
+    with render_style_context():
+        return _render_evaluated_figure(document, evaluated, fit_results, dpi=dpi)
+
+
+def _release_agg_figure(figure) -> None:
+    """Clear artists and sever the Figure/Canvas ownership edge."""
+    canvas = getattr(figure, "canvas", None)
+    try:
+        figure.clear()
+    finally:
+        try:
+            figure.set_canvas(None)
+            if getattr(canvas, "figure", None) is figure:
+                canvas.figure = None
+        finally:
+            figure = canvas = None
+
+
+def save_evaluated_figure(
+    document: FigureDocument,
+    evaluated: EvaluatedFigureData,
+    fit_results: dict[str, FitResultBatch],
+    destination,
+    *,
+    image_format: str,
+    dpi: float,
+) -> None:
+    """Construct, draw, and release one product figure on the Matplotlib compose lane."""
+
+    dpi = _render_dpi(dpi)
+    with render_style_context():
+        figure = None
+        try:
+            figure = _render_evaluated_figure(
+                document,
+                evaluated,
+                fit_results,
+                dpi=dpi,
+            )
+            figure.savefig(destination, format=image_format, dpi=dpi)
+        finally:
+            if figure is not None:
+                _release_agg_figure(figure)
+            figure = None
+            # The caller's last strong local must be gone before collecting the
+            # remaining Matplotlib artist-parent cycles.
+            gc.collect()
+
+
+def _render_evaluated_figure(
+    document: FigureDocument,
+    evaluated: EvaluatedFigureData,
+    fit_results: dict[str, FitResultBatch],
+    *,
+    dpi: float,
+):
+    """Render immutable DTOs without pyplot or shared Figures."""
 
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
@@ -368,31 +463,42 @@ def render_evaluated_figure(
     panels = _panels(evaluated)
     columns = min(3, max(1, len(panels)))
     rows = math.ceil(len(panels) / columns)
-    figure = Figure(figsize=(5.0 * columns, 4.0 * rows), constrained_layout=True)
-    FigureCanvasAgg(figure)
-    axes = figure.subplots(rows, columns, squeeze=False).reshape(-1)
+    figure = Figure(
+        figsize=(5.0 * columns, 4.0 * rows),
+        dpi=dpi,
+        constrained_layout=True,
+    )
+    axes = None
+    try:
+        FigureCanvasAgg(figure)
+        axes = figure.subplots(rows, columns, squeeze=False).reshape(-1)
 
-    for target, (layer, cell, series_group) in zip(axes, panels):
-        fit_result = fit_results.get(layer.layer_id)
-        kind = series_group[0].data
-        if isinstance(kind, EvaluatedCurve):
-            _curve(target, layer, cell, series_group, fit_result)
-        elif isinstance(kind, EvaluatedImage):
-            _image(target, figure, layer, cell, series_group[0], fit_result)
-        elif isinstance(kind, EvaluatedHistogram):
-            if fit_result is not None:
-                raise ValueError("fit overlays require a curve or image view")
-            _histogram(target, series_group)
-        elif isinstance(kind, EvaluatedMeter):
-            if fit_result is not None:
-                raise ValueError("fit overlays require a curve or image view")
-            _meter(target, series_group)
-        else:  # pragma: no cover - closed EvaluatedLayerData union
-            raise TypeError(f"unsupported evaluated data {type(kind).__name__}")
-        target.set_title(_panel_title(document, layer, cell, series_group))
-    for unused in axes[len(panels):]:
-        unused.set_visible(False)
-    return figure
+        for target, (layer, cell, series_group) in zip(axes, panels):
+            fit_result = fit_results.get(layer.layer_id)
+            kind = series_group[0].data
+            if isinstance(kind, EvaluatedCurve):
+                _curve(target, layer, cell, series_group, fit_result)
+            elif isinstance(kind, EvaluatedImage):
+                _image(target, figure, layer, cell, series_group[0], fit_result)
+            elif isinstance(kind, EvaluatedHistogram):
+                if fit_result is not None:
+                    raise ValueError("fit overlays require a curve or image view")
+                _histogram(target, series_group)
+            elif isinstance(kind, EvaluatedMeter):
+                if fit_result is not None:
+                    raise ValueError("fit overlays require a curve or image view")
+                _meter(target, series_group)
+            else:  # pragma: no cover - closed EvaluatedLayerData union
+                raise TypeError(f"unsupported evaluated data {type(kind).__name__}")
+            target.set_title(_panel_title(document, layer, cell, series_group))
+        for unused in axes[len(panels):]:
+            unused.set_visible(False)
+        return figure
+    except BaseException:
+        _release_agg_figure(figure)
+        figure = axes = None
+        gc.collect()
+        raise
 
 
 class SingleCurveAggRenderer:
@@ -422,28 +528,36 @@ class SingleCurveAggRenderer:
             raise TypeError("document must be FigureDocument")
         width = positive_integer(width, "width")
         height = positive_integer(height, "height")
-        if (
-            isinstance(dpi, bool)
-            or not isinstance(dpi, Number)
-            or not math.isfinite(float(dpi))
-            or float(dpi) <= 0
-        ):
-            raise ValueError("dpi must be a finite positive number")
-        dpi = float(dpi)
-        figure = Figure(
-            figsize=(width / dpi, height / dpi),
-            dpi=dpi,
-            constrained_layout=True,
-        )
-        FigureCanvasAgg(figure)
+        dpi = _render_dpi(dpi)
+        with render_style_context():
+            figure = None
+            axis = None
+            try:
+                figure = Figure(
+                    figsize=(width / dpi, height / dpi),
+                    dpi=dpi,
+                    constrained_layout=True,
+                )
+                FigureCanvasAgg(figure)
+                axis = figure.subplots()
+            except BaseException:
+                if figure is not None:
+                    _release_agg_figure(figure)
+                figure = axis = None
+                gc.collect()
+                raise
         self._owner_thread = threading.get_ident()
         self._document = document
         self._figure = figure
-        self._axis = figure.subplots()
+        self._axis = axis
         self._lines = ()
         self._topology = None
 
     def render(self, evaluated: EvaluatedFigureData) -> RasterBuffer:
+        with render_style_context():
+            return self._render(evaluated)
+
+    def _render(self, evaluated: EvaluatedFigureData) -> RasterBuffer:
         self._require_owner()
         figure = self._figure
         axis = self._axis
@@ -489,7 +603,7 @@ class SingleCurveAggRenderer:
         if multiple_series or any(series.batch_address for series in series_group):
             legend = axis.get_legend()
             if legend is None:
-                legend = axis.legend(fontsize="small")
+                legend = axis.legend(fontsize=ANNOTATION_FONT_SIZE)
             else:
                 texts = legend.get_texts()
                 if len(texts) != len(self._lines):
@@ -509,28 +623,23 @@ class SingleCurveAggRenderer:
         )
 
     def close(self) -> None:
+        with render_style_context():
+            self._close()
+
+    def _close(self) -> None:
         self._require_owner()
         figure = self._figure
         if figure is None:
             return
-        canvas = figure.canvas
-        try:
-            figure.clear()
-        finally:
-            try:
-                figure.set_canvas(None)
-                if getattr(canvas, "figure", None) is figure:
-                    canvas.figure = None
-            finally:
-                self._figure = None
-                self._axis = None
-                self._lines = ()
-                self._topology = None
-                figure = canvas = None
-                # Matplotlib's artist tree contains parent cycles even after
-                # clear().  Collect them before the worker reports done so the
-                # FINAL renderer cannot overlap a provisional Agg surface.
-                gc.collect()
+        self._figure = None
+        self._axis = None
+        self._lines = ()
+        self._topology = None
+        # Collect before the worker reports done so the FINAL renderer cannot
+        # overlap a provisional Agg surface.
+        _release_agg_figure(figure)
+        figure = None
+        gc.collect()
 
     def _one_curve_panel(self, evaluated: EvaluatedFigureData):
         _require_evaluated_identity(self._document, evaluated)
@@ -551,5 +660,6 @@ __all__ = [
     "estimate_render_peak_nbytes",
     "estimate_single_curve_raster_peak_nbytes",
     "render_evaluated_figure",
+    "save_evaluated_figure",
     "SingleCurveAggRenderer",
 ]

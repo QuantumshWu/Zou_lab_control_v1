@@ -14,7 +14,7 @@ QA), see `docs/MAINTAINER_NOTES.md`.
 
 - `pulse_gui.py`: Confocal-style pulse editor. Edits `PulseTableState` and calls
   a supplied `SequencerDevice`.
-- `qt_fluent.py`: reusable Fluent/Confocal PyQt styling, widgets, and the layout
+- `zlc_frontend.qt_widgets`: reusable Fluent/Confocal PyQt styling, widgets, and the layout
   primitives (`Metrics`, `ElidedLabel`, `FluentScanDot`, `mark_scan_field`,
   `FluentLabeledField`, `FluentFormGrid`, `measure_text_width`).
 - `live.py`, `data_figure.py`, `canvas.py`: plotting and live-refresh layer.
