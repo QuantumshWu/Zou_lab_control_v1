@@ -90,6 +90,7 @@ def open_figure_workbench(
     intent=None,
     selection=None,
     preferences=None,
+    occupancy_output=None,
     memory_limit_bytes: int = _DEFAULT_FIGURE_GUI_MEMORY_LIMIT_BYTES,
 ) -> FrozenRasterWindow:
     """Resolve and render a current artifact entirely on the bounded worker."""
@@ -97,14 +98,16 @@ def open_figure_workbench(
     if not callable(figure_factory):
         raise TypeError("figure_factory must be callable")
     limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
+    options = {
+        "intent": intent,
+        "selection": selection,
+        "preferences": preferences,
+        "memory_limit_bytes": limit,
+    }
+    if occupancy_output is not None:
+        options["occupancy_output"] = occupancy_output
     return _open_figure_window(
-        lambda: figure_factory(
-            source,
-            intent=intent,
-            selection=selection,
-            preferences=preferences,
-            memory_limit_bytes=limit,
-        ),
+        lambda: figure_factory(source, **options),
         memory_limit_bytes=limit,
     )
 

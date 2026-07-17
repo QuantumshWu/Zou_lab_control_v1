@@ -14,7 +14,10 @@ from zlc_data import (
     AxisId,
     ComponentValidity,
     DataBlock,
+    DatasetSchema,
     StreamGenerationId,
+    dataset_schema_from_tree,
+    dataset_schema_to_tree,
 )
 from zlc_neutral_atom.artifacts.capture import (
     AdmittedCapture,
@@ -80,6 +83,7 @@ from .occupancy import (
     _estimate_committed_occupancy_peak_from_footprints,
     _occupancy_generation_for_run,
     _require_committed_occupancy_context,
+    _require_occupancy_output_schemas,
     _resolve_committed_occupancy_structure,
 )
 from .occupancy_reference import (
@@ -114,6 +118,8 @@ _ARTIFACT_FIELDS = frozenset(
         "readout_event_axis_id",
         "model_kind",
         "generation",
+        "counts_schema",
+        "occupied_schema",
         "counts_blob",
         "occupied_blob",
         "validity_blob",
@@ -123,9 +129,9 @@ _MANIFEST_FIELDS = frozenset(
     {"format", "repository_id", "metadata_blob"}
 )
 _ARTIFACT_DECODE_LIMITS = CanonicalDecodeLimits(
-    max_depth=16,
-    max_nodes=256,
-    max_container_entries=128,
+    max_depth=32,
+    max_nodes=32_768,
+    max_container_entries=32_768,
     max_arrays=0,
     max_total_array_bytes=0,
 )
@@ -138,6 +144,8 @@ class _StoredOccupancy:
     readout_event_axis_id: AxisId
     model_kind: ReadoutModelKind
     generation: StreamGenerationId
+    counts_schema: DatasetSchema
+    occupied_schema: DatasetSchema
     counts_blob: ContentRef
     occupied_blob: ContentRef
     validity_blob: ContentRef
@@ -153,14 +161,40 @@ class _StoredOccupancy:
             raise TypeError("model_kind must be ReadoutModelKind")
         if not isinstance(self.generation, StreamGenerationId):
             raise TypeError("generation must be StreamGenerationId")
+        _require_occupancy_output_schemas(
+            self.counts_schema,
+            self.occupied_schema,
+        )
         refs = (self.counts_blob, self.occupied_blob, self.validity_blob)
         if any(not isinstance(reference, ContentRef) for reference in refs):
             raise TypeError("occupancy blobs must be ContentRef")
-        if self.occupied_blob.size < 1 or (
-            self.validity_blob.size != self.occupied_blob.size
-            or self.counts_blob.size != 8 * self.occupied_blob.size
+        elements = math.prod(self.counts_schema.physical_shape)
+        if (
+            self.counts_blob.size != 8 * elements
+            or self.occupied_blob.size != elements
+            or self.validity_blob.size != elements
         ):
-            raise ValueError("occupancy blob sizes do not share one element domain")
+            raise ValueError("occupancy blob sizes differ from the stored schemas")
+
+
+@dataclass(frozen=True, slots=True)
+class OccupancyArtifactInspection:
+    """FINAL occupancy schemas obtained without materializing result arrays."""
+
+    reference: OccupancyArtifactRef
+    model_kind: ReadoutModelKind
+    counts_schema: DatasetSchema
+    occupied_schema: DatasetSchema
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reference, OccupancyArtifactRef):
+            raise TypeError("reference must be OccupancyArtifactRef")
+        if not isinstance(self.model_kind, ReadoutModelKind):
+            raise TypeError("model_kind must be ReadoutModelKind")
+        _require_occupancy_output_schemas(
+            self.counts_schema,
+            self.occupied_schema,
+        )
 
 
 def _artifact_to_tree(value: _StoredOccupancy) -> dict[str, object]:
@@ -177,6 +211,8 @@ def _artifact_to_tree(value: _StoredOccupancy) -> dict[str, object]:
         "readout_event_axis_id": value.readout_event_axis_id.value,
         "model_kind": value.model_kind.value,
         "generation": value.generation.value,
+        "counts_schema": dataset_schema_to_tree(value.counts_schema),
+        "occupied_schema": dataset_schema_to_tree(value.occupied_schema),
         "counts_blob": content_ref_to_tree(value.counts_blob),
         "occupied_blob": content_ref_to_tree(value.occupied_blob),
         "validity_blob": content_ref_to_tree(value.validity_blob),
@@ -200,6 +236,8 @@ def _artifact_from_tree(tree: object) -> _StoredOccupancy:
             canonical_text(data["model_kind"], "model_kind")
         ),
         StreamGenerationId(canonical_text(data["generation"], "generation")),
+        dataset_schema_from_tree(data["counts_schema"]),
+        dataset_schema_from_tree(data["occupied_schema"]),
         content_ref_from_tree(data["counts_blob"]),
         content_ref_from_tree(data["occupied_blob"]),
         content_ref_from_tree(data["validity_blob"]),
@@ -635,6 +673,10 @@ class OccupancyRepository:
             or stored.model_kind is not binding.model.kind
         ):
             raise ValueError("occupancy metadata differs from its resolved binding")
+        if stored.counts_schema != binding.counts_schema or (
+            stored.occupied_schema != binding.occupied_schema
+        ):
+            raise ValueError("occupancy stored schemas differ from resolved inputs")
         if (
             stored.counts_blob.size,
             stored.occupied_blob.size,
@@ -706,6 +748,29 @@ class OccupancyRepository:
             counts,
             occupied,
         )
+
+    def inspect_final(
+        self,
+        reference: OccupancyArtifactRef,
+        *,
+        memory_limit_bytes: int = _DEFAULT_MEMORY_LIMIT_BYTES,
+    ) -> OccupancyArtifactInspection:
+        """Read FINAL output schemas without materializing occupancy arrays."""
+
+        with self._root_lease.borrow() as read_borrow:
+            read_borrow.require_active()
+            intent = self._require_final_commit(reference)
+            stored, _metadata_bytes = self._stored(
+                reference,
+                memory_limit_bytes=memory_limit_bytes,
+            )
+            self._require_run_generation(stored, intent)
+            return OccupancyArtifactInspection(
+                reference,
+                stored.model_kind,
+                stored.counts_schema,
+                stored.occupied_schema,
+            )
 
     def admit(
         self,
@@ -845,6 +910,8 @@ class OccupancyRepository:
             artifact.readout_event_axis_id,
             artifact.model_kind,
             artifact.generation,
+            artifact.counts.schema,
+            artifact.occupied.schema,
             authority.identify_blob(counts_payload),
             authority.identify_blob(occupied_payload),
             authority.identify_blob(validity_payload),
@@ -1070,10 +1137,26 @@ def compile_occupancy_artifact_plan(
             expected_readout_binding=expected_readout_binding,
             memory_limit_bytes=memory_limit,
         )
+        analysis_peak = _estimate_committed_occupancy_peak_from_footprints(
+            event_count=event_count,
+            site_count=site_count,
+            source_read_scratch_bytes=source_read_scratch,
+            dependency_retained_bytes=prepared_retained,
+            runtime_scratch_bytes=runtime_scratch,
+        )
+        early_peak = max(dependency_peak, analysis_peak)
+        if early_peak > memory_limit:
+            raise MemoryError(
+                f"occupancy analysis peak {early_peak} exceeds limit "
+                f"{memory_limit}"
+            )
+        source, calibration, binding = admit_dependencies(context)
+        exact_sizes = OccupancyRepository._expected_blob_sizes(binding)
         elements = event_count * site_count
-        counts_bytes = elements * 8
-        occupied_bytes = elements
-        validity_bytes = elements
+        if exact_sizes != (elements * 8, elements, elements):
+            raise ValueError(
+                "occupancy runtime summary differs from admitted output geometry"
+            )
         placeholder_digest = "0" * 64
         prospective = _StoredOccupancy(
             source_capture_ref,
@@ -1081,9 +1164,11 @@ def compile_occupancy_artifact_plan(
             readout_event_axis_id,
             model_kind,
             _occupancy_generation_for_run(context.run_id.value),
-            ContentRef(placeholder_digest, counts_bytes),
-            ContentRef(placeholder_digest, occupied_bytes),
-            ContentRef(placeholder_digest, validity_bytes),
+            binding.counts_schema,
+            binding.occupied_schema,
+            ContentRef(placeholder_digest, exact_sizes[0]),
+            ContentRef(placeholder_digest, exact_sizes[1]),
+            ContentRef(placeholder_digest, exact_sizes[2]),
         )
         metadata_bytes = len(_encode_artifact(prospective))
         if metadata_bytes > _MAX_ARTIFACT_METADATA_BYTES:
@@ -1096,13 +1181,6 @@ def compile_occupancy_artifact_plan(
             metadata_bytes,
             memory_limit_bytes=memory_limit,
         )
-        analysis_peak = _estimate_committed_occupancy_peak_from_footprints(
-            event_count=event_count,
-            site_count=site_count,
-            source_read_scratch_bytes=source_read_scratch,
-            dependency_retained_bytes=prepared_retained,
-            runtime_scratch_bytes=runtime_scratch,
-        )
         peak = max(
             dependency_peak,
             analysis_peak,
@@ -1111,12 +1189,6 @@ def compile_occupancy_artifact_plan(
         if peak > memory_limit:
             raise MemoryError(
                 f"occupancy analysis peak {peak} exceeds limit {memory_limit}"
-            )
-        source, calibration, binding = admit_dependencies(context)
-        exact_sizes = OccupancyRepository._expected_blob_sizes(binding)
-        if exact_sizes != (counts_bytes, occupied_bytes, validity_bytes):
-            raise ValueError(
-                "occupancy runtime summary differs from admitted output geometry"
             )
         resolved = _require_committed_occupancy_context(
             source,
@@ -1219,6 +1291,7 @@ def compile_occupancy_artifact_plan(
 __all__ = [
     "OCCUPANCY_ARTIFACT_FORMAT",
     "OCCUPANCY_MANIFEST_FORMAT",
+    "OccupancyArtifactInspection",
     "OccupancyRepository",
     "compile_occupancy_artifact_plan",
 ]

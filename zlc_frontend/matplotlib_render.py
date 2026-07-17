@@ -317,11 +317,26 @@ def _image(axis, figure, layer, cell, series, fit_result):
 
 def _histogram(axis, series_group):
     multiple_series = len(series_group) > 1
+    all_boolean = all(
+        isinstance(series.data, EvaluatedHistogram)
+        and np.issubdtype(series.data.samples.dtype, np.bool_)
+        for series in series_group
+    )
     for series in series_group:
         data = series.data
         assert isinstance(data, EvaluatedHistogram)
         label = _series_label(series, include_reductions=multiple_series)
-        axis.hist(data.samples, bins="auto", histtype="step", label=label)
+        samples = data.samples
+        if np.issubdtype(samples.dtype, np.bool_):
+            # NumPy's automatic binning collapses False and True into one
+            # [0, 1] bin.  Preserve the two categorical states explicitly.
+            samples = samples.astype(np.uint8, copy=False)
+            bins = (-0.5, 0.5, 1.5)
+        else:
+            bins = "auto"
+        axis.hist(samples, bins=bins, histtype="step", label=label)
+    if all_boolean:
+        axis.set_xticks((0, 1), ("false", "true"))
     if len(series_group) > 1 or any(series.batch_address for series in series_group):
         axis.legend(fontsize=ANNOTATION_FONT_SIZE)
 

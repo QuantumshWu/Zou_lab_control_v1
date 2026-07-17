@@ -47,6 +47,7 @@ def open_figure_workbench(
     intent=None,
     selection=None,
     preferences=None,
+    occupancy_output=None,
     memory_limit_bytes=None,
 ):
     """Resolve and display one frozen artifact without blocking the Qt owner."""
@@ -58,6 +59,8 @@ def open_figure_workbench(
         "selection": selection,
         "preferences": preferences,
     }
+    if occupancy_output is not None:
+        options["occupancy_output"] = occupancy_output
     if memory_limit_bytes is not None:
         options["memory_limit_bytes"] = memory_limit_bytes
     return _open(figure_factory, source, **options)

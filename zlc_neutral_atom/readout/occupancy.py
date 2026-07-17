@@ -95,6 +95,46 @@ OCCUPANCY_COUNTS_BLOCK_ID = BlockId("occupancy-counts")
 OCCUPANCY_OCCUPIED_BLOCK_ID = BlockId("occupancy-occupied")
 
 
+def _require_occupancy_output_schemas(
+    counts_schema: DatasetSchema,
+    occupied_schema: DatasetSchema,
+) -> AxisSpec:
+    """Validate the one canonical counts/occupied dataset relationship."""
+
+    if not isinstance(counts_schema, DatasetSchema) or not isinstance(
+        occupied_schema,
+        DatasetSchema,
+    ):
+        raise TypeError("occupancy output schemas must be DatasetSchema")
+    if (
+        counts_schema.repeat_axis,
+        counts_schema.point_axes,
+        counts_schema.point_layout,
+        counts_schema.cell_schema.data_axes,
+    ) != (
+        occupied_schema.repeat_axis,
+        occupied_schema.point_axes,
+        occupied_schema.point_layout,
+        occupied_schema.cell_schema.data_axes,
+    ):
+        raise ValueError("occupancy output schemas do not share one axis domain")
+    axes = counts_schema.cell_schema.data_axes
+    if len(axes) != 1 or axes[0].role != SITE:
+        raise ValueError("occupancy output requires exactly one site data axis")
+    site_axis = axes[0]
+    component_contract = ValidityContract.components(site_axis.axis_id)
+    if counts_schema.cell_schema.validity_contract != component_contract or (
+        occupied_schema.cell_schema.validity_contract != component_contract
+    ):
+        raise ValueError("occupancy output requires site component validity")
+    if counts_schema.cell_schema.dtype != np.dtype("<f8") or (
+        occupied_schema.cell_schema.dtype != np.dtype(bool)
+        or occupied_schema.cell_schema.value_unit != "occupation"
+    ):
+        raise ValueError("occupancy output dtype/unit contracts are not canonical")
+    return site_axis
+
+
 def _same_validity(left: ComponentValidity, right: ComponentValidity) -> bool:
     return left.axis_ids == right.axis_ids and np.array_equal(left.mask, right.mask)
 
@@ -146,16 +186,11 @@ class ResolvedOccupancyStreamSchema:
             raise TypeError("counts_schema must be DatasetSchema")
         if not isinstance(self.occupied_schema, DatasetSchema):
             raise TypeError("occupied_schema must be DatasetSchema")
-        if (
-            self.counts_schema.repeat_axis is not self.occupied_schema.repeat_axis
-            or self.counts_schema.point_axes != self.occupied_schema.point_axes
-            or self.counts_schema.point_layout is not self.occupied_schema.point_layout
-        ):
-            raise ValueError("occupancy output schemas must share one outer axis domain")
-        site_axis = self.selected_model.feature.site_axis
-        if self.counts_schema.cell_schema.data_axes != (site_axis,) or (
-            self.occupied_schema.cell_schema.data_axes != (site_axis,)
-        ):
+        site_axis = _require_occupancy_output_schemas(
+            self.counts_schema,
+            self.occupied_schema,
+        )
+        if self.selected_model.feature.site_axis != site_axis:
             raise ValueError("occupancy output schemas differ from the selected model")
 
     @property
@@ -400,40 +435,17 @@ class OccupancyArtifact:
             self.occupied.block_id != OCCUPANCY_OCCUPIED_BLOCK_ID
         ):
             raise ValueError("occupancy blocks use non-canonical BlockId values")
-        left = self.counts.schema
-        right = self.occupied.schema
-        if (
-            left.repeat_axis,
-            left.point_axes,
-            left.point_layout,
-            left.cell_schema.data_axes,
-        ) != (
-            right.repeat_axis,
-            right.point_axes,
-            right.point_layout,
-            right.cell_schema.data_axes,
-        ):
-            raise ValueError("occupancy blocks do not share one sampling/data domain")
-        axes = left.cell_schema.data_axes
-        if len(axes) != 1 or axes[0].role != SITE:
-            raise ValueError("occupancy artifact requires exactly one site data axis")
-        component_contract = ValidityContract.components(axes[0].axis_id)
-        if left.cell_schema.validity_contract != component_contract or (
-            right.cell_schema.validity_contract != component_contract
-        ):
-            raise ValueError("occupancy blocks require site component validity")
-        if left.cell_schema.dtype != np.dtype("<f8") or (
-            right.cell_schema.dtype != np.dtype(bool)
-            or right.cell_schema.value_unit != "occupation"
-        ):
-            raise ValueError("occupancy block dtype/unit contracts are not canonical")
+        site_axis = _require_occupancy_output_schemas(
+            self.counts.schema,
+            self.occupied.schema,
+        )
         if self.counts.revision != self.occupied.revision:
             raise ValueError("occupancy blocks must share one revision")
         if self.counts.validity is not self.occupied.validity:
             raise ValueError("occupancy blocks must share one validity authority")
         validity = self.counts.validity
         if not isinstance(validity, ComponentValidity) or (
-            validity.axis_ids != (axes[0].axis_id,)
+            validity.axis_ids != (site_axis.axis_id,)
         ):
             raise ValueError("occupancy validity must name exactly the site axis")
         if not np.all(np.isfinite(self.counts.values)):

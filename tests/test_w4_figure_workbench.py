@@ -31,23 +31,29 @@ from zlc_data import (
     DatasetSchema,
     OwnedSnapshot,
     PointLayout,
+    Selection,
     StreamGenerationId,
     ValidityContract,
     ValueSchema,
 )
 from zlc_frontend import DataFigure
 from zlc_frontend.figure import (
+    AxisViewRole,
     DatasetDescriptor,
     DatasetId,
     FigureDocument,
     FigureLayer,
     ResolvedDataset,
     ResolvedDatasetMap,
+    DisplayReductionMethod,
+    EvaluatedHistogram,
+    EvaluatedMeter,
     ViewIntent,
     ViewPreferences,
     suggest_view,
 )
 from zlc_frontend.qt_widgets import QtImageBoard
+from zlc_frontend.matplotlib_render import release_agg_figure
 from zlc_neutral_atom.readout.calibration import (
     GridOrder,
     PerSitePsfFeature,
@@ -79,6 +85,45 @@ def calibration_product(capture_product):
     reference = experiment.readout.sitemap(frames=12)
     computation = experiment.readout.load_calibration_computation(reference)
     return experiment, reference, computation
+
+
+@pytest.fixture(scope="module")
+def occupancy_product(capture_product, calibration_product):
+    from zlc_neutral_atom.readout.sitemap import load_packaged_sitemap_pulse
+
+    experiment, _unrelated_capture = capture_product
+    _same_experiment, calibration_reference, _computation = calibration_product
+    document = load_packaged_sitemap_pulse()
+    trigger_index = document.target.raw_lanes.index("ch11")
+    trigger_run = 0
+    previous = False
+    periods = []
+    for period in document.periods:
+        states = list(period.states)
+        high = bool(states[trigger_index])
+        if high and not previous:
+            trigger_run += 1
+        states[trigger_index] = int(high and trigger_run == 2)
+        periods.append(replace(period, states=tuple(states)))
+        previous = high
+    assert trigger_run == 3
+    readout_document = replace(
+        document,
+        name="w4-occupancy-readout",
+        periods=tuple(periods),
+        repeat=None,
+    )
+    capture_reference = experiment.readout.capture(
+        readout_document,
+        trigger_channel="ch11",
+        readout_events_per_repeat=1,
+    )
+    request = experiment.readout.detection_request(
+        capture_reference,
+        calibration_reference,
+    )
+    reference = experiment.readout.detect(request)
+    return experiment, reference, experiment.readout.load_occupancy(reference)
 
 
 def _until(application, predicate, *, timeout: float = 10.0) -> None:
@@ -718,6 +763,216 @@ def test_public_calibration_report_gui_loads_and_renders_off_qt_owner(
             reference,
             memory_limit_bytes=512 << 20,
         ) is computation
+    finally:
+        if window.isVisible():
+            _close(application, window)
+
+
+def test_occupancy_document_uses_metadata_only_exact_output_schemas(
+    occupancy_product,
+    capture_product,
+    monkeypatch,
+):
+    from zlc_neutral_atom.readout.occupancy_repository import OccupancyRepository
+
+    experiment, reference, resolved = occupancy_product
+    artifact = resolved.artifact
+
+    def forbidden_admit(*_args, **_kwargs):
+        raise AssertionError("figure_document must not materialize occupancy arrays")
+
+    monkeypatch.setattr(OccupancyRepository, "admit", forbidden_admit)
+    occupied = experiment.figure_document(reference)
+    assert len(occupied.datasets) == len(occupied.layers) == 1
+    assert occupied.datasets[0].schema_fingerprint == (
+        artifact.occupied.schema.fingerprint
+    )
+    assert "occupancy occupied" in occupied.datasets[0].label
+    occupied_view = occupied.layers[0].view
+    assert occupied_view.intent is ViewIntent.METER
+    repeat_binding = occupied_view.binding(
+        artifact.occupied.schema.repeat_axis.axis_id
+    )
+    assert repeat_binding.role is AxisViewRole.REDUCED
+    assert repeat_binding.reduction is not None
+    assert repeat_binding.reduction.method is DisplayReductionMethod.MEAN
+    site_axis = artifact.occupied.schema.cell_schema.data_axes[0]
+    assert occupied_view.binding(site_axis.axis_id).role is AxisViewRole.FACET
+
+    counts = experiment.figure_document(reference, occupancy_output="counts")
+    assert counts.datasets[0].schema_fingerprint == artifact.counts.schema.fingerprint
+    assert counts.layers[0].view.intent is ViewIntent.HISTOGRAM
+    assert "occupancy counts" in counts.datasets[0].label
+
+    def forbidden_inspect(*_args, **_kwargs):
+        raise AssertionError("invalid output must fail before repository inspection")
+
+    monkeypatch.setattr(OccupancyRepository, "inspect_final", forbidden_inspect)
+    with pytest.raises(ValueError, match="occupancy_output"):
+        experiment.figure_document(reference, occupancy_output="flattened")
+    with pytest.raises(ValueError, match="only for OccupancyArtifactRef"):
+        experiment.figure_document(
+            capture_product[1],
+            occupancy_output="occupied",
+        )
+
+
+def test_occupancy_figure_preserves_selected_block_lineage_validity_and_axes(
+    occupancy_product,
+):
+    experiment, reference, resolved = occupancy_product
+    artifact = resolved.artifact
+    occupied = experiment.figure(reference)
+    assert occupied.evaluated.inputs[0].ref == artifact.occupied_snapshot.ref
+    assert artifact.occupied.values.shape == (
+        artifact.occupied.schema.repeat_axis.size,
+        artifact.occupied.schema.point_layout.storage_size,
+        artifact.occupied.schema.cell_schema.data_axes[0].size,
+    )
+    layer = occupied.evaluated.layers[0]
+    site_axis = artifact.occupied.schema.cell_schema.data_axes[0]
+    raw_values = artifact.occupied.values
+    raw_validity = artifact.occupied.validity.mask
+    for cell in layer.cells:
+        site = next(
+            address.index
+            for address in cell.facet_address
+            if address.axis_id == site_axis.axis_id
+        )
+        meter = cell.series[0].data
+        assert isinstance(meter, EvaluatedMeter)
+        valid = raw_validity[:, 0, site]
+        expected = raw_values[:, 0, site][valid]
+        assert meter.valid is bool(expected.size)
+        if expected.size:
+            assert float(meter.value) == pytest.approx(float(np.mean(expected)))
+
+    counts = experiment.figure(reference, occupancy_output="counts")
+    assert counts.evaluated.inputs[0].ref == artifact.counts_snapshot.ref
+    assert counts.document.datasets[0].schema_fingerprint == (
+        artifact.counts.schema.fingerprint
+    )
+    first_cell = counts.evaluated.layers[0].cells[0]
+    first_site = next(
+        address.index
+        for address in first_cell.facet_address
+        if address.axis_id == site_axis.axis_id
+    )
+    histogram = first_cell.series[0].data
+    assert isinstance(histogram, EvaluatedHistogram)
+    valid = artifact.counts.validity.mask[:, 0, first_site]
+    np.testing.assert_array_equal(
+        histogram.samples,
+        artifact.counts.values[:, 0, first_site][valid],
+    )
+
+
+def test_occupancy_preflight_rejects_known_peak_before_full_dependency_admit(
+    occupancy_product,
+    monkeypatch,
+):
+    import zlc_neutral_atom.readout.occupancy_repository as occupancy_repository
+    from zlc_neutral_atom.artifacts.capture import CaptureRepository
+    from zlc_neutral_atom.runtime.run import RunFailed
+
+    experiment, _reference, resolved = occupancy_product
+    artifact = resolved.artifact
+    request = experiment.readout.detection_request(
+        artifact.source_capture_ref,
+        artifact.calibration_reference,
+        model_kind=artifact.model_kind,
+    )
+    monkeypatch.setattr(
+        occupancy_repository,
+        "_estimate_committed_occupancy_peak_from_footprints",
+        lambda **_kwargs: request.memory_limit_bytes + 1,
+    )
+    admits = []
+
+    def forbidden_admit(*args, **kwargs):
+        admits.append((args, kwargs))
+        raise AssertionError("known-over-budget preflight must not admit dependencies")
+
+    monkeypatch.setattr(CaptureRepository, "admit", forbidden_admit)
+    with pytest.raises(RunFailed, match="occupancy analysis peak"):
+        experiment.readout.detect(request)
+    assert admits == []
+
+
+def test_boolean_histogram_keeps_false_and_true_as_two_categories(
+    occupancy_product,
+    monkeypatch,
+):
+    from matplotlib.axes import Axes
+
+    experiment, reference, resolved = occupancy_product
+    site_axis = resolved.artifact.occupied.schema.cell_schema.data_axes[0]
+    figure = experiment.figure(
+        reference,
+        occupancy_output="occupied",
+        intent=ViewIntent.HISTOGRAM,
+        selection=Selection.index(site_axis.axis_id, 0),
+    )
+    assert isinstance(figure.evaluated.layers[0].cells[0].series[0].data, EvaluatedHistogram)
+    observed_bins = []
+    original_hist = Axes.hist
+
+    def traced_hist(self, values, *args, **kwargs):
+        observed_bins.append(tuple(kwargs["bins"]))
+        return original_hist(self, values, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "hist", traced_hist)
+    rendered = figure.render()
+    try:
+        assert observed_bins == [(-0.5, 0.5, 1.5)]
+        assert [tick.get_text() for tick in rendered.axes[0].get_xticklabels()] == [
+            "false",
+            "true",
+        ]
+    finally:
+        release_agg_figure(rendered)
+
+
+def test_public_occupancy_figure_gui_forwards_selected_output_off_qt_owner(
+    application,
+    occupancy_product,
+    monkeypatch,
+):
+    experiment, reference, resolved = occupancy_product
+    site_axis = resolved.artifact.counts.schema.cell_schema.data_axes[0]
+    selection = Selection.index(site_axis.axis_id, 0)
+    owner_thread = threading.get_ident()
+    calls = []
+    original = type(experiment).figure
+
+    def traced(self, source, *args, **kwargs):
+        calls.append((threading.get_ident(), source, args, kwargs))
+        return original(self, source, *args, **kwargs)
+
+    monkeypatch.setattr(type(experiment), "figure", traced)
+    window = experiment.figure_gui(
+        reference,
+        occupancy_output="counts",
+        intent=ViewIntent.HISTOGRAM,
+        selection=selection,
+    )
+    try:
+        _until(application, lambda: window.raster_ready, timeout=45.0)
+        assert len(calls) == 1
+        thread_id, source, args, options = calls[0]
+        assert thread_id != owner_thread
+        assert source == reference and args == ()
+        assert options["occupancy_output"] == "counts"
+        assert options["intent"] is ViewIntent.HISTOGRAM
+        assert options["selection"] == selection
+        assert options["preferences"] is None
+        assert options["memory_limit_bytes"] == 512 << 20
+        assert "histogram" in window.findChild(
+            QtWidgets.QLabel,
+            "figureViewerSummary",
+        ).text()
+        _close(application, window)
+        assert experiment.figure_document(reference).layers
     finally:
         if window.isVisible():
             _close(application, window)

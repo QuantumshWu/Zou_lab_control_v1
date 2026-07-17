@@ -1226,6 +1226,7 @@ def _project_notebook_figure(
     intent,
     selection,
     preferences,
+    occupancy_output,
     memory_limit_bytes: int | None,
 ):
     """Composition-only ref dispatch; frontend never sees a neutral repository."""
@@ -1237,6 +1238,7 @@ def _project_notebook_figure(
         FigureLayer,
         ResolvedDataset,
         ResolvedDatasetMap,
+        RepeatViewMode,
         SuggestionStatus,
         ViewIntent,
         ViewPreferences,
@@ -1250,10 +1252,19 @@ def _project_notebook_figure(
         raise TypeError("intent must be ViewIntent or None")
     if preferences is not None and not isinstance(preferences, ViewPreferences):
         raise TypeError("preferences must be ViewPreferences or None")
+    is_occupancy = isinstance(source, OccupancyArtifactRef)
+    if occupancy_output is not None and occupancy_output not in (
+        "occupied",
+        "counts",
+    ):
+        raise ValueError("occupancy_output must be 'occupied', 'counts', or None")
+    if not is_occupancy and occupancy_output is not None:
+        raise ValueError("occupancy_output is valid only for OccupancyArtifactRef")
 
     fit_result = None
     snapshot = None
     admitted = None
+    selected_occupancy_output = None
     source_label = "capture"
     if isinstance(source, ScanArtifactRef):
         source_label = "scan"
@@ -1266,6 +1277,39 @@ def _project_notebook_figure(
             )
             schema = materialized.schema
             snapshot = materialized.snapshot
+        source_ref = None
+    elif is_occupancy:
+        selected_occupancy_output = (
+            "occupied" if occupancy_output is None else occupancy_output
+        )
+        repository = _occupancy_repository(services)
+        if memory_limit_bytes is None:
+            inspected = repository.inspect_final(source)
+            schema = (
+                inspected.occupied_schema
+                if selected_occupancy_output == "occupied"
+                else inspected.counts_schema
+            )
+            model_kind = inspected.model_kind
+        else:
+            resolved = repository.admit(
+                source,
+                services.capture_repository,
+                _calibration_repository(services),
+                memory_limit_bytes=memory_limit_bytes,
+            )
+            artifact = resolved.artifact
+            snapshot = (
+                artifact.occupied_snapshot
+                if selected_occupancy_output == "occupied"
+                else artifact.counts_snapshot
+            )
+            schema = snapshot.block.schema
+            model_kind = artifact.model_kind
+            del artifact, resolved
+        source_label = (
+            f"occupancy {selected_occupancy_output} | {model_kind.value}"
+        )
         source_ref = None
     elif isinstance(source, CaptureArtifactRef):
         source_ref = source
@@ -1284,9 +1328,9 @@ def _project_notebook_figure(
         fit_result = source.result
     else:
         raise TypeError(
-            "figure source must be ScanArtifactRef, CaptureArtifactRef, "
-            "FitExecution, CaptureFitResultArtifactRef, or "
-            "AdmittedCaptureFitResult"
+            "figure source must be ScanArtifactRef, OccupancyArtifactRef, "
+            "CaptureArtifactRef, FitExecution, CaptureFitResultArtifactRef, "
+            "or AdmittedCaptureFitResult"
         )
 
     if source_ref is not None:
@@ -1302,7 +1346,12 @@ def _project_notebook_figure(
                     *schema.cell_schema.data_axes,
                 )
             }
-            if SPATIAL_X in roles and SPATIAL_Y in roles:
+            if selected_occupancy_output == "occupied":
+                if roles.intersection((SCAN_POINT, SPECTRAL, MONITOR_HISTORY)):
+                    resolved_intent = ViewIntent.CURVE
+                else:
+                    resolved_intent = ViewIntent.METER
+            elif SPATIAL_X in roles and SPATIAL_Y in roles:
                 resolved_intent = ViewIntent.IMAGE
             elif roles.intersection((SCAN_POINT, SPECTRAL, MONITOR_HISTORY)):
                 resolved_intent = ViewIntent.CURVE
@@ -1310,11 +1359,21 @@ def _project_notebook_figure(
                 resolved_intent = ViewIntent.HISTOGRAM
         else:
             resolved_intent = intent
+        resolved_preferences = preferences
+        if (
+            selected_occupancy_output == "occupied"
+            and resolved_intent is ViewIntent.METER
+            and (preferences is None or preferences.repeat_mode is None)
+        ):
+            resolved_preferences = replace(
+                ViewPreferences() if preferences is None else preferences,
+                repeat_mode=RepeatViewMode.MEAN,
+            )
         suggestion = suggest_view(
             schema,
             resolved_intent,
             selection,
-            preferences,
+            resolved_preferences,
         )
         label = source_label
     else:
@@ -1484,6 +1543,7 @@ class Experiment:
         self,
         source: (
             ScanArtifactRef
+            | OccupancyArtifactRef
             | CaptureArtifactRef
             | FitExecution
             | CaptureFitResultArtifactRef
@@ -1493,8 +1553,13 @@ class Experiment:
         intent: "ViewIntent | None" = None,
         selection: Selection | None = None,
         preferences: "ViewPreferences | None" = None,
+        occupancy_output: str | None = None,
     ) -> "FigureDocument":
-        """Project one committed scan/capture/result into a renderer-free document."""
+        """Project one committed source into a renderer-free document.
+
+        Occupancy defaults to its classified ``occupied`` block; ``counts`` is
+        an explicit presentation alternative.
+        """
 
         with _service_guard(self._authority_token) as services:
             document, _datasets, _fit = _project_notebook_figure(
@@ -1503,6 +1568,7 @@ class Experiment:
                 intent=intent,
                 selection=selection,
                 preferences=preferences,
+                occupancy_output=occupancy_output,
                 memory_limit_bytes=None,
             )
         return document
@@ -1511,6 +1577,7 @@ class Experiment:
         self,
         source: (
             ScanArtifactRef
+            | OccupancyArtifactRef
             | CaptureArtifactRef
             | FitExecution
             | CaptureFitResultArtifactRef
@@ -1520,6 +1587,7 @@ class Experiment:
         intent: "ViewIntent | None" = None,
         selection: Selection | None = None,
         preferences: "ViewPreferences | None" = None,
+        occupancy_output: str | None = None,
         memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
     ) -> "DataFigure":
         """Resolve one frozen source and return its optional-render DataFigure."""
@@ -1532,6 +1600,7 @@ class Experiment:
                 intent=intent,
                 selection=selection,
                 preferences=preferences,
+                occupancy_output=occupancy_output,
                 memory_limit_bytes=limit,
             )
         assert datasets is not None
@@ -1559,6 +1628,7 @@ class Experiment:
         self,
         source: (
             ScanArtifactRef
+            | OccupancyArtifactRef
             | CaptureArtifactRef
             | FitExecution
             | CaptureFitResultArtifactRef
@@ -1568,6 +1638,7 @@ class Experiment:
         intent: "ViewIntent | None" = None,
         selection: Selection | None = None,
         preferences: "ViewPreferences | None" = None,
+        occupancy_output: str | None = None,
         memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
     ):
         """Resolve and show one frozen figure without blocking the notebook GUI."""
@@ -1580,6 +1651,7 @@ class Experiment:
             intent=intent,
             selection=selection,
             preferences=preferences,
+            occupancy_output=occupancy_output,
             memory_limit_bytes=memory_limit_bytes,
         )
 
