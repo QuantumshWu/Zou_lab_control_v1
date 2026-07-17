@@ -1,8 +1,10 @@
-"""W4a frozen DataFigure Qt product-path oracles."""
+"""W4 frozen DataFigure/calibration immutable-raster product-path oracles."""
 
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+from dataclasses import replace
 import os
 from pathlib import Path
 import threading
@@ -46,6 +48,11 @@ from zlc_frontend.figure import (
     suggest_view,
 )
 from zlc_frontend.qt_widgets import QtImageBoard
+from zlc_neutral_atom.readout.calibration import (
+    GridOrder,
+    PerSitePsfFeature,
+    site_grid_positions_yx,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +71,14 @@ def capture_product(tmp_path_factory):
         repository=tmp_path_factory.mktemp("w4-figure-workspace"),
     ) as experiment:
         yield experiment, experiment.readout.capture(PULSE)
+
+
+@pytest.fixture(scope="module")
+def calibration_product(capture_product):
+    experiment, _capture_reference = capture_product
+    reference = experiment.readout.sitemap(frames=12)
+    computation = experiment.readout.load_calibration_computation(reference)
+    return experiment, reference, computation
 
 
 def _until(application, predicate, *, timeout: float = 10.0) -> None:
@@ -381,5 +396,328 @@ def test_close_does_not_wait_for_an_inflight_render(
         release.set()
         if queued_window is not None and queued_window.isVisible():
             _close(application, queued_window)
+        if window.isVisible():
+            _close(application, window)
+
+
+def test_paired_calibration_load_projects_authoritative_arrays_without_reshape(
+    calibration_product,
+):
+    _experiment, reference, computation = calibration_product
+    from Zou_lab_control.workbench._calibration import _project_calibration
+
+    assert computation.artifact.source_binding.source_capture_ref
+    assert computation.report.request.grid_shape_yx == (5, 7)
+    view = _project_calibration(computation)
+    artifact = computation.artifact
+    report = computation.report
+    assert view.actual_centers_xy.shape == (35, 2)
+    assert view.grid_shape_yx == (5, 7)
+    assert view.site_grid_positions_yx == site_grid_positions_yx(
+        (5, 7),
+        computation.artifact.site_map.ordering,
+    )
+    assert view.occupied_labels.shape == report.labels.occupied.shape
+    assert view.dark_labels.shape == report.labels.dark.shape
+    assert view.label_validity.shape == report.labels.valid.shape
+    np.testing.assert_array_equal(view.occupied_labels, report.labels.occupied)
+    np.testing.assert_array_equal(view.dark_labels, report.labels.dark)
+    np.testing.assert_array_equal(view.label_validity, report.labels.valid)
+    np.testing.assert_allclose(view.actual_centers_xy, artifact.site_map.coordinates_xy)
+    for projected, stored_model, stored_report in zip(
+        view.models,
+        artifact.models,
+        report.models,
+        strict=True,
+    ):
+        assert projected.signals.shape == report.labels.valid.shape
+        np.testing.assert_array_equal(projected.signals, stored_report.short_signals)
+        np.testing.assert_array_equal(
+            projected.signal_validity,
+            stored_report.short_validity,
+        )
+        np.testing.assert_array_equal(
+            projected.runtime_thresholds,
+            stored_model.thresholds,
+        )
+        np.testing.assert_array_equal(
+            projected.runtime_usable,
+            stored_model.usable_sites.mask,
+        )
+        assert len(projected.runtime_threshold_sources) == 35
+    per_site = next(
+        model for model in artifact.models
+        if isinstance(model.feature, PerSitePsfFeature)
+    )
+    np.testing.assert_array_equal(view.psf_kernels, per_site.feature.kernels)
+    assert reference.target_ref.startswith("calibration/")
+
+
+def test_calibration_histogram_rejects_finite_invalid_filler(
+    calibration_product,
+    monkeypatch,
+):
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+    from zlc_frontend.calibration_render import _build_histogram_grid
+    from Zou_lab_control.workbench._calibration import _project_calibration
+
+    view = _project_calibration(calibration_product[2])
+    model = view.models[0]
+    sentinel = 9.87654321e99
+    signals = np.array(model.signals, copy=True)
+    signal_validity = np.array(model.signal_validity, copy=True)
+    signals[0, 0] = sentinel
+    signal_validity[0, 0] = False
+    model = replace(
+        model,
+        signals=signals,
+        signal_validity=signal_validity,
+    )
+    captured = []
+    original_hist = Axes.hist
+
+    def traced_hist(self, values, *args, **kwargs):
+        captured.extend(np.asarray(values, dtype=float).tolist())
+        return original_hist(self, values, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "hist", traced_hist)
+    figure = Figure()
+    _build_histogram_grid(view, model, figure)
+    assert captured
+    assert sentinel not in captured
+
+
+def test_calibration_render_uses_one_source_plus_render_budget_before_agg(
+    calibration_product,
+    monkeypatch,
+):
+    import zlc_frontend.calibration_render as calibration_render
+    from Zou_lab_control.workbench._calibration import _project_calibration
+
+    view = _project_calibration(calibration_product[2])
+    allocations = []
+    monkeypatch.setattr(
+        calibration_render,
+        "_new_figure",
+        lambda *_args, **_kwargs: allocations.append(True),
+    )
+    source_retained = 3 << 20
+    render_without_source = (
+        calibration_render._RENDER_FIXED_BYTES
+        + calibration_render._RASTER_PEAK_MULTIPLIER * 1800 * 1100 * 4
+        + calibration_render._ARRAY_PEAK_MULTIPLIER * view.array_nbytes
+    )
+    with pytest.raises(MemoryError, match="composition requires"):
+        calibration_render.render_calibration_report(
+            view,
+            memory_limit_bytes=render_without_source + source_retained - 1,
+            source_retained_upper_bound_bytes=source_retained,
+        )
+    assert allocations == []
+
+
+def test_calibration_figure_release_remains_inside_matplotlib_lane(
+    calibration_product,
+    monkeypatch,
+):
+    import zlc_frontend.calibration_render as calibration_render
+    from Zou_lab_control.workbench._calibration import _project_calibration
+
+    events = []
+
+    @contextmanager
+    def traced_lane():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    def traced_release(_figure):
+        events.append("release")
+        assert events[0] == "enter" and "exit" not in events
+
+    monkeypatch.setattr(calibration_render, "render_style_context", traced_lane)
+    monkeypatch.setattr(calibration_render, "release_agg_figure", traced_release)
+    calibration_render._render_page(
+        _project_calibration(calibration_product[2]),
+        width=80,
+        height=60,
+        retained_png_bytes=0,
+        source_retained_upper_bound_bytes=1,
+        memory_limit_bytes=64 << 20,
+        builder=lambda _figure: None,
+        checkpoint=lambda: None,
+    )
+    assert events == ["enter", "release", "exit"]
+
+
+def test_threshold_provenance_uses_the_domain_gate_not_numeric_equality(
+    calibration_product,
+):
+    from zlc_neutral_atom.readout.analysis import (
+        calibration_runtime_threshold_sources,
+    )
+
+    report = calibration_product[2].report
+    first = replace(
+        report.models[0],
+        quick_thresholds=report.models[0].thresholds,
+    )
+    blocked = replace(
+        report.models[-1],
+        site_fidelity=tuple(
+            replace(item, model_fidelity=float("nan"))
+            for item in report.models[-1].site_fidelity
+        ),
+    )
+    modified = replace(report, models=(first, *report.models[1:-1], blocked))
+    sources = calibration_runtime_threshold_sources(modified)
+    assert all(source == "quick-fallback" for model in sources for source in model)
+
+
+def test_calibration_view_accepts_unusable_nan_and_omits_unusable_pool_samples(
+    calibration_product,
+    monkeypatch,
+):
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+    from zlc_frontend.calibration_render import _build_overview
+    from zlc_frontend.render_style import render_style_context
+    from Zou_lab_control.workbench._calibration import _project_calibration
+
+    view = _project_calibration(calibration_product[2])
+    model = next(item for item in view.models if item.is_default)
+    signals = np.array(model.signals, copy=True)
+    signal_validity = np.array(model.signal_validity, copy=True)
+    thresholds = np.array(model.runtime_thresholds, copy=True)
+    usable = np.array(model.runtime_usable, copy=True)
+    nan_threshold_sentinel = 8.7654321e98
+    finite_threshold_sentinel = 7.654321e97
+    signals[:, 0] = nan_threshold_sentinel
+    signals[:, 1] = finite_threshold_sentinel
+    signal_validity[:, :2] = True
+    usable[0] = False
+    usable[1] = False
+    thresholds[0] = np.nan
+    modified_model = replace(
+        model,
+        signals=signals,
+        signal_validity=signal_validity,
+        runtime_thresholds=thresholds,
+        runtime_usable=usable,
+    )
+    modified = replace(
+        view,
+        models=tuple(
+            modified_model if item is model else item for item in view.models
+        ),
+    )
+    captured = []
+    original_hist = Axes.hist
+
+    def traced_hist(self, values, *args, **kwargs):
+        captured.extend(np.asarray(values, dtype=float).tolist())
+        return original_hist(self, values, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "hist", traced_hist)
+    with render_style_context():
+        _build_overview(modified, Figure())
+    assert captured
+    assert nan_threshold_sentinel not in captured
+    assert finite_threshold_sentinel not in captured
+
+
+def test_calibration_grids_follow_every_declared_grid_order(calibration_product):
+    from matplotlib.figure import Figure
+    from zlc_frontend.calibration_render import _build_histogram_grid
+    from Zou_lab_control.workbench._calibration import _project_calibration
+
+    view = _project_calibration(calibration_product[2])
+    model = view.models[0]
+    for ordering in GridOrder:
+        positions = site_grid_positions_yx(view.grid_shape_yx, ordering)
+        figure = Figure()
+        _build_histogram_grid(
+            replace(view, site_grid_positions_yx=positions),
+            model,
+            figure,
+        )
+        columns = view.grid_shape_yx[1]
+        for site, (row, column) in enumerate(positions):
+            assert view.site_labels[site] in figure.axes[row * columns + column].get_title()
+
+
+def test_public_calibration_report_gui_loads_and_renders_off_qt_owner(
+    application,
+    calibration_product,
+    monkeypatch,
+):
+    experiment, reference, computation = calibration_product
+    readout = experiment.readout
+    owner_thread = threading.get_ident()
+    loader_calls = []
+    present_calls = []
+    original_present = QtImageBoard.present_encoded
+
+    def traced_load(self, candidate, *, memory_limit_bytes):
+        loader_calls.append((threading.get_ident(), candidate, memory_limit_bytes))
+        return computation, 8 << 20
+
+    def traced_present(self, payload, *, image_format="PNG"):
+        present_calls.append((threading.get_ident(), self.objectName(), payload))
+        return original_present(self, payload, image_format=image_format)
+
+    monkeypatch.setattr(
+        type(readout),
+        "_load_calibration_report_source",
+        traced_load,
+    )
+    monkeypatch.setattr(QtImageBoard, "present_encoded", traced_present)
+    window = readout.calibration_report_gui(reference)
+    try:
+        _until(application, lambda: window.raster_ready, timeout=45.0)
+        assert len(loader_calls) == 1
+        assert loader_calls[0][0] != owner_thread
+        assert loader_calls[0][1] == reference
+        assert loader_calls[0][2] == 512 << 20
+        assert window.findChild(
+            QtWidgets.QLabel,
+            "calibrationReportMode",
+        ).text() == "FROZEN CALIBRATION REPORT · DISPLAY ONLY"
+        assert window.findChild(
+            QtWidgets.QLabel,
+            "calibrationReportStatus",
+        ).text() == "READY"
+        summary = window.findChild(
+            QtWidgets.QLabel,
+            "calibrationReportSummary",
+        ).text()
+        assert reference.target_ref in summary
+        assert computation.artifact.source_binding.source_capture_ref.target_ref in summary
+        assert "35 sites · 3 models" in summary
+        tabs = window.findChild(QtWidgets.QTabWidget, "calibrationReportTabs")
+        assert [tabs.tabText(index) for index in range(tabs.count())] == [
+            "Overview",
+            "box",
+            "psf",
+            "uniform_psf",
+            "PSF kernels",
+        ]
+        assert len(present_calls) == tabs.count()
+        assert all(thread_id == owner_thread for thread_id, _name, _payload in present_calls)
+        assert all(payload.startswith(b"\x89PNG\r\n\x1a\n") for _thread, _name, payload in present_calls)
+        assert all(
+            board.has_front
+            for board in window.findChildren(QtImageBoard)
+            if board.objectName().startswith("calibrationReportBoard_")
+        )
+        _close(application, window)
+        assert experiment.readout.load_calibration_computation(
+            reference,
+            memory_limit_bytes=512 << 20,
+        ) is computation
+    finally:
         if window.isVisible():
             _close(application, window)

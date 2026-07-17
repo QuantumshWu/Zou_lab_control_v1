@@ -61,6 +61,48 @@ class GridOrder(str, Enum):
     COLUMN_SERPENTINE = "column-serpentine"
 
 
+def site_grid_positions_yx(
+    grid_shape_yx: tuple[int, int],
+    ordering: GridOrder,
+) -> tuple[tuple[int, int], ...]:
+    """Return physical ``(row, column)`` positions in canonical site order.
+
+    Site-valued arrays always remain one-dimensional and follow ``ordering``;
+    this projection is the one domain-owned bridge to a physical grid view.
+    """
+
+    try:
+        raw_grid = tuple(grid_shape_yx)
+    except TypeError as exc:
+        raise ValueError("grid_shape_yx must contain two positive integers") from exc
+    if len(raw_grid) != 2:
+        raise ValueError("grid_shape_yx must contain two positive integers")
+    rows = _positive_integer(raw_grid[0], "grid_shape_yx[0]")
+    columns = _positive_integer(raw_grid[1], "grid_shape_yx[1]")
+    if not isinstance(ordering, GridOrder):
+        raise TypeError("ordering must be GridOrder")
+
+    if ordering in (GridOrder.ROW_MAJOR, GridOrder.SERPENTINE):
+        return tuple(
+            (row, column)
+            for row in range(rows)
+            for column in (
+                range(columns - 1, -1, -1)
+                if ordering is GridOrder.SERPENTINE and row % 2
+                else range(columns)
+            )
+        )
+    return tuple(
+        (row, column)
+        for column in range(columns)
+        for row in (
+            range(rows - 1, -1, -1)
+            if ordering is GridOrder.COLUMN_SERPENTINE and column % 2
+            else range(rows)
+        )
+    )
+
+
 class ReadoutModelKind(str, Enum):
     BOX = "box"
     PER_SITE_PSF = "psf"
@@ -1163,4 +1205,5 @@ __all__ = [
     "derive_calibration_readout_physical_context",
     "extract_readout_features",
     "readout_runtime_scratch_nbytes",
+    "site_grid_positions_yx",
 ]

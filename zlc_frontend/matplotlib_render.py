@@ -402,7 +402,7 @@ def render_evaluated_figure(
         return _render_evaluated_figure(document, evaluated, fit_results, dpi=dpi)
 
 
-def _release_agg_figure(figure) -> None:
+def release_agg_figure(figure) -> None:
     """Clear artists and sever the Figure/Canvas ownership edge."""
     canvas = getattr(figure, "canvas", None)
     try:
@@ -440,7 +440,7 @@ def save_evaluated_figure(
             figure.savefig(destination, format=image_format, dpi=dpi)
         finally:
             if figure is not None:
-                _release_agg_figure(figure)
+                release_agg_figure(figure)
             figure = None
             # The caller's last strong local must be gone before collecting the
             # remaining Matplotlib artist-parent cycles.
@@ -495,7 +495,7 @@ def _render_evaluated_figure(
             unused.set_visible(False)
         return figure
     except BaseException:
-        _release_agg_figure(figure)
+        release_agg_figure(figure)
         figure = axes = None
         gc.collect()
         raise
@@ -542,7 +542,7 @@ class SingleCurveAggRenderer:
                 axis = figure.subplots()
             except BaseException:
                 if figure is not None:
-                    _release_agg_figure(figure)
+                    release_agg_figure(figure)
                 figure = axis = None
                 gc.collect()
                 raise
@@ -637,7 +637,7 @@ class SingleCurveAggRenderer:
         self._topology = None
         # Collect before the worker reports done so the FINAL renderer cannot
         # overlap a provisional Agg surface.
-        _release_agg_figure(figure)
+        release_agg_figure(figure)
         figure = None
         gc.collect()
 
@@ -660,6 +660,7 @@ __all__ = [
     "estimate_render_peak_nbytes",
     "estimate_single_curve_raster_peak_nbytes",
     "render_evaluated_figure",
+    "release_agg_figure",
     "save_evaluated_figure",
     "SingleCurveAggRenderer",
 ]

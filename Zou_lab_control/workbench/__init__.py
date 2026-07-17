@@ -11,6 +11,25 @@ def open_capture_workbench(experiment, request):
     return _open(experiment, request)
 
 
+def open_calibration_report_workbench(
+    computation_loader,
+    reference,
+    *,
+    memory_limit_bytes=None,
+):
+    """Open one committed calibration report without eager Qt imports."""
+
+    from ._calibration import open_calibration_report_workbench as _open
+
+    if memory_limit_bytes is None:
+        return _open(computation_loader, reference)
+    return _open(
+        computation_loader,
+        reference,
+        memory_limit_bytes=memory_limit_bytes,
+    )
+
+
 def open_data_figure_workbench(figure, *, memory_limit_bytes=None):
     """Open one already-resolved DataFigure without eager Qt imports."""
 
@@ -88,6 +107,7 @@ def open_offline_pulse_workbench(
 
 
 __all__ = [
+    "open_calibration_report_workbench",
     "open_capture_workbench",
     "open_data_figure_workbench",
     "open_figure_workbench",

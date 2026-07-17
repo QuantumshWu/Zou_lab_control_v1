@@ -48,6 +48,7 @@ from .calibration import (
     ReadoutModelKind,
     SiteMap,
     UniformPsfFeature,
+    site_grid_positions_yx,
     _annulus_background,
     _extract_readout_arrays,
     _immutable_array,
@@ -596,6 +597,45 @@ def _main_reference_thresholds_available(
     )
 
 
+def _runtime_threshold_source_mask(
+    report: ModelCalibrationReport,
+    *,
+    use_reference_thresholds: bool,
+) -> np.ndarray:
+    mask = np.asarray(
+        use_reference_thresholds & np.isfinite(report.thresholds),
+        dtype=bool,
+    )
+    mask.setflags(write=False)
+    return mask
+
+
+def calibration_runtime_threshold_sources(
+    report: CalibrationReport,
+) -> tuple[tuple[str, ...], ...]:
+    """Describe the exact threshold authority selected for every model/site.
+
+    The nested tuples follow ``report.models`` and each model's canonical site
+    axis.  Values are ``"formal"`` or ``"quick-fallback"`` and are derived
+    from the same all-model gate used to construct the runtime artifact; callers
+    must not infer provenance by comparing floating-point threshold values.
+    """
+
+    if not isinstance(report, CalibrationReport):
+        raise TypeError("report must be CalibrationReport")
+    use_reference_thresholds = _main_reference_thresholds_available(report.models)
+    return tuple(
+        tuple(
+            "formal" if uses_formal else "quick-fallback"
+            for uses_formal in _runtime_threshold_source_mask(
+                model,
+                use_reference_thresholds=use_reference_thresholds,
+            )
+        )
+        for model in report.models
+    )
+
+
 def _runtime_model_values(
     feature: ReadoutFeature,
     report: ModelCalibrationReport,
@@ -616,10 +656,11 @@ def _runtime_model_values(
     formal = report.thresholds
     quick = report.quick_thresholds
     has_labelled_threshold = np.isfinite(formal)
-    if use_reference_thresholds:
-        thresholds = np.where(has_labelled_threshold, formal, quick)
-    else:
-        thresholds = np.array(quick, copy=True)
+    uses_formal_threshold = _runtime_threshold_source_mask(
+        report,
+        use_reference_thresholds=use_reference_thresholds,
+    )
+    thresholds = np.where(uses_formal_threshold, formal, quick)
 
     labelled_quality = np.asarray(
         [
@@ -1006,25 +1047,19 @@ def _sort_centers_grid(
     rows, columns = grid_shape_yx
     if centers.shape != (rows * columns, 2):
         raise ValueError("center count does not match grid_shape_yx")
+    positions = site_grid_positions_yx(grid_shape_yx, ordering)
+    grid = np.empty((rows, columns, 2), dtype=float)
     if ordering in (GridOrder.ROW_MAJOR, GridOrder.SERPENTINE):
-        output = []
         for row_index, chunk in enumerate(
             np.array_split(centers[np.argsort(centers[:, 1])], rows)
         ):
-            row = chunk[np.argsort(chunk[:, 0])]
-            if ordering is GridOrder.SERPENTINE and row_index % 2:
-                row = row[::-1]
-            output.append(row)
-        return np.vstack(output)
-    output = []
-    for column_index, chunk in enumerate(
-        np.array_split(centers[np.argsort(centers[:, 0])], columns)
-    ):
-        column = chunk[np.argsort(chunk[:, 1])]
-        if ordering is GridOrder.COLUMN_SERPENTINE and column_index % 2:
-            column = column[::-1]
-        output.append(column)
-    return np.vstack(output)
+            grid[row_index, :, :] = chunk[np.argsort(chunk[:, 0])]
+    else:
+        for column_index, chunk in enumerate(
+            np.array_split(centers[np.argsort(centers[:, 0])], columns)
+        ):
+            grid[:, column_index, :] = chunk[np.argsort(chunk[:, 1])]
+    return np.stack(tuple(grid[row, column] for row, column in positions))
 
 
 def _robust_axis_lattice(anchors: np.ndarray, count: int) -> np.ndarray:
@@ -2431,6 +2466,7 @@ __all__ = [
     "SiteFidelity",
     "TrainTestSplit",
     "characterize_readout",
+    "calibration_runtime_threshold_sources",
     "compute_calibration",
     "estimate_calibration_analysis_peak_bytes",
     "find_site_centers",

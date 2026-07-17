@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     from zlc_neutral_atom.artifacts.capture import AdmittedCapture, CaptureRepository
     from .analysis import (
         CalibrationAnalysisResult,
+        CalibrationComputation,
         CalibrationReport,
     )
 
@@ -752,11 +753,11 @@ class CalibrationRepository:
             )
         return payload, average_ref, validity_ref
 
-    def _load_report_ref(
+    def _load_computation_ref(
         self,
         artifact: CalibrationArtifact,
         reference: ContentRef,
-    ) -> CalibrationReport:
+    ) -> CalibrationComputation:
         from .analysis import CalibrationComputation
 
         authority = self._content_authority()
@@ -774,9 +775,8 @@ class CalibrationRepository:
             reference_average=average,
             reference_average_validity=validity,
         )
-        # Reuse the analysis owner's complete artifact/report binding check.
-        CalibrationComputation(artifact, report)
-        return report
+        # The analysis owner performs the complete artifact/report binding check.
+        return CalibrationComputation(artifact, report)
 
     def load(
         self,
@@ -801,13 +801,13 @@ class CalibrationRepository:
             )
             return self._materialize_artifact(artifact_ref, report_ref, summary)
 
-    def load_report(
+    def load_computation(
         self,
         reference: CalibrationArtifactRef,
         *,
         memory_limit_bytes: int | None = None,
-    ) -> CalibrationReport:
-        """Load FINAL diagnostics under one artifact-plus-report memory limit."""
+    ) -> CalibrationComputation:
+        """Load one validated FINAL artifact/report pair under one memory limit."""
 
         with self._root_lease.borrow() as read_borrow:
             read_borrow.require_active()
@@ -827,7 +827,20 @@ class CalibrationRepository:
                 report_ref,
                 summary,
             )
-            return self._load_report_ref(artifact, report_ref)
+            return self._load_computation_ref(artifact, report_ref)
+
+    def load_report(
+        self,
+        reference: CalibrationArtifactRef,
+        *,
+        memory_limit_bytes: int | None = None,
+    ) -> CalibrationReport:
+        """Load FINAL diagnostics under one artifact-plus-report memory limit."""
+
+        return self.load_computation(
+            reference,
+            memory_limit_bytes=memory_limit_bytes,
+        ).report
 
     def has(self, reference: CalibrationArtifactRef) -> bool:
         with self._root_lease.borrow() as read_borrow:

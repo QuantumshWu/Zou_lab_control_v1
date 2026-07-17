@@ -127,7 +127,10 @@ from zlc_storage import positive_real as _positive_real
 if TYPE_CHECKING:
     from zlc_frontend import DataFigure
     from zlc_frontend.figure import FigureDocument, ViewIntent, ViewPreferences
-    from zlc_neutral_atom.readout.analysis import CalibrationReport
+    from zlc_neutral_atom.readout.analysis import (
+        CalibrationComputation,
+        CalibrationReport,
+    )
     from zlc_neutral_atom.readout.calibration_repository import (
         CalibrationRepository,
     )
@@ -1056,25 +1059,73 @@ class ReadoutFacade:
             self._require_binding(resolved.artifact.frame_contract.binding)
             return resolved
 
+    def load_calibration_computation(
+        self,
+        reference: CalibrationArtifactRef,
+        *,
+        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
+    ) -> "CalibrationComputation":
+        computation, _retained_upper_bound = self._load_calibration_report_source(
+            reference,
+            memory_limit_bytes=memory_limit_bytes,
+        )
+        return computation
+
+    def _load_calibration_report_source(
+        self,
+        reference: CalibrationArtifactRef,
+        *,
+        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
+    ) -> tuple["CalibrationComputation", int]:
+        """Load diagnostics plus the repository-owned retained-memory bound."""
+
+        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        with _service_guard(self._token) as services:
+            repository = _calibration_repository(services)
+            summary = repository.inspect_final(
+                reference,
+                memory_limit_bytes=memory_limit,
+            )
+            self._require_binding(summary.readout_binding)
+            computation = repository.load_computation(
+                reference,
+                memory_limit_bytes=memory_limit,
+            )
+            retained_upper_bound = (
+                summary.artifact_retained_upper_bound_bytes
+                + summary.report_materialization_peak_upper_bound_bytes
+            )
+            return computation, retained_upper_bound
+
     def load_calibration_report(
         self,
         reference: CalibrationArtifactRef,
         *,
         memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
     ) -> "CalibrationReport":
-        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
-        with _service_guard(self._token) as services:
-            repository = _calibration_repository(services)
-            self._require_binding(
-                repository.inspect_final(
-                    reference,
-                    memory_limit_bytes=memory_limit,
-                ).readout_binding
-            )
-            return repository.load_report(
-                reference,
-                memory_limit_bytes=memory_limit,
-            )
+        return self.load_calibration_computation(
+            reference,
+            memory_limit_bytes=memory_limit_bytes,
+        ).report
+
+    def calibration_report_gui(
+        self,
+        reference: CalibrationArtifactRef,
+        *,
+        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
+    ):
+        """Open one committed calibration report without blocking the Qt owner."""
+
+        if not isinstance(reference, CalibrationArtifactRef):
+            raise TypeError("reference must be CalibrationArtifactRef")
+        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        from Zou_lab_control.workbench import open_calibration_report_workbench
+
+        return open_calibration_report_workbench(
+            self._load_calibration_report_source,
+            reference,
+            memory_limit_bytes=limit,
+        )
 
     def detection_request(
         self,
