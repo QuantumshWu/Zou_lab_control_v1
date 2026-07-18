@@ -223,6 +223,7 @@ def _evaluated_axis(axis: AxisSpec, indices: tuple[int, ...]) -> EvaluatedAxis:
     return EvaluatedAxis(
         axis.axis_id,
         axis.name,
+        axis.role,
         axis.unit,
         indices,
         tuple(_axis_coordinate(axis, index) for index in indices),
@@ -1120,7 +1121,13 @@ def _image(working: _WorkingData, view, allowed) -> EvaluatedImage:
     return EvaluatedImage(x_out, y_out, output, valid)
 
 
-def _curve(working: _WorkingData, view, allowed) -> EvaluatedCurve:
+def _curve(
+    working: _WorkingData,
+    view,
+    allowed,
+    *,
+    value_unit: str | None,
+) -> EvaluatedCurve:
     binding = next(binding for binding in view.axis_bindings if binding.role is AxisViewRole.X)
     axes = {axis.axis_id: axis for axis in working.cell_axes + working.data_axes}
     axis = axes[binding.axis_id]
@@ -1141,8 +1148,13 @@ def _curve(working: _WorkingData, view, allowed) -> EvaluatedCurve:
         if working.cell_axes or len(working.values) > 1 or len(working.data_axes) != 1:
             raise FigureEvaluationError("curve x data axis retains unrelated axes")
         if len(working.values) == 1:
-            return EvaluatedCurve(out_axis, working.values[0], working.validity[0])
-    return EvaluatedCurve(out_axis, output, valid)
+            return EvaluatedCurve(
+                out_axis,
+                value_unit,
+                working.values[0],
+                working.validity[0],
+            )
+    return EvaluatedCurve(out_axis, value_unit, output, valid)
 
 
 def _sample_coordinate_values(
@@ -1400,7 +1412,12 @@ class FigureEvaluator:
                 if view.intent is ViewIntent.IMAGE:
                     data = _image(working, view, allowed)
                 elif view.intent is ViewIntent.CURVE:
-                    data = _curve(working, view, allowed)
+                    data = _curve(
+                        working,
+                        view,
+                        allowed,
+                        value_unit=block.schema.cell_schema.value_unit,
+                    )
                 elif view.intent is ViewIntent.HISTOGRAM:
                     data = _histogram(working, view, guard)
                 else:

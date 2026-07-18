@@ -6,13 +6,13 @@ import numpy as np
 
 from zlc_storage import nonnegative_integer, positive_integer
 
-from .figure import EvaluatedImage
-from .image_display import (
-    ImageDisplayState,
-    ImageRelimMode,
-    deadband_image_color_limits,
-    validated_image_range,
+from .display_range import (
+    RelimMode,
+    deadband_display_range,
+    validated_display_range,
 )
+from .figure import EvaluatedImage
+from .image_display import ImageDisplayState
 from .render import PixelFormat, RasterBuffer
 
 
@@ -136,7 +136,7 @@ def rasterize_image_indexed8(
     state: ImageDisplayState,
     *,
     current_color_limits: tuple[float, float] | None,
-    previous_relim_mode: ImageRelimMode | None,
+    previous_relim_mode: RelimMode | None,
 ) -> tuple[
     RasterBuffer,
     tuple[float, float] | None,
@@ -156,9 +156,9 @@ def rasterize_image_indexed8(
         raise TypeError("state must be ImageDisplayState")
     if previous_relim_mode is not None and not isinstance(
         previous_relim_mode,
-        ImageRelimMode,
+        RelimMode,
     ):
-        raise TypeError("previous_relim_mode must be ImageRelimMode or None")
+        raise TypeError("previous_relim_mode must be RelimMode or None")
     if not isinstance(image, EvaluatedImage):
         raise TypeError("image must be EvaluatedImage")
     values = image.values
@@ -176,23 +176,24 @@ def rasterize_image_indexed8(
         value_range = (low, high)
     if value_range is None:
         if (
-            state.relim_mode is ImageRelimMode.FIXED
+            state.relim_mode is RelimMode.FIXED
             and state.fixed_color_limits is not None
         ):
             color_limits = state.fixed_color_limits
         elif current_color_limits is not None:
-            color_limits = validated_image_range(
+            color_limits = validated_display_range(
                 current_color_limits,
                 "current_color_limits",
             )
         else:
             color_limits = (0.0, 1.0)
     else:
-        color_limits = deadband_image_color_limits(
-            state,
+        color_limits = deadband_display_range(
+            state.relim_mode,
             current_color_limits,
             value_range[0],
             value_range[1],
+            fixed_range=state.fixed_color_limits,
             force=(
                 previous_relim_mode is None
                 or previous_relim_mode is not state.relim_mode

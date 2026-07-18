@@ -61,12 +61,14 @@ tests/test_zlc_data_kernel.py
 tests/test_zlc_data_transform.py
 tests/test_zlc_fit_convenience.py
 tests/test_zlc_frontend_form.py
+tests/test_zlc_display_editor.py
+tests/test_zlc_curve_display.py
 tests/test_zlc_image_display.py
-tests/test_zlc_image_display_editor.py
 tests/test_zlc_frontend_figure.py
 tests/test_zlc_frontend_qt_widgets.py
 tests/test_zlc_image_view.py
 tests/test_zlc_qt_image_interaction.py
+tests/test_u02c_qt_curve_interaction.py
 tests/test_zlc_occupancy_processor.py
 tests/test_zlc_pulse_authoring.py
 tests/test_zlc_pulse_client.py

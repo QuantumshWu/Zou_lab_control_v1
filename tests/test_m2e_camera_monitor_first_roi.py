@@ -18,7 +18,7 @@ from zlc_frontend.qt_widgets import QtRasterBoard
 from zlc_neutral_atom.processing.roi_monitor import RoiScalarStreamProjection
 from zlc_neutral_atom.runtime.control import ControlAckStatus
 from zlc_neutral_atom.runtime.run import RunState
-from zlc_workbench.live import LiveImageBoardController
+from zlc_workbench.live import LiveBoardController
 
 
 _RAW_PANELS = ("camera-monitor-image",)
@@ -239,7 +239,7 @@ def test_rejected_initial_roi_and_raw_presentation_failure_keep_both_causes(
         "project",
         reject_initial_branch,
     )
-    real_reconfigure = LiveImageBoardController.reconfigure_scalar
+    real_reconfigure = LiveBoardController.reconfigure_scalar
 
     def fail_raw_fallback(
         self,
@@ -247,6 +247,7 @@ def test_rejected_initial_roi_and_raw_presentation_failure_keep_both_causes(
         *,
         scalar_dataset_id,
         scalar_documents,
+        curve_display,
     ):
         if state.binding is None:
             raise RuntimeError("synthetic initial raw presentation failure")
@@ -255,10 +256,11 @@ def test_rejected_initial_roi_and_raw_presentation_failure_keep_both_causes(
             state,
             scalar_dataset_id=scalar_dataset_id,
             scalar_documents=scalar_documents,
+            curve_display=curve_display,
         )
 
     monkeypatch.setattr(
-        LiveImageBoardController,
+        LiveBoardController,
         "reconfigure_scalar",
         fail_raw_fallback,
     )
@@ -502,9 +504,10 @@ def test_first_roi_presentation_failure_rolls_back_staged_layout_once(
             *,
             scalar_dataset_id,
             scalar_documents,
+            curve_display,
         ):
             live_reconfigures.append(
-                (state, scalar_dataset_id, tuple(scalar_documents))
+                (state, scalar_dataset_id, tuple(scalar_documents), curve_display)
             )
             raise RuntimeError("synthetic live scalar reconfigure failure")
 
@@ -808,6 +811,7 @@ def test_overlapping_unpresented_roi_changes_freeze_the_old_coherent_front(
             *,
             scalar_dataset_id,
             scalar_documents,
+            curve_display,
         ):
             if state.binding is None:
                 raise RuntimeError("synthetic overlapping raw presentation failure")
@@ -815,6 +819,7 @@ def test_overlapping_unpresented_roi_changes_freeze_the_old_coherent_front(
                 state,
                 scalar_dataset_id=scalar_dataset_id,
                 scalar_documents=scalar_documents,
+                curve_display=curve_display,
             )
 
         monkeypatch.setattr(live, "reconfigure_scalar", reject_raw_reconfigure)

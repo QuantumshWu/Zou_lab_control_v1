@@ -505,6 +505,7 @@ class AxisAddress:
 class EvaluatedAxis:
     axis_id: AxisId
     name: str
+    role: AxisRoleId
     unit: str | None
     indices: tuple[int, ...]
     coordinates: tuple[Any, ...]
@@ -513,6 +514,8 @@ class EvaluatedAxis:
         if not isinstance(self.axis_id, AxisId):
             raise TypeError("evaluated axis_id must be AxisId")
         object.__setattr__(self, "name", _text(self.name, "evaluated axis name"))
+        if not isinstance(self.role, AxisRoleId):
+            raise TypeError("evaluated axis role must be AxisRoleId")
         indices = tuple(_nonnegative(index, "axis index") for index in self.indices)
         coordinates = tuple(self.coordinates)
         if len(indices) != len(coordinates):
@@ -549,12 +552,19 @@ class EvaluatedImage:
 @dataclass(frozen=True, eq=False)
 class EvaluatedCurve:
     x_axis: EvaluatedAxis
+    value_unit: str | None
     values: np.ndarray
     validity: np.ndarray
 
     def __post_init__(self) -> None:
         if not isinstance(self.x_axis, EvaluatedAxis):
             raise TypeError("curve x_axis must be EvaluatedAxis")
+        if self.value_unit is not None:
+            object.__setattr__(
+                self,
+                "value_unit",
+                _text(self.value_unit, "curve value unit"),
+            )
         values = _immutable_evaluated_array(self.values, ndim=1)
         validity = _immutable_evaluated_array(
             self.validity,

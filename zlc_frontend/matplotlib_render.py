@@ -24,8 +24,19 @@ from .figure import (
     EvaluatedMeter,
     FigureDocument,
 )
+from .curve_display import (
+    CurveDisplayState,
+    CurveViewportTransform,
+    curve_home_x_limits,
+    numeric_curve_coordinates,
+)
 from .data_figure import FigurePanelRegion
-from .render import PixelFormat, RasterBuffer
+from .display_range import (
+    RelimMode,
+    deadband_display_range,
+    validated_display_range,
+)
+from .render import CurvePanelPayload, PixelFormat, RasterBuffer
 from .render_style import (
     ANNOTATION_FONT_SIZE,
     CURVE_LINESTYLE,
@@ -34,6 +45,7 @@ from .render_style import (
     FIT_CONTOUR_LINEWIDTH,
     FIT_FAILURE_COLOR,
     FIT_LINESTYLE,
+    PALETTE,
     render_style_context,
 )
 
@@ -138,6 +150,8 @@ def estimate_live_panel_raster_peak_nbytes(
     *,
     evaluated_data_upper_bound_bytes: int = 0,
     histogram_bins: int | None = None,
+    extra_retained_fronts: int = 0,
+    extra_retained_evaluated_data_bytes: int = 0,
 ) -> int:
     """Static preflight bound for one coalesced single-panel Agg front.
 
@@ -146,7 +160,9 @@ def estimate_live_panel_raster_peak_nbytes(
     the next evaluated revision into those artists.  The bound also covers the
     persistent Agg canvas plus queued/visible immutable raster fronts.  A live
     histogram additionally admits its bounded counts, edges, and closed-step
-    vertices; ``None`` means that the panel is a curve or meter.
+    vertices; ``None`` means that the panel is a curve or meter.  Pointer-hold
+    retention is explicit: every extra immutable RGBA front and older exact
+    evaluated payload is added directly rather than hidden in a multiplier.
     """
 
     width = positive_integer(width, "width")
@@ -154,6 +170,14 @@ def estimate_live_panel_raster_peak_nbytes(
     data_bytes = nonnegative_integer(
         evaluated_data_upper_bound_bytes,
         "evaluated_data_upper_bound_bytes",
+    )
+    extra_fronts = nonnegative_integer(
+        extra_retained_fronts,
+        "extra_retained_fronts",
+    )
+    extra_data_bytes = nonnegative_integer(
+        extra_retained_evaluated_data_bytes,
+        "extra_retained_evaluated_data_bytes",
     )
     histogram_geometry_bytes = 0
     if histogram_bins is not None:
@@ -169,6 +193,8 @@ def estimate_live_panel_raster_peak_nbytes(
         + _RASTER_BUFFER_MULTIPLIER * width * height * 4
         + _ARTIST_ARRAY_MULTIPLIER
         * (data_bytes + histogram_geometry_bytes)
+        + extra_fronts * width * height * 4
+        + extra_data_bytes
     )
 
 
@@ -197,6 +223,21 @@ def _series_label(series, *, include_reductions: bool) -> str | None:
         parts.append(_reduction_label(series.reductions))
     label = " | ".join(part for part in parts if part)
     return label or None
+
+
+def _display_series_label(
+    layer_id: str,
+    series,
+    index: int,
+    *,
+    multiple_series: bool,
+) -> str:
+    """Return the nonempty label used by both artists and exact payloads."""
+
+    label = _series_label(series, include_reductions=multiple_series)
+    if label is not None:
+        return label
+    return layer_id if not multiple_series else f"{layer_id} {index + 1}"
 
 
 def _axis_label(axis) -> str:
@@ -307,18 +348,27 @@ def _curve_values(series):
 
 def _curve(axis, layer, cell, series_group, fit_result):
     multiple_series = len(series_group) > 1
-    for series in series_group:
+    for index, series in enumerate(series_group):
         data = series.data
         assert isinstance(data, EvaluatedCurve)
         x = np.asarray(data.x_axis.coordinates)
         values = _curve_values(series)
-        label = _series_label(series, include_reductions=multiple_series)
+        label = _display_series_label(
+            layer.layer_id,
+            series,
+            index,
+            multiple_series=multiple_series,
+        )
+        style = {}
+        if not multiple_series:
+            style["color"] = PALETTE["line_single"]
         axis.plot(
             x,
             values,
             marker=CURVE_MARKER,
             linestyle=CURVE_LINESTYLE,
             label=label,
+            **style,
         )
         if fit_result is not None:
             index = _batch_storage_index(fit_result, layer, cell, series)
@@ -333,6 +383,9 @@ def _curve(axis, layer, cell, series_group, fit_result):
                 )
     data = series_group[0].data
     axis.set_xlabel(_axis_label(data.x_axis))
+    axis.set_ylabel(
+        "Value" if data.value_unit is None else f"Value [{data.value_unit}]"
+    )
     if len(series_group) > 1 or any(series.batch_address for series in series_group):
         axis.legend(fontsize=ANNOTATION_FONT_SIZE)
 
@@ -809,6 +862,164 @@ class SinglePanelAggRenderer:
             return self._render(evaluated)
 
     def _render(self, evaluated: EvaluatedFigureData) -> RasterBuffer:
+        figure, axis, _layer, _cell, series_group = self._prepare_panel(evaluated)
+        first = series_group[0].data
+        if isinstance(first, (EvaluatedCurve, EvaluatedHistogram)):
+            axis.set_autoscalex_on(True)
+            axis.set_autoscaley_on(True)
+            axis.relim(visible_only=True)
+            axis.autoscale_view()
+        return self._draw_raster(figure)
+
+    def render_interactive_curve(
+        self,
+        evaluated: EvaluatedFigureData,
+        state: CurveDisplayState,
+        *,
+        current_y_limits: tuple[float, float] | None,
+        previous_relim_mode: RelimMode | None,
+    ) -> tuple[RasterBuffer, CurvePanelPayload]:
+        """Render one exact interactive curve front on this worker owner.
+
+        The caller owns the previously accepted y baseline.  This method uses
+        it to resolve hysteresis but never stores or advances it internally;
+        the returned viewport is the only candidate the caller may accept.
+        """
+
+        with render_style_context():
+            return self._render_interactive_curve(
+                evaluated,
+                state,
+                current_y_limits=current_y_limits,
+                previous_relim_mode=previous_relim_mode,
+            )
+
+    def _render_interactive_curve(
+        self,
+        evaluated: EvaluatedFigureData,
+        state: CurveDisplayState,
+        *,
+        current_y_limits: tuple[float, float] | None,
+        previous_relim_mode: RelimMode | None,
+    ) -> tuple[RasterBuffer, CurvePanelPayload]:
+        if not isinstance(state, CurveDisplayState):
+            raise TypeError("state must be CurveDisplayState")
+        if previous_relim_mode is not None and not isinstance(
+            previous_relim_mode,
+            RelimMode,
+        ):
+            raise TypeError("previous_relim_mode must be RelimMode or None")
+        # Validate the closed interactive contract before mutating this
+        # persistent Agg surface.  A rejected categorical/non-monotonic front
+        # must not leave a unit converter or partial artist topology behind.
+        pre_layer, _pre_cell, pre_series_group = self._one_panel(evaluated)
+        curves = tuple(series.data for series in pre_series_group)
+        if any(not isinstance(curve, EvaluatedCurve) for curve in curves):
+            raise ValueError("interactive render requires one CURVE panel")
+        first_curve = curves[0]
+        assert isinstance(first_curve, EvaluatedCurve)
+        numeric_curve_coordinates(first_curve.x_axis)
+        if any(curve.x_axis != first_curve.x_axis for curve in curves[1:]):
+            raise ValueError("interactive curve series must share one exact x axis")
+        value_unit = first_curve.value_unit
+        if any(curve.value_unit != value_unit for curve in curves[1:]):
+            raise ValueError("interactive curve series must share value_unit")
+        for series in pre_series_group:
+            _curve_values(series)
+
+        figure, axis, layer, _cell, series_group = self._prepare_panel(evaluated)
+        if layer is not pre_layer or series_group is not pre_series_group:
+            raise RuntimeError("interactive panel identity changed during preparation")
+
+        finite_groups: list[np.ndarray] = []
+        for series in series_group:
+            data = series.data
+            assert isinstance(data, EvaluatedCurve)
+            values = np.asarray(data.values)
+            valid = np.asarray(data.validity, dtype=bool)
+            if np.any(valid):
+                finite_groups.append(np.asarray(values[valid], dtype=np.float64))
+
+        home_x_limits = curve_home_x_limits(first_curve.x_axis)
+        x_limits = state.x_view or home_x_limits
+        if finite_groups:
+            data_min = min(float(np.min(group)) for group in finite_groups)
+            data_max = max(float(np.max(group)) for group in finite_groups)
+            y_limits = deadband_display_range(
+                state.relim_mode,
+                current_y_limits,
+                data_min,
+                data_max,
+                fixed_range=state.fixed_y_limits,
+                force=(
+                    previous_relim_mode is None
+                    or previous_relim_mode is not state.relim_mode
+                ),
+            )
+        elif state.relim_mode is RelimMode.FIXED:
+            assert state.fixed_y_limits is not None
+            y_limits = state.fixed_y_limits
+        elif current_y_limits is not None:
+            y_limits = validated_display_range(
+                current_y_limits,
+                "current_y_limits",
+            )
+        else:
+            y_limits = (0.0, 1.0)
+
+        # Authored x and resolved y are applied after every artist has received
+        # the same evaluated revision.  No autoscale call follows these pins.
+        axis.set_xlim(*x_limits)
+        axis.set_ylim(*y_limits)
+        raster = self._draw_raster(figure)
+        actual_x_limits = validated_display_range(
+            tuple(float(value) for value in axis.get_xlim()),
+            "drawn curve x limits",
+        )
+        actual_y_limits = validated_display_range(
+            tuple(float(value) for value in axis.get_ylim()),
+            "drawn curve y limits",
+        )
+        x0, y0, width, height = (
+            float(value) for value in axis.bbox.bounds
+        )
+        plot_bounds = (
+            x0 / raster.width,
+            1.0 - (y0 + height) / raster.height,
+            (x0 + width) / raster.width,
+            1.0 - y0 / raster.height,
+        )
+        viewport = CurveViewportTransform(
+            first_curve.x_axis,
+            state.revision,
+            plot_bounds,
+            actual_x_limits,
+            actual_y_limits,
+            home_x_limits,
+        )
+        try:
+            evaluated_input = next(
+                item for item in evaluated.inputs if item.dataset_id == layer.dataset_id
+            )
+        except StopIteration as exc:
+            raise ValueError(
+                "interactive curve layer dataset is absent from evaluated inputs"
+            ) from exc
+        if sum(
+            item.dataset_id == layer.dataset_id for item in evaluated.inputs
+        ) != 1:
+            raise ValueError(
+                "interactive curve layer requires one exact evaluated input"
+            )
+        labels = self._curve_series_labels(layer.layer_id, series_group)
+        return raster, CurvePanelPayload(
+            evaluated_input,
+            viewport,
+            tuple(series_group),
+            labels,
+        )
+
+    def _prepare_panel(self, evaluated: EvaluatedFigureData):
         self._require_owner()
         figure = self._figure
         axis = self._axis
@@ -819,7 +1030,13 @@ class SinglePanelAggRenderer:
         kind = type(first)
         if isinstance(first, EvaluatedCurve):
             series_topology = tuple(
-                (series.batch_address, series.data.x_axis)
+                (
+                    series.batch_address,
+                    series.data.x_axis.axis_id,
+                    series.data.x_axis.role,
+                    len(series.data.x_axis.indices),
+                    series.data.value_unit,
+                )
                 for series in series_group
             )
         elif isinstance(first, EvaluatedHistogram):
@@ -876,12 +1093,24 @@ class SinglePanelAggRenderer:
 
         multiple_series = len(series_group) > 1
         if isinstance(first, (EvaluatedCurve, EvaluatedHistogram)):
-            for line, series in zip(self._artists, series_group, strict=True):
+            for index, (line, series) in enumerate(
+                zip(self._artists, series_group, strict=True)
+            ):
                 line.set_label(
-                    _series_label(series, include_reductions=multiple_series)
+                    _display_series_label(
+                        layer.layer_id,
+                        series,
+                        index,
+                        multiple_series=multiple_series,
+                    )
                 )
         if isinstance(first, EvaluatedCurve):
             axis.set_xlabel(_axis_label(first.x_axis))
+            axis.set_ylabel(
+                "Value"
+                if first.value_unit is None
+                else f"Value [{first.value_unit}]"
+            )
         axis.set_title(_panel_title(self._document, layer, cell, series_group))
         if isinstance(first, (EvaluatedCurve, EvaluatedHistogram)) and (
             multiple_series or any(series.batch_address for series in series_group)
@@ -895,9 +1124,24 @@ class SinglePanelAggRenderer:
                     raise RuntimeError("progressive panel legend topology changed")
                 for text, line in zip(texts, self._artists, strict=True):
                     text.set_text(line.get_label())
-        if isinstance(first, (EvaluatedCurve, EvaluatedHistogram)):
-            axis.relim(visible_only=True)
-            axis.autoscale_view()
+        return figure, axis, layer, cell, series_group
+
+    @staticmethod
+    def _curve_series_labels(layer_id: str, series_group) -> tuple[str, ...]:
+        multiple_series = len(series_group) > 1
+        labels = []
+        for index, series in enumerate(series_group):
+            label = _display_series_label(
+                layer_id,
+                series,
+                index,
+                multiple_series=multiple_series,
+            )
+            labels.append(label)
+        return tuple(labels)
+
+    @staticmethod
+    def _draw_raster(figure) -> RasterBuffer:
         figure.canvas.draw()
         actual_width, actual_height = figure.canvas.get_width_height()
         return RasterBuffer(

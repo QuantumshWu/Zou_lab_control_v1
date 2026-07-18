@@ -1312,8 +1312,8 @@ def test_explicit_current_point_admission_counts_visible_frame_not_rolling_histo
 
 
 def test_evaluated_validity_is_exact_bool_and_complex_views_fail_closed():
-    x_out = EvaluatedAxis(AxisId("dto-x"), "x", None, (0,), (0,))
-    y_out = EvaluatedAxis(AxisId("dto-y"), "y", None, (0,), (0,))
+    x_out = EvaluatedAxis(AxisId("dto-x"), "x", SPATIAL_X, None, (0,), (0,))
+    y_out = EvaluatedAxis(AxisId("dto-y"), "y", SPATIAL_Y, None, (0,), (0,))
     with pytest.raises(TypeError, match="validity dtype must be bool"):
         EvaluatedImage(
             x_out,
@@ -1324,6 +1324,7 @@ def test_evaluated_validity_is_exact_bool_and_complex_views_fail_closed():
     with pytest.raises(TypeError, match="validity dtype must be bool"):
         EvaluatedCurve(
             x_out,
+            None,
             np.zeros((1,), dtype=np.float64),
             np.array([np.nan]),
         )

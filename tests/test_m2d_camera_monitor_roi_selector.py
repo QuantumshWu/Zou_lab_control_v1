@@ -10,7 +10,7 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
-from PyQt5 import QtCore, QtTest, QtWidgets
+from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 import pytest
 
 import Zou_lab_control.notebook as zlc
@@ -54,7 +54,8 @@ from zlc_neutral_atom.runtime.control import ControlAckStatus, create_control_to
 import zlc_neutral_atom.runtime.dataset as dataset_runtime
 from zlc_neutral_atom.runtime.run import RunState
 from zlc_storage import canonical_digest
-from zlc_workbench.live import LiveDatasetSlot, LiveImageBoardController
+import zlc_workbench.live as live_module
+from zlc_workbench.live import LiveBoardController, LiveDatasetSlot
 
 
 @pytest.fixture(scope="module")
@@ -86,6 +87,23 @@ def _close_window(application, window) -> None:
     window.deleteLater()
     application.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
     application.processEvents()
+
+
+def _wheel_down(board: QtRasterBoard, target: QtCore.QRectF) -> QtGui.QWheelEvent:
+    center = target.center()
+    position = QtCore.QPoint(int(center.x()), int(center.y()))
+    event = QtGui.QWheelEvent(
+        QtCore.QPointF(position),
+        QtCore.QPointF(board.mapToGlobal(position)),
+        QtCore.QPoint(),
+        QtCore.QPoint(0, -120),
+        QtCore.Qt.NoButton,
+        QtCore.Qt.NoModifier,
+        QtCore.Qt.ScrollUpdate,
+        False,
+    )
+    board.wheelEvent(event)
+    return event
 
 
 def _camera_kernel(dtype=np.dtype("<u2")):
@@ -282,7 +300,7 @@ def test_max_is_typed_validity_aware_and_all_roi_reducers_reject_valid_nonfinite
 
 
 def test_sticky_presentation_freeze_ends_a_candidate_waiting_for_gui_admission():
-    controller = object.__new__(LiveImageBoardController)
+    controller = object.__new__(LiveBoardController)
     controller._owner_thread = threading.get_ident()
     controller._lock = threading.Lock()
     controller._closed = False
@@ -368,7 +386,7 @@ def test_live_view_fault_isolated_from_source_and_visible_status():
 
     wakes = []
     visible_status = object()
-    controller = object.__new__(LiveImageBoardController)
+    controller = object.__new__(LiveBoardController)
     controller._lock = threading.Lock()
     controller._closed = False
     controller._fault = None
@@ -407,7 +425,7 @@ def test_old_live_render_job_cannot_touch_a_new_configuration():
         candidate=SimpleNamespace(configuration=old_configuration),
         port=object(),
     )
-    controller = object.__new__(LiveImageBoardController)
+    controller = object.__new__(LiveBoardController)
     controller._lock = threading.Lock()
     controller._closed = False
     controller._fault = None
@@ -436,7 +454,7 @@ def test_old_live_render_job_cannot_touch_a_new_configuration():
 
 
 def test_scalar_dataset_id_and_stream_generation_are_a_stable_pair():
-    controller = object.__new__(LiveImageBoardController)
+    controller = object.__new__(LiveBoardController)
     controller._scalar_dataset_generations = {}
     controller._scalar_generation_datasets = {}
     dataset_id = DatasetId("scalar-generation-a")
@@ -602,8 +620,14 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
         old_generation = window._run_owner.generation
         old_binding = window._running_binding
         old_slot = window._slot
+        live = window._live
         old_frame = board.front_frame
-        assert old_handle is not None and old_binding is not None and old_slot is not None
+        assert (
+            old_handle is not None
+            and old_binding is not None
+            and old_slot is not None
+            and live is not None
+        )
         assert old_frame is not None
         old_raw_source = old_frame.panels[0].source_identity
         old_scalar_source = old_frame.panels[1].source_identity
@@ -616,6 +640,44 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
         old_visible_projection = window._visible_projection_text
         assert old_visible_projection is not None
         assert board._selector_applied_bounds == _overlay_bounds(board, initial_roi)
+        _until(
+            application,
+            lambda: (
+                live._curve_y_limits is not None
+                and live._curve_relim_mode is not None
+            ),
+        )
+        curve_origin = board.visible_curve_origin()
+        curve_payload = board.visible_curve_payload()
+        assert curve_origin is not None and curve_payload is not None
+        x_low, x_high = curve_payload.viewport.x_limits
+        selected_span = (
+            x_low + 0.25 * (x_high - x_low),
+            x_low + 0.75 * (x_high - x_low),
+        )
+        window._set_curve_range_candidate(curve_origin, selected_span)
+        assert window._curve_range_candidate == (curve_origin, selected_span)
+        assert board._curve_applied_span == selected_span
+
+        reconfigure_observations = []
+        real_reconfigure_scalar = live.reconfigure_scalar
+
+        def observe_reconfigure_scalar(*args, **kwargs):
+            # Exclude a worker completion from refilling the new baseline
+            # before this exact post-transaction fact is observed.
+            with live._worker_gate:
+                previous = live._configuration
+                result = real_reconfigure_scalar(*args, **kwargs)
+                current = live._configuration
+                with live._lock:
+                    accepted_range = live._curve_y_limits
+                    accepted_mode = live._curve_relim_mode
+                reconfigure_observations.append(
+                    (previous, current, accepted_range, accepted_mode)
+                )
+                return result
+
+        monkeypatch.setattr(live, "reconfigure_scalar", observe_reconfigure_scalar)
 
         receipts = []
         submitted = []
@@ -698,6 +760,21 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
             f"Display: {old_visible_projection} · target "
         )
         assert window._projection_status.text().endswith(" pending")
+        assert window._curve_range_candidate is None
+        assert board._curve_applied_span is None
+        assert not window._visible_curve_matches_current_state()
+        assert not window._edit_curve_display.isEnabled()
+        assert window._edit_image_display.isEnabled()
+        assert window._selector_switch.isChecked()
+        assert window._selector_switch.isEnabled()
+        assert board._image_interaction_armed()
+        assert not board._curve_interaction_armed()
+        stale_curve_viewport = board.visible_curve_payload().viewport
+        stale_curve_event = _wheel_down(board, board._curve_target()[0])
+        assert not stale_curve_event.isAccepted()
+        assert board.visible_curve_payload().viewport == stale_curve_viewport
+        assert board.curve_selector_fault is None
+        assert board._curve_pending_viewport is None
         _until(
             application,
             lambda: (
@@ -713,6 +790,7 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
             timeout=20.0,
         )
         assert window._handle is old_handle
+        assert window._live is live
         assert not old_handle.snapshot().state.terminal
         assert window._run_owner.generation == old_generation
         assert window._slot is old_slot
@@ -744,6 +822,39 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
             for metadata in scalar_metadata
         )
         assert receipts[0].snapshot().revision > old_control_revision
+        assert len(reconfigure_observations) == 1
+        (
+            previous_configuration,
+            current_configuration,
+            reset_range,
+            reset_mode,
+        ) = reconfigure_observations[0]
+        assert (
+            live_module._curve_semantic_identity(previous_configuration)
+            != live_module._curve_semantic_identity(current_configuration)
+        )
+        assert (
+            previous_configuration.scalar_binding_fingerprint
+            != current_configuration.scalar_binding_fingerprint
+        )
+        assert (
+            current_configuration.scalar_binding_fingerprint
+            == window._running_binding.fingerprint
+        )
+        assert (
+            current_configuration.scalar_control_revision
+            == receipts[0].snapshot().revision
+        )
+        assert (
+            current_configuration.scalar_generation
+            == old_joined.scalar.ref.stream_generation
+        )
+        assert current_configuration.scalar_block_id == old_joined.scalar.ref.block_id
+        assert reset_range is None and reset_mode is None
+        assert window._visible_curve_matches_current_state()
+        assert window._edit_curve_display.isEnabled()
+        assert board._curve_interaction_armed()
+        assert board.curve_selector_fault is None
         new_frame = board.front_frame
         assert (
             new_frame.panels[0].coherence_stamp.join_key_digest
@@ -1338,7 +1449,8 @@ def test_broken_view_notification_faults_only_presentation_while_raw_ingest_cont
             timeout=20.0,
         )
         fault_front = board.front_frame
-        assert fault_front is coherent_front
+        assert fault_front is not None
+        assert fault_front.sequence >= coherent_front.sequence
 
         def raw_advanced_after_view_fault():
             _run, _epoch, current = slot.freeze_camera_current()

@@ -6,16 +6,19 @@ not re-export it and therefore never loads PyQt as a side effect.
 
 from ..image_view import ImageViewportTransform
 from ..selector import (
+    CurveInteractionIntent,
+    CurveRangeGesture,
+    CurveViewportCommit,
     ImageColorLimitsCommit,
     ImageInteractionCommit,
-    ImageInteractionOrigin,
     ImageViewportCommit,
+    PanelInteractionOrigin,
     RectangleGesture,
 )
 from .axis_navigator import AxisLayoutNavigator
 from .board import QtImageBoard, QtOwnerWake, QtRasterBoard
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
-from .image_display import FluentImageDisplayEditor
+from .display_editor import FluentRevisionedFormEditor
 from .fluent import (
     ElidedLabel,
     FluentButton,
@@ -160,7 +163,7 @@ __all__ = [
     "FluentFormGrid",
     "FluentFrame",
     "FluentGroupBox",
-    "FluentImageDisplayEditor",
+    "FluentRevisionedFormEditor",
     "FluentInputDialog",
     "FluentLabel",
     "FluentLabeledField",
@@ -191,8 +194,11 @@ __all__ = [
     "ImageViewportTransform",
     "ImageColorLimitsCommit",
     "ImageInteractionCommit",
-    "ImageInteractionOrigin",
     "ImageViewportCommit",
+    "CurveInteractionIntent",
+    "CurveRangeGesture",
+    "CurveViewportCommit",
+    "PanelInteractionOrigin",
     "MUTED_LABEL_STYLE",
     "Metrics",
     "ORANGE",

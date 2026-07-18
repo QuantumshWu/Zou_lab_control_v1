@@ -31,10 +31,19 @@ from zlc_frontend.figure import (
     suggest_view,
     validate_view_spec,
 )
+from zlc_frontend.curve_display import (
+    CurveDisplayState,
+    curve_display_form_spec,
+    curve_display_form_values,
+    curve_display_from_form,
+    curve_display_with_x_view,
+)
+from zlc_frontend.display_range import RelimMode
 from zlc_frontend.image_display import (
     ImageDisplayState,
-    ImageRelimMode,
     image_display_for_viewport,
+    image_display_form_spec,
+    image_display_form_values,
     image_display_from_form,
     image_viewport_for_display_state,
 )
@@ -47,7 +56,7 @@ from zlc_frontend.matplotlib_render import (
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentComboBox,
-    FluentImageDisplayEditor,
+    FluentRevisionedFormEditor,
     FluentLabel,
     FluentPopup,
     FluentSwitch,
@@ -70,10 +79,13 @@ from zlc_frontend.qt_widgets import (
 )
 from zlc_frontend.render import RenderSurface
 from zlc_frontend.selector import (
+    CurveInteractionIntent,
+    CurveRangeGesture,
+    CurveViewportCommit,
     ImageColorLimitsCommit,
     ImageInteractionCommit,
-    ImageInteractionOrigin,
     ImageViewportCommit,
+    PanelInteractionOrigin,
 )
 from zlc_neutral_atom.monitor_application import (
     CameraMonitorRoiState,
@@ -87,7 +99,7 @@ from zlc_neutral_atom.runtime.control import (
     ControlReceipt,
 )
 from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot, RunState
-from zlc_workbench.live import LiveDatasetSlot, LiveImageBoardController
+from zlc_workbench.live import LiveBoardController, LiveDatasetSlot
 from zlc_workbench.run_owner import QtRunOwnerMailbox
 from zlc_workbench.workspace import BoardController, BoardModel, PanelSlot
 
@@ -172,7 +184,9 @@ def _roi_scalar_views(schema, binding):
     return views, summary
 
 
-def _scalar_presentation_peak(schema) -> tuple[int, tuple[int, ...]]:
+def _scalar_presentation_peak(
+    schema,
+) -> tuple[int, tuple[int, ...], int]:
     """Return the full three-panel live reserve for one possible scalar schema."""
 
     views = _roi_scalar_view_specs(schema)
@@ -187,8 +201,9 @@ def _scalar_presentation_peak(schema) -> tuple[int, tuple[int, ...]]:
         estimate_view_evaluation_peak_nbytes(schema, view) for view in views
     )
     total = 0
+    curve_hold_extra = 0
     for view, evaluation_peak in zip(views, evaluation_peaks, strict=True):
-        total += evaluation_peak + estimate_live_panel_raster_peak_nbytes(
+        raster_peak = estimate_live_panel_raster_peak_nbytes(
             *_SCALAR_RASTER_SIZE,
             evaluated_data_upper_bound_bytes=evaluation_peak,
             histogram_bins=(
@@ -197,7 +212,18 @@ def _scalar_presentation_peak(schema) -> tuple[int, tuple[int, ...]]:
                 else None
             ),
         )
-    return total, evaluation_peaks
+        total += evaluation_peak + raster_peak
+        if view.intent is ViewIntent.CURVE:
+            held_peak = estimate_live_panel_raster_peak_nbytes(
+                *_SCALAR_RASTER_SIZE,
+                evaluated_data_upper_bound_bytes=evaluation_peak,
+                extra_retained_fronts=1,
+                extra_retained_evaluated_data_bytes=evaluation_peak,
+            )
+            curve_hold_extra = held_peak - raster_peak
+    if curve_hold_extra <= 0:
+        raise RuntimeError("scalar presentation has no curve hold reserve")
+    return total, evaluation_peaks, curve_hold_extra
 
 
 def _scalar_documents(
@@ -296,13 +322,22 @@ def _prepare_monitor_view(
         raise ValueError("camera monitor IMAGE view needs an explicit axis choice")
     image_view = suggestion.spec
     image_evaluation_peak = estimate_view_evaluation_peak_nbytes(schema, image_view)
-    downstream_peak = image_evaluation_peak + estimate_indexed8_raster_peak_nbytes(
+    image_base_raster_peak = estimate_indexed8_raster_peak_nbytes(
+        y_axes[0].size,
+        x_axes[0].size,
+        value_itemsize=schema.cell_schema.dtype.itemsize,
+        retained_fronts=1,
+        retained_sample_fronts=1,
+    )
+    image_held_raster_peak = estimate_indexed8_raster_peak_nbytes(
         y_axes[0].size,
         x_axes[0].size,
         value_itemsize=schema.cell_schema.dtype.itemsize,
         retained_fronts=2,
         retained_sample_fronts=2,
     )
+    image_hold_extra = image_held_raster_peak - image_base_raster_peak
+    downstream_peak = image_evaluation_peak + image_base_raster_peak
 
     scalar_views: tuple[ViewSpec, ...] = ()
     projection_text = _RAW_PROJECTION_TEXT
@@ -320,9 +355,20 @@ def _prepare_monitor_view(
     # armed.  Reserve the largest possible scalar board even for a raw-only
     # initial request; worker-affine renderer replacement is serialized, so
     # mutually exclusive scalar schemas contribute a maximum rather than a sum.
-    downstream_peak += max(total for total, _peaks in possible_scalar_reserves)
+    downstream_peak += max(
+        total for total, _peaks, _hold_extra in possible_scalar_reserves
+    )
+    # QtRasterBoard owns at most one pointer hold across the whole board.  The
+    # reserve therefore admits the larger exact IMAGE/CURVE hold once, rather
+    # than pretending both can coexist or undercounting retained curve arrays.
+    downstream_peak += max(
+        image_hold_extra,
+        *(hold_extra for _total, _peaks, hold_extra in possible_scalar_reserves),
+    )
     possible_scalar_evaluation_peaks = tuple(
-        peak for _total, peaks in possible_scalar_reserves for peak in peaks
+        peak
+        for _total, peaks, _hold_extra in possible_scalar_reserves
+        for peak in peaks
     )
     if scalar_schema is None:
         if roi_binding is not None or command.request.roi is not None:
@@ -430,10 +476,13 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._visible_projection_text: str | None = None
         self._draft_selection: Selection | None = None
         self._image_display = ImageDisplayState()
+        self._curve_display = CurveDisplayState()
         self._image_viewport: ImageViewportTransform | None = None
-        self._pending_image_interaction_origin: ImageInteractionOrigin | None = None
+        self._pending_image_interaction_origin: PanelInteractionOrigin | None = None
+        self._pending_curve_interaction_origin: PanelInteractionOrigin | None = None
+        self._curve_range_candidate: tuple[PanelInteractionOrigin, tuple[float, float]] | None = None
         self._slot: LiveDatasetSlot | None = None
-        self._live: LiveImageBoardController | None = None
+        self._live: LiveBoardController | None = None
         self._board: BoardController | None = None
         self._last_snapshot: RunSnapshot | None = None
         self._prepare_inflight = False
@@ -483,7 +532,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._clear_roi_button.setObjectName("clearRoiButton")
         self._clear_roi_button.setEnabled(False)
         self._setting_button = FluentButton("Setting…", self, color=GREY)
-        self._setting_button.setObjectName("imageDisplaySettingButton")
+        self._setting_button.setObjectName("displaySettingButton")
         self._roi_status = FluentLabel(
             (
                 "ROI: start the raw monitor, then draw a rectangle"
@@ -515,24 +564,54 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         live_layout = QtWidgets.QVBoxLayout(self._live_page)
         live_layout.setContentsMargins(0, 0, 0, 0)
         live_layout.addWidget(self._board_container, 1)
-        self._edit_image_display = FluentImageDisplayEditor(self._tabs)
+        self._edit_display_tabs = FluentTabWidget(self._tabs)
+        self._edit_display_tabs.setObjectName("displayEditTabs")
+        self._edit_image_display = FluentRevisionedFormEditor(
+            image_display_form_spec(),
+            "image display",
+            runtime_placeholder_fields=("color_min", "color_max"),
+            parent=self._edit_display_tabs,
+        )
         self._edit_image_display.setObjectName("imageDisplayEditEditor")
+        self._edit_curve_display = FluentRevisionedFormEditor(
+            curve_display_form_spec(),
+            "curve display",
+            runtime_placeholder_fields=("y_min", "y_max"),
+            parent=self._edit_display_tabs,
+        )
+        self._edit_curve_display.setObjectName("curveDisplayEditEditor")
+        self._edit_display_tabs.addTab(self._edit_image_display, "Image")
+        self._edit_display_tabs.addTab(self._edit_curve_display, "Curve")
         self._tabs.addTab(self._live_page, "Live")
-        self._tabs.addTab(self._edit_image_display, "Edit")
+        self._tabs.addTab(self._edit_display_tabs, "Edit")
 
         self._settings_popup = FluentPopup(self)
-        self._settings_popup.setObjectName("imageDisplaySettingsPopup")
+        self._settings_popup.setObjectName("displaySettingsPopup")
         settings_layout = QtWidgets.QVBoxLayout(self._settings_popup)
         settings_layout.setContentsMargins(*(scaled_px(10, minimum=8),) * 4)
-        self._setting_image_display = FluentImageDisplayEditor(
-            self._settings_popup
+        self._setting_display_tabs = FluentTabWidget(self._settings_popup)
+        self._setting_display_tabs.setObjectName("displaySettingTabs")
+        self._setting_image_display = FluentRevisionedFormEditor(
+            image_display_form_spec(),
+            "image display",
+            runtime_placeholder_fields=("color_min", "color_max"),
+            parent=self._setting_display_tabs,
         )
         self._setting_image_display.setObjectName("imageDisplaySettingEditor")
-        settings_layout.addWidget(self._setting_image_display)
+        self._setting_curve_display = FluentRevisionedFormEditor(
+            curve_display_form_spec(),
+            "curve display",
+            runtime_placeholder_fields=("y_min", "y_max"),
+            parent=self._setting_display_tabs,
+        )
+        self._setting_curve_display.setObjectName("curveDisplaySettingEditor")
+        self._setting_display_tabs.addTab(self._setting_image_display, "Image")
+        self._setting_display_tabs.addTab(self._setting_curve_display, "Curve")
+        settings_layout.addWidget(self._setting_display_tabs)
         self._settings_dismissed_at = float("-inf")
         self._settings_popup._on_hidden = self._record_settings_dismissed
-        self._edit_image_display.load(self._image_display)
-        self._setting_image_display.load(self._image_display)
+        self._sync_image_display_editors()
+        self._sync_curve_display_editors()
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self._run_status)
@@ -559,7 +638,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._selector_switch.toggled.connect(self._set_selector_enabled)
         self._reducer_combo.currentIndexChanged.connect(self._reducer_changed)
         self._clear_roi_button.clicked.connect(self._clear_roi)
-        self._setting_button.clicked.connect(self._open_image_settings)
+        self._setting_button.clicked.connect(self._open_display_settings)
         self._edit_image_display.applyRequested.connect(
             lambda revision, values: self._apply_image_display_form(
                 self._edit_image_display,
@@ -574,13 +653,33 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 values,
             )
         )
+        self._edit_curve_display.applyRequested.connect(
+            lambda revision, values: self._apply_curve_display_form(
+                self._edit_curve_display,
+                revision,
+                values,
+            )
+        )
+        self._setting_curve_display.applyRequested.connect(
+            lambda revision, values: self._apply_curve_display_form(
+                self._setting_curve_display,
+                revision,
+                values,
+            )
+        )
         self._edit_image_display.cancelRequested.connect(
             lambda: self._reload_image_display_editor(self._edit_image_display)
         )
         self._setting_image_display.cancelRequested.connect(
             lambda: self._reload_image_display_editor(self._setting_image_display)
         )
-        self._update_image_display_controls()
+        self._edit_curve_display.cancelRequested.connect(
+            lambda: self._reload_curve_display_editor(self._edit_curve_display)
+        )
+        self._setting_curve_display.cancelRequested.connect(
+            lambda: self._reload_curve_display_editor(self._setting_curve_display)
+        )
+        self._update_display_controls()
         self._submit_prepare()
 
     @property
@@ -598,11 +697,11 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
 
     def _set_selector_enabled(self, enabled: bool) -> None:
         board = self._board_widget
-        setter = getattr(board, "set_rectangle_selector_enabled", None)
+        setter = getattr(board, "set_selectors_enabled", None)
         if callable(setter):
             setter(bool(enabled))
 
-    def _open_image_settings(self) -> None:
+    def _open_display_settings(self) -> None:
         if not self._setting_button.isEnabled():
             return
         popup = self._settings_popup
@@ -612,9 +711,10 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         if time.monotonic() - self._settings_dismissed_at < 0.25:
             return
         self._reload_image_display_editor(self._setting_image_display)
+        self._reload_curve_display_editor(self._setting_curve_display)
         popup.adjustSize()
-        form_hint = self._setting_image_display.form.sizeHint()
-        editor_hint = self._setting_image_display.sizeHint()
+        form_hint = self._setting_display_tabs.sizeHint()
+        editor_hint = self._setting_display_tabs.sizeHint()
         button_top_left = self._setting_button.mapToGlobal(QtCore.QPoint(0, 0))
         button_bottom_right = self._setting_button.mapToGlobal(
             QtCore.QPoint(
@@ -683,17 +783,29 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
     def _record_settings_dismissed(self) -> None:
         self._settings_dismissed_at = time.monotonic()
 
-    def _update_image_display_controls(self) -> None:
+    def _update_display_controls(self) -> None:
         live_healthy = self._live is None or self._live.fault is None
-        enabled = (
+        image_enabled = (
             not self._closing
             and self._image_viewport is not None
             and not self._view_attach_inflight
             and live_healthy
+            and (
+                self._live is None
+                or self._visible_image_matches_display_revision()
+            )
         )
-        self._setting_button.setEnabled(enabled)
-        self._edit_image_display.setEnabled(enabled)
-        self._setting_image_display.setEnabled(enabled)
+        curve_enabled = (
+            not self._closing
+            and not self._view_attach_inflight
+            and live_healthy
+            and self._visible_curve_matches_current_state()
+        )
+        self._setting_button.setEnabled(image_enabled or curve_enabled)
+        self._edit_image_display.setEnabled(image_enabled)
+        self._setting_image_display.setEnabled(image_enabled)
+        self._edit_curve_display.setEnabled(curve_enabled)
+        self._setting_curve_display.setEnabled(curve_enabled)
 
     def _visible_image_color_limits(self) -> tuple[float, float] | None:
         board = self._board_widget
@@ -721,45 +833,181 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             and origin.presentation.panel_revision == self._image_display.revision
         )
 
+    def _visible_curve_y_limits(self) -> tuple[float, float] | None:
+        board = self._board_widget
+        if not isinstance(board, QtRasterBoard):
+            return None
+        if self._live is not None and not self._visible_curve_matches_current_state():
+            return None
+        payload = board.visible_curve_payload()
+        return None if payload is None else payload.viewport.y_limits
+
+    def _visible_curve_matches_current_state(self) -> bool:
+        """Require painted curve presentation and ROI provenance to be current."""
+
+        board = self._board_widget
+        if not isinstance(board, QtRasterBoard):
+            return False
+        origin = board.visible_curve_origin()
+        front = board.front_frame
+        live = self._live
+        status = None if live is None else live.front_status
+        binding = self._running_binding
+        return (
+            origin is not None
+            and origin.panel_id == _CURVE_PANEL_ID
+            and origin.presentation.panel_revision == self._curve_display.revision
+            and front is not None
+            and status is not None
+            and status.sequence == front.sequence
+            and binding is not None
+            and status.scalar_binding_fingerprint == binding.fingerprint
+            and self._applied_control_revision is not None
+            and status.scalar_control_revision == self._applied_control_revision
+        )
+
+    @staticmethod
+    def _runtime_range_placeholders(
+        value: tuple[float, float] | None,
+        low_key: str,
+        high_key: str,
+    ) -> dict[str, str] | None:
+        if value is None:
+            return None
+        return {
+            low_key: f"{value[0]:.12g}",
+            high_key: f"{value[1]:.12g}",
+        }
+
     def _reload_image_display_editor(
         self,
-        editor: FluentImageDisplayEditor,
+        editor: FluentRevisionedFormEditor,
     ) -> None:
-        if editor not in (
+        editors = (
             self._edit_image_display,
             self._setting_image_display,
-        ):
-            raise ValueError("image display editor does not belong to this window")
+        )
+        self._require_display_editor(editor, editors, "image")
         editor.load(
-            self._image_display,
-            self._visible_image_color_limits(),
+            revision=self._image_display.revision,
+            semantic_identity=self._image_display,
+            values=image_display_form_values(self._image_display),
+            runtime_placeholders=self._runtime_range_placeholders(
+                self._visible_image_color_limits(),
+                "color_min",
+                "color_max",
+            ),
         )
 
     def _sync_image_display_editors(
         self,
         *,
-        accepted_editor: FluentImageDisplayEditor | None = None,
+        accepted_editor: FluentRevisionedFormEditor | None = None,
         accepted_base_revision: int | None = None,
     ) -> None:
         limits = self._visible_image_color_limits()
-        for editor in (
-            self._edit_image_display,
-            self._setting_image_display,
-        ):
+        values = image_display_form_values(self._image_display)
+        placeholders = self._runtime_range_placeholders(
+            limits,
+            "color_min",
+            "color_max",
+        )
+        self._sync_display_editors(
+            (self._edit_image_display, self._setting_image_display),
+            revision=self._image_display.revision,
+            semantic_identity=self._image_display,
+            values=values,
+            runtime_placeholders=placeholders,
+            accepted_editor=accepted_editor,
+            accepted_base_revision=accepted_base_revision,
+        )
+
+    def _reload_curve_display_editor(
+        self,
+        editor: FluentRevisionedFormEditor,
+    ) -> None:
+        editors = (
+            self._edit_curve_display,
+            self._setting_curve_display,
+        )
+        self._require_display_editor(editor, editors, "curve")
+        editor.load(
+            revision=self._curve_display.revision,
+            semantic_identity=self._curve_display,
+            values=curve_display_form_values(self._curve_display),
+            runtime_placeholders=self._runtime_range_placeholders(
+                self._visible_curve_y_limits(),
+                "y_min",
+                "y_max",
+            ),
+        )
+
+    def _sync_curve_display_editors(
+        self,
+        *,
+        accepted_editor: FluentRevisionedFormEditor | None = None,
+        accepted_base_revision: int | None = None,
+    ) -> None:
+        values = curve_display_form_values(self._curve_display)
+        placeholders = self._runtime_range_placeholders(
+            self._visible_curve_y_limits(),
+            "y_min",
+            "y_max",
+        )
+        self._sync_display_editors(
+            (self._edit_curve_display, self._setting_curve_display),
+            revision=self._curve_display.revision,
+            semantic_identity=self._curve_display,
+            values=values,
+            runtime_placeholders=placeholders,
+            accepted_editor=accepted_editor,
+            accepted_base_revision=accepted_base_revision,
+        )
+
+    @staticmethod
+    def _require_display_editor(
+        editor: FluentRevisionedFormEditor,
+        editors: tuple[FluentRevisionedFormEditor, ...],
+        kind: str,
+    ) -> None:
+        if editor not in editors:
+            raise ValueError(f"{kind} display editor does not belong to this window")
+
+    @staticmethod
+    def _sync_display_editors(
+        editors: tuple[FluentRevisionedFormEditor, ...],
+        *,
+        revision: int,
+        semantic_identity: object,
+        values: dict[str, object],
+        runtime_placeholders: dict[str, str] | None,
+        accepted_editor: FluentRevisionedFormEditor | None,
+        accepted_base_revision: int | None,
+    ) -> None:
+        if accepted_editor is not None and accepted_editor not in editors:
+            raise ValueError("accepted display editor is not one of the synchronized surfaces")
+        for editor in editors:
             if editor is accepted_editor:
                 if accepted_base_revision is None:
-                    raise RuntimeError("accepted editor has no base revision")
+                    raise RuntimeError("accepted display editor has no base revision")
                 editor.accept_commit(
-                    accepted_base_revision,
-                    self._image_display,
-                    limits,
+                    base_revision=accepted_base_revision,
+                    revision=revision,
+                    semantic_identity=semantic_identity,
+                    values=values,
+                    runtime_placeholders=runtime_placeholders,
                 )
             else:
-                editor.load(self._image_display, limits)
+                editor.load(
+                    revision=revision,
+                    semantic_identity=semantic_identity,
+                    values=values,
+                    runtime_placeholders=runtime_placeholders,
+                )
 
     def _apply_image_display_form(
         self,
-        editor: FluentImageDisplayEditor,
+        editor: FluentRevisionedFormEditor,
         base_revision: int,
         values: object,
     ) -> None:
@@ -796,12 +1044,50 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 accepted_base_revision=base_revision,
             )
         except Exception as error:
-            editor.load(
-                self._image_display,
-                self._visible_image_color_limits(),
-            )
             self._record_local_failure(
                 f"Image display edit rejected: {type(error).__name__}: {error}"
+            )
+
+    def _apply_curve_display_form(
+        self,
+        editor: FluentRevisionedFormEditor,
+        base_revision: int,
+        values: object,
+    ) -> None:
+        if editor not in (
+            self._edit_curve_display,
+            self._setting_curve_display,
+        ):
+            raise ValueError("curve display editor does not belong to this window")
+        try:
+            if self._closing or self._view_attach_inflight:
+                raise RuntimeError(
+                    "curve display cannot change while the live view is attaching"
+                )
+            if self._live is not None and not self._visible_curve_matches_current_state():
+                raise RuntimeError(
+                    "curve display cannot change until the current ROI front is visible"
+                )
+            if base_revision != self._curve_display.revision:
+                raise RuntimeError(
+                    f"curve display edit base r{base_revision} is stale; "
+                    f"current revision is r{self._curve_display.revision}"
+                )
+            if not isinstance(values, dict):
+                raise TypeError("curve display form must emit one exact mapping")
+            candidate = curve_display_from_form(
+                self._curve_display,
+                values,
+                current_y_limits=self._visible_curve_y_limits(),
+            )
+            self._commit_curve_display(
+                candidate,
+                accepted_editor=editor,
+                accepted_base_revision=base_revision,
+            )
+        except Exception as error:
+            self._record_local_failure(
+                f"Curve display edit rejected: {type(error).__name__}: {error}"
             )
 
     def _viewport_for_image_display(
@@ -847,7 +1133,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             candidate = replace(
                 self._image_display,
                 revision=self._image_display.revision + 1,
-                relim_mode=ImageRelimMode.FIXED,
+                relim_mode=RelimMode.FIXED,
                 fixed_color_limits=command.color_limits,
             )
             viewport = image_viewport_for_display_state(
@@ -865,9 +1151,9 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         state: ImageDisplayState,
         viewport: ImageViewportTransform,
         *,
-        accepted_editor: FluentImageDisplayEditor | None = None,
+        accepted_editor: FluentRevisionedFormEditor | None = None,
         accepted_base_revision: int | None = None,
-        interaction_origin: ImageInteractionOrigin | None = None,
+        interaction_origin: PanelInteractionOrigin | None = None,
     ) -> None:
         current = self._image_display
         if not isinstance(state, ImageDisplayState):
@@ -909,6 +1195,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         # Keep the user's selector switch intent checked, but disarm the board
         # until a front carrying this exact revision is actually painted.
         self._update_roi_controls()
+        self._update_display_controls()
         if (
             changed
             and live is None
@@ -925,6 +1212,79 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             self._refresh_diagnostics(self._last_snapshot)
             self._submit_prepare()
 
+    def _accept_curve_interaction(
+        self,
+        command: CurveInteractionIntent,
+    ) -> None:
+        if not isinstance(command, (CurveViewportCommit, CurveRangeGesture)):
+            raise TypeError("curve interaction callback received an unknown command")
+        board = self._board_widget
+        if not isinstance(board, QtRasterBoard):
+            raise RuntimeError("curve interaction has no raster board")
+        origin = command.origin
+        if origin.panel_id != _CURVE_PANEL_ID:
+            raise RuntimeError("curve interaction belongs to another panel")
+        if not self._visible_curve_matches_current_state():
+            raise RuntimeError("curve interaction ROI provenance is stale")
+        if board.visible_curve_origin() != origin:
+            raise RuntimeError("curve interaction origin is no longer painted")
+        if origin.presentation.panel_revision != self._curve_display.revision:
+            raise RuntimeError("curve interaction origin is stale")
+        if isinstance(command, CurveRangeGesture):
+            self._set_curve_range_candidate(origin, command.x_span)
+            self._roi_status.setText(
+                "Curve: DISPLAY ONLY x span "
+                f"{command.x_span[0]:.6g}..{command.x_span[1]:.6g}"
+            )
+            return
+        if command.viewport.display_revision != self._curve_display.revision + 1:
+            raise RuntimeError("curve viewport interaction must advance once")
+        candidate = curve_display_with_x_view(
+            self._curve_display,
+            command.viewport.x_limits,
+        )
+        self._commit_curve_display(
+            candidate,
+            interaction_origin=origin,
+        )
+
+    def _commit_curve_display(
+        self,
+        state: CurveDisplayState,
+        *,
+        accepted_editor: FluentRevisionedFormEditor | None = None,
+        accepted_base_revision: int | None = None,
+        interaction_origin: PanelInteractionOrigin | None = None,
+    ) -> None:
+        current = self._curve_display
+        if not isinstance(state, CurveDisplayState):
+            raise TypeError("state must be CurveDisplayState")
+        changed = state != current
+        if changed and state.revision != current.revision + 1:
+            raise ValueError("curve display commit must advance exactly once")
+        if not changed and state.revision != current.revision:
+            raise ValueError("curve display no-op changed revision")
+        if accepted_editor is not None:
+            if accepted_base_revision != current.revision:
+                raise ValueError("accepted curve editor base differs from current revision")
+            if accepted_editor.base_revision != accepted_base_revision:
+                raise ValueError("accepted curve editor no longer owns its emitted base")
+        if interaction_origin is not None and not changed:
+            raise ValueError("curve interaction cannot commit a semantic no-op")
+
+        live = self._live
+        if changed and live is not None:
+            live.reconfigure_curve_display(state)
+        if changed:
+            self._curve_display = state
+            self._pending_curve_interaction_origin = interaction_origin
+        self._sync_curve_display_editors(
+            accepted_editor=accepted_editor,
+            accepted_base_revision=accepted_base_revision,
+        )
+        self._update_roi_controls()
+        self._update_display_controls()
+
     def _discard_pending_image_interaction(self) -> None:
         origin = self._pending_image_interaction_origin
         if origin is None:
@@ -933,6 +1293,34 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         if isinstance(board, QtRasterBoard):
             board.discard_pending_image_interaction(origin)
         self._pending_image_interaction_origin = None
+
+    def _discard_pending_curve_interaction(self) -> None:
+        origin = self._pending_curve_interaction_origin
+        if origin is None:
+            return
+        board = self._board_widget
+        if isinstance(board, QtRasterBoard):
+            board.discard_pending_curve_interaction(origin)
+        self._pending_curve_interaction_origin = None
+
+    def _set_curve_range_candidate(
+        self,
+        origin: PanelInteractionOrigin,
+        x_span: tuple[float, float],
+    ) -> None:
+        board = self._board_widget
+        if not isinstance(board, QtRasterBoard):
+            raise RuntimeError("curve range candidate has no raster board")
+        if board.visible_curve_origin() != origin:
+            raise RuntimeError("curve range candidate origin is no longer painted")
+        self._curve_range_candidate = (origin, x_span)
+        board.set_curve_range_candidate(x_span)
+
+    def _clear_curve_range_candidate(self) -> None:
+        self._curve_range_candidate = None
+        board = self._board_widget
+        if isinstance(board, QtRasterBoard):
+            board.set_curve_range_candidate(None)
 
     def _accept_rectangle_gesture(self, gesture: RectangleGesture) -> None:
         if not isinstance(gesture, RectangleGesture):
@@ -982,16 +1370,27 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             and board.fault is None
             and self._roi_presentation_failure is None
         )
-        selector_healthy = (
-            self._board_widget is not None
-            and self._board_widget.selector_fault is None
-        )
+        image_interaction_ready = False
+        curve_interaction_ready = False
+        if isinstance(self._board_widget, QtRasterBoard):
+            image_interaction_ready = (
+                self._board_widget.selector_fault is None
+                and self._visible_image_matches_display_revision()
+            )
+            curve_interaction_ready = (
+                self._board_widget.curve_selector_fault is None
+                and self._visible_curve_matches_current_state()
+            )
+            self._board_widget.set_interaction_readiness(
+                image=image_interaction_ready,
+                curve=curve_interaction_ready,
+            )
+        selector_healthy = image_interaction_ready or curve_interaction_ready
         active = (
             self._handle is not None
             and not self._handle.snapshot().state.terminal
             and self._board_widget is not None
             and self._board_widget.has_front
-            and self._visible_image_matches_display_revision()
             and view_healthy
         )
         self._selector_switch.setEnabled(not busy and active and selector_healthy)
@@ -1009,7 +1408,10 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             )
         )
         self._set_selector_enabled(
-            self._selector_switch.isChecked() and not busy and active
+            self._selector_switch.isChecked()
+            and not busy
+            and active
+            and selector_healthy
         )
 
     def _reducer_changed(self, *_args) -> None:
@@ -1095,6 +1497,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._board_widget = widget
         self._board_panel_ids = panel_ids
         self._pending_image_interaction_origin = None
+        self._pending_curve_interaction_origin = None
+        self._clear_curve_range_candidate()
         self._visible_binding_fingerprint = None
         self._visible_projection_text = None
 
@@ -1159,6 +1563,14 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 enabled=False,
                 interaction_callback=self._accept_image_interaction,
             )
+            if prepared_view.scalar_documents:
+                selector_board.bind_curve_interaction(
+                    _CURVE_PANEL_ID,
+                    self._accept_curve_interaction,
+                    enabled=False,
+                )
+            else:
+                selector_board.unbind_curve_interaction()
             if not selector_board.has_front:
                 selector_board.set_selector_applied_selection(None)
             selector_board.set_selector_draft_selection(self._draft_selection)
@@ -1190,7 +1602,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(False)
         self._update_roi_controls()
-        self._update_image_display_controls()
+        self._update_display_controls()
 
         dataset_id = prepared_view.dataset_id
         scalar_dataset_id = prepared_view.scalar_dataset_id
@@ -1288,7 +1700,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 ):
                     self._reconcile_snapshot(snapshot)
             self._refresh_view_status()
-            self._update_image_display_controls()
+            self._update_display_controls()
             self._maybe_finish_close()
         except BaseException as error:
             message = f"Workbench owner failed: {type(error).__name__}: {error}"
@@ -1709,6 +2121,14 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
     ) -> QtRasterBoard:
         if not isinstance(state, CameraMonitorRoiState):
             raise TypeError("camera ROI state has an unexpected type")
+        previous_curve_semantics = (
+            (
+                None
+                if self._running_binding is None
+                else self._running_binding.fingerprint
+            ),
+            self._applied_control_revision,
+        )
         live = self._live
         board = self._board
         board_widget = self._board_widget
@@ -1792,6 +2212,9 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     state,
                     scalar_dataset_id=scalar_dataset_id,
                     scalar_documents=scalar_documents,
+                    curve_display=(
+                        self._curve_display if scalar_documents else None
+                    ),
                 )
             except BaseException as error:
                 rollback_errors = []
@@ -1829,6 +2252,12 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     ) from error
                 raise
 
+        next_curve_semantics = (
+            None if state.binding is None else state.binding.fingerprint,
+            state.control_revision,
+        )
+        if next_curve_semantics != previous_curve_semantics:
+            self._clear_curve_range_candidate()
         self._running_binding = state.binding
         self._applied_control_revision = state.control_revision
         self._observed_roi_state_revision = state.state_revision
@@ -1885,7 +2314,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     board_widget,
                     self._wake.request_owner_wake,
                 )
-                live = LiveImageBoardController(
+                live = LiveBoardController(
                     slot,
                     image_document,
                     board,
@@ -1896,6 +2325,9 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     worker_thread_affine=self._run_owner.worker_thread_affine,
                     image_display=image_display,
                     image_viewport=image_viewport,
+                    curve_display=(
+                        self._curve_display if scalar_documents else None
+                    ),
                 )
                 self._slot = slot
                 self._board = board
@@ -1903,11 +2335,11 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 self._view_attach_inflight = False
                 self._initial_roi_receipt = None
                 self._initial_roi_receipt_loaded = False
-                self._update_image_display_controls()
+                self._update_display_controls()
                 response["accepted"] = True
             except BaseException as error:
                 self._view_attach_inflight = False
-                self._update_image_display_controls()
+                self._update_display_controls()
                 response["accepted"] = False
                 response["error"] = f"{type(error).__name__}: {error}"
                 try:
@@ -1948,17 +2380,39 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             fault = self._roi_presentation_failure
         if failure is not None or fault is not None:
             self._discard_pending_image_interaction()
+            self._discard_pending_curve_interaction()
             detail = failure if failure is not None else str(fault)
             self._view_status.setText(f"View: FAILED · {detail}")
             self._update_roi_controls()
             return
         board_widget = self._board_widget
         if isinstance(board_widget, QtRasterBoard):
-            selector_fault = board_widget.selector_fault
-            if selector_fault is not None:
+            image_selector_fault = board_widget.selector_fault
+            curve_selector_fault = board_widget.curve_selector_fault
+            image_selector_healthy = (
+                image_selector_fault is None
+                and board_widget.visible_image_origin() is not None
+            )
+            curve_selector_healthy = (
+                curve_selector_fault is None
+                and board_widget.visible_curve_origin() is not None
+            )
+            if (
+                not image_selector_healthy
+                and not curve_selector_healthy
+                and (
+                    image_selector_fault is not None
+                    or curve_selector_fault is not None
+                )
+            ):
                 self._selector_switch.setChecked(False)
+            if image_selector_fault is not None:
                 self._roi_status.setText(
-                    f"ROI selector disabled: {selector_fault}"
+                    f"ROI selector disabled: {image_selector_fault}"
+                )
+            elif curve_selector_fault is not None:
+                self._roi_status.setText(
+                    f"Curve interaction disabled: {curve_selector_fault}"
                 )
         if live is not None and board_widget is not None and board_widget.has_front:
             front = board_widget.front_frame
@@ -1998,6 +2452,23 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 self._sync_image_display_editors()
                 self._update_roi_controls()
                 return
+            if (
+                self._running_binding is not None
+                and status.curve_display_revision != self._curve_display.revision
+            ):
+                shown = (
+                    "unknown"
+                    if status.curve_display_revision is None
+                    else f"r{status.curve_display_revision}"
+                )
+                self._view_status.setText(
+                    "View: WAITING · previous curve display retained "
+                    f"({shown}) · target r{self._curve_display.revision}"
+                )
+                self._sync_image_display_editors()
+                self._sync_curve_display_editors()
+                self._update_roi_controls()
+                return
             pending_origin = self._pending_image_interaction_origin
             if (
                 pending_origin is not None
@@ -2005,7 +2476,15 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 > pending_origin.presentation.panel_revision
             ):
                 self._pending_image_interaction_origin = None
+            pending_curve_origin = self._pending_curve_interaction_origin
+            if (
+                pending_curve_origin is not None
+                and self._curve_display.revision
+                > pending_curve_origin.presentation.panel_revision
+            ):
+                self._pending_curve_interaction_origin = None
             self._sync_image_display_editors()
+            self._sync_curve_display_editors()
             coverage = status.raw_coverage
             scalar_coverage = status.scalar_coverage
             histogram_valid = status.histogram_valid_samples
@@ -2054,7 +2533,17 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 f"View: LIVE · {self._projection_text} · "
                 f"display r{self._image_display.revision} "
                 f"{self._image_display.relim_mode.value}/"
-                f"{self._image_display.colormap.value} · {suffix}"
+                f"{self._image_display.colormap.value}"
+                + (
+                    ""
+                    if status.curve_display_revision is None
+                    else (
+                        f" · curve r{status.curve_display_revision} "
+                        f"{self._curve_display.relim_mode.value} "
+                        f"y={status.curve_y_limits}"
+                    )
+                )
+                + f" · {suffix}"
             )
         elif self._handle is not None and not self._handle.snapshot().state.terminal:
             self._view_status.setText(f"View: WAITING · {self._projection_text}")
@@ -2117,6 +2606,12 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             # During staged promotion the old complete front remains visible.
             # It is stale presentation, not a data/source failure.
             return False
+        if board_widget.visible_curve_origin() is None:
+            board_widget.bind_curve_interaction(
+                _CURVE_PANEL_ID,
+                self._accept_curve_interaction,
+                enabled=board_widget.selectors_enabled,
+            )
         if self._visible_binding_fingerprint != binding.fingerprint:
             board_widget.set_selector_applied_selection(binding.selection)
             self._visible_binding_fingerprint = binding.fingerprint
@@ -2217,11 +2712,15 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         board_widget = self._board_widget
         if isinstance(board_widget, QtRasterBoard):
             board_widget.unbind_rectangle_selector()
+            board_widget.unbind_curve_interaction()
         self._pending_image_interaction_origin = None
+        self._pending_curve_interaction_origin = None
+        self._clear_curve_range_candidate()
         live = self._live
         if live is None:
             self._sync_image_display_editors()
-            self._update_image_display_controls()
+            self._sync_curve_display_editors()
+            self._update_display_controls()
             return
         self._fold_roi_state_for_detach()
         try:
@@ -2244,7 +2743,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._slot = None
         self._board = None
         self._sync_image_display_editors()
-        self._update_image_display_controls()
+        self._sync_curve_display_editors()
+        self._update_display_controls()
 
     def _fold_roi_state_for_detach(self) -> None:
         """Persist the latest applied downstream intent before slot teardown."""
@@ -2310,7 +2810,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             self._start_button.setEnabled(False)
             self._stop_button.setEnabled(False)
             self._settings_popup.hide()
-            self._update_image_display_controls()
+            self._update_display_controls()
             self._run_status.setText("Monitor: CLOSING")
             handle = self._handle
             if handle is not None and not handle.snapshot().state.terminal:

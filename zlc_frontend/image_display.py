@@ -10,23 +10,18 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 import math
-from typing import TypeAlias
+from zlc_storage import exact_mapping, nonnegative_integer
 
-from zlc_storage import exact_mapping, finite_real, nonnegative_integer
-
+from .display_range import (
+    DisplayRange,
+    RelimMode,
+    display_range_form_values,
+    display_range_from_form,
+    optional_display_range,
+    validated_display_range,
+)
 from .form import FormChoice, FormFieldProps, FormSpec
 from .image_view import ImageViewportTransform
-
-
-ImageRange: TypeAlias = tuple[float, float]
-
-
-class ImageRelimMode(str, Enum):
-    """Closed colour-limit behaviours supported by a pixel image."""
-
-    TIGHT = "tight"
-    NORMAL = "normal"
-    FIXED = "fixed"
 
 
 class ImageColormap(str, Enum):
@@ -40,32 +35,6 @@ class ImageColormap(str, Enum):
     COOLWARM = "coolwarm"
 
 
-def validated_image_range(
-    value: object,
-    field: str,
-    *,
-    allow_degenerate: bool = False,
-) -> ImageRange:
-    """Return the canonical finite two-endpoint IMAGE range."""
-
-    if not isinstance(value, tuple) or len(value) != 2:
-        raise TypeError(f"{field} must be a two-item tuple")
-    low = finite_real(value[0], f"{field} low")
-    high = finite_real(value[1], f"{field} high")
-    if low > high or (low == high and not allow_degenerate):
-        relation = "cannot exceed" if allow_degenerate else "must be below"
-        raise ValueError(f"{field} low {relation} high")
-    if not math.isfinite(high - low):
-        raise ValueError(f"{field} span must be finite")
-    return low, high
-
-
-def _optional_finite_range(value: object, field: str) -> ImageRange | None:
-    if value is None:
-        return None
-    return validated_image_range(value, field)
-
-
 @dataclass(frozen=True, slots=True)
 class ImageDisplayState:
     """One authored image-panel display value.
@@ -75,11 +44,11 @@ class ImageDisplayState:
     """
 
     revision: int = 0
-    relim_mode: ImageRelimMode = ImageRelimMode.TIGHT
+    relim_mode: RelimMode = RelimMode.TIGHT
     colormap: ImageColormap = ImageColormap.GRAY
-    x_view: ImageRange | None = None
-    y_view: ImageRange | None = None
-    fixed_color_limits: ImageRange | None = None
+    x_view: DisplayRange | None = None
+    y_view: DisplayRange | None = None
+    fixed_color_limits: DisplayRange | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -87,18 +56,18 @@ class ImageDisplayState:
             "revision",
             nonnegative_integer(self.revision, "image display revision"),
         )
-        if not isinstance(self.relim_mode, ImageRelimMode):
-            raise TypeError("relim_mode must be ImageRelimMode")
+        if not isinstance(self.relim_mode, RelimMode):
+            raise TypeError("relim_mode must be RelimMode")
         if not isinstance(self.colormap, ImageColormap):
             raise TypeError("colormap must be ImageColormap")
         for field in ("x_view", "y_view", "fixed_color_limits"):
             object.__setattr__(
                 self,
                 field,
-                _optional_finite_range(getattr(self, field), field),
+                optional_display_range(getattr(self, field), field),
             )
         if (
-            self.relim_mode is ImageRelimMode.FIXED
+            self.relim_mode is RelimMode.FIXED
             and self.fixed_color_limits is None
         ):
             raise ValueError("fixed relim_mode requires fixed_color_limits")
@@ -175,9 +144,9 @@ _IMAGE_DISPLAY_FORM = FormSpec(
             "relim_mode",
             "choice",
             "Color limits",
-            default=ImageRelimMode.TIGHT,
+            default=RelimMode.TIGHT,
             choices=tuple(
-                FormChoice(mode.value.title(), mode) for mode in ImageRelimMode
+                FormChoice(mode.value.title(), mode) for mode in RelimMode
             ),
         ),
         FormFieldProps(
@@ -205,18 +174,14 @@ def image_display_form_spec() -> FormSpec:
     return _IMAGE_DISPLAY_FORM
 
 
-def _range_form_values(value: ImageRange | None) -> tuple[float | None, float | None]:
-    return (None, None) if value is None else value
-
-
 def image_display_form_values(state: ImageDisplayState) -> dict[str, object]:
     """Project authored state to the form's exact typed keys."""
 
     if not isinstance(state, ImageDisplayState):
         raise TypeError("state must be ImageDisplayState")
-    x_min, x_max = _range_form_values(state.x_view)
-    y_min, y_max = _range_form_values(state.y_view)
-    color_min, color_max = _range_form_values(state.fixed_color_limits)
+    x_min, x_max = display_range_form_values(state.x_view)
+    y_min, y_max = display_range_form_values(state.y_view)
+    color_min, color_max = display_range_form_values(state.fixed_color_limits)
     return {
         "relim_mode": state.relim_mode,
         "colormap": state.colormap,
@@ -229,26 +194,11 @@ def image_display_form_values(state: ImageDisplayState) -> dict[str, object]:
     }
 
 
-def _range_from_form(
-    values: dict[str, object],
-    low_key: str,
-    high_key: str,
-    field: str,
-) -> ImageRange | None:
-    low = values[low_key]
-    high = values[high_key]
-    if low is None and high is None:
-        return None
-    if low is None or high is None:
-        raise ValueError(f"{field} requires both minimum and maximum")
-    return validated_image_range((low, high), field)
-
-
 def image_display_from_form(
     base: ImageDisplayState,
     values: dict[str, object],
     *,
-    current_color_limits: ImageRange | None = None,
+    current_color_limits: DisplayRange | None = None,
 ) -> ImageDisplayState:
     """Apply one exact Setting/Edit projection to ``base``.
 
@@ -268,26 +218,26 @@ def image_display_from_form(
     )
     relim_mode = values["relim_mode"]
     colormap = values["colormap"]
-    if not isinstance(relim_mode, ImageRelimMode):
-        raise TypeError("relim_mode form value must be ImageRelimMode")
+    if not isinstance(relim_mode, RelimMode):
+        raise TypeError("relim_mode form value must be RelimMode")
     if not isinstance(colormap, ImageColormap):
         raise TypeError("colormap form value must be ImageColormap")
 
-    x_view = _range_from_form(values, "x_min", "x_max", "x_view")
-    y_view = _range_from_form(values, "y_min", "y_max", "y_view")
-    submitted_fixed = _range_from_form(
+    x_view = display_range_from_form(values, "x_min", "x_max", "x_view")
+    y_view = display_range_from_form(values, "y_min", "y_max", "y_view")
+    submitted_fixed = display_range_from_form(
         values,
         "color_min",
         "color_max",
         "fixed_color_limits",
     )
-    if relim_mode is ImageRelimMode.FIXED:
-        if base.relim_mode is not ImageRelimMode.FIXED:
+    if relim_mode is RelimMode.FIXED:
+        if base.relim_mode is not RelimMode.FIXED:
             if current_color_limits is None:
                 raise ValueError(
                     "entering fixed relim_mode requires current_color_limits"
                 )
-            fixed_color_limits = validated_image_range(
+            fixed_color_limits = validated_display_range(
                 current_color_limits,
                 "current_color_limits",
             )
@@ -313,99 +263,12 @@ def image_display_from_form(
     return replace(candidate, revision=base.revision + 1)
 
 
-def _data_range(data_min: object, data_max: object) -> tuple[float, float]:
-    low = finite_real(data_min, "data minimum")
-    high = finite_real(data_max, "data maximum")
-    if low > high:
-        raise ValueError("data minimum cannot exceed data maximum")
-    return low, high
-
-
-def target_image_color_limits(
-    state: ImageDisplayState,
-    data_min: object,
-    data_max: object,
-) -> ImageRange:
-    """Derive the established tight/normal/fixed target for one frame."""
-
-    if not isinstance(state, ImageDisplayState):
-        raise TypeError("state must be ImageDisplayState")
-    if state.relim_mode is ImageRelimMode.FIXED:
-        assert state.fixed_color_limits is not None
-        return state.fixed_color_limits
-
-    low, high = _data_range(data_min, data_max)
-    span = (high - low) or (abs(high) or 1.0)
-    if not math.isfinite(span):
-        raise ValueError("data range span must be finite")
-    if state.relim_mode is ImageRelimMode.NORMAL and low >= 0.0:
-        target = (0.0, high * 1.2 if high else 1.0)
-    else:
-        target = (low - 0.1 * span, high + 0.1 * span)
-    return validated_image_range(target, "derived color limits")
-
-
-def deadband_image_color_limits(
-    state: ImageDisplayState,
-    current_color_limits: ImageRange | None,
-    data_min: object,
-    data_max: object,
-    *,
-    force: bool = False,
-) -> ImageRange:
-    """Return current or target limits using the mature live-view hysteresis.
-
-    Growth is immediate whenever data would clip.  NORMAL holds while its high
-    value occupies 70--100% of the current ceiling.  TIGHT holds while no value
-    clips and the data has not vacated more than 35% at either side.  ``force``
-    bypasses both dead bands for an authored mode change.
-    """
-
-    if not isinstance(state, ImageDisplayState):
-        raise TypeError("state must be ImageDisplayState")
-    if not isinstance(force, bool):
-        raise TypeError("force must be bool")
-    if state.relim_mode is ImageRelimMode.FIXED:
-        assert state.fixed_color_limits is not None
-        return state.fixed_color_limits
-    low, high = _data_range(data_min, data_max)
-    target = target_image_color_limits(state, low, high)
-    if current_color_limits is None or force:
-        return target
-    current_low, current_high = validated_image_range(
-        current_color_limits,
-        "current_color_limits",
-    )
-
-    effective_normal = state.relim_mode is ImageRelimMode.NORMAL and low >= 0.0
-    if effective_normal:
-        if (
-            current_low == 0.0
-            and current_high > 0.0
-            and 0.7 * current_high <= high <= current_high
-        ):
-            return current_low, current_high
-        return target
-
-    span = current_high - current_low
-    clips = low < current_low or high > current_high
-    too_empty = high < current_high - 0.35 * span or low > current_low + 0.35 * span
-    if not clips and not too_empty:
-        return current_low, current_high
-    return target
-
-
 __all__ = [
     "ImageColormap",
     "ImageDisplayState",
-    "ImageRange",
-    "ImageRelimMode",
-    "deadband_image_color_limits",
     "image_display_form_spec",
     "image_display_for_viewport",
     "image_display_form_values",
     "image_display_from_form",
     "image_viewport_for_display_state",
-    "target_image_color_limits",
-    "validated_image_range",
 ]

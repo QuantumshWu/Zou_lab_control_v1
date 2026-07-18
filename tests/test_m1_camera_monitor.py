@@ -16,7 +16,8 @@ import pytest
 
 import Zou_lab_control.notebook as zlc
 from zlc_data import MONITOR_HISTORY, SPATIAL_X, SPATIAL_Y
-from zlc_frontend.image_display import ImageColormap, ImageRelimMode
+from zlc_frontend.display_range import RelimMode
+from zlc_frontend.image_display import ImageColormap
 from zlc_frontend.qt_widgets import QtRasterBoard
 from zlc_frontend.render import PixelFormat
 from zlc_frontend.selector import ImageViewportCommit
@@ -116,14 +117,14 @@ def _raw_revision(window):
 
 
 def _choose_image_display_value(editor, key: str, value: object) -> None:
-    widget = editor.form.widget_for(key)
+    widget = editor._form.widget_for(key)
     assert isinstance(widget, QtWidgets.QComboBox)
     index = widget.findData(value)
     assert index >= 0
     widget.setCurrentIndex(index)
     # Choice handlers intentionally treat only a user activation as an edit;
     # this helper supplies that one public form notification after selecting.
-    editor.form.changed.emit(key)
+    editor._form.changed.emit(key)
 
 
 def _wheel_image_down(board: QtRasterBoard) -> QtGui.QWheelEvent:
@@ -177,7 +178,7 @@ def test_public_monitor_preserves_axes_restarts_with_fresh_identity_and_clears_f
         visible = board.front_frame
         assert visible is not None
         image_panel = visible.panels[0]
-        payload = image_panel.image_payload
+        payload = image_panel.display_payload
         assert image_panel.raster.pixel_format is PixelFormat.INDEXED8
         assert payload is not None
         assert payload.evaluated_input in image_panel.coherence_stamp.inputs
@@ -251,7 +252,7 @@ def test_display_gesture_and_form_reconfigure_only_the_live_presentation(
         # is restored automatically when the exact r1 front is painted.
         assert selector.isChecked() and not selector.isEnabled()
         assert not board._selector_enabled
-        assert board._interaction_is_pending()
+        assert board._image_interaction_is_pending()
         assert board.visible_image_origin().presentation.panel_revision == 0
         _until(
             application,
@@ -263,7 +264,7 @@ def test_display_gesture_and_form_reconfigure_only_the_live_presentation(
         )
         _until(application, selector.isEnabled)
         assert selector.isChecked() and board._selector_enabled
-        assert not board._interaction_is_pending()
+        assert not board._image_interaction_is_pending()
         assert board.selector_fault is None
         _until(application, lambda: _raw_revision(window) > first_raw_revision)
         assert _live_display_identity(window) == stable_identity
@@ -271,7 +272,7 @@ def test_display_gesture_and_form_reconfigure_only_the_live_presentation(
         second_raw_revision = _raw_revision(window)
         editor = window._edit_image_display
         _choose_image_display_value(editor, "colormap", ImageColormap.VIRIDIS)
-        editor.apply_button.click()
+        editor._apply_button.click()
         form_revision = window._image_display.revision
         assert form_revision == gesture_revision + 1
         assert window._image_display.colormap is ImageColormap.VIRIDIS
@@ -359,15 +360,15 @@ def test_entering_fixed_freezes_visible_painted_payload_not_ahead_status(
             )
 
         editor = window._setting_image_display
-        values = editor.read_all()
-        values["relim_mode"] = ImageRelimMode.FIXED
+        values = editor._form.read_all()
+        values["relim_mode"] = RelimMode.FIXED
         window._apply_image_display_form(
             editor,
             editor.base_revision,
             values,
         )
 
-        assert window._image_display.relim_mode is ImageRelimMode.FIXED
+        assert window._image_display.relim_mode is RelimMode.FIXED
         assert window._image_display.fixed_color_limits == painted_limits
         assert window._image_display.fixed_color_limits != ahead_limits
     finally:
@@ -384,15 +385,15 @@ def test_setting_and_edit_share_spec_and_one_owner_cas_workflow(
         _until(application, start.isEnabled)
         edit = window._edit_image_display
         setting = window._setting_image_display
-        assert edit.form.spec is setting.form.spec
-        assert edit.form.keys == setting.form.keys
+        assert edit._form.spec is setting._form.spec
+        assert edit._form.keys == setting._form.keys
         assert edit.base_revision == setting.base_revision == 0
 
         from zlc_frontend.qt_widgets import FluentPopup
 
         setting_button = window.findChild(
             QtWidgets.QPushButton,
-            "imageDisplaySettingButton",
+            "displaySettingButton",
         )
         assert setting_button is not None
         setting_button.click()
@@ -415,29 +416,29 @@ def test_setting_and_edit_share_spec_and_one_owner_cas_workflow(
 
         # Keep one unapplied Setting draft while Edit commits from the same
         # optimistic base.  The submitting surface cleans; the other is stale.
-        setting.form.widget_for("x_min").setText("10")
-        assert setting.dirty and not setting.stale
-        setting_draft = setting.read_all()
+        setting._form.widget_for("x_min").setText("10")
+        assert setting._dirty and not setting._stale
+        setting_draft = setting._form.read_all()
         _choose_image_display_value(edit, "colormap", ImageColormap.MAGMA)
-        edit.apply_button.click()
+        edit._apply_button.click()
 
         assert window._image_display.revision == 1
         assert window._image_display.colormap is ImageColormap.MAGMA
-        assert edit.base_revision == 1 and not edit.dirty and not edit.stale
-        assert setting.base_revision == 0 and setting.dirty and setting.stale
-        assert setting.read_all() == setting_draft
+        assert edit.base_revision == 1 and not edit._dirty and not edit._stale
+        assert setting.base_revision == 0 and setting._dirty and setting._stale
+        assert setting._form.read_all() == setting_draft
 
-        setting.cancel_button.click()
+        setting._cancel_button.click()
         assert setting.base_revision == 1
-        assert not setting.dirty and not setting.stale
-        assert setting.read_all() == edit.read_all()
+        assert not setting._dirty and not setting._stale
+        assert setting._form.read_all() == edit._form.read_all()
 
         # Applying the exact current projection is a semantic no-op: it
         # acknowledges the submitter without manufacturing another revision.
         before = window._image_display
-        edit.apply_button.click()
+        edit._apply_button.click()
         assert window._image_display is before
-        assert edit.base_revision == 1 and not edit.dirty and not edit.stale
+        assert edit.base_revision == 1 and not edit._dirty and not edit._stale
     finally:
         _close_window(application, window)
 
@@ -453,7 +454,7 @@ def test_stop_start_preserves_authored_display_and_resets_selector_off(
         _until(application, start.isEnabled)
         editor = window._edit_image_display
         _choose_image_display_value(editor, "colormap", ImageColormap.PLASMA)
-        editor.apply_button.click()
+        editor._apply_button.click()
         authored = window._image_display
         assert authored.revision == 1
 
@@ -504,9 +505,9 @@ def test_changed_display_commit_recovers_stopped_not_ready_preparation(
 
         # Author a real coordinate pin, then reproduce the exact stopped state
         # left when a newly discovered schema rejects that retained pin.
-        editor.form.widget_for("x_min").setText("10")
-        editor.form.widget_for("x_max").setText("100")
-        editor.apply_button.click()
+        editor._form.widget_for("x_min").setText("10")
+        editor._form.widget_for("x_max").setText("100")
+        editor._apply_button.click()
         assert window._image_display.x_view == (10.0, 100.0)
         assert window._prepared is not None and window._live is None
         window._prepared = None
@@ -521,9 +522,9 @@ def test_changed_display_commit_recovers_stopped_not_ready_preparation(
         # Clearing the rejected pin is one changed owner CAS.  It retries the
         # existing prepare path; no source Run is armed as a side effect.
         editor = window._edit_image_display
-        editor.form.widget_for("x_min").clear()
-        editor.form.widget_for("x_max").clear()
-        editor.apply_button.click()
+        editor._form.widget_for("x_min").clear()
+        editor._form.widget_for("x_max").clear()
+        editor._apply_button.click()
         assert window._image_display.x_view is None
         assert window._handle is None and window._live is None
         assert window._prepare_inflight

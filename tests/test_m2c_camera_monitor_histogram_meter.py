@@ -51,6 +51,7 @@ from zlc_frontend.figure import (
     ViewIntent,
     ViewSpec,
 )
+from zlc_frontend.curve_display import CurveDisplayState
 from zlc_frontend.matplotlib_render import (
     SinglePanelAggRenderer,
     histogram_bin_counts,
@@ -166,7 +167,7 @@ def test_four_panel_board_uses_one_scalar_revision_and_typed_view_semantics(
         assert len(stamp.presentations) == 4
         assert tuple(
             document.layers[0].view.intent
-            for document in window._live._scalar_documents
+            for document in window._live._configuration.scalar_documents
         ) == (ViewIntent.CURVE, ViewIntent.HISTOGRAM, ViewIntent.METER)
 
         status = window._live.front_status
@@ -195,7 +196,7 @@ def test_four_panel_board_uses_one_scalar_revision_and_typed_view_semantics(
         )
         evaluated = tuple(
             FigureEvaluator(window._slot.evaluation_policy).evaluate(document, resolved)
-            for document in window._live._scalar_documents
+            for document in window._live._configuration.scalar_documents
         )
         histogram = evaluated[1].layers[0].cells[0].series[0].data
         meter = evaluated[2].layers[0].cells[0].series[0].data
@@ -488,6 +489,21 @@ def test_image_reconfigure_shares_first_scalar_renderer_holder_across_worker_rac
         def render(self, evaluated):
             return self._inner.render(evaluated)
 
+        def render_interactive_curve(
+            self,
+            evaluated,
+            state,
+            *,
+            current_y_limits,
+            previous_relim_mode,
+        ):
+            return self._inner.render_interactive_curve(
+                evaluated,
+                state,
+                current_y_limits=current_y_limits,
+                previous_relim_mode=previous_relim_mode,
+            )
+
         def close(self):
             self.close_count += 1
             self._inner.close()
@@ -602,7 +618,7 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
         _slot=None,
         _run_owner=SimpleNamespace(take_pending_snapshot=lambda: None),
         _refresh_view_status=lambda: events.append("status"),
-        _update_image_display_controls=lambda: None,
+        _update_display_controls=lambda: None,
         _record_local_failure=lambda message: events.append(("failure", message)),
         _maybe_finish_close=lambda: None,
     )
@@ -627,11 +643,15 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
         _projection_text="projection",
         _roi_presentation_failure=None,
         _image_display=ImageDisplayState(),
+        _curve_display=CurveDisplayState(),
+        _running_binding=None,
         _pending_image_interaction_origin=None,
+        _pending_curve_interaction_origin=None,
         _view_status=label,
         _handle=None,
         _reconcile_visible_roi=lambda _status: True,
         _sync_image_display_editors=lambda: None,
+        _sync_curve_display_editors=lambda: None,
         _update_roi_controls=lambda: None,
     )
     CameraMonitorWorkbenchWindow._refresh_view_status(status_harness)
@@ -665,6 +685,7 @@ def test_close_failure_after_front_clear_immediately_drops_visible_label():
         _visible_projection_text="old projection",
         _projection_text="target projection",
         _projection_status=projection_label,
+        _clear_curve_range_candidate=lambda: None,
     )
     harness._show_projection_target = lambda: (
         CameraMonitorWorkbenchWindow._show_projection_target(harness)

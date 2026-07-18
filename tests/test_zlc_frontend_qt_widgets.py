@@ -830,7 +830,7 @@ def test_qt_raster_board_releases_every_hold_lifecycle_exit() -> None:
                 QtCore.QEvent(QtCore.QEvent.UngrabMouse),
             )
         elif exit_name == "disable":
-            board.set_rectangle_selector_enabled(False)
+            board.set_selectors_enabled(False)
         elif exit_name == "unbind":
             board.unbind_rectangle_selector()
         elif exit_name == "rebind":
@@ -883,7 +883,8 @@ def test_qt_raster_board_releases_hold_after_selector_callback_fault() -> None:
     QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
 
     assert board._selector_hold is None
-    assert board._selector_enabled is False
+    assert board._selector_enabled is True
+    assert board._image_binding_enabled is False
     assert board.selector_fault is not None
     assert "selector callback failed" in str(board.selector_fault)
     board.close()

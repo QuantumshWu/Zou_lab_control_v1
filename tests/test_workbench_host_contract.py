@@ -29,8 +29,8 @@ from zlc_frontend.figure import (
 from zlc_frontend.image_view import ImageViewportTransform
 from zlc_frontend.image_display import (
     ImageDisplayState,
-    ImageRelimMode,
 )
+from zlc_frontend.display_range import RelimMode
 from zlc_frontend.render import (
     AtomicBoardFront,
     BoardFrame,
@@ -57,7 +57,7 @@ from zlc_workbench.workspace import (
     PanelSourceBinding,
     WorkspaceModel,
 )
-from zlc_workbench.live import _accepted_image_relim_mode
+from zlc_workbench.live import _accepted_relim_mode
 
 
 SCHEMA_A = "a" * 64
@@ -246,8 +246,22 @@ def test_image_panel_payload_carries_exact_samples_and_matching_view_revision() 
         coordinate_frame=frame_id,
     )
     image = EvaluatedImage(
-        EvaluatedAxis(x_axis.axis_id, "x", "pixel", (0, 1), (10, 11)),
-        EvaluatedAxis(y_axis.axis_id, "y", "pixel", (0,), (20,)),
+        EvaluatedAxis(
+            x_axis.axis_id,
+            "x",
+            x_axis.role,
+            "pixel",
+            (0, 1),
+            (10, 11),
+        ),
+        EvaluatedAxis(
+            y_axis.axis_id,
+            "y",
+            y_axis.role,
+            "pixel",
+            (0,),
+            (20,),
+        ),
         np.asarray([[2, 9]], dtype=np.uint16),
         np.asarray([[True, True]], dtype=bool),
     )
@@ -268,7 +282,7 @@ def test_image_panel_payload_carries_exact_samples_and_matching_view_revision() 
     raster = RasterBuffer(2, 1, 2, PixelFormat.INDEXED8, bytes((1, 255)))
     panel = PanelFrame("a", "shot", source, stamp, raster, payload)
 
-    assert panel.image_payload is payload
+    assert panel.display_payload is payload
     assert int(payload.image.values[0, 1]) == 9
     with pytest.raises(ValueError):
         payload.image.values.setflags(write=True)
@@ -282,7 +296,7 @@ def test_image_panel_payload_carries_exact_samples_and_matching_view_revision() 
         stamp.inputs,
         (_presentation("a", panel_revision=2),),
     )
-    with pytest.raises(ValueError, match="viewport revision"):
+    with pytest.raises(ValueError, match="payload revision"):
         PanelFrame("a", "shot", source, stale_stamp, raster, payload)
     with pytest.raises(ValueError, match="INDEXED8"):
         PanelFrame("a", "shot", source, stamp, _raster(), payload)
@@ -302,23 +316,23 @@ def test_image_panel_payload_carries_exact_samples_and_matching_view_revision() 
 
 
 def test_invalid_fronts_do_not_consume_or_confuse_the_next_valid_relim() -> None:
-    tight = ImageDisplayState(relim_mode=ImageRelimMode.TIGHT)
+    tight = ImageDisplayState(relim_mode=RelimMode.TIGHT)
     fixed = ImageDisplayState(
         revision=1,
-        relim_mode=ImageRelimMode.FIXED,
+        relim_mode=RelimMode.FIXED,
         fixed_color_limits=(20.0, 40.0),
     )
-    back_to_tight = ImageDisplayState(revision=2, relim_mode=ImageRelimMode.TIGHT)
+    back_to_tight = ImageDisplayState(revision=2, relim_mode=RelimMode.TIGHT)
 
-    mode = _accepted_image_relim_mode(None, tight, (1.0, 10.0))
-    assert mode is ImageRelimMode.TIGHT
-    mode = _accepted_image_relim_mode(mode, fixed, None)
-    assert mode is ImageRelimMode.FIXED
-    mode = _accepted_image_relim_mode(mode, back_to_tight, None)
-    assert mode is ImageRelimMode.FIXED
+    mode = _accepted_relim_mode(None, tight.relim_mode, (1.0, 10.0))
+    assert mode is RelimMode.TIGHT
+    mode = _accepted_relim_mode(mode, fixed.relim_mode, None)
+    assert mode is RelimMode.FIXED
+    mode = _accepted_relim_mode(mode, back_to_tight.relim_mode, None)
+    assert mode is RelimMode.FIXED
     assert mode is not back_to_tight.relim_mode  # next valid front must force relim
-    mode = _accepted_image_relim_mode(mode, back_to_tight, (2.0, 3.0))
-    assert mode is ImageRelimMode.TIGHT
+    mode = _accepted_relim_mode(mode, back_to_tight.relim_mode, (2.0, 3.0))
+    assert mode is RelimMode.TIGHT
 
 
 def test_source_identity_and_coherence_are_separate_typed_values() -> None:

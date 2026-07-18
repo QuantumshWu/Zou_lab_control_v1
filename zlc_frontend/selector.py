@@ -1,4 +1,4 @@
-"""Headless, front-bound selection gestures for regular pixel images.
+"""Headless, front-bound display gestures for raster panels.
 
 Coordinate and viewport math has one owner in :mod:`zlc_frontend.image_view`.
 This module only binds a completed selection gesture to the exact immutable
@@ -14,7 +14,8 @@ from typing import TypeAlias
 from zlc_storage import canonical_text, nonnegative_integer
 
 from .figure import EvaluatedInput
-from .image_display import validated_image_range
+from .curve_display import CurveViewportTransform
+from .display_range import validated_display_range
 from .image_view import (
     ImageViewportTransform,
     NormalizedRectangle,
@@ -54,7 +55,7 @@ class RectangleGesture:
 
 
 @dataclass(frozen=True, slots=True)
-class ImageInteractionOrigin:
+class PanelInteractionOrigin:
     """The exact painted front against which one display intent was authored."""
 
     panel_id: str
@@ -100,12 +101,12 @@ class ImageInteractionOrigin:
 class ImageViewportCommit:
     """Request one new committed viewport; the owner performs the state CAS."""
 
-    origin: ImageInteractionOrigin
+    origin: PanelInteractionOrigin
     viewport: ImageViewportTransform
 
     def __post_init__(self) -> None:
-        if not isinstance(self.origin, ImageInteractionOrigin):
-            raise TypeError("origin must be ImageInteractionOrigin")
+        if not isinstance(self.origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
         if not isinstance(self.viewport, ImageViewportTransform):
             raise TypeError("viewport must be ImageViewportTransform")
         if self.viewport.viewport_revision <= self.origin.presentation.panel_revision:
@@ -116,28 +117,67 @@ class ImageViewportCommit:
 class ImageColorLimitsCommit:
     """Request FIXED colour limits without mutating the painted QImage LUT."""
 
-    origin: ImageInteractionOrigin
+    origin: PanelInteractionOrigin
     color_limits: tuple[float, float]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.origin, ImageInteractionOrigin):
-            raise TypeError("origin must be ImageInteractionOrigin")
+        if not isinstance(self.origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
         object.__setattr__(
             self,
             "color_limits",
-            validated_image_range(self.color_limits, "color_limits"),
+            validated_display_range(self.color_limits, "color_limits"),
         )
 
 
 ImageInteractionCommit: TypeAlias = ImageViewportCommit | ImageColorLimitsCommit
 
 
+@dataclass(frozen=True, slots=True)
+class CurveViewportCommit:
+    """Request one display-only CURVE x viewport from an exact painted front."""
+
+    origin: PanelInteractionOrigin
+    viewport: CurveViewportTransform
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
+        if not isinstance(self.viewport, CurveViewportTransform):
+            raise TypeError("viewport must be CurveViewportTransform")
+        if self.viewport.display_revision <= self.origin.presentation.panel_revision:
+            raise ValueError("curve viewport commit revision must exceed its painted origin")
+
+
+@dataclass(frozen=True, slots=True)
+class CurveRangeGesture:
+    """One exact display-only x-span candidate; it is not an authority Selection."""
+
+    origin: PanelInteractionOrigin
+    x_span: tuple[float, float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
+        object.__setattr__(
+            self,
+            "x_span",
+            validated_display_range(self.x_span, "curve x_span"),
+        )
+
+
+CurveInteractionIntent: TypeAlias = CurveViewportCommit | CurveRangeGesture
+
+
 __all__ = [
+    "CurveInteractionIntent",
+    "CurveRangeGesture",
+    "CurveViewportCommit",
     "ImageColorLimitsCommit",
     "ImageInteractionCommit",
-    "ImageInteractionOrigin",
     "ImageViewportCommit",
     "ImageViewportTransform",
     "NormalizedRectangle",
+    "PanelInteractionOrigin",
     "RectangleGesture",
 ]

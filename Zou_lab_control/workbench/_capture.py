@@ -46,7 +46,7 @@ from zlc_frontend.render import RenderSurface
 from zlc_neutral_atom.capture_application import PreparedFiniteCapture
 from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
 from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot, RunState
-from zlc_workbench.live import LiveDatasetSlot, LiveImageBoardController
+from zlc_workbench.live import LiveBoardController, LiveDatasetSlot
 from zlc_workbench.run_owner import QtRunOwnerMailbox
 from zlc_workbench.workspace import BoardController, BoardModel, PanelSlot
 
@@ -71,7 +71,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         self._request = request
         self._prepared: PreparedFiniteCapture | None = None
         self._slot: LiveDatasetSlot | None = None
-        self._live: LiveImageBoardController | None = None
+        self._live: LiveBoardController | None = None
         self._board: BoardController | None = None
         self._last_snapshot: RunSnapshot | None = None
         self._final_reference = None
@@ -482,7 +482,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                     self._board_widget,
                     self._wake.request_owner_wake,
                 )
-                live = LiveImageBoardController(
+                live = LiveBoardController(
                     slot,
                     document,
                     board,

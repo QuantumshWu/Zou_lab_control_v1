@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Callable
 
+import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from zlc_data import Selection
 from zlc_storage import canonical_text, nonnegative_integer
 
+from ..curve_display import CurveViewportTransform
+from ..display_range import validated_display_range
 from ..image_raster import indexed8_code_for_value
 from ..render import (
     BoardFrame,
+    CurvePanelPayload,
     ImagePanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
@@ -22,12 +26,15 @@ from ..render import (
     detached_render_fault,
 )
 from ..selector import (
+    CurveInteractionIntent,
+    CurveRangeGesture,
+    CurveViewportCommit,
     ImageColorLimitsCommit,
     ImageInteractionCommit,
-    ImageInteractionOrigin,
     ImageViewportTransform,
     ImageViewportCommit,
     NormalizedRectangle,
+    PanelInteractionOrigin,
     RectangleGesture,
 )
 from .style import BG, GREEN, ORANGE
@@ -44,7 +51,9 @@ def _prepared_qimage(panel_or_raster) -> tuple[bytes, QtGui.QImage]:
 
     if isinstance(panel_or_raster, PanelFrame):
         raster = panel_or_raster.raster
-        payload = panel_or_raster.image_payload
+        payload = panel_or_raster.display_payload
+        if payload is not None and not isinstance(payload, ImagePanelPayload):
+            payload = None
     else:
         raster = panel_or_raster
         payload = None
@@ -205,6 +214,35 @@ def _raster_geometry(panel: PanelFrame) -> tuple[int, int, int, PixelFormat]:
     )
 
 
+def _image_payload(
+    panel_or_hold: PanelFrame | _HeldPanelFront,
+) -> ImagePanelPayload | None:
+    payload = panel_or_hold.display_payload
+    return payload if isinstance(payload, ImagePanelPayload) else None
+
+
+def _curve_payload(
+    panel_or_hold: PanelFrame | _HeldPanelFront,
+) -> CurvePanelPayload | None:
+    payload = panel_or_hold.display_payload
+    return payload if isinstance(payload, CurvePanelPayload) else None
+
+
+def _curve_plot_geometry(
+    panel_bounds: QtCore.QRect,
+    viewport: CurveViewportTransform,
+) -> QtCore.QRectF:
+    """Map the worker's exact top-origin Agg axes bbox into this Qt cell."""
+
+    left, top, right, bottom = viewport.plot_bounds
+    return QtCore.QRectF(
+        panel_bounds.x() + left * panel_bounds.width(),
+        panel_bounds.y() + top * panel_bounds.height(),
+        (right - left) * panel_bounds.width(),
+        (bottom - top) * panel_bounds.height(),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _ImageSample:
     """Exact painted sample used only by this board's visual overlays."""
@@ -218,6 +256,23 @@ class _ImageSample:
 
 
 @dataclass(frozen=True, slots=True)
+class _CurveCross:
+    """One arbitrary continuous CURVE cursor, never a snapped sample."""
+
+    x: float
+    y: float
+
+
+@dataclass(frozen=True, slots=True)
+class _CurveSample:
+    """Nearest valid sample borrowed from one exact immutable curve payload."""
+
+    series_label: str
+    x: float
+    y: float
+
+
+@dataclass(frozen=True, slots=True)
 class _HeldPanelFront:
     """One GUI-owned display overlay; it is never an authoritative BoardFrame."""
 
@@ -228,19 +283,17 @@ class _HeldPanelFront:
     coherence_group: str
     source_identity: SourceIdentity
     presentation: PanelPresentationIdentity
-    viewport_revision: int
     raster_geometry: tuple[int, int, int, PixelFormat]
     prepared: tuple[bytes, QtGui.QImage]
-    image_payload: ImagePanelPayload | None
+    display_payload: ImagePanelPayload | CurvePanelPayload | None
 
     @property
-    def gesture_identity(self) -> tuple[str, int, int, SourceIdentity, int]:
+    def gesture_identity(self) -> tuple[str, int, int, SourceIdentity]:
         return (
             self.board_id,
             self.layout_generation,
             self.sequence,
             self.source_identity,
-            self.viewport_revision,
         )
 
 
@@ -360,7 +413,7 @@ class QtImageBoard(QtWidgets.QWidget):
         payload = (
             None
             if self._front_frame is None
-            else self._front_frame.panels[0].image_payload
+            else _image_payload(self._front_frame.panels[0])
         )
         source = _image_source_rect(
             image,
@@ -378,7 +431,7 @@ class QtImageBoard(QtWidgets.QWidget):
             payload = (
                 None
                 if self._front_frame is None
-                else self._front_frame.panels[0].image_payload
+                else _image_payload(self._front_frame.panels[0])
             )
             source = _image_source_rect(
                 front[1],
@@ -422,6 +475,8 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._selector_callback: Callable[[RectangleGesture], object] | None = None
         self._interaction_callback: Callable[[ImageInteractionCommit], object] | None = None
         self._selector_enabled = False
+        self._image_binding_enabled = False
+        self._image_interaction_ready = False
         self._selector_applied_bounds: NormalizedRectangle | None = None
         self._selector_draft_bounds: NormalizedRectangle | None = None
         self._selector_drag_anchor: tuple[float, float] | None = None
@@ -431,7 +486,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._pan_candidate: ImageViewportTransform | None = None
         self._pending_viewport: ImageViewportTransform | None = None
         self._pending_color_limits: tuple[float, float] | None = None
-        self._pending_origin: ImageInteractionOrigin | None = None
+        self._pending_origin: PanelInteractionOrigin | None = None
         self._clim_drag: str | None = None
         self._clim_origin_limits: tuple[float, float] | None = None
         self._clim_candidate: tuple[float, float] | None = None
@@ -441,8 +496,26 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._hover_sample: _ImageSample | None = None
         self._hover_position: QtCore.QPointF | None = None
         self._selector_fault: RuntimeError | None = None
+        self._curve_panel_id: str | None = None
+        self._curve_viewport: CurveViewportTransform | None = None
+        self._curve_callback: Callable[[CurveInteractionIntent], object] | None = None
+        self._curve_binding_enabled = False
+        self._curve_interaction_ready = False
+        self._curve_pending_viewport: CurveViewportTransform | None = None
+        self._curve_pending_origin: PanelInteractionOrigin | None = None
+        self._curve_applied_span: tuple[float, float] | None = None
+        self._curve_span_anchor: float | None = None
+        self._curve_span_candidate: tuple[float, float] | None = None
+        self._curve_pan_anchor: float | None = None
+        self._curve_pan_origin: CurveViewportTransform | None = None
+        self._curve_pan_candidate: tuple[float, float] | None = None
+        self._curve_cross: _CurveCross | None = None
+        self._curve_hover: _CurveSample | None = None
+        self._curve_hover_position: QtCore.QPointF | None = None
+        self._curve_fault: RuntimeError | None = None
         self._closed = False
         self.setMouseTracking(True)
+        self.setFocusPolicy(QtCore.Qt.ClickFocus)
         self.setMinimumSize(128, 64)
 
     @property
@@ -487,7 +560,10 @@ class QtRasterBoard(QtWidgets.QWidget):
                 raise ValueError("staged layout_generation must increase")
         self._staged_layout = (*identity, ids, column_count)
         if self._selector_hold is not None:
-            self._cancel_rectangle_gesture(clear_draft=True)
+            self._cancel_active_gesture(
+                clear_image_draft=True,
+                clear_curve_span=True,
+            )
             self.update()
 
     def discard_staged_layout(
@@ -522,6 +598,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         target_columns = self._columns
         target_identity = self._active_layout_identity
         target_viewport = self._selector_viewport
+        target_curve_viewport = self._curve_viewport
         try:
             if not isinstance(frame, BoardFrame):
                 raise TypeError("frame must be BoardFrame")
@@ -575,7 +652,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 ]
                 if (
                     self._interaction_callback is not None
-                    and target_panel.image_payload is None
+                    and _image_payload(target_panel) is None
                 ):
                     raise ValueError(
                         "image interaction callback requires exact ImagePanelPayload"
@@ -583,14 +660,24 @@ class QtRasterBoard(QtWidgets.QWidget):
                 if (
                     pending_origin is not None
                     and pending_limits is not None
-                    and target_panel.image_payload is not None
+                    and _image_payload(target_panel) is not None
                     and target_viewport.viewport_revision
                     == pending_origin.presentation.panel_revision + 1
-                    and target_panel.image_payload.color_limits != pending_limits
+                    and _image_payload(target_panel).color_limits != pending_limits
                 ):
                     raise ValueError(
                         "pending image color-limit revision returned conflicting limits"
                     )
+            if (
+                self._curve_panel_id is not None
+                and self._curve_panel_id in target_panel_ids
+            ):
+                target_curve_viewport = self._curve_viewport_for_presented_panel(
+                    self._curve_panel_id,
+                    self._curve_viewport,
+                    frame,
+                    panel_ids=target_panel_ids,
+                )
             if interaction_was_active:
                 hold = self._selector_hold
                 if hold is None:
@@ -609,7 +696,10 @@ class QtRasterBoard(QtWidgets.QWidget):
             if promoting:
                 self._staged_layout = None
             if interaction_was_active:
-                self._cancel_rectangle_gesture(clear_draft=True)
+                self._cancel_active_gesture(
+                    clear_image_draft=True,
+                    clear_curve_span=True,
+                )
                 self.update()
             raise
         previous = self._front
@@ -629,9 +719,34 @@ class QtRasterBoard(QtWidgets.QWidget):
                     self._pending_viewport = None
                     self._pending_color_limits = None
                     self._pending_origin = None
-                    cancel_interaction = interaction_was_active
+                    cancel_interaction = (
+                        interaction_was_active
+                        and self._selector_hold is not None
+                        and self._selector_hold.panel_id == panel_id
+                    )
+        if self._curve_panel_id is not None:
+            panel_id = self._curve_panel_id
+            if panel_id not in target_panel_ids:
+                self._reset_curve_binding()
+            elif previous is not None and panel_id in self._panel_ids:
+                old_panel = previous[0].panels[self._panel_ids.index(panel_id)]
+                new_panel = frame.panels[target_panel_ids.index(panel_id)]
+                if self._panel_semantics_changed(old_panel, new_panel):
+                    self._curve_span_candidate = None
+                    self._curve_applied_span = None
+                    self._set_curve_cross(None)
+                    self._curve_pending_viewport = None
+                    self._curve_pending_origin = None
+                    cancel_interaction = (
+                        interaction_was_active
+                        and self._selector_hold is not None
+                        and self._selector_hold.panel_id == panel_id
+                    )
         if cancel_interaction:
-            self._cancel_rectangle_gesture(clear_draft=True)
+            self._cancel_active_gesture(
+                clear_image_draft=True,
+                clear_curve_span=True,
+            )
         if promoting:
             self._panel_ids = target_panel_ids
             self._columns = target_columns
@@ -639,6 +754,9 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._active_layout_identity = target_identity
         self._selector_viewport = (
             target_viewport if self._selector_panel_id is not None else None
+        )
+        self._curve_viewport = (
+            target_curve_viewport if self._curve_panel_id is not None else None
         )
         pending = self._pending_viewport
         if pending is not None and target_viewport is not None:
@@ -656,13 +774,23 @@ class QtRasterBoard(QtWidgets.QWidget):
             > pending_origin.presentation.panel_revision
         ):
             self._pending_color_limits = None
-        if not self._interaction_is_pending():
+        if not self._image_interaction_is_pending():
             self._pending_origin = None
+        curve_pending = self._curve_pending_viewport
+        if curve_pending is not None and target_curve_viewport is not None:
+            if (
+                target_curve_viewport.display_revision
+                >= curve_pending.display_revision
+            ):
+                self._curve_pending_viewport = None
+        if self._curve_pending_viewport is None:
+            self._curve_pending_origin = None
         hover_position = self._hover_position
+        curve_hover_position = self._curve_hover_position
         self._front = (frame, prepared)
         if (
-            self._selector_enabled
-            and not self._interaction_is_pending()
+            self._image_interaction_armed()
+            and not self._image_interaction_is_pending()
             and hover_position is not None
         ):
             target = self._selector_target()
@@ -676,6 +804,23 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._set_hover_sample(sample)
         else:
             self._set_hover_sample(None)
+        if (
+            self._curve_interaction_armed()
+            and self._curve_pending_viewport is None
+            and curve_hover_position is not None
+        ):
+            curve_target = self._curve_target()
+            sample = (
+                None
+                if curve_target is None
+                or not curve_target[0].contains(curve_hover_position)
+                else self._curve_sample_for_target(curve_target, curve_hover_position)
+            )
+            if sample is not None:
+                self._curve_hover_position = QtCore.QPointF(curve_hover_position)
+            self._set_curve_hover(sample)
+        else:
+            self._set_curve_hover(None)
         self.update()
 
     def clear(self) -> None:
@@ -683,13 +828,22 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._front = None
         self._active_layout_identity = None
         self._staged_layout = None
-        self._cancel_rectangle_gesture(clear_draft=True)
+        self._cancel_active_gesture(
+            clear_image_draft=True,
+            clear_curve_span=True,
+        )
         self._pending_viewport = None
         self._pending_color_limits = None
         self._pending_origin = None
         self._selector_applied_bounds = None
         self._set_cross_sample(None)
         self._set_hover_sample(None)
+        self._curve_pending_viewport = None
+        self._curve_pending_origin = None
+        self._curve_span_candidate = None
+        self._curve_applied_span = None
+        self._set_curve_cross(None)
+        self._set_curve_hover(None)
         self.update()
 
     @property
@@ -705,50 +859,50 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._require_owner()
         return self._selector_fault
 
-    def visible_image_payload(self) -> ImagePanelPayload | None:
-        """Return the exact samples paired with the currently painted IMAGE.
+    @property
+    def curve_selector_fault(self) -> RuntimeError | None:
+        self._require_owner()
+        return self._curve_fault
 
-        During A/pan interaction this is the held target payload, not the
-        advancing board front.  Setting/Edit can therefore freeze FIXED limits
-        from exactly what the operator sees without retaining a BoardFrame.
-        """
+    @property
+    def selectors_enabled(self) -> bool:
+        """Return the effective board-wide interaction intent."""
 
         self._require_owner()
-        hold = self._selector_hold
-        if hold is not None:
-            return hold.image_payload
-        front = self._front
-        panel_id = self._selector_panel_id
-        if front is None or panel_id is None or panel_id not in self._panel_ids:
-            return None
-        return front[0].panels[self._panel_ids.index(panel_id)].image_payload
+        return self._selector_enabled
 
-    def visible_image_origin(self) -> ImageInteractionOrigin | None:
-        """Return provenance for the exact held/current IMAGE being painted."""
+    def _visible_display(
+        self,
+        panel_id: str | None,
+        payload_type: type[ImagePanelPayload] | type[CurvePanelPayload],
+    ) -> tuple[
+        ImagePanelPayload | CurvePanelPayload | None,
+        PanelInteractionOrigin | None,
+    ]:
+        """Resolve one typed payload and origin from the exact painted panel."""
 
-        self._require_owner()
         hold = self._selector_hold
-        if hold is not None:
-            if hold.image_payload is None:
-                return None
-            return ImageInteractionOrigin(
+        if hold is not None and hold.panel_id == panel_id:
+            payload = hold.display_payload
+            if not isinstance(payload, payload_type):
+                return None, None
+            return payload, PanelInteractionOrigin(
                 hold.panel_id,
                 hold.board_id,
                 hold.layout_generation,
                 hold.sequence,
                 hold.source_identity,
                 hold.presentation,
-                hold.image_payload.evaluated_input,
+                payload.evaluated_input,
             )
         front = self._front
-        panel_id = self._selector_panel_id
         if front is None or panel_id is None or panel_id not in self._panel_ids:
-            return None
+            return None, None
         panel = front[0].panels[self._panel_ids.index(panel_id)]
-        payload = panel.image_payload
-        if payload is None:
-            return None
-        return ImageInteractionOrigin(
+        payload = panel.display_payload
+        if not isinstance(payload, payload_type):
+            return None, None
+        return payload, PanelInteractionOrigin(
             panel.panel_id,
             front[0].board_id,
             front[0].layout_generation,
@@ -758,9 +912,34 @@ class QtRasterBoard(QtWidgets.QWidget):
             payload.evaluated_input,
         )
 
+    def visible_image_payload(self) -> ImagePanelPayload | None:
+        """Return the exact samples paired with the currently painted IMAGE.
+
+        During A/pan interaction this is the held target payload, not the
+        advancing board front.  Setting/Edit can therefore freeze FIXED limits
+        from exactly what the operator sees without retaining a BoardFrame.
+        """
+
+        self._require_owner()
+        payload, _origin = self._visible_display(
+            self._selector_panel_id,
+            ImagePanelPayload,
+        )
+        return payload if isinstance(payload, ImagePanelPayload) else None
+
+    def visible_image_origin(self) -> PanelInteractionOrigin | None:
+        """Return provenance for the exact held/current IMAGE being painted."""
+
+        self._require_owner()
+        _payload, origin = self._visible_display(
+            self._selector_panel_id,
+            ImagePanelPayload,
+        )
+        return origin
+
     def discard_pending_image_interaction(
         self,
-        origin: ImageInteractionOrigin,
+        origin: PanelInteractionOrigin,
     ) -> bool:
         """Release only one exact failed display intent.
 
@@ -771,13 +950,52 @@ class QtRasterBoard(QtWidgets.QWidget):
         """
 
         self._require_owner()
-        if not isinstance(origin, ImageInteractionOrigin):
-            raise TypeError("origin must be ImageInteractionOrigin")
-        if not self._interaction_is_pending() or origin != self._pending_origin:
+        if not isinstance(origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
+        if not self._image_interaction_is_pending() or origin != self._pending_origin:
             return False
         self._pending_viewport = None
         self._pending_color_limits = None
         self._pending_origin = None
+        self.update()
+        return True
+
+    def visible_curve_payload(self) -> CurvePanelPayload | None:
+        """Return the exact held/current CURVE payload currently painted."""
+
+        self._require_owner()
+        payload, _origin = self._visible_display(
+            self._curve_panel_id,
+            CurvePanelPayload,
+        )
+        return payload if isinstance(payload, CurvePanelPayload) else None
+
+    def visible_curve_origin(self) -> PanelInteractionOrigin | None:
+        """Return provenance for the exact held/current CURVE being painted."""
+
+        self._require_owner()
+        _payload, origin = self._visible_display(
+            self._curve_panel_id,
+            CurvePanelPayload,
+        )
+        return origin
+
+    def discard_pending_curve_interaction(
+        self,
+        origin: PanelInteractionOrigin,
+    ) -> bool:
+        """Discard only the exact failed CURVE display intent."""
+
+        self._require_owner()
+        if not isinstance(origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
+        if (
+            self._curve_pending_viewport is None
+            or origin != self._curve_pending_origin
+        ):
+            return False
+        self._curve_pending_viewport = None
+        self._curve_pending_origin = None
         self.update()
         return True
 
@@ -799,11 +1017,10 @@ class QtRasterBoard(QtWidgets.QWidget):
             gesture.layout_generation,
             gesture.sequence,
             gesture.source_identity,
-            gesture.viewport_revision,
         ) != hold.gesture_identity:
             raise RuntimeError("rectangle gesture differs from its held panel origin")
         viewport = self._require_selector_viewport()
-        if viewport.viewport_revision != hold.viewport_revision:
+        if viewport.viewport_revision != gesture.viewport_revision:
             raise RuntimeError("rectangle gesture viewport changed before dispatch")
         front = self._front
         if front is None or not self._hold_matches_frame(
@@ -837,6 +1054,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise TypeError("interaction_callback must be callable or None")
         if not isinstance(enabled, bool):
             raise TypeError("selector enabled must be bool")
+        if self._curve_panel_id is not None and enabled != self._selector_enabled:
+            raise ValueError(
+                "a second selector family must match the board-wide enabled state; "
+                "call set_selectors_enabled explicitly"
+            )
         if self._front is not None:
             self._validate_selector_binding(
                 panel_id,
@@ -845,7 +1067,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             )
             if interaction_callback is not None:
                 index = self._panel_ids.index(panel_id)
-                if self._front[0].panels[index].image_payload is None:
+                if _image_payload(self._front[0].panels[index]) is None:
                     raise ValueError(
                         "image interaction callback requires exact ImagePanelPayload"
                     )
@@ -858,27 +1080,123 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._pending_viewport = None
         self._pending_color_limits = None
         self._pending_origin = None
-        self._selector_enabled = enabled
+        self._image_binding_enabled = True
+        self._image_interaction_ready = enabled
+        if self._curve_panel_id is None:
+            self._selector_enabled = enabled
         self.update()
 
-    def set_rectangle_selector_enabled(self, enabled: bool) -> None:
+    def set_interaction_readiness(
+        self,
+        *,
+        image: bool,
+        curve: bool,
+    ) -> None:
+        """Arm only panel families whose painted provenance is current.
+
+        ``set_selectors_enabled`` carries the operator's board-wide intent.
+        Readiness is a separate presentation fact supplied by the owner after
+        comparing each painted payload with its current semantic state.  A
+        stale sibling therefore cannot emit an intent merely because another
+        panel on the same board is current.
+        """
+
+        self._require_owner()
+        if not isinstance(image, bool) or not isinstance(curve, bool):
+            raise TypeError("interaction readiness values must be bool")
+        if not image and self._image_interaction_ready:
+            self._cancel_image_gesture(clear_draft=True)
+            self._set_hover_sample(None)
+        if not curve and self._curve_interaction_ready:
+            self._cancel_curve_gesture(clear_span=True)
+            self._set_curve_hover(None)
+        self._image_interaction_ready = image
+        self._curve_interaction_ready = curve
+        self.update()
+
+    def set_selectors_enabled(self, enabled: bool) -> None:
+        """Park or arm all healthy bound selector families without rebuilding."""
+
         self._require_owner()
         if not isinstance(enabled, bool):
             raise TypeError("selector enabled must be bool")
-        if enabled and (
-            self._selector_panel_id is None
-            or self._selector_viewport is None
-            or self._selector_callback is None
-        ):
-            raise RuntimeError("rectangle selector is not bound")
-        if enabled and self._selector_fault is not None:
-            raise RuntimeError("rectangle selector must be rebound after a callback fault")
+        healthy_image = (
+            self._image_binding_enabled
+            and self._image_interaction_ready
+            and self._selector_panel_id is not None
+            and self._selector_viewport is not None
+            and self._selector_callback is not None
+            and self._selector_fault is None
+        )
+        healthy_curve = (
+            self._curve_binding_enabled
+            and self._curve_interaction_ready
+            and self._curve_panel_id is not None
+            and self._curve_viewport is not None
+            and self._curve_callback is not None
+            and self._curve_fault is None
+        )
+        if enabled and not (healthy_image or healthy_curve):
+            raise RuntimeError("no healthy selector binding is available")
         self._selector_enabled = enabled
         if not enabled:
-            self._cancel_rectangle_gesture(
-                clear_draft=self._selector_drag_anchor is not None
-            )
+            self._cancel_active_gesture(clear_image_draft=True, clear_curve_span=True)
             self._set_hover_sample(None)
+            self._set_curve_hover(None)
+        self.update()
+
+    def _image_interaction_armed(self) -> bool:
+        return (
+            self._selector_enabled
+            and self._image_binding_enabled
+            and self._image_interaction_ready
+        )
+
+    def _curve_interaction_armed(self) -> bool:
+        return (
+            self._selector_enabled
+            and self._curve_binding_enabled
+            and self._curve_interaction_ready
+        )
+
+    def bind_curve_interaction(
+        self,
+        panel_id: str,
+        callback: Callable[[CurveInteractionIntent], object],
+        *,
+        enabled: bool = True,
+    ) -> None:
+        """Bind the board's one CURVE panel to display-only typed intents."""
+
+        self._require_owner()
+        panel_id = canonical_text(panel_id, "curve panel_id")
+        if panel_id not in self._panel_ids:
+            raise ValueError("curve panel_id is absent from this board")
+        if not callable(callback):
+            raise TypeError("curve callback must be callable")
+        if not isinstance(enabled, bool):
+            raise TypeError("selector enabled must be bool")
+        if self._selector_panel_id is not None and enabled != self._selector_enabled:
+            raise ValueError(
+                "a second selector family must match the board-wide enabled state; "
+                "call set_selectors_enabled explicitly"
+            )
+        viewport = None
+        if self._front is not None:
+            panel = self._front[0].panels[self._panel_ids.index(panel_id)]
+            payload = _curve_payload(panel)
+            if payload is None:
+                raise ValueError("curve interaction requires exact CurvePanelPayload")
+            viewport = payload.viewport
+        self._reset_curve_binding()
+        self._curve_fault = None
+        self._curve_panel_id = panel_id
+        self._curve_viewport = viewport
+        self._curve_callback = callback
+        self._curve_binding_enabled = True
+        self._curve_interaction_ready = enabled
+        if self._selector_panel_id is None:
+            self._selector_enabled = enabled
         self.update()
 
     def set_selector_applied_selection(self, selection: Selection | None) -> None:
@@ -903,12 +1221,31 @@ class QtRasterBoard(QtWidgets.QWidget):
             if selection is None
             else viewport.normalized_bounds_for_selection(selection)
         )
-        self._cancel_rectangle_gesture(clear_draft=False)
+        self._cancel_image_gesture(clear_draft=False)
+        self.update()
+
+    def set_curve_range_candidate(
+        self,
+        x_span: tuple[float, float] | None,
+    ) -> None:
+        """Project the Workbench-owned display-only CURVE range candidate."""
+
+        self._require_owner()
+        self._curve_applied_span = (
+            None
+            if x_span is None
+            else validated_display_range(x_span, "curve range candidate")
+        )
         self.update()
 
     def unbind_rectangle_selector(self) -> None:
         self._require_owner()
         self._reset_rectangle_selector()
+        self.update()
+
+    def unbind_curve_interaction(self) -> None:
+        self._require_owner()
+        self._reset_curve_binding()
         self.update()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
@@ -939,9 +1276,9 @@ class QtRasterBoard(QtWidgets.QWidget):
                 else latest_image
             )
             payload = (
-                hold.image_payload
+                hold.display_payload
                 if hold is not None and hold.panel_id == panel_id
-                else panel.image_payload
+                else panel.display_payload
             )
             bounds = _panel_bounds(
                 self.rect(),
@@ -949,13 +1286,23 @@ class QtRasterBoard(QtWidgets.QWidget):
                 count=len(images),
                 columns=self._columns,
             )
-            target, source, rail = _panel_image_geometry(
-                bounds,
-                image,
-                payload,
-            )
+            if isinstance(payload, CurvePanelPayload):
+                target = bounds
+                source = QtCore.QRectF(
+                    0.0,
+                    0.0,
+                    float(image.width()),
+                    float(image.height()),
+                )
+                rail = None
+            else:
+                target, source, rail = _panel_image_geometry(
+                    bounds,
+                    image,
+                    payload if isinstance(payload, ImagePanelPayload) else None,
+                )
             painter.drawImage(QtCore.QRectF(target), image, source)
-            if payload is not None and rail is not None:
+            if isinstance(payload, ImagePanelPayload) and rail is not None:
                 self._paint_color_rail(painter, payload, rail)
             if hold is not None and hold.panel_id == panel_id:
                 held_target = target
@@ -967,16 +1314,61 @@ class QtRasterBoard(QtWidgets.QWidget):
                 live_sequence=front[0].sequence,
             )
         self._paint_selector_overlays(painter)
+        self._paint_curve_overlays(painter)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if not self._selector_enabled:
+            super().mousePressEvent(event)
+            return
+        curve_target = self._curve_target()
+        hits_curve = (
+            self._curve_interaction_armed()
+            and curve_target is not None
+            and curve_target[0].contains(event.localPos())
+        )
+        if hits_curve:
+            if (
+                self._curve_pending_viewport is not None
+                or self._selector_hold is not None
+            ):
+                event.accept()
+                return
+            point = self._curve_normalized_point(curve_target, event.localPos())
+            viewport = curve_target[4].viewport
+            if event.button() == QtCore.Qt.RightButton:
+                x, y = viewport.widget_normalized_to_data(*point)
+                self._set_curve_cross(_CurveCross(x, y))
+                self._set_curve_hover(None)
+                self.update()
+                event.accept()
+                return
+            if event.button() == QtCore.Qt.MiddleButton:
+                self._selector_hold = self._held_panel_from_target(curve_target)
+                self._curve_pan_anchor = point[0]
+                self._curve_pan_origin = viewport
+                self._curve_pan_candidate = viewport.x_limits
+                self._set_curve_hover(None)
+                self.update()
+                event.accept()
+                return
+            if event.button() == QtCore.Qt.LeftButton:
+                self._selector_hold = self._held_panel_from_target(curve_target)
+                self._curve_span_anchor = point[0]
+                self._curve_span_candidate = None
+                self._set_curve_hover(None)
+                self.update()
+                event.accept()
+                return
+            super().mousePressEvent(event)
+            return
+        if not self._image_interaction_armed():
             super().mousePressEvent(event)
             return
         target = self._selector_target()
         rail_target = self._clim_rail_target()
         hits_image = target is not None and target[0].contains(event.pos())
         hits_rail = rail_target is not None and rail_target[0].contains(event.pos())
-        if self._interaction_is_pending() or self._selector_hold is not None:
+        if self._image_interaction_is_pending() or self._selector_hold is not None:
             if hits_image or hits_rail:
                 event.accept()
             else:
@@ -1044,6 +1436,45 @@ class QtRasterBoard(QtWidgets.QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._curve_span_anchor is not None:
+            target = self._curve_target()
+            if target is not None:
+                viewport = target[4].viewport
+                point = self._curve_normalized_point(
+                    target,
+                    event.localPos(),
+                    clamp_to_plot=True,
+                )
+                if point[0] == self._curve_span_anchor:
+                    self._curve_span_candidate = None
+                else:
+                    try:
+                        self._curve_span_candidate = viewport.selection_x_span(
+                            self._curve_span_anchor,
+                            point[0],
+                        )
+                    except ValueError:
+                        self._curve_span_candidate = None
+                self.update()
+            event.accept()
+            return
+        if (
+            self._curve_pan_anchor is not None
+            and self._curve_pan_origin is not None
+        ):
+            target = self._curve_target()
+            if target is not None:
+                point = self._curve_normalized_point(target, event.localPos())
+                try:
+                    self._curve_pan_candidate = self._curve_pan_origin.panned_x_limits(
+                        self._curve_pan_anchor,
+                        point[0],
+                        start_x_limits=self._curve_pan_origin.x_limits,
+                    )
+                except ValueError:
+                    self._curve_pan_candidate = None
+            event.accept()
+            return
         if self._clim_drag is not None:
             rail_target = self._clim_rail_target()
             if (
@@ -1095,7 +1526,29 @@ class QtRasterBoard(QtWidgets.QWidget):
             event.accept()
             return
 
-        if self._selector_enabled and not self._interaction_is_pending():
+        if (
+            self._curve_interaction_armed()
+            and self._curve_pending_viewport is None
+        ):
+            curve_target = self._curve_target()
+            if curve_target is not None and curve_target[0].contains(event.localPos()):
+                sample = self._curve_sample_for_target(
+                    curve_target,
+                    event.localPos(),
+                )
+                self._curve_hover_position = (
+                    None if sample is None else QtCore.QPointF(event.localPos())
+                )
+                self._set_curve_hover(sample)
+                self._set_hover_sample(None)
+                self.update()
+                super().mouseMoveEvent(event)
+                return
+            self._set_curve_hover(None)
+        if (
+            self._image_interaction_armed()
+            and not self._image_interaction_is_pending()
+        ):
             target = self._selector_target()
             sample = (
                 None
@@ -1110,6 +1563,51 @@ class QtRasterBoard(QtWidgets.QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if (
+            self._curve_pan_anchor is not None
+            and event.button() == QtCore.Qt.MiddleButton
+        ):
+            candidate = self._curve_pan_candidate
+            hold = self._selector_hold
+            try:
+                if candidate is not None and hold is not None:
+                    self._commit_curve_viewport(candidate, hold=hold)
+            finally:
+                self._cancel_active_gesture(
+                    clear_image_draft=False,
+                    clear_curve_span=False,
+                )
+                self.update()
+            event.accept()
+            return
+        if (
+            self._curve_span_anchor is not None
+            and event.button() == QtCore.Qt.LeftButton
+        ):
+            candidate = self._curve_span_candidate
+            hold = self._selector_hold
+            callback = self._curve_callback
+            self._curve_span_anchor = None
+            try:
+                if candidate is not None and hold is not None and callback is not None:
+                    callback(
+                        CurveRangeGesture(
+                            self._curve_interaction_origin(hold=hold),
+                            candidate,
+                        )
+                    )
+            except BaseException as error:
+                if self._curve_fault is None:
+                    self._curve_fault = detached_render_fault(error)
+                self._curve_binding_enabled = False
+            finally:
+                self._cancel_active_gesture(
+                    clear_image_draft=False,
+                    clear_curve_span=True,
+                )
+                self.update()
+            event.accept()
+            return
         if self._clim_drag is not None and event.button() == QtCore.Qt.LeftButton:
             candidate = self._clim_candidate
             hold = self._selector_hold
@@ -1117,7 +1615,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 if candidate is not None and hold is not None:
                     self._commit_color_limits(candidate, hold=hold)
             finally:
-                self._cancel_rectangle_gesture(clear_draft=False)
+                self._cancel_image_gesture(clear_draft=False)
                 self.update()
             event.accept()
             return
@@ -1128,7 +1626,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 if candidate is not None and hold is not None:
                     self._commit_viewport(candidate, hold=hold)
             finally:
-                self._cancel_rectangle_gesture(clear_draft=False)
+                self._cancel_image_gesture(clear_draft=False)
                 self.update()
             event.accept()
             return
@@ -1164,23 +1662,57 @@ class QtRasterBoard(QtWidgets.QWidget):
                     sequence=hold.sequence,
                     source_identity=hold.source_identity,
                     normalized_bounds=bounds,
-                    viewport_revision=hold.viewport_revision,
+                    viewport_revision=self._require_selector_viewport().viewport_revision,
                 )
                 callback(gesture)
                 delivered = True
         except BaseException as error:
             if self._selector_fault is None:
                 self._selector_fault = detached_render_fault(error)
-            self._selector_enabled = False
+            self._image_binding_enabled = False
         finally:
-            self._cancel_rectangle_gesture(
+            self._cancel_image_gesture(
                 clear_draft=(bounds is not None and not delivered)
             )
             self.update()
         event.accept()
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
-        if not self._selector_enabled or self._interaction_callback is None:
+        if not self._selector_enabled:
+            super().wheelEvent(event)
+            return
+        curve_target = self._curve_target()
+        if (
+            self._curve_interaction_armed()
+            and self._curve_callback is not None
+            and curve_target is not None
+            and curve_target[0].contains(event.posF())
+        ):
+            if (
+                self._curve_pending_viewport is not None
+                or self._selector_hold is not None
+            ):
+                event.accept()
+                return
+            delta = event.angleDelta().y()
+            if delta == 0:
+                super().wheelEvent(event)
+                return
+            point = self._curve_normalized_point(curve_target, event.posF())
+            viewport = curve_target[4].viewport
+            anchor_x = viewport.widget_normalized_to_data(*point)[0]
+            factor = 1.0 / 1.1 if delta < 0 else 1.1
+            try:
+                candidate = viewport.zoomed_x_limits(anchor_x, factor)
+            except ValueError:
+                candidate = None
+            if candidate is not None:
+                self._commit_curve_viewport(candidate)
+            self._set_curve_hover(None)
+            self.update()
+            event.accept()
+            return
+        if not self._image_interaction_armed() or self._interaction_callback is None:
             super().wheelEvent(event)
             return
         target = self._selector_target()
@@ -1188,7 +1720,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         position = event.pos()
         hits_image = target is not None and target[0].contains(position)
         hits_rail = rail_target is not None and rail_target[0].contains(position)
-        if self._interaction_is_pending() or self._selector_hold is not None:
+        if self._image_interaction_is_pending() or self._selector_hold is not None:
             if hits_image or hits_rail:
                 event.accept()
             else:
@@ -1215,11 +1747,48 @@ class QtRasterBoard(QtWidgets.QWidget):
         if not self._selector_enabled:
             super().mouseDoubleClickEvent(event)
             return
+        curve_target = self._curve_target()
+        if (
+            self._curve_interaction_armed()
+            and curve_target is not None
+            and curve_target[0].contains(event.localPos())
+        ):
+            if (
+                self._curve_pending_viewport is not None
+                or self._selector_hold is not None
+            ):
+                event.accept()
+                return
+            if event.button() == QtCore.Qt.RightButton:
+                self._set_curve_cross(None)
+                self._set_curve_hover(None)
+                self.update()
+                event.accept()
+                return
+            if (
+                event.button() == QtCore.Qt.MiddleButton
+                and self._curve_callback is not None
+            ):
+                viewport = curve_target[4].viewport
+                self._commit_curve_viewport(
+                    viewport.home_x_limits
+                    if self._curve_applied_span is None
+                    else self._curve_applied_span
+                )
+                self._set_curve_hover(None)
+                self.update()
+                event.accept()
+                return
+            super().mouseDoubleClickEvent(event)
+            return
+        if not self._image_interaction_armed():
+            super().mouseDoubleClickEvent(event)
+            return
         target = self._selector_target()
         rail_target = self._clim_rail_target()
         hits_image = target is not None and target[0].contains(event.pos())
         hits_rail = rail_target is not None and rail_target[0].contains(event.pos())
-        if self._interaction_is_pending() or self._selector_hold is not None:
+        if self._image_interaction_is_pending() or self._selector_hold is not None:
             if hits_image or hits_rail:
                 event.accept()
             else:
@@ -1250,18 +1819,37 @@ class QtRasterBoard(QtWidgets.QWidget):
     def leaveEvent(self, event: QtCore.QEvent) -> None:
         self._set_hover_sample(None)
         self._hover_position = None
+        self._set_curve_hover(None)
+        self._curve_hover_position = None
         self.update()
         super().leaveEvent(event)
 
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() == QtCore.Qt.Key_Escape and self._selector_hold is not None:
+            self._cancel_active_gesture(
+                clear_image_draft=True,
+                clear_curve_span=True,
+            )
+            self.update()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         if self._selector_hold is not None:
-            self._cancel_rectangle_gesture(clear_draft=True)
+            self._cancel_active_gesture(
+                clear_image_draft=True,
+                clear_curve_span=True,
+            )
         self._set_hover_sample(None)
         self._hover_position = None
+        self._set_curve_hover(None)
+        self._curve_hover_position = None
         super().resizeEvent(event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._reset_rectangle_selector()
+        self._reset_curve_binding()
         self._front = None
         self._active_layout_identity = None
         self._staged_layout = None
@@ -1271,6 +1859,7 @@ class QtRasterBoard(QtWidgets.QWidget):
     def event(self, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.DeferredDelete:
             self._reset_rectangle_selector()
+            self._reset_curve_binding()
             self._front = None
             self._active_layout_identity = None
             self._staged_layout = None
@@ -1282,9 +1871,15 @@ class QtRasterBoard(QtWidgets.QWidget):
         ):
             changed = getattr(self, "_selector_hold", None) is not None
             if changed:
-                self._cancel_rectangle_gesture(clear_draft=True)
+                self._cancel_active_gesture(
+                    clear_image_draft=True,
+                    clear_curve_span=True,
+                )
             if getattr(self, "_hover_sample", None) is not None:
                 self._set_hover_sample(None)
+                changed = True
+            if getattr(self, "_curve_hover", None) is not None:
+                self._set_curve_hover(None)
                 changed = True
             if changed:
                 self.update()
@@ -1314,7 +1909,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             )
         if frame.panels[index].panel_id != panel_id:
             raise ValueError("selector panel identity changed")
-        payload = frame.panels[index].image_payload
+        payload = _image_payload(frame.panels[index])
         if payload is not None and payload.viewport != viewport:
             raise ValueError(
                 "selector viewport differs from the exact image payload viewport"
@@ -1330,7 +1925,7 @@ class QtRasterBoard(QtWidgets.QWidget):
     ) -> ImageViewportTransform:
         index = panel_ids.index(panel_id)
         panel = frame.panels[index]
-        payload = panel.image_payload
+        payload = _image_payload(panel)
         if payload is None:
             return current
         candidate = payload.viewport
@@ -1359,6 +1954,44 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise ValueError("one image viewport revision describes conflicting bounds")
         return candidate
 
+    def _curve_viewport_for_presented_panel(
+        self,
+        panel_id: str,
+        current: CurveViewportTransform | None,
+        frame: BoardFrame,
+        *,
+        panel_ids: tuple[str, ...],
+    ) -> CurveViewportTransform:
+        panel = frame.panels[panel_ids.index(panel_id)]
+        payload = _curve_payload(panel)
+        if payload is None:
+            raise ValueError("curve interaction requires exact CurvePanelPayload")
+        candidate = payload.viewport
+        previous = self._front
+        structurally_new = previous is None or panel_id not in self._panel_ids
+        if not structurally_new and previous is not None:
+            old_panel = previous[0].panels[self._panel_ids.index(panel_id)]
+            structurally_new = self._panel_semantics_changed(old_panel, panel)
+        if current is None or structurally_new:
+            return candidate
+        if candidate.x_axis != current.x_axis:
+            raise ValueError("curve x axis changed without panel structure change")
+        if candidate.display_revision < current.display_revision:
+            raise ValueError("stale curve display revision cannot replace the visible front")
+        pending = self._curve_pending_viewport
+        if (
+            pending is not None
+            and candidate.display_revision == pending.display_revision
+            and candidate.x_limits != pending.x_limits
+        ):
+            raise ValueError("pending curve viewport revision returned conflicting bounds")
+        if candidate.display_revision == current.display_revision and (
+            candidate.x_limits != current.x_limits
+            or candidate.home_x_limits != current.home_x_limits
+        ):
+            raise ValueError("one curve display revision describes conflicting x bounds")
+        return candidate
+
     def _selector_target(self):
         front = self._front
         panel_id = self._selector_panel_id
@@ -1380,12 +2013,120 @@ class QtRasterBoard(QtWidgets.QWidget):
             columns=self._columns,
         )
         payload = (
-            hold.image_payload
+            _image_payload(hold)
             if hold is not None and hold.panel_id == panel_id
-            else front[0].panels[index].image_payload
+            else _image_payload(front[0].panels[index])
         )
         target, _source, _rail = _panel_image_geometry(bounds, image, payload)
         return target, front[0], front[0].panels[index], prepared
+
+    def _curve_target(self):
+        front = self._front
+        panel_id = self._curve_panel_id
+        if front is None or panel_id is None or panel_id not in self._panel_ids:
+            return None
+        index = self._panel_ids.index(panel_id)
+        hold = self._selector_hold
+        prepared = (
+            hold.prepared
+            if hold is not None and hold.panel_id == panel_id
+            else front[1][index]
+        )
+        panel = front[0].panels[index]
+        payload = (
+            _curve_payload(hold)
+            if hold is not None and hold.panel_id == panel_id
+            else _curve_payload(panel)
+        )
+        if payload is None:
+            return None
+        bounds = _panel_bounds(
+            self.rect(),
+            index=index,
+            count=len(front[1]),
+            columns=self._columns,
+        )
+        plot = _curve_plot_geometry(bounds, payload.viewport)
+        return plot, front[0], panel, prepared, payload, bounds
+
+    @staticmethod
+    def _curve_normalized_point(
+        target,
+        point: QtCore.QPointF,
+        *,
+        clamp_to_plot: bool = False,
+    ) -> tuple[float, float]:
+        bounds = target[5]
+        x = (float(point.x()) - bounds.x()) / max(1, bounds.width())
+        y = (float(point.y()) - bounds.y()) / max(1, bounds.height())
+        if clamp_to_plot:
+            left, top, right, bottom = target[4].viewport.plot_bounds
+            x = min(right, max(left, x))
+            y = min(bottom, max(top, y))
+        return x, y
+
+    def _curve_sample_for_target(
+        self,
+        target,
+        point: QtCore.QPointF,
+    ) -> _CurveSample | None:
+        payload = target[4]
+        viewport = payload.viewport
+        bounds = target[5]
+        best: tuple[float, int, int, _CurveSample] | None = None
+        coordinates = np.asarray(
+            payload.series[0].data.x_axis.coordinates,
+            dtype=np.float64,
+        )
+        x_low, x_high = viewport.x_limits
+        y_low, y_high = viewport.y_limits
+        left, top, right, bottom = viewport.plot_bounds
+        x_widget = bounds.x() + (
+            left
+            + (coordinates - x_low) / (x_high - x_low) * (right - left)
+        ) * bounds.width()
+        for series_index, (series, label) in enumerate(
+            zip(payload.series, payload.series_labels)
+        ):
+            curve = series.data
+            values = np.asarray(curve.values, dtype=np.float64)
+            valid = np.asarray(curve.validity, dtype=bool)
+            visible = (
+                valid
+                & np.isfinite(values)
+                & (coordinates >= x_low)
+                & (coordinates <= x_high)
+                & (values >= y_low)
+                & (values <= y_high)
+            )
+            sample_indices = np.flatnonzero(visible)
+            if not sample_indices.size:
+                continue
+            visible_values = values[sample_indices]
+            y_widget = bounds.y() + (
+                top
+                + (y_high - visible_values) / (y_high - y_low) * (bottom - top)
+            ) * bounds.height()
+            distances = (
+                (x_widget[sample_indices] - point.x()) ** 2
+                + (y_widget - point.y()) ** 2
+            )
+            local_index = int(np.argmin(distances))
+            sample_index = int(sample_indices[local_index])
+            sample = _CurveSample(
+                label,
+                float(coordinates[sample_index]),
+                float(values[sample_index]),
+            )
+            candidate = (
+                float(distances[local_index]),
+                series_index,
+                sample_index,
+                sample,
+            )
+            if best is None or candidate[:3] < best[:3]:
+                best = candidate
+        return None if best is None else best[3]
 
     def _clim_rail_target(self):
         front = self._front
@@ -1401,9 +2142,9 @@ class QtRasterBoard(QtWidgets.QWidget):
         )
         panel = front[0].panels[index]
         payload = (
-            hold.image_payload
+            _image_payload(hold)
             if hold is not None and hold.panel_id == panel_id
-            else panel.image_payload
+            else _image_payload(panel)
         )
         if payload is None:
             return None
@@ -1421,10 +2162,10 @@ class QtRasterBoard(QtWidgets.QWidget):
     def _viewport_for_target(self, target) -> ImageViewportTransform:
         hold = self._selector_hold
         if hold is not None and hold.panel_id == target[2].panel_id:
-            payload = hold.image_payload
+            payload = _image_payload(hold)
             if payload is not None:
                 return payload.viewport
-        payload = target[2].image_payload
+        payload = _image_payload(target[2])
         if payload is not None:
             return payload.viewport
         return self._require_selector_viewport()
@@ -1437,10 +2178,10 @@ class QtRasterBoard(QtWidgets.QWidget):
         image_target, frame, panel = target[0], target[1], target[2]
         hold = self._selector_hold
         if hold is not None and hold.panel_id == panel.panel_id:
-            payload = hold.image_payload
+            payload = _image_payload(hold)
             presentation = hold.presentation
         else:
-            payload = panel.image_payload
+            payload = _image_payload(panel)
             presentation = _panel_presentation(panel)
         if payload is None:
             return None
@@ -1483,7 +2224,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise ValueError("viewport commit cannot change image axes")
         if candidate.viewport_revision <= current.viewport_revision:
             raise ValueError("viewport commit revision must increase")
-        if self._interaction_is_pending():
+        if self._image_interaction_is_pending():
             return False
         front = self._front
         if front is None:
@@ -1508,8 +2249,56 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._pending_origin = None
             if self._selector_fault is None:
                 self._selector_fault = detached_render_fault(error)
-            self._selector_enabled = False
+            self._image_binding_enabled = False
             self._set_hover_sample(None)
+            return False
+        return True
+
+    def _commit_curve_viewport(
+        self,
+        x_limits: tuple[float, float],
+        *,
+        hold: _HeldPanelFront | None = None,
+    ) -> bool:
+        payload = (
+            _curve_payload(hold)
+            if hold is not None
+            else self.visible_curve_payload()
+        )
+        if payload is None or x_limits == payload.viewport.x_limits:
+            return False
+        if self._curve_pending_viewport is not None:
+            return False
+        front = self._front
+        if front is None:
+            return False
+        if hold is not None and not self._hold_matches_frame(
+            hold,
+            front[0],
+            panel_ids=self._panel_ids,
+        ):
+            return False
+        callback = self._curve_callback
+        if callback is None:
+            return False
+        origin = self._curve_interaction_origin(hold=hold)
+        candidate = replace(
+            payload.viewport,
+            display_revision=payload.viewport.display_revision + 1,
+            x_limits=x_limits,
+        )
+        command = CurveViewportCommit(origin, candidate)
+        self._curve_pending_viewport = candidate
+        self._curve_pending_origin = origin
+        try:
+            callback(command)
+        except BaseException as error:
+            self._curve_pending_viewport = None
+            self._curve_pending_origin = None
+            if self._curve_fault is None:
+                self._curve_fault = detached_render_fault(error)
+            self._curve_binding_enabled = False
+            self._set_curve_hover(None)
             return False
         return True
 
@@ -1533,10 +2322,10 @@ class QtRasterBoard(QtWidgets.QWidget):
         *,
         hold: _HeldPanelFront,
     ) -> bool:
-        payload = hold.image_payload
+        payload = _image_payload(hold)
         if payload is None or limits == payload.color_limits:
             return False
-        if self._interaction_is_pending():
+        if self._image_interaction_is_pending():
             return False
         front = self._front
         if front is None or not self._hold_matches_frame(
@@ -1559,12 +2348,12 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._pending_origin = None
             if self._selector_fault is None:
                 self._selector_fault = detached_render_fault(error)
-            self._selector_enabled = False
+            self._image_binding_enabled = False
             self._set_hover_sample(None)
             return False
         return True
 
-    def _interaction_is_pending(self) -> bool:
+    def _image_interaction_is_pending(self) -> bool:
         return (
             self._pending_viewport is not None
             or self._pending_color_limits is not None
@@ -1574,12 +2363,39 @@ class QtRasterBoard(QtWidgets.QWidget):
         self,
         *,
         hold: _HeldPanelFront | None = None,
-    ) -> ImageInteractionOrigin:
+    ) -> PanelInteractionOrigin:
+        return self._require_interaction_origin(
+            panel_id=self._selector_panel_id,
+            payload_type=ImagePanelPayload,
+            hold=hold,
+            kind="image",
+        )
+
+    def _curve_interaction_origin(
+        self,
+        *,
+        hold: _HeldPanelFront | None = None,
+    ) -> PanelInteractionOrigin:
+        return self._require_interaction_origin(
+            panel_id=self._curve_panel_id,
+            payload_type=CurvePanelPayload,
+            hold=hold,
+            kind="curve",
+        )
+
+    def _require_interaction_origin(
+        self,
+        *,
+        panel_id: str | None,
+        payload_type: type[ImagePanelPayload] | type[CurvePanelPayload],
+        hold: _HeldPanelFront | None,
+        kind: str,
+    ) -> PanelInteractionOrigin:
         if hold is not None and hold is not self._selector_hold:
-            raise RuntimeError("image interaction hold is no longer painted")
-        origin = self.visible_image_origin()
+            raise RuntimeError(f"{kind} interaction hold is no longer painted")
+        _payload, origin = self._visible_display(panel_id, payload_type)
         if origin is None:
-            raise RuntimeError("image interaction origin has no exact payload")
+            raise RuntimeError(f"{kind} interaction origin has no exact payload")
         return origin
 
     def _set_cross_sample(self, sample: _ImageSample | None) -> None:
@@ -1594,9 +2410,16 @@ class QtRasterBoard(QtWidgets.QWidget):
         if sample is None:
             self._hover_position = None
 
+    def _set_curve_cross(self, sample: _CurveCross | None) -> None:
+        self._curve_cross = sample
+
+    def _set_curve_hover(self, sample: _CurveSample | None) -> None:
+        self._curve_hover = sample
+        if sample is None:
+            self._curve_hover_position = None
+
     def _held_panel_from_target(self, target) -> _HeldPanelFront:
         frame, panel, prepared = target[1], target[2], target[3]
-        viewport = self._viewport_for_target(target)
         return _HeldPanelFront(
             panel_id=panel.panel_id,
             board_id=frame.board_id,
@@ -1605,18 +2428,29 @@ class QtRasterBoard(QtWidgets.QWidget):
             coherence_group=panel.coherence_group,
             source_identity=panel.source_identity,
             presentation=_panel_presentation(panel),
-            viewport_revision=viewport.viewport_revision,
             raster_geometry=_raster_geometry(panel),
             prepared=prepared,
-            image_payload=panel.image_payload,
+            display_payload=(
+                target[4]
+                if len(target) > 4
+                else panel.display_payload
+            ),
         )
 
     @staticmethod
     def _panel_semantics_changed(old: PanelFrame, new: PanelFrame) -> bool:
         old_presentation = _panel_presentation(old)
         new_presentation = _panel_presentation(new)
-        old_axes = None if old.image_payload is None else old.image_payload.viewport.axes
-        new_axes = None if new.image_payload is None else new.image_payload.viewport.axes
+        old_payload = old.display_payload
+        new_payload = new.display_payload
+
+        def interaction_geometry(payload):
+            if isinstance(payload, ImagePanelPayload):
+                return (ImagePanelPayload, payload.viewport.axes)
+            if isinstance(payload, CurvePanelPayload):
+                return (CurvePanelPayload, payload.viewport.x_axis)
+            return (None,)
+
         return (
             old.panel_id != new.panel_id
             or old.coherence_group != new.coherence_group
@@ -1627,7 +2461,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             or old_presentation.selection_revision
             != new_presentation.selection_revision
             or _raster_geometry(old) != _raster_geometry(new)
-            or old_axes != new_axes
+            or interaction_geometry(old_payload) != interaction_geometry(new_payload)
         )
 
     def _hold_matches_frame(
@@ -1643,17 +2477,29 @@ class QtRasterBoard(QtWidgets.QWidget):
             or hold.panel_id not in panel_ids
         ):
             return False
-        viewport = self._selector_viewport
-        if viewport is None or viewport.viewport_revision != hold.viewport_revision:
-            return False
         index = panel_ids.index(hold.panel_id)
         panel = frame.panels[index]
+        held_payload = hold.display_payload
+        current_payload = panel.display_payload
+        if isinstance(held_payload, ImagePanelPayload):
+            payload_matches = (
+                isinstance(current_payload, ImagePanelPayload)
+                and current_payload.viewport.axes == held_payload.viewport.axes
+            )
+        elif isinstance(held_payload, CurvePanelPayload):
+            payload_matches = (
+                isinstance(current_payload, CurvePanelPayload)
+                and current_payload.viewport.x_axis == held_payload.viewport.x_axis
+            )
+        else:
+            payload_matches = current_payload is None
         return (
             panel.panel_id == hold.panel_id
             and panel.coherence_group == hold.coherence_group
             and panel.source_identity == hold.source_identity
             and _panel_presentation(panel) == hold.presentation
             and _raster_geometry(panel) == hold.raster_geometry
+            and payload_matches
         )
 
     @staticmethod
@@ -1759,7 +2605,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             limits = (
                 self._clim_candidate
                 if self._selector_hold is not None
-                and self._selector_hold.image_payload is payload
+                and _image_payload(self._selector_hold) is payload
                 and self._clim_candidate is not None
                 else payload.color_limits
             )
@@ -1880,7 +2726,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                     QtGui.QColor(GREEN),
                     dashed=False,
                     handles=(
-                        self._selector_enabled
+                        self._image_interaction_armed()
                         and self._selector_draft_bounds is None
                         and self._rectangle_fully_visible(
                             self._selector_applied_bounds
@@ -1904,7 +2750,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                     QtGui.QColor(ORANGE),
                     dashed=True,
                     handles=(
-                        self._selector_enabled
+                        self._image_interaction_armed()
                         and self._rectangle_fully_visible(
                             self._selector_draft_bounds
                         )
@@ -1912,14 +2758,14 @@ class QtRasterBoard(QtWidgets.QWidget):
                     endpoint_bounds=self._selector_draft_bounds,
                 )
         hold = self._selector_hold
+        held_image_payload = None if hold is None else _image_payload(hold)
         if (
-            hold is not None
-            and hold.image_payload is not None
+            held_image_payload is not None
             and self._clim_candidate is not None
         ):
             self._paint_clim_candidate_label(
                 painter,
-                hold.image_payload,
+                held_image_payload,
                 image_target,
             )
         if self._cross_sample is not None:
@@ -1936,6 +2782,108 @@ class QtRasterBoard(QtWidgets.QWidget):
                 image_target,
             )
         painter.restore()
+
+    def _paint_curve_overlays(self, painter: QtGui.QPainter) -> None:
+        target = self._curve_target()
+        if target is None:
+            return
+        plot, payload, bounds = target[0], target[4], target[5]
+        viewport = payload.viewport
+
+        def widget_point(x: float, y: float) -> QtCore.QPointF:
+            normalized = viewport.data_to_widget_normalized(x, y)
+            return QtCore.QPointF(
+                bounds.x() + normalized[0] * bounds.width(),
+                bounds.y() + normalized[1] * bounds.height(),
+            )
+
+        painter.save()
+        try:
+            painter.setClipRect(plot)
+            span = self._curve_span_candidate or self._curve_applied_span
+            if span is not None:
+                left = widget_point(span[0], viewport.y_limits[0]).x()
+                right = widget_point(span[1], viewport.y_limits[0]).x()
+                rectangle = QtCore.QRectF(
+                    min(left, right),
+                    plot.top(),
+                    abs(right - left),
+                    plot.height(),
+                ).intersected(plot)
+                painter.fillRect(rectangle, QtGui.QColor(245, 166, 35, 38))
+                pen = QtGui.QPen(QtGui.QColor(ORANGE), 1.5)
+                pen.setStyle(QtCore.Qt.DashLine)
+                painter.setPen(pen)
+                painter.drawRect(rectangle)
+
+            cross = self._curve_cross
+            if cross is not None:
+                point = widget_point(cross.x, cross.y)
+                if plot.contains(point):
+                    painter.setPen(QtGui.QPen(QtGui.QColor(GREEN), 1.5))
+                    painter.drawLine(
+                        QtCore.QPointF(point.x(), plot.top()),
+                        QtCore.QPointF(point.x(), plot.bottom()),
+                    )
+                    painter.drawLine(
+                        QtCore.QPointF(plot.left(), point.y()),
+                        QtCore.QPointF(plot.right(), point.y()),
+                    )
+                self._paint_curve_label(
+                    painter,
+                    f"x={cross.x:.6g}  y={cross.y:.6g}",
+                    plot,
+                    QtGui.QColor(GREEN),
+                    top_right=True,
+                )
+
+            sample = self._curve_hover
+            position = self._curve_hover_position
+            if sample is not None and position is not None:
+                point = widget_point(sample.x, sample.y)
+                if plot.contains(point):
+                    painter.setPen(QtGui.QPen(QtGui.QColor(ORANGE), 1.5))
+                    painter.setBrush(QtGui.QBrush(QtGui.QColor(ORANGE)))
+                    painter.drawEllipse(point, 3.5, 3.5)
+                unit = "" if payload.value_unit is None else f" {payload.value_unit}"
+                self._paint_curve_label(
+                    painter,
+                    (
+                        f"{sample.series_label}  x={sample.x:.6g}  "
+                        f"y={sample.y:.6g}{unit}"
+                    ),
+                    plot,
+                    QtGui.QColor(ORANGE),
+                    anchor=position,
+                )
+        finally:
+            painter.restore()
+
+    @staticmethod
+    def _paint_curve_label(
+        painter: QtGui.QPainter,
+        label: str,
+        plot: QtCore.QRectF,
+        color: QtGui.QColor,
+        *,
+        anchor: QtCore.QPointF | None = None,
+        top_right: bool = False,
+    ) -> None:
+        metrics = painter.fontMetrics()
+        label_bounds = metrics.boundingRect(label).adjusted(-5, -2, 5, 2)
+        if top_right:
+            label_bounds.moveTopRight(plot.topRight().toPoint() + QtCore.QPoint(-5, 5))
+        else:
+            if anchor is None:
+                anchor = plot.topLeft()
+            x = min(int(plot.right()) - label_bounds.width(), int(anchor.x()) + 12)
+            y = min(int(plot.bottom()) - label_bounds.height(), int(anchor.y()) + 12)
+            label_bounds.moveTopLeft(
+                QtCore.QPoint(max(int(plot.left()), x), max(int(plot.top()), y))
+            )
+        painter.fillRect(label_bounds, QtGui.QColor(0, 0, 0, 190))
+        painter.setPen(color)
+        painter.drawText(label_bounds, QtCore.Qt.AlignCenter, label)
 
     def _rectangle_fully_visible(self, bounds: NormalizedRectangle) -> bool:
         try:
@@ -2139,7 +3087,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             f"{float(selected_y.upper):.{y_precision}f})"
         )
 
-    def _cancel_rectangle_gesture(self, *, clear_draft: bool) -> None:
+    def _cancel_image_gesture(self, *, clear_draft: bool) -> None:
         self._selector_drag_anchor = None
         self._pan_anchor = None
         self._pan_origin = None
@@ -2149,23 +3097,68 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._clim_origin_limits = None
         self._clim_candidate = None
         self._clim_domain = None
-        self._selector_hold = None
+        if (
+            self._selector_hold is not None
+            and self._selector_hold.panel_id == self._selector_panel_id
+        ):
+            self._selector_hold = None
         if clear_draft:
             self._selector_draft_bounds = None
 
+    def _cancel_curve_gesture(self, *, clear_span: bool) -> None:
+        self._curve_span_anchor = None
+        self._curve_pan_anchor = None
+        self._curve_pan_origin = None
+        self._curve_pan_candidate = None
+        if (
+            self._selector_hold is not None
+            and self._selector_hold.panel_id == self._curve_panel_id
+        ):
+            self._selector_hold = None
+        if clear_span:
+            self._curve_span_candidate = None
+
+    def _cancel_active_gesture(
+        self,
+        *,
+        clear_image_draft: bool,
+        clear_curve_span: bool,
+    ) -> None:
+        self._cancel_image_gesture(clear_draft=clear_image_draft)
+        self._cancel_curve_gesture(clear_span=clear_curve_span)
+        self._selector_hold = None
+
     def _reset_rectangle_selector(self) -> None:
-        self._cancel_rectangle_gesture(clear_draft=True)
+        self._cancel_image_gesture(clear_draft=True)
         self._selector_applied_bounds = None
         self._pending_viewport = None
         self._pending_color_limits = None
         self._pending_origin = None
         self._set_cross_sample(None)
         self._set_hover_sample(None)
-        self._selector_enabled = False
+        self._image_binding_enabled = False
+        self._image_interaction_ready = False
         self._selector_panel_id = None
         self._selector_viewport = None
         self._selector_callback = None
         self._interaction_callback = None
+        if self._curve_panel_id is None:
+            self._selector_enabled = False
+
+    def _reset_curve_binding(self) -> None:
+        self._cancel_curve_gesture(clear_span=True)
+        self._curve_applied_span = None
+        self._curve_pending_viewport = None
+        self._curve_pending_origin = None
+        self._set_curve_cross(None)
+        self._set_curve_hover(None)
+        self._curve_binding_enabled = False
+        self._curve_interaction_ready = False
+        self._curve_panel_id = None
+        self._curve_viewport = None
+        self._curve_callback = None
+        if self._selector_panel_id is None:
+            self._selector_enabled = False
 
     def _require_owner(self) -> None:
         if QtCore.QThread.currentThread() != self.thread():

@@ -8,6 +8,12 @@ import sys
 
 import pytest
 
+from zlc_frontend.display_range import (
+    RelimMode,
+    deadband_display_range,
+    target_display_range,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -78,12 +84,12 @@ def test_image_display_state_rejects_ambiguous_or_nonfinite_values(
 
 
 def test_fixed_state_requires_one_strict_color_range() -> None:
-    from zlc_frontend.image_display import ImageDisplayState, ImageRelimMode
+    from zlc_frontend.image_display import ImageDisplayState
 
     with pytest.raises(ValueError, match="requires fixed_color_limits"):
-        ImageDisplayState(relim_mode=ImageRelimMode.FIXED)
+        ImageDisplayState(relim_mode=RelimMode.FIXED)
     state = ImageDisplayState(
-        relim_mode=ImageRelimMode.FIXED,
+        relim_mode=RelimMode.FIXED,
         fixed_color_limits=(10, 20),
     )
     assert state.fixed_color_limits == (10.0, 20.0)
@@ -93,7 +99,6 @@ def test_one_form_projection_is_exact_typed_and_revisioned() -> None:
     from zlc_frontend.image_display import (
         ImageColormap,
         ImageDisplayState,
-        ImageRelimMode,
         image_display_form_spec,
         image_display_form_values,
         image_display_from_form,
@@ -113,7 +118,7 @@ def test_one_form_projection_is_exact_typed_and_revisioned() -> None:
     )
     values = image_display_form_values(base)
     assert set(values) == set(spec.keys)
-    assert values["relim_mode"] is ImageRelimMode.TIGHT
+    assert values["relim_mode"] is RelimMode.TIGHT
     assert values["colormap"] is ImageColormap.GRAY
     assert image_display_from_form(base, values) is base
 
@@ -132,7 +137,7 @@ def test_one_form_projection_is_exact_typed_and_revisioned() -> None:
 
     with pytest.raises(ValueError, match="exactly"):
         image_display_from_form(changed, {**values, "extra": 1})
-    with pytest.raises(TypeError, match="ImageRelimMode"):
+    with pytest.raises(TypeError, match="RelimMode"):
         image_display_from_form(changed, {**values, "relim_mode": "normal"})
     with pytest.raises(ValueError, match="both minimum and maximum"):
         image_display_from_form(changed, {**values, "x_max": None})
@@ -141,14 +146,13 @@ def test_one_form_projection_is_exact_typed_and_revisioned() -> None:
 def test_entering_fixed_freezes_visible_range_then_accepts_explicit_edits() -> None:
     from zlc_frontend.image_display import (
         ImageDisplayState,
-        ImageRelimMode,
         image_display_form_values,
         image_display_from_form,
     )
 
     base = ImageDisplayState(fixed_color_limits=(1.0, 2.0))
     values = image_display_form_values(base)
-    values["relim_mode"] = ImageRelimMode.FIXED
+    values["relim_mode"] = RelimMode.FIXED
     with pytest.raises(ValueError, match="current_color_limits"):
         image_display_from_form(base, values)
 
@@ -168,65 +172,62 @@ def test_entering_fixed_freezes_visible_range_then_accepts_explicit_edits() -> N
 
 
 def test_target_color_limits_match_mature_tight_normal_and_fixed_rules() -> None:
-    from zlc_frontend.image_display import (
-        ImageDisplayState,
-        ImageRelimMode,
-        target_image_color_limits,
-    )
+    from zlc_frontend.image_display import ImageDisplayState
 
-    tight = ImageDisplayState(relim_mode=ImageRelimMode.TIGHT)
-    normal = ImageDisplayState(relim_mode=ImageRelimMode.NORMAL)
+    tight = ImageDisplayState(relim_mode=RelimMode.TIGHT)
+    normal = ImageDisplayState(relim_mode=RelimMode.NORMAL)
     fixed = ImageDisplayState(
-        relim_mode=ImageRelimMode.FIXED,
+        relim_mode=RelimMode.FIXED,
         fixed_color_limits=(11.0, 19.0),
     )
-    assert target_image_color_limits(tight, 50.0, 250.0) == (30.0, 270.0)
-    assert target_image_color_limits(normal, 50.0, 250.0) == (0.0, 300.0)
-    assert target_image_color_limits(normal, -50.0, 200.0) == (-75.0, 225.0)
-    assert target_image_color_limits(tight, 5.0, 5.0) == (4.5, 5.5)
-    assert target_image_color_limits(tight, 0.0, 0.0) == (-0.1, 0.1)
-    assert target_image_color_limits(normal, 0.0, 0.0) == (0.0, 1.0)
-    assert target_image_color_limits(fixed, float("nan"), float("nan")) == (
+    assert target_display_range(tight.relim_mode, 50.0, 250.0) == (30.0, 270.0)
+    assert target_display_range(normal.relim_mode, 50.0, 250.0) == (0.0, 300.0)
+    assert target_display_range(normal.relim_mode, -50.0, 200.0) == (-75.0, 225.0)
+    assert target_display_range(tight.relim_mode, 5.0, 5.0) == (4.5, 5.5)
+    assert target_display_range(tight.relim_mode, 0.0, 0.0) == (-0.1, 0.1)
+    assert target_display_range(normal.relim_mode, 0.0, 0.0) == (0.0, 1.0)
+    assert target_display_range(
+        fixed.relim_mode,
+        float("nan"),
+        float("nan"),
+        fixed_range=fixed.fixed_color_limits,
+    ) == (
         11.0,
         19.0,
     )
 
 
 def test_deadband_never_clips_and_avoids_normal_or_tight_jitter() -> None:
-    from zlc_frontend.image_display import (
-        ImageDisplayState,
-        ImageRelimMode,
-        deadband_image_color_limits,
-    )
+    from zlc_frontend.image_display import ImageDisplayState
 
-    normal = ImageDisplayState(relim_mode=ImageRelimMode.NORMAL)
-    assert deadband_image_color_limits(normal, (0.0, 120.0), 0.0, 100.0) == (
+    normal = ImageDisplayState(relim_mode=RelimMode.NORMAL)
+    assert deadband_display_range(normal.relim_mode, (0.0, 120.0), 0.0, 100.0) == (
         0.0,
         120.0,
     )
-    assert deadband_image_color_limits(normal, (0.0, 120.0), 0.0, 121.0) == (
+    assert deadband_display_range(normal.relim_mode, (0.0, 120.0), 0.0, 121.0) == (
         0.0,
         pytest.approx(145.2),
     )
-    assert deadband_image_color_limits(normal, (0.0, 120.0), 0.0, 50.0) == (
+    assert deadband_display_range(normal.relim_mode, (0.0, 120.0), 0.0, 50.0) == (
         0.0,
         60.0,
     )
 
-    tight = ImageDisplayState(relim_mode=ImageRelimMode.TIGHT)
-    assert deadband_image_color_limits(tight, (-1.0, 11.0), 0.1, 9.9) == (
+    tight = ImageDisplayState(relim_mode=RelimMode.TIGHT)
+    assert deadband_display_range(tight.relim_mode, (-1.0, 11.0), 0.1, 9.9) == (
         -1.0,
         11.0,
     )
-    grown = deadband_image_color_limits(tight, (-1.0, 11.0), 0.0, 20.0)
+    grown = deadband_display_range(tight.relim_mode, (-1.0, 11.0), 0.0, 20.0)
     assert grown == (-2.0, 22.0)
     assert grown[0] <= 0.0 and grown[1] >= 20.0
-    assert deadband_image_color_limits(tight, (-1.0, 11.0), 4.0, 6.0) == (
+    assert deadband_display_range(tight.relim_mode, (-1.0, 11.0), 4.0, 6.0) == (
         3.8,
         6.2,
     )
-    assert deadband_image_color_limits(
-        tight,
+    assert deadband_display_range(
+        tight.relim_mode,
         (-1.0, 11.0),
         0.1,
         9.9,
@@ -234,23 +235,23 @@ def test_deadband_never_clips_and_avoids_normal_or_tight_jitter() -> None:
     ) == pytest.approx((-0.88, 10.88))
 
     # A negative NORMAL frame derives TIGHT for this frame without mutating intent.
-    negative = deadband_image_color_limits(normal, (0.0, 120.0), -5.0, 100.0)
+    negative = deadband_display_range(normal.relim_mode, (0.0, 120.0), -5.0, 100.0)
     assert negative == (-15.5, 110.5)
-    assert normal.relim_mode is ImageRelimMode.NORMAL
+    assert normal.relim_mode is RelimMode.NORMAL
 
     # NORMAL must regain its zero anchor after a negative frame.  A high-value
     # deadband match alone cannot preserve the previous tight negative floor.
-    positive_again = deadband_image_color_limits(normal, negative, 1.0, 90.0)
+    positive_again = deadband_display_range(normal.relim_mode, negative, 1.0, 90.0)
     assert positive_again == (0.0, 108.0)
-    negative_again = deadband_image_color_limits(
-        normal,
+    negative_again = deadband_display_range(
+        normal.relim_mode,
         positive_again,
         -2.0,
         80.0,
     )
     assert negative_again == pytest.approx((-10.2, 88.2))
-    assert deadband_image_color_limits(
-        normal,
+    assert deadband_display_range(
+        normal.relim_mode,
         negative_again,
         1.0,
         70.0,
@@ -260,7 +261,7 @@ def test_deadband_never_clips_and_avoids_normal_or_tight_jitter() -> None:
 def _evaluated_image(values, validity):
     import numpy as np
 
-    from zlc_data import AxisId
+    from zlc_data import AxisId, SPATIAL_X, SPATIAL_Y
     from zlc_frontend.figure import EvaluatedAxis, EvaluatedImage
 
     array = np.asarray(values)
@@ -269,6 +270,7 @@ def _evaluated_image(values, validity):
         EvaluatedAxis(
             AxisId("indexed-test.x"),
             "x",
+            SPATIAL_X,
             "pixel",
             tuple(range(width)),
             tuple(range(width)),
@@ -276,6 +278,7 @@ def _evaluated_image(values, validity):
         EvaluatedAxis(
             AxisId("indexed-test.y"),
             "y",
+            SPATIAL_Y,
             "pixel",
             tuple(range(height)),
             tuple(range(height)),
@@ -298,7 +301,7 @@ def _rasterize(image, state=None):
 
 
 def test_indexed_raster_reserves_zero_for_invalid_and_reports_exact_codebook() -> None:
-    from zlc_frontend.image_display import ImageDisplayState, ImageRelimMode
+    from zlc_frontend.image_display import ImageDisplayState
     from zlc_frontend.render import PixelFormat
 
     image = _evaluated_image(
@@ -306,7 +309,7 @@ def test_indexed_raster_reserves_zero_for_invalid_and_reports_exact_codebook() -
         [[True, True, True, True], [False, True, True, True]],
     )
     state = ImageDisplayState(
-        relim_mode=ImageRelimMode.FIXED,
+        relim_mode=RelimMode.FIXED,
         fixed_color_limits=(0.0, 100.0),
     )
     raster, value_range, histogram, limits = _rasterize(image, state)
@@ -362,7 +365,7 @@ def test_indexed_raster_rejects_an_unrepresentable_infinite_display_span() -> No
 def test_indexed_raster_maps_adjacent_subnormal_values_without_collapsing_validity() -> None:
     import numpy as np
 
-    from zlc_frontend.image_display import ImageDisplayState, ImageRelimMode
+    from zlc_frontend.image_display import ImageDisplayState
 
     smallest = np.nextafter(np.float64(0.0), np.float64(1.0))
     image = _evaluated_image(
@@ -370,7 +373,7 @@ def test_indexed_raster_maps_adjacent_subnormal_values_without_collapsing_validi
         [[True, True, True]],
     )
     state = ImageDisplayState(
-        relim_mode=ImageRelimMode.FIXED,
+        relim_mode=RelimMode.FIXED,
         fixed_color_limits=(0.0, float(smallest * 2.0)),
     )
     raster, value_range, histogram, _limits = _rasterize(image, state)
@@ -383,7 +386,7 @@ def test_indexed_raster_maps_adjacent_subnormal_values_without_collapsing_validi
 def test_display_raster_quantizes_directly_inside_narrow_fixed_limits() -> None:
     import numpy as np
 
-    from zlc_frontend.image_display import ImageDisplayState, ImageRelimMode
+    from zlc_frontend.image_display import ImageDisplayState
     from zlc_frontend.image_raster import rasterize_image_indexed8
 
     in_window = np.arange(1000, 1101, dtype=np.uint16)
@@ -392,7 +395,7 @@ def test_display_raster_quantizes_directly_inside_narrow_fixed_limits() -> None:
     ).reshape(1, -1)
     image = _evaluated_image(values, np.ones(values.shape, dtype=bool))
     state = ImageDisplayState(
-        relim_mode=ImageRelimMode.FIXED,
+        relim_mode=RelimMode.FIXED,
         fixed_color_limits=(1000.0, 1100.0),
     )
     raster, data_range, histogram, limits = rasterize_image_indexed8(

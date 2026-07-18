@@ -28,7 +28,7 @@ from zlc_neutral_atom.monitor_application import (
 )
 from zlc_neutral_atom.runtime.control import ControlAckStatus, create_control_topic
 import zlc_workbench.live as live_module
-from zlc_workbench.live import LiveDatasetSlot, LiveImageBoardController
+from zlc_workbench.live import LiveBoardController, LiveDatasetSlot
 
 
 ROOT = Path(__file__).parents[1]
@@ -386,7 +386,7 @@ def test_notification_failure_is_visible_without_detaching_source_dataset():
     assert slot._dataset is dataset
 
     visible_status = object()
-    controller = object.__new__(LiveImageBoardController)
+    controller = object.__new__(LiveBoardController)
     controller._slot = slot
     controller._lock = threading.Lock()
     controller._closed = False
@@ -466,7 +466,7 @@ def test_camera_roi_state_cache_rejects_conflicting_same_revision_truth():
 
 
 def test_freeze_presentation_revokes_work_and_preserves_the_coherent_front_state():
-    controller = object.__new__(LiveImageBoardController)
+    controller = object.__new__(LiveBoardController)
     controller._owner_thread = threading.get_ident()
     controller._lock = threading.Lock()
     controller._closed = False
@@ -498,7 +498,10 @@ def test_scalar_control_change_reuses_layout_when_panel_ids_are_unchanged(monkey
         image_document=object(),
         image_display=None,
         image_viewport=None,
-        scalar_documents=(object(),),
+        scalar_dataset_id=object(),
+        scalar_documents=(SimpleNamespace(document_id="curve", revision=0),),
+        scalar_binding_fingerprint="binding",
+        scalar_control_revision=2,
     )
     replacement = SimpleNamespace(
         board_id=previous.board_id,
@@ -515,7 +518,7 @@ def test_scalar_control_change_reuses_layout_when_panel_ids_are_unchanged(monkey
         "_build_live_configuration",
         lambda **_kwargs: replacement,
     )
-    controller = object.__new__(LiveImageBoardController)
+    controller = object.__new__(LiveBoardController)
     controller._owner_thread = threading.get_ident()
     controller._slot = SimpleNamespace(
         spec=CameraSpec(),
@@ -551,6 +554,7 @@ def test_scalar_control_change_reuses_layout_when_panel_ids_are_unchanged(monkey
         CameraMonitorRoiState(None, 3, None, None, None, 3),
         None,
         (),
+        None,
     )
 
     assert controller._configuration is replacement

@@ -29,9 +29,10 @@ from zlc_frontend.figure import (
     ViewIntent,
     validate_view_spec,
 )
+from zlc_frontend.curve_display import CurveDisplayState
+from zlc_frontend.display_range import DisplayRange, RelimMode
 from zlc_frontend.image_display import (
     ImageDisplayState,
-    ImageRelimMode,
     image_viewport_for_display_state,
 )
 from zlc_frontend.image_raster import rasterize_image_indexed8
@@ -39,6 +40,8 @@ from zlc_frontend.image_view import ImageViewportTransform
 from zlc_frontend.render import (
     BoardFrame,
     CoherenceStamp,
+    CurvePanelPayload,
+    DisplayPayload,
     ImagePanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
@@ -103,6 +106,8 @@ class LiveFrontStatus:
     scalar_control_revision: int | None = None
     image_display_revision: int | None = None
     image_color_limits: tuple[float, float] | None = None
+    curve_display_revision: int | None = None
+    curve_y_limits: DisplayRange | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +123,7 @@ class _LiveRenderConfiguration:
     image_document: FigureDocument
     image_display: ImageDisplayState | None
     image_viewport: ImageViewportTransform | None
+    curve_display: CurveDisplayState | None
     scalar_dataset_id: DatasetId | None
     scalar_documents: tuple[FigureDocument, ...]
     scalar_block_id: BlockId | None
@@ -531,8 +537,8 @@ class LiveDatasetSlot:
             return dataset, listener
 
 
-class LiveImageBoardController:
-    """Latest-only IMAGE board with a dynamically reconfigurable scalar branch."""
+class LiveBoardController:
+    """Latest-only live board with IMAGE and typed scalar presentations."""
 
     def __init__(
         self,
@@ -544,6 +550,7 @@ class LiveImageBoardController:
         request_owner_wake: Callable[[], None],
         image_display: ImageDisplayState,
         image_viewport: ImageViewportTransform,
+        curve_display: CurveDisplayState | None = None,
         scalar_documents: tuple[FigureDocument, ...] = (),
         scalar_raster_size: tuple[int, int] = (800, 520),
         worker_thread_affine: bool = False,
@@ -567,6 +574,15 @@ class LiveImageBoardController:
             raise TypeError("image_viewport must be ImageViewportTransform")
         if image_viewport.viewport_revision != image_display.revision:
             raise ValueError("image viewport revision must match image display revision")
+        if curve_display is not None and not isinstance(
+            curve_display,
+            CurveDisplayState,
+        ):
+            raise TypeError("curve_display must be CurveDisplayState or None")
+        if bool(scalar_documents) != (curve_display is not None):
+            raise ValueError(
+                "curve display state must match the admitted scalar panel set"
+            )
         if scalar_documents and not worker_thread_affine:
             raise ValueError("live scalar Agg panels require a thread-affine worker lane")
         if (
@@ -597,6 +613,7 @@ class LiveImageBoardController:
             image_document=document,
             image_display=image_display,
             image_viewport=image_viewport,
+            curve_display=curve_display,
             scalar_dataset_id=slot.scalar_dataset_id,
             scalar_documents=scalar_documents,
             scalar_block_id=scalar_block_id,
@@ -633,7 +650,9 @@ class LiveImageBoardController:
         # This records the mode of the last successfully published *valid*
         # image, not merely the configured intent.  An all-invalid first front
         # must not consume the forced relim owed by the first valid frame.
-        self._image_relim_mode: ImageRelimMode | None = None
+        self._image_relim_mode: RelimMode | None = None
+        self._curve_y_limits: DisplayRange | None = None
+        self._curve_relim_mode: RelimMode | None = None
         self._front_invalidated = False
         self._presentation_frozen = False
         self._closed = False
@@ -652,18 +671,12 @@ class LiveImageBoardController:
         with self._lock:
             return self._front_status
 
-    @property
-    def _scalar_documents(self) -> tuple[FigureDocument, ...]:
-        """Compatibility view of the active frozen documents for diagnostics."""
-
-        with self._lock:
-            return self._configuration.scalar_documents
-
     def reconfigure_scalar(
         self,
         state: CameraMonitorRoiState,
         scalar_dataset_id: DatasetId | None,
         scalar_documents: tuple[FigureDocument, ...],
+        curve_display: CurveDisplayState | None,
     ) -> None:
         """Owner-thread switch to one applied scalar branch without clearing front."""
 
@@ -677,6 +690,8 @@ class LiveImageBoardController:
             raise TypeError("scalar_documents must contain FigureDocument values")
         active = state.binding is not None
         if active:
+            if not isinstance(curve_display, CurveDisplayState):
+                raise TypeError("an applied ROI branch requires curve_display")
             if not isinstance(scalar_dataset_id, DatasetId):
                 raise TypeError("an applied ROI branch requires scalar_dataset_id")
             if not self._worker_thread_affine:
@@ -709,17 +724,19 @@ class LiveImageBoardController:
                     "one scalar stream generation must retain its frontend DatasetId"
                 )
         else:
+            if curve_display is not None:
+                raise ValueError("raw-only ROI state cannot have curve_display")
             if scalar_dataset_id is not None:
                 raise ValueError("raw-only ROI state cannot have scalar_dataset_id")
             if scalar_documents:
                 raise ValueError("raw-only ROI state cannot have scalar documents")
         with self._lock:
             if self._closed:
-                raise RuntimeError("live image controller is closed")
+                raise RuntimeError("live board controller is closed")
             if self._fault is not None:
-                raise RuntimeError("live image controller is faulted")
+                raise RuntimeError("live board controller is faulted")
             if self._slot.failure is not None or self._slot.withdrawn:
-                raise RuntimeError("live image source is no longer available")
+                raise RuntimeError("live source is no longer available")
             epoch = self._configuration_epoch + 1
             previous = self._configuration
             previous_port = self._port
@@ -745,6 +762,7 @@ class LiveImageBoardController:
             image_document=previous.image_document,
             image_display=previous.image_display,
             image_viewport=previous.image_viewport,
+            curve_display=curve_display,
             scalar_dataset_id=scalar_dataset_id,
             scalar_documents=scalar_documents,
             scalar_block_id=state.scalar_block_id,
@@ -756,13 +774,16 @@ class LiveImageBoardController:
             scalar_control_revision=state.control_revision,
             strict_scalar_identity=True,
         )
+        curve_semantics_changed = _curve_semantic_identity(
+            previous
+        ) != _curve_semantic_identity(configuration)
         with self._lock:
             if self._closed:
-                raise RuntimeError("live image controller is closed")
+                raise RuntimeError("live board controller is closed")
             if self._fault is not None:
-                raise RuntimeError("live image controller is faulted")
+                raise RuntimeError("live board controller is faulted")
             if self._slot.failure is not None or self._slot.withdrawn:
-                raise RuntimeError("live image source is no longer available")
+                raise RuntimeError("live source is no longer available")
             if epoch != self._configuration_epoch + 1:
                 raise RuntimeError("live scalar reconfiguration lost owner serialization")
             if self._configuration is not previous:
@@ -795,6 +816,9 @@ class LiveImageBoardController:
                 previous_sources if replacement_port is not None else None
             )
             self._dirty = True
+            if curve_semantics_changed:
+                self._curve_y_limits = None
+                self._curve_relim_mode = None
             if candidate_waiting:
                 self._active = False
             request_now = not self._presentation_frozen and not self._active
@@ -828,11 +852,11 @@ class LiveImageBoardController:
             raise ValueError("image display and viewport revisions differ")
         with self._lock:
             if self._closed:
-                raise RuntimeError("live image controller is closed")
+                raise RuntimeError("live board controller is closed")
             if self._fault is not None:
-                raise RuntimeError("live image controller is faulted")
+                raise RuntimeError("live board controller is faulted")
             if self._slot.failure is not None or self._slot.withdrawn:
-                raise RuntimeError("live image source is no longer available")
+                raise RuntimeError("live source is no longer available")
             previous = self._configuration
             previous_state = previous.image_display
             previous_viewport = previous.image_viewport
@@ -862,6 +886,7 @@ class LiveImageBoardController:
             image_document=previous.image_document,
             image_display=state,
             image_viewport=viewport,
+            curve_display=previous.curve_display,
             scalar_dataset_id=previous.scalar_dataset_id,
             scalar_documents=previous.scalar_documents,
             scalar_block_id=previous.scalar_block_id,
@@ -873,20 +898,102 @@ class LiveImageBoardController:
             scalar_renderers=previous.scalar_renderers,
         )
         # Display-only replacement shares the worker-lane-owned renderer
-        # holder itself, not a racy snapshot of its current entries.  A first
-        # render that completes after this GUI-thread reconfiguration therefore
-        # remains owned by the replacement configuration and is closed once.
+        # holder itself, not a racy snapshot of its current entries.
+        request_now = self._install_display_configuration(
+            previous=previous,
+            configuration=configuration,
+            epoch=epoch,
+            previous_port=previous_port,
+            previous_sources=previous_sources,
+            operation="image display",
+        )
+        if request_now:
+            self._request_snapshot()
+
+    def reconfigure_curve_display(self, state: CurveDisplayState) -> None:
+        """Replace one CURVE presentation revision without touching its source."""
+
+        self._require_owner()
+        if not isinstance(state, CurveDisplayState):
+            raise TypeError("state must be CurveDisplayState")
         with self._lock:
             if self._closed:
-                raise RuntimeError("live image controller is closed")
+                raise RuntimeError("live board controller is closed")
             if self._fault is not None:
-                raise RuntimeError("live image controller is faulted")
+                raise RuntimeError("live board controller is faulted")
             if self._slot.failure is not None or self._slot.withdrawn:
-                raise RuntimeError("live image source is no longer available")
+                raise RuntimeError("live source is no longer available")
+            previous = self._configuration
+            previous_state = previous.curve_display
+            previous_port = self._port
+            previous_sources = self._sources
+            epoch = self._configuration_epoch + 1
+        if previous_state is None:
+            raise RuntimeError("live board has no interactive CURVE presentation")
+        if state == previous_state:
+            return
+        if state.revision != previous_state.revision + 1:
+            raise ValueError("curve display revision must advance exactly once")
+        target_model = self._board.model
+        if (
+            target_model.board_id != previous.board_id
+            or target_model.layout_generation != previous.layout_generation
+            or target_model.panels != previous.panels
+        ):
+            raise RuntimeError(
+                "curve display reconfiguration cannot cross a board topology change"
+            )
+        configuration = _build_live_configuration(
+            epoch=epoch,
+            model=target_model,
+            image_document=previous.image_document,
+            image_display=previous.image_display,
+            image_viewport=previous.image_viewport,
+            curve_display=state,
+            scalar_dataset_id=previous.scalar_dataset_id,
+            scalar_documents=previous.scalar_documents,
+            scalar_block_id=previous.scalar_block_id,
+            scalar_dataset_edge=previous.scalar_dataset_edge,
+            scalar_generation=previous.scalar_generation,
+            scalar_binding_fingerprint=previous.scalar_binding_fingerprint,
+            scalar_control_revision=previous.scalar_control_revision,
+            strict_scalar_identity=previous.strict_scalar_identity,
+            scalar_renderers=previous.scalar_renderers,
+        )
+        request_now = self._install_display_configuration(
+            previous=previous,
+            configuration=configuration,
+            epoch=epoch,
+            previous_port=previous_port,
+            previous_sources=previous_sources,
+            operation="curve display",
+        )
+        if request_now:
+            self._request_snapshot()
+
+    def _install_display_configuration(
+        self,
+        *,
+        previous: _LiveRenderConfiguration,
+        configuration: _LiveRenderConfiguration,
+        epoch: int,
+        previous_port: BoardPublishPort | None,
+        previous_sources: tuple[SourceIdentity, ...] | None,
+        operation: str,
+    ) -> bool:
+        """Atomically replace one same-topology display-only configuration."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("live board controller is closed")
+            if self._fault is not None:
+                raise RuntimeError("live board controller is faulted")
+            if self._slot.failure is not None or self._slot.withdrawn:
+                raise RuntimeError("live source is no longer available")
             if epoch != self._configuration_epoch + 1:
-                raise RuntimeError("image display reconfiguration lost owner serialization")
+                raise RuntimeError(f"{operation} reconfiguration lost owner serialization")
             if self._configuration is not previous:
-                raise RuntimeError("live image configuration changed unexpectedly")
+                raise RuntimeError(f"live {operation} configuration changed unexpectedly")
             replacement_port: BoardPublishPort | None = None
             if previous_port is not None:
                 if previous_sources is None or len(previous_sources) != len(
@@ -912,9 +1019,7 @@ class LiveImageBoardController:
             self._dirty = True
             if candidate_waiting:
                 self._active = False
-            request_now = not self._presentation_frozen and not self._active
-        if request_now:
-            self._request_snapshot()
+            return not self._presentation_frozen and not self._active
 
     def freeze_presentation(self) -> None:
         """Revoke all render work while preserving the last coherent front."""
@@ -1279,10 +1384,12 @@ class LiveImageBoardController:
             else:
                 raise RuntimeError("live IMAGE configuration has no display state")
             rasters = [image_raster]
-            payloads: list[ImagePanelPayload | None] = [image_payload]
+            payloads: list[DisplayPayload | None] = [image_payload]
             histogram_valid_samples = None
             histogram_dropped_samples = None
             latest_scalar_valid = None
+            curve_y_limits: DisplayRange | None = None
+            curve_has_valid_samples = False
             if configuration.scalar_documents:
                 if (
                     scalar_snapshot is None
@@ -1310,20 +1417,34 @@ class LiveImageBoardController:
                 if (
                     len(scalar_evaluated.layers) != 1
                     or len(scalar_evaluated.layers[0].cells) != 1
-                    or len(scalar_evaluated.layers[0].cells[0].series) != 1
                 ):
-                    raise RuntimeError("live scalar document must evaluate to one series")
-                scalar_data = scalar_evaluated.layers[0].cells[0].series[0].data
+                    raise RuntimeError("live scalar document must evaluate to one cell")
+                scalar_series = scalar_evaluated.layers[0].cells[0].series
+                if not scalar_series:
+                    raise RuntimeError("live scalar document evaluated no series")
                 intent = scalar_document.layers[0].view.intent
-                expected_type = {
-                    ViewIntent.CURVE: EvaluatedCurve,
-                    ViewIntent.HISTOGRAM: EvaluatedHistogram,
-                    ViewIntent.METER: EvaluatedMeter,
-                }[intent]
-                if not isinstance(scalar_data, expected_type):
-                    raise RuntimeError(
-                        f"live {intent.value} document evaluated to another data kind"
-                    )
+                if intent is ViewIntent.CURVE:
+                    if any(
+                        not isinstance(series.data, EvaluatedCurve)
+                        for series in scalar_series
+                    ):
+                        raise RuntimeError(
+                            "live CURVE document evaluated to another data kind"
+                        )
+                else:
+                    if len(scalar_series) != 1:
+                        raise RuntimeError(
+                            f"live {intent.value} document must evaluate one series"
+                        )
+                    expected_type = {
+                        ViewIntent.HISTOGRAM: EvaluatedHistogram,
+                        ViewIntent.METER: EvaluatedMeter,
+                    }[intent]
+                    if not isinstance(scalar_series[0].data, expected_type):
+                        raise RuntimeError(
+                            f"live {intent.value} document evaluated to another data kind"
+                        )
+                scalar_data = scalar_series[0].data
                 if isinstance(scalar_data, EvaluatedHistogram):
                     histogram_valid_samples = len(scalar_data.samples)
                     histogram_dropped_samples = scalar_data.dropped_count
@@ -1348,8 +1469,33 @@ class LiveImageBoardController:
                         height=self._scalar_size[1],
                     )
                     configuration.scalar_renderers[index] = renderer
-                rasters.append(renderer.render(scalar_evaluated))
-                payloads.append(None)
+                if intent is ViewIntent.CURVE:
+                    curve_display = configuration.curve_display
+                    if curve_display is None:
+                        raise RuntimeError(
+                            "live CURVE document has no display configuration"
+                        )
+                    with self._lock:
+                        if self._configuration is not configuration:
+                            return
+                        accepted_y_limits = self._curve_y_limits
+                        accepted_relim_mode = self._curve_relim_mode
+                    curve_raster, curve_payload = renderer.render_interactive_curve(
+                        scalar_evaluated,
+                        curve_display,
+                        current_y_limits=accepted_y_limits,
+                        previous_relim_mode=accepted_relim_mode,
+                    )
+                    curve_y_limits = curve_payload.viewport.y_limits
+                    curve_has_valid_samples = any(
+                        bool(series.data.validity.any())
+                        for series in scalar_series
+                    )
+                    rasters.append(curve_raster)
+                    payloads.append(curve_payload)
+                else:
+                    rasters.append(renderer.render(scalar_evaluated))
+                    payloads.append(None)
             frame = BoardFrame(
                 configuration.board_id,
                 configuration.layout_generation,
@@ -1401,6 +1547,12 @@ class LiveImageBoardController:
                         None if image_display is None else image_display.revision
                     ),
                     image_color_limits=image_color_limits,
+                    curve_display_revision=(
+                        None
+                        if configuration.curve_display is None
+                        else configuration.curve_display.revision
+                    ),
+                    curve_y_limits=curve_y_limits,
                 )
                 published = job.port.publish(job.token, frame)
                 if published:
@@ -1416,10 +1568,27 @@ class LiveImageBoardController:
                             if image_display is not None:
                                 assert image_color_limits is not None
                                 self._image_color_limits = image_color_limits
-                                self._image_relim_mode = _accepted_image_relim_mode(
+                                self._image_relim_mode = _accepted_relim_mode(
                                     self._image_relim_mode,
-                                    image_display,
+                                    image_display.relim_mode,
                                     image_data_range,
+                                )
+                            curve_display = configuration.curve_display
+                            if curve_display is not None:
+                                assert curve_y_limits is not None
+                                if (
+                                    curve_has_valid_samples
+                                    or curve_display.relim_mode is RelimMode.FIXED
+                                ):
+                                    self._curve_y_limits = curve_y_limits
+                                self._curve_relim_mode = _accepted_relim_mode(
+                                    self._curve_relim_mode,
+                                    curve_display.relim_mode,
+                                    (
+                                        curve_y_limits
+                                        if curve_has_valid_samples
+                                        else None
+                                    ),
                                 )
                             accepted_status = True
                     if accepted_status:
@@ -1661,7 +1830,7 @@ def _validate_live_documents(
     view = document.layers[0].view
     validate_view_spec(schema, view)
     if view.intent is not ViewIntent.IMAGE:
-        raise ValueError("live image controller requires IMAGE intent")
+        raise ValueError("live board requires an IMAGE primary document")
     scalar_edge = (
         slot.spec.scalar_dataset_edge
         if isinstance(slot.spec, CameraMonitorViewSpec)
@@ -1680,17 +1849,17 @@ def _validate_live_documents(
     )
 
 
-def _accepted_image_relim_mode(
-    previous: ImageRelimMode | None,
-    state: ImageDisplayState,
+def _accepted_relim_mode(
+    previous: RelimMode | None,
+    mode: RelimMode,
     value_range: tuple[float, float] | None,
-) -> ImageRelimMode | None:
+) -> RelimMode | None:
     """Advance only the range policy fully initialized by an accepted front."""
 
-    if not isinstance(state, ImageDisplayState):
-        raise TypeError("state must be ImageDisplayState")
-    if value_range is not None or state.relim_mode is ImageRelimMode.FIXED:
-        return state.relim_mode
+    if not isinstance(mode, RelimMode):
+        raise TypeError("mode must be RelimMode")
+    if value_range is not None or mode is RelimMode.FIXED:
+        return mode
     return previous
 
 
@@ -1732,6 +1901,23 @@ def _validate_scalar_documents(
             )
 
 
+def _curve_semantic_identity(
+    configuration: _LiveRenderConfiguration,
+) -> tuple[object, ...] | None:
+    """Identity whose change invalidates accepted CURVE range history."""
+
+    if not configuration.scalar_documents:
+        return None
+    document = configuration.scalar_documents[0]
+    return (
+        configuration.scalar_dataset_id,
+        document.document_id,
+        document.revision,
+        configuration.scalar_binding_fingerprint,
+        configuration.scalar_control_revision,
+    )
+
+
 def _build_live_configuration(
     *,
     epoch: int,
@@ -1739,6 +1925,7 @@ def _build_live_configuration(
     image_document: FigureDocument,
     image_display: ImageDisplayState | None,
     image_viewport: ImageViewportTransform | None,
+    curve_display: CurveDisplayState | None,
     scalar_dataset_id: DatasetId | None,
     scalar_documents: tuple[FigureDocument, ...],
     scalar_block_id: BlockId | None,
@@ -1761,8 +1948,15 @@ def _build_live_configuration(
         if image_viewport.viewport_revision != image_display.revision:
             raise ValueError("image display and viewport revisions differ")
         image_viewport_for_display_state(image_display, image_viewport)
+    if curve_display is not None and not isinstance(
+        curve_display,
+        CurveDisplayState,
+    ):
+        raise TypeError("curve_display must be CurveDisplayState or None")
     panels = model.panels
     documents = (image_document, *scalar_documents)
+    if bool(scalar_documents) != (curve_display is not None):
+        raise ValueError("curve display state must match scalar documents")
     if len(panels) != len(documents):
         raise ValueError("live board panel count does not match its frozen documents")
     coherence_groups = {panel.coherence_group for panel in panels}
@@ -1778,7 +1972,15 @@ def _build_live_configuration(
             panel_document.document_id,
             panel_document.revision,
             0,
-            image_display.revision if index == 0 and image_display is not None else 0,
+            (
+                image_display.revision
+                if index == 0 and image_display is not None
+                else (
+                    curve_display.revision
+                    if index == 1 and curve_display is not None
+                    else 0
+                )
+            ),
         )
         for index, (panel, panel_document) in enumerate(
             zip(panels, documents, strict=True)
@@ -1801,6 +2003,7 @@ def _build_live_configuration(
         image_document,
         image_display,
         image_viewport,
+        curve_display,
         scalar_dataset_id,
         scalar_documents,
         scalar_block_id,
@@ -1813,4 +2016,4 @@ def _build_live_configuration(
     )
 
 
-__all__ = ["LiveDatasetSlot", "LiveFrontStatus", "LiveImageBoardController"]
+__all__ = ["LiveBoardController", "LiveDatasetSlot", "LiveFrontStatus"]
