@@ -8,7 +8,7 @@ from typing import Callable
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from zlc_data import Selection
-from zlc_storage import canonical_text
+from zlc_storage import canonical_text, nonnegative_integer
 
 from ..render import BoardFrame, PixelFormat, SourceIdentity, detached_render_fault
 from ..selector import (
@@ -77,6 +77,18 @@ def _panel_bounds(
         right - (bounds.x() + column * cell_width),
         bottom - (bounds.y() + row * cell_height),
     )
+
+
+def _validated_panel_layout(
+    panel_ids: tuple[str, ...],
+    columns: int,
+) -> tuple[tuple[str, ...], int]:
+    ids = tuple(canonical_text(value, "panel_id") for value in panel_ids)
+    if not ids or len(set(ids)) != len(ids):
+        raise ValueError("QtRasterBoard requires unique panel ids")
+    if isinstance(columns, bool) or not isinstance(columns, int) or columns <= 0:
+        raise ValueError("columns must be a positive integer")
+    return ids, min(columns, len(ids))
 
 
 class QtOwnerWake(QtCore.QObject):
@@ -225,13 +237,9 @@ class QtRasterBoard(QtWidgets.QWidget):
         empty_text: str = "",
     ) -> None:
         super().__init__(parent)
-        ids = tuple(canonical_text(value, "panel_id") for value in panel_ids)
-        if not ids or len(set(ids)) != len(ids):
-            raise ValueError("QtRasterBoard requires unique panel ids")
-        if isinstance(columns, bool) or not isinstance(columns, int) or columns <= 0:
-            raise ValueError("columns must be a positive integer")
-        self._panel_ids = ids
-        self._columns = min(columns, len(ids))
+        self._panel_ids, self._columns = _validated_panel_layout(panel_ids, columns)
+        self._active_layout_identity: tuple[str, int] | None = None
+        self._staged_layout: tuple[str, int, tuple[str, ...], int] | None = None
         self._empty_text = str(empty_text)
         self._front: tuple[BoardFrame, tuple[tuple[bytes, QtGui.QImage], ...]] | None = None
         self._selector_panel_id: str | None = None
@@ -251,37 +259,152 @@ class QtRasterBoard(QtWidgets.QWidget):
             int,
         ] | None = None
         self._selector_fault: RuntimeError | None = None
+        self._closed = False
         self.setMinimumSize(128, 64)
+
+    @property
+    def panel_ids(self) -> tuple[str, ...]:
+        """Panel order of the currently visible/active layout."""
+
+        self._require_owner()
+        return self._panel_ids
+
+    @property
+    def columns(self) -> int:
+        self._require_owner()
+        return self._columns
+
+    def stage_layout(
+        self,
+        panel_ids: tuple[str, ...],
+        *,
+        board_id: str,
+        layout_generation: int,
+        columns: int = 2,
+    ) -> None:
+        """Admit one newer layout without disturbing the currently painted front."""
+
+        self._require_owner()
+        self._ensure_open()
+        ids, column_count = _validated_panel_layout(panel_ids, columns)
+        identity = (
+            canonical_text(board_id, "board_id"),
+            nonnegative_integer(layout_generation, "layout_generation"),
+        )
+        current = self._staged_layout
+        floor = (
+            self._active_layout_identity
+            if current is None
+            else (current[0], current[1])
+        )
+        if floor is not None:
+            if identity[0] != floor[0]:
+                raise ValueError("QtRasterBoard cannot change board identity")
+            if identity[1] <= floor[1]:
+                raise ValueError("staged layout_generation must increase")
+        self._staged_layout = (*identity, ids, column_count)
+        if self._selector_interaction_announced:
+            self._cancel_rectangle_gesture(clear_draft=True)
+            self.update()
+
+    def discard_staged_layout(
+        self,
+        *,
+        board_id: str,
+        layout_generation: int,
+    ) -> bool:
+        """Discard only the named unpresented layout, preserving the old front."""
+
+        self._require_owner()
+        if self._closed:
+            return False
+        identity = (
+            canonical_text(board_id, "board_id"),
+            nonnegative_integer(layout_generation, "layout_generation"),
+        )
+        staged = self._staged_layout
+        if staged is None or (staged[0], staged[1]) != identity:
+            return False
+        self._staged_layout = None
+        self.update()
+        return True
 
     def present(self, frame: BoardFrame) -> None:
         self._require_owner()
+        self._ensure_open()
         interaction_was_active = self._selector_interaction_announced
+        promoting = False
+        target_panel_ids = self._panel_ids
+        target_columns = self._columns
+        target_identity = self._active_layout_identity
         try:
             if not isinstance(frame, BoardFrame):
                 raise TypeError("frame must be BoardFrame")
-            if tuple(panel.panel_id for panel in frame.panels) != self._panel_ids:
+            frame_identity = (frame.board_id, frame.layout_generation)
+            frame_panel_ids = tuple(panel.panel_id for panel in frame.panels)
+            staged = self._staged_layout
+            if staged is not None:
+                staged_identity = (staged[0], staged[1])
+                if frame_identity != staged_identity or frame_panel_ids != staged[2]:
+                    raise ValueError(
+                        "QtRasterBoard frame does not match its staged layout identity"
+                    )
+                promoting = True
+                target_identity = staged_identity
+                target_panel_ids = staged[2]
+                target_columns = staged[3]
+            elif frame_panel_ids != self._panel_ids:
                 raise ValueError(
                     "QtRasterBoard frame does not match its configured panel order"
                 )
+            elif (
+                self._active_layout_identity is not None
+                and frame_identity != self._active_layout_identity
+            ):
+                raise ValueError(
+                    "QtRasterBoard frame does not match its active layout identity"
+                )
+            else:
+                target_identity = frame_identity
             prepared = tuple(_prepared_qimage(panel.raster) for panel in frame.panels)
-            if self._selector_panel_id is not None and self._selector_viewport is not None:
+            if (
+                self._selector_panel_id is not None
+                and self._selector_panel_id in target_panel_ids
+                and self._selector_viewport is not None
+            ):
                 self._validate_selector_binding(
                     self._selector_panel_id,
                     self._selector_viewport,
                     frame,
                     prepared,
+                    panel_ids=target_panel_ids,
                 )
         except BaseException:
+            if promoting:
+                self._staged_layout = None
             if interaction_was_active:
                 self._cancel_rectangle_gesture(clear_draft=True)
                 self.update()
             raise
         previous = self._front
-        if previous is not None and self._selector_panel_id is not None:
-            index = self._panel_ids.index(self._selector_panel_id)
-            if previous[0].panels[index].source_identity != frame.panels[index].source_identity:
-                self._selector_applied_bounds = None
-                self._selector_draft_bounds = None
+        if self._selector_panel_id is not None:
+            panel_id = self._selector_panel_id
+            if panel_id not in target_panel_ids:
+                self._reset_rectangle_selector()
+            elif previous is not None:
+                old_index = self._panel_ids.index(panel_id)
+                new_index = target_panel_ids.index(panel_id)
+                if (
+                    previous[0].panels[old_index].source_identity
+                    != frame.panels[new_index].source_identity
+                ):
+                    self._selector_applied_bounds = None
+                    self._selector_draft_bounds = None
+        if promoting:
+            self._panel_ids = target_panel_ids
+            self._columns = target_columns
+            self._staged_layout = None
+        self._active_layout_identity = target_identity
         self._front = (frame, prepared)
         if interaction_was_active:
             self._cancel_rectangle_gesture(clear_draft=True)
@@ -290,6 +413,8 @@ class QtRasterBoard(QtWidgets.QWidget):
     def clear(self) -> None:
         self._require_owner()
         self._front = None
+        self._active_layout_identity = None
+        self._staged_layout = None
         self._cancel_rectangle_gesture(clear_draft=True)
         self._selector_applied_bounds = None
         self.update()
@@ -527,12 +652,18 @@ class QtRasterBoard(QtWidgets.QWidget):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._reset_rectangle_selector()
         self._front = None
+        self._active_layout_identity = None
+        self._staged_layout = None
+        self._closed = True
         super().closeEvent(event)
 
     def event(self, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.DeferredDelete:
             self._reset_rectangle_selector()
             self._front = None
+            self._active_layout_identity = None
+            self._staged_layout = None
+            self._closed = True
         elif event.type() in (QtCore.QEvent.Hide, QtCore.QEvent.WindowDeactivate) and (
             getattr(self, "_selector_interaction_announced", False)
         ):
@@ -552,8 +683,11 @@ class QtRasterBoard(QtWidgets.QWidget):
         viewport: ImageViewportTransform,
         frame,
         prepared,
+        *,
+        panel_ids: tuple[str, ...] | None = None,
     ) -> None:
-        index = self._panel_ids.index(panel_id)
+        configured_ids = self._panel_ids if panel_ids is None else panel_ids
+        index = configured_ids.index(panel_id)
         image = prepared[index][1]
         expected_height, expected_width = viewport.raster_shape
         if image.width() != expected_width or image.height() != expected_height:
@@ -776,6 +910,10 @@ class QtRasterBoard(QtWidgets.QWidget):
     def _require_owner(self) -> None:
         if QtCore.QThread.currentThread() != self.thread():
             raise RuntimeError("QtRasterBoard presentation is GUI-thread affine")
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("QtRasterBoard is closed")
 
 
 __all__ = ["QtImageBoard", "QtOwnerWake", "QtRasterBoard"]

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import threading
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 import weakref
 
 from zlc_frontend import (
@@ -207,7 +207,12 @@ class BoardController:
             raise TypeError("request_owner_wake must be callable")
         self._owner_thread = threading.get_ident()
         self._lock = threading.Lock()
-        self._model = model
+        # Covers dequeue -> presenter.present -> model promotion.  Worker-side
+        # revocation uses the same gate, so an already dequeued frame either
+        # presents wholly before a fault or is revoked wholly before present.
+        self._present_gate = threading.Lock()
+        self._active_model = model
+        self._staged_model: BoardModel | None = None
         self._presenter: BoardPresenter | None = presenter
         self._request_owner_wake = request_owner_wake
         self._pending: BoardFrame | None = None
@@ -223,7 +228,7 @@ class BoardController:
     @property
     def model(self) -> BoardModel:
         with self._lock:
-            return self._model
+            return self._staged_model or self._active_model
 
     @property
     def fault(self) -> BaseException | None:
@@ -234,15 +239,28 @@ class BoardController:
         self._require_owner()
         if not isinstance(model, BoardModel):
             raise TypeError("model must be BoardModel")
-        if model.board_id != self._model.board_id:
-            raise ValueError("BoardController cannot change board identity")
-        if model.layout_generation <= self._model.layout_generation:
-            raise ValueError("reconfigure requires a newer layout_generation")
         with self._lock:
             self._ensure_usable()
-            self._model = model
+            target = self._staged_model or self._active_model
+            if model.board_id != target.board_id:
+                raise ValueError("BoardController cannot change board identity")
+            if model.layout_generation <= target.layout_generation:
+                raise ValueError("reconfigure requires a newer layout_generation")
+            self._staged_model = model
             self._revoke_source_locked()
-        self._clear_presenter()
+
+    def discard_staged_model(self, model: BoardModel) -> bool:
+        """Rollback only the named unpresented model without clearing the front."""
+
+        self._require_owner()
+        if not isinstance(model, BoardModel):
+            raise TypeError("model must be BoardModel")
+        with self._lock:
+            if self._closed or self._staged_model is not model:
+                return False
+            self._staged_model = None
+            self._revoke_source_locked()
+            return True
 
     def open_publish_port(
         self,
@@ -255,16 +273,16 @@ class BoardController:
         by_panel = {value.panel_id: value for value in bindings}
         if len(by_panel) != len(bindings):
             raise ValueError("panel source bindings must have unique panel ids")
-        expected = set(self._model.panel_ids)
-        if set(by_panel) != expected:
-            raise ValueError("source bindings must cover every active panel exactly")
         token = object()
         with self._lock:
             self._ensure_usable()
+            target = self._staged_model or self._active_model
+            expected = set(target.panel_ids)
+            if set(by_panel) != expected:
+                raise ValueError("source bindings must cover every target panel exactly")
             self._revoke_source_locked()
             self._publish_token = token
             self._source_bindings = by_panel
-        self._clear_presenter()
         return BoardPublishPort(self, token)
 
     def invalidate(self) -> None:
@@ -274,8 +292,56 @@ class BoardController:
         with self._lock:
             if self._closed:
                 return
+            self._staged_model = None
             self._revoke_source_locked()
         self._clear_presenter()
+
+    def freeze_front(self) -> None:
+        """Revoke pending publication while retaining the last coherent front."""
+
+        self._require_owner()
+        self.revoke_pending_publication()
+
+    def revoke_pending_publication(
+        self,
+        before_revoke: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Fence presentation, install an optional owner fact, then revoke.
+
+        ``before_revoke`` runs while the presentation gate excludes dequeue and
+        presenter callbacks.  It lets a controller publish its local failure or
+        withdrawal fact at the same boundary as Board capability revocation,
+        without ever holding that controller's lock while waiting for this
+        gate.  Returning ``False`` means that the local fact was stale and the
+        Board must remain untouched.
+        """
+
+        if before_revoke is not None and not callable(before_revoke):
+            raise TypeError("before_revoke must be callable")
+        with self._present_gate:
+            try:
+                should_revoke = (
+                    True if before_revoke is None else before_revoke()
+                )
+            except BaseException:
+                # A broken state callback must not leave a formerly admitted
+                # frame eligible for a later present.
+                with self._lock:
+                    if not self._closed:
+                        self._revoke_source_locked()
+                raise
+            if not isinstance(should_revoke, bool):
+                with self._lock:
+                    if not self._closed:
+                        self._revoke_source_locked()
+                raise TypeError("before_revoke must return bool")
+            if not should_revoke:
+                return False
+            with self._lock:
+                if self._closed:
+                    return False
+                self._revoke_source_locked()
+            return True
 
     def _admit_work(
         self,
@@ -315,8 +381,9 @@ class BoardController:
                 raise RuntimeError("board publish port is revoked")
             if sequence <= self._requested_sequence:
                 raise ValueError("board work sequence must increase")
+            target = self._staged_model or self._active_model
             model_groups: dict[str, list[str]] = {}
-            for panel in self._model.panels:
+            for panel in target.panels:
                 model_groups.setdefault(panel.coherence_group, []).append(
                     panel.panel_id
                 )
@@ -381,7 +448,7 @@ class BoardController:
                 or work_token is not self._work_token
             ):
                 return False
-            model = self._model
+            model = self._staged_model or self._active_model
             if frame.board_id != model.board_id:
                 raise ValueError("frame belongs to another board")
             if frame.layout_generation != model.layout_generation:
@@ -417,8 +484,8 @@ class BoardController:
                 with self._lock:
                     if token is self._publish_token:
                         self._fault = detached_render_fault(exc)
-                        self._pending = None
-                        self._publish_token = None
+                        self._staged_model = None
+                        self._revoke_source_locked()
                 raise
         return True
 
@@ -426,25 +493,36 @@ class BoardController:
         """Owner-thread atomic board flip; never presents individual panels separately."""
 
         self._require_owner()
-        with self._lock:
-            if self._closed:
-                return False
-            self._ensure_usable()
-            self._wake_queued = False
-            frame, self._pending = self._pending, None
-        if frame is None:
-            return False
-        try:
-            presenter = self._presenter
-            if presenter is None:
-                return False
-            presenter.present(frame)
-        except BaseException as exc:
+        with self._present_gate:
             with self._lock:
-                self._fault = detached_render_fault(exc)
-                self._pending = None
-            raise
-        return True
+                if self._closed:
+                    return False
+                self._ensure_usable()
+                self._wake_queued = False
+                frame, self._pending = self._pending, None
+                presented_model = self._staged_model or self._active_model
+            if frame is None:
+                return False
+            try:
+                presenter = self._presenter
+                if presenter is None:
+                    return False
+                presenter.present(frame)
+            except BaseException as exc:
+                with self._lock:
+                    self._fault = detached_render_fault(exc)
+                    self._staged_model = None
+                    self._revoke_source_locked()
+                raise
+            with self._lock:
+                if (
+                    frame.board_id == presented_model.board_id
+                    and frame.layout_generation == presented_model.layout_generation
+                ):
+                    self._active_model = presented_model
+                    if self._staged_model is presented_model:
+                        self._staged_model = None
+            return True
 
     def close(self) -> None:
         self._require_owner()
@@ -458,6 +536,7 @@ class BoardController:
             self._work_token = None
             self._expected_stamps = {}
             self._wake_queued = False
+            self._staged_model = None
             self._closed = True
             presenter = self._presenter
             self._request_owner_wake = None
@@ -487,8 +566,8 @@ class BoardController:
         except BaseException as exc:
             with self._lock:
                 self._fault = detached_render_fault(exc)
-                self._pending = None
-                self._publish_token = None
+                self._staged_model = None
+                self._revoke_source_locked()
             raise
 
     def _revoke_source_locked(self) -> None:

@@ -1533,6 +1533,11 @@ class MonitorTap(Generic[PayloadT]):
         return self._take(owner, latest=True)
 
     def _source_ended(self, error: StreamError | None) -> None:
+        self._terminalize_from_source(error)
+
+    def _terminalize_from_source(self, error: StreamError | None) -> None:
+        """Non-callback terminal fallback owned by the stream fan-out path."""
+
         with self._condition:
             self._source_finished = True
             self._terminal_error = error
@@ -1812,6 +1817,8 @@ class AcquisitionStream(Generic[PayloadT]):
         with self._condition:
             if self._closed:
                 if self._terminal_error is not None:
+                    if self._monitors:
+                        self._close_generation_locked(self._terminal_error)
                     raise self._terminal_error
                 raise StreamEndedEarly("cannot emit after end-of-stream")
             sequence = self._next_sequence
@@ -1893,7 +1900,10 @@ class AcquisitionStream(Generic[PayloadT]):
                         raise StreamBackpressure(
                             "exact consumer exceeded its byte backlog budget"
                         )
-                self._trim_locked(extra_events=1, extra_bytes=size)
+                trim_removals = self._plan_trim_locked(
+                    extra_events=1,
+                    extra_bytes=size,
+                )
             except StreamBackpressure as error:
                 if self.flow_control is ProducerFlowControl.BACKPRESSURE_CAPABLE:
                     raise
@@ -1912,33 +1922,84 @@ class AcquisitionStream(Generic[PayloadT]):
                 self._close_generation_locked(overrun)
                 raise overrun from error
             stored = _Stored(envelope, size)
-            self._records[sequence] = stored
-            self._order.append(sequence)
-            self._retained_bytes += size
-            self._next_sequence += 1
-            for reservation in self._reservations.values():
-                if (
-                    reservation._state
-                    in (ReservationState.RESERVED, ReservationState.ACTIVE, ReservationState.DRAINING)
-                    and reservation.start_sequence <= sequence < reservation.end_sequence
-                ):
-                    reservation._unacked_bytes += size
-                    if self._next_sequence >= reservation.end_sequence and reservation._state is ReservationState.ACTIVE:
-                        reservation._state = ReservationState.DRAINING
-            for monitor in tuple(self._monitors):
-                monitor._offer(stored)
-            self._condition.notify_all()
+            committed_next_sequence = sequence + 1
+            # This counter is the first authoritative mutation of publication.
+            # Callers with the exclusive producer can therefore use its delta
+            # as a precise commit outcome even when a wrapper raises after emit.
+            # Anything failing after this marker terminalizes the generation;
+            # partially offered records can never be mistaken for a retryable
+            # pre-publication failure.
+            try:
+                self._next_sequence = committed_next_sequence
+                self._apply_trim_locked(trim_removals)
+                self._records[sequence] = stored
+                self._order.append(sequence)
+                self._retained_bytes += size
+                for reservation in self._reservations.values():
+                    if (
+                        reservation._state
+                        in (
+                            ReservationState.RESERVED,
+                            ReservationState.ACTIVE,
+                            ReservationState.DRAINING,
+                        )
+                        and reservation.start_sequence
+                        <= sequence
+                        < reservation.end_sequence
+                    ):
+                        reservation._unacked_bytes += size
+                        if (
+                            self._next_sequence >= reservation.end_sequence
+                            and reservation._state is ReservationState.ACTIVE
+                        ):
+                            reservation._state = ReservationState.DRAINING
+                for monitor in tuple(self._monitors):
+                    monitor._offer(stored)
+                self._condition.notify_all()
+            except BaseException as error:
+                if self._next_sequence == sequence:
+                    # Every fallible preparation step, including the retention
+                    # plan and stored-record allocation, precedes the marker.
+                    # A failure to install the marker therefore leaves the
+                    # generation byte-for-byte retryable.
+                    raise
+                failure = SourceFailed(
+                    "stream publication failed after authoritative sequence "
+                    f"{sequence} committed: {type(error).__name__}: {error}"
+                )
+                self._terminal_error = failure
+                for reservation in self._reservations.values():
+                    if reservation._state in (
+                        ReservationState.RESERVED,
+                        ReservationState.ACTIVE,
+                        ReservationState.DRAINING,
+                    ):
+                        reservation._state = ReservationState.FAILED
+                self._close_generation_locked(failure)
+                raise failure from error
         return envelope
 
     def _close_generation_locked(self, error: StreamError | None) -> None:
         """Publish one terminal state to every monitor while the stream lock is held."""
 
         self._closed = True
-        monitors = tuple(self._monitors)
-        self._monitors.clear()
-        for monitor in monitors:
-            monitor._source_ended(error)
-        self._condition.notify_all()
+        try:
+            while self._monitors:
+                monitor = self._monitors.pop()
+                try:
+                    monitor._source_ended(error)
+                except BaseException:
+                    # Terminal delivery is cleanup, not an extension callback.
+                    # If the normal method boundary itself is corrupted, invoke
+                    # the sealed state transition directly so one tap cannot
+                    # strand every remaining consumer after the set was cleared.
+                    try:
+                        MonitorTap._terminalize_from_source(monitor, error)
+                    except BaseException:
+                        self._monitors.add(monitor)
+                        raise
+        finally:
+            self._condition.notify_all()
 
     def _finish(self, producer: AcquisitionProducer[PayloadT]) -> EndOfStream:
         with self._condition:
@@ -1947,6 +2008,8 @@ class AcquisitionStream(Generic[PayloadT]):
             if self._terminal_error is not None:
                 raise self._terminal_error
             if self._eos is not None:
+                if self._monitors:
+                    self._close_generation_locked(None)
                 return self._eos
             if self._formal_rebind_required:
                 raise StreamEndedEarly(
@@ -1988,6 +2051,8 @@ class AcquisitionStream(Generic[PayloadT]):
                 raise StreamEndedEarly("completed stream generation cannot be superseded")
             if isinstance(self._terminal_error, SchemaChanged):
                 if self._terminal_error.replacement == replacement:
+                    if self._monitors:
+                        self._close_generation_locked(self._terminal_error)
                     return
                 raise StreamEndedEarly("stream generation was already superseded")
             if self._terminal_error is not None:
@@ -2009,6 +2074,8 @@ class AcquisitionStream(Generic[PayloadT]):
                 raise StreamEndedEarly("completed stream cannot fail")
             if self._terminal_error is not None:
                 if self._terminal_error is error:
+                    if self._monitors:
+                        self._close_generation_locked(error)
                     return
                 raise StreamEndedEarly("stream already has a terminal failure")
             self._terminal_error = error
@@ -2367,35 +2434,47 @@ class AcquisitionStream(Generic[PayloadT]):
         ]
         return min(watermarks) if watermarks else None
 
-    def _trim_locked(self, *, extra_events: int = 0, extra_bytes: int = 0) -> None:
+    def _plan_trim_locked(
+        self,
+        *,
+        extra_events: int = 0,
+        extra_bytes: int = 0,
+    ) -> int:
         protected = self._protected_sequence_locked()
-        prospective_order = deque(self._order)
+        prospective_count = len(self._order)
         prospective_bytes = self._retained_bytes
-        removals: list[int] = []
-        while prospective_order and protected is not None and prospective_order[0] < protected:
-            oldest = prospective_order.popleft()
-            prospective_bytes -= self._records[oldest].payload_bytes
-            removals.append(oldest)
-        while prospective_order and (
-            len(prospective_order) + extra_events > self.retention_events
-            or prospective_bytes + extra_bytes > self.retention_bytes
-        ):
-            oldest = prospective_order[0]
-            if protected is not None and oldest >= protected:
+        removal_count = 0
+        for oldest in self._order:
+            below_protected_watermark = protected is not None and oldest < protected
+            over_capacity = (
+                prospective_count + extra_events > self.retention_events
+                or prospective_bytes + extra_bytes > self.retention_bytes
+            )
+            if not below_protected_watermark and not over_capacity:
+                break
+            if not below_protected_watermark and protected is not None:
                 raise StreamBackpressure("stream retention is pinned by an unacknowledged exact cursor")
-            prospective_order.popleft()
+            prospective_count -= 1
             prospective_bytes -= self._records[oldest].payload_bytes
-            removals.append(oldest)
-        if len(prospective_order) + extra_events > self.retention_events:
+            removal_count += 1
+        if prospective_count + extra_events > self.retention_events:
             raise StreamBackpressure("stream event retention capacity is exhausted")
         if prospective_bytes + extra_bytes > self.retention_bytes:
             raise StreamBackpressure("stream byte retention capacity is exhausted")
-        for oldest in removals:
-            actual = self._order.popleft()
-            if actual != oldest:
-                raise RuntimeError("stream retention order changed while locked")
+        return removal_count
+
+    def _apply_trim_locked(self, removal_count: int) -> None:
+        for _ in range(removal_count):
+            oldest = self._order.popleft()
             removed = self._records.pop(oldest)
             self._retained_bytes -= removed.payload_bytes
+
+    def _trim_locked(self, *, extra_events: int = 0, extra_bytes: int = 0) -> None:
+        removal_count = self._plan_trim_locked(
+            extra_events=extra_events,
+            extra_bytes=extra_bytes,
+        )
+        self._apply_trim_locked(removal_count)
 
 
 __all__ = [

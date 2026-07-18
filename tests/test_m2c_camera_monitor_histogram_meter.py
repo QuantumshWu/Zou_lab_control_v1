@@ -426,6 +426,9 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
         fault = None
         front_status = status
 
+        def reconcile_faults(self):
+            return False
+
         def admit_pending(self):
             events.append("admit")
             assert board.front_sequence == status.sequence
@@ -434,6 +437,7 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
     harness = SimpleNamespace(
         _drain_results=lambda: None,
         _drain_attachments=lambda: None,
+        _drain_roi_controls=lambda: None,
         _live=Live(),
         _board=board,
         _selector_interacting=False,
@@ -441,6 +445,7 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
         _slot=None,
         _run_owner=SimpleNamespace(take_pending_snapshot=lambda: None),
         _refresh_view_status=lambda: events.append("status"),
+        _record_local_failure=lambda message: events.append(("failure", message)),
         _maybe_finish_close=lambda: None,
     )
     CameraMonitorWorkbenchWindow._owner_cycle(harness)
@@ -462,13 +467,107 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
             front_frame=SimpleNamespace(sequence=6),
         ),
         _projection_text="projection",
+        _roi_presentation_failure=None,
         _view_status=label,
         _handle=None,
-        _reconcile_visible_roi=lambda _status: None,
+        _reconcile_visible_roi=lambda _status: True,
         _update_roi_controls=lambda: None,
     )
     CameraMonitorWorkbenchWindow._refresh_view_status(status_harness)
-    assert label.text.endswith("diagnostics pending")
+    assert label.text == "View: WAITING · previous front retained · diagnostics pending"
     status_harness._board_widget.front_frame = SimpleNamespace(sequence=7)
     CameraMonitorWorkbenchWindow._refresh_view_status(status_harness)
     assert "raw missed=0" in label.text
+
+
+def test_close_failure_after_front_clear_immediately_drops_visible_label():
+    board_widget = SimpleNamespace(has_front=True)
+    projection_label = SimpleNamespace(text=None)
+    projection_label.setText = lambda value: setattr(
+        projection_label,
+        "text",
+        value,
+    )
+
+    class Live:
+        def close(self):
+            board_widget.has_front = False
+            raise RuntimeError("synthetic cleanup failure after front clear")
+
+    harness = SimpleNamespace(
+        _live=Live(),
+        _fold_roi_state_for_detach=lambda: None,
+        _board_widget=board_widget,
+        _visible_binding_fingerprint="binding",
+        _visible_projection_text="old projection",
+        _projection_text="target projection",
+        _projection_status=projection_label,
+    )
+    harness._show_projection_target = lambda: (
+        CameraMonitorWorkbenchWindow._show_projection_target(harness)
+    )
+
+    with pytest.raises(RuntimeError, match="cleanup failure after front clear"):
+        CameraMonitorWorkbenchWindow._close_live(harness)
+
+    assert harness._visible_binding_fingerprint is None
+    assert harness._visible_projection_text is None
+    assert projection_label.text == "Display: no coherent front · target target projection"
+
+
+def test_selector_end_cannot_resume_a_sticky_presentation_failure():
+    calls = []
+    live = SimpleNamespace(
+        fault=None,
+        pause=lambda: calls.append("pause"),
+        resume=lambda: calls.append("resume"),
+    )
+    harness = SimpleNamespace(
+        _live=live,
+        _slot=SimpleNamespace(
+            failure=None,
+            notification_failure=None,
+            terminal=False,
+            withdrawn=False,
+        ),
+        _board=SimpleNamespace(fault=None),
+        _roi_presentation_failure="sticky presentation failure",
+        _selector_interacting=False,
+    )
+
+    CameraMonitorWorkbenchWindow._sync_live_pause(harness)
+
+    assert calls == ["pause"]
+
+
+def test_every_presentation_failure_path_freezes_before_recording_status():
+    events = []
+    status = SimpleNamespace(text=None)
+    status.setText = lambda value: setattr(status, "text", value)
+    request = object()
+    harness = SimpleNamespace(
+        _live=SimpleNamespace(
+            freeze_presentation=lambda: events.append("freeze")
+        ),
+        _applied_request=None,
+        _request=None,
+        _draft_selection=None,
+        _roi_presentation_failure=None,
+        _roi_terminal_notice=None,
+        _roi_status=status,
+        _record_local_failure=lambda _message: events.append("record"),
+        _update_roi_controls=lambda: events.append("controls"),
+    )
+
+    CameraMonitorWorkbenchWindow._record_roi_presentation_failure(
+        harness,
+        "pre-adopt authority mismatch",
+        RuntimeError("synthetic pre-adopt failure"),
+        request=request,
+        state=None,
+        draft_selection=None,
+    )
+
+    assert events == ["freeze", "record", "controls"]
+    assert harness._applied_request is request and harness._request is request
+    assert "synthetic pre-adopt failure" in harness._roi_presentation_failure

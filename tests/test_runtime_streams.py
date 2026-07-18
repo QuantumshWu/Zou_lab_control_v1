@@ -818,6 +818,78 @@ def test_rejected_emit_has_no_retention_side_effects():
     assert cursor.next().envelope is expected
 
 
+def test_prepublication_record_failure_keeps_existing_retention(monkeypatch):
+    source, producer = stream(events=1)
+    cursor = source.subscribe(start_sequence=0)
+    expected = emit(producer, 1.0)
+
+    def fail_stored_record(*_args, **_kwargs):
+        raise MemoryError("synthetic stored-record allocation failure")
+
+    monkeypatch.setattr(runtime_streams, "_Stored", fail_stored_record)
+    with pytest.raises(MemoryError, match="stored-record allocation"):
+        emit(producer, 2.0)
+
+    assert source.next_sequence == 1
+    assert source.retained_events == 1
+    assert cursor.next().envelope is expected
+
+
+def test_no_eviction_publish_does_not_scan_the_retained_backlog():
+    source, producer = stream(events=128)
+    for index in range(64):
+        emit(producer, float(index))
+
+    class CountingOrder:
+        def __init__(self, values):
+            self.values = runtime_streams.deque(values)
+            self.iterated = 0
+
+        def __len__(self):
+            return len(self.values)
+
+        def __iter__(self):
+            for value in self.values:
+                self.iterated += 1
+                yield value
+
+        def append(self, value):
+            self.values.append(value)
+
+        def popleft(self):
+            return self.values.popleft()
+
+    order = CountingOrder(source._order)
+    source._order = order
+    emit(producer, 64.0)
+
+    assert order.iterated == 1
+
+
+def test_first_post_marker_failure_terminalizes_without_retryable_hole(monkeypatch):
+    source, producer = stream(events=1)
+    emit(producer, 1.0)
+    real_apply_trim = AcquisitionStream._apply_trim_locked
+
+    def fail_target_trim(self, removals):
+        if self is source:
+            raise RuntimeError("synthetic first post-marker failure")
+        return real_apply_trim(self, removals)
+
+    monkeypatch.setattr(AcquisitionStream, "_apply_trim_locked", fail_target_trim)
+    with pytest.raises(SourceFailed, match="authoritative sequence 1 committed"):
+        emit(producer, 2.0)
+
+    assert source.next_sequence == 2
+    with pytest.raises(SourceFailed, match="authoritative sequence 1 committed"):
+        producer.emit(
+            scalar_value(3.0),
+            captured_at=3.0,
+            trace=trace(),
+            join_key=(0, 3),
+        )
+
+
 def test_non_backpressure_overrun_permanently_poisons_generation():
     source, producer = stream(
         events=1,
@@ -862,6 +934,32 @@ def test_first_terminal_fact_cannot_be_replaced():
         producer2.fail(SourceFailed("late failure"))
     with pytest.raises(SchemaChanged):
         source2.subscribe(start_sequence=0).next()
+
+
+def test_one_broken_terminal_tap_cannot_strand_the_remaining_fanout(monkeypatch):
+    source, producer = stream()
+    broken = source.monitor(max_events=1, max_bytes=8)
+    healthy = source.monitor(max_events=1, max_bytes=8)
+    real_source_ended = runtime_streams.MonitorTap._source_ended
+
+    def fail_one_tap(self, error):
+        if self is broken:
+            raise RuntimeError("synthetic terminal tap failure")
+        return real_source_ended(self, error)
+
+    monkeypatch.setattr(
+        runtime_streams.MonitorTap,
+        "_source_ended",
+        fail_one_tap,
+    )
+    failure = SourceFailed("driver terminal truth")
+    producer.fail(failure)
+
+    for tap in (broken, healthy):
+        with pytest.raises(SourceFailed, match="driver terminal truth") as caught:
+            tap.next(0.0)
+        assert caught.value is failure
+    assert source._closed and not source._monitors
 
 
 def test_producer_owns_stream_but_terminal_receipt_does_not_create_a_cycle():

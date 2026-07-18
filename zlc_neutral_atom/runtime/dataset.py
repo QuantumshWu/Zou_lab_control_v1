@@ -1778,6 +1778,21 @@ class ExactDatasetPreviewReader:
             return builder.materialize()
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _AppendWindowReplacement(Generic[PayloadT]):
+    """Fully written append-window shadow awaiting one authoritative envelope."""
+
+    payload: PayloadT
+    payload_digest: str
+    base_revision: int
+    expected_sequence: int
+    values: np.ndarray
+    written: np.ndarray
+    validity: np.ndarray
+    cell_metadata: list[object | None]
+    event_refs: list[EventRef | None]
+
+
 class MonitorDataset(Generic[PayloadT]):
     """Sequence-owned live materializer; never a formal artifact authority."""
 
@@ -1881,6 +1896,7 @@ class MonitorDataset(Generic[PayloadT]):
             self._head: EventRef | None = None
             self._next_slot = 0
             self._count = 0
+            self._append_replacement: _AppendWindowReplacement[PayloadT] | None = None
             self._aborted = False
         except BaseException:
             source.close()
@@ -1897,13 +1913,185 @@ class MonitorDataset(Generic[PayloadT]):
 
     def ingest_next(self, timeout: float | None = None) -> DatasetRevisionRef:
         with self._consume_lock:
+            with self._lock:
+                if self._append_replacement is not None:
+                    raise DatasetError(
+                        "ordinary monitor ingest cannot consume a staged append replacement"
+                    )
             update = self._monitor._next_for(self, timeout)
             return self._ingest(update)
 
     def ingest_latest(self) -> DatasetRevisionRef:
         with self._consume_lock:
+            with self._lock:
+                if self._append_replacement is not None:
+                    raise DatasetError(
+                        "ordinary monitor ingest cannot consume a staged append replacement"
+                    )
             update = self._monitor._latest_for(self)
             return self._ingest(update)
+
+    def prepare_append_replacement(
+        self,
+        payload: PayloadT,
+    ) -> _AppendWindowReplacement[PayloadT]:
+        """Write every fallible part of one fresh append window before publish.
+
+        The returned private token is not a stream event.  Until a matching
+        authoritative envelope is committed, the existing materialization and
+        its sequence watermark remain untouched.
+        """
+
+        with self._consume_lock:
+            with self._lock:
+                self._ensure_writable_locked()
+                if self._cycle_schedule is not None:
+                    raise DatasetError(
+                        "prepare_append_replacement requires an append window"
+                    )
+                if self._append_replacement is not None:
+                    raise DatasetError("append replacement is already pending")
+
+                contract = self.edge.payload_contract
+                owned_payload = contract.snapshot(payload)
+                contract.validate(owned_payload)
+                retained = contract.retained_nbytes(owned_payload)
+                if (
+                    isinstance(retained, bool)
+                    or not isinstance(retained, Integral)
+                    or retained <= 0
+                    or retained > self.edge.payload_max_retained_nbytes
+                ):
+                    raise ValueError(
+                        "append replacement payload exceeds its retained-byte contract"
+                    )
+                payload_digest = _sha256_digest(
+                    contract.digest(owned_payload),
+                    "append replacement payload digest",
+                )
+                value, metadata, _digest = _project_payload(
+                    self.edge,
+                    owned_payload,
+                    include_metadata_digest=False,
+                )
+                validity_mask = _value_validity_mask(self.schema, value.validity)
+                total_cells = (
+                    self.schema.repeat_axis.size
+                    * self.schema.point_layout.storage_size
+                )
+                values = np.zeros(
+                    self.schema.physical_shape,
+                    dtype=self.schema.cell_schema.dtype,
+                )
+                written = np.zeros(self.schema.physical_shape[:2], dtype=bool)
+                validity = _new_validity_storage(self.schema)
+                cell_metadata: list[object | None] = [None] * total_cells
+                event_refs: list[EventRef | None] = [None] * total_cells
+                _write_cell(
+                    (0, 0),
+                    value,
+                    validity_mask,
+                    values,
+                    written,
+                    validity,
+                )
+                cell_metadata[0] = metadata
+                replacement = _AppendWindowReplacement(
+                    owned_payload,
+                    payload_digest,
+                    self._revision,
+                    0 if self._last_sequence is None else self._last_sequence + 1,
+                    values,
+                    written,
+                    validity,
+                    cell_metadata,
+                    event_refs,
+                )
+                self._append_replacement = replacement
+                return replacement
+
+    def abort_append_replacement(
+        self,
+        replacement: _AppendWindowReplacement[PayloadT],
+    ) -> None:
+        """Discard exactly one unpublished replacement without touching history."""
+
+        with self._consume_lock:
+            with self._lock:
+                self._ensure_writable_locked()
+                if self._append_replacement is not replacement:
+                    raise DatasetError("append replacement token is not pending")
+                self._append_replacement = None
+
+    def commit_append_replacement(
+        self,
+        replacement: _AppendWindowReplacement[PayloadT],
+        envelope: Envelope[PayloadT],
+        *,
+        timeout: float | None = 0.0,
+    ) -> None:
+        """Bind a published envelope to a fully written shadow and swap owners.
+
+        No projector, allocator, reducer, or cell writer is called after the
+        stream publication boundary.  A failure here is therefore an internal
+        stream/tap identity violation; callers must retire the generation rather
+        than resume its old binding.
+        """
+
+        if not isinstance(envelope, Envelope):
+            raise TypeError("append replacement envelope must be Envelope")
+        with self._consume_lock:
+            with self._lock:
+                self._ensure_writable_locked()
+                if self._append_replacement is not replacement:
+                    raise DatasetError("append replacement token is not pending")
+            try:
+                update = self._monitor._next_for(self, timeout)
+                with self._lock:
+                    self._ensure_writable_locked()
+                    if self._append_replacement is not replacement:
+                        raise DatasetError("append replacement changed during commit")
+                    if update.envelope is not envelope:
+                        raise DatasetError(
+                            "append replacement consumed another stream envelope"
+                        )
+                    self._validate_envelope_identity_locked(envelope)
+                    if envelope.payload_digest != replacement.payload_digest:
+                        raise DatasetError(
+                            "append replacement payload digest changed at publication"
+                        )
+                    if envelope.sequence != replacement.expected_sequence:
+                        raise DatasetError(
+                            "append replacement sequence differs from its staged watermark"
+                        )
+                    if update.missed != 0:
+                        raise DatasetError(
+                            "append replacement publication overwrote an unconsumed event"
+                        )
+                    if self._revision != replacement.base_revision:
+                        raise DatasetError(
+                            "append replacement base revision changed before commit"
+                        )
+
+                    replacement.event_refs[0] = envelope.ref
+                    self._values = replacement.values
+                    self._written = replacement.written
+                    self._validity = replacement.validity
+                    self._cell_metadata = replacement.cell_metadata
+                    self._event_refs = replacement.event_refs
+                    capacity = self.schema.point_layout.storage_size
+                    self._next_slot = 1 % capacity
+                    self._count = 1
+                    self._missed_events = 0
+                    self._last_sequence = envelope.sequence
+                    self._head = envelope.ref
+                    self._revision += 1
+                    self._append_replacement = None
+            except BaseException:
+                with self._lock:
+                    if self._append_replacement is replacement:
+                        self._append_replacement = None
+                raise
 
     def _ingest(self, update: MonitorUpdate[PayloadT]) -> DatasetRevisionRef:
         envelope = update.envelope
@@ -1916,20 +2104,35 @@ class MonitorDataset(Generic[PayloadT]):
         with self._lock:
             self._ensure_writable_locked()
             self._validate_envelope_identity_locked(envelope)
-            expected_sequence = 0 if self._last_sequence is None else self._last_sequence + 1
+            expected_sequence = (
+                0 if self._last_sequence is None else self._last_sequence + 1
+            )
             if envelope.sequence < expected_sequence:
-                raise DatasetError("monitor dataset events must remain strictly ordered")
+                raise DatasetError(
+                    "monitor dataset events must remain strictly ordered"
+                )
             sequence_gap = envelope.sequence - expected_sequence
-            self._missed_events += max(update.missed, sequence_gap)
             if self._cycle_schedule is None:
-                cell = (0, self._next_slot)
+                values = self._values
+                written = self._written
+                validity = self._validity
+                cell_metadata = self._cell_metadata
+                event_refs = self._event_refs
+                next_slot = self._next_slot
+                count = self._count
+                missed_events = self._missed_events + max(
+                    update.missed,
+                    sequence_gap,
+                )
+                cell = (0, next_slot)
             else:
                 offset = envelope.sequence % len(self._cycle_schedule)
                 expected_address = self._cycle_schedule.cell_at(offset)
                 if envelope.join_key != expected_address:
                     raise DatasetError(
                         f"monitor cycle key {envelope.join_key!r} differs from "
-                        f"frozen key {expected_address!r} at sequence {envelope.sequence}"
+                        f"frozen key {expected_address!r} at sequence "
+                        f"{envelope.sequence}"
                     )
                 if offset == 0 or sequence_gap > 0 or update.missed > 0:
                     self._clear_locked()
@@ -1937,21 +2140,31 @@ class MonitorDataset(Generic[PayloadT]):
                     expected_address.repeat_index,
                     expected_address.point_storage_index,
                 )
+                values = self._values
+                written = self._written
+                validity = self._validity
+                cell_metadata = self._cell_metadata
+                event_refs = self._event_refs
+                missed_events = self._missed_events + max(
+                    update.missed,
+                    sequence_gap,
+                )
             _write_cell(
                 cell,
                 value,
                 validity_mask,
-                self._values,
-                self._written,
-                self._validity,
+                values,
+                written,
+                validity,
             )
             flat_cell = cell[0] * self.schema.point_layout.storage_size + cell[1]
-            self._cell_metadata[flat_cell] = metadata
-            self._event_refs[flat_cell] = envelope.ref
+            cell_metadata[flat_cell] = metadata
+            event_refs[flat_cell] = envelope.ref
             if self._cycle_schedule is None:
                 capacity = self.schema.point_layout.storage_size
-                self._next_slot = (self._next_slot + 1) % capacity
-                self._count = min(self._count + 1, capacity)
+                self._next_slot = (next_slot + 1) % capacity
+                self._count = min(count + 1, capacity)
+            self._missed_events = missed_events
             self._last_sequence = envelope.sequence
             self._head = envelope.ref
             self._revision += 1
@@ -2000,6 +2213,7 @@ class MonitorDataset(Generic[PayloadT]):
     def close(self) -> None:
         with self._lock:
             self._aborted = True
+            self._append_replacement = None
         self._monitor.close()
 
     def __enter__(self) -> "MonitorDataset":

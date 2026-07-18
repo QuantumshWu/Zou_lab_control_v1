@@ -227,7 +227,7 @@ def test_roi_scalar_projection_omits_invalid_components_and_carries_lineage():
         + np.dtype(bool).itemsize
     )
     output_contract = RoiScalarSampleContract(
-        binding,
+        binding.output_schema,
         RoiScalarMetadataContract(CameraFrameMetadataContract()),
     )
     source, source_producer = AcquisitionStream.create(
@@ -248,7 +248,7 @@ def test_roi_scalar_projection_omits_invalid_components_and_carries_lineage():
         retention_events=1,
         retention_bytes=output_contract.max_retained_nbytes,
     )
-    projection = RoiScalarStreamProjection(binding, source_tap, output_producer)
+    projection = RoiScalarStreamProjection(source_tap)
     metadata = CameraFrameMetadata(
         0,
         1,
@@ -276,9 +276,11 @@ def test_roi_scalar_projection_omits_invalid_components_and_carries_lineage():
         captured_at=metadata.captured_at,
         trace=TraceContext("m2b-run", "camera", metadata.correlation_id),
     )
-    derived = projection.process_next(timeout=0.0)
+    update = projection.take_next(timeout=0.0)
+    payload = projection.project(update, binding, 1)
+    derived = projection.publish(update, payload, output_producer)
     assert derived.trace.causation_refs == (source_envelope.ref,)
-    assert derived.trace.control_revision is None
+    assert derived.trace.control_revision == 1
     assert derived.trace.config_revision is None
     assert derived.payload.metadata.source_event_ref == source_envelope.ref
     assert derived.payload.value.validity is VALID
@@ -291,7 +293,7 @@ def test_roi_scalar_projection_omits_invalid_components_and_carries_lineage():
     assert fail_closed.values == pytest.approx(expected)
 
     source_producer.finish()
-    projection.finish()
+    output_producer.finish()
     projection.close()
     assert output.next_sequence == 1
 
@@ -317,7 +319,7 @@ def test_scalar_history_memory_is_admitted_without_growing_raw_history(experimen
     metadata_bytes = RoiScalarMetadataContract(
         CameraFrameMetadataContract()
     ).max_retained_nbytes
-    expected_delta = (
+    expected_delta = 2 * (
         2 * mutable_dataset_storage_nbytes(many.scalar_output_schema)
         + dataset_storage_nbytes(many.scalar_output_schema)
         + 20 * metadata_bytes

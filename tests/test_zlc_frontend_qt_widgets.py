@@ -98,6 +98,73 @@ def _run_fresh(source: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _raster_board_frame(
+    panel_ids: tuple[str, ...],
+    *,
+    layout_generation: int,
+    sequence: int,
+):
+    from zlc_data import (
+        BlockId,
+        DatasetRevision,
+        DatasetRevisionRef,
+        StreamGenerationId,
+    )
+    from zlc_frontend.figure import DatasetId, EvaluatedInput
+    from zlc_frontend.render import (
+        BoardFrame,
+        CoherenceStamp,
+        PanelFrame,
+        PanelPresentationIdentity,
+        PixelFormat,
+        RasterBuffer,
+        SourceIdentity,
+    )
+
+    schema = "a" * 64
+    dataset_id = DatasetId("camera")
+    ref = DatasetRevisionRef(
+        BlockId("camera-block"),
+        StreamGenerationId("camera-generation"),
+        schema,
+        DatasetRevision(sequence + 1),
+    )
+    source = SourceIdentity(
+        dataset_id,
+        ref.block_id,
+        ref.stream_generation,
+        schema,
+    )
+    stamp = CoherenceStamp(
+        "camera-run",
+        f"epoch-{sequence}",
+        "camera-frame",
+        schema,
+        "b" * 64,
+        (EvaluatedInput(dataset_id, ref),),
+        tuple(
+            PanelPresentationIdentity(panel_id, f"document-{panel_id}", 0, 0, 0)
+            for panel_id in panel_ids
+        ),
+    )
+    raster = RasterBuffer(
+        2,
+        1,
+        8,
+        PixelFormat.RGBA8888,
+        bytes([sequence % 256]) * 8,
+    )
+    return BoardFrame(
+        "camera-board",
+        layout_generation,
+        sequence,
+        tuple(
+            PanelFrame(panel_id, "camera", source, stamp, raster)
+            for panel_id in panel_ids
+        ),
+    )
+
+
 def test_qt_widgets_is_the_only_current_qt_owner() -> None:
     assert not (ROOT / "Zou_lab_control" / "frontend" / "qt_fluent.py").exists()
     assert not (ROOT / "Zou_lab_control" / "frontend" / "style.py").exists()
@@ -298,6 +365,107 @@ def test_frontend_and_workbench_roots_remain_headless() -> None:
         "assert not any(k == 'PyQt5' or k.startswith('PyQt5.') for k in sys.modules)\n"
     )
     assert notebook_result.returncode == 0, notebook_result.stderr
+
+
+def test_qt_raster_board_promotes_only_a_matching_staged_layout(
+    monkeypatch,
+) -> None:
+    import sys
+
+    import pytest
+
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+
+    application = ensure_qt_app()
+    board = QtRasterBoard(("image",), columns=1)
+    old = _raster_board_frame(("image",), layout_generation=0, sequence=1)
+    target_panels = ("image", "curve", "meter")
+    target = _raster_board_frame(
+        target_panels,
+        layout_generation=1,
+        sequence=2,
+    )
+    stale = _raster_board_frame(
+        target_panels,
+        layout_generation=0,
+        sequence=2,
+    )
+
+    board.present(old)
+    board.stage_layout(
+        target_panels,
+        board_id="camera-board",
+        layout_generation=1,
+        columns=2,
+    )
+    assert board.front_frame is old
+    assert board.panel_ids == ("image",)
+    assert board.columns == 1
+    assert board.discard_staged_layout(
+        board_id="camera-board",
+        layout_generation=1,
+    )
+    assert not board.discard_staged_layout(
+        board_id="camera-board",
+        layout_generation=1,
+    )
+    assert board.front_frame is old
+    board.stage_layout(
+        target_panels,
+        board_id="camera-board",
+        layout_generation=1,
+        columns=2,
+    )
+
+    with pytest.raises(ValueError, match="staged layout identity"):
+        board.present(stale)
+    assert board.front_frame is old
+    assert board.panel_ids == ("image",)
+
+    board.present(target)
+    assert board.front_frame is target
+    assert board.panel_ids == target_panels
+    assert board.columns == 2
+    with pytest.raises(ValueError, match="active layout identity"):
+        board.present(stale)
+    assert board.front_frame is target
+
+    board.stage_layout(
+        target_panels,
+        board_id="camera-board",
+        layout_generation=2,
+        columns=1,
+    )
+    failed_target = _raster_board_frame(
+        target_panels,
+        layout_generation=2,
+        sequence=3,
+    )
+    board_module = sys.modules[QtRasterBoard.__module__]
+
+    def fail_prepare(_raster):
+        raise RuntimeError("QImage preparation failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(board_module, "_prepared_qimage", fail_prepare)
+        with pytest.raises(RuntimeError, match="QImage preparation failed"):
+            board.present(failed_target)
+    assert board.front_frame is target
+    assert board.panel_ids == target_panels
+    assert board.columns == 2
+    with pytest.raises(ValueError, match="active layout identity"):
+        board.present(failed_target)
+
+    board.stage_layout(
+        target_panels,
+        board_id="camera-board",
+        layout_generation=2,
+        columns=1,
+    )
+    board.close()
+    application.processEvents()
+    with pytest.raises(RuntimeError, match="closed"):
+        board.present(failed_target)
 
 
 def test_first_qapplication_creation_is_rejected_from_a_worker_thread() -> None:

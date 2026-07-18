@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -20,7 +22,13 @@ from Zou_lab_control.workbench import open_capture_workbench
 from zlc_data import BlockId, SPATIAL_X, SPATIAL_Y
 from zlc_frontend.figure import DatasetId, FigureEvaluationPolicy
 from zlc_frontend.qt_widgets import GREEN, ORANGE, QtImageBoard
-from zlc_workbench.live import LiveDatasetSlot
+from zlc_neutral_atom.monitor_application import (
+    CameraMonitorLiveDataset,
+    CameraMonitorRoiState,
+)
+from zlc_neutral_atom.runtime.control import ControlAckStatus, create_control_topic
+import zlc_workbench.live as live_module
+from zlc_workbench.live import LiveDatasetSlot, LiveImageBoardController
 
 
 ROOT = Path(__file__).parents[1]
@@ -308,3 +316,240 @@ def test_public_import_is_lazy_and_w1_has_no_runtime_boundary_leak():
         "_authority_token",
     ):
         assert forbidden not in source
+
+
+class _CameraControlDataset(CameraMonitorLiveDataset):
+    def __init__(self, state: CameraMonitorRoiState) -> None:
+        self.state = state
+        self.closed = False
+        self.slot = None
+        self.topic, self.consumer = create_control_topic(lambda value: value)
+
+    def current_roi_state(self):
+        return self.state
+
+    def submit_roi_control(self, candidate):
+        receipt = self.topic.publish(candidate)
+        if self.slot is not None:
+            self.slot.close()
+        return receipt
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.consumer.terminate("camera control dataset closed")
+
+
+def _camera_control_slot(dataset):
+    slot = object.__new__(LiveDatasetSlot)
+    slot._lock = threading.Lock()
+    slot._dataset = dataset
+    slot._camera_roi_state = CameraMonitorRoiState(
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    slot._failure = None
+    slot._notification_failure = None
+    slot._terminal = False
+    slot._withdrawn = False
+    slot._closed = False
+    slot._listener = None
+    slot._listener_claimed = False
+    slot._pending_change = False
+    slot._retain_on_terminal = False
+    return slot
+
+
+def test_notification_failure_is_visible_without_detaching_source_dataset():
+    dataset = _CameraControlDataset(
+        CameraMonitorRoiState(None, None, None, None, None)
+    )
+    slot = _camera_control_slot(dataset)
+    wakes = []
+    slot.set_change_listener(lambda: wakes.append("wake"))
+    slot.notification_failed("view change listener failed")
+    assert slot.failure is None
+    assert slot.notification_failure == "view change listener failed"
+    assert wakes == ["wake"]
+    assert slot._dataset is dataset
+    assert not dataset.closed
+    assert slot.current_camera_roi_state() == dataset.state
+
+    slot.notification_failed("later failure must not replace first cause")
+    assert slot.failure is None
+    assert slot.notification_failure == "view change listener failed"
+    assert wakes == ["wake"]
+    assert slot._dataset is dataset
+
+    visible_status = object()
+    controller = object.__new__(LiveImageBoardController)
+    controller._slot = slot
+    controller._lock = threading.Lock()
+    controller._closed = False
+    controller._fault = None
+    controller._candidate = object()
+    controller._active = True
+    controller._dirty = True
+    controller._port = object()
+    controller._sources = (object(),)
+    controller._front_status = visible_status
+    revoked = []
+
+    def revoke(before_revoke=None):
+        if before_revoke is not None and not before_revoke():
+            return False
+        revoked.append(True)
+        return True
+
+    controller._board = SimpleNamespace(
+        revoke_pending_publication=revoke
+    )
+    controller._request_owner_wake = lambda: wakes.append("controller-fault")
+    assert controller.admit_pending() is False
+    assert controller.fault is not None
+    assert controller._front_status is visible_status
+    assert revoked == [True]
+    assert slot._dataset is dataset and not dataset.closed
+
+    slot.source_terminal()
+    assert dataset.closed and slot.terminal
+
+
+def test_camera_control_submit_returns_receipt_when_detach_loses_the_race():
+    state = CameraMonitorRoiState(None, None, None, None, None)
+    dataset = _CameraControlDataset(state)
+    slot = _camera_control_slot(dataset)
+    dataset.slot = slot
+    receipt = slot.submit_camera_roi_control(None)
+    assert receipt.snapshot().status is ControlAckStatus.TERMINATED
+    assert dataset.closed and slot.terminal
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_camera_roi_state_survives_failure_or_terminal_detach(terminal):
+    initial = CameraMonitorRoiState(None, 1, None, None, None, 1)
+    final = CameraMonitorRoiState(
+        None,
+        1,
+        None,
+        None,
+        None,
+        2,
+        "scalar branch failed",
+    )
+    dataset = _CameraControlDataset(initial)
+    slot = _camera_control_slot(dataset)
+    assert slot.current_camera_roi_state() is initial
+    dataset.state = final
+    if terminal:
+        slot.source_terminal()
+    else:
+        slot.fail("camera source failed")
+    assert slot.current_camera_roi_state() is final
+    assert dataset.closed
+
+
+def test_camera_roi_state_cache_rejects_conflicting_same_revision_truth():
+    first = CameraMonitorRoiState(None, 1, None, None, None, 1)
+    conflicting = CameraMonitorRoiState(None, 2, None, None, None, 1)
+    dataset = _CameraControlDataset(first)
+    slot = _camera_control_slot(dataset)
+    assert slot.current_camera_roi_state() is first
+    dataset.state = conflicting
+    with pytest.raises(RuntimeError, match="without advancing state_revision"):
+        slot.current_camera_roi_state()
+    assert slot._camera_roi_state is first
+
+
+def test_freeze_presentation_revokes_work_and_preserves_the_coherent_front_state():
+    controller = object.__new__(LiveImageBoardController)
+    controller._owner_thread = threading.get_ident()
+    controller._lock = threading.Lock()
+    controller._closed = False
+    controller._candidate = object()
+    controller._port = object()
+    controller._sources = (object(),)
+    controller._dirty = True
+    controller._active = True
+    controller._paused = False
+    frozen = []
+    controller._board = SimpleNamespace(freeze_front=lambda: frozen.append(True))
+    controller.freeze_presentation()
+    assert controller._candidate is None
+    assert controller._port is None and controller._sources is None
+    assert not controller._dirty and not controller._active
+    assert controller._paused
+    assert frozen == [True]
+
+
+def test_scalar_control_change_reuses_layout_when_panel_ids_are_unchanged(monkeypatch):
+    class CameraSpec:
+        pass
+
+    panels = (SimpleNamespace(panel_id="image"),)
+    previous = SimpleNamespace(
+        board_id="camera-board",
+        layout_generation=4,
+        panels=panels,
+        scalar_documents=(object(),),
+    )
+    replacement = SimpleNamespace(
+        board_id=previous.board_id,
+        layout_generation=previous.layout_generation,
+        panels=panels,
+        scalar_documents=(),
+        presentations=(object(),),
+    )
+    requests = []
+    retired = []
+    monkeypatch.setattr(live_module, "CameraMonitorViewSpec", CameraSpec)
+    monkeypatch.setattr(
+        live_module,
+        "_build_live_configuration",
+        lambda **_kwargs: replacement,
+    )
+    controller = object.__new__(LiveImageBoardController)
+    controller._owner_thread = threading.get_ident()
+    controller._slot = SimpleNamespace(
+        spec=CameraSpec(),
+        failure=None,
+        withdrawn=False,
+    )
+    controller._worker_thread_affine = True
+    controller._scalar_dataset_generations = {}
+    controller._scalar_generation_datasets = {}
+    controller._lock = threading.Lock()
+    controller._closed = False
+    controller._fault = None
+    controller._configuration_epoch = 8
+    controller._configuration = previous
+    controller._port = None
+    controller._sources = None
+    controller._candidate = None
+    controller._dirty = False
+    controller._active = False
+    controller._paused = False
+    controller._board = SimpleNamespace(
+        model=SimpleNamespace(
+            board_id=previous.board_id,
+            layout_generation=previous.layout_generation,
+            panels=panels,
+        )
+    )
+    controller._document = object()
+    controller._submit = lambda work: retired.append(work)
+    controller._request_snapshot = lambda: requests.append(None)
+
+    controller.reconfigure_scalar(
+        CameraMonitorRoiState(None, 3, None, None, None, 3),
+        None,
+        (),
+    )
+
+    assert controller._configuration is replacement
+    assert controller._configuration_epoch == 9
+    assert retired and requests == [None]

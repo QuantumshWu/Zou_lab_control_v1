@@ -117,10 +117,11 @@ def _frame(
     *,
     generation: int = 0,
     revision: int = 1,
+    panel_ids: tuple[str, ...] = ("a", "b"),
 ) -> tuple[BoardFrame, SourceIdentity, CoherenceStamp]:
     source, evaluated = _source(revision=revision)
     stamp = _stamp(
-        ("a", "b"),
+        panel_ids,
         evaluated_input=evaluated,
         epoch=f"epoch-{revision}",
         join_digest=(f"{revision:x}" * 64)[:64],
@@ -131,9 +132,9 @@ def _frame(
             "board",
             generation,
             sequence,
-            (
-                PanelFrame("a", "shot", source, stamp, _raster(sequence)),
-                PanelFrame("b", "shot", source, stamp, _raster(sequence)),
+            tuple(
+                PanelFrame(panel_id, "shot", source, stamp, _raster(sequence))
+                for panel_id in panel_ids
             ),
         ),
         source,
@@ -141,14 +142,17 @@ def _frame(
     )
 
 
-def _board(generation: int = 0) -> BoardModel:
+def _board(
+    generation: int = 0,
+    panel_ids: tuple[str, ...] = ("a", "b"),
+) -> BoardModel:
     return BoardModel(
         "board",
         generation,
         RenderSurface.WORKER_RASTER_LIVE,
-        (
-            PanelSlot("a", "image", "shot"),
-            PanelSlot("b", "curve", "shot"),
+        tuple(
+            PanelSlot(panel_id, f"controller-{panel_id}", "shot")
+            for panel_id in panel_ids
         ),
     )
 
@@ -283,6 +287,128 @@ def test_newer_admission_revokes_an_older_worker_result() -> None:
     assert not controller.present_pending()
 
 
+def test_freeze_front_revokes_inflight_and_pending_publication_without_clearing_front() -> None:
+    controller, port, callbacks, presenter, first, stamp = _controller()
+    first_work = port.admit(first.sequence, (("shot", stamp),))
+    assert port.publish(first_work, first)
+    callbacks.pop()()
+    assert presenter.frames == [first]
+
+    pending, _source, pending_stamp = _frame(2, revision=2)
+    pending_work = port.admit(pending.sequence, (("shot", pending_stamp),))
+    assert port.publish(pending_work, pending)
+    assert len(callbacks) == 1
+    controller.freeze_front()
+
+    assert callbacks.pop()() is False
+    assert presenter.frames == [first]
+    assert presenter.clear_count == 0
+    assert not controller.present_pending()
+    assert not port.publish(pending_work, pending)
+    with pytest.raises(RuntimeError, match="revoked"):
+        port.admit(3, (("shot", pending_stamp),))
+
+    # A worker that passed its live-side currency check before freeze still
+    # holds only this revoked port/work capability and cannot publish later.
+    stale_controller, stale_port, _callbacks, stale_presenter, stale, stale_stamp = (
+        _controller()
+    )
+    stale_work = stale_port.admit(stale.sequence, (("shot", stale_stamp),))
+    stale_controller.freeze_front()
+    assert not stale_port.publish(stale_work, stale)
+    assert stale_presenter.frames == []
+
+
+def test_pending_publication_can_be_revoked_from_a_view_worker() -> None:
+    controller, port, _callbacks, presenter, frame, stamp = _controller()
+    work = port.admit(frame.sequence, (("shot", stamp),))
+    errors = []
+
+    def revoke() -> None:
+        try:
+            controller.revoke_pending_publication()
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=revoke)
+    worker.start()
+    worker.join()
+
+    assert not errors
+    assert not port.publish(work, frame)
+    assert not controller.present_pending()
+    assert presenter.frames == []
+
+
+@pytest.mark.parametrize(
+    ("before_revoke", "error_type"),
+    (
+        (lambda: None, TypeError),
+        (lambda: (_ for _ in ()).throw(RuntimeError("broken state fence")), RuntimeError),
+    ),
+)
+def test_broken_revocation_state_fence_still_revokes_pending(
+    before_revoke,
+    error_type,
+) -> None:
+    controller, port, callbacks, presenter, frame, stamp = _controller()
+    work = port.admit(frame.sequence, (("shot", stamp),))
+    assert port.publish(work, frame)
+
+    with pytest.raises(error_type):
+        controller.revoke_pending_publication(before_revoke)
+
+    assert callbacks.pop()() is False
+    assert presenter.frames == []
+    assert not port.publish(work, frame)
+
+
+def test_revocation_serializes_with_a_frame_already_dequeued_for_present() -> None:
+    entered = threading.Event()
+    attempting_revoke = threading.Event()
+    fact_installed = threading.Event()
+    release_present = threading.Event()
+    revoke_returned = threading.Event()
+
+    class BlockingPresenter(_Presenter):
+        def present(self, frame: BoardFrame) -> None:
+            entered.set()
+            if not release_present.wait(2.0):
+                raise TimeoutError("test did not release blocked board present")
+            super().present(frame)
+
+    presenter = BlockingPresenter()
+    controller, port, _callbacks, _value, frame, stamp = _controller(presenter)
+    work = port.admit(frame.sequence, (("shot", stamp),))
+    assert port.publish(work, frame)
+
+    def revoke() -> None:
+        assert entered.wait(2.0)
+        attempting_revoke.set()
+        controller.revoke_pending_publication(
+            lambda: fact_installed.set() is None
+        )
+        revoke_returned.set()
+
+    def release() -> None:
+        assert attempting_revoke.wait(2.0)
+        assert not revoke_returned.wait(0.05)
+        assert not fact_installed.is_set()
+        release_present.set()
+
+    revoker = threading.Thread(target=revoke)
+    releaser = threading.Thread(target=release)
+    revoker.start()
+    releaser.start()
+    assert controller.present_pending()
+    revoker.join()
+    releaser.join()
+
+    assert revoke_returned.is_set()
+    assert fact_installed.is_set()
+    assert presenter.frames == [frame]
+
+
 def test_atomic_board_front_swaps_the_complete_mapping_old_or_new() -> None:
     front = AtomicBoardFront()
     first, _source_value, _stamp_value = _frame(1)
@@ -295,21 +421,44 @@ def test_atomic_board_front_swaps_the_complete_mapping_old_or_new() -> None:
     assert tuple(panel.panel_id for panel in front.current().panels) == ("a", "b")
 
 
-def test_board_controller_rejects_stale_layout_and_wrong_thread_present() -> None:
-    controller, old_port, callbacks, _presenter, frame, stamp = _controller()
-    controller.reconfigure(_board(1))
-    with pytest.raises(RuntimeError, match="revoked"):
-        old_port.admit(1, (("shot", stamp),))
+def test_board_controller_promotes_new_topology_only_with_its_complete_front() -> None:
+    controller, old_port, callbacks, presenter, frame, stamp = _controller()
+    old_work = old_port.admit(frame.sequence, (("shot", stamp),))
+    assert old_port.publish(old_work, frame)
+    callbacks.pop()()
+    assert presenter.frames == [frame]
 
-    current, source, current_stamp = _frame(1, generation=1)
+    target_panels = ("a", "b", "c")
+    controller.reconfigure(_board(1, target_panels))
+    assert presenter.frames == [frame]
+    assert presenter.clear_count == 0
+    with pytest.raises(RuntimeError, match="revoked"):
+        old_port.admit(2, (("shot", stamp),))
+    assert not old_port.publish(old_work, frame)
+
+    current, source, current_stamp = _frame(
+        1,
+        generation=1,
+        panel_ids=target_panels,
+    )
     port = controller.open_publish_port(
         tuple(
             PanelSourceBinding(source, presentation)
             for presentation in current_stamp.presentations
         )
     )
+    assert presenter.frames == [frame]
+    assert presenter.clear_count == 0
     work = port.admit(1, (("shot", current_stamp),))
+    stale, _stale_source, _stale_stamp = _frame(
+        1,
+        generation=0,
+        panel_ids=target_panels,
+    )
+    assert not port.publish(work, stale)
+    assert presenter.frames == [frame]
     assert port.publish(work, current)
+    assert presenter.frames == [frame]
 
     errors = []
 
@@ -324,12 +473,79 @@ def test_board_controller_rejects_stale_layout_and_wrong_thread_present() -> Non
     thread.join()
     assert len(errors) == 1
     assert "owner-thread affine" in str(errors[0])
-    assert callbacks
+    assert len(callbacks) == 1
+    callbacks.pop()()
+    assert presenter.frames == [frame, current]
+
+
+def test_failed_staged_present_revokes_authority_without_erasing_old_front() -> None:
+    class FailingPresenter(_Presenter):
+        def present(self, frame: BoardFrame) -> None:
+            if frame.layout_generation == 1:
+                raise RuntimeError("target widget rejected frame")
+            super().present(frame)
+
+    presenter = FailingPresenter()
+    controller, old_port, callbacks, _value, old, old_stamp = _controller(presenter)
+    old_work = old_port.admit(old.sequence, (("shot", old_stamp),))
+    assert old_port.publish(old_work, old)
+    callbacks.pop()()
+
+    controller.reconfigure(_board(1))
+    target, source, target_stamp = _frame(1, generation=1)
+    port = controller.open_publish_port(
+        tuple(
+            PanelSourceBinding(source, presentation)
+            for presentation in target_stamp.presentations
+        )
+    )
+    work = port.admit(target.sequence, (("shot", target_stamp),))
+    assert port.publish(work, target)
+    with pytest.raises(RuntimeError, match="target widget rejected frame"):
+        callbacks.pop()()
+
+    assert presenter.frames == [old]
+    assert presenter.clear_count == 0
+    assert controller.fault is not None
+    assert not port.publish(work, target)
+    with pytest.raises(RuntimeError, match="revoked"):
+        port.admit(2, (("shot", target_stamp),))
+
+
+def test_staged_model_rollback_keeps_front_and_can_reopen_the_active_layout() -> None:
+    controller, old_port, callbacks, presenter, old, old_stamp = _controller()
+    old_work = old_port.admit(old.sequence, (("shot", old_stamp),))
+    assert old_port.publish(old_work, old)
+    callbacks.pop()()
+
+    target_model = _board(1, ("a", "b", "c"))
+    controller.reconfigure(target_model)
+    assert controller.model is target_model
+    assert controller.discard_staged_model(target_model)
+    assert not controller.discard_staged_model(target_model)
+    assert controller.model.layout_generation == 0
+    assert presenter.frames == [old]
+    assert presenter.clear_count == 0
+    with pytest.raises(RuntimeError, match="revoked"):
+        old_port.admit(2, (("shot", old_stamp),))
+
+    resumed, source, resumed_stamp = _frame(2, generation=0)
+    port = controller.open_publish_port(
+        tuple(
+            PanelSourceBinding(source, presentation)
+            for presentation in resumed_stamp.presentations
+        )
+    )
+    work = port.admit(resumed.sequence, (("shot", resumed_stamp),))
+    assert port.publish(work, resumed)
+    callbacks.pop()()
+    assert presenter.frames == [old, resumed]
 
 
 def test_publish_port_is_revoked_on_close() -> None:
     controller, port, _callbacks, _presenter, frame, stamp = _controller()
     work = port.admit(frame.sequence, (("shot", stamp),))
+    controller.reconfigure(_board(1))
     controller.close()
 
     assert not port.publish(work, frame)

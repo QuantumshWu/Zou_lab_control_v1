@@ -17,6 +17,8 @@ from zlc_data import (
     REPEAT,
     ReductionMethod,
     Selection,
+    StreamGenerationId,
+    ValueSchema,
     ValidityPolicy,
     selection_from_tree,
     selection_to_tree,
@@ -24,6 +26,7 @@ from zlc_data import (
 from zlc_neutral_atom.acquisition.camera import (
     CameraDatasetEventAdapter,
     CameraSample,
+    CameraSampleContract,
 )
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.processing.roi_monitor import (
@@ -34,10 +37,17 @@ from zlc_neutral_atom.processing.roi_monitor import (
     RoiScalarSample,
     RoiScalarSampleContract,
     RoiScalarStreamProjection,
+    max_roi_scalar_reduction_scratch_nbytes,
+    roi_scalar_output_schema,
 )
 from zlc_neutral_atom.runtime._failure import safe_error_summary
 from zlc_neutral_atom.runtime.cancellation import CancellationRequested
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
+from zlc_neutral_atom.runtime.control import (
+    ControlCommand,
+    ControlReceipt,
+    create_control_topic,
+)
 from zlc_neutral_atom.runtime.dataset import (
     FrozenDatasetEdge,
     MonitorDataset,
@@ -59,6 +69,7 @@ from zlc_neutral_atom.runtime.run import RunContext, RunHandle, RunPlan
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionProducer,
     AcquisitionStream,
+    MonitorUpdate,
     ProducerFlowControl,
     StreamError,
     StreamId,
@@ -236,6 +247,73 @@ class CameraMonitorViewSpec:
         )
 
 
+@dataclass(frozen=True)
+class CameraMonitorRoiState:
+    """Currently applied ROI branch; pending commands live only in receipts."""
+
+    binding: RoiScalarBinding | None
+    control_revision: int | None
+    scalar_block_id: BlockId | None
+    scalar_dataset_edge: FrozenDatasetEdge[RoiScalarSample] | None
+    scalar_generation: StreamGenerationId | None
+    state_revision: int = 0
+    failure_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "state_revision",
+            nonnegative_integer(self.state_revision, "state_revision"),
+        )
+        if self.failure_reason is not None:
+            object.__setattr__(
+                self,
+                "failure_reason",
+                canonical_text(self.failure_reason, "ROI state failure reason"),
+            )
+        scalar_values = (
+            self.scalar_block_id,
+            self.scalar_dataset_edge,
+            self.scalar_generation,
+        )
+        if self.binding is None:
+            if any(value is not None for value in scalar_values):
+                raise ValueError("raw-only ROI state cannot retain scalar identity")
+            if self.control_revision is not None:
+                object.__setattr__(
+                    self,
+                    "control_revision",
+                    positive_integer(self.control_revision, "control_revision"),
+                )
+            if self.state_revision == 0 and (
+                self.control_revision is not None or self.failure_reason is not None
+            ):
+                raise ValueError("initial ROI state cannot report applied or failed state")
+            return
+        if not isinstance(self.binding, RoiScalarBinding):
+            raise TypeError("binding must be RoiScalarBinding or None")
+        object.__setattr__(
+            self,
+            "control_revision",
+            positive_integer(self.control_revision, "control_revision"),
+        )
+        if not isinstance(self.scalar_block_id, BlockId):
+            raise TypeError("applied ROI state requires scalar_block_id")
+        edge = self.scalar_dataset_edge
+        if not isinstance(edge, FrozenDatasetEdge):
+            raise TypeError("applied ROI state requires scalar_dataset_edge")
+        if not isinstance(self.scalar_generation, StreamGenerationId):
+            raise TypeError("applied ROI state requires scalar_generation")
+        if edge.cell_schedule is not None:
+            raise ValueError("ROI scalar state requires a schedule-free dataset edge")
+        if edge.schema.cell_schema is not self.binding.output_schema:
+            raise ValueError("ROI scalar state edge differs from the applied output schema")
+        if self.state_revision == 0:
+            raise ValueError("applied ROI state requires a positive state_revision")
+        if self.failure_reason is not None:
+            raise ValueError("applied ROI state cannot contain failure_reason")
+
+
 class CameraMonitorViewPort(Protocol):
     """Workbench-owned sink; binding transfers the MonitorDataset lifetime."""
 
@@ -254,6 +332,8 @@ class CameraMonitorViewPort(Protocol):
     ) -> None: ...
 
     def updated(self) -> None: ...
+
+    def notification_failed(self, message: str) -> None: ...
 
     def fail(self, message: str) -> None: ...
 
@@ -285,41 +365,194 @@ class CameraMonitorSnapshot:
             raise ValueError("ROI scalar head belongs to another raw camera event")
 
 
+@dataclass
+class _RoiScalarBranch:
+    binding: RoiScalarBinding
+    control_revision: int
+    block_id: BlockId
+    edge: FrozenDatasetEdge[RoiScalarSample]
+    stream: AcquisitionStream[RoiScalarSample]
+    producer: AcquisitionProducer[RoiScalarSample]
+    dataset: MonitorDataset[RoiScalarSample]
+
+    def state(self, state_revision: int) -> CameraMonitorRoiState:
+        return CameraMonitorRoiState(
+            self.binding,
+            self.control_revision,
+            self.block_id,
+            self.edge,
+            self.stream.generation,
+            state_revision,
+        )
+
+
 class CameraMonitorLiveDataset:
-    """Single owner for atomically ingesting and freezing the live product pair."""
+    """Stable raw owner with one revisioned, replaceable ROI scalar branch."""
 
     def __init__(
         self,
         raw: MonitorDataset[CameraSample],
         *,
-        scalar: MonitorDataset[RoiScalarSample] | None = None,
-        projection: RoiScalarStreamProjection | None = None,
+        projection: RoiScalarStreamProjection,
+        input_contract: CameraSampleContract,
+        scalar_edges: tuple[FrozenDatasetEdge[RoiScalarSample], ...],
+        scalar_stream_id: StreamId,
+        max_reduction_scratch_nbytes: int,
+        initial_scalar_block_id: BlockId | None = None,
+        initial_scalar_edge: FrozenDatasetEdge[RoiScalarSample] | None = None,
+        initial_binding: RoiScalarBinding | None = None,
     ) -> None:
         if not isinstance(raw, MonitorDataset):
             raise TypeError("raw must be MonitorDataset")
-        if (scalar is None) != (projection is None):
-            raise ValueError("scalar dataset and projection must appear together")
-        if scalar is not None and not isinstance(scalar, MonitorDataset):
-            raise TypeError("scalar must be MonitorDataset or None")
-        if projection is not None and not isinstance(
-            projection,
-            RoiScalarStreamProjection,
+        if not isinstance(projection, RoiScalarStreamProjection):
+            raise TypeError("projection must be RoiScalarStreamProjection")
+        if not isinstance(input_contract, CameraSampleContract):
+            raise TypeError("input_contract must be CameraSampleContract")
+        edges = tuple(scalar_edges)
+        if not edges or any(not isinstance(edge, FrozenDatasetEdge) for edge in edges):
+            raise TypeError("scalar_edges must contain FrozenDatasetEdge values")
+        edge_by_schema: dict[str, FrozenDatasetEdge[RoiScalarSample]] = {}
+        for edge in edges:
+            if edge.cell_schedule is not None or edge.schema.cell_schema.data_axes:
+                raise ValueError("ROI control edges must be schedule-free scalar histories")
+            fingerprint = edge.schema.cell_schema.fingerprint
+            if fingerprint in edge_by_schema:
+                raise ValueError("scalar_edges must contain unique value schemas")
+            edge_by_schema[fingerprint] = edge
+        if not isinstance(scalar_stream_id, StreamId):
+            raise TypeError("scalar_stream_id must be StreamId")
+        scratch = nonnegative_integer(
+            max_reduction_scratch_nbytes,
+            "max_reduction_scratch_nbytes",
+        )
+        initial_values = (
+            initial_scalar_block_id,
+            initial_scalar_edge,
+            initial_binding,
+        )
+        if any(value is None for value in initial_values) and not all(
+            value is None for value in initial_values
         ):
-            raise TypeError("projection must be RoiScalarStreamProjection or None")
+            raise ValueError("initial scalar block, edge, and binding must appear together")
+        if initial_binding is not None:
+            assert initial_scalar_block_id is not None and initial_scalar_edge is not None
+            if not isinstance(initial_scalar_block_id, BlockId):
+                raise TypeError("initial_scalar_block_id must be BlockId")
+            if not any(edge is initial_scalar_edge for edge in edges):
+                raise ValueError("initial_scalar_edge is absent from scalar_edges")
+            if initial_scalar_edge.schema.cell_schema is not initial_binding.output_schema:
+                raise ValueError("initial ROI binding differs from its dataset edge")
         self.raw = raw
-        self.scalar = scalar
-        self.projection = projection
+        self._projection = projection
+        self._input_contract = input_contract
+        self._edge_by_schema = edge_by_schema
+        self._scalar_stream_id = scalar_stream_id
+        self._max_reduction_scratch_nbytes = scratch
+        self._initial_scalar_block_id = initial_scalar_block_id
+        self._initial_scalar_edge = initial_scalar_edge
+        self._initial_revision = 1 if initial_binding is not None else None
+        self._branch: _RoiScalarBranch | None = None
+        self._roi_state = CameraMonitorRoiState(None, None, None, None, None)
+        self._projection_usable = True
+        self._controls_terminated = False
         self._lock = threading.RLock()
         self._closed = False
+        self._roi_topic, self._roi_consumer = create_control_topic(
+            self._snapshot_roi_candidate
+        )
+        self._initial_roi_receipt = None
+        if initial_binding is not None:
+            # The declarative initial ROI is the first real command.  It is not
+            # reported as applied until its first scalar event commits.
+            self._initial_roi_receipt = self._roi_topic.publish(initial_binding)
 
-    def ingest_next(self) -> None:
+    @property
+    def initial_roi_receipt(self) -> ControlReceipt | None:
+        """Revision-one receipt for a declarative request ROI, if present."""
+
+        return self._initial_roi_receipt
+
+    def prepare_roi_control(
+        self,
+        selection: Selection | None,
+        reduction: ReductionMethod = ReductionMethod.MEAN,
+        validity_policy: ValidityPolicy = ValidityPolicy.REQUIRE_ALL,
+    ) -> RoiScalarBinding | None:
+        """Validate and freeze one candidate without accepting a revision."""
+
+        if selection is None:
+            return None
+        if not isinstance(selection, Selection):
+            raise TypeError("selection must be zlc_data.Selection or None")
+        if not isinstance(reduction, ReductionMethod):
+            raise TypeError("reduction must be zlc_data.ReductionMethod")
+        if not isinstance(validity_policy, ValidityPolicy):
+            raise TypeError("validity_policy must be zlc_data.ValidityPolicy")
+        owned_selection = selection_from_tree(selection_to_tree(selection))
+        output = roi_scalar_output_schema(self._input_contract, reduction)
+        try:
+            edge = self._edge_by_schema[output.fingerprint]
+        except KeyError as error:
+            raise ValueError("ROI reduction output schema was not admitted") from error
+        binding = RoiScalarBinding(
+            self._input_contract,
+            owned_selection,
+            reduction,
+            validity_policy,
+            edge.schema.cell_schema,
+        )
+        if binding.reduction_scratch_nbytes > self._max_reduction_scratch_nbytes:
+            raise MemoryError("ROI candidate exceeds the admitted reduction scratch bound")
+        return binding
+
+    def submit_roi_control(
+        self,
+        candidate: RoiScalarBinding | None,
+    ) -> ControlReceipt:
+        """Accept one latest-wins candidate for the next source-shot boundary."""
+
+        # Publishing must not wait behind a reduction that currently owns the
+        # data transaction lock.  ControlTopic linearizes publish vs terminal
+        # shutdown and snapshots the candidate before accepting a revision.
+        return self._roi_topic.publish(candidate)
+
+    def current_roi_state(self) -> CameraMonitorRoiState:
+        with self._lock:
+            return self._roi_state
+
+    def ingest_next(
+        self,
+        checkpoint: Callable[[], None] | None = None,
+    ) -> None:
+        if checkpoint is not None and not callable(checkpoint):
+            raise TypeError("checkpoint must be callable or None")
         with self._lock:
             self._ensure_open()
             self.raw.ingest_next(timeout=0.0)
-            if self.projection is not None:
-                assert self.scalar is not None
-                self.projection.process_next(timeout=0.0)
-                self.scalar.ingest_next(timeout=0.0)
+            if not self._projection_usable:
+                return
+            try:
+                update = self._projection.take_next(timeout=0.0)
+            except BaseException as error:
+                self._projection_usable = False
+                self._drop_branch_locked(
+                    f"ROI processor ingress failed: {safe_error_summary(error)}"
+                )
+                self._terminate_controls_locked(
+                    f"ROI processor ingress terminated: {safe_error_summary(error)}"
+                )
+                return
+
+            try:
+                self._checkpoint(checkpoint)
+                command = self._roi_consumer.take_latest()
+                if command is None:
+                    self._process_applied_branch_locked(update, checkpoint)
+                    return
+                self._apply_command_locked(command, update, checkpoint)
+            except CancellationRequested:
+                self._terminate_controls_locked("camera monitor source was cancelled")
+                raise
 
     def materialize(self) -> CameraMonitorSnapshot:
         with self._lock:
@@ -329,15 +562,24 @@ class CameraMonitorLiveDataset:
     def finish(self) -> None:
         with self._lock:
             self._ensure_open()
-            if self.projection is not None:
-                self.projection.finish()
+            self._terminate_controls_locked("camera monitor source finished")
+            branch, self._branch = self._branch, None
+            if branch is not None:
+                self._set_raw_roi_state_locked(branch.control_revision)
+                self._retire_branch_locked(branch)
 
     def fail(self, error: StreamError) -> None:
         if not isinstance(error, StreamError):
             raise TypeError("error must be StreamError")
         with self._lock:
-            if not self._closed and self.projection is not None:
-                self.projection.fail(error)
+            if self._closed:
+                return
+            self._terminate_controls_locked(
+                f"camera monitor source failed: {safe_error_summary(error)}"
+            )
+            self._drop_branch_locked(
+                f"camera monitor source failed: {safe_error_summary(error)}"
+            )
 
     def close(self) -> None:
         errors: list[BaseException] = []
@@ -345,13 +587,15 @@ class CameraMonitorLiveDataset:
             if self._closed:
                 return
             self._closed = True
-            for close in (
-                None if self.projection is None else self.projection.close,
-                None if self.scalar is None else self.scalar.close,
-                self.raw.close,
-            ):
-                if close is None:
-                    continue
+            self._terminate_controls_locked("camera monitor live dataset closed")
+            branch, self._branch = self._branch, None
+            if branch is not None:
+                self._set_raw_roi_state_locked(branch.control_revision)
+                try:
+                    self._retire_branch_locked(branch)
+                except BaseException as error:
+                    errors.append(error)
+            for close in (self._projection.close, self.raw.close):
                 try:
                     close()
                 except BaseException as error:
@@ -361,9 +605,10 @@ class CameraMonitorLiveDataset:
 
     def _materialize_locked(self) -> CameraMonitorSnapshot:
         raw = self.raw.materialize(None)
-        if self.scalar is None:
+        branch = self._branch
+        if branch is None:
             return CameraMonitorSnapshot(raw, None, None)
-        scalar = self.scalar.materialize(None)
+        scalar = branch.dataset.materialize(None)
         if scalar.head is None:
             raise RuntimeError("ROI scalar dataset has no head event")
         try:
@@ -373,11 +618,355 @@ class CameraMonitorLiveDataset:
         metadata = scalar.cell_metadata[head_index]
         if not isinstance(metadata, RoiScalarMetadata):
             raise TypeError("ROI scalar dataset head metadata has another type")
-        projection = self.projection
-        assert projection is not None
-        if metadata.binding_fingerprint != projection.binding.fingerprint:
+        if metadata.binding_fingerprint != branch.binding.fingerprint:
             raise RuntimeError("ROI scalar metadata differs from the admitted binding")
+        if metadata.control_revision != branch.control_revision:
+            raise RuntimeError("ROI scalar metadata differs from the applied control revision")
         return CameraMonitorSnapshot(raw, scalar, metadata)
+
+    def _snapshot_roi_candidate(
+        self,
+        candidate: RoiScalarBinding | None,
+    ) -> RoiScalarBinding | None:
+        if candidate is None:
+            return None
+        if not isinstance(candidate, RoiScalarBinding):
+            raise TypeError("ROI control candidate must be RoiScalarBinding or None")
+        if candidate.input_contract.fingerprint != self._input_contract.fingerprint:
+            raise ValueError("ROI control candidate belongs to another camera contract")
+        return self.prepare_roi_control(
+            candidate.selection,
+            candidate.reduction,
+            candidate.validity_policy,
+        )
+
+    def _apply_command_locked(
+        self,
+        command: ControlCommand[RoiScalarBinding | None],
+        update: MonitorUpdate[CameraSample],
+        checkpoint: Callable[[], None] | None,
+    ) -> None:
+        candidate = command.value
+        if candidate is None:
+            self._checkpoint(checkpoint)
+            branch, self._branch = self._branch, None
+            self._set_raw_roi_state_locked(command.revision)
+            self._roi_consumer.applied(command)
+            if branch is not None:
+                self._retire_branch_locked(branch)
+            return
+
+        try:
+            payload = self._projection.project(update, candidate, command.revision)
+        except CancellationRequested:
+            raise
+        except BaseException as error:
+            self._roi_consumer.rejected(
+                command,
+                f"ROI candidate failed: {safe_error_summary(error)}",
+            )
+            self._process_applied_branch_locked(update, checkpoint)
+            return
+
+        # The reduction may be the longest downstream operation.  Cancellation
+        # that won while it was running must terminalize this in-flight command
+        # before any scalar commit or APPLIED acknowledgement can become stale.
+        self._checkpoint(checkpoint)
+
+        branch = self._branch
+        if branch is not None and branch.edge.schema.cell_schema is candidate.output_schema:
+            try:
+                replacement = branch.dataset.prepare_append_replacement(payload)
+            except BaseException as error:
+                self._roi_consumer.rejected(
+                    command,
+                    f"ROI retarget staging failed: {safe_error_summary(error)}",
+                )
+                self._process_applied_branch_locked(update, checkpoint)
+                return
+            try:
+                self._checkpoint(checkpoint)
+            except CancellationRequested:
+                try:
+                    branch.dataset.abort_append_replacement(replacement)
+                except BaseException:
+                    pass
+                raise
+            sequence_before_publish = branch.stream.next_sequence
+            if sequence_before_publish != replacement.expected_sequence:
+                try:
+                    branch.dataset.abort_append_replacement(replacement)
+                except BaseException:
+                    pass
+                reason = (
+                    "ROI retarget staged watermark differs from the exclusive "
+                    "producer sequence"
+                )
+                self._roi_consumer.rejected(command, reason)
+                self._drop_branch_locked(reason)
+                return
+            try:
+                envelope = self._projection.publish(
+                    update,
+                    replacement.payload,
+                    branch.producer,
+                )
+            except CancellationRequested:
+                try:
+                    branch.dataset.abort_append_replacement(replacement)
+                except BaseException:
+                    pass
+                if branch.stream.next_sequence != sequence_before_publish:
+                    # Cancellation arrived through a wrapper only after the
+                    # exclusive producer had irreversibly published.  Never
+                    # resume the old consumer across that consumed sequence.
+                    self._drop_branch_locked(
+                        "ROI retarget publication committed before cancellation"
+                    )
+                raise
+            except BaseException as error:
+                publication_committed = (
+                    branch.stream.next_sequence != sequence_before_publish
+                )
+                try:
+                    branch.dataset.abort_append_replacement(replacement)
+                except BaseException as abort_error:
+                    reason = (
+                        "ROI scalar replacement abort failed: "
+                        f"{safe_error_summary(abort_error)}"
+                    )
+                    self._roi_consumer.rejected(command, reason)
+                    self._drop_branch_locked(reason)
+                    return
+                if publication_committed:
+                    reason = (
+                        "ROI retarget publish failed after authoritative sequence "
+                        f"advance: {safe_error_summary(error)}"
+                    )
+                    self._roi_consumer.rejected(command, reason)
+                    self._drop_branch_locked(reason)
+                    return
+                self._roi_consumer.rejected(
+                    command,
+                    f"ROI retarget publish failed: {safe_error_summary(error)}",
+                )
+                self._process_applied_branch_locked(update, checkpoint)
+                return
+            try:
+                branch.dataset.commit_append_replacement(
+                    replacement,
+                    envelope,
+                    timeout=0.0,
+                )
+            except BaseException as error:
+                reason = (
+                    "ROI retarget authoritative commit failed: "
+                    f"{safe_error_summary(error)}"
+                )
+                self._roi_consumer.rejected(command, reason)
+                # Publication already consumed a sequence.  The old binding can
+                # no longer resume without manufacturing a provenance gap.
+                self._drop_branch_locked(reason)
+                return
+            # The publish/finalize pair is the irreversible data-plane half of
+            # this control transaction.  Once it succeeds, binding/state/APPLIED
+            # must follow without another cancellation point; a later Stop wins
+            # only after this revision has become one coherent transaction.
+            branch.binding = candidate
+            branch.control_revision = command.revision
+            self._roi_state = branch.state(self._next_roi_state_revision_locked())
+            self._roi_consumer.applied(command)
+            return
+
+        replacement: _RoiScalarBranch | None = None
+        try:
+            replacement = self._create_branch_locked(candidate, command.revision)
+            self._checkpoint(checkpoint)
+            self._projection.publish(update, payload, replacement.producer)
+            self._checkpoint(checkpoint)
+            replacement.dataset.ingest_next(timeout=0.0)
+        except CancellationRequested:
+            if replacement is not None:
+                self._retire_branch_locked(replacement)
+            raise
+        except BaseException as error:
+            if replacement is not None:
+                self._retire_branch_locked(
+                    replacement,
+                    error=StreamError(safe_error_summary(error)),
+                )
+            self._roi_consumer.rejected(
+                command,
+                f"ROI migration failed: {safe_error_summary(error)}",
+            )
+            self._process_applied_branch_locked(update, checkpoint)
+            return
+
+        assert replacement is not None
+        previous, self._branch = self._branch, replacement
+        self._roi_state = replacement.state(self._next_roi_state_revision_locked())
+        self._roi_consumer.applied(command)
+        if previous is not None:
+            self._retire_branch_locked(
+                previous,
+                replacement=replacement.stream.generation,
+            )
+
+    def _process_applied_branch_locked(
+        self,
+        update: MonitorUpdate[CameraSample],
+        checkpoint: Callable[[], None] | None,
+    ) -> None:
+        branch = self._branch
+        if branch is None:
+            return
+        try:
+            payload = self._projection.project(
+                update,
+                branch.binding,
+                branch.control_revision,
+            )
+        except CancellationRequested:
+            raise
+        except BaseException as error:
+            self._drop_branch_locked(
+                f"ROI scalar branch failed: {safe_error_summary(error)}"
+            )
+            return
+        self._checkpoint(checkpoint)
+        try:
+            self._projection.publish(update, payload, branch.producer)
+            self._checkpoint(checkpoint)
+            branch.dataset.ingest_next(timeout=0.0)
+        except CancellationRequested:
+            raise
+        except BaseException as error:
+            self._drop_branch_locked(
+                f"ROI scalar branch failed: {safe_error_summary(error)}"
+            )
+
+    def _create_branch_locked(
+        self,
+        binding: RoiScalarBinding,
+        control_revision: int,
+    ) -> _RoiScalarBranch:
+        edge = self._edge_by_schema[binding.output_schema.fingerprint]
+        if edge.schema.cell_schema is not binding.output_schema:
+            raise ValueError("ROI binding did not retain the admitted schema owner")
+        use_initial_identity = (
+            self._initial_revision == control_revision
+            and self._initial_scalar_block_id is not None
+            and self._initial_scalar_edge is edge
+        )
+        block_id = (
+            self._initial_scalar_block_id
+            if use_initial_identity
+            else BlockId(f"camera-monitor-roi-scalar-{uuid.uuid4().hex}")
+        )
+        assert block_id is not None
+        stream = None
+        producer = None
+        tap = None
+        dataset = None
+        try:
+            stream, producer = AcquisitionStream.create(
+                self._scalar_stream_id,
+                edge.payload_contract,
+                flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
+                retention_events=_STREAM_RETENTION_EVENTS,
+                retention_bytes=(
+                    _STREAM_RETENTION_EVENTS * edge.payload_max_retained_nbytes
+                ),
+            )
+            tap = stream.monitor(
+                max_events=_TAP_BACKLOG_EVENTS,
+                max_bytes=_TAP_BACKLOG_EVENTS * edge.payload_max_retained_nbytes,
+            )
+            dataset = MonitorDataset.append_window(block_id, tap, edge)
+            return _RoiScalarBranch(
+                binding,
+                control_revision,
+                block_id,
+                edge,
+                stream,
+                producer,
+                dataset,
+            )
+        except BaseException:
+            try:
+                if dataset is not None:
+                    dataset.close()
+                elif tap is not None:
+                    tap.close()
+            except BaseException:
+                pass
+            if producer is not None:
+                try:
+                    producer.fail(StreamError("ROI scalar branch construction failed"))
+                except BaseException:
+                    pass
+            raise
+
+    def _drop_branch_locked(self, reason: str) -> None:
+        branch, self._branch = self._branch, None
+        if branch is None:
+            return
+        self._set_raw_roi_state_locked(
+            branch.control_revision,
+            failure_reason=reason,
+        )
+        self._retire_branch_locked(branch, error=StreamError(reason))
+
+    def _set_raw_roi_state_locked(
+        self,
+        control_revision: int,
+        *,
+        failure_reason: str | None = None,
+    ) -> None:
+        self._roi_state = CameraMonitorRoiState(
+            None,
+            control_revision,
+            None,
+            None,
+            None,
+            self._next_roi_state_revision_locked(),
+            failure_reason,
+        )
+
+    def _next_roi_state_revision_locked(self) -> int:
+        return self._roi_state.state_revision + 1
+
+    @staticmethod
+    def _retire_branch_locked(
+        branch: _RoiScalarBranch,
+        *,
+        replacement: StreamGenerationId | None = None,
+        error: StreamError | None = None,
+    ) -> None:
+        try:
+            if error is not None:
+                branch.producer.fail(error)
+            elif replacement is not None:
+                branch.producer.supersede(replacement)
+            else:
+                branch.producer.finish()
+        except BaseException:
+            pass
+        try:
+            branch.dataset.close()
+        except BaseException:
+            pass
+
+    def _terminate_controls_locked(self, reason: str) -> None:
+        if self._controls_terminated:
+            return
+        self._controls_terminated = True
+        self._roi_consumer.terminate(reason)
+
+    @staticmethod
+    def _checkpoint(checkpoint: Callable[[], None] | None) -> None:
+        if checkpoint is not None:
+            checkpoint()
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -394,6 +983,7 @@ class _CameraMonitorTransaction:
     session_id: str
     io_timeout_seconds: float
     prepare_attempted: bool = False
+    view_notifications_enabled: bool = True
 
     def execute(self, context: RunContext) -> None:
         device = context.device(self.port.device.key)
@@ -458,8 +1048,25 @@ class _CameraMonitorTransaction:
                     metadata.correlation_id,
                 ),
             )
-            self.dataset.ingest_next()
+            self.dataset.ingest_next(context.checkpoint)
+            self._notify_view_updated()
+
+    def _notify_view_updated(self) -> None:
+        """Disable a failed display notification without failing acquisition."""
+
+        if not self.view_notifications_enabled:
+            return
+        try:
             self.view.updated()
+        except BaseException as error:
+            self.view_notifications_enabled = False
+            try:
+                self.view.notification_failed(
+                    "camera monitor view notification failed: "
+                    f"{safe_error_summary(error)}"
+                )
+            except BaseException:
+                pass
 
     def cleanup(
         self,
@@ -547,6 +1154,8 @@ class PreparedCameraMonitor:
         "_port",
         "_request",
         "_roi_binding",
+        "_roi_control_edges",
+        "_max_roi_reduction_scratch_nbytes",
         "_scalar_edge",
         "_start_run",
         "_started",
@@ -595,24 +1204,38 @@ class PreparedCameraMonitor:
             schema,
             CameraDatasetEventAdapter(capability.payload_contract),
         )
-        self._roi_binding = (
-            None
-            if request.roi is None
-            else RoiScalarBinding(
-                capability.payload_contract,
-                request.roi,
-                request.roi_reduction,
-                request.roi_validity_policy,
-            )
+        metadata_contract = RoiScalarMetadataContract(
+            capability.payload_contract.metadata_contract
         )
-        if self._roi_binding is None:
-            self._scalar_edge = None
-        else:
+        control_edges: list[FrozenDatasetEdge[RoiScalarSample]] = []
+        seen_output_schemas: set[str] = set()
+        scratch_bounds: list[int] = []
+        for reduction in (
+            ReductionMethod.MEAN,
+            ReductionMethod.SUM,
+            ReductionMethod.MAX,
+        ):
+            try:
+                output_schema = roi_scalar_output_schema(
+                    capability.payload_contract,
+                    reduction,
+                )
+                scratch_bounds.append(
+                    max_roi_scalar_reduction_scratch_nbytes(
+                        capability.payload_contract,
+                        reduction,
+                    )
+                )
+            except TypeError:
+                # MAX has no meaningful order for complex camera values.  The
+                # other two families still form a complete admitted catalog.
+                continue
+            if output_schema.fingerprint in seen_output_schemas:
+                continue
+            seen_output_schemas.add(output_schema.fingerprint)
             scalar_contract = RoiScalarSampleContract(
-                self._roi_binding,
-                RoiScalarMetadataContract(
-                    capability.payload_contract.metadata_contract
-                ),
+                output_schema,
+                metadata_contract,
             )
             scalar_schema = DatasetSchema(
                 AxisSpec(
@@ -631,17 +1254,47 @@ class PreparedCameraMonitor:
                     ),
                 ),
                 PointLayout.rect_c((request.scalar_history_capacity,)),
-                self._roi_binding.output_schema,
+                output_schema,
             )
-            self._scalar_edge = FrozenDatasetEdge(
-                scalar_schema,
-                RoiScalarDatasetEventAdapter(scalar_contract),
+            control_edges.append(
+                FrozenDatasetEdge(
+                    scalar_schema,
+                    RoiScalarDatasetEventAdapter(scalar_contract),
+                )
+            )
+        if not control_edges or not scratch_bounds:
+            raise ValueError("camera contract admits no ROI scalar reduction schema")
+        self._roi_control_edges = tuple(control_edges)
+        self._max_roi_reduction_scratch_nbytes = max(scratch_bounds)
+        self._roi_binding = (
+            None
+            if request.roi is None
+            else RoiScalarBinding(
+                capability.payload_contract,
+                request.roi,
+                request.roi_reduction,
+                request.roi_validity_policy,
+                _edge_for_output_schema(
+                    self._roi_control_edges,
+                    roi_scalar_output_schema(
+                        capability.payload_contract,
+                        request.roi_reduction,
+                    ),
+                ).schema.cell_schema,
+            )
+        )
+        if self._roi_binding is None:
+            self._scalar_edge = None
+        else:
+            self._scalar_edge = _edge_for_output_schema(
+                self._roi_control_edges,
+                self._roi_binding.output_schema,
             )
         base_peak = _base_monitor_peak_bytes(
             port,
             self._edge,
-            self._scalar_edge,
-            self._roi_binding,
+            self._roi_control_edges,
+            self._max_roi_reduction_scratch_nbytes,
         )
         if base_peak > request.memory_limit_bytes:
             raise MemoryError(
@@ -674,6 +1327,10 @@ class PreparedCameraMonitor:
     @property
     def scalar_view_schema(self) -> DatasetSchema | None:
         return None if self._scalar_edge is None else self._scalar_edge.schema
+
+    @property
+    def roi_control_schemas(self) -> tuple[DatasetSchema, ...]:
+        return tuple(edge.schema for edge in self._roi_control_edges)
 
     @property
     def request(self) -> CameraMonitorRequest:
@@ -725,6 +1382,10 @@ class PreparedCameraMonitor:
             self._request,
             self._port,
             view,
+            roi_control_edges=self._roi_control_edges,
+            max_roi_reduction_scratch_nbytes=(
+                self._max_roi_reduction_scratch_nbytes
+            ),
         )
         try:
             return self._start_run(plan)
@@ -745,8 +1406,8 @@ class PreparedCameraMonitor:
 def _base_monitor_peak_bytes(
     port: BoundCameraMonitorPort,
     edge: FrozenDatasetEdge[CameraSample],
-    scalar_edge: FrozenDatasetEdge[RoiScalarSample] | None,
-    roi_binding: RoiScalarBinding | None,
+    scalar_edges: tuple[FrozenDatasetEdge[RoiScalarSample], ...],
+    max_roi_reduction_scratch_nbytes: int,
 ) -> int:
     capability = port.capability
     payload = capability.payload_contract.max_retained_nbytes
@@ -763,45 +1424,81 @@ def _base_monitor_peak_bytes(
         capability.driver_ring_bytes
         + capability.adapter_record_retention_bytes
         + (_STREAM_RETENTION_EVENTS * payload)
+        # Raw display and the stable ROI processor ingress each own a monitor
+        # tap from the unchanged source generation.
+        + (_TAP_BACKLOG_EVENTS * payload)
         + (_TAP_BACKLOG_EVENTS * payload)
         + mutable_materializer
         + immutable_snapshot
         + reorder_scratch
         + (history_cells * edge.metadata_max_retained_nbytes)
     )
-    if scalar_edge is None:
-        if roi_binding is not None:
-            raise ValueError("ROI binding requires a scalar dataset edge")
-        return raw_peak
-    if roi_binding is None:
-        raise ValueError("scalar dataset edge requires an ROI binding")
-    scalar_schema = scalar_edge.schema
+    edges = tuple(scalar_edges)
+    if not edges:
+        raise ValueError("scalar_edges cannot be empty")
+    branch_peaks = sorted(
+        (_scalar_branch_peak_bytes(scalar_edge) for scalar_edge in edges),
+        reverse=True,
+    )
+    # A schema migration commits its replacement before superseding the old
+    # branch.  Same-schema retarget likewise owns old plus shadow append
+    # storage until its first replacement event commits.  Two full branch
+    # peaks conservatively close both overlap shapes with one admitted bound.
+    scalar_overlap = (
+        sum(branch_peaks[:2])
+        if len(branch_peaks) > 1
+        else 2 * branch_peaks[0]
+    )
+    return (
+        raw_peak
+        + scalar_overlap
+        + nonnegative_integer(
+            max_roi_reduction_scratch_nbytes,
+            "max_roi_reduction_scratch_nbytes",
+        )
+    )
+
+
+def _scalar_branch_peak_bytes(
+    edge: FrozenDatasetEdge[RoiScalarSample],
+) -> int:
+    scalar_schema = edge.schema
     scalar_cells = (
         scalar_schema.repeat_axis.size * scalar_schema.point_layout.storage_size
     )
     scalar_mutable = mutable_dataset_storage_nbytes(scalar_schema)
     scalar_snapshot = dataset_storage_nbytes(scalar_schema)
     scalar_reorder = scalar_mutable if scalar_cells > 1 else 0
-    scalar_payload = scalar_edge.payload_max_retained_nbytes
+    scalar_payload = edge.payload_max_retained_nbytes
     return (
-        raw_peak
-        # The processor has its own admitted source tap; it never steals the
-        # raw materializer's delivery.
-        + (_TAP_BACKLOG_EVENTS * payload)
-        + (_STREAM_RETENTION_EVENTS * scalar_payload)
+        (_STREAM_RETENTION_EVENTS * scalar_payload)
         + (_TAP_BACKLOG_EVENTS * scalar_payload)
         + scalar_mutable
         + scalar_snapshot
         + scalar_reorder
-        + (scalar_cells * scalar_edge.metadata_max_retained_nbytes)
-        + roi_binding.reduction_scratch_nbytes
+        + (scalar_cells * edge.metadata_max_retained_nbytes)
     )
+
+
+def _edge_for_output_schema(
+    edges: tuple[FrozenDatasetEdge[RoiScalarSample], ...],
+    output_schema: ValueSchema,
+) -> FrozenDatasetEdge[RoiScalarSample]:
+    if not isinstance(output_schema, ValueSchema):
+        raise TypeError("output_schema must be ValueSchema")
+    for edge in edges:
+        if edge.schema.cell_schema.fingerprint == output_schema.fingerprint:
+            return edge
+    raise ValueError("ROI output schema was not admitted")
 
 
 def _compile_camera_monitor_plan(
     request: CameraMonitorRequest,
     port: BoundCameraMonitorPort,
     view: CameraMonitorViewPort,
+    *,
+    roi_control_edges: tuple[FrozenDatasetEdge[RoiScalarSample], ...],
+    max_roi_reduction_scratch_nbytes: int,
 ) -> RunPlan[_CameraMonitorTransaction, None, None]:
     spec = getattr(view, "spec", None)
     if not isinstance(spec, CameraMonitorViewSpec):
@@ -813,9 +1510,6 @@ def _compile_camera_monitor_plan(
         raw_tap = None
         processor_tap = None
         raw_dataset = None
-        scalar_producer = None
-        scalar_tap = None
-        scalar_dataset = None
         projection = None
         dataset = None
         try:
@@ -841,46 +1535,28 @@ def _compile_camera_monitor_plan(
                 raw_tap,
                 spec.dataset_edge,
             )
-            if spec.scalar_dataset_edge is not None:
-                assert spec.scalar_block_id is not None and spec.roi_binding is not None
-                processor_tap = stream.monitor(
-                    max_events=_TAP_BACKLOG_EVENTS,
-                    max_bytes=(
-                        _TAP_BACKLOG_EVENTS
-                        * port.capability.payload_contract.max_retained_nbytes
-                    ),
-                )
-                scalar_stream, scalar_producer = AcquisitionStream.create(
-                    StreamId(f"camera-monitor-roi-scalar:{request.camera_ref.role}"),
-                    spec.scalar_dataset_edge.payload_contract,
-                    flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-                    retention_events=_STREAM_RETENTION_EVENTS,
-                    retention_bytes=(
-                        _STREAM_RETENTION_EVENTS
-                        * spec.scalar_dataset_edge.payload_max_retained_nbytes
-                    ),
-                )
-                scalar_tap = scalar_stream.monitor(
-                    max_events=_TAP_BACKLOG_EVENTS,
-                    max_bytes=(
-                        _TAP_BACKLOG_EVENTS
-                        * spec.scalar_dataset_edge.payload_max_retained_nbytes
-                    ),
-                )
-                scalar_dataset = MonitorDataset.append_window(
-                    spec.scalar_block_id,
-                    scalar_tap,
-                    spec.scalar_dataset_edge,
-                )
-                projection = RoiScalarStreamProjection(
-                    spec.roi_binding,
-                    processor_tap,
-                    scalar_producer,
-                )
+            processor_tap = stream.monitor(
+                max_events=_TAP_BACKLOG_EVENTS,
+                max_bytes=(
+                    _TAP_BACKLOG_EVENTS
+                    * port.capability.payload_contract.max_retained_nbytes
+                ),
+            )
+            projection = RoiScalarStreamProjection(processor_tap)
             dataset = CameraMonitorLiveDataset(
                 raw_dataset,
-                scalar=scalar_dataset,
                 projection=projection,
+                input_contract=port.capability.payload_contract,
+                scalar_edges=roi_control_edges,
+                scalar_stream_id=StreamId(
+                    f"camera-monitor-roi-scalar:{request.camera_ref.role}"
+                ),
+                max_reduction_scratch_nbytes=(
+                    max_roi_reduction_scratch_nbytes
+                ),
+                initial_scalar_block_id=spec.scalar_block_id,
+                initial_scalar_edge=spec.scalar_dataset_edge,
+                initial_binding=spec.roi_binding,
             )
             view.bind(
                 dataset,
@@ -909,8 +1585,6 @@ def _compile_camera_monitor_plan(
             else:
                 for close in (
                     None if projection is None else projection.close,
-                    None if scalar_dataset is None else scalar_dataset.close,
-                    None if scalar_tap is None else scalar_tap.close,
                     None if processor_tap is None else processor_tap.close,
                     None if raw_dataset is None else raw_dataset.close,
                     None if raw_tap is None else raw_tap.close,
@@ -921,11 +1595,6 @@ def _compile_camera_monitor_plan(
                         close()
                     except BaseException:
                         pass
-            if scalar_producer is not None:
-                try:
-                    scalar_producer.fail(StreamError(safe_error_summary(error)))
-                except BaseException:
-                    pass
             if producer is not None:
                 try:
                     producer.fail(StreamError(safe_error_summary(error)))
@@ -979,6 +1648,7 @@ __all__ = [
     "CameraMonitorDescriptor",
     "CameraMonitorLiveDataset",
     "CameraMonitorRequest",
+    "CameraMonitorRoiState",
     "CameraMonitorSnapshot",
     "CameraMonitorViewPort",
     "CameraMonitorViewSpec",
