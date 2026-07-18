@@ -124,6 +124,56 @@ hardware_change_review_allowed :=
 
 因此，用户看到的主要入口、操作结构和视觉风格基本一致；变化集中在功能可发现性、错误提示和安全状态。内部实现则会彻底重构。
 
+### 2.1 UX 行为权威、冻结条款与 salvage gate
+
+**UX 行为权威固定为 `main` 分支旧实现。** 这与规则 4“物理/数值权威为 `main`”同构：selector 覆盖哪些 plot kind、zoom/pan 手感、live 是否不断流、ROI/threshold 是否热更新、fit 从哪里触发及何时可见、relim/cmap/limits 控件、Setting/Edit 布局与保存/载入流程，默认逐项继承 `main` 的真实用户行为。新架构可以彻底替换内部对象、线程、数据合同与包边界，但不能因实现更容易而缩窄用户面；安全或数据正确性要求确实需要偏离时，只能进入 §2.2 的 UX 偏离账本，不能散落在 checkpoint 中被写成永久产品合同。
+
+以下条款为**冻结条款清单**，任何后续 checkpoint、局部 READY、实现困难或测试便利均不能覆盖：
+
+1. §2 的“日常工作流应保持熟悉”和“视觉语言保持一致”；
+2. §7.2 的 `ControlTopic[T]`：ROI、threshold 等运行控制是 typed、revisioned、acknowledged，已 ACCEPTED revision 必须在事务边界得到 `APPLIED` 或明确的 terminal ack；
+3. §12.5 的 `WORKER_RASTER_LIVE`：worker raster 与 GUI 解耦的同时，Qt overlay 必须承担 ROI/crosshair/selection/hover，`ViewportTransform` 必须承担同 revision 的 zoom/pan 与命中换算；
+4. §18.4 的真实 launcher/composition-root E2E：必须用真实交互事件证明日常流程和操作时序未退化，不能只证明 controller 内部状态或静态 PNG；
+5. §12.6 的用户可见 Fit：普通 Fit 即提交权威 draft，selector/SelectionCandidate 可预填同一 draft，不能用额外确认步骤或独立工具窗口替代主工作流。
+
+**行为 salvage gate 是每个 GUI/交互切片的开工前置证据。** 实现者必须先只读检查 `main` 对应旧实现，并在该切片 checkpoint 的首段冻结下列清单；未完成这一步不得改目标代码：
+
+| 字段 | 必须记录的证据 |
+|---|---|
+| exact oracle | `main` 的 exact commit（本轮修宪基线为 `6c337d49c7086fa0ff21f879cd159bdf0e753f51`）、对应文件/符号与真实 consumer |
+| 入口与控件 | 真实 launcher、菜单/按钮/快捷键、Setting/Edit 字段和默认值 |
+| 交互覆盖 | selector/zoom/pan/hover/crosshair/relim/cmap/fit 各覆盖哪些 plot kind |
+| 时序 | 按下、拖动、松手、Apply、Stop/Close 后何时可见、何时 authoritative |
+| 不可中断项 | 哪个 source、raw front、其它 panel 或硬件 Run 在交互期间继续运行 |
+| 即时生效项 | 哪些修改热更新，revision/ack 在何处显示 APPLIED |
+| 保存/恢复 | workspace、figure、selection、fit 与控件状态的持久/重开行为 |
+| authority | `DISPLAY_STATE / SELECTION_CANDIDATE / REVISIONED_CONTROL / AUTHORITATIVE_DRAFT / COMMITTED_RESULT` 中的边界与跨越动作 |
+| 禁止复制机制 | 对应旧 Hub/共享 Figure/shape 猜测/隐式降维等只属于实现、不得迁入的机制 |
+| 收口对照 | 新实现逐项 PASS/FAIL；FAIL 必须登记 §2.2，不能改写旧行为或删掉验收项 |
+
+每一行只可标记 `MATCHED / MUST_CLOSE / LEDGERED_PENDING_APPROVAL / APPROVED_DEVIATION / NOT_APPLICABLE_WITH_EVIDENCE`，并附真实 launcher E2E、event、Run/frame/revision 证据。salvage 只把 `main` 当 UX/物理/算法 oracle，不把旧 `DeviceSet/Registry/Hub/LogicNode`、线程共享方式或包结构迁入目标架构。做不动时只能把能力拆成更小、仍保持行为闭合的纵向切片，或按冻结合同继续实现；“实现复杂”永远不构成降低 UX 的理由。
+
+### 2.2 UX 偏离账本（全部待用户批准）
+
+账本不阻塞后续纠正和迁移，但任何未关闭项都必须在《迁移完成报告》首页列为**待用户裁决**；未得到用户批准的偏离不能被称为终态设计。默认动作是恢复 `main` 行为并关闭账本项，而不是等待批准后才修复。
+
+| id | `main` 旧行为权威 | 当前分支/既有 checkpoint 的偏离 | 形成原因（非正当化） | 状态与必须关闭的证据 |
+|---|---|---|---|---|
+| `UX-001` | 修改已有 ROI 时 raw camera source 与可见 raw 画面不断流；running downstream 在 drag 完成后直接 retarget | M2d/M2e 以 immutable whole-Run replacement 重启 source/stream/history，且 draft 还需额外 `Apply ROI` | 为避免首个 consumer 前置 ControlTopic 而选了较小实现 | **待用户批准 / 默认必须修复**：drag release 自动提交 revisioned ROI ControlTopic，事务边界 APPLIED 后才显示 applied；新建/删除只替换下游 generation；source Run、raw front、tap topology 不变的 E2E |
+| `UX-002` | live plot 的 selector、zoom/pan、十字、hover 读值、relim 与 cmap/limits 覆盖旧 plot contract；拖动只冻结当前 panel，其它 panel 不停流，松手补拍 | 当前 S1/M2 产品只交付局部 rectangle overlay，并用整个 `_live.pause()` 暂停 board；缺完整 ViewportTransform 交互与 Setting/Edit 控件 | 早期窄 leaf 被误当作可长期冻结产品面 | **待用户批准 / 默认必须修复**：所有 live plot kind 的非空交互句柄合同；per-panel interaction freeze/owed beat；三种 relim 与 cmap/lim E2E |
+| `UX-003` | figure viewer 载入后是可交互 panel，可 zoom/pan、重新 fit 与导出；GridPlot 可 focus/返回 | W4 generic figure 与部分 artifact 查看器冻结为 PNG/display-only；W7 只有 saved-fit focus/export，未成为通用交互 viewer/重 fit 入口 | 以 immutable raster 先闭合线程/内存所有权 | **待用户批准 / 默认必须修复**：通用 figure/archive viewer 恢复交互、re-fit、export；报告类多页可保留 frozen raster，但必须可 zoom |
+| `UX-004` | plot/panel 内直接发起 fit，框选与 fit selection 联动，普通 Fit 一步生效；2D box ROI fit 可见 | 当前主 UX 依赖独立 `fit_gui`，TaskConsole `Add Analysis -> Fit` / `Analyze -> Fit`、SelectionCandidate 与 2D box fit 尚未闭合 | 先交付了 typed solver/editor 与 exact artifact 路径 | **待用户批准 / 默认必须修复**：§12.6 两入口、一键 authority draft、框选预填、2D 双空间轴 fit 与即时 overlay E2E |
+| `UX-005` | TaskConsole 支持全部 addable plot kind、Monitor board、Logic rows、Start/Stop、统一 Setting/Edit、树形 signal picker、布局与 workspace | 当前 target TaskConsole 仍是 one-card/one-Task 窄产品，不能完成旧 tutorial 日常流程 | 纵向迁移尚未接完，而窄 checkpoint 容易被误读为产品完成 | **待用户批准 / 默认必须修复**：U0#4 全清单与真实 launcher tutorial E2E 零代码走通 |
+| `UX-006` | calibration/site-map/occupancy 图沿统一交互 viewer/GridPlot 获得 focus、selector、zoom 与 export | 已提交 calibration report 与 exact occupancy cell viewer 是静态 frozen raster；未提交工作树不能作为闭合证据 | 先闭合 immutable report/exact-address 与预算/线程所有权 | **待用户批准 / 默认必须修复**：报告类多页至少 zoom；通用 calibration/occupancy 查看路径按旧 surface 补适用的 focus/selector/export，或逐项提交用户裁决 |
+| `UX-007` | 旧实现可能按 first/flatten/trailing mean 直接把非标量送入权威结果 | 新设计只让显示层 role-driven auto；fit/scan-y/derived artifact 必须显式冻结 `CommittedTransform` | 防止静默丢轴和错误物理结论 | **待用户批准；安全边界不可回退**：默认视图低摩擦、当前投影始终可见可改、authority draft 由视图预填但明确提交 |
+| `UX-008` | 旧 UI 可能继续显示拼接/latest，或在缺帧、gap/schema/hardware mismatch 后隐式继续 | 新设计明确报错并使 exact attempt 失败 | 防止数据错位和伪成功 | **待用户批准其提示/恢复 UX；正确性不可回退**：错误可理解、原始失败证据可查、monitor 与 formal 状态不混淆 |
+| `UX-009` | 旧 qCMOS 路径可在缺少当前资格/末端证明时继续；部分软件路径可能逐 cell host stepping | Formal 必须 Q0+preflight+EndAttestation；SCAN_SLOT/MOT 保持冻结 bitstream 的 autonomous hardware timing，不允许 host-stepped fallback | 物理时序与帧关联正确性 | **待用户批准其 gate/重跑 UX；硬件/正确性边界不可回退**：INVALID 原因、手动 reject-and-redo 与资格状态清楚可见 |
+| `UX-010` | Stop/设备切换可能立即 release 或静默抢占 | UI 在真实 terminal/SAFE/reap 前显示 `CANCELLING`，冲突等待原 owner 退出 | 防止双 owner 与未安全停止即重用 | **待用户批准其等待/错误 UX；安全边界不可回退**：真实 launcher cancel/close/conflict E2E |
+| `UX-011` | 历史软件 artifact 可能由同一 reader 猜格式或宽松升级 | 普通软件只接受 current plain schema；历史转换为独立离线工具 | 删除升级链和双 reader 历史残余 | **待用户批准其错误/转换 UX；current-only边界不可回退**：拒绝信息与离线转换 runbook |
+| `UX-012` | monitor 为实时性可跳中间显示帧，重型操作曾阻塞 GUI 或由 GUI/worker 共享 Figure | 新 monitor 仍允许显示丢帧但同一 board coherent；compose/fit/calibration 在有界 worker，GUI 保持响应 | 保持交互性能同时消除 shot 混合和线程竞态 | **待用户批准 / 默认匹配旧手感**：profile + coherent board + GUI event latency E2E，不能把 monitor skip 泄漏到 formal exact |
+
+只有用户明确批准的偏离才可把状态改为 `APPROVED`，并必须记录批准范围、日期与替代验收；实现者、测试通过或局部架构审查都无权自行批准。
+
 ## 3. 当前实现的根本问题
 
 ### 3.1 包边界相互反向依赖
@@ -624,9 +674,13 @@ W4d补上一个更窄但物理完整的冻结产品面：`.readout.occupancy_cel
 
 W4e只补W4d已有exact-address产品的离散cell导航，不把它扩成live grid或图形selector。窗口先在同一个shared frozen-raster lane异步读取metadata-only `OccupancyCellNavigation`：content-addressed artifact target、occupied schema fingerprint、generation、完整repeat/point `AxisSpec`、`PointLayout`与schema-owned `cell_layout`。这些长期metadata和按轴Qt控件的retained upper bound先从唯一总预算扣除，剩余预算才逐字传给W4d exact-cell load/render/presentation；换cell前先清旧PNG/QImage front。每根非singleton轴保持显式“未选择”，绝不默认first/latest；只有singleton可自动取0。控件只按轴数建立spin/index editor并即时显示coordinate/unit，不按axis size建立item列表。Load把全部repeat/point轴冻结为具名`IndexSelection`；Previous/Next沿`cell_layout`的repeat-major physical storage order移动，因此EXPLICIT sparse hole天然跳过且不wrap。
 
-同一窗口在全局唯一capacity-one lane上至多有一个已提交job和一个可覆盖的latest pending selection；每个结果同时校验UI request revision、artifact/schema/generation identity与canonical Selection，stale success/error/cancellation一律不能改status、summary或front。旧Future/PNG在当前owner callback真正退栈后，下一次queued owner turn才启动pending，避免两次大图生命周期重叠。Close只清pending/front、置cooperative cancellation并立即返回；已进入repository/Agg的工作诚实排空但永不发布。该能力仍永久是`DISPLAY ONLY`：没有`ViewportTransform`、鼠标selector/ROI、zoom、export、live source或第二scheduler；这些只有与真实rolling/fit/control consumer同一纵切时才可加入。
+同一窗口在全局唯一capacity-one lane上至多有一个已提交job和一个可覆盖的latest pending selection；每个结果同时校验UI request revision、artifact/schema/generation identity与canonical Selection，stale success/error/cancellation一律不能改status、summary或front。旧Future/PNG在当前owner callback真正退栈后，下一次queued owner turn才启动pending，避免两次大图生命周期重叠。Close只清pending/front、置cooperative cancellation并立即返回；已进入repository/Agg的工作诚实排空但永不发布。W4e当时只完成离散 exact-address 导航，尚无`ViewportTransform`、鼠标selector/ROI、zoom、export或live source；“永久 `DISPLAY ONLY`”这一产品能力上限现已废止。artifact/source仍不可原地修改，但该查看面必须在U0纠正3或通用viewer切片复用统一interaction owner补齐旧行为。
+
+**术语裁决（覆盖本节以上 W4/W7 现态摘要及后文历史 checkpoint）：** `DISPLAY_ONLY` 以后只允许表示 ViewSpec/viewport/display reducer/export raster 不能静默升级成 FitSpec、ScanOutputContract、CommittedTransform 或修改 source artifact；绝不表示产品 UI 可以永久缺少 zoom/pan/selector/re-fit/export。W4a/W4d/W4e 仍保留已证明的 immutable source、预算、单 render owner、cancel/close 与 revision-check 不变量，但其产品能力上限已撤销。W4b calibration 多页报告是 frozen raster 的合法例外，仍必须补 zoom；其 site/grid focus/export 是否适用按规则 9 salvage。W7 exact-result replay 继续禁止**隐式** solver/rewrite；用户显式 `Analyze -> Fit` 必须从 exact source ref + SelectionCandidate 新建 authority draft/result/ref，绝不原地改旧 artifact。
 
 W5交付第一个current交互Fit产品：`.fit_gui(CaptureArtifactRef, model=None)`从已提交raw capture开始，后台从同一schema和closed model catalog生成可用模型，以共享form DSL编辑显式parameter seed/bounds/fixed值；W5首切片拒绝`CommittedTransform`，W8b随后只为W8a已经证明可忠实显示的selection-only子集增加显式`committed_transform=`参数。raw路径仍以`None`逐值通过同一gate；transformed路径要求调用者先提交权威transform，Workbench没有ROI/transform editor，也不读取当前ViewSpec、selector、viewport或display reducer。`FitSpec`冻结具名fit axes，所有其余repeat/point/data axes原样成为batch axes；Qt分别显示不可编辑的authority摘要和axis name/AxisId/role/size/unit，并显示每个batch cell的status/quality。Fit使用独立capacity-one worker lane，普通冻结Figure继续使用原lane；两者只在既有Agg render owner处短暂串行，不让长solver占住Figure materialization。
+
+上述“调用者先提供 transform、Workbench 不读取 selector”只约束独立 `fit_gui` 直达入口，不能约束 TaskConsole/figure 的主 Fit UX。主路径必须由当前 selector 产生 `SelectionCandidate`，经 authority-side `suggest_fit_draft` 预填，并由普通 Fit 动作一键提交；display state 本身仍不能无动作越权成为 authority。
 
 `FitExecution`与唯一未保存draft由headless `CaptureFitDraftAuthority`独占；Qt只得到不可保存的`FitDraftResult`和immutable raster。draft overlay把不可保存的`FitResultBatch`与窗口创建时冻结的`CaptureArtifactRef`重新组合，并在物化前调用data owner的完整source/schema/fit-axis/batch-layout binding validator；不存在把execution交给arbitrary projector的回调。只有显式`Save Fit Result`才通过notebook composition提供的lifecycle-gated save command发布neutral-owned`CaptureFitResultArtifactRef`，随后必须从该exact ref重开overlay；Clear只撤draft/画面，不删除已发布artifact。Save一旦返回ref，后续reopen/render失败或Close请求都不能吞掉ref；Save进行中Close明确defer。
 
@@ -980,6 +1034,8 @@ JoinKey 是 frozen、可序列化的领域值（例如 TriggerKey/ScanCellKey/Sh
 Artifact Repository 是持久化原语，不是 stream。
 
 ControlTopic 的 ack 明确区分 `ACCEPTED`、`APPLIED(at transaction boundary)`、`REJECTED(reason)`、`SUPERSEDED(by_revision)` 与 `TERMINATED(reason)`；发送成功不等于硬件已经应用。每个被 ACCEPTED 的 revision 最终必须恰好收到 APPLIED、SUPERSEDED、REJECTED 或 TERMINATED 之一，UI 不会永久等待一个被 coalesce 或 owner shutdown 吞掉的 command。有限正式 Run 拒绝 reconfigure 时必须返回 REJECTED，UI 不能先改成本地“已生效”状态。
+
+monitor 的 ROI/threshold value 更新必须把 **source acquisition 与 downstream analysis 生命周期分开**。相机 source Run、raw stream/tap 和可见 raw front 持续运行；修改一个已经存在的 ROI/threshold processor 只向该 downstream owner 的 `ControlTopic` 发布新 revision，并在该 processor 的事务边界得到 `APPLIED` 后切换语义，不能重启 source、重建 raw history 或制造 running consumer gap。新建/删除 ROI processor 只创建/终止该 downstream stream/generation；source tap topology 仍不变。schema-affecting 的 downstream 变更可以迁移该 downstream generation，但不得借此迁移 source generation。只有 source 本身的硬件/采集 schema 确实改变时，才按下文 source generation migration 执行；不能把 M2d/M2e 的 whole-Run replacement 当成 monitor retarget 的实现捷径。
 
 EventStream 中 progress 可以 coalesce，transition 必须按 run revision 有序；但通知流不是状态真相源。RunHandle 保存可查询的最新 authoritative state/error/phase snapshot，UI 初次连接、漏事件或重连后先读取 snapshot，再订阅后续事件，因此 terminal event 即使 UI 当时阻塞也不会“丢掉终态”。
 
@@ -1992,7 +2048,7 @@ Setting 与 Edit 使用同一个 `ScanIntentForm` 类和同一个 card-owned `Sc
 2. `WORKER_RASTER_LIVE`：高成本 2D、grid 和多 panel board；render worker 永久拥有独立 Agg Figure 或纯 raster backend，GUI 只接 immutable front QImage/texture + coordinate transform，并用 Qt overlay 处理 ROI/crosshair/selection/hover；
 3. `WORKER_HEADLESS_EXPORT`：export worker 永久拥有独立 Figure，只返回 immutable image/file artifact。
 
-W4a冻结Figure窗口是第三类的一次性GUI投影：viewer module的唯一capacity-one lane先调用notebook提供的窄`.figure` callable，再用既有串行Agg owner合成整个board PNG；Qt owner在按当前物理board尺寸完成front预算准入后，只做一次`QtImageBoard.present_encoded()`原子换front。它不是`WORKER_RASTER_LIVE`，没有持续source、latest/coalescing、overlay、ViewportTransform或交互selector；关闭会立即置cooperative cancellation并撤销发布，尚未开始及repository/Agg阶段之间的工作直接终止，已经进入不可安全强杀的repository/Agg调用则由共享lane诚实排空，GUI不等待且最终丢弃返回值，绝不发布stale front。
+W4a冻结Figure窗口是一个**历史线程/内存所有权 checkpoint，而不是终态 UX 合同**：viewer module的唯一capacity-one lane先调用notebook提供的窄`.figure` callable，再用既有串行Agg owner合成整个board PNG；Qt owner在按当前物理board尺寸完成front预算准入后，只做一次`QtImageBoard.present_encoded()`原子换front。它当时没有持续source、latest/coalescing、overlay、ViewportTransform或交互selector；这只能说明该切片尚未完成，不能把缺失能力冻结成永久`DISPLAY ONLY`。§2.2 `UX-003` 与 §19 的纠正 3 要求通用 figure/archive 查看路径恢复 `main` 的 zoom/pan/re-fit/export；只有报告类多页可继续以 frozen raster 为数值呈现载体，并补 zoom。关闭仍须立即置cooperative cancellation并撤销发布，尚未开始及repository/Agg阶段之间的工作直接终止，已经进入不可安全强杀的repository/Agg调用则由共享lane诚实排空，GUI不等待且最终丢弃返回值，绝不发布stale front。
 
 `WORKER_RASTER_LIVE` 是复合板的正式性能路径，不是把每个 panel 退回 GUI compose。worker 可一次 compose 整个 board 或一组共享布局，并通过 double/triple buffer 发布：
 
@@ -2024,7 +2080,7 @@ M1是`WORKER_RASTER_LIVE`的第一个continuous单panel产品，不是第四种r
 
 “普通 present 失败保留旧完整 front”与“source 已失效”分开：capture/preview source failure 通过同一个 no-payload owner wake 到达 controller，owner 先 `invalidate()` 撤销 publish/work authority再清空旧 front，防止失败 run 的最后一帧继续伪装为有效。当前 leaf 还没有 PROVISIONAL/FINAL 徽标或错误 overlay，所以只能保守清空；在这些状态 UI 接线前不能暴露为完成的产品 surface。
 
-GUI 不读取 worker-owned Figure/artist；所有命中测试和选择都使用随 front buffer 一起发布的 ViewportTransform。静态 axes/labels/colorbar 可由 worker raster 缓存，动态 overlay 由 Qt 画；export 始终从 FigureDocument + frozen data revision 重画，不保存屏幕 texture。
+GUI 不读取 worker-owned Figure/artist；所有命中测试和选择都使用随 front buffer 一起发布的 ViewportTransform。静态 axes/labels/colorbar 可由 worker raster 缓存，动态 overlay 由 Qt 画；export 始终从 FigureDocument + frozen data revision 重画，不保存屏幕 texture。该交互不是可选 enhancement：每个用户可见 `WORKER_RASTER_LIVE` panel 必须按 `main` salvage 清单提供适用的 zoom/pan/crosshair/hover/selector，并使 Setting/Edit 中的 relim、cmap 与 limits 走同一 document/view revision；不适用的 plot kind 必须由旧行为证据明确，而不能返回空交互句柄冒充完成。
 
 ```text
 LiveRasterFrame:
@@ -2045,7 +2101,7 @@ W3d 的单 CURVE progressive scan 是该规则的第一个窄实现；M2c 又让
 
 因此终态仍禁止 worker 与 GUI 同时或无确认地访问同一个 Figure；这里接纳的是现有性能事实和明确的迁移 handoff，不是把双 owner/barrier 自死锁提升成架构合同。
 
-底层 Qt leaf 仍只画一张 immutable GRAY8、保持声明的 `(Y,X)` 方向并做 aspect-fit；它没有 `ViewportTransform`、ROI/crosshair/selection/hover、zoom/pan、固定色阶 control、axes/colorbar、save/export、Matplotlib/Agg、多 panel compose、多 source join或 continuous/free-running monitor。W1 已在这个leaf上交付一个真实用户可见、仅支持one-event finite exact capture的`CaptureWorkbenchWindow`：prepare/start/result/reap都在window-owned有界worker上，GUI只用一个no-payload owner wake串行处理attachment、whole-board present和generation/run-id匹配的`RunSnapshot`，Stop只cancel不wait，close异步等Run terminal与owner reap且不关闭Experiment。它是S0.5的第一个纵向产品consumer，不等于通用Workspace/PanelHost或完整S1/S5 GUI；上述缺失能力继续NO-GO。
+底层 Qt leaf 在 W1 历史切片中只画一张 immutable GRAY8、保持声明的 `(Y,X)` 方向并做 aspect-fit；当时尚无 `ViewportTransform`、ROI/crosshair/selection/hover、zoom/pan、固定色阶 control、axes/colorbar、save/export、多 panel compose、多 source join或 continuous/free-running monitor。W1 的 one-event finite exact `CaptureWorkbenchWindow` 只证明 prepare/start/result/reap 与异步 Stop/Close 所有权；它不是终态交互 panel。所有仍缺的用户面必须按 §2.1/§2.2 与 §19 纠正 2/3 继续交付，不能因 leaf 曾局部 READY 而成为合法降级。
 
 ### 12.6 UI 可见 Fit
 
@@ -2061,6 +2117,8 @@ Plot card -> Analyze -> Fit
 UI 明确展示 input、fit axes、batch axes、selection、reduction、model、initial/bounds、status、result 和 overlay。
 
 Fit 面板先调用 authority-side `suggest_fit_draft(schema, FitPolicy, SelectionCandidate)`，不把 Fit 当作 ViewIntent。用户看到的普通 `Fit` 动作就是对该权威 draft 的提交，不额外制造无意义确认框；但存在未解决 axis 时按钮不可执行，并明确指出需要 ROI、选择 axis 或定义物理 reducer。当前 ViewSpec 只帮助用户理解候选 selection，不提供可复制的 display reduction。运行后 selection/reduction 改变会创建新 revision 和新结果，旧结果不能覆盖。
+
+`SelectionCandidate` 必须可由当前 panel/figure selector 直接产生并预填同一个 authority draft；框选后点普通 `Fit` 不再经过第二个确认窗口。1D range fit 与 2D box ROI fit 都是 baseline：后者显式绑定两根 `SPATIAL_X/SPATIAL_Y` fit axis，保留其余 repeat/point/data axes 为 batch，不得把二维 ROI flatten 成一条匿名轴。fit 求解在有界 worker 中运行，source/live panel 与其它 panel 继续响应；最新合法 draft 的结果按 revision 更新 overlay，旧 completion 不覆盖新 selection。
 
 ### 12.7 Shutdown
 
@@ -3177,6 +3235,17 @@ Correctness tests 使用 deterministic TestClock/Scheduler，不依赖真实 sle
 
 Workbench E2E 必须从真实 launcher/composition root 驱动用户路径：Add Panel -> Setting -> 选 Measurement/Processor -> Start -> selector/repeat -> Add Analysis/Fit -> Save/Load -> Stop/Close；不能用 demo fixture、直接 poke controller 内部或手工调用 `_tick` 代替。PulseGUI 同样从真实入口执行 Edit -> Preview -> Scan/prepare -> cancel/safe。三档 DPI 截图与交互事件验证视觉/操作不退化。
 
+这里的“交互事件”必须由真实 Qt input/event 路径覆盖，而不是只断言 controller state：
+
+- 在运行中的 raw camera panel 上创建 ROI、热修改已有 ROI/threshold 并删除下游 processor；逐 revision 观察 `ACCEPTED -> APPLIED/terminal`，同时证明 source Run、raw stream generation、raw front sequence 与 source tap topology 不重启、不回退且无 gap；
+- 对 `main` salvage 清单中每种 live plot kind 执行 selector、zoom/pan、crosshair/hover 读值；shown plot 必须返回适用的非空 interaction handle，并用同 revision 的 `ViewportTransform` 验证 raster↔data 命中；
+- 拖拽/调整一个 panel 期间，其它 panel 继续 present；被拖 panel 在 release 后补到最新合法 revision，不把拖拽期间的 stale front 当新 front；
+- 通过同一 Setting/Edit 路径切换 `normal/tight/fixed` relim、cmap 与 limits，并验证保存/重开；
+- 从 panel/figure 的 `Add Analysis -> Fit` 或 `Analyze -> Fit` 一键提交 authority draft，框选直接预填同一 draft，覆盖 1D range 与 2D box ROI fit，并证明后台求解时 live/其它 panel 仍响应、stale completion 不覆盖新 selection；
+- 从通用 figure/archive viewer 载入任意已存 figure/artifact，执行 zoom/pan、re-fit 与 export；报告类 frozen multi-page raster 至少必须支持 zoom，不能以静态 PNG 通过通用 viewer 验收。
+
+每条 E2E 都必须同时验证用户可见结果、时序与不中断项；截图只补视觉证据，不能替代行为 oracle。
+
 virtual 与 real adapter 运行相同 Task/Measurement bind、PipelineSpec/RunPlan、artifact repository 和文件夹流程，只替换最低层 Port；adapter contract kit 使用生产 Port 的真实属性/方法名，并覆盖`ORDERED_END_ATTESTED_RUN`、CameraExternalTriggerQualification、DCAM frame metadata、timeout、buffer reuse、disconnect与health recovery。virtual adapter可以注入drop/reorder验证整run invalidation与qualification revocation状态机，但不能用fake队列代替Q0真机有限样本、统计上界与工作区间资格化证据。
 
 ## 19. 实施路线：证据门、并行轨与纵向切片
@@ -3195,6 +3264,28 @@ producer/adapter
 同一个 use case 不允许双写、双读或自动 fallback；尚未迁移的其它 use case 可以暂时停留在旧实现，但不能通过 bridge 污染新合同。S0.5 只允许 host/catalog/render/resource containment，不允许把旧 Hub/LogicNode/metadata vocabulary 适配成新 event/data/runtime 类型；这叫迁移隔离，不是领域兼容层。旧 panel 可由 LegacyPanelHost 逐项托管，旧 hardware workflow 必须经过 LegacyRuntimeFence，加入同一 process-lifetime InstallationRuntime、ResourceArbiter、DeviceBroker与shutdown lifecycle gate。共享 primitive 只在首个消费它的切片中建立最小正式版本；后续若无第二用例，不提前泛化。
 
 追溯审查判断“是否保留”时必须看终态职责和已排期 consumer，不能把中间提交的 production reachability 当成唯一标准。`MonitorTap -> MonitorDataset -> LiveDatasetSlot` 的未来 GUI live/rolling consumer、calibration/occupancy 的 S3 consumer、FitResultBatch 的 gridplot consumer 都是明确需求；它们可以因职责混杂、重复 owner 或过度包装而重构、压缩或替换，但不能仅因当前 composition 尚未接线就整簇删除。只有目标职责已有更小的唯一 owner、全部当前与已排期 consumer 都完成迁移，并有 dependency-closed 删除证据时才物理删除。
+
+### U0：UX 修宪后的纠正顺序（先于任何新能力）
+
+历史 S/W/M checkpoint 仍保留为“当时实现了什么”的审计事实，但其中把缺失用户面冻结为永久合同的句子已由 §2.1、§2.2 与规则 9 废止。自本 checkpoint 起，下面顺序覆盖旧 roadmap 中任何相反的“下一切片”建议；前三项纠正全部闭合前，不铸造新便利切片：
+
+1. **Monitor/ROI 生命周期纠正。** 相机 source Run/raw front 永不因 ROI/threshold retarget、新建或删除而重启或 gap；已有 downstream processor 由 revisioned `ControlTopic` 在事务边界 `APPLIED`，新建/删除只迁移该 downstream stream/generation。以 `main:frontend/task_console.py::_apply_panel_analysis/_publish_region` 的“retarget can never gap a running consumer”为 UX oracle，并用真实 launcher E2E 证明 source run id/generation/tap topology 与 raw sequence 连续。
+2. **补齐 full live interaction。** 为全部 `main` 声明可交互的 live plot kind 交付 `ViewportTransform + Qt overlay` 的 zoom/pan/crosshair/hover/selector；拖拽一个 panel 时其它 panel 不停流，被拖 panel 松手补拍；Setting/Edit 恢复 `normal/tight/fixed` relim、cmap 与 limits。shown plot 返回空 interaction handle 一律验收失败。
+3. **纠正已暴露 figure/viewer/Fit 产品面并建立唯一交互 owner。** 先让现有 W4 generic `figure_gui`、W7 saved-fit grid、calibration/occupancy 已暴露路径恢复适用的zoom/pan、selector、显式re-fit与export；frozen raster只允许报告类多页使用且必须可zoom。本纠正建立后续复用的唯一 viewer interaction/Fit owner，但只验收当前已经公开的source/ref类型，不在此处预建“任意artifact catalog/browser”。panel/figure 的 `Add Analysis -> Fit` / `Analyze -> Fit` 是主入口，普通 Fit 一键提交 authority draft，selector 直接预填同一 draft，并同时交付 1D range 与 2D box ROI fit；独立 `fit_gui` 只保留为直达入口。
+
+每一项开工前都先完成 §2.1 salvage gate，在 checkpoint 固化旧行为清单；收口逐项 PASS/FAIL，FAIL 只能进入 §2.2 账本。每个 commit 必须满足规则 8 的完整活动白名单 collect+run 全绿、独立 oracle、一次有界对抗审查、规则 6 与精确 staging。
+
+纠正闭合后，剩余产品顺序固定为：
+
+4. 完整 TaskConsole：全 plot-kind live/rolling grid/拖拽布局/Add Panel；catalog 驱动的 Logic 节点列表、Start/Stop、树形 signal picker 与自动 schema edit；共享 Setting/Edit；task/monitor/status；workspace save/load；
+5. 通用 `figure_viewer` 广度与迁移收口：复用纠正3的同一interaction/Fit owner，把catalog/browse/open覆盖扩到任意已存figure/artifact，接入workspace/真实launcher，迁走旧`figure_viewer`最后consumer并dependency-closed删除旧路径；不建立第二套viewer、selector、fit或export实现；
+6. device manager 与 task_console/pulse_gui launcher 切换到新 composition；
+7. E01 的 temperature/MOT/fidelity operations 逐条迁移并按最后 consumer 删除旧路径；
+8. 清活动白名单的全部 collect/validity 债务，错误清单只减不增；
+9. Z0 零残余；`Zou_lab_control/workbench` 与 notebook 是新产品面，不作为旧树删除；
+10. 全分支一次独立对抗终审：P0=0、P1=0、活动白名单完整实跑全绿，并交付 UX 偏离账本、迁移完成报告与真机 bring-up runbook。
+
+`AUTONOMOUS_STREAMED` 的 9999 点级实验不是清单外便利能力。近期 resident 上限不足时，`AUTONOMOUS_REFILLED` 仍须满足 §15.4/H1 的冻结 bitstream 强证明；实现必须保留明确的 >4096/9999 host refill 启用路径。若只有真机资格化才能最终开放，软件先以 typed fail-closed 交付，runbook 必须逐条写明资格化实验、启用配置、命令、判据、回退与如何证明 host 只供应冻结 chunk、不参与硬件 edge 时序。
 
 依赖关系是：
 
@@ -3287,7 +3378,7 @@ S0.6完成时目标composition已经只使用InstallationDeviceGraph。旧`Devic
 5. 同时交付薄 Experiment：`connect -> capture -> inspect/figure -> save` 保持少量语句。
 6. E2E 后只删除**已经迁入新 CameraPort/DatasetBuilder 的 standalone camera use case**对应的旧累计 buffer/latest polling/render 旁路。旧 `OccupancyProcessor` 已删除，但 generic camera producer/LogicNode 仍服务 ROI、monitor、temperature 及剩余 legacy measurement/UI；它与这些消费者必须作为 dependency-closed island 保留到实际最后消费者迁走（当前预计 S5），不能把删除时点写死为 S3，也不能建立把旧 Hub 翻译成新 Dataset 的临时 bridge。任何时刻同一真实 camera 仍只有 legacy 或 new 一个 owner。当前具体发布 `TaskOutput` 的旧 Task 只剩 `OptimizeMotFieldTask`，在该最后消费者迁走的 S5 删除。
 
-当前完成三块仍有限定的S1子集：S1#1的adapter-neutral record/working-point software seam已经把endpoint对`VirtualCamera`的硬编码移除，非Virtual contract fake可贯通exact command boundary，且virtual capability/artifact identity保持不变；但camera owner I/O lane、real AssetMap/Q0/tail evidence与最终DCAM迁移均未交付，所以real qCMOS仍NO-GO。S1#3的finite exact preview foundation保留完整cell data axes并接通FigureEvaluator/GRAY8、单panel BoardController与Qt presenter；W1进一步交付真实public app composition、Start/Stop、重复Run、FINAL/NOT FINAL/preview故障分离和异步window teardown。W1只接受唯一singleton READOUT_EVENT且cell data axes恰为声明的SPATIAL_Y/SPATIAL_X；这项资格校验只在请求preview时惰性执行，不能反向限制普通notebook multi-event finite capture。其它多维数据仍完整写入exact artifact，但当前image panel在Start前明确拒绝而不flatten/select-first/reduce。M1已交付virtual free-running raw IMAGE monitor；M2e在M2b/M2c/M2d基础上交付显式typed ROI scalar event、独立长history、同source-exact snapshot的IMAGE+CURVE+HISTOGRAM+METER四panel board、绑定可见front的Qt rectangle draft/overlay、整Run不可变Apply，以及从默认raw单panel创建第一个ROI并在旧generation完整终态后切换拓扑。save current-view、通用grid/动态layout、旧camera panel替换和真实qCMOS仍未交付，所以S0.5与S1均不得标COMPLETE，也不得据此删除任何旧GUI producer/consumer。
+当前完成三块仍有限定的S1子集：S1#1的adapter-neutral record/working-point software seam已经把endpoint对`VirtualCamera`的硬编码移除，非Virtual contract fake可贯通exact command boundary，且virtual capability/artifact identity保持不变；但camera owner I/O lane、real AssetMap/Q0/tail evidence与最终DCAM迁移均未交付，所以real qCMOS仍NO-GO。S1#3的finite exact preview foundation保留完整cell data axes并接通FigureEvaluator/GRAY8、单panel BoardController与Qt presenter；W1进一步交付真实public app composition、Start/Stop、重复Run、FINAL/NOT FINAL/preview故障分离和异步window teardown。W1只接受唯一singleton READOUT_EVENT且cell data axes恰为声明的SPATIAL_Y/SPATIAL_X；这项资格校验只在请求preview时惰性执行，不能反向限制普通notebook multi-event finite capture。其它多维数据仍完整写入exact artifact，但当前image panel在Start前明确拒绝而不flatten/select-first/reduce。M1已交付virtual free-running raw IMAGE monitor；M2b/M2c/M2d/M2e在当时交付typed ROI scalar、独立history、IMAGE+CURVE+HISTOGRAM+METER coherent board与front-bound rectangle draft/overlay，但其“Apply时替换整个source Run/首ROI先停旧generation”的结论已由规则9与`UX-001`否决，只保留为历史实现事实。U0纠正1必须改为已有ROI走`ControlTopic/APPLIED`、首个ROI创建/删除只迁移downstream processor generation，raw source/Run/front/tap topology始终连续；U0纠正2再补完整interaction。save current-view、通用grid/动态layout、旧camera panel替换和真实qCMOS仍未交付，所以S0.5与S1均不得标COMPLETE，也不得据此删除任何旧GUI producer/consumer。
 
 ### H1：Pulse bounded-context 与冻结 bitstream bring-up（与 S0.5-S3 并行）
 
@@ -3362,7 +3453,7 @@ W3d/W3e兑现S4中不依赖Q0/real composition的source-neutral软件纵切与cu
 1. 在 S0.5 宿主上迁剩余 WorkspaceModel/RunCoordinator/controllers；Setting/Edit 使用共享 EditorSession/schema widgets/base-revision conflict，catalog 只做各 bounded context capability/definition 的本地投影。
 2. Fit 保持 zlc_data 单一算法 owner；W5已交付raw committed-capture的独立`.fit_gui()` editor/draft overlay/explicit Save/reopen/Clear纵切，W8b又把调用者显式冻结的W8a selection-only CommittedTransform接入同一窗口，仍不从display/selector生成权威。后续由同一headless presenter与draft authority接入TaskConsole明确的`Add Analysis -> Fit` / `Analyze -> Fit`，不得复制模型表、solver或把display transform升级为权威；Pulse prepare/fire/safe继续后台托管。
 3. 所有 panel 使用 S1/S2 的 render/evaluation lanes；完成 acknowledgement-driven shutdown、persistent quarantine 和 ControlTopic terminal/superseded ack。
-4. 逐条迁 temperature、MOT、readout、device manager 和 notebook convenience；W4a完成current artifact的冻结`.figure_gui()`，W4b完成current calibration artifact/report的冻结只读报告，W4c完成current occupancy artifact按单一真实output选择的冻结Figure/GUI，W4d/W4e完成具名exact cell的同shot原帧+物理occupancy三态图与离散导航，W5完成raw committed-capture交互Fit，W8b完成调用者显式selection-only transform的同窗口Fit，W6完成显式calibration request创建/编辑、formal Run原子提交、exact ref重开与报告复用，W7完成exact saved-fit GridPlot分页/focus/export，M1完成virtual free-running MOT raw IMAGE monitor，M2e在M2b/M2c/M2d四panel数据面与front-bound selector基础上完成从默认raw单panel创建首个typed ROI、显式选择reducer并整Run替换；通用live grid/动态layout、TaskConsole/scan/live Fit、ROI/transform authoring、可zoom/export的live calibration/occupancy grid、跨artifact saved gallery、real Pylon qualification与其它convenience仍按各自纵切迁移；每条都按纵向切片删除自己的旧路径。
+4. 逐条迁 temperature、MOT、readout、device manager 和 notebook convenience；W4a-W4e、W5-W8与M1-M2e只记录各自已经证明的data/authority/预算/线程/lifecycle子合同，不再被解释为终态用户面。whole-Run ROI replacement、永久 frozen generic viewer、缺 selector/zoom/re-fit 与独立 `fit_gui` 作为主入口均先按U0三项纠正关闭；随后再完成通用live grid/动态layout、TaskConsole/scan/live Fit、ROI/transform authoring、可zoom/export的live calibration/occupancy grid、跨artifact saved gallery、real Pylon qualification及其它 convenience。每条按最后 consumer 做dependency-closed删除，不能提前删共享producer，也不能以“不重开旧审查”为由拒绝补齐缺失UX。
 5. 真实入口 E2E 覆盖 fit/gridplot、calibration/occupancy、PulseScan、save/load、cancel/quarantine、shutdown 和 virtual/real adapter parity。
 6. `OptimizeMotFieldTask` 迁走后删除 `TaskOutput`；每个删除项由“移走最后一个消费者”的切片负责，而不是由第一个碰到该类型的切片负责。
 7. 最后一个 consumer 消失时物理删除 `neutral_atom/core`，不保留空 re-export 包。
@@ -3521,24 +3612,59 @@ apps/
 
 #### 规则 8：活动迁移测试与旧树边界
 
-迁移结构尚未闭合期间，`tests/migration_active_tests.txt` 是**唯一合法的pytest路径集合**。只有为目标新架构编写并已先登记进该tracked清单的定向contract/E2E测试可以运行；调用者必须先由清单机械确认目标文件，不能把任意path、目录、自动discovery或清单外依赖带入命令。清单外文件一律视为不存在：不执行、不修改，也不因其预期改变target production。曾误加并在仓库内调用`pytest.main()`的`tests/run_migration_active.py`已物理删除，不恢复第二个runner。迁移结束时再按终态架构整批删除或重写其余历史测试。
+迁移结构尚未闭合期间，`tests/migration_active_tests.txt` 是**当前唯一授权证据面**，不再只是终态 inventory。每个 commit 在提交前必须同时完成：机械读取清单中全部非空、非注释路径；对全部路径执行一次 `pytest --collect-only`；再实跑同一完整集合；collection error、test failure、unexpected skip/xpass 均为 0。只跑“本切片直接相关”的子集可以作为开发中反馈，但不能替代 commit gate。活动错误清单只允许减少，不能为了让提交通过而删除路径、放宽断言、增加 skip/xfail 或把失败移到清单外。
 
-当前闭包证据只允许两类：上述白名单内与当前切片直接相关的最小定向测试，以及机械证据，包括changed-file/owner账本、AST/symbol/consumer搜索、静态import-DAG、canonical/digest/版本常量/重复validator扫描、`py_compile`/AST parse、main行数与物理算法只读对照、手写current-format确定性oracle和必要的真实profile。定向测试只证明本切片公开contract，不授权为旧API补compatibility；机械证据也不能冒充完整产品行为验收。本节之前账本里属于清单外历史suite的`N passed`、`pytest items`或`collect-only`数字都只是旧checkpoint，不重跑、不作为当前owner COMPLETE的必要条件。
+仓库级 `conftest.py` 必须机械拒绝任何未在 manifest 中登记的测试文件被收集或显式调用，也拒绝 manifest 中不存在、重复、越界或非测试路径；该守卫本身属于活动白名单证据。调用者不能把任意 path、目录、自动 discovery 或清单外依赖带入命令。清单外历史测试一律冻结：不执行、不修改，也不因其预期改变 target production；只有其对应 use case 在终态切片重写为新架构独立 oracle 时，才以同一精确 commit 加入 manifest。曾误加并在仓库内调用 `pytest.main()` 的 `tests/run_migration_active.py` 已物理删除，不恢复第二个 runner；标准 pytest + manifest/conftest 是唯一执行机制。
+
+本修宪 adoption 前以`HEAD` tracked manifest（2026-07-17，85个路径；不混入另一个未提交W9切片的manifest行）得到的首次全量基线为`798 collected / 24 collection errors`。这说明旧门规尚未兑现，不能伪写为green；修宪文档提交只负责让新门规生效，是唯一一次 adoption bootstrap，不是实现checkpoint。自该提交之后，**不得提交任何其它代码、测试或文档**，直到一个原子 Rule-8 gate-repair 工作树同时把以下库存降为0、建立conftest机械拒绝并让全量collect+run全绿；该修复自身只在最终全绿时一次提交，不能拆成仍红的中间commit。此例外不可复用：
+
+```text
+test_camera_capture_endpoint.py
+test_camera_sample_contract.py
+test_capture_artifact_repository.py
+test_capture_checkpoint_commit.py
+test_capture_fit_artifact.py
+test_capture_repository_authority.py
+test_compiled_capture_cell_plan.py
+test_pulse_command_port.py
+test_remote_sequencer_execution_endpoint.py
+test_runtime_capture.py
+test_runtime_commit_journal.py
+test_runtime_dataset_builder.py
+test_runtime_resource_arbiter.py
+test_runtime_run_lifecycle.py
+test_sequencer_execution_endpoint.py
+test_stream_processor_worker.py
+test_triggered_capture_pipeline.py
+test_workbench_endpoint_binding.py
+test_workbench_host_contract.py
+test_zlc_calibration_commit.py
+test_zlc_calibration_stream_contracts.py
+test_zlc_occupancy_processor.py
+test_zlc_pulse_playback.py
+test_zlc_readout_physical_context.py
+```
+
+当前闭包证据包括：完整活动白名单 collect+run、该切片新增的独立 oracle，以及 changed-file/owner 账本、AST/symbol/consumer 搜索、静态 import-DAG、canonical/digest/版本常量/重复 validator 扫描、`py_compile`/AST parse、main 行数与物理算法只读对照、手写 current-format 确定性 oracle 和必要的真实 profile。测试通过不授权为旧 API 补 compatibility，机械证据也不能冒充完整产品行为验收。本节之前属于清单外历史 suite 的数字只保留为历史 checkpoint；但已经进入活动 manifest 的路径从本修正案起每个 commit 都必须完整收集并实跑。
 
 旧 `DeviceSet/Registry/session/GUI/public compatibility` 语义只允许登记“分支改过什么、最后消费者、删除切片”，或在dependency-closed切片中删除；禁止为它们新增适配、修守卫或追求旧测试通过。尚未迁址、但仍被target endpoint作为唯一真实硬件owner消费的adapter文件可以接受证据驱动的物理正确性修复，例如DCAM count/ring/metadata边界；这种修复不得恢复旧composition、registry或public API。main仍可只读用于行数锚点和已验证物理/算法oracle。本轮`discovery.py/registry.py`的worktree变化是精确恢复main、撤销此前错误的target适配，不是把旧接口接回目标包。教程、手册与旧GUI说明在迁移完成前不做同步；本设计文档例外，任何计划级取舍必须与代码同commit更新。
 
 本门规来自一次已复现的工作流失败：审查过程反复让历史测试和 legacy `DeviceSet/Registry` 竞态反向驱动目标架构，造成无价值守卫、镜像测试和重复执行。故它不是通用预防机制。违反测试冻结边界或触碰旧树适配，即使偶然得到测试通过也不能形成闭包证据。
 
-规则 1–7 的审查集合必须每次由 Git 机械产生，不能靠上下文记忆或“我记得写过哪些提交”。整改启动时的固定证据是 `git rev-list --count main..HEAD = 113`、`git diff --name-only main...HEAD = 315`；在纠正误删并完成 tracked-fixture 整改的 checkpoint `12f3414`，分支变为 139/323；清除错误 calibration 历史并把唯一 oracle 重新冻结到 exact main 后，checkpoint `455ff97` 为 160 个领先提交、330 个 changed files；`e31cb9407ae8` 为 161/330；完成 superseded calibration/readout graph 删除后的 checkpoint `5e2e2f6` 为 170/375；清除当前活动代码、构建与审计 skip 中的历史 reference/archive 残余后，checkpoint `8285e43` 为 177/386。后续数字会随整改提交增长，因此报告必须同时写 checkpoint commit，不能把任一组历史数字当永久常量。
+#### 规则 9：UX 行为忠实与偏离治理
 
-本文件是目标架构、迁移顺序和 Rules 1–7 gate 的唯一计划级权威。`docs/MAINTAINER_NOTES.md` 以及 `Zou_lab_control/frontend` 内的说明和结构测试只描述仍在 `SerializedLegacyAggBridge` 后运行的 legacy island；它们可以在最后 consumer 迁走前保护现状，但不得反向规定 `zlc_frontend`、`zlc_workbench` 或其它目标包的类型、继承树和 UI/runtime 架构。旧 roadmap 不再作为并行计划源；计划级决定必须与实现同 commit 回填本文件。
+UX 权威为 `main` 分支旧实现，与规则 4 的物理/数值权威同级。每个 GUI/交互切片必须先完成 §2.1 salvage gate，再以真实 launcher/input event 逐项证明旧行为清单；内部重构、线程模型、包边界或实现难度都不能自行删减 selector 覆盖、zoom/pan、live 连续性、ROI 热更新、fit 即时性、relim/cmap/limits、布局手感与保存/恢复。未达到项必须登记 §2.2，状态保持待用户批准；实现 commit、测试通过、checkpoint 或审查结论都不能把偏离自行改成批准。迁移完成报告首页必须列出全部未批准项。
+
+规则 1–7 的 owner 审查集合、规则 8 的活动测试集合与规则 9 的 UX 行为清单都必须由 Git/manifest/salvage checkpoint 机械产生，不能靠上下文记忆或“我记得写过哪些提交”。整改启动时的固定证据是 `git rev-list --count main..HEAD = 113`、`git diff --name-only main...HEAD = 315`；在纠正误删并完成 tracked-fixture 整改的 checkpoint `12f3414`，分支变为 139/323；清除错误 calibration 历史并把唯一 oracle 重新冻结到 exact main 后，checkpoint `455ff97` 为 160 个领先提交、330 个 changed files；`e31cb9407ae8` 为 161/330；完成 superseded calibration/readout graph 删除后的 checkpoint `5e2e2f6` 为 170/375；清除当前活动代码、构建与审计 skip 中的历史 reference/archive 残余后，checkpoint `8285e43` 为 177/386。后续数字会随整改提交增长，因此报告必须同时写 checkpoint commit，不能把任一组历史数字当永久常量。
+
+本文件是目标架构、迁移顺序和 Rules 1–9 gate 的唯一计划级权威。`docs/MAINTAINER_NOTES.md` 以及 `Zou_lab_control/frontend` 内的说明和结构测试只描述仍在 `SerializedLegacyAggBridge` 后运行的 legacy island；它们可以在最后 consumer 迁走前保护现状，但不得反向规定 `zlc_frontend`、`zlc_workbench` 或其它目标包的类型、继承树和 UI/runtime 架构。旧 roadmap 不再作为并行计划源；计划级决定必须与实现同 commit 回填本文件。
 
 验收必须分成两个互不替代的轴，避免“未来功能没实现，所以现有代码永远审不完；现有代码没审完，所以又不准实现未来功能”的闭环死锁：
 
-- **owner audit status**只回答当前changed-file集合中的既有实现是否完整执行Rules 1–7，取值`NOT_STARTED/PARTIAL/COMPLETE`。未来尚未实现的`InstallationRuntime`、Q0、EndAttestation、API segmented或GUI consumer不会把已经审完的既有owner重新降为PARTIAL；它们作为明确backlog进入下一轴。
+- **owner audit status**只回答当前changed-file集合中的既有实现是否完整执行Rules 1–7，取值`NOT_STARTED/PARTIAL/COMPLETE`。未来尚未实现的`InstallationRuntime`、Q0、EndAttestation、API segmented或GUI consumer不会把已经审完的既有owner重新降为PARTIAL；它们作为明确backlog进入下一轴。规则 8/9 是跨 owner 的每提交 gate，不能由一次历史 owner COMPLETE 永久豁免。
 - **implementation/capability status**回答目标纵切是否已经交付、真实设备/用户入口是否可启用，取值`BACKLOG/IMPLEMENTED/READY/NO-GO`。audit COMPLETE绝不等于capability READY；例如真实qCMOS exact在当前代码fail-closed仍可完成adapter owner审查，但Formal capability继续NO-GO。
 
-Rules 1–8 的canonical定义与COMPLETE条件如下。前七条评估existing-code owner audit；第八条是整个追溯阶段的操作门禁：
+Rules 1–9 的 canonical 定义与 COMPLETE 条件如下。前七条评估 existing-code owner audit；第八、九条是整个迁移阶段持续生效的操作/产品门禁：
 
 | rule | 名称与目的 | 必需证据 | owner COMPLETE 条件 |
 |---:|---|---|---|
@@ -3546,14 +3672,15 @@ Rules 1–8 的canonical定义与COMPLETE条件如下。前七条评估existing-
 | 2 | 无历史残余且按真实consumer裁决：不保留alias、fallback、archive、自证fixture或无语义wrapper，也不因暂未接线误删已排期能力 | Git历史/全仓reachability/目标consumer/最后consumer删除账本 | 每个保留抽象能指出真实当前或已排期consumer；每个legacy面有dependency-closed删除点；无兼容残余 |
 | 3 | current-only持久与wire语义：软件edit counter、upgrade chain、dual reader不得冒充部署ABI | schema/codec/version常量/asset全仓扫描与owner serialization核对 | 普通软件格式只有plain current schema+exact admission；仅真实跨进程/硬件ABI保留版本或generation |
 | 4 | 物理与数值忠实：迁移不得改变main已验证实验算法或硬件事实，差异必须有物理原因 | main只读逐项/同帧oracle、硬件手册/本地driver事实、量纲与边界反例 | 等价物逐项一致；每个故意差异有明确理由、输入域与fail-closed边界；多维轴/validity不丢 |
-| 5 | 独立证据而非实现自证：writer/reader、两实例或同公式镜像不能证明正确 | 手写primitive tree/literal golden、malformed input、独立数学/物理oracle、静态结构检查 | 关键identity、codec、mapping、terminal与异常路径至少有一种不调用被审owner的独立证据；迁移期不运行pytest |
+| 5 | 独立证据而非实现自证：writer/reader、两实例或同公式镜像不能证明正确 | 手写primitive tree/literal golden、malformed input、独立数学/物理oracle、静态结构检查及活动白名单测试 | 关键identity、codec、mapping、terminal与异常路径至少有一种不调用被审owner的独立证据；相关 oracle 纳入规则 8 证据面 |
 | 6 | 海拔/复杂度必须对得起能力：逐切片报告current→main PLOC/NCLOC/class/dataclass/enum/function与热点资源 | 机械计数、超过约3倍的逐抽象理由、针对大帧/大scan/profile | 无单成员enum、单实例class、纯转发wrapper或重复DTO；高倍率项逐一压缩或说明“删除它会恢复哪类已证实问题” |
 | 7 | 对抗式可实现性、生命周期与性能：从反例而非happy path找静默错、竞态、无界资源和硬件不可实现承诺 | 独立agent/人工反例、deadline/cancel/ownership/overrun分析、针对性profile与静态故障路径 | 当前既有代码无未处置P0/P1；P2有清楚触发条件；未来缺失能力转入implementation backlog而不伪称READY |
-| 8 | 迁移测试与旧树冻结 | 无pytest runner/调用，本轮命令与staged diff审计，旧树只读/删除账本 | 当前审查链未运行/改写历史测试、未用legacy语义驱动target；并行未归属test diff不得进入本提交或闭包证据 |
+| 8 | 活动迁移测试与旧树冻结 | manifest 全路径机械校验、完整 collect-only、完整实跑、conftest 越界拒绝、本轮 staged diff 审计 | 每个 commit 的活动白名单 collection/test 全绿且错误清单只减不增；清单外历史测试未运行/改写，未归属 test diff 不进入提交或证据 |
+| 9 | UX 行为忠实与偏离治理 | `main` salvage 清单、真实 launcher/input-event E2E、§2.2 偏离账本 | 只有全部条目为`MATCHED`或用户明确批准的`APPROVED_DEVIATION`才COMPLETE；`LEDGERED_PENDING_APPROVAL`可让正交整改继续，但Rule 9保持PARTIAL、最终迁移保持NO-GO |
 
 `12f3414` 的 323 文件第一集合按顶层 owner 分布为：tests 142、旧树 `Zou_lab_control` 48、`zlc_neutral_atom` 42、`zlc_pulse` 23、`zlc_data` 20、`zlc_workbench` 10、`zlc_frontend` 8、FPGA host/config 8、tracked pulse assets 6、`zlc_storage` 6、tutorials 5、docs 2、root/config 3；文件类型为 Python 298、JSON 9、Markdown 7、notebook 5，其余 TOML/gitignore/TeX body/batch 各 1。每个文件必须分配一个 primary owner/slice，测试跟随被测 owner审查；跨域文件还要记录 secondary seam，不能因“另一路 agent 看过相邻包”漏掉。
 
-机械覆盖至少包含：完整 changed-file set；Python AST 的 class/dataclass/enum/function/import/call-site 清点；重复 validator/digest/codec/版本常量的符号与语义搜索；production + 已排期 target consumer 图；main 等价物的 NCLOC/class/dataclass 比；以及对大帧 digest/copy、fit/calibration、journal、pulse compile/pack 的针对性 profile。规则8冻结前已记录的测试oracle/fixture provenance只保留为历史账本，不重新打开或运行；当前阶段只允许手写current-format/物理oracle。每条规则的完成报告必须给出覆盖checkpoint、发现总数（包含点名样本之外的新发现）、净行数变化、涉及owner、独立验证和未来ratchet。只给抽样或只说测试通过，不算完成。
+机械覆盖至少包含：完整 changed-file set；Python AST 的 class/dataclass/enum/function/import/call-site 清点；重复 validator/digest/codec/版本常量的符号与语义搜索；production + 已排期 target consumer 图；main 等价物的 NCLOC/class/dataclass 比；对大帧 digest/copy、fit/calibration、journal、pulse compile/pack 的针对性 profile；活动 manifest 的完整 collect/run；以及 GUI 切片的 `main` UX salvage/E2E。清单外历史测试的 oracle/fixture provenance只保留为历史账本，不重新打开或运行；当前 oracle 必须成为活动白名单的一部分。每条规则的完成报告必须给出覆盖 checkpoint、发现总数（包含点名样本之外的新发现）、净行数变化、涉及 owner、独立验证和未来 ratchet。只给抽样或只说测试通过，不算完成。
 
 为防止上下文压缩后重复审查、漏审或把secondary seam误算成新闭包，最终production owner账本固定为下列11个互斥闭包。P01/H01追溯轮开始快照为`merge-base(main, HEAD)=6c337d49`、HEAD `9b2662aae8cb`：`main..HEAD=190`个提交、`main...HEAD=387`个路径。当前worktree相对main机械去重为403个路径，其中188个是production `.py/.json/.toml/.bat/.tcl`（排除tests/docs/tutorials）。从旧194到188的六项变化可机械解释：`zlc_workbench/legacy_neutral_atom.py`、`legacy_runtime.py`、`pulse_control.py`已物理删除，`devices/discovery.py`、`devices/registry.py`与旧`subsystems/timing.py`已精确恢复main，不再属于target changed set。188个production文件全部恰好分配一次；未归属的测试、文档、教程脏改不进入本轮审查证据或提交。本节后续保留各已提交checkpoint在**当时**的局部GO/NO-GO与“迁移继续冻结”字样作为审计因果，它们不是当前门规；当前状态的唯一来源是下表后的现态段以及本节末尾总状态段，后写状态明确覆盖较早checkpoint措辞。
 
@@ -3571,7 +3698,7 @@ Rules 1–8 的canonical定义与COMPLETE条件如下。前七条评估existing-
 | `E01_EXPERIMENT_OPERATIONS` | 旧neutral core、operations、measurements、processors、tasks、subsystems | 22 | COMPLETE：existing primary paths按task/measurement/processor语义及最后consumer账闭合 | raw exact coordinator IMPLEMENTED；Formal ScanOutput与旧operations迁移BACKLOG，真实链NO-GO |
 | `A01_PUBLIC_SURFACE` | `pyproject.toml`、包根/umbrella、`_gui`、manual launcher、notebook public facade | 8 | COMPLETE：existing primary paths及本轮notebook/packaging/W1差量复审闭合 | target virtual notebook与lazy finite-capture Workbench入口READY；legacy launchers、完整Workbench与真实硬件composition仍NO-GO |
 
-计数仍按审查冻结快照为`18+7+6+26+7+22+33+22+17+22+8=188`；新增implementation文件作为其owner的差量复验记录，不伪造为第十二个闭包。11个owner audit与Rules 1–8追溯门规现均COMPLETE，故“先完成1–7再迁移”的审查冻结已经解除，并已从R02/A01/U01的第一个dependency-closed virtual纵切恢复实现。解除冻结、局部READY与全迁移完成是三件不同的事：真实qCMOS/remote composition、完整Workbench/legacy launchers与Formal Scan仍按implementation轴NO-GO；W1的窄Qt产品READY不能由owner audit COMPLETE外推成这些能力可用。
+计数仍按审查冻结快照为`18+7+6+26+7+22+33+22+17+22+8=188`；新增implementation文件作为其owner的差量复验记录，不伪造为第十二个闭包。该 checkpoint 只证明11个owner的Rules 1–7 existing-code审查在当时COMPLETE，并曾解除“先完成1–7”的冻结；它不能一次性完成持续生效的规则8/9。自本修正案起，规则8必须每commit完整白名单全绿，规则9必须每GUI切片salvage/ledger/E2E；当前只能按U0先完成机械门和三项UX纠正。解除历史owner冻结、局部READY与全迁移完成是三件不同的事：真实qCMOS/remote composition、完整Workbench/legacy launchers与Formal Scan仍按implementation轴NO-GO；W1的窄Qt产品READY不能由owner audit COMPLETE外推成这些能力可用。
 
 `P01_PULSE_EXECUTION` 以本节记录的 `9b2662aae8cb` 快照为差量基线，对33个primary production path逐文件阅读，并沿current document→compiler→TargetIR→wire/schedule→artifact/RPC/storage→neutral/workbench consumer追踪完整producer-consumer闭包；旧 timing/PulseTable 只登记最后消费者与删除点，没有用旧测试或旧`DeviceSet/Registry`语义反向修改target。收口共修复9类不重叠根因：逐edge Python对象图放大、TargetIR scan canonical list放大、canonical producer缺少与decoder同源的结构资源域、artifact aggregate edge/byte总预算缺口、准入前复制、下游可放宽owner上限、wire `<u4` 前未拒绝越界地址、空`steady_rises`在巨大loop count下空转，以及旧`.edges`物化API/重复session state残余。`DigitalTriggerSchedule`现以只读`<u4 point_indices>/<u4 loop_iterations>/<u8 ticks>`保存物理列；channel由schedule拥有，global ordinal为行号，point-local ordinal按声明的单调point列派生，`TriggerEdge`只是在`iter_edges()`消费边界产生的临时typed row。TargetIR scan table、duration与wire words也使用定宽array codec；这只改变内存/编码表示，不改变多维scan row、repeat、trigger归属或任何data trailing axis。
 
@@ -3587,7 +3714,7 @@ H01收口修复9类qCMOS/host根因：transfer-info失败、负count和count后�
 
 因此H01 existing-code owner audit为COMPLETE、当前P0/P1=0，但real qCMOS Formal exact仍明确NO-GO。原因不是要改FPGA，而是typed Q0外触发资格、post-terminal tail/EOS与EndAttestation尚未交付且真机DCAM跨线程`cap_stop`语义仍需E0 contract kit证明；当前capability必须在arm前fail-closed。近期正式scan仍只允许冻结bitstream上的`AUTONOMOUS_STREAMED`，不得恢复`HOST_STEPPED_GROUP`。只有E0在工作余量内实测出丢帧/乱序，或证明现有RTL与既定物理设计不符，才可另立证据驱动的硬件修复切片；owner审查COMPLETE绝不把这些future/real-hardware gate伪写成READY。
 
-当前审查gate为 **GO：Rules 1–8 existing-code追溯闭包已完成，允许继续dependency-closed迁移切片**；这只解除工作冻结，不代表全系统READY。Calibration/readout/occupancy/raw CaptureArtifact 的main同帧oracle、流式内存、多轴physical context、exact triggered consumer、typed codec以及coordinator-backed FINAL持久化均已闭合；direct-CAS `CaptureFitResultRepository` 不在这项FINAL持久提交结论内。real qCMOS Formal仍受E0/Q0 common-aperture、first-edge/run-boundary、ordered-trigger、tail/EOS与EndAttestation真机资格化约束，因此真实硬件capability继续NO-GO。后续每个切片仍需增量Rules 1–8证据，不能把局部virtual/offline READY改写成全局迁移完成。
+该历史审查 gate 的准确含义是 **Rules 1–7 existing-code owner闭包在当时GO**，不是规则8/9永久COMPLETE，也不是任意新便利切片可开始。Calibration/readout/occupancy/raw CaptureArtifact 的main同帧oracle、流式内存、多轴physical context、exact triggered consumer、typed codec以及coordinator-backed FINAL持久化结论保留；direct-CAS `CaptureFitResultRepository` 不在这项FINAL持久提交结论内。real qCMOS Formal仍受E0/Q0 common-aperture、first-edge/run-boundary、ordered-trigger、tail/EOS与EndAttestation真机资格化约束，因此真实硬件capability继续NO-GO。后续每个commit须满足Rules 1–9中适用的增量证据，并先按U0纠正，不能把局部virtual/offline READY改写成全局迁移完成。
 
 规则 1 的 storage journal 整改以“扫描边界一次解码”为唯一 owner：`FramedJournal._scan()` 在校验 frame 长度、digest 与 canonical record 后同时保留原始 payload 和已解码 value；原始 bytes 继续负责同 id 冲突/幂等判定，`records()` 与 `append_checked()` 只消费已验证 value，不得再次 decode 已有记录。新 append 的候选仍须经过 canonical `encode -> decode` 规范化，torn-tail repair、跨进程锁、fsync 与 corruption fail-closed 语义不变。调用计数测试必须锁定 N 条已有记录每次扫描恰好 N 次 decode，避免以后以 wrapper 或 getter 的形式恢复重复工作。
 
@@ -3790,9 +3917,11 @@ Rule-6仍以既有scan package加integration owner为同一归因口径。W3b的
 | current `ScanArtifact -> DataFigure/typed scan panel/TaskConsole SCAN_SLOT` | notebook direct/occupancy scan inspect/render、direct FINAL-only Qt、occupancy PROVISIONAL→FINAL Qt、TaskConsole Add/Setting/Edit/Start/Stop/Save/Load 与 camera→occupancy-counts y；后续API_SLOT、scan-fit及其余panel | W3d已交付source-neutral exact pipeline、processor y、stable output和exact progressive occupancy panel；W3e复用该产品接入静态catalog与单revision编辑，不复制Run/render状态机 | API_SLOT、scan-fit及最后legacy panel consumer各自交付后，才dependency-closed删除对应旧路 |
 | legacy PulseTableState readers | 尚未迁完的 Camera/PulseScan/PulseGUI 岛 | 先迁每个保留 consumer 到 current PulseDocument/compiler | 最后 consumer 迁走的 H1/S3/S5 dependency-closed commit |
 
-规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`。§22.1固定的11个互斥production owner闭包已经逐一完成，规则1–8的**existing-code追溯审查轴全部COMPLETE**，所以“完成1–7前不得继续迁移”的冻结已经解除；这不等于implementation全部READY。当前明确为GO的是virtual finite capture/pulse owner、BoardController coherence foundation、W1 single-event finite exact capture的public virtual/offscreen Qt产品、S3a“committed capture -> calibration ref -> artifact/report reopen”、S3b“committed capture + calibration ref -> occupancy ref -> reopen”、S3c“installation-qualified short sitemap -> raw FINAL -> calibration FINAL/recoverable failure”、W3e TaskConsole SCAN_SLOT，以及W3f `API_SLOT_SEGMENTED_EXISTING` direct/occupancy的virtual/offline纵切；W-UI1a静态表单owner同样COMPLETE，W-UI1b/W-UI1c仍未开始。既有结案证据包括完整preflight→execute→FINAL→admit current-format手工oracle、1-byte预算与raw recovery、fresh-process notebook不加载SciPy/Qt/Matplotlib、exact `(R,P,*data_shape)`/`(R,P,site)`/component-validity检查、repository close与run borrow生命周期、static DAG/shape/旧Registry扫描，以及每个切片的有界独立对抗审查均`P0=0/P1=0/GO`；W1/W3e/W3f另有tracked白名单Qt E2E、snapshot/source invalidation、preview故障隔离、generation/run-id/editor-revision或metadata-receipt生命周期。没有运行清单外历史pytest。remote/real qCMOS、正式scan物理资格、完整GUI scheduler、rolling/overlay、其它panel的Save/Setting/Edit、GUI site-map/gridplot和普通用户真实设备入口仍分别NO-GO；virtual/offline API segmented不能倒写成真实qCMOS Formal资格。每个后续dependency-closed切片仍须按规则1–8做增量审查，完整迁移结束后还必须对最终分支做一次独立对抗验收；局部GO或owner audit COMPLETE都不能改写成全局实现完成。
+规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`。§22.1固定的11个互斥production owner闭包已逐一完成Rules 1–7 existing-code审查，所以“完成1–7前不得继续迁移”的历史冻结曾解除；规则8/9是持续per-commit gate，不能一次永久COMPLETE。virtual finite capture/pulse owner、BoardController coherence foundation、W1 single-event finite exact capture、S3a/S3b/S3c、W3e/W3f与W-UI1a已经证明的底层/authority/lifecycle事实保留，但其缺失UX按§2.2/U0继续MUST_CLOSE。既有结案证据包括preflight→execute→FINAL→admit current-format oracle、预算/recovery、headless import、exact多维轴/component-validity、repository/Run生命周期、DAG/shape扫描与有界对抗审查；从本修正案起，这些机械证据必须叠加活动白名单完整collect+run与适用的UX salvage/E2E。remote/real qCMOS、正式scan物理资格、完整GUI scheduler、rolling/overlay、其它panel的Save/Setting/Edit、GUI site-map/gridplot和普通用户真实设备入口仍分别NO-GO；virtual/offline API segmented不能倒写成真实qCMOS Formal资格。每个后续dependency-closed切片须按Rules 1–9做增量审查，完整迁移结束后再对最终分支做一次独立对抗验收；局部GO或owner audit COMPLETE都不能改写成全局实现完成。
 
 W4b之后，上段“GUI site-map/gridplot仍NO-GO”精确指可交互live/focus/zoom/export与TaskConsole consumer；current calibration artifact/report的static frozen Overview、三model histogram grid与empirical PSF grid已经GO。冻结报告不能倒写成真实qCMOS qualification、live product或可编辑calibration已完成。
+
+**历史 checkpoint 规范效力裁决：** 自此以下所有“最新实现”“下一切片/下一checkpoint”“不重开W…”“局部GO/COMPLETE”只记录当时的代码、发现和证据，不再决定当前顺序或终态产品能力；当前唯一顺序是§19 U0及其后4–10。`不重开`只表示不重复审查已经证明的数值、authority、预算、线程与lifecycle不变量，绝不能阻止补齐缺失UX或修正被规则9否决的实现。任何whole-Run monitor retarget、permanent frozen/display-only viewer、空interaction handle或独立fit_gui主入口措辞均无规范效力。
 
 实现 checkpoint：W3e current TaskConsole SCAN_SLOT 纵切已经完成，本段、代码与白名单测试由同一显式提交冻结。`Experiment.task_console()` 现在打开一个 current one-card product：Catalog composition 显式包含 Autonomous SCAN_SLOT Task、camera Measurement 与 occupancy StreamProcessor 三项静态 Definition；每项都必须被投影，Definition 不含 callable 或本次绑定的 schema/deadline，旧 runtime/processing 模块也不再转出口冒充第二 owner。Add Panel、Setting、Edit、Run Scan、Stop、Save/Load 都只操作 typed `TaskConsoleScanIntent`，并复用 W3d 的同一个 `ScanWorkbenchWindow/ScanPanelController`、exact camera→occupancy pipeline、progressive worker raster 与 FINAL artifact projection；没有第二套 Run 状态机、signal hub、renderer、raw device 或 generic workflow graph。
 
@@ -3818,7 +3947,7 @@ W3f/API segmented与同一提交交付的W-UI1a按24个实际受影响production
 
 QApplication事实也在本轮校正：current production只有`zlc_frontend.qt_widgets`中的`ensure_qt_app()`拥有构造权，W1/W2/W3调用同一个singleton，不存在三份QApplication authority。剩余重复只是少量`owner-thread -> scale -> factory -> screen-fit -> show -> center -> retain` launcher choreography；只有在不包裹原窗口、不接管close、不持有Run且四个真consumer合同一致时，才可提取薄`launch_owned_top_level(factory, size_ratio)`。不得为了消除这几行重新引入`FluentWindow` wrapper或GenericRunPanel，从而破坏各窗口自己的cancel/reap/committed-close owner。
 
-**历史实现 checkpoint：W4a current frozen DataFigure Qt viewer纵切完成。** `Experiment.figure_gui(...)`通过lazy notebook→workbench optional edge打开capture/scan/fit source；notebook只交出绑定后的`.figure`窄callable及显式intent/selection/preferences/budget，viewer不反向import notebook facade、不保存Experiment、raw runtime、repository resolver、Figure或artist。module-owned唯一capacity-one lane顺序完成source admission、DataFigure evaluation与一次Agg/PNG整板compose，关闭以cooperative event撤销未开始/阶段间工作；已经进入不可安全强杀的repository/Agg调用只在后台诚实排空，Qt owner不等待且不发布stale result。跨线程DTO只有owned immutable PNG和string summary；Qt decode前同时准入source front与当前device-pixel-ratio物理board front，成功只调用一次`QtImageBoard.present_encoded()`，因此多panel/grid仍是一张coherent front。该surface永久标为`FROZEN DATA FIGURE · DISPLAY ONLY`，不会把ViewSpec/display reduction升级为FitSpec、ScanOutputContract或任何权威artifact。
+**历史实现 checkpoint：W4a current frozen DataFigure Qt viewer线程/内存纵切完成，产品交互未完成。** `Experiment.figure_gui(...)`通过lazy notebook→workbench optional edge打开capture/scan/fit source；notebook只交出绑定后的`.figure`窄callable及显式intent/selection/preferences/budget，viewer不反向import notebook facade、不保存Experiment、raw runtime、repository resolver、Figure或artist。module-owned唯一capacity-one lane顺序完成source admission、DataFigure evaluation与一次Agg/PNG整板compose，关闭以cooperative event撤销未开始/阶段间工作；已经进入不可安全强杀的repository/Agg调用只在后台诚实排空，Qt owner不等待且不发布stale result。跨线程DTO只有owned immutable PNG和string summary；Qt decode前同时准入source front与当前device-pixel-ratio物理board front，成功只调用一次`QtImageBoard.present_encoded()`，因此多panel/grid仍是一张coherent front。ViewSpec/display reduction不得升级为FitSpec、ScanOutputContract或权威artifact这一类型边界继续有效；“frozen/display-only即终态viewer”的产品结论已废止，U0纠正3必须补zoom/pan/re-fit/export。
 
 W4a没有复制DataFigure/FigureEvaluator/FitResultBatch/renderer或Qt widget owner，只复用W3a/W-UI0既有实现；共享PNG IHDR/front估算从W3 final scan中的局部副本收口到`zlc_frontend.image_raster`唯一纯函数。相对parent `9d20dba`，五个实际受影响production Python文件（notebook facade、lazy workbench入口、新figure window、image raster helper、scan presentation委托）为`3277 -> 3719 physical`、`2936 -> 3322 nonblank`、`2930 -> 3317 NCLOC`，净`+442/+386/+387`，classes`17 -> 19`、dataclasses`9 -> 10`、enums`0 -> 0`、functions/methods`152 -> 173`；整体仅`1.135x/1.132x/1.132x`，没有超过约3倍。新`_figure.py`为`335 physical / 296 NCLOC`。main旧`frontend/figure_viewer.py`的saved-NPZ Browse/gallery/Edit/Fit/Flow/重保存广义包络为`965 physical / 691 NCLOC`；W4a净增量是其`0.458x/0.560x`，只作复杂度包络而不伪称职责等价。旧saved viewer的lazy export、session/neutral GUI及root launcher仍是最后consumer，所以本切片没有可dependency-closed删除的旧文件；其产品能力必须由后续独立纵切替换后一次性删除，不能把W4a当兼容层。
 
@@ -3828,7 +3957,7 @@ focused W4a offscreen oracle为`5 passed`：真实FINAL capture ref的`.figure_g
 
 阈值来源不能由数值相等反推：analysis owner的`calibration_runtime_threshold_sources()`与runtime artifact构造共用同一个all-model gate，明确逐model/site输出`formal`或`quick-fallback`；即使quick与formal数值相同，UI仍显示真实来源。`runtime_usable => finite threshold && feature-valid`，但unusable site可合法保存NaN或有限threshold；该site显示`T=N/A`/`runtime-unused`且不进入pooled histogram和summary均值。GridOrder同样由neutral owner的`site_grid_positions_yx()`唯一派生，ROW_MAJOR、SERPENTINE、COLUMN_MAJOR、COLUMN_SERPENTINE都把canonical site向量放到明确物理`(row,column)`，frontend只验证完整bijection并消费，不自己看shape猜顺序。image/site/signal/label/component validity分别保留，有限invalid filler不会进入直方图。
 
-W4a原窗口壳已压缩为shared `FrozenRasterWindow`；DataFigure与Calibration共用一个capacity-one executor、cancel/reap、owned immutable `EncodedRasterDocument/Page`、Qt owner decode和atomic multipage present。每个报告page在同一个Matplotlib RLock中完成Figure构造、draw/save、release与GC，页前后检查cancel；已经生成的全部PNG与当前canvas、view arrays、repository-owned artifact/report retained upper bound使用同一个总预算，不能把同一512 MiB分别发给load和render后相加突破。worker结束只留下encoded bytes；Qt阶段再顺序准入全部source/scaled physical fronts，任一页decode失败清空全部board且绝不进入partial READY。该surface永久是`FROZEN CALIBRATION REPORT · DISPLAY ONLY`；不取得Experiment、repository、Figure、artist、edit/recalibrate authority，也不宣称大site grid的interactive zoom/export已完成。
+W4a原窗口壳已压缩为shared `FrozenRasterWindow`；DataFigure与Calibration共用一个capacity-one executor、cancel/reap、owned immutable `EncodedRasterDocument/Page`、Qt owner decode和atomic multipage present。每个报告page在同一个Matplotlib RLock中完成Figure构造、draw/save、release与GC，页前后检查cancel；已经生成的全部PNG与当前canvas、view arrays、repository-owned artifact/report retained upper bound使用同一个总预算，不能把同一512 MiB分别发给load和render后相加突破。worker结束只留下encoded bytes；Qt阶段再顺序准入全部source/scaled physical fronts，任一页decode失败清空全部board且绝不进入partial READY。frozen calibration report可以继续不取得Experiment、repository、Figure、artist或edit/recalibrate authority，但“永久只读且无交互”已废止：报告类多页至少补zoom，大site grid的focus/selector/export按规则9 salvage；显式recalibrate仍创建新request/artifact而不修改旧report。
 
 Rule-6按相对parent `531eef1`的11个实际受影响production Python文件机械计数：`8381 -> 9522 physical`、`7629 -> 8658 nonblank`、`7553 -> 8582 NCLOC`，净`+1141/+1029/+1029`；classes`42 -> 45`、dataclasses`27 -> 30`、enums`4 -> 4`、functions/methods`307 -> 339`，整体仅`1.136x/1.135x/1.136x`。窄看calibration-specific `_calibration.py + calibration_render.py`为`849 physical / 783 NCLOC`，相对main静态文件写出器`frontend/calibration_report.py 199/155`确实超过3倍；这不是隐藏而是触发了压缩：W4a的335行专属窗口被抽为115行薄adapter，线程、Qt生命周期与multipage present进入两个真实consumer共享的297行shell，跨线程page/document DTO也由两条产品路径共同消费；没有新增enum、repository、manager、第二executor、workflow或compatibility wrapper。与真实用户面的main广义包络`calibration_report.py + figure_viewer.py = 1164 physical / 846 NCLOC`相比，calibration-specific current面为`0.729x/0.926x`；再把main numeric report算入只作更宽包络，不伪称逐行职责等价。两个report view dataclass保留的理由是阻止frontend导入neutral并把validity/provenance/order显式冻结；删除它们会恢复跨包dict/shape猜测。旧calibration report owner已在前一dependency-closed切片删除；legacy `live.py` grid/saved viewer仍有其它真实consumer，本轮既不适配也不提前删除。
 
@@ -3842,7 +3971,7 @@ current tracked W4 oracle为`18 passed`：真实DetectionRequest提交/reopen oc
 
 **历史实现 checkpoint：W4d exact physical occupancy cell + same-shot source frame纵切完成。** public seam为`Experiment.readout.occupancy_cell_gui(OccupancyArtifactRef, selection=..., memory_limit_bytes=...)`。具名repeat/point轴中只有singleton可自动选0，其余必须给exact `IndexSelection`；range、未知轴、缺失非单例轴和sparse `PointLayout` hole都fail closed。解析出的同一个`DatasetCellAddress`同时索引`occupied`/逐SITE ComponentValidity与`CaptureFrameSource.read(address)`；source与occupancy的repeat/point axes、PointLayout、revision、generation、model、source/calibration refs全部重验。底层完整`(R,P,SITE)` artifact不变，frame只做一次exact read，禁止whole-capture materialize；Calibration只加载已提交SiteMap artifact取得centers/validity，不加载report或重跑物理算法。frontend view只含本图实际消费的frame/pixel validity、centers、occupied/site validity与可见lineage摘要；counts继续由W4c显示，不为未来交互携带site labels/counts等零消费者字段。
 
-该surface复用shared `FrozenRasterWindow`与唯一capacity-one lane：worker完成全部repository读取、三态overlay与Agg/PNG，Qt owner只原子present immutable PNG，模式永久标为`EXACT OCCUPANCY CELL · SAME-SHOT FRAME · DISPLAY ONLY`。empty、occupied、invalid分别独立显示，invalid绝不被False filler冒充empty。总预算先保留occupancy/capture/calibration三个inspection的owner-reported retained bound与整个view peak，再把唯一余额逐阶段交给occupancy admit、calibration load和capture admit/read；任一组合超限在大数组admit前拒绝。一次有界对抗审查发现并关闭两项P1：旧最近邻半径的`O(S²)`临时矩阵改为固定128×128复用scratch，逐site `Circle`改为最多三个`EllipseCollection`，共享半径几何归`matplotlib_render`而非让calibration依赖occupancy产品。实测到2048 sites时半径scratch峰值约544 KiB（预算1 MiB），collection完整save的线性峰值斜率约16 B/site、样本极值包络低于65 B/site（预算512 B/site），因此预算有证据且不保留二次爆炸。
+该surface复用shared `FrozenRasterWindow`与唯一capacity-one lane：worker完成全部repository读取、三态overlay与Agg/PNG，Qt owner只原子present immutable PNG；这只记录W4d当时的呈现机制，不再允许把`EXACT OCCUPANCY CELL · SAME-SHOT FRAME · DISPLAY ONLY`当永久产品上限。empty、occupied、invalid分别独立显示，invalid绝不被False filler冒充empty；source artifact保持immutable，但通用viewer/overlay切片必须按规则9补适用的zoom/pan/selector/export。总预算先保留occupancy/capture/calibration三个inspection的owner-reported retained bound与整个view peak，再把唯一余额逐阶段交给occupancy admit、calibration load和capture admit/read；任一组合超限在大数组admit前拒绝。一次有界对抗审查发现并关闭两项P1：旧最近邻半径的`O(S²)`临时矩阵改为固定128×128复用scratch，逐site `Circle`改为最多三个`EllipseCollection`，共享半径几何归`matplotlib_render`而非让calibration依赖occupancy产品。实测到2048 sites时半径scratch峰值约544 KiB（预算1 MiB），collection完整save的线性峰值斜率约16 B/site、样本极值包络低于65 B/site（预算512 B/site），因此预算有证据且不保留二次爆炸。
 
 Rule-6相对parent `24a3ea6`按七个实际受影响production Python文件（notebook facade、workbench lazy入口/薄occupancy adapter、occupancy/calibration/matplotlib renderer、occupancy repository）机械计数：`5094 -> 5865 physical`、`4632 -> 5341 nonblank`、`4621 -> 5328 NCLOC`，净`+771/+709/+707`；classes`17 -> 18`、dataclasses`9 -> 10`、enums`0 -> 0`、functions/methods`201 -> 215`，整体`1.151x/1.153x/1.153x`。main中与这张静态物理图相关的`LiveSiteMap + site_map + plot_occupancy/plot_detection_image + TaskConsole site inputs/aux`窄包络为`294 physical / 242 NCLOC`；W4d净增量为`2.622x/2.921x`，仍低于约3倍。额外代码只来自具名exact selection/sparse layout、同shot lineage、ComponentValidity、跨repository单总预算和worker/Qt ownership；没有新enum、repository、manager、scheduler、selector framework或compatibility wrapper，唯一新view dataclass用于阻止frontend反向import neutral并冻结跨线程owned facts。
 
@@ -3892,7 +4021,7 @@ Workbench给raw IMAGE和scalar CURVE分配不同DatasetId，并在同一`Coheren
 
 总内存继续在arm前一次合计：raw driver/adapter/stream/tap/window/snapshot/reorder/metadata、processor的第二raw tap、scalar stream/tap/payload、独立mutable/snapshot/reorder/每cell metadata、ROI reduction scratch，以及IMAGE/CURVE evaluate/raster/Qt front均在同一cap内。增大Hscalar不会增大raw schema；过大Hscalar在设备prepare/arm前拒绝。没有改RTL/bitstream，没有host-stepped scan或软件时序替代；real Pylon free-running仍受现有qualification gate约束。
 
-M2b刻意没有预建dynamic selector、revisioned ControlTopic/terminal ACK、history reset/generation、histogram、METER、Formal scan-y、Fit/Save或real qCMOS路径。它列出的第一个下一候选“让真实histogram/meter消费现有scalar history”已由下述M2c完成；当时预判鼠标selector需要revisioned ControlTopic，M2d用真实单consumer复核后选择更小且更诚实的整Run immutable replacement：selection/reducer改变产生新Run/stream/block/history generation，而不是在同一Run热换binding。selection若进入权威scan/fit仍必须重新构造对应authority spec。legacy `RoiProcessor`、`LiveLive/LiveLiveDis`、TaskConsole rolling/histogram与camera producer还拥有crop/scatter/value ROI、raw-only首ROI、side histogram/fit、scan-y及其它未迁consumer，本轮不提前删除；dependency-closed删除的只是current M2a raw-history display-reduction路径，不保留第二套实现。
+M2b刻意没有预建dynamic selector、revisioned ControlTopic/terminal ACK、history reset/generation、histogram、METER、Formal scan-y、Fit/Save或real qCMOS路径。它列出的第一个下一候选“让真实histogram/meter消费现有scalar history”已由下述M2c完成；M2d随后选择selection/reducer改变时重建整个Run/stream/block/history generation。这个选择只保留为历史因果，规则9与`UX-001`已经明确否决其“更诚实/更小所以可作终态”的结论：monitor retarget必须保持source Run/raw generation/tap topology连续，由downstream `ControlTopic`在事务边界APPLIED。selection若进入权威scan/fit仍必须重新构造对应authority spec。legacy `RoiProcessor`、`LiveLive/LiveLiveDis`、TaskConsole rolling/histogram与camera producer还拥有crop/scatter/value ROI、raw-only首ROI、side histogram/fit、scan-y及其它未迁consumer，本轮不提前删除；dependency-closed删除的只是current M2a raw-history display-reduction路径，不保留第二套实现。
 
 M2b Rule-6按六个实际受影响production文件相对`f19bedb`机械计数为`4905 -> 6013 physical`、`4475 -> 5500 nonblank`、`4455 -> 5474 token-NCLOC`，净`+1108/+1025/+1019`；classes`20 -> 29`、dataclasses`9 -> 16`、enums`0 -> 0`、functions/methods`197 -> 242`。main真实窄oracle `RoiProcessor + LiveLive`为`314/278/254 physical/nonblank/NCLOC`，本轮净增为其`3.53x/3.69x/4.01x`，严格海拔超过约3倍，不能隐藏；加入默认`LiveLiveDis`与真实`PanelCard._render`的宽用户面包络为`596/543/438`，对应`1.86x/1.89x/2.33x`。超过窄oracle的增量承担main没有的typed validity/control binding、source-event lineage、payload/metadata容量与digest、独立scalar history、raw/scalar原子coherence和非阻塞Qt生命周期。审查后`RoiScalarSample`直接拥有`RoiScalarMetadata`，零production-consumer的package-root re-export也已删除；剩余binding、stream contract/adapter、ordered projection、atomic live dataset与presentation owner分别有不同generic接缝或生命周期，未发现可再压缩的P1、single-member enum、manager、plugin、scheduler framework或compatibility wrapper。
 
@@ -3910,11 +4039,11 @@ M2c Rule-6按最终六个受影响production文件（`_camera_monitor.py`、`_ca
 
 限定验证按process-lifetime installation边界分进程运行：M2c `6 passed`、M2b `3 passed`、M2a current回归`3 passed`、M1 `5 passed`、直接受影响W1 `7 passed`、W3 renderer回归`5 passed`，另有figure histogram/meter contract `4 passed`；owned production/test `py_compile`、fresh import、旧renderer/curve-only符号扫描与`git diff --check`通过。两路独立对抗审查共发现并关闭三个P1：CURVE/METER valid NaN/Inf未fail-closed、60-bin渲染与预算常量手抄漂移、可见front与多字段诊断跨revision拼接；原审查员定向复核均为`READY/P0=0/P1=0`。完整迁移仍为NO-GO；这里只判M2c纵切GO，不重开已完成产品，也不运行/修改历史架构测试去迎合已迁移边界。
 
-**最新实现 checkpoint：M2d fixed-ROI front-bound selector + immutable Run replacement完成。** 当前真实consumer只是在已有typed ROI四panel camera monitor中重新画rectangle并选择`MEAN|SUM|MAX`。`RectangleGesture`冻结`panel/board/layout/sequence/source/viewport revision`与normalized pixel-cell-edge bounds；`ImageViewportTransform`只接受恰好一对显式、规则、数值、`unit="pixel"`、同coordinate frame且role为`SPATIAL_X/SPATIAL_Y`的具名轴。它不看rank/singleton猜角色，也不近似irregular axis。Qt overlay只画accepted与draft rectangle；worker继续一次compose完整board，GUI不取得Figure/Agg。mouse press同步暂停live admission，release、front变化、resize、hide、disable、unbind、destroy与异常均成对恢复；暂停时丢弃已冻结candidate也同时释放active状态，避免resume永久等待。
+**历史实现 checkpoint：M2d fixed-ROI front-bound selector完成；source Run replacement结论已废止。** 当时真实consumer只是在已有typed ROI四panel camera monitor中重新画rectangle并选择`MEAN|SUM|MAX`。`RectangleGesture`冻结`panel/board/layout/sequence/source/viewport revision`与normalized pixel-cell-edge bounds；`ImageViewportTransform`只接受恰好一对显式、规则、数值、`unit="pixel"`、同coordinate frame且role为`SPATIAL_X/SPATIAL_Y`的具名轴。它不看rank/singleton猜角色，也不近似irregular axis。Qt overlay只画accepted与draft rectangle；worker继续一次compose完整board，GUI不取得Figure/Agg。当时mouse press会暂停整个live admission；U0纠正2必须改成只暂缓/coalesce被拖panel的presentation，source与其它panel继续推进，release后从最新合法revision补拍，所有退出路径仍成对释放interaction state。
 
-draft始终可见且不改变正在发布的scalar；只有显式`Apply ROI`才构造新immutable `CameraMonitorRequest`。因为当前只有这一个真实consumer，没有建立ControlTopic、terminal ACK、in-run mutable generation或通用control framework。Apply在任何破坏性动作前先冻结完整`_PreparedMonitorView`：candidate command、下一generation、raw/scalar DatasetId、全部FigureDocument、histogram/evaluation policy、viewport、全部evaluator/raster/downstream peak与总内存准入。可预知的schema/view/budget失败因此保留旧Run、front、history、accepted ROI与draft overlay；相机设置、exposure、物理acquisition ROI、pulse/trigger timing及RTL/bitstream均未改变。
+当时draft始终可见且不改变正在发布的scalar，只有显式`Apply ROI`才构造replacement request；这解释了旧实现的preflight/预算事实，不再定义目标UX。U0纠正1要求drag release（或旧oracle对应的直接动作）自动提交downstream revisioned ControlTopic，UI保持pending直到事务边界`APPLIED`，不再要求第二次`Apply ROI`。downstream owner仍须在应用前冻结candidate binding、schema、documents、histogram/evaluation policy与预算；可预知失败保留旧applied downstream binding与raw source。相机设置、exposure、物理acquisition ROI、pulse/trigger timing及RTL/bitstream均不在该ControlTopic中改变。
 
-只有旧Run的首次`CancelOutcome.REQUESTED`授予replacement promotion authority；`ALREADY_REQUESTED`、其它cancel outcome、非`CANCELLED` terminal或用户Stop意图都撤销staged candidate。即使CANCELLING snapshot重入，`PREPARING/REPLACING/manual Stop`也不会重新启用Stop；reap再次检查manual intent，防止显式Stop被自动restart反转。成功路径必须先等旧owner terminal并完整reap、关闭旧live/board资源，再用prepared product启动全新的Run、raw/scalar stream generation、BlockId、DatasetId与history；第一张source-exact coherent front的binding fingerprint匹配前，UI只显示WAITING而不宣称APPLIED。旧generation的completion/front不能覆盖新generation。
+旧实现以cancel/reap后启动全新source Run来promotion replacement；这一整段只能作为待删除实现的竞态审计事实，不能复用于纠正后的monitor retarget。新合同不cancel source：同一个downstream processor owner在transaction boundary原子安装新binding并发`APPLIED`，新输出携control revision；stale downstream completion不得覆盖新revision。只有用户Stop/source failure/source schema reconfigure才进入source Run terminal/reap路径。
 
 MAX只在声明selection与ComponentValidity为真的contributors上计算：整数和浮点均保持source dtype，complex在prepare拒绝；全invalid返回typed zero + INVALID，`REQUIRE_ALL`有任一坏component时保留由有效contributors得到的诊断值但标INVALID，`OMIT_INVALID`只忽略显式invalid component。三种reducer都在同一ROI kernel层拒绝valid NaN/Inf，invalid NaN/Inf不误伤有效结果；selected compact copy、float finite mask与widened accumulator分别进入pre-arm scratch上界。M2d同时删除从未表达mutation的恒零`config_revision/control_revision`，join与metadata只携完整source `EventRef + semantic binding fingerprint`；metadata contract identity随字段布局更新。相同binding跨restart可有相同fingerprint，但Run/stream/block/dataset generation严格区分历史。
 
@@ -3950,6 +4079,8 @@ W6 Rule-6按五个实际受影响production Python文件相对parent `7522b66`�
 
 **最新实现 checkpoint：W7 exact saved-fit GridPlot explorer纵切完成。** `Experiment.figure_gui(CaptureFitResultArtifactRef)`在没有自定义intent/selection/preferences时按typed ref分派到saved-fit explorer；携自定义view参数仍走既有generic frozen Figure，不建立第二套projection语义。explorer只读取这个content-addressed exact ref已有的`FitResultBatch`，从不调用solver/`execute()`、不改变`FitSpec`、不创建draft，也不发布新artifact。每根fit batch axis仍按原`AxisSpec`与`AxisLayout`存在：repeat显式为`FACET`而非mean/latest/index-0，其余当前页跨度大于1的轴显式facet；每页逻辑panel上限36。EXPLICIT layout的hole保留在原逻辑位置并带`fit_storage_index=None`，绝不以相邻physical row补位。
 
+这里“replay不调用solver”是必须保留的authority不变量，只禁止打开旧结果时隐式重算或改写旧artifact；它不禁止viewer的显式re-fit。U0纠正3中的`Analyze -> Fit`必须用exact source ref与当前/已保存的SelectionCandidate建立新的authority draft，运行同一BoundFit owner并产生新result/revision/ref；旧W7 artifact始终不变。
+
 一次Agg compose同时返回最终panel的normalized实际坐标、完整具名`Selection`与exact stored row；double-click只接受这份hit map。共享`AxisLayoutNavigator`从W4e occupancy抽成唯一Qt owner，按axis count而非axis size建控件，非singleton保持`Select…`，Previous/Next严格沿physical storage order并跳过hole。focus详情只取选中stored row已有的status、parameters、covariance uncertainty、present/valid/used/evaluation counts、RSS-derived per-cell RMSE与R²；failed row不显示伪参数，也不访问/物化整批RMSE。Esc直接恢复缓存的当前page front，不重新solve或重新读取artifact。
 
 性能与内存合同不是“每点重开repository”。窗口得到的仍只是一个窄worker-affine callable；该callable第一次在shared frozen-raster worker中按调用者总预算检查encoded blob、解码后的fit retained bound、source dataset与compact model，随后一次物化exact source snapshot并在私有session中复用。focus、换页和export都继续经过Experiment lifecycle guard，但复用同一个immutable result/snapshot，不再次decode完整fit或materialize qCMOS source；Qt owner不能访问这个session，只持compact `FitGridModel`、bounded page、cell text、PNG与hit regions。以后每个job先从总cap扣掉session、model以及仍保留的page/current front，再把唯一余额交给Figure evaluation/Agg；低预算在decode/materialize/Qt decode前fail-closed。model identity同时冻结artifact target、完整axis values和同一exact `AxisLayout` mapping，不能把同shape的另一张sparse表接到旧navigator。
@@ -3960,9 +4091,9 @@ W7 Rule-6按20个实际受影响production Python文件相对parent `4cb2f49`机
 
 验证为W7白名单`7 passed`，直接受影响frontend Figure与W4 Figure/occupancy回归`39 passed`，W5真实save/reopen fresh-process回归`1 passed`；owned `py_compile`、fresh headless import、exact-ref/no-refit、sparse-hole、repeat-FACET、one-load/one-materialize、低预算pre-decode拒绝、atomic export/Close与shape-loss扫描通过。一次有界独立对抗先报出budget传递、非原子export和每次focus全量重读三个P1：第一项在审查结果到达前已由repository budget接线关闭并补上“decode不可到达”oracle，后两项以上述session复用与同目录原子替换关闭。W7纵切现为`P0=0/P1=0/GO`；完整迁移仍为NO-GO。本切片没有dependency-closed legacy删除：旧TaskConsole/Live/GridPlot仍拥有live artist、scan/ROI-transform fit、selector和其它rolling consumer，下一切片必须从最新Git checkpoint重新选择真实consumer，不能为了删文件把这些路径提前打黑。
 
-**最新实现 checkpoint：M2e default raw monitor first typed ROI纵切完成。** 默认`.readout.camera_monitor_gui()`仍从`roi=None`的一个raw IMAGE panel启动，没有scalar DatasetId、processor tap或hidden scalar stream；raw schema继续完整保留`(R, P, *data_shape)`与具名`SPATIAL_Y/SPATIAL_X`、ComponentValidity、EventRef、revision和provenance。raw与已有ROI两种窗口现在共用唯一`QtRasterBoard`/`ImageViewportTransform` selector host；selector默认关闭，只有用户显式启用后，gesture才按当前可见`BoardFrame`的board/layout/sequence/source identity及viewport revision解析成typed pixel-cell rectangle。该Selection是下游analysis/monitor ROI，不是camera acquisition ROI；它不改变exposure、硬件ROI、trigger、FPGA/RTL或bitstream，也不进入FitSpec、ScanOutputContract、CommittedTransform、Save或artifact manifest。
+**历史实现 checkpoint：M2e default raw monitor first typed ROI纵切完成；首ROI source restart已废止。** 默认`.readout.camera_monitor_gui()`仍从`roi=None`的一个raw IMAGE panel启动，没有scalar DatasetId、processor tap或hidden scalar stream；raw schema继续完整保留`(R, P, *data_shape)`与具名`SPATIAL_Y/SPATIAL_X`、ComponentValidity、EventRef、revision和provenance。raw与已有ROI两种窗口共用唯一`QtRasterBoard`/`ImageViewportTransform` selector host；selector只有用户显式启用后，gesture才按当前可见`BoardFrame`的board/layout/sequence/source identity及viewport revision解析成typed pixel-cell rectangle。该Selection是下游analysis/monitor ROI，不是camera acquisition ROI；它不改变exposure、硬件ROI、trigger、FPGA/RTL或bitstream，也不进入FitSpec、ScanOutputContract、CommittedTransform、Save或artifact manifest。
 
-画框只产生可见draft，运行中的raw source不变；`MEAN|SUM|MAX`是UI中可见且随Apply一并冻结的显式reducer，不存在拖框即隐藏平均。Apply先在既有worker-affine lane完整准备immutable replacement request、下一Run/stream/block/dataset/history generation、raw+scalar documents、viewport和全内存准入。可预知失败保持旧raw Run、单panel front、draft overlay、BlockId和stream generation；成功也必须先得到旧Run `CANCELLED`、完成`wait()`/owner reap并关闭旧live/发布口，才把board从1 panel切成4 panels并启动新generation。新Run重新取得RunId、LiveDatasetSlot、DatasetId、BlockId、stream generation与scalar history，首个coherent front出现后才把draft提升为applied。Close或manual Stop清除staged candidate；stale completion不能切换topology或发布新front。
+当时画框只产生可见draft，`MEAN|SUM|MAX`作为显式reducer随Apply冻结；随后实现会取消raw Run并以新Run/generation把board从1 panel切成4 panels。这个source restart流程已由`UX-001`否决。纠正后，首个ROI创建只建立downstream subscription/processor stream/generation并在其首个合法output后原子接入board；raw source RunId、raw stream generation、raw front与source tap topology不变。reducer继续显式可见，existing ROI retarget走ControlTopic/APPLIED；Close/manual Stop与stale downstream completion都不能错误切换topology。
 
 M2e Rule-6按唯一实际修改的production文件相对parent `2a21bf2`机械计数：`1341 -> 1345 physical`、`1280 -> 1284 nonblank`、`1278 -> 1282 token-NCLOC`，净`+4/+4/+4`，整体约`1.003x`；classes`2 -> 2`、dataclasses`1 -> 1`、enums`0 -> 0`、functions/methods`34 -> 34`。净差量相对main严格相关first-ROI包络`1730 physical / 1455 token-NCLOC`仅`0.0023x/0.0027x`，相对公平完整包络`7014/5540`为`0.0006x/0.0007x`；整个current owner文件相对严格包络为`0.78x/0.88x`。本切片没有新class、worker、executor、ControlTopic、repository、renderer、manager、registry、compatibility wrapper或通用ROI多态机，差量只支付raw/ROI共用selector host与终态后的topology handoff。
 
@@ -4091,6 +4222,15 @@ Pulse/FPGA：
 - virtual 与 real 在各自进程startup选择backend后走同一request/run/data路径；不提供进程内切换；
 - notebook 的 connect/capture/fit/save 仍保持短路径，不暴露内部 PipelineSpec/Port ceremony；
 - UI 视觉和交互能力不因架构拆分退化。
+
+最终证据与交付：
+
+- `tests/migration_active_tests.txt` 的全部路径经conftest机械授权，完整`--collect-only`与完整实跑全绿；清单外历史测试没有被运行或改写；
+- 对最终分支只做一次有界独立对抗终审，结论必须为P0=0、P1=0；P2逐项给出触发条件、owner与后续动作，不能用“未来再看”隐藏；
+- 《迁移完成报告》候选稿首页列§2.2全部未批准UX偏离，随后给最终commit、包/能力状态、删除账、规则1–9证据、性能结果、已知限制和实机未资格化项；只要仍有未批准偏离，它就是待用户裁决的候选报告、Rule 9仍PARTIAL且迁移NO-GO；用户批准或实现恢复parity后才可签为终版；
+- 《真机bring-up runbook》给出上电/唯一owner/AssetMap与fingerprint检查、camera工作点与Q0资格化、virtual scan、resident Formal、EndAttestation/reject-and-redo、安全停止/断线/quarantine的顺序、命令、预期结果、通过/失败判据与恢复动作；
+- 用户上机第一天清单按“真实launcher GUI日常流程 -> virtual scan/fit/save/reopen -> qCMOS只读identity/working point -> 已批准qualification -> resident真机Formal”排序，任何fail-closed gate不得靠手工改状态绕过；
+- >4096/9999点扫描若在交付时仍受真机资格化约束，runbook必须单列`AUTONOMOUS_REFILLED`启用步骤：冻结全schedule/chunk digest、单I/O owner、refill硬上界、每个seam时间观测与residual证据、配置/命令、9999点压力实验、underflow/gap/late-chunk拒绝判据、关闭条件与resident回退。host只供应预先冻结chunk，FPGA继续决定全部精密edge时序；未通过时typed拒绝而不退化为host stepping。
 
 ## 23. 核心结论
 
