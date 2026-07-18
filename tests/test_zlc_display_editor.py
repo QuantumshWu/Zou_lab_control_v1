@@ -213,6 +213,45 @@ def test_cancel_reload_gate_and_runtime_placeholder_never_overwrite_draft() -> N
     assert not editor._dirty and not editor._stale
 
 
+def test_explicit_owner_replacement_discards_old_revision_and_dirty_units() -> None:
+    Editor, _image_spec, curve_spec = _types()
+    editor = Editor(
+        curve_spec,
+        "curve display",
+        runtime_placeholder_fields=("x_min", "x_max"),
+    )
+    old_values = {
+        "mode": "fixed",
+        "x_min": 10.0,
+        "x_max": 20.0,
+        "enabled": True,
+    }
+    reset_values = {
+        "mode": "normal",
+        "x_min": None,
+        "x_max": None,
+        "enabled": True,
+    }
+    editor.load(
+        revision=9,
+        semantic_identity=("MHz scan", 9),
+        values=old_values,
+    )
+    editor._form.widget_for("x_min").setText("12")
+    assert editor._dirty
+
+    editor.replace_owner_state(
+        revision=0,
+        semantic_identity=("ms scan", 0),
+        values=reset_values,
+        runtime_placeholders={"x_min": "0", "x_max": "5"},
+    )
+    assert editor.base_revision == 0
+    assert editor._form.read_all() == reset_values
+    assert not editor._dirty and not editor._stale
+    assert editor._form.widget_for("x_min").placeholderText() == "0"
+
+
 def test_runtime_placeholder_contract_is_closed_and_line_edit_only() -> None:
     Editor, _image_spec, curve_spec = _types()
     with pytest.raises(TypeError, match="must project to QLineEdit"):

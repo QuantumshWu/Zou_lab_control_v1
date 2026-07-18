@@ -70,12 +70,14 @@ from zlc_frontend.qt_widgets import (
     WINDOW_SCREEN_FRACTION,
     center_window_on_primary_screen,
     ensure_qt_app,
-    popup_gap,
     release_window,
     retain_window,
+    runtime_range_placeholders,
     screen_fit_window_size,
     scaled_px,
     set_fluent_scale,
+    show_fluent_popup_for_anchor,
+    sync_revisioned_form_editors,
 )
 from zlc_frontend.render import RenderSurface
 from zlc_frontend.selector import (
@@ -712,73 +714,11 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             return
         self._reload_image_display_editor(self._setting_image_display)
         self._reload_curve_display_editor(self._setting_curve_display)
-        popup.adjustSize()
-        form_hint = self._setting_display_tabs.sizeHint()
-        editor_hint = self._setting_display_tabs.sizeHint()
-        button_top_left = self._setting_button.mapToGlobal(QtCore.QPoint(0, 0))
-        button_bottom_right = self._setting_button.mapToGlobal(
-            QtCore.QPoint(
-                max(0, self._setting_button.width() - 1),
-                max(0, self._setting_button.height() - 1),
-            )
+        show_fluent_popup_for_anchor(
+            popup,
+            self._setting_button,
+            self._setting_display_tabs,
         )
-        button_center = QtCore.QPoint(
-            (button_top_left.x() + button_bottom_right.x()) // 2,
-            (button_top_left.y() + button_bottom_right.y()) // 2,
-        )
-        screen = QtWidgets.QApplication.screenAt(button_center)
-        if screen is None and hasattr(self, "screen"):
-            screen = self.screen()
-        if screen is None:
-            screen = QtWidgets.QApplication.primaryScreen()
-        available = None if screen is None else screen.availableGeometry()
-        desired_width = max(
-            scaled_px(360, minimum=320),
-            form_hint.width() + scaled_px(28, minimum=20),
-            editor_hint.width(),
-        )
-        desired_height = max(
-            scaled_px(300, minimum=260),
-            form_hint.height() + scaled_px(120, minimum=96),
-            editor_hint.height(),
-        )
-        if available is not None:
-            desired_width = min(
-                desired_width,
-                max(1, int(available.width() * 0.55)),
-            )
-            desired_height = min(desired_height, max(1, int(available.height() * 0.90)))
-            gap = popup_gap()
-            below_top = button_bottom_right.y() + 1 + gap
-            above_bottom = button_top_left.y() - gap - 1
-            below_space = max(0, available.bottom() - below_top + 1)
-            above_space = max(0, above_bottom - available.top() + 1)
-            if desired_height <= below_space:
-                top = below_top
-            elif desired_height <= above_space:
-                top = above_bottom - desired_height + 1
-            elif above_space >= below_space:
-                desired_height = max(1, min(desired_height, above_space))
-                top = above_bottom - desired_height + 1
-            else:
-                desired_height = max(1, min(desired_height, below_space))
-                top = below_top
-        else:
-            top = button_bottom_right.y() + 1 + popup_gap()
-        popup.resize(desired_width, desired_height)
-        left = button_bottom_right.x() - popup.width() + 1
-        if available is not None:
-            left = max(
-                available.left(),
-                min(left, available.right() - popup.width() + 1),
-            )
-            top = max(
-                available.top(),
-                min(top, available.bottom() - popup.height() + 1),
-            )
-        popup.move(left, top)
-        popup.show()
-        popup.raise_()
 
     def _record_settings_dismissed(self) -> None:
         self._settings_dismissed_at = time.monotonic()
@@ -866,19 +806,6 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             and status.scalar_control_revision == self._applied_control_revision
         )
 
-    @staticmethod
-    def _runtime_range_placeholders(
-        value: tuple[float, float] | None,
-        low_key: str,
-        high_key: str,
-    ) -> dict[str, str] | None:
-        if value is None:
-            return None
-        return {
-            low_key: f"{value[0]:.12g}",
-            high_key: f"{value[1]:.12g}",
-        }
-
     def _reload_image_display_editor(
         self,
         editor: FluentRevisionedFormEditor,
@@ -892,7 +819,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             revision=self._image_display.revision,
             semantic_identity=self._image_display,
             values=image_display_form_values(self._image_display),
-            runtime_placeholders=self._runtime_range_placeholders(
+            runtime_placeholders=runtime_range_placeholders(
                 self._visible_image_color_limits(),
                 "color_min",
                 "color_max",
@@ -907,12 +834,12 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
     ) -> None:
         limits = self._visible_image_color_limits()
         values = image_display_form_values(self._image_display)
-        placeholders = self._runtime_range_placeholders(
+        placeholders = runtime_range_placeholders(
             limits,
             "color_min",
             "color_max",
         )
-        self._sync_display_editors(
+        sync_revisioned_form_editors(
             (self._edit_image_display, self._setting_image_display),
             revision=self._image_display.revision,
             semantic_identity=self._image_display,
@@ -935,7 +862,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             revision=self._curve_display.revision,
             semantic_identity=self._curve_display,
             values=curve_display_form_values(self._curve_display),
-            runtime_placeholders=self._runtime_range_placeholders(
+            runtime_placeholders=runtime_range_placeholders(
                 self._visible_curve_y_limits(),
                 "y_min",
                 "y_max",
@@ -949,12 +876,12 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         accepted_base_revision: int | None = None,
     ) -> None:
         values = curve_display_form_values(self._curve_display)
-        placeholders = self._runtime_range_placeholders(
+        placeholders = runtime_range_placeholders(
             self._visible_curve_y_limits(),
             "y_min",
             "y_max",
         )
-        self._sync_display_editors(
+        sync_revisioned_form_editors(
             (self._edit_curve_display, self._setting_curve_display),
             revision=self._curve_display.revision,
             semantic_identity=self._curve_display,
@@ -972,38 +899,6 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
     ) -> None:
         if editor not in editors:
             raise ValueError(f"{kind} display editor does not belong to this window")
-
-    @staticmethod
-    def _sync_display_editors(
-        editors: tuple[FluentRevisionedFormEditor, ...],
-        *,
-        revision: int,
-        semantic_identity: object,
-        values: dict[str, object],
-        runtime_placeholders: dict[str, str] | None,
-        accepted_editor: FluentRevisionedFormEditor | None,
-        accepted_base_revision: int | None,
-    ) -> None:
-        if accepted_editor is not None and accepted_editor not in editors:
-            raise ValueError("accepted display editor is not one of the synchronized surfaces")
-        for editor in editors:
-            if editor is accepted_editor:
-                if accepted_base_revision is None:
-                    raise RuntimeError("accepted display editor has no base revision")
-                editor.accept_commit(
-                    base_revision=accepted_base_revision,
-                    revision=revision,
-                    semantic_identity=semantic_identity,
-                    values=values,
-                    runtime_placeholders=runtime_placeholders,
-                )
-            else:
-                editor.load(
-                    revision=revision,
-                    semantic_identity=semantic_identity,
-                    values=values,
-                    runtime_placeholders=runtime_placeholders,
-                )
 
     def _apply_image_display_form(
         self,

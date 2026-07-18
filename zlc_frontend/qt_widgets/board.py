@@ -2789,6 +2789,8 @@ class QtRasterBoard(QtWidgets.QWidget):
             return
         plot, payload, bounds = target[0], target[4], target[5]
         viewport = payload.viewport
+        x_unit = "" if viewport.x_axis.unit is None else f" {viewport.x_axis.unit}"
+        y_unit = "" if payload.value_unit is None else f" {payload.value_unit}"
 
         def widget_point(x: float, y: float) -> QtCore.QPointF:
             normalized = viewport.data_to_widget_normalized(x, y)
@@ -2831,7 +2833,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                     )
                 self._paint_curve_label(
                     painter,
-                    f"x={cross.x:.6g}  y={cross.y:.6g}",
+                    f"x={cross.x:.6g}{x_unit}  y={cross.y:.6g}{y_unit}",
                     plot,
                     QtGui.QColor(GREEN),
                     top_right=True,
@@ -2845,12 +2847,11 @@ class QtRasterBoard(QtWidgets.QWidget):
                     painter.setPen(QtGui.QPen(QtGui.QColor(ORANGE), 1.5))
                     painter.setBrush(QtGui.QBrush(QtGui.QColor(ORANGE)))
                     painter.drawEllipse(point, 3.5, 3.5)
-                unit = "" if payload.value_unit is None else f" {payload.value_unit}"
                 self._paint_curve_label(
                     painter,
                     (
-                        f"{sample.series_label}  x={sample.x:.6g}  "
-                        f"y={sample.y:.6g}{unit}"
+                        f"{sample.series_label}  x={sample.x:.6g}{x_unit}  "
+                        f"y={sample.y:.6g}{y_unit}"
                     ),
                     plot,
                     QtGui.QColor(ORANGE),

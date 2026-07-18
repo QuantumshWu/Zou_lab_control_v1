@@ -44,7 +44,7 @@ def _curve_panel(sequence: int, *, display_revision: int = 0, offset: float = 0.
         AxisId("monitor.history"),
         "Shots ago",
         MONITOR_HISTORY,
-        None,
+        "ms",
         (0, 1, 2, 3),
         (0.0, 1.0, 2.0, 3.0),
     )
@@ -346,6 +346,51 @@ def test_curve_hover_all_series_and_continuous_cross() -> None:
             )
         )
         assert board._curve_cross is None
+    finally:
+        board.close()
+        application.processEvents()
+
+
+def test_curve_cross_and_hover_overlay_show_both_axis_units(monkeypatch) -> None:
+    from PyQt5 import QtCore, QtGui, QtTest
+
+    curve_commands = []
+    application, board = _board(_frame(0), curve_commands, [])
+    try:
+        plot = board._curve_target()[0]
+        position = _point(plot, 0.55, 0.45)
+        QtTest.QTest.mouseMove(board, position)
+        assert board._curve_hover is not None
+
+        labels = []
+
+        def capture_label(_painter, label, _plot, _color, **_kwargs):
+            labels.append(label)
+
+        monkeypatch.setattr(
+            type(board),
+            "_paint_curve_label",
+            staticmethod(capture_label),
+        )
+        image = QtGui.QImage(
+            board.size(),
+            QtGui.QImage.Format_ARGB32_Premultiplied,
+        )
+        painter = QtGui.QPainter(image)
+        try:
+            board._paint_curve_overlays(painter)
+        finally:
+            painter.end()
+        QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=position)
+        assert board._curve_cross is not None
+        painter = QtGui.QPainter(image)
+        try:
+            board._paint_curve_overlays(painter)
+        finally:
+            painter.end()
+        assert len(labels) == 2
+        assert all("x=" in label and " ms" in label for label in labels)
+        assert all("y=" in label and " count" in label for label in labels)
     finally:
         board.close()
         application.processEvents()

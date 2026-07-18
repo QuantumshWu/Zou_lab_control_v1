@@ -514,6 +514,57 @@ def compile_occupancy_scan_artifact_plan(
         raise
 
 
+def _admit_optional_preview_data_limit(
+    source_schema: DatasetSchema,
+    output_contract: ScanOutputContract,
+    *,
+    memory_limit_bytes: int,
+    retained_base_bytes: int,
+    preview: ExactDatasetPreviewPort | None,
+    preview_spec: ExactDatasetPreviewSpec | None,
+) -> tuple[
+    int,
+    ExactDatasetPreviewPort | None,
+    ExactDatasetPreviewSpec | None,
+]:
+    """Admit science data first, then retain a preview only when it also fits.
+
+    Type/schema/terminal errors are validated before this helper and remain
+    hard failures.  Only the exact delta introduced by an otherwise valid
+    preview may degrade to FINAL-only, and the rejected port receives that
+    capacity reason from the neutral owner of the memory formula.
+    """
+
+    if (preview is None) != (preview_spec is None):
+        raise ValueError("preview and preview_spec must be present together")
+    preview_bytes = (
+        0 if preview_spec is None else preview_spec.downstream_peak_bytes
+    )
+    try:
+        admitted = _admit_final_data_limit(
+            source_schema,
+            output_contract,
+            memory_limit_bytes=memory_limit_bytes,
+            retained_overhead_bytes=retained_base_bytes + preview_bytes,
+        )
+    except MemoryError as preview_error:
+        if preview is None:
+            raise
+        baseline = _admit_final_data_limit(
+            source_schema,
+            output_contract,
+            memory_limit_bytes=memory_limit_bytes,
+            retained_overhead_bytes=retained_base_bytes,
+        )
+        _notify_preview_failure(preview, preview_error)
+        if preview.terminal is not True:
+            raise RuntimeError(
+                "capacity-rejected preview did not reach a terminal state"
+            ) from preview_error
+        return baseline, None, None
+    return admitted, preview, preview_spec
+
+
 def _compile_occupancy_scan_artifact_plan(
     spec: TriggeredOccupancySpec,
     repository: ScanRepository,
@@ -533,36 +584,28 @@ def _compile_occupancy_scan_artifact_plan(
         camera_schema,
     )
     preview_spec = _occupancy_preview_spec(spec.occupancy, preview)
-    preview_bytes = (
-        0 if preview_spec is None else preview_spec.downstream_peak_bytes
-    )
     _require_output_binding(
         program=program,
         source_schema=resolved.counts_schema,
         output_contract=output_contract,
-    )
-    _admit_final_data_limit(
-        resolved.counts_schema,
-        output_contract,
-        memory_limit_bytes=memory_limit_bytes,
-        retained_overhead_bytes=preview_bytes,
     )
     static_lineage = repository._admit_static_lineage(
         program,
         (spec.pulse_request.artifact,),
         memory_limit_bytes=memory_limit_bytes,
     )
-    final_data_limit = _admit_final_data_limit(
+    final_data_limit, preview, preview_spec = _admit_optional_preview_data_limit(
         resolved.counts_schema,
         output_contract,
         memory_limit_bytes=memory_limit_bytes,
-        retained_overhead_bytes=(
+        retained_base_bytes=(
             static_lineage.retained_upper_bound_bytes
             + calibration_retained_array_nbytes(
                 spec.occupancy.processor.calibration.artifact
             )
-            + preview_bytes
         ),
+        preview=preview,
+        preview_spec=preview_spec,
     )
 
     def adapt(

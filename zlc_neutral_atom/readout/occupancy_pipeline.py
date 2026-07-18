@@ -443,6 +443,8 @@ def _open_exact_occupancy(
 
     if not isinstance(spec, OccupancyPipelineSpec):
         raise TypeError("spec must be OccupancyPipelineSpec")
+    if (preview is None) != (preview_spec is None):
+        raise ValueError("preview and preview_spec must be present together")
     measurement, contract = spec.measurement, spec.measurement.capture_contract
     session = measurement.capture_port.open_session(
         contract, TraceBinding(context.run_id.value, contract.source_id), measurement.capture_spec
@@ -466,10 +468,34 @@ def _open_exact_occupancy(
             retained_overhead_bytes=retained_overhead_bytes,
         )
         if peak > spec.memory_limit_bytes:
-            raise MemoryError(
-                f"occupancy pipeline owned-buffer peak {peak} exceeds "
-                f"limit {spec.memory_limit_bytes}"
+            if preview is None:
+                raise MemoryError(
+                    f"occupancy pipeline owned-buffer peak {peak} exceeds "
+                    f"limit {spec.memory_limit_bytes}"
+                )
+            preview_error = MemoryError(
+                "occupancy pipeline owned-buffer peak with optional preview "
+                f"{peak} exceeds limit {spec.memory_limit_bytes}"
             )
+            baseline_peak = _estimate_peak_bytes(
+                spec,
+                bound,
+                None,
+                retained_overhead_bytes=retained_overhead_bytes,
+            )
+            if baseline_peak > spec.memory_limit_bytes:
+                raise MemoryError(
+                    "occupancy pipeline science baseline owned-buffer peak "
+                    f"{baseline_peak} exceeds limit {spec.memory_limit_bytes}"
+                )
+            _notify_preview_failure(preview, preview_error)
+            if preview.terminal is not True:
+                raise RuntimeError(
+                    "capacity-rejected occupancy preview did not reach a "
+                    "terminal state"
+                ) from preview_error
+            preview = None
+            preview_spec = None
         source = session.reserve_exact()
         source_cursor = source.activate()
         payload = bound.output_payload_contract

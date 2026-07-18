@@ -674,6 +674,101 @@ class FluentPopup(QtWidgets.QFrame):
         painter.drawRoundedRect(rect, self._radius, self._radius)
 
 
+def show_fluent_popup_for_anchor(
+    popup: FluentPopup,
+    anchor: QtWidgets.QWidget,
+    content: QtWidgets.QWidget,
+    *,
+    minimum_width: int = 360,
+    minimum_height: int = 300,
+) -> None:
+    """Size and place one Fluent popup beside its anchor on the active screen.
+
+    This is the single owner of the Setting-popup placement contract used by
+    Workbench surfaces: prefer below, fall back above, clamp to the current
+    screen, and leave the shared Fluent outer gap.  Popup content and its draft
+    lifecycle remain entirely owned by the caller.
+    """
+
+    if not isinstance(popup, FluentPopup):
+        raise TypeError("popup must be FluentPopup")
+    if not isinstance(anchor, QtWidgets.QWidget):
+        raise TypeError("anchor must be QWidget")
+    if not isinstance(content, QtWidgets.QWidget):
+        raise TypeError("content must be QWidget")
+    for value, name in (
+        (minimum_width, "minimum_width"),
+        (minimum_height, "minimum_height"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+
+    popup.adjustSize()
+    hint = content.sizeHint()
+    anchor_top_left = anchor.mapToGlobal(QtCore.QPoint(0, 0))
+    anchor_bottom_right = anchor.mapToGlobal(
+        QtCore.QPoint(max(0, anchor.width() - 1), max(0, anchor.height() - 1))
+    )
+    anchor_center = QtCore.QPoint(
+        (anchor_top_left.x() + anchor_bottom_right.x()) // 2,
+        (anchor_top_left.y() + anchor_bottom_right.y()) // 2,
+    )
+    screen = QtWidgets.QApplication.screenAt(anchor_center)
+    if screen is None and hasattr(anchor, "screen"):
+        screen = anchor.screen()
+    if screen is None:
+        screen = QtWidgets.QApplication.primaryScreen()
+    available = None if screen is None else screen.availableGeometry()
+    desired_width = max(
+        scaled_px(minimum_width, minimum=320),
+        hint.width() + scaled_px(28, minimum=20),
+    )
+    desired_height = max(
+        scaled_px(minimum_height, minimum=260),
+        hint.height() + scaled_px(120, minimum=96),
+    )
+    gap = popup_gap()
+    if available is not None:
+        desired_width = min(
+            desired_width,
+            max(1, int(available.width() * 0.55)),
+        )
+        desired_height = min(
+            desired_height,
+            max(1, int(available.height() * 0.90)),
+        )
+        below_top = anchor_bottom_right.y() + 1 + gap
+        above_bottom = anchor_top_left.y() - gap - 1
+        below_space = max(0, available.bottom() - below_top + 1)
+        above_space = max(0, above_bottom - available.top() + 1)
+        if desired_height <= below_space:
+            top = below_top
+        elif desired_height <= above_space:
+            top = above_bottom - desired_height + 1
+        elif above_space >= below_space:
+            desired_height = max(1, min(desired_height, above_space))
+            top = above_bottom - desired_height + 1
+        else:
+            desired_height = max(1, min(desired_height, below_space))
+            top = below_top
+    else:
+        top = anchor_bottom_right.y() + 1 + gap
+    popup.resize(desired_width, desired_height)
+    left = anchor_bottom_right.x() - popup.width() + 1
+    if available is not None:
+        left = max(
+            available.left(),
+            min(left, available.right() - popup.width() + 1),
+        )
+        top = max(
+            available.top(),
+            min(top, available.bottom() - popup.height() + 1),
+        )
+    popup.move(left, top)
+    popup.show()
+    popup.raise_()
+
+
 class FluentGroupBox(QtWidgets.QGroupBox):
     def __init__(self, title: str = "", parent=None):
         super().__init__(title, parent)

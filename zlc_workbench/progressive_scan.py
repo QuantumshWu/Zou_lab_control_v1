@@ -25,7 +25,13 @@ from zlc_frontend.matplotlib_render import (
     SinglePanelAggRenderer,
     estimate_live_panel_raster_peak_nbytes,
 )
+from zlc_frontend.curve_display import (
+    CurveDisplayState,
+    numeric_curve_coordinates,
+)
+from zlc_frontend.display_range import RelimMode
 from zlc_frontend.figure import (
+    CURVE_CONTRACT,
     DatasetDescriptor,
     DatasetId,
     FigureDocument,
@@ -33,6 +39,7 @@ from zlc_frontend.figure import (
     FigureEvaluator,
     FigureLayer,
     AxisViewRole,
+    EvaluatedAxis,
     EvaluatedInput,
     ResolvedDataset,
     ResolvedDatasetMap,
@@ -47,6 +54,7 @@ from zlc_frontend.render import (
     BoardFrame,
     BoardPresenter,
     CoherenceStamp,
+    CurvePanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
     RasterBuffer,
@@ -112,6 +120,8 @@ class ProgressiveScanSpec:
     preview_spec: ExactDatasetPreviewSpec
     display_selection: Selection | None
     display_preferences: ViewPreferences
+    interactive_curve: bool
+    interaction_unavailable_reason: str | None
 
     def __post_init__(self) -> None:
         if not isinstance(self.output_contract, ScanOutputContract):
@@ -134,6 +144,22 @@ class ProgressiveScanSpec:
             raise TypeError("display_selection must be Selection or None")
         if not isinstance(self.display_preferences, ViewPreferences):
             raise TypeError("display_preferences must be ViewPreferences")
+        if not isinstance(self.interactive_curve, bool):
+            raise TypeError("interactive_curve must be bool")
+        if self.interactive_curve:
+            if self.interaction_unavailable_reason is not None:
+                raise ValueError(
+                    "interactive curve cannot have an unavailable reason"
+                )
+        else:
+            object.__setattr__(
+                self,
+                "interaction_unavailable_reason",
+                canonical_text(
+                    self.interaction_unavailable_reason,
+                    "interaction_unavailable_reason",
+                ),
+            )
         dataset_id = self.document.datasets[0].dataset_id if self.document.datasets else None
         if (
             len(self.document.datasets) != 1
@@ -188,6 +214,23 @@ def build_occupancy_progressive_spec(
     if not output_schema.point_axes:
         raise ValueError("progressive scan curve requires a declared point axis")
     x_axis = output_schema.point_axes[0]
+    try:
+        numeric_curve_coordinates(
+            EvaluatedAxis(
+                x_axis.axis_id,
+                x_axis.name,
+                x_axis.role,
+                x_axis.unit,
+                tuple(range(x_axis.size)),
+                tuple(x_axis.coordinates),
+            )
+        )
+    except (TypeError, ValueError) as error:
+        interactive_curve = False
+        interaction_unavailable_reason = f"{type(error).__name__}: {error}"
+    else:
+        interactive_curve = True
+        interaction_unavailable_reason = None
     first_point = output_schema.point_layout.multi_index(0)
     terms = [
         IndexSelection(axis.axis_id, first_point[index])
@@ -201,16 +244,20 @@ def build_occupancy_progressive_spec(
     if len(site_axes) != 1:
         raise ValueError("occupancy output must declare exactly one SITE axis")
     site_axis = site_axes[0]
+    batch_limit = CURVE_CONTRACT.maximum_batch_series
     if display_intent.site_mode == "batch":
-        if not 1 < site_axis.size <= 32:
-            raise ValueError("site batch display requires between 2 and 32 sites")
+        if not 1 < site_axis.size <= batch_limit:
+            raise ValueError(
+                "site batch display requires between 2 and "
+                f"{batch_limit} sites"
+            )
         batch_axis = site_axis
     elif display_intent.site_mode == "select":
         if display_intent.site_index >= site_axis.size:
             raise ValueError("selected site index exceeds the declared SITE axis")
         batch_axis = None
     else:
-        batch_axis = site_axis if 1 < site_axis.size <= 32 else None
+        batch_axis = site_axis if 1 < site_axis.size <= batch_limit else None
     terms.extend(
         IndexSelection(
             axis.axis_id,
@@ -272,6 +319,12 @@ def build_occupancy_progressive_spec(
         summary += f" · {batch_axis.name}=batch/{batch_axis.size}"
     if selections:
         summary += " · " + " · ".join(selections)
+    if not interactive_curve:
+        assert interaction_unavailable_reason is not None
+        summary += (
+            " · static curve (interactive selector unavailable: "
+            f"{interaction_unavailable_reason})"
+        )
     transform_peak = transformed_snapshot_peak_nbytes(
         source_schema,
         output_contract.committed_transform,
@@ -281,6 +334,10 @@ def build_occupancy_progressive_spec(
         _RASTER_WIDTH,
         _RASTER_HEIGHT,
         evaluated_data_upper_bound_bytes=evaluation_peak,
+        extra_retained_fronts=(1 if interactive_curve else 0),
+        extra_retained_evaluated_data_bytes=(
+            evaluation_peak if interactive_curve else 0
+        ),
     )
     # source_terminal may freeze while the render worker still owns its source
     # snapshot.  One additional immutable source copy is cheaper and safer than
@@ -301,6 +358,8 @@ def build_occupancy_progressive_spec(
         ExactDatasetPreviewSpec(source_schema.fingerprint, downstream_peak),
         selection,
         preferences,
+        interactive_curve,
+        interaction_unavailable_reason,
     )
 
 
@@ -514,7 +573,11 @@ class _RenderedCandidate:
     run_id: str
     causation_domain_id: str
     output_ref: DatasetRevisionRef
+    presentation: PanelPresentationIdentity
+    display_state: CurveDisplayState
     raster: RasterBuffer
+    display_payload: CurvePanelPayload | None
+    curve_has_valid_samples: bool
     written_cells: int
     total_cells: int
 
@@ -528,6 +591,7 @@ class ProgressiveScanPreview:
         spec: ProgressiveScanSpec,
         presenter: BoardPresenter,
         *,
+        curve_display: CurveDisplayState,
         submit_worker: Callable[[Callable[[], None]], object],
         request_owner_wake: Callable[[], None],
     ) -> None:
@@ -537,6 +601,8 @@ class ProgressiveScanPreview:
             raise TypeError("spec must be ProgressiveScanSpec")
         if not isinstance(presenter, BoardPresenter):
             raise TypeError("presenter must implement BoardPresenter")
+        if not isinstance(curve_display, CurveDisplayState):
+            raise TypeError("curve_display must be CurveDisplayState")
         if not callable(submit_worker) or not callable(request_owner_wake):
             raise TypeError("worker submission and owner wake must be callable")
         if slot.spec != spec.preview_spec:
@@ -547,6 +613,7 @@ class ProgressiveScanPreview:
         self._request_owner_wake = request_owner_wake
         self._submit_worker = submit_worker
         self._lock = threading.Lock()
+        self._candidate_condition = threading.Condition(self._lock)
         self._candidate: _RenderedCandidate | None = None
         self._fault: BaseException | None = None
         self._watch_started = False
@@ -557,13 +624,12 @@ class ProgressiveScanPreview:
         self._presented = False
         self._sequence = 0
         self._port: BoardPublishPort | None = None
-        self._presentation = PanelPresentationIdentity(
-            _PANEL_ID,
-            spec.document.document_id,
-            spec.document.revision,
-            0,
-            0,
-        )
+        self._port_source: SourceIdentity | None = None
+        self._port_presentation: PanelPresentationIdentity | None = None
+        self._curve_display = curve_display
+        self._configuration_epoch = 0
+        self._curve_y_limits: tuple[float, float] | None = None
+        self._curve_relim_mode: RelimMode | None = None
         self._board = BoardController(
             BoardModel(
                 f"scan-preview-board-{spec.dataset_id.value}",
@@ -575,6 +641,15 @@ class ProgressiveScanPreview:
             request_owner_wake,
         )
         slot.set_change_listener(self._source_changed)
+
+    @property
+    def curve_display(self) -> CurveDisplayState:
+        with self._lock:
+            return self._curve_display
+
+    @property
+    def interactive_curve(self) -> bool:
+        return self._spec.interactive_curve
 
     @property
     def fault(self) -> BaseException | None:
@@ -616,29 +691,85 @@ class ProgressiveScanPreview:
         if failure is not None:
             self._set_fault(RuntimeError(failure), invalidate=True)
             return
-        with self._lock:
+        with self._candidate_condition:
             if self._closed:
                 return
-            candidate, self._candidate = self._candidate, None
-        if candidate is not None:
-            self._publish_candidate(candidate)
-        self._board.present_pending()
+            candidate = self._candidate
+            current_state = self._curve_display
+        try:
+            if candidate is not None and candidate.display_state == current_state:
+                self._publish_candidate(candidate)
+            self._board.present_pending()
+        finally:
+            # Capacity one extends through the real owner-thread present
+            # boundary.  Releasing the worker before this point makes the
+            # next relim/deadband baseline depend on thread scheduling rather
+            # than the previously accepted front.
+            with self._candidate_condition:
+                if self._candidate is candidate:
+                    self._candidate = None
+                self._candidate_condition.notify_all()
+
+    def reconfigure_curve_display(self, state: CurveDisplayState) -> None:
+        """Replace display-only curve intent without touching the scan source."""
+
+        self._require_owner()
+        if not isinstance(state, CurveDisplayState):
+            raise TypeError("state must be CurveDisplayState")
+        if not self._spec.interactive_curve:
+            raise RuntimeError("this progressive curve uses a static fallback")
+        with self._candidate_condition:
+            if self._closed:
+                raise RuntimeError("progressive preview is closed")
+            if self._fault is not None:
+                raise RuntimeError("progressive preview is faulted")
+            current = self._curve_display
+            if state == current:
+                return
+            if state.revision != current.revision + 1:
+                raise ValueError("curve display revision must advance exactly once")
+            self._curve_display = state
+            self._configuration_epoch += 1
+            self._candidate = None
+            self._port = None
+            self._port_source = None
+            self._port_presentation = None
+            self._candidate_condition.notify_all()
+        # Revoke an admitted old-revision raster but deliberately retain the
+        # visible front until the worker repaints this same exact dataset.
+        self._board.revoke_pending_publication()
 
     def close(self) -> None:
         self._require_owner()
         first_close = False
-        with self._lock:
+        with self._candidate_condition:
             if not self._closed:
                 self._closed = True
                 self._candidate = None
                 if not self._watch_started:
                     self._worker_done = True
                 first_close = True
+                self._candidate_condition.notify_all()
         if first_close:
             self._slot.close()
         self._board.close()
         with self._lock:
             self._close_complete = True
+
+    def accept_worker_completion(self, error: BaseException | None) -> None:
+        """Settle a watcher Future, including cancellation before it started."""
+
+        self._require_owner()
+        if error is not None and not isinstance(error, BaseException):
+            raise TypeError("worker completion error must be BaseException or None")
+        if error is not None:
+            self._set_fault(error)
+        with self._candidate_condition:
+            # A normal watcher sets this in its own finally.  A Future that was
+            # cancelled while queued never enters _watch(), so the owner must
+            # close that otherwise permanent retirement gap explicitly.
+            self._worker_done = True
+            self._candidate_condition.notify_all()
 
     def _source_changed(self) -> None:
         failure = self._slot.failure
@@ -672,9 +803,16 @@ class ProgressiveScanPreview:
 
     def _watch(self) -> None:
         last_revision = DatasetRevision(0)
-        candidate = None
+        frozen_candidate = None
         source = None
-        output = None
+        last_evaluated = None
+        last_output_ref = None
+        last_run_id = None
+        last_causation = None
+        last_written_cells = 0
+        last_total_cells = 0
+        rendered_output_ref = None
+        rendered_epoch = -1
         evaluated = None
         rendered = None
         renderer = None
@@ -699,59 +837,151 @@ class ProgressiveScanPreview:
                 with self._lock:
                     if self._closed:
                         break
-                candidate = self._slot.wait_and_freeze(
+                    target_epoch = self._configuration_epoch
+                frozen_candidate = self._slot.wait_and_freeze(
                     last_revision,
-                    timeout=0.1,
+                    # Display-only commits are observed within one UI cycle
+                    # without introducing another worker or touching the Run.
+                    timeout=0.04,
                 )
-                if candidate is None:
-                    if self._slot.terminal:
-                        break
-                    continue
-                run_id, causation, source = candidate
-                candidate = None
-                if source.ref.revision <= last_revision:
+                if frozen_candidate is not None:
+                    run_id, causation, source = frozen_candidate
+                    frozen_candidate = None
+                    if source.ref.revision > last_revision:
+                        output_ref = DatasetRevisionRef(
+                            self._spec.output_block_id,
+                            source.ref.stream_generation,
+                            self._spec.output_contract.output_schema_fingerprint,
+                            source.ref.revision,
+                        )
+                        output = materialize_transformed_snapshot(
+                            source.snapshot,
+                            self._spec.output_contract.committed_transform,
+                            output_ref=output_ref,
+                            output_schema=(
+                                self._spec.output_contract.output_dataset_schema
+                            ),
+                            memory_limit_bytes=self._spec.transform_peak_bytes,
+                        )
+                        last_revision = source.ref.revision
+                        next_evaluated = evaluator.evaluate(
+                            self._spec.document,
+                            ResolvedDatasetMap(
+                                (ResolvedDataset(self._spec.dataset_id, output),)
+                            ),
+                            cancel_requested=lambda: self.closed,
+                        )
+                        last_evaluated = next_evaluated
+                        last_output_ref = output.ref
+                        last_run_id = run_id
+                        last_causation = causation
+                        last_written_cells = source.coverage.written_cells
+                        last_total_cells = source.coverage.total_cells
+                        output = None
                     source = None
-                    continue
-                last_revision = source.ref.revision
-                output_ref = DatasetRevisionRef(
-                    self._spec.output_block_id,
-                    source.ref.stream_generation,
-                    self._spec.output_contract.output_schema_fingerprint,
-                    source.ref.revision,
-                )
-                output = materialize_transformed_snapshot(
-                    source.snapshot,
-                    self._spec.output_contract.committed_transform,
-                    output_ref=output_ref,
-                    output_schema=(
-                        self._spec.output_contract.output_dataset_schema
-                    ),
-                    memory_limit_bytes=self._spec.transform_peak_bytes,
-                )
-                evaluated = evaluator.evaluate(
-                    self._spec.document,
-                    ResolvedDatasetMap(
-                        (ResolvedDataset(self._spec.dataset_id, output),)
-                    ),
-                    cancel_requested=lambda: self.closed,
-                )
-                rendered = _RenderedCandidate(
-                    run_id,
-                    causation,
-                    output_ref,
-                    renderer.render(evaluated),
-                    source.coverage.written_cells,
-                    source.coverage.total_cells,
-                )
+
                 with self._lock:
                     if self._closed:
                         break
-                    self._candidate = rendered
-                    self._coverage = (
-                        f"{rendered.written_cells}/{rendered.total_cells}"
+                    target_epoch = self._configuration_epoch
+                    display_state = self._curve_display
+                    accepted_y_limits = self._curve_y_limits
+                    accepted_relim_mode = self._curve_relim_mode
+                needs_render = (
+                    last_evaluated is not None
+                    and (
+                        rendered_output_ref != last_output_ref
+                        or rendered_epoch != target_epoch
                     )
-                source = output = evaluated = rendered = None
-                self._request_owner_wake()
+                )
+                if not needs_render:
+                    if self._slot.terminal:
+                        # The exact source may finish before the owner swaps to
+                        # the canonical FINAL view.  Keep this same renderer
+                        # available for display-only gestures on the frozen
+                        # terminal revision; close() is the sole retirement
+                        # signal and wakes this condition without polling.
+                        with self._candidate_condition:
+                            self._candidate_condition.wait_for(
+                                lambda: (
+                                    self._closed
+                                    or self._configuration_epoch != target_epoch
+                                    or self._curve_display != display_state
+                                )
+                            )
+                            if self._closed:
+                                break
+                    continue
+
+                assert last_evaluated is not None
+                assert last_output_ref is not None
+                assert last_run_id is not None
+                assert last_causation is not None
+                evaluated = last_evaluated
+                display_payload = None
+                curve_has_valid_samples = False
+                if self._spec.interactive_curve:
+                    raster, display_payload = renderer.render_interactive_curve(
+                        evaluated,
+                        display_state,
+                        current_y_limits=accepted_y_limits,
+                        previous_relim_mode=accepted_relim_mode,
+                    )
+                    curve_has_valid_samples = any(
+                        bool(series.data.validity.any())
+                        for series in display_payload.series
+                    )
+                else:
+                    raster = renderer.render(evaluated)
+                presentation = PanelPresentationIdentity(
+                    _PANEL_ID,
+                    self._spec.document.document_id,
+                    self._spec.document.revision,
+                    0,
+                    display_state.revision,
+                )
+                rendered = _RenderedCandidate(
+                    last_run_id,
+                    last_causation,
+                    last_output_ref,
+                    presentation,
+                    display_state,
+                    raster,
+                    display_payload,
+                    curve_has_valid_samples,
+                    last_written_cells,
+                    last_total_cells,
+                )
+                installed = False
+                with self._lock:
+                    if self._closed:
+                        break
+                    if (
+                        self._configuration_epoch == target_epoch
+                        and self._curve_display == display_state
+                    ):
+                        self._candidate = rendered
+                        self._coverage = (
+                            f"{rendered.written_cells}/{rendered.total_cells}"
+                        )
+                        rendered_output_ref = last_output_ref
+                        rendered_epoch = target_epoch
+                        installed = True
+                installed_candidate = rendered if installed else None
+                evaluated = rendered = None
+                if installed:
+                    assert installed_candidate is not None
+                    self._request_owner_wake()
+                    with self._candidate_condition:
+                        self._candidate_condition.wait_for(
+                            lambda: (
+                                self._closed
+                                or self._candidate is not installed_candidate
+                                or self._configuration_epoch != target_epoch
+                                or self._curve_display != display_state
+                            )
+                        )
+                    installed_candidate = None
         except BaseException as error:
             self._set_fault(error)
             try:
@@ -759,7 +989,7 @@ class ProgressiveScanPreview:
             except BaseException:
                 pass
         finally:
-            candidate = source = output = evaluated = rendered = None
+            frozen_candidate = source = last_evaluated = evaluated = rendered = None
             if renderer is not None:
                 try:
                     renderer.close()
@@ -775,6 +1005,9 @@ class ProgressiveScanPreview:
             self._request_owner_wake()
 
     def _publish_candidate(self, candidate: _RenderedCandidate) -> None:
+        with self._lock:
+            if self._closed or candidate.display_state != self._curve_display:
+                return
         source_ref = candidate.output_ref
         source = SourceIdentity(
             self._spec.dataset_id,
@@ -796,15 +1029,22 @@ class ProgressiveScanPreview:
                 }
             ),
             (EvaluatedInput(self._spec.dataset_id, source_ref),),
-            (self._presentation,),
+            (candidate.presentation,),
         )
-        if self._port is None:
+        if (
+            self._port is None
+            or self._port_source != source
+            or self._port_presentation != candidate.presentation
+        ):
             self._port = self._board.open_publish_port(
-                (PanelSourceBinding(source, self._presentation),)
+                (PanelSourceBinding(source, candidate.presentation),)
             )
+            self._port_source = source
+            self._port_presentation = candidate.presentation
+        port = self._port
         sequence = self._sequence
         self._sequence += 1
-        token = self._port.admit(
+        token = port.admit(
             sequence,
             ((_COHERENCE_GROUP, stamp),),
         )
@@ -819,17 +1059,31 @@ class ProgressiveScanPreview:
                     source,
                     stamp,
                     candidate.raster,
+                    candidate.display_payload,
                 ),
             ),
         )
-        if self._port.publish(token, frame):
+        if port.publish(token, frame):
             with self._lock:
-                self._presented = True
+                if (
+                    not self._closed
+                    and self._curve_display == candidate.display_state
+                    and self._port is port
+                ):
+                    self._presented = True
+                    payload = candidate.display_payload
+                    if payload is not None:
+                        if (
+                            candidate.curve_has_valid_samples
+                            or candidate.display_state.relim_mode is RelimMode.FIXED
+                        ):
+                            self._curve_y_limits = payload.viewport.y_limits
+                        self._curve_relim_mode = candidate.display_state.relim_mode
 
     def _set_fault(self, error: BaseException, *, invalidate: bool = False) -> None:
         first_fault = False
         should_invalidate = False
-        with self._lock:
+        with self._candidate_condition:
             if self._fault is None:
                 self._fault = detached_render_fault(error)
                 first_fault = True
@@ -837,6 +1091,7 @@ class ProgressiveScanPreview:
             if invalidate:
                 self._presented = False
                 should_invalidate = True
+            self._candidate_condition.notify_all()
         if should_invalidate:
             try:
                 self._board.invalidate()

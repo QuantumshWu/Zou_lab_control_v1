@@ -18,7 +18,11 @@ from ..selector import (
 from .axis_navigator import AxisLayoutNavigator
 from .board import QtImageBoard, QtOwnerWake, QtRasterBoard
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
-from .display_editor import FluentRevisionedFormEditor
+from .display_editor import (
+    FluentRevisionedFormEditor,
+    runtime_range_placeholders,
+    sync_revisioned_form_editors,
+)
 from .fluent import (
     ElidedLabel,
     FluentButton,
@@ -75,6 +79,7 @@ from .fluent import (
     measure_text_width,
     muted_note_label,
     popup_gap,
+    show_fluent_popup_for_anchor,
     release_window,
     resolve_fluent_auto_scale,
     retain_window,
@@ -164,6 +169,8 @@ __all__ = [
     "FluentFrame",
     "FluentGroupBox",
     "FluentRevisionedFormEditor",
+    "runtime_range_placeholders",
+    "sync_revisioned_form_editors",
     "FluentInputDialog",
     "FluentLabel",
     "FluentLabeledField",
@@ -253,6 +260,7 @@ __all__ = [
     "measure_text_width",
     "muted_note_label",
     "popup_gap",
+    "show_fluent_popup_for_anchor",
     "release_window",
     "raster_placeholder_stylesheet",
     "resolve_fluent_auto_scale",

@@ -24,6 +24,7 @@ from zlc_neutral_atom.runtime.run import (
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewPort
 from zlc_frontend.render import BoardPresenter
+from zlc_frontend.curve_display import CurveDisplayState
 from zlc_frontend.image_raster import (
     estimate_encoded_png_front_peak_nbytes,
     png_raster_size,
@@ -134,6 +135,9 @@ class ScanPanelViewModel:
     display_phase: str = "EMPTY"
     projection_summary: str | None = None
     final_only: bool = True
+    progressive_interactive: bool = False
+    interaction_unavailable_reason: str | None = None
+    preview_attached: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +192,15 @@ class ScanPanelController:
         )
         self._owns_executor = executor is None
         self._executor_closed = False
+        # The preview watcher is deliberately long-lived so a terminal exact
+        # front remains interactive until canonical FINAL replaces it.  It
+        # cannot share an unconstrained Executor with finite prepare/result/
+        # projection work: a one-worker executor would deadlock at terminal.
+        self._preview_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="zlc-scan-preview",
+        )
+        self._preview_executor_closed = False
         self._preview_presenter = preview_presenter
 
         self._lock = threading.Lock()
@@ -207,6 +220,9 @@ class ScanPanelController:
         self._artifact_ref: ScanArtifactRef | None = None
         self._presentation: FinalScanPresentation | None = None
         self._progressive_summary: str | None = None
+        self._progressive_interactive = False
+        self._interaction_unavailable_reason: str | None = None
+        self._progressive_curve_display = CurveDisplayState()
         self._preview: ProgressiveScanPreview | None = None
         self._preview_close_retry_at = 0.0
         self._preview_fault_seen: str | None = None
@@ -238,6 +254,32 @@ class ScanPanelController:
         self._require_owner()
         return self._closed
 
+    @property
+    def progressive_curve_display(self) -> CurveDisplayState:
+        self._require_owner()
+        return self._progressive_curve_display
+
+    def reconfigure_progressive_curve_display(
+        self,
+        state: CurveDisplayState,
+    ) -> int:
+        """Commit one display-only revision without changing the active Run."""
+
+        self._require_owner()
+        if not isinstance(state, CurveDisplayState):
+            raise TypeError("state must be CurveDisplayState")
+        current = self._progressive_curve_display
+        if state == current:
+            return current.revision
+        if state.revision != current.revision + 1:
+            raise ValueError("curve display revision must advance exactly once")
+        preview = self._preview
+        if preview is not None and not preview.closed:
+            preview.reconfigure_curve_display(state)
+        self._progressive_curve_display = state
+        self._publish_model()
+        return state.revision
+
     def reconfigure(self, application: ScanPanelApplication) -> int:
         """Atomically replace an idle panel configuration and clear stale output.
 
@@ -259,6 +301,9 @@ class ScanPanelController:
         self._artifact_ref = None
         self._presentation = None
         self._progressive_summary = None
+        self._progressive_interactive = False
+        self._interaction_unavailable_reason = None
+        self._progressive_curve_display = CurveDisplayState()
         self._pending_projection = None
         self._diagnostic = None
         self._status = "IDLE · FINAL-ONLY"
@@ -285,6 +330,8 @@ class ScanPanelController:
         self._artifact_ref = None
         self._presentation = None
         self._progressive_summary = None
+        self._progressive_interactive = False
+        self._interaction_unavailable_reason = None
         self._preview_fault_seen = None
         self._preview_close_retry_at = 0.0
         self._diagnostic = None
@@ -396,10 +443,38 @@ class ScanPanelController:
         self._maybe_finish_close()
 
     def _submit(self, kind: str, token: _WorkToken, work: object) -> Future:
+        return self._submit_on(self._executor, kind, token, work)
+
+    def _submit_preview(
+        self,
+        token: _WorkToken,
+        work: object,
+    ) -> Future:
+        if self._preview_executor_closed:
+            future = Future()
+            future.set_exception(RuntimeError("scan preview worker is unavailable"))
+            with self._lock:
+                self._mailbox.append(("preview-worker", token, future))
+            self._request_wake()
+            return future
+        return self._submit_on(
+            self._preview_executor,
+            "preview-worker",
+            token,
+            work,
+        )
+
+    def _submit_on(
+        self,
+        executor: Executor,
+        kind: str,
+        token: _WorkToken,
+        work: object,
+    ) -> Future:
         try:
-            if self._executor_closed or not callable(work):
+            if not callable(work):
                 raise RuntimeError("scan panel worker is unavailable")
-            future = self._executor.submit(work)
+            future = executor.submit(work)
         except BaseException as error:
             future = Future()
             future.set_exception(error)
@@ -480,6 +555,8 @@ class ScanPanelController:
             self._status = "CANCELLED BEFORE ADMISSION · NOT FINAL"
             return
         self._progressive_summary = None
+        self._progressive_interactive = False
+        self._interaction_unavailable_reason = None
         preview_port: ExactDatasetPreviewPort | None = None
         presenter = self._preview_presenter
         if progressive is not None and presenter is not None:
@@ -489,15 +566,16 @@ class ScanPanelController:
                     slot,
                     progressive,
                     presenter,
-                    submit_worker=lambda work: self._submit(
-                        "preview-worker",
-                        token,
-                        work,
-                    ),
+                    curve_display=self._progressive_curve_display,
+                    submit_worker=lambda work: self._submit_preview(token, work),
                     request_owner_wake=self._request_wake,
                 )
                 preview_port = slot
                 self._progressive_summary = progressive.projection_summary
+                self._progressive_interactive = progressive.interactive_curve
+                self._interaction_unavailable_reason = (
+                    progressive.interaction_unavailable_reason
+                )
             except BaseException as error:
                 self._record_diagnostic(
                     f"progressive attachment failed: {_error_summary(error)}"
@@ -516,13 +594,20 @@ class ScanPanelController:
         )
 
     def _accept_preview_worker(self, token: _WorkToken, future: Future) -> None:
+        error: BaseException | None = None
         try:
             future.result()
-        except BaseException as error:
+        except BaseException as caught:
+            error = caught
+        preview = self._preview
+        if preview is not None and token.generation == self._generation:
+            preview.accept_worker_completion(error)
+        if error is not None:
             if token.generation == self._generation and not self._closing:
                 self._record_diagnostic(
                     f"progressive worker failed: {_error_summary(error)}"
                 )
+                self._retire_preview()
 
     def _accept_start(self, token: _WorkToken, future: Future) -> None:
         try:
@@ -684,6 +769,9 @@ class ScanPanelController:
         preview = self._preview
         if preview is None:
             return
+        self._progressive_summary = None
+        self._progressive_interactive = False
+        self._interaction_unavailable_reason = None
         now = time.monotonic()
         if preview.closed and now < self._preview_close_retry_at:
             return
@@ -864,6 +952,11 @@ class ScanPanelController:
             display_phase=display_phase,
             projection_summary=projection_summary,
             final_only=self._progressive_summary is None,
+            progressive_interactive=self._progressive_interactive,
+            interaction_unavailable_reason=self._interaction_unavailable_reason,
+            preview_attached=(
+                self._preview is not None and not self._preview.closed
+            ),
         )
 
     def _publish_model(self) -> None:
@@ -880,6 +973,9 @@ class ScanPanelController:
         if self._owns_executor and not self._executor_closed:
             self._executor.shutdown(wait=False, cancel_futures=False)
         self._executor_closed = True
+        if not self._preview_executor_closed:
+            self._preview_executor.shutdown(wait=False, cancel_futures=False)
+        self._preview_executor_closed = True
         self._application = None
         self._preview_presenter = None
         self._request_owner_wake = None

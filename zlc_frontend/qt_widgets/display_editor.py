@@ -9,6 +9,7 @@ optimistic Apply request back to the host.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 
 from PyQt5 import QtCore, QtWidgets
 
@@ -25,6 +26,88 @@ from .fluent import (
 
 
 _UNSET = object()
+
+
+def runtime_range_placeholders(
+    value: tuple[float, float] | None,
+    low_key: str,
+    high_key: str,
+) -> dict[str, str] | None:
+    """Project one accepted runtime range into shared form placeholders."""
+
+    if value is None:
+        return None
+    if not isinstance(value, tuple) or len(value) != 2:
+        raise TypeError("runtime range must be a pair or None")
+    if not isinstance(low_key, str) or not low_key:
+        raise TypeError("low_key must be a non-empty string")
+    if not isinstance(high_key, str) or not high_key:
+        raise TypeError("high_key must be a non-empty string")
+    low, high = value
+    if (
+        isinstance(low, bool)
+        or isinstance(high, bool)
+        or not isinstance(low, (int, float))
+        or not isinstance(high, (int, float))
+        or not math.isfinite(float(low))
+        or not math.isfinite(float(high))
+        or float(low) >= float(high)
+    ):
+        raise ValueError("runtime range must contain increasing finite numbers")
+    return {low_key: f"{float(low):.12g}", high_key: f"{float(high):.12g}"}
+
+
+def sync_revisioned_form_editors(
+    editors: tuple["FluentRevisionedFormEditor", ...],
+    *,
+    revision: int,
+    semantic_identity: object,
+    values: Mapping[str, object],
+    runtime_placeholders: Mapping[str, str] | None = None,
+    accepted_editor: "FluentRevisionedFormEditor" | None = None,
+    accepted_base_revision: int | None = None,
+    replace_owner: bool = False,
+) -> None:
+    """Project one owner state into every Setting/Edit surface atomically."""
+
+    editors = tuple(editors)
+    if not editors or any(
+        not isinstance(editor, FluentRevisionedFormEditor) for editor in editors
+    ):
+        raise TypeError("editors must contain FluentRevisionedFormEditor values")
+    if len({id(editor) for editor in editors}) != len(editors):
+        raise ValueError("revisioned editor surfaces must be distinct")
+    if accepted_editor is not None and accepted_editor not in editors:
+        raise ValueError("accepted editor is not one of the synchronized surfaces")
+    if not isinstance(replace_owner, bool):
+        raise TypeError("replace_owner must be bool")
+    if replace_owner and accepted_editor is not None:
+        raise ValueError("owner replacement cannot accept an old draft commit")
+    for editor in editors:
+        if replace_owner:
+            editor.replace_owner_state(
+                revision=revision,
+                semantic_identity=semantic_identity,
+                values=values,
+                runtime_placeholders=runtime_placeholders,
+            )
+        elif editor is accepted_editor:
+            if accepted_base_revision is None:
+                raise RuntimeError("accepted editor has no base revision")
+            editor.accept_commit(
+                base_revision=accepted_base_revision,
+                revision=revision,
+                semantic_identity=semantic_identity,
+                values=values,
+                runtime_placeholders=runtime_placeholders,
+            )
+        else:
+            editor.load(
+                revision=revision,
+                semantic_identity=semantic_identity,
+                values=values,
+                runtime_placeholders=runtime_placeholders,
+            )
 
 
 def _revision(value: object, name: str) -> int:
@@ -170,6 +253,33 @@ class FluentRevisionedFormEditor(QtWidgets.QWidget):
 
         self._install_runtime_placeholders(placeholders)
 
+    def replace_owner_state(
+        self,
+        *,
+        revision: int,
+        semantic_identity: object,
+        values: Mapping[str, object],
+        runtime_placeholders: Mapping[str, str] | None = None,
+    ) -> None:
+        """Replace the revision domain after the host swaps applications.
+
+        Ordinary observations remain monotonic and preserve dirty drafts.
+        This explicit lifecycle edge is only for a complete owner/application
+        replacement, where carrying an old-unit viewport draft would be less
+        safe than discarding it.
+        """
+
+        revision = _revision(revision, "revision")
+        values = self._exact_values(values)
+        placeholders = self._prepare_runtime_placeholders(runtime_placeholders)
+        # Form validation is atomic and completes before any owner facts are
+        # reset, so a malformed replacement leaves the old domain untouched.
+        self._form.populate(values)
+        self._latest_revision = None
+        self._latest_semantic_identity = _UNSET
+        self._install_draft_facts(revision, semantic_identity)
+        self._install_runtime_placeholders(placeholders)
+
     def accept_commit(
         self,
         *,
@@ -208,6 +318,13 @@ class FluentRevisionedFormEditor(QtWidgets.QWidget):
         # FluentParameterForm.populate validates every exact key before changing
         # the first widget, so a rejected owner projection cannot partially load.
         self._form.populate(values)
+        self._install_draft_facts(revision, semantic_identity)
+
+    def _install_draft_facts(
+        self,
+        revision: int,
+        semantic_identity: object,
+    ) -> None:
         self._record_observation(revision, semantic_identity)
         self._base_revision = revision
         self._base_semantic_identity = semantic_identity
@@ -339,4 +456,8 @@ class FluentRevisionedFormEditor(QtWidgets.QWidget):
         self.cancelRequested.emit()
 
 
-__all__ = ["FluentRevisionedFormEditor"]
+__all__ = [
+    "FluentRevisionedFormEditor",
+    "runtime_range_placeholders",
+    "sync_revisioned_form_editors",
+]

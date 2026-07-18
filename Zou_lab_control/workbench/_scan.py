@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from PyQt5 import QtCore, QtWidgets
 
 from Zou_lab_control.notebook.facade import (
@@ -14,19 +16,42 @@ from zlc_frontend.qt_widgets import (
     ElidedLabel,
     FluentButton,
     FluentLabel,
+    FluentPopup,
+    FluentRevisionedFormEditor,
+    FluentSwitch,
+    FluentTabWidget,
     GREEN,
+    GREY,
     ORANGE,
     QtImageBoard,
     QtOwnerWake,
+    QtRasterBoard,
     WINDOW_SCREEN_FRACTION,
     center_window_on_primary_screen,
     ensure_qt_app,
     release_window,
     retain_window,
+    runtime_range_placeholders,
     screen_fit_window_size,
+    scaled_px,
     set_fluent_scale,
+    show_fluent_popup_for_anchor,
+    sync_revisioned_form_editors,
+)
+from zlc_frontend.curve_display import (
+    CurveDisplayState,
+    curve_display_form_spec,
+    curve_display_form_values,
+    curve_display_from_form,
+    curve_display_with_x_view,
 )
 from zlc_frontend.figure import ViewIntent
+from zlc_frontend.selector import (
+    CurveInteractionIntent,
+    CurveRangeGesture,
+    CurveViewportCommit,
+    PanelInteractionOrigin,
+)
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_neutral_atom.scan.contracts import AutonomousScanSlotProgram
 from zlc_storage import canonical_digest
@@ -41,6 +66,9 @@ from zlc_workbench.scan import (
     ScanPanelController,
     ScanPanelViewModel,
 )
+
+
+_SCAN_CURVE_PANEL_ID = "scan-curve"
 
 
 class _FrozenScanApplication:
@@ -167,6 +195,16 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self.setWindowTitle("Pulse Scan")
         self._allow_close = False
         self._shown_presentation: FinalScanPresentation | None = None
+        self._rejected_presentation: FinalScanPresentation | None = None
+        self._curve_display = CurveDisplayState()
+        self._pending_curve_interaction_origin: PanelInteractionOrigin | None = None
+        self._curve_range_candidate: tuple[
+            PanelInteractionOrigin,
+            tuple[float, float],
+        ] | None = None
+        self._curve_binding_active = False
+        self._settings_dismissed_at = float("-inf")
+        self._local_display_diagnostic = ""
 
         occupancy = isinstance(request, OccupancyScanRequest)
         progressive = occupancy and isinstance(
@@ -201,9 +239,21 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             empty_text="No FINAL result",
         )
         self._raster.setObjectName("scanRaster")
-        self._raster.setMinimumSize(320, 240)
-        self._provisional_board = QtImageBoard("scan-curve", self)
+        self._raster.setMinimumSize(
+            scaled_px(320, minimum=240),
+            scaled_px(240, minimum=160),
+        )
+        self._provisional_board = QtRasterBoard(
+            (_SCAN_CURVE_PANEL_ID,),
+            self,
+            columns=1,
+            empty_text="Waiting for progressive scan data",
+        )
         self._provisional_board.setObjectName("scanProvisionalBoard")
+        self._provisional_board.setMinimumSize(
+            scaled_px(320, minimum=240),
+            scaled_px(240, minimum=160),
+        )
         self._display_stack = QtWidgets.QStackedWidget(self)
         self._display_stack.addWidget(self._provisional_board)
         self._display_stack.addWidget(self._raster)
@@ -216,17 +266,57 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._start.setObjectName("startScanButton")
         self._stop = FluentButton("Stop", self, color=ORANGE)
         self._stop.setObjectName("stopScanButton")
+        self._selector_switch = FluentSwitch("Selector", self)
+        self._selector_switch.setObjectName("scanSelectorSwitch")
+        self._selector_switch.setChecked(False)
+        self._selector_switch.setEnabled(False)
+        self._setting_button = FluentButton("Setting…", self, color=GREY)
+        self._setting_button.setObjectName("scanDisplaySettingButton")
+        self._setting_button.setEnabled(False)
 
         controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(self._selector_switch)
+        controls.addWidget(self._setting_button)
         controls.addWidget(self._start)
         controls.addWidget(self._stop)
         controls.addStretch(1)
+
+        self._tabs = FluentTabWidget(self)
+        self._tabs.setObjectName("scanTabs")
+        self._live_page = QtWidgets.QWidget(self._tabs)
+        self._live_page.setObjectName("scanLiveTab")
+        live_layout = QtWidgets.QVBoxLayout(self._live_page)
+        live_layout.setContentsMargins(0, 0, 0, 0)
+        live_layout.addWidget(self._display_stack, 1)
+        self._edit_curve_display = FluentRevisionedFormEditor(
+            curve_display_form_spec(),
+            "curve display",
+            runtime_placeholder_fields=("y_min", "y_max"),
+            parent=self._tabs,
+        )
+        self._edit_curve_display.setObjectName("scanCurveEditEditor")
+        self._tabs.addTab(self._live_page, "Live")
+        self._tabs.addTab(self._edit_curve_display, "Edit")
+
+        self._settings_popup = FluentPopup(self)
+        self._settings_popup.setObjectName("scanDisplaySettingsPopup")
+        settings_layout = QtWidgets.QVBoxLayout(self._settings_popup)
+        settings_layout.setContentsMargins(*(scaled_px(10, minimum=8),) * 4)
+        self._setting_curve_display = FluentRevisionedFormEditor(
+            curve_display_form_spec(),
+            "curve display",
+            runtime_placeholder_fields=("y_min", "y_max"),
+            parent=self._settings_popup,
+        )
+        self._setting_curve_display.setObjectName("scanCurveSettingEditor")
+        settings_layout.addWidget(self._setting_curve_display)
+        self._settings_popup._on_hidden = self._record_settings_dismissed
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self._mode)
         layout.addWidget(self._status)
         layout.addWidget(self._artifact)
         layout.addWidget(self._projection)
-        layout.addWidget(self._display_stack, 1)
+        layout.addWidget(self._tabs, 1)
         layout.addWidget(self._diagnostics)
         layout.addLayout(controls)
 
@@ -242,6 +332,8 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             self._wake.request_owner_wake,
             preview_presenter=self._provisional_board,
         )
+        if self._controller.progressive_curve_display != self._curve_display:
+            raise RuntimeError("scan curve display owners disagree at construction")
         self._wake.bind(self._owner_cycle)
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(40)
@@ -249,6 +341,31 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._timer.start()
         self._start.clicked.connect(self._start_scan)
         self._stop.clicked.connect(self._stop_scan)
+        self._selector_switch.toggled.connect(self._set_selector_enabled)
+        self._setting_button.clicked.connect(self._open_display_settings)
+        self._edit_curve_display.applyRequested.connect(
+            lambda revision, values: self._apply_curve_display_form(
+                self._edit_curve_display,
+                revision,
+                values,
+            )
+        )
+        self._setting_curve_display.applyRequested.connect(
+            lambda revision, values: self._apply_curve_display_form(
+                self._setting_curve_display,
+                revision,
+                values,
+            )
+        )
+        self._edit_curve_display.cancelRequested.connect(
+            lambda: self._reload_curve_display_editor(self._edit_curve_display)
+        )
+        self._setting_curve_display.cancelRequested.connect(
+            lambda: self._reload_curve_display_editor(
+                self._setting_curve_display
+            )
+        )
+        self._sync_curve_display_editors()
         self._apply_model(self._controller.view_model)
 
     @property
@@ -267,6 +384,307 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
     def closed(self) -> bool:
         return self._controller.closed
 
+    def _visible_curve_matches_current_state(self) -> bool:
+        origin = self._provisional_board.visible_curve_origin()
+        return (
+            origin is not None
+            and origin.panel_id == _SCAN_CURVE_PANEL_ID
+            and origin.presentation.panel_revision == self._curve_display.revision
+        )
+
+    def _visible_curve_y_limits(self) -> tuple[float, float] | None:
+        if not self._visible_curve_matches_current_state():
+            return None
+        payload = self._provisional_board.visible_curve_payload()
+        return None if payload is None else payload.viewport.y_limits
+
+    def _reload_curve_display_editor(
+        self,
+        editor: FluentRevisionedFormEditor,
+    ) -> None:
+        editors = (self._edit_curve_display, self._setting_curve_display)
+        if editor not in editors:
+            raise ValueError("curve display editor does not belong to this window")
+        editor.load(
+            revision=self._curve_display.revision,
+            semantic_identity=self._curve_display,
+            values=curve_display_form_values(self._curve_display),
+            runtime_placeholders=runtime_range_placeholders(
+                self._visible_curve_y_limits(),
+                "y_min",
+                "y_max",
+            ),
+        )
+
+    def _sync_curve_display_editors(
+        self,
+        *,
+        accepted_editor: FluentRevisionedFormEditor | None = None,
+        accepted_base_revision: int | None = None,
+        replace_owner: bool = False,
+    ) -> None:
+        sync_revisioned_form_editors(
+            (self._edit_curve_display, self._setting_curve_display),
+            revision=self._curve_display.revision,
+            semantic_identity=self._curve_display,
+            values=curve_display_form_values(self._curve_display),
+            runtime_placeholders=runtime_range_placeholders(
+                self._visible_curve_y_limits(),
+                "y_min",
+                "y_max",
+            ),
+            accepted_editor=accepted_editor,
+            accepted_base_revision=accepted_base_revision,
+            replace_owner=replace_owner,
+        )
+
+    def _apply_curve_display_form(
+        self,
+        editor: FluentRevisionedFormEditor,
+        base_revision: int,
+        values: object,
+    ) -> None:
+        if editor not in (
+            self._edit_curve_display,
+            self._setting_curve_display,
+        ):
+            raise ValueError("curve display editor does not belong to this window")
+        try:
+            if not self._visible_curve_matches_current_state():
+                raise RuntimeError(
+                    "curve display cannot change until its current front is visible"
+                )
+            if base_revision != self._curve_display.revision:
+                raise RuntimeError(
+                    f"curve display edit base r{base_revision} is stale; "
+                    f"current revision is r{self._curve_display.revision}"
+                )
+            if not isinstance(values, dict):
+                raise TypeError("curve display form must emit one exact mapping")
+            candidate = curve_display_from_form(
+                self._curve_display,
+                values,
+                current_y_limits=self._visible_curve_y_limits(),
+            )
+            self._commit_curve_display(
+                candidate,
+                accepted_editor=editor,
+                accepted_base_revision=base_revision,
+            )
+        except Exception as error:
+            self._record_display_failure(
+                f"Curve display edit rejected: {type(error).__name__}: {error}"
+            )
+
+    def _commit_curve_display(
+        self,
+        state: CurveDisplayState,
+        *,
+        accepted_editor: FluentRevisionedFormEditor | None = None,
+        accepted_base_revision: int | None = None,
+        interaction_origin: PanelInteractionOrigin | None = None,
+    ) -> None:
+        current = self._curve_display
+        if not isinstance(state, CurveDisplayState):
+            raise TypeError("state must be CurveDisplayState")
+        changed = state != current
+        if changed and state.revision != current.revision + 1:
+            raise ValueError("curve display commit must advance exactly once")
+        if not changed and state.revision != current.revision:
+            raise ValueError("curve display no-op changed revision")
+        if accepted_editor is not None:
+            if accepted_base_revision != current.revision:
+                raise ValueError("accepted curve editor base differs from current revision")
+            if accepted_editor.base_revision != accepted_base_revision:
+                raise ValueError("accepted curve editor no longer owns its emitted base")
+        if interaction_origin is not None and not changed:
+            raise ValueError("curve interaction cannot commit a semantic no-op")
+        if changed:
+            self._controller.reconfigure_progressive_curve_display(state)
+            self._curve_display = state
+            self._pending_curve_interaction_origin = interaction_origin
+            self._clear_curve_range_candidate()
+        self._local_display_diagnostic = ""
+        self._refresh_diagnostics(self._controller.view_model)
+        self._sync_curve_display_editors(
+            accepted_editor=accepted_editor,
+            accepted_base_revision=accepted_base_revision,
+        )
+        self._update_curve_controls(self._controller.view_model)
+
+    def _accept_curve_interaction(
+        self,
+        command: CurveInteractionIntent,
+    ) -> None:
+        if not isinstance(command, (CurveViewportCommit, CurveRangeGesture)):
+            raise TypeError("curve interaction callback received an unknown command")
+        origin = command.origin
+        if origin.panel_id != _SCAN_CURVE_PANEL_ID:
+            raise RuntimeError("curve interaction belongs to another panel")
+        if not self._visible_curve_matches_current_state():
+            raise RuntimeError("curve interaction provenance is stale")
+        if self._provisional_board.visible_curve_origin() != origin:
+            raise RuntimeError("curve interaction origin is no longer painted")
+        if origin.presentation.panel_revision != self._curve_display.revision:
+            raise RuntimeError("curve interaction origin is stale")
+        if isinstance(command, CurveRangeGesture):
+            self._curve_range_candidate = (origin, command.x_span)
+            self._provisional_board.set_curve_range_candidate(command.x_span)
+            self._update_projection_label(self._controller.view_model)
+            return
+        if command.viewport.display_revision != self._curve_display.revision + 1:
+            raise RuntimeError("curve viewport interaction must advance once")
+        self._commit_curve_display(
+            curve_display_with_x_view(
+                self._curve_display,
+                command.viewport.x_limits,
+            ),
+            interaction_origin=origin,
+        )
+
+    def _set_selector_enabled(self, enabled: bool) -> None:
+        try:
+            self._provisional_board.set_selectors_enabled(bool(enabled))
+        except Exception as error:
+            blocker = QtCore.QSignalBlocker(self._selector_switch)
+            self._selector_switch.setChecked(False)
+            del blocker
+            self._provisional_board.set_selectors_enabled(False)
+            self._record_display_failure(
+                f"Curve selector rejected: {type(error).__name__}: {error}"
+            )
+
+    def _ensure_curve_binding(self, required: bool) -> None:
+        if required == self._curve_binding_active:
+            return
+        if required:
+            self._provisional_board.bind_curve_interaction(
+                _SCAN_CURVE_PANEL_ID,
+                self._accept_curve_interaction,
+                enabled=False,
+            )
+        else:
+            self._provisional_board.unbind_curve_interaction()
+            self._pending_curve_interaction_origin = None
+            self._clear_curve_range_candidate()
+        self._curve_binding_active = required
+
+    def _clear_curve_range_candidate(self) -> None:
+        self._curve_range_candidate = None
+        self._provisional_board.set_curve_range_candidate(None)
+
+    def _update_curve_controls(self, model: ScanPanelViewModel) -> None:
+        binding_required = model.preview_attached and model.progressive_interactive
+        self._ensure_curve_binding(binding_required)
+        fault = (
+            self._provisional_board.curve_selector_fault
+            if self._curve_binding_active
+            else None
+        )
+        interaction_unavailable = not binding_required or fault is not None
+        if interaction_unavailable and self._settings_popup.isVisible():
+            self._settings_popup.hide()
+        if interaction_unavailable and self._selector_switch.isChecked():
+            blocker = QtCore.QSignalBlocker(self._selector_switch)
+            self._selector_switch.setChecked(False)
+            del blocker
+        ready = (
+            binding_required
+            and fault is None
+            and self._visible_curve_matches_current_state()
+        )
+        if ready:
+            pending = self._pending_curve_interaction_origin
+            visible = self._provisional_board.visible_curve_origin()
+            if (
+                pending is not None
+                and visible is not None
+                and visible.presentation.panel_revision
+                > pending.presentation.panel_revision
+            ):
+                self._pending_curve_interaction_origin = None
+            self._sync_curve_display_editors()
+        if self._curve_binding_active:
+            self._provisional_board.set_interaction_readiness(
+                image=False,
+                curve=ready,
+            )
+        if not ready and self._provisional_board.selectors_enabled:
+            self._provisional_board.set_selectors_enabled(False)
+        elif ready:
+            self._provisional_board.set_selectors_enabled(
+                self._selector_switch.isChecked()
+            )
+        self._selector_switch.setEnabled(ready)
+        self._setting_button.setEnabled(ready)
+        self._edit_curve_display.setEnabled(ready)
+        self._setting_curve_display.setEnabled(ready)
+        if fault is not None:
+            unavailable = (
+                "Curve interaction disabled after callback failure: "
+                f"{type(fault).__name__}: {fault}"
+            )
+        else:
+            unavailable = (
+                model.interaction_unavailable_reason
+                if model.preview_attached and not model.progressive_interactive
+                else None
+            )
+        tooltip = "" if unavailable is None else unavailable
+        self._selector_switch.setToolTip(tooltip)
+        self._setting_button.setToolTip(tooltip)
+        self._edit_curve_display.setToolTip(tooltip)
+        self._setting_curve_display.setToolTip(tooltip)
+        self._refresh_diagnostics(model)
+
+    def _open_display_settings(self) -> None:
+        if not self._setting_button.isEnabled():
+            return
+        popup = self._settings_popup
+        if popup.isVisible():
+            popup.hide()
+            return
+        if time.monotonic() - self._settings_dismissed_at < 0.25:
+            return
+        self._reload_curve_display_editor(self._setting_curve_display)
+        show_fluent_popup_for_anchor(
+            popup,
+            self._setting_button,
+            self._setting_curve_display,
+        )
+
+    def _record_settings_dismissed(self) -> None:
+        self._settings_dismissed_at = time.monotonic()
+
+    def _record_display_failure(self, message: str) -> None:
+        self._local_display_diagnostic = str(message).strip()
+        self._refresh_diagnostics(self._controller.view_model)
+
+    def _refresh_diagnostics(self, model: ScanPanelViewModel) -> None:
+        fault = (
+            self._provisional_board.curve_selector_fault
+            if self._curve_binding_active
+            else None
+        )
+        interaction_fault = (
+            ""
+            if fault is None
+            else (
+                "Curve interaction disabled after callback failure: "
+                f"{type(fault).__name__}: {fault}"
+            )
+        )
+        parts = tuple(
+            part
+            for part in (
+                model.diagnostic,
+                self._local_display_diagnostic,
+                interaction_fault,
+            )
+            if part
+        )
+        self._diagnostics.setText("\n".join(parts))
+
     def reconfigure(
         self,
         request: ScanRequest | OccupancyScanRequest,
@@ -284,6 +702,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         )
         self._controller.reconfigure(replacement)
         self._application = replacement
+        self._curve_display = self._controller.progressive_curve_display
         occupancy = isinstance(request, OccupancyScanRequest)
         self._progressive_requested = occupancy and isinstance(
             request.program,
@@ -295,20 +714,35 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             else "DIRECT CAMERA · CANONICAL FINAL-ONLY"
         )
         self._shown_presentation = None
+        self._rejected_presentation = None
         self._raster.clear()
+        self._local_display_diagnostic = ""
+        self._pending_curve_interaction_origin = None
+        self._clear_curve_range_candidate()
+        self._selector_switch.setChecked(False)
+        self._settings_popup.hide()
+        self._sync_curve_display_editors(replace_owner=True)
         self._apply_model(self._controller.view_model)
 
     def shutdown(self) -> None:
         """Begin the same nonblocking close path used by the standalone window."""
 
+        self._settings_popup.hide()
+        self._selector_switch.setChecked(False)
         self._controller.close()
         self._owner_cycle()
 
     def _start_scan(self) -> None:
         try:
+            self._selector_switch.setChecked(False)
+            self._pending_curve_interaction_origin = None
+            self._clear_curve_range_candidate()
+            self._settings_popup.hide()
+            self._local_display_diagnostic = ""
+            self._rejected_presentation = None
             self._controller.start()
         except BaseException as error:
-            self._diagnostics.setText(
+            self._record_display_failure(
                 f"Start failed: {type(error).__name__}: {error}"
             )
         self._owner_cycle()
@@ -317,7 +751,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         try:
             self._controller.stop()
         except BaseException as error:
-            self._diagnostics.setText(
+            self._record_display_failure(
                 f"Stop failed: {type(error).__name__}: {error}"
             )
         self._owner_cycle()
@@ -333,8 +767,10 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(0, self.close)
 
     def _apply_model(self, model: ScanPanelViewModel) -> None:
-        progressive_mode = self._progressive_requested and (
-            model.generation == 0 or not model.final_only
+        progressive_mode = self._progressive_requested and model.artifact_ref is None and (
+            model.can_start
+            or model.status.startswith("PREPARING")
+            or not model.final_only
         )
         self._mode.setText(
             (
@@ -349,33 +785,41 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             if model.artifact_ref is None
             else f"Artifact: {model.artifact_ref.target_ref}"
         )
-        self._diagnostics.setText(model.diagnostic or "")
+        self._refresh_diagnostics(model)
         self._start.setEnabled(model.can_start)
         self._stop.setEnabled(model.can_stop)
         if model.display_phase == "PROVISIONAL":
             self._display_stack.setCurrentWidget(self._provisional_board)
         else:
             self._display_stack.setCurrentWidget(self._raster)
-        if model.projection_summary is not None:
-            prefix = (
-                "Display (PROVISIONAL): "
-                if model.display_phase == "PROVISIONAL"
-                else "Display: "
-            )
-            self._projection.setText(prefix + model.projection_summary)
+        self._update_projection_label(model)
         presentation = model.presentation
         if presentation is None:
             if model.artifact_ref is None:
-                if self._shown_presentation is not None:
+                if (
+                    self._shown_presentation is not None
+                    or self._rejected_presentation is not None
+                ):
                     self._shown_presentation = None
+                    self._rejected_presentation = None
                     self._raster.clear()
                 if model.projection_summary is None:
-                    self._projection.setText("Display: waiting for scan preparation")
+                    self._projection.setText(
+                        "Display: FINAL-only; waiting for canonical artifact"
+                        if model.final_only and not model.can_start
+                        else "Display: waiting for scan preparation"
+                    )
+                self._update_curve_controls(model)
             else:
                 self._projection.setText("Display: FINAL artifact retained; raster unavailable")
+                self._update_curve_controls(model)
             return
         self._projection.setText(f"Display: {presentation.projection_summary}")
         if presentation is self._shown_presentation:
+            self._update_curve_controls(model)
+            return
+        if presentation is self._rejected_presentation:
+            self._update_curve_controls(model)
             return
         try:
             self._raster.present_encoded(
@@ -383,11 +827,34 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
                 image_format="PNG",
             )
         except BaseException as error:
-            self._diagnostics.setText(
+            self._rejected_presentation = presentation
+            self._record_display_failure(
                 f"Qt rejected the worker-produced PNG raster: {error}"
             )
+            self._update_curve_controls(model)
             return
         self._shown_presentation = presentation
+        self._rejected_presentation = None
+        self._local_display_diagnostic = ""
+        self._refresh_diagnostics(model)
+        self._update_curve_controls(model)
+
+    def _update_projection_label(self, model: ScanPanelViewModel) -> None:
+        if model.projection_summary is None:
+            return
+        prefix = (
+            "Display (PROVISIONAL): "
+            if model.display_phase == "PROVISIONAL"
+            else "Display: "
+        )
+        text = prefix + model.projection_summary
+        candidate = self._curve_range_candidate
+        if candidate is not None and model.display_phase == "PROVISIONAL":
+            text += (
+                " · DISPLAY ONLY range="
+                f"{candidate[1][0]:.6g}..{candidate[1][1]:.6g}"
+            )
+        self._projection.setText(text)
 
     def closeEvent(self, event) -> None:
         if self._allow_close:
@@ -395,6 +862,8 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             event.accept()
             return
         event.ignore()
+        self._settings_popup.hide()
+        self._selector_switch.setChecked(False)
         self._controller.close()
         self._owner_cycle()
 

@@ -5,6 +5,10 @@ import time
 
 import pytest
 
+from zlc_frontend.curve_display import (
+    CurveDisplayState,
+    curve_display_with_x_view,
+)
 from zlc_neutral_atom.runtime.run import (
     CancelOutcome,
     RunCancelled,
@@ -203,6 +207,17 @@ def _reach_committed_reference(controller, handle, executor):
     assert handle.result_calls == 0
     executor.run_next()  # handle.result -> also joins/reaps
     controller.owner_cycle()  # accepts ref, schedules final projection
+
+
+def test_application_reconfigure_resets_unscoped_curve_display_state() -> None:
+    controller, _application, _handle, _executor, _wakes = _controller()
+    changed = curve_display_with_x_view(CurveDisplayState(), (1.0, 2.0))
+    assert controller.reconfigure_progressive_curve_display(changed) == 1
+    assert controller.progressive_curve_display == changed
+
+    replacement_handle = _FakeHandle("replacement-run", _ref("b"))
+    controller.reconfigure(_Application(replacement_handle))
+    assert controller.progressive_curve_display == CurveDisplayState()
 
 
 def test_final_only_controller_reaps_terminal_before_projecting() -> None:
