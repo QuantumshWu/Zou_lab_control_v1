@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, Future
-import os
 from pathlib import Path
-import tempfile
 import threading
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -30,7 +28,15 @@ from zlc_frontend.qt_widgets import (
 from zlc_neutral_atom.capture_fit_reference import CaptureFitResultArtifactRef
 from zlc_storage import positive_integer
 
-from ._frozen_raster import FrozenRasterWindow, _error_summary, _open_frozen_window
+from ._frozen_raster import (
+    FrozenRasterWindow,
+)
+from ._window_runtime import (
+    cancel_export_commits,
+    error_summary,
+    open_workbench_window,
+    stage_and_replace_export,
+)
 
 
 _DEFAULT_FIT_GRID_MEMORY_LIMIT_BYTES = 512 << 20
@@ -182,15 +188,8 @@ def _export_grid_view(
     image_format = target.suffix.lstrip(".") or "png"
     if not target.suffix:
         target = target.with_suffix(f".{image_format}")
-    temporary = None
-    try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{target.name}.",
-            suffix=target.suffix,
-            dir=target.parent,
-        )
-        os.close(descriptor)
-        temporary = Path(temporary_name)
+
+    def write_staged(temporary: Path) -> None:
         exported = figure.export(
             temporary,
             image_format=image_format,
@@ -198,14 +197,14 @@ def _export_grid_view(
         )
         if Path(exported) != temporary:
             raise RuntimeError("saved-fit export changed its staged destination")
-        with commit_lock:
-            _require_not_cancelled(cancelled)
-            os.replace(temporary, target)
-        temporary = None
-        return revision, target
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+
+    committed = stage_and_replace_export(
+        target,
+        write_staged=write_staged,
+        cancelled=cancelled,
+        commit_lock=commit_lock,
+    )
+    return revision, committed
 
 
 class SavedFitGridWindow(FrozenRasterWindow):
@@ -398,7 +397,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             selection = model.selection_for_indices(indices)
             storage, _multi, address = model.resolve_selection(selection)
         except BaseException as error:
-            self._cell_detail.setText(_error_summary(error))
+            self._cell_detail.setText(error_summary(error))
             return
         self._cell_detail.setText(
             f"{address}\nstorage row {storage} · activate to load stored fit facts"
@@ -440,7 +439,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 keep_current=False,
             )
         except BaseException as error:
-            self._diagnostic.setText(_error_summary(error))
+            self._diagnostic.setText(error_summary(error))
             return
         self._clear_bundle()
         self._page_bundle = None
@@ -497,7 +496,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._start_focus(selection)
         except BaseException as error:
             self._status.setText("FIT CELL INVALID")
-            self._diagnostic.setText(_error_summary(error))
+            self._diagnostic.setText(error_summary(error))
 
     def _start_focus(self, selection: Selection) -> None:
         if self._future is not None or self._closing:
@@ -513,7 +512,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             )
         except BaseException as error:
             self._status.setText("FIT CELL INVALID")
-            self._diagnostic.setText(_error_summary(error))
+            self._diagnostic.setText(error_summary(error))
             return
         self._clear_bundle()
         self._regions = ()
@@ -575,7 +574,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             )
         except BaseException as error:
             self._status.setText("FIT VIEW EXPORT FAILED")
-            self._diagnostic.setText(_error_summary(error))
+            self._diagnostic.setText(error_summary(error))
             return
         self._request_revision += 1
         self._active_revision = self._request_revision
@@ -705,7 +704,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             if not self._closing:
                 self._status.setText("SAVED FIT GRID FAILED")
                 self._summary.setText("The exact saved artifact remains unchanged")
-                self._diagnostic.setText(_error_summary(error))
+                self._diagnostic.setText(error_summary(error))
                 self._set_controls_enabled(True)
         else:
             if self._closing:
@@ -726,7 +725,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             except BaseException as error:
                 self._status.setText("SAVED FIT GRID FAILED")
                 self._summary.setText("The exact saved artifact remains unchanged")
-                self._diagnostic.setText(_error_summary(error))
+                self._diagnostic.setText(error_summary(error))
                 self._set_controls_enabled(True)
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
@@ -739,8 +738,10 @@ class SavedFitGridWindow(FrozenRasterWindow):
     def shutdown(self) -> None:
         if self._closing or self._closed:
             return
-        with self._export_commit_lock:
-            self._cancelled.set()
+        cancel_export_commits(
+            cancelled=self._cancelled,
+            commit_lock=self._export_commit_lock,
+        )
         if self._navigator is not None:
             self._navigator.set_interaction_enabled(False)
         for button in (
@@ -772,7 +773,7 @@ def open_saved_fit_grid_workbench(
     memory_limit_bytes: int = _DEFAULT_FIT_GRID_MEMORY_LIMIT_BYTES,
 ) -> SavedFitGridWindow:
     limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-    return _open_frozen_window(
+    return open_workbench_window(
         lambda: SavedFitGridWindow(
             view_loader,
             reference,

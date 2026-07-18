@@ -14,6 +14,16 @@ from matplotlib import font_manager as fm
 
 from zlc_storage import canonical_text
 
+from .site_map import (
+    SITE_EMPTY_ALPHA,
+    SITE_EMPTY_COLOR,
+    SITE_EMPTY_LINEWIDTH,
+    SITE_INVALID_COLOR,
+    SITE_OCCUPIED_ALPHA,
+    SITE_OCCUPIED_COLOR,
+    SITE_OCCUPIED_LINEWIDTH,
+)
+
 NEW_BLACK = "black"
 FONT_PATH = Path(__file__).resolve().parent / "assets" / "helvetica-light-587ebe5a59211.ttf"
 
@@ -277,7 +287,7 @@ def indexed_colormap(name: str) -> tuple[int, ...]:
 RENDER_TEXT = NEW_BLACK
 RENDER_BACKGROUND = "#FFFFFF"
 RENDER_GRID = _PALETTE["pulse_grid"]
-FIT_FAILURE_COLOR = "#CD7380"
+FIT_FAILURE_COLOR = SITE_INVALID_COLOR
 FIT_CONTOUR_COLOR = "#FFFFFF"
 FIT_CONTOUR_LINEWIDTH = 0.8
 FIT_LINESTYLE = "--"
@@ -307,8 +317,16 @@ def render_style_context() -> Iterator[None]:
 # (the earlier faint alpha=0.22 vanished on grey -- the fix is opacity + a real stroke,
 # NOT a coloured ring); the occupied ring stays warm-orange so the two never confuse.
 SITE_OCCUPANCY_STYLE: Mapping[str, Mapping[str, Any]] = MappingProxyType({
-    "empty":    MappingProxyType({"color": "#FFFFFF", "alpha": 0.85, "linewidth": 0.6}),
-    "occupied": MappingProxyType({"color": "#D07850", "alpha": 0.95, "linewidth": 0.9}),
+    "empty": MappingProxyType({
+        "color": SITE_EMPTY_COLOR,
+        "alpha": SITE_EMPTY_ALPHA,
+        "linewidth": SITE_EMPTY_LINEWIDTH,
+    }),
+    "occupied": MappingProxyType({
+        "color": SITE_OCCUPIED_COLOR,
+        "alpha": SITE_OCCUPIED_ALPHA,
+        "linewidth": SITE_OCCUPIED_LINEWIDTH,
+    }),
 })
 
 

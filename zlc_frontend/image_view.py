@@ -13,6 +13,8 @@ import math
 from numbers import Real
 from typing import TypeAlias
 
+import numpy as np
+
 from zlc_data import (
     AxisSpec,
     CoordinateFrameId,
@@ -20,6 +22,7 @@ from zlc_data import (
     Selection,
     SPATIAL_X,
     SPATIAL_Y,
+    immutable_array,
     resolve_selection_indices,
 )
 from zlc_storage import nonnegative_integer, positive_integer
@@ -375,6 +378,91 @@ class ImageViewportTransform:
         return (
             min(1.0, max(0.0, (x - left) / (right - left))),
             min(1.0, max(0.0, (y - top) / (bottom - top))),
+        )
+
+    def full_points_for_coordinates(
+        self,
+        coordinates_xy: object,
+        *,
+        coordinate_frame: CoordinateFrameId,
+    ) -> np.ndarray:
+        """Freeze many physical points in complete-raster normalized coordinates.
+
+        Axis regularity and edge geometry are resolved once per axis, not once
+        per point.  The returned float64 matrix is backed by immutable bytes so
+        a composite payload can safely retain it across worker/GUI hand-off.
+        """
+
+        if not isinstance(coordinate_frame, CoordinateFrameId):
+            raise TypeError("coordinate_frame must be CoordinateFrameId")
+        if coordinate_frame != self.coordinate_frame:
+            raise ValueError("coordinates belong to another coordinate frame")
+        source = np.asarray(coordinates_xy)
+        if source.ndim != 2 or source.shape[1:] != (2,):
+            raise ValueError("coordinates_xy must have shape (points, 2)")
+        if source.dtype.kind not in "iuf" or source.dtype.kind == "b":
+            raise TypeError("coordinates_xy must contain real numeric values")
+        values = np.asarray(source, dtype=np.float64, order="C")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("coordinates_xy must be finite")
+
+        normalized = np.empty(values.shape, dtype=np.float64)
+        for column, axis, name in (
+            (0, self.x_axis, "x coordinates"),
+            (1, self.y_axis, "y coordinates"),
+        ):
+            start, stop = _axis_edge_coordinates(axis)
+            low, high = sorted((start, stop))
+            coordinates = values[:, column]
+            magnitude = max(
+                1.0,
+                abs(low),
+                abs(high),
+                0.0 if not len(coordinates) else float(np.max(np.abs(coordinates))),
+            )
+            tolerance = 8.0 * math.ulp(magnitude)
+            if np.any(coordinates < low - tolerance) or np.any(
+                coordinates > high + tolerance
+            ):
+                raise ValueError(
+                    f"{name} lie outside axis {axis.axis_id} edge extent "
+                    f"[{low}, {high}]"
+                )
+            target = normalized[:, column]
+            np.subtract(coordinates, start, out=target)
+            np.divide(target, stop - start, out=target)
+            np.clip(target, 0.0, 1.0, out=target)
+
+        return immutable_array(
+            normalized,
+            dtype=np.dtype("<f8"),
+            shape=normalized.shape,
+        )
+
+    def visible_span_for_coordinate_span(
+        self,
+        span_xy: tuple[object, object],
+        *,
+        coordinate_frame: CoordinateFrameId,
+    ) -> tuple[float, float]:
+        """Return visible-normalized width/height for a physical coordinate span."""
+
+        if not isinstance(span_xy, tuple) or len(span_xy) != 2:
+            raise TypeError("span_xy must be a two-item tuple")
+        if not isinstance(coordinate_frame, CoordinateFrameId):
+            raise TypeError("coordinate_frame must be CoordinateFrameId")
+        if coordinate_frame != self.coordinate_frame:
+            raise ValueError("coordinate span belongs to another coordinate frame")
+        span_x = _finite_number(span_xy[0], "x coordinate span")
+        span_y = _finite_number(span_xy[1], "y coordinate span")
+        if span_x <= 0.0 or span_y <= 0.0:
+            raise ValueError("coordinate spans must be positive")
+        x_start, x_stop = _axis_edge_coordinates(self.x_axis)
+        y_start, y_stop = _axis_edge_coordinates(self.y_axis)
+        left, top, right, bottom = self.visible_bounds
+        return (
+            span_x / abs(x_stop - x_start) / (right - left),
+            span_y / abs(y_stop - y_start) / (bottom - top),
         )
 
     def visible_bounds_for_full_bounds(

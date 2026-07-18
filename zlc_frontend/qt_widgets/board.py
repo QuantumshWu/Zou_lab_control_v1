@@ -15,15 +15,29 @@ from zlc_storage import canonical_text, nonnegative_integer
 from ..curve_display import CurveViewportTransform
 from ..display_range import validated_display_range
 from ..image_raster import indexed8_code_for_value
+from ..image_view import validate_normalized_rectangle
 from ..render import (
     BoardFrame,
     CurvePanelPayload,
+    DisplayPayload,
     ImagePanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
     PixelFormat,
+    SiteMapPanelPayload,
     SourceIdentity,
     detached_render_fault,
+)
+from ..site_map import (
+    SITE_EMPTY_ALPHA,
+    SITE_EMPTY_COLOR,
+    SITE_EMPTY_LINEWIDTH,
+    SITE_INVALID_ALPHA,
+    SITE_INVALID_COLOR,
+    SITE_INVALID_LINEWIDTH,
+    SITE_OCCUPIED_ALPHA,
+    SITE_OCCUPIED_COLOR,
+    SITE_OCCUPIED_LINEWIDTH,
 )
 from ..selector import (
     CurveInteractionIntent,
@@ -37,7 +51,11 @@ from ..selector import (
     PanelInteractionOrigin,
     RectangleGesture,
 )
-from .style import BG, GREEN, ORANGE
+from .style import (
+    BG,
+    GREEN,
+    ORANGE,
+)
 
 
 def _prepared_qimage(panel_or_raster) -> tuple[bytes, QtGui.QImage]:
@@ -52,7 +70,9 @@ def _prepared_qimage(panel_or_raster) -> tuple[bytes, QtGui.QImage]:
     if isinstance(panel_or_raster, PanelFrame):
         raster = panel_or_raster.raster
         payload = panel_or_raster.display_payload
-        if payload is not None and not isinstance(payload, ImagePanelPayload):
+        if isinstance(payload, SiteMapPanelPayload):
+            payload = payload.background
+        elif not isinstance(payload, ImagePanelPayload):
             payload = None
     else:
         raster = panel_or_raster
@@ -102,10 +122,19 @@ def _image_source_rect(
 def _aspect_target_for_source(
     bounds: QtCore.QRect,
     source: QtCore.QRectF,
+    *,
+    aspect_ratio: float | None = None,
+    anchor_west: bool = False,
 ) -> QtCore.QRect:
     if source.width() <= 0.0 or source.height() <= 0.0:
         raise ValueError("image source viewport must have positive geometry")
-    source_ratio = source.width() / source.height()
+    source_ratio = (
+        source.width() / source.height()
+        if aspect_ratio is None
+        else float(aspect_ratio)
+    )
+    if not math.isfinite(source_ratio) or source_ratio <= 0.0:
+        raise ValueError("image aspect ratio must be finite and positive")
     bounds_ratio = bounds.width() / max(1, bounds.height())
     if bounds_ratio > source_ratio:
         height = bounds.height()
@@ -114,7 +143,9 @@ def _aspect_target_for_source(
         width = bounds.width()
         height = max(1, int(round(width / source_ratio)))
     return QtCore.QRect(
-        bounds.x() + (bounds.width() - width) // 2,
+        bounds.x()
+        if anchor_west
+        else bounds.x() + (bounds.width() - width) // 2,
         bounds.y() + (bounds.height() - height) // 2,
         width,
         height,
@@ -125,6 +156,8 @@ def _panel_image_geometry(
     bounds: QtCore.QRect,
     image: QtGui.QImage,
     payload: ImagePanelPayload | None,
+    *,
+    site_map_payload: SiteMapPanelPayload | None = None,
 ) -> tuple[QtCore.QRect, QtCore.QRectF, QtCore.QRect | None]:
     source = _image_source_rect(
         image,
@@ -140,7 +173,16 @@ def _panel_image_geometry(
         max(1, bounds.width() - rail_width - gap),
         bounds.height(),
     )
-    target = _aspect_target_for_source(image_bounds, source)
+    target = _aspect_target_for_source(
+        image_bounds,
+        source,
+        aspect_ratio=(
+            None
+            if site_map_payload is None
+            else site_map_payload.visible_coordinate_aspect_ratio
+        ),
+        anchor_west=site_map_payload is not None,
+    )
     rail = QtCore.QRect(
         bounds.right() - rail_width + 1,
         target.top(),
@@ -218,7 +260,38 @@ def _image_payload(
     panel_or_hold: PanelFrame | _HeldPanelFront,
 ) -> ImagePanelPayload | None:
     payload = panel_or_hold.display_payload
+    if isinstance(payload, SiteMapPanelPayload):
+        return payload.background
     return payload if isinstance(payload, ImagePanelPayload) else None
+
+
+def _site_map_payload(
+    panel_or_hold: PanelFrame | _HeldPanelFront,
+) -> SiteMapPanelPayload | None:
+    payload = panel_or_hold.display_payload
+    return payload if isinstance(payload, SiteMapPanelPayload) else None
+
+
+def _payload_input(
+    payload: ImagePanelPayload | CurvePanelPayload | SiteMapPanelPayload,
+):
+    return (
+        payload.occupancy_input
+        if isinstance(payload, SiteMapPanelPayload)
+        else payload.evaluated_input
+    )
+
+
+def _input_structure(evaluated_input) -> tuple[object, object, object, str]:
+    """Return producer structure while deliberately excluding normal revisions."""
+
+    ref = evaluated_input.ref
+    return (
+        evaluated_input.dataset_id,
+        ref.block_id,
+        ref.stream_generation,
+        ref.schema_fingerprint,
+    )
 
 
 def _curve_payload(
@@ -285,7 +358,7 @@ class _HeldPanelFront:
     presentation: PanelPresentationIdentity
     raster_geometry: tuple[int, int, int, PixelFormat]
     prepared: tuple[bytes, QtGui.QImage]
-    display_payload: ImagePanelPayload | CurvePanelPayload | None
+    display_payload: ImagePanelPayload | CurvePanelPayload | SiteMapPanelPayload | None
 
     @property
     def gesture_identity(self) -> tuple[str, int, int, SourceIdentity]:
@@ -874,9 +947,9 @@ class QtRasterBoard(QtWidgets.QWidget):
     def _visible_display(
         self,
         panel_id: str | None,
-        payload_type: type[ImagePanelPayload] | type[CurvePanelPayload],
+        payload_type: type | tuple[type, ...],
     ) -> tuple[
-        ImagePanelPayload | CurvePanelPayload | None,
+        DisplayPayload | None,
         PanelInteractionOrigin | None,
     ]:
         """Resolve one typed payload and origin from the exact painted panel."""
@@ -893,7 +966,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 hold.sequence,
                 hold.source_identity,
                 hold.presentation,
-                payload.evaluated_input,
+                _payload_input(payload),
             )
         front = self._front
         if front is None or panel_id is None or panel_id not in self._panel_ids:
@@ -909,7 +982,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             front[0].sequence,
             panel.source_identity,
             _panel_presentation(panel),
-            payload.evaluated_input,
+            _payload_input(payload),
         )
 
     def visible_image_payload(self) -> ImagePanelPayload | None:
@@ -923,8 +996,10 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._require_owner()
         payload, _origin = self._visible_display(
             self._selector_panel_id,
-            ImagePanelPayload,
+            (ImagePanelPayload, SiteMapPanelPayload),
         )
+        if isinstance(payload, SiteMapPanelPayload):
+            return payload.background
         return payload if isinstance(payload, ImagePanelPayload) else None
 
     def visible_image_origin(self) -> PanelInteractionOrigin | None:
@@ -933,9 +1008,19 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._require_owner()
         _payload, origin = self._visible_display(
             self._selector_panel_id,
-            ImagePanelPayload,
+            (ImagePanelPayload, SiteMapPanelPayload),
         )
         return origin
+
+    def visible_site_map_payload(self) -> SiteMapPanelPayload | None:
+        """Return the exact composite payload painted by the image-family panel."""
+
+        self._require_owner()
+        payload, _origin = self._visible_display(
+            self._selector_panel_id,
+            SiteMapPanelPayload,
+        )
+        return payload if isinstance(payload, SiteMapPanelPayload) else None
 
     def discard_pending_image_interaction(
         self,
@@ -1019,6 +1104,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             gesture.source_identity,
         ) != hold.gesture_identity:
             raise RuntimeError("rectangle gesture differs from its held panel origin")
+        if isinstance(hold.display_payload, SiteMapPanelPayload):
+            raise RuntimeError(
+                "site-map rectangles are display-only candidates; "
+                "a spatial box cannot be promoted to authoritative SITE selection"
+            )
         viewport = self._require_selector_viewport()
         if viewport.viewport_revision != gesture.viewport_revision:
             raise RuntimeError("rectangle gesture viewport changed before dispatch")
@@ -1224,6 +1314,21 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._cancel_image_gesture(clear_draft=False)
         self.update()
 
+    def set_site_map_rectangle_candidate(
+        self,
+        bounds: NormalizedRectangle | None,
+    ) -> None:
+        """Retain one display-only spatial candidate without forging SITE authority."""
+
+        self._require_owner()
+        if self.visible_site_map_payload() is None:
+            raise RuntimeError("no exact SiteMap payload is currently painted")
+        self._selector_applied_bounds = (
+            None if bounds is None else validate_normalized_rectangle(bounds)
+        )
+        self._cancel_image_gesture(clear_draft=True)
+        self.update()
+
     def set_curve_range_candidate(
         self,
         x_span: tuple[float, float] | None,
@@ -1286,6 +1391,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 count=len(images),
                 columns=self._columns,
             )
+            image_payload = None
             if isinstance(payload, CurvePanelPayload):
                 target = bounds
                 source = QtCore.QRectF(
@@ -1296,14 +1402,28 @@ class QtRasterBoard(QtWidgets.QWidget):
                 )
                 rail = None
             else:
+                image_payload = (
+                    payload.background
+                    if isinstance(payload, SiteMapPanelPayload)
+                    else payload
+                    if isinstance(payload, ImagePanelPayload)
+                    else None
+                )
                 target, source, rail = _panel_image_geometry(
                     bounds,
                     image,
-                    payload if isinstance(payload, ImagePanelPayload) else None,
+                    image_payload,
+                    site_map_payload=(
+                        payload
+                        if isinstance(payload, SiteMapPanelPayload)
+                        else None
+                    ),
                 )
             painter.drawImage(QtCore.QRectF(target), image, source)
-            if isinstance(payload, ImagePanelPayload) and rail is not None:
-                self._paint_color_rail(painter, payload, rail)
+            if isinstance(payload, SiteMapPanelPayload):
+                self._paint_site_map_rings(painter, payload, target)
+            if image_payload is not None and rail is not None:
+                self._paint_color_rail(painter, image_payload, rail)
             if hold is not None and hold.panel_id == panel_id:
                 held_target = target
         if hold is not None and held_target is not None:
@@ -2012,12 +2132,22 @@ class QtRasterBoard(QtWidgets.QWidget):
             count=len(front[1]),
             columns=self._columns,
         )
+        composite = (
+            _site_map_payload(hold)
+            if hold is not None and hold.panel_id == panel_id
+            else _site_map_payload(front[0].panels[index])
+        )
         payload = (
             _image_payload(hold)
             if hold is not None and hold.panel_id == panel_id
             else _image_payload(front[0].panels[index])
         )
-        target, _source, _rail = _panel_image_geometry(bounds, image, payload)
+        target, _source, _rail = _panel_image_geometry(
+            bounds,
+            image,
+            payload,
+            site_map_payload=composite,
+        )
         return target, front[0], front[0].panels[index], prepared
 
     def _curve_target(self):
@@ -2146,6 +2276,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             if hold is not None and hold.panel_id == panel_id
             else _image_payload(panel)
         )
+        composite = (
+            _site_map_payload(hold)
+            if hold is not None and hold.panel_id == panel_id
+            else _site_map_payload(panel)
+        )
         if payload is None:
             return None
         bounds = _panel_bounds(
@@ -2154,7 +2289,12 @@ class QtRasterBoard(QtWidgets.QWidget):
             count=len(front[1]),
             columns=self._columns,
         )
-        _target, _source, rail = _panel_image_geometry(bounds, prepared[1], payload)
+        _target, _source, rail = _panel_image_geometry(
+            bounds,
+            prepared[1],
+            payload,
+            site_map_payload=composite,
+        )
         if rail is None:
             return None
         return rail, front[0], panel, prepared, payload
@@ -2366,7 +2506,7 @@ class QtRasterBoard(QtWidgets.QWidget):
     ) -> PanelInteractionOrigin:
         return self._require_interaction_origin(
             panel_id=self._selector_panel_id,
-            payload_type=ImagePanelPayload,
+            payload_type=(ImagePanelPayload, SiteMapPanelPayload),
             hold=hold,
             kind="image",
         )
@@ -2387,7 +2527,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         self,
         *,
         panel_id: str | None,
-        payload_type: type[ImagePanelPayload] | type[CurvePanelPayload],
+        payload_type: type | tuple[type, ...],
         hold: _HeldPanelFront | None,
         kind: str,
     ) -> PanelInteractionOrigin:
@@ -2449,6 +2589,15 @@ class QtRasterBoard(QtWidgets.QWidget):
                 return (ImagePanelPayload, payload.viewport.axes)
             if isinstance(payload, CurvePanelPayload):
                 return (CurvePanelPayload, payload.viewport.x_axis)
+            if isinstance(payload, SiteMapPanelPayload):
+                return (
+                    SiteMapPanelPayload,
+                    payload.background.viewport.axes,
+                    _input_structure(payload.background.evaluated_input),
+                    payload.site_axis,
+                    payload.coordinate_frame,
+                    payload.geometry_identity,
+                )
             return (None,)
 
         return (
@@ -2491,6 +2640,17 @@ class QtRasterBoard(QtWidgets.QWidget):
                 isinstance(current_payload, CurvePanelPayload)
                 and current_payload.viewport.x_axis == held_payload.viewport.x_axis
             )
+        elif isinstance(held_payload, SiteMapPanelPayload):
+            payload_matches = (
+                isinstance(current_payload, SiteMapPanelPayload)
+                and current_payload.background.viewport.axes
+                == held_payload.background.viewport.axes
+                and _input_structure(current_payload.background.evaluated_input)
+                == _input_structure(held_payload.background.evaluated_input)
+                and current_payload.site_axis == held_payload.site_axis
+                and current_payload.coordinate_frame == held_payload.coordinate_frame
+                and current_payload.geometry_identity == held_payload.geometry_identity
+            )
         else:
             payload_matches = current_payload is None
         return (
@@ -2520,6 +2680,71 @@ class QtRasterBoard(QtWidgets.QWidget):
             painter.fillRect(label_bounds, QtGui.QColor(0, 0, 0, 190))
             painter.setPen(QtGui.QColor(ORANGE))
             painter.drawText(label_bounds, QtCore.Qt.AlignCenter, label)
+        finally:
+            painter.restore()
+
+    @staticmethod
+    def _paint_site_map_rings(
+        painter: QtGui.QPainter,
+        payload: SiteMapPanelPayload,
+        target: QtCore.QRect,
+    ) -> None:
+        """Paint calibrated rings over the exact background front in Qt."""
+
+        viewport = payload.background.viewport
+        width, height = payload.visible_ring_span
+        ring_width = width * target.width()
+        ring_height = height * target.height()
+        left, top, right, bottom = viewport.visible_bounds
+        occupied = payload.site_validity & payload.occupied
+        empty = payload.site_validity & ~payload.occupied
+        invalid = ~payload.site_validity
+        styles = (
+            (
+                empty,
+                SITE_EMPTY_COLOR,
+                SITE_EMPTY_ALPHA,
+                SITE_EMPTY_LINEWIDTH,
+                False,
+            ),
+            (
+                occupied,
+                SITE_OCCUPIED_COLOR,
+                SITE_OCCUPIED_ALPHA,
+                SITE_OCCUPIED_LINEWIDTH,
+                False,
+            ),
+            (
+                invalid,
+                SITE_INVALID_COLOR,
+                SITE_INVALID_ALPHA,
+                SITE_INVALID_LINEWIDTH,
+                True,
+            ),
+        )
+        painter.save()
+        try:
+            painter.setClipRect(target)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            for mask, color_name, alpha, linewidth, dashed in styles:
+                color = QtGui.QColor(color_name)
+                color.setAlphaF(alpha)
+                pen = QtGui.QPen(color, linewidth)
+                if dashed:
+                    pen.setStyle(QtCore.Qt.DashLine)
+                painter.setPen(pen)
+                for full_x, full_y in payload.full_normalized_centers_xy[mask]:
+                    x = (float(full_x) - left) / (right - left)
+                    y = (float(full_y) - top) / (bottom - top)
+                    painter.drawEllipse(
+                        QtCore.QRectF(
+                            target.x() + x * target.width() - ring_width / 2.0,
+                            target.y() + y * target.height() - ring_height / 2.0,
+                            ring_width,
+                            ring_height,
+                        )
+                    )
         finally:
             painter.restore()
 
@@ -2936,7 +3161,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             painter.drawEllipse(QtCore.QPointF(x, y), 3.5, 3.5)
         value = self._formatted_sample_value(sample)
         suffix = " · off-view" if point is None else ""
-        label = f"({sample.x_coordinate}, {sample.y_coordinate}, {value}){suffix}"
+        label = (
+            f"({sample.x_coordinate}, {sample.y_coordinate}){suffix}"
+            if self.visible_site_map_payload() is not None
+            else f"({sample.x_coordinate}, {sample.y_coordinate}, {value}){suffix}"
+        )
         metrics = painter.fontMetrics()
         bounds = metrics.boundingRect(label).adjusted(-5, -2, 5, 2)
         bounds.moveTopRight(target.topRight() + QtCore.QPoint(-5, 5))
@@ -2951,10 +3180,32 @@ class QtRasterBoard(QtWidgets.QWidget):
         position: QtCore.QPointF,
         target: QtCore.QRect,
     ) -> None:
-        label = (
-            f"x={sample.x_coordinate}  y={sample.y_coordinate}  "
-            f"z={self._formatted_sample_value(sample)}"
-        )
+        site_map = self.visible_site_map_payload()
+        if site_map is None:
+            label = (
+                f"x={sample.x_coordinate}  y={sample.y_coordinate}  "
+                f"z={self._formatted_sample_value(sample)}"
+            )
+        else:
+            point = np.asarray(
+                (float(sample.x_coordinate), float(sample.y_coordinate)),
+                dtype=np.float64,
+            )
+            distances = np.sum(np.square(site_map.centers_xy - point), axis=1)
+            site_index = int(np.argmin(distances))
+            state = (
+                "invalid"
+                if not site_map.site_validity[site_index]
+                else "occupied"
+                if site_map.occupied[site_index]
+                else "empty"
+            )
+            site_label = site_map.site_axis.coordinate_at(site_index)
+            label = (
+                f"x={sample.x_coordinate}  y={sample.y_coordinate}  "
+                f"z={self._formatted_sample_value(sample)}  "
+                f"nearest={site_label} ({state})"
+            )
         metrics = painter.fontMetrics()
         bounds = metrics.boundingRect(label).adjusted(-5, -2, 5, 2)
         x = min(target.right() - bounds.width(), int(position.x()) + 12)

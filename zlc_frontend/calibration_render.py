@@ -18,7 +18,8 @@ from zlc_storage import canonical_text, positive_integer
 
 from .encoded_raster import EncodedRasterDocument, EncodedRasterPage
 from .image_raster import png_raster_size
-from .matplotlib_render import release_agg_figure, site_ring_radius
+from .matplotlib_render import release_agg_figure
+from .site_map import site_ring_radius
 from .render_style import (
     FIT_FAILURE_COLOR,
     HIST_FILL_ALPHA,

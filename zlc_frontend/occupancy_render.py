@@ -1,53 +1,44 @@
-"""Display-only physical site map for one exact committed occupancy cell."""
+"""Headless exact occupancy-cell values and interactive SiteMap budgets."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
-import gc
-from io import BytesIO
 import math
 
 import numpy as np
-from matplotlib import colormaps
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.collections import EllipseCollection
-from matplotlib.figure import Figure
 
 from zlc_data import (
     AxisLayout,
     AxisSpec,
+    CoordinateFrameId,
     IndexSelection,
     PointLayout,
+    SITE,
+    SPATIAL_X,
+    SPATIAL_Y,
     Selection,
     StreamGenerationId,
     resolve_selection_indices,
 )
 from zlc_storage import canonical_text, positive_integer, sha256_text
 
-from .encoded_raster import EncodedRasterDocument, EncodedRasterPage
-from .image_raster import png_raster_size
-from .matplotlib_render import release_agg_figure, site_ring_radius
-from .render_style import (
-    FIT_FAILURE_COLOR,
-    PALETTE,
-    SITE_OCCUPANCY_STYLE,
-    apply_title,
-    render_style_context,
+from .figure import EvaluatedImage, EvaluatedInput
+from .image_raster import (
+    estimate_evaluated_image_retained_nbytes,
+    estimate_indexed8_raster_peak_nbytes,
 )
+from .image_view import ImageViewportTransform
+from .site_map import immutable_site_state
 
 
-_SCREEN_DPI = 150
-_RASTER_WIDTH = 1300
-_RASTER_HEIGHT = 1000
-_RENDER_FIXED_BYTES = 8 << 20
-_RASTER_PEAK_MULTIPLIER = 8
-_ARRAY_PEAK_MULTIPLIER = 8
 _VIEW_FIXED_BYTES = 1 << 20
-_RADIUS_WORKSPACE_BYTES = 1 << 20
-_SITE_COLLECTION_PEAK_BYTES = 512
 _NAVIGATION_UI_FIXED_BYTES = 1 << 20
 _NAVIGATION_UI_AXIS_BYTES = 64 << 10
+_SITE_MAP_FRONT_OBJECT_BYTES = 1 << 20
+_SITE_RADIUS_EXACT_WORKSPACE_BYTES = (
+    3 * 128 * 128 * np.dtype(np.float64).itemsize
+    + 128 * 128 * np.dtype(bool).itemsize
+)
 
 
 def estimate_occupancy_navigation_retained_nbytes(
@@ -77,6 +68,7 @@ class OccupancyCellNavigation:
     point_layout: PointLayout
     cell_layout: AxisLayout
     retained_upper_bound_bytes: int
+    cell_peak_upper_bound_bytes: int
 
     def __post_init__(self) -> None:
         canonical_text(self.artifact_identity, "artifact_identity")
@@ -108,6 +100,10 @@ class OccupancyCellNavigation:
         positive_integer(
             self.retained_upper_bound_bytes,
             "retained_upper_bound_bytes",
+        )
+        positive_integer(
+            self.cell_peak_upper_bound_bytes,
+            "cell_peak_upper_bound_bytes",
         )
         object.__setattr__(self, "point_axes", point_axes)
 
@@ -217,23 +213,6 @@ class OccupancyCellNavigation:
         return self.cell_layout.storage_index((repeat_index, *logical))
 
 
-def _owned_array(
-    value,
-    dtype,
-    shape: tuple[int, ...],
-    field: str,
-    *,
-    finite: bool = False,
-) -> np.ndarray:
-    array = np.array(value, dtype=dtype, copy=True, order="C")
-    if array.shape != shape:
-        raise ValueError(f"{field} must have shape {shape}, got {array.shape}")
-    if finite and not np.all(np.isfinite(array)):
-        raise ValueError(f"{field} must be finite")
-    array.setflags(write=False)
-    return array
-
-
 def estimate_occupancy_cell_view_retained_nbytes(
     frame_shape: tuple[int, int],
     frame_dtype: np.dtype | str,
@@ -261,56 +240,180 @@ def estimate_occupancy_cell_view_retained_nbytes(
     )
 
 
+def estimate_interactive_site_map_peak_nbytes(
+    frame_shape: tuple[int, int],
+    frame_dtype: np.dtype | str,
+    site_count: int,
+    *,
+    source_projection_peak_upper_bound_bytes: int,
+) -> int:
+    """Bound load, raster, present, revision overlap, and pointer hold.
+
+    ``source_projection_peak_upper_bound_bytes`` is the facade-owned aggregate
+    for repository inspections/admission plus construction of the current
+    exact :class:`OccupancyCellView`.  Two older GUI generations may coexist:
+    the current front and a pointer-held front.  The capacity-one candidate is
+    the third generation and remains charged until Qt accepts or discards it.
+    """
+
+    shape = tuple(frame_shape)
+    if (
+        len(shape) != 2
+        or any(
+            isinstance(size, bool) or not isinstance(size, int) or size <= 0
+            for size in shape
+        )
+    ):
+        raise ValueError("frame_shape must contain two positive integers")
+    dtype = np.dtype(frame_dtype)
+    if dtype.hasobject or dtype.kind not in "biuf":
+        raise TypeError("physical site-map frames must be real numeric arrays")
+    sites = positive_integer(site_count, "site_count")
+    source_peak = positive_integer(
+        source_projection_peak_upper_bound_bytes,
+        "source_projection_peak_upper_bound_bytes",
+    )
+    height, width = shape
+    pixels = height * width
+    sample = estimate_evaluated_image_retained_nbytes(
+        height,
+        width,
+        value_itemsize=dtype.itemsize,
+    )
+    # Each frozen SiteMap payload owns centers, occupancy, validity, and the
+    # precomputed full-raster normalized centers: 16S + S + S + 16S.
+    payload_sites = 34 * sites
+    source_sites = 18 * sites
+    front = (
+        _SITE_MAP_FRONT_OBJECT_BYTES
+        + sample
+        + payload_sites
+        # RasterBuffer bytes plus the private INDEXED8 plane detached by Qt's
+        # color table.  Palette/histogram objects live in the fixed allowance.
+        + 2 * pixels
+    )
+    site_workspace = max(
+        _SITE_RADIUS_EXACT_WORKSPACE_BYTES,
+        16 * sites,  # vectorized normalized-center construction
+        3 * sites,  # empty / occupied / invalid paint masks
+    )
+    indexed = estimate_indexed8_raster_peak_nbytes(
+        height,
+        width,
+        value_itemsize=dtype.itemsize,
+        retained_fronts=2,
+        retained_sample_fronts=2,
+    )
+    load_with_old_fronts = source_peak + 2 * front
+    payload_with_old_fronts = 2 * front + (
+        _SITE_MAP_FRONT_OBJECT_BYTES
+        + sample
+        + source_sites
+        + payload_sites
+        + site_workspace
+    )
+    indexed_candidate = (
+        indexed
+        + 3 * _SITE_MAP_FRONT_OBJECT_BYTES
+        + sample
+        # candidate source+payload, current payload, and pointer-held payload
+        + 120 * sites
+    )
+    # Qt may paint a three-generation swap while a pointer-held SiteMap is
+    # sampled.  Ring-state masks need 3S bytes; nearest-site hover temporarily
+    # holds two Nx2 float64 planes plus one float64 distance vector (40S).
+    qt_interaction_workspace = max(3 * sites, 40 * sites)
+    qt_swap = 3 * front + qt_interaction_workspace
+    return max(
+        load_with_old_fronts,
+        payload_with_old_fronts,
+        indexed_candidate,
+        qt_swap,
+    )
+
+
 @dataclass(frozen=True, eq=False)
 class OccupancyCellView:
     """Self-contained physical facts for one exact ``(repeat, point)`` cell."""
 
-    frame: np.ndarray
-    frame_validity: np.ndarray
+    background: EvaluatedImage
+    background_input: EvaluatedInput
+    occupancy_input: EvaluatedInput
+    home_viewport: ImageViewportTransform
+    site_axis: AxisSpec
+    coordinate_frame: CoordinateFrameId
     centers_xy: np.ndarray
     occupied: np.ndarray
     site_validity: np.ndarray
-    cell_label: str
+    calibration_identity: str
+    cell_identity: str
+    cell_selection: Selection
+    run_id: str
+    provenance_epoch_id: str
     summary: str
-    value_unit: str | None = None
 
     def __post_init__(self) -> None:
-        frame = np.asarray(self.frame)
-        if frame.ndim != 2 or frame.dtype.hasobject or frame.dtype.kind == "c":
-            raise ValueError("frame must be one real two-dimensional image")
-        frame = _owned_array(frame, frame.dtype, frame.shape, "frame")
-        frame_validity = _owned_array(
-            self.frame_validity,
-            bool,
-            frame.shape,
-            "frame_validity",
-        )
-        centers = np.asarray(self.centers_xy)
-        if centers.ndim != 2 or centers.shape[1:] != (2,):
-            raise ValueError("centers_xy must have shape (sites, 2)")
-        centers = _owned_array(
-            centers,
-            "<f8",
-            centers.shape,
-            "centers_xy",
-            finite=True,
-        )
-        sites = centers.shape[0]
-        occupied = _owned_array(self.occupied, bool, (sites,), "occupied")
-        site_validity = _owned_array(
+        if not isinstance(self.background, EvaluatedImage):
+            raise TypeError("background must be EvaluatedImage")
+        if not isinstance(self.background_input, EvaluatedInput):
+            raise TypeError("background_input must be EvaluatedInput")
+        if not isinstance(self.occupancy_input, EvaluatedInput):
+            raise TypeError("occupancy_input must be EvaluatedInput")
+        if self.background_input.dataset_id == self.occupancy_input.dataset_id:
+            raise ValueError("background and occupancy inputs require distinct DatasetIds")
+        if self.background_input.ref.revision != self.occupancy_input.ref.revision:
+            raise ValueError("background and occupancy inputs must name one exact revision")
+        if not isinstance(self.home_viewport, ImageViewportTransform):
+            raise TypeError("home_viewport must be ImageViewportTransform")
+        if self.home_viewport.viewport_revision != 0:
+            raise ValueError("home_viewport must begin in authored revision zero")
+        for evaluated, declared, role, name in (
+            (self.background.x_axis, self.home_viewport.x_axis, SPATIAL_X, "x"),
+            (self.background.y_axis, self.home_viewport.y_axis, SPATIAL_Y, "y"),
+        ):
+            if declared.role != role or evaluated.role != role:
+                raise ValueError(f"occupancy background {name} axis has the wrong role")
+            if (
+                evaluated.axis_id != declared.axis_id
+                or evaluated.name != declared.name
+                or evaluated.unit != declared.unit
+                or evaluated.indices != tuple(range(declared.size))
+                or evaluated.coordinates
+                != tuple(declared.coordinate_at(index) for index in range(declared.size))
+            ):
+                raise ValueError(
+                    f"occupancy background {name} axis differs from its declared viewport"
+                )
+        if self.background.values.dtype.kind == "c":
+            raise TypeError("occupancy background must contain real values")
+        if not isinstance(self.site_axis, AxisSpec) or self.site_axis.role != SITE:
+            raise ValueError("site_axis must be an AxisSpec with role SITE")
+        if not isinstance(self.coordinate_frame, CoordinateFrameId):
+            raise TypeError("coordinate_frame must be CoordinateFrameId")
+        if self.home_viewport.coordinate_frame != self.coordinate_frame:
+            raise ValueError("background and site geometry coordinate frames differ")
+        sites = self.site_axis.size
+        centers, occupied, site_validity = immutable_site_state(
+            self.centers_xy,
+            self.occupied,
             self.site_validity,
-            bool,
-            (sites,),
-            "site_validity",
+            site_count=sites,
         )
-        if np.any(occupied[~site_validity]):
-            raise ValueError("invalid sites require canonical False fillers")
-        canonical_text(self.cell_label, "cell_label")
+        if not isinstance(self.cell_selection, Selection):
+            raise TypeError("cell_selection must be Selection")
+        if any(
+            not isinstance(term, IndexSelection)
+            for term in self.cell_selection.terms
+        ):
+            raise TypeError("cell_selection must contain only exact IndexSelection terms")
+        for value, name in (
+            (self.calibration_identity, "calibration_identity"),
+            (self.cell_identity, "cell_identity"),
+            (self.run_id, "run_id"),
+            (self.provenance_epoch_id, "provenance_epoch_id"),
+        ):
+            canonical_text(value, name)
         canonical_text(self.summary, "occupancy cell summary")
-        if self.value_unit is not None:
-            canonical_text(self.value_unit, "value_unit")
-        object.__setattr__(self, "frame", frame)
-        object.__setattr__(self, "frame_validity", frame_validity)
         object.__setattr__(self, "centers_xy", centers)
         object.__setattr__(self, "occupied", occupied)
         object.__setattr__(self, "site_validity", site_validity)
@@ -320,8 +423,8 @@ class OccupancyCellView:
         return sum(
             int(value.nbytes)
             for value in (
-                self.frame,
-                self.frame_validity,
+                self.background.values,
+                self.background.validity,
                 self.centers_xy,
                 self.occupied,
                 self.site_validity,
@@ -329,164 +432,10 @@ class OccupancyCellView:
         )
 
 
-def _add_site_ring_collection(
-    axis,
-    centers_xy: np.ndarray,
-    mask: np.ndarray,
-    *,
-    radius: float,
-    color: str,
-    alpha: float,
-    linewidth: float,
-    linestyle: str,
-) -> None:
-    offsets = centers_xy[mask]
-    if not len(offsets):
-        return
-    collection = EllipseCollection(
-        (2.0 * radius,),
-        (2.0 * radius,),
-        (0.0,),
-        units="xy",
-        offsets=offsets,
-        offset_transform=axis.transData,
-        facecolors="none",
-        edgecolors=color,
-        alpha=alpha,
-        linewidths=linewidth,
-        linestyles=linestyle,
-        zorder=5,
-    )
-    axis.add_collection(collection)
-
-
-def _build_site_map(view: OccupancyCellView, figure: Figure) -> None:
-    axis = figure.add_subplot(1, 1, 1)
-    cmap = colormaps[PALETTE["cmap_camera"]].copy()
-    cmap.set_bad(FIT_FAILURE_COLOR)
-    visible = np.isfinite(view.frame) & view.frame_validity
-    image = np.ma.array(view.frame, mask=~visible)
-    artist = axis.imshow(image, cmap=cmap, origin="upper", interpolation="nearest")
-    radius = site_ring_radius(view.centers_xy)
-    empty = view.site_validity & ~view.occupied
-    occupied = view.site_validity & view.occupied
-    invalid = ~view.site_validity
-    for mask, style, linestyle in (
-        (empty, SITE_OCCUPANCY_STYLE["empty"], "-"),
-        (occupied, SITE_OCCUPANCY_STYLE["occupied"], "-"),
-        (
-            invalid,
-            {
-                "color": FIT_FAILURE_COLOR,
-                "alpha": 0.95,
-                "linewidth": SITE_OCCUPANCY_STYLE["occupied"]["linewidth"],
-            },
-            "--",
-        ),
-    ):
-        _add_site_ring_collection(
-            axis,
-            view.centers_xy,
-            mask,
-            radius=radius,
-            color=str(style["color"]),
-            alpha=float(style["alpha"]),
-            linewidth=float(style["linewidth"]),
-            linestyle=linestyle,
-        )
-    axis.set_aspect("equal", adjustable="box")
-    axis.set_xlabel("camera x [px]")
-    axis.set_ylabel("camera y [px]")
-    apply_title(axis, view.cell_label)
-    colorbar = figure.colorbar(artist, ax=axis, fraction=0.046, pad=0.04)
-    colorbar.set_label("camera signal" if view.value_unit is None else view.value_unit)
-    valid_count = int(np.count_nonzero(view.site_validity))
-    occupied_count = int(np.count_nonzero(view.occupied & view.site_validity))
-    axis.text(
-        0.01,
-        0.99,
-        f"occupied {occupied_count}/{valid_count} valid | invalid {len(view.site_validity) - valid_count}",
-        transform=axis.transAxes,
-        ha="left",
-        va="top",
-        color="white",
-        fontsize=7,
-        bbox={"facecolor": "black", "edgecolor": "none", "alpha": 0.55, "pad": 2.0},
-        zorder=6,
-    )
-
-
-def render_occupancy_cell(
-    view: OccupancyCellView,
-    *,
-    memory_limit_bytes: int,
-    source_retained_upper_bound_bytes: int,
-    checkpoint: Callable[[], None] | None = None,
-) -> EncodedRasterDocument:
-    """Render one exact same-shot physical map without reducing any dataset axis."""
-
-    if not isinstance(view, OccupancyCellView):
-        raise TypeError("view must be OccupancyCellView")
-    limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-    source_retained = positive_integer(
-        source_retained_upper_bound_bytes,
-        "source_retained_upper_bound_bytes",
-    )
-    if source_retained < view.array_nbytes:
-        raise ValueError("source retained bound is smaller than the projected arrays")
-    check = (lambda: None) if checkpoint is None else checkpoint
-    if not callable(check):
-        raise TypeError("checkpoint must be callable or None")
-    required = (
-        _RENDER_FIXED_BYTES
-        + source_retained
-        + _RADIUS_WORKSPACE_BYTES
-        + _SITE_COLLECTION_PEAK_BYTES * len(view.site_validity)
-        + _ARRAY_PEAK_MULTIPLIER * view.array_nbytes
-        + _RASTER_PEAK_MULTIPLIER * _RASTER_WIDTH * _RASTER_HEIGHT * 4
-    )
-    if required > limit:
-        raise MemoryError(
-            f"occupancy cell raster composition requires {required} bytes; limit is {limit}"
-        )
-    figure = None
-    payload = b""
-    with render_style_context():
-        try:
-            check()
-            figure = Figure(
-                figsize=(_RASTER_WIDTH / _SCREEN_DPI, _RASTER_HEIGHT / _SCREEN_DPI),
-                dpi=_SCREEN_DPI,
-                constrained_layout=True,
-            )
-            FigureCanvasAgg(figure)
-            _build_site_map(view, figure)
-            target = BytesIO()
-            figure.savefig(target, format="png", dpi=_SCREEN_DPI)
-            payload = target.getvalue()
-            check()
-        finally:
-            if figure is not None:
-                release_agg_figure(figure)
-            figure = None
-            gc.collect()
-    png_raster_size(payload)
-    valid = int(np.count_nonzero(view.site_validity))
-    occupied = int(np.count_nonzero(view.occupied & view.site_validity))
-    summary = (
-        f"{view.summary}\n"
-        f"occupied={occupied}/{valid} valid sites | invalid={len(view.site_validity) - valid}"
-    )
-    return EncodedRasterDocument(
-        summary,
-        (EncodedRasterPage("exact-cell", "Exact cell", payload),),
-    )
-
-
 __all__ = [
     "OccupancyCellNavigation",
     "OccupancyCellView",
+    "estimate_interactive_site_map_peak_nbytes",
     "estimate_occupancy_cell_view_retained_nbytes",
     "estimate_occupancy_navigation_retained_nbytes",
-    "render_occupancy_cell",
 ]

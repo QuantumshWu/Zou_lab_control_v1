@@ -69,6 +69,12 @@ tests/test_zlc_frontend_qt_widgets.py
 tests/test_zlc_image_view.py
 tests/test_zlc_qt_image_interaction.py
 tests/test_u02c_qt_curve_interaction.py
+tests/test_u02d_site_map_budget.py
+tests/test_u02d_occupancy_workbench.py
+tests/test_u02d_site_map_viewport.py
+tests/test_u02d_site_map_payload.py
+tests/test_u02d_qt_site_map_interaction.py
+tests/test_zlc_site_map_geometry.py
 tests/test_zlc_occupancy_processor.py
 tests/test_zlc_pulse_authoring.py
 tests/test_zlc_pulse_client.py

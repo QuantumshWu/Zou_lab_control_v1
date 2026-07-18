@@ -119,9 +119,10 @@ def estimate_indexed8_raster_peak_nbytes(
     retained_rasters = (
         2 * retained_fronts * pixels * np.dtype(np.uint8).itemsize
     )
-    retained_samples = retained_sample_fronts * (
-        pixels * (value_itemsize + np.dtype(bool).itemsize)
-        + _DISPLAY_COORDINATE_ENTRY_BYTES * (height + width)
+    retained_samples = retained_sample_fronts * estimate_evaluated_image_retained_nbytes(
+        height,
+        width,
+        value_itemsize=value_itemsize,
     )
     # bincount(0..255), the immutable tuple copy, and one 256-entry QRgb LUT
     # are fixed-size next to a multi-megapixel frame.  Keep an explicit 64 KiB
@@ -129,6 +130,23 @@ def estimate_indexed8_raster_peak_nbytes(
     # objects rather than hiding them in a per-pixel multiplier.
     indexed_metadata = 64 * 1024
     return scratch_and_result + retained_rasters + retained_samples + indexed_metadata
+
+
+def estimate_evaluated_image_retained_nbytes(
+    height: int,
+    width: int,
+    *,
+    value_itemsize: int,
+) -> int:
+    """Bound one immutable image sample plus its explicit axis coordinates."""
+
+    height = positive_integer(height, "height")
+    width = positive_integer(width, "width")
+    value_itemsize = positive_integer(value_itemsize, "value_itemsize")
+    return (
+        height * width * (value_itemsize + np.dtype(bool).itemsize)
+        + _DISPLAY_COORDINATE_ENTRY_BYTES * (height + width)
+    )
 
 
 def rasterize_image_indexed8(
@@ -268,6 +286,7 @@ def _automatic_range(values: np.ndarray, valid: np.ndarray) -> tuple[float, floa
 
 __all__ = [
     "estimate_encoded_png_front_peak_nbytes",
+    "estimate_evaluated_image_retained_nbytes",
     "estimate_indexed8_raster_peak_nbytes",
     "indexed8_code_for_value",
     "png_raster_size",

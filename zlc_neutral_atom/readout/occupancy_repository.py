@@ -815,6 +815,87 @@ class OccupancyRepository:
                 _storage_peak_bytes(raw_bytes, metadata_bytes),
             )
 
+    @staticmethod
+    def _admission_peak_for_stored(
+        stored: _StoredOccupancy,
+        metadata_bytes: int,
+        capture_repository: CaptureRepository,
+        calibration_repository: CalibrationRepository,
+        *,
+        memory_limit_bytes: int,
+    ) -> int:
+        raw_bytes = (
+            stored.counts_blob.size
+            + stored.occupied_blob.size
+            + stored.validity_blob.size
+        )
+        storage_peak = _storage_peak_bytes(raw_bytes, metadata_bytes)
+        (
+            _event_count,
+            _site_count,
+            _source_read_scratch,
+            _runtime_scratch,
+            prepared_retained,
+            dependency_peak,
+        ) = _inspect_dependency_envelope(
+            capture_repository,
+            calibration_repository,
+            stored.source_capture_ref,
+            stored.calibration_reference,
+            readout_event_axis_id=stored.readout_event_axis_id,
+            model_kind=stored.model_kind,
+            memory_limit_bytes=memory_limit_bytes,
+        )
+        occupancy_inspection_retained = (
+            _REPOSITORY_FIXED_BYTES
+            + _METADATA_MATERIALIZATION_MULTIPLIER * metadata_bytes
+        )
+        return max(
+            occupancy_inspection_retained + dependency_peak,
+            prepared_retained + storage_peak,
+        )
+
+    def admission_peak_upper_bound_bytes(
+        self,
+        reference: OccupancyArtifactRef,
+        capture_repository: CaptureRepository,
+        calibration_repository: CalibrationRepository,
+        *,
+        memory_limit_bytes: int = _DEFAULT_MEMORY_LIMIT_BYTES,
+    ) -> int:
+        """Return the same complete dependency-aware peak enforced by ``admit``.
+
+        The bound belongs here because occupancy admission resolves and retains
+        both capture and calibration dependencies before decoding its own
+        arrays.  A composition facade may reserve this number, but must not
+        reconstruct the repository's dependency envelope.
+        """
+
+        if type(capture_repository) is not CaptureRepository:
+            raise TypeError("capture_repository must be CaptureRepository")
+        if type(calibration_repository) is not CalibrationRepository:
+            raise TypeError("calibration_repository must be CalibrationRepository")
+        memory_limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
+        with self._root_lease.borrow() as admission_borrow:
+            admission_borrow.require_active()
+            with capture_repository._root_lease.borrow() as source_borrow:
+                with calibration_repository._root_lease.borrow() as calibration_borrow:
+                    source_borrow.require_active()
+                    calibration_borrow.require_active()
+                    intent = self._require_final_commit(reference)
+                    stored, metadata_bytes = self._stored(
+                        reference,
+                        memory_limit_bytes=memory_limit,
+                    )
+                    self._require_run_generation(stored, intent)
+                    return self._admission_peak_for_stored(
+                        stored,
+                        metadata_bytes,
+                        capture_repository,
+                        calibration_repository,
+                        memory_limit_bytes=memory_limit,
+                    )
+
     def admit(
         self,
         reference: OccupancyArtifactRef,
@@ -843,30 +924,12 @@ class OccupancyRepository:
                         memory_limit_bytes=memory_limit,
                     )
                     self._require_run_generation(stored, intent)
-                    storage_peak = self._require_storage_budget(
+                    peak = self._admission_peak_for_stored(
                         stored,
                         metadata_bytes,
-                        memory_limit_bytes=memory_limit,
-                    )
-                    (
-                        _event_count,
-                        _site_count,
-                        _source_read_scratch,
-                        _runtime_scratch,
-                        prepared_retained,
-                        dependency_peak,
-                    ) = _inspect_dependency_envelope(
                         capture_repository,
                         calibration_repository,
-                        stored.source_capture_ref,
-                        stored.calibration_reference,
-                        readout_event_axis_id=stored.readout_event_axis_id,
-                        model_kind=stored.model_kind,
                         memory_limit_bytes=memory_limit,
-                    )
-                    peak = max(
-                        dependency_peak,
-                        prepared_retained + storage_peak,
                     )
                     if peak > memory_limit:
                         raise MemoryError(

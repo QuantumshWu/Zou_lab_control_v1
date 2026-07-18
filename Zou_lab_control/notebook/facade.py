@@ -525,7 +525,12 @@ def _occupancy_repository(
     return repository
 
 
-def _occupancy_cell_navigation(reference, inspected):
+def _occupancy_cell_navigation(
+    reference,
+    inspected,
+    *,
+    cell_peak_upper_bound_bytes: int,
+):
     """Project neutral FINAL metadata into the frontend-owned navigation value."""
 
     from zlc_frontend.occupancy_render import (
@@ -547,7 +552,33 @@ def _occupancy_cell_navigation(reference, inspected):
             inspected.inspection_retained_upper_bound_bytes,
             len(axes),
         ),
+        cell_peak_upper_bound_bytes=cell_peak_upper_bound_bytes,
     )
+
+
+def _occupancy_cell_source_projection_peak(
+    inspected,
+    source_inspection,
+    calibration_inspection,
+    *,
+    view_peak_upper_bound_bytes: int,
+    occupancy_admission_peak_upper_bound_bytes: int,
+) -> int:
+    """Compose sequential repository phases without reimplementing their peaks."""
+
+    inspection_retained = (
+        inspected.inspection_retained_upper_bound_bytes
+        + source_inspection.inspection_retained_upper_bound_bytes
+        + calibration_inspection.inspection_retained_upper_bound_bytes
+    )
+    repository_phase = max(
+        occupancy_admission_peak_upper_bound_bytes,
+        calibration_inspection.artifact_decode_peak_upper_bound_bytes,
+        source_inspection.admission_decode_peak_upper_bound_bytes,
+        source_inspection.admission_retained_upper_bound_bytes
+        + source_inspection.max_read_scratch_bytes,
+    )
+    return inspection_retained + view_peak_upper_bound_bytes + repository_phase
 
 
 class PulseFacade:
@@ -1450,14 +1481,97 @@ class ReadoutFacade:
             raise TypeError("reference must be OccupancyArtifactRef")
         limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         with _service_guard(self._token) as services:
-            inspected = _occupancy_repository(services).inspect_final(
+            occupancy_repository = _occupancy_repository(services)
+            calibration_repository = _calibration_repository(services)
+            inspected = occupancy_repository.inspect_final(
                 reference,
                 memory_limit_bytes=limit,
             )
-            navigation = _occupancy_cell_navigation(reference, inspected)
-            if navigation.retained_upper_bound_bytes >= limit:
+            source_info = services.capture_repository.inspect_final(
+                inspected.source_capture_ref,
+                memory_limit_bytes=limit,
+            )
+            calibration_info = calibration_repository.inspect_final(
+                inspected.calibration_reference,
+                memory_limit_bytes=limit,
+            )
+            self._require_binding(source_info.readout_binding)
+            if calibration_info.readout_binding != source_info.readout_binding:
+                raise ValueError("occupancy source and calibration bindings differ")
+            if (
+                source_info.dataset_schema.repeat_axis
+                != inspected.occupied_schema.repeat_axis
+                or source_info.dataset_schema.point_axes
+                != inspected.occupied_schema.point_axes
+                or source_info.dataset_schema.point_layout
+                != inspected.occupied_schema.point_layout
+            ):
+                raise ValueError("occupancy outer axes differ from the source capture")
+            frame_schema = source_info.dataset_schema.cell_schema
+            if len(frame_schema.data_shape) != 2:
+                raise ValueError(
+                    "physical occupancy map requires a two-dimensional camera frame"
+                )
+            frame_axes = frame_schema.data_axes
+            x_axes = tuple(axis for axis in frame_axes if axis.role == SPATIAL_X)
+            y_axes = tuple(axis for axis in frame_axes if axis.role == SPATIAL_Y)
+            if len(x_axes) != 1 or len(y_axes) != 1:
+                raise ValueError(
+                    "physical occupancy map requires exactly one declared "
+                    "SPATIAL_X and SPATIAL_Y frame axis"
+                )
+            site_count = inspected.occupied_schema.cell_schema.data_axes[0].size
+            if calibration_info.site_count != site_count:
+                raise ValueError("occupancy SITE cardinality differs from calibration")
+            from zlc_frontend.occupancy_render import (
+                estimate_interactive_site_map_peak_nbytes,
+                estimate_occupancy_cell_view_retained_nbytes,
+            )
+
+            view_peak = estimate_occupancy_cell_view_retained_nbytes(
+                frame_schema.data_shape,
+                frame_schema.dtype,
+                site_count,
+            )
+            inspection_retained = (
+                inspected.inspection_retained_upper_bound_bytes
+                + source_info.inspection_retained_upper_bound_bytes
+                + calibration_info.inspection_retained_upper_bound_bytes
+            )
+            repository_limit = limit - inspection_retained - view_peak
+            if repository_limit <= 0:
                 raise MemoryError(
-                    "occupancy navigation metadata leaves no exact-cell display budget"
+                    "occupancy navigation inspections leave no exact-cell display budget"
+                )
+            admission_peak = occupancy_repository.admission_peak_upper_bound_bytes(
+                reference,
+                services.capture_repository,
+                calibration_repository,
+                memory_limit_bytes=repository_limit,
+            )
+            source_projection_peak = _occupancy_cell_source_projection_peak(
+                inspected,
+                source_info,
+                calibration_info,
+                view_peak_upper_bound_bytes=view_peak,
+                occupancy_admission_peak_upper_bound_bytes=admission_peak,
+            )
+            cell_peak = estimate_interactive_site_map_peak_nbytes(
+                (y_axes[0].size, x_axes[0].size),
+                frame_schema.dtype,
+                site_count,
+                source_projection_peak_upper_bound_bytes=source_projection_peak,
+            )
+            navigation = _occupancy_cell_navigation(
+                reference,
+                inspected,
+                cell_peak_upper_bound_bytes=cell_peak,
+            )
+            required = navigation.retained_upper_bound_bytes + cell_peak
+            if required > limit:
+                raise MemoryError(
+                    f"interactive occupancy cell requires {required} bytes; "
+                    f"limit is {limit}"
                 )
             return navigation
 
@@ -1479,8 +1593,16 @@ class ReadoutFacade:
         from zlc_frontend.occupancy_render import (
             OccupancyCellNavigation,
             OccupancyCellView,
+            estimate_interactive_site_map_peak_nbytes,
             estimate_occupancy_cell_view_retained_nbytes,
         )
+        from zlc_frontend.figure import (
+            DatasetId,
+            EvaluatedAxis,
+            EvaluatedImage,
+            EvaluatedInput,
+        )
+        from zlc_frontend.image_view import ImageViewportTransform
         from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 
         if expected_navigation is not None and not isinstance(
@@ -1501,24 +1623,6 @@ class ReadoutFacade:
                 raise MemoryError(
                     "occupancy inspection leaves no display budget"
                 )
-            current_navigation = _occupancy_cell_navigation(reference, inspected)
-            if (
-                expected_navigation is not None
-                and current_navigation.identity != expected_navigation.identity
-            ):
-                raise ValueError("occupancy artifact changed after navigation inspection")
-            navigation = (
-                current_navigation
-                if expected_navigation is None
-                else expected_navigation
-            )
-            repeat_index, point_storage_index, logical_point, cell_label = (
-                navigation.resolve_selection(selection)
-            )
-            address = DatasetCellAddress(
-                repeat_index,
-                point_storage_index,
-            )
             source_info = services.capture_repository.inspect_final(
                 inspected.source_capture_ref,
                 memory_limit_bytes=limit - inspection_headroom,
@@ -1545,6 +1649,22 @@ class ReadoutFacade:
             frame_schema = source_info.dataset_schema.cell_schema
             if len(frame_schema.data_shape) != 2:
                 raise ValueError("physical occupancy map requires a two-dimensional camera frame")
+            frame_axes = frame_schema.data_axes
+            x_positions = tuple(
+                index for index, axis in enumerate(frame_axes) if axis.role == SPATIAL_X
+            )
+            y_positions = tuple(
+                index for index, axis in enumerate(frame_axes) if axis.role == SPATIAL_Y
+            )
+            if len(x_positions) != 1 or len(y_positions) != 1:
+                raise ValueError(
+                    "physical occupancy map requires exactly one declared "
+                    "SPATIAL_X and SPATIAL_Y frame axis"
+                )
+            x_position, y_position = x_positions[0], y_positions[0]
+            if x_position == y_position:
+                raise ValueError("physical occupancy frame axes are not distinct")
+            x_axis, y_axis = frame_axes[x_position], frame_axes[y_position]
             site_axis = inspected.occupied_schema.cell_schema.data_axes[0]
             view_bound = estimate_occupancy_cell_view_retained_nbytes(
                 frame_schema.data_shape,
@@ -1552,13 +1672,63 @@ class ReadoutFacade:
                 site_axis.size,
             )
             available = limit - inspection_headroom - view_bound
-            if available <= 0 or (
-                inspected.materialization_peak_upper_bound_bytes > available
-            ):
+            if available <= 0:
                 raise MemoryError(
                     "occupancy inspections, exact-cell projection, and materialization "
                     "exceed the display budget"
                 )
+            admission_peak = occupancy_repository.admission_peak_upper_bound_bytes(
+                reference,
+                services.capture_repository,
+                calibration_repository,
+                memory_limit_bytes=available,
+            )
+            if admission_peak > available:
+                raise MemoryError(
+                    "occupancy dependency admission, exact-cell projection, and "
+                    "inspections exceed the display budget"
+                )
+            source_projection_peak = _occupancy_cell_source_projection_peak(
+                inspected,
+                source_info,
+                calibration_info,
+                view_peak_upper_bound_bytes=view_bound,
+                occupancy_admission_peak_upper_bound_bytes=admission_peak,
+            )
+            cell_peak = estimate_interactive_site_map_peak_nbytes(
+                (y_axis.size, x_axis.size),
+                frame_schema.dtype,
+                site_axis.size,
+                source_projection_peak_upper_bound_bytes=source_projection_peak,
+            )
+            current_navigation = _occupancy_cell_navigation(
+                reference,
+                inspected,
+                cell_peak_upper_bound_bytes=cell_peak,
+            )
+            if expected_navigation is not None and (
+                current_navigation.identity != expected_navigation.identity
+                or current_navigation.cell_peak_upper_bound_bytes
+                != expected_navigation.cell_peak_upper_bound_bytes
+            ):
+                raise ValueError("occupancy artifact changed after navigation inspection")
+            navigation = (
+                current_navigation
+                if expected_navigation is None
+                else expected_navigation
+            )
+            if cell_peak > limit:
+                raise MemoryError(
+                    f"interactive occupancy cell requires {cell_peak} bytes; "
+                    f"limit is {limit}"
+                )
+            repeat_index, point_storage_index, logical_point, _cell_label = (
+                navigation.resolve_selection(selection)
+            )
+            address = DatasetCellAddress(
+                repeat_index,
+                point_storage_index,
+            )
 
             resolved = occupancy_repository.admit(
                 reference,
@@ -1590,6 +1760,10 @@ class ReadoutFacade:
             site_validity = np.array(validity.mask[r, p, :], copy=True, order="C")
             revision = artifact.occupied.revision
             generation = artifact.generation
+            occupancy_input = EvaluatedInput(
+                DatasetId(f"occupancy-cell-state-{reference.manifest_digest}"),
+                artifact.occupied.ref(generation),
+            )
             model_kind = artifact.model_kind
             source_ref = artifact.source_capture_ref
             calibration_ref = artifact.calibration_reference
@@ -1614,6 +1788,15 @@ class ReadoutFacade:
                 copy=True,
                 order="C",
             )
+            coordinate_frame = calibration.site_map.coordinate_frame
+            if (
+                x_axis.coordinate_frame != coordinate_frame
+                or y_axis.coordinate_frame != coordinate_frame
+            ):
+                raise ValueError(
+                    "camera spatial axes and calibration centers use different "
+                    "coordinate frames"
+                )
             del calibration, calibration_site_axis
 
             if source_info.dataset_schema.repeat_axis != inspected.occupied_schema.repeat_axis or (
@@ -1637,11 +1820,17 @@ class ReadoutFacade:
                     "view exceed the display budget"
                 )
             source = services.capture_repository.admit(source_ref)
-            frame_source = source.artifact.frame_source
+            source_artifact = source.artifact
+            frame_source = source_artifact.frame_source
             if frame_source.schema != source_info.dataset_schema:
                 raise ValueError("admitted capture differs from its FINAL inspection")
             if frame_source.revision != revision:
                 raise ValueError("occupancy revision differs from its source frame revision")
+            source_generation = source_artifact.provenance.generation
+            background_input = EvaluatedInput(
+                DatasetId(f"occupancy-cell-frame-{source_ref.manifest_digest}"),
+                frame_source.ref(source_generation),
+            )
             sample = frame_source.read(address)
             if sample.image.schema != frame_schema:
                 raise ValueError("exact source frame differs from the inspected frame schema")
@@ -1649,6 +1838,28 @@ class ReadoutFacade:
                 sample.image.validity,
                 sample.image.schema,
             )
+            frame_order_yx = (y_position, x_position)
+            frame_values_yx = np.transpose(sample.image.values, frame_order_yx)
+            frame_validity_yx = np.transpose(frame_validity, frame_order_yx)
+
+            def evaluated_axis(axis: AxisSpec):
+                indices = tuple(range(axis.size))
+                return EvaluatedAxis(
+                    axis.axis_id,
+                    axis.name,
+                    axis.role,
+                    axis.unit,
+                    indices,
+                    tuple(axis.coordinate_at(index) for index in indices),
+                )
+
+            background = EvaluatedImage(
+                evaluated_axis(x_axis),
+                evaluated_axis(y_axis),
+                frame_values_yx,
+                frame_validity_yx,
+            )
+            home_viewport = ImageViewportTransform((y_axis, x_axis))
             metadata = sample.metadata
             timestamp = f"{metadata.captured_at:.9f}s"
             summary = (
@@ -1661,19 +1872,40 @@ class ReadoutFacade:
                 f"camera_stamp={metadata.camera_stamp} | captured_at={timestamp} | "
                 f"correlation={metadata.correlation_id}"
             )
+            cell_identity = canonical_digest(
+                {
+                    "schema": "zlc_frontend.ExactOccupancyCell",
+                    "occupancy_artifact": reference.target_ref,
+                    "source_capture": source_ref.target_ref,
+                    "calibration": calibration_ref.target_ref,
+                    "repeat_index": r,
+                    "point_storage_index": p,
+                    "logical_point": logical_point,
+                }
+            )
             view = OccupancyCellView(
-                frame=sample.image.values,
-                frame_validity=frame_validity,
+                background=background,
+                background_input=background_input,
+                occupancy_input=occupancy_input,
+                home_viewport=home_viewport,
+                site_axis=site_axis,
+                coordinate_frame=coordinate_frame,
                 centers_xy=centers_xy,
                 occupied=occupied,
                 site_validity=site_validity,
-                cell_label=f"Exact occupancy cell | {cell_label}",
+                calibration_identity=calibration_ref.target_ref,
+                cell_identity=cell_identity,
+                cell_selection=navigation.selection_for_indices(
+                    repeat_index,
+                    logical_point,
+                ),
+                run_id=source_artifact.run_id,
+                provenance_epoch_id=source_generation.value,
                 summary=summary,
-                value_unit=frame_schema.value_unit,
             )
             if view.array_nbytes > view_bound:
                 raise MemoryError("occupancy cell projection exceeded its owner bound")
-            del source, frame_source, sample, frame_validity
+            del source, source_artifact, frame_source, sample, frame_validity
             return view, view_bound
 
     def occupancy_cell_gui(

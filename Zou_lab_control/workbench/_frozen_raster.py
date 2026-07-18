@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import CancelledError, Executor, Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Executor, Future
 import math
 import threading
 from typing import Callable
@@ -18,46 +18,16 @@ from zlc_frontend.qt_widgets import (
     GREY,
     QtImageBoard,
     QtOwnerWake,
-    WINDOW_SCREEN_FRACTION,
-    center_window_on_primary_screen,
-    ensure_qt_app,
-    release_window,
-    retain_window,
-    screen_fit_window_size,
-    set_fluent_scale,
 )
 from zlc_storage import canonical_text, positive_integer
 
-
-_FROZEN_RASTER_EXECUTOR = ThreadPoolExecutor(
-    max_workers=1,
-    thread_name_prefix="zlc-frozen-raster",
+from ._window_runtime import (
+    RASTER_WORK_EXECUTOR,
+    error_summary,
+    load_raster_bundle,
+    open_workbench_window,
+    release_window,
 )
-
-
-def _error_summary(error: BaseException) -> str:
-    message = str(error).strip()
-    return type(error).__name__ if not message else f"{type(error).__name__}: {message}"
-
-
-def _load_bundle(
-    loader: Callable[[threading.Event], EncodedRasterDocument],
-    memory_limit_bytes: int,
-    cancelled: threading.Event,
-) -> EncodedRasterDocument:
-    if cancelled.is_set():
-        raise CancelledError()
-    bundle = loader(cancelled)
-    if not isinstance(bundle, EncodedRasterDocument):
-        raise TypeError("frozen raster loader must return EncodedRasterDocument")
-    if cancelled.is_set():
-        raise CancelledError()
-    if bundle.source_front_peak_nbytes > memory_limit_bytes:
-        raise MemoryError(
-            "encoded raster fronts require "
-            f"{bundle.source_front_peak_nbytes} bytes; limit is {memory_limit_bytes}"
-        )
-    return bundle
 
 
 class FrozenRasterWindow(QtWidgets.QWidget):
@@ -84,7 +54,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
             memory_limit_bytes,
             "memory_limit_bytes",
         )
-        self._executor = _FROZEN_RASTER_EXECUTOR if executor is None else executor
+        self._executor = RASTER_WORK_EXECUTOR if executor is None else executor
         self._prefix = canonical_text(object_prefix, "object_prefix")
         self._subject = canonical_text(subject, "subject").upper()
         self._future: Future[EncodedRasterDocument] | None = None
@@ -138,7 +108,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         self._close_button.clicked.connect(self.shutdown)
         if loader is not None:
             self._submit_future(
-                _load_bundle,
+                load_raster_bundle,
                 loader,
                 self._memory_limit_bytes,
                 self._cancelled,
@@ -151,7 +121,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
             future = self._executor.submit(function, *args)
         except BaseException as error:
             self._status.setText(f"{self._subject} FAILED")
-            self._diagnostic.setText(_error_summary(error))
+            self._diagnostic.setText(error_summary(error))
             return False
         self._future = future
         future.add_done_callback(lambda _done: self._wake.request_owner_wake())
@@ -249,7 +219,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
                 board.clear()
             self._status.setText("DISPLAY FAILED")
             self._summary.setText(f"The frozen {self._subject.lower()} remains valid")
-            self._diagnostic.setText(_error_summary(error))
+            self._diagnostic.setText(error_summary(error))
             return False
         self._bundle = bundle
         self._boards = boards
@@ -268,7 +238,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
             if not self._closing:
                 self._status.setText(f"{self._subject} FAILED")
                 self._summary.setText("No raster was admitted")
-                self._diagnostic.setText(_error_summary(error))
+                self._diagnostic.setText(error_summary(error))
         else:
             if not self._closing:
                 self._present_bundle(bundle)
@@ -317,24 +287,11 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         self.shutdown()
 
 
-def _open_frozen_window(factory):
-    application = ensure_qt_app()
-    if QtCore.QThread.currentThread() != application.thread():
-        raise RuntimeError("frozen raster Workbench must be opened on the Qt GUI thread")
-    set_fluent_scale(None)
-    window = factory()
-    window.resize(screen_fit_window_size(WINDOW_SCREEN_FRACTION))
-    retain_window(window)
-    window.show()
-    center_window_on_primary_screen(window, application)
-    return window
-
-
 def open_frozen_raster_window(
     loader: Callable[[threading.Event], EncodedRasterDocument],
     **options,
 ) -> FrozenRasterWindow:
-    return _open_frozen_window(lambda: FrozenRasterWindow(loader, **options))
+    return open_workbench_window(lambda: FrozenRasterWindow(loader, **options))
 
 
 __all__ = [

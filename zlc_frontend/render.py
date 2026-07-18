@@ -3,22 +3,35 @@
 The renderer may use Matplotlib, Qt, or neither, but the worker/GUI boundary is
 always an immutable :class:`BoardFrame`.  No live Figure, Artist, mutable or
 aliased ndarray view, or QImage storage crosses this module's boundary.  The
-exact IMAGE/CURVE interaction payloads are allowed because their evaluated
-arrays are intrinsically backed by owned immutable bytes.
+exact image, curve, and calibrated site-map interaction payloads are allowed
+because their evaluated arrays are intrinsically backed by owned immutable
+bytes.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from numbers import Integral
 import threading
 from typing import Protocol, runtime_checkable
 
-from zlc_data import BlockId, StreamGenerationId
+import numpy as np
+
+from zlc_data import (
+    AxisSpec,
+    BlockId,
+    CoordinateFrameId,
+    SITE,
+    StreamGenerationId,
+    axis_to_tree,
+    dataset_revision_ref_to_tree,
+)
 from zlc_storage import (
+    canonical_digest,
     canonical_text as _text,
     nonnegative_integer as _nonnegative,
+    sha256_digest,
     sha256_text,
 )
 
@@ -32,6 +45,23 @@ from .figure import (
     EvaluatedSeries,
 )
 from .image_view import ImageViewportTransform
+from .site_map import immutable_site_state, site_ring_radius
+
+
+SITE_MAP_JOIN_SCHEMA_DIGEST = canonical_digest(
+    {
+        "schema": "zlc_frontend.SiteMapJoinSchema",
+        "value_schema": "zlc_frontend.SiteMapJoin",
+        "fields": (
+            "cell_identity",
+            "occupancy.dataset_id",
+            "occupancy.ref[zlc_data.DatasetRevisionRef]",
+            "background.dataset_id",
+            "background.ref[zlc_data.DatasetRevisionRef]",
+            "geometry_identity",
+        ),
+    }
+)
 
 
 def detached_render_fault(error: BaseException) -> RuntimeError:
@@ -355,7 +385,159 @@ class CurvePanelPayload:
         return curve.value_unit
 
 
-DisplayPayload = ImagePanelPayload | CurvePanelPayload
+@dataclass(frozen=True, slots=True, eq=False)
+class SiteMapPanelPayload:
+    """One IMAGE background plus calibrated, exact per-site occupancy state.
+
+    Site coordinates carry an explicit frame and are never inferred from array
+    shape.  Occupancy and background remain distinct evaluated inputs so a
+    :class:`CoherenceStamp` can prove their exact joined revisions.
+    """
+
+    background: ImagePanelPayload
+    occupancy_input: EvaluatedInput
+    site_axis: AxisSpec
+    coordinate_frame: CoordinateFrameId
+    centers_xy: np.ndarray
+    occupied: np.ndarray
+    site_validity: np.ndarray
+    calibration_identity: str
+    cell_identity: str
+    _full_normalized_centers_xy: np.ndarray = field(init=False, repr=False)
+    _visible_ring_span: tuple[float, float] = field(init=False, repr=False)
+    _geometry_identity: str = field(init=False, repr=False)
+    _join_key_digest: str = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.background, ImagePanelPayload):
+            raise TypeError("site-map background must be ImagePanelPayload")
+        if not isinstance(self.occupancy_input, EvaluatedInput):
+            raise TypeError("site-map occupancy_input must be EvaluatedInput")
+        if not isinstance(self.site_axis, AxisSpec) or self.site_axis.role != SITE:
+            raise ValueError("site-map site_axis must be an AxisSpec with role SITE")
+        if not isinstance(self.coordinate_frame, CoordinateFrameId):
+            raise TypeError("site-map coordinate_frame must be CoordinateFrameId")
+        if self.coordinate_frame != self.background.viewport.coordinate_frame:
+            raise ValueError(
+                "site-map coordinate_frame differs from its background viewport"
+            )
+        if (
+            self.occupancy_input.dataset_id
+            == self.background.evaluated_input.dataset_id
+        ):
+            raise ValueError(
+                "site-map occupancy and background require distinct dataset ids"
+            )
+
+        site_count = self.site_axis.size
+        centers, occupied, validity = immutable_site_state(
+            self.centers_xy,
+            self.occupied,
+            self.site_validity,
+            site_count=site_count,
+        )
+        radius = site_ring_radius(centers)
+        viewport = self.background.viewport
+        try:
+            normalized_centers = viewport.full_points_for_coordinates(
+                centers,
+                coordinate_frame=self.coordinate_frame,
+            )
+            visible_ring_span = viewport.visible_span_for_coordinate_span(
+                (2.0 * radius, 2.0 * radius),
+                coordinate_frame=self.coordinate_frame,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "site-map geometry cannot be painted on its background viewport"
+            ) from exc
+        object.__setattr__(self, "centers_xy", centers)
+        object.__setattr__(
+            self,
+            "_full_normalized_centers_xy",
+            normalized_centers,
+        )
+        object.__setattr__(self, "_visible_ring_span", visible_ring_span)
+        object.__setattr__(self, "occupied", occupied)
+        object.__setattr__(self, "site_validity", validity)
+        calibration_identity = _text(
+            self.calibration_identity,
+            "site-map calibration_identity",
+        )
+        cell_identity = _text(self.cell_identity, "site-map cell_identity")
+        object.__setattr__(self, "calibration_identity", calibration_identity)
+        object.__setattr__(self, "cell_identity", cell_identity)
+        axis = self.site_axis
+        geometry_identity = canonical_digest(
+            {
+                "schema": "zlc_frontend.SiteMapGeometry",
+                "calibration_identity": calibration_identity,
+                "coordinate_frame": self.coordinate_frame.value,
+                "site_axis": axis_to_tree(axis),
+                "centers_sha256": sha256_digest(memoryview(centers).cast("B")),
+                "ring_radius": radius,
+            }
+        )
+
+        input_trees = {}
+        for name, value in (
+            ("occupancy", self.occupancy_input),
+            ("background", self.background.evaluated_input),
+        ):
+            ref = value.ref
+            input_trees[name] = {
+                "dataset_id": value.dataset_id.value,
+                "ref": dataset_revision_ref_to_tree(ref),
+            }
+
+        object.__setattr__(self, "_geometry_identity", geometry_identity)
+        object.__setattr__(
+            self,
+            "_join_key_digest",
+            canonical_digest(
+                {
+                    "schema": "zlc_frontend.SiteMapJoin",
+                    "cell_identity": cell_identity,
+                    "occupancy": input_trees["occupancy"],
+                    "background": input_trees["background"],
+                    "geometry_identity": geometry_identity,
+                }
+            ),
+        )
+
+    @property
+    def full_normalized_centers_xy(self) -> np.ndarray:
+        """Return immutable full-raster points used by the Qt paint hot path."""
+
+        return self._full_normalized_centers_xy
+
+    @property
+    def visible_ring_span(self) -> tuple[float, float]:
+        """Return the current viewport-normalized ring width and height."""
+
+        return self._visible_ring_span
+
+    @property
+    def visible_coordinate_aspect_ratio(self) -> float:
+        """Return target raster width/height for isotropic physical coordinates."""
+
+        width, height = self._visible_ring_span
+        return height / width
+
+    @property
+    def geometry_identity(self) -> str:
+        """Digest calibration-owned geometry used for hold/topology checks."""
+
+        return self._geometry_identity
+
+    @property
+    def join_key_digest(self) -> str:
+        """Digest the exact cell, both data revisions, and calibration geometry."""
+
+        return self._join_key_digest
+
+
+DisplayPayload = ImagePanelPayload | CurvePanelPayload | SiteMapPanelPayload
 
 
 @dataclass(frozen=True)
@@ -382,10 +564,13 @@ class PanelFrame:
             raise TypeError("raster must be RasterBuffer")
         payload = self.display_payload
         if payload is not None:
-            if not isinstance(payload, (ImagePanelPayload, CurvePanelPayload)):
+            if not isinstance(
+                payload,
+                (ImagePanelPayload, CurvePanelPayload, SiteMapPanelPayload),
+            ):
                 raise TypeError(
                     "display_payload must be ImagePanelPayload, "
-                    "CurvePanelPayload, or None"
+                    "CurvePanelPayload, SiteMapPanelPayload, or None"
                 )
             presentations = tuple(
                 presentation
@@ -403,10 +588,43 @@ class PanelFrame:
                 ):
                     raise ValueError("image payload and raster geometry differ")
                 payload_revision = payload.viewport.viewport_revision
-            else:
+                source_input = payload.evaluated_input
+            elif isinstance(payload, CurvePanelPayload):
                 if self.raster.pixel_format is not PixelFormat.RGBA8888:
                     raise ValueError("curve payload requires an RGBA8888 raster")
                 payload_revision = payload.viewport.display_revision
+                source_input = payload.evaluated_input
+            else:
+                background = payload.background
+                if self.raster.pixel_format is not PixelFormat.INDEXED8:
+                    raise ValueError("site-map payload requires an INDEXED8 raster")
+                if background.viewport.raster_shape != (
+                    self.raster.height,
+                    self.raster.width,
+                ):
+                    raise ValueError("site-map background and raster geometry differ")
+                payload_revision = background.viewport.viewport_revision
+                source_input = payload.occupancy_input
+                try:
+                    background_ref = next(
+                        value.ref
+                        for value in self.coherence_stamp.inputs
+                        if value.dataset_id
+                        == background.evaluated_input.dataset_id
+                    )
+                except StopIteration as exc:
+                    raise ValueError(
+                        "site-map background is absent from its coherence stamp"
+                    ) from exc
+                if background.evaluated_input.ref != background_ref:
+                    raise ValueError(
+                        "site-map background differs from its frozen coherence input"
+                    )
+                if self.coherence_stamp.join_key_digest != payload.join_key_digest:
+                    raise ValueError(
+                        "site-map coherence digest omits or changes its exact cell, "
+                        "inputs, or calibration geometry"
+                    )
             if presentations[0].panel_revision != payload_revision:
                 raise ValueError(
                     "display payload revision differs from panel presentation"
@@ -422,12 +640,21 @@ class PanelFrame:
                     "display payload source is absent from its coherence stamp"
                 ) from exc
             if (
-                payload.evaluated_input.dataset_id
-                != self.source_identity.dataset_id
-                or payload.evaluated_input.ref != expected_ref
+                source_input.dataset_id != self.source_identity.dataset_id
+                or source_input.ref != expected_ref
             ):
                 raise ValueError(
                     "display payload input differs from its frozen coherence input"
+                )
+            if isinstance(payload, SiteMapPanelPayload) and (
+                self.source_identity.block_id != source_input.ref.block_id
+                or self.source_identity.stream_generation
+                != source_input.ref.stream_generation
+                or self.source_identity.schema_fingerprint
+                != source_input.ref.schema_fingerprint
+            ):
+                raise ValueError(
+                    "site-map source identity differs from its occupancy input"
                 )
 
 
@@ -542,7 +769,9 @@ __all__ = [
     "SourceIdentity",
     "PanelFrame",
     "ImagePanelPayload",
+    "SiteMapPanelPayload",
     "PixelFormat",
     "RasterBuffer",
     "RenderSurface",
+    "SITE_MAP_JOIN_SCHEMA_DIGEST",
 ]

@@ -32,10 +32,9 @@ from zlc_workbench.run_owner import QtRunOwnerMailbox
 
 from ._frozen_raster import (
     FrozenRasterWindow,
-    _error_summary,
-    _open_frozen_window,
     open_frozen_raster_window,
 )
+from ._window_runtime import error_summary, open_workbench_window
 
 
 _DEFAULT_CALIBRATION_GUI_MEMORY_LIMIT_BYTES = 512 << 20
@@ -279,7 +278,7 @@ def _prepare_calibration_editor(
     except BaseException as error:
         if cancelled.is_set() or isinstance(error, CancelledError):
             raise CancelledError() from error
-        return prepared, None, _error_summary(error)
+        return prepared, None, error_summary(error)
     return prepared, bundle, None
 
 
@@ -469,7 +468,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             )
         except (TypeError, ValueError) as error:
             self._status.setText("CALIBRATION REQUEST INVALID")
-            self._diagnostic.setText(_error_summary(error))
+            self._diagnostic.setText(error_summary(error))
             return
         self._run_revision = self._editor_revision
         self._run_active = True
@@ -500,7 +499,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             self._run_owner.mark_owner_reaped()
             self._run_active = False
             self._status.setText("CALIBRATION START FAILED")
-            self._diagnostic.setText(_error_summary(error))
+            self._diagnostic.setText(error_summary(error))
             self._set_busy(None)
 
     def _stop_calibration(self) -> None:
@@ -534,7 +533,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
                 super().shutdown()
             else:
                 self._status.setText("CALIBRATION START FAILED")
-                self._diagnostic.setText(_error_summary(error))
+                self._diagnostic.setText(error_summary(error))
                 self._set_busy(None)
             return
         self._run_owner.set_handle(handle)
@@ -605,7 +604,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
                     "or close automatically."
                 )
                 self._diagnostic.setText(
-                    self._diagnostic_with_run_warnings(_error_summary(error))
+                    self._diagnostic_with_run_warnings(error_summary(error))
                 )
                 self._set_busy(None)
                 return
@@ -616,13 +615,13 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             elif isinstance(error, RunCancelled):
                 self._status.setText("CALIBRATION CANCELLED")
                 self._summary.setText("No new calibration artifact was committed.")
-                self._diagnostic.setText(_error_summary(error))
+                self._diagnostic.setText(error_summary(error))
                 self._set_busy(None)
             else:
                 self._status.setText("CALIBRATION FAILED")
                 self._summary.setText("No new calibration artifact was committed.")
                 self._diagnostic.setText(
-                    self._diagnostic_with_run_warnings(_error_summary(error))
+                    self._diagnostic_with_run_warnings(error_summary(error))
                 )
                 self._set_busy(None)
             return
@@ -641,7 +640,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
                     "receipt.  No exact reference is being guessed or hidden."
                 )
                 self._diagnostic.setText(
-                    self._diagnostic_with_run_warnings(_error_summary(error))
+                    self._diagnostic_with_run_warnings(error_summary(error))
                 )
                 self._set_busy(None)
                 return
@@ -652,7 +651,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             else:
                 self._status.setText("CALIBRATION FAILED")
                 self._summary.setText("No calibration artifact was committed.")
-                self._diagnostic.setText(_error_summary(error))
+                self._diagnostic.setText(error_summary(error))
                 self._set_busy(None)
             return
         if not snapshot.final_committed:
@@ -709,7 +708,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             except BaseException as error:
                 if not self._closing:
                     self._status.setText("CALIBRATION PREPARATION FAILED")
-                    self._diagnostic.setText(_error_summary(error))
+                    self._diagnostic.setText(error_summary(error))
             else:
                 if not self._closing:
                     try:
@@ -727,7 +726,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
                             self._diagnostic.setText("")
                     except BaseException as error:
                         self._status.setText("CALIBRATION PRESENTATION FAILED")
-                        self._diagnostic.setText(_error_summary(error))
+                        self._diagnostic.setText(error_summary(error))
             self._set_busy(None)
             return
         if kind != "report":
@@ -749,7 +748,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             if not self._closing:
                 self._status.setText(self._terminal_status(display_failed=True))
                 self._diagnostic.setText(
-                    self._diagnostic_with_run_warnings(_error_summary(error))
+                    self._diagnostic_with_run_warnings(error_summary(error))
                 )
         else:
             if not self._closing:
@@ -872,7 +871,7 @@ def open_calibration_workbench(
     else:
         limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
         timeout = positive_real(timeout_seconds, "timeout_seconds")
-    return _open_frozen_window(
+    return open_workbench_window(
         lambda: CalibrationWorkbenchWindow(
             computation_loader,
             run_starter,

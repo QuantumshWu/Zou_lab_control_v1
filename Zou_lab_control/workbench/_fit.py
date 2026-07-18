@@ -55,10 +55,8 @@ from zlc_workbench.fit import CaptureFitDraftAuthority, FitDraftResult
 from ._figure import _render_figure
 from ._frozen_raster import (
     FrozenRasterWindow,
-    _error_summary,
-    _load_bundle,
-    _open_frozen_window,
 )
+from ._window_runtime import error_summary, load_raster_bundle, open_workbench_window
 
 
 _DEFAULT_FIT_GUI_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
@@ -107,7 +105,7 @@ def _render_source(
             options["selection"] = selection
         return figure_factory(source, **options)
 
-    return _load_bundle(
+    return load_raster_bundle(
         lambda token: _render_figure(
             build_figure,
             memory_limit_bytes,
@@ -187,7 +185,7 @@ def _prepare_and_render(
     except BaseException as error:
         if cancelled.is_set() or isinstance(error, CancelledError):
             raise CancelledError() from error
-        return options, source_selection, None, _error_summary(error)
+        return options, source_selection, None, error_summary(error)
     return options, source_selection, bundle, None
 
 
@@ -222,7 +220,7 @@ def _fit_and_render(
         if cancelled() or isinstance(error, CancelledError):
             authority.discard(draft)
             raise CancelledError() from error
-        return draft, None, _error_summary(error)
+        return draft, None, error_summary(error)
     if cancelled():
         authority.discard(draft)
         raise CancelledError()
@@ -249,7 +247,7 @@ def _save_and_render(
     except BaseException as error:
         if cancelled.is_set() or isinstance(error, CancelledError):
             raise CancelledError() from error
-        return reference, None, _error_summary(error)
+        return reference, None, error_summary(error)
     return reference, bundle, None
 
 
@@ -495,7 +493,7 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
             spec = fit_spec_from_form(self._current_bound(), form.read_all())
         except (TypeError, ValueError) as error:
             self._status.setText("FIT REQUEST INVALID")
-            self._diagnostic.setText(_error_summary(error))
+            self._diagnostic.setText(error_summary(error))
             return
         previous_draft, self._draft_result = self._draft_result, None
         if previous_draft is not None:
@@ -694,7 +692,7 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
         except FitDeadlineExceeded as error:
             if not self._closing:
                 self._status.setText("FIT DEADLINE EXCEEDED")
-                self._diagnostic.setText(_error_summary(error))
+                self._diagnostic.setText(error_summary(error))
         except BaseException as error:
             if completed_draft is not None:
                 self._draft_authority.discard(completed_draft)
@@ -711,7 +709,7 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
                     "save": "SAVE FAILED",
                 }.get(kind, "FIT WORK FAILED")
                 self._status.setText(label)
-                self._diagnostic.setText(_error_summary(error))
+                self._diagnostic.setText(error_summary(error))
         else:
             if not self._closing:
                 try:
@@ -789,7 +787,7 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
                         )
                 except BaseException as error:
                     self._status.setText("FIT PRESENTATION FAILED")
-                    self._diagnostic.setText(_error_summary(error))
+                    self._diagnostic.setText(error_summary(error))
         if kind == "save" and self._close_deferred_during_save:
             self._close_deferred_during_save = False
         self._set_busy(None)
@@ -810,7 +808,7 @@ def open_capture_fit_workbench(
 ) -> CaptureFitWorkbenchWindow:
     limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
     timeout = positive_real(timeout_seconds, "timeout_seconds")
-    return _open_frozen_window(
+    return open_workbench_window(
         lambda: CaptureFitWorkbenchWindow(
             figure_factory,
             draft_figure_factory,
