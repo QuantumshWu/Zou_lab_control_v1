@@ -19,6 +19,38 @@ def open_capture_workbench(experiment, request):
     return _open(experiment, request)
 
 
+def open_capture_fit_workbench(
+    figure_factory,
+    draft_figure_factory,
+    fit_preparer,
+    fit_executor,
+    fit_saver,
+    source,
+    *,
+    selected_model=None,
+    memory_limit_bytes=None,
+    timeout_seconds=None,
+):
+    """Open typed committed-capture fit authoring without eager Qt imports."""
+
+    from ._fit import open_capture_fit_workbench as _open
+
+    keywords = {"selected_model": selected_model}
+    if memory_limit_bytes is not None:
+        keywords["memory_limit_bytes"] = memory_limit_bytes
+    if timeout_seconds is not None:
+        keywords["timeout_seconds"] = timeout_seconds
+    return _open(
+        figure_factory,
+        draft_figure_factory,
+        fit_preparer,
+        fit_executor,
+        fit_saver,
+        source,
+        **keywords,
+    )
+
+
 def open_calibration_report_workbench(
     computation_loader,
     reference,
@@ -138,6 +170,7 @@ def open_offline_pulse_workbench(
 __all__ = [
     "open_calibration_report_workbench",
     "open_camera_monitor_workbench",
+    "open_capture_fit_workbench",
     "open_capture_workbench",
     "open_data_figure_workbench",
     "open_figure_workbench",

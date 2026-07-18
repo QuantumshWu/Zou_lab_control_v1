@@ -27,18 +27,24 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     BlockId,
+    BoundFit,
     CommittedTransform,
     ComponentValidity,
     DataTransformSpec,
     FitNumericPolicy,
     FitParameterConstraint,
+    FitCancelled,
+    FitResultBatch,
     FitSpec,
     ReductionMethod,
     Selection,
     ValidityPolicy,
+    bind_fit,
     commit_transform,
     expand_value_validity,
+    fit_model_catalog,
     fit_spec_for,
+    validate_fit_result_source_binding,
 )
 from zlc_neutral_atom.artifacts import (
     AdmittedCaptureFitResult,
@@ -157,6 +163,7 @@ _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_OCCUPANCY_TIMEOUT_SECONDS = 300.0
 _DEFAULT_SCAN_MATERIALIZATION_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES = 512 << 20
+_DEFAULT_FIT_GUI_TIMEOUT_SECONDS = 30.0
 _SCAN_REPEAT_AXIS_ID = AxisId("scan.repeat")
 _SCAN_READOUT_EVENT_AXIS_ID = AxisId("scan.readout_event")
 
@@ -431,6 +438,7 @@ class _ExperimentServices:
     fit_repository: CaptureFitResultRepository
     catalog: DeviceCatalogView
     operation_lock: threading.RLock
+    active_fit_operations: int = 0
     state: str = "OPEN"
 
 
@@ -457,6 +465,34 @@ def _service_guard(
         if services.state != "OPEN":
             raise RuntimeError("Experiment is closing or closed")
         yield services
+
+
+@contextmanager
+def _fit_service_guard(
+    token: object,
+) -> Iterator[_ExperimentServices]:
+    """Keep repositories alive for one long Fit without serializing figures."""
+
+    with _AUTHORITY_LOCK:
+        services = _AUTHORITIES.get(token)
+    if services is None:
+        raise RuntimeError("Experiment is closed")
+    with services.operation_lock:
+        if services.state != "OPEN":
+            raise RuntimeError("Experiment is closing or closed")
+        services.active_fit_operations += 1
+    completed = False
+    try:
+        yield services
+        completed = True
+    finally:
+        with services.operation_lock:
+            if services.active_fit_operations <= 0:
+                raise RuntimeError("Experiment Fit operation count underflow")
+            services.active_fit_operations -= 1
+            remained_open = services.state == "OPEN"
+    if completed and not remained_open:
+        raise FitCancelled("Experiment began closing during Fit execution")
 
 
 def _calibration_repository(
@@ -1607,6 +1643,7 @@ def _project_notebook_figure(
     preferences,
     occupancy_output,
     memory_limit_bytes: int | None,
+    draft_fit_result: FitResultBatch | None = None,
 ):
     """Composition-only ref dispatch; frontend never sees a neutral repository."""
 
@@ -1640,12 +1677,24 @@ def _project_notebook_figure(
     if not is_occupancy and occupancy_output is not None:
         raise ValueError("occupancy_output is valid only for OccupancyArtifactRef")
 
-    fit_result = None
+    if draft_fit_result is not None and not isinstance(
+        draft_fit_result,
+        FitResultBatch,
+    ):
+        raise TypeError("draft_fit_result must be FitResultBatch or None")
+
+    fit_result = draft_fit_result
     snapshot = None
     admitted = None
     selected_occupancy_output = None
     source_label = "capture"
-    if isinstance(source, ScanArtifactRef):
+    if draft_fit_result is not None:
+        if not isinstance(source, CaptureArtifactRef):
+            raise TypeError(
+                "a draft fit result can only be projected over its capture source"
+            )
+        source_ref = source
+    elif isinstance(source, ScanArtifactRef):
         source_label = "scan"
         if memory_limit_bytes is None:
             schema = services.scan_repository.inspect_final(source).output_schema
@@ -1715,6 +1764,13 @@ def _project_notebook_figure(
     if source_ref is not None:
         admitted = services.capture_repository.admit(source_ref)
         schema = admitted.artifact.frame_source.schema
+        if draft_fit_result is not None:
+            frame_source = admitted.artifact.frame_source
+            validate_fit_result_source_binding(
+                draft_fit_result,
+                frame_source.ref(admitted.artifact.provenance.generation),
+                schema,
+            )
     if fit_result is None:
         if intent is None:
             roles = {
@@ -1786,6 +1842,50 @@ def _project_notebook_figure(
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
         fit_result,
+    )
+
+
+def _data_figure_for_services(
+    services: _ExperimentServices,
+    source,
+    *,
+    intent,
+    selection,
+    preferences,
+    occupancy_output,
+    memory_limit_bytes: int,
+    draft_fit_result: FitResultBatch | None = None,
+) -> "DataFigure":
+    """Build one frozen DataFigure while repository authority stays private."""
+
+    document, datasets, fit_result = _project_notebook_figure(
+        services,
+        source,
+        intent=intent,
+        selection=selection,
+        preferences=preferences,
+        occupancy_output=occupancy_output,
+        memory_limit_bytes=memory_limit_bytes,
+        draft_fit_result=draft_fit_result,
+    )
+    assert datasets is not None
+    from zlc_frontend import DataFigure
+
+    retained_input_bytes = sum(
+        dataset_storage_nbytes(entry.snapshot.block.schema)
+        for entry in datasets.entries
+    )
+    evaluation_limit = memory_limit_bytes - retained_input_bytes
+    if evaluation_limit <= 0:
+        raise MemoryError(
+            "figure input snapshot leaves no memory for view evaluation"
+        )
+    return DataFigure(
+        document,
+        datasets,
+        fit_results=({"data": fit_result} if fit_result is not None else None),
+        evaluation_memory_limit_bytes=evaluation_limit,
+        render_memory_limit_bytes=memory_limit_bytes,
     )
 
 
@@ -1918,6 +2018,131 @@ class Experiment:
                 services.capture_repository,
             )
 
+    def fit_gui(
+        self,
+        source: CaptureArtifactRef,
+        *,
+        model: str | None = None,
+        memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
+        timeout_seconds: float = _DEFAULT_FIT_GUI_TIMEOUT_SECONDS,
+    ):
+        """Author, preview, and explicitly save one raw committed-capture fit.
+
+        The first GUI slice deliberately accepts no ``CommittedTransform`` and
+        never derives authority from a current display or selector.  Models
+        are offered only when their declared axis roles have one unambiguous
+        match in the source schema; advanced axis/transform authoring remains
+        available through :meth:`fit`.
+        """
+
+        if not isinstance(source, CaptureArtifactRef):
+            raise TypeError("source must be CaptureArtifactRef")
+        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        timeout = _positive_real(timeout_seconds, "timeout_seconds")
+        selected_model = None if model is None else _text(model, "model")
+
+        def prepare_fit() -> tuple[BoundFit, ...]:
+            with _service_guard(self._authority_token) as services:
+                inspection = services.capture_repository.inspect_final(
+                    source,
+                    memory_limit_bytes=limit,
+                )
+            schema = inspection.dataset_schema
+            options: list[BoundFit] = []
+            for definition in fit_model_catalog():
+                try:
+                    spec = fit_spec_for(schema, definition.model_id)
+                    bound = bind_fit(spec, schema)
+                except ValueError:
+                    continue
+                if bound.spec.committed_transform is not None:
+                    raise RuntimeError(
+                        "raw fit option unexpectedly contains a transform"
+                    )
+                options.append(bound)
+            if not options:
+                raise ValueError(
+                    "capture schema has no unambiguous current fit model; use fit() "
+                    "with explicit fit_axis_ids"
+                )
+            if selected_model is not None and selected_model not in {
+                option.spec.model_id for option in options
+            }:
+                raise ValueError(
+                    f"fit model {selected_model!r} is not unambiguous for this "
+                    "capture schema"
+                )
+            return tuple(options)
+
+        def execute_fit(
+            spec: FitSpec,
+            cancel_check,
+            deadline_monotonic: float,
+        ) -> FitExecution:
+            if not isinstance(spec, FitSpec):
+                raise TypeError("fit GUI execution requires FitSpec")
+            if spec.committed_transform is not None:
+                raise ValueError("fit GUI does not accept CommittedTransform")
+            with _fit_service_guard(self._authority_token) as services:
+                admitted = services.capture_repository.admit(source)
+                schema = admitted.artifact.frame_source.schema
+                if spec.input_schema_fingerprint != schema.fingerprint:
+                    raise ValueError("fit GUI spec belongs to another source schema")
+                bind_fit(spec, schema)
+                return services.fit_repository.execute(
+                    admitted,
+                    spec,
+                    cancel_check=cancel_check,
+                    deadline_monotonic=deadline_monotonic,
+                )
+
+        def preview_fit_result(
+            result: FitResultBatch,
+            *,
+            memory_limit_bytes: int,
+        ) -> "DataFigure":
+            preview_limit = _positive_int(
+                memory_limit_bytes,
+                "memory_limit_bytes",
+            )
+            if not isinstance(result, FitResultBatch):
+                raise TypeError("fit preview requires FitResultBatch")
+            with _service_guard(self._authority_token) as services:
+                return _data_figure_for_services(
+                    services,
+                    source,
+                    intent=None,
+                    selection=None,
+                    preferences=None,
+                    occupancy_output=None,
+                    memory_limit_bytes=preview_limit,
+                    draft_fit_result=result,
+                )
+
+        def save_fit_execution(
+            execution: FitExecution,
+        ) -> CaptureFitResultArtifactRef:
+            if not isinstance(execution, FitExecution):
+                raise TypeError("fit save requires FitExecution")
+            if execution.source_capture_ref != source:
+                raise ValueError("fit save execution belongs to another capture")
+            with _service_guard(self._authority_token):
+                return execution.save()
+
+        from Zou_lab_control.workbench import open_capture_fit_workbench
+
+        return open_capture_fit_workbench(
+            self.figure,
+            preview_fit_result,
+            prepare_fit,
+            execute_fit,
+            save_fit_execution,
+            source,
+            selected_model=selected_model,
+            memory_limit_bytes=limit,
+            timeout_seconds=timeout,
+        )
+
     def figure_document(
         self,
         source: (
@@ -1973,7 +2198,7 @@ class Experiment:
 
         limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         with _service_guard(self._authority_token) as services:
-            document, datasets, fit_result = _project_notebook_figure(
+            return _data_figure_for_services(
                 services,
                 source,
                 intent=intent,
@@ -1982,26 +2207,6 @@ class Experiment:
                 occupancy_output=occupancy_output,
                 memory_limit_bytes=limit,
             )
-        assert datasets is not None
-        from zlc_frontend import DataFigure
-
-        retained_input_bytes = sum(
-            dataset_storage_nbytes(entry.snapshot.block.schema)
-            for entry in datasets.entries
-        )
-        evaluation_limit = limit - retained_input_bytes
-        if evaluation_limit <= 0:
-            raise MemoryError(
-                "figure input snapshot leaves no memory for view evaluation"
-            )
-
-        return DataFigure(
-            document,
-            datasets,
-            fit_results=({"data": fit_result} if fit_result is not None else None),
-            evaluation_memory_limit_bytes=evaluation_limit,
-            render_memory_limit_bytes=limit,
-        )
 
     def figure_gui(
         self,
@@ -2043,6 +2248,11 @@ class Experiment:
             if services.state == "CLOSED":
                 return
             services.state = "CLOSING"
+            if services.active_fit_operations:
+                raise RuntimeError(
+                    "Experiment close is waiting for an active Fit operation "
+                    "to terminate"
+                )
             shutdown = services.runtime.shutdown(timeout=2.0)
             if not shutdown:
                 raise RuntimeError(

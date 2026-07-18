@@ -41,6 +41,7 @@ tests/test_w3_api_segmented_scan.py
 tests/test_w3_scan_panel_controller.py
 tests/test_w3_task_console.py
 tests/test_w4_figure_workbench.py
+tests/test_w5_capture_fit_workbench.py
 tests/test_m1_camera_monitor.py
 tests/test_m2_camera_monitor_roi_curve.py
 tests/test_m2b_camera_monitor_scalar_history.py

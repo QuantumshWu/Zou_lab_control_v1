@@ -9,6 +9,7 @@ commit journal.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 import threading
 
@@ -261,13 +262,20 @@ class CaptureFitResultRepository:
         self,
         source: AdmittedCapture,
         spec: FitSpec,
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+        deadline_monotonic: float | None = None,
     ) -> FitExecution:
         with self._lifecycle_lock:
             self._require_integrity()
         snapshot = source.materialize_snapshot(
             memory_limit_bytes=self.materialization_memory_limit_bytes,
         )
-        result = bind_fit(spec, snapshot.block.schema).run(snapshot)
+        result = bind_fit(spec, snapshot.block.schema).run(
+            snapshot,
+            cancel_check=cancel_check,
+            deadline_monotonic=deadline_monotonic,
+        )
         with self._lifecycle_lock:
             self._require_integrity()
             return FitExecution(

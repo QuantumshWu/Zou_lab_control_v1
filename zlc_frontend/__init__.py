@@ -8,6 +8,11 @@ from .form import (
     FormSpec,
     parse_number_text,
 )
+from .fit_editor import (
+    fit_axis_summary,
+    fit_constraint_form,
+    fit_spec_from_form,
+)
 from .render import (
     AtomicBoardFront,
     BoardFrame,
@@ -124,6 +129,9 @@ __all__ = [
     "encode_figure_document",
     "encode_view_spec",
     "estimate_view_evaluation_peak_nbytes",
+    "fit_axis_summary",
+    "fit_constraint_form",
+    "fit_spec_from_form",
     "suggest_view",
     "suggest_fit_view",
     "validate_view_spec",

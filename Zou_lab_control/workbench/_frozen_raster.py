@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Executor, Future, ThreadPoolExecutor
 import math
 import threading
 from typing import Callable
@@ -73,14 +73,18 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         object_prefix: str,
         subject: str,
         memory_limit_bytes: int,
+        executor: Executor | None = None,
     ) -> None:
         super().__init__()
         if loader is not None and not callable(loader):
             raise TypeError("loader must be callable or None")
+        if executor is not None and not isinstance(executor, Executor):
+            raise TypeError("executor must implement concurrent.futures.Executor")
         self._memory_limit_bytes = positive_integer(
             memory_limit_bytes,
             "memory_limit_bytes",
         )
+        self._executor = _FROZEN_RASTER_EXECUTOR if executor is None else executor
         self._prefix = canonical_text(object_prefix, "object_prefix")
         self._subject = canonical_text(subject, "subject").upper()
         self._future: Future[EncodedRasterDocument] | None = None
@@ -144,7 +148,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         if self._future is not None:
             raise RuntimeError("frozen raster window already has active work")
         try:
-            future = _FROZEN_RASTER_EXECUTOR.submit(function, *args)
+            future = self._executor.submit(function, *args)
         except BaseException as error:
             self._status.setText(f"{self._subject} FAILED")
             self._diagnostic.setText(_error_summary(error))
