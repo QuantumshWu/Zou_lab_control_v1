@@ -16,7 +16,7 @@ import pytest
 
 import Zou_lab_control.notebook as zlc
 from zlc_data import MONITOR_HISTORY, SPATIAL_X, SPATIAL_Y
-from zlc_frontend.qt_widgets import QtImageBoard
+from zlc_frontend.qt_widgets import QtRasterBoard
 from zlc_neutral_atom.runtime.run import RunState
 from zlc_neutral_atom.bootstrap._virtual_hardware import (
     VirtualMonitorCamera,
@@ -60,7 +60,7 @@ def _widgets(window):
         window.findChild(QtWidgets.QLabel, "monitorStatus"),
         window.findChild(QtWidgets.QLabel, "monitorViewStatus"),
         window.findChild(QtWidgets.QLabel, "diagnostics"),
-        window.findChild(QtImageBoard, "cameraMonitorImageBoard"),
+        window.findChild(QtRasterBoard, "cameraMonitorImageBoard"),
     )
 
 

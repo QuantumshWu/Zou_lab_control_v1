@@ -43,7 +43,6 @@ from zlc_frontend.qt_widgets import (
     GREEN,
     ImageViewportTransform,
     ORANGE,
-    QtImageBoard,
     QtOwnerWake,
     QtRasterBoard,
     RectangleGesture,
@@ -152,7 +151,7 @@ class _PreparedMonitorView:
     scalar_documents: tuple[FigureDocument, ...]
     evaluation_policy: FigureEvaluationPolicy
     downstream_peak_bytes: int
-    viewport: ImageViewportTransform | None
+    viewport: ImageViewportTransform
     projection_text: str
 
 
@@ -200,7 +199,10 @@ def _prepare_monitor_view(
     scalar_views: tuple[ViewSpec, ...] = ()
     scalar_evaluation_peaks: tuple[int, ...] = ()
     projection_text = _RAW_PROJECTION_TEXT
-    viewport = None
+    viewport = ImageViewportTransform(
+        (y_axes[0], x_axes[0]),
+        viewport_revision=generation,
+    )
     if scalar_schema is None:
         if roi_binding is not None or command.request.roi is not None:
             raise RuntimeError("ROI request has no scalar view product")
@@ -243,10 +245,6 @@ def _prepare_monitor_view(
                     else None
                 ),
             )
-        viewport = ImageViewportTransform(
-            (y_axes[0], x_axes[0]),
-            viewport_revision=generation,
-        )
         # Resolve once during preparation so binding the GUI overlay after the
         # old Run is gone cannot discover a coordinate/selection mismatch.
         viewport.normalized_bounds_for_selection(roi_binding.selection)
@@ -366,7 +364,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._diagnostics = FluentLabel("")
         self._diagnostics.setObjectName("diagnostics")
         self._diagnostics.setWordWrap(True)
-        self._board_widget: QtImageBoard | QtRasterBoard | None = None
+        self._board_widget: QtRasterBoard | None = None
+        self._board_panel_ids: tuple[str, ...] | None = None
         self._board_container = QtWidgets.QWidget(self)
         self._board_layout = QtWidgets.QVBoxLayout(self._board_container)
         self._board_layout.setContentsMargins(0, 0, 0, 0)
@@ -374,7 +373,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._selector_switch = FluentSwitch("ROI selector", self)
         self._selector_switch.setObjectName("roiSelectorSwitch")
         self._selector_switch.setChecked(False)
-        self._selector_switch.setEnabled(request.roi is not None)
+        self._selector_switch.setEnabled(False)
         self._reducer_combo = FluentComboBox(self)
         self._reducer_combo.setObjectName("roiReducerCombo")
         for label, reduction in (
@@ -386,12 +385,16 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         initial_reducer = self._reducer_combo.findData(request.roi_reduction)
         if initial_reducer >= 0:
             self._reducer_combo.setCurrentIndex(initial_reducer)
-        self._reducer_combo.setEnabled(request.roi is not None)
+        self._reducer_combo.setEnabled(False)
         self._apply_roi_button = FluentButton("Apply ROI", self, color=ORANGE)
         self._apply_roi_button.setObjectName("applyRoiButton")
         self._apply_roi_button.setEnabled(False)
         self._roi_status = FluentLabel(
-            "ROI: unavailable" if request.roi is None else "ROI: fixed request"
+            (
+                "ROI: start the raw monitor, then draw a rectangle"
+                if request.roi is None
+                else "ROI: fixed request"
+            )
         )
         self._roi_status.setObjectName("roiStatus")
         self._roi_status.setWordWrap(True)
@@ -523,7 +526,6 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         return value
 
     def _update_roi_controls(self, *_args) -> None:
-        roi_available = self._applied_request.roi is not None
         busy = (
             self._closing
             or self._manual_stop_requested
@@ -541,17 +543,17 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 and self._draft_selection != self._applied_request.roi
             )
             or (
-                roi_available
+                self._applied_request.roi is not None
                 and self._selected_reducer() is not self._applied_request.roi_reduction
             )
         )
-        self._selector_switch.setEnabled(roi_available and not busy and active)
-        self._reducer_combo.setEnabled(roi_available and not busy and active)
+        self._selector_switch.setEnabled(not busy and active)
+        self._reducer_combo.setEnabled(not busy and active)
         self._apply_roi_button.setEnabled(
-            roi_available and not busy and active and changed
+            not busy and active and changed
         )
         self._set_selector_enabled(
-            self._selector_switch.isChecked() and roi_available and not busy and active
+            self._selector_switch.isChecked() and not busy and active
         )
 
     def _apply_roi_draft(self) -> None:
@@ -596,31 +598,28 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._run_owner.submit("apply_prepare", prepare, generation=generation)
 
     def _configure_board_widget(self, *, scalar: bool) -> None:
-        expected = QtRasterBoard if scalar else QtImageBoard
+        panel_ids = (
+            (_IMAGE_PANEL_ID, *_SCALAR_PANEL_IDS)
+            if scalar
+            else (_IMAGE_PANEL_ID,)
+        )
         current = self._board_widget
-        if isinstance(current, expected):
+        if isinstance(current, QtRasterBoard) and self._board_panel_ids == panel_ids:
             return
         if current is not None:
             self._board_layout.removeWidget(current)
             current.setParent(None)
             current.deleteLater()
-        widget = (
-            QtRasterBoard(
-                (_IMAGE_PANEL_ID, *_SCALAR_PANEL_IDS),
-                self._board_container,
-                columns=2,
-                empty_text="Monitor stopped",
-            )
-            if scalar
-            else QtImageBoard(
-                _IMAGE_PANEL_ID,
-                self._board_container,
-                empty_text="Monitor stopped",
-            )
+        widget = QtRasterBoard(
+            panel_ids,
+            self._board_container,
+            columns=2 if scalar else 1,
+            empty_text="Monitor stopped",
         )
         widget.setObjectName("cameraMonitorImageBoard")
         self._board_layout.addWidget(widget)
         self._board_widget = widget
+        self._board_panel_ids = panel_ids
 
     def _submit_prepare(self) -> None:
         if self._closing or self._prepare_inflight or self._prepared is not None:
@@ -669,28 +668,24 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._close_live()
         generation = self._run_owner.begin_generation()
         try:
-            if roi_binding is None:
-                self._viewport_transform = None
-            else:
-                selector_board = self._board_widget
-                selector_viewport = prepared_view.viewport
-                if not isinstance(selector_board, QtRasterBoard):
-                    raise RuntimeError("ROI selector host changed after preparation")
-                if (
-                    selector_viewport is None
-                    or selector_viewport.viewport_revision != generation
-                ):
-                    raise RuntimeError("selector viewport generation prediction changed")
-                selector_board.bind_rectangle_selector(
-                    _IMAGE_PANEL_ID,
-                    selector_viewport,
-                    self._accept_rectangle_gesture,
-                    interaction_callback=self._set_selector_interacting,
-                    enabled=False,
-                )
-                selector_board.set_selector_applied_selection(roi_binding.selection)
-                selector_board.set_selector_draft_selection(None)
-                self._viewport_transform = selector_viewport
+            selector_board = self._board_widget
+            selector_viewport = prepared_view.viewport
+            if not isinstance(selector_board, QtRasterBoard):
+                raise RuntimeError("ROI selector host changed after preparation")
+            if selector_viewport.viewport_revision != generation:
+                raise RuntimeError("selector viewport generation prediction changed")
+            selector_board.bind_rectangle_selector(
+                _IMAGE_PANEL_ID,
+                selector_viewport,
+                self._accept_rectangle_gesture,
+                interaction_callback=self._set_selector_interacting,
+                enabled=False,
+            )
+            selector_board.set_selector_applied_selection(
+                None if roi_binding is None else roi_binding.selection
+            )
+            selector_board.set_selector_draft_selection(None)
+            self._viewport_transform = selector_viewport
         except BaseException as error:
             self._run_owner.mark_owner_reaped()
             self._running_binding = None
@@ -1026,6 +1021,12 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                                 self._pending_request = None
                                 self._prepared = self._prepared_apply
                                 self._prepared_apply = None
+                                self._configure_board_widget(
+                                    scalar=(
+                                        self._prepared.command.scalar_view_schema
+                                        is not None
+                                    )
+                                )
                                 self._apply_phase = "WAITING_FRONT"
                                 self._roi_status.setText(
                                     "ROI: old generation terminal · starting replacement"
@@ -1286,6 +1287,9 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         event.ignore()
         if not self._closing:
             self._closing = True
+            self._prepared_apply = None
+            self._pending_request = None
+            self._apply_phase = None
             self._start_button.setEnabled(False)
             self._stop_button.setEnabled(False)
             self._run_status.setText("Monitor: CLOSING")

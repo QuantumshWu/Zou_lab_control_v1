@@ -49,6 +49,7 @@ tests/test_m2_camera_monitor_roi_curve.py
 tests/test_m2b_camera_monitor_scalar_history.py
 tests/test_m2c_camera_monitor_histogram_meter.py
 tests/test_m2d_camera_monitor_roi_selector.py
+tests/test_m2e_camera_monitor_first_roi.py
 tests/test_zlc_calibration_commit.py
 tests/test_zlc_calibration_stream_contracts.py
 tests/test_zlc_camera_adapter_sdk.py
