@@ -281,19 +281,24 @@ def test_max_is_typed_validity_aware_and_all_roi_reducers_reject_valid_nonfinite
     assert metadata_contract.fingerprint != old_layout_fingerprint
 
 
-def test_pause_ends_a_candidate_waiting_for_gui_admission():
+def test_sticky_presentation_freeze_ends_a_candidate_waiting_for_gui_admission():
     controller = object.__new__(LiveImageBoardController)
+    controller._owner_thread = threading.get_ident()
     controller._lock = threading.Lock()
     controller._closed = False
-    controller._paused = False
+    controller._presentation_frozen = False
     controller._dirty = True
     controller._active = True
     controller._candidate = object()
-    controller.pause()
-    assert controller._paused is True
+    controller._port = object()
+    controller._sources = (object(),)
+    controller._board = SimpleNamespace(freeze_front=lambda: None)
+    controller.freeze_presentation()
+    assert controller._presentation_frozen is True
     assert controller._dirty is False
     assert controller._candidate is None
     assert controller._active is False
+    assert controller._port is None and controller._sources is None
 
 
 class _NarrowCameraDataset(CameraMonitorLiveDataset):
@@ -641,9 +646,6 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
         monkeypatch.setattr(board, "stage_layout", observe_stage_layout)
         old_layout_generation = window._board.model.layout_generation
 
-        window._live.pause()
-        _until(application, lambda: not window._live._active)
-        window._board.present_pending()
         retained_front = board.front_frame
         assert retained_front is not None
         old_board_sequence = retained_front.sequence
@@ -658,13 +660,27 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
             target.top() + 3 * target.height() // 4,
         )
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start_point)
-        assert window._selector_interacting is True
+        held_pixels = board._selector_hold.prepared[0]
+        _until(
+            application,
+            lambda: (
+                board.front_frame.sequence > old_board_sequence
+                and window._live.front_status is not None
+                and window._live.front_status.sequence == board.front_frame.sequence
+            ),
+            timeout=20.0,
+        )
+        hold = board._selector_hold
+        assert hold is not None
+        assert hold.panel_id == "camera-monitor-image"
+        assert hold.sequence == old_board_sequence
+        assert board.front_frame.sequence > hold.sequence
+        assert hold.prepared[0] is held_pixels
         QtTest.QTest.mouseMove(board, end_point)
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end_point)
         assert len(receipts) == 1 and len(submitted) == 1
         draft = submitted[0].selection
         assert draft != initial_roi
-        assert window._selector_interacting is False
         assert window._handle is old_handle
         _until(
             application,
@@ -674,14 +690,14 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
             ),
             timeout=20.0,
         )
-        assert board.front_frame is retained_front
+        assert board.front_frame.sequence > old_board_sequence
+        assert board._selector_hold is None
         assert board._selector_applied_bounds == _overlay_bounds(board, initial_roi)
         assert board._selector_draft_bounds == _overlay_bounds(board, draft)
         assert window._projection_status.text().startswith(
             f"Display: {old_visible_projection} · target "
         )
         assert window._projection_status.text().endswith(" pending")
-        window._live.resume()
         _until(
             application,
             lambda: (
@@ -691,6 +707,8 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
                 and window._live.front_status.scalar_control_revision
                 == receipts[0].snapshot().revision
                 and board.front_frame.sequence > old_board_sequence
+                and window._live.front_status.sequence == board.front_frame.sequence
+                and window._draft_selection is None
             ),
             timeout=20.0,
         )
@@ -839,7 +857,7 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
             "publish",
             fail_before_real_publish,
         )
-        retryable_selection = window._viewport_transform.selection_for_normalized_bounds(
+        retryable_selection = board._selector_viewport.selection_for_normalized_bounds(
             (0.05, 0.05, 0.3, 0.3)
         )
         window._submit_roi_control(retryable_selection)
@@ -899,7 +917,7 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
             "publish",
             publish_then_raise,
         )
-        committed_failure_selection = window._viewport_transform.selection_for_normalized_bounds(
+        committed_failure_selection = board._selector_viewport.selection_for_normalized_bounds(
             (0.2, 0.2, 0.45, 0.45)
         )
         window._submit_roi_control(committed_failure_selection)
@@ -1101,7 +1119,7 @@ def test_stop_after_same_schema_commit_keeps_the_revision_applied(
             "commit_append_replacement",
             hold_after_irreversible_commit,
         )
-        target_selection = window._viewport_transform.selection_for_normalized_bounds(
+        target_selection = board._selector_viewport.selection_for_normalized_bounds(
             (0.15, 0.15, 0.55, 0.55)
         )
         window._submit_roi_control(target_selection)
@@ -1179,10 +1197,9 @@ def test_spontaneous_roi_branch_failure_falls_back_to_raw_without_source_gap(
         _run, _epoch, before = slot.freeze_camera_current()
         assert before.scalar is not None
 
-        # Freeze presentation only.  The producer and downstream branch keep
-        # running, so the raw fallback must first coexist with the old scalar
-        # front instead of clearing or relabelling it.
-        live.pause()
+        # Delay only the owner-side failure fold.  The producer keeps running;
+        # adopting raw-only must retain the old coherent front until its first
+        # replacement board arrives, without a reversible whole-live pause.
         real_project = RoiScalarStreamProjection.project
 
         def fail_applied_branch(self, update, binding, control_revision):
@@ -1230,7 +1247,6 @@ def test_spontaneous_roi_branch_failure_falls_back_to_raw_without_source_gap(
         )
         assert after_failure.raw.head.sequence > before.raw.head.sequence
 
-        live.resume()
         _until(
             application,
             lambda: (

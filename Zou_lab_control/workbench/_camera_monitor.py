@@ -279,6 +279,7 @@ def _prepare_monitor_view(
     downstream_peak = image_evaluation_peak + estimate_gray8_raster_peak_nbytes(
         y_axes[0].size,
         x_axes[0].size,
+        retained_fronts=2,
     )
 
     scalar_views: tuple[ViewSpec, ...] = ()
@@ -406,8 +407,6 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._visible_binding_fingerprint: str | None = None
         self._visible_projection_text: str | None = None
         self._draft_selection: Selection | None = None
-        self._viewport_transform = None
-        self._selector_interacting = False
         self._slot: LiveDatasetSlot | None = None
         self._live: LiveImageBoardController | None = None
         self._board: BoardController | None = None
@@ -519,64 +518,21 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
     def _submit_worker(self, work):
         return self._run_owner.submit_render(work)
 
-    def _sync_live_pause(self) -> None:
-        live = self._live
-        if live is None:
-            return
-        slot = self._slot
-        board = self._board
-        unhealthy = (
-            self._roi_presentation_failure is not None
-            or live.fault is not None
-            or (board is not None and board.fault is not None)
-            or (slot is not None and slot.failure is not None)
-            or (slot is not None and slot.notification_failure is not None)
-            or (slot is not None and (slot.terminal or slot.withdrawn))
-        )
-        if self._selector_interacting or unhealthy:
-            live.pause()
-        else:
-            live.resume()
-
     def _set_selector_enabled(self, enabled: bool) -> None:
         board = self._board_widget
         setter = getattr(board, "set_rectangle_selector_enabled", None)
         if callable(setter):
             setter(bool(enabled))
 
-    def _set_selector_interacting(self, active: bool) -> None:
-        if not isinstance(active, bool):
-            raise TypeError("selector interaction state must be bool")
-        self._selector_interacting = active
-        self._sync_live_pause()
-        self._wake.request_owner_wake()
-
     def _accept_rectangle_gesture(self, gesture: RectangleGesture) -> None:
         if not isinstance(gesture, RectangleGesture):
             raise TypeError("selector callback requires RectangleGesture")
         board = self._board_widget
-        viewport = self._viewport_transform
-        if not isinstance(board, QtRasterBoard) or viewport is None:
+        if not isinstance(board, QtRasterBoard):
             raise RuntimeError("ROI selector has no active raster viewport")
-        front = board.front_frame
-        if (
-            front is None
-            or gesture.panel_id != _IMAGE_PANEL_ID
-            or gesture.board_id != front.board_id
-            or gesture.layout_generation != front.layout_generation
-            or gesture.sequence != front.sequence
-            or gesture.viewport_revision != viewport.viewport_revision
-        ):
-            raise RuntimeError("ROI gesture is stale relative to the visible front")
-        image_panel = next(
-            (panel for panel in front.panels if panel.panel_id == _IMAGE_PANEL_ID),
-            None,
-        )
-        if image_panel is None or image_panel.source_identity != gesture.source_identity:
-            raise RuntimeError("ROI gesture source differs from the visible image")
-        selection = viewport.selection_for_normalized_bounds(
-            gesture.normalized_bounds
-        )
+        if gesture.panel_id != _IMAGE_PANEL_ID:
+            raise RuntimeError("ROI gesture belongs to another panel")
+        selection = board.selection_for_rectangle_gesture(gesture)
         if selection == self._applied_request.roi:
             selection = None
         self._draft_selection = selection
@@ -786,13 +742,11 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 _IMAGE_PANEL_ID,
                 selector_viewport,
                 self._accept_rectangle_gesture,
-                interaction_callback=self._set_selector_interacting,
                 enabled=False,
             )
             if not selector_board.has_front:
                 selector_board.set_selector_applied_selection(None)
             selector_board.set_selector_draft_selection(self._draft_selection)
-            self._viewport_transform = selector_viewport
         except BaseException as error:
             self._run_owner.mark_owner_reaped()
             self._running_binding = None
@@ -884,18 +838,16 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             self._drain_roi_controls()
             live = self._live
             board = self._board
-            view_frozen = self._selector_interacting
             view_faulted = False
-            if live is not None and not view_frozen:
+            if live is not None:
                 view_faulted = live.reconcile_faults()
             if (
                 board is not None
                 and board.fault is None
-                and not view_frozen
                 and not view_faulted
             ):
                 board.present_pending()
-            if live is not None and not view_frozen and not view_faulted:
+            if live is not None and not view_faulted:
                 # Present the previous completed raster before admitting the
                 # next candidate, so front_status remains sequence-gated.
                 live.admit_pending()

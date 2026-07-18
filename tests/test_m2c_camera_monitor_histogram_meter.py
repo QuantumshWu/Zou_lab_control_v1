@@ -54,6 +54,7 @@ from zlc_frontend.matplotlib_render import (
     SinglePanelAggRenderer,
     histogram_bin_counts,
 )
+from zlc_frontend.image_raster import estimate_gray8_raster_peak_nbytes
 from zlc_frontend.qt_widgets import QtRasterBoard
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_workbench.live import LiveFrontStatus
@@ -364,12 +365,40 @@ def test_scalar_display_budget_rejects_before_monitor_arm(experiment, applicatio
         scalar_history_capacity=8,
         memory_limit_bytes=1 << 30,
     )
-    base_peak = experiment.readout.inspect_camera_monitor(roomy).base_peak_bytes
+    window = experiment.readout.camera_monitor_gui(roomy)
+    try:
+        start = window.findChild(QtWidgets.QPushButton, "startButton")
+        _until(application, start.isEnabled)
+        prepared = window._prepared
+        assert prepared is not None
+        required_peak = (
+            prepared.command.descriptor.base_peak_bytes
+            + prepared.downstream_peak_bytes
+        )
+        y_axis, x_axis = prepared.command.view_schema.cell_schema.data_axes
+        held_bytes = y_axis.size * x_axis.size
+        assert (
+            estimate_gray8_raster_peak_nbytes(
+                y_axis.size,
+                x_axis.size,
+                retained_fronts=2,
+            )
+            - estimate_gray8_raster_peak_nbytes(
+                y_axis.size,
+                x_axis.size,
+                retained_fronts=1,
+            )
+            == held_bytes
+        )
+    finally:
+        if window.isVisible():
+            _close_window(application, window)
+
     request = experiment.readout.camera_monitor_request(
         history_capacity=2,
         roi=roi,
         scalar_history_capacity=8,
-        memory_limit_bytes=base_peak + 1,
+        memory_limit_bytes=required_peak - held_bytes,
     )
     window = experiment.readout.camera_monitor_gui(request)
     try:
@@ -378,6 +407,21 @@ def test_scalar_display_budget_rejects_before_monitor_arm(experiment, applicatio
         assert not start.isEnabled()
         assert window._handle is None
         assert window._slot is None
+    finally:
+        if window.isVisible():
+            _close_window(application, window)
+
+    exact = experiment.readout.camera_monitor_request(
+        history_capacity=2,
+        roi=roi,
+        scalar_history_capacity=8,
+        memory_limit_bytes=required_peak,
+    )
+    window = experiment.readout.camera_monitor_gui(exact)
+    try:
+        start = window.findChild(QtWidgets.QPushButton, "startButton")
+        _until(application, start.isEnabled)
+        assert window._handle is None and window._slot is None
     finally:
         if window.isVisible():
             _close_window(application, window)
@@ -440,7 +484,6 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
         _drain_roi_controls=lambda: None,
         _live=Live(),
         _board=board,
-        _selector_interacting=False,
         _apply_phase=None,
         _slot=None,
         _run_owner=SimpleNamespace(take_pending_snapshot=lambda: None),
@@ -513,31 +556,6 @@ def test_close_failure_after_front_clear_immediately_drops_visible_label():
     assert harness._visible_binding_fingerprint is None
     assert harness._visible_projection_text is None
     assert projection_label.text == "Display: no coherent front · target target projection"
-
-
-def test_selector_end_cannot_resume_a_sticky_presentation_failure():
-    calls = []
-    live = SimpleNamespace(
-        fault=None,
-        pause=lambda: calls.append("pause"),
-        resume=lambda: calls.append("resume"),
-    )
-    harness = SimpleNamespace(
-        _live=live,
-        _slot=SimpleNamespace(
-            failure=None,
-            notification_failure=None,
-            terminal=False,
-            withdrawn=False,
-        ),
-        _board=SimpleNamespace(fault=None),
-        _roi_presentation_failure="sticky presentation failure",
-        _selector_interacting=False,
-    )
-
-    CameraMonitorWorkbenchWindow._sync_live_pause(harness)
-
-    assert calls == ["pause"]
 
 
 def test_every_presentation_failure_path_freezes_before_recording_status():

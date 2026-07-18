@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from zlc_storage import positive_integer
+from zlc_storage import nonnegative_integer, positive_integer
 
 from .figure import EvaluatedImage
 from .render import PixelFormat, RasterBuffer
@@ -59,22 +59,31 @@ def estimate_encoded_png_front_peak_nbytes(
     )
 
 
-def estimate_gray8_raster_peak_nbytes(height: int, width: int) -> int:
-    """Bound raster scratch, returned bytes, and one previous live front.
+def estimate_gray8_raster_peak_nbytes(
+    height: int,
+    width: int,
+    *,
+    retained_fronts: int = 1,
+) -> int:
+    """Bound raster scratch, returned bytes, and retained live fronts.
 
     The caller-owned :class:`EvaluatedImage` is deliberately excluded.  The
-    five terms are a finite mask, float32 normalization workspace, uint8
-    workspace, returned immutable bytes, and the prior presenter front.
+    terms are a finite mask, float32 normalization workspace, uint8 workspace,
+    returned immutable bytes, and ``retained_fronts`` presenter/interaction
+    fronts.  A live rectangle hold uses two: the latest board front plus the
+    older target-panel raster kept visible under the pointer.
     """
 
     height = positive_integer(height, "height")
     width = positive_integer(width, "width")
+    retained_fronts = nonnegative_integer(retained_fronts, "retained_fronts")
     pixels = height * width
-    return pixels * (
+    scratch_and_result = pixels * (
         np.dtype(bool).itemsize
         + np.dtype(np.float32).itemsize
-        + 3 * np.dtype(np.uint8).itemsize
+        + 2 * np.dtype(np.uint8).itemsize
     )
+    return scratch_and_result + retained_fronts * pixels * np.dtype(np.uint8).itemsize
 
 
 def rasterize_image_gray8(

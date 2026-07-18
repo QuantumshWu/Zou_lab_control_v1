@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 from typing import Callable
 
@@ -10,7 +11,14 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from zlc_data import Selection
 from zlc_storage import canonical_text, nonnegative_integer
 
-from ..render import BoardFrame, PixelFormat, SourceIdentity, detached_render_fault
+from ..render import (
+    BoardFrame,
+    PanelFrame,
+    PanelPresentationIdentity,
+    PixelFormat,
+    SourceIdentity,
+    detached_render_fault,
+)
 from ..selector import (
     ImageViewportTransform,
     NormalizedRectangle,
@@ -89,6 +97,53 @@ def _validated_panel_layout(
     if isinstance(columns, bool) or not isinstance(columns, int) or columns <= 0:
         raise ValueError("columns must be a positive integer")
     return ids, min(columns, len(ids))
+
+
+def _panel_presentation(panel: PanelFrame) -> PanelPresentationIdentity:
+    matches = tuple(
+        value
+        for value in panel.coherence_stamp.presentations
+        if value.panel_id == panel.panel_id
+    )
+    if len(matches) != 1:
+        raise RuntimeError("panel coherence stamp has no unique presentation identity")
+    return matches[0]
+
+
+def _raster_geometry(panel: PanelFrame) -> tuple[int, int, int, PixelFormat]:
+    raster = panel.raster
+    return (
+        raster.width,
+        raster.height,
+        raster.stride_bytes,
+        raster.pixel_format,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _HeldPanelFront:
+    """One GUI-owned display overlay; it is never an authoritative BoardFrame."""
+
+    panel_id: str
+    board_id: str
+    layout_generation: int
+    sequence: int
+    coherence_group: str
+    source_identity: SourceIdentity
+    presentation: PanelPresentationIdentity
+    viewport_revision: int
+    raster_geometry: tuple[int, int, int, PixelFormat]
+    prepared: tuple[bytes, QtGui.QImage]
+
+    @property
+    def gesture_identity(self) -> tuple[str, int, int, SourceIdentity, int]:
+        return (
+            self.board_id,
+            self.layout_generation,
+            self.sequence,
+            self.source_identity,
+            self.viewport_revision,
+        )
 
 
 class QtOwnerWake(QtCore.QObject):
@@ -245,19 +300,11 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._selector_panel_id: str | None = None
         self._selector_viewport: ImageViewportTransform | None = None
         self._selector_callback: Callable[[RectangleGesture], object] | None = None
-        self._selector_interaction_callback: Callable[[bool], object] | None = None
-        self._selector_interaction_announced = False
         self._selector_enabled = False
         self._selector_applied_bounds: NormalizedRectangle | None = None
         self._selector_draft_bounds: NormalizedRectangle | None = None
         self._selector_drag_anchor: tuple[float, float] | None = None
-        self._selector_drag_front: tuple[
-            str,
-            int,
-            int,
-            SourceIdentity,
-            int,
-        ] | None = None
+        self._selector_hold: _HeldPanelFront | None = None
         self._selector_fault: RuntimeError | None = None
         self._closed = False
         self.setMinimumSize(128, 64)
@@ -303,7 +350,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             if identity[1] <= floor[1]:
                 raise ValueError("staged layout_generation must increase")
         self._staged_layout = (*identity, ids, column_count)
-        if self._selector_interaction_announced:
+        if self._selector_hold is not None:
             self._cancel_rectangle_gesture(clear_draft=True)
             self.update()
 
@@ -332,8 +379,9 @@ class QtRasterBoard(QtWidgets.QWidget):
     def present(self, frame: BoardFrame) -> None:
         self._require_owner()
         self._ensure_open()
-        interaction_was_active = self._selector_interaction_announced
+        interaction_was_active = self._selector_hold is not None
         promoting = False
+        cancel_interaction = False
         target_panel_ids = self._panel_ids
         target_columns = self._columns
         target_identity = self._active_layout_identity
@@ -379,6 +427,17 @@ class QtRasterBoard(QtWidgets.QWidget):
                     prepared,
                     panel_ids=target_panel_ids,
                 )
+            if interaction_was_active:
+                hold = self._selector_hold
+                if hold is None:
+                    raise RuntimeError(
+                        "active rectangle interaction has no held panel front"
+                    )
+                cancel_interaction = not self._hold_matches_frame(
+                    hold,
+                    frame,
+                    panel_ids=target_panel_ids,
+                )
         except BaseException:
             if promoting:
                 self._staged_layout = None
@@ -394,20 +453,20 @@ class QtRasterBoard(QtWidgets.QWidget):
             elif previous is not None:
                 old_index = self._panel_ids.index(panel_id)
                 new_index = target_panel_ids.index(panel_id)
-                if (
-                    previous[0].panels[old_index].source_identity
-                    != frame.panels[new_index].source_identity
-                ):
+                old_panel = previous[0].panels[old_index]
+                new_panel = frame.panels[new_index]
+                if self._panel_semantics_changed(old_panel, new_panel):
                     self._selector_applied_bounds = None
                     self._selector_draft_bounds = None
+                    cancel_interaction = interaction_was_active
+        if cancel_interaction:
+            self._cancel_rectangle_gesture(clear_draft=True)
         if promoting:
             self._panel_ids = target_panel_ids
             self._columns = target_columns
             self._staged_layout = None
         self._active_layout_identity = target_identity
         self._front = (frame, prepared)
-        if interaction_was_active:
-            self._cancel_rectangle_gesture(clear_draft=True)
         self.update()
 
     def clear(self) -> None:
@@ -432,22 +491,44 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._require_owner()
         return self._selector_fault
 
+    def selection_for_rectangle_gesture(self, gesture: RectangleGesture) -> Selection:
+        """Resolve a gesture only while its exact display-only origin is held."""
+
+        self._require_owner()
+        if not isinstance(gesture, RectangleGesture):
+            raise TypeError("gesture must be RectangleGesture")
+        hold = self._selector_hold
+        if hold is None or self._selector_drag_anchor is not None:
+            raise RuntimeError("rectangle gesture has no completed held origin")
+        if gesture.panel_id != hold.panel_id or (
+            gesture.board_id,
+            gesture.layout_generation,
+            gesture.sequence,
+            gesture.source_identity,
+            gesture.viewport_revision,
+        ) != hold.gesture_identity:
+            raise RuntimeError("rectangle gesture differs from its held panel origin")
+        viewport = self._require_selector_viewport()
+        if viewport.viewport_revision != hold.viewport_revision:
+            raise RuntimeError("rectangle gesture viewport changed before dispatch")
+        front = self._front
+        if front is None or not self._hold_matches_frame(
+            hold,
+            front[0],
+            panel_ids=self._panel_ids,
+        ):
+            raise RuntimeError("rectangle gesture origin is stale for this panel binding")
+        return viewport.selection_for_normalized_bounds(gesture.normalized_bounds)
+
     def bind_rectangle_selector(
         self,
         panel_id: str,
         viewport: ImageViewportTransform,
         callback: Callable[[RectangleGesture], object],
         *,
-        interaction_callback: Callable[[bool], object],
         enabled: bool = True,
     ) -> None:
-        """Bind one image panel without giving the widget a runtime control sink.
-
-        ``interaction_callback`` is a synchronous, balanced owner-thread gate:
-        ``True`` freezes live-front presentation before press handling returns;
-        every release or cancellation reports ``False``.  Live consumers must
-        gate presentation here rather than poll widget state.
-        """
+        """Bind one image panel without giving the widget a runtime control sink."""
 
         self._require_owner()
         panel_id = canonical_text(panel_id, "selector panel_id")
@@ -457,8 +538,6 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise TypeError("viewport must be ImageViewportTransform")
         if not callable(callback):
             raise TypeError("selector callback must be callable")
-        if not callable(interaction_callback):
-            raise TypeError("selector interaction_callback must be callable")
         if not isinstance(enabled, bool):
             raise TypeError("selector enabled must be bool")
         if self._front is not None:
@@ -468,17 +547,11 @@ class QtRasterBoard(QtWidgets.QWidget):
                 self._front[0],
                 self._front[1],
             )
-        if not self._reset_rectangle_selector():
-            self.update()
-            raise RuntimeError(
-                "previous selector interaction could not be released; "
-                "inspect selector_fault"
-            )
+        self._reset_rectangle_selector()
         self._selector_fault = None
         self._selector_panel_id = panel_id
         self._selector_viewport = viewport
         self._selector_callback = callback
-        self._selector_interaction_callback = interaction_callback
         self._selector_enabled = enabled
         self.update()
 
@@ -542,14 +615,38 @@ class QtRasterBoard(QtWidgets.QWidget):
                 painter.drawText(self.rect(), QtCore.Qt.AlignCenter, self._empty_text)
             return
         images = front[1]
-        for index, (_pixels, image) in enumerate(images):
+        hold = self._selector_hold
+        if hold is not None and not self._hold_matches_frame(
+            hold,
+            front[0],
+            panel_ids=self._panel_ids,
+        ):
+            hold = None
+        held_target = None
+        for index, (_pixels, latest_image) in enumerate(images):
+            panel_id = self._panel_ids[index]
+            image = (
+                hold.prepared[1]
+                if hold is not None and hold.panel_id == panel_id
+                else latest_image
+            )
             bounds = _panel_bounds(
                 self.rect(),
                 index=index,
                 count=len(images),
                 columns=self._columns,
             )
-            painter.drawImage(_aspect_target(bounds, image), image)
+            target = _aspect_target(bounds, image)
+            painter.drawImage(target, image)
+            if hold is not None and hold.panel_id == panel_id:
+                held_target = target
+        if hold is not None and held_target is not None:
+            self._paint_hold_badge(
+                painter,
+                hold,
+                held_target,
+                live_sequence=front[0].sequence,
+            )
         self._paint_selector_overlays(painter)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -567,10 +664,8 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._selector_drag_anchor = (
             point if handle is None else self._opposite_corner_anchor(bounds, handle)
         )
-        self._selector_drag_front = self._selector_front_identity(target)
-        if not self._notify_selector_interaction(True):
-            self._cancel_rectangle_gesture(clear_draft=True)
-            self.update()
+        self._selector_hold = self._held_panel_from_target(target)
+        self.update()
         event.accept()
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -608,44 +703,41 @@ class QtRasterBoard(QtWidgets.QWidget):
                     anchor,
                     point,
                 )
-        current = None if target is None else self._selector_front_identity(target)
-        frozen = self._selector_drag_front
+        hold = self._selector_hold
         bounds = self._selector_draft_bounds
         callback = self._selector_callback
-        stale = current != frozen
         delivered = False
         # Geometry is complete before the consumer callback runs, but the
-        # synchronous front gate remains active until that callback returns.
+        # synchronous held origin remains alive until that callback returns.
         # A re-entrant PREPARING/disable transition must therefore preserve
         # this completed draft rather than classify it as a partial drag.
         self._selector_drag_anchor = None
-        self._selector_drag_front = None
-        if not stale and bounds is not None and frozen is not None and callback is not None:
-            assert self._selector_panel_id is not None
-            gesture = RectangleGesture(
-                panel_id=self._selector_panel_id,
-                board_id=frozen[0],
-                layout_generation=frozen[1],
-                sequence=frozen[2],
-                source_identity=frozen[3],
-                normalized_bounds=bounds,
-                viewport_revision=frozen[4],
-            )
-            try:
+        try:
+            if bounds is not None and hold is not None and callback is not None:
+                gesture = RectangleGesture(
+                    panel_id=hold.panel_id,
+                    board_id=hold.board_id,
+                    layout_generation=hold.layout_generation,
+                    sequence=hold.sequence,
+                    source_identity=hold.source_identity,
+                    normalized_bounds=bounds,
+                    viewport_revision=hold.viewport_revision,
+                )
                 callback(gesture)
                 delivered = True
-            except BaseException as error:
-                if self._selector_fault is None:
-                    self._selector_fault = detached_render_fault(error)
-                self._selector_enabled = False
-        self._cancel_rectangle_gesture(
-            clear_draft=stale or (bounds is not None and not delivered)
-        )
-        self.update()
+        except BaseException as error:
+            if self._selector_fault is None:
+                self._selector_fault = detached_render_fault(error)
+            self._selector_enabled = False
+        finally:
+            self._cancel_rectangle_gesture(
+                clear_draft=(bounds is not None and not delivered)
+            )
+            self.update()
         event.accept()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
-        if self._selector_interaction_announced:
+        if self._selector_hold is not None:
             self._cancel_rectangle_gesture(clear_draft=True)
         super().resizeEvent(event)
 
@@ -664,9 +756,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._active_layout_identity = None
             self._staged_layout = None
             self._closed = True
-        elif event.type() in (QtCore.QEvent.Hide, QtCore.QEvent.WindowDeactivate) and (
-            getattr(self, "_selector_interaction_announced", False)
-        ):
+        elif event.type() in (
+            QtCore.QEvent.Hide,
+            QtCore.QEvent.WindowDeactivate,
+            QtCore.QEvent.UngrabMouse,
+        ) and getattr(self, "_selector_hold", None) is not None:
             self._cancel_rectangle_gesture(clear_draft=True)
             self.update()
         return super().event(event)
@@ -704,7 +798,13 @@ class QtRasterBoard(QtWidgets.QWidget):
         if front is None or panel_id is None or viewport is None:
             return None
         index = self._panel_ids.index(panel_id)
-        image = front[1][index][1]
+        hold = self._selector_hold
+        prepared = (
+            hold.prepared
+            if hold is not None and hold.panel_id == panel_id
+            else front[1][index]
+        )
+        image = prepared[1]
         bounds = _panel_bounds(
             self.rect(),
             index=index,
@@ -712,18 +812,80 @@ class QtRasterBoard(QtWidgets.QWidget):
             columns=self._columns,
         )
         target = _aspect_target(bounds, image)
-        return target, front[0], front[0].panels[index]
+        return target, front[0], front[0].panels[index], prepared
 
-    def _selector_front_identity(self, target):
+    def _held_panel_from_target(self, target) -> _HeldPanelFront:
         viewport = self._require_selector_viewport()
-        frame, panel = target[1], target[2]
-        return (
-            frame.board_id,
-            frame.layout_generation,
-            frame.sequence,
-            panel.source_identity,
-            viewport.viewport_revision,
+        frame, panel, prepared = target[1], target[2], target[3]
+        return _HeldPanelFront(
+            panel_id=panel.panel_id,
+            board_id=frame.board_id,
+            layout_generation=frame.layout_generation,
+            sequence=frame.sequence,
+            coherence_group=panel.coherence_group,
+            source_identity=panel.source_identity,
+            presentation=_panel_presentation(panel),
+            viewport_revision=viewport.viewport_revision,
+            raster_geometry=_raster_geometry(panel),
+            prepared=prepared,
         )
+
+    @staticmethod
+    def _panel_semantics_changed(old: PanelFrame, new: PanelFrame) -> bool:
+        return (
+            old.panel_id != new.panel_id
+            or old.coherence_group != new.coherence_group
+            or old.source_identity != new.source_identity
+            or _panel_presentation(old) != _panel_presentation(new)
+            or _raster_geometry(old) != _raster_geometry(new)
+        )
+
+    def _hold_matches_frame(
+        self,
+        hold: _HeldPanelFront,
+        frame: BoardFrame,
+        *,
+        panel_ids: tuple[str, ...],
+    ) -> bool:
+        if (
+            frame.board_id != hold.board_id
+            or frame.layout_generation != hold.layout_generation
+            or hold.panel_id not in panel_ids
+        ):
+            return False
+        viewport = self._selector_viewport
+        if viewport is None or viewport.viewport_revision != hold.viewport_revision:
+            return False
+        index = panel_ids.index(hold.panel_id)
+        panel = frame.panels[index]
+        return (
+            panel.panel_id == hold.panel_id
+            and panel.coherence_group == hold.coherence_group
+            and panel.source_identity == hold.source_identity
+            and _panel_presentation(panel) == hold.presentation
+            and _raster_geometry(panel) == hold.raster_geometry
+        )
+
+    @staticmethod
+    def _paint_hold_badge(
+        painter: QtGui.QPainter,
+        hold: _HeldPanelFront,
+        target: QtCore.QRect,
+        *,
+        live_sequence: int,
+    ) -> None:
+        painter.save()
+        try:
+            painter.setClipRect(target)
+            label = f"H {hold.sequence}→{live_sequence}"
+            metrics = painter.fontMetrics()
+            label_bounds = metrics.boundingRect(label).adjusted(-6, -3, 6, 3)
+            label_bounds.moveTopLeft(target.topLeft() + QtCore.QPoint(6, 6))
+            painter.fillRect(label_bounds, QtGui.QColor(0, 0, 0, 190))
+            painter.setPen(QtGui.QColor(ORANGE))
+            painter.drawText(label_bounds, QtCore.Qt.AlignCenter, label)
+        finally:
+            painter.restore()
 
     @staticmethod
     def _normalized_point(
@@ -860,52 +1022,19 @@ class QtRasterBoard(QtWidgets.QWidget):
                 )
             )
 
-    def _cancel_rectangle_gesture(self, *, clear_draft: bool) -> bool:
+    def _cancel_rectangle_gesture(self, *, clear_draft: bool) -> None:
         self._selector_drag_anchor = None
-        self._selector_drag_front = None
+        self._selector_hold = None
         if clear_draft:
             self._selector_draft_bounds = None
-        return self._notify_selector_interaction(False)
 
-    def _notify_selector_interaction(self, active: bool) -> bool:
-        callback = self._selector_interaction_callback
-        if active:
-            if self._selector_interaction_announced:
-                return True
-            if callback is None:
-                return False
-            self._selector_interaction_announced = True
-        elif not self._selector_interaction_announced:
-            return True
-        else:
-            self._selector_interaction_announced = False
-        try:
-            callback(active)
-        except BaseException as error:
-            if self._selector_fault is None:
-                self._selector_fault = detached_render_fault(error)
-            self._selector_enabled = False
-            if active and self._selector_interaction_announced:
-                self._selector_interaction_announced = False
-                try:
-                    callback(False)
-                except BaseException:
-                    pass
-            return False
-        return not active or (
-            self._selector_interaction_announced
-            and self._selector_drag_anchor is not None
-        )
-
-    def _reset_rectangle_selector(self) -> bool:
-        released = self._cancel_rectangle_gesture(clear_draft=True)
+    def _reset_rectangle_selector(self) -> None:
+        self._cancel_rectangle_gesture(clear_draft=True)
         self._selector_applied_bounds = None
         self._selector_enabled = False
         self._selector_panel_id = None
         self._selector_viewport = None
         self._selector_callback = None
-        self._selector_interaction_callback = None
-        return released
 
     def _require_owner(self) -> None:
         if QtCore.QThread.currentThread() != self.thread():

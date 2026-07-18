@@ -277,7 +277,7 @@ def test_rejected_initial_roi_and_raw_presentation_failure_keep_both_causes(
         )
         assert window._handle is not None
         assert not window._handle.snapshot().state.terminal
-        assert window._live is not None and window._live._paused
+        assert window._live is not None and window._live._presentation_frozen
     finally:
         if window.isVisible():
             _close_window(application, window)
@@ -542,7 +542,7 @@ def test_first_roi_presentation_failure_rolls_back_staged_layout_once(
         assert board._staged_model is None
         assert board_widget._staged_layout is None
         assert live._configuration is old_configuration
-        assert live._paused and live._port is None and live._sources is None
+        assert live._presentation_frozen and live._port is None and live._sources is None
         assert window._board_panel_ids == _RAW_PANELS
         assert board_widget.panel_ids == _RAW_PANELS
         assert staged_frames[0] is not None
@@ -780,9 +780,8 @@ def test_overlapping_unpresented_roi_changes_freeze_the_old_coherent_front(
             return receipt
 
         monkeypatch.setattr(slot, "submit_camera_roi_control", observe_submit)
-        live.pause()
-        _until(application, lambda: not live._active)
         board.present_pending()
+        monkeypatch.setattr(board, "present_pending", lambda: False)
         old_model = board.model
         _draw_first_roi(window, board_widget)
         assert len(receipts) == 1
@@ -839,7 +838,7 @@ def test_overlapping_unpresented_roi_changes_freeze_the_old_coherent_front(
         assert board_widget._staged_layout is None
         assert board_widget.front_frame is old_front
         assert live._configuration is scalar_configuration
-        assert live._paused and live._port is None and live._sources is None
+        assert live._presentation_frozen and live._port is None and live._sources is None
         assert live.fault is None and slot.failure is None
         assert not handle.snapshot().state.terminal
         assert not window._selector_switch.isEnabled()
@@ -918,7 +917,7 @@ def test_close_terminalizes_a_pending_roi_revision_without_stale_layout_promotio
         _draw_first_roi(window, board)
         assert len(receipts) == 1
         _until(application, projection_entered.is_set)
-        second_selection = window._viewport_transform.selection_for_normalized_bounds(
+        second_selection = board._selector_viewport.selection_for_normalized_bounds(
             (0.1, 0.1, 0.4, 0.4)
         )
         publish_started = time.perf_counter()

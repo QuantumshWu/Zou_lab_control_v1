@@ -609,7 +609,7 @@ class LiveImageBoardController:
         self._fault: BaseException | None = None
         self._front_status: LiveFrontStatus | None = None
         self._front_invalidated = False
-        self._paused = False
+        self._presentation_frozen = False
         self._closed = False
         self._close_complete = False
         slot.set_change_listener(self._source_changed)
@@ -769,7 +769,7 @@ class LiveImageBoardController:
             self._dirty = True
             if candidate_waiting:
                 self._active = False
-            request_now = not self._paused and not self._active
+            request_now = not self._presentation_frozen and not self._active
             if active:
                 assert scalar_dataset_id is not None
                 assert state.scalar_generation is not None
@@ -791,7 +791,7 @@ class LiveImageBoardController:
         with self._lock:
             if self._closed:
                 return
-            self._paused = True
+            self._presentation_frozen = True
             self._dirty = False
             self._active = False
             self._candidate = None
@@ -840,34 +840,9 @@ class LiveImageBoardController:
 
         self._board.revoke_pending_publication(install_source_fact)
 
-    def pause(self) -> None:
-        """Stop admitting new snapshots while one visible front remains frozen."""
-
-        with self._lock:
-            if self._closed:
-                return
-            self._paused = True
-            self._dirty = False
-            # A frozen candidate waits for the GUI owner rather than for a
-            # worker completion.  Dropping it must also end that admission
-            # cycle; otherwise resume() observes ``_active`` forever and never
-            # schedules the latest replacement snapshot.
-            if self._candidate is not None:
-                self._active = False
-            self._candidate = None
-
-    def resume(self) -> None:
-        """Resume latest-only evaluation after a GUI interaction or staged replace."""
-
-        with self._lock:
-            if self._closed or not self._paused:
-                return
-            self._paused = False
-        self._request_snapshot()
-
     def _request_snapshot(self) -> None:
         with self._lock:
-            if self._closed or self._paused or self._fault is not None:
+            if self._closed or self._presentation_frozen or self._fault is not None:
                 return
             self._dirty = True
             if self._active:
@@ -889,7 +864,7 @@ class LiveImageBoardController:
             with self._lock:
                 if (
                     self._closed
-                    or self._paused
+                    or self._presentation_frozen
                     or self._fault is not None
                     or self._slot.withdrawn
                 ):
@@ -947,7 +922,7 @@ class LiveImageBoardController:
         if self.reconcile_faults():
             return False
         with self._lock:
-            if self._closed or self._paused or self._fault is not None:
+            if self._closed or self._presentation_frozen or self._fault is not None:
                 return False
             candidate, self._candidate = self._candidate, None
             configuration = self._configuration
@@ -1042,7 +1017,7 @@ class LiveImageBoardController:
             with self._lock:
                 stale_after_evaluation = (
                     self._closed
-                    or self._paused
+                    or self._presentation_frozen
                     or self._fault is not None
                     or self._slot.failure is not None
                     or self._slot.notification_failure is not None
@@ -1311,7 +1286,7 @@ class LiveImageBoardController:
     def _finish_stale_cycle(self) -> None:
         restart = False
         with self._lock:
-            if self._closed or self._paused or self._fault is not None:
+            if self._closed or self._presentation_frozen or self._fault is not None:
                 self._active = False
                 return
             if self._dirty:
@@ -1382,7 +1357,7 @@ class LiveImageBoardController:
                         restart = (
                             self._dirty
                             and not self._closed
-                            and not self._paused
+                            and not self._presentation_frozen
                             and self._fault is None
                         )
                         if restart:
@@ -1441,7 +1416,7 @@ class LiveImageBoardController:
             self._active = False
             self._dirty = False
             self._candidate = None
-            self._paused = False
+            self._presentation_frozen = False
             self._front_status = None
             self._front_invalidated = True
             configuration = self._configuration

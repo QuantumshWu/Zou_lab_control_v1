@@ -103,6 +103,10 @@ def _raster_board_frame(
     *,
     layout_generation: int,
     sequence: int,
+    panel_values: tuple[int, ...] | None = None,
+    document_revision: int = 0,
+    source_suffix: str = "",
+    raster_size: tuple[int, int] = (2, 1),
 ):
     from zlc_data import (
         BlockId,
@@ -124,8 +128,8 @@ def _raster_board_frame(
     schema = "a" * 64
     dataset_id = DatasetId("camera")
     ref = DatasetRevisionRef(
-        BlockId("camera-block"),
-        StreamGenerationId("camera-generation"),
+        BlockId(f"camera-block{source_suffix}"),
+        StreamGenerationId(f"camera-generation{source_suffix}"),
         schema,
         DatasetRevision(sequence + 1),
     )
@@ -143,26 +147,97 @@ def _raster_board_frame(
         "b" * 64,
         (EvaluatedInput(dataset_id, ref),),
         tuple(
-            PanelPresentationIdentity(panel_id, f"document-{panel_id}", 0, 0, 0)
+            PanelPresentationIdentity(
+                panel_id,
+                f"document-{panel_id}",
+                document_revision,
+                0,
+                0,
+            )
             for panel_id in panel_ids
         ),
     )
-    raster = RasterBuffer(
-        2,
-        1,
-        8,
-        PixelFormat.RGBA8888,
-        bytes([sequence % 256]) * 8,
+    values = (
+        tuple(sequence % 256 for _panel_id in panel_ids)
+        if panel_values is None
+        else tuple(panel_values)
     )
+    if len(values) != len(panel_ids) or any(not 0 <= value <= 255 for value in values):
+        raise ValueError("panel_values must match panel_ids with byte values")
     return BoardFrame(
         "camera-board",
         layout_generation,
         sequence,
         tuple(
-            PanelFrame(panel_id, "camera", source, stamp, raster)
-            for panel_id in panel_ids
+            PanelFrame(
+                panel_id,
+                "camera",
+                source,
+                stamp,
+                RasterBuffer(
+                    raster_size[0],
+                    raster_size[1],
+                    raster_size[0] * 4,
+                    PixelFormat.RGBA8888,
+                    bytes((value, value, value, 255))
+                    * raster_size[0]
+                    * raster_size[1],
+                ),
+            )
+            for panel_id, value in zip(panel_ids, values, strict=True)
         ),
     )
+
+
+def _image_viewport(*, width: int = 2, height: int = 1, revision: int = 7):
+    from zlc_data import (
+        AxisId,
+        AxisSpec,
+        CoordinateFrameId,
+        SPATIAL_X,
+        SPATIAL_Y,
+    )
+    from zlc_frontend.qt_widgets import ImageViewportTransform
+
+    frame = CoordinateFrameId("qt-held-image")
+    return ImageViewportTransform(
+        (
+            AxisSpec(
+                AxisId("qt-held-image.y"),
+                "y",
+                SPATIAL_Y,
+                height,
+                tuple(range(height)),
+                unit="pixel",
+                coordinate_frame=frame,
+            ),
+            AxisSpec(
+                AxisId("qt-held-image.x"),
+                "x",
+                SPATIAL_X,
+                width,
+                tuple(range(width)),
+                unit="pixel",
+                coordinate_frame=frame,
+            ),
+        ),
+        viewport_revision=revision,
+    )
+
+
+def _render_qt_widget(widget):
+    """Exercise the widget paint path without relying on a window backing store."""
+
+    from PyQt5 import QtCore, QtGui
+
+    image = QtGui.QImage(widget.size(), QtGui.QImage.Format_RGBA8888)
+    image.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(image)
+    try:
+        widget.render(painter)
+    finally:
+        painter.end()
+    return image
 
 
 def test_qt_widgets_is_the_only_current_qt_owner() -> None:
@@ -466,6 +541,353 @@ def test_qt_raster_board_promotes_only_a_matching_staged_layout(
     application.processEvents()
     with pytest.raises(RuntimeError, match="closed"):
         board.present(failed_target)
+
+
+def test_qt_raster_board_holds_only_the_interacting_panel_while_latest_board_advances() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_frontend.qt_widgets import (
+        QtRasterBoard,
+        ensure_qt_app,
+    )
+
+    class RecordingRasterBoard(QtRasterBoard):
+        def __init__(self, *args, **kwargs):
+            self.update_calls = 0
+            super().__init__(*args, **kwargs)
+
+        def update(self, *args):
+            self.update_calls += 1
+            return super().update(*args)
+
+    application = ensure_qt_app()
+    board = RecordingRasterBoard(("image", "curve"), columns=2)
+    board.resize(400, 200)
+    board.show()
+    application.processEvents()
+    first = _raster_board_frame(
+        ("image", "curve"),
+        layout_generation=0,
+        sequence=1,
+        panel_values=(10, 20),
+    )
+    latest = _raster_board_frame(
+        ("image", "curve"),
+        layout_generation=0,
+        sequence=2,
+        panel_values=(30, 40),
+    )
+    board.present(first)
+    viewport = _image_viewport()
+    gestures = []
+    selections = []
+
+    def accept(gesture) -> None:
+        gestures.append(gesture)
+        selections.append(board.selection_for_rectangle_gesture(gesture))
+
+    board.bind_rectangle_selector(
+        "image",
+        viewport,
+        accept,
+        enabled=True,
+    )
+    target = board._selector_target()[0]
+    start = QtCore.QPoint(target.left() + 1, target.top() + 1)
+    end = QtCore.QPoint(target.right() - 1, target.bottom() - 1)
+    board.update_calls = 0
+    QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
+    assert board.update_calls == 1
+    hold = board._selector_hold
+    assert hold is not None and hold.panel_id == "image" and hold.sequence == 1
+    assert board.front_frame is not None and board.front_frame.sequence == 1
+    held_bytes = hold.prepared[0]
+
+    board.present(latest)
+    application.processEvents()
+    assert board.front_frame is latest
+    assert board._selector_hold is hold and hold.prepared[0] is held_bytes
+    painted = _render_qt_widget(board)
+    assert painted.pixelColor(100, 100).red() == 10
+    assert painted.pixelColor(300, 100).red() == 40
+
+    QtTest.QTest.mouseMove(board, end)
+    QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
+    application.processEvents()
+    assert len(gestures) == len(selections) == 1
+    assert gestures[0].sequence == 1
+    assert board._selector_hold is None
+    painted = _render_qt_widget(board)
+    assert painted.pixelColor(100, 100).red() == 30
+    assert painted.pixelColor(300, 100).red() == 40
+    board.close()
+    application.processEvents()
+
+
+def test_qt_raster_board_cancels_a_hold_when_panel_semantics_change() -> None:
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+
+    application = ensure_qt_app()
+    for changed in (
+        {"document_revision": 1},
+        {"source_suffix": "-replacement"},
+    ):
+        board = QtRasterBoard(("image",), columns=1)
+        board.resize(200, 100)
+        first = _raster_board_frame(
+            ("image",),
+            layout_generation=0,
+            sequence=1,
+            panel_values=(10,),
+        )
+        replacement = _raster_board_frame(
+            ("image",),
+            layout_generation=0,
+            sequence=2,
+            panel_values=(20,),
+            **changed,
+        )
+        board.present(first)
+        board.bind_rectangle_selector(
+            "image",
+            _image_viewport(),
+            lambda _gesture: None,
+            enabled=True,
+        )
+        target = board._selector_target()[0]
+        QtTest.QTest.mousePress(
+            board,
+            QtCore.Qt.LeftButton,
+            pos=QtCore.QPoint(target.left() + 1, target.top() + 1),
+        )
+
+        board.present(replacement)
+
+        assert board.front_frame is replacement
+        assert board._selector_hold is None
+        assert board._selector_draft_bounds is None
+        board.close()
+    application.processEvents()
+
+
+def test_qt_raster_board_hold_label_is_clipped_to_the_target_panel() -> None:
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+
+    application = ensure_qt_app()
+    board = QtRasterBoard(("image", "curve"), columns=2)
+    board.resize(128, 64)
+    board.present(
+        _raster_board_frame(
+            ("image", "curve"),
+            layout_generation=0,
+            sequence=1,
+            panel_values=(10, 20),
+        )
+    )
+    board.bind_rectangle_selector(
+        "image",
+        _image_viewport(),
+        lambda _gesture: None,
+        enabled=True,
+    )
+    target = board._selector_target()[0]
+    QtTest.QTest.mousePress(
+        board,
+        QtCore.Qt.LeftButton,
+        pos=QtCore.QPoint(target.left() + 1, target.top() + 1),
+    )
+    board.present(
+        _raster_board_frame(
+            ("image", "curve"),
+            layout_generation=0,
+            sequence=2,
+            panel_values=(30, 40),
+        )
+    )
+
+    painted = _render_qt_widget(board)
+    assert painted.pixelColor(3 * board.width() // 4, board.height() // 2).red() == 40
+    board.close()
+    application.processEvents()
+
+
+def test_qt_raster_board_releases_a_hold_when_a_new_front_is_rejected() -> None:
+    import pytest
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+
+    application = ensure_qt_app()
+    board = QtRasterBoard(("image",), columns=1)
+    board.resize(200, 100)
+    first = _raster_board_frame(
+        ("image",),
+        layout_generation=0,
+        sequence=1,
+    )
+    board.present(first)
+    board.bind_rectangle_selector(
+        "image",
+        _image_viewport(),
+        lambda _gesture: None,
+        enabled=True,
+    )
+    target = board._selector_target()[0]
+    QtTest.QTest.mousePress(
+        board,
+        QtCore.Qt.LeftButton,
+        pos=QtCore.QPoint(target.left() + 1, target.top() + 1),
+    )
+    incompatible = _raster_board_frame(
+        ("image",),
+        layout_generation=0,
+        sequence=2,
+        raster_size=(3, 1),
+    )
+
+    with pytest.raises(ValueError, match="viewport axes"):
+        board.present(incompatible)
+
+    assert board.front_frame is first
+    assert board._selector_hold is None
+    assert board._selector_draft_bounds is None
+    board.close()
+    application.processEvents()
+
+
+def test_qt_raster_board_releases_every_hold_lifecycle_exit() -> None:
+    from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
+
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+
+    application = ensure_qt_app()
+    for exit_name in (
+        "stage-layout",
+        "clear",
+        "resize",
+        "hide",
+        "deactivate",
+        "ungrab-mouse",
+        "disable",
+        "unbind",
+        "rebind",
+        "close",
+    ):
+        board = QtRasterBoard(("image",), columns=1)
+        board.resize(200, 100)
+        board.present(
+            _raster_board_frame(
+                ("image",),
+                layout_generation=0,
+                sequence=1,
+            )
+        )
+        board.bind_rectangle_selector(
+            "image",
+            _image_viewport(),
+            lambda _gesture: None,
+            enabled=True,
+        )
+        target = board._selector_target()[0]
+        QtTest.QTest.mousePress(
+            board,
+            QtCore.Qt.LeftButton,
+            pos=QtCore.QPoint(target.left() + 1, target.top() + 1),
+        )
+        hold = board._selector_hold
+        assert hold is not None and hold.panel_id == "image" and hold.sequence == 1
+
+        if exit_name == "stage-layout":
+            board.stage_layout(
+                ("image", "curve"),
+                board_id="camera-board",
+                layout_generation=1,
+                columns=2,
+            )
+        elif exit_name == "clear":
+            board.clear()
+        elif exit_name == "resize":
+            QtWidgets.QApplication.sendEvent(
+                board,
+                QtGui.QResizeEvent(QtCore.QSize(201, 101), board.size()),
+            )
+        elif exit_name == "hide":
+            QtWidgets.QApplication.sendEvent(board, QtGui.QHideEvent())
+        elif exit_name == "deactivate":
+            QtWidgets.QApplication.sendEvent(
+                board,
+                QtCore.QEvent(QtCore.QEvent.WindowDeactivate),
+            )
+        elif exit_name == "ungrab-mouse":
+            QtWidgets.QApplication.sendEvent(
+                board,
+                QtCore.QEvent(QtCore.QEvent.UngrabMouse),
+            )
+        elif exit_name == "disable":
+            board.set_rectangle_selector_enabled(False)
+        elif exit_name == "unbind":
+            board.unbind_rectangle_selector()
+        elif exit_name == "rebind":
+            board.bind_rectangle_selector(
+                "image",
+                _image_viewport(revision=8),
+                lambda _gesture: None,
+                enabled=True,
+            )
+        elif exit_name == "close":
+            board.close()
+        else:  # pragma: no cover - the tuple above is deliberately exhaustive
+            raise AssertionError(exit_name)
+
+        assert board._selector_hold is None, exit_name
+        if exit_name != "close":
+            board.close()
+    application.processEvents()
+
+
+def test_qt_raster_board_releases_hold_after_selector_callback_fault() -> None:
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+
+    application = ensure_qt_app()
+    board = QtRasterBoard(("image",), columns=1)
+    board.resize(200, 100)
+    board.present(
+        _raster_board_frame(
+            ("image",),
+            layout_generation=0,
+            sequence=1,
+        )
+    )
+    def fail(_gesture) -> None:
+        raise RuntimeError("selector callback failed")
+
+    board.bind_rectangle_selector(
+        "image",
+        _image_viewport(),
+        fail,
+        enabled=True,
+    )
+    target = board._selector_target()[0]
+    start = QtCore.QPoint(target.left() + 1, target.top() + 1)
+    end = QtCore.QPoint(target.right() - 1, target.bottom() - 1)
+    QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
+    QtTest.QTest.mouseMove(board, end)
+    QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
+
+    assert board._selector_hold is None
+    assert board._selector_enabled is False
+    assert board.selector_fault is not None
+    assert "selector callback failed" in str(board.selector_fault)
+    board.close()
+    application.processEvents()
 
 
 def test_first_qapplication_creation_is_rejected_from_a_worker_thread() -> None:

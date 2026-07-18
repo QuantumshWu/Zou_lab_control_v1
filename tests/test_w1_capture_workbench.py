@@ -475,14 +475,14 @@ def test_freeze_presentation_revokes_work_and_preserves_the_coherent_front_state
     controller._sources = (object(),)
     controller._dirty = True
     controller._active = True
-    controller._paused = False
+    controller._presentation_frozen = False
     frozen = []
     controller._board = SimpleNamespace(freeze_front=lambda: frozen.append(True))
     controller.freeze_presentation()
     assert controller._candidate is None
     assert controller._port is None and controller._sources is None
     assert not controller._dirty and not controller._active
-    assert controller._paused
+    assert controller._presentation_frozen
     assert frozen == [True]
 
 
@@ -532,7 +532,7 @@ def test_scalar_control_change_reuses_layout_when_panel_ids_are_unchanged(monkey
     controller._candidate = None
     controller._dirty = False
     controller._active = False
-    controller._paused = False
+    controller._presentation_frozen = False
     controller._board = SimpleNamespace(
         model=SimpleNamespace(
             board_id=previous.board_id,
