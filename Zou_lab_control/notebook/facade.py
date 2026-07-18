@@ -1196,6 +1196,71 @@ class ReadoutFacade:
         self._require_binding(request.readout_binding)
         return _run_calibration(self._token, request)
 
+    def _start_calibration_from_editor(
+        self,
+        source_capture_ref: CaptureArtifactRef,
+        readout_binding: ReadoutBindingKey,
+        analysis: CalibrationAnalysisRequest,
+        memory_limit_bytes: int,
+        timeout_seconds: float,
+    ) -> RunHandle:
+        """Narrow Workbench command; request construction stays in this owner."""
+
+        return self.start_calibration(
+            CalibrationArtifactRequest(
+                source_capture_ref,
+                readout_binding,
+                analysis,
+                memory_limit_bytes,
+                timeout_seconds,
+            )
+        )
+
+    def calibration_gui(self, request: CalibrationArtifactRequest):
+        """Edit one explicit request and commit each successful formal Run."""
+
+        if not isinstance(request, CalibrationArtifactRequest):
+            raise TypeError("request must be CalibrationArtifactRequest")
+        self._require_binding(request.readout_binding)
+        from zlc_workbench.calibration import CalibrationEditorSeed
+        from Zou_lab_control.workbench import open_calibration_workbench
+
+        seed = CalibrationEditorSeed(
+            request.source_capture_ref,
+            request.readout_binding,
+            request.analysis,
+            request.memory_limit_bytes,
+            request.timeout_seconds,
+        )
+        return open_calibration_workbench(
+            self._load_calibration_report_source,
+            self._start_calibration_from_editor,
+            seed=seed,
+        )
+
+    def calibration_edit_gui(
+        self,
+        reference: CalibrationArtifactRef,
+        *,
+        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
+        timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS,
+    ):
+        """Reopen an exact calibration and create a new immutable revision."""
+
+        if not isinstance(reference, CalibrationArtifactRef):
+            raise TypeError("reference must be CalibrationArtifactRef")
+        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        timeout = _positive_real(timeout_seconds, "timeout_seconds")
+        from Zou_lab_control.workbench import open_calibration_workbench
+
+        return open_calibration_workbench(
+            self._load_calibration_report_source,
+            self._start_calibration_from_editor,
+            reference=reference,
+            memory_limit_bytes=limit,
+            timeout_seconds=timeout,
+        )
+
     def load_calibration(
         self,
         reference: CalibrationArtifactRef,

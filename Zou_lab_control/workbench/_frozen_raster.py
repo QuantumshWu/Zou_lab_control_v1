@@ -172,7 +172,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         return self._closed
 
     def _build_boards(self, bundle: EncodedRasterDocument) -> tuple[QtImageBoard, ...]:
-        self._tabs.clear()
+        self._retire_tab_pages()
         boards = []
         one_page = len(bundle.pages) == 1
         for page in bundle.pages:
@@ -189,9 +189,25 @@ class FrozenRasterWindow(QtWidgets.QWidget):
             )
             self._tabs.addTab(board, page.title)
             boards.append(board)
-        if one_page:
-            self._tabs.tabBar().hide()
+        self._tabs.tabBar().setVisible(not one_page)
         return tuple(boards)
+
+    def _retire_tab_pages(self) -> None:
+        """Drop every old Qt front before admitting a replacement bundle."""
+
+        old_boards = self._boards
+        self._boards = ()
+        for board in old_boards:
+            board.clear()
+        while self._tabs.count():
+            widget = self._tabs.widget(0)
+            self._tabs.removeTab(0)
+            if isinstance(widget, QtImageBoard):
+                widget.clear()
+            widget.setParent(None)
+            widget.deleteLater()
+        if self._placeholder is not None:
+            self._placeholder = None
 
     def _presentation_peak(
         self,

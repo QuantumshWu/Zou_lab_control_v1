@@ -70,6 +70,31 @@ def open_calibration_report_workbench(
     )
 
 
+def open_calibration_workbench(
+    computation_loader,
+    run_starter,
+    *,
+    seed=None,
+    reference=None,
+    memory_limit_bytes=None,
+    timeout_seconds=None,
+):
+    """Open formal calibration creation/editing without eager Qt imports."""
+
+    from ._calibration import open_calibration_workbench as _open
+
+    options = {"seed": seed, "reference": reference}
+    if memory_limit_bytes is not None:
+        options["memory_limit_bytes"] = memory_limit_bytes
+    if timeout_seconds is not None:
+        options["timeout_seconds"] = timeout_seconds
+    return _open(
+        computation_loader,
+        run_starter,
+        **options,
+    )
+
+
 def open_data_figure_workbench(figure, *, memory_limit_bytes=None):
     """Open one already-resolved DataFigure without eager Qt imports."""
 
@@ -168,6 +193,7 @@ def open_offline_pulse_workbench(
 
 
 __all__ = [
+    "open_calibration_workbench",
     "open_calibration_report_workbench",
     "open_camera_monitor_workbench",
     "open_capture_fit_workbench",
