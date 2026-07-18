@@ -20,16 +20,20 @@ from PyQt5 import QtCore, QtWidgets
 
 from zlc_data import (
     BoundFit,
+    CommittedTransform,
     FitBatchStatus,
     FitCancelled,
     FitDeadlineExceeded,
     FitSpec,
+    Selection,
 )
 from zlc_frontend import (
     DataFigure,
+    fit_authority_summary,
     fit_axis_summary,
     fit_constraint_form,
     fit_spec_from_form,
+    selection_fit_view_projection,
 )
 from zlc_frontend.encoded_raster import EncodedRasterDocument
 from zlc_frontend.qt_widgets import (
@@ -91,13 +95,20 @@ def _render_source(
     source,
     memory_limit_bytes: int,
     cancelled: threading.Event,
+    selection: Selection | None = None,
 ) -> EncodedRasterDocument:
+    if selection is not None and not isinstance(selection, Selection):
+        raise TypeError("source selection must be Selection or None")
+
+    def build_figure():
+        options = {"memory_limit_bytes": memory_limit_bytes}
+        if selection is not None:
+            options["selection"] = selection
+        return figure_factory(source, **options)
+
     return _load_bundle(
         lambda token: _render_figure(
-            lambda: figure_factory(
-                source,
-                memory_limit_bytes=memory_limit_bytes,
-            ),
+            build_figure,
             memory_limit_bytes,
             token,
         ),
@@ -109,7 +120,13 @@ def _render_source(
 def _validate_fit_options(
     options: object,
     selected_model: str | None,
+    committed_transform: CommittedTransform | None,
 ) -> tuple[BoundFit, ...]:
+    if committed_transform is not None and not isinstance(
+        committed_transform,
+        CommittedTransform,
+    ):
+        raise TypeError("committed_transform must be CommittedTransform or None")
     prepared = tuple(options) if not isinstance(options, tuple) else options
     if not prepared or any(not isinstance(option, BoundFit) for option in prepared):
         raise ValueError("fit Workbench requires BoundFit options")
@@ -117,8 +134,19 @@ def _validate_fit_options(
     models = tuple(option.spec.model_id for option in prepared)
     if len(schemas) != 1 or len(models) != len(set(models)):
         raise ValueError("fit options require one source schema and unique models")
-    if any(option.spec.committed_transform is not None for option in prepared):
-        raise ValueError("fit Workbench only accepts raw untransformed options")
+    if any(
+        option.spec.committed_transform != committed_transform
+        for option in prepared
+    ):
+        raise ValueError(
+            "fit options must share the exact frozen transform authority"
+        )
+    if committed_transform is not None:
+        selections = tuple(
+            selection_fit_view_projection(option)[1] for option in prepared
+        )
+        if any(selection != selections[0] for selection in selections[1:]):
+            raise ValueError("fit options project different authority selections")
     if selected_model is not None and selected_model not in models:
         raise ValueError("selected_model is not present in fit options")
     return prepared
@@ -129,12 +157,22 @@ def _prepare_and_render(
     figure_factory,
     source: CaptureArtifactRef,
     selected_model: str | None,
+    committed_transform: CommittedTransform | None,
     memory_limit_bytes: int,
     cancelled: threading.Event,
 ):
     if cancelled.is_set():
         raise CancelledError()
-    options = _validate_fit_options(fit_preparer(), selected_model)
+    options = _validate_fit_options(
+        fit_preparer(),
+        selected_model,
+        committed_transform,
+    )
+    source_selection = (
+        None
+        if committed_transform is None
+        else selection_fit_view_projection(options[0])[1]
+    )
     if cancelled.is_set():
         raise CancelledError()
     try:
@@ -143,12 +181,13 @@ def _prepare_and_render(
             source,
             memory_limit_bytes,
             cancelled,
+            source_selection,
         )
     except BaseException as error:
         if cancelled.is_set() or isinstance(error, CancelledError):
             raise CancelledError() from error
-        return options, None, _error_summary(error)
-    return options, bundle, None
+        return options, source_selection, None, _error_summary(error)
+    return options, source_selection, bundle, None
 
 
 def _fit_and_render(
@@ -226,6 +265,7 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
         source: CaptureArtifactRef,
         *,
         selected_model: str | None,
+        committed_transform: CommittedTransform | None,
         memory_limit_bytes: int,
         timeout_seconds: float,
     ) -> None:
@@ -246,6 +286,13 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
             not isinstance(selected_model, str) or not selected_model.strip()
         ):
             raise ValueError("selected_model must be non-empty text or None")
+        if committed_transform is not None and not isinstance(
+            committed_transform,
+            CommittedTransform,
+        ):
+            raise TypeError(
+                "committed_transform must be CommittedTransform or None"
+            )
 
         self._figure_factory = figure_factory
         self._draft_figure_factory = draft_figure_factory
@@ -253,6 +300,8 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
         self._draft_authority = CaptureFitDraftAuthority(fit_executor, fit_saver)
         self._source = source
         self._selected_model = selected_model
+        self._committed_transform = committed_transform
+        self._source_selection: Selection | None = None
         self._fit_options: dict[str, BoundFit] = {}
         self._fit_timeout_seconds = positive_real(
             timeout_seconds,
@@ -291,6 +340,10 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
         self._axis_summary.setObjectName("captureFitAxes")
         self._axis_summary.setWordWrap(True)
         editor_layout.addWidget(self._axis_summary)
+        self._authority_summary = FluentLabel("", editor)
+        self._authority_summary.setObjectName("captureFitAuthority")
+        self._authority_summary.setWordWrap(True)
+        editor_layout.addWidget(self._authority_summary)
         self._constraint_scroll = QtWidgets.QScrollArea(editor)
         self._constraint_scroll.setObjectName("captureFitConstraintScroll")
         self._constraint_scroll.setWidgetResizable(True)
@@ -327,6 +380,7 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
             self._figure_factory,
             self._source,
             self._selected_model,
+            self._committed_transform,
             self._memory_limit_bytes,
             self._cancelled,
         ):
@@ -346,7 +400,11 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
         return tuple(self._fit_options)
 
     def _install_options(self, options: tuple[BoundFit, ...]) -> None:
-        prepared = _validate_fit_options(options, self._selected_model)
+        prepared = _validate_fit_options(
+            options,
+            self._selected_model,
+            self._committed_transform,
+        )
         self._fit_options = {
             option.spec.model_id: option for option in prepared
         }
@@ -386,6 +444,7 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
         self._constraint_scroll.setWidget(form)
         self._constraint_form = form
         self._axis_summary.setText(fit_axis_summary(bound))
+        self._authority_summary.setText(fit_authority_summary(bound))
 
     def _model_changed(self, _index: int) -> None:
         self._rebuild_constraint_form()
@@ -518,6 +577,7 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
             self._source,
             self._memory_limit_bytes,
             self._cancelled,
+            self._source_selection,
         ):
             self._job_kind = None
             self._job_revision = None
@@ -562,8 +622,26 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
         try:
             result = future.result()
             if kind == "prepare":
-                options, bundle, render_error = result
-                options = _validate_fit_options(options, self._selected_model)
+                options, source_selection, bundle, render_error = result
+                options = _validate_fit_options(
+                    options,
+                    self._selected_model,
+                    self._committed_transform,
+                )
+                if source_selection is not None and not isinstance(
+                    source_selection,
+                    Selection,
+                ):
+                    raise TypeError("prepare worker returned an invalid selection")
+                expected_selection = (
+                    None
+                    if self._committed_transform is None
+                    else selection_fit_view_projection(options[0])[1]
+                )
+                if source_selection != expected_selection:
+                    raise ValueError(
+                        "prepare worker returned a different authority selection"
+                    )
                 if bundle is not None and not isinstance(
                     bundle,
                     EncodedRasterDocument,
@@ -637,6 +715,7 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
             if not self._closing:
                 try:
                     if kind == "prepare":
+                        self._source_selection = source_selection
                         self._install_options(options)
                         render_error = self._present_optional_bundle(
                             bundle,
@@ -724,6 +803,7 @@ def open_capture_fit_workbench(
     source: CaptureArtifactRef,
     *,
     selected_model: str | None = None,
+    committed_transform: CommittedTransform | None = None,
     memory_limit_bytes: int = _DEFAULT_FIT_GUI_MEMORY_LIMIT_BYTES,
     timeout_seconds: float = _DEFAULT_FIT_TIMEOUT_SECONDS,
 ) -> CaptureFitWorkbenchWindow:
@@ -738,6 +818,7 @@ def open_capture_fit_workbench(
             fit_saver,
             source,
             selected_model=selected_model,
+            committed_transform=committed_transform,
             memory_limit_bytes=limit,
             timeout_seconds=timeout,
         )

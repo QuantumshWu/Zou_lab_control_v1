@@ -19,6 +19,7 @@ from .contract import (
     contract_for,
     dataset_axes,
     display_axis_indices,
+    selection_fit_view_projection,
     validate_view_spec,
 )
 from .evaluate import (
@@ -91,5 +92,5 @@ __all__ = [
     "decode_view_spec", "encode_figure_document", "encode_view_spec",
     "figure_document_from_tree", "figure_document_to_tree", "suggest_fit_view", "suggest_view",
     "estimate_view_evaluation_peak_nbytes",
-    "validate_view_spec", "view_spec_from_tree", "view_spec_to_tree",
+    "selection_fit_view_projection", "validate_view_spec", "view_spec_from_tree", "view_spec_to_tree",
 ]

@@ -2135,23 +2135,34 @@ class Experiment:
         source: CaptureArtifactRef,
         *,
         model: str | None = None,
+        committed_transform: CommittedTransform | None = None,
         memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
         timeout_seconds: float = _DEFAULT_FIT_GUI_TIMEOUT_SECONDS,
     ):
-        """Author, preview, and explicitly save one raw committed-capture fit.
+        """Author, preview, and explicitly save one committed-capture fit.
 
-        The first GUI slice deliberately accepts no ``CommittedTransform`` and
-        never derives authority from a current display or selector.  Models
-        are offered only when their declared axis roles have one unambiguous
-        match in the source schema; advanced axis/transform authoring remains
-        available through :meth:`fit`.
+        A supplied transform is frozen before the window opens and must satisfy
+        the narrow selection-only Fit-display contract.  The GUI edits model
+        constraints only; it never derives authority from a current display or
+        selector.  Reduction and transform authoring remain explicit through
+        :meth:`fit`.
         """
 
         if not isinstance(source, CaptureArtifactRef):
             raise TypeError("source must be CaptureArtifactRef")
+        if committed_transform is not None and not isinstance(
+            committed_transform,
+            CommittedTransform,
+        ):
+            raise TypeError(
+                "committed_transform must be CommittedTransform or None"
+            )
         limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         timeout = _positive_real(timeout_seconds, "timeout_seconds")
         selected_model = None if model is None else _text(model, "model")
+        frozen_transform = committed_transform
+
+        from zlc_frontend import selection_fit_view_projection
 
         def prepare_fit() -> tuple[BoundFit, ...]:
             with _service_guard(self._authority_token) as services:
@@ -2163,19 +2174,26 @@ class Experiment:
             options: list[BoundFit] = []
             for definition in fit_model_catalog():
                 try:
-                    spec = fit_spec_for(schema, definition.model_id)
+                    spec = fit_spec_for(
+                        schema,
+                        definition.model_id,
+                        committed_transform=frozen_transform,
+                    )
                     bound = bind_fit(spec, schema)
+                    if frozen_transform is not None:
+                        selection_fit_view_projection(bound)
                 except ValueError:
                     continue
-                if bound.spec.committed_transform is not None:
+                if bound.spec.committed_transform != frozen_transform:
                     raise RuntimeError(
-                        "raw fit option unexpectedly contains a transform"
+                        "fit option differs from the frozen transform authority"
                     )
                 options.append(bound)
             if not options:
                 raise ValueError(
-                    "capture schema has no unambiguous current fit model; use fit() "
-                    "with explicit fit_axis_ids"
+                    "capture schema and committed transform have no unambiguous "
+                    "displayable current fit model; use fit() with explicit "
+                    "fit_axis_ids for non-displayable transforms"
                 )
             if selected_model is not None and selected_model not in {
                 option.spec.model_id for option in options
@@ -2193,14 +2211,18 @@ class Experiment:
         ) -> FitExecution:
             if not isinstance(spec, FitSpec):
                 raise TypeError("fit GUI execution requires FitSpec")
-            if spec.committed_transform is not None:
-                raise ValueError("fit GUI does not accept CommittedTransform")
+            if spec.committed_transform != frozen_transform:
+                raise ValueError(
+                    "fit GUI spec differs from the frozen transform authority"
+                )
             with _fit_service_guard(self._authority_token) as services:
                 admitted = services.capture_repository.admit(source)
                 schema = admitted.artifact.frame_source.schema
                 if spec.input_schema_fingerprint != schema.fingerprint:
                     raise ValueError("fit GUI spec belongs to another source schema")
-                bind_fit(spec, schema)
+                bound = bind_fit(spec, schema)
+                if frozen_transform is not None:
+                    selection_fit_view_projection(bound)
                 return services.fit_repository.execute(
                     admitted,
                     spec,
@@ -2251,6 +2273,7 @@ class Experiment:
             save_fit_execution,
             source,
             selected_model=selected_model,
+            committed_transform=frozen_transform,
             memory_limit_bytes=limit,
             timeout_seconds=timeout,
         )

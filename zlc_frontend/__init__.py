@@ -1,5 +1,6 @@
 """Target frontend public values with no implicit renderer or Qt import."""
 
+from .authority import describe_authoritative_transform
 from .data_figure import DataFigure, FigurePanelRegion
 from .fit_grid import FitGridCellSummary, FitGridModel, FitGridPage
 from .form import (
@@ -10,6 +11,7 @@ from .form import (
     parse_number_text,
 )
 from .fit_editor import (
+    fit_authority_summary,
     fit_axis_summary,
     fit_constraint_form,
     fit_spec_from_form,
@@ -68,6 +70,7 @@ from .figure import (
     encode_figure_document,
     encode_view_spec,
     estimate_view_evaluation_peak_nbytes,
+    selection_fit_view_projection,
     suggest_view,
     suggest_fit_view,
     validate_view_spec,
@@ -128,6 +131,7 @@ __all__ = [
     "ViewSpec",
     "ViewSuggestion",
     "contract_for",
+    "describe_authoritative_transform",
     "display_axis_indices",
     "decode_figure_document",
     "decode_view_spec",
@@ -135,10 +139,12 @@ __all__ = [
     "encode_view_spec",
     "estimate_view_evaluation_peak_nbytes",
     "fit_axis_summary",
+    "fit_authority_summary",
     "fit_constraint_form",
     "fit_spec_from_form",
     "suggest_view",
     "suggest_fit_view",
     "validate_view_spec",
     "parse_number_text",
+    "selection_fit_view_projection",
 ]

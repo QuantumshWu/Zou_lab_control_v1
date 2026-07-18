@@ -19,6 +19,7 @@ from zlc_data import (
     bind_fit,
 )
 
+from .authority import describe_authoritative_transform
 from .form import FormFieldProps, FormSpec
 
 
@@ -50,6 +51,17 @@ def fit_axis_summary(bound: BoundFit) -> str:
         describe(axis_id) for axis_id in bound.spec.batch_axis_ids
     )
     return f"fit axes: {fit_axes} · batch axes: {batch_axes or 'none'}"
+
+
+def fit_authority_summary(bound: BoundFit) -> str:
+    """Describe the immutable transform authority carried by one bound Fit."""
+
+    if not isinstance(bound, BoundFit):
+        raise TypeError("bound must be BoundFit")
+    transform = bound.spec.committed_transform
+    return describe_authoritative_transform(
+        None if transform is None else transform.spec
+    )
 
 
 def fit_constraint_form(bound: BoundFit) -> FormSpec:
@@ -125,6 +137,7 @@ def fit_spec_from_form(
 
 
 __all__ = [
+    "fit_authority_summary",
     "fit_axis_summary",
     "fit_constraint_form",
     "fit_spec_from_form",

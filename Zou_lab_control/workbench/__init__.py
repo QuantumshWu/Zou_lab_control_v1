@@ -28,6 +28,7 @@ def open_capture_fit_workbench(
     source,
     *,
     selected_model=None,
+    committed_transform=None,
     memory_limit_bytes=None,
     timeout_seconds=None,
 ):
@@ -35,7 +36,10 @@ def open_capture_fit_workbench(
 
     from ._fit import open_capture_fit_workbench as _open
 
-    keywords = {"selected_model": selected_model}
+    keywords = {
+        "selected_model": selected_model,
+        "committed_transform": committed_transform,
+    }
     if memory_limit_bytes is not None:
         keywords["memory_limit_bytes"] = memory_limit_bytes
     if timeout_seconds is not None:

@@ -51,6 +51,7 @@ from zlc_neutral_atom.scan.contracts import (
     AutonomousScanSlotProgram,
 )
 from zlc_pulse import FIELD_DAC, PulseDocument, load_pulse_document
+from zlc_frontend import describe_authoritative_transform
 from zlc_workbench.task_console import (
     ScanDisplayIntent,
     ScanEditConflict,
@@ -58,7 +59,6 @@ from zlc_workbench.task_console import (
     ScanEditorSession,
     TaskConsoleScanIntent,
     compose_task_console_catalog,
-    describe_authoritative_transform,
     load_task_console_scan_intent,
     save_task_console_scan_intent,
     task_console_catalog_items,

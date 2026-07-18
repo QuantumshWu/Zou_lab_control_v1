@@ -15,12 +15,7 @@ import threading
 from uuid import uuid4
 
 from zlc_data import (
-    CoordinateRangeSelection,
     DataTransformSpec,
-    IndexRangeSelection,
-    IndexSelection,
-    ReductionSpec,
-    Selection,
     data_transform_spec_from_tree,
     data_transform_spec_to_tree,
 )
@@ -233,55 +228,6 @@ def _optional_text(value: object, field: str) -> str | None:
     if value is None:
         return None
     return canonical_text(value, field)
-
-
-def describe_authoritative_transform(
-    spec: DataTransformSpec | None,
-) -> str:
-    """Describe every persisted authority operation without inferring axes."""
-
-    if spec is None:
-        return "None · no user-authored Select/Reduce"
-    if not isinstance(spec, DataTransformSpec):
-        raise TypeError("spec must be DataTransformSpec or None")
-    operations: list[str] = []
-    for operation in spec.operations:
-        if isinstance(operation, Selection):
-            terms: list[str] = []
-            for term in operation.terms:
-                axis = term.axis_id.value
-                if isinstance(term, IndexSelection):
-                    terms.append(f"{axis}=index[{term.index}]")
-                elif isinstance(term, IndexRangeSelection):
-                    terms.append(f"{axis}=indices[{term.start}:{term.stop}]")
-                elif isinstance(term, CoordinateRangeSelection):
-                    frame = (
-                        ""
-                        if term.coordinate_frame is None
-                        else f"@{term.coordinate_frame.value}"
-                    )
-                    terms.append(
-                        f"{axis}=coordinates[{term.lower},{term.upper}]{frame}"
-                    )
-                else:  # pragma: no cover - Selection owns the closed term union.
-                    raise TypeError("Selection contains an unsupported term")
-            operations.append("select(" + ", ".join(terms) + ")")
-        elif isinstance(operation, ReductionSpec):
-            axes = ",".join(axis_id.value for axis_id in operation.axis_ids)
-            minimum = (
-                ""
-                if operation.minimum_valid_count is None
-                else f"/min={operation.minimum_valid_count}"
-            )
-            operations.append(
-                f"reduce({axes})={operation.method.value}"
-                f"/{operation.missing_policy.value}"
-                f"/{operation.validity_policy.value}"
-                f"{minimum}"
-            )
-        else:  # pragma: no cover - DataTransformSpec owns the closed union.
-            raise TypeError("DataTransformSpec contains an unsupported operation")
-    return "AUTHORITATIVE · " + " → ".join(operations)
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,7 +570,6 @@ __all__ = [
     "TaskConsoleScanIntent",
     "compose_task_console_catalog",
     "decode_task_console_scan_intent",
-    "describe_authoritative_transform",
     "encode_task_console_scan_intent",
     "load_task_console_scan_intent",
     "save_task_console_scan_intent",

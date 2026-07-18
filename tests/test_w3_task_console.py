@@ -47,6 +47,7 @@ from zlc_pulse import (
     load_pulse_document,
     replace_pulse_field,
 )
+from zlc_frontend import describe_authoritative_transform
 from zlc_workbench.task_console import (
     SCAN_INTENT_DEFAULT_CAMERA_ROLE,
     SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES,
@@ -60,7 +61,6 @@ from zlc_workbench.task_console import (
     TaskConsoleScanIntent,
     compose_task_console_catalog,
     decode_task_console_scan_intent,
-    describe_authoritative_transform,
     encode_task_console_scan_intent,
     load_task_console_scan_intent,
     save_task_console_scan_intent,

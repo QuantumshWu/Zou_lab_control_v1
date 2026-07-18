@@ -6,6 +6,9 @@ from typing import Sequence
 
 from zlc_data import (
     COMPONENT,
+    AxisId,
+    BoundFit,
+    CommittedTransform,
     CoordinateRangeSelection,
     FitResultBatch,
     IndexRangeSelection,
@@ -20,6 +23,7 @@ from zlc_data import (
     AxisSpec,
     DatasetSchema,
     Selection,
+    TransformedSchema,
     ValidityContract,
     ValueSchema,
     resolve_selection_indices,
@@ -166,11 +170,12 @@ def dataset_axes(schema: DatasetSchema):
     return (schema.repeat_axis, *schema.point_axes, *schema.cell_schema.data_axes)
 
 
-def _selection_fit_projection(
+def _selection_transform_projection(
     source_schema: DatasetSchema,
-    result: FitResultBatch,
-) -> tuple[DatasetSchema, Selection]:
-    """Return the exact effective schema for one displayable Fit ROI.
+    transform: CommittedTransform,
+    fit_axis_ids: tuple[AxisId, ...],
+) -> tuple[TransformedSchema, DatasetSchema, Selection]:
+    """Validate and project the one displayable committed Fit ROI.
 
     This is a narrow authority-to-presentation contract, not a second transform
     engine.  It accepts exactly one range-preserving Selection over spatial
@@ -178,9 +183,13 @@ def _selection_fit_projection(
     snapshot through the identical selection without inventing a derived ref.
     """
 
-    transform = result.spec.committed_transform
-    if transform is None:
-        raise ValueError("fit result has no committed transform")
+    if not isinstance(source_schema, DatasetSchema):
+        raise TypeError("source_schema must be DatasetSchema")
+    if not isinstance(transform, CommittedTransform):
+        raise TypeError("transform must be CommittedTransform")
+    fit_axis_ids = tuple(fit_axis_ids)
+    if any(not isinstance(axis_id, AxisId) for axis_id in fit_axis_ids):
+        raise TypeError("fit_axis_ids must contain AxisId values")
     operations = transform.spec.operations
     if len(operations) != 1 or not isinstance(operations[0], Selection):
         raise ValueError(
@@ -206,7 +215,7 @@ def _selection_fit_projection(
         raise ValueError(
             "transformed fit display selections must name spatial data axes"
         )
-    if not selected_ids <= set(result.spec.fit_axis_ids):
+    if not selected_ids <= set(fit_axis_ids):
         raise ValueError(
             "every selected spatial axis must remain an explicit fit axis"
         )
@@ -220,14 +229,6 @@ def _selection_fit_projection(
         raise ValueError(
             "transformed fit display cannot select or reduce repeat/point axes"
         )
-    if result.effective_schema_fingerprint != resolved.fingerprint:
-        raise ValueError("fit result effective schema differs from its transform")
-    if result.fit_axis_specs != tuple(
-        resolved.axis(axis_id) for axis_id in result.spec.fit_axis_ids
-    ) or result.batch_axis_specs != tuple(
-        resolved.axis(axis_id) for axis_id in result.spec.batch_axis_ids
-    ):
-        raise ValueError("fit result axes differ from its transformed schema")
     validity_contract = (
         ValidityContract.components(*resolved.validity_axis_ids)
         if resolved.validity_axis_ids
@@ -244,6 +245,52 @@ def _selection_fit_projection(
             resolved.value_unit,
         ),
     )
+    return resolved, effective_schema, authority_selection
+
+
+def selection_fit_view_projection(
+    bound: BoundFit,
+) -> tuple[DatasetSchema, Selection]:
+    """Return the exact raw-snapshot projection for one displayable bound Fit."""
+
+    if not isinstance(bound, BoundFit):
+        raise TypeError("bound must be BoundFit")
+    resolved, effective_schema, authority_selection = (
+        _selection_transform_projection(
+            bound.expected_schema,
+            bound.spec.committed_transform,
+            bound.spec.fit_axis_ids,
+        )
+    )
+    if bound.effective_schema != resolved:
+        raise ValueError("bound Fit effective schema differs from its transform")
+    return effective_schema, authority_selection
+
+
+def _selection_fit_projection(
+    source_schema: DatasetSchema,
+    result: FitResultBatch,
+) -> tuple[DatasetSchema, Selection]:
+    """Return the exact effective schema for one displayable Fit result."""
+
+    transform = result.spec.committed_transform
+    if transform is None:
+        raise ValueError("fit result has no committed transform")
+    resolved, effective_schema, authority_selection = (
+        _selection_transform_projection(
+            source_schema,
+            transform,
+            result.spec.fit_axis_ids,
+        )
+    )
+    if result.effective_schema_fingerprint != resolved.fingerprint:
+        raise ValueError("fit result effective schema differs from its transform")
+    if result.fit_axis_specs != tuple(
+        resolved.axis(axis_id) for axis_id in result.spec.fit_axis_ids
+    ) or result.batch_axis_specs != tuple(
+        resolved.axis(axis_id) for axis_id in result.spec.batch_axis_ids
+    ):
+        raise ValueError("fit result axes differ from its transformed schema")
     return effective_schema, authority_selection
 
 
