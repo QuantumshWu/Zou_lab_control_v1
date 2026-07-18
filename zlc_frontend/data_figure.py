@@ -20,6 +20,7 @@ from .figure import (
     ResolvedDatasetMap,
     ViewIntent,
 )
+from .figure.contract import _validate_selection_fit_view
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,11 +118,19 @@ class DataFigure:
                 raise ValueError(
                     f"fit overlay references unknown layer {layer_id!r}"
                 ) from exc
-            if result.spec.committed_transform is not None:
-                raise ValueError(
-                    "a transformed fit cannot be overlaid on a raw FigureDocument"
-                )
             snapshot = datasets.resolve(layer.dataset_id)
+            if result.spec.committed_transform is not None:
+                try:
+                    _validate_selection_fit_view(
+                        snapshot.block.schema,
+                        result,
+                        layer.view,
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "transformed fit overlay is not faithfully displayable: "
+                        f"{exc}"
+                    ) from exc
             validate_fit_result_source_binding(result, snapshot.ref, snapshot.block.schema)
             fit_layers[layer_id] = (layer, result)
 

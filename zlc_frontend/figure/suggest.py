@@ -14,6 +14,7 @@ from zlc_data import (
 
 from .contract import (
     _first_visible_point_tuple,
+    _selection_fit_projection,
     contract_for,
     dataset_axes,
     display_axis_indices,
@@ -479,34 +480,14 @@ def suggest_view(
     )
 
 
-def suggest_fit_view(
+def _suggest_fit_view_for_effective_schema(
     schema: DatasetSchema,
     result: FitResultBatch,
     selection: Selection | None = None,
     preferences: ViewPreferences | None = None,
 ) -> ViewSuggestion:
-    """Suggest a display that identifies one exact batch cell per fit overlay.
+    """Suggest against the exact schema consumed by one fit."""
 
-    This is authority-to-presentation projection only: it never creates or
-    modifies a ``FitSpec``.  The current evaluator consumes raw
-    ``DatasetSchema`` snapshots, so a fit over transformed data is rejected
-    instead of being overlaid on different observations.
-    """
-
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("result must be FitResultBatch")
-    if result.source_ref.schema_fingerprint != schema.fingerprint:
-        return _needs(
-            "FIT_SOURCE_SCHEMA_MISMATCH",
-            "fit result and displayed source use different schemas",
-        )
-    if result.spec.committed_transform is not None:
-        return _needs(
-            "TRANSFORMED_FIT_DISPLAY_UNAVAILABLE",
-            "a transformed fit cannot be overlaid on the raw source view",
-        )
     arity = len(result.fit_axis_specs)
     if arity not in (1, 2):
         return _needs(
@@ -575,6 +556,91 @@ def suggest_fit_view(
                 axis_id=axis.axis_id,
             )
     return suggestion
+
+
+def suggest_fit_view(
+    schema: DatasetSchema,
+    result: FitResultBatch,
+    selection: Selection | None = None,
+    preferences: ViewPreferences | None = None,
+) -> ViewSuggestion:
+    """Suggest one faithful display for raw or explicitly transformed fit data."""
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("result must be FitResultBatch")
+    if result.source_ref.schema_fingerprint != schema.fingerprint:
+        return _needs(
+            "FIT_SOURCE_SCHEMA_MISMATCH",
+            "fit result and displayed source use different schemas",
+        )
+    if result.spec.committed_transform is None:
+        return _suggest_fit_view_for_effective_schema(
+            schema,
+            result,
+            selection,
+            preferences,
+        )
+    if selection is not None:
+        if not isinstance(selection, Selection):
+            raise TypeError("selection must be zlc_data.Selection or None")
+        batch_ids = {axis.axis_id for axis in result.batch_axis_specs}
+        if any(term.axis_id not in batch_ids for term in selection.terms):
+            return _needs(
+                "TRANSFORMED_FIT_SELECTION_CONFLICT",
+                "additional transformed-fit display selection may name batch axes only",
+            )
+    try:
+        effective_schema, authority_selection = _selection_fit_projection(
+            schema,
+            result,
+        )
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        return _needs("TRANSFORMED_FIT_DISPLAY_UNAVAILABLE", str(exc))
+    effective = _suggest_fit_view_for_effective_schema(
+        effective_schema,
+        result,
+        selection,
+        preferences,
+    )
+    if effective.spec is None:
+        return effective
+    try:
+        display_selection = Selection(
+            (
+                *authority_selection.terms,
+                *(
+                    term
+                    for display in effective.spec.display_selections
+                    for term in display.terms
+                ),
+            )
+        )
+        lifted = ViewSpec(
+            schema.fingerprint,
+            effective.spec.intent,
+            effective.spec.axis_bindings,
+            (display_selection,),
+        )
+        validate_view_spec(schema, lifted, contract_for(lifted.intent))
+    except (TypeError, ValueError, IndexError) as exc:
+        return _needs(
+            "TRANSFORMED_FIT_VIEW_REJECTED",
+            f"committed ROI and display selection cannot be composed: {exc}",
+        )
+    return ViewSuggestion(
+        lifted,
+        effective.status,
+        (
+            DecisionReason(
+                "COMMITTED_TRANSFORM_DISPLAY",
+                "the visible ROI is copied exactly from the committed FitSpec",
+            ),
+            *effective.reasons,
+        ),
+        (),
+    )
 
 
 __all__ = ["suggest_fit_view", "suggest_view"]

@@ -6,6 +6,9 @@ from typing import Sequence
 
 from zlc_data import (
     COMPONENT,
+    CoordinateRangeSelection,
+    FitResultBatch,
+    IndexRangeSelection,
     MONITOR_HISTORY,
     READOUT_EVENT,
     REPEAT,
@@ -17,7 +20,10 @@ from zlc_data import (
     AxisSpec,
     DatasetSchema,
     Selection,
+    ValidityContract,
+    ValueSchema,
     resolve_selection_indices,
+    resolve_transformed_schema,
 )
 
 from .model import (
@@ -158,6 +164,87 @@ def dataset_axes(schema: DatasetSchema):
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
     return (schema.repeat_axis, *schema.point_axes, *schema.cell_schema.data_axes)
+
+
+def _selection_fit_projection(
+    source_schema: DatasetSchema,
+    result: FitResultBatch,
+) -> tuple[DatasetSchema, Selection]:
+    """Return the exact effective schema for one displayable Fit ROI.
+
+    This is a narrow authority-to-presentation contract, not a second transform
+    engine.  It accepts exactly one range-preserving Selection over spatial
+    data axes that remain fitted axes.  FigureEvaluator can then read the raw
+    snapshot through the identical selection without inventing a derived ref.
+    """
+
+    transform = result.spec.committed_transform
+    if transform is None:
+        raise ValueError("fit result has no committed transform")
+    operations = transform.spec.operations
+    if len(operations) != 1 or not isinstance(operations[0], Selection):
+        raise ValueError(
+            "transformed fit display requires exactly one spatial Selection"
+        )
+    authority_selection = operations[0]
+    if any(
+        not isinstance(term, (IndexRangeSelection, CoordinateRangeSelection))
+        for term in authority_selection.terms
+    ):
+        raise ValueError(
+            "transformed fit display supports only range-preserving selections"
+        )
+    source_data = {
+        axis.axis_id: axis for axis in source_schema.cell_schema.data_axes
+    }
+    selected_ids = {term.axis_id for term in authority_selection.terms}
+    if any(
+        axis_id not in source_data
+        or source_data[axis_id].role not in (SPATIAL_X, SPATIAL_Y)
+        for axis_id in selected_ids
+    ):
+        raise ValueError(
+            "transformed fit display selections must name spatial data axes"
+        )
+    if not selected_ids <= set(result.spec.fit_axis_ids):
+        raise ValueError(
+            "every selected spatial axis must remain an explicit fit axis"
+        )
+
+    resolved = resolve_transformed_schema(source_schema, transform)
+    source_cell_axes = (source_schema.repeat_axis, *source_schema.point_axes)
+    if (
+        resolved.cell_axes != source_cell_axes
+        or resolved.cell_layout != source_schema.cell_layout
+    ):
+        raise ValueError(
+            "transformed fit display cannot select or reduce repeat/point axes"
+        )
+    if result.effective_schema_fingerprint != resolved.fingerprint:
+        raise ValueError("fit result effective schema differs from its transform")
+    if result.fit_axis_specs != tuple(
+        resolved.axis(axis_id) for axis_id in result.spec.fit_axis_ids
+    ) or result.batch_axis_specs != tuple(
+        resolved.axis(axis_id) for axis_id in result.spec.batch_axis_ids
+    ):
+        raise ValueError("fit result axes differ from its transformed schema")
+    validity_contract = (
+        ValidityContract.components(*resolved.validity_axis_ids)
+        if resolved.validity_axis_ids
+        else ValidityContract.value()
+    )
+    effective_schema = DatasetSchema(
+        source_schema.repeat_axis,
+        source_schema.point_axes,
+        source_schema.point_layout,
+        ValueSchema(
+            resolved.data_axes,
+            validity_contract,
+            resolved.dtype,
+            resolved.value_unit,
+        ),
+    )
+    return effective_schema, authority_selection
 
 
 def display_axis_indices(
@@ -416,6 +503,61 @@ def validate_view_spec(
         )
         if unresolved:
             raise ValueError(f"METER has unresolved axes: {unresolved}")
+
+
+def _validate_selection_fit_view(
+    schema: DatasetSchema,
+    result: FitResultBatch,
+    view: ViewSpec,
+) -> None:
+    """Prove that a raw view reproduces one selection-only Fit authority.
+
+    Figure evaluation still reads the immutable raw snapshot.  Therefore the
+    committed selection must appear byte-for-byte in the display selection,
+    and the only additional selection terms may identify saved batch cells.
+    Any display reduction would change the observations and is rejected.
+    """
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("result must be FitResultBatch")
+    if not isinstance(view, ViewSpec):
+        raise TypeError("view must be ViewSpec")
+    if result.spec.committed_transform is None:
+        return
+
+    _effective_schema, authority_selection = _selection_fit_projection(
+        schema,
+        result,
+    )
+    terms = tuple(
+        term
+        for selection in view.display_selections
+        for term in selection.terms
+    )
+    actual_terms = {term.axis_id: term for term in terms}
+    if len(actual_terms) != len(terms):
+        raise ValueError("figure selection repeats an axis")
+    authority_terms = {
+        term.axis_id: term for term in authority_selection.terms
+    }
+    if any(
+        actual_terms.get(axis_id) != term
+        for axis_id, term in authority_terms.items()
+    ):
+        raise ValueError("figure ROI differs from the fit committed transform")
+    batch_ids = {axis.axis_id for axis in result.batch_axis_specs}
+    if set(actual_terms) - set(authority_terms) - batch_ids:
+        raise ValueError(
+            "figure selection outside fit batch axes differs from the committed transform"
+        )
+    if any(
+        binding.role is AxisViewRole.REDUCED
+        for binding in view.axis_bindings
+    ):
+        raise ValueError("selection-only transformed fit display cannot reduce axes")
+    validate_view_spec(schema, view, contract_for(view.intent))
 
 
 __all__ = [
