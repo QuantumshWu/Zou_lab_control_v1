@@ -19,6 +19,7 @@ from zlc_data import (
     bind_fit,
     decode_fit_result_batch,
     encode_fit_result_batch,
+    fit_result_retained_upper_bound_nbytes,
     validate_fit_result_source_binding,
 )
 from zlc_storage import (
@@ -323,6 +324,8 @@ class CaptureFitResultRepository:
         self,
         reference: CaptureFitResultArtifactRef,
         capture_repository: CaptureRepository,
+        *,
+        memory_limit_bytes: int | None = None,
     ) -> AdmittedCaptureFitResult:
         with self._lifecycle_lock:
             self._require_integrity()
@@ -336,6 +339,11 @@ class CaptureFitResultRepository:
                 )
             if type(capture_repository) is not CaptureRepository:
                 raise TypeError("capture_repository must be CaptureRepository")
+            memory_limit = (
+                None
+                if memory_limit_bytes is None
+                else positive_integer(memory_limit_bytes, "memory_limit_bytes")
+            )
             manifest_payload = self._store_authority.read_manifest(
                 CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE,
                 reference.manifest_digest,
@@ -365,12 +373,23 @@ class CaptureFitResultRepository:
             result_ref = content_ref_from_tree(manifest["result_blob"])
             if result_ref.size > _MAX_RESULT_BLOB_BYTES:
                 raise ValueError("capture-fit result blob exceeds repository limit")
+            if memory_limit is not None and result_ref.size > memory_limit:
+                raise MemoryError(
+                    "capture-fit result blob exceeds the caller memory budget"
+                )
             result = decode_fit_result_batch(
                 self._store_authority.read_blob(
                     result_ref,
                     max_bytes=_MAX_RESULT_BLOB_BYTES,
                 )
             )
+            if (
+                memory_limit is not None
+                and fit_result_retained_upper_bound_nbytes(result) > memory_limit
+            ):
+                raise MemoryError(
+                    "decoded capture-fit result exceeds the caller memory budget"
+                )
             source = capture_repository.admit(source_ref)
             validate_fit_result_source_binding(
                 result,

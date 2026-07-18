@@ -1,6 +1,7 @@
 """Target frontend public values with no implicit renderer or Qt import."""
 
-from .data_figure import DataFigure
+from .data_figure import DataFigure, FigurePanelRegion
+from .fit_grid import FitGridCellSummary, FitGridModel, FitGridPage
 from .form import (
     FormChoice,
     FormFieldKind,
@@ -100,12 +101,16 @@ __all__ = [
     "FigureEvaluationPolicy",
     "FigureEvaluator",
     "FigureLayer",
+    "FigurePanelRegion",
     "FigureSelection",
     "FixedIndex",
     "FormChoice",
     "FormFieldKind",
     "FormFieldProps",
     "FormSpec",
+    "FitGridCellSummary",
+    "FitGridModel",
+    "FitGridPage",
     "LatestNonempty",
     "PanelFrame",
     "PanelPresentationIdentity",

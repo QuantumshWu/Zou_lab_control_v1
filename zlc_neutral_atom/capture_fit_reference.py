@@ -18,3 +18,13 @@ class CaptureFitResultArtifactRef:
     def __post_init__(self) -> None:
         canonical_text(self.repository_id, "repository_id")
         sha256_text(self.manifest_digest, "manifest_digest")
+
+    @property
+    def target_ref(self) -> str:
+        return f"{CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE}/{self.manifest_digest}"
+
+
+__all__ = [
+    "CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE",
+    "CaptureFitResultArtifactRef",
+]

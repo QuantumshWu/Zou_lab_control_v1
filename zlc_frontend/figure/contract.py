@@ -50,7 +50,12 @@ IMAGE_CONTRACT = ViewContract(
         AxisRolePolicy(SPATIAL_X, ()),
         AxisRolePolicy(SPATIAL_Y, ()),
     ),
-    (RepeatViewMode.MEAN, RepeatViewMode.LATEST, RepeatViewMode.SUM),
+    (
+        RepeatViewMode.MEAN,
+        RepeatViewMode.LATEST,
+        RepeatViewMode.SUM,
+        RepeatViewMode.FACET,
+    ),
     RepeatViewMode.MEAN,
     (REPEAT,),
     maximum_batch_series=1,
@@ -68,8 +73,8 @@ CURVE_CONTRACT = ViewContract(
         AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
         AxisRolePolicy(SITE, (AxisViewRole.BATCH, AxisViewRole.FACET)),
         AxisRolePolicy(COMPONENT, (AxisViewRole.BATCH, AxisViewRole.FACET)),
-        # A spatial curve requires an explicit pixel/ROI selection.  It is
-        # never made scalar by an automatic mean.
+        # A spatial curve requires an explicit pixel/ROI/page selection.  It
+        # is never made scalar by an automatic mean or automatic gallery.
         AxisRolePolicy(SPATIAL_X, ()),
         AxisRolePolicy(SPATIAL_Y, ()),
     ),
@@ -78,6 +83,7 @@ CURVE_CONTRACT = ViewContract(
         RepeatViewMode.LATEST,
         RepeatViewMode.SUM,
         RepeatViewMode.BATCH,
+        RepeatViewMode.FACET,
     ),
     RepeatViewMode.MEAN,
     (REPEAT, SPATIAL_X, SPATIAL_Y),
@@ -229,6 +235,8 @@ def _repeat_mode_for_binding(binding) -> RepeatViewMode:
         )
     if binding.role is AxisViewRole.BATCH:
         return RepeatViewMode.BATCH
+    if binding.role is AxisViewRole.FACET:
+        return RepeatViewMode.FACET
     if binding.role is AxisViewRole.SAMPLE:
         return RepeatViewMode.SAMPLE
     if binding.role is AxisViewRole.SELECTED:
@@ -360,12 +368,18 @@ def validate_view_spec(
             if axis.role == REPEAT:
                 pass
             elif policy is None or binding.role not in policy.automatic_roles:
+                explicit_spatial_curve_page = (
+                    spec.intent is ViewIntent.CURVE
+                    and axis.role in (SPATIAL_X, SPATIAL_Y)
+                    and binding.role is AxisViewRole.FACET
+                    and axis.axis_id in selected_axis_ids
+                )
                 # Explicit SAMPLE is permitted for histogram axes only; it is
                 # review-required at suggestion time but still a valid spec.
                 if not (
                     spec.intent is ViewIntent.HISTOGRAM
                     and binding.role is AxisViewRole.SAMPLE
-                ):
+                ) and not explicit_spatial_curve_page:
                     raise ValueError(
                         f"{binding.role.value} is not allowed for axis role {axis.role}"
                     )

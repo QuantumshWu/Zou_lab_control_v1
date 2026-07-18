@@ -128,6 +128,8 @@ class QtOwnerWake(QtCore.QObject):
 class QtImageBoard(QtWidgets.QWidget):
     """Single-panel BoardPresenter that paints directly from immutable bytes."""
 
+    normalizedDoubleClicked = QtCore.pyqtSignal(float, float)
+
     def __init__(
         self,
         panel_id: str,
@@ -191,6 +193,20 @@ class QtImageBoard(QtWidgets.QWidget):
             return
         image = front[1]
         painter.drawImage(_aspect_target(self.rect(), image), image)
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
+        front = self._front
+        if front is not None:
+            target = _aspect_target(self.rect(), front[1])
+            position = event.pos()
+            if target.contains(position) and target.width() > 0 and target.height() > 0:
+                self.normalizedDoubleClicked.emit(
+                    (position.x() - target.x()) / target.width(),
+                    (position.y() - target.y()) / target.height(),
+                )
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     def _require_owner(self) -> None:
         if QtCore.QThread.currentThread() != self.thread():

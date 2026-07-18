@@ -5,6 +5,7 @@ not re-export it and therefore never loads PyQt as a side effect.
 """
 
 from ..selector import ImageViewportTransform, RectangleGesture
+from .axis_navigator import AxisLayoutNavigator
 from .board import QtImageBoard, QtOwnerWake, QtRasterBoard
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
 from .fluent import (
@@ -128,6 +129,7 @@ __all__ = [
     "ACCENT",
     "API_VIOLET",
     "API_VIOLET_DARK",
+    "AxisLayoutNavigator",
     "BG",
     "CARD_PAD",
     "CARD_TITLE_PX",

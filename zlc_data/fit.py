@@ -20,6 +20,7 @@ from .fit_contract import (
     FitParameterConstraint,
     FitResultBatch,
     FitSpec,
+    fit_result_retained_upper_bound_nbytes,
 )
 from .fit_model import (
     FitModelDefinition,
@@ -154,6 +155,7 @@ __all__ = [
     "encode_fit_spec",
     "fit_model_catalog",
     "fit_model_definition",
+    "fit_result_retained_upper_bound_nbytes",
     "fit_spec_from_tree",
     "fit_spec_for",
     "fit_spec_to_tree",

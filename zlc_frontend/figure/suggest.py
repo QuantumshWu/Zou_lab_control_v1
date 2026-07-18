@@ -83,6 +83,8 @@ def _repeat_binding(axis_id, mode: RepeatViewMode, allowed_indices) -> AxisViewB
         return AxisViewBinding(axis_id, AxisViewRole.SELECTED, selector=LatestNonempty())
     if mode is RepeatViewMode.BATCH:
         return AxisViewBinding(axis_id, AxisViewRole.BATCH)
+    if mode is RepeatViewMode.FACET:
+        return AxisViewBinding(axis_id, AxisViewRole.FACET)
     return AxisViewBinding(axis_id, AxisViewRole.SAMPLE)
 
 

@@ -36,6 +36,7 @@ from zlc_data import (
     FitCancelled,
     FitResultBatch,
     FitSpec,
+    OwnedSnapshot,
     ReductionMethod,
     Selection,
     ValidityPolicy,
@@ -43,6 +44,7 @@ from zlc_data import (
     commit_transform,
     expand_value_validity,
     fit_model_catalog,
+    fit_result_retained_upper_bound_nbytes,
     fit_spec_for,
     validate_fit_result_source_binding,
 )
@@ -1709,6 +1711,7 @@ def _project_notebook_figure(
     occupancy_output,
     memory_limit_bytes: int | None,
     draft_fit_result: FitResultBatch | None = None,
+    preloaded_snapshot: OwnedSnapshot | None = None,
 ):
     """Composition-only ref dispatch; frontend never sees a neutral repository."""
 
@@ -1747,9 +1750,21 @@ def _project_notebook_figure(
         FitResultBatch,
     ):
         raise TypeError("draft_fit_result must be FitResultBatch or None")
+    if preloaded_snapshot is not None and not isinstance(
+        preloaded_snapshot,
+        OwnedSnapshot,
+    ):
+        raise TypeError("preloaded_snapshot must be OwnedSnapshot or None")
+    if preloaded_snapshot is not None and not isinstance(
+        source,
+        AdmittedCaptureFitResult,
+    ):
+        raise TypeError(
+            "a preloaded figure snapshot is valid only for an admitted saved fit"
+        )
 
     fit_result = draft_fit_result
-    snapshot = None
+    snapshot = preloaded_snapshot
     admitted = None
     selected_occupancy_output = None
     source_label = "capture"
@@ -1813,6 +1828,7 @@ def _project_notebook_figure(
         admitted_fit = services.fit_repository.load(
             source,
             services.capture_repository,
+            memory_limit_bytes=memory_limit_bytes,
         )
         source_ref = admitted_fit.source_capture_ref
         fit_result = admitted_fit.result
@@ -1827,8 +1843,11 @@ def _project_notebook_figure(
         )
 
     if source_ref is not None:
-        admitted = services.capture_repository.admit(source_ref)
-        schema = admitted.artifact.frame_source.schema
+        if snapshot is None:
+            admitted = services.capture_repository.admit(source_ref)
+            schema = admitted.artifact.frame_source.schema
+        else:
+            schema = snapshot.block.schema
         if draft_fit_result is not None:
             frame_source = admitted.artifact.frame_source
             validate_fit_result_source_binding(
@@ -1902,7 +1921,14 @@ def _project_notebook_figure(
         return document, None, fit_result
     if snapshot is None:
         assert admitted is not None
-        snapshot = admitted.materialize_snapshot(memory_limit_bytes=memory_limit_bytes)
+        source_limit = memory_limit_bytes
+        if fit_result is not None:
+            source_limit -= fit_result_retained_upper_bound_nbytes(fit_result)
+            if source_limit <= 0:
+                raise MemoryError(
+                    "fit overlay leaves no source materialization budget"
+                )
+        snapshot = admitted.materialize_snapshot(memory_limit_bytes=source_limit)
     return (
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
@@ -1920,6 +1946,8 @@ def _data_figure_for_services(
     occupancy_output,
     memory_limit_bytes: int,
     draft_fit_result: FitResultBatch | None = None,
+    preloaded_snapshot: OwnedSnapshot | None = None,
+    retained_inputs_prebudgeted: bool = False,
 ) -> "DataFigure":
     """Build one frozen DataFigure while repository authority stays private."""
 
@@ -1932,25 +1960,44 @@ def _data_figure_for_services(
         occupancy_output=occupancy_output,
         memory_limit_bytes=memory_limit_bytes,
         draft_fit_result=draft_fit_result,
+        preloaded_snapshot=preloaded_snapshot,
     )
     assert datasets is not None
     from zlc_frontend import DataFigure
 
-    retained_input_bytes = sum(
-        dataset_storage_nbytes(entry.snapshot.block.schema)
-        for entry in datasets.entries
-    )
-    evaluation_limit = memory_limit_bytes - retained_input_bytes
-    if evaluation_limit <= 0:
-        raise MemoryError(
-            "figure input snapshot leaves no memory for view evaluation"
+    if retained_inputs_prebudgeted:
+        if preloaded_snapshot is None:
+            raise ValueError(
+                "prebudgeted figure inputs require an explicit preloaded snapshot"
+            )
+        evaluation_limit = memory_limit_bytes
+        render_limit = memory_limit_bytes
+    else:
+        retained_input_bytes = sum(
+            dataset_storage_nbytes(entry.snapshot.block.schema)
+            for entry in datasets.entries
         )
+        retained_fit_bytes = (
+            0
+            if fit_result is None
+            else fit_result_retained_upper_bound_nbytes(fit_result)
+        )
+        evaluation_limit = (
+            memory_limit_bytes - retained_input_bytes - retained_fit_bytes
+        )
+        if evaluation_limit <= 0:
+            raise MemoryError(
+                "figure source and fit overlay leave no memory for view evaluation"
+            )
+        render_limit = memory_limit_bytes - retained_fit_bytes
+        if render_limit <= 0:
+            raise MemoryError("fit overlay leaves no memory for figure rendering")
     return DataFigure(
         document,
         datasets,
         fit_results=({"data": fit_result} if fit_result is not None else None),
         evaluation_memory_limit_bytes=evaluation_limit,
-        render_memory_limit_bytes=memory_limit_bytes,
+        render_memory_limit_bytes=render_limit,
     )
 
 
@@ -2291,6 +2338,137 @@ class Experiment:
         memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
     ):
         """Resolve and show one frozen figure without blocking the notebook GUI."""
+
+        if (
+            isinstance(source, CaptureFitResultArtifactRef)
+            and intent is None
+            and selection is None
+            and preferences is None
+            and occupancy_output is None
+        ):
+            limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+            authority_token = self._authority_token
+            session_thread_id = None
+            session_admitted = None
+            session_snapshot = None
+            session_model = None
+            session_retained_bytes = 0
+
+            def load_saved_fit_grid_view(
+                reference,
+                *,
+                page_address,
+                cell_selection,
+                memory_limit_bytes,
+            ):
+                nonlocal session_thread_id
+                nonlocal session_admitted
+                nonlocal session_snapshot
+                nonlocal session_model
+                nonlocal session_retained_bytes
+                if reference != source:
+                    raise ValueError("saved-fit loader received another artifact ref")
+                view_limit = _positive_int(
+                    memory_limit_bytes,
+                    "memory_limit_bytes",
+                )
+                worker_thread_id = threading.get_ident()
+                if session_thread_id is None:
+                    session_thread_id = worker_thread_id
+                elif session_thread_id != worker_thread_id:
+                    raise RuntimeError(
+                        "saved-fit view session changed worker thread"
+                    )
+                with _service_guard(authority_token) as services:
+                    from zlc_frontend import FitGridModel
+
+                    if session_admitted is None:
+                        admitted = services.fit_repository.load(
+                            reference,
+                            services.capture_repository,
+                            memory_limit_bytes=view_limit,
+                        )
+                        model = FitGridModel.from_result(
+                            reference.target_ref,
+                            admitted.result,
+                        )
+                        source_admitted = services.capture_repository.admit(
+                            admitted.source_capture_ref
+                        )
+                        fit_bytes = fit_result_retained_upper_bound_nbytes(
+                            admitted.result
+                        )
+                        source_bytes = dataset_storage_nbytes(
+                            source_admitted.artifact.frame_source.schema
+                        )
+                        retained_bytes = fit_bytes + source_bytes + (64 << 10)
+                        materialize_limit = (
+                            view_limit
+                            - fit_bytes
+                            - model.retained_upper_bound_bytes
+                        )
+                        figure_limit = (
+                            view_limit
+                            - retained_bytes
+                            - model.retained_upper_bound_bytes
+                        )
+                        if materialize_limit <= 0 or figure_limit <= 0:
+                            raise MemoryError(
+                                "saved-fit session leaves no source/view budget"
+                            )
+                        snapshot = source_admitted.materialize_snapshot(
+                            memory_limit_bytes=materialize_limit,
+                        )
+                    else:
+                        admitted = session_admitted
+                        snapshot = session_snapshot
+                        model = session_model
+                        retained_bytes = session_retained_bytes
+                        figure_limit = view_limit
+                        assert snapshot is not None and model is not None
+                    if cell_selection is None:
+                        page = model.page(page_address)
+                        resolved_selection = page.selection
+                        resolved_preferences = page.preferences
+                        cell_summary = None
+                    else:
+                        if page_address is not None:
+                            raise ValueError(
+                                "saved-fit view cannot request a page and cell together"
+                            )
+                        model.resolve_selection(cell_selection)
+                        page = None
+                        resolved_selection = cell_selection
+                        resolved_preferences = model.focus_preferences()
+                        cell_summary = model.cell_summary(
+                            admitted.result,
+                            cell_selection,
+                        )
+                    figure = _data_figure_for_services(
+                        services,
+                        admitted,
+                        intent=None,
+                        selection=resolved_selection,
+                        preferences=resolved_preferences,
+                        occupancy_output=None,
+                        memory_limit_bytes=figure_limit,
+                        preloaded_snapshot=snapshot,
+                        retained_inputs_prebudgeted=True,
+                    )
+                    if session_admitted is None:
+                        session_admitted = admitted
+                        session_snapshot = snapshot
+                        session_model = model
+                        session_retained_bytes = retained_bytes
+                return figure, model, page, cell_summary, retained_bytes
+
+            from Zou_lab_control.workbench import open_saved_fit_grid_workbench
+
+            return open_saved_fit_grid_workbench(
+                load_saved_fit_grid_view,
+                source,
+                memory_limit_bytes=limit,
+            )
 
         from Zou_lab_control.workbench import open_figure_workbench
 

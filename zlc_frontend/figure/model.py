@@ -79,6 +79,7 @@ class RepeatViewMode(str, Enum):
     SUM = "SUM"
     LATEST = "LATEST"
     BATCH = "BATCH"
+    FACET = "FACET"
     SAMPLE = "SAMPLE"
 
 

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from io import BytesIO
+import math
 from numbers import Integral
 from pathlib import Path
 
-from zlc_data import FitResultBatch, validate_fit_result_source_binding
+from zlc_data import FitResultBatch, Selection, validate_fit_result_source_binding
+from zlc_storage import canonical_text
 
 from .figure import (
     AxisViewRole,
@@ -18,6 +20,54 @@ from .figure import (
     ResolvedDatasetMap,
     ViewIntent,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class FigurePanelRegion:
+    """One display-only panel hit target in normalized raster coordinates."""
+
+    key: str
+    selection: Selection | None
+    fit_storage_index: int | None
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+    def __post_init__(self) -> None:
+        canonical_text(self.key, "figure panel key")
+        if self.selection is not None and not isinstance(self.selection, Selection):
+            raise TypeError("panel selection must be Selection or None")
+        if self.fit_storage_index is not None and (
+            isinstance(self.fit_storage_index, bool)
+            or not isinstance(self.fit_storage_index, Integral)
+            or self.fit_storage_index < 0
+        ):
+            raise ValueError("fit_storage_index must be non-negative or None")
+        if self.fit_storage_index is not None:
+            object.__setattr__(self, "fit_storage_index", int(self.fit_storage_index))
+        bounds = tuple(float(value) for value in (
+            self.left,
+            self.top,
+            self.right,
+            self.bottom,
+        ))
+        if any(not math.isfinite(value) for value in bounds):
+            raise ValueError("panel bounds must be finite")
+        left, top, right, bottom = bounds
+        if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
+            raise ValueError("panel bounds must be an ordered normalized rectangle")
+        object.__setattr__(self, "left", left)
+        object.__setattr__(self, "top", top)
+        object.__setattr__(self, "right", right)
+        object.__setattr__(self, "bottom", bottom)
+
+    def contains(self, x: float, y: float) -> bool:
+        x_value, y_value = float(x), float(y)
+        return (
+            self.left <= x_value <= self.right
+            and self.top <= y_value <= self.bottom
+        )
 
 
 class DataFigure:
@@ -190,6 +240,27 @@ class DataFigure:
             raise MemoryError("PNG payload exceeds figure render memory limit")
         return payload
 
+    def to_png_bytes_with_panel_regions(
+        self,
+        *,
+        dpi: float = 100.0,
+        memory_limit_bytes: int | None = None,
+    ) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
+        """Encode the same frozen figure plus exact display-panel hit regions."""
+
+        from .matplotlib_render import encode_evaluated_figure_with_panel_regions
+
+        effective_limit = self._check_render_budget(dpi, memory_limit_bytes)
+        payload, regions = encode_evaluated_figure_with_panel_regions(
+            self._document,
+            self._evaluated,
+            dict(self._fit_results),
+            dpi=dpi,
+        )
+        if effective_limit is not None and len(payload) > effective_limit:
+            raise MemoryError("PNG payload exceeds figure render memory limit")
+        return payload, regions
+
     def _repr_png_(self) -> bytes:
         return self.to_png_bytes()
 
@@ -254,4 +325,4 @@ class DataFigure:
         return int(value)
 
 
-__all__ = ["DataFigure"]
+__all__ = ["DataFigure", "FigurePanelRegion"]

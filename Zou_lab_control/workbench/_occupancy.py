@@ -5,17 +5,13 @@ from __future__ import annotations
 from concurrent.futures import CancelledError
 import threading
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore
 
 from zlc_data import Selection
 from zlc_frontend.encoded_raster import EncodedRasterDocument
 from zlc_frontend.occupancy_render import OccupancyCellNavigation
 from zlc_frontend.qt_widgets import (
-    FluentButton,
-    FluentFormGrid,
-    FluentLabel,
-    FluentSpinBox,
-    GREY,
+    AxisLayoutNavigator,
     signals_blocked,
 )
 from zlc_neutral_atom.readout.occupancy_reference import OccupancyArtifactRef
@@ -146,7 +142,7 @@ class OccupancyCellWindow(FrozenRasterWindow):
         self._initial_selection = selection
         self._cell_memory_limit_bytes = 0
         self._navigation: OccupancyCellNavigation | None = None
-        self._axis_controls = ()
+        self._navigator: AxisLayoutNavigator | None = None
         self._active_kind: str | None = None
         self._active_revision = 0
         self._pending: tuple[int, Selection] | None = None
@@ -154,30 +150,6 @@ class OccupancyCellWindow(FrozenRasterWindow):
         self._request_revision = 0
         self._requested_selection: Selection | None = None
         self._presented_selection: Selection | None = None
-        self._navigation_host = QtWidgets.QWidget(self)
-        self._navigation_host.setObjectName("occupancyCellNavigation")
-        self._navigation_layout = QtWidgets.QVBoxLayout(self._navigation_host)
-        self._navigation_layout.setContentsMargins(0, 0, 0, 0)
-        self._navigation_layout.setSpacing(6)
-
-        self._previous_button = FluentButton("Previous", self, color=GREY)
-        self._previous_button.setObjectName("occupancyCellPrevious")
-        self._load_button = FluentButton("Load exact cell", self)
-        self._load_button.setObjectName("occupancyCellLoad")
-        self._next_button = FluentButton("Next", self, color=GREY)
-        self._next_button.setObjectName("occupancyCellNext")
-        for button in (self._previous_button, self._load_button, self._next_button):
-            button.setEnabled(False)
-        navigation_buttons = QtWidgets.QHBoxLayout()
-        navigation_buttons.addWidget(self._previous_button)
-        navigation_buttons.addWidget(self._load_button)
-        navigation_buttons.addWidget(self._next_button)
-        navigation_buttons.addStretch(1)
-        self._navigation_layout.addLayout(navigation_buttons)
-        self._layout.insertWidget(3, self._navigation_host)
-        self._previous_button.clicked.connect(lambda: self._move(-1))
-        self._load_button.clicked.connect(self._load_candidate)
-        self._next_button.clicked.connect(lambda: self._move(1))
         self._start_navigation()
 
     @property
@@ -238,46 +210,28 @@ class OccupancyCellWindow(FrozenRasterWindow):
         navigation = self._navigation
         if navigation is None:
             return
-        form = FluentFormGrid(self._navigation_host)
-        form.setObjectName("occupancyCellAxisForm")
-        controls = []
-        for position, axis in enumerate(navigation.axes):
-            spin = FluentSpinBox(form)
-            spin.setObjectName(f"occupancyCellAxis_{position}")
-            spin.setProperty("axisId", axis.axis_id.value)
-            coordinate = FluentLabel("", form)
-            coordinate.setObjectName(f"occupancyCellCoordinate_{position}")
-            if axis.size == 1:
-                spin.setRange(0, 0)
-                spin.setValue(0)
-                spin.setEnabled(False)
-            else:
-                spin.setRange(-1, axis.size - 1)
-                spin.setSpecialValueText("Select…")
-                spin.setValue(-1)
-            form.add_row(axis.name, spin, coordinate)
-            controls.append((axis, spin, coordinate))
-        self._axis_controls = tuple(controls)
-        self._navigation_layout.insertWidget(0, form)
-        for _axis, spin, _coordinate in self._axis_controls:
-            spin.valueChanged.connect(self._axis_value_changed)
-        self._update_coordinate_labels()
-
-    def _update_coordinate_labels(self) -> None:
-        for axis, spin, label in self._axis_controls:
-            index = spin.value()
-            if index < 0:
-                label.setText("not selected")
-                continue
-            unit = "" if axis.unit is None else f" {axis.unit}"
-            label.setText(f"{axis.coordinate_at(index)}{unit} · index {index}")
+        navigator = AxisLayoutNavigator(
+            navigation.axes,
+            navigation.cell_layout,
+            object_prefix="occupancyCell",
+            action_text="Load exact cell",
+            parent=self,
+        )
+        navigator.candidateChanged.connect(self._axis_value_changed)
+        navigator.activated.connect(self._activate_indices)
+        # Preserve the existing automation/accessibility identity while the
+        # mechanical controls move into the shared widget owner.
+        navigator.action_button.setObjectName("occupancyCellLoad")
+        self._navigator = navigator
+        self._layout.insertWidget(3, navigator)
 
     def _selection_from_controls(self) -> Selection | None:
         navigation = self._navigation
-        if navigation is None or not self._axis_controls:
+        navigator = self._navigator
+        if navigation is None or navigator is None:
             return None
-        indices = tuple(spin.value() for _axis, spin, _label in self._axis_controls)
-        if any(index < 0 for index in indices):
+        indices = navigator.indices
+        if indices is None:
             return None
         try:
             return navigation.selection_for_indices(indices[0], tuple(indices[1:]))
@@ -286,15 +240,13 @@ class OccupancyCellWindow(FrozenRasterWindow):
 
     def _set_controls(self, selection: Selection) -> None:
         navigation = self._navigation
-        if navigation is None:
+        navigator = self._navigator
+        if navigation is None or navigator is None:
             return
         repeat_index, _storage, logical, _label = navigation.resolve_selection(selection)
         values = (repeat_index, *logical)
-        spins = tuple(spin for _axis, spin, _label in self._axis_controls)
-        with signals_blocked(*spins):
-            for spin, value in zip(spins, values, strict=True):
-                spin.setValue(value)
-        self._update_coordinate_labels()
+        with signals_blocked(navigator):
+            navigator.set_indices(values)
 
     def _clear_front(self) -> None:
         self._bundle = None
@@ -309,14 +261,13 @@ class OccupancyCellWindow(FrozenRasterWindow):
             return self._boards
         return super()._build_boards(bundle)
 
-    def _axis_value_changed(self, _value: int) -> None:
+    def _axis_value_changed(self) -> None:
         if self._closing:
             return
         self._request_revision += 1
         self._pending = None
         self._requested_selection = None
         self._clear_front()
-        self._update_coordinate_labels()
         self._refresh_candidate_state()
 
     def _refresh_candidate_state(self) -> None:
@@ -326,9 +277,6 @@ class OccupancyCellWindow(FrozenRasterWindow):
             self._status.setText("POINT NOT ACQUIRED")
             self._summary.setText("Choose a logical point present in the frozen PointLayout")
             self._diagnostic.setText(_error_summary(error))
-            self._load_button.setEnabled(False)
-            self._previous_button.setEnabled(False)
-            self._next_button.setEnabled(False)
             return
         if selection is None:
             self._status.setText("NEEDS CELL SELECTION")
@@ -336,9 +284,6 @@ class OccupancyCellWindow(FrozenRasterWindow):
                 "Choose an exact index for every non-singleton repeat / point axis"
             )
             self._diagnostic.setText("")
-            self._load_button.setEnabled(False)
-            self._previous_button.setEnabled(False)
-            self._next_button.setEnabled(False)
             return
         navigation = self._navigation
         assert navigation is not None
@@ -346,30 +291,15 @@ class OccupancyCellWindow(FrozenRasterWindow):
         self._status.setText("EXACT CELL READY TO LOAD")
         self._summary.setText(label)
         self._diagnostic.setText("")
-        self._load_button.setEnabled(True)
-        self._update_move_buttons(selection)
 
-    def _update_move_buttons(self, selection: Selection | None) -> None:
+    def _activate_indices(self, indices: object) -> None:
         navigation = self._navigation
-        if navigation is None or selection is None:
-            self._previous_button.setEnabled(False)
-            self._next_button.setEnabled(False)
+        if navigation is None:
             return
-        linear = navigation.linear_index(selection)
-        self._previous_button.setEnabled(linear > 0)
-        self._next_button.setEnabled(linear + 1 < navigation.linear_cell_count)
-
-    def _load_candidate(self) -> None:
-        try:
-            selection = self._selection_from_controls()
-        except BaseException as error:
-            self._status.setText("POINT NOT ACQUIRED")
-            self._diagnostic.setText(_error_summary(error))
-            return
-        if selection is None:
-            self._refresh_candidate_state()
-            return
-        self._queue_cell(selection)
+        multi = tuple(indices)
+        self._queue_cell(
+            navigation.selection_for_indices(multi[0], tuple(multi[1:]))
+        )
 
     def _queue_cell(self, selection: Selection) -> None:
         navigation = self._navigation
@@ -387,29 +317,10 @@ class OccupancyCellWindow(FrozenRasterWindow):
             f"{label} | physical point row {point_storage} | request {revision}"
         )
         self._diagnostic.setText("")
-        self._load_button.setEnabled(True)
-        self._update_move_buttons(canonical)
         if self._future is None and not self._pending_start_scheduled:
             self._start_cell(revision, canonical)
         else:
             self._pending = (revision, canonical)
-
-    def _move(self, delta: int) -> None:
-        if delta not in (-1, 1):
-            raise ValueError("occupancy navigation delta must be -1 or 1")
-        navigation = self._navigation
-        if navigation is None:
-            return
-        try:
-            selection = self._selection_from_controls()
-        except BaseException:
-            return
-        if selection is None:
-            return
-        target = navigation.linear_index(selection) + delta
-        if not 0 <= target < navigation.linear_cell_count:
-            return
-        self._queue_cell(navigation.selection_at_linear(target))
 
     def _accept_navigation(self, navigation: OccupancyCellNavigation) -> None:
         if navigation.artifact_identity != self._reference.target_ref:
@@ -457,7 +368,6 @@ class OccupancyCellWindow(FrozenRasterWindow):
             raise TypeError("occupancy cell job returned an invalid raster document")
         if self._present_bundle(bundle):
             self._presented_selection = selection
-            self._update_move_buttons(selection)
 
     def _schedule_pending_start(self) -> None:
         if self._pending_start_scheduled:
@@ -517,12 +427,8 @@ class OccupancyCellWindow(FrozenRasterWindow):
         self._pending = None
         self._pending_start_scheduled = False
         self._requested_selection = None
-        for button in (
-            self._previous_button,
-            self._load_button,
-            self._next_button,
-        ):
-            button.setEnabled(False)
+        if self._navigator is not None:
+            self._navigator.set_interaction_enabled(False)
         super().shutdown()
 
     def _finish_close_if_ready(self) -> None:
@@ -530,7 +436,7 @@ class OccupancyCellWindow(FrozenRasterWindow):
             self._navigation_loader = None
             self._cell_loader = None
             self._navigation = None
-            self._axis_controls = ()
+            self._navigator = None
         super()._finish_close_if_ready()
 
 

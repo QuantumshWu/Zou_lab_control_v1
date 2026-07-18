@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+from io import BytesIO
 import math
 import threading
 from dataclasses import fields, is_dataclass
@@ -10,7 +11,7 @@ from numbers import Number
 
 import numpy as np
 
-from zlc_data import FitBatchStatus, FitResultBatch
+from zlc_data import FitBatchStatus, FitResultBatch, IndexSelection, Selection
 from zlc_storage import nonnegative_integer, positive_integer
 
 from .figure import (
@@ -23,6 +24,7 @@ from .figure import (
     EvaluatedMeter,
     FigureDocument,
 )
+from .data_figure import FigurePanelRegion
 from .render import PixelFormat, RasterBuffer
 from .render_style import (
     ANNOTATION_FONT_SIZE,
@@ -564,7 +566,116 @@ def save_evaluated_figure(
 ) -> None:
     """Construct, draw, and release one product figure on the Matplotlib compose lane."""
 
+    _save_evaluated_figure(
+        document,
+        evaluated,
+        fit_results,
+        destination,
+        image_format=image_format,
+        dpi=dpi,
+        include_panel_regions=False,
+    )
+
+
+def encode_evaluated_figure_with_panel_regions(
+    document: FigureDocument,
+    evaluated: EvaluatedFigureData,
+    fit_results: dict[str, FitResultBatch],
+    *,
+    dpi: float,
+) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
+    """Encode a product PNG and the final Agg panel rectangles from one draw."""
+
+    output = BytesIO()
+    regions = _save_evaluated_figure(
+        document,
+        evaluated,
+        fit_results,
+        output,
+        image_format="png",
+        dpi=dpi,
+        include_panel_regions=True,
+    )
+    return output.getvalue(), regions
+
+
+def _panel_selection(layer, cell, series_group, fit_result) -> Selection | None:
+    expected = (
+        set()
+        if fit_result is None
+        else {axis.axis_id for axis in fit_result.batch_axis_specs}
+    )
+    addresses = [*cell.facet_address]
+    if len(series_group) == 1:
+        addresses.extend(series_group[0].batch_address)
+    addresses.extend(layer.resolutions)
+    by_axis = {}
+    for address in addresses:
+        if expected and address.axis_id not in expected:
+            continue
+        incumbent = by_axis.setdefault(address.axis_id, address.index)
+        if incumbent != address.index:
+            raise RuntimeError("figure panel addresses disagree")
+    terms = tuple(
+        IndexSelection(axis_id, index)
+        for axis_id, index in sorted(
+            by_axis.items(),
+            key=lambda item: item[0].value,
+        )
+    )
+    return None if not terms else Selection(terms)
+
+
+def _figure_panel_regions(
+    figure,
+    evaluated: EvaluatedFigureData,
+    fit_results: dict[str, FitResultBatch],
+) -> tuple[FigurePanelRegion, ...]:
+    panels = _panels(evaluated)
+    axes = tuple(figure.axes[: len(panels)])
+    if len(axes) != len(panels):
+        raise RuntimeError("rendered figure lost one or more data-panel axes")
+    regions = []
+    for index, (axis, (layer, cell, series_group)) in enumerate(
+        zip(axes, panels, strict=True)
+    ):
+        bounds = axis.get_position()
+        fit_result = fit_results.get(layer.layer_id)
+        selection = _panel_selection(layer, cell, series_group, fit_result)
+        fit_storage_index = None
+        if fit_result is not None and len(series_group) == 1:
+            fit_storage_index = _batch_storage_index(
+                fit_result,
+                layer,
+                cell,
+                series_group[0],
+            )
+        regions.append(
+            FigurePanelRegion(
+                f"panel-{index}",
+                selection,
+                fit_storage_index,
+                float(bounds.x0),
+                float(1.0 - bounds.y1),
+                float(bounds.x1),
+                float(1.0 - bounds.y0),
+            )
+        )
+    return tuple(regions)
+
+
+def _save_evaluated_figure(
+    document: FigureDocument,
+    evaluated: EvaluatedFigureData,
+    fit_results: dict[str, FitResultBatch],
+    destination,
+    *,
+    image_format: str,
+    dpi: float,
+    include_panel_regions: bool,
+) -> tuple[FigurePanelRegion, ...]:
     dpi = _render_dpi(dpi)
+    regions: tuple[FigurePanelRegion, ...] = ()
     with render_style_context():
         figure = None
         try:
@@ -575,6 +686,8 @@ def save_evaluated_figure(
                 dpi=dpi,
             )
             figure.savefig(destination, format=image_format, dpi=dpi)
+            if include_panel_regions:
+                regions = _figure_panel_regions(figure, evaluated, fit_results)
         finally:
             if figure is not None:
                 release_agg_figure(figure)
@@ -582,6 +695,7 @@ def save_evaluated_figure(
             # The caller's last strong local must be gone before collecting the
             # remaining Matplotlib artist-parent cycles.
             gc.collect()
+    return regions
 
 
 def _render_evaluated_figure(
@@ -837,6 +951,7 @@ class SinglePanelAggRenderer:
 
 __all__ = [
     "DEFAULT_HISTOGRAM_BINS",
+    "encode_evaluated_figure_with_panel_regions",
     "estimate_live_panel_raster_peak_nbytes",
     "estimate_render_peak_nbytes",
     "histogram_bin_counts",

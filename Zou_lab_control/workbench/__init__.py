@@ -149,6 +149,25 @@ def open_figure_workbench(
     return _open(figure_factory, source, **options)
 
 
+def open_saved_fit_grid_workbench(
+    view_loader,
+    reference,
+    *,
+    memory_limit_bytes=None,
+):
+    """Open one exact saved-fit GridPlot without eager Qt imports."""
+
+    from ._fit_grid import open_saved_fit_grid_workbench as _open
+
+    if memory_limit_bytes is None:
+        return _open(view_loader, reference)
+    return _open(
+        view_loader,
+        reference,
+        memory_limit_bytes=memory_limit_bytes,
+    )
+
+
 def open_pulse_workbench(experiment, document=None, *, path=None):
     """Open the current PulseWorkbench without loading Qt at package import."""
 
@@ -201,6 +220,7 @@ __all__ = [
     "open_data_figure_workbench",
     "open_figure_workbench",
     "open_occupancy_cell_workbench",
+    "open_saved_fit_grid_workbench",
     "open_offline_pulse_workbench",
     "open_pulse_workbench",
     "open_scan_workbench",

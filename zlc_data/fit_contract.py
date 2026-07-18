@@ -698,6 +698,64 @@ class FitResultBatch:
         return evaluate_fit_model(model, coordinates, self.parameter_values[index])
 
 
+def fit_result_retained_upper_bound_nbytes(result: FitResultBatch) -> int:
+    """Conservatively bound one decoded result while it remains strongly held.
+
+    The fit artifact codec has a bounded blob size, but a decoded result also
+    owns NumPy buffers plus Python tuples/strings for statuses, errors, axes,
+    and sparse layout addresses.  Composition roots use this bound to admit a
+    source snapshot, view evaluation, and render without pretending that the
+    overlay result is free.
+    """
+
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("result must be FitResultBatch")
+    arrays = (
+        result.parameter_values,
+        result.covariance,
+        result.covariance_valid,
+        result.present_observation_counts,
+        result.valid_observation_counts,
+        result.used_observation_counts,
+        result.evaluation_counts,
+        result.residual_sum_squares,
+        result.r_squared,
+        result.r_squared_valid,
+    )
+    array_bytes = sum(int(value.nbytes) for value in arrays)
+    text_bytes = sum(
+        0 if value is None else len(value.encode("utf-8"))
+        for value in result.errors
+    )
+    axes = (*result.fit_axis_specs, *result.batch_axis_specs)
+    coordinate_bytes = sum(
+        len(str(value).encode("utf-8")) + 128
+        for axis in axes
+        for value in (() if axis.coordinates is None else axis.coordinates)
+    )
+    axis_text_bytes = sum(
+        len(axis.name.encode("utf-8"))
+        + (0 if axis.unit is None else len(axis.unit.encode("utf-8")))
+        + 512
+        for axis in axes
+    )
+    batch_size = result.batch_layout.storage_size
+    axis_count = len(result.batch_axis_specs)
+    # Per-row allowance covers tuple/PyLong layout addresses, status/error
+    # references, and allocator overhead.  Rectangular layouts intentionally
+    # receive the same conservative allowance so admission never depends on a
+    # CPython implementation detail.
+    row_bytes = batch_size * (1024 + 128 * axis_count)
+    return int(
+        64 * 1024
+        + array_bytes
+        + text_bytes
+        + coordinate_bytes
+        + axis_text_bytes
+        + row_bytes
+    )
+
+
 def resolve_parameter_units(
     parameters: tuple[FitParameterDefinition, ...],
     fit_axes: tuple[AxisSpec, ...],
