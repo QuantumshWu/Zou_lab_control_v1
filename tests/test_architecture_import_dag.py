@@ -47,11 +47,24 @@ CANONICAL_HELPER_NAMES = frozenset(
 
 ALLOWED_STRIP_CONTEXTS = frozenset(
     {
+        (Path("zlc_frontend/form.py"), "parse_number_text"),
+        (Path("zlc_frontend/form.py"), "FormChoice.__post_init__"),
+        (Path("zlc_frontend/form.py"), "FormFieldProps.__post_init__"),
+        (Path("zlc_frontend/form.py"), "FormFieldProps.row_label"),
+        (Path("zlc_frontend/qt_widgets/fluent.py"), "align_to_resolution"),
+        (Path("zlc_frontend/qt_widgets/fluent.py"), "FluentPathEdit._dialog_start"),
+        (Path("zlc_frontend/qt_widgets/fluent.py"), "FluentTreeComboBox.current_signal"),
+        (Path("zlc_frontend/qt_widgets/form.py"), "_TextHandler.is_empty"),
+        (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.read"),
+        (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.is_empty"),
+        (Path("zlc_frontend/qt_widgets/form.py"), "_NumberHandler.read"),
+        (Path("zlc_frontend/qt_widgets/form.py"), "_NumberHandler.is_empty"),
+        (Path("zlc_frontend/qt_widgets/form.py"), "_LosslessFloatSpinBox.valueFromText"),
+        (Path("zlc_frontend/qt_widgets/form.py"), "_LosslessFloatSpinBox.validate"),
+        (Path("zlc_frontend/qt_widgets/form.py"), "_FloatHandler.read"),
+        (Path("zlc_frontend/qt_widgets/form.py"), "_FloatHandler.is_empty"),
         (Path("zlc_pulse/document.py"), "ScanRecipeProvenance.__post_init__"),
         (Path("zlc_pulse/transport/axi.py"), "VivadoAxiRegisterTransport._parse_read"),
-        (Path("zlc_workbench/camera_capture.py"), "_camera_dtype"),
-        (Path("zlc_workbench/legacy_neutral_atom.py"), "_qcmos_identity_probe.probe"),
-        (Path("zlc_workbench/legacy_neutral_atom.py"), "_pylon_live_identity"),
     }
 )
 

@@ -109,7 +109,7 @@ if TYPE_CHECKING:
     from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
 
 
-CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact.v2"
+CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact"
 _CAPTURE_ARTIFACT_KIND = "capture"
 _ADMITTED_CAPTURE_TOKEN = object()
 _CAPTURE_ADMISSION_FIXED_BYTES = 512 * 1024

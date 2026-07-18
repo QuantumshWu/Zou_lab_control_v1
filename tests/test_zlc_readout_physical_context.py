@@ -30,14 +30,12 @@ from zlc_neutral_atom.timing.capture_plan import compile_capture_cell_plan
 from zlc_neutral_atom.timing.lineage import PulseCaptureBinding
 from zlc_pulse import (
     CompiledPulseArtifact,
-    PhysicalBusValueChange,
     PulseExecutionForm,
     TargetBusDelay,
     TargetBusSegment,
     TargetIR,
     build_digital_trigger_schedules,
     compile_pulse_artifact,
-    expand_physical_bus_value_changes,
     load_pulse_document,
     pack_target_ir,
 )
@@ -45,6 +43,7 @@ from zlc_pulse import (
 
 ROOT = Path(__file__).parents[1]
 CLOCK_HZ = 50e6
+IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
 
 
 def _axis(name: str, role: str, size: int) -> AxisSpec:
@@ -363,16 +362,15 @@ def test_finite_done_safe_transition_uses_delay_and_registered_tick() -> None:
         bus_delays=(TargetBusDelay(0, 7),),
     )
 
-    assert expand_physical_bus_value_changes(artifact.target_ir) == (
-        # Mid-frame edge: source tick 25, then registered visibility +1 and d=7.
-        PhysicalBusValueChange("bias", 33, 600),
-        # DONE at tick 100: registered safe visibility +1 and the same d=7.
-        PhysicalBusValueChange("bias", 108, 512),
+    # The current pulse owner exposes a bounded trigger-normalized window, not
+    # a materialized tuple of every physical bus assignment.  Relative to the
+    # trigger at tick 10, the edge is visible at 25 + register(1) + delay(7)
+    # = 33 (relative 23), and finite DONE returns SAFE at 100 + 1 + 7 = 108
+    # (relative 98).
+    full_window = _derive(artifact, offset_ticks=0, exposure_ticks=100)
+    assert full_window.buses == (
+        BusReadoutTrace("bias", 512, ((23, 600), (98, 512))),
     )
-
-    assert expand_physical_bus_value_changes(
-        replace(artifact.target_ir, repeat_forever=True)
-    ) == (PhysicalBusValueChange("bias", 33, 600),)
 
     ending_at_safe = _derive(artifact, offset_ticks=0, exposure_ticks=98)
     assert ending_at_safe.buses == (
@@ -444,7 +442,7 @@ def test_live_state_dac_ramp_fails_closed() -> None:
         bus_segments=(ramp,),
     )
 
-    with pytest.raises(ValueError, match="cannot derive a live-state DAC ramp exactly"):
+    with pytest.raises(ValueError, match="cannot represent a live-state DAC ramp exactly"):
         _derive(artifact, offset_ticks=0, exposure_ticks=50)
 
 
@@ -461,7 +459,7 @@ def test_missing_qualified_integration_offset_fails_closed() -> None:
 
 
 def test_real_target_context_contains_only_logical_outputs_and_decoded_buses() -> None:
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_TEMPLATE)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=CLOCK_HZ,

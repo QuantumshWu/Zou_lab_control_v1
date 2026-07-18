@@ -24,6 +24,34 @@ from zlc_storage import encode
 
 
 ROOT = Path(__file__).parents[1]
+IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+
+
+class _InProcessTimedResult:
+    """Synchronous stand-in for the RPyC timed-result boundary only."""
+
+    def __init__(self, call):
+        self._call = call
+
+    @property
+    def value(self):
+        return self._call()
+
+
+def _install_in_process_rpyc_timed(monkeypatch):
+    """Keep netref scheduling/timeout behavior in transport integration tests."""
+
+    import rpyc
+
+    def timed(call, timeout):
+        assert timeout > 0
+
+        def invoke(*args, **kwargs):
+            return _InProcessTimedResult(lambda: call(*args, **kwargs))
+
+        return invoke
+
+    monkeypatch.setattr(rpyc, "timed", timed)
 
 
 class Backend:
@@ -91,7 +119,7 @@ class Connection:
 
 
 def _fixture():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_TEMPLATE)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -104,7 +132,8 @@ def _fixture():
     return artifact, service, connection
 
 
-def test_remote_client_runs_one_current_generation_without_legacy_payloads():
+def test_remote_client_runs_one_current_generation_without_legacy_payloads(monkeypatch):
+    _install_in_process_rpyc_timed(monkeypatch)
     artifact, _service, connection = _fixture()
     interrupt_connection = Connection(_service)
     client = RemotePulseExecutionClient(
@@ -170,7 +199,8 @@ def test_remote_client_requires_a_physically_distinct_interrupt_connection():
         RemotePulseExecutionClient(connection, connection)
 
 
-def test_remote_client_serializes_concurrent_close_to_one_safe_request():
+def test_remote_client_serializes_concurrent_close_to_one_safe_request(monkeypatch):
+    _install_in_process_rpyc_timed(monkeypatch)
     _artifact, service, connection = _fixture()
     interrupt_connection = Connection(service)
     client = RemotePulseExecutionClient(connection, interrupt_connection)

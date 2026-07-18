@@ -105,7 +105,7 @@ if TYPE_CHECKING:
     )
 
 
-CALIBRATION_MANIFEST_FORMAT = "zlc_neutral_atom.calibration-manifest.v2"
+CALIBRATION_MANIFEST_FORMAT = "zlc_neutral_atom.calibration-manifest"
 _CALIBRATION_ARTIFACT_KIND = "calibration"
 _MAX_MANIFEST_BYTES = 1 * 1024 * 1024
 _MAX_ARTIFACT_BYTES = 256 * 1024 * 1024

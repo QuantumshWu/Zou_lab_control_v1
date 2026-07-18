@@ -26,6 +26,132 @@ root_text = str(REPO_ROOT)
 if sys.path[0] != root_text:
     sys.path.insert(0, root_text)
 
+ACTIVE_TEST_MANIFEST = REPO_ROOT / "tests" / "migration_active_tests.txt"
+
+
+def load_active_test_paths(
+    manifest: Path = ACTIVE_TEST_MANIFEST,
+) -> tuple[Path, ...]:
+    """Validate and return the migration test authority as canonical paths."""
+
+    manifest = Path(manifest).resolve()
+    try:
+        manifest.relative_to(REPO_ROOT)
+    except ValueError as exc:
+        raise pytest.UsageError(
+            f"migration test manifest escapes the repository: {manifest}"
+        ) from exc
+    if not manifest.is_file():
+        raise pytest.UsageError(
+            f"migration test manifest does not exist: {manifest}"
+        )
+
+    active: list[Path] = []
+    seen: dict[str, int] = {}
+    for line_number, raw in enumerate(
+        manifest.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        entry = raw.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        relative = Path(entry)
+        canonical_entry = relative.as_posix()
+        if (
+            entry != canonical_entry
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or len(relative.parts) != 2
+            or relative.parts[0] != "tests"
+            or not relative.name.startswith("test_")
+            or relative.suffix != ".py"
+        ):
+            raise pytest.UsageError(
+                f"{manifest}:{line_number}: invalid active test path {entry!r}"
+            )
+        previous = seen.get(entry)
+        if previous is not None:
+            raise pytest.UsageError(
+                f"{manifest}:{line_number}: duplicate active test path {entry!r} "
+                f"(first declared on line {previous})"
+            )
+        path = (REPO_ROOT / relative).resolve()
+        try:
+            path.relative_to(REPO_ROOT / "tests")
+        except ValueError as exc:
+            raise pytest.UsageError(
+                f"{manifest}:{line_number}: active test escapes tests/: {entry!r}"
+            ) from exc
+        if not path.is_file():
+            raise pytest.UsageError(
+                f"{manifest}:{line_number}: active test does not exist: {entry!r}"
+            )
+        seen[entry] = line_number
+        active.append(path)
+    if not active:
+        raise pytest.UsageError("migration active test manifest is empty")
+    return tuple(active)
+
+
+def pytest_configure(config):
+    allowed = frozenset(load_active_test_paths())
+    requested: set[Path] = set()
+    for argument in config.args:
+        file_part = str(argument).split("::", 1)[0]
+        candidate = Path(file_part)
+        if not candidate.is_absolute():
+            candidate = REPO_ROOT / candidate
+        candidate = candidate.resolve()
+        if candidate.is_dir():
+            raise pytest.UsageError(
+                "pytest directory/automatic discovery is disabled during migration; "
+                "enumerate paths from tests/migration_active_tests.txt"
+            )
+        if candidate.suffix != ".py" or not candidate.name.startswith("test_"):
+            raise pytest.UsageError(
+                f"pytest invocation is not an explicit test file: {argument!r}"
+            )
+        if candidate not in allowed:
+            raise pytest.UsageError(
+                "pytest invocation is restricted to "
+                "tests/migration_active_tests.txt; unauthorized path: "
+                f"{candidate}"
+            )
+        requested.add(candidate)
+    if not requested:
+        raise pytest.UsageError(
+            "pytest requires explicit paths from tests/migration_active_tests.txt"
+        )
+    config._zlc_active_test_paths = allowed
+    config._zlc_requested_test_paths = frozenset(requested)
+
+
+def pytest_ignore_collect(collection_path, config):
+    """Reject historical tests before pytest imports their modules."""
+
+    path = Path(str(collection_path)).resolve()
+    if path.suffix != ".py" or not path.name.startswith("test_"):
+        return None
+    allowed = config._zlc_active_test_paths
+    return path not in allowed
+
+
+def pytest_collection_modifyitems(config, items):
+    allowed = config._zlc_active_test_paths
+    collected = {Path(str(item.path)).resolve() for item in items}
+    unauthorized = sorted(str(path) for path in collected if path not in allowed)
+    if unauthorized:
+        raise pytest.UsageError(
+            "pytest collected tests outside tests/migration_active_tests.txt: "
+            + ", ".join(unauthorized)
+        )
+    if config._zlc_requested_test_paths == allowed:
+        missing = sorted(str(path) for path in allowed - collected)
+        if missing:
+            raise pytest.UsageError(
+                "active manifest files collected no tests: " + ", ".join(missing)
+            )
+
 
 def tracked_repo_files(pattern: str) -> tuple[Path, ...]:
     """Return repository fixtures selected from Git's tracked-file set only.
@@ -48,15 +174,6 @@ def tracked_repo_files(pattern: str) -> tuple[Path, ...]:
     )
 
 
-# The virtual backend is a REAL-TIME hardware simulator (sleep_scale=1.0 by default), so a
-# fired pulse program takes its real wall-clock duration and the live camera paces with the
-# pulse.  The pytest suite must NOT pay that wall-clock -- fast-forward it: flip the virtual
-# default to 0 so the SAME data/physics path runs without the timing sleeps.  Real-time itself
-# is exercised explicitly (sleep_scale=1.0) in tests/test_virtual_realtime_pacing.py.
-import Zou_lab_control.neutral_atom.devices.virtual as _virtual_backend  # noqa: E402
-_virtual_backend.DEFAULT_SLEEP_SCALE = 0.0
-
-
 @pytest.fixture(autouse=True)
 def close_matplotlib_figures():
     yield
@@ -65,196 +182,6 @@ def close_matplotlib_figures():
     except Exception:
         return
     plt.close("all")
-
-
-@pytest.fixture
-def fit_thread_guard(monkeypatch):
-    """Arm the opt-in fit-thread guard for a test: while active, a REAL unbounded curve-fit solve
-    (``core.fitting._solve_candidates`` via ``fit_selected``) that runs ON the Qt application thread
-    RAISES (#6).  Off by default so a notebook main-thread solve stays legal; a worker-node solve and a
-    ``solve=False`` reconstruction both pass.  A per-kind test uses this to mechanically prove a console
-    fit never solves on the GUI event loop."""
-    from Zou_lab_control.neutral_atom.core.fitting import _FIT_THREAD_GUARD_ENV
-    monkeypatch.setenv(_FIT_THREAD_GUARD_ENV, "1")
-    yield
-
-
-def fire_imaging_pulse(
-    sequencer,
-    *,
-    exposure=20e-3,
-    cooling=2e-3,
-    trigger_channel=None,
-):
-    """Fire a CONTINUOUS imaging pulse (``repeat_forever``) on a raw sequencer -- the
-    software model of the pulse GUI's "On Pulse".  An externally-triggered camera produces
-    frames ONLY while the streamer is firing such a pulse; ``sequencer.set_safe_state()``
-    ("Stop Pulse") clears it and the live image freezes.  Returns the fired sequence.
-
-    Camera tests use this so they take the SAME firing path as real hardware (the camera is
-    purely trigger-driven -- there is no fabricated live frame)."""
-    from Zou_lab_control.neutral_atom.timing import (
-        imaging_channel_kwargs,
-        imaging_sequence,
-    )
-
-    if trigger_channel is None:
-        catalog = getattr(sequencer, "port_catalog", None)
-        if catalog is not None:
-            trigger_channel = next(
-                (
-                    port.lanes[0]
-                    for port in catalog.digital_ports
-                    if port.label == "emCCD"
-                ),
-                None,
-            )
-    channel_kwargs = imaging_channel_kwargs(
-        sequencer,
-        trigger_channel=trigger_channel,
-    )
-    seq = imaging_sequence(
-        exposure=exposure,
-        load=True,
-        name="live",
-        cooling=cooling,
-        **channel_kwargs,
-    ).forever()
-    sequencer.prepare(seq)
-    sequencer.fire()
-    return seq
-
-
-def fire_live_imaging(exp, *, exposure=None):
-    """Fire the live imaging pulse on a session's sequencer (see :func:`fire_imaging_pulse`).
-    Mirrors the user clicking "On Pulse" in the pulse GUI so the session's live camera streams."""
-    devs = raw_device_set(exp)
-    cooling = getattr(getattr(devs, "trap_array", None), "mot_load_s", None)
-    kw = {} if cooling is None else {"cooling": float(cooling)}
-    if exposure is None:
-        exposure = devs.camera.exposure
-    return fire_imaging_pulse(
-        devs.sequencer,
-        exposure=exposure,
-        trigger_channel=devs.camera.primary_trigger_channel,
-        **kw,
-    )
-
-
-def raw_device_set(exp):
-    """White-box fixture seam for adapter/runtime tests.
-
-    Public experiment code must use typed facades and ``device_catalog``.  A test that
-    needs a raw spy keeps that intent explicit instead of teaching production callers to
-    recover hardware from the public catalog.
-    """
-
-    return exp._device_set
-
-
-def pulse_command_port_for_test(sequencer, *, generation=1):
-    """Explicit testing adapter from a fake/simulated sequencer to the GUI port."""
-
-    from zlc_workbench.pulse_control import PulseCommandPort, PulseTargetDescriptor
-
-    target = PulseTargetDescriptor(
-        "test-installation",
-        int(generation),
-        sequencer.port_catalog,
-        float(sequencer.clock_hz),
-        "Test installation",
-    )
-    return PulseCommandPort(sequencer, target, lambda: int(generation))
-
-
-def pulse_editor_for_test(state=None, *, sequencer, **kwargs):
-    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
-
-    port = pulse_command_port_for_test(sequencer)
-    return PulseSequenceEditor(
-        state,
-        target_descriptor=port.target,
-        command_port=port,
-        **kwargs,
-    )
-
-
-def make_console(exp, *, running_nodes=None, window_px=(900, 600)):
-    """A real offscreen TaskConsole wired exactly like ``exp.task_console()`` -- the ONE
-    console factory for lifecycle tests (build / start / stop / task flows), so every test
-    drives the same specs + hub wiring the GUI entry point does.  The background tick timer
-    is stopped for determinism: tests drive frames themselves -- use :func:`tick` when the
-    test asserts RENDERED state (``con._tick()`` alone only submits to the render worker)."""
-    from zlc_frontend.qt_widgets import ensure_qt_app
-    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
-    from Zou_lab_control.neutral_atom.core.signals import SignalHub
-
-    ensure_qt_app()
-    runtime = exp._require_runtime_services()
-    con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
-                      measurements=exp.readout.measurement_specs(),
-                      processors=exp.readout.processor_specs(),
-                      tasks=exp.readout.task_specs(), window_px=window_px,
-                      running_nodes=list(running_nodes or ()),
-                      runtime_fence=runtime,
-                      runtime_fence_provider=lambda: exp._require_runtime_services())
-    con._enroll_composed_nodes(tuple(running_nodes or ()), runtime)
-    con._timer.stop()
-    return con
-
-
-def tick(con):
-    """ONE deterministic console frame.  ``_tick()`` SUBMITS the dirty panels to the
-    background render worker; the finished batch normally comes back through the queued
-    ``job_done`` signal -- which never runs for a test that does not spin the Qt event
-    loop.  ``barrier()`` both waits out the compose and delivers the batch to the GUI
-    pass synchronously, so after this call every submitted panel is built + presented."""
-    con._tick()
-    con._render_loop.barrier()
-
-
-def write_saved_npz(path, *, data_x, data_y, **info):
-    """Write a hand-crafted saved-figure ``.npz`` through the ONE production writer
-    (``data_figure._write_saved_npz``), filling the required-but-unspecified ``info`` records with
-    inert defaults.  A reload test that needs a bespoke payload (a site map with a stored frame, a
-    pulse recipe, a promote-fallback with no value role) builds it HERE instead of a raw
-    ``np.savez(info=...)`` -- so a test fixture can never drift from the current envelope again (the
-    old raw-``savez`` fixtures silently rotted the moment the envelope grew its typed records)."""
-    from Zou_lab_control.frontend.data_figure import _write_saved_npz
-    from Zou_lab_control.neutral_atom.operations.figure_capture import raw_data_flow_graph
-    record = {
-        "name": "fig", "kind": None, "labels": ["X", "Y", "Z"], "unit": "",
-        "points_done": 0, "repeat_cur": 1, "view": {}, "fit": None, "size": "2x2",
-        "signals": {}, "figure_recipe": None, "provenance": {},
-    }
-    record.update(info)
-    # Every current envelope carries a flow_graph inside provenance and, for a pulse recipe, a
-    # panel_size -- fill the ones a partial fixture omitted so the payload validates like a real save.
-    provenance = dict(record["provenance"] or {})
-    provenance.setdefault("flow_graph", raw_data_flow_graph())
-    record["provenance"] = provenance
-    recipe = record["figure_recipe"]
-    if isinstance(recipe, dict) and recipe.get("kind") == "pulse" and "panel_size" not in recipe:
-        # panel_size is a REQUIRED non-empty recipe key: a real pulse save stamps the OPTIMAL default
-        # size (``default_pulse_size``) when the operator has not chosen one, so a fixture that omits it
-        # gets exactly that -- the same single source the save and the viewer's fallback both use.
-        from Zou_lab_control.frontend.live import default_pulse_size
-        from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
-        state = PulseTableState.from_dict(recipe["pulse_state"])
-        recipe = {**recipe, "panel_size": default_pulse_size(
-            state, include_always_off=bool(recipe.get("include_always_off", True)))}
-        record["figure_recipe"] = recipe
-    _write_saved_npz(path, data_x=data_x, data_y=data_y, info=record)
-
-
-def add_logic_row(con, data):
-    """Add a logic row through the REAL Add-Panel path (kind combo -> ``_add_panel``) and
-    return it -- e.g. ``add_logic_row(con, ("camera", "live"))``."""
-    kc = con.kind_combo
-    i = next(j for j in range(kc.count()) if kc.itemData(j) == data)
-    kc.setCurrentIndex(i)
-    con._add_panel()
-    return con.logic_nodes[-1]
 
 
 def pulse_backend_completion_for(artifact, *, transport_id="test-transport"):

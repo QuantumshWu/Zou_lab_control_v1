@@ -333,6 +333,14 @@ def test_qt_and_render_extras_are_independent_and_workbench_is_their_union() -> 
 
 
 def test_w1_w2_w3_take_existing_common_controls_from_qt_widgets() -> None:
+    lifecycle_helpers = {
+        "center_window_on_primary_screen",
+        "ensure_qt_app",
+        "release_window",
+        "retain_window",
+        "screen_fit_window_size",
+        "set_fluent_scale",
+    }
     qt_shells = tuple(
         path for path in WORKBENCH_MODULES if _imports_qt_surface(_tree(path))
     )
@@ -346,20 +354,46 @@ def test_w1_w2_w3_take_existing_common_controls_from_qt_widgets() -> None:
             and node.module == "zlc_frontend.qt_widgets"
             for alias in node.names
         }
-        has_launcher = any(
+        launchers = tuple(
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name.startswith(("open_", "show_", "launch_"))
             for node in tree.body
         )
-        if has_launcher:
-            assert {
-                "center_window_on_primary_screen",
-                "ensure_qt_app",
-                "release_window",
-                "retain_window",
-                "screen_fit_window_size",
-                "set_fluent_scale",
-            }.issubset(imported), path
+        if any(launchers) and not lifecycle_helpers.issubset(imported):
+            delegated_calls = {
+                call.func.id
+                for node, is_launcher in zip(tree.body, launchers)
+                if is_launcher
+                for call in ast.walk(node)
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            }
+            delegated_owners: set[str] = set()
+            for node in tree.body:
+                if not (
+                    isinstance(node, ast.ImportFrom)
+                    and node.level == 1
+                    and node.module
+                ):
+                    continue
+                owner_path = path.parent / f"{node.module}.py"
+                if not owner_path.is_file():
+                    continue
+                owner_tree = _tree(owner_path)
+                owner_imported = {
+                    alias.name
+                    for owner_node in owner_tree.body
+                    if isinstance(owner_node, ast.ImportFrom)
+                    and owner_node.module == "zlc_frontend.qt_widgets"
+                    for alias in owner_node.names
+                }
+                for alias in node.names:
+                    local_name = alias.asname or alias.name
+                    if (
+                        local_name in delegated_calls
+                        and lifecycle_helpers.issubset(owner_imported)
+                    ):
+                        delegated_owners.add(local_name)
+            assert delegated_owners, path
 
         import_aliases: dict[str, str] = {}
         for node in ast.walk(tree):

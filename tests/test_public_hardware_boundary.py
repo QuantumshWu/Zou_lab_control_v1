@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 import Zou_lab_control.neutral_atom as na
+from Zou_lab_control.notebook import connect
 from Zou_lab_control.neutral_atom import adapter_sdk, testing
 
 
@@ -62,8 +63,8 @@ def test_simulation_fakes_require_the_explicit_testing_namespace():
     assert not hasattr(na, "VirtualSequencer")
 
 
-def test_public_session_exposes_catalog_values_not_raw_devices():
-    exp = na.connect("virtual")
+def test_public_session_exposes_catalog_values_not_raw_devices(tmp_path):
+    exp = connect("virtual", repository=tmp_path / "workspace")
     try:
         assert not hasattr(exp, "devices")
         assert exp.device_catalog.roles()

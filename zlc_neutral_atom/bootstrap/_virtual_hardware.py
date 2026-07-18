@@ -30,6 +30,7 @@ from zlc_pulse import (
     sample_compiled_bus_codes,
 )
 from zlc_storage import canonical_digest
+from zlc_storage.canonical import positive_integer as _positive_int
 
 
 _K_B = 1.380649e-23
@@ -42,15 +43,6 @@ def _positive(value: object, name: str) -> float:
     result = float(value)
     if not math.isfinite(result) or result <= 0.0:
         raise ValueError(f"{name} must be finite and positive")
-    return result
-
-
-def _positive_int(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-        raise TypeError(f"{name} must be an integer")
-    result = int(value)
-    if result < 1:
-        raise ValueError(f"{name} must be positive")
     return result
 
 

@@ -1,4 +1,4 @@
-"""Restart and recovery contracts for installation-level safety facts."""
+"""Durability and single-owner contracts for the installation safety journal."""
 
 from __future__ import annotations
 
@@ -7,11 +7,13 @@ import threading
 
 import pytest
 
-from zlc_neutral_atom.runtime import (
+from zlc_neutral_atom.runtime.resources import (
+    DeviceBindingStamp,
+    DeviceIdentityEvidenceKind,
     HazardAppendStatus,
     HazardClaim,
     HazardRecord,
-    PersistentSafetyJournal,
+    PhysicalDeviceIdentity,
     RecoveryBundle,
     RecoveryClaim,
     RecoveryEvidence,
@@ -20,19 +22,111 @@ from zlc_neutral_atom.runtime import (
     ResourceKey,
     ResourceLease,
     ResourceQuarantined,
-    SafetyAuthorityBusy,
+    SafeReceipt,
+    SafetyDecision,
     SafetyDispositionBundle,
     SafetyDispositionRecord,
-    SafetyDecision,
+    SafetyJournalSnapshot,
     SafetyOutcome,
 )
+from zlc_neutral_atom.runtime.safety_journal import (
+    PersistentSafetyJournal,
+    SafetyAuthorityBusy,
+)
+from zlc_storage.framed_journal import FramedJournal
 
 
-def _assert_second_call_waits(call, entered, release):
+def physical() -> PhysicalDeviceIdentity:
+    return PhysicalDeviceIdentity(
+        stable_device_identity="physical-device",
+        evidence_kind=DeviceIdentityEvidenceKind.HARDWARE_IDENTITY_READBACK,
+        evidence_digest="identity-readback",
+        asset_map_revision="assets-v1",
+    )
+
+
+def stamp(generation: str = "generation") -> DeviceBindingStamp:
+    return DeviceBindingStamp(physical(), generation)
+
+
+def hazard(
+    resource: ResourceKey,
+    *,
+    record_id: str = "hazard",
+    run_id: str = "run",
+    generation: str = "generation",
+    activated_at: float = 1.0,
+) -> HazardRecord:
+    return HazardRecord(
+        record_id=record_id,
+        key=resource,
+        binding_stamp=stamp(generation),
+        run_id=run_id,
+        activated_at=activated_at,
+    )
+
+
+def unsafe_bundle(
+    record: HazardRecord,
+    *,
+    bundle_id: str = "safety",
+    disposition_id: str = "quarantine",
+    recorded_at: float = 2.0,
+) -> SafetyDispositionBundle:
+    return SafetyDispositionBundle(
+        bundle_id=bundle_id,
+        run_id=record.run_id,
+        records=(
+            SafetyDispositionRecord(
+                disposition_id=disposition_id,
+                key=record.key,
+                outcome=SafetyOutcome.UNSAFE,
+                hazard_record_id=record.record_id,
+                binding_stamp=record.binding_stamp,
+                safe_receipt=None,
+                reason="safe state could not be verified",
+                recovery_action="re-establish the same asset and verify safe state",
+            ),
+        ),
+        recorded_at=recorded_at,
+    )
+
+
+def safe_bundle(
+    record: HazardRecord,
+    *,
+    bundle_id: str,
+    recorded_at: float,
+) -> SafetyDispositionBundle:
+    return SafetyDispositionBundle(
+        bundle_id=bundle_id,
+        run_id=record.run_id,
+        records=(
+            SafetyDispositionRecord(
+                disposition_id=f"disposition-{record.record_id}",
+                key=record.key,
+                outcome=SafetyOutcome.SAFE,
+                hazard_record_id=record.record_id,
+                binding_stamp=record.binding_stamp,
+                safe_receipt=SafeReceipt(
+                    record.key,
+                    record.binding_stamp,
+                    "VERIFY_SAFE_STATE",
+                    "safe-state",
+                ),
+                reason=None,
+                recovery_action=None,
+            ),
+        ),
+        recorded_at=recorded_at,
+    )
+
+
+def assert_second_call_waits(call, entered, release) -> None:
     second_returned = threading.Event()
-    failures = []
+    failures: list[BaseException] = []
 
-    def invoke(done=None):
+    def invoke(done=None) -> None:
         try:
             call()
         except BaseException as exc:
@@ -44,140 +138,205 @@ def _assert_second_call_waits(call, entered, release):
     first = threading.Thread(target=invoke)
     second = threading.Thread(target=invoke, args=(second_returned,))
     first.start()
-    assert entered.wait(2.0)
+    assert entered.wait(2)
     second.start()
     assert not second_returned.wait(0.05)
     release.set()
-    first.join(2.0)
-    second.join(2.0)
+    first.join(2)
+    second.join(2)
     assert not first.is_alive() and not second.is_alive()
     assert failures == []
 
 
 def test_hazard_survives_restart_and_blocks_ordinary_acquisition(tmp_path):
     path = tmp_path / "installation-safety.zlcj"
-    key = ResourceKey.parse("device/camera/qcmos")
+    resource = ResourceKey.parse("device/camera/qcmos")
     journal = PersistentSafetyJournal(path)
-    journal.append_hazards(
-        (
-            HazardRecord(
-                record_id="hazard-one",
-                key=key,
-                stable_device_identity=str(key),
-                connection_generation="generation-one",
-                run_id="run-one",
-                activated_at=1.0,
-            ),
-        )
-    )
+    record = hazard(resource)
+    assert journal.append_hazards((record,)) is HazardAppendStatus.APPENDED
     journal.close()
 
     restarted = PersistentSafetyJournal(path)
-    assert tuple(record.record_id for record in restarted.snapshot().unresolved_hazards) == (
-        "hazard-one",
+    assert restarted.snapshot().unresolved_hazards == (record,)
+    arbiter = ResourceArbiter(restarted)
+    assert isinstance(
+        arbiter.acquire_all("another-run", (ResourceClaim(resource),)),
+        ResourceQuarantined,
     )
-    outcome = ResourceArbiter(restarted).acquire_all(
-        "another-run",
-        (ResourceClaim(key),),
-    )
-    assert isinstance(outcome, ResourceQuarantined)
+    arbiter.shutdown()
 
 
-def test_quarantine_and_verified_recovery_facts_round_trip(tmp_path):
+def test_quarantine_and_recovery_round_trip_with_new_generation_and_clock_rollback(
+    tmp_path,
+):
     path = tmp_path / "installation-safety.zlcj"
-    key = ResourceKey.parse("device/fpga/pulse")
+    resource = ResourceKey.parse("device/fpga/pulse")
     journal = PersistentSafetyJournal(path)
-    hazard = HazardRecord(
-        record_id="hazard-two",
-        key=key,
-        stable_device_identity=str(key),
-        connection_generation="generation-two",
-        run_id="run-two",
-        activated_at=2.0,
-    )
-    journal.append_hazards((hazard,))
+    record = hazard(resource, activated_at=10_000.0)
+    journal.append_hazards((record,))
     journal.append_safety_bundle(
-        SafetyDispositionBundle(
-            bundle_id="safety-two",
-            run_id="run-two",
-            records=(
-                SafetyDispositionRecord(
-                    disposition_id="quarantine-two",
-                    key=key,
-                    outcome=SafetyOutcome.UNSAFE,
-                    hazard_record_id="hazard-two",
-                    stable_device_identity=str(key),
-                    connection_generation="generation-two",
-                    safe_receipt=None,
-                    reason="safe state could not be verified",
-                    recovery_action="reconnect and verify hardware safe state",
-                ),
-            ),
-            recorded_at=3.0,
-        )
+        unsafe_bundle(record, recorded_at=-10_000.0)
+    )
+    snapshot = journal.snapshot()
+    assert snapshot.unresolved_hazards == ()
+    assert tuple(item.record_id for item in snapshot.unresolved_quarantines) == (
+        "quarantine",
     )
 
-    quarantined = journal.snapshot()
-    assert quarantined.unresolved_hazards == ()
-    assert tuple(record.record_id for record in quarantined.unresolved_quarantines) == (
-        "quarantine-two",
+    recovery = RecoveryBundle(
+        bundle_id="recovery",
+        claim=RecoveryClaim(
+            key=resource,
+            physical_identity=physical(),
+            blocking_record_id="quarantine",
+        ),
+        evidence=RecoveryEvidence(
+            binding_stamp=stamp("new-generation"),
+            safe_state_digest="verified-safe-state",
+        ),
+        recorded_at=-20_000.0,
     )
-    with pytest.raises(ValueError, match="safety records"):
-        journal.append_hazards(
-            (
-                HazardRecord(
-                    record_id="hazard-while-quarantined",
-                    key=key,
-                    stable_device_identity=str(key),
-                    connection_generation="generation-three",
-                    run_id="run-three",
-                    activated_at=3.5,
-                ),
+    journal.append_recovery_bundle(recovery)
+    journal.append_recovery_bundle(recovery)
+    assert journal.snapshot() == SafetyJournalSnapshot((), ())
+    assert journal.append_hazards((record,)) is HazardAppendStatus.ALREADY_RESOLVED
+    journal.close()
+
+    reopened = PersistentSafetyJournal(path)
+    assert reopened.snapshot() == SafetyJournalSnapshot((), ())
+    reopened.close()
+
+
+def test_durable_then_lost_ack_retry_does_not_duplicate_or_rescan(tmp_path, monkeypatch):
+    import zlc_storage.framed_journal as framed_journal
+
+    path = tmp_path / "installation-safety.zlcj"
+    resource = ResourceKey.parse("device/camera/lost-ack")
+    journal = PersistentSafetyJournal(path)
+    record = hazard(resource)
+    real_fsync = framed_journal.os.fsync
+    failed = False
+
+    def durable_then_raise(file_descriptor):
+        nonlocal failed
+        real_fsync(file_descriptor)
+        if not failed:
+            failed = True
+            raise OSError("fsync acknowledgement lost")
+
+    monkeypatch.setattr(framed_journal.os, "fsync", durable_then_raise)
+    with pytest.raises(OSError, match="acknowledgement lost"):
+        journal.append_hazards((record,))
+    assert journal.snapshot().unresolved_hazards == (record,)
+    assert (
+        journal.append_hazards((record,))
+        is HazardAppendStatus.ALREADY_UNRESOLVED_SAME
+    )
+    journal.close()
+    reopened = PersistentSafetyJournal(path)
+    assert reopened.snapshot().unresolved_hazards == (record,)
+    reopened.close()
+
+
+def test_torn_tail_is_repaired_without_losing_last_complete_safety_fact(tmp_path):
+    path = tmp_path / "installation-safety.zlcj"
+    resource = ResourceKey.parse("device/camera/torn-tail")
+    record = hazard(resource)
+    journal = PersistentSafetyJournal(path)
+    journal.append_hazards((record,))
+    journal.close()
+    complete_size = path.stat().st_size
+    with path.open("ab") as stream:
+        stream.write(b"ZLCJNL1")
+        stream.flush()
+        os.fsync(stream.fileno())
+    assert path.stat().st_size > complete_size
+
+    repaired = PersistentSafetyJournal(path)
+    assert repaired.snapshot().unresolved_hazards == (record,)
+    assert path.stat().st_size == complete_size
+    repaired.close()
+
+
+def test_steady_append_uses_one_startup_scan(tmp_path, monkeypatch):
+    path = tmp_path / "installation-safety.zlcj"
+    scans = 0
+    real_scan = FramedJournal._scan
+
+    def counting_scan(self, *args, **kwargs):
+        nonlocal scans
+        scans += 1
+        return real_scan(self, *args, **kwargs)
+
+    monkeypatch.setattr(FramedJournal, "_scan", counting_scan)
+    journal = PersistentSafetyJournal(path)
+    assert scans == 1
+    for index in range(25):
+        record = hazard(
+            ResourceKey.parse(f"device/camera/unit-{index}"),
+            record_id=f"hazard-{index}",
+            run_id=f"run-{index}",
+            activated_at=float(index),
+        )
+        journal.append_hazards((record,))
+        journal.append_safety_bundle(
+            safe_bundle(
+                record,
+                bundle_id=f"safety-{index}",
+                recorded_at=float(index),
             )
         )
+    assert journal.snapshot() == SafetyJournalSnapshot((), ())
+    assert scans == 1
+    journal.close()
 
-    journal.append_recovery_bundle(
-        RecoveryBundle(
-            bundle_id="recovery-two",
-            claim=RecoveryClaim(
-                key=key,
-                stable_device_identity=str(key),
-                quarantine_record_ids=("quarantine-two",),
-                hazard_record_ids=(),
-            ),
-            evidence=RecoveryEvidence(
-                stable_device_identity=str(key),
-                connection_generation="generation-three",
-                health_digest="healthy",
-                safe_state_digest="safe",
-                verified_at=4.0,
-            ),
-            recorded_at=4.0,
-        )
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda value: value["binding_stamp"]["physical_identity"].pop(
+            "evidence_digest"
+        ),
+        lambda value: value["binding_stamp"]["physical_identity"].update(
+            {"unexpected": "field"}
+        ),
+        lambda value: value["binding_stamp"]["physical_identity"].update(
+            {"evidence_kind": "GUESSED"}
+        ),
+        lambda value: value["binding_stamp"].update(
+            {"connection_generation": ""}
+        ),
+    ),
+)
+def test_identity_stamp_codec_is_strict_and_fail_closed(tmp_path, mutate):
+    path = tmp_path / "malformed-safety.zlcj"
+    value = {
+        "record_id": "hazard",
+        "key": "device/camera/test",
+        "binding_stamp": {
+            "physical_identity": {
+                "stable_device_identity": "camera-serial",
+                "evidence_kind": "HARDWARE_IDENTITY_READBACK",
+                "evidence_digest": "readback",
+                "asset_map_revision": "assets-v1",
+            },
+            "connection_generation": "generation",
+        },
+        "run_id": "run",
+        "activated_at": 1.0,
+    }
+    mutate(value)
+    FramedJournal(path).append(
+        "malformed",
+        {"kind": "HAZARD_BATCH", "records": [value]},
     )
-    assert journal.snapshot().unresolved_quarantines == ()
-    assert journal.append_hazards((hazard,)) is HazardAppendStatus.ALREADY_RESOLVED
-    assert journal.snapshot().unresolved_hazards == ()
+    with pytest.raises((TypeError, ValueError)):
+        PersistentSafetyJournal(path)
+    valid = PersistentSafetyJournal(tmp_path / "valid-safety.zlcj")
+    valid.close()
 
 
-def test_lost_ack_retry_is_idempotent_for_hazard_batch(tmp_path):
-    path = tmp_path / "installation-safety.zlcj"
-    key = ResourceKey.parse("device/camera/retry")
-    record = HazardRecord(
-        record_id="hazard-retry",
-        key=key,
-        stable_device_identity=str(key),
-        connection_generation="generation-retry",
-        run_id="run-retry",
-        activated_at=5.0,
-    )
-    journal = PersistentSafetyJournal(path)
-    journal.append_hazards((record,))
-    journal.append_hazards((record,))
-    assert journal.snapshot().unresolved_hazards == (record,)
-
-
-def test_second_installation_safety_authority_is_rejected(tmp_path):
+def test_second_installation_authority_is_rejected_until_real_close(tmp_path):
     path = tmp_path / "installation-safety.zlcj"
     first = PersistentSafetyJournal(path)
     with pytest.raises(SafetyAuthorityBusy):
@@ -185,125 +344,75 @@ def test_second_installation_safety_authority_is_rejected(tmp_path):
     first.close()
     with pytest.raises(RuntimeError, match="authority is closed"):
         first.snapshot()
-    assert isinstance(PersistentSafetyJournal(path), PersistentSafetyJournal)
+    second = PersistentSafetyJournal(path)
+    second.close()
 
 
-def test_concurrent_safety_close_waits_for_actual_lock_release(
+def test_concurrent_close_waits_for_physical_owner_unlock(tmp_path, monkeypatch):
+    import zlc_storage.framed_journal as framed_journal
+
+    path = tmp_path / "installation-safety.zlcj"
+    journal = PersistentSafetyJournal(path)
+    real_unlock = framed_journal.release_file_lock
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_unlock(stream):
+        entered.set()
+        assert release.wait(2)
+        real_unlock(stream)
+
+    monkeypatch.setattr(framed_journal, "release_file_lock", blocked_unlock)
+    assert_second_call_waits(journal.close, entered, release)
+    reopened = PersistentSafetyJournal(path)
+    reopened.close()
+
+
+def test_concurrent_arbiter_shutdown_waits_for_physical_owner_unlock(
     tmp_path,
     monkeypatch,
 ):
-    import zlc_neutral_atom.runtime.safety_journal as safety_journal
-
-    path = tmp_path / "installation-safety.zlcj"
-    journal = PersistentSafetyJournal(path)
-    real_unlock = safety_journal.release_file_lock
-    entered = threading.Event()
-    release = threading.Event()
-
-    def blocked_unlock(stream):
-        entered.set()
-        if not release.wait(2.0):
-            raise TimeoutError("test did not release safety unlock")
-        real_unlock(stream)
-
-    monkeypatch.setattr(safety_journal, "release_file_lock", blocked_unlock)
-    _assert_second_call_waits(journal.close, entered, release)
-    PersistentSafetyJournal(path).close()
-
-
-def test_concurrent_arbiter_shutdown_waits_for_owner_release(tmp_path, monkeypatch):
-    import zlc_neutral_atom.runtime.safety_journal as safety_journal
+    import zlc_storage.framed_journal as framed_journal
 
     path = tmp_path / "installation-safety.zlcj"
     arbiter = ResourceArbiter(PersistentSafetyJournal(path))
+    real_unlock = framed_journal.release_file_lock
     entered = threading.Event()
     release = threading.Event()
-    real_unlock = safety_journal.release_file_lock
 
     def blocked_unlock(stream):
         entered.set()
-        if not release.wait(2.0):
-            raise TimeoutError("test did not release arbiter shutdown")
+        assert release.wait(2)
         real_unlock(stream)
 
-    monkeypatch.setattr(safety_journal, "release_file_lock", blocked_unlock)
-    _assert_second_call_waits(arbiter.shutdown, entered, release)
-    PersistentSafetyJournal(path).close()
+    monkeypatch.setattr(framed_journal, "release_file_lock", blocked_unlock)
+    assert_second_call_waits(arbiter.shutdown, entered, release)
+    reopened = PersistentSafetyJournal(path)
+    reopened.close()
 
 
-def test_safety_authority_cannot_bind_across_owner_close(tmp_path, monkeypatch):
-    import zlc_neutral_atom.runtime.safety_journal as safety_journal
+def test_unlock_failure_leaves_old_authority_permanently_closed(tmp_path, monkeypatch):
+    import zlc_storage.framed_journal as framed_journal
 
     path = tmp_path / "installation-safety.zlcj"
     journal = PersistentSafetyJournal(path)
-    unlock_entered = threading.Event()
-    release_unlock = threading.Event()
-    bind_returned = threading.Event()
-    close_failures = []
-    bind_failures = []
-    real_unlock = safety_journal.release_file_lock
-
-    def blocked_unlock(stream):
-        unlock_entered.set()
-        if not release_unlock.wait(2.0):
-            raise TimeoutError("test did not release safety owner close")
-        real_unlock(stream)
-
-    def close():
-        try:
-            journal.close()
-        except BaseException as exc:
-            close_failures.append(exc)
-
-    def bind():
-        try:
-            ResourceArbiter(journal)
-        except BaseException as exc:
-            bind_failures.append(exc)
-        finally:
-            bind_returned.set()
-
-    monkeypatch.setattr(safety_journal, "release_file_lock", blocked_unlock)
-    close_thread = threading.Thread(target=close)
-    bind_thread = threading.Thread(target=bind)
-    close_thread.start()
-    assert unlock_entered.wait(2.0)
-    bind_thread.start()
-    assert not bind_returned.wait(0.05)
-    release_unlock.set()
-    close_thread.join(2.0)
-    bind_thread.join(2.0)
-
-    assert not close_thread.is_alive() and not bind_thread.is_alive()
-    assert close_failures == []
-    assert len(bind_failures) == 1
-    assert isinstance(bind_failures[0], RuntimeError)
-    assert "closed" in str(bind_failures[0])
-    PersistentSafetyJournal(path).close()
-
-
-def test_unlock_failure_still_closes_old_safety_authority(tmp_path, monkeypatch):
-    import zlc_neutral_atom.runtime.safety_journal as safety_journal
-
-    path = tmp_path / "installation-safety.zlcj"
-    journal = PersistentSafetyJournal(path)
-    real_unlock = safety_journal.release_file_lock
+    real_unlock = framed_journal.release_file_lock
 
     def fail_unlock(_stream):
-        raise OSError("injected safety unlock failure")
+        raise OSError("injected owner unlock failure")
 
-    monkeypatch.setattr(safety_journal, "release_file_lock", fail_unlock)
+    monkeypatch.setattr(framed_journal, "release_file_lock", fail_unlock)
     with pytest.raises(OSError, match="unlock failure"):
         journal.close()
     with pytest.raises(RuntimeError, match="authority is closed"):
         journal.snapshot()
-
-    monkeypatch.setattr(safety_journal, "release_file_lock", real_unlock)
-    PersistentSafetyJournal(path).close()
+    monkeypatch.setattr(framed_journal, "release_file_lock", real_unlock)
+    reopened = PersistentSafetyJournal(path)
+    reopened.close()
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork contract")
-def test_forked_safety_copy_cannot_unlock_parent_authority(tmp_path):
+def test_forked_copy_cannot_unlock_parent_authority(tmp_path):
     path = tmp_path / "installation-safety.zlcj"
     journal = PersistentSafetyJournal(path)
     child = os.fork()
@@ -322,18 +431,14 @@ def test_forked_safety_copy_cannot_unlock_parent_authority(tmp_path):
         journal.close()
 
 
-def test_active_resource_authority_cannot_release_installation_owner_lock(tmp_path):
+def test_active_resource_authority_cannot_release_owner_lock(tmp_path):
     path = tmp_path / "installation-safety.zlcj"
-    key = ResourceKey.parse("device/fpga/live-owner")
+    resource = ResourceKey.parse("device/fpga/live-owner")
     journal = PersistentSafetyJournal(path)
     arbiter = ResourceArbiter(journal)
-    lease = arbiter.acquire_all("live-run", (ResourceClaim(key),))
+    lease = arbiter.acquire_all("live-run", (ResourceClaim(resource),))
     assert isinstance(lease, ResourceLease)
-    lease.activate_hazards(
-        (
-            HazardClaim(key, str(key), "live-generation"),
-        )
-    )
+    lease.activate_hazards((HazardClaim(resource, stamp("live-generation")),))
     with pytest.raises(RuntimeError, match="owned by ResourceArbiter"):
         journal.close()
     with pytest.raises(RuntimeError, match="active ownership"):
@@ -344,7 +449,7 @@ def test_active_resource_authority_cannot_release_installation_owner_lock(tmp_pa
     lease._commit_safety(
         (
             SafetyDecision.unsafe(
-                key,
+                resource,
                 reason="safe state unknown",
                 recovery_action="verify hardware",
             ),

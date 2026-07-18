@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 import zlc_pulse.artifact as pulse_artifact_module
 import zlc_pulse.fpga as pulse_fpga_module
@@ -26,10 +27,11 @@ from zlc_pulse import (
 
 
 ROOT = Path(__file__).parents[1]
+IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
 
 
 def test_static_artifact_binds_source_ir_wire_and_trigger_schedule():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_PULSE)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -51,7 +53,7 @@ def test_static_artifact_binds_source_ir_wire_and_trigger_schedule():
 
 
 def test_compiled_identity_getters_do_not_rehash_after_construction(monkeypatch):
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_PULSE)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -67,8 +69,12 @@ def test_compiled_identity_getters_do_not_rehash_after_construction(monkeypatch)
     def unexpected_digest(*_args, **_kwargs):
         raise AssertionError("immutable identity getter recomputed its canonical digest")
 
-    for module in (pulse_ir_module, pulse_fpga_module, pulse_artifact_module):
-        monkeypatch.setattr(module, "canonical_digest", unexpected_digest)
+    for module, name in (
+        (pulse_ir_module, "canonical_digest"),
+        (pulse_fpga_module, "canonical_digest"),
+        (pulse_artifact_module, "sha256_digest"),
+    ):
+        monkeypatch.setattr(module, name, unexpected_digest)
     for _ in range(2):
         assert artifact.target_ir.fingerprint == expected[0]
         assert artifact.wire_image.digest == expected[1]
@@ -91,12 +97,13 @@ def test_scan_artifact_preserves_each_physical_point_in_trigger_provenance():
     )
     schedule = artifact.trigger_schedules[0]
     assert schedule.point_count == 3
-    assert [edge.point_index for edge in schedule.edges] == [0, 1, 2]
-    assert [edge.point_trigger_ordinal for edge in schedule.edges] == [0, 0, 0]
+    edges = tuple(schedule.iter_edges())
+    assert [edge.point_index for edge in edges] == [0, 1, 2]
+    assert [edge.point_trigger_ordinal for edge in edges] == [0, 0, 0]
 
 
 def test_artifact_rejects_wire_or_schedule_from_another_compilation():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_PULSE)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -109,16 +116,17 @@ def test_artifact_rejects_wire_or_schedule_from_another_compilation():
             wire_image=replace(artifact.wire_image, source_ir_digest="0" * 64),
         )
     schedule = artifact.trigger_schedules[0]
-    changed_edge = replace(schedule.edges[0], tick_from_run_start=schedule.edges[0].tick_from_run_start + 1)
+    changed_ticks = np.array(schedule.ticks_from_run_start, copy=True)
+    changed_ticks[0] += 1
     with pytest.raises(ValueError, match="deterministic"):
         replace(
             artifact,
-            trigger_schedules=(replace(schedule, edges=(changed_edge, *schedule.edges[1:])),),
+            trigger_schedules=(replace(schedule, ticks_from_run_start=changed_ticks),),
         )
 
 
 def test_continuous_artifact_has_no_finite_trigger_schedule():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_PULSE)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -151,7 +159,7 @@ def test_only_physical_digital_lanes_can_be_declared_as_triggers(kind):
 
 
 def test_compiled_artifact_requires_exact_current_schema():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_PULSE)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,

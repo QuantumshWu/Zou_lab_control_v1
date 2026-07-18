@@ -7,6 +7,7 @@ import pytest
 
 from zlc_pulse import (
     CompiledPulseArtifact,
+    MAX_MATERIALIZED_PLAYBACK_PULSES,
     OutputDelay,
     PORT_DIGITAL,
     PulseExecutionForm,
@@ -17,10 +18,15 @@ from zlc_pulse import (
     load_pulse_document,
     pack_target_ir,
 )
-from zlc_pulse.simulation import MAX_MATERIALIZED_PLAYBACK_TRANSITIONS
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def _document_path(filename: str) -> Path:
+    if filename == "imaging_template.json":
+        return ROOT / "zlc_neutral_atom" / "assets" / filename
+    return ROOT / "pulses" / filename
 
 
 def _active_digital_lane(document):
@@ -43,7 +49,7 @@ def _active_digital_lane(document):
     ),
 )
 def test_playback_rising_edges_are_the_compiled_trigger_schedule(filename, form):
-    document = load_pulse_document(ROOT / "pulses" / filename)
+    document = load_pulse_document(_document_path(filename))
     trigger = _active_digital_lane(document)
     artifact = compile_pulse_artifact(
         document,
@@ -60,7 +66,8 @@ def test_playback_rising_edges_are_the_compiled_trigger_schedule(filename, form)
     )
 
     assert starts == tuple(
-        edge.tick_from_run_start for edge in artifact.trigger_schedules[0].edges
+        edge.tick_from_run_start
+        for edge in artifact.trigger_schedules[0].iter_edges()
     )
     assert playback.logical_duration == pytest.approx(
         artifact.target_ir.duration_seconds
@@ -68,7 +75,7 @@ def test_playback_rising_edges_are_the_compiled_trigger_schedule(filename, form)
 
 
 def test_continuous_playback_is_cyclic_but_never_fabricates_a_finite_schedule():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(_document_path("imaging_template.json"))
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -83,7 +90,7 @@ def test_continuous_playback_is_cyclic_but_never_fabricates_a_finite_schedule():
 
 
 def _repeated_imaging_document(count=12):
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(_document_path("imaging_template.json"))
     return replace(
         document,
         repeat=RepeatRegion(
@@ -107,7 +114,7 @@ def test_full_document_repeat_retains_point_loop_trigger_groups():
 
     assert schedule.loop_count == 12
     assert schedule.full_point_loop
-    assert tuple(edge.loop_iteration for edge in schedule.edges) == tuple(
+    assert tuple(edge.loop_iteration for edge in schedule.iter_edges()) == tuple(
         repeat for repeat in range(12) for _event in range(3)
     )
     assert playback.trigger_group_sizes(("ch11",)) == (3,) * 12
@@ -115,7 +122,7 @@ def test_full_document_repeat_retains_point_loop_trigger_groups():
         round(pulse.start * artifact.target_ir.clock_hz)
         for pulse in playback.effective_pulses()
         if pulse.channel == "ch11" and pulse.value
-    ) == tuple(edge.tick_from_run_start for edge in schedule.edges)
+    ) == tuple(edge.tick_from_run_start for edge in schedule.iter_edges())
 
 
 def test_delay_unroll_keeps_source_groups_while_ticks_remain_physical():
@@ -141,11 +148,11 @@ def test_delay_unroll_keeps_source_groups_while_ticks_remain_physical():
         round(pulse.start * artifact.target_ir.clock_hz)
         for pulse in playback.effective_pulses()
         if pulse.channel == "ch11" and pulse.value
-    ) == tuple(edge.tick_from_run_start for edge in schedule.edges)
+    ) == tuple(edge.tick_from_run_start for edge in schedule.iter_edges())
 
 
 def test_partial_repeat_requires_explicit_virtual_shot_semantics():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(_document_path("imaging_template.json"))
     partial = replace(
         document,
         repeat=RepeatRegion(
@@ -184,20 +191,21 @@ def test_virtual_shot_grouping_rejects_multiple_trigger_lines():
 
 
 def test_playback_rejects_an_unbounded_materialized_compact_projection():
-    loops = MAX_MATERIALIZED_PLAYBACK_TRANSITIONS + 1
+    loops = MAX_MATERIALIZED_PLAYBACK_PULSES + 1
     ir = TargetIR(
         clock_hz=50e6,
         target_abi_fingerprint="a" * 64,
         channels=("trigger",),
-        ticks=(0, 10),
-        masks=(0, 0),
+        ticks=(0, 5, 10),
+        masks=(1, 0, 0),
         duration_seconds=10 * loops / 50e6,
         repeat_forever=False,
         loop_start_index=0,
         loop_end_tick=10,
         loop_count=loops,
-        tick_slot_coeffs=((), ()),
+        tick_slot_coeffs=((), (), ()),
         channel_delays=(0,),
+        logical_digital_outputs=(("trigger", "trigger"),),
     )
     artifact = CompiledPulseArtifact(
         "b" * 64,
@@ -207,5 +215,5 @@ def test_playback_rejects_an_unbounded_materialized_compact_projection():
         pack_target_ir(ir),
         (),
     )
-    with pytest.raises(ValueError, match="materialization limit"):
+    with pytest.raises(ValueError, match="physical digital playback requires"):
         build_pulse_playback(artifact)

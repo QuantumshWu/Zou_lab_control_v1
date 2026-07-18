@@ -22,6 +22,7 @@ from zlc_pulse.deployment import APPROVED_DEPLOYED_TARGET_ABI
 
 
 ROOT = Path(__file__).parents[1]
+IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
 
 
 def test_every_shipped_document_matches_the_packaged_deployment_target():
@@ -33,21 +34,21 @@ def test_every_shipped_document_matches_the_packaged_deployment_target():
 
 
 @pytest.mark.parametrize(
-    ("filename", "form", "trigger_channel"),
+    ("path", "form", "trigger_channel"),
     [
-        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "ch11"),
-        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch11"),
-        ("probe_template.json", PulseExecutionForm.STATIC_ONCE, "ch11"),
-        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "ch11"),
+        (IMAGING_PULSE, PulseExecutionForm.STATIC_ONCE, "ch11"),
+        (ROOT / "pulses" / "mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch11"),
+        (ROOT / "pulses" / "probe_template.json", PulseExecutionForm.STATIC_ONCE, "ch11"),
+        (ROOT / "pulses" / "release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "ch11"),
     ],
 )
 def test_shipped_hardware_documents_embed_the_approved_deployment_target(
-    filename,
+    path,
     form,
     trigger_channel,
 ):
     target = load_deployed_pulse_target()
-    document = load_pulse_document(ROOT / "pulses" / filename)
+    document = load_pulse_document(path)
 
     assert document.target == target
     assert target.abi_fingerprint == APPROVED_DEPLOYED_TARGET_ABI
@@ -65,7 +66,7 @@ def test_shipped_hardware_documents_embed_the_approved_deployment_target(
 
 def test_binding_rekeys_referenced_ports_only_by_exact_physical_ownership():
     live_target = load_deployed_pulse_target()
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_PULSE)
     authored_target = PulseTarget(
         live_target.raw_lanes,
         tuple(
@@ -89,7 +90,7 @@ def test_binding_rekeys_referenced_ports_only_by_exact_physical_ownership():
 
 
 def test_referenced_lane_cannot_be_guessed_into_a_different_port_kind():
-    source = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    source = load_pulse_document(IMAGING_PULSE)
     ports = []
     for port in source.target.ports:
         if port.key == "ch11":
@@ -103,7 +104,7 @@ def test_referenced_lane_cannot_be_guessed_into_a_different_port_kind():
 
 
 def test_binding_cannot_inject_an_unreferenced_hardware_clock_output():
-    source = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    source = load_pulse_document(IMAGING_PULSE)
     injected = PulseTarget(
         source.target.raw_lanes,
         tuple(

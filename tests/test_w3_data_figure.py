@@ -36,6 +36,7 @@ from zlc_data import (
     ValueSchema,
     commit_transform,
     bind_fit,
+    fit_result_retained_upper_bound_nbytes,
     fit_spec_for,
 )
 from zlc_frontend import DataFigure
@@ -378,7 +379,10 @@ def test_notebook_fit_figure_maps_each_visible_batch_and_skips_failure(monkeypat
 
         render_limit = 512 << 20
         data_figure = exp.figure(execution, memory_limit_bytes=render_limit)
-        assert data_figure.render_memory_limit_bytes == render_limit
+        assert data_figure.render_memory_limit_bytes == (
+            render_limit
+            - fit_result_retained_upper_bound_nbytes(execution.result)
+        )
         import zlc_frontend.matplotlib_render as render_module
 
         with monkeypatch.context() as budget_patch:

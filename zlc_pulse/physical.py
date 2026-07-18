@@ -24,6 +24,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from zlc_storage.canonical import (
+    canonical_text as _text,
+    nonnegative_integer as _nonnegative_integer,
+    nonnegative_real as _nonnegative_real,
+    positive_integer as _positive_integer,
+    positive_real as _positive_real,
+)
+
 from .ir import TargetIR, evaluate_affine_tick
 
 
@@ -47,43 +55,6 @@ _PROJECTION_TRANSITION_BYTES = 192
 
 class PhysicalReadoutContextUnsupportedError(ValueError):
     """The pulse is valid, but the optional readout-window index cannot model it."""
-
-
-def _text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{field} must be non-empty text")
-    return value
-
-
-def _nonnegative_integer(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer")
-    return int(value)
-
-
-def _positive_integer(value: object, field: str) -> int:
-    result = _nonnegative_integer(value, field)
-    if result == 0:
-        raise ValueError(f"{field} must be positive")
-    return result
-
-
-def _nonnegative_real(value: object, field: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-        or float(value) < 0.0
-    ):
-        raise ValueError(f"{field} must be a finite non-negative real")
-    return float(value)
-
-
-def _positive_real(value: object, field: str) -> float:
-    result = _nonnegative_real(value, field)
-    if result == 0.0:
-        raise ValueError(f"{field} must be positive")
-    return result
 
 
 def _callback(value: object, field: str) -> Callable[[], None]:

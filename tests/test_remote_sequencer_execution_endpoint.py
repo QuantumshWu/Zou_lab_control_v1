@@ -1,27 +1,34 @@
+"""Current target-owned remote pulse endpoint and interrupt fencing."""
+
 from __future__ import annotations
 
 from pathlib import Path
 import threading
+
+import pytest
+
 from conftest import pulse_backend_completion_for
 
-from zlc_neutral_atom.runtime import (
-    CleanupStepAck,
+from zlc_neutral_atom.bootstrap._sequencer_endpoint import (
+    RemotePulseExecutionEndpoint,
+)
+from zlc_neutral_atom.runtime.ports import (
     DeviceBroker,
-    DeviceIdentityAck,
-    DeviceIdentityEvidenceKind,
-    MemoryQuarantineJournal,
-    ResourceArbiter,
-    ResourceKey,
-    RunController,
-    RunMode,
-    RunPlan,
-    SafeStateAck,
     SafetyOperation,
+    SessionCloseCommand,
+)
+from zlc_neutral_atom.runtime.resources import (
+    DeviceIdentityEvidenceKind,
+    PhysicalDeviceIdentity,
+    ResourceKey,
 )
 from zlc_neutral_atom.timing.pulse import (
+    CompletePulseCommand,
     FinitePulseExecutionRequest,
+    FirePulseCommand,
     PreparePulseCommand,
     PulseTerminalEvidenceKind,
+    SequencerCapabilitySnapshot,
 )
 from zlc_pulse import (
     PulseCompletion,
@@ -30,6 +37,7 @@ from zlc_pulse import (
     RemotePulseExecutionClient,
     compile_pulse_artifact,
     load_pulse_document,
+    pulse_server_snapshot_from_tree,
 )
 from zlc_pulse.server import (
     decode_artifact_message,
@@ -37,16 +45,11 @@ from zlc_pulse.server import (
     encode_completion_message,
     encode_prepared_ref_message,
 )
-from zlc_storage import encode
-from zlc_workbench.legacy_runtime import LegacyDeviceRegistration, LegacyDeviceRegistry
-from zlc_workbench.sequencer_execution import (
-    RemotePulseExecutionEndpoint,
-    SequencerBindingRequest,
-    bind_sequencer_port,
-)
+from zlc_storage import decode, encode
 
 
 ROOT = Path(__file__).parents[1]
+IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
 
 
 class Backend:
@@ -80,7 +83,7 @@ class Backend:
         self.safe = True
 
     def request_interrupt(self):
-        pass
+        return None
 
     def snapshot(self):
         return {"safe": self.safe}
@@ -105,7 +108,8 @@ class Root:
     def current_complete(self, payload, timeout):
         return encode_completion_message(
             self.service.complete(
-                decode_prepared_ref_message(bytes(payload)), timeout=timeout
+                decode_prepared_ref_message(bytes(payload)),
+                timeout=timeout,
             )
         )
 
@@ -116,40 +120,85 @@ class Root:
 class Connection:
     def __init__(self, service):
         self.root = Root(service)
+        self.closed = False
 
     def close(self):
-        pass
+        self.closed = True
 
 
-def _plan(port, request):
-    def preflight(_context):
-        return port.open_session(request)
+class InProcessRemotePulseExecutionClient(RemotePulseExecutionClient):
+    """Current client semantics over a synchronous in-process RPC double."""
 
-    def execute(context, session):
-        session.prepare(context)
-        session.fire(context)
-        return session.complete(context)
+    def _safe_state_owned(self, logical_timeout):
+        self._require_open()
+        snapshot = pulse_server_snapshot_from_tree(
+            decode(
+                bytes(
+                    self._interrupt_root.current_interrupt_safe_state(
+                        self.connection_generation
+                    )
+                )
+            )
+        )
+        if snapshot.connection_generation != self.connection_generation:
+            raise RuntimeError("interrupt safe_state returned another connection generation")
+        if snapshot.state != "SAFE" or snapshot.prepared_ref is not None:
+            raise RuntimeError("pulse server acknowledged safe_state without publishing SAFE")
+        return snapshot
 
-    def cleanup(context, session, _primary):
-        return port.verify_idle(context) if session is None else session.cleanup(context)
 
-    return RunPlan(
-        "remote current pulse",
-        RunMode.FINITE_EXACT,
-        (port.resource_claim,),
-        (port.hazard_claim,),
-        (port.device,),
-        preflight,
-        execute,
-        cleanup,
-        lambda _context, result: result,
-        port.interrupt_operations,
-        5.0,
+def _bound_remote(client, endpoint, *, suffix="main"):
+    broker = DeviceBroker()
+    identity = broker.verify_identity(
+        lambda: PhysicalDeviceIdentity(
+            f"installation-endpoint:test-fpga-{suffix}",
+            DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+            f"installation-assertion:test-fpga-{suffix}",
+            "test-assets-v1",
+        )
+    )
+    binding = None
+
+    def current_binding():
+        assert binding is not None
+        return binding
+
+    binding = broker.bind(
+        key=ResourceKey.parse(f"device/sequencer/remote-{suffix}"),
+        identity=identity,
+        execute_command=lambda command: endpoint.execute_command(
+            current_binding(), command
+        ),
+        cleanup_operations={SafetyOperation.SAFE_STATE: endpoint.cleanup},
+        verify_safe_state=endpoint.verify_safe_state,
+        capability_probe=lambda: endpoint.capability_probe(current_binding()),
+        close_session=lambda command: endpoint.close_session(
+            current_binding(), command
+        ),
+        interrupt_operations={SafetyOperation.SAFE_STATE: endpoint.interrupt},
+    )
+    capability = broker.verify_capability(binding).snapshot
+    assert isinstance(capability, SequencerCapabilitySnapshot)
+    return broker, binding, capability
+
+
+def _commands(request, capability, *, session_id, run_id):
+    artifact = request.artifact
+    return (
+        PreparePulseCommand(
+            session_id,
+            run_id,
+            request,
+            capability.capability_fingerprint,
+            5.0,
+        ),
+        FirePulseCommand(session_id, artifact.fingerprint),
+        CompletePulseCommand(session_id, artifact.fingerprint, 5.0),
     )
 
 
-def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe() -> None:
+    document = load_pulse_document(IMAGING_TEMPLATE)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -158,49 +207,33 @@ def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe():
     )
     backend = Backend()
     service = PulseExecutionService(document.target, clock_hz=50e6, backend=backend)
-    client = RemotePulseExecutionClient(
-        Connection(service),
-        Connection(service),
+    control = Connection(service)
+    interrupt = Connection(service)
+    client = InProcessRemotePulseExecutionClient(
+        control,
+        interrupt,
         transport_timeout_seconds=10.0,
     )
-    endpoint = RemotePulseExecutionEndpoint(client, endpoint_label="test-fpga", max_blocking_call_seconds=5.0)
-    broker = DeviceBroker()
-    registry = LegacyDeviceRegistry(broker)
-    key = ResourceKey.parse("device/sequencer/remote")
-
-    def cleanup():
-        client.safe_state()
-        return CleanupStepAck(SafetyOperation.SAFE_STATE, "remote-safe-command")
-
-    def verify():
-        if client.snapshot().state != "SAFE":
-            raise RuntimeError("remote server is not safe")
-        return SafeStateAck("test-qualified-remote-safe")
-
-    registry.register(
-        LegacyDeviceRegistration(
-            client,
-            key,
-            lambda: DeviceIdentityAck(
-                "installation-endpoint:test-fpga",
-                DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-                "remote-current-connection",
-                "test-assets-v1",
-            ),
-            {SafetyOperation.SAFE_STATE: cleanup},
-            (SafetyOperation.SAFE_STATE,),
-            verify,
-            target_endpoint=endpoint.target_endpoint,
-        )
+    endpoint = RemotePulseExecutionEndpoint(
+        client,
+        endpoint_label="test-fpga",
+        max_blocking_call_seconds=5.0,
     )
-    port = bind_sequencer_port(
-        type("DeviceSet", (), {"devices": {"sequencer": client}})(),
-        registry,
-        SequencerBindingRequest(),
+    broker, binding, capability = _bound_remote(client, endpoint)
+    request = FinitePulseExecutionRequest(document, artifact)
+    prepare, fire, complete = _commands(
+        request,
+        capability,
+        session_id="remote-session",
+        run_id="remote-run",
     )
 
-    terminal = RunController(ResourceArbiter(MemoryQuarantineJournal())).run(
-        _plan(port, FinitePulseExecutionRequest(document, artifact))
+    endpoint.execute_command(binding, prepare)
+    endpoint.execute_command(binding, fire)
+    terminal = endpoint.execute_command(binding, complete)
+    closed = endpoint.close_session(
+        binding,
+        SessionCloseCommand("remote-session", 5.0),
     )
 
     assert isinstance(terminal.receipt, PulseCompletion)
@@ -210,11 +243,17 @@ def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe():
     assert terminal.receipt.hardware_terminal == backend.completion.hardware_terminal
     assert terminal.receipt.post_terminal_tail == backend.completion.post_terminal_tail
     assert terminal.artifact_digest == artifact.fingerprint
+    assert closed.is_terminal
+    assert service.snapshot()["state"] == "SAFE"
     assert backend.actions == ["prepare", "fire", "wait", "safe"]
 
+    broker.shutdown()
+    client.close()
+    assert control.closed and interrupt.closed
 
-def test_interrupt_fences_a_provisional_remote_prepare_before_it_can_fire():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+
+def test_interrupt_fences_a_provisional_remote_prepare_before_it_can_fire() -> None:
+    document = load_pulse_document(IMAGING_TEMPLATE)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -230,66 +269,42 @@ def test_interrupt_fences_a_provisional_remote_prepare_before_it_can_fire():
 
         def current_prepare(self, payload):
             self.entered.set()
-            assert self.release.wait(1.0)
+            assert self.release.wait(5.0)
             return super().current_prepare(payload)
 
     backend = Backend()
     service = PulseExecutionService(document.target, clock_hz=50e6, backend=backend)
-    control_connection = Connection(service)
+    control = Connection(service)
     blocking_root = BlockingBeforeServiceRoot(service)
-    control_connection.root = blocking_root
-    client = RemotePulseExecutionClient(
-        control_connection,
-        Connection(service),
+    control.root = blocking_root
+    interrupt = Connection(service)
+    client = InProcessRemotePulseExecutionClient(
+        control,
+        interrupt,
         transport_timeout_seconds=10.0,
     )
     endpoint = RemotePulseExecutionEndpoint(
         client,
-        endpoint_label="test-fpga",
+        endpoint_label="test-fpga-race",
         max_blocking_call_seconds=5.0,
     )
-    broker = DeviceBroker()
-    registry = LegacyDeviceRegistry(broker)
-    key = ResourceKey.parse("device/sequencer/remote-race")
-    registry.register(
-        LegacyDeviceRegistration(
-            client,
-            key,
-            lambda: DeviceIdentityAck(
-                "installation-endpoint:test-fpga-race",
-                DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-                "remote-current-connection",
-                "test-assets-v1",
-            ),
-            {
-                SafetyOperation.SAFE_STATE: lambda: (
-                    client.safe_state(),
-                    CleanupStepAck(SafetyOperation.SAFE_STATE, "remote-safe-command"),
-                )[1]
-            },
-            (SafetyOperation.SAFE_STATE,),
-            lambda: SafeStateAck("test-qualified-remote-safe"),
-            target_endpoint=endpoint.target_endpoint,
-        )
-    )
-    port = bind_sequencer_port(
-        type("DeviceSet", (), {"devices": {"sequencer": client}})(),
-        registry,
-        SequencerBindingRequest(),
+    broker, binding, capability = _bound_remote(
+        client,
+        endpoint,
+        suffix="race",
     )
     request = FinitePulseExecutionRequest(document, artifact)
-    command = PreparePulseCommand(
-        "race-session",
-        "race-run",
+    command, _fire, _complete = _commands(
         request,
-        port.capability.capability_fingerprint,
-        5.0,
+        capability,
+        session_id="race-session",
+        run_id="race-run",
     )
     errors = []
 
     def prepare():
         try:
-            endpoint.execute_command(port.device, command)
+            endpoint.execute_command(binding, command)
         except BaseException as error:
             errors.append(error)
 
@@ -297,12 +312,47 @@ def test_interrupt_fences_a_provisional_remote_prepare_before_it_can_fire():
     worker.start()
     assert blocking_root.entered.wait(1.0), errors
     endpoint.interrupt()
+
+    retry_command = PreparePulseCommand(
+        "retry-session",
+        "retry-run",
+        request,
+        capability.capability_fingerprint,
+        5.0,
+    )
+    with pytest.raises(RuntimeError, match="physical operation in flight"):
+        endpoint.execute_command(binding, retry_command)
+    with pytest.raises(TimeoutError, match="did not join"):
+        endpoint.close_session(
+            binding,
+            SessionCloseCommand(command.session_id, 0.01),
+        )
+    assert worker.is_alive()
+
     blocking_root.release.set()
-    worker.join(1.0)
+    worker.join(2.0)
 
     assert not worker.is_alive()
-    assert errors
+    assert len(errors) == 1
     assert "superseded by interrupt" in str(errors[0])
+    # The server coalesces the bounded close attempt while it is already SAFE;
+    # the late prepare must still be followed by a second physical SAFE.
     assert backend.actions == ["safe", "prepare", "safe"]
     assert service.snapshot()["state"] == "SAFE"
-    assert endpoint._session is not None and endpoint._session.closed
+
+    # Reuse remains fenced until a joined, terminally acknowledged close.
+    closed = endpoint.close_session(
+        binding,
+        SessionCloseCommand(command.session_id, 5.0),
+    )
+    assert closed.is_terminal
+    acknowledgement = endpoint.execute_command(binding, retry_command)
+    assert acknowledgement.session_id == retry_command.session_id
+    retry_closed = endpoint.close_session(
+        binding,
+        SessionCloseCommand(retry_command.session_id, 5.0),
+    )
+    assert retry_closed.is_terminal
+
+    broker.shutdown()
+    client.close()

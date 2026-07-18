@@ -23,6 +23,7 @@ from zlc_pulse.schedule import MAX_MATERIALIZED_TRIGGER_EDGES
 
 
 ROOT = Path(__file__).parents[1]
+IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
 
 
 def _compact(document):
@@ -75,18 +76,18 @@ def _model_rising_ticks(ir, channel):
 
 
 @pytest.mark.parametrize(
-    ("name", "form", "channel"),
+    ("path", "form", "channel"),
     [
-        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "ch11"),
-        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch11"),
-        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "ch11"),
+        (IMAGING_PULSE, PulseExecutionForm.STATIC_ONCE, "ch11"),
+        (ROOT / "pulses" / "mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch11"),
+        (ROOT / "pulses" / "release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "ch11"),
     ],
 )
-def test_schedule_rising_ticks_equal_cycle_accurate_model(name, form, channel):
-    document = _compact(load_pulse_document(ROOT / "pulses" / name))
+def test_schedule_rising_ticks_equal_cycle_accurate_model(path, form, channel):
+    document = _compact(load_pulse_document(path))
     ir = compile_pulse_document(document, clock_hz=50e6, execution_form=form)
     schedule = build_digital_trigger_schedules(ir, (channel,))[0]
-    assert [edge.tick_from_run_start for edge in schedule.edges] == _model_rising_ticks(ir, channel)
+    assert [edge.tick_from_run_start for edge in schedule.iter_edges()] == _model_rising_ticks(ir, channel)
 
 
 def test_scan_schedule_keeps_point_identity_before_output_delay():
@@ -111,16 +112,17 @@ def test_scan_schedule_keeps_point_identity_before_output_delay():
         channel_delays=tuple(100 if index == bit else value for index, value in enumerate(ir.channel_delays)),
     )
     schedule = build_digital_trigger_schedules(delayed, (trigger_channel,))[0]
+    edges = tuple(schedule.iter_edges())
     assert schedule.point_count == len(ir.scan_points)
-    assert [edge.point_index for edge in schedule.edges] == list(range(len(ir.scan_points)))
-    assert all(edge.point_trigger_ordinal == 0 for edge in schedule.edges)
-    assert [edge.tick_from_run_start for edge in schedule.edges] == _model_rising_ticks(
+    assert [edge.point_index for edge in edges] == list(range(len(ir.scan_points)))
+    assert all(edge.point_trigger_ordinal == 0 for edge in edges)
+    assert [edge.tick_from_run_start for edge in edges] == _model_rising_ticks(
         delayed, trigger_channel
     )
 
 
 def test_cyclic_and_clock_mux_channels_have_no_finite_schedule():
-    document = _compact(load_pulse_document(ROOT / "pulses" / "imaging_template.json"))
+    document = _compact(load_pulse_document(IMAGING_PULSE))
     cyclic = compile_pulse_document(
         document,
         clock_hz=50e6,
@@ -163,7 +165,7 @@ def test_compact_trigger_projection_is_bounded_without_expanding_loop_count():
         rising_each_loop=False,
     )
     schedule = build_digital_trigger_schedules(no_rises, ("trigger",))[0]
-    assert schedule.edges == ()
+    assert tuple(schedule.iter_edges()) == ()
 
     artifact = CompiledPulseArtifact(
         "9" * 64,

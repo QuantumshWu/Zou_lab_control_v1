@@ -1508,10 +1508,14 @@ def test_meter_latest_with_explicit_point_facets_yields_typed_scalars():
     assert [meter.value for meter in meters] == [3.0, 4.0]
 
 
-def test_figure_package_has_no_authority_transform_conversion_surface():
+def test_figure_package_has_no_authority_transform_mutation_or_conversion_surface():
     root = Path(__file__).resolve().parents[1] / "zlc_frontend" / "figure"
     source = "\n".join(path.read_text(encoding="utf-8") for path in root.glob("*.py"))
-    assert "CommittedTransform" not in source
+    # Figure may narrowly consume a committed, selection-only transform so that
+    # it displays the exact authority selection.  It must never mint, apply, or
+    # convert one into a second authority surface.
+    assert "commit_transform" not in source
+    assert "apply_transform" not in source
     assert "DataTransformSpec" not in source
     assert "to_transform" not in source
     assert "expand_dataset_validity" not in source

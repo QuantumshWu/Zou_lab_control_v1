@@ -22,14 +22,13 @@ from zlc_data import (
     ValidityContract,
     ValueSchema,
 )
-from zlc_neutral_atom.runtime import DatasetCellAddress
+from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 from zlc_neutral_atom.timing.capture_plan import (
-    CaptureCellAssignment,
+    CaptureCellJoinContract,
     CompiledCaptureCellPlan,
+    capture_cell_join_contract_from_tree,
+    capture_cell_join_contract_to_tree,
     compile_capture_cell_plan,
-    decode_compiled_capture_cell_plan,
-    encode_compiled_capture_cell_plan,
-    repeat_major_capture_grouping,
 )
 from zlc_neutral_atom.timing.lineage import PulseCaptureBinding
 from zlc_pulse import (
@@ -40,9 +39,11 @@ from zlc_pulse import (
     freeze_scan_table,
     load_pulse_document,
 )
+from zlc_storage import decode, encode
 
 
 ROOT = Path(__file__).parents[1]
+IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
 
 
 def axis(name, role, size):
@@ -65,7 +66,7 @@ def image_schema(*, component_count: int | None = None):
 
 
 def scanned_artifact(*, points: int, four_edges: bool = False):
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_TEMPLATE)
     periods = document.periods[:5]
     if four_edges:
         high = document.periods[5]
@@ -104,7 +105,7 @@ def scanned_artifact(*, points: int, four_edges: bool = False):
 
 
 def test_static_three_frame_capture_uses_readout_event_not_fake_scan_axis():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_TEMPLATE)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -127,7 +128,7 @@ def test_static_three_frame_capture_uses_readout_event_not_fake_scan_axis():
         scan_point_layout=PointLayout.rect_c(()),
     )
 
-    assert plan.expected_cells == tuple(
+    assert tuple(plan.cell_schedule) == tuple(
         DatasetCellAddress(0, event_index) for event_index in range(3)
     )
     assert schema.physical_shape == (1, 3, 2, 3, 4)
@@ -153,7 +154,7 @@ def test_r2_p3_e1_uses_physical_point_major_order_without_row_shift():
         scan_point_layout=PointLayout.rect_c((3,)),
     )
 
-    assert plan.expected_cells == (
+    assert tuple(plan.cell_schedule) == (
         DatasetCellAddress(0, 0),
         DatasetCellAddress(1, 0),
         DatasetCellAddress(0, 1),
@@ -185,16 +186,16 @@ def test_event_axis_position_and_explicit_scan_layout_drive_storage_mapping():
         schema,
         readout_event_axis_id=event.axis_id,
         scan_point_layout=scan_layout,
-        within_point_grouping=repeat_major_capture_grouping(2, 2),
+        within_point_grouping=((0, 0), (0, 1), (1, 0), (1, 1)),
     )
 
-    assert plan.expected_cells[:4] == (
+    assert tuple(plan.cell_schedule)[:4] == (
         DatasetCellAddress(0, 2),
         DatasetCellAddress(0, 5),
         DatasetCellAddress(1, 2),
         DatasetCellAddress(1, 5),
     )
-    assert len(set(plan.expected_cells)) == 12
+    assert len(set(plan.cell_schedule)) == 12
 
 
 def test_per_point_cardinality_mismatch_is_rejected_even_when_total_can_match():
@@ -207,7 +208,7 @@ def test_per_point_cardinality_mismatch_is_rejected_even_when_total_can_match():
         PointLayout.rect_c((3, 3)),
         image_schema(),
     )
-    with pytest.raises(ValueError, match=r"R \* E"):
+    with pytest.raises(ValueError, match="cardinality differs"):
         compile_capture_cell_plan(
             artifact,
             "ch11",
@@ -217,7 +218,7 @@ def test_per_point_cardinality_mismatch_is_rejected_even_when_total_can_match():
         )
 
 
-def test_plan_codec_is_canonical_and_rejects_assignment_reordering():
+def test_join_contract_codec_is_canonical_and_compiled_plan_is_factory_sealed():
     artifact = scanned_artifact(points=3)
     scan = axis("capture.scan", SCAN_POINT, 3)
     event = axis("capture.event", READOUT_EVENT, 1)
@@ -234,50 +235,25 @@ def test_plan_codec_is_canonical_and_rejects_assignment_reordering():
         readout_event_axis_id=event.axis_id,
         scan_point_layout=PointLayout.rect_c((3,)),
     )
-    payload = encode_compiled_capture_cell_plan(plan)
-    assert decode_compiled_capture_cell_plan(payload) == plan
-    assert decode_compiled_capture_cell_plan(payload).fingerprint == plan.fingerprint
+    tree = capture_cell_join_contract_to_tree(plan.join_contract)
+    payload = encode(tree)
+    decoded = capture_cell_join_contract_from_tree(decode(payload))
+    assert decoded == plan.join_contract
+    assert encode(capture_cell_join_contract_to_tree(decoded)) == payload
 
-    swapped = list(plan.assignments)
-    swapped[0], swapped[1] = swapped[1], swapped[0]
-    with pytest.raises(ValueError, match="trigger ordinals"):
-        CompiledCaptureCellPlan(
-            plan.compiled_pulse_artifact_digest,
-            plan.execution_form,
-            plan.trigger_channel,
-            plan.trigger_schedule_digest,
-            plan.dataset_schema_fingerprint,
-            plan.repeat_axis_id,
-            plan.scan_axis_ids,
-            plan.scan_point_layout,
-            plan.readout_event_axis_id,
-            plan.repeat_count,
-            plan.scan_point_count,
-            plan.readout_events_per_repeat,
-            plan.within_point_grouping,
-            tuple(swapped),
-        )
+    with pytest.raises(ValueError, match="unknown field set"):
+        capture_cell_join_contract_from_tree({**tree, "assignments": []})
 
-    broken = replace(
-        plan.assignments[0],
-        point_storage_index=plan.assignments[2].point_storage_index,
-    )
-    with pytest.raises(ValueError, match="cover every dataset cell"):
+    with pytest.raises(TypeError, match="built by its compiler"):
         CompiledCaptureCellPlan(
-            plan.compiled_pulse_artifact_digest,
-            plan.execution_form,
-            plan.trigger_channel,
-            plan.trigger_schedule_digest,
-            plan.dataset_schema_fingerprint,
-            plan.repeat_axis_id,
-            plan.scan_axis_ids,
-            plan.scan_point_layout,
-            plan.readout_event_axis_id,
-            plan.repeat_count,
-            plan.scan_point_count,
-            plan.readout_events_per_repeat,
-            plan.within_point_grouping,
-            (broken, *plan.assignments[1:]),
+            object(),
+            compiled_pulse_artifact_digest=plan.compiled_pulse_artifact_digest,
+            execution_form=plan.execution_form,
+            trigger_channel=plan.trigger_channel,
+            trigger_schedule_digest=plan.trigger_schedule_digest,
+            dataset_schema=plan.dataset_schema,
+            join_contract=plan.join_contract,
+            cell_schedule=plan.cell_schedule,
         )
 
 
@@ -327,13 +303,13 @@ def test_explicit_repeat_major_and_event_major_groupings_remain_distinct():
         within_point_grouping=((0, 0), (1, 0), (0, 1), (1, 1)),
         **common,
     )
-    assert repeat_major.expected_cells == (
+    assert tuple(repeat_major.cell_schedule) == (
         DatasetCellAddress(0, 0),
         DatasetCellAddress(0, 1),
         DatasetCellAddress(1, 0),
         DatasetCellAddress(1, 1),
     )
-    assert event_major.expected_cells == (
+    assert tuple(event_major.cell_schedule) == (
         DatasetCellAddress(0, 0),
         DatasetCellAddress(1, 0),
         DatasetCellAddress(0, 1),
@@ -374,7 +350,7 @@ def test_grouping_must_be_a_complete_unique_r_by_e_permutation(grouping):
         )
 
 
-def test_persisted_scan_layout_is_revalidated_not_only_hashed():
+def test_join_layout_and_compiled_artifact_binding_are_revalidated():
     artifact = scanned_artifact(points=3)
     scan = axis("capture.scan", SCAN_POINT, 3)
     event = axis("capture.event", READOUT_EVENT, 1)
@@ -391,29 +367,36 @@ def test_persisted_scan_layout_is_revalidated_not_only_hashed():
         readout_event_axis_id=event.axis_id,
         scan_point_layout=PointLayout.rect_c((3,)),
     )
-    tampered = replace(
-        plan,
-        scan_point_layout=PointLayout.explicit((3,), ((2,), (0,), (1,))),
+    tampered = CaptureCellJoinContract(
+        PointLayout.rect_c((1, 3)),
+        plan.join_contract.within_point_grouping,
     )
-    with pytest.raises(ValueError, match="persisted scan layout"):
-        tampered.validate_dataset_schema(schema)
+    schedule = next(
+        schedule
+        for schedule in artifact.trigger_schedules
+        if schedule.channel == "ch11"
+    )
+    with pytest.raises(ValueError, match="scan layout differs"):
+        tuple(tampered.iter_cell_schedule(schedule, schema))
 
-    assignments = tuple(
-        replace(
-            item,
-            pulse_point_index=(
-                1
-                if item.pulse_point_index == 0
-                else 0
-                if item.pulse_point_index == 1
-                else item.pulse_point_index
-            ),
-        )
-        for item in plan.assignments
+    other_artifact = scanned_artifact(points=2)
+    other_scan = axis("capture.scan", SCAN_POINT, 2)
+    other_schema = DatasetSchema(
+        axis("capture.repeat", REPEAT, 2),
+        (other_scan, event),
+        PointLayout.rect_c((2, 1)),
+        image_schema(),
     )
-    with pytest.raises(ValueError, match="edge association differs"):
+    other_plan = compile_capture_cell_plan(
+        other_artifact,
+        "ch11",
+        other_schema,
+        readout_event_axis_id=event.axis_id,
+        scan_point_layout=PointLayout.rect_c((2,)),
+    )
+    with pytest.raises(ValueError, match="another compiled artifact"):
         PulseCaptureBinding(
             artifact,
             "ch11",
-            replace(plan, assignments=assignments),
+            other_plan,
         )

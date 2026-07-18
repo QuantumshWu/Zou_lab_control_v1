@@ -195,7 +195,7 @@ def test_resident_finite_terminal_owner_starts_at_fire_before_await():
 
 def test_static_terminal_evidence_never_reads_semantically_empty_cursor():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -331,7 +331,7 @@ def test_safe_after_fire_command_commit_cannot_be_overwritten_by_late_fire():
 
 def test_safe_interrupts_tail_wait_without_republishing_a_drain_deadline():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     delayed = replace(document, delays=(OutputDelay("ch11", 200, "ms"),))
     artifact = compile_pulse_artifact(
         delayed,
@@ -401,7 +401,7 @@ def test_terminal_cursor_mismatch_is_rejected_even_when_done_is_set():
 
 def test_short_wait_does_not_allow_next_prepare_to_cut_off_delay_tail():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     delayed = replace(document, delays=(OutputDelay("ch11", 20, "ms"),))
     artifact = compile_pulse_artifact(
         delayed,
@@ -490,7 +490,7 @@ def test_axi_absolute_deadline_includes_waiting_for_the_io_owner(tmp_path):
 
 def test_safe_absolute_deadline_includes_waiting_for_an_older_safe():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     transport = TraceRegisterTransport(params)
     session = DeployedStreamerSession(
         transport,
@@ -527,7 +527,7 @@ def test_safe_absolute_deadline_includes_waiting_for_an_older_safe():
 
 def test_clear_host_config_rechecks_layout_before_its_first_write():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     transport = TraceRegisterTransport(params)
     transport.words[CtrlWords.LAYOUT_ID] ^= 1
     session = _session(document, params, transport)
@@ -539,7 +539,7 @@ def test_clear_host_config_rechecks_layout_before_its_first_write():
 
 def test_layout_mismatch_close_revokes_without_geometry_dependent_writes():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     transport = TraceRegisterTransport(params)
     transport.words[CtrlWords.LAYOUT_ID] ^= 1
     lease = MemoryDeviceLease()
@@ -561,7 +561,7 @@ def test_layout_mismatch_close_revokes_without_geometry_dependent_writes():
 
 def test_bringup_enters_acknowledged_safe_before_clearing_live_configuration():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     transport = TraceRegisterTransport(params)
     session = _session(document, params, transport)
 
@@ -586,7 +586,7 @@ def test_safe_requires_a_bounded_stable_status_acknowledgement():
             self.write_batches.append(rows)
 
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     transport = StuckSafeTransport(params)
     session = DeployedStreamerSession(
         transport,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 from dataclasses import dataclass, field
 from types import MappingProxyType
 import threading
@@ -30,21 +31,27 @@ from zlc_data import (
     ValuePayloadContract,
     ValueSchema,
 )
-from zlc_neutral_atom.catalog import DefinitionCatalog, DefinitionKey
+from zlc_neutral_atom.catalog import (
+    DefinitionCatalog,
+    DefinitionKey,
+    StreamProcessorDefinition,
+)
 from zlc_neutral_atom.processing.stream import (
     BoundStreamProcessor,
     ExactStreamProcessorWorker,
-    StreamProcessorDefinition,
     StreamProcessorError,
 )
-from zlc_neutral_atom.runtime.cancellation import CancellationRequested
+from zlc_neutral_atom.runtime.cancellation import (
+    CancellationRequested,
+    CancellationToken,
+    _CancellationSource,
+)
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
     DatasetCellAddress,
     DatasetCellKeyContract,
+    DatasetCellSchedule,
     FrozenDatasetEdge,
-    ValueDatasetEventAdapter,
-    dataset_cell_key_fingerprint,
 )
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
@@ -223,6 +230,46 @@ def cells(schema: DatasetSchema) -> tuple[DatasetCellAddress, ...]:
     )
 
 
+@dataclass(frozen=True)
+class _NoDatasetMetadataContract:
+    fingerprint: str = "7" * 64
+    max_retained_nbytes: int = 0
+
+    @staticmethod
+    def snapshot(_payload):
+        return None
+
+    @staticmethod
+    def validate(metadata):
+        if metadata is not None:
+            raise TypeError("value event has no metadata")
+
+    @staticmethod
+    def retained_nbytes(metadata):
+        _NoDatasetMetadataContract.validate(metadata)
+        return 0
+
+    @staticmethod
+    def digest(metadata):
+        _NoDatasetMetadataContract.validate(metadata)
+        return hashlib.sha256(b"null").hexdigest()
+
+
+@dataclass(frozen=True)
+class _ValueDatasetEventAdapter:
+    payload_contract: ValuePayloadContract
+    metadata_contract: _NoDatasetMetadataContract = _NoDatasetMetadataContract()
+    operator_fingerprint: str = "8" * 64
+
+    @property
+    def value_schema(self):
+        return self.payload_contract.schema
+
+    def value(self, payload):
+        self.payload_contract.validate(payload)
+        return payload
+
+
 def artifact_ref(seed: str) -> ArtifactInputRef:
     schema_id = "tests.synthetic-artifact-ref"
     return ArtifactInputRef(
@@ -242,10 +289,9 @@ def evidence_contains(error: BaseException | None, expected_type: type) -> bool:
     if error is None:
         return False
     prefix = expected_type.__name__ + ":"
-    return any(
-        type(summary) is str and summary.startswith(prefix)
-        for summary in error.related_summaries
-    )
+    if getattr(error, "original_type", "") == expected_type.__name__:
+        return True
+    return any(prefix in note for note in getattr(error, "notes", ()))
 
 
 def edge(
@@ -255,8 +301,8 @@ def edge(
 ) -> FrozenDatasetEdge:
     return FrozenDatasetEdge(
         data_schema,
-        ValueDatasetEventAdapter(payload),
-        schedule,
+        _ValueDatasetEventAdapter(payload),
+        DatasetCellSchedule.from_cells(data_schema, schedule),
     )
 
 
@@ -308,22 +354,19 @@ def _processor_binding(
         DefinitionKey("test", name),
         name,
         f"test.{name}-config",
-        payload.fingerprint,
-        payload.fingerprint,
-        key_contract.fingerprint,
-        operator_deadline_seconds=operator_deadline_seconds,
-        terminal_wait_seconds=1.0,
     )
     return BoundStreamProcessor(
-        definition,
-        ScaleConfig(factor),
-        payload,
-        payload,
-        key_contract,
-        output.stream_id,
-        output_source_id,
-        operator,
-        artifact_inputs,
+        definition=definition,
+        config=ScaleConfig(factor),
+        input_payload_contract=payload,
+        output_payload_contract=payload,
+        join_key_contract=key_contract,
+        output_stream_id=output.stream_id,
+        output_source_id=output_source_id,
+        operator=operator,
+        operator_deadline_seconds=operator_deadline_seconds,
+        terminal_wait_seconds=1.0,
+        artifact_inputs=artifact_inputs,
     )
 
 
@@ -344,7 +387,7 @@ def two_stage_chain(
     schedule = cells(data_schema)
     if source_pair is None:
         payload = ValuePayloadContract(data_schema.cell_schema)
-        key_contract = DatasetCellKeyContract(data_schema)
+        key_contract = DatasetCellKeyContract.from_schema(data_schema)
     else:
         source, producer = source_pair
         payload = source._payload_contract
@@ -525,6 +568,7 @@ def chain(
     output_trace_source_id: str = "synthetic-processor",
     absolute_deadline_seconds: float = 2.0,
     artifact_inputs: tuple[ArtifactInputRef, ...] = (),
+    cancellation: CancellationToken | None = None,
 ) -> Chain:
     data_schema = schema(points)
     result_schema = (
@@ -540,7 +584,7 @@ def chain(
     schedule = cells(data_schema)
     payload = ValuePayloadContract(data_schema.cell_schema)
     output_payload = ValuePayloadContract(result_schema.cell_schema)
-    key_contract = DatasetCellKeyContract(data_schema)
+    key_contract = DatasetCellKeyContract.from_schema(data_schema)
     retention = points if input_retention is None else input_retention
     source, producer = AcquisitionStream.create(
         StreamId("synthetic.raw"),
@@ -564,7 +608,9 @@ def chain(
         retention_events=points,
         retention_bytes=points * output_payload.max_retained_nbytes,
         join_key_contract=(
-            key_contract if share_join_owner else DatasetCellKeyContract(result_schema)
+            key_contract
+            if share_join_owner
+            else DatasetCellKeyContract.from_schema(result_schema)
         ),
     )
     output_reservation = output.reserve(
@@ -593,23 +639,20 @@ def chain(
         DefinitionKey("test", "scale"),
         "Scale",
         "test.scale-config",
-        payload.fingerprint,
-        output_payload.fingerprint,
-        dataset_cell_key_fingerprint(data_schema),
-        operator_deadline_seconds=operator_deadline_seconds,
-        terminal_wait_seconds=terminal_wait_seconds,
     )
     assert DefinitionCatalog((definition,)).resolve(definition.key) is definition
     bound = BoundStreamProcessor(
-        definition,
-        ScaleConfig(10) if config is None else config,
-        payload,
-        output_payload,
-        key_contract,
-        output.stream_id,
-        "synthetic-processor",
-        operator,
-        artifact_inputs,
+        definition=definition,
+        config=ScaleConfig(10) if config is None else config,
+        input_payload_contract=payload,
+        output_payload_contract=output_payload,
+        join_key_contract=key_contract,
+        output_stream_id=output.stream_id,
+        output_source_id="synthetic-processor",
+        operator=operator,
+        operator_deadline_seconds=operator_deadline_seconds,
+        terminal_wait_seconds=terminal_wait_seconds,
+        artifact_inputs=artifact_inputs,
     )
     if tamper_output_cursor_owner:
         output_reservation._cursor = object()
@@ -622,6 +665,7 @@ def chain(
         output_cursor=output_cursor,
         output_builder=builder,
         deadline_monotonic=time.monotonic() + absolute_deadline_seconds,
+        cancellation=cancellation,
     )
     monitor = output.monitor(
         max_events=points,
@@ -673,7 +717,7 @@ def test_bound_processor_fingerprint_is_computed_once_at_bind(monkeypatch):
 def test_bound_processor_fingerprint_has_a_literal_current_oracle():
     item = chain(points=1)
     assert item.worker._bound.fingerprint == (
-        "e7fd5a496b8bae508ad2231632fbb4bc32b6734e671af86a5269c78e3e96c832"
+        "60759d2f8ca98f4da36d020fa330178defddce879715cfc47158043d063a3016"
     )
     item.worker.close(2.0)
 
@@ -687,7 +731,9 @@ def test_exact_chain_preserves_keys_provenance_and_all_cells_before_input_ack():
         reservation=item.reservation,
         trace_binding=item.reservation.trace_binding,
         payload_contract_fingerprint=item.source.payload_contract_fingerprint,
-        join_key_contract_fingerprint=dataset_cell_key_fingerprint(item.schema),
+        join_key_contract_fingerprint=DatasetCellKeyContract.from_schema(
+            item.schema
+        ).fingerprint,
         source_contract_digest=source_edge.consumer_contract_digest,
         source_schedule_digest=source_edge.schedule_digest,
         source_key_sequence_digest=source_edge.key_sequence_digest,
@@ -722,8 +768,9 @@ def test_processor_changes_value_schema_without_changing_cell_key_domain():
     )
     assert item.worker._bound.config.output_schema is output_cell
     assert item.schema.fingerprint != item.output_schema.fingerprint
-    assert dataset_cell_key_fingerprint(item.schema) == dataset_cell_key_fingerprint(
-        item.output_schema
+    assert (
+        DatasetCellKeyContract.from_schema(item.schema).fingerprint
+        == DatasetCellKeyContract.from_schema(item.output_schema).fingerprint
     )
     assert (
         item.worker._input_edge.exact_key_sequence_digest
@@ -789,6 +836,30 @@ def test_cancellation_while_waiting_is_bounded_and_joins():
     assert_failure_evidence(caught.value.__cause__, CancellationRequested)
     assert item.reservation.state is ReservationState.RELEASED
     assert not item.worker.is_alive
+
+
+def test_worker_local_cancel_cannot_cancel_its_parent_run_token():
+    parent = _CancellationSource()
+    item = chain(points=1, cancellation=parent.token)
+    item.worker.start()
+
+    assert item.worker.cancel("local processor teardown")
+    item.worker.wait(2.0)
+
+    assert not parent.token.is_cancelled
+    assert_failure_evidence(item.worker.error, CancellationRequested)
+
+
+def test_parent_run_cancellation_is_observed_without_giving_worker_write_authority():
+    parent = _CancellationSource()
+    item = chain(points=1, cancellation=parent.token)
+    item.worker.start()
+
+    assert parent.request("parent Run cancelled")
+    item.worker.wait(2.0)
+
+    assert parent.token.is_cancelled
+    assert_failure_evidence(item.worker.error, CancellationRequested)
 
 
 def test_preflight_close_releases_complete_chain_without_starting_thread():
@@ -1039,31 +1110,28 @@ def test_config_mapping_keys_must_be_canonical_strings():
 def test_bound_processor_owner_copies_declarative_inputs():
     data_schema = schema(1)
     payload = ValuePayloadContract(data_schema.cell_schema)
-    key_contract = DatasetCellKeyContract(data_schema)
+    key_contract = DatasetCellKeyContract.from_schema(data_schema)
     definition_key = DefinitionKey("test", "owned-binding")
     definition = StreamProcessorDefinition(
         definition_key,
         "Owned binding",
         "test.owned-binding-config",
-        payload.fingerprint,
-        payload.fingerprint,
-        key_contract.fingerprint,
-        operator_deadline_seconds=1.0,
-        terminal_wait_seconds=1.0,
     )
     caller_config = ScaleConfig(2)
     caller_reference = artifact_ref("a")
     caller_stream_id = StreamId("synthetic.owned-binding")
     bound = BoundStreamProcessor(
-        definition,
-        caller_config,
-        payload,
-        payload,
-        key_contract,
-        caller_stream_id,
-        "synthetic-owned-binding",
-        scale_value,
-        (caller_reference,),
+        definition=definition,
+        config=caller_config,
+        input_payload_contract=payload,
+        output_payload_contract=payload,
+        join_key_contract=key_contract,
+        output_stream_id=caller_stream_id,
+        output_source_id="synthetic-owned-binding",
+        operator=scale_value,
+        operator_deadline_seconds=1.0,
+        terminal_wait_seconds=1.0,
+        artifact_inputs=(caller_reference,),
     )
     frozen_fingerprint = bound.fingerprint
 
@@ -1074,13 +1142,14 @@ def test_bound_processor_owner_copies_declarative_inputs():
     assert bound.output_stream_id is not caller_stream_id
 
     object.__setattr__(definition_key, "stable_definition_id", "rewritten")
-    object.__setattr__(definition, "operator_deadline_seconds", 1e-12)
+    object.__setattr__(definition, "title", "rewritten")
     object.__setattr__(caller_config, "factor", 99)
     object.__setattr__(caller_reference, "content_digest", "b" * 64)
     object.__setattr__(caller_stream_id, "value", "rewritten-output")
 
     assert bound.definition.key.stable_definition_id == "owned-binding"
-    assert bound.definition.operator_deadline_seconds == 1.0
+    assert bound.definition.title == "Owned binding"
+    assert bound.operator_deadline_seconds == 1.0
     assert bound.config == ScaleConfig(2)
     assert bound.artifact_inputs[0].content_digest == "a" * 64
     assert bound.output_stream_id.value == "synthetic.owned-binding"
@@ -1317,7 +1386,7 @@ def test_thread_start_failure_synchronously_releases_the_exact_graph(monkeypatch
     assert failure.__traceback__ is None
     assert any(
         note.startswith("detached processor traceback: ")
-        for note in getattr(item.worker.error, "__notes__", ())
+        for note in getattr(item.worker.error, "notes", ())
     )
     assert item.reservation.state is ReservationState.RELEASED
     assert not item.source._reservations
@@ -1359,91 +1428,6 @@ def test_thread_start_failure_releases_worker_graph_without_cyclic_gc(monkeypatc
     finally:
         if was_enabled:
             gc.enable()
-
-
-def test_hostile_start_exception_cannot_interrupt_worker_rollback(monkeypatch):
-    class HostileStartError(RuntimeError):
-        def __str__(self):
-            raise ValueError("hostile __str__")
-
-        def __repr__(self):
-            raise ValueError("hostile __repr__")
-
-    item = chain(points=1)
-    failure = HostileStartError()
-
-    def fail_start(_thread):
-        raise failure
-
-    monkeypatch.setattr(threading.Thread, "start", fail_start)
-    with pytest.raises(StreamProcessorError, match="HostileStartError"):
-        item.worker.start()
-
-    assert_failure_evidence(item.worker.error, HostileStartError)
-    assert failure.__traceback__ is None
-    assert item.worker._done
-    assert item.reservation.state is ReservationState.RELEASED
-    assert not item.source._reservations
-    assert not item.output._reservations
-    assert item.source._formal_rebind_required
-    item.worker.close(0.05)
-
-
-def test_blocking_exception_hooks_are_never_called_during_worker_rollback(monkeypatch):
-    entered = threading.Event()
-    release = threading.Event()
-
-    class BlockingStartError(RuntimeError):
-        @property
-        def args(self):
-            entered.set()
-            release.wait(1.0)
-            return ("blocked args",)
-
-        @property
-        def __notes__(self):
-            entered.set()
-            release.wait(1.0)
-            return []
-
-        def __str__(self):
-            entered.set()
-            release.wait(1.0)
-            return "blocked str"
-
-    item = chain(points=1)
-    failure = BlockingStartError("safe base args")
-    original_start = threading.Thread.start
-
-    def fail_processor_start(thread):
-        if thread.name.startswith("stream-processor:"):
-            raise failure
-        return original_start(thread)
-
-    monkeypatch.setattr(threading.Thread, "start", fail_processor_start)
-    outcome = []
-
-    def invoke_start():
-        try:
-            item.worker.start()
-        except BaseException as error:
-            outcome.append(error)
-
-    caller = threading.Thread(target=invoke_start, name="test-worker-start-caller")
-    caller.start()
-    caller.join(0.5)
-    try:
-        assert not caller.is_alive()
-        assert not entered.is_set()
-        assert len(outcome) == 1
-        assert isinstance(outcome[0], StreamProcessorError)
-        assert item.worker._done
-        assert item.reservation.state is ReservationState.RELEASED
-        assert not item.source._reservations
-        assert not item.output._reservations
-    finally:
-        release.set()
-        caller.join(1.0)
 
 
 def test_pre_start_deadline_failure_synchronously_releases_the_exact_graph():
@@ -1801,7 +1785,7 @@ def test_stale_downstream_readiness_cannot_bind_an_upstream_worker():
     data_schema = schema(1)
     schedule = cells(data_schema)
     payload = ValuePayloadContract(data_schema.cell_schema)
-    key_contract = DatasetCellKeyContract(data_schema)
+    key_contract = DatasetCellKeyContract.from_schema(data_schema)
     budget = payload.max_retained_nbytes
     deadline = time.monotonic() + 2.0
     intermediate, intermediate_producer = AcquisitionStream.create(

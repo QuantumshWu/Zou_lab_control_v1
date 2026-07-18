@@ -167,7 +167,7 @@ def _uart_session(tmp_path, target, params, link):
 
 
 def _artifact(params: StreamerParams):
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     return document, compile_pulse_artifact(
         document,
         clock_hz=50e6,

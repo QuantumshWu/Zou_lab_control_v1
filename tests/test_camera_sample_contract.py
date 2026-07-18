@@ -10,6 +10,7 @@ import pytest
 from zlc_data import (
     AxisId,
     AxisSpec,
+    CoordinateFrameId,
     DatasetSchema,
     PointLayout,
     REPEAT,
@@ -34,11 +35,28 @@ from zlc_neutral_atom.acquisition.camera import (
     decode_camera_capture_spec,
     freeze_camera_capture_spec,
 )
-from zlc_neutral_atom.runtime import (
+from zlc_neutral_atom.runtime.capture import (
+    CameraCapabilityEvidence,
+    CameraCaptureContract,
+    CameraCaptureProvenance,
+    CameraPhysicalFacts,
     CaptureCapabilitySnapshot,
-    CaptureRuntimeProfile,
-    CaptureStreamContract,
+)
+from zlc_neutral_atom.readout.contracts import (
+    CameraCaptureDescriptor,
+    ReadoutBindingKey,
+)
+from zlc_neutral_atom.runtime.dataset import (
     DatasetCellAddress,
+    DatasetCellSchedule,
+    FrozenDatasetEdge,
+)
+from zlc_neutral_atom.runtime.resources import (
+    DeviceBindingStamp,
+    DeviceIdentityEvidenceKind,
+    PhysicalDeviceIdentity,
+)
+from zlc_neutral_atom.runtime.streams import (
     ProducerFlowControl,
     StreamId,
 )
@@ -50,10 +68,27 @@ def _axis(name: str, role, size: int) -> AxisSpec:
 
 
 def _schemas() -> tuple[ValueSchema, DatasetSchema]:
+    frame = CoordinateFrameId("camera.roi-local")
     value_schema = ValueSchema(
         (
-            _axis("camera.y", SPATIAL_Y, 3),
-            _axis("camera.x", SPATIAL_X, 4),
+            AxisSpec(
+                AxisId("camera.y"),
+                "camera.y",
+                SPATIAL_Y,
+                3,
+                tuple(range(3)),
+                "pixel",
+                frame,
+            ),
+            AxisSpec(
+                AxisId("camera.x"),
+                "camera.x",
+                SPATIAL_X,
+                4,
+                tuple(range(4)),
+                "pixel",
+                frame,
+            ),
         ),
         ValidityContract.value(),
         np.dtype("<u2"),
@@ -198,12 +233,30 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         for repeat in range(2)
         for point in range(2)
     )
-    capability = CaptureCapabilitySnapshot(
-        binding_id="camera-binding",
-        stable_device_identity="camera:test",
-        connection_generation="generation-1",
-        capability_fingerprint="b" * 64,
-        settings_fingerprint="a" * 64,
+    physical_facts = CameraPhysicalFacts(
+        camera_identity="camera:test",
+        sensor_identity="sensor:test",
+        optical_path="test-path",
+        capture_trigger_channels=("camera-trigger",),
+        sensor_shape_yx=(3, 4),
+        roi_origin_yx=(0, 0),
+        roi_shape_yx=(3, 4),
+        binning_yx=(1, 1),
+        spatial_y_axis_id=AxisId("camera.y"),
+        spatial_x_axis_id=AxisId("camera.x"),
+        coordinate_frame=CoordinateFrameId("camera.roi-local"),
+        dtype=np.dtype("<u2"),
+        count_unit="count",
+        exposure_seconds=1.0,
+        required_external_trigger_interval_seconds=0.0,
+        external_trigger_integration_start_offset_seconds=None,
+        gain=0.0,
+        readout_mode="test",
+        opaque_frame_settings_fingerprint="a" * 64,
+    )
+    evidence = CameraCapabilityEvidence(
+        adapter_type="tests.Camera",
+        source_id="camera",
         payload_contract_fingerprint=payload_contract.fingerprint,
         capture_spec_owner_fingerprint=CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
         flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
@@ -212,17 +265,62 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         adapter_record_retention_bytes=1 << 20,
         max_blocking_call_seconds=1.0,
         max_capture_spec_bytes=4096,
+        physical_facts=physical_facts,
     )
-    contract = CaptureStreamContract(
-        StreamId("camera.frames"),
-        "camera",
-        dataset_schema,
-        payload_contract,
-        event_adapter,
-        cells,
-        capability,
-        CaptureRuntimeProfile(0, 3 << 20),
-        CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+    binding_stamp = DeviceBindingStamp(
+        PhysicalDeviceIdentity(
+            "camera:test",
+            DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+            "test-evidence",
+            "test-assets-v1",
+        ),
+        "camera-binding",
+    )
+    capability = CaptureCapabilitySnapshot(
+        binding_stamp=binding_stamp,
+        payload_contract=payload_contract,
+        camera_capability_evidence=evidence,
+    )
+    arm_spec = freeze_camera_capture_spec(
+        CameraCaptureSpec(
+            CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+            len(cells),
+            evidence.settings_fingerprint,
+        )
+    )
+    descriptor = CameraCaptureDescriptor(
+        camera_identity=physical_facts.camera_identity,
+        sensor_identity=physical_facts.sensor_identity,
+        optical_path=physical_facts.optical_path,
+        sensor_shape_yx=physical_facts.sensor_shape_yx,
+        roi_origin_yx=physical_facts.roi_origin_yx,
+        roi_shape_yx=physical_facts.roi_shape_yx,
+        binning_yx=physical_facts.binning_yx,
+        spatial_y_axis_id=physical_facts.spatial_y_axis_id,
+        spatial_x_axis_id=physical_facts.spatial_x_axis_id,
+        coordinate_frame=physical_facts.coordinate_frame,
+        dtype=physical_facts.dtype,
+        count_unit=physical_facts.count_unit,
+        readout_event_axis_id=None,
+        event_settings=(physical_facts.event_setting(0),),
+        camera_arm_spec_fingerprint=arm_spec.digest,
+    )
+    contract = CameraCaptureContract(
+        stream_id=StreamId("camera.frames"),
+        dataset_edge=FrozenDatasetEdge(
+            dataset_schema,
+            event_adapter,
+            DatasetCellSchedule.from_cells(dataset_schema, cells),
+        ),
+        capability=capability,
+        required_consumer_lag_events=0,
+        transport_memory_limit_bytes=3 << 20,
+        camera_provenance=CameraCaptureProvenance(
+            descriptor,
+            ReadoutBindingKey("camera"),
+            binding_stamp,
+            capability.capability_fingerprint,
+        ),
     )
 
     assert contract.dataset_schema.physical_shape == (2, 2, 3, 4)

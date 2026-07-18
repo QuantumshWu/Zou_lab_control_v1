@@ -305,21 +305,39 @@ class FramedJournalSession:
             self._stream = None
         if self._lock_stream is not None:
             lock_stream = self._lock_stream
+            release_error: BaseException | None = None
             if os.getpid() == self._creator_pid and self._owns_lock:
-                release_file_lock(lock_stream)
-                self._owns_lock = False
+                try:
+                    release_file_lock(lock_stream)
+                except BaseException as error:
+                    release_error = error
+                else:
+                    self._owns_lock = False
             elif os.getpid() != self._creator_pid:
                 # A fork child owns only duplicated descriptors.  Explicitly
                 # unlocking their shared file description would unlock the parent.
                 self._owns_lock = False
             try:
                 lock_stream.close()
-            except BaseException:
+            except BaseException as error:
                 if lock_stream.closed:
                     self._lock_stream = None
-                    self._closed = not self._owns_lock
+                    # Closing the last creator descriptor releases the OS lock
+                    # even when the explicit unlock call itself reported an
+                    # error.  Logical authority must never revive after that.
+                    self._owns_lock = False
+                if release_error is not None:
+                    error.add_note(
+                        "explicit journal lock release also failed: "
+                        f"{type(release_error).__name__}: {release_error}"
+                    )
                 raise
-            self._lock_stream = None
+            else:
+                self._lock_stream = None
+                self._owns_lock = False
+            if release_error is not None:
+                self._closed = True
+                raise release_error
         self._closed = not self._owns_lock
         if not self._closed:
             raise RuntimeError("framed journal session still owns its file lock")

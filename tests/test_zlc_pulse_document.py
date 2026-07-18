@@ -54,7 +54,7 @@ def test_save_and_load_use_only_the_typed_current_schema(tmp_path):
 
 def test_unknown_payload_schema_is_rejected(tmp_path):
     payload = pulse_document_to_tree(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     )
     payload["schema"] = "unsupported-pulse-document"
     source = tmp_path / "old.json"
@@ -64,7 +64,7 @@ def test_unknown_payload_schema_is_rejected(tmp_path):
 
 
 def test_document_values_are_deeply_immutable():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     with pytest.raises(FrozenInstanceError):
         document.name = "changed"
     with pytest.raises(TypeError):
@@ -93,7 +93,7 @@ def test_authoring_fields_are_numeric_and_bindings_are_typed():
 
 
 def test_equal_numeric_values_have_one_canonical_document_identity():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     period = document.periods[0]
     integer_period = replace(period, duration=20, unit="ns")
     float_period = replace(period, duration=20.0, unit="ns")
@@ -120,7 +120,7 @@ def test_document_rejects_empty_scan_tables_and_large_half_tick_values():
     with pytest.raises(ValueError, match="at least one row"):
         FrozenScanTable(("x",), ())
 
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     period = document.periods[0]
     half_tick_ns = (1_000_000_000_000 + 0.5) * document.time_step_ns
     with pytest.raises(ValueError, match="not frozen"):

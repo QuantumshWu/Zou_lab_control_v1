@@ -13,6 +13,7 @@ from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentLabel,
     FluentParameterForm,
+    FluentScrollArea,
     GREEN,
     GREY,
     ORANGE,
@@ -347,7 +348,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
         self._authority.setWordWrap(True)
         self._authority.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         editor_layout.addWidget(self._authority)
-        self._form_scroll = QtWidgets.QScrollArea(editor)
+        self._form_scroll = FluentScrollArea(editor)
         self._form_scroll.setObjectName("calibrationFormScroll")
         self._form_scroll.setWidgetResizable(True)
         self._form_scroll.setMaximumHeight(360)

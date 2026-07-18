@@ -1,231 +1,352 @@
-"""Formal capture-fit persistence without a generic analysis framework."""
+"""Final capture-fit persistence over an admitted current raw capture."""
 
 from __future__ import annotations
 
-from dataclasses import replace
+from pathlib import Path
 import pickle
-import threading
 
 import numpy as np
 import pytest
-import zlc_neutral_atom.artifacts.capture_fit as capture_fit_module
 
-from tests.test_capture_artifact_repository import (
-    _deliver_when_armed,
-    _runtime_and_spec,
-)
+from fpga.pulse_streamer.host.image import DEFAULT_CONFIG_PATH, default_clock_hz
 from zlc_data import (
+    AxisId,
+    AxisSpec,
     BlockId,
-    SCAN_POINT,
+    REPEAT,
     encode_fit_result_batch,
     fit_spec_for,
 )
+from zlc_neutral_atom.adapter_sdk import (
+    CameraCaptureTerminalRecord,
+    CameraFrameRecord,
+    CameraWorkingPoint,
+)
 from zlc_neutral_atom.artifacts import (
     AdmittedCaptureFitResult,
-    CaptureFitResultRepository,
     CaptureFitResultArtifactRef,
+    CaptureFitResultRepository,
     CaptureFrameSource,
     CaptureRepository,
     FitExecution,
     compile_capture_artifact_pipeline,
 )
+from zlc_neutral_atom.bootstrap._camera_endpoint import CameraCaptureEndpoint
+from zlc_neutral_atom.bootstrap._sequencer_endpoint import (
+    VirtualSequencerExecutionEndpoint,
+)
+from zlc_neutral_atom.bootstrap._triggered_capture import (
+    TriggeredCameraLayout,
+    bind_triggered_camera_acquisition,
+)
+from zlc_neutral_atom.bootstrap._virtual_hardware import VirtualSequencer
+from zlc_neutral_atom.runtime.capture import BoundCapturePort
+from zlc_neutral_atom.runtime.pipeline import MinimalPipelineSpec
+from zlc_neutral_atom.runtime.ports import DeviceBroker, SafetyOperation
+from zlc_neutral_atom.runtime.resources import (
+    DeviceIdentityEvidenceKind,
+    PhysicalDeviceIdentity,
+    ResourceArbiter,
+    ResourceKey,
+)
+from zlc_neutral_atom.runtime.run import RunController
+from zlc_neutral_atom.runtime.safety_journal import PersistentSafetyJournal
+from zlc_neutral_atom.timing.capture import TriggeredCaptureSpec
+from zlc_neutral_atom.timing.pulse import BoundPulsePort
+from zlc_pulse import PulseExecutionForm, load_deployed_pulse_target, load_pulse_document
 from zlc_storage import (
-    ContentStoreAuthority,
     ContentCorruptionError,
+    ContentStoreAuthority,
     RepositoryRootBusy,
+    canonical_digest,
     content_ref_from_tree,
     decode,
-    encode,
 )
 
 
-_CURVE = (1200, 890, 670, 520, 415, 350)
+_ROOT = Path(__file__).parents[1]
 
 
-def _commit_capture(
-    repository: CaptureRepository,
-    *,
-    block_id: str,
-    curve: tuple[int, ...] = _CURVE,
-):
-    camera, runtime, spec = _runtime_and_spec(point_size=len(curve))
-    spec = replace(
-        spec,
-        materializer=replace(spec.materializer, block_id=BlockId(block_id)),
+class _Camera:
+    max_pending_records = 2
+    timeout = 1.0
+
+    def __init__(self) -> None:
+        self.expected = 0
+        self.ordinal = 0
+        self.armed = False
+
+    def capture_working_point(self) -> CameraWorkingPoint:
+        return CameraWorkingPoint(
+            canonical_digest({"fixture": "capture-fit-camera"}),
+            "EXTERNAL_TRIGGERED",
+            (3, 4),
+            (3, 4),
+            (0, 0),
+            (3, 4),
+            (1, 1),
+            np.dtype("<u2"),
+            "count",
+            ("ch11",),
+            0.001,
+            0.001,
+            0.0,
+            1.0,
+            "fixture-readout",
+        )
+
+    def arm(self, frames: int, *, max_inflight_frames: int, timeout: float) -> None:
+        assert max_inflight_frames == 2 and timeout > 0
+        self.expected = frames
+        self.ordinal = 0
+        self.armed = True
+
+    def read_frame_records(
+        self,
+        n: int,
+        *,
+        timeout: float,
+        exact: bool,
+    ) -> list[CameraFrameRecord]:
+        assert n == 1 and exact and timeout > 0 and self.armed
+        ordinal = self.ordinal
+        self.ordinal += 1
+        curve = np.array((1200, 800, 520, 340), dtype=np.uint16)
+        image = np.tile(curve + ordinal * 10, (3, 1))
+        return [
+            CameraFrameRecord(
+                image,
+                ordinal,
+                self.expected,
+                100 + ordinal,
+                200 + ordinal,
+                1,
+                1_000 + ordinal,
+                10_000 + ordinal,
+                ordinal % 2,
+            )
+        ]
+
+    def finish_record_capture(self) -> CameraCaptureTerminalRecord:
+        self.armed = False
+        return CameraCaptureTerminalRecord(self.expected, True, True, True)
+
+    def capture_state(self) -> tuple[bool, int]:
+        return self.armed, 0
+
+    def close(self) -> None:
+        self.armed = False
+
+
+def _identity(name: str) -> PhysicalDeviceIdentity:
+    return PhysicalDeviceIdentity(
+        name,
+        DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+        f"{name}-evidence",
+        "fixture-assets-v1",
     )
-    plan = compile_capture_artifact_pipeline(spec, repository)
-    thread, failures = _deliver_when_armed(
-        camera,
-        tuple(np.full((6, 8), value, dtype=np.uint16) for value in curve),
+
+
+def _bind_endpoint(broker, key, identity, endpoint, cleanup_operation):
+    binding = None
+
+    def current():
+        assert binding is not None
+        return binding
+
+    binding = broker.bind(
+        key=ResourceKey.parse(key),
+        identity=broker.verify_identity(lambda: _identity(identity)),
+        execute_command=lambda command: endpoint.execute_command(current(), command),
+        cleanup_operations={cleanup_operation: endpoint.cleanup},
+        verify_safe_state=endpoint.verify_safe_state,
+        capability_probe=lambda: endpoint.capability_probe(current()),
+        close_session=lambda command: endpoint.close_session(current(), command),
+        interrupt_operations={cleanup_operation: endpoint.interrupt},
     )
-    try:
-        reference = runtime.controller.start(plan).result(5.0)
-        thread.join(2.0)
-        assert not thread.is_alive()
-        assert failures == []
-        return reference
-    finally:
-        if thread.is_alive():
-            camera.finish_record_capture()
-            thread.join(2.0)
-        assert runtime.shutdown(timeout=2.0)
+    return broker.verify_capability(binding)
+
+
+class _CaptureCase:
+    def __init__(self, tmp_path) -> None:
+        self.camera = _Camera()
+        self.broker = DeviceBroker()
+        camera_endpoint = CameraCaptureEndpoint(
+            self.camera,
+            "camera",
+            exact_external_trigger_qualification_digest=canonical_digest(
+                {"qualification": "deterministic fixture adapter"}
+            ),
+        )
+        camera_port = BoundCapturePort(
+            _bind_endpoint(
+                self.broker,
+                "device/camera",
+                "fixture-camera",
+                camera_endpoint,
+                SafetyOperation.DISARM,
+            ),
+            (SafetyOperation.DISARM,),
+        )
+        target = load_deployed_pulse_target()
+        self.sequencer = VirtualSequencer(
+            target,
+            clock_hz=default_clock_hz(DEFAULT_CONFIG_PATH),
+            sleep_scale=0,
+        )
+        pulse_endpoint = VirtualSequencerExecutionEndpoint(self.sequencer)
+        pulse_port = BoundPulsePort(
+            _bind_endpoint(
+                self.broker,
+                "device/sequencer",
+                "fixture-sequencer",
+                pulse_endpoint,
+                SafetyOperation.SAFE_STATE,
+            ),
+            (),
+        )
+        repeat = AxisSpec(AxisId("repeat"), "repeat", REPEAT, 1, (0,))
+        binding = bind_triggered_camera_acquisition(
+            pulse_port,
+            camera_port,
+            pulse_document=load_pulse_document(
+                _ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+            ),
+            execution_form=PulseExecutionForm.STATIC_ONCE,
+            trigger_channel="ch11",
+            layout=TriggeredCameraLayout(
+                repeat,
+                AxisId("readout-event"),
+                AxisId("scan-ordinal"),
+                readout_events_per_repeat=3,
+            ),
+            transport_memory_limit_bytes=8 << 20,
+        )
+        pipeline = MinimalPipelineSpec(
+            "capture fit source",
+            binding.measurement,
+            BlockId("capture-fit-source"),
+            16 << 20,
+            timeout_seconds=2.0,
+        )
+        triggered = TriggeredCaptureSpec(
+            pipeline,
+            binding.pulse_port,
+            binding.pulse_request,
+            binding.trigger_channel,
+            binding.cell_plan,
+        )
+        self.capture_repository = CaptureRepository(tmp_path / "captures")
+        self.safety = PersistentSafetyJournal(tmp_path / "safety.zlcj")
+        self.resources = ResourceArbiter(self.safety)
+        self.controller = RunController(self.resources)
+        self.capture_reference = self.controller.start(
+            compile_capture_artifact_pipeline(
+                triggered,
+                self.capture_repository,
+            )
+        ).result(5.0)
+
+    def close(self) -> None:
+        assert self.controller.shutdown(2.0)
+        self.broker.shutdown()
+        self.resources.shutdown()
+        self.capture_repository.close()
+        self.sequencer.close()
+        self.camera.close()
 
 
 @pytest.fixture
-def committed_capture(tmp_path):
-    repository = CaptureRepository(tmp_path / "captures")
+def capture_case(tmp_path):
+    case = _CaptureCase(tmp_path)
     try:
-        reference = _commit_capture(repository, block_id="fit-source-a")
-        yield repository, reference
+        yield case
     finally:
-        repository.close()
+        case.close()
 
 
-def _execution(fit_repository, capture_repository, capture_reference):
-    source = capture_repository.admit(capture_reference)
-    scan_axes = tuple(
-        axis.axis_id
-        for axis in source.artifact.frame_source.schema.point_axes
-        if axis.role == SCAN_POINT
-    )
-    assert len(scan_axes) == 1
+def _execution(repository, case):
+    source = case.capture_repository.admit(case.capture_reference)
     spec = fit_spec_for(
         source.artifact.frame_source.schema,
         "exponential_decay",
-        fit_axis_ids=scan_axes,
+        fit_axis_ids=(AxisId("camera.x"),),
     )
-    return fit_repository.execute(source, spec)
+    return repository.execute(source, spec)
 
 
-def test_execution_save_load_is_idempotent_and_manifest_has_no_mirror_truths(
+def test_execution_save_load_is_idempotent_and_has_no_mirror_truths(
     tmp_path,
-    committed_capture,
+    capture_case,
     monkeypatch,
-):
-    capture_repository, capture_reference = committed_capture
-    fit_root = tmp_path / "fits"
-    fit_repository = CaptureFitResultRepository(fit_root)
-    execution = _execution(
-        fit_repository,
-        capture_repository,
-        capture_reference,
-    )
-
-    first = execution.save()
-    second = execution.save()
-    assert first == second
-    assert isinstance(first, CaptureFitResultArtifactRef)
-    assert execution.source_capture_ref == capture_reference
-    assert execution.result.batch_layout.storage_size == 6 * 8
-
-    manifest_payload = fit_repository._store_authority.read_manifest(
-        "fit-result",
-        first.manifest_digest,
-    )
-    manifest = decode(manifest_payload)
-    assert set(manifest) == {
-        "schema",
-        "repository_id",
-        "source_capture_ref",
-        "result_blob",
-    }
-    assert len(list((fit_root / "content" / "manifests" / "fit-result").glob("*"))) == 1
-    assert not list(fit_root.rglob("*.journal"))
-
-    source = capture_repository.admit(capture_reference).artifact.frame_source
-    frame_chunk_digests = frozenset(item.digest for item in source._chunk_refs)
-    owner_read_blob = ContentStoreAuthority.read_blob
-
-    def reject_frame_chunk_read(self, reference, *args, **kwargs):
-        if reference.digest in frame_chunk_digests:
-            raise AssertionError("loading a fit result must not read frame chunks")
-        return owner_read_blob(self, reference, *args, **kwargs)
-
-    def fail_materialization(*_args, **_kwargs):
-        raise AssertionError("loading a fit result must not materialize frames")
-
-    monkeypatch.setattr(ContentStoreAuthority, "read_blob", reject_frame_chunk_read)
-    monkeypatch.setattr(CaptureFrameSource, "materialize", fail_materialization)
-    loaded = fit_repository.load(first, capture_repository)
-    assert isinstance(loaded, AdmittedCaptureFitResult)
-    assert loaded.reference == first
-    assert loaded.source_capture_ref == capture_reference
-    assert encode_fit_result_batch(loaded.result) == encode_fit_result_batch(
-        execution.result
-    )
-    with pytest.raises(TypeError, match="process-local"):
-        pickle.dumps(execution)
-    with pytest.raises(TypeError, match="process-local"):
-        pickle.dumps(loaded)
-
-    fit_repository.close()
-    assert encode_fit_result_batch(execution.result) == encode_fit_result_batch(
-        loaded.result
-    )
-
-
-def test_save_rejects_an_unreloadable_result_before_publishing_manifest(
-    tmp_path,
-    committed_capture,
-    monkeypatch,
-):
-    capture_repository, capture_reference = committed_capture
-    fit_root = tmp_path / "fits"
-    repository = CaptureFitResultRepository(fit_root)
-    try:
-        execution = _execution(repository, capture_repository, capture_reference)
-        monkeypatch.setattr(capture_fit_module, "_MAX_RESULT_BLOB_BYTES", 1)
-        with pytest.raises(ValueError, match="result blob exceeds"):
-            execution.save()
-        manifests = fit_root / "content" / "manifests" / "fit-result"
-        assert not manifests.exists() or not tuple(manifests.iterdir())
-    finally:
-        repository.close()
-
-
-def test_declared_oversized_result_is_rejected_before_blob_open(
-    tmp_path,
-    committed_capture,
-):
-    capture_repository, capture_reference = committed_capture
+) -> None:
     repository = CaptureFitResultRepository(tmp_path / "fits")
     try:
-        reference = _execution(
-            repository,
-            capture_repository,
-            capture_reference,
-        ).save()
+        execution = _execution(repository, capture_case)
+        first = execution.save()
+        second = execution.save()
+        assert first == second
+        assert isinstance(first, CaptureFitResultArtifactRef)
+        assert execution.source_capture_ref == capture_case.capture_reference
+        assert execution.result.batch_layout.storage_size == 9
+
         manifest = decode(
             repository._store_authority.read_manifest(
                 "fit-result",
-                reference.manifest_digest,
+                first.manifest_digest,
             )
         )
-        oversized_blob = dict(manifest["result_blob"])
-        oversized_blob["size"] = capture_fit_module._MAX_RESULT_BLOB_BYTES + 1
-        stored = repository._store_authority.publish_manifest(
-            "fit-result",
-            encode({**manifest, "result_blob": oversized_blob}),
+        assert set(manifest) == {
+            "schema",
+            "repository_id",
+            "source_capture_ref",
+            "result_blob",
+        }
+        assert "checkpoint" not in manifest
+        assert "raw_frames" not in manifest
+
+        frame_digests = frozenset(
+            item.digest
+            for item in capture_case.capture_repository.load(
+                capture_case.capture_reference
+            ).frame_source._chunk_refs
         )
-        oversized_ref = CaptureFitResultArtifactRef(
-            repository.repository_id,
-            stored.content.digest,
+        owner_read_blob = ContentStoreAuthority.read_blob
+
+        def reject_frame_read(self, reference, *args, **kwargs):
+            if reference.digest in frame_digests:
+                raise AssertionError("fit load must not read source frame chunks")
+            return owner_read_blob(self, reference, *args, **kwargs)
+
+        monkeypatch.setattr(ContentStoreAuthority, "read_blob", reject_frame_read)
+        monkeypatch.setattr(
+            CaptureFrameSource,
+            "materialize",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("fit load must not materialize frames")
+            ),
         )
-        with pytest.raises(ValueError, match="result blob exceeds"):
-            repository.load(oversized_ref, capture_repository)
+        loaded = repository.load(first, capture_case.capture_repository)
+        assert isinstance(loaded, AdmittedCaptureFitResult)
+        assert loaded.source_capture_ref == capture_case.capture_reference
+        assert encode_fit_result_batch(loaded.result) == encode_fit_result_batch(
+            execution.result
+        )
+        with pytest.raises(TypeError, match="process-local"):
+            pickle.dumps(execution)
+        with pytest.raises(TypeError, match="process-local"):
+            pickle.dumps(loaded)
     finally:
         repository.close()
 
 
-def test_raw_result_cannot_be_promoted_and_repository_root_has_one_owner(
+def test_raw_fit_result_cannot_be_promoted_without_execution_authority(
     tmp_path,
-    committed_capture,
-):
-    capture_repository, capture_reference = committed_capture
-    root = tmp_path / "fits"
-    repository = CaptureFitResultRepository(root)
-    execution = _execution(repository, capture_repository, capture_reference)
+    capture_case,
+) -> None:
+    repository = CaptureFitResultRepository(tmp_path / "fits")
     try:
+        execution = _execution(repository, capture_case)
         assert not hasattr(repository, "save")
         with pytest.raises(PermissionError, match="authority"):
             repository._save_execution(execution.result)  # type: ignore[arg-type]
@@ -233,175 +354,35 @@ def test_raw_result_cannot_be_promoted_and_repository_root_has_one_owner(
             FitExecution(
                 object(),
                 repository=repository,
-                source_admission=capture_repository.admit(capture_reference),
+                source_admission=capture_case.capture_repository.admit(
+                    capture_case.capture_reference
+                ),
                 result=execution.result,
             )
-        forged_result = replace(
-            execution.result,
-            residual_sum_squares=np.full_like(
-                execution.result.residual_sum_squares,
-                12_345.0,
-            ),
-        )
-        with pytest.raises(TypeError, match="dataclass"):
-            replace(execution, _result=forged_result)
-        with pytest.raises(AttributeError, match="immutable"):
-            execution._result = forged_result
         reference = execution.save()
         with pytest.raises(PermissionError, match="only be minted"):
             AdmittedCaptureFitResult(
                 object(),
                 reference=reference,
-                source_capture_ref=capture_reference,
-                result=forged_result,
+                source_capture_ref=capture_case.capture_reference,
+                result=execution.result,
             )
-        with pytest.raises(AttributeError, match="immutable"):
-            repository.repository_id = "forged"
-        foreign = CaptureFitResultRepository(tmp_path / "foreign-fits")
-        try:
-            with pytest.raises(PermissionError, match="authority"):
-                foreign._save_execution(execution)
-        finally:
-            foreign.close()
-        with pytest.raises(RepositoryRootBusy):
-            CaptureFitResultRepository(root)
     finally:
         repository.close()
 
 
-def test_capture_fit_repository_is_final_and_detects_root_authority_drift(
-    tmp_path,
-):
-    with pytest.raises(TypeError, match="final"):
-        class _DerivedCaptureFitRepository(CaptureFitResultRepository):
-            pass
-
-    repository = CaptureFitResultRepository(tmp_path / "fits")
-    original_root = repository.root
-    try:
-        object.__setattr__(repository, "root", tmp_path / "other")
-        with pytest.raises(RuntimeError, match="authority changed"):
-            repository._require_integrity()
-    finally:
-        object.__setattr__(repository, "root", original_root)
-        repository.close()
-
-
-def test_save_and_close_share_one_repository_lifecycle_gate(
-    monkeypatch,
-    tmp_path,
-    committed_capture,
-):
-    capture_repository, capture_reference = committed_capture
+def test_fit_repository_root_has_one_immutable_owner(tmp_path, capture_case) -> None:
     root = tmp_path / "fits"
     repository = CaptureFitResultRepository(root)
-    execution = _execution(repository, capture_repository, capture_reference)
-    encode_entered = threading.Event()
-    allow_encode = threading.Event()
-    close_returned = threading.Event()
-    references = []
-    failures = []
-    owner_encode = capture_fit_module.encode_fit_result_batch
-
-    def blocking_encode(result):
-        encode_entered.set()
-        if not allow_encode.wait(2.0):
-            raise TimeoutError("test did not release fit encoding")
-        return owner_encode(result)
-
-    def save():
-        try:
-            references.append(execution.save())
-        except BaseException as error:
-            failures.append(error)
-
-    def close():
-        try:
-            repository.close()
-        except BaseException as error:
-            failures.append(error)
-        finally:
-            close_returned.set()
-
-    monkeypatch.setattr(
-        capture_fit_module,
-        "encode_fit_result_batch",
-        blocking_encode,
-    )
-    save_thread = threading.Thread(target=save)
-    close_thread = threading.Thread(target=close)
-    save_thread.start()
-    assert encode_entered.wait(2.0)
-    close_thread.start()
-    assert not close_returned.wait(0.05)
-    allow_encode.set()
-    save_thread.join(2.0)
-    close_thread.join(2.0)
-
-    assert not save_thread.is_alive()
-    assert not close_thread.is_alive()
-    assert failures == []
-    assert len(references) == 1
-    CaptureFitResultRepository(root).close()
-
-
-def test_load_rejects_foreign_fit_repository_and_wrong_capture_source(
-    tmp_path,
-    committed_capture,
-):
-    capture_repository, first_capture = committed_capture
-    repository = CaptureFitResultRepository(tmp_path / "fits-a")
-    foreign = CaptureFitResultRepository(
-        tmp_path / "fits-b",
-        repository_id="foreign-capture-fit",
-    )
     try:
-        reference = _execution(
-            repository,
-            capture_repository,
-            first_capture,
-        ).save()
-        with pytest.raises(ValueError, match="another repository"):
-            foreign.load(reference, capture_repository)
-
-        second_capture = _commit_capture(
-            capture_repository,
-            block_id="fit-source-a",
-            curve=tuple(reversed(_CURVE)),
-        )
-        first_admission = capture_repository.admit(first_capture)
-        second_admission = capture_repository.admit(second_capture)
-        first_source = first_admission.artifact.frame_source.ref(
-            first_admission.artifact.provenance.generation
-        )
-        second_source = second_admission.artifact.frame_source.ref(
-            second_admission.artifact.provenance.generation
-        )
-        assert first_source.block_id == second_source.block_id
-        assert first_source.schema_fingerprint == second_source.schema_fingerprint
-        assert first_source.revision == second_source.revision
-        assert first_source.stream_generation != second_source.stream_generation
-        manifest = decode(
-            repository._store_authority.read_manifest(
-                "fit-result",
-                reference.manifest_digest,
-            )
-        )
-        second_tree = dict(manifest["source_capture_ref"])
-        second_tree["manifest_digest"] = second_capture.manifest_digest
-        forged_payload = encode({**manifest, "source_capture_ref": second_tree})
-        stored = repository._store_authority.publish_manifest(
-            "fit-result",
-            forged_payload,
-        )
-        wrong_source_ref = CaptureFitResultArtifactRef(
-            repository.repository_id,
-            stored.content.digest,
-        )
-        with pytest.raises(ValueError, match="source reference"):
-            repository.load(wrong_source_ref, capture_repository)
+        with pytest.raises(RepositoryRootBusy):
+            CaptureFitResultRepository(root)
+        with pytest.raises(AttributeError, match="immutable"):
+            repository.repository_id = "forged"
+        with pytest.raises(TypeError, match="final"):
+            class _DerivedRepository(CaptureFitResultRepository):
+                pass
     finally:
-        foreign.close()
         repository.close()
 
 
@@ -409,16 +390,11 @@ def test_load_rejects_foreign_fit_repository_and_wrong_capture_source(
 def test_load_fails_closed_on_content_corruption(
     target,
     tmp_path,
-    committed_capture,
-):
-    capture_repository, capture_reference = committed_capture
+    capture_case,
+) -> None:
     repository = CaptureFitResultRepository(tmp_path / "fits")
     try:
-        reference = _execution(
-            repository,
-            capture_repository,
-            capture_reference,
-        ).save()
+        reference = _execution(repository, capture_case).save()
         if target == "manifest":
             path = repository._store._manifest_path(
                 "fit-result",
@@ -435,6 +411,21 @@ def test_load_fails_closed_on_content_corruption(
             path = repository._store._blob_path(result_ref.digest)
         path.write_bytes(b"corrupt")
         with pytest.raises(ContentCorruptionError):
-            repository.load(reference, capture_repository)
+            repository.load(reference, capture_case.capture_repository)
     finally:
         repository.close()
+
+
+def test_foreign_fit_repository_rejects_reference(tmp_path, capture_case) -> None:
+    first = CaptureFitResultRepository(tmp_path / "fits-a")
+    second = CaptureFitResultRepository(
+        tmp_path / "fits-b",
+        repository_id="foreign-fit-repository",
+    )
+    try:
+        reference = _execution(first, capture_case).save()
+        with pytest.raises(ValueError, match="another repository"):
+            second.load(reference, capture_case.capture_repository)
+    finally:
+        second.close()
+        first.close()

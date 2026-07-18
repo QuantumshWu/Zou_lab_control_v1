@@ -950,7 +950,7 @@ def test_boolean_histogram_keeps_false_and_true_as_two_categories(
     occupancy_product,
     monkeypatch,
 ):
-    from matplotlib.axes import Axes
+    import zlc_frontend.matplotlib_render as render_module
 
     experiment, reference, resolved = occupancy_product
     site_axis = resolved.artifact.occupied.schema.cell_schema.data_axes[0]
@@ -962,13 +962,14 @@ def test_boolean_histogram_keeps_false_and_true_as_two_categories(
     )
     assert isinstance(figure.evaluated.layers[0].cells[0].series[0].data, EvaluatedHistogram)
     observed_bins = []
-    original_hist = Axes.hist
+    original_counts = render_module.histogram_bin_counts
 
-    def traced_hist(self, values, *args, **kwargs):
-        observed_bins.append(tuple(kwargs["bins"]))
-        return original_hist(self, values, *args, **kwargs)
+    def traced_counts(values, *, bins=60):
+        counts, edges = original_counts(values, bins=bins)
+        observed_bins.append(tuple(edges))
+        return counts, edges
 
-    monkeypatch.setattr(Axes, "hist", traced_hist)
+    monkeypatch.setattr(render_module, "histogram_bin_counts", traced_counts)
     rendered = figure.render()
     try:
         assert observed_bins == [(-0.5, 0.5, 1.5)]

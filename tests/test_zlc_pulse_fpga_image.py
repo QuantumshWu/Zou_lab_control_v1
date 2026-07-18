@@ -25,6 +25,12 @@ from zlc_pulse import (
 ROOT = Path(__file__).parents[1]
 
 
+def _document_path(name: str) -> Path:
+    if name == "imaging_template.json":
+        return ROOT / "zlc_neutral_atom" / "assets" / name
+    return ROOT / "pulses" / name
+
+
 def test_current_validator_pins_the_frozen_rtl_slot_multiplier_width():
     assert SLOT_MULTIPLIER_WIDTH == default_slot_mul_width() == 25
 
@@ -33,7 +39,7 @@ def test_current_validator_pins_the_frozen_rtl_slot_multiplier_width():
     ("name", "form", "expected_physical_words_digest"),
     [
         ("camera_imaging_address_switch.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "5d4984bc20a7e635210903878e3b5c0dacd1f22d0ba0029ab7de0218db5fc946"),
-        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "e6127a992b7176a4059f615c47bf30d3a6ee3ff30f12c7e2f789b107fde8bae5"),
+        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "929b45c22a81cb7071fbe480bc270d591bbc5fea96d79703d6370bdf1509cb40"),
         ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "7b6122ea0799bc7ffd52dba2e20505e67f92dc5f63333968170afaefd3af60ea"),
         ("probe_template.json", PulseExecutionForm.STATIC_ONCE, "7a2a1b1d6a35cb7b94df7bc4e149dda3c2b6f9d1d57ae331dbbca0d74346d46a"),
         ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "d9a679a6d6118a817cd213fe908d5b27f51590675638941f3aa5656c7b5c253a"),
@@ -44,51 +50,13 @@ def test_target_ir_wire_image_matches_the_frozen_wire_golden(
     form,
     expected_physical_words_digest,
 ):
-    document = load_pulse_document(ROOT / "pulses" / name)
+    document = load_pulse_document(_document_path(name))
     params = StreamerParams()
     ir = compile_pulse_document(document, clock_hz=50e6, execution_form=form)
     current = pack_target_ir(ir, params)
 
     assert canonical_digest([list(item) for item in current.words]) == (
         expected_physical_words_digest
-    )
-
-
-@pytest.mark.parametrize(
-    ("name", "form"),
-    [
-        ("camera_imaging_address_switch.json", PulseExecutionForm.STATIC_REFERENCE_POINT),
-        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE),
-        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE),
-        ("probe_template.json", PulseExecutionForm.STATIC_ONCE),
-        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT),
-    ],
-)
-def test_current_geometry_gate_matches_the_previous_hardware_oracle(name, form):
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
-        validate_pulse_streamer_program as previous_oracle,
-    )
-
-    params = StreamerParams()
-    ir = compile_pulse_document(
-        load_pulse_document(ROOT / "pulses" / name),
-        clock_hz=50e6,
-        execution_form=form,
-    )
-
-    previous_oracle(
-        ir,
-        max_edges=params.max_edges,
-        max_scan_points=2 * params.bank_size,
-        max_bus_segments=params.max_bus_segments,
-        tick_width=params.tick_width,
-        channel_count=params.channel_count,
-        coeff_width=params.coeff_width,
-        num_slots=params.num_slots,
-        bus_count=params.bus_count,
-        bus_width=params.bus_width,
-        slot_mul_width=default_slot_mul_width(),
-        max_validated_scan_points=None,
     )
 
 

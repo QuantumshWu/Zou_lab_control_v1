@@ -46,7 +46,7 @@ ROOT = Path(__file__).parents[1]
 
 
 def _static_artifact():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     return compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -110,13 +110,10 @@ def test_neutral_terminal_ack_codec_preserves_hardware_and_simulated_receipts():
     reference = PreparedPulseRef(
         "generation-1",
         artifact.fingerprint,
-        artifact.target_ir.fingerprint,
-        artifact.wire_image.digest,
     )
     hardware = PulseTerminalAck(
         "session-1",
         "binding-1",
-        "generation-1",
         PulseCompletion(
             reference,
             backend.hardware_terminal,
@@ -127,7 +124,6 @@ def test_neutral_terminal_ack_codec_preserves_hardware_and_simulated_receipts():
     simulated = PulseTerminalAck(
         "session-2",
         "binding-2",
-        "generation-2",
         SimulatedPulseReceipt(
             artifact.fingerprint,
             "test-simulator",
@@ -152,8 +148,6 @@ def test_success_completion_and_neutral_boundary_reject_fabricated_evidence():
     reference = PreparedPulseRef(
         "generation-1",
         artifact.fingerprint,
-        artifact.target_ir.fingerprint,
-        artifact.wire_image.digest,
     )
     failed_terminal = StaticOnceTerminalEvidence(
         STATIC_STATUS_READ_RECIPE,
@@ -177,7 +171,6 @@ def test_success_completion_and_neutral_boundary_reject_fabricated_evidence():
     acknowledgement = PulseTerminalAck(
         "session",
         "binding",
-        "generation",
         PulseCompletion(
             reference,
             valid.hardware_terminal,
@@ -222,7 +215,6 @@ def test_neutral_boundary_rejects_simulated_duration_or_tail_not_derived_from_ar
         acknowledgement = PulseTerminalAck(
             "session",
             "binding",
-            "generation",
             receipt,
         )
         with pytest.raises(ValueError, match=message):

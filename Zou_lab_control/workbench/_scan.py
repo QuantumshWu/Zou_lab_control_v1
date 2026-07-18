@@ -1,4 +1,4 @@
-"""Thin Qt shell for one autonomous SCAN_SLOT request."""
+"""Thin Qt shell for one current typed pulse-scan request."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from zlc_frontend.qt_widgets import (
 )
 from zlc_frontend.figure import ViewIntent
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
+from zlc_neutral_atom.scan.contracts import AutonomousScanSlotProgram
 from zlc_storage import canonical_digest
 from zlc_workbench.progressive_scan import (
     ProgressiveScanSpec,
@@ -86,7 +87,7 @@ class _FrozenScanApplication:
         identity = canonical_digest(
             {
                 "owner": "Zou_lab_control.workbench.occupancy-scan",
-                "pulse_document": self._request.pulse_document.fingerprint,
+                "program": self._request.program.fingerprint,
                 "source_schema": command.source_schema.fingerprint,
                 "output_contract": command.output_contract.fingerprint,
             }
@@ -105,8 +106,14 @@ class _FrozenScanApplication:
                     "prepared progressive preview budget changed before start"
                 )
             return command.start(preview)
-
-        return PreparedScanPanelRun(progressive, start_occupancy)
+        progressive_enabled = isinstance(
+            self._request.program,
+            AutonomousScanSlotProgram,
+        )
+        return PreparedScanPanelRun(
+            progressive if progressive_enabled else None,
+            start_occupancy,
+        )
 
     def project_final(
         self,
@@ -157,15 +164,19 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         if not isinstance(request, (ScanRequest, OccupancyScanRequest)):
             raise TypeError("request must be a current scan request")
 
-        self.setWindowTitle("Autonomous Scan")
+        self.setWindowTitle("Pulse Scan")
         self._allow_close = False
         self._shown_presentation: FinalScanPresentation | None = None
 
-        progressive = isinstance(request, OccupancyScanRequest)
+        occupancy = isinstance(request, OccupancyScanRequest)
+        progressive = occupancy and isinstance(
+            request.program,
+            AutonomousScanSlotProgram,
+        )
         self._progressive_requested = progressive
         self._final_mode_text = (
             "OCCUPANCY · CANONICAL FINAL-ONLY"
-            if progressive
+            if occupancy
             else "DIRECT CAMERA · CANONICAL FINAL-ONLY"
         )
         self._mode = FluentLabel(
@@ -273,10 +284,14 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         )
         self._controller.reconfigure(replacement)
         self._application = replacement
-        self._progressive_requested = isinstance(request, OccupancyScanRequest)
+        occupancy = isinstance(request, OccupancyScanRequest)
+        self._progressive_requested = occupancy and isinstance(
+            request.program,
+            AutonomousScanSlotProgram,
+        )
         self._final_mode_text = (
             "OCCUPANCY · CANONICAL FINAL-ONLY"
-            if self._progressive_requested
+            if occupancy
             else "DIRECT CAMERA · CANONICAL FINAL-ONLY"
         )
         self._shown_presentation = None

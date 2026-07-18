@@ -443,7 +443,7 @@ def test_result_rejects_artifact_thresholds_not_supported_by_report() -> None:
         models=(mismatched_model,),
     )
 
-    with pytest.raises(TypeError, match="returned by analyze_calibration"):
+    with pytest.raises(TypeError, match="returned by a committed calibration Run"):
         CalibrationAnalysisResult(mismatched_artifact, result.report)
     with pytest.raises(ValueError, match="thresholds differ"):
         CalibrationComputation(mismatched_artifact, result.report)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from fractions import Fraction
+from itertools import accumulate
 from pathlib import Path
 
 import pytest
@@ -23,10 +25,44 @@ from zlc_pulse import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+_SECONDS_PER_TIME_UNIT = {
+    "ns": Fraction(1, 1_000_000_000),
+    "us": Fraction(1, 1_000_000),
+    "ms": Fraction(1, 1_000),
+    "s": Fraction(1, 1),
+}
+
+
+def _time_seconds(value, unit):
+    return float(Fraction(str(value)) * _SECONDS_PER_TIME_UNIT[unit])
+
+
+def _time_ticks(value, unit, clock_hz):
+    ticks = (
+        Fraction(str(value))
+        * _SECONDS_PER_TIME_UNIT[unit]
+        * Fraction(str(clock_hz))
+    )
+    assert ticks.denominator == 1
+    return ticks.numerator
+
+
+def _period_ticks(periods, clock_hz):
+    return tuple(_time_ticks(period.duration, period.unit, clock_hz) for period in periods)
+
+
+def _cumulative_ticks(periods, clock_hz):
+    return tuple(accumulate(_period_ticks(periods, clock_hz), initial=0))
+
+
+def _period_mask(period):
+    return sum(int(state) << index for index, state in enumerate(period.states))
 
 
 def test_native_compiler_preserves_compact_and_delay_unrolled_repeat_semantics():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_TEMPLATE)
+    clock_hz = 50e6
     active_port = next(
         port
         for port in document.target.ports
@@ -41,68 +77,60 @@ def test_native_compiler_preserves_compact_and_delay_unrolled_repeat_semantics()
 
     compact_ir = compile_pulse_document(
         compact,
-        clock_hz=50e6,
+        clock_hz=clock_hz,
         execution_form=PulseExecutionForm.STATIC_ONCE,
     )
     delayed_ir = compile_pulse_document(
         delayed,
-        clock_hz=50e6,
+        clock_hz=clock_hz,
         execution_form=PulseExecutionForm.STATIC_ONCE,
     )
 
-    assert compact_ir.ticks == (
-        0,
-        100_000,
-        1_100_000,
-        1_105_000,
-        1_355_000,
-        1_360_000,
-        2_360_000,
-    )
-    assert compact_ir.masks == (513, 2568, 512, 2568, 512, 2568, 0)
-    assert compact_ir.loop_start_index == 1
-    assert compact_ir.loop_end_tick == 1_355_000
-    assert compact_ir.loop_count == 3
+    periods = tuple(document.periods)
+    repeat = compact.repeat
+    assert repeat is not None
+    period_index = {period.period_id: index for index, period in enumerate(periods)}
+    repeat_start = period_index[repeat.start_period_id]
+    repeat_end = period_index[repeat.end_period_id]
+    compact_ticks = _cumulative_ticks(periods, clock_hz)
+
+    assert compact_ir.ticks == compact_ticks
+    assert compact_ir.masks == tuple(_period_mask(period) for period in periods) + (0,)
+    assert compact_ir.loop_start_index == repeat_start
+    assert compact_ir.loop_end_tick == compact_ticks[repeat_end + 1]
+    assert compact_ir.loop_count == repeat.count
     assert not any(compact_ir.channel_delays)
 
-    assert delayed_ir.ticks == (
-        0,
-        100_000,
-        1_100_000,
-        1_105_000,
-        1_355_000,
-        2_355_000,
-        2_360_000,
-        2_610_000,
-        3_610_000,
-        3_615_000,
-        3_865_000,
-        3_870_000,
-        4_870_000,
+    repeat_members = periods[repeat_start : repeat_end + 1]
+    expanded_periods = (
+        periods[:repeat_start]
+        + repeat_members * repeat.count
+        + periods[repeat_end + 1 :]
     )
-    assert delayed_ir.masks == (
-        513,
-        2568,
-        512,
-        2568,
-        2568,
-        512,
-        2568,
-        2568,
-        512,
-        2568,
-        512,
-        2568,
-        0,
-    )
+    expanded_ticks = _cumulative_ticks(expanded_periods, clock_hz)
+    assert delayed_ir.ticks == expanded_ticks
+    assert delayed_ir.masks == tuple(
+        _period_mask(period) for period in expanded_periods
+    ) + (0,)
     assert delayed_ir.loop_start_index == 0
-    assert delayed_ir.loop_end_tick == 4_870_000
+    assert delayed_ir.loop_end_tick == expanded_ticks[-1]
     assert delayed_ir.loop_count == 1
+    active_lane_indices = tuple(
+        index
+        for index in range(len(document.target.raw_lanes))
+        if any(period.states[index] for period in periods)
+    )
+    delayed_lane_index = document.target.raw_lanes.index(active_port.lanes[0])
+    normalized_delay_ticks = _time_ticks(40, "ns", clock_hz)
     assert [
         (index, delay)
         for index, delay in enumerate(delayed_ir.channel_delays)
         if delay
-    ] == [(3, 2), (9, 2), (11, 2)]
+    ] == [
+        (index, normalized_delay_ticks)
+        for index in active_lane_indices
+        if index != delayed_lane_index
+    ]
 
 
 def test_native_compiler_folds_digital_and_dac_delays_in_one_schedule():
@@ -143,7 +171,7 @@ def test_native_compiler_folds_digital_and_dac_delays_in_one_schedule():
 
 
 def test_scan_duration_includes_every_compact_inner_repeat_iteration():
-    base = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    base = load_pulse_document(IMAGING_TEMPLATE)
     parameter = ScanParameter(
         "gap_duration",
         PulseFieldRef(FIELD_DURATION, "p3"),
@@ -155,10 +183,11 @@ def test_scan_duration_includes_every_compact_inner_repeat_iteration():
         scan_parameters=(parameter,),
         repeat=RepeatRegion("p2", "p4", 3),
     )
+    scan_rows = ((0.0001,), (0.0002,))
     table, _report = freeze_scan_table(
         document,
         (parameter.parameter_id,),
-        ((0.0001,), (0.0002,)),
+        scan_rows,
     )
     document = replace(document, scan_table=table)
 
@@ -168,9 +197,32 @@ def test_scan_duration_includes_every_compact_inner_repeat_iteration():
         execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
     )
 
-    assert actual.loop_count == 3
-    assert actual.scan_point_durations == pytest.approx((0.0974, 0.0977))
-    assert actual.duration_seconds == pytest.approx(0.1951)
+    repeat = document.repeat
+    assert repeat is not None
+    period_index = {
+        period.period_id: index for index, period in enumerate(document.periods)
+    }
+    repeat_start = period_index[repeat.start_period_id]
+    repeat_end = period_index[repeat.end_period_id]
+    scanned_period = period_index[parameter.field.period_id]
+    base_durations = [
+        _time_seconds(period.duration, period.unit) for period in document.periods
+    ]
+    expected_point_durations = []
+    for (scanned_duration,) in table.rows:
+        point_durations = list(base_durations)
+        point_durations[scanned_period] = _time_seconds(
+            scanned_duration,
+            parameter.unit,
+        )
+        repeat_duration = sum(point_durations[repeat_start : repeat_end + 1])
+        expected_point_durations.append(
+            sum(point_durations) + (repeat.count - 1) * repeat_duration
+        )
+
+    assert actual.loop_count == repeat.count
+    assert actual.scan_point_durations == pytest.approx(expected_point_durations)
+    assert actual.duration_seconds == pytest.approx(sum(expected_point_durations))
 
 
 def test_scan_rejects_dac_segments_inside_compact_inner_repeat():

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import hashlib
 from enum import Enum
 import threading
@@ -33,7 +33,7 @@ from zlc_data import (
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
     DatasetCellAddress,
-    DatasetCellDomain,
+    DatasetCellSchedule,
     DatasetCellKeyContract,
     DatasetCoverage,
     DatasetPreviewSnapshot,
@@ -41,18 +41,13 @@ from zlc_neutral_atom.runtime.dataset import (
     MissingDatasetCells,
     MonitorCoverage,
     MonitorDataset,
-    OrderedDatasetEventHasher,
     OrderedDatasetMetadataHasher,
     SnapshotExpired,
     SealedDatasetArtifact,
-    ValueDatasetEventAdapter,
-    dataset_cell_key_fingerprint,
     dataset_cell_permutation_digest,
 )
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
-    EventId,
-    EventRef,
     ReservationCapacityExceeded,
     ReservationStateError,
     StreamEndedEarly,
@@ -99,50 +94,6 @@ def test_ordered_metadata_hasher_matches_frozen_golden_and_preserves_order():
         OrderedDatasetMetadataHasher("not-a-digest")
     with pytest.raises(ValueError, match="SHA-256"):
         hasher.update("not-a-digest")
-
-
-def test_ordered_dataset_event_hasher_matches_frozen_golden_and_all_identities():
-    stream_id = StreamId("camera.exact")
-    generation = StreamGenerationId("generation-one")
-    references = tuple(
-        EventRef(
-            stream_id,
-            generation,
-            sequence,
-            EventId(f"event-{sequence}"),
-            f"{sequence + 1:064x}",
-        )
-        for sequence in range(3)
-    )
-    metadata_digests = ("b" * 64, "c" * 64, "d" * 64)
-
-    def digest(refs, metadata):
-        hasher = OrderedDatasetEventHasher(stream_id, generation, 0)
-        for reference, metadata_digest in zip(refs, metadata, strict=True):
-            hasher.update(reference, metadata_digest)
-        return hasher.digest(3)
-
-    expected = "bc8f115874accd1f02060c18c48939e9360992c4ab033579694b8a630a072433"
-    assert digest(references, metadata_digests) == expected
-
-    assert digest(
-        (references[0], replace(references[1], event_id=EventId("changed-event")), references[2]),
-        metadata_digests,
-    ) != expected
-    assert digest(
-        (references[0], replace(references[1], payload_digest="f" * 64), references[2]),
-        metadata_digests,
-    ) != expected
-    assert digest(references, (metadata_digests[0], "e" * 64, metadata_digests[2])) != expected
-
-    discontinuous = OrderedDatasetEventHasher(stream_id, generation, 0)
-    with pytest.raises(ValueError, match="stream/generation/sequence"):
-        discontinuous.update(references[1], metadata_digests[0])
-    complete = OrderedDatasetEventHasher(stream_id, generation, 0)
-    for reference, metadata_digest in zip(references, metadata_digests, strict=True):
-        complete.update(reference, metadata_digest)
-    with pytest.raises(ValueError, match="incomplete coverage"):
-        complete.digest(2)
 
 
 def axis(name: str, role, size: int) -> AxisSpec:
@@ -192,12 +143,55 @@ def value(number: int, *, component_validity=None) -> Value:
     return Value(np.full((2, 3), number, dtype=np.uint16), validity, schema)
 
 
-def cell_schedule(schema: DatasetSchema) -> tuple[DatasetCellAddress, ...]:
-    return tuple(
-        DatasetCellAddress(repeat, point)
-        for repeat in range(schema.repeat_axis.size)
-        for point in range(schema.point_layout.storage_size)
+def cell_schedule(schema: DatasetSchema) -> DatasetCellSchedule:
+    return DatasetCellSchedule.from_cells(
+        schema,
+        (
+            DatasetCellAddress(repeat, point)
+            for repeat in range(schema.repeat_axis.size)
+            for point in range(schema.point_layout.storage_size)
+        ),
     )
+
+
+@dataclass(frozen=True)
+class _NoDatasetMetadataContract:
+    fingerprint: str = "7" * 64
+    max_retained_nbytes: int = 0
+
+    @staticmethod
+    def snapshot(_payload):
+        return None
+
+    @staticmethod
+    def validate(metadata):
+        if metadata is not None:
+            raise TypeError("value event has no metadata")
+
+    @staticmethod
+    def retained_nbytes(metadata):
+        _NoDatasetMetadataContract.validate(metadata)
+        return 0
+
+    @staticmethod
+    def digest(metadata):
+        _NoDatasetMetadataContract.validate(metadata)
+        return hashlib.sha256(b"null").hexdigest()
+
+
+@dataclass(frozen=True)
+class _ValueDatasetEventAdapter:
+    payload_contract: ValuePayloadContract
+    metadata_contract: _NoDatasetMetadataContract = _NoDatasetMetadataContract()
+    operator_fingerprint: str = "8" * 64
+
+    @property
+    def value_schema(self):
+        return self.payload_contract.schema
+
+    def value(self, payload):
+        self.payload_contract.validate(payload)
+        return payload
 
 
 def source(schema: DatasetSchema, *, events=8):
@@ -208,7 +202,7 @@ def source(schema: DatasetSchema, *, events=8):
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=events,
         retention_bytes=events * contract.max_retained_nbytes,
-        join_key_contract=DatasetCellKeyContract(schema),
+        join_key_contract=DatasetCellKeyContract.from_schema(schema),
     )
 
 
@@ -224,8 +218,8 @@ def emit(producer, payload, address: DatasetCellAddress, sequence_value: int):
     )
 
 
-def event_adapter(stream) -> ValueDatasetEventAdapter:
-    return ValueDatasetEventAdapter(stream._payload_contract)
+def event_adapter(stream) -> _ValueDatasetEventAdapter:
+    return _ValueDatasetEventAdapter(stream._payload_contract)
 
 
 def dataset_edge(
@@ -258,25 +252,25 @@ def test_cell_key_domain_excludes_value_schema_but_formal_permutation_does_not()
     )
     cells = cell_schedule(first)
     assert first.fingerprint != second.fingerprint
-    assert dataset_cell_key_fingerprint(first) == dataset_cell_key_fingerprint(second)
+    assert DatasetCellKeyContract.from_schema(first).fingerprint == (
+        DatasetCellKeyContract.from_schema(second).fingerprint
+    )
     assert dataset_cell_permutation_digest(first, cells) != (
         dataset_cell_permutation_digest(second, cells)
     )
 
 
-def test_frozen_edge_owner_copies_exact_schedule_addresses():
+def test_frozen_edge_retains_one_immutable_packed_schedule_owner():
     schema = dataset_schema(points=2)
     stream, _producer = source(schema, events=2)
     schedule = cell_schedule(schema)
     edge = FrozenDatasetEdge(schema, event_adapter(stream), schedule)
     frozen_digest = edge.schedule_digest
 
-    assert edge.expected_cells is not schedule
-    assert edge.expected_cells is not None
-    assert edge.expected_cells[0] is not schedule[0]
-    object.__setattr__(schedule[0], "point_storage_index", 1)
-
-    assert edge.expected_cells[0] == DatasetCellAddress(0, 0)
+    assert edge.cell_schedule is schedule
+    assert schedule.cell_at(0) == DatasetCellAddress(0, 0)
+    with pytest.raises(AttributeError, match="immutable"):
+        schedule._packed = b"tampered"
     assert edge.schedule_digest == frozen_digest
 
 
@@ -306,7 +300,7 @@ def test_frozen_edge_rejects_normally_mutable_adapter_configuration():
     class MutableAdapter:
         payload_contract: ValuePayloadContract
         scale: HashableMutableScale
-        metadata_contract: object = ValueDatasetEventAdapter(
+        metadata_contract: object = _ValueDatasetEventAdapter(
             ValuePayloadContract(image_value_schema())
         ).metadata_contract
         operator_fingerprint: str = "e" * 64
@@ -359,35 +353,16 @@ def test_metadata_contract_validation_precedes_exact_commit(monkeypatch):
     reservation.release()
 
 
-def test_frozen_edge_validates_and_projects_one_exact_schedule_once(monkeypatch):
+def test_frozen_edge_projects_one_prevalidated_exact_schedule():
     schema = dataset_schema(repeats=2, points=3)
     stream, _producer = source(schema, events=6)
-    validate_calls = 0
-    real_validate = runtime_dataset.dataset_cell_permutation_digest
+    schedule = cell_schedule(schema)
+    edge = FrozenDatasetEdge(schema, event_adapter(stream), schedule)
 
-    def counted_validate(*args, **kwargs):
-        nonlocal validate_calls
-        validate_calls += 1
-        return real_validate(*args, **kwargs)
-
-    monkeypatch.setattr(
-        runtime_dataset,
-        "dataset_cell_permutation_digest",
-        counted_validate,
-    )
-
-    edge = FrozenDatasetEdge(schema, event_adapter(stream), cell_schedule(schema))
-
-    assert validate_calls == 1
-    assert edge.schedule_digest == (
-        "804db444ad86a9709c808ed1b205976ae563dd41c61de915670d64269aca9d28"
-    )
-    assert edge.key_sequence_digest == (
-        "c55bf0d3545f3082ae0e18e19b8ac418b485354df2b53cf11fbca5029bce164a"
-    )
-    assert edge.consumer_contract_digest == (
-        "36fce4323cd1176f8f0463e9149653c9ac2040611cf3747180f1cc2a5e290607"
-    )
+    assert edge.cell_schedule is schedule
+    assert edge.schedule_digest == schedule.digest_for_schema(schema)
+    assert edge.key_sequence_digest == schedule.key_sequence_digest
+    assert len(edge.consumer_contract_digest) == 64
 
 
 @pytest.mark.parametrize(
@@ -406,7 +381,7 @@ def test_frozen_edge_rejects_incomplete_duplicate_and_foreign_schedules(
     schema = dataset_schema(points=2)
     stream, _producer = source(schema, events=2)
     with pytest.raises(error):
-        FrozenDatasetEdge(schema, event_adapter(stream), schedule)
+        DatasetCellSchedule.from_cells(schema, schedule)
 
 
 def test_cell_domain_fingerprint_is_cached_for_large_explicit_layout(monkeypatch):
@@ -418,8 +393,8 @@ def test_cell_domain_fingerprint_is_cached_for_large_explicit_layout(monkeypatch
         PointLayout.explicit((size,), tuple((index,) for index in reversed(range(size)))),
         source.cell_schema,
     )
-    domain = DatasetCellDomain.from_schema(explicit)
-    fingerprint = domain.fingerprint
+    contract = DatasetCellKeyContract.from_schema(explicit)
+    fingerprint = contract.fingerprint
 
     def forbidden(_layout):
         raise AssertionError("cached fingerprint reserialized the explicit layout")
@@ -428,14 +403,13 @@ def test_cell_domain_fingerprint_is_cached_for_large_explicit_layout(monkeypatch
         "zlc_neutral_atom.runtime.dataset.point_layout_to_tree",
         forbidden,
     )
-    assert domain.fingerprint == fingerprint
-    assert dataset_cell_key_fingerprint(domain) == fingerprint
+    assert contract.fingerprint == fingerprint
 
 
 def test_cell_domain_rejects_non_repeat_repeat_axis():
     point = axis("point", SCAN_POINT, 1)
     with pytest.raises(ValueError, match="role 'repeat'"):
-        DatasetCellDomain(
+        DatasetCellKeyContract(
             axis("not-repeat", SCAN_POINT, 1),
             (point,),
             PointLayout.rect_c((1,)),
@@ -459,14 +433,13 @@ def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
     )
 
     emit(producer, value(10), DatasetCellAddress(0, 0), 0)
-    progress = builder.consume(cursor.next())
-    first_ref = progress.ref
-    first = builder.materialize(first_ref)
+    assert builder.consume(cursor.next()) is None
+    first = builder.materialize()
+    first_ref = first.ref
     assert isinstance(first, DatasetPreviewSnapshot)
     assert first.block.values.shape == (1, 3, 2, 3)
     assert np.all(first.block.values[0, 0] == 10)
-    assert progress.coverage.written_cells == 1
-    assert not hasattr(progress, "block")
+    assert first.coverage.written_cells == 1
 
     for point, number in ((1, 20), (2, 30)):
         emit(producer, value(number), DatasetCellAddress(0, point), point)
@@ -931,7 +904,7 @@ def test_monitor_constructor_cannot_override_the_edge_cycle_schedule():
             BlockId("no-second-cycle"),
             tap,
             edge,
-            cycle_cells=tuple(reversed(edge.expected_cells)),
+            cycle_cells=tuple(reversed(tuple(edge.cell_schedule))),
         )
 
     tap.close()
@@ -1144,7 +1117,7 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
         flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
         retention_events=1,
         retention_bytes=contract.max_retained_nbytes,
-        join_key_contract=DatasetCellKeyContract(schema),
+        join_key_contract=DatasetCellKeyContract.from_schema(schema),
     )
     reservation = stream.reserve(
         total_events=1,

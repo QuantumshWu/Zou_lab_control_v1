@@ -1,116 +1,109 @@
+"""Current declarative pulse application and Workbench composition boundary."""
+
 from __future__ import annotations
 
+from dataclasses import fields
 import inspect
 from pathlib import Path
 
-import pytest
-
-from Zou_lab_control.neutral_atom.ports import PortCatalog
-from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
-from zlc_workbench.pulse_control import PulseCommandPort, PulseTargetDescriptor
-
-
-class _Facade:
-    def __init__(self):
-        self.calls = []
-
-    def prepare(self, payload):
-        self.calls.append(("prepare", payload))
-        return "prepared"
-
-    def fire(self, payload=None):
-        self.calls.append(("fire", payload))
-        return "running"
-
-    def set_safe_state(self):
-        self.calls.append(("safe", None))
-
-    def scan_progress(self):
-        self.calls.append(("progress", None))
-        return {"scanning": False}
-
-    def snapshot(self):
-        self.calls.append(("snapshot", None))
-        return {"state": "safe"}
+from Zou_lab_control.workbench import (
+    open_offline_pulse_workbench,
+    open_pulse_workbench,
+)
+from zlc_neutral_atom.installation import DeviceRef
+from zlc_neutral_atom.pulse_application import (
+    PulseRunRequest,
+    PulseTargetDescriptor,
+)
+from zlc_pulse import (
+    PulseExecutionForm,
+    load_pulse_document,
+    resolve_api_parameters,
+)
 
 
-def _target(generation=1):
+ROOT = Path(__file__).parents[1]
+IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+
+
+def _descriptor() -> PulseTargetDescriptor:
+    document = load_pulse_document(IMAGING_TEMPLATE)
     return PulseTargetDescriptor(
-        "installation-a",
-        generation,
-        PortCatalog.from_channels(["ch00", "ch01"]),
+        DeviceRef("installation-a", "runtime-a", "sequencer"),
+        document.target,
         50e6,
-        "Virtual installation",
+        0x1234ABCD,
+        4_096,
     )
 
 
-def test_command_port_runs_semantic_pulse_commands_without_raw_escape():
-    facade = _Facade()
-    port = PulseCommandPort(facade, _target(), lambda: 1)
-    state = PulseTableState(port_catalog=port.target.port_catalog)
+def test_pulse_target_descriptor_is_capability_free() -> None:
+    descriptor = _descriptor()
 
-    assert port.prepare(state) == "prepared"
-    assert port.run(state) == "prepared"
-    port.stop()
-    assert port.scan_progress() == {"scanning": False}
-    assert port.snapshot() == {"state": "safe"}
-    assert [name for name, _ in facade.calls] == [
-        "prepare",
-        "safe",
+    assert {field.name for field in fields(PulseTargetDescriptor)} == {
+        "sequencer_ref",
+        "target",
+        "clock_hz",
+        "geometry_fingerprint",
+        "resident_scan_point_capacity",
+    }
+    assert descriptor.time_step_ns == 20.0
+    for forbidden in (
+        "sequencer",
         "prepare",
         "fire",
-        "safe",
-        "progress",
-        "snapshot",
-    ]
-    assert not hasattr(port, "sequencer")
-    assert not hasattr(port, "fire")
-    assert not hasattr(port, "set_safe_state")
-
-
-def test_stale_generation_fails_before_any_facade_call():
-    facade = _Facade()
-    port = PulseCommandPort(facade, _target(generation=4), lambda: 5)
-
-    with pytest.raises(RuntimeError, match="stale installation generation"):
-        port.stop()
-    assert facade.calls == []
-
-
-def test_frontend_pulse_api_cannot_accept_or_construct_raw_hardware():
-    from Zou_lab_control.frontend.pulse_gui import (
-        PulseSequenceEditor,
-        show_pulse_gui,
-    )
-
-    for callable_ in (PulseSequenceEditor, show_pulse_gui):
-        parameters = inspect.signature(callable_).parameters
-        assert "sequencer" not in parameters
-        assert "experiment" not in parameters
-        assert "target_descriptor" in parameters
-        assert "command_port" in parameters
-
-    source = Path(inspect.getsourcefile(PulseSequenceEditor)).read_text(
-        encoding="utf-8"
-    )
-    for forbidden in (
-        "RemoteSequencer",
-        "VirtualSequencer",
-        "self.sequencer",
-        "experiment.devices",
+        "set_safe_state",
+        "execute_command",
     ):
-        assert forbidden not in source
+        assert not hasattr(descriptor, forbidden)
 
 
-def test_standalone_launcher_composes_a_session_instead_of_raw_adapters():
-    root = Path(__file__).resolve().parents[1]
-    source = (root / "pulse_gui.py").read_text(encoding="utf-8")
+def test_pulse_run_request_freezes_intent_without_a_hardware_callback() -> None:
+    descriptor = _descriptor()
+    document = load_pulse_document(IMAGING_TEMPLATE)
+    document = resolve_api_parameters(
+        document,
+        {
+            parameter.parameter_id: document.field_value(parameter.field)[0]
+            for parameter in document.api_parameters
+        },
+    )
+    request = PulseRunRequest(
+        document,
+        PulseExecutionForm.STATIC_ONCE,
+        descriptor.sequencer_ref,
+        3.0,
+    )
 
-    assert 'na.connect("virtual")' in source
-    assert '"remote_template"' in source
-    assert "managed_pulse_command_port" in source
-    assert "na.RemoteSequencer" not in source
-    assert "na.VirtualSequencer" not in source
-    assert "sequencer" not in inspect.signature(
-        __import__("Zou_lab_control.frontend", fromlist=["show_pulse_gui"]).show_pulse_gui
-    ).parameters
+    assert request.document is document
+    assert request.sequencer_ref == descriptor.sequencer_ref
+    assert request.execution_form is PulseExecutionForm.STATIC_ONCE
+    assert {field.name for field in fields(PulseRunRequest)} == {
+        "document",
+        "execution_form",
+        "sequencer_ref",
+        "timeout_seconds",
+    }
+    assert not hasattr(request, "port")
+    assert not hasattr(request, "device")
+
+
+def test_current_workbench_entry_points_never_accept_a_raw_sequencer() -> None:
+    online = inspect.signature(open_pulse_workbench).parameters
+    offline = inspect.signature(open_offline_pulse_workbench).parameters
+
+    assert tuple(online) == ("experiment", "document", "path")
+    assert "sequencer" not in online and "command_port" not in online
+    assert "sequencer" not in offline and "command_port" not in offline
+    assert "target" in offline and "time_step_ns" in offline
+
+
+def test_standalone_launcher_composes_the_current_product_surface() -> None:
+    source = (ROOT / "pulse_gui.py").read_text(encoding="utf-8")
+
+    assert 'connect(\n            "virtual"' in source
+    assert "open_pulse_workbench" in source
+    assert "open_offline_pulse_workbench" in source
+    assert "managed_pulse_command_port" not in source
+    assert "RemoteSequencer" not in source
+    assert "VirtualSequencer" not in source

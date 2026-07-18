@@ -35,6 +35,7 @@ from zlc_pulse import (
 
 
 ROOT = Path(__file__).parents[1]
+IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
 
 
 def test_freeze_scan_table_names_columns_and_reports_clock_normalization():
@@ -84,10 +85,10 @@ def test_free_form_scan_expressions_cannot_enter_authoring_values():
 
 
 def test_api_resolution_uses_semantic_identity_and_changes_only_its_field():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_TEMPLATE)
     before = tuple(period.duration for period in document.periods)
 
-    resolved = resolve_api_parameters(document, {"readout_exposure": 0.007})
+    resolved = resolve_api_parameters(document, {"readout_probe_duration": 0.007})
 
     after = tuple(period.duration for period in resolved.periods)
     assert before == tuple(period.duration for period in document.periods)
@@ -99,7 +100,7 @@ def test_api_resolution_uses_semantic_identity_and_changes_only_its_field():
 
 
 def test_delay_api_requires_and_updates_one_explicit_logical_port_delay():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_TEMPLATE)
     delay_ref = PulseFieldRef("delay", None, "ch11")
     document = replace(
         document,
@@ -155,18 +156,18 @@ def test_period_removal_preflights_and_reports_every_cascade():
 
 
 def test_api_bound_period_removal_is_never_silent():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_TEMPLATE)
 
     with pytest.raises(DestructivePulseEditError) as caught:
         remove_period(document, "p4")
 
-    assert caught.value.impact.removed_api_parameters == ("readout_exposure",)
+    assert caught.value.impact.removed_api_parameters == ("readout_probe_duration",)
     result = remove_period(document, "p4", cascade=True)
-    assert "readout_exposure" not in result.document.api_parameter_by_id
+    assert "readout_probe_duration" not in result.document.api_parameter_by_id
 
 
 def test_repeat_endpoints_use_period_identity_across_front_insertions():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_TEMPLATE)
     repeated = replace(document, repeat=RepeatRegion("p2", "p4", 3))
     added = new_period(repeated, duration=100, unit="ns")
 
@@ -222,8 +223,8 @@ def test_scan_recipe_must_reproduce_table_and_remains_bound_to_freeze_context():
 
 
 def test_authoritative_api_and_field_edits_never_snap_silently():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
-    reference = document.api_parameter_by_id["readout_exposure"].field
+    document = load_pulse_document(IMAGING_TEMPLATE)
+    reference = document.api_parameter_by_id["readout_probe_duration"].field
     half_tick_seconds = (1_000_000_000_000 + 0.5) * 20e-9
 
     with pytest.raises(ValueError, match="not frozen"):
@@ -245,7 +246,7 @@ def test_authoritative_api_and_field_edits_never_snap_silently():
 
 
 def test_generated_period_identity_is_not_a_reusable_sequence_position():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(IMAGING_TEMPLATE)
     removed = remove_period(document, "p6", cascade=True).document
 
     created = new_period(removed)

@@ -1,47 +1,59 @@
-"""The new notebook API stays short without exposing the raw hardware graph."""
+"""The short notebook facade without leaking process-owned hardware authority."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
+import os
 from pathlib import Path
-from types import SimpleNamespace
+import subprocess
+import sys
+import threading
 
 import pytest
 
 import Zou_lab_control.notebook as zlc
 import Zou_lab_control.notebook.facade as facade_impl
-from Zou_lab_control.neutral_atom.devices.base import BaseDevice
-from Zou_lab_control.neutral_atom.devices.registry import DeviceSet
-from Zou_lab_control.neutral_atom.device_catalog import DeviceRef
-from zlc_data import (
-    FitNumericPolicy,
-    SPATIAL_X,
-    SPATIAL_Y,
-    encode_fit_result_batch,
-)
+from zlc_data import FitNumericPolicy, SPATIAL_X, SPATIAL_Y, encode_fit_result_batch
 from zlc_neutral_atom.artifacts import (
     CaptureArtifactRef,
-    CaptureFitResultRepository,
     CaptureFitResultArtifactRef,
+    CaptureFitResultRepository,
     CaptureRepository,
 )
+from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.readout.calibration_repository import CalibrationRepository
 from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
+from zlc_neutral_atom.runtime.ports import BoundDevice
+from zlc_neutral_atom.runtime.run import RunPlan
 from zlc_storage import RepositoryRootBusy
-from zlc_neutral_atom.runtime import BoundDevice, RunPlan
 
 
-ROOT = Path(__file__).parents[1]
+ROOT = Path(__file__).resolve().parents[1]
+IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
 
 
-def test_virtual_connect_capture_load_is_a_short_current_api(tmp_path):
-    exp = zlc.connect("virtual", repository=tmp_path / "workspace")
+def _expect(error_type, text: str, operation):
     try:
-        request = exp.readout.capture_request(
-            ROOT / "pulses" / "imaging_template.json"
-        )
+        operation()
+    except error_type as error:
+        assert text in str(error), str(error)
+        return error
+    raise AssertionError(f"expected {error_type.__name__}: {text}")
+
+
+def _assert_repository_roots_released(root: Path) -> None:
+    CaptureRepository(root / "captures").close()
+    CalibrationRepository(root / "calibrations").close()
+    CaptureFitResultRepository(root / "fits").close()
+
+
+def _case_capture_and_fit(root: Path) -> None:
+    with zlc.connect("virtual", repository=root) as exp:
+        request = exp.readout.capture_request(IMAGING_PULSE)
         assert request.camera_ref == exp.device_catalog["camera"].ref
         assert request.sequencer_ref == exp.device_catalog["sequencer"].ref
+
         descriptor = exp.inspect(request)
         assert descriptor.camera_role == "camera"
         assert descriptor.sequencer_role == "sequencer"
@@ -55,44 +67,25 @@ def test_virtual_connect_capture_load_is_a_short_current_api(tmp_path):
         assert isinstance(reference, CaptureArtifactRef)
         artifact = exp.readout.load_capture(reference)
         assert artifact.frame_source.schema.physical_shape == descriptor.output_shape
-        assert artifact.pulse_lineage is not None
-        assert (
-            artifact.pulse_lineage.compiled_artifact.fingerprint
-            == descriptor.compiled_pulse_digest
-        )
-        assert artifact.pulse_lineage.expected_trigger_count == 3
-        assert (
-            artifact.frame_source.cell_schedule
-            == artifact.pulse_lineage.cell_plan.expected_cells
+        evidence = artifact.pulse_evidence
+        assert evidence is not None
+        assert evidence.compiled_artifact.fingerprint == descriptor.compiled_pulse_digest
+        assert evidence.expected_trigger_count == descriptor.expected_frames
+        assert tuple(artifact.frame_source.iter_cell_schedule()) == tuple(
+            evidence.join_contract.iter_cell_schedule(
+                evidence.trigger_schedule,
+                artifact.frame_source.schema,
+            )
         )
         assert tuple(
             setting.event_index
             for setting in artifact.camera_provenance.descriptor.event_settings
         ) == (0, 1, 2)
-        assert not hasattr(artifact.camera_provenance, "readout_event_index")
-        assert not hasattr(artifact.camera_provenance, "frame_contract")
-    finally:
-        exp.close()
-        exp.close()
 
-
-def test_readout_capture_convenience_uses_the_same_authoritative_path(tmp_path):
-    with zlc.connect("virtual", repository=tmp_path / "workspace") as exp:
-        reference = exp.readout.capture(
-            ROOT / "pulses" / "imaging_template.json"
-        )
-        assert exp.readout.load_capture(reference).pulse_lineage is not None
-
-
-def test_capture_fit_save_load_is_short_headless_and_preserves_named_batch_axes(
-    tmp_path,
-):
-    with zlc.connect("virtual", repository=tmp_path / "workspace") as exp:
-        capture_ref = exp.readout.capture(
-            ROOT / "pulses" / "imaging_template.json"
-        )
+        convenience_reference = exp.readout.capture(IMAGING_PULSE)
+        assert exp.readout.load_capture(convenience_reference).pulse_evidence is not None
         execution = exp.fit(
-            capture_ref,
+            convenience_reference,
             model="radial_gaussian_center",
             numeric_policy=FitNumericPolicy(
                 max_evaluations=500,
@@ -113,143 +106,214 @@ def test_capture_fit_save_load_is_short_headless_and_preserves_named_batch_axes(
         assert isinstance(fit_ref, CaptureFitResultArtifactRef)
         admitted = exp.load_fit(fit_ref)
         assert admitted.reference == fit_ref
-        assert admitted.source_capture_ref == capture_ref
+        assert admitted.source_capture_ref == convenience_reference
         assert encode_fit_result_batch(admitted.result) == encode_fit_result_batch(
             execution.result
         )
 
 
-def test_public_experiment_graph_contains_no_drive_capability(tmp_path):
-    exp = zlc.connect("virtual", repository=tmp_path / "workspace")
-    forbidden = (BaseDevice, DeviceSet, BoundDevice, RunPlan)
+def _case_public_authority_and_validation(root: Path) -> None:
+    exp = zlc.connect("virtual", repository=root)
     try:
-        public_values = [
+        forbidden = (BoundDevice, RunPlan)
+        public_values = (
             exp.name,
             exp.device_catalog,
             exp.readout,
-            exp.timing,
-            exp.timing.target,
-        ]
-        assert not any(isinstance(value, forbidden) for value in public_values)
-        assert not hasattr(exp, "devices")
-        assert not hasattr(exp, "camera")
-        assert not hasattr(exp, "sequencer")
-        assert not hasattr(exp.readout, "camera")
-        assert not hasattr(exp.timing, "sequencer")
-    finally:
-        exp.close()
-
-
-def test_connect_requires_an_explicit_repository_root():
-    with pytest.raises(TypeError):
-        zlc.connect("virtual")  # type: ignore[call-arg]
-
-    with pytest.raises(TypeError, match="workspace root"):
-        zlc.connect(
-            "virtual",
-            repository=CaptureRepository,
+            exp.pulse,
+            exp.pulse.target,
         )
+        assert not any(isinstance(value, forbidden) for value in public_values)
+        for attribute in ("devices", "camera", "sequencer"):
+            assert not hasattr(exp, attribute)
+        assert not hasattr(exp.readout, "camera")
+        assert not hasattr(exp.pulse, "sequencer")
 
-
-def test_camera_wiring_mismatch_fails_before_start(tmp_path):
-    exp = zlc.connect("virtual", repository=tmp_path / "workspace")
-    try:
-        request = exp.readout.capture_request(
-            ROOT / "pulses" / "imaging_template.json",
+        _expect(
+            ValueError,
+            "not 'camera'",
+            lambda: exp.readout.capture_request(
+                IMAGING_PULSE,
+                camera_role="sequencer",
+            ),
+        )
+        wiring_request = exp.readout.capture_request(
+            IMAGING_PULSE,
             trigger_channel="mot_trigger",
         )
-        with pytest.raises(ValueError, match="not wired"):
-            exp.inspect(request)
-        assert exp.device_catalog.availability.value == "available"
-    finally:
-        exp.close()
+        _expect(ValueError, "not wired", lambda: exp.inspect(wiring_request))
 
-
-def test_capture_request_rejects_wrong_domain_and_stale_device_generation(tmp_path):
-    with zlc.connect("virtual", repository=tmp_path / "workspace") as exp:
-        with pytest.raises(ValueError, match="not 'camera'"):
-            exp.readout.capture_request(
-                ROOT / "pulses" / "imaging_template.json",
-                camera_role="sequencer",
-            )
-
-        request = exp.readout.capture_request(
-            ROOT / "pulses" / "imaging_template.json"
-        )
+        request = exp.readout.capture_request(IMAGING_PULSE)
         stale = DeviceRef(
             request.camera_ref.installation_id,
-            request.camera_ref.installation_generation + 1,
+            request.camera_ref.runtime_instance_id + "-stale",
             request.camera_ref.role,
         )
-        with pytest.raises(RuntimeError, match="stale installation generation"):
-            exp.inspect(replace(request, camera_ref=stale))
-
-
-def test_experiment_owns_typed_sibling_repositories_until_close(tmp_path):
-    root = tmp_path / "experiment-workspace"
-    exp = zlc.connect("virtual", repository=root)
-    try:
-        with pytest.raises(RepositoryRootBusy, match="live owner"):
-            CaptureRepository(root / "captures")
-        with pytest.raises(RepositoryRootBusy, match="live owner"):
-            CalibrationRepository(root / "calibrations")
-        with pytest.raises(RepositoryRootBusy, match="live owner"):
-            CaptureFitResultRepository(root / "fits")
-    finally:
-        exp.close()
-
-    CaptureRepository(root / "captures").close()
-    CalibrationRepository(root / "calibrations").close()
-    CaptureFitResultRepository(root / "fits").close()
-
-
-def test_failed_composition_releases_all_repository_roots(tmp_path):
-    root = tmp_path / "failed-workspace"
-    with pytest.raises(TypeError, match="string indices"):
-        zlc.connect(
-            {"schema": "not-a-device-config"},
-            repository=root,
+        _expect(
+            RuntimeError,
+            "another runtime instance",
+            lambda: exp.inspect(replace(request, camera_ref=stale)),
         )
-    CaptureRepository(root / "captures").close()
-    CalibrationRepository(root / "calibrations").close()
-    CaptureFitResultRepository(root / "fits").close()
 
+        _expect(
+            RepositoryRootBusy,
+            "live owner",
+            lambda: CaptureRepository(root / "captures"),
+        )
+        _expect(
+            RepositoryRootBusy,
+            "live owner",
+            lambda: CaptureFitResultRepository(root / "fits"),
+        )
 
-def test_failed_composition_reports_runtime_that_did_not_shutdown(
-    tmp_path,
-    monkeypatch,
-):
-    root = tmp_path / "failed-runtime-workspace"
-
-    class _RuntimeThatWillNotShutdown:
-        def __init__(self, _devices, **_kwargs):
-            self.asset_map = SimpleNamespace(revision="a" * 64)
-
-        def shutdown(self, *, timeout):
-            assert timeout == 2.0
-            return False
-
-    monkeypatch.setattr(
-        facade_impl,
-        "LegacyNeutralAtomRuntime",
-        _RuntimeThatWillNotShutdown,
-    )
-
-    def fail_catalog(*_args, **_kwargs):
-        raise ValueError("catalog construction failed")
-
-    monkeypatch.setattr(facade_impl, "_catalog_from_device_set", fail_catalog)
-    with pytest.raises(RuntimeError, match="cleanup deadline") as caught:
-        zlc.connect("virtual", repository=root)
-    assert isinstance(caught.value.__cause__, ValueError)
-    CaptureRepository(root / "captures").close()
-    CalibrationRepository(root / "calibrations").close()
-    CaptureFitResultRepository(root / "fits").close()
-
-
-def test_readout_binding_view_is_typed_without_session_calibration_state(tmp_path):
-    with zlc.connect("virtual", repository=tmp_path / "workspace") as exp:
         bound = exp.readout.for_binding(ReadoutBindingKey("camera"))
         assert not hasattr(bound, "current_calibration_ref")
-        with pytest.raises(ValueError, match="cannot switch"):
-            bound.for_binding("sequencer")
+        _expect(ValueError, "cannot switch", lambda: bound.for_binding("sequencer"))
+    finally:
+        exp.close()
+        exp.close()
+    _assert_repository_roots_released(root)
+
+
+def _case_close_retry(root: Path) -> None:
+    exp = zlc.connect("virtual", repository=root)
+    token = exp._authority_token
+    services = facade_impl._AUTHORITIES[token]
+    borrow = services.capture_repository._root_lease.borrow()
+    try:
+        _expect(facade_impl._ResourceCleanupError, "close failed", exp.close)
+        assert facade_impl._AUTHORITIES[token] is services
+        assert services.state == "CLOSING"
+        _expect(
+            RuntimeError,
+            "closing or closed",
+            lambda: exp.readout.load_capture(object()),
+        )
+    finally:
+        borrow.close()
+    exp.close()
+    assert token not in facade_impl._AUTHORITIES
+    _assert_repository_roots_released(root)
+
+
+def _case_close_race(root: Path, surface: str) -> None:
+    exp = zlc.connect("virtual", repository=root)
+    services = facade_impl._AUTHORITIES[exp._authority_token]
+    passed_initial_lookup = threading.Event()
+    backend_calls: list[str] = []
+    failures: list[BaseException] = []
+    original_guard = facade_impl._service_guard
+
+    @contextmanager
+    def observed_guard(token):
+        passed_initial_lookup.set()
+        with original_guard(token) as value:
+            yield value
+
+    facade_impl._service_guard = observed_guard
+    if surface == "capture":
+        type(services.capture_repository).load = (
+            lambda _self, _reference: backend_calls.append("capture-load")
+        )
+        operation = lambda: exp.readout.load_capture(object())
+    else:
+        type(services.runtime).pulse_port = (
+            lambda _self, _reference: backend_calls.append("pulse-port")
+        )
+        operation = lambda: exp.pulse.target
+
+    def invoke() -> None:
+        try:
+            operation()
+        except BaseException as error:
+            failures.append(error)
+
+    with services.operation_lock:
+        thread = threading.Thread(target=invoke, daemon=False)
+        thread.start()
+        assert passed_initial_lookup.wait(1.0)
+        exp.close()
+    thread.join(2.0)
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], RuntimeError)
+    assert str(failures[0]) == "Experiment is closing or closed"
+    assert backend_calls == []
+
+
+def _case_failed_public_root(root: Path) -> None:
+    authority_count = len(facade_impl._AUTHORITIES)
+
+    def reject_public_root(*_args, **_kwargs):
+        raise RuntimeError("public root construction failed")
+
+    facade_impl.Experiment = reject_public_root
+    error = _expect(
+        RuntimeError,
+        "public root construction failed",
+        lambda: zlc.connect("virtual", repository=root),
+    )
+    assert error.__cause__ is None
+    assert len(facade_impl._AUTHORITIES) == authority_count
+    _assert_repository_roots_released(root)
+
+
+def _run_case(case: str, root_text: str) -> None:
+    root = Path(root_text)
+    cases = {
+        "capture-and-fit": lambda: _case_capture_and_fit(root),
+        "public-authority": lambda: _case_public_authority_and_validation(root),
+        "close-retry": lambda: _case_close_retry(root),
+        "close-race-capture": lambda: _case_close_race(root, "capture"),
+        "close-race-pulse": lambda: _case_close_race(root, "pulse"),
+        "failed-public-root": lambda: _case_failed_public_root(root),
+    }
+    cases[case]()
+
+
+def _run_isolated(case: str, root: Path) -> subprocess.CompletedProcess[str]:
+    command = (
+        "import runpy,sys; "
+        "runpy.run_path(sys.argv[1])['_run_case'](sys.argv[2], sys.argv[3])"
+    )
+    environment = os.environ.copy()
+    environment.setdefault("QT_QPA_PLATFORM", "offscreen")
+    return subprocess.run(
+        (sys.executable, "-c", command, str(Path(__file__).resolve()), case, str(root)),
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "capture-and-fit",
+        "public-authority",
+        "close-retry",
+        "close-race-capture",
+        "close-race-pulse",
+        "failed-public-root",
+    ),
+)
+def test_notebook_facade_in_process_lifetime_installation(
+    case: str,
+    tmp_path: Path,
+) -> None:
+    completed = _run_isolated(case, tmp_path / case)
+    assert completed.returncode == 0, (
+        f"isolated notebook case {case!r} failed\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
+
+
+def test_connect_rejects_implicit_or_non_string_target(tmp_path: Path) -> None:
+    with pytest.raises(TypeError):
+        zlc.connect("virtual")  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="explicit target backend"):
+        zlc.connect({}, repository=tmp_path / "workspace")  # type: ignore[arg-type]

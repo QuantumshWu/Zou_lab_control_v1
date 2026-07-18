@@ -63,7 +63,7 @@ class RecordingBackend:
 
 
 def _artifact(params=None, execution_form=PulseExecutionForm.STATIC_ONCE):
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
     return compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -77,7 +77,7 @@ def test_server_executes_one_exact_current_artifact_and_returns_schedule_receipt
     artifact = _artifact()
     backend = RecordingBackend()
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
         connection_generation="server-generation-1",
@@ -102,7 +102,7 @@ def test_server_messages_are_current_canonical_owner_codecs():
     artifact = _artifact()
     backend = RecordingBackend()
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
         connection_generation="server-generation-1",
@@ -145,7 +145,7 @@ def test_completed_receipt_is_replayed_without_reentering_the_backend():
     artifact = _artifact()
     backend = RecordingBackend()
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
         connection_generation="server-generation-1",
@@ -169,7 +169,7 @@ def test_stale_generation_and_geometry_fail_before_backend_prepare():
     artifact = _artifact()
     backend = RecordingBackend()
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
         connection_generation="server-generation-1",
@@ -204,7 +204,7 @@ def test_wire_image_must_equal_the_deterministic_current_ir_packing():
     )
     backend = RecordingBackend()
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
     )
@@ -219,7 +219,7 @@ def test_timeout_is_not_reported_as_a_completed_schedule():
     backend = RecordingBackend()
     backend.done = False
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
     )
@@ -256,7 +256,7 @@ def test_independent_safe_interrupts_a_blocked_completion_without_waiting_for_it
 
     backend = BlockingBackend()
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
     )
@@ -288,7 +288,7 @@ def test_safe_during_artifact_validation_is_a_terminal_admission_fence(monkeypat
     artifact = _artifact()
     backend = RecordingBackend()
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
     )
@@ -327,7 +327,7 @@ def test_continuous_execution_has_no_false_logical_completion():
     artifact = _artifact(execution_form=PulseExecutionForm.CONTINUOUS_MONITOR)
     backend = RecordingBackend()
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
     )
@@ -345,7 +345,7 @@ def test_failed_safe_is_never_published_as_safe():
     backend = RecordingBackend()
     backend.fail_safe = True
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
     )
@@ -361,7 +361,7 @@ def test_new_connection_generation_permanently_invalidates_old_prepared_refs():
     artifact = _artifact()
     backend = RecordingBackend()
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
         connection_generation="server-generation-1",
@@ -384,7 +384,7 @@ def test_interrupt_receipt_never_leaks_a_new_connection_generation(monkeypatch):
     artifact = _artifact()
     backend = RecordingBackend()
     service = PulseExecutionService(
-        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json").target,
         clock_hz=50e6,
         backend=backend,
         connection_generation="old-generation",
@@ -393,11 +393,13 @@ def test_interrupt_receipt_never_leaks_a_new_connection_generation(monkeypatch):
     original = service._safe_state
 
     def disconnect_and_replace_owner(*, expected_generation):
-        original(expected_generation=expected_generation)
+        receipt = original(expected_generation=expected_generation)
         service.renew_connection_generation()
+        return receipt
 
     monkeypatch.setattr(service, "_safe_state", disconnect_and_replace_owner)
 
-    with pytest.raises(RuntimeError, match="changed before safe receipt"):
-        service.safe_state_for_generation("old-generation")
+    receipt = service.safe_state_for_generation("old-generation")
+    assert receipt["connection_generation"] == "old-generation"
+    assert receipt["state"] == "SAFE"
     assert service.connection_generation != "old-generation"

@@ -1,816 +1,229 @@
-"""Adversarial authority, resource, and recovery gates for raw captures."""
+"""Final-only repository authority and crash-reconciliation contracts."""
 
 from __future__ import annotations
 
-from dataclasses import replace
-import gc
-import pickle
-import shutil
-import threading
-
 import pytest
 
-from tests.test_capture_artifact_repository import (
-    _deliver_when_armed,
-    _runtime_and_spec,
-)
-from zlc_neutral_atom.artifacts.capture import (
-    AdmittedCapture,
-    CAPTURE_ARTIFACT_SCHEMA,
-    CaptureArtifactRef,
-    CaptureRepository,
-    CaptureRepositoryResourcePolicy,
-    CaptureResourceExceeded,
-    DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY,
-)
-from zlc_neutral_atom import artifacts as artifact_api
-from zlc_neutral_atom.runtime import (
-    CommitIntent,
-    CommitKind,
-    CommitTarget,
-    PublishVisibilityUnknown,
-    RunFailed,
-    compile_pipeline,
-)
+from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.commit import (
+    CommitTarget,
+    FinalCommit,
     PersistentCommitJournal,
-    _journal_mutation_authority,
+    PublishVisibilityUnknown,
+    PublishedManifest,
+    RepositoryCommitCoordinator,
 )
-from zlc_storage import (
-    ContentAddressedStore,
-    DirectoryDurabilityError,
-    RepositoryRootBusy,
-    content_ref_from_tree,
-    decode,
-)
+from zlc_neutral_atom.runtime.resources import ResourceArbiter
+from zlc_neutral_atom.runtime.run import RunController, RunFailed, RunPlan
+from zlc_neutral_atom.runtime.safety_journal import PersistentSafetyJournal
+from zlc_storage import RepositoryRootLease
 
 
-@pytest.fixture
-def capture_runtime():
-    camera, runtime, spec = _runtime_and_spec()
-    try:
-        yield camera, runtime, spec
-    finally:
-        assert runtime.shutdown(timeout=2.0)
+_DIGEST = "a" * 64
 
 
-def _images():
-    import numpy as np
-
-    return (
-        np.full((6, 8), 11, dtype=np.uint16),
-        np.full((6, 8), 23, dtype=np.uint16),
-    )
-
-
-def _commit_capture(
-    repository: CaptureRepository,
-    camera,
-    runtime,
-    spec,
-    *,
-    checkpoint: bool = False,
-    both: bool = False,
-):
-    base = compile_pipeline(spec)
-
-    def finalize(context, result):
-        if both:
-            checkpoint_ref = context.commit_checkpoint(
-                repository.checkpoint_commit(context, result)
-            )
-            final_ref = context.commit_final(repository.final_commit(context, result))
-            assert checkpoint_ref == final_ref
-            return final_ref
-        if checkpoint:
-            return context.commit_checkpoint(
-                repository.checkpoint_commit(context, result)
-            )
-        return context.commit_final(repository.final_commit(context, result))
-
-    plan = replace(
-        base,
-        name="capture authority fixture",
-        finalize=finalize,
-        requires_final_commit=not checkpoint or both,
-    )
-    thread, failures = _deliver_when_armed(camera, _images())
-    try:
-        handle = runtime.controller.start(plan)
-        reference = handle.result(3.0)
-        thread.join(2.0)
-        assert not thread.is_alive()
-        assert failures == []
-        return handle, reference
-    finally:
-        if thread.is_alive():
-            camera.finish_record_capture()
-            thread.join(2.0)
-
-
-def _manifest(repository: CaptureRepository, reference: CaptureArtifactRef):
-    payload = repository._store_authority.read_manifest(
-        "capture",
-        reference.manifest_digest,
-        max_bytes=repository.resource_policy.max_manifest_bytes,
-    )
-    return decode(payload)
-
-
-def _pending_intent(
-    reference: CaptureArtifactRef,
-    artifact,
-    *,
-    kind: CommitKind,
-    commit_id: str | None = None,
-) -> CommitIntent:
-    operation = "final" if kind is CommitKind.FINAL else "checkpoint"
-    return CommitIntent(
-        kind=kind,
-        commit_id=(
-            commit_id
-            or f"capture-{operation}-{artifact.run_id}-{reference.manifest_digest}"
-        ),
-        run_id=artifact.run_id,
-        safety_bundle_id=artifact.safety_bundle_id,
-        target=CommitTarget(
-            reference.repository_id,
+class _CommitHarness:
+    def __init__(self, tmp_path, *, publish=None, recover=None) -> None:
+        self.root = tmp_path / "repository"
+        self.root_lease = RepositoryRootLease(self.root)
+        self.journal = PersistentCommitJournal(
+            self.root / "final-commit.zlcj",
+            "capture-repository",
+        )
+        self.target = CommitTarget(
+            "capture-repository",
             "capture",
-            CAPTURE_ARTIFACT_SCHEMA,
-            reference.target_ref,
-            reference.manifest_digest,
-        ),
-        created_at=1.0,
-    )
+            "zlc_neutral_atom.CaptureArtifact",
+            f"capture/{_DIGEST}",
+            _DIGEST,
+        )
+        self.publish = (
+            (lambda: PublishedManifest(self.target.target_ref, _DIGEST, "published"))
+            if publish is None
+            else publish
+        )
+        self.recover = (lambda _intent: None) if recover is None else recover
+        self.coordinator = RepositoryCommitCoordinator(
+            self.journal,
+            self.recover,
+            root_lease=self.root_lease,
+        )
+        self.safety = PersistentSafetyJournal(tmp_path / "safety.zlcj")
+        self.resources = ResourceArbiter(self.safety)
+        self.controller = RunController(self.resources)
+
+    def operation(self, context, *, run_id=None, safety_bundle_id=None):
+        subject = context.authorize_commit_preparation()
+        selected_run = subject[0] if run_id is None else run_id
+        selected_safety = subject[1] if safety_bundle_id is None else safety_bundle_id
+        return self.coordinator.prepare(
+            f"capture-final-{selected_run}-{_DIGEST}",
+            selected_run,
+            selected_safety,
+            self.target,
+            self.publish,
+        )
+
+    def plan(self, finalize) -> RunPlan:
+        return RunPlan(
+            name="final commit authority fixture",
+            resource_claims=(),
+            bound_devices=(),
+            preflight=lambda _context: "prepared",
+            execute=lambda _context, prepared: prepared,
+            cleanup=lambda _context, _prepared, _primary: CleanupReport.safe(()),
+            finalize=finalize,
+            requires_final_commit=True,
+        )
+
+    def close(self) -> None:
+        assert self.controller.shutdown(2.0)
+        self.resources.shutdown()
+        self.coordinator.close()
 
 
-def test_capture_staging_holds_repository_before_first_cas_write(
-    tmp_path,
-    capture_runtime,
-    monkeypatch,
-):
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    entered = threading.Event()
-    release = threading.Event()
-    real_stage = CaptureRepository._stage_pipeline_result
+def test_final_commit_is_unforgeable_and_single_use(tmp_path) -> None:
+    harness = _CommitHarness(tmp_path)
 
-    def blocked_stage(owner, result, context):
-        if owner is repository:
-            entered.set()
-            if not release.wait(2.0):
-                raise TimeoutError("test did not release capture staging")
-        return real_stage(owner, result, context)
+    def finalize(context, _result):
+        operation = harness.operation(context)
+        assert isinstance(operation, FinalCommit)
+        first = context.commit_final(operation)
+        with pytest.raises(RuntimeError, match="already consumed"):
+            context.commit_final(operation)
+        return first
 
-    monkeypatch.setattr(CaptureRepository, "_stage_pipeline_result", blocked_stage)
-    base = compile_pipeline(spec)
-
-    def finalize(context, result):
-        return context.commit_final(repository.final_commit(context, result))
-
-    plan = replace(
-        base,
-        name="capture staging repository lifetime",
-        finalize=finalize,
-        requires_final_commit=True,
-    )
-    source, failures = _deliver_when_armed(camera, _images())
-    handle = runtime.controller.start(plan)
     try:
-        assert entered.wait(2.0)
+        handle = harness.controller.start(harness.plan(finalize))
+        assert handle.result(3.0) == "published"
+        assert handle.snapshot().final_committed
+        assert harness.journal.pending() == ()
+        committed = harness.journal.committed_for(harness.target)
+        assert len(committed) == 1
+        assert committed[0].commit_id.startswith("capture-final-")
+    finally:
+        harness.close()
+
+
+def test_finalize_failure_abandons_unconsumed_authority(tmp_path) -> None:
+    harness = _CommitHarness(tmp_path)
+
+    def finalize(context, _result):
+        harness.operation(context)
+        raise RuntimeError("synthetic finalize failure")
+
+    try:
+        with pytest.raises(RunFailed, match="synthetic finalize failure"):
+            harness.controller.start(harness.plan(finalize)).result(3.0)
+        assert harness.coordinator._authorities == {}
+        assert harness.journal.pending() == ()
+    finally:
+        harness.close()
+
+
+def test_commit_subject_mismatch_fails_without_publication(tmp_path) -> None:
+    published = []
+    harness = _CommitHarness(
+        tmp_path,
+        publish=lambda: published.append(True),
+    )
+
+    def finalize(context, _result):
+        operation = harness.operation(context, run_id="another-run")
+        return context.commit_final(operation)
+
+    try:
+        with pytest.raises(RunFailed, match="another Run"):
+            harness.controller.start(harness.plan(finalize)).result(3.0)
+        assert published == []
+        assert harness.journal.pending() == ()
+    finally:
+        harness.close()
+
+
+def test_unknown_publish_visibility_is_reconciled_by_the_repository_owner(
+    tmp_path,
+) -> None:
+    visible = {"value": False}
+    harness = None
+
+    def publish():
+        visible["value"] = True
+        raise PublishVisibilityUnknown("acknowledgement lost")
+
+    def recover(_intent):
+        if not visible["value"]:
+            return None
+        assert harness is not None
+        return PublishedManifest(
+            harness.target.target_ref,
+            _DIGEST,
+            "recovered",
+        )
+
+    harness = _CommitHarness(tmp_path, publish=publish, recover=recover)
+
+    def finalize(context, _result):
+        return context.commit_final(harness.operation(context))
+
+    try:
+        handle = harness.controller.start(harness.plan(finalize))
+        assert handle.result(3.0) == "recovered"
+        snapshot = handle.snapshot()
+        assert snapshot.final_committed
+        assert "acknowledgement lost" in snapshot.commit_recovery_warning
+        assert harness.journal.pending() == ()
+    finally:
+        harness.close()
+
+
+def test_absent_manifest_recovery_aborts_instead_of_forging_success(tmp_path) -> None:
+    def publish():
+        raise PublishVisibilityUnknown("visibility unknown")
+
+    harness = _CommitHarness(
+        tmp_path,
+        publish=publish,
+        recover=lambda _intent: None,
+    )
+
+    def finalize(context, _result):
+        return context.commit_final(harness.operation(context))
+
+    try:
+        with pytest.raises(RunFailed, match="visibility unknown"):
+            harness.controller.start(harness.plan(finalize)).result(3.0)
+        assert harness.journal.pending() == ()
+        assert harness.journal.committed_for(harness.target) == ()
+    finally:
+        harness.close()
+
+
+def test_coordinator_and_journal_have_no_checkpoint_or_kind_surface(tmp_path) -> None:
+    harness = _CommitHarness(tmp_path)
+    try:
+        assert not hasattr(harness.coordinator, "prepare_checkpoint")
+        assert not hasattr(harness.journal, "checkpoint")
+        assert not hasattr(harness.target, "kind")
+        assert not hasattr(harness.journal, "startup_reconciliations")
+    finally:
+        harness.close()
+
+
+def test_repository_root_cannot_close_while_authority_is_live(tmp_path) -> None:
+    harness = _CommitHarness(tmp_path)
+    operation = harness.coordinator.prepare(
+        "capture-final-detached-" + _DIGEST,
+        "detached",
+        None,
+        harness.target,
+        harness.publish,
+    )
+    try:
         with pytest.raises(RuntimeError, match="outstanding operations"):
-            repository.close()
-        release.set()
-        reference = handle.result(3.0)
-        source.join(2.0)
-        assert not source.is_alive() and failures == []
-        assert repository.admit(reference).reference == reference
+            harness.coordinator.close()
+        operation.abandon()
+        harness.coordinator.close()
     finally:
-        release.set()
-        if source.is_alive():
-            camera.finish_record_capture()
-            source.join(2.0)
-        repository.close()
-
-    CaptureRepository(repository.root).close()
-
-
-def _journal_writer(repository: CaptureRepository):
-    return _journal_mutation_authority(repository._journal)
-
-
-def test_visible_manifest_without_committed_intent_is_inspectable_but_not_admitted(
-    tmp_path,
-    capture_runtime,
-):
-    camera, runtime, spec = capture_runtime
-    source = CaptureRepository(tmp_path / "source", repository_id="captures")
-    _handle, reference = _commit_capture(source, camera, runtime, spec)
-
-    copied_root = tmp_path / "copied"
-    shutil.copytree(source.root / "content", copied_root / "content")
-    copied = CaptureRepository(copied_root, repository_id="captures")
-    assert copied.load(reference).ref == reference
-    with pytest.raises(PermissionError, match="no committed journal authority"):
-        copied.admit(reference)
-    assert not hasattr(copied, "put")
-
-
-def test_capture_authority_types_are_exposed_from_the_artifact_owner_package():
-    assert artifact_api.AdmittedCapture is AdmittedCapture
-    assert artifact_api.CaptureRepository is CaptureRepository
-    assert artifact_api.CaptureRepositoryResourcePolicy is CaptureRepositoryResourcePolicy
-    assert artifact_api.CaptureResourceExceeded is CaptureResourceExceeded
-    assert (
-        artifact_api.DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY
-        is DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY
-    )
-
-
-def test_prepared_unconsumed_authority_blocks_close_until_explicit_discard(
-    tmp_path,
-    capture_runtime,
-):
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    operations = []
-    base = compile_pipeline(spec)
-
-    def finalize(context, result):
-        operations.extend(
-            (
-                repository.checkpoint_commit(context, result),
-                repository.checkpoint_commit(context, result),
-            )
-        )
-        with pytest.raises(RuntimeError, match="outstanding operations"):
-            repository.close()
-        with pytest.raises(RepositoryRootBusy, match="live owner"):
-            CaptureRepository(repository.root)
-
-        operations[0].abandon()
-        tampered = operations[1].authority
-        object.__setattr__(
-            tampered,
-            "_preparation",
-            replace(tampered._preparation, commit_id="tampered-commit-id"),
-        )
-        tampered.abandon()
-        assert repository._coordinator._authorities == {}
-        return "prepared-only"
-
-    plan = replace(
-        base,
-        name="prepared capture authority lifetime",
-        finalize=finalize,
-        requires_final_commit=False,
-    )
-    thread, failures = _deliver_when_armed(camera, _images())
-    try:
-        handle = runtime.controller.start(plan)
-        assert handle.result(3.0) == "prepared-only"
-        thread.join(2.0)
-        assert not thread.is_alive() and failures == []
-    finally:
-        if thread.is_alive():
-            camera.finish_record_capture()
-            thread.join(2.0)
-
-    assert repository._coordinator._authorities == {}
-
-    repository.close()
-    reopened = CaptureRepository(repository.root)
-    reopened.close()
-
-
-def test_abandoned_authority_is_reclaimed_when_finalize_raises(
-    tmp_path,
-    capture_runtime,
-):
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    base = compile_pipeline(spec)
-
-    def finalize(context, result):
-        operation = repository.checkpoint_commit(context, result)
-        assert operation.commit_id.startswith("capture-checkpoint-")
-        raise RuntimeError("analysis failed after preparing capture commit")
-
-    plan = replace(
-        base,
-        name="abandoned capture authority",
-        finalize=finalize,
-        requires_final_commit=False,
-    )
-    thread, failures = _deliver_when_armed(camera, _images())
-    try:
-        handle = runtime.controller.start(plan)
-        with pytest.raises(RunFailed, match="analysis failed"):
-            handle.result(3.0)
-        thread.join(2.0)
-        assert not thread.is_alive() and failures == []
-    finally:
-        if thread.is_alive():
-            camera.finish_record_capture()
-            thread.join(2.0)
-
-    gc.collect()
-    assert repository._coordinator._authorities == {}
-    repository.close()
-    reopened = CaptureRepository(repository.root)
-    reopened.close()
-
-
-def test_inflight_commit_blocks_close_and_second_writer_without_poisoning_run(
-    tmp_path,
-    capture_runtime,
-    monkeypatch,
-):
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    publish_entered = threading.Event()
-    publish_release = threading.Event()
-    real_publish = ContentAddressedStore._publish_manifest
-
-    def blocked_publish(store, *args, **kwargs):
-        if store is repository._store:
-            publish_entered.set()
-            if not publish_release.wait(3.0):
-                raise TimeoutError("test did not release capture publication")
-        return real_publish(store, *args, **kwargs)
-
-    monkeypatch.setattr(
-        ContentAddressedStore,
-        "_publish_manifest",
-        blocked_publish,
-    )
-    journal_constructions = 0
-    real_journal_init = PersistentCommitJournal.__init__
-
-    def counted_journal_init(journal, *args, **kwargs):
-        nonlocal journal_constructions
-        journal_constructions += 1
-        real_journal_init(journal, *args, **kwargs)
-
-    monkeypatch.setattr(
-        PersistentCommitJournal,
-        "__init__",
-        counted_journal_init,
-    )
-    base = compile_pipeline(spec)
-
-    def finalize(context, result):
-        return context.commit_final(repository.final_commit(context, result))
-
-    plan = replace(
-        base,
-        name="capture publication lease race",
-        finalize=finalize,
-        requires_final_commit=True,
-    )
-    thread, failures = _deliver_when_armed(camera, _images())
-    try:
-        handle = runtime.controller.start(plan)
-        assert publish_entered.wait(2.0)
-        with pytest.raises(RuntimeError, match="outstanding operations"):
-            repository.close()
-        assert repository._root_lease.active
-        with pytest.raises(RepositoryRootBusy, match="live owner"):
-            CaptureRepository(repository.root)
-        assert journal_constructions == 0
-
-        publish_release.set()
-        reference = handle.result(3.0)
-        thread.join(2.0)
-        assert not thread.is_alive() and failures == []
-        assert repository.admit(reference).reference == reference
-    finally:
-        publish_release.set()
-        if thread.is_alive():
-            camera.finish_record_capture()
-            thread.join(2.0)
-
-    repository.close()
-    reopened = CaptureRepository(repository.root)
-    assert journal_constructions == 1
-    reopened.close()
-
-
-def test_lost_manifest_directory_ack_remains_pending_until_durable_confirm(
-    tmp_path,
-    capture_runtime,
-    monkeypatch,
-):
-    import zlc_storage.content_store as content_store
-
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    manifest_parent = repository.root / "content" / "manifests" / "capture"
-    content_store.durability.durable_mkdir(manifest_parent)
-    real_flush = content_store.durability.flush_directory
-    target_flushes = 0
-
-    def fail_first_two_target_flushes(directory):
-        nonlocal target_flushes
-        visible_manifest = manifest_parent.is_dir() and any(
-            path.suffix == ".manifest" for path in manifest_parent.iterdir()
-        )
-        if directory == manifest_parent and visible_manifest:
-            target_flushes += 1
-            if target_flushes <= 2:
-                raise DirectoryDurabilityError(
-                    "capture manifest directory acknowledgement lost"
-                )
-        return real_flush(directory)
-
-    monkeypatch.setattr(
-        content_store.durability,
-        "flush_directory",
-        fail_first_two_target_flushes,
-    )
-    base = compile_pipeline(spec)
-
-    def finalize(context, result):
-        return context.commit_final(repository.final_commit(context, result))
-
-    plan = replace(
-        base,
-        name="capture durable-confirm retry",
-        finalize=finalize,
-        requires_final_commit=True,
-    )
-    thread, failures = _deliver_when_armed(camera, _images())
-    try:
-        handle = runtime.controller.start(plan)
-        handle.wait_for(
-            lambda snapshot: snapshot.phase == "final-commit-reconciliation-failed",
-            3.0,
-        )
-        assert target_flushes == 2
-        assert len(repository._journal.pending()) == 1
-        with pytest.raises(RuntimeError, match="outstanding operations"):
-            repository.close()
-        with pytest.raises(RepositoryRootBusy, match="live owner"):
-            CaptureRepository(repository.root)
-
-        assert handle.retry_recovery()
-        reference = handle.result(3.0)
-        thread.join(2.0)
-        assert not thread.is_alive() and failures == []
-        assert target_flushes >= 3
-        assert repository._journal.pending() == ()
-        assert repository.admit(reference).reference == reference
-    finally:
-        if thread.is_alive():
-            camera.finish_record_capture()
-            thread.join(2.0)
-
-    repository.close()
-    reopened = CaptureRepository(repository.root)
-    reopened.close()
-
-
-def test_recovery_durable_confirmation_never_recreates_a_disappeared_manifest(
-    tmp_path,
-    capture_runtime,
-    monkeypatch,
-):
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    _handle, reference = _commit_capture(
-        repository,
-        camera,
-        runtime,
-        spec,
-        checkpoint=True,
-    )
-    artifact = repository.load(reference)
-    _journal_writer(repository).begin(
-        _pending_intent(reference, artifact, kind=CommitKind.FINAL)
-    )
-    manifest_path = repository._store._manifest_path(
-        "capture",
-        reference.manifest_digest,
-    )
-    repository.close()
-    real_confirm = ContentAddressedStore._confirm_manifest_durable
-
-    def disappear_before_confirm(store, namespace, digest, **kwargs):
-        if store.root == repository.root / "content":
-            store._manifest_path(namespace, digest).unlink()
-        return real_confirm(store, namespace, digest, **kwargs)
-
-    monkeypatch.setattr(
-        ContentAddressedStore,
-        "_confirm_manifest_durable",
-        disappear_before_confirm,
-    )
-    with pytest.raises(FileNotFoundError):
-        CaptureRepository(repository.root)
-    assert not manifest_path.exists()
-
-
-def test_checkpoint_and_final_admission_are_process_local_and_final_wins(
-    tmp_path,
-    capture_runtime,
-):
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    _handle, reference = _commit_capture(
-        repository,
-        camera,
-        runtime,
-        spec,
-        both=True,
-    )
-
-    admitted = repository.admit(reference)
-    assert type(admitted) is AdmittedCapture
-    assert admitted.reference == reference
-    assert admitted.artifact.ref == reference
-    assert admitted.commit_kind is CommitKind.FINAL
-    assert admitted.commit_id.startswith("capture-final-")
-    assert len(admitted.evidence_digest) == 64
-    assert admitted._matches_admission(repository.admit(reference))
-    with pytest.raises(TypeError, match="process-local"):
-        pickle.dumps(admitted)
-    with pytest.raises(AttributeError, match="immutable"):
-        admitted._commit_id = "forged"
-    with pytest.raises(TypeError, match="final"):
-        class _AdmittedSubclass(AdmittedCapture):
-            pass
-
-    repository.close()
-    reopened = CaptureRepository(
-        repository.root,
-        repository_id=repository.repository_id,
-    )
-    reopened_admitted = reopened.admit(reference)
-    assert reopened_admitted.commit_kind is CommitKind.FINAL
-    assert reopened_admitted.evidence_digest == admitted.evidence_digest
-    assert not admitted._matches_admission(reopened_admitted)
-
-
-def test_checkpoint_only_capture_is_admitted_as_checkpoint(
-    tmp_path,
-    capture_runtime,
-):
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    _handle, reference = _commit_capture(
-        repository,
-        camera,
-        runtime,
-        spec,
-        checkpoint=True,
-    )
-    admitted = repository.admit(reference)
-    assert admitted.commit_kind is CommitKind.CHECKPOINT
-    assert admitted.commit_id.startswith("capture-checkpoint-")
-
-
-def test_repository_is_final_and_sealed(tmp_path):
-    repository = CaptureRepository(tmp_path / "captures", repository_id="captures")
-    with pytest.raises(TypeError, match="final"):
-        class _RepositorySubclass(CaptureRepository):
-            pass
-
-    for name, value in (
-        ("root", tmp_path / "redirected"),
-        ("repository_id", "redirected"),
-        ("load", lambda _reference: object()),
-        ("_store", ContentAddressedStore(tmp_path / "other-content")),
-    ):
-        with pytest.raises(AttributeError, match="immutable"):
-            setattr(repository, name, value)
-
-
-def test_repository_defensively_copies_caller_policy(tmp_path):
-    caller_policy = CaptureRepositoryResourcePolicy(max_cells=17)
-    repository = CaptureRepository(
-        tmp_path / "captures",
-        resource_policy=caller_policy,
-    )
-    assert repository.resource_policy == caller_policy
-    assert repository.resource_policy is not caller_policy
-
-    object.__setattr__(caller_policy, "max_cells", 1)
-    assert repository.resource_policy.max_cells == 17
-    assert repository.startup_reconciliations == ()
-
-
-@pytest.mark.parametrize(
-    ("field", "limit", "message"),
-    (
-        ("max_cells", 1, "frame storage"),
-        ("max_manifest_bytes", 1, "manifest"),
-        ("max_total_frame_bytes", 1, "frame storage"),
-        ("max_frame_chunk_blob_bytes", 1, "frame storage"),
-        ("max_frame_index_blob_bytes", 1, "frame-index"),
-    ),
-)
-def test_load_rejects_whole_oversized_multidimensional_content_without_reduction(
-    tmp_path,
-    capture_runtime,
-    field,
-    limit,
-    message,
-):
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    _handle, reference = _commit_capture(repository, camera, runtime, spec)
-    constrained = replace(
-        DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY,
-        **{field: limit},
-    )
-    repository.close()
-    reopened = CaptureRepository(
-        repository.root,
-        repository_id=repository.repository_id,
-        resource_policy=constrained,
-    )
-    with pytest.raises(CaptureResourceExceeded, match=message):
-        reopened.load(reference)
-
-
-def test_cell_budget_rejects_frame_index_before_its_value_materialization(
-    tmp_path,
-    capture_runtime,
-    monkeypatch,
-):
-    import zlc_storage.canonical as canonical
-
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    _handle, reference = _commit_capture(repository, camera, runtime, spec)
-    repository.close()
-    constrained = CaptureRepository(
-        repository.root,
-        resource_policy=replace(
-            DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY,
-            max_cells=1,
-        ),
-    )
-    top_level_decodes = 0
-    real_decode_value = canonical._decode_value
-
-    def observed_materialization(*args, **kwargs):
-        nonlocal top_level_decodes
-        if kwargs.get("path") == "$":
-            top_level_decodes += 1
-        return real_decode_value(*args, **kwargs)
-
-    monkeypatch.setattr(canonical, "_decode_value", observed_materialization)
-    with pytest.raises(CaptureResourceExceeded, match="frame storage"):
-        constrained.load(reference)
-    # The small capture manifest is decoded once to find its frame-index ref;
-    # the oversized frame index itself is rejected by structural admission
-    # before a second top-level value materialization.
-    assert top_level_decodes == 1
-    constrained.close()
-
-
-def test_visible_manifest_with_missing_blob_fails_recovery_closed(
-    tmp_path,
-    capture_runtime,
-):
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    _handle, reference = _commit_capture(
-        repository,
-        camera,
-        runtime,
-        spec,
-        checkpoint=True,
-    )
-    artifact = repository.load(reference)
-    _journal_writer(repository).begin(
-        _pending_intent(reference, artifact, kind=CommitKind.FINAL)
-    )
-    manifest = _manifest(repository, reference)
-    frame_index_ref = content_ref_from_tree(manifest["frame_index_blob"])
-    frame_index = decode(
-        repository._store_authority.read_blob(
-            frame_index_ref,
-            max_bytes=repository.resource_policy.max_frame_index_blob_bytes,
-        )
-    )
-    chunk_ref = content_ref_from_tree(frame_index["frame_chunks"][0])
-    repository._store._blob_path(chunk_ref.digest).unlink()
-    repository.close()
-
-    with pytest.raises(FileNotFoundError):
-        CaptureRepository(
-            repository.root,
-            repository_id=repository.repository_id,
-        )
-
-
-def test_plain_post_replace_failure_becomes_unknown_and_reconciles(
-    tmp_path,
-    capture_runtime,
-    monkeypatch,
-):
-    camera, runtime, spec = capture_runtime
-    repository = CaptureRepository(tmp_path / "captures")
-    real_publish = ContentAddressedStore._publish_manifest
-    calls = 0
-
-    def publish_then_fail(store, *args, **kwargs):
-        nonlocal calls
-        stored = real_publish(store, *args, **kwargs)
-        if store is repository._store:
-            calls += 1
-            if calls == 1:
-                raise OSError("directory durability acknowledgement lost")
-        return stored
-
-    monkeypatch.setattr(
-        ContentAddressedStore,
-        "_publish_manifest",
-        publish_then_fail,
-    )
-    handle, reference = _commit_capture(repository, camera, runtime, spec)
-
-    assert calls == 1
-    assert repository.admit(reference).reference == reference
-    assert "acknowledgement" in handle.snapshot().commit_recovery_warning
-    assert repository._journal.pending() == ()
-
-
-def test_recovery_rejects_kind_commit_id_mismatch_before_absence(tmp_path):
-    repository = CaptureRepository(tmp_path / "captures")
-    digest = "1" * 64
-    reference = CaptureArtifactRef(repository.repository_id, digest)
-    fake_artifact = type(
-        "Evidence",
-        (),
-        {"run_id": "run", "safety_bundle_id": "safety"},
-    )()
-    _journal_writer(repository).begin(
-        _pending_intent(
-            reference,
-            fake_artifact,
-            kind=CommitKind.CHECKPOINT,
-            commit_id=f"capture-final-run-{digest}",
-        )
-    )
-    repository.close()
-    with pytest.raises(ValueError, match="commit id differs"):
-        CaptureRepository(
-            repository.root,
-            repository_id=repository.repository_id,
-        )
-
-
-@pytest.mark.parametrize(
-    "target_ref",
-    [
-        f"calibration/{'1' * 64}",
-        f"capture/{'2' * 64}",
-    ],
-)
-def test_capture_recovery_rejects_namespace_or_target_digest_mismatch(
-    tmp_path,
-    target_ref,
-):
-    repository = CaptureRepository(tmp_path / "captures")
-    reference = CaptureArtifactRef(repository.repository_id, "1" * 64)
-    evidence = type(
-        "Evidence",
-        (),
-        {"run_id": "run", "safety_bundle_id": "safety"},
-    )()
-    intent = _pending_intent(reference, evidence, kind=CommitKind.FINAL)
-    mismatched = replace(
-        intent,
-        target=replace(intent.target, target_ref=target_ref),
-    )
-
-    with pytest.raises(ValueError, match="target ref and digest differ"):
-        repository._recover(mismatched)
-
-
-def test_absent_manifest_recovery_aborts_by_inspection_without_publication(tmp_path):
-    repository = CaptureRepository(tmp_path / "captures")
-    digest = "2" * 64
-    reference = CaptureArtifactRef(repository.repository_id, digest)
-    evidence = type(
-        "Evidence",
-        (),
-        {"run_id": "run", "safety_bundle_id": "safety"},
-    )()
-    _journal_writer(repository).begin(
-        _pending_intent(reference, evidence, kind=CommitKind.FINAL)
-    )
-    repository.close()
-
-    reopened = CaptureRepository(
-        repository.root,
-        repository_id=repository.repository_id,
-    )
-    assert len(reopened.startup_reconciliations) == 1
-    assert not reopened.startup_reconciliations[0].recovery.committed
-    assert reopened._journal.pending() == ()
-    manifest_path = reopened._store._manifest_path("capture", digest)
-    assert not manifest_path.exists()
+        harness.controller.shutdown(2.0)
+        harness.resources.shutdown()

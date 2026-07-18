@@ -41,6 +41,7 @@ from zlc_frontend.qt_widgets import (
     FluentComboBox,
     FluentLabel,
     FluentParameterForm,
+    FluentScrollArea,
     FluentSettingRow,
     GREEN,
     GREY,
@@ -344,7 +345,7 @@ class CaptureFitWorkbenchWindow(FrozenRasterWindow):
         self._authority_summary.setObjectName("captureFitAuthority")
         self._authority_summary.setWordWrap(True)
         editor_layout.addWidget(self._authority_summary)
-        self._constraint_scroll = QtWidgets.QScrollArea(editor)
+        self._constraint_scroll = FluentScrollArea(editor)
         self._constraint_scroll.setObjectName("captureFitConstraintScroll")
         self._constraint_scroll.setWidgetResizable(True)
         self._constraint_scroll.setMaximumHeight(260)
