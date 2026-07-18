@@ -6,19 +6,36 @@ import subprocess
 import sys
 import threading
 
+import numpy as np
 import pytest
 
 from zlc_data import (
+    AxisId,
+    AxisSpec,
     BlockId,
+    CoordinateFrameId,
     DatasetRevision,
     DatasetRevisionRef,
+    SPATIAL_X,
+    SPATIAL_Y,
     StreamGenerationId,
 )
-from zlc_frontend.figure import DatasetId, EvaluatedInput
+from zlc_frontend.figure import (
+    DatasetId,
+    EvaluatedAxis,
+    EvaluatedImage,
+    EvaluatedInput,
+)
+from zlc_frontend.image_view import ImageViewportTransform
+from zlc_frontend.image_display import (
+    ImageDisplayState,
+    ImageRelimMode,
+)
 from zlc_frontend.render import (
     AtomicBoardFront,
     BoardFrame,
     CoherenceStamp,
+    ImagePanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
     PixelFormat,
@@ -40,6 +57,7 @@ from zlc_workbench.workspace import (
     PanelSourceBinding,
     WorkspaceModel,
 )
+from zlc_workbench.live import _accepted_image_relim_mode
 
 
 SCHEMA_A = "a" * 64
@@ -205,6 +223,102 @@ def test_board_frame_rejects_mixed_coherence_and_mutable_pixels() -> None:
             ),
         )
     assert stamp != later
+
+
+def test_image_panel_payload_carries_exact_samples_and_matching_view_revision() -> None:
+    frame_id = CoordinateFrameId("camera-frame")
+    x_axis = AxisSpec(
+        AxisId("camera.x"),
+        "x",
+        SPATIAL_X,
+        2,
+        (10, 11),
+        unit="pixel",
+        coordinate_frame=frame_id,
+    )
+    y_axis = AxisSpec(
+        AxisId("camera.y"),
+        "y",
+        SPATIAL_Y,
+        1,
+        (20,),
+        unit="pixel",
+        coordinate_frame=frame_id,
+    )
+    image = EvaluatedImage(
+        EvaluatedAxis(x_axis.axis_id, "x", "pixel", (0, 1), (10, 11)),
+        EvaluatedAxis(y_axis.axis_id, "y", "pixel", (0,), (20,)),
+        np.asarray([[2, 9]], dtype=np.uint16),
+        np.asarray([[True, True]], dtype=bool),
+    )
+    viewport = ImageViewportTransform((y_axis, x_axis), viewport_revision=1)
+    histogram = [0] * 255
+    histogram[0] = histogram[-1] = 1
+    source, evaluated = _source()
+    payload = ImagePanelPayload(
+        image,
+        evaluated,
+        viewport,
+        (2.0, 9.0),
+        tuple(histogram),
+        tuple(0xFF000000 | index for index in range(256)),
+        (1.3, 9.7),
+    )
+    stamp = _stamp(("a",), evaluated_input=evaluated)
+    raster = RasterBuffer(2, 1, 2, PixelFormat.INDEXED8, bytes((1, 255)))
+    panel = PanelFrame("a", "shot", source, stamp, raster, payload)
+
+    assert panel.image_payload is payload
+    assert int(payload.image.values[0, 1]) == 9
+    with pytest.raises(ValueError):
+        payload.image.values.setflags(write=True)
+
+    stale_stamp = CoherenceStamp(
+        stamp.run_id,
+        stamp.provenance_epoch_id,
+        stamp.join_key_type,
+        stamp.join_key_schema_fingerprint,
+        stamp.join_key_digest,
+        stamp.inputs,
+        (_presentation("a", panel_revision=2),),
+    )
+    with pytest.raises(ValueError, match="viewport revision"):
+        PanelFrame("a", "shot", source, stale_stamp, raster, payload)
+    with pytest.raises(ValueError, match="INDEXED8"):
+        PanelFrame("a", "shot", source, stamp, _raster(), payload)
+    other_source, other_input = _source(dataset="other-image")
+    del other_source
+    mismatched_payload = ImagePanelPayload(
+        image,
+        other_input,
+        viewport,
+        (2.0, 9.0),
+        tuple(histogram),
+        tuple(0xFF000000 | index for index in range(256)),
+        (1.3, 9.7),
+    )
+    with pytest.raises(ValueError, match="frozen coherence input"):
+        PanelFrame("a", "shot", source, stamp, raster, mismatched_payload)
+
+
+def test_invalid_fronts_do_not_consume_or_confuse_the_next_valid_relim() -> None:
+    tight = ImageDisplayState(relim_mode=ImageRelimMode.TIGHT)
+    fixed = ImageDisplayState(
+        revision=1,
+        relim_mode=ImageRelimMode.FIXED,
+        fixed_color_limits=(20.0, 40.0),
+    )
+    back_to_tight = ImageDisplayState(revision=2, relim_mode=ImageRelimMode.TIGHT)
+
+    mode = _accepted_image_relim_mode(None, tight, (1.0, 10.0))
+    assert mode is ImageRelimMode.TIGHT
+    mode = _accepted_image_relim_mode(mode, fixed, None)
+    assert mode is ImageRelimMode.FIXED
+    mode = _accepted_image_relim_mode(mode, back_to_tight, None)
+    assert mode is ImageRelimMode.FIXED
+    assert mode is not back_to_tight.relim_mode  # next valid front must force relim
+    mode = _accepted_image_relim_mode(mode, back_to_tight, (2.0, 3.0))
+    assert mode is ImageRelimMode.TIGHT
 
 
 def test_source_identity_and_coherence_are_separate_typed_values() -> None:

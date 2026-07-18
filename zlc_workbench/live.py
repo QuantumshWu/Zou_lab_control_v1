@@ -29,10 +29,17 @@ from zlc_frontend.figure import (
     ViewIntent,
     validate_view_spec,
 )
-from zlc_frontend.image_raster import rasterize_image_gray8
+from zlc_frontend.image_display import (
+    ImageDisplayState,
+    ImageRelimMode,
+    image_viewport_for_display_state,
+)
+from zlc_frontend.image_raster import rasterize_image_indexed8
+from zlc_frontend.image_view import ImageViewportTransform
 from zlc_frontend.render import (
     BoardFrame,
     CoherenceStamp,
+    ImagePanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
     SourceIdentity,
@@ -94,6 +101,8 @@ class LiveFrontStatus:
     scalar_source_missed: int | None = None
     scalar_binding_fingerprint: str | None = None
     scalar_control_revision: int | None = None
+    image_display_revision: int | None = None
+    image_color_limits: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +115,9 @@ class _LiveRenderConfiguration:
     panels: tuple[PanelSlot, ...]
     coherence_group: str
     presentations: tuple[PanelPresentationIdentity, ...]
+    image_document: FigureDocument
+    image_display: ImageDisplayState | None
+    image_viewport: ImageViewportTransform | None
     scalar_dataset_id: DatasetId | None
     scalar_documents: tuple[FigureDocument, ...]
     scalar_block_id: BlockId | None
@@ -530,6 +542,8 @@ class LiveImageBoardController:
         *,
         submit_worker: Callable[[Callable[[], None]], object],
         request_owner_wake: Callable[[], None],
+        image_display: ImageDisplayState,
+        image_viewport: ImageViewportTransform,
         scalar_documents: tuple[FigureDocument, ...] = (),
         scalar_raster_size: tuple[int, int] = (800, 520),
         worker_thread_affine: bool = False,
@@ -547,6 +561,12 @@ class LiveImageBoardController:
             raise TypeError("scalar_documents must contain FigureDocument values")
         if not isinstance(worker_thread_affine, bool):
             raise TypeError("worker_thread_affine must be bool")
+        if not isinstance(image_display, ImageDisplayState):
+            raise TypeError("image_display must be ImageDisplayState")
+        if not isinstance(image_viewport, ImageViewportTransform):
+            raise TypeError("image_viewport must be ImageViewportTransform")
+        if image_viewport.viewport_revision != image_display.revision:
+            raise ValueError("image viewport revision must match image display revision")
         if scalar_documents and not worker_thread_affine:
             raise ValueError("live scalar Agg panels require a thread-affine worker lane")
         if (
@@ -575,6 +595,8 @@ class LiveImageBoardController:
             epoch=0,
             model=model,
             image_document=document,
+            image_display=image_display,
+            image_viewport=image_viewport,
             scalar_dataset_id=slot.scalar_dataset_id,
             scalar_documents=scalar_documents,
             scalar_block_id=scalar_block_id,
@@ -585,7 +607,6 @@ class LiveImageBoardController:
             strict_scalar_identity=False,
         )
         self._slot = slot
-        self._document = document
         self._board = board
         self._configuration = configuration
         self._configuration_epoch = 0
@@ -608,6 +629,11 @@ class LiveImageBoardController:
         self._sequence = 0
         self._fault: BaseException | None = None
         self._front_status: LiveFrontStatus | None = None
+        self._image_color_limits: tuple[float, float] | None = None
+        # This records the mode of the last successfully published *valid*
+        # image, not merely the configured intent.  An all-invalid first front
+        # must not consume the forced relim owed by the first valid frame.
+        self._image_relim_mode: ImageRelimMode | None = None
         self._front_invalidated = False
         self._presentation_frozen = False
         self._closed = False
@@ -716,7 +742,9 @@ class LiveImageBoardController:
         configuration = _build_live_configuration(
             epoch=epoch,
             model=target_model,
-            image_document=self._document,
+            image_document=previous.image_document,
+            image_display=previous.image_display,
+            image_viewport=previous.image_viewport,
             scalar_dataset_id=scalar_dataset_id,
             scalar_documents=scalar_documents,
             scalar_block_id=state.scalar_block_id,
@@ -781,6 +809,110 @@ class LiveImageBoardController:
                 ] = scalar_dataset_id
         if previous.scalar_documents:
             self._submit(lambda: self._close_scalar_renderers(previous))
+        if request_now:
+            self._request_snapshot()
+
+    def reconfigure_image_display(
+        self,
+        state: ImageDisplayState,
+        viewport: ImageViewportTransform,
+    ) -> None:
+        """Replace one IMAGE presentation revision without touching its source Run."""
+
+        self._require_owner()
+        if not isinstance(state, ImageDisplayState):
+            raise TypeError("state must be ImageDisplayState")
+        if not isinstance(viewport, ImageViewportTransform):
+            raise TypeError("viewport must be ImageViewportTransform")
+        if viewport.viewport_revision != state.revision:
+            raise ValueError("image display and viewport revisions differ")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("live image controller is closed")
+            if self._fault is not None:
+                raise RuntimeError("live image controller is faulted")
+            if self._slot.failure is not None or self._slot.withdrawn:
+                raise RuntimeError("live image source is no longer available")
+            previous = self._configuration
+            previous_state = previous.image_display
+            previous_viewport = previous.image_viewport
+            previous_port = self._port
+            previous_sources = self._sources
+            epoch = self._configuration_epoch + 1
+        if previous_state is None or previous_viewport is None:
+            raise RuntimeError("live controller has no interactive IMAGE presentation")
+        if state == previous_state and viewport == previous_viewport:
+            return
+        if state.revision <= previous_state.revision:
+            raise ValueError("image display revision must increase")
+        if viewport.axes != previous_viewport.axes:
+            raise ValueError("image display reconfiguration cannot change source axes")
+        target_model = self._board.model
+        if (
+            target_model.board_id != previous.board_id
+            or target_model.layout_generation != previous.layout_generation
+            or target_model.panels != previous.panels
+        ):
+            raise RuntimeError(
+                "image display reconfiguration cannot cross a board topology change"
+            )
+        configuration = _build_live_configuration(
+            epoch=epoch,
+            model=target_model,
+            image_document=previous.image_document,
+            image_display=state,
+            image_viewport=viewport,
+            scalar_dataset_id=previous.scalar_dataset_id,
+            scalar_documents=previous.scalar_documents,
+            scalar_block_id=previous.scalar_block_id,
+            scalar_dataset_edge=previous.scalar_dataset_edge,
+            scalar_generation=previous.scalar_generation,
+            scalar_binding_fingerprint=previous.scalar_binding_fingerprint,
+            scalar_control_revision=previous.scalar_control_revision,
+            strict_scalar_identity=previous.strict_scalar_identity,
+            scalar_renderers=previous.scalar_renderers,
+        )
+        # Display-only replacement shares the worker-lane-owned renderer
+        # holder itself, not a racy snapshot of its current entries.  A first
+        # render that completes after this GUI-thread reconfiguration therefore
+        # remains owned by the replacement configuration and is closed once.
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("live image controller is closed")
+            if self._fault is not None:
+                raise RuntimeError("live image controller is faulted")
+            if self._slot.failure is not None or self._slot.withdrawn:
+                raise RuntimeError("live image source is no longer available")
+            if epoch != self._configuration_epoch + 1:
+                raise RuntimeError("image display reconfiguration lost owner serialization")
+            if self._configuration is not previous:
+                raise RuntimeError("live image configuration changed unexpectedly")
+            replacement_port: BoardPublishPort | None = None
+            if previous_port is not None:
+                if previous_sources is None or len(previous_sources) != len(
+                    configuration.presentations
+                ):
+                    raise RuntimeError("active live publish identity is incomplete")
+                replacement_port = self._board.open_publish_port(
+                    tuple(
+                        PanelSourceBinding(source, presentation)
+                        for source, presentation in zip(
+                            previous_sources,
+                            configuration.presentations,
+                            strict=True,
+                        )
+                    )
+                )
+            candidate_waiting = self._candidate is not None
+            self._configuration = configuration
+            self._configuration_epoch = epoch
+            self._candidate = None
+            self._port = replacement_port
+            self._sources = previous_sources if replacement_port is not None else None
+            self._dirty = True
+            if candidate_waiting:
+                self._active = False
+            request_now = not self._presentation_frozen and not self._active
         if request_now:
             self._request_snapshot()
 
@@ -1087,7 +1219,7 @@ class LiveImageBoardController:
             snapshot = raw_snapshot.snapshot
             raw_input = (EvaluatedInput(self._slot.dataset_id, snapshot.ref),)
             image_evaluated = self._evaluator.evaluate(
-                self._document,
+                configuration.image_document,
                 ResolvedDatasetMap(
                     (ResolvedDataset(self._slot.dataset_id, snapshot),)
                 ),
@@ -1105,7 +1237,49 @@ class LiveImageBoardController:
             data = layer.cells[0].series[0].data
             if not isinstance(data, EvaluatedImage):
                 raise RuntimeError("live IMAGE document did not evaluate to an image")
-            rasters = [rasterize_image_gray8(data)]
+            if not self._job_is_current(job):
+                return
+            image_payload: ImagePanelPayload | None = None
+            image_color_limits: tuple[float, float] | None = None
+            image_display = configuration.image_display
+            image_viewport = configuration.image_viewport
+            if image_display is not None:
+                assert image_viewport is not None
+                with self._lock:
+                    if self._configuration is not configuration:
+                        return
+                    previous_color_limits = self._image_color_limits
+                    previous_relim_mode = self._image_relim_mode
+                (
+                    image_raster,
+                    image_data_range,
+                    image_histogram,
+                    image_color_limits,
+                ) = rasterize_image_indexed8(
+                    data,
+                    image_display,
+                    current_color_limits=previous_color_limits,
+                    previous_relim_mode=previous_relim_mode,
+                )
+                if not self._job_is_current(job):
+                    return
+                # Keep Matplotlib and its palette owner on the render worker;
+                # Qt receives only the immutable sampled QRgb table.
+                from zlc_frontend.render_style import indexed_colormap
+
+                image_payload = ImagePanelPayload(
+                    image=data,
+                    evaluated_input=raw_input[0],
+                    viewport=image_viewport,
+                    data_range=image_data_range,
+                    histogram_counts=image_histogram,
+                    base_palette=indexed_colormap(image_display.colormap.value),
+                    color_limits=image_color_limits,
+                )
+            else:
+                raise RuntimeError("live IMAGE configuration has no display state")
+            rasters = [image_raster]
+            payloads: list[ImagePanelPayload | None] = [image_payload]
             histogram_valid_samples = None
             histogram_dropped_samples = None
             latest_scalar_valid = None
@@ -1175,6 +1349,7 @@ class LiveImageBoardController:
                     )
                     configuration.scalar_renderers[index] = renderer
                 rasters.append(renderer.render(scalar_evaluated))
+                payloads.append(None)
             frame = BoardFrame(
                 configuration.board_id,
                 configuration.layout_generation,
@@ -1186,11 +1361,13 @@ class LiveImageBoardController:
                         source,
                         job.stamp,
                         raster,
+                        payload,
                     )
-                    for panel, source, raster in zip(
+                    for panel, source, raster, payload in zip(
                         configuration.panels,
                         job.sources,
                         rasters,
+                        payloads,
                         strict=True,
                     )
                 ),
@@ -1220,6 +1397,10 @@ class LiveImageBoardController:
                         if scalar_metadata is None
                         else scalar_metadata.control_revision
                     ),
+                    image_display_revision=(
+                        None if image_display is None else image_display.revision
+                    ),
+                    image_color_limits=image_color_limits,
                 )
                 published = job.port.publish(job.token, frame)
                 if published:
@@ -1232,6 +1413,14 @@ class LiveImageBoardController:
                             and self._port is job.port
                         ):
                             self._front_status = front_status
+                            if image_display is not None:
+                                assert image_color_limits is not None
+                                self._image_color_limits = image_color_limits
+                                self._image_relim_mode = _accepted_image_relim_mode(
+                                    self._image_relim_mode,
+                                    image_display,
+                                    image_data_range,
+                                )
                             accepted_status = True
                     if accepted_status:
                         # BoardController may have queued its wake before this
@@ -1491,6 +1680,20 @@ def _validate_live_documents(
     )
 
 
+def _accepted_image_relim_mode(
+    previous: ImageRelimMode | None,
+    state: ImageDisplayState,
+    value_range: tuple[float, float] | None,
+) -> ImageRelimMode | None:
+    """Advance only the range policy fully initialized by an accepted front."""
+
+    if not isinstance(state, ImageDisplayState):
+        raise TypeError("state must be ImageDisplayState")
+    if value_range is not None or state.relim_mode is ImageRelimMode.FIXED:
+        return state.relim_mode
+    return previous
+
+
 def _validate_scalar_documents(
     scalar_edge: FrozenDatasetEdge[RoiScalarSample],
     scalar_dataset_id: DatasetId,
@@ -1534,6 +1737,8 @@ def _build_live_configuration(
     epoch: int,
     model: BoardModel,
     image_document: FigureDocument,
+    image_display: ImageDisplayState | None,
+    image_viewport: ImageViewportTransform | None,
     scalar_dataset_id: DatasetId | None,
     scalar_documents: tuple[FigureDocument, ...],
     scalar_block_id: BlockId | None,
@@ -1542,9 +1747,20 @@ def _build_live_configuration(
     scalar_binding_fingerprint: str | None,
     scalar_control_revision: int | None,
     strict_scalar_identity: bool,
+    scalar_renderers: list[SinglePanelAggRenderer | None] | None = None,
 ) -> _LiveRenderConfiguration:
     if not isinstance(model, BoardModel):
         raise TypeError("model must be BoardModel")
+    if (image_display is None) != (image_viewport is None):
+        raise ValueError("image display state and viewport must be paired")
+    if image_display is not None:
+        if not isinstance(image_display, ImageDisplayState):
+            raise TypeError("image_display must be ImageDisplayState")
+        if not isinstance(image_viewport, ImageViewportTransform):
+            raise TypeError("image_viewport must be ImageViewportTransform")
+        if image_viewport.viewport_revision != image_display.revision:
+            raise ValueError("image display and viewport revisions differ")
+        image_viewport_for_display_state(image_display, image_viewport)
     panels = model.panels
     documents = (image_document, *scalar_documents)
     if len(panels) != len(documents):
@@ -1562,10 +1778,19 @@ def _build_live_configuration(
             panel_document.document_id,
             panel_document.revision,
             0,
-            0,
+            image_display.revision if index == 0 and image_display is not None else 0,
         )
-        for panel, panel_document in zip(panels, documents, strict=True)
+        for index, (panel, panel_document) in enumerate(
+            zip(panels, documents, strict=True)
+        )
     )
+    renderers = (
+        [None for _document in scalar_documents]
+        if scalar_renderers is None
+        else scalar_renderers
+    )
+    if len(renderers) != len(scalar_documents):
+        raise ValueError("scalar renderer holder does not match scalar documents")
     return _LiveRenderConfiguration(
         epoch,
         model.board_id,
@@ -1573,6 +1798,9 @@ def _build_live_configuration(
         panels,
         next(iter(coherence_groups)),
         presentations,
+        image_document,
+        image_display,
+        image_viewport,
         scalar_dataset_id,
         scalar_documents,
         scalar_block_id,
@@ -1581,7 +1809,7 @@ def _build_live_configuration(
         scalar_binding_fingerprint,
         scalar_control_revision,
         strict_scalar_identity,
-        [None for _document in scalar_documents],
+        renderers,
     )
 
 

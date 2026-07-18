@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 import threading
 from types import MappingProxyType
@@ -10,6 +11,8 @@ from typing import Any, Iterator, Mapping
 
 import matplotlib
 from matplotlib import font_manager as fm
+
+from zlc_storage import canonical_text
 
 NEW_BLACK = "black"
 FONT_PATH = Path(__file__).resolve().parent / "assets" / "helvetica-light-587ebe5a59211.ttf"
@@ -232,6 +235,43 @@ _PALETTE: dict[str, Any] = {
 }
 PALETTE: Mapping[str, Any] = MappingProxyType(_PALETTE)
 
+
+def _argb32(red: int, green: int, blue: int, alpha: int = 255) -> int:
+    return (
+        (int(alpha) << 24)
+        | (int(red) << 16)
+        | (int(green) << 8)
+        | int(blue)
+    )
+
+
+@lru_cache(maxsize=8)
+def indexed_colormap(name: str) -> tuple[int, ...]:
+    """Return the canonical invalid + 255-sample QRgb table for one cmap.
+
+    The render owner samples Matplotlib once per closed colormap name.  Qt
+    installs this immutable table directly; a clim edit re-quantizes pixels in
+    the worker and never asks Qt to invent a second value-to-colour mapping.
+    """
+
+    name = canonical_text(name, "colormap name")
+    try:
+        cmap = matplotlib.colormaps[name]
+    except KeyError as exc:
+        raise ValueError(f"unknown Matplotlib colormap {name!r}") from exc
+    rgba = cmap([index / 254.0 for index in range(255)], bytes=True)
+    bad_rgba = tuple(
+        round(channel * 255)
+        for channel in matplotlib.colors.to_rgba(_PALETTE["bad"])
+    )
+    return (
+        _argb32(*bad_rgba),
+        *(
+            _argb32(int(red), int(green), int(blue), int(alpha))
+            for red, green, blue, alpha in rgba
+        ),
+    )
+
 # Current headless FigureDocument/Agg tokens extend the mature plotting system above; they do
 # not establish a second palette or rcParams owner.  Every renderer imports from this module.
 RENDER_TEXT = NEW_BLACK
@@ -319,6 +359,7 @@ __all__ = [
     "FONT_PATH",
     "NEW_BLACK",
     "PALETTE",
+    "indexed_colormap",
     "PANEL_DISPLAY_SCALE",
     "PULSE_SCAN_ANNOTATION_COLOR",
     "PULSE_SCAN_ANNOTATION_FONT_SIZE",

@@ -4,10 +4,18 @@ Import this leaf explicitly.  The headless :mod:`zlc_frontend` package root does
 not re-export it and therefore never loads PyQt as a side effect.
 """
 
-from ..selector import ImageViewportTransform, RectangleGesture
+from ..image_view import ImageViewportTransform
+from ..selector import (
+    ImageColorLimitsCommit,
+    ImageInteractionCommit,
+    ImageInteractionOrigin,
+    ImageViewportCommit,
+    RectangleGesture,
+)
 from .axis_navigator import AxisLayoutNavigator
 from .board import QtImageBoard, QtOwnerWake, QtRasterBoard
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
+from .image_display import FluentImageDisplayEditor
 from .fluent import (
     ElidedLabel,
     FluentButton,
@@ -152,6 +160,7 @@ __all__ = [
     "FluentFormGrid",
     "FluentFrame",
     "FluentGroupBox",
+    "FluentImageDisplayEditor",
     "FluentInputDialog",
     "FluentLabel",
     "FluentLabeledField",
@@ -180,6 +189,10 @@ __all__ = [
     "HINT",
     "HOVER",
     "ImageViewportTransform",
+    "ImageColorLimitsCommit",
+    "ImageInteractionCommit",
+    "ImageInteractionOrigin",
+    "ImageViewportCommit",
     "MUTED_LABEL_STYLE",
     "Metrics",
     "ORANGE",

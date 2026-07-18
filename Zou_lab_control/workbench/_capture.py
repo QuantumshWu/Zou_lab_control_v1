@@ -24,7 +24,9 @@ from zlc_frontend.figure import (
     estimate_view_evaluation_peak_nbytes,
     suggest_view,
 )
-from zlc_frontend.image_raster import estimate_gray8_raster_peak_nbytes
+from zlc_frontend.image_display import ImageDisplayState
+from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
+from zlc_frontend.image_view import ImageViewportTransform
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentLabel,
@@ -205,9 +207,11 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             return
         view = suggestion.spec
         evaluation_peak = estimate_view_evaluation_peak_nbytes(schema, view)
-        downstream_peak = evaluation_peak + estimate_gray8_raster_peak_nbytes(
+        downstream_peak = evaluation_peak + estimate_indexed8_raster_peak_nbytes(
             y_axes[0].size,
             x_axes[0].size,
+            value_itemsize=schema.cell_schema.dtype.itemsize,
+            retained_sample_fronts=1,
         )
         policy = FigureEvaluationPolicy(max_live_nbytes=evaluation_peak)
         dataset_id = DatasetId(f"capture-preview-{generation}")
@@ -218,6 +222,8 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             (FigureLayer("capture-image", dataset_id, view),),
         )
         block_id = BlockId(f"capture-preview-{uuid.uuid4().hex}")
+        image_display = ImageDisplayState()
+        image_viewport = ImageViewportTransform((y_axes[0], x_axes[0]))
 
         def factory(spec: CapturePreviewSpec):
             slot = LiveDatasetSlot(
@@ -228,7 +234,14 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             attached = threading.Event()
             response: dict[str, object] = {}
             self._run_owner.post_attachment(
-                (slot, document, attached, response),
+                (
+                    slot,
+                    document,
+                    image_display,
+                    image_viewport,
+                    attached,
+                    response,
+                ),
                 generation=generation,
             )
             if not attached.wait(5.0):
@@ -444,7 +457,14 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
 
     def _drain_attachments(self) -> None:
         for generation, payload in self._run_owner.drain_attachments():
-            slot, document, attached, response = payload
+            (
+                slot,
+                document,
+                image_display,
+                image_viewport,
+                attached,
+                response,
+            ) = payload
             try:
                 if self._closing or generation != self._run_owner.generation:
                     raise RuntimeError("Workbench no longer accepts this preview")
@@ -468,6 +488,8 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                     board,
                     submit_worker=self._submit_worker,
                     request_owner_wake=self._wake.request_owner_wake,
+                    image_display=image_display,
+                    image_viewport=image_viewport,
                 )
                 self._slot = slot
                 self._board = board

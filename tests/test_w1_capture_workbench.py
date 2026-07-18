@@ -155,10 +155,10 @@ def test_render_failure_does_not_change_final_capture(
 ):
     import zlc_workbench.live as live_module
 
-    def fail_raster(_image):
+    def fail_raster(_image, _state, **_kwargs):
         raise RuntimeError("injected raster failure")
 
-    monkeypatch.setattr(live_module, "rasterize_image_gray8", fail_raster)
+    monkeypatch.setattr(live_module, "rasterize_image_indexed8", fail_raster)
     window = None
     try:
         request = experiment.readout.capture_request(SINGLE_EVENT_PULSE)
@@ -495,6 +495,9 @@ def test_scalar_control_change_reuses_layout_when_panel_ids_are_unchanged(monkey
         board_id="camera-board",
         layout_generation=4,
         panels=panels,
+        image_document=object(),
+        image_display=None,
+        image_viewport=None,
         scalar_documents=(object(),),
     )
     replacement = SimpleNamespace(

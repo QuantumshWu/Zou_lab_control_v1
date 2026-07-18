@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import threading
+import time
 
 from PyQt5 import QtCore, QtWidgets
 
@@ -30,7 +31,15 @@ from zlc_frontend.figure import (
     suggest_view,
     validate_view_spec,
 )
-from zlc_frontend.image_raster import estimate_gray8_raster_peak_nbytes
+from zlc_frontend.image_display import (
+    ImageDisplayState,
+    ImageRelimMode,
+    image_display_for_viewport,
+    image_display_from_form,
+    image_viewport_for_display_state,
+)
+from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
+from zlc_frontend.image_view import ImageViewportTransform
 from zlc_frontend.matplotlib_render import (
     DEFAULT_HISTOGRAM_BINS,
     estimate_live_panel_raster_peak_nbytes,
@@ -38,10 +47,13 @@ from zlc_frontend.matplotlib_render import (
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentComboBox,
+    FluentImageDisplayEditor,
     FluentLabel,
+    FluentPopup,
     FluentSwitch,
+    FluentTabWidget,
     GREEN,
-    ImageViewportTransform,
+    GREY,
     ORANGE,
     QtOwnerWake,
     QtRasterBoard,
@@ -49,12 +61,20 @@ from zlc_frontend.qt_widgets import (
     WINDOW_SCREEN_FRACTION,
     center_window_on_primary_screen,
     ensure_qt_app,
+    popup_gap,
     release_window,
     retain_window,
     screen_fit_window_size,
+    scaled_px,
     set_fluent_scale,
 )
 from zlc_frontend.render import RenderSurface
+from zlc_frontend.selector import (
+    ImageColorLimitsCommit,
+    ImageInteractionCommit,
+    ImageInteractionOrigin,
+    ImageViewportCommit,
+)
 from zlc_neutral_atom.monitor_application import (
     CameraMonitorRoiState,
     CameraMonitorRequest,
@@ -276,17 +296,19 @@ def _prepare_monitor_view(
         raise ValueError("camera monitor IMAGE view needs an explicit axis choice")
     image_view = suggestion.spec
     image_evaluation_peak = estimate_view_evaluation_peak_nbytes(schema, image_view)
-    downstream_peak = image_evaluation_peak + estimate_gray8_raster_peak_nbytes(
+    downstream_peak = image_evaluation_peak + estimate_indexed8_raster_peak_nbytes(
         y_axes[0].size,
         x_axes[0].size,
+        value_itemsize=schema.cell_schema.dtype.itemsize,
         retained_fronts=2,
+        retained_sample_fronts=2,
     )
 
     scalar_views: tuple[ViewSpec, ...] = ()
     projection_text = _RAW_PROJECTION_TEXT
     viewport = ImageViewportTransform(
         (y_axes[0], x_axes[0]),
-        viewport_revision=generation,
+        viewport_revision=0,
     )
     possible_scalar_reserves = tuple(
         _scalar_presentation_peak(possible_schema)
@@ -407,11 +429,15 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._visible_binding_fingerprint: str | None = None
         self._visible_projection_text: str | None = None
         self._draft_selection: Selection | None = None
+        self._image_display = ImageDisplayState()
+        self._image_viewport: ImageViewportTransform | None = None
+        self._pending_image_interaction_origin: ImageInteractionOrigin | None = None
         self._slot: LiveDatasetSlot | None = None
         self._live: LiveImageBoardController | None = None
         self._board: BoardController | None = None
         self._last_snapshot: RunSnapshot | None = None
         self._prepare_inflight = False
+        self._view_attach_inflight = False
         self._local_diagnostic = ""
         self._manual_stop_requested = False
         self._closing = False
@@ -437,7 +463,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._board_layout = QtWidgets.QVBoxLayout(self._board_container)
         self._board_layout.setContentsMargins(0, 0, 0, 0)
         self._configure_board_widget(scalar=request.roi is not None)
-        self._selector_switch = FluentSwitch("ROI selector", self)
+        self._selector_switch = FluentSwitch("Selector", self)
         self._selector_switch.setObjectName("roiSelectorSwitch")
         self._selector_switch.setChecked(False)
         self._selector_switch.setEnabled(False)
@@ -456,6 +482,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._clear_roi_button = FluentButton("Clear ROI", self, color=ORANGE)
         self._clear_roi_button.setObjectName("clearRoiButton")
         self._clear_roi_button.setEnabled(False)
+        self._setting_button = FluentButton("Setting…", self, color=GREY)
+        self._setting_button.setObjectName("imageDisplaySettingButton")
         self._roi_status = FluentLabel(
             (
                 "ROI: start the raw monitor, then draw a rectangle"
@@ -475,15 +503,43 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         controls.addWidget(self._selector_switch)
         controls.addWidget(self._reducer_combo)
         controls.addWidget(self._clear_roi_button)
+        controls.addWidget(self._setting_button)
         controls.addWidget(self._start_button)
         controls.addWidget(self._stop_button)
         controls.addStretch(1)
+
+        self._tabs = FluentTabWidget(self)
+        self._tabs.setObjectName("cameraMonitorTabs")
+        self._live_page = QtWidgets.QWidget(self._tabs)
+        self._live_page.setObjectName("cameraMonitorLiveTab")
+        live_layout = QtWidgets.QVBoxLayout(self._live_page)
+        live_layout.setContentsMargins(0, 0, 0, 0)
+        live_layout.addWidget(self._board_container, 1)
+        self._edit_image_display = FluentImageDisplayEditor(self._tabs)
+        self._edit_image_display.setObjectName("imageDisplayEditEditor")
+        self._tabs.addTab(self._live_page, "Live")
+        self._tabs.addTab(self._edit_image_display, "Edit")
+
+        self._settings_popup = FluentPopup(self)
+        self._settings_popup.setObjectName("imageDisplaySettingsPopup")
+        settings_layout = QtWidgets.QVBoxLayout(self._settings_popup)
+        settings_layout.setContentsMargins(*(scaled_px(10, minimum=8),) * 4)
+        self._setting_image_display = FluentImageDisplayEditor(
+            self._settings_popup
+        )
+        self._setting_image_display.setObjectName("imageDisplaySettingEditor")
+        settings_layout.addWidget(self._setting_image_display)
+        self._settings_dismissed_at = float("-inf")
+        self._settings_popup._on_hidden = self._record_settings_dismissed
+        self._edit_image_display.load(self._image_display)
+        self._setting_image_display.load(self._image_display)
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self._run_status)
         layout.addWidget(self._view_status)
         layout.addWidget(self._projection_status)
         layout.addWidget(self._roi_status)
-        layout.addWidget(self._board_container, 1)
+        layout.addWidget(self._tabs, 1)
         layout.addWidget(self._diagnostics)
         layout.addLayout(controls)
 
@@ -503,6 +559,28 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._selector_switch.toggled.connect(self._set_selector_enabled)
         self._reducer_combo.currentIndexChanged.connect(self._reducer_changed)
         self._clear_roi_button.clicked.connect(self._clear_roi)
+        self._setting_button.clicked.connect(self._open_image_settings)
+        self._edit_image_display.applyRequested.connect(
+            lambda revision, values: self._apply_image_display_form(
+                self._edit_image_display,
+                revision,
+                values,
+            )
+        )
+        self._setting_image_display.applyRequested.connect(
+            lambda revision, values: self._apply_image_display_form(
+                self._setting_image_display,
+                revision,
+                values,
+            )
+        )
+        self._edit_image_display.cancelRequested.connect(
+            lambda: self._reload_image_display_editor(self._edit_image_display)
+        )
+        self._setting_image_display.cancelRequested.connect(
+            lambda: self._reload_image_display_editor(self._setting_image_display)
+        )
+        self._update_image_display_controls()
         self._submit_prepare()
 
     @property
@@ -523,6 +601,338 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         setter = getattr(board, "set_rectangle_selector_enabled", None)
         if callable(setter):
             setter(bool(enabled))
+
+    def _open_image_settings(self) -> None:
+        if not self._setting_button.isEnabled():
+            return
+        popup = self._settings_popup
+        if popup.isVisible():
+            popup.hide()
+            return
+        if time.monotonic() - self._settings_dismissed_at < 0.25:
+            return
+        self._reload_image_display_editor(self._setting_image_display)
+        popup.adjustSize()
+        form_hint = self._setting_image_display.form.sizeHint()
+        editor_hint = self._setting_image_display.sizeHint()
+        button_top_left = self._setting_button.mapToGlobal(QtCore.QPoint(0, 0))
+        button_bottom_right = self._setting_button.mapToGlobal(
+            QtCore.QPoint(
+                max(0, self._setting_button.width() - 1),
+                max(0, self._setting_button.height() - 1),
+            )
+        )
+        button_center = QtCore.QPoint(
+            (button_top_left.x() + button_bottom_right.x()) // 2,
+            (button_top_left.y() + button_bottom_right.y()) // 2,
+        )
+        screen = QtWidgets.QApplication.screenAt(button_center)
+        if screen is None and hasattr(self, "screen"):
+            screen = self.screen()
+        if screen is None:
+            screen = QtWidgets.QApplication.primaryScreen()
+        available = None if screen is None else screen.availableGeometry()
+        desired_width = max(
+            scaled_px(360, minimum=320),
+            form_hint.width() + scaled_px(28, minimum=20),
+            editor_hint.width(),
+        )
+        desired_height = max(
+            scaled_px(300, minimum=260),
+            form_hint.height() + scaled_px(120, minimum=96),
+            editor_hint.height(),
+        )
+        if available is not None:
+            desired_width = min(
+                desired_width,
+                max(1, int(available.width() * 0.55)),
+            )
+            desired_height = min(desired_height, max(1, int(available.height() * 0.90)))
+            gap = popup_gap()
+            below_top = button_bottom_right.y() + 1 + gap
+            above_bottom = button_top_left.y() - gap - 1
+            below_space = max(0, available.bottom() - below_top + 1)
+            above_space = max(0, above_bottom - available.top() + 1)
+            if desired_height <= below_space:
+                top = below_top
+            elif desired_height <= above_space:
+                top = above_bottom - desired_height + 1
+            elif above_space >= below_space:
+                desired_height = max(1, min(desired_height, above_space))
+                top = above_bottom - desired_height + 1
+            else:
+                desired_height = max(1, min(desired_height, below_space))
+                top = below_top
+        else:
+            top = button_bottom_right.y() + 1 + popup_gap()
+        popup.resize(desired_width, desired_height)
+        left = button_bottom_right.x() - popup.width() + 1
+        if available is not None:
+            left = max(
+                available.left(),
+                min(left, available.right() - popup.width() + 1),
+            )
+            top = max(
+                available.top(),
+                min(top, available.bottom() - popup.height() + 1),
+            )
+        popup.move(left, top)
+        popup.show()
+        popup.raise_()
+
+    def _record_settings_dismissed(self) -> None:
+        self._settings_dismissed_at = time.monotonic()
+
+    def _update_image_display_controls(self) -> None:
+        live_healthy = self._live is None or self._live.fault is None
+        enabled = (
+            not self._closing
+            and self._image_viewport is not None
+            and not self._view_attach_inflight
+            and live_healthy
+        )
+        self._setting_button.setEnabled(enabled)
+        self._edit_image_display.setEnabled(enabled)
+        self._setting_image_display.setEnabled(enabled)
+
+    def _visible_image_color_limits(self) -> tuple[float, float] | None:
+        board = self._board_widget
+        if not isinstance(board, QtRasterBoard):
+            return None
+        payload = board.visible_image_payload()
+        return None if payload is None else payload.color_limits
+
+    def _visible_image_matches_display_revision(self) -> bool:
+        """Return whether interaction would target the authored display state.
+
+        A display commit is accepted by the live controller before its worker
+        can publish the replacement front.  During that bounded interval the
+        old pixels remain visible, but must not be allowed to author another
+        gesture against the newer Workbench revision.
+        """
+
+        board = self._board_widget
+        if not isinstance(board, QtRasterBoard):
+            return False
+        origin = board.visible_image_origin()
+        return (
+            origin is not None
+            and origin.panel_id == _IMAGE_PANEL_ID
+            and origin.presentation.panel_revision == self._image_display.revision
+        )
+
+    def _reload_image_display_editor(
+        self,
+        editor: FluentImageDisplayEditor,
+    ) -> None:
+        if editor not in (
+            self._edit_image_display,
+            self._setting_image_display,
+        ):
+            raise ValueError("image display editor does not belong to this window")
+        editor.load(
+            self._image_display,
+            self._visible_image_color_limits(),
+        )
+
+    def _sync_image_display_editors(
+        self,
+        *,
+        accepted_editor: FluentImageDisplayEditor | None = None,
+        accepted_base_revision: int | None = None,
+    ) -> None:
+        limits = self._visible_image_color_limits()
+        for editor in (
+            self._edit_image_display,
+            self._setting_image_display,
+        ):
+            if editor is accepted_editor:
+                if accepted_base_revision is None:
+                    raise RuntimeError("accepted editor has no base revision")
+                editor.accept_commit(
+                    accepted_base_revision,
+                    self._image_display,
+                    limits,
+                )
+            else:
+                editor.load(self._image_display, limits)
+
+    def _apply_image_display_form(
+        self,
+        editor: FluentImageDisplayEditor,
+        base_revision: int,
+        values: object,
+    ) -> None:
+        if editor not in (
+            self._edit_image_display,
+            self._setting_image_display,
+        ):
+            raise ValueError("image display editor does not belong to this window")
+        try:
+            if (
+                self._closing
+                or self._view_attach_inflight
+            ):
+                raise RuntimeError(
+                    "image display cannot change while the live view is attaching"
+                )
+            if base_revision != self._image_display.revision:
+                raise RuntimeError(
+                    f"image display edit base r{base_revision} is stale; "
+                    f"current revision is r{self._image_display.revision}"
+                )
+            if not isinstance(values, dict):
+                raise TypeError("image display form must emit one exact mapping")
+            candidate = image_display_from_form(
+                self._image_display,
+                values,
+                current_color_limits=self._visible_image_color_limits(),
+            )
+            viewport = self._viewport_for_image_display(candidate)
+            self._commit_image_display(
+                candidate,
+                viewport,
+                accepted_editor=editor,
+                accepted_base_revision=base_revision,
+            )
+        except Exception as error:
+            editor.load(
+                self._image_display,
+                self._visible_image_color_limits(),
+            )
+            self._record_local_failure(
+                f"Image display edit rejected: {type(error).__name__}: {error}"
+            )
+
+    def _viewport_for_image_display(
+        self,
+        state: ImageDisplayState,
+    ) -> ImageViewportTransform:
+        reference = self._image_viewport
+        if reference is None and self._prepared is not None:
+            reference = self._prepared.viewport
+        if reference is None:
+            raise RuntimeError("image display axes are not prepared")
+        return image_viewport_for_display_state(state, reference)
+
+    def _accept_image_interaction(
+        self,
+        command: ImageInteractionCommit,
+    ) -> None:
+        if not isinstance(command, (ImageViewportCommit, ImageColorLimitsCommit)):
+            raise TypeError("image interaction callback received an unknown command")
+        board = self._board_widget
+        if not isinstance(board, QtRasterBoard):
+            raise RuntimeError("image interaction has no raster board")
+        origin = command.origin
+        if origin.panel_id != _IMAGE_PANEL_ID:
+            raise RuntimeError("image interaction belongs to another panel")
+        if board.visible_image_origin() != origin:
+            raise RuntimeError("image interaction origin is no longer painted")
+        if origin.presentation.panel_revision != self._image_display.revision:
+            raise RuntimeError("image interaction origin is stale")
+        current_viewport = self._image_viewport
+        if current_viewport is None:
+            raise RuntimeError("image interaction has no committed viewport")
+
+        if isinstance(command, ImageViewportCommit):
+            if command.viewport.viewport_revision != self._image_display.revision + 1:
+                raise RuntimeError("image viewport interaction must advance once")
+            candidate = image_display_for_viewport(
+                self._image_display,
+                command.viewport,
+            )
+            viewport = command.viewport
+        else:
+            candidate = replace(
+                self._image_display,
+                revision=self._image_display.revision + 1,
+                relim_mode=ImageRelimMode.FIXED,
+                fixed_color_limits=command.color_limits,
+            )
+            viewport = image_viewport_for_display_state(
+                candidate,
+                current_viewport,
+            )
+        self._commit_image_display(
+            candidate,
+            viewport,
+            interaction_origin=origin,
+        )
+
+    def _commit_image_display(
+        self,
+        state: ImageDisplayState,
+        viewport: ImageViewportTransform,
+        *,
+        accepted_editor: FluentImageDisplayEditor | None = None,
+        accepted_base_revision: int | None = None,
+        interaction_origin: ImageInteractionOrigin | None = None,
+    ) -> None:
+        current = self._image_display
+        if not isinstance(state, ImageDisplayState):
+            raise TypeError("state must be ImageDisplayState")
+        if not isinstance(viewport, ImageViewportTransform):
+            raise TypeError("viewport must be ImageViewportTransform")
+        if viewport.viewport_revision != state.revision:
+            raise ValueError("image display and viewport revisions differ")
+        changed = state != current
+        if changed and state.revision != current.revision + 1:
+            raise ValueError("image display commit must advance exactly once")
+        if not changed and state.revision != current.revision:
+            raise ValueError("image display no-op changed revision")
+        if accepted_editor is not None:
+            if accepted_base_revision != current.revision:
+                raise ValueError("accepted editor base differs from current revision")
+            if accepted_editor.base_revision != accepted_base_revision:
+                raise ValueError("accepted editor no longer owns its emitted base")
+        if interaction_origin is not None and not changed:
+            raise ValueError("image interaction cannot commit a semantic no-op")
+
+        live = self._live
+        if changed and live is not None:
+            # This is the only runtime mutation.  It replaces presentation
+            # identity while preserving the source Run, stream, slot and board
+            # topology.  Install it before publishing the authored state.
+            live.reconfigure_image_display(state, viewport)
+
+        if changed:
+            self._image_display = state
+            self._image_viewport = viewport
+            if live is None and self._prepared is not None:
+                self._prepared = replace(self._prepared, viewport=viewport)
+            self._pending_image_interaction_origin = interaction_origin
+        self._sync_image_display_editors(
+            accepted_editor=accepted_editor,
+            accepted_base_revision=accepted_base_revision,
+        )
+        # Keep the user's selector switch intent checked, but disarm the board
+        # until a front carrying this exact revision is actually painted.
+        self._update_roi_controls()
+        if (
+            changed
+            and live is None
+            and self._prepared is None
+            and not self._prepare_inflight
+        ):
+            # A newly discovered camera schema can reject retained authored
+            # coordinate pins while stopped.  Clearing/changing those pins is
+            # the recovery action: retry the existing one-shot preparation
+            # only after the new display state is authoritative, so the fresh
+            # axes are mapped against that state rather than the rejected one.
+            self._run_status.setText("Monitor: PREPARING")
+            self._local_diagnostic = ""
+            self._refresh_diagnostics(self._last_snapshot)
+            self._submit_prepare()
+
+    def _discard_pending_image_interaction(self) -> None:
+        origin = self._pending_image_interaction_origin
+        if origin is None:
+            return
+        board = self._board_widget
+        if isinstance(board, QtRasterBoard):
+            board.discard_pending_image_interaction(origin)
+        self._pending_image_interaction_origin = None
 
     def _accept_rectangle_gesture(self, gesture: RectangleGesture) -> None:
         if not isinstance(gesture, RectangleGesture):
@@ -581,6 +991,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             and not self._handle.snapshot().state.terminal
             and self._board_widget is not None
             and self._board_widget.has_front
+            and self._visible_image_matches_display_revision()
             and view_healthy
         )
         self._selector_switch.setEnabled(not busy and active and selector_healthy)
@@ -683,6 +1094,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._board_layout.addWidget(widget)
         self._board_widget = widget
         self._board_panel_ids = panel_ids
+        self._pending_image_interaction_origin = None
         self._visible_binding_fingerprint = None
         self._visible_projection_text = None
 
@@ -734,19 +1146,23 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         try:
             selector_board = self._board_widget
             selector_viewport = prepared_view.viewport
+            image_display = self._image_display
             if not isinstance(selector_board, QtRasterBoard):
                 raise RuntimeError("ROI selector host changed after preparation")
-            if selector_viewport.viewport_revision != generation:
-                raise RuntimeError("selector viewport generation prediction changed")
+            if selector_viewport.viewport_revision != image_display.revision:
+                raise RuntimeError("selector viewport and image display revisions differ")
+            self._selector_switch.setChecked(False)
             selector_board.bind_rectangle_selector(
                 _IMAGE_PANEL_ID,
                 selector_viewport,
                 self._accept_rectangle_gesture,
                 enabled=False,
+                interaction_callback=self._accept_image_interaction,
             )
             if not selector_board.has_front:
                 selector_board.set_selector_applied_selection(None)
             selector_board.set_selector_draft_selection(self._draft_selection)
+            self._image_viewport = selector_viewport
         except BaseException as error:
             self._run_owner.mark_owner_reaped()
             self._running_binding = None
@@ -757,6 +1173,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             self._submit_prepare()
             return
         self._prepared = None
+        self._view_attach_inflight = True
         self._last_snapshot = None
         self._manual_stop_requested = False
         self._local_diagnostic = ""
@@ -773,6 +1190,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(False)
         self._update_roi_controls()
+        self._update_image_display_controls()
 
         dataset_id = prepared_view.dataset_id
         scalar_dataset_id = prepared_view.scalar_dataset_id
@@ -790,7 +1208,15 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             attached = threading.Event()
             response: dict[str, object] = {}
             self._run_owner.post_attachment(
-                (slot, image_document, scalar_documents, attached, response),
+                (
+                    slot,
+                    image_document,
+                    scalar_documents,
+                    image_display,
+                    selector_viewport,
+                    attached,
+                    response,
+                ),
                 generation=generation,
             )
             if not attached.wait(5.0):
@@ -862,6 +1288,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 ):
                     self._reconcile_snapshot(snapshot)
             self._refresh_view_status()
+            self._update_image_display_controls()
             self._maybe_finish_close()
         except BaseException as error:
             message = f"Workbench owner failed: {type(error).__name__}: {error}"
@@ -893,6 +1320,13 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                         raise TypeError("camera prepare returned an invalid view product")
                     if prepared.generation != generation + 1:
                         raise RuntimeError("prepared camera view generation changed")
+                    prepared = replace(
+                        prepared,
+                        viewport=image_viewport_for_display_state(
+                            self._image_display,
+                            prepared.viewport,
+                        ),
+                    )
                 except BaseException as error:
                     if not self._closing and generation == self._run_owner.generation:
                         self._run_status.setText("Monitor: NOT READY")
@@ -902,6 +1336,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     continue
                 if not self._closing and generation == self._run_owner.generation:
                     self._prepared = prepared
+                    self._image_viewport = prepared.viewport
                     scalar_schema = prepared.command.scalar_view_schema
                     binding = prepared.command.roi_binding
                     self._configure_board_widget(scalar=scalar_schema is not None)
@@ -921,6 +1356,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                         self._run_status.setText("Monitor: READY")
                     self._update_start_button()
                     self._update_roi_controls()
+                    self._sync_image_display_editors()
                 continue
             if kind == "start":
                 try:
@@ -1400,7 +1836,15 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
 
     def _drain_attachments(self) -> None:
         for generation, payload in self._run_owner.drain_attachments():
-            slot, image_document, scalar_documents, attached, response = payload
+            (
+                slot,
+                image_document,
+                scalar_documents,
+                image_display,
+                image_viewport,
+                attached,
+                response,
+            ) = payload
             try:
                 if self._closing or generation != self._run_owner.generation:
                     raise RuntimeError("Workbench no longer accepts this monitor")
@@ -1410,7 +1854,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     raise RuntimeError(
                         "ROI monitor attachment requires its closed three-panel scalar set"
                     )
-                self._close_live()
+                if self._live is not None:
+                    self._close_live()
                 panels = [
                     PanelSlot(
                         _IMAGE_PANEL_ID,
@@ -1449,14 +1894,20 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     scalar_documents=scalar_documents,
                     scalar_raster_size=_SCALAR_RASTER_SIZE,
                     worker_thread_affine=self._run_owner.worker_thread_affine,
+                    image_display=image_display,
+                    image_viewport=image_viewport,
                 )
                 self._slot = slot
                 self._board = board
                 self._live = live
+                self._view_attach_inflight = False
                 self._initial_roi_receipt = None
                 self._initial_roi_receipt_loaded = False
+                self._update_image_display_controls()
                 response["accepted"] = True
             except BaseException as error:
+                self._view_attach_inflight = False
+                self._update_image_display_controls()
                 response["accepted"] = False
                 response["error"] = f"{type(error).__name__}: {error}"
                 try:
@@ -1496,6 +1947,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         if fault is None:
             fault = self._roi_presentation_failure
         if failure is not None or fault is not None:
+            self._discard_pending_image_interaction()
             detail = failure if failure is not None else str(fault)
             self._view_status.setText(f"View: FAILED · {detail}")
             self._update_roi_controls()
@@ -1533,6 +1985,27 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 )
                 self._update_roi_controls()
                 return
+            if status.image_display_revision != self._image_display.revision:
+                shown = (
+                    "unknown"
+                    if status.image_display_revision is None
+                    else f"r{status.image_display_revision}"
+                )
+                self._view_status.setText(
+                    "View: WAITING · previous image display retained "
+                    f"({shown}) · target r{self._image_display.revision}"
+                )
+                self._sync_image_display_editors()
+                self._update_roi_controls()
+                return
+            pending_origin = self._pending_image_interaction_origin
+            if (
+                pending_origin is not None
+                and self._image_display.revision
+                > pending_origin.presentation.panel_revision
+            ):
+                self._pending_image_interaction_origin = None
+            self._sync_image_display_editors()
             coverage = status.raw_coverage
             scalar_coverage = status.scalar_coverage
             histogram_valid = status.histogram_valid_samples
@@ -1578,7 +2051,10 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 + scalar_suffix
             )
             self._view_status.setText(
-                f"View: LIVE · {self._projection_text} · {suffix}"
+                f"View: LIVE · {self._projection_text} · "
+                f"display r{self._image_display.revision} "
+                f"{self._image_display.relim_mode.value}/"
+                f"{self._image_display.colormap.value} · {suffix}"
             )
         elif self._handle is not None and not self._handle.snapshot().state.terminal:
             self._view_status.setText(f"View: WAITING · {self._projection_text}")
@@ -1736,14 +2212,21 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         )
 
     def _close_live(self) -> None:
+        self._view_attach_inflight = False
+        self._selector_switch.setChecked(False)
+        board_widget = self._board_widget
+        if isinstance(board_widget, QtRasterBoard):
+            board_widget.unbind_rectangle_selector()
+        self._pending_image_interaction_origin = None
         live = self._live
         if live is None:
+            self._sync_image_display_editors()
+            self._update_image_display_controls()
             return
         self._fold_roi_state_for_detach()
         try:
             live.close()
         finally:
-            board_widget = self._board_widget
             if board_widget is not None and not board_widget.has_front:
                 # Board close may have cleared the real front before a later
                 # slot/renderer cleanup error escapes.  Visible markers follow
@@ -1760,6 +2243,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._live = None
         self._slot = None
         self._board = None
+        self._sync_image_display_editors()
+        self._update_image_display_controls()
 
     def _fold_roi_state_for_detach(self) -> None:
         """Persist the latest applied downstream intent before slot teardown."""
@@ -1824,6 +2309,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             self._closing = True
             self._start_button.setEnabled(False)
             self._stop_button.setEnabled(False)
+            self._settings_popup.hide()
+            self._update_image_display_controls()
             self._run_status.setText("Monitor: CLOSING")
             handle = self._handle
             if handle is not None and not handle.snapshot().state.terminal:

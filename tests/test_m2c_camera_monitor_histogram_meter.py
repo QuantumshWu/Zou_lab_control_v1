@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 import time
 from types import SimpleNamespace
@@ -54,7 +55,12 @@ from zlc_frontend.matplotlib_render import (
     SinglePanelAggRenderer,
     histogram_bin_counts,
 )
-from zlc_frontend.image_raster import estimate_gray8_raster_peak_nbytes
+from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
+from zlc_frontend.image_display import (
+    ImageColormap,
+    ImageDisplayState,
+    image_viewport_for_display_state,
+)
 from zlc_frontend.qt_widgets import QtRasterBoard
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_workbench.live import LiveFrontStatus
@@ -211,7 +217,6 @@ def test_four_panel_board_uses_one_scalar_revision_and_typed_view_semantics(
     finally:
         if window.isVisible():
             _close_window(application, window)
-
 
 def _scalar_documents(values, validity):
     repeat = AxisSpec(AxisId("m2c.repeat"), "repeat", REPEAT, 1)
@@ -376,17 +381,27 @@ def test_scalar_display_budget_rejects_before_monitor_arm(experiment, applicatio
             + prepared.downstream_peak_bytes
         )
         y_axis, x_axis = prepared.command.view_schema.cell_schema.data_axes
-        held_bytes = y_axis.size * x_axis.size
+        pixels = y_axis.size * x_axis.size
+        value_itemsize = prepared.command.view_schema.cell_schema.dtype.itemsize
+        held_bytes = pixels * (
+            2  # immutable INDEXED8 bytes + detached QImage pixel plane
+            + value_itemsize  # exact value plane for Z/H/hover
+            + np.dtype(bool).itemsize  # exact component validity
+        ) + 128 * (y_axis.size + x_axis.size)  # retained axis DTO entries
         assert (
-            estimate_gray8_raster_peak_nbytes(
+            estimate_indexed8_raster_peak_nbytes(
                 y_axis.size,
                 x_axis.size,
+                value_itemsize=value_itemsize,
                 retained_fronts=2,
+                retained_sample_fronts=2,
             )
-            - estimate_gray8_raster_peak_nbytes(
+            - estimate_indexed8_raster_peak_nbytes(
                 y_axis.size,
                 x_axis.size,
+                value_itemsize=value_itemsize,
                 retained_fronts=1,
+                retained_sample_fronts=1,
             )
             == held_bytes
         )
@@ -447,6 +462,103 @@ def test_scalar_display_budget_rejects_before_monitor_arm(experiment, applicatio
             _close_window(application, window)
 
 
+def test_image_reconfigure_shares_first_scalar_renderer_holder_across_worker_race(
+    experiment,
+    application,
+    monkeypatch,
+):
+    import threading
+
+    import zlc_frontend.matplotlib_render as matplotlib_render
+
+    real_renderer = matplotlib_render.SinglePanelAggRenderer
+    constructor_entered = threading.Event()
+    release_constructor = threading.Event()
+    instances = []
+
+    class BlockingRenderer:
+        def __init__(self, document, *, width, height):
+            constructor_entered.set()
+            if not release_constructor.wait(10.0):
+                raise RuntimeError("test did not release scalar renderer construction")
+            self._inner = real_renderer(document, width=width, height=height)
+            self.close_count = 0
+            instances.append(self)
+
+        def render(self, evaluated):
+            return self._inner.render(evaluated)
+
+        def close(self):
+            self.close_count += 1
+            self._inner.close()
+
+    monkeypatch.setattr(
+        matplotlib_render,
+        "SinglePanelAggRenderer",
+        BlockingRenderer,
+    )
+    request = experiment.readout.camera_monitor_request(
+        history_capacity=3,
+        roi=_typed_roi(experiment),
+        scalar_history_capacity=12,
+    )
+    window = experiment.readout.camera_monitor_gui(request)
+    try:
+        start = window.findChild(QtWidgets.QPushButton, "startButton")
+        _until(application, start.isEnabled)
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        _until(application, constructor_entered.is_set)
+        live = window._live
+        assert live is not None
+        previous = live._configuration
+        holder = previous.scalar_renderers
+        assert holder and all(renderer is None for renderer in holder)
+
+        first = replace(
+            window._image_display,
+            revision=window._image_display.revision + 1,
+            colormap=ImageColormap.VIRIDIS,
+        )
+        first_viewport = image_viewport_for_display_state(
+            first,
+            window._image_viewport,
+        )
+        window._commit_image_display(first, first_viewport)
+        assert live._configuration.scalar_renderers is holder
+
+        release_constructor.set()
+        _until(
+            application,
+            lambda: (
+                live.front_status is not None
+                and live.front_status.image_display_revision == first.revision
+                and all(renderer is not None for renderer in holder)
+            ),
+        )
+        assert len(instances) == len(holder)
+
+        second = replace(
+            first,
+            revision=first.revision + 1,
+            colormap=ImageColormap.MAGMA,
+        )
+        second_viewport = image_viewport_for_display_state(second, first_viewport)
+        window._commit_image_display(second, second_viewport)
+        assert live._configuration.scalar_renderers is holder
+        _until(
+            application,
+            lambda: (
+                live.front_status is not None
+                and live.front_status.image_display_revision == second.revision
+            ),
+        )
+        assert len(instances) == len(holder)
+    finally:
+        release_constructor.set()
+        if window.isVisible():
+            _close_window(application, window)
+    assert instances and all(renderer.close_count == 1 for renderer in instances)
+
 def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
     events = []
 
@@ -464,6 +576,8 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
     status = LiveFrontStatus(
         7,
         MonitorCoverage(1, 3, 0, False),
+        image_display_revision=0,
+        image_color_limits=(0.0, 1.0),
     )
 
     class Live:
@@ -488,6 +602,7 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
         _slot=None,
         _run_owner=SimpleNamespace(take_pending_snapshot=lambda: None),
         _refresh_view_status=lambda: events.append("status"),
+        _update_image_display_controls=lambda: None,
         _record_local_failure=lambda message: events.append(("failure", message)),
         _maybe_finish_close=lambda: None,
     )
@@ -511,9 +626,12 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
         ),
         _projection_text="projection",
         _roi_presentation_failure=None,
+        _image_display=ImageDisplayState(),
+        _pending_image_interaction_origin=None,
         _view_status=label,
         _handle=None,
         _reconcile_visible_roi=lambda _status: True,
+        _sync_image_display_editors=lambda: None,
         _update_roi_controls=lambda: None,
     )
     CameraMonitorWorkbenchWindow._refresh_view_status(status_harness)
@@ -539,6 +657,8 @@ def test_close_failure_after_front_clear_immediately_drops_visible_label():
 
     harness = SimpleNamespace(
         _live=Live(),
+        _view_attach_inflight=False,
+        _selector_switch=SimpleNamespace(setChecked=lambda _value: None),
         _fold_roi_state_for_detach=lambda: None,
         _board_widget=board_widget,
         _visible_binding_fingerprint="binding",

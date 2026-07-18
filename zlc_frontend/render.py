@@ -1,14 +1,17 @@
 """Headless render hand-off values owned by the target frontend package.
 
 The renderer may use Matplotlib, Qt, or neither, but the worker/GUI boundary is
-always an immutable :class:`BoardFrame`.  No live Figure, Artist, ndarray view,
-or QImage storage crosses this module's boundary.
+always an immutable :class:`BoardFrame`.  No live Figure, Artist, mutable or
+aliased ndarray view, or QImage storage crosses this module's boundary.  The
+one exact IMAGE interaction payload is allowed because ``EvaluatedImage`` is
+intrinsically backed by owned immutable bytes.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from numbers import Integral
 import threading
 from typing import Protocol, runtime_checkable
 
@@ -19,7 +22,9 @@ from zlc_storage import (
     sha256_text,
 )
 
-from .figure import DatasetId, EvaluatedInput
+from .figure import DatasetId, EvaluatedImage, EvaluatedInput
+from .image_display import validated_image_range
+from .image_view import ImageViewportTransform
 
 
 def detached_render_fault(error: BaseException) -> RuntimeError:
@@ -42,6 +47,7 @@ class PixelFormat(Enum):
     RGBA8888 = "rgba8888"
     RGB888 = "rgb888"
     GRAY8 = "gray8"
+    INDEXED8 = "indexed8"
 
     @property
     def channels(self) -> int:
@@ -49,6 +55,7 @@ class PixelFormat(Enum):
             PixelFormat.RGBA8888: 4,
             PixelFormat.RGB888: 3,
             PixelFormat.GRAY8: 1,
+            PixelFormat.INDEXED8: 1,
         }[self]
 
 
@@ -207,6 +214,93 @@ class RasterBuffer:
             raise ValueError("pixels length must equal stride_bytes * height")
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class ImagePanelPayload:
+    """Exact immutable samples and display mapping for one IMAGE raster front.
+
+    Codes 1..255 always span ``color_limits``.  ``data_range`` retains the
+    full observed span for exact diagnostics and in-window guide lines even
+    when the painted/interactive colour domain is much narrower.
+    """
+
+    image: EvaluatedImage
+    evaluated_input: EvaluatedInput
+    viewport: ImageViewportTransform
+    data_range: tuple[float, float] | None
+    histogram_counts: tuple[int, ...]
+    base_palette: tuple[int, ...]
+    color_limits: tuple[float, float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.image, EvaluatedImage):
+            raise TypeError("image payload requires EvaluatedImage")
+        if not isinstance(self.evaluated_input, EvaluatedInput):
+            raise TypeError("image payload requires one EvaluatedInput")
+        if not isinstance(self.viewport, ImageViewportTransform):
+            raise TypeError("image payload requires ImageViewportTransform")
+        expected_shape = self.viewport.raster_shape
+        if self.image.values.shape != expected_shape:
+            raise ValueError("image payload values do not match viewport geometry")
+        for evaluated, axis, name in (
+            (self.image.x_axis, self.viewport.x_axis, "x"),
+            (self.image.y_axis, self.viewport.y_axis, "y"),
+        ):
+            if evaluated.axis_id != axis.axis_id:
+                raise ValueError(f"image payload {name} axis identity changed")
+            if len(evaluated.indices) != axis.size or any(
+                actual != expected
+                for expected, actual in enumerate(evaluated.indices)
+            ):
+                raise ValueError(f"image payload {name} axis is not the full raster")
+            if len(evaluated.coordinates) != axis.size or any(
+                actual != axis.coordinate_at(index)
+                for index, actual in enumerate(evaluated.coordinates)
+            ):
+                raise ValueError(f"image payload {name} coordinates changed")
+
+        data_range = self.data_range
+        if data_range is not None:
+            data_range = validated_image_range(
+                data_range,
+                "image data_range",
+                allow_degenerate=True,
+            )
+        object.__setattr__(self, "data_range", data_range)
+        object.__setattr__(
+            self,
+            "color_limits",
+            validated_image_range(self.color_limits, "image color_limits"),
+        )
+
+        counts = tuple(self.histogram_counts)
+        if len(counts) != 255:
+            raise ValueError("image histogram_counts must contain 255 scalar codes")
+        if any(
+            isinstance(count, bool)
+            or not isinstance(count, Integral)
+            or int(count) < 0
+            for count in counts
+        ):
+            raise ValueError("image histogram counts must be nonnegative integers")
+        counts = tuple(int(count) for count in counts)
+        valid_count = sum(counts)
+        if valid_count > self.image.values.size:
+            raise ValueError("image histogram count exceeds raster cardinality")
+        if data_range is None and valid_count:
+            raise ValueError("image histogram cannot contain samples without data_range")
+        object.__setattr__(self, "histogram_counts", counts)
+
+        palette = tuple(self.base_palette)
+        if len(palette) != 256 or any(
+            isinstance(color, bool)
+            or not isinstance(color, Integral)
+            or not 0 <= int(color) <= 0xFFFFFFFF
+            for color in palette
+        ):
+            raise ValueError("image base_palette must contain 256 unsigned ARGB32 values")
+        object.__setattr__(self, "base_palette", tuple(int(color) for color in palette))
+
+
 @dataclass(frozen=True)
 class PanelFrame:
     panel_id: str
@@ -214,6 +308,7 @@ class PanelFrame:
     source_identity: SourceIdentity
     coherence_stamp: CoherenceStamp
     raster: RasterBuffer
+    image_payload: ImagePanelPayload | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "panel_id", _text(self.panel_id, "panel_id"))
@@ -228,6 +323,49 @@ class PanelFrame:
             raise TypeError("coherence_stamp must be CoherenceStamp")
         if not isinstance(self.raster, RasterBuffer):
             raise TypeError("raster must be RasterBuffer")
+        payload = self.image_payload
+        if payload is not None:
+            if not isinstance(payload, ImagePanelPayload):
+                raise TypeError("image_payload must be ImagePanelPayload or None")
+            if self.raster.pixel_format is not PixelFormat.INDEXED8:
+                raise ValueError("image payload requires an INDEXED8 raster")
+            if payload.viewport.raster_shape != (
+                self.raster.height,
+                self.raster.width,
+            ):
+                raise ValueError("image payload and raster geometry differ")
+            presentations = tuple(
+                presentation
+                for presentation in self.coherence_stamp.presentations
+                if presentation.panel_id == self.panel_id
+            )
+            if len(presentations) != 1:
+                raise ValueError("image panel has no unique presentation identity")
+            if (
+                presentations[0].panel_revision
+                != payload.viewport.viewport_revision
+            ):
+                raise ValueError(
+                    "image viewport revision differs from panel presentation"
+                )
+            try:
+                expected_ref = next(
+                    value.ref
+                    for value in self.coherence_stamp.inputs
+                    if value.dataset_id == self.source_identity.dataset_id
+                )
+            except StopIteration as exc:
+                raise ValueError(
+                    "image payload source is absent from its coherence stamp"
+                ) from exc
+            if (
+                payload.evaluated_input.dataset_id
+                != self.source_identity.dataset_id
+                or payload.evaluated_input.ref != expected_ref
+            ):
+                raise ValueError(
+                    "image payload input differs from its frozen coherence input"
+                )
 
 
 @dataclass(frozen=True)
@@ -338,6 +476,7 @@ __all__ = [
     "PanelPresentationIdentity",
     "SourceIdentity",
     "PanelFrame",
+    "ImagePanelPayload",
     "PixelFormat",
     "RasterBuffer",
     "RenderSurface",
