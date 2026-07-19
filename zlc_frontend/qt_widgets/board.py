@@ -23,6 +23,7 @@ from ..render import (
     DisplayPayload,
     HistogramPanelPayload,
     ImagePanelPayload,
+    MeterPanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
     PixelFormat,
@@ -290,6 +291,7 @@ def _payload_input(
         ImagePanelPayload
         | CurvePanelPayload
         | HistogramPanelPayload
+        | MeterPanelPayload
         | SiteMapPanelPayload
     ),
 ):
@@ -1216,6 +1218,28 @@ class QtRasterBoard(QtWidgets.QWidget):
         )
         return payload if isinstance(payload, HistogramPanelPayload) else None
 
+    def visible_meter_payload(
+        self,
+        panel_id: str | None = None,
+    ) -> MeterPanelPayload | None:
+        """Return the exact display-only METER payload currently painted."""
+
+        self._require_owner()
+        if panel_id is None:
+            frame = None if self._front is None else self._front[0]
+            if frame is None:
+                return None
+            matches = tuple(
+                panel.panel_id
+                for panel in frame.panels
+                if isinstance(panel.display_payload, MeterPanelPayload)
+            )
+            if len(matches) != 1:
+                return None
+            panel_id = matches[0]
+        payload, _origin = self._visible_display(panel_id, MeterPanelPayload)
+        return payload if isinstance(payload, MeterPanelPayload) else None
+
     def visible_histogram_origin(
         self,
         panel_id: str | None = None,
@@ -1702,7 +1726,10 @@ class QtRasterBoard(QtWidgets.QWidget):
                 columns=self._columns,
             )
             image_payload = None
-            if isinstance(payload, (CurvePanelPayload, HistogramPanelPayload)):
+            if isinstance(
+                payload,
+                (CurvePanelPayload, HistogramPanelPayload, MeterPanelPayload),
+            ):
                 target = bounds
                 source = QtCore.QRectF(
                     0.0,
@@ -3339,6 +3366,12 @@ class QtRasterBoard(QtWidgets.QWidget):
             if isinstance(payload, HistogramPanelPayload):
                 return (
                     HistogramPanelPayload,
+                    payload.value_unit,
+                    payload.series_labels,
+                )
+            if isinstance(payload, MeterPanelPayload):
+                return (
+                    MeterPanelPayload,
                     payload.value_unit,
                     payload.series_labels,
                 )

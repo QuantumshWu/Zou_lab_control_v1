@@ -1,7 +1,7 @@
 """Nonblocking Qt viewer for one frozen current :class:`DataFigure`.
 
-The generic fallback remains an immutable encoded board.  The three earned
-products -- one logical IMAGE, CURVE, or HISTOGRAM panel -- share one typed
+The generic fallback remains an immutable encoded board.  The four earned
+products -- one logical IMAGE, CURVE, HISTOGRAM, or METER panel -- share one typed
 board, one Setting/Edit projection, and one render/export lifecycle.  No
 whole-board PNG is reverse-mapped into data.
 """
@@ -37,9 +37,11 @@ from zlc_frontend import (
     CurveFitOverlay,
     CurvePanelPayload,
     DataFigure,
+    FigurePanelRegion,
     FitAuthoringOption,
     HistogramPanelPayload,
     ImagePanelPayload,
+    MeterPanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
     PixelFormat,
@@ -67,6 +69,7 @@ from zlc_frontend.figure import (
     EvaluatedCurve,
     EvaluatedHistogram,
     EvaluatedImage,
+    EvaluatedMeter,
     ViewIntent,
 )
 from zlc_frontend.histogram_display import (
@@ -100,6 +103,7 @@ from zlc_frontend.qt_widgets import (
     GREY,
     ORANGE,
     QtRasterBoard,
+    QtImageBoard,
     runtime_range_placeholders,
     show_fluent_popup_for_anchor,
     sync_revisioned_form_editors,
@@ -202,6 +206,15 @@ def _classify_single_typed(
         isinstance(item.data, EvaluatedHistogram) for item in series
     ):
         return intent, None
+    if intent is ViewIntent.METER:
+        if figure.has_fit_overlays:
+            return None, "METER display does not accept fit overlays"
+        if all(isinstance(item.data, EvaluatedMeter) for item in series):
+            units = {item.data.value_unit for item in series}
+            if len(units) != 1:
+                return None, "METER series do not share one exact value unit"
+            return intent, None
+        return None, "METER intent did not evaluate to homogeneous meter series"
     if intent is not ViewIntent.CURVE:
         return None, f"{intent.value} is outside the current typed interaction slice"
     first = series[0].data
@@ -218,6 +231,36 @@ def _classify_single_typed(
         if curve.x_axis != first.x_axis or curve.value_unit != first.value_unit:
             return None, "curve series do not share one exact x axis and value unit"
     return intent, None
+
+
+def _classify_meter_grid(figure: DataFigure) -> tuple[int | None, str | None]:
+    """Return a supported single-layer METER panel count without selecting one."""
+
+    if not isinstance(figure, DataFigure):
+        raise TypeError("figure must be DataFigure")
+    if figure.has_fit_overlays:
+        return None, "multi-cell METER display does not accept fit overlays"
+    if (
+        len(figure.document.layers) != 1
+        or len(figure.evaluated.layers) != 1
+        or len(figure.evaluated.inputs) != 1
+    ):
+        return None, "METER overview requires exactly one layer and input"
+    if figure.document.layers[0].view.intent is not ViewIntent.METER:
+        return None, "figure is not a METER overview"
+    cells = figure.evaluated.layers[0].cells
+    if len(cells) <= 1:
+        return None, "METER overview requires more than one logical panel"
+    for cell in cells:
+        series_group = cell.series
+        if not series_group or any(
+            not isinstance(series.data, EvaluatedMeter)
+            for series in series_group
+        ):
+            return None, "METER overview contains another evaluated data kind"
+        if len({series.data.value_unit for series in series_group}) != 1:
+            return None, "METER overview panel mixes value units"
+    return len(cells), None
 
 
 def _encoded_figure(
@@ -262,8 +305,129 @@ def _render_figure(
     return _encoded_figure(figure, memory_limit_bytes, cancelled)
 
 
-_TypedDisplayState = ImageDisplayState | CurveDisplayState | HistogramDisplayState
-_TypedPanelPayload = ImagePanelPayload | CurvePanelPayload | HistogramPanelPayload
+@dataclass(frozen=True, slots=True)
+class _MeterDisplayState:
+    panel_index: int
+    expected_selection: Selection | None
+    revision: int = 0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.panel_index, bool) or not isinstance(self.panel_index, int):
+            raise TypeError("meter panel_index must be a non-negative integer")
+        if self.panel_index < 0:
+            raise ValueError("meter panel_index must be a non-negative integer")
+        if self.expected_selection is not None and not isinstance(
+            self.expected_selection,
+            Selection,
+        ):
+            raise TypeError("meter expected_selection must be Selection or None")
+        object.__setattr__(
+            self,
+            "revision",
+            nonnegative_integer(self.revision, "meter display revision"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _MeterGridOverview:
+    bundle: EncodedRasterDocument
+    regions: tuple[FigurePanelRegion, ...]
+    external_retained_upper_bound_bytes: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bundle, EncodedRasterDocument):
+            raise TypeError("meter overview requires EncodedRasterDocument")
+        if len(self.bundle.pages) != 1:
+            raise ValueError("meter overview requires one encoded page")
+        regions = tuple(self.regions)
+        if len(regions) <= 1 or any(
+            not isinstance(region, FigurePanelRegion) for region in regions
+        ):
+            raise ValueError("meter overview requires multiple FigurePanelRegion values")
+        if len({region.key for region in regions}) != len(regions):
+            raise ValueError("meter overview region keys must be unique")
+        selections = tuple(region.selection for region in regions)
+        if any(selection is None for selection in selections):
+            raise ValueError("multi-cell METER regions require exact selections")
+        if len(set(selections)) != len(selections):
+            raise ValueError("meter overview selections must identify unique panels")
+        object.__setattr__(self, "regions", regions)
+        object.__setattr__(
+            self,
+            "external_retained_upper_bound_bytes",
+            positive_integer(
+                self.external_retained_upper_bound_bytes,
+                "meter overview external retained bytes",
+            ),
+        )
+
+
+def _render_meter_grid_overview(
+    figure: DataFigure,
+    memory_limit_bytes: int,
+    cancelled: threading.Event,
+) -> _MeterGridOverview:
+    panel_count, reason = _classify_meter_grid(figure)
+    if panel_count is None:
+        raise ValueError(
+            "meter overview requires a supported multi-cell figure"
+            + ("" if reason is None else f": {reason}")
+        )
+    _require_not_cancelled(cancelled)
+    from zlc_frontend.matplotlib_render import (
+        estimate_render_peak_nbytes,
+        evaluated_figure_array_nbytes,
+    )
+
+    retained = figure.retained_upper_bound_nbytes
+    evaluated_bytes = evaluated_figure_array_nbytes(figure.evaluated)
+    region_bytes = 64 * 1024 + panel_count * 4096
+    render_peak = estimate_render_peak_nbytes(figure.evaluated, dpi=100.0)
+    render_session_peak = (
+        render_peak + max(0, retained - evaluated_bytes) + region_bytes
+    )
+    aggregate = positive_integer(memory_limit_bytes, "memory_limit_bytes")
+    if render_session_peak > aggregate:
+        raise MemoryError(
+            f"METER overview render requires {render_session_peak} bytes; "
+            f"limit is {aggregate}"
+        )
+    render_limit = _figure_render_limit(figure, aggregate)
+    payload, regions = figure.to_png_bytes_with_panel_regions(
+        memory_limit_bytes=render_limit,
+    )
+    _require_not_cancelled(cancelled)
+    if len(regions) != panel_count:
+        raise RuntimeError("METER overview regions do not cover every canonical panel")
+    bundle = EncodedRasterDocument(
+        _figure_summary(figure),
+        (EncodedRasterPage("meter-overview", "Overview", payload),),
+    )
+    steady_peak = retained + region_bytes + bundle.source_front_peak_nbytes
+    required = max(render_session_peak, steady_peak)
+    if required > aggregate:
+        raise MemoryError(
+            f"METER overview retention requires {required} bytes; limit is {aggregate}"
+        )
+    return _MeterGridOverview(
+        bundle,
+        regions,
+        retained + region_bytes,
+    )
+
+
+_TypedDisplayState = (
+    ImageDisplayState
+    | CurveDisplayState
+    | HistogramDisplayState
+    | _MeterDisplayState
+)
+_TypedPanelPayload = (
+    ImagePanelPayload
+    | CurvePanelPayload
+    | HistogramPanelPayload
+    | MeterPanelPayload
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,7 +652,9 @@ def _state_intent(state: _TypedDisplayState) -> ViewIntent:
         return ViewIntent.CURVE
     if isinstance(state, HistogramDisplayState):
         return ViewIntent.HISTOGRAM
-    raise TypeError("typed display state must be IMAGE, CURVE, or HISTOGRAM")
+    if isinstance(state, _MeterDisplayState):
+        return ViewIntent.METER
+    raise TypeError("typed display state must be IMAGE, CURVE, HISTOGRAM, or METER")
 
 
 def _default_typed_state(intent: ViewIntent) -> _TypedDisplayState:
@@ -498,7 +664,9 @@ def _default_typed_state(intent: ViewIntent) -> _TypedDisplayState:
         return CurveDisplayState()
     if intent is ViewIntent.HISTOGRAM:
         return HistogramDisplayState()
-    raise ValueError("typed intent must be IMAGE, CURVE, or HISTOGRAM")
+    if intent is ViewIntent.METER:
+        return _MeterDisplayState(0, None)
+    raise ValueError("typed intent must be IMAGE, CURVE, HISTOGRAM, or METER")
 
 
 def _typed_form_spec(state: _TypedDisplayState):
@@ -508,6 +676,8 @@ def _typed_form_spec(state: _TypedDisplayState):
         return curve_display_form_spec()
     if isinstance(state, HistogramDisplayState):
         return histogram_display_form_spec()
+    if isinstance(state, _MeterDisplayState):
+        raise ValueError("METER has no authored display form")
     raise TypeError("unknown typed display state")
 
 
@@ -518,6 +688,8 @@ def _typed_form_values(state: _TypedDisplayState) -> dict[str, object]:
         return curve_display_form_values(state)
     if isinstance(state, HistogramDisplayState):
         return histogram_display_form_values(state)
+    if isinstance(state, _MeterDisplayState):
+        raise ValueError("METER has no authored display form")
     raise TypeError("unknown typed display state")
 
 
@@ -545,6 +717,8 @@ def _typed_state_from_form(
             values,
             current_count_limits=current_value_limits,
         )
+    if isinstance(state, _MeterDisplayState):
+        raise ValueError("METER has no authored display form")
     raise TypeError("unknown typed display state")
 
 
@@ -566,6 +740,8 @@ def _payload_intent(payload: _TypedPanelPayload) -> ViewIntent:
         return ViewIntent.CURVE
     if isinstance(payload, HistogramPanelPayload):
         return ViewIntent.HISTOGRAM
+    if isinstance(payload, MeterPanelPayload):
+        return ViewIntent.METER
     raise TypeError("unknown typed payload")
 
 
@@ -679,6 +855,7 @@ class _TypedFigureFront:
             ViewIntent.IMAGE,
             ViewIntent.CURVE,
             ViewIntent.HISTOGRAM,
+            ViewIntent.METER,
         ):
             raise ValueError("typed figure front has another intent")
         if _state_intent(self.state) is not self.intent:
@@ -763,7 +940,12 @@ class _TypedFigureFront:
             panel.panel_id != _TYPED_PANEL_ID
             or not isinstance(
                 payload,
-                (ImagePanelPayload, CurvePanelPayload, HistogramPanelPayload),
+                (
+                    ImagePanelPayload,
+                    CurvePanelPayload,
+                    HistogramPanelPayload,
+                    MeterPanelPayload,
+                ),
             )
             or _payload_intent(payload) is not self.intent
         ):
@@ -844,7 +1026,12 @@ def _build_typed_front_contract(
     payload = panel.display_payload
     assert isinstance(
         payload,
-        (ImagePanelPayload, CurvePanelPayload, HistogramPanelPayload),
+        (
+            ImagePanelPayload,
+            CurvePanelPayload,
+            HistogramPanelPayload,
+            MeterPanelPayload,
+        ),
     )
     stamp = panel.coherence_stamp
     if len(stamp.presentations) != 1:
@@ -938,6 +1125,14 @@ def _validate_rendered_authored_payload(
 ) -> None:
     """Perform data-sized authored-state proof on the render worker."""
 
+    if isinstance(expected_state, _MeterDisplayState):
+        if not isinstance(payload, MeterPanelPayload):
+            raise ValueError("METER worker returned another payload kind")
+        if fit_result_identity is not None:
+            raise ValueError("METER display cannot carry a Fit result identity")
+        if payload.display_revision != expected_state.revision:
+            raise ValueError("METER worker returned another display revision")
+        return
     viewport = payload.viewport
     revision = (
         viewport.viewport_revision
@@ -1083,6 +1278,46 @@ def _typed_front_required_peak_bytes(
     return estimate_live_panel_raster_peak_nbytes(width, height, **options)
 
 
+def _meter_focus_preflight_nbytes(
+    figure: DataFigure,
+    panel_index: int,
+    *,
+    external_session_retained_bytes: int,
+) -> tuple[int, int, int]:
+    """Bound focus DTO, one Agg candidate, and the cached overview arithmetically."""
+
+    if not isinstance(figure, DataFigure):
+        raise TypeError("figure must be DataFigure")
+    external = nonnegative_integer(
+        external_session_retained_bytes,
+        "external_session_retained_bytes",
+    )
+    focused_retained = (
+        figure.focused_meter_panel_retained_upper_bound_nbytes(panel_index)
+    )
+    from zlc_frontend.matplotlib_render import estimate_live_panel_raster_peak_nbytes
+
+    width, height = _NUMERIC_RASTER_SIZE
+    current_front_bytes = width * height * 4
+    render_required = estimate_live_panel_raster_peak_nbytes(
+        width,
+        height,
+        extra_retained_fronts=1,
+        extra_retained_evaluated_data_bytes=external,
+    )
+    next_render_required = estimate_live_panel_raster_peak_nbytes(
+        width,
+        height,
+        extra_retained_fronts=1,
+    )
+    aggregate_peak = max(
+        render_required + focused_retained,
+        focused_retained + external + current_front_bytes,
+        next_render_required + focused_retained,
+    )
+    return focused_retained, render_required, aggregate_peak
+
+
 def _render_typed_front(
     figure: DataFigure,
     state: _TypedDisplayState,
@@ -1120,6 +1355,12 @@ def _render_typed_front(
             )
     elif (fit_result is None) != (fit_result_identity is None):
         raise ValueError("transient typed Fit result and identity must be present together")
+    if intent is ViewIntent.METER and (
+        figure.has_fit_overlays
+        or fit_result is not None
+        or fit_result_identity is not None
+    ):
+        raise ValueError("METER display cannot carry a Fit overlay")
     fit_result_retained_bytes = (
         0
         if fit_result is None
@@ -1323,13 +1564,19 @@ def _render_typed_front(
                     previous_relim_mode=previous_relim_mode,
                     fit_overlays=curve_fit_overlays,
                 )
-            else:
+            elif isinstance(state, HistogramDisplayState):
                 raster, payload = renderer.render_interactive_histogram(
                     figure.evaluated,
                     state,
                     current_count_limits=current_value_limits,
                     previous_relim_mode=previous_relim_mode,
                     previous_count_scale=previous_count_scale,
+                )
+            else:
+                assert isinstance(state, _MeterDisplayState)
+                raster, payload = renderer.render_meter(
+                    figure.evaluated,
+                    display_revision=state.revision,
                 )
         finally:
             renderer.close()
@@ -1443,7 +1690,10 @@ def _export_typed_png(
             commit_lock=commit_lock,
         )
         return revision, result
-    if not isinstance(payload, (CurvePanelPayload, HistogramPanelPayload)):
+    if not isinstance(
+        payload,
+        (CurvePanelPayload, HistogramPanelPayload, MeterPanelPayload),
+    ):
         raise ValueError("typed export payload is unsupported")
     raster = panel.raster
     if (
@@ -1474,8 +1724,32 @@ def _export_typed_png(
     return revision, result
 
 
+def _export_encoded_png(
+    payload: bytes,
+    destination: Path,
+    revision: int,
+    cancelled: threading.Event,
+    commit_lock: threading.Lock,
+) -> tuple[int, Path]:
+    if not isinstance(payload, bytes):
+        raise TypeError("encoded export requires owned immutable bytes")
+
+    def write_staged(path: Path) -> None:
+        _require_not_cancelled(cancelled)
+        path.write_bytes(payload)
+        _require_not_cancelled(cancelled)
+
+    result = stage_and_replace_export(
+        Path(destination),
+        write_staged=write_staged,
+        cancelled=cancelled,
+        commit_lock=commit_lock,
+    )
+    return revision, result
+
+
 class DataFigureWindow(FrozenRasterWindow):
-    """Frozen generic viewer with one closed IMAGE/CURVE/HISTOGRAM front."""
+    """Frozen generic viewer with one closed IMAGE/CURVE/HISTOGRAM/METER front."""
 
     def __init__(
         self,
@@ -1529,6 +1803,11 @@ class DataFigureWindow(FrozenRasterWindow):
         self._fit_axis_ids: tuple[AxisId, ...] = ()
         self._fit_axis_roles: tuple[tuple[AxisId, AxisViewRole], ...] = ()
         self._visible_fit_result_identity: str | None = None
+        self._meter_overview: _MeterGridOverview | None = None
+        self._meter_overview_presentation_bytes = 0
+        self._meter_overview_admission_retained_bytes = 0
+        self._meter_focus_pending: _MeterDisplayState | None = None
+        self._discard_meter_focus_sequence: int | None = None
 
         self._fit_future: Future | None = None
         self._fit_job_kind: str | None = None
@@ -1605,14 +1884,18 @@ class DataFigureWindow(FrozenRasterWindow):
         self._export_button.setObjectName("figureViewerTypedExportButton")
         self._analyze_button = FluentButton("Analyze → Fit", self, color=ORANGE)
         self._analyze_button.setObjectName("figureViewerAnalyzeFitButton")
+        self._overview_button = FluentButton("Overview", self, color=GREY)
+        self._overview_button.setObjectName("figureViewerMeterOverviewButton")
         self._controls.insertWidget(0, self._interaction_switch)
         self._controls.insertWidget(1, self._settings_button)
         self._controls.insertWidget(2, self._analyze_button)
-        self._controls.insertWidget(3, self._export_button)
+        self._controls.insertWidget(3, self._overview_button)
+        self._controls.insertWidget(4, self._export_button)
         for widget in (
             self._interaction_switch,
             self._settings_button,
             self._analyze_button,
+            self._overview_button,
             self._export_button,
         ):
             widget.hide()
@@ -1625,6 +1908,7 @@ class DataFigureWindow(FrozenRasterWindow):
         )
         self._export_button.clicked.connect(self._choose_export)
         self._analyze_button.clicked.connect(self._open_fit_analysis)
+        self._overview_button.clicked.connect(self._show_meter_overview)
         self._interaction_switch.toggled.connect(self._toggle_interaction)
         if fit_bindings is not None:
             pane = FitAuthoringPane(self._tabs)
@@ -1647,9 +1931,151 @@ class DataFigureWindow(FrozenRasterWindow):
             self._cancelled,
         )
 
+    def _presentation_memory_limit(self) -> int:
+        retained = self._meter_overview_admission_retained_bytes
+        if retained <= 0:
+            return super()._presentation_memory_limit()
+        remaining = self._memory_limit_bytes - retained
+        if remaining <= 0:
+            raise MemoryError("frozen METER data leaves no Qt overview budget")
+        return remaining
+
+    def _present_meter_overview(self, overview: _MeterGridOverview) -> None:
+        if not isinstance(overview, _MeterGridOverview):
+            raise TypeError("overview must be _MeterGridOverview")
+        retained = overview.external_retained_upper_bound_bytes
+        self._meter_overview_admission_retained_bytes = retained
+        try:
+            if not self._present_bundle(overview.bundle):
+                raise RuntimeError("Qt rejected the immutable METER overview")
+        finally:
+            self._meter_overview_admission_retained_bytes = 0
+        if len(self._boards) != 1 or not isinstance(self._boards[0], QtImageBoard):
+            raise RuntimeError("METER overview did not admit one encoded board")
+        presentation_bytes = self._presentation_peak(overview.bundle, self._boards)
+        if retained + presentation_bytes > self._memory_limit_bytes:
+            raise MemoryError("METER overview exceeds the aggregate presentation budget")
+        board = self._boards[0]
+        board.normalizedDoubleClicked.connect(self._focus_meter_region)
+        self._meter_overview = overview
+        self._meter_overview_presentation_bytes = presentation_bytes
+        self._view_family = "meter-overview"
+        self._display = None
+        self._typed_contract = None
+        self._tabs.setCurrentWidget(board)
+        self._tabs.tabBar().setVisible(False)
+        self._mode.setText("EXACT METER GRID · DISPLAY ONLY")
+        self._status.setText("READY")
+        self._summary.setText(overview.bundle.summary)
+        self._diagnostic.setText("")
+        for widget in (
+            self._interaction_switch,
+            self._settings_button,
+            self._analyze_button,
+            self._overview_button,
+        ):
+            widget.hide()
+        self._export_button.show()
+        self._set_typed_controls_enabled(True)
+
+    @QtCore.pyqtSlot(float, float)
+    def _focus_meter_region(self, x: float, y: float) -> None:
+        overview = self._meter_overview
+        if (
+            overview is None
+            or self._view_family != "meter-overview"
+            or self._future is not None
+            or self._closing
+        ):
+            return
+        hits = tuple(
+            (index, region)
+            for index, region in enumerate(overview.regions)
+            if region.contains(x, y)
+        )
+        if not hits:
+            return
+        if len(hits) != 1:
+            self._diagnostic.setText(
+                "METER focus rejected an ambiguous panel-boundary hit."
+            )
+            return
+        panel_index, region = hits[0]
+        if region.selection is None:
+            raise RuntimeError("multi-cell METER region lost its exact selection")
+        state = _MeterDisplayState(panel_index, region.selection)
+        self._request_revision += 1
+        self._meter_focus_pending = state
+        self._discard_meter_focus_sequence = None
+        self._active_kind = "meter_focus"
+        self._status.setText("RENDERING METER")
+        self._diagnostic.setText("")
+        self._set_typed_controls_enabled(False)
+        renderer = self._typed_renderer
+        if renderer is None or not self._submit_future(
+            renderer,
+            None,
+            None,
+            state,
+            None,
+            None,
+            None,
+            self._request_revision,
+            self._memory_limit_bytes,
+            self._cancelled,
+            0,
+            overview.external_retained_upper_bound_bytes
+            + self._meter_overview_presentation_bytes,
+        ):
+            self._meter_focus_pending = None
+            self._active_kind = None
+            self._set_typed_controls_enabled(True)
+
+    def _show_meter_overview(self) -> None:
+        overview = self._meter_overview
+        if overview is None or self._closing:
+            return
+        if self._active_kind == "meter_focus" and self._future is not None:
+            self._discard_meter_focus_sequence = self._request_revision
+            self._future.cancel()
+            self._status.setText("RETURNING TO OVERVIEW")
+            return
+        if self._future is not None or self._view_family != "meter":
+            return
+        if len(self._boards) != 1 or not self._boards[0].has_front:
+            raise RuntimeError("cached METER overview front is unavailable")
+        self._board_widget.clear()
+        self._display = None
+        self._typed_contract = None
+        self._current_front_peak_bytes = 0
+        self._visible_fit_overlay_retained_bytes = 0
+        self._visible_fit_result_identity = None
+        self._visible_transient_fit_result_owner = None
+        self._visible_transient_fit_result_retained_bytes = 0
+        self._fit_axis_ids = ()
+        self._fit_axis_roles = ()
+        self._fit_overlay_desired = None
+        self._view_family = "meter-overview"
+        self._tabs.setCurrentWidget(self._boards[0])
+        self._tabs.tabBar().setVisible(False)
+        self._mode.setText("EXACT METER GRID · DISPLAY ONLY")
+        self._status.setText("READY")
+        self._summary.setText(overview.bundle.summary)
+        self._diagnostic.setText("")
+        self._overview_button.hide()
+        self._export_button.show()
+        self._set_typed_controls_enabled(True)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == QtCore.Qt.Key_Escape and self._meter_overview is not None:
+            self._show_meter_overview()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     @property
     def raster_ready(self) -> bool:
-        if self._view_family in ("image", "curve", "histogram"):
+        if self._view_family in ("image", "curve", "histogram", "meter"):
             display = self._display
             payload = self._visible_typed_payload()
             visible_revision = (
@@ -1658,6 +2084,8 @@ class DataFigureWindow(FrozenRasterWindow):
                 else (
                     payload.viewport.viewport_revision
                     if isinstance(payload, ImagePanelPayload)
+                    else payload.display_revision
+                    if isinstance(payload, MeterPanelPayload)
                     else payload.viewport.display_revision
                 )
             )
@@ -1702,6 +2130,8 @@ class DataFigureWindow(FrozenRasterWindow):
             payload = self._board_widget.visible_curve_payload(_TYPED_PANEL_ID)
         elif self._view_family == "histogram":
             payload = self._board_widget.visible_histogram_payload(_TYPED_PANEL_ID)
+        elif self._view_family == "meter":
+            payload = self._board_widget.visible_meter_payload(_TYPED_PANEL_ID)
         else:
             return None
         if payload is not None:
@@ -1720,6 +2150,8 @@ class DataFigureWindow(FrozenRasterWindow):
                 CurvePanelPayload
                 if self._view_family == "curve"
                 else HistogramPanelPayload
+                if self._view_family == "histogram"
+                else MeterPanelPayload
             )
         )
         return candidate if isinstance(candidate, expected_type) else None
@@ -1920,6 +2352,29 @@ class DataFigureWindow(FrozenRasterWindow):
         )
 
     def _set_typed_controls_enabled(self, enabled: bool) -> None:
+        if self._view_family in ("meter", "meter-overview"):
+            ready = bool(enabled and not self._typed_ui_faulted)
+            self._board_widget.set_interaction_readiness(
+                image=False,
+                curve=False,
+                histogram=False,
+            )
+            self._settings_button.setEnabled(False)
+            self._analyze_button.setEnabled(False)
+            self._interaction_switch.setEnabled(False)
+            self._overview_button.setEnabled(
+                ready
+                and self._view_family == "meter"
+                and self._meter_overview is not None
+                and self._future is None
+            )
+            visible = (
+                self._bundle is not None
+                if self._view_family == "meter-overview"
+                else self._board_widget.front_frame is not None
+            )
+            self._export_button.setEnabled(ready and visible)
+            return
         active = bool(
             enabled
             and not self._typed_ui_faulted
@@ -1940,6 +2395,7 @@ class DataFigureWindow(FrozenRasterWindow):
             and self._view_family in ("curve", "image")
         )
         self._interaction_switch.setEnabled(active)
+        self._overview_button.setEnabled(False)
         for editor in (self._edit_display, self._setting_display):
             if editor is not None:
                 editor.setEnabled(active)
@@ -2723,7 +3179,12 @@ class DataFigureWindow(FrozenRasterWindow):
         payload = front.frame.panels[0].display_payload
         assert isinstance(
             payload,
-            (ImagePanelPayload, CurvePanelPayload, HistogramPanelPayload),
+            (
+                ImagePanelPayload,
+                CurvePanelPayload,
+                HistogramPanelPayload,
+                MeterPanelPayload,
+            ),
         )
         _validate_rendered_authored_payload(
             payload,
@@ -2786,7 +3247,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._visible_transient_fit_result_retained_bytes = (
             front.transient_fit_result_retained_bytes
         )
-        if self._fit_overlay_desired is None:
+        if front.intent is not ViewIntent.METER and self._fit_overlay_desired is None:
             self._fit_overlay_desired = _FitOverlayRequest(
                 self._fit_analysis_revision,
                 None,
@@ -2796,17 +3257,21 @@ class DataFigureWindow(FrozenRasterWindow):
         # immutable data front.  Their faults can disable UI, never roll it back.
         try:
             if not self._typed_pages_admitted:
-                self._retire_tab_pages()
+                if self._meter_overview is None:
+                    self._retire_tab_pages()
                 self._tabs.addTab(self._typed_page, front.intent.value.title())
                 self._tabs.tabBar().setVisible(False)
                 self._typed_page.show()
                 self._typed_pages_admitted = True
+            self._tabs.setCurrentWidget(self._typed_page)
             fit_capable = (
                 self._fit_bindings is not None
                 and front.intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
             )
             self._mode.setText(
-                f"EXACT {front.intent.value} · INTERACTIVE"
+                f"EXACT {front.intent.value} · DISPLAY ONLY"
+                if front.intent is ViewIntent.METER
+                else f"EXACT {front.intent.value} · INTERACTIVE"
                 + ("" if fit_capable else " · DISPLAY ONLY")
             )
             self._status.setText("READY")
@@ -2817,6 +3282,18 @@ class DataFigureWindow(FrozenRasterWindow):
             self._set_typed_controls_enabled(False)
             self._status.setText("TYPED CONTROLS FAILED")
             self._diagnostic.setText(error_summary(error))
+            return
+        if front.intent is ViewIntent.METER:
+            for widget in (
+                self._interaction_switch,
+                self._settings_button,
+                self._analyze_button,
+            ):
+                widget.hide()
+            self._export_button.show()
+            self._overview_button.setVisible(self._meter_overview is not None)
+            self._tabs.tabBar().setVisible(False)
+            self._set_typed_controls_enabled(True)
             return
         try:
             self._ensure_typed_controls(expected_state)
@@ -2866,6 +3343,13 @@ class DataFigureWindow(FrozenRasterWindow):
                 self._status.setText("FIGURE CANCELLED")
                 if kind == "typed":
                     self._discard_pending_typed()
+                elif kind == "meter_focus":
+                    self._meter_focus_pending = None
+                    self._discard_meter_focus_sequence = None
+                    self._active_kind = None
+                    self._status.setText("READY")
+                    self._diagnostic.setText("")
+                    self._set_typed_controls_enabled(True)
                 else:
                     self._active_kind = None
         except BaseException as error:
@@ -3084,11 +3568,37 @@ class DataFigureWindow(FrozenRasterWindow):
                     expected_state=_default_typed_state(result.intent),
                     request_revision=self._request_revision,
                 )
-                if not self._typed_ui_faulted:
+                if (
+                    result.intent is not ViewIntent.METER
+                    and not self._typed_ui_faulted
+                ):
                     self._sync_committed_typed_controls()
+            elif isinstance(result, _MeterGridOverview):
+                self._present_meter_overview(result)
             else:
                 raise TypeError("initial figure worker returned another result")
             self._active_kind = None
+            return
+        if kind == "meter_focus":
+            if not isinstance(result, _TypedFigureFront):
+                raise TypeError("METER focus worker returned another result")
+            pending = self._meter_focus_pending
+            if pending is None:
+                raise RuntimeError("METER focus completed without a pending panel")
+            discarded = self._discard_meter_focus_sequence == self._request_revision
+            self._meter_focus_pending = None
+            self._discard_meter_focus_sequence = None
+            self._active_kind = None
+            if discarded:
+                self._status.setText("READY")
+                self._diagnostic.setText("")
+                self._set_typed_controls_enabled(True)
+                return
+            self._present_typed_front(
+                result,
+                expected_state=pending,
+                request_revision=self._request_revision,
+            )
             return
         if kind == "typed":
             if not isinstance(result, _TypedFigureFront):
@@ -3212,6 +3722,14 @@ class DataFigureWindow(FrozenRasterWindow):
             self._diagnostic.setText(error_summary(error))
             self._fit_overlay_inflight = None
             self._discard_pending_typed()
+        elif kind == "meter_focus":
+            discarded = self._discard_meter_focus_sequence == self._request_revision
+            self._meter_focus_pending = None
+            self._discard_meter_focus_sequence = None
+            self._active_kind = None
+            self._status.setText("READY" if discarded else "METER FOCUS FAILED")
+            self._diagnostic.setText("" if discarded else error_summary(error))
+            self._set_typed_controls_enabled(True)
         elif kind == "fit_overlay":
             self._status.setText("FIT OVERLAY FAILED")
             self._diagnostic.setText(error_summary(error))
@@ -3231,11 +3749,20 @@ class DataFigureWindow(FrozenRasterWindow):
             self._active_kind = None
 
     def _choose_export(self) -> None:
+        overview_ready = bool(
+            self._view_family == "meter-overview"
+            and self._bundle is not None
+            and len(self._bundle.pages) == 1
+            and len(self._boards) == 1
+            and self._boards[0].has_front
+        )
+        typed_ready = self._board_widget.front_frame is not None
         if (
             self._future is not None
             or self._closing
-            or self._view_family not in ("image", "curve", "histogram")
-            or self._board_widget.front_frame is None
+            or self._view_family
+            not in ("image", "curve", "histogram", "meter", "meter-overview")
+            or not (overview_ready or typed_ready)
         ):
             return
         family = self._view_family
@@ -3253,13 +3780,38 @@ class DataFigureWindow(FrozenRasterWindow):
 
     def _start_export(self, destination: Path) -> None:
         frame = self._board_widget.front_frame
-        if self._future is not None or self._closing or frame is None:
+        overview = self._meter_overview
+        overview_payload = (
+            self._bundle.pages[0].png_bytes
+            if self._view_family == "meter-overview"
+            and overview is not None
+            and self._bundle is not None
+            and len(self._bundle.pages) == 1
+            else None
+        )
+        if (
+            self._future is not None
+            or self._closing
+            or (frame is None and overview_payload is None)
+        ):
             return
         self._request_revision += 1
         self._active_kind = "export"
         self._status.setText(f"EXPORTING {self._view_family.upper()}")
         self._diagnostic.setText("")
         self._set_typed_controls_enabled(False)
+        if overview_payload is not None:
+            if not self._submit_future(
+                _export_encoded_png,
+                overview_payload,
+                Path(destination),
+                self._request_revision,
+                self._cancelled,
+                self._export_commit_lock,
+            ):
+                self._active_kind = None
+                self._set_typed_controls_enabled(True)
+            return
         display = self._display
         if display is None:
             self._active_kind = None
@@ -3291,8 +3843,12 @@ class DataFigureWindow(FrozenRasterWindow):
 
     def _clear_bundle(self) -> None:
         super()._clear_bundle()
-        if self._view_family in ("image", "curve", "histogram"):
-            self._board_widget.clear()
+        self._board_widget.clear()
+        self._meter_overview = None
+        self._meter_overview_presentation_bytes = 0
+        self._meter_overview_admission_retained_bytes = 0
+        self._meter_focus_pending = None
+        self._discard_meter_focus_sequence = None
 
     @QtCore.pyqtSlot()
     def _owner_cycle(self) -> None:
@@ -3424,6 +3980,7 @@ def _figure_window_factory(
     worker_thread_id: int | None = None
     cached_typed: DataFigure | None = None
     cached_base: DataFigure | None = None
+    cached_meter_grid: DataFigure | None = None
     cached_canonical_result_retained_bytes = 0
 
     def require_worker_owner() -> None:
@@ -3439,7 +3996,8 @@ def _figure_window_factory(
         sequence: int,
         cancelled: threading.Event,
     ):
-        nonlocal cached_typed, cached_base, cached_canonical_result_retained_bytes
+        nonlocal cached_typed, cached_base, cached_meter_grid
+        nonlocal cached_canonical_result_retained_bytes
         require_worker_owner()
         _require_not_cancelled(cancelled)
         figure = loader()
@@ -3490,6 +4048,27 @@ def _figure_window_factory(
                 else figure
             )
             return front
+        meter_panel_count, _meter_reason = _classify_meter_grid(figure)
+        if meter_panel_count is not None:
+            if initial_fit_result_identity is not None:
+                raise ValueError("Fit result identity was supplied for a METER overview")
+            try:
+                overview = _render_meter_grid_overview(
+                    figure,
+                    memory_limit,
+                    cancelled,
+                )
+            except MemoryError:
+                return _encoded_figure(
+                    figure,
+                    memory_limit,
+                    cancelled,
+                    unavailable_reason=(
+                        "interactive METER focus exceeds the frozen memory budget"
+                    ),
+                )
+            cached_meter_grid = figure
+            return overview
         return _encoded_figure(
             figure,
             memory_limit,
@@ -3511,6 +4090,49 @@ def _figure_window_factory(
         window_external_retained_bytes: int,
     ) -> _TypedFigureFront:
         require_worker_owner()
+        if isinstance(state, _MeterDisplayState) and cached_meter_grid is not None:
+            if fit_result is not None or fit_result_identity is not None:
+                raise ValueError("METER focus cannot carry a Fit result")
+            external_retained = nonnegative_integer(
+                window_external_retained_bytes,
+                "window_external_retained_bytes",
+            )
+            focused_bound, render_required, aggregate_peak = (
+                _meter_focus_preflight_nbytes(
+                    cached_meter_grid,
+                    state.panel_index,
+                    external_session_retained_bytes=external_retained,
+                )
+            )
+            effective_limit = _figure_render_limit(cached_meter_grid, memory_limit)
+            if render_required > effective_limit:
+                raise MemoryError(
+                    f"interactive meter requires {render_required} bytes; "
+                    f"limit is {effective_limit}"
+                )
+            if aggregate_peak > memory_limit:
+                raise MemoryError(
+                    f"interactive meter aggregate peak {aggregate_peak} "
+                    f"exceeds limit {memory_limit}"
+                )
+            focused = cached_meter_grid.focused_meter_panel(
+                state.panel_index,
+                expected_selection=state.expected_selection,
+            )
+            if focused.retained_upper_bound_nbytes > focused_bound:
+                raise RuntimeError("focused METER exceeded its preflight bound")
+            return _render_typed_front(
+                focused,
+                state,
+                current_value_limits=None,
+                previous_relim_mode=None,
+                previous_count_scale=None,
+                sequence=sequence,
+                memory_limit_bytes=memory_limit,
+                cancelled=cancelled,
+                previous_fit_overlay_retained_bytes=0,
+                external_session_retained_bytes=external_retained,
+            )
         figure = cached_typed
         base = cached_base
         if base is None:

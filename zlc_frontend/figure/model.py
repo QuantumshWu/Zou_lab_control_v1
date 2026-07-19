@@ -633,6 +633,7 @@ class EvaluatedHistogram:
 class EvaluatedMeter:
     value: bool | Number
     valid: bool
+    value_unit: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.valid, (bool, np.bool_)):
@@ -642,6 +643,12 @@ class EvaluatedMeter:
         if not isinstance(value, (bool, Number)):
             raise TypeError("meter value must be a numeric or boolean scalar")
         object.__setattr__(self, "value", value)
+        if self.value_unit is not None:
+            object.__setattr__(
+                self,
+                "value_unit",
+                _text(self.value_unit, "meter value unit"),
+            )
 
 
 EvaluatedLayerData = EvaluatedImage | EvaluatedCurve | EvaluatedHistogram | EvaluatedMeter

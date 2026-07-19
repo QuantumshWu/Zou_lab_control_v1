@@ -1633,8 +1633,14 @@ class LiveBoardController:
                     rasters.append(histogram_raster)
                     payloads.append(histogram_payload)
                 else:
-                    rasters.append(renderer.render(scalar_evaluated))
-                    payloads.append(None)
+                    meter_raster, meter_payload = renderer.render_meter(
+                        scalar_evaluated,
+                        display_revision=(
+                            configuration.presentations[index + 1].panel_revision
+                        ),
+                    )
+                    rasters.append(meter_raster)
+                    payloads.append(meter_payload)
             frame = BoardFrame(
                 configuration.board_id,
                 configuration.layout_generation,

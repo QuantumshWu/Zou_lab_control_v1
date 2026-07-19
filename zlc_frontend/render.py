@@ -47,6 +47,7 @@ from .figure import (
     EvaluatedHistogram,
     EvaluatedImage,
     EvaluatedInput,
+    EvaluatedMeter,
     EvaluatedSeries,
 )
 from .image_view import ImageViewportTransform
@@ -757,6 +758,48 @@ class HistogramPanelPayload:
     def bin_edges(self) -> np.ndarray:
         return self.bin_projection.bin_edges
 
+
+@dataclass(frozen=True, slots=True)
+class MeterPanelPayload:
+    """Exact scalar and source identity paired with one METER raster front."""
+
+    evaluated_input: EvaluatedInput
+    display_revision: int
+    series: tuple[EvaluatedSeries, ...]
+    series_labels: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.evaluated_input, EvaluatedInput):
+            raise TypeError("meter payload requires one EvaluatedInput")
+        object.__setattr__(
+            self,
+            "display_revision",
+            _nonnegative(self.display_revision, "meter display revision"),
+        )
+        series = tuple(self.series)
+        if not series or any(not isinstance(item, EvaluatedSeries) for item in series):
+            raise ValueError("meter payload requires EvaluatedSeries values")
+        meters = tuple(item.data for item in series)
+        if any(not isinstance(item, EvaluatedMeter) for item in meters):
+            raise TypeError("meter payload series must all contain EvaluatedMeter")
+        value_unit = meters[0].value_unit
+        if any(item.value_unit != value_unit for item in meters[1:]):
+            raise ValueError("meter payload series must share value_unit")
+        labels = tuple(
+            _text(label, f"meter series label {index}")
+            for index, label in enumerate(self.series_labels)
+        )
+        if len(labels) != len(series):
+            raise ValueError("meter series labels must align with its exact series")
+        object.__setattr__(self, "series", series)
+        object.__setattr__(self, "series_labels", labels)
+
+    @property
+    def value_unit(self) -> str | None:
+        meter = self.series[0].data
+        assert isinstance(meter, EvaluatedMeter)
+        return meter.value_unit
+
 @dataclass(frozen=True, slots=True, eq=False)
 class SiteMapPanelPayload:
     """One IMAGE background plus calibrated, exact per-site occupancy state.
@@ -913,6 +956,7 @@ DisplayPayload = (
     ImagePanelPayload
     | CurvePanelPayload
     | HistogramPanelPayload
+    | MeterPanelPayload
     | SiteMapPanelPayload
 )
 
@@ -947,12 +991,13 @@ class PanelFrame:
                     ImagePanelPayload,
                     CurvePanelPayload,
                     HistogramPanelPayload,
+                    MeterPanelPayload,
                     SiteMapPanelPayload,
                 ),
             ):
                 raise TypeError(
                     "display_payload must be ImagePanelPayload, "
-                    "CurvePanelPayload, HistogramPanelPayload, "
+                    "CurvePanelPayload, HistogramPanelPayload, MeterPanelPayload, "
                     "SiteMapPanelPayload, or None"
                 )
             presentations = tuple(
@@ -981,6 +1026,11 @@ class PanelFrame:
                 if self.raster.pixel_format is not PixelFormat.RGBA8888:
                     raise ValueError("histogram payload requires an RGBA8888 raster")
                 payload_revision = payload.viewport.display_revision
+                source_input = payload.evaluated_input
+            elif isinstance(payload, MeterPanelPayload):
+                if self.raster.pixel_format is not PixelFormat.RGBA8888:
+                    raise ValueError("meter payload requires an RGBA8888 raster")
+                payload_revision = payload.display_revision
                 source_input = payload.evaluated_input
             else:
                 background = payload.background
@@ -1153,6 +1203,7 @@ __all__ = [
     "CurveFitOverlay",
     "CurvePanelPayload",
     "HistogramPanelPayload",
+    "MeterPanelPayload",
     "detached_render_fault",
     "DisplayPayload",
     "PanelPresentationIdentity",

@@ -18,18 +18,27 @@ from zlc_data import (
     DatasetSchema,
     FitResultBatch,
     Selection,
+    dataset_revision_ref_to_tree,
     dataset_schema_retained_upper_bound_nbytes,
     fit_result_source_validation_additional_peak_upper_bound_nbytes,
     validate_fit_result_source_binding,
 )
-from zlc_storage import canonical_text
+from zlc_storage import canonical_digest, canonical_text
 
 from .figure import (
+    AxisResolution,
+    AxisViewBinding,
     AxisViewRole,
     DatasetId,
+    EvaluatedCell,
+    EvaluatedFigureData,
+    EvaluatedLayer,
+    EvaluatedMeter,
     FigureDocument,
     FigureEvaluator,
     FigureEvaluationPolicy,
+    FigureLayer,
+    FixedIndex,
     ResolvedDatasetMap,
     ViewIntent,
 )
@@ -451,6 +460,218 @@ class DataFigure:
         clone._fit_results = validated
         clone._render_memory_limit_bytes = self._render_memory_limit_bytes
         clone._source_schemas = self._source_schemas
+        return clone
+
+    def _meter_focus_parts(self, panel_index: int):
+        if isinstance(panel_index, bool) or not isinstance(panel_index, Integral):
+            raise TypeError("panel_index must be a non-negative integer")
+        panel_index = int(panel_index)
+        if panel_index < 0:
+            raise ValueError("panel_index must be a non-negative integer")
+        if self._fit_results:
+            raise ValueError("focused METER display does not accept fit overlays")
+        if (
+            len(self._document.layers) != 1
+            or len(self._evaluated.layers) != 1
+            or len(self._evaluated.inputs) != 1
+        ):
+            raise ValueError("focused METER display requires one layer and input")
+        source_layer = self._document.layers[0]
+        layer = self._evaluated.layers[0]
+        if (
+            source_layer.layer_id != layer.layer_id
+            or source_layer.dataset_id != layer.dataset_id
+            or source_layer.view.intent is not ViewIntent.METER
+        ):
+            raise RuntimeError("document/evaluated METER layer identity differs")
+        if panel_index >= len(layer.cells):
+            raise IndexError("panel_index is outside the frozen figure")
+        cell = layer.cells[panel_index]
+        if not cell.series or any(
+            not isinstance(series.data, EvaluatedMeter) for series in cell.series
+        ):
+            raise ValueError("focused METER display requires one METER panel")
+        source_schemas = tuple(
+            item for item in self._source_schemas if item[0] == layer.dataset_id
+        )
+        if len(source_schemas) != 1:
+            raise RuntimeError("focused METER source schema is absent or ambiguous")
+        return panel_index, source_layer, layer, cell, source_schemas
+
+    def _meter_focus_retained_bound(
+        self,
+        source_layer,
+        layer,
+        cell,
+        source_schemas,
+    ) -> int:
+        metadata_seed = (
+            self._document.descriptor(layer.dataset_id),
+            source_layer,
+            self._evaluated.inputs,
+            layer.layer_id,
+            layer.dataset_id,
+            cell,
+            layer.resolutions,
+        )
+        return int(
+            64 * 1024
+            + _metadata_retained_upper_bound_nbytes(metadata_seed)
+            + sum(
+                dataset_schema_retained_upper_bound_nbytes(schema)
+                for _dataset_id, schema in source_schemas
+            )
+        )
+
+    def focused_meter_panel_retained_upper_bound_nbytes(
+        self,
+        panel_index: int,
+    ) -> int:
+        """Bound one focus derivation without allocating its Figure DTO graph."""
+
+        _index, source_layer, layer, cell, source_schemas = (
+            self._meter_focus_parts(panel_index)
+        )
+        return self._meter_focus_retained_bound(
+            source_layer,
+            layer,
+            cell,
+            source_schemas,
+        )
+
+    def focused_meter_panel(
+        self,
+        panel_index: int,
+        *,
+        expected_selection: Selection | None,
+    ) -> DataFigure:
+        """Derive one exact display-only METER panel from this frozen figure.
+
+        The panel order and selection are the same canonical facts used by the
+        whole-figure renderer.  No dataset is resolved or evaluated again, and
+        no display selection is promoted to an authority transform.
+        """
+
+        if expected_selection is not None and not isinstance(
+            expected_selection,
+            Selection,
+        ):
+            raise TypeError("expected_selection must be Selection or None")
+        panel_index, source_layer, layer, cell, source_schemas = (
+            self._meter_focus_parts(panel_index)
+        )
+        retained_bound = self._meter_focus_retained_bound(
+            source_layer,
+            layer,
+            cell,
+            source_schemas,
+        )
+
+        # Imported lazily because fit_image_projection also imports the public
+        # FigurePanelRegion DTO from this module.
+        from .fit_image_projection import fit_panel_selection
+
+        series_group = cell.series
+        actual_selection = fit_panel_selection(layer, cell, series_group, None)
+        if actual_selection != expected_selection:
+            raise ValueError("panel selection differs from the frozen overview region")
+
+        facet_by_axis = {address.axis_id: address for address in cell.facet_address}
+        if len(facet_by_axis) != len(cell.facet_address):
+            raise RuntimeError("focused METER facet address repeats an axis")
+        facet_bindings = {
+            binding.axis_id
+            for binding in source_layer.view.axis_bindings
+            if binding.role is AxisViewRole.FACET
+        }
+        if facet_bindings != set(facet_by_axis):
+            raise RuntimeError("focused METER facet addresses do not match its view")
+        bindings = tuple(
+            AxisViewBinding(
+                binding.axis_id,
+                AxisViewRole.SELECTED,
+                selector=FixedIndex(facet_by_axis[binding.axis_id].index),
+            )
+            if binding.role is AxisViewRole.FACET
+            else binding
+            for binding in source_layer.view.axis_bindings
+        )
+
+        resolutions = {item.axis_id: item for item in layer.resolutions}
+        if len(resolutions) != len(layer.resolutions):
+            raise RuntimeError("focused METER layer repeats a resolution axis")
+        for address in cell.facet_address:
+            candidate = AxisResolution(
+                address.axis_id,
+                "FIXED_INDEX",
+                address.index,
+                address.coordinate,
+            )
+            incumbent = resolutions.setdefault(address.axis_id, candidate)
+            if incumbent != candidate:
+                raise RuntimeError("focused METER resolution conflicts with its facet")
+
+        identity = canonical_digest(
+            {
+                "schema": "zlc_frontend.FocusedMeterPanel",
+                "source_document_id": self._document.document_id,
+                "source_document_revision": self._document.revision,
+                "dataset_id": layer.dataset_id.value,
+                "dataset_revision_ref": dataset_revision_ref_to_tree(
+                    self._evaluated.inputs[0].ref
+                ),
+                "layer_id": layer.layer_id,
+                "panel_index": panel_index,
+                "facet_indices": tuple(
+                    (address.axis_id.value, address.index)
+                    for address in sorted(
+                        cell.facet_address,
+                        key=lambda item: item.axis_id.value,
+                    )
+                ),
+            }
+        )
+        document_id = f"meter-focus-{identity}"
+        descriptor = self._document.descriptor(layer.dataset_id)
+        focused_document = FigureDocument(
+            document_id,
+            0,
+            (descriptor,),
+            (
+                FigureLayer(
+                    source_layer.layer_id,
+                    source_layer.dataset_id,
+                    replace(source_layer.view, axis_bindings=bindings),
+                ),
+            ),
+        )
+        focused_evaluated = EvaluatedFigureData(
+            document_id,
+            0,
+            self._evaluated.inputs,
+            (
+                EvaluatedLayer(
+                    layer.layer_id,
+                    layer.dataset_id,
+                    (EvaluatedCell((), tuple(series_group)),),
+                    tuple(
+                        resolutions[axis_id]
+                        for axis_id in sorted(
+                            resolutions,
+                            key=lambda item: item.value,
+                        )
+                    ),
+                ),
+            ),
+        )
+        clone = object.__new__(type(self))
+        clone._document = focused_document
+        clone._evaluated = focused_evaluated
+        clone._fit_results = ()
+        clone._render_memory_limit_bytes = self._render_memory_limit_bytes
+        clone._source_schemas = source_schemas
+        if clone.retained_upper_bound_nbytes > retained_bound:
+            raise RuntimeError("focused METER DTO exceeded its preflight bound")
         return clone
 
     def render(

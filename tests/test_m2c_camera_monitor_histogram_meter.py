@@ -659,6 +659,12 @@ def test_image_reconfigure_shares_first_scalar_renderer_holder_across_worker_rac
                 previous_count_scale=previous_count_scale,
             )
 
+        def render_meter(self, evaluated, *, display_revision):
+            return self._inner.render_meter(
+                evaluated,
+                display_revision=display_revision,
+            )
+
         def close(self):
             self.close_count += 1
             self._inner.close()

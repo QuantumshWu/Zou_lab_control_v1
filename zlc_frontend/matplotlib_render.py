@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import gc
+from decimal import Decimal
 from io import BytesIO
 import math
 import threading
 from dataclasses import fields, is_dataclass
-from numbers import Number
+from numbers import Integral, Number
 
 import numpy as np
 
@@ -61,6 +62,7 @@ from .render import (
     CurvePanelPayload,
     HistogramPanelPayload,
     ImagePanelPayload,
+    MeterPanelPayload,
     PixelFormat,
     RasterBuffer,
     _validated_curve_fit_overlays,
@@ -1062,12 +1064,27 @@ def _meter_text(series_group) -> str:
         label = _series_label(series, include_reductions=multiple_series) or ""
         if data.valid and not _finite_numeric_scalar(data.value):
             raise ValueError("valid meter values must be finite")
-        value = str(data.value) if data.valid else "invalid"
+        if data.valid:
+            value = (
+                "true"
+                if data.value is True
+                else "false"
+                if data.value is False
+                else format(Decimal(int(data.value)), ".6g")
+                if isinstance(data.value, Integral)
+                else format(data.value, ".6g")
+            )
+            if data.value_unit is not None:
+                value = f"{value} {data.value_unit}"
+        else:
+            value = "invalid"
         lines.append(f"{label}: {value}" if label else value)
     return "\n".join(lines)
 
 
 def _finite_numeric_scalar(value: Number) -> bool:
+    if isinstance(value, Integral):
+        return True
     try:
         return bool(np.isfinite(value))
     except TypeError:
@@ -1384,6 +1401,46 @@ class SinglePanelAggRenderer:
             axis.autoscale_view()
         return self._draw_raster(figure)
 
+    def render_meter(
+        self,
+        evaluated: EvaluatedFigureData,
+        *,
+        display_revision: int,
+    ) -> tuple[RasterBuffer, MeterPanelPayload]:
+        """Render one exact display-only METER front and its immutable payload."""
+
+        revision = nonnegative_integer(display_revision, "meter display_revision")
+        with render_style_context():
+            layer, _cell, series_group = self._one_panel(evaluated)
+            if not series_group or any(
+                not isinstance(series.data, EvaluatedMeter)
+                for series in series_group
+            ):
+                raise ValueError("typed meter render requires METER series")
+            value_unit = series_group[0].data.value_unit
+            if any(
+                series.data.value_unit != value_unit
+                for series in series_group[1:]
+            ):
+                raise ValueError("typed meter series must share value_unit")
+            # Formatting is pure and performs the valid/non-finite check before
+            # the persistent Agg surface can acquire or mutate artists.
+            _meter_text(series_group)
+            evaluated_input = self._evaluated_input_for_layer(evaluated, layer)
+            figure, _axis, prepared_layer, _cell, prepared_series = (
+                self._prepare_panel(evaluated)
+            )
+            if prepared_layer is not layer or prepared_series is not series_group:
+                raise RuntimeError("meter panel identity changed during preparation")
+            raster = self._draw_raster(figure)
+            labels = self._series_labels(layer.layer_id, series_group)
+            return raster, MeterPanelPayload(
+                evaluated_input,
+                revision,
+                tuple(series_group),
+                labels,
+            )
+
     def render_interactive_curve(
         self,
         evaluated: EvaluatedFigureData,
@@ -1525,7 +1582,7 @@ class SinglePanelAggRenderer:
             actual_y_limits,
             home_x_limits,
         )
-        labels = self._curve_series_labels(layer.layer_id, series_group)
+        labels = self._series_labels(layer.layer_id, series_group)
         return raster, CurvePanelPayload(
             evaluated_input,
             viewport,
@@ -1644,7 +1701,7 @@ class SinglePanelAggRenderer:
             raise ValueError(
                 "interactive histogram layer requires one exact evaluated input"
             )
-        labels = self._curve_series_labels(layer.layer_id, series_group)
+        labels = self._series_labels(layer.layer_id, series_group)
         return raster, HistogramPanelPayload(
             evaluated_input,
             viewport,
@@ -1686,7 +1743,10 @@ class SinglePanelAggRenderer:
             )
         else:
             assert isinstance(first, EvaluatedMeter)
-            series_topology = tuple(series.batch_address for series in series_group)
+            series_topology = tuple(
+                (series.batch_address, series.data.value_unit)
+                for series in series_group
+            )
         topology = (
             layer.layer_id,
             layer.dataset_id,
@@ -1847,7 +1907,7 @@ class SinglePanelAggRenderer:
             or len(self._fit_diagnostic_artists) != len(series_group)
         ):
             raise RuntimeError("curve fit artist topology differs from its series")
-        labels = self._curve_series_labels(layer.layer_id, series_group)
+        labels = self._series_labels(layer.layer_id, series_group)
         active_fit_artists = []
         for index, (fit_artist, diagnostic_artist, series, label) in enumerate(
             zip(
@@ -1911,7 +1971,7 @@ class SinglePanelAggRenderer:
         return matches[0]
 
     @staticmethod
-    def _curve_series_labels(layer_id: str, series_group) -> tuple[str, ...]:
+    def _series_labels(layer_id: str, series_group) -> tuple[str, ...]:
         multiple_series = len(series_group) > 1
         labels = []
         for index, series in enumerate(series_group):

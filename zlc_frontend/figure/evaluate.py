@@ -1239,14 +1239,22 @@ def _histogram(
     )
 
 
-def _meter(working: _WorkingData) -> EvaluatedMeter:
+def _meter(
+    working: _WorkingData,
+    *,
+    value_unit: str | None,
+) -> EvaluatedMeter:
     if working.cell_axes or working.data_axes:
         raise FigureEvaluationError("meter retains unresolved axes")
     if working.values.size == 0:
-        return EvaluatedMeter(0.0, False)
+        return EvaluatedMeter(0.0, False, value_unit)
     if working.values.size != 1:
         raise FigureEvaluationError("meter evaluation produced more than one value")
-    return EvaluatedMeter(working.values.reshape(-1)[0], bool(working.validity.reshape(-1)[0]))
+    return EvaluatedMeter(
+        working.values.item(),
+        bool(working.validity.item()),
+        value_unit,
+    )
 
 
 def _address(axis: AxisSpec, index: int) -> AxisAddress:
@@ -1446,7 +1454,10 @@ class FigureEvaluator:
                         value_unit=block.schema.cell_schema.value_unit,
                     )
                 else:
-                    data = _meter(working)
+                    data = _meter(
+                        working,
+                        value_unit=block.schema.cell_schema.value_unit,
+                    )
                 series.append(
                     EvaluatedSeries(
                         tuple(
