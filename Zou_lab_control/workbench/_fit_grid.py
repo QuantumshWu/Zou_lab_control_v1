@@ -2402,6 +2402,22 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._settings_popup.hide()
         super().shutdown()
 
+    def _forget_presented_pages(self) -> None:
+        """Drop every page and focus display fact this window still holds."""
+
+        self._page = None
+        self._page_panels = ()
+        self._page_frame = None
+        self._page_retained_bytes = 0
+        self._page_color_limits = None
+        self._page_encoded_bundle = None
+        self._page_regions = ()
+        self._current_panels = ()
+        self._current_frame = None
+        self._current_retained_bytes = 0
+        self._current_encoded_bundle = None
+        self._regions = ()
+
     def _clear_bundle(self) -> None:
         self._bundle = None
         self._boards = ()
@@ -2417,18 +2433,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
         encoded_board = getattr(self, "_encoded_board", None)
         if encoded_board is not None:
             encoded_board.clear()
-        self._page = None
-        self._page_panels = ()
-        self._page_frame = None
-        self._page_retained_bytes = 0
-        self._page_color_limits = None
-        self._page_encoded_bundle = None
-        self._page_regions = ()
-        self._current_panels = ()
-        self._current_frame = None
-        self._current_retained_bytes = 0
-        self._current_encoded_bundle = None
-        self._regions = ()
+        self._forget_presented_pages()
         self._current_selection = None
         self._requested_selection = None
         self._showing_page = True
@@ -2443,18 +2448,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._model = None
             self._session_retained_bytes = 0
             self._navigator = None
-            self._page = None
-            self._page_panels = ()
-            self._page_frame = None
-            self._page_retained_bytes = 0
-            self._page_color_limits = None
-            self._page_encoded_bundle = None
-            self._page_regions = ()
-            self._current_panels = ()
-            self._current_frame = None
-            self._current_retained_bytes = 0
-            self._current_encoded_bundle = None
-            self._regions = ()
+            self._forget_presented_pages()
         super()._finish_close_if_ready()
 
 
