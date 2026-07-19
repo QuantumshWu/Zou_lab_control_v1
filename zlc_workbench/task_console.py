@@ -96,36 +96,46 @@ def compose_task_console_catalog() -> DefinitionCatalog:
     )
 
 
+_CATALOG_GROUP_BY_DEFINITION = (
+    (TaskDefinition, "Task"),
+    (MeasurementDefinition, "Measurement"),
+    (StreamProcessorDefinition, "Processor"),
+)
+
+
 def task_console_catalog_items(
     catalog: DefinitionCatalog,
 ) -> tuple[TaskConsoleCatalogItem, ...]:
-    """Project every supplied Definition, rejecting silent catalog omissions."""
+    """Project every supplied Definition, rejecting silent catalog omissions.
+
+    The projection is driven by each Definition's own type, never by a pinned
+    key set, so a newly registered Definition reaches this product without a
+    GUI edit.  A Definition kind this product cannot group is still refused
+    rather than dropped, which is the omission this projection exists to catch.
+    """
 
     if not isinstance(catalog, DefinitionCatalog):
         raise TypeError("catalog must be DefinitionCatalog")
-    expected = {
-        PULSE_SCAN_TASK_KEY,
-        CAMERA_MEASUREMENT_KEY,
-        OCCUPANCY_STREAM_PROCESSOR_KEY,
-    }
-    actual = set(catalog.by_key)
-    if actual != expected:
-        raise ValueError(
-            "TaskConsole catalog projection is incomplete; "
-            f"missing={sorted(map(str, expected - actual))}, "
-            f"unexpected={sorted(map(str, actual - expected))}"
+    items = []
+    for definition in catalog.definitions:
+        group = next(
+            (
+                name
+                for kind, name in _CATALOG_GROUP_BY_DEFINITION
+                if type(definition) is kind
+            ),
+            None,
         )
-    task = catalog.resolve(PULSE_SCAN_TASK_KEY, TaskDefinition)
-    measurement = catalog.resolve(CAMERA_MEASUREMENT_KEY, MeasurementDefinition)
-    processor = catalog.resolve(
-        OCCUPANCY_STREAM_PROCESSOR_KEY,
-        StreamProcessorDefinition,
-    )
-    return (
-        TaskConsoleCatalogItem(task.key, "Task", task.title),
-        TaskConsoleCatalogItem(measurement.key, "Measurement", measurement.title),
-        TaskConsoleCatalogItem(processor.key, "Processor", processor.title),
-    )
+        if group is None:
+            raise TypeError(
+                "TaskConsole cannot group definition "
+                f"{getattr(definition, 'key', definition)} of type "
+                f"{type(definition).__name__}"
+            )
+        items.append(
+            TaskConsoleCatalogItem(definition.key, group, definition.title)
+        )
+    return tuple(items)
 
 
 def _role_form_field(
