@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
-from typing import Callable
+from typing import Callable, Literal, TypeAlias
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -13,13 +13,15 @@ from zlc_data import Selection
 from zlc_storage import canonical_text, nonnegative_integer
 
 from ..curve_display import CurveViewportTransform
-from ..display_range import validated_display_range
+from ..display_range import RelimMode, validated_display_range
+from ..histogram_display import HistogramViewportTransform
 from ..image_raster import indexed8_code_for_value
 from ..image_view import validate_normalized_rectangle
 from ..render import (
     BoardFrame,
     CurvePanelPayload,
     DisplayPayload,
+    HistogramPanelPayload,
     ImagePanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
@@ -43,6 +45,9 @@ from ..selector import (
     CurveInteractionIntent,
     CurveRangeGesture,
     CurveViewportCommit,
+    HistogramInteractionIntent,
+    HistogramRangeGesture,
+    HistogramViewportCommit,
     ImageColorLimitsCommit,
     ImageInteractionCommit,
     ImageViewportTransform,
@@ -273,7 +278,12 @@ def _site_map_payload(
 
 
 def _payload_input(
-    payload: ImagePanelPayload | CurvePanelPayload | SiteMapPanelPayload,
+    payload: (
+        ImagePanelPayload
+        | CurvePanelPayload
+        | HistogramPanelPayload
+        | SiteMapPanelPayload
+    ),
 ):
     return (
         payload.occupancy_input
@@ -301,9 +311,31 @@ def _curve_payload(
     return payload if isinstance(payload, CurvePanelPayload) else None
 
 
-def _curve_plot_geometry(
+def _histogram_payload(
+    panel_or_hold: PanelFrame | _HeldPanelFront,
+) -> HistogramPanelPayload | None:
+    payload = panel_or_hold.display_payload
+    return payload if isinstance(payload, HistogramPanelPayload) else None
+
+
+_NumericKind: TypeAlias = Literal["curve", "histogram"]
+_NumericPayload: TypeAlias = CurvePanelPayload | HistogramPanelPayload
+_NumericViewport: TypeAlias = CurveViewportTransform | HistogramViewportTransform
+_NumericIntent: TypeAlias = CurveInteractionIntent | HistogramInteractionIntent
+
+
+def _numeric_payload(
+    panel_or_hold: PanelFrame | _HeldPanelFront,
+    kind: _NumericKind,
+) -> _NumericPayload | None:
+    if kind == "curve":
+        return _curve_payload(panel_or_hold)
+    return _histogram_payload(panel_or_hold)
+
+
+def _numeric_plot_geometry(
     panel_bounds: QtCore.QRect,
-    viewport: CurveViewportTransform,
+    viewport: _NumericViewport,
 ) -> QtCore.QRectF:
     """Map the worker's exact top-origin Agg axes bbox into this Qt cell."""
 
@@ -329,8 +361,8 @@ class _ImageSample:
 
 
 @dataclass(frozen=True, slots=True)
-class _CurveCross:
-    """One arbitrary continuous CURVE cursor, never a snapped sample."""
+class _NumericCross:
+    """One arbitrary continuous numeric cursor, never a snapped sample."""
 
     x: float
     y: float
@@ -346,6 +378,25 @@ class _CurveSample:
 
 
 @dataclass(frozen=True, slots=True)
+class _HistogramBinSample:
+    """One bin borrowed from a frozen HistogramPanelPayload projection."""
+
+    series_label: str
+    left: float
+    right: float
+    count: int
+    right_closed: bool
+
+    @property
+    def x(self) -> float:
+        return 0.5 * (self.left + self.right)
+
+    @property
+    def y(self) -> float:
+        return float(self.count)
+
+
+@dataclass(frozen=True, slots=True)
 class _HeldPanelFront:
     """One GUI-owned display overlay; it is never an authoritative BoardFrame."""
 
@@ -358,7 +409,13 @@ class _HeldPanelFront:
     presentation: PanelPresentationIdentity
     raster_geometry: tuple[int, int, int, PixelFormat]
     prepared: tuple[bytes, QtGui.QImage]
-    display_payload: ImagePanelPayload | CurvePanelPayload | SiteMapPanelPayload | None
+    display_payload: (
+        ImagePanelPayload
+        | CurvePanelPayload
+        | HistogramPanelPayload
+        | SiteMapPanelPayload
+        | None
+    )
 
     @property
     def gesture_identity(self) -> tuple[str, int, int, SourceIdentity]:
@@ -368,6 +425,41 @@ class _HeldPanelFront:
             self.sequence,
             self.source_identity,
         )
+
+
+@dataclass(slots=True)
+class _NumericPanelBinding:
+    """The sole mutable owner for one bound numeric panel."""
+
+    kind: _NumericKind
+    panel_id: str
+    callback: Callable[[_NumericIntent], object]
+    viewport: _NumericViewport | None = None
+    binding_enabled: bool = True
+    interaction_ready: bool = False
+    pending_viewport: _NumericViewport | None = None
+    pending_origin: PanelInteractionOrigin | None = None
+    applied_span: tuple[float, float] | None = None
+    span_anchor: float | None = None
+    span_candidate: tuple[float, float] | None = None
+    pan_anchor: float | None = None
+    pan_origin: _NumericViewport | None = None
+    pan_candidate: tuple[float, float] | None = None
+    cross: _NumericCross | None = None
+    hover: _CurveSample | _HistogramBinSample | None = None
+    hover_position: QtCore.QPointF | None = None
+    fault: RuntimeError | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _NumericTarget:
+    plot: QtCore.QRectF
+    frame: BoardFrame
+    panel: PanelFrame
+    prepared: tuple[bytes, QtGui.QImage]
+    payload: _NumericPayload
+    bounds: QtCore.QRect
+    binding: _NumericPanelBinding
 
 
 class QtOwnerWake(QtCore.QObject):
@@ -569,23 +661,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._hover_sample: _ImageSample | None = None
         self._hover_position: QtCore.QPointF | None = None
         self._selector_fault: RuntimeError | None = None
-        self._curve_panel_id: str | None = None
-        self._curve_viewport: CurveViewportTransform | None = None
-        self._curve_callback: Callable[[CurveInteractionIntent], object] | None = None
-        self._curve_binding_enabled = False
-        self._curve_interaction_ready = False
-        self._curve_pending_viewport: CurveViewportTransform | None = None
-        self._curve_pending_origin: PanelInteractionOrigin | None = None
-        self._curve_applied_span: tuple[float, float] | None = None
-        self._curve_span_anchor: float | None = None
-        self._curve_span_candidate: tuple[float, float] | None = None
-        self._curve_pan_anchor: float | None = None
-        self._curve_pan_origin: CurveViewportTransform | None = None
-        self._curve_pan_candidate: tuple[float, float] | None = None
-        self._curve_cross: _CurveCross | None = None
-        self._curve_hover: _CurveSample | None = None
-        self._curve_hover_position: QtCore.QPointF | None = None
-        self._curve_fault: RuntimeError | None = None
+        self._numeric_bindings: dict[str, _NumericPanelBinding] = {}
         self._closed = False
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.ClickFocus)
@@ -635,7 +711,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         if self._selector_hold is not None:
             self._cancel_active_gesture(
                 clear_image_draft=True,
-                clear_curve_span=True,
+                clear_numeric_spans=True,
             )
             self.update()
 
@@ -671,7 +747,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         target_columns = self._columns
         target_identity = self._active_layout_identity
         target_viewport = self._selector_viewport
-        target_curve_viewport = self._curve_viewport
+        target_numeric_viewports: dict[str, _NumericViewport] = {}
         try:
             if not isinstance(frame, BoardFrame):
                 raise TypeError("frame must be BoardFrame")
@@ -741,16 +817,15 @@ class QtRasterBoard(QtWidgets.QWidget):
                     raise ValueError(
                         "pending image color-limit revision returned conflicting limits"
                     )
-            if (
-                self._curve_panel_id is not None
-                and self._curve_panel_id in target_panel_ids
-            ):
-                target_curve_viewport = self._curve_viewport_for_presented_panel(
-                    self._curve_panel_id,
-                    self._curve_viewport,
-                    frame,
-                    panel_ids=target_panel_ids,
-                )
+            for panel_id, binding in self._numeric_bindings.items():
+                if panel_id in target_panel_ids:
+                    target_numeric_viewports[panel_id] = (
+                        self._numeric_viewport_for_presented_panel(
+                            binding,
+                            frame,
+                            panel_ids=target_panel_ids,
+                        )
+                    )
             if interaction_was_active:
                 hold = self._selector_hold
                 if hold is None:
@@ -771,7 +846,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             if interaction_was_active:
                 self._cancel_active_gesture(
                     clear_image_draft=True,
-                    clear_curve_span=True,
+                    clear_numeric_spans=True,
                 )
                 self.update()
             raise
@@ -797,19 +872,18 @@ class QtRasterBoard(QtWidgets.QWidget):
                         and self._selector_hold is not None
                         and self._selector_hold.panel_id == panel_id
                     )
-        if self._curve_panel_id is not None:
-            panel_id = self._curve_panel_id
+        for panel_id, binding in tuple(self._numeric_bindings.items()):
             if panel_id not in target_panel_ids:
-                self._reset_curve_binding()
+                self._reset_numeric_binding(panel_id)
             elif previous is not None and panel_id in self._panel_ids:
                 old_panel = previous[0].panels[self._panel_ids.index(panel_id)]
                 new_panel = frame.panels[target_panel_ids.index(panel_id)]
                 if self._panel_semantics_changed(old_panel, new_panel):
-                    self._curve_span_candidate = None
-                    self._curve_applied_span = None
-                    self._set_curve_cross(None)
-                    self._curve_pending_viewport = None
-                    self._curve_pending_origin = None
+                    self._clear_numeric_transient(
+                        binding,
+                        clear_applied_span=True,
+                        clear_pending=True,
+                    )
                     cancel_interaction = (
                         interaction_was_active
                         and self._selector_hold is not None
@@ -818,7 +892,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         if cancel_interaction:
             self._cancel_active_gesture(
                 clear_image_draft=True,
-                clear_curve_span=True,
+                clear_numeric_spans=True,
             )
         if promoting:
             self._panel_ids = target_panel_ids
@@ -828,9 +902,10 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._selector_viewport = (
             target_viewport if self._selector_panel_id is not None else None
         )
-        self._curve_viewport = (
-            target_curve_viewport if self._curve_panel_id is not None else None
-        )
+        for panel_id, viewport in target_numeric_viewports.items():
+            binding = self._numeric_bindings.get(panel_id)
+            if binding is not None:
+                binding.viewport = viewport
         pending = self._pending_viewport
         if pending is not None and target_viewport is not None:
             if (
@@ -849,17 +924,22 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._pending_color_limits = None
         if not self._image_interaction_is_pending():
             self._pending_origin = None
-        curve_pending = self._curve_pending_viewport
-        if curve_pending is not None and target_curve_viewport is not None:
+        for panel_id, binding in self._numeric_bindings.items():
+            pending = binding.pending_viewport
+            candidate = target_numeric_viewports.get(panel_id)
             if (
-                target_curve_viewport.display_revision
-                >= curve_pending.display_revision
+                pending is not None
+                and candidate is not None
+                and candidate.display_revision >= pending.display_revision
             ):
-                self._curve_pending_viewport = None
-        if self._curve_pending_viewport is None:
-            self._curve_pending_origin = None
+                binding.pending_viewport = None
+            if binding.pending_viewport is None:
+                binding.pending_origin = None
         hover_position = self._hover_position
-        curve_hover_position = self._curve_hover_position
+        numeric_hover_positions = {
+            panel_id: binding.hover_position
+            for panel_id, binding in self._numeric_bindings.items()
+        }
         self._front = (frame, prepared)
         if (
             self._image_interaction_armed()
@@ -877,23 +957,21 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._set_hover_sample(sample)
         else:
             self._set_hover_sample(None)
-        if (
-            self._curve_interaction_armed()
-            and self._curve_pending_viewport is None
-            and curve_hover_position is not None
-        ):
-            curve_target = self._curve_target()
-            sample = (
-                None
-                if curve_target is None
-                or not curve_target[0].contains(curve_hover_position)
-                else self._curve_sample_for_target(curve_target, curve_hover_position)
-            )
-            if sample is not None:
-                self._curve_hover_position = QtCore.QPointF(curve_hover_position)
-            self._set_curve_hover(sample)
-        else:
-            self._set_curve_hover(None)
+        for panel_id, binding in self._numeric_bindings.items():
+            position = numeric_hover_positions.get(panel_id)
+            target = self._numeric_target(binding)
+            sample = None
+            if (
+                self._numeric_interaction_armed(binding)
+                and binding.pending_viewport is None
+                and position is not None
+                and target is not None
+                and target.plot.contains(position)
+            ):
+                sample = self._numeric_sample_for_target(target, position)
+            if sample is not None and position is not None:
+                binding.hover_position = QtCore.QPointF(position)
+            self._set_numeric_hover(binding, sample)
         self.update()
 
     def clear(self) -> None:
@@ -903,7 +981,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._staged_layout = None
         self._cancel_active_gesture(
             clear_image_draft=True,
-            clear_curve_span=True,
+            clear_numeric_spans=True,
         )
         self._pending_viewport = None
         self._pending_color_limits = None
@@ -911,12 +989,12 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._selector_applied_bounds = None
         self._set_cross_sample(None)
         self._set_hover_sample(None)
-        self._curve_pending_viewport = None
-        self._curve_pending_origin = None
-        self._curve_span_candidate = None
-        self._curve_applied_span = None
-        self._set_curve_cross(None)
-        self._set_curve_hover(None)
+        for binding in self._numeric_bindings.values():
+            self._clear_numeric_transient(
+                binding,
+                clear_applied_span=True,
+                clear_pending=True,
+            )
         self.update()
 
     @property
@@ -935,7 +1013,14 @@ class QtRasterBoard(QtWidgets.QWidget):
     @property
     def curve_selector_fault(self) -> RuntimeError | None:
         self._require_owner()
-        return self._curve_fault
+        binding = self._numeric_binding_for_kind("curve")
+        return None if binding is None else binding.fault
+
+    @property
+    def histogram_selector_fault(self) -> RuntimeError | None:
+        self._require_owner()
+        binding = self._numeric_binding_for_kind("histogram")
+        return None if binding is None else binding.fault
 
     @property
     def selectors_enabled(self) -> bool:
@@ -1045,23 +1130,55 @@ class QtRasterBoard(QtWidgets.QWidget):
         self.update()
         return True
 
-    def visible_curve_payload(self) -> CurvePanelPayload | None:
+    def visible_curve_payload(
+        self,
+        panel_id: str | None = None,
+    ) -> CurvePanelPayload | None:
         """Return the exact held/current CURVE payload currently painted."""
 
         self._require_owner()
+        binding = self._numeric_binding_for_kind("curve", panel_id=panel_id)
         payload, _origin = self._visible_display(
-            self._curve_panel_id,
-            CurvePanelPayload,
+            None if binding is None else binding.panel_id, CurvePanelPayload
         )
         return payload if isinstance(payload, CurvePanelPayload) else None
 
-    def visible_curve_origin(self) -> PanelInteractionOrigin | None:
+    def visible_curve_origin(
+        self,
+        panel_id: str | None = None,
+    ) -> PanelInteractionOrigin | None:
         """Return provenance for the exact held/current CURVE being painted."""
 
         self._require_owner()
+        binding = self._numeric_binding_for_kind("curve", panel_id=panel_id)
         _payload, origin = self._visible_display(
-            self._curve_panel_id,
-            CurvePanelPayload,
+            None if binding is None else binding.panel_id, CurvePanelPayload
+        )
+        return origin
+
+    def visible_histogram_payload(
+        self,
+        panel_id: str | None = None,
+    ) -> HistogramPanelPayload | None:
+        """Return the exact held/current HISTOGRAM payload currently painted."""
+
+        self._require_owner()
+        binding = self._numeric_binding_for_kind("histogram", panel_id=panel_id)
+        payload, _origin = self._visible_display(
+            None if binding is None else binding.panel_id, HistogramPanelPayload
+        )
+        return payload if isinstance(payload, HistogramPanelPayload) else None
+
+    def visible_histogram_origin(
+        self,
+        panel_id: str | None = None,
+    ) -> PanelInteractionOrigin | None:
+        """Return provenance for the exact held/current HISTOGRAM front."""
+
+        self._require_owner()
+        binding = self._numeric_binding_for_kind("histogram", panel_id=panel_id)
+        _payload, origin = self._visible_display(
+            None if binding is None else binding.panel_id, HistogramPanelPayload
         )
         return origin
 
@@ -1074,13 +1191,38 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._require_owner()
         if not isinstance(origin, PanelInteractionOrigin):
             raise TypeError("origin must be PanelInteractionOrigin")
+        binding = self._numeric_bindings.get(origin.panel_id)
         if (
-            self._curve_pending_viewport is None
-            or origin != self._curve_pending_origin
+            binding is None
+            or binding.kind != "curve"
+            or binding.pending_viewport is None
+            or origin != binding.pending_origin
         ):
             return False
-        self._curve_pending_viewport = None
-        self._curve_pending_origin = None
+        binding.pending_viewport = None
+        binding.pending_origin = None
+        self.update()
+        return True
+
+    def discard_pending_histogram_interaction(
+        self,
+        origin: PanelInteractionOrigin,
+    ) -> bool:
+        """Discard only the exact failed HISTOGRAM display intent."""
+
+        self._require_owner()
+        if not isinstance(origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
+        binding = self._numeric_bindings.get(origin.panel_id)
+        if (
+            binding is None
+            or binding.kind != "histogram"
+            or binding.pending_viewport is None
+            or origin != binding.pending_origin
+        ):
+            return False
+        binding.pending_viewport = None
+        binding.pending_origin = None
         self.update()
         return True
 
@@ -1144,7 +1286,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise TypeError("interaction_callback must be callable or None")
         if not isinstance(enabled, bool):
             raise TypeError("selector enabled must be bool")
-        if self._curve_panel_id is not None and enabled != self._selector_enabled:
+        if self._numeric_bindings and enabled != self._selector_enabled:
             raise ValueError(
                 "a second selector family must match the board-wide enabled state; "
                 "call set_selectors_enabled explicitly"
@@ -1172,7 +1314,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._pending_origin = None
         self._image_binding_enabled = True
         self._image_interaction_ready = enabled
-        if self._curve_panel_id is None:
+        if not self._numeric_bindings:
             self._selector_enabled = enabled
         self.update()
 
@@ -1181,6 +1323,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         *,
         image: bool,
         curve: bool,
+        histogram: bool = False,
     ) -> None:
         """Arm only panel families whose painted provenance is current.
 
@@ -1192,16 +1335,23 @@ class QtRasterBoard(QtWidgets.QWidget):
         """
 
         self._require_owner()
-        if not isinstance(image, bool) or not isinstance(curve, bool):
+        if (
+            not isinstance(image, bool)
+            or not isinstance(curve, bool)
+            or not isinstance(histogram, bool)
+        ):
             raise TypeError("interaction readiness values must be bool")
         if not image and self._image_interaction_ready:
             self._cancel_image_gesture(clear_draft=True)
             self._set_hover_sample(None)
-        if not curve and self._curve_interaction_ready:
-            self._cancel_curve_gesture(clear_span=True)
-            self._set_curve_hover(None)
         self._image_interaction_ready = image
-        self._curve_interaction_ready = curve
+        readiness = {"curve": curve, "histogram": histogram}
+        for binding in self._numeric_bindings.values():
+            ready = readiness[binding.kind]
+            if not ready and binding.interaction_ready:
+                self._cancel_numeric_gesture(binding, clear_span=True)
+                self._set_numeric_hover(binding, None)
+            binding.interaction_ready = ready
         self.update()
 
     def set_selectors_enabled(self, enabled: bool) -> None:
@@ -1218,21 +1368,24 @@ class QtRasterBoard(QtWidgets.QWidget):
             and self._selector_callback is not None
             and self._selector_fault is None
         )
-        healthy_curve = (
-            self._curve_binding_enabled
-            and self._curve_interaction_ready
-            and self._curve_panel_id is not None
-            and self._curve_viewport is not None
-            and self._curve_callback is not None
-            and self._curve_fault is None
+        healthy_numeric = any(
+            binding.binding_enabled
+            and binding.interaction_ready
+            and binding.viewport is not None
+            and binding.fault is None
+            for binding in self._numeric_bindings.values()
         )
-        if enabled and not (healthy_image or healthy_curve):
+        if enabled and not (healthy_image or healthy_numeric):
             raise RuntimeError("no healthy selector binding is available")
         self._selector_enabled = enabled
         if not enabled:
-            self._cancel_active_gesture(clear_image_draft=True, clear_curve_span=True)
+            self._cancel_active_gesture(
+                clear_image_draft=True,
+                clear_numeric_spans=True,
+            )
             self._set_hover_sample(None)
-            self._set_curve_hover(None)
+            for binding in self._numeric_bindings.values():
+                self._set_numeric_hover(binding, None)
         self.update()
 
     def _image_interaction_armed(self) -> bool:
@@ -1242,11 +1395,13 @@ class QtRasterBoard(QtWidgets.QWidget):
             and self._image_interaction_ready
         )
 
-    def _curve_interaction_armed(self) -> bool:
+    def _numeric_interaction_armed(self, binding: _NumericPanelBinding) -> bool:
         return (
             self._selector_enabled
-            and self._curve_binding_enabled
-            and self._curve_interaction_ready
+            and binding.binding_enabled
+            and binding.interaction_ready
+            and binding.viewport is not None
+            and binding.fault is None
         )
 
     def bind_curve_interaction(
@@ -1256,38 +1411,24 @@ class QtRasterBoard(QtWidgets.QWidget):
         *,
         enabled: bool = True,
     ) -> None:
-        """Bind the board's one CURVE panel to display-only typed intents."""
+        """Bind one CURVE panel to display-only typed intents."""
 
-        self._require_owner()
-        panel_id = canonical_text(panel_id, "curve panel_id")
-        if panel_id not in self._panel_ids:
-            raise ValueError("curve panel_id is absent from this board")
-        if not callable(callback):
-            raise TypeError("curve callback must be callable")
-        if not isinstance(enabled, bool):
-            raise TypeError("selector enabled must be bool")
-        if self._selector_panel_id is not None and enabled != self._selector_enabled:
-            raise ValueError(
-                "a second selector family must match the board-wide enabled state; "
-                "call set_selectors_enabled explicitly"
-            )
-        viewport = None
-        if self._front is not None:
-            panel = self._front[0].panels[self._panel_ids.index(panel_id)]
-            payload = _curve_payload(panel)
-            if payload is None:
-                raise ValueError("curve interaction requires exact CurvePanelPayload")
-            viewport = payload.viewport
-        self._reset_curve_binding()
-        self._curve_fault = None
-        self._curve_panel_id = panel_id
-        self._curve_viewport = viewport
-        self._curve_callback = callback
-        self._curve_binding_enabled = True
-        self._curve_interaction_ready = enabled
-        if self._selector_panel_id is None:
-            self._selector_enabled = enabled
-        self.update()
+        self._bind_numeric_interaction(
+            "curve", panel_id, callback, enabled=enabled
+        )
+
+    def bind_histogram_interaction(
+        self,
+        panel_id: str,
+        callback: Callable[[HistogramInteractionIntent], object],
+        *,
+        enabled: bool = True,
+    ) -> None:
+        """Bind one HISTOGRAM panel to display-only typed intents."""
+
+        self._bind_numeric_interaction(
+            "histogram", panel_id, callback, enabled=enabled
+        )
 
     def set_selector_applied_selection(self, selection: Selection | None) -> None:
         self._require_owner()
@@ -1332,14 +1473,42 @@ class QtRasterBoard(QtWidgets.QWidget):
     def set_curve_range_candidate(
         self,
         x_span: tuple[float, float] | None,
+        *,
+        panel_id: str | None = None,
     ) -> None:
         """Project the Workbench-owned display-only CURVE range candidate."""
 
         self._require_owner()
-        self._curve_applied_span = (
+        binding = self._numeric_binding_for_kind("curve", panel_id=panel_id)
+        if binding is None:
+            if x_span is None:
+                return
+            raise RuntimeError("no curve panel is bound")
+        binding.applied_span = (
             None
             if x_span is None
             else validated_display_range(x_span, "curve range candidate")
+        )
+        self.update()
+
+    def set_histogram_range_candidate(
+        self,
+        x_span: tuple[float, float] | None,
+        *,
+        panel_id: str | None = None,
+    ) -> None:
+        """Project one display-only HISTOGRAM value-range candidate."""
+
+        self._require_owner()
+        binding = self._numeric_binding_for_kind("histogram", panel_id=panel_id)
+        if binding is None:
+            if x_span is None:
+                return
+            raise RuntimeError("no histogram panel is bound")
+        binding.applied_span = (
+            None
+            if x_span is None
+            else validated_display_range(x_span, "histogram range candidate")
         )
         self.update()
 
@@ -1348,9 +1517,18 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._reset_rectangle_selector()
         self.update()
 
-    def unbind_curve_interaction(self) -> None:
+    def unbind_curve_interaction(self, panel_id: str | None = None) -> None:
         self._require_owner()
-        self._reset_curve_binding()
+        binding = self._numeric_binding_for_kind("curve", panel_id=panel_id)
+        if binding is not None:
+            self._reset_numeric_binding(binding.panel_id)
+        self.update()
+
+    def unbind_histogram_interaction(self, panel_id: str | None = None) -> None:
+        self._require_owner()
+        binding = self._numeric_binding_for_kind("histogram", panel_id=panel_id)
+        if binding is not None:
+            self._reset_numeric_binding(binding.panel_id)
         self.update()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
@@ -1392,7 +1570,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 columns=self._columns,
             )
             image_payload = None
-            if isinstance(payload, CurvePanelPayload):
+            if isinstance(payload, (CurvePanelPayload, HistogramPanelPayload)):
                 target = bounds
                 source = QtCore.QRectF(
                     0.0,
@@ -1434,48 +1612,53 @@ class QtRasterBoard(QtWidgets.QWidget):
                 live_sequence=front[0].sequence,
             )
         self._paint_selector_overlays(painter)
-        self._paint_curve_overlays(painter)
+        self._paint_numeric_overlays(painter)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if not self._selector_enabled:
             super().mousePressEvent(event)
             return
-        curve_target = self._curve_target()
-        hits_curve = (
-            self._curve_interaction_armed()
-            and curve_target is not None
-            and curve_target[0].contains(event.localPos())
-        )
-        if hits_curve:
+        numeric_target = self._numeric_target_at(event.localPos())
+        if (
+            numeric_target is not None
+            and self._numeric_interaction_armed(numeric_target.binding)
+        ):
+            binding = numeric_target.binding
             if (
-                self._curve_pending_viewport is not None
+                binding.pending_viewport is not None
                 or self._selector_hold is not None
             ):
                 event.accept()
                 return
-            point = self._curve_normalized_point(curve_target, event.localPos())
-            viewport = curve_target[4].viewport
+            point = self._numeric_normalized_point(
+                numeric_target, event.localPos()
+            )
+            viewport = numeric_target.payload.viewport
             if event.button() == QtCore.Qt.RightButton:
                 x, y = viewport.widget_normalized_to_data(*point)
-                self._set_curve_cross(_CurveCross(x, y))
-                self._set_curve_hover(None)
+                binding.cross = _NumericCross(x, y)
+                self._set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
                 return
             if event.button() == QtCore.Qt.MiddleButton:
-                self._selector_hold = self._held_panel_from_target(curve_target)
-                self._curve_pan_anchor = point[0]
-                self._curve_pan_origin = viewport
-                self._curve_pan_candidate = viewport.x_limits
-                self._set_curve_hover(None)
+                self._selector_hold = self._held_panel_from_numeric_target(
+                    numeric_target
+                )
+                binding.pan_anchor = point[0]
+                binding.pan_origin = viewport
+                binding.pan_candidate = viewport.x_limits
+                self._set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
                 return
             if event.button() == QtCore.Qt.LeftButton:
-                self._selector_hold = self._held_panel_from_target(curve_target)
-                self._curve_span_anchor = point[0]
-                self._curve_span_candidate = None
-                self._set_curve_hover(None)
+                self._selector_hold = self._held_panel_from_numeric_target(
+                    numeric_target
+                )
+                binding.span_anchor = point[0]
+                binding.span_candidate = None
+                self._set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
                 return
@@ -1556,43 +1739,47 @@ class QtRasterBoard(QtWidgets.QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        if self._curve_span_anchor is not None:
-            target = self._curve_target()
+        numeric_binding = self._active_numeric_binding()
+        if numeric_binding is not None and numeric_binding.span_anchor is not None:
+            target = self._numeric_target(numeric_binding)
             if target is not None:
-                viewport = target[4].viewport
-                point = self._curve_normalized_point(
+                viewport = target.payload.viewport
+                point = self._numeric_normalized_point(
                     target,
                     event.localPos(),
                     clamp_to_plot=True,
                 )
-                if point[0] == self._curve_span_anchor:
-                    self._curve_span_candidate = None
+                if point[0] == numeric_binding.span_anchor:
+                    numeric_binding.span_candidate = None
                 else:
                     try:
-                        self._curve_span_candidate = viewport.selection_x_span(
-                            self._curve_span_anchor,
+                        numeric_binding.span_candidate = viewport.selection_x_span(
+                            numeric_binding.span_anchor,
                             point[0],
                         )
                     except ValueError:
-                        self._curve_span_candidate = None
+                        numeric_binding.span_candidate = None
                 self.update()
             event.accept()
             return
         if (
-            self._curve_pan_anchor is not None
-            and self._curve_pan_origin is not None
+            numeric_binding is not None
+            and numeric_binding.pan_anchor is not None
+            and numeric_binding.pan_origin is not None
         ):
-            target = self._curve_target()
+            target = self._numeric_target(numeric_binding)
             if target is not None:
-                point = self._curve_normalized_point(target, event.localPos())
+                point = self._numeric_normalized_point(target, event.localPos())
                 try:
-                    self._curve_pan_candidate = self._curve_pan_origin.panned_x_limits(
-                        self._curve_pan_anchor,
+                    numeric_binding.pan_candidate = (
+                        numeric_binding.pan_origin.panned_x_limits(
+                        numeric_binding.pan_anchor,
                         point[0],
-                        start_x_limits=self._curve_pan_origin.x_limits,
+                        start_x_limits=numeric_binding.pan_origin.x_limits,
+                        )
                     )
                 except ValueError:
-                    self._curve_pan_candidate = None
+                    numeric_binding.pan_candidate = None
             event.accept()
             return
         if self._clim_drag is not None:
@@ -1646,25 +1833,30 @@ class QtRasterBoard(QtWidgets.QWidget):
             event.accept()
             return
 
+        numeric_target = self._numeric_target_at(event.localPos())
+        hovered_numeric = None
         if (
-            self._curve_interaction_armed()
-            and self._curve_pending_viewport is None
+            numeric_target is not None
+            and self._numeric_interaction_armed(numeric_target.binding)
+            and numeric_target.binding.pending_viewport is None
         ):
-            curve_target = self._curve_target()
-            if curve_target is not None and curve_target[0].contains(event.localPos()):
-                sample = self._curve_sample_for_target(
-                    curve_target,
-                    event.localPos(),
-                )
-                self._curve_hover_position = (
-                    None if sample is None else QtCore.QPointF(event.localPos())
-                )
-                self._set_curve_hover(sample)
-                self._set_hover_sample(None)
-                self.update()
-                super().mouseMoveEvent(event)
-                return
-            self._set_curve_hover(None)
+            hovered_numeric = numeric_target.binding
+            sample = self._numeric_sample_for_target(
+                numeric_target,
+                event.localPos(),
+            )
+            hovered_numeric.hover_position = (
+                None if sample is None else QtCore.QPointF(event.localPos())
+            )
+            self._set_numeric_hover(hovered_numeric, sample)
+            self._set_hover_sample(None)
+        for binding in self._numeric_bindings.values():
+            if binding is not hovered_numeric:
+                self._set_numeric_hover(binding, None)
+        if hovered_numeric is not None:
+            self.update()
+            super().mouseMoveEvent(event)
+            return
         if (
             self._image_interaction_armed()
             and not self._image_interaction_is_pending()
@@ -1683,47 +1875,57 @@ class QtRasterBoard(QtWidgets.QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        numeric_binding = self._active_numeric_binding()
         if (
-            self._curve_pan_anchor is not None
+            numeric_binding is not None
+            and numeric_binding.pan_anchor is not None
             and event.button() == QtCore.Qt.MiddleButton
         ):
-            candidate = self._curve_pan_candidate
+            candidate = numeric_binding.pan_candidate
             hold = self._selector_hold
             try:
                 if candidate is not None and hold is not None:
-                    self._commit_curve_viewport(candidate, hold=hold)
+                    self._commit_numeric_viewport(
+                        numeric_binding,
+                        candidate,
+                        hold=hold,
+                    )
             finally:
                 self._cancel_active_gesture(
                     clear_image_draft=False,
-                    clear_curve_span=False,
+                    clear_numeric_spans=False,
                 )
                 self.update()
             event.accept()
             return
         if (
-            self._curve_span_anchor is not None
+            numeric_binding is not None
+            and numeric_binding.span_anchor is not None
             and event.button() == QtCore.Qt.LeftButton
         ):
-            candidate = self._curve_span_candidate
+            candidate = numeric_binding.span_candidate
             hold = self._selector_hold
-            callback = self._curve_callback
-            self._curve_span_anchor = None
+            numeric_binding.span_anchor = None
             try:
-                if candidate is not None and hold is not None and callback is not None:
-                    callback(
-                        CurveRangeGesture(
-                            self._curve_interaction_origin(hold=hold),
-                            candidate,
-                        )
+                if hold is not None:
+                    origin = self._numeric_interaction_origin(
+                        numeric_binding,
+                        hold=hold,
                     )
+                    gesture: _NumericIntent = (
+                        CurveRangeGesture(origin, candidate)
+                        if numeric_binding.kind == "curve"
+                        else HistogramRangeGesture(origin, candidate)
+                    )
+                    numeric_binding.callback(gesture)
             except BaseException as error:
-                if self._curve_fault is None:
-                    self._curve_fault = detached_render_fault(error)
-                self._curve_binding_enabled = False
+                if numeric_binding.fault is None:
+                    numeric_binding.fault = detached_render_fault(error)
+                numeric_binding.binding_enabled = False
             finally:
                 self._cancel_active_gesture(
                     clear_image_draft=False,
-                    clear_curve_span=True,
+                    clear_numeric_spans=True,
                 )
                 self.update()
             event.accept()
@@ -1801,15 +2003,14 @@ class QtRasterBoard(QtWidgets.QWidget):
         if not self._selector_enabled:
             super().wheelEvent(event)
             return
-        curve_target = self._curve_target()
+        numeric_target = self._numeric_target_at(event.posF())
         if (
-            self._curve_interaction_armed()
-            and self._curve_callback is not None
-            and curve_target is not None
-            and curve_target[0].contains(event.posF())
+            numeric_target is not None
+            and self._numeric_interaction_armed(numeric_target.binding)
         ):
+            binding = numeric_target.binding
             if (
-                self._curve_pending_viewport is not None
+                binding.pending_viewport is not None
                 or self._selector_hold is not None
             ):
                 event.accept()
@@ -1818,8 +2019,8 @@ class QtRasterBoard(QtWidgets.QWidget):
             if delta == 0:
                 super().wheelEvent(event)
                 return
-            point = self._curve_normalized_point(curve_target, event.posF())
-            viewport = curve_target[4].viewport
+            point = self._numeric_normalized_point(numeric_target, event.posF())
+            viewport = numeric_target.payload.viewport
             anchor_x = viewport.widget_normalized_to_data(*point)[0]
             factor = 1.0 / 1.1 if delta < 0 else 1.1
             try:
@@ -1827,8 +2028,8 @@ class QtRasterBoard(QtWidgets.QWidget):
             except ValueError:
                 candidate = None
             if candidate is not None:
-                self._commit_curve_viewport(candidate)
-            self._set_curve_hover(None)
+                self._commit_numeric_viewport(binding, candidate)
+            self._set_numeric_hover(binding, None)
             self.update()
             event.accept()
             return
@@ -1867,35 +2068,35 @@ class QtRasterBoard(QtWidgets.QWidget):
         if not self._selector_enabled:
             super().mouseDoubleClickEvent(event)
             return
-        curve_target = self._curve_target()
+        numeric_target = self._numeric_target_at(event.localPos())
         if (
-            self._curve_interaction_armed()
-            and curve_target is not None
-            and curve_target[0].contains(event.localPos())
+            numeric_target is not None
+            and self._numeric_interaction_armed(numeric_target.binding)
         ):
+            binding = numeric_target.binding
             if (
-                self._curve_pending_viewport is not None
+                binding.pending_viewport is not None
                 or self._selector_hold is not None
             ):
                 event.accept()
                 return
             if event.button() == QtCore.Qt.RightButton:
-                self._set_curve_cross(None)
-                self._set_curve_hover(None)
+                binding.cross = None
+                self._set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
                 return
             if (
                 event.button() == QtCore.Qt.MiddleButton
-                and self._curve_callback is not None
             ):
-                viewport = curve_target[4].viewport
-                self._commit_curve_viewport(
+                viewport = numeric_target.payload.viewport
+                self._commit_numeric_viewport(
+                    binding,
                     viewport.home_x_limits
-                    if self._curve_applied_span is None
-                    else self._curve_applied_span
+                    if binding.applied_span is None
+                    else binding.applied_span,
                 )
-                self._set_curve_hover(None)
+                self._set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
                 return
@@ -1939,8 +2140,8 @@ class QtRasterBoard(QtWidgets.QWidget):
     def leaveEvent(self, event: QtCore.QEvent) -> None:
         self._set_hover_sample(None)
         self._hover_position = None
-        self._set_curve_hover(None)
-        self._curve_hover_position = None
+        for binding in self._numeric_bindings.values():
+            self._set_numeric_hover(binding, None)
         self.update()
         super().leaveEvent(event)
 
@@ -1948,7 +2149,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         if event.key() == QtCore.Qt.Key_Escape and self._selector_hold is not None:
             self._cancel_active_gesture(
                 clear_image_draft=True,
-                clear_curve_span=True,
+                clear_numeric_spans=True,
             )
             self.update()
             event.accept()
@@ -1959,17 +2160,17 @@ class QtRasterBoard(QtWidgets.QWidget):
         if self._selector_hold is not None:
             self._cancel_active_gesture(
                 clear_image_draft=True,
-                clear_curve_span=True,
+                clear_numeric_spans=True,
             )
         self._set_hover_sample(None)
         self._hover_position = None
-        self._set_curve_hover(None)
-        self._curve_hover_position = None
+        for binding in self._numeric_bindings.values():
+            self._set_numeric_hover(binding, None)
         super().resizeEvent(event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._reset_rectangle_selector()
-        self._reset_curve_binding()
+        self._reset_all_numeric_bindings()
         self._front = None
         self._active_layout_identity = None
         self._staged_layout = None
@@ -1979,7 +2180,7 @@ class QtRasterBoard(QtWidgets.QWidget):
     def event(self, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.DeferredDelete:
             self._reset_rectangle_selector()
-            self._reset_curve_binding()
+            self._reset_all_numeric_bindings()
             self._front = None
             self._active_layout_identity = None
             self._staged_layout = None
@@ -1993,14 +2194,15 @@ class QtRasterBoard(QtWidgets.QWidget):
             if changed:
                 self._cancel_active_gesture(
                     clear_image_draft=True,
-                    clear_curve_span=True,
+                    clear_numeric_spans=True,
                 )
             if getattr(self, "_hover_sample", None) is not None:
                 self._set_hover_sample(None)
                 changed = True
-            if getattr(self, "_curve_hover", None) is not None:
-                self._set_curve_hover(None)
-                changed = True
+            for binding in getattr(self, "_numeric_bindings", {}).values():
+                if binding.hover is not None:
+                    self._set_numeric_hover(binding, None)
+                    changed = True
             if changed:
                 self.update()
         return super().event(event)
@@ -2074,42 +2276,174 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise ValueError("one image viewport revision describes conflicting bounds")
         return candidate
 
-    def _curve_viewport_for_presented_panel(
+    def _numeric_binding_for_kind(
         self,
+        kind: _NumericKind,
+        *,
+        panel_id: str | None = None,
+    ) -> _NumericPanelBinding | None:
+        if panel_id is not None:
+            panel_id = canonical_text(panel_id, f"{kind} panel_id")
+            binding = self._numeric_bindings.get(panel_id)
+            return binding if binding is not None and binding.kind == kind else None
+        matches = tuple(
+            binding
+            for binding in self._numeric_bindings.values()
+            if binding.kind == kind
+        )
+        if len(matches) > 1:
+            raise ValueError(f"multiple {kind} panels are bound; panel_id is required")
+        return None if not matches else matches[0]
+
+    def _bind_numeric_interaction(
+        self,
+        kind: _NumericKind,
         panel_id: str,
-        current: CurveViewportTransform | None,
+        callback: Callable[[_NumericIntent], object],
+        *,
+        enabled: bool,
+    ) -> None:
+        self._require_owner()
+        panel_id = canonical_text(panel_id, f"{kind} panel_id")
+        if panel_id not in self._panel_ids:
+            raise ValueError(f"{kind} panel_id is absent from this board")
+        if not callable(callback):
+            raise TypeError(f"{kind} callback must be callable")
+        if not isinstance(enabled, bool):
+            raise TypeError("selector enabled must be bool")
+        has_other_family = (
+            self._selector_panel_id is not None
+            or any(value.panel_id != panel_id for value in self._numeric_bindings.values())
+        )
+        if has_other_family and enabled != self._selector_enabled:
+            raise ValueError(
+                "a second selector family must match the board-wide enabled state; "
+                "call set_selectors_enabled explicitly"
+            )
+        viewport = None
+        if self._front is not None:
+            panel = self._front[0].panels[self._panel_ids.index(panel_id)]
+            payload = _numeric_payload(panel, kind)
+            if payload is None:
+                raise ValueError(
+                    f"{kind} interaction requires exact {kind.title()}PanelPayload"
+                )
+            if _panel_presentation(panel).panel_revision != payload.viewport.display_revision:
+                raise ValueError(
+                    f"{kind} payload viewport revision differs from its presentation"
+                )
+            viewport = payload.viewport
+        if panel_id in self._numeric_bindings:
+            self._reset_numeric_binding(panel_id)
+        self._numeric_bindings[panel_id] = _NumericPanelBinding(
+            kind,
+            panel_id,
+            callback,
+            viewport=viewport,
+            interaction_ready=enabled,
+        )
+        if not has_other_family:
+            self._selector_enabled = enabled
+        self.update()
+
+    def _numeric_viewport_for_presented_panel(
+        self,
+        binding: _NumericPanelBinding,
         frame: BoardFrame,
         *,
         panel_ids: tuple[str, ...],
-    ) -> CurveViewportTransform:
-        panel = frame.panels[panel_ids.index(panel_id)]
-        payload = _curve_payload(panel)
+    ) -> _NumericViewport:
+        panel = frame.panels[panel_ids.index(binding.panel_id)]
+        payload = _numeric_payload(panel, binding.kind)
         if payload is None:
-            raise ValueError("curve interaction requires exact CurvePanelPayload")
+            raise ValueError(
+                f"{binding.kind} interaction requires its exact typed payload"
+            )
         candidate = payload.viewport
+        if _panel_presentation(panel).panel_revision != candidate.display_revision:
+            raise ValueError(
+                f"{binding.kind} viewport revision differs from its presentation"
+            )
+        current = binding.viewport
         previous = self._front
-        structurally_new = previous is None or panel_id not in self._panel_ids
+        structurally_new = previous is None or binding.panel_id not in self._panel_ids
         if not structurally_new and previous is not None:
-            old_panel = previous[0].panels[self._panel_ids.index(panel_id)]
+            old_panel = previous[0].panels[
+                self._panel_ids.index(binding.panel_id)
+            ]
             structurally_new = self._panel_semantics_changed(old_panel, panel)
         if current is None or structurally_new:
             return candidate
-        if candidate.x_axis != current.x_axis:
+        if type(candidate) is not type(current):
+            raise ValueError("numeric viewport type changed without panel structure change")
+        if (
+            isinstance(candidate, CurveViewportTransform)
+            and isinstance(current, CurveViewportTransform)
+            and candidate.x_axis != current.x_axis
+        ):
             raise ValueError("curve x axis changed without panel structure change")
         if candidate.display_revision < current.display_revision:
-            raise ValueError("stale curve display revision cannot replace the visible front")
-        pending = self._curve_pending_viewport
+            raise ValueError(
+                f"stale {binding.kind} display revision cannot replace the visible front"
+            )
+        pending = binding.pending_viewport
         if (
             pending is not None
             and candidate.display_revision == pending.display_revision
             and candidate.x_limits != pending.x_limits
         ):
-            raise ValueError("pending curve viewport revision returned conflicting bounds")
-        if candidate.display_revision == current.display_revision and (
-            candidate.x_limits != current.x_limits
-            or candidate.home_x_limits != current.home_x_limits
+            raise ValueError(
+                f"pending {binding.kind} viewport returned conflicting x bounds"
+            )
+        if (
+            isinstance(candidate, HistogramViewportTransform)
+            and isinstance(pending, HistogramViewportTransform)
+            and candidate.display_revision == pending.display_revision
+            and (
+                candidate.count_scale is not pending.count_scale
+                or candidate.relim_mode is not pending.relim_mode
+                or candidate.x_limits_are_auto != pending.x_limits_are_auto
+                or candidate.bin_count != pending.bin_count
+                or (
+                    candidate.relim_mode is RelimMode.FIXED
+                    and candidate.count_limits != pending.count_limits
+                )
+            )
         ):
-            raise ValueError("one curve display revision describes conflicting x bounds")
+            raise ValueError(
+                "pending histogram viewport returned conflicting authored state"
+            )
+        if candidate.display_revision == current.display_revision:
+            if isinstance(candidate, CurveViewportTransform) and (
+                candidate.x_limits != current.x_limits
+                or candidate.home_x_limits != current.home_x_limits
+            ):
+                raise ValueError(
+                    "one curve display revision describes conflicting x bounds"
+                )
+            if (
+                isinstance(candidate, HistogramViewportTransform)
+                and isinstance(current, HistogramViewportTransform)
+                and (
+                    candidate.count_scale is not current.count_scale
+                    or candidate.relim_mode is not current.relim_mode
+                    or candidate.x_limits_are_auto != current.x_limits_are_auto
+                    or candidate.bin_count != current.bin_count
+                    or (
+                        not candidate.x_limits_are_auto
+                        and candidate.x_limits != current.x_limits
+                    )
+                    or (
+                        candidate.relim_mode is RelimMode.FIXED
+                        and candidate.count_limits != current.count_limits
+                    )
+                )
+            ):
+                raise ValueError(
+                    "one histogram display revision describes conflicting authored state"
+                )
+            # Histogram home/x/count limits are data-derived in AUTO modes and
+            # may legitimately advance at one authored display revision.
         return candidate
 
     def _selector_target(self):
@@ -2150,9 +2484,12 @@ class QtRasterBoard(QtWidgets.QWidget):
         )
         return target, front[0], front[0].panels[index], prepared
 
-    def _curve_target(self):
+    def _numeric_target(
+        self,
+        binding: _NumericPanelBinding,
+    ) -> _NumericTarget | None:
         front = self._front
-        panel_id = self._curve_panel_id
+        panel_id = binding.panel_id
         if front is None or panel_id is None or panel_id not in self._panel_ids:
             return None
         index = self._panel_ids.index(panel_id)
@@ -2164,9 +2501,9 @@ class QtRasterBoard(QtWidgets.QWidget):
         )
         panel = front[0].panels[index]
         payload = (
-            _curve_payload(hold)
+            _numeric_payload(hold, binding.kind)
             if hold is not None and hold.panel_id == panel_id
-            else _curve_payload(panel)
+            else _numeric_payload(panel, binding.kind)
         )
         if payload is None:
             return None
@@ -2176,33 +2513,50 @@ class QtRasterBoard(QtWidgets.QWidget):
             count=len(front[1]),
             columns=self._columns,
         )
-        plot = _curve_plot_geometry(bounds, payload.viewport)
-        return plot, front[0], panel, prepared, payload, bounds
+        plot = _numeric_plot_geometry(bounds, payload.viewport)
+        return _NumericTarget(plot, front[0], panel, prepared, payload, bounds, binding)
+
+    def _numeric_target_at(self, point: QtCore.QPointF) -> _NumericTarget | None:
+        for binding in self._numeric_bindings.values():
+            target = self._numeric_target(binding)
+            if target is not None and target.plot.contains(point):
+                return target
+        return None
 
     @staticmethod
-    def _curve_normalized_point(
-        target,
+    def _numeric_normalized_point(
+        target: _NumericTarget,
         point: QtCore.QPointF,
         *,
         clamp_to_plot: bool = False,
     ) -> tuple[float, float]:
-        bounds = target[5]
+        bounds = target.bounds
         x = (float(point.x()) - bounds.x()) / max(1, bounds.width())
         y = (float(point.y()) - bounds.y()) / max(1, bounds.height())
         if clamp_to_plot:
-            left, top, right, bottom = target[4].viewport.plot_bounds
+            left, top, right, bottom = target.payload.viewport.plot_bounds
             x = min(right, max(left, x))
             y = min(bottom, max(top, y))
         return x, y
 
-    def _curve_sample_for_target(
+    def _numeric_sample_for_target(
         self,
-        target,
+        target: _NumericTarget,
+        point: QtCore.QPointF,
+    ) -> _CurveSample | _HistogramBinSample | None:
+        if isinstance(target.payload, HistogramPanelPayload):
+            return self._histogram_sample_for_target(target, point)
+        return self._curve_sample_for_numeric_target(target, point)
+
+    def _curve_sample_for_numeric_target(
+        self,
+        target: _NumericTarget,
         point: QtCore.QPointF,
     ) -> _CurveSample | None:
-        payload = target[4]
+        payload = target.payload
+        assert isinstance(payload, CurvePanelPayload)
         viewport = payload.viewport
-        bounds = target[5]
+        bounds = target.bounds
         best: tuple[float, int, int, _CurveSample] | None = None
         coordinates = np.asarray(
             payload.series[0].data.x_axis.coordinates,
@@ -2257,6 +2611,45 @@ class QtRasterBoard(QtWidgets.QWidget):
             if best is None or candidate[:3] < best[:3]:
                 best = candidate
         return None if best is None else best[3]
+
+    def _histogram_sample_for_target(
+        self,
+        target: _NumericTarget,
+        point: QtCore.QPointF,
+    ) -> _HistogramBinSample | None:
+        payload = target.payload
+        assert isinstance(payload, HistogramPanelPayload)
+        viewport = payload.viewport
+        normalized = self._numeric_normalized_point(target, point)
+        x_value, _count_value = viewport.widget_normalized_to_data(*normalized)
+        edges = np.asarray(payload.bin_edges, dtype=np.float64)
+        index = int(np.searchsorted(edges, x_value, side="right") - 1)
+        if x_value == float(edges[-1]):
+            index = len(edges) - 2
+        if not 0 <= index < len(edges) - 1:
+            return None
+        best: tuple[float, int, _HistogramBinSample] | None = None
+        for series_index, (counts, label) in enumerate(
+            zip(payload.bin_counts, payload.series_labels, strict=True)
+        ):
+            count = int(counts[index])
+            if viewport.count_scale.value == "log" and count <= 0:
+                continue
+            if not viewport.count_limits[0] <= count <= viewport.count_limits[1]:
+                continue
+            sample = _HistogramBinSample(
+                label,
+                float(edges[index]),
+                float(edges[index + 1]),
+                count,
+                index == len(edges) - 2,
+            )
+            widget = viewport.data_to_widget_normalized(sample.x, sample.y)
+            widget_y = target.bounds.y() + widget[1] * target.bounds.height()
+            candidate = (abs(widget_y - point.y()), series_index, sample)
+            if best is None or candidate[:2] < best[:2]:
+                best = candidate
+        return None if best is None else best[2]
 
     def _clim_rail_target(self):
         front = self._front
@@ -2394,20 +2787,27 @@ class QtRasterBoard(QtWidgets.QWidget):
             return False
         return True
 
-    def _commit_curve_viewport(
+    def _commit_numeric_viewport(
         self,
+        binding: _NumericPanelBinding,
         x_limits: tuple[float, float],
         *,
         hold: _HeldPanelFront | None = None,
     ) -> bool:
         payload = (
-            _curve_payload(hold)
+            _numeric_payload(hold, binding.kind)
             if hold is not None
-            else self.visible_curve_payload()
+            else self._visible_display(
+                binding.panel_id,
+                CurvePanelPayload
+                if binding.kind == "curve"
+                else HistogramPanelPayload,
+            )[0]
         )
         if payload is None or x_limits == payload.viewport.x_limits:
             return False
-        if self._curve_pending_viewport is not None:
+        assert isinstance(payload, (CurvePanelPayload, HistogramPanelPayload))
+        if binding.pending_viewport is not None:
             return False
         front = self._front
         if front is None:
@@ -2418,27 +2818,33 @@ class QtRasterBoard(QtWidgets.QWidget):
             panel_ids=self._panel_ids,
         ):
             return False
-        callback = self._curve_callback
-        if callback is None:
-            return False
-        origin = self._curve_interaction_origin(hold=hold)
+        origin = self._numeric_interaction_origin(binding, hold=hold)
         candidate = replace(
             payload.viewport,
             display_revision=payload.viewport.display_revision + 1,
             x_limits=x_limits,
+            **(
+                {"x_limits_are_auto": False}
+                if isinstance(payload, HistogramPanelPayload)
+                else {}
+            ),
         )
-        command = CurveViewportCommit(origin, candidate)
-        self._curve_pending_viewport = candidate
-        self._curve_pending_origin = origin
+        command: _NumericIntent = (
+            CurveViewportCommit(origin, candidate)
+            if binding.kind == "curve"
+            else HistogramViewportCommit(origin, candidate)
+        )
+        binding.pending_viewport = candidate
+        binding.pending_origin = origin
         try:
-            callback(command)
+            binding.callback(command)
         except BaseException as error:
-            self._curve_pending_viewport = None
-            self._curve_pending_origin = None
-            if self._curve_fault is None:
-                self._curve_fault = detached_render_fault(error)
-            self._curve_binding_enabled = False
-            self._set_curve_hover(None)
+            binding.pending_viewport = None
+            binding.pending_origin = None
+            if binding.fault is None:
+                binding.fault = detached_render_fault(error)
+            binding.binding_enabled = False
+            self._set_numeric_hover(binding, None)
             return False
         return True
 
@@ -2511,16 +2917,21 @@ class QtRasterBoard(QtWidgets.QWidget):
             kind="image",
         )
 
-    def _curve_interaction_origin(
+    def _numeric_interaction_origin(
         self,
+        binding: _NumericPanelBinding,
         *,
         hold: _HeldPanelFront | None = None,
     ) -> PanelInteractionOrigin:
         return self._require_interaction_origin(
-            panel_id=self._curve_panel_id,
-            payload_type=CurvePanelPayload,
+            panel_id=binding.panel_id,
+            payload_type=(
+                CurvePanelPayload
+                if binding.kind == "curve"
+                else HistogramPanelPayload
+            ),
             hold=hold,
-            kind="curve",
+            kind=binding.kind,
         )
 
     def _require_interaction_origin(
@@ -2550,13 +2961,20 @@ class QtRasterBoard(QtWidgets.QWidget):
         if sample is None:
             self._hover_position = None
 
-    def _set_curve_cross(self, sample: _CurveCross | None) -> None:
-        self._curve_cross = sample
-
-    def _set_curve_hover(self, sample: _CurveSample | None) -> None:
-        self._curve_hover = sample
+    def _set_numeric_hover(
+        self,
+        binding: _NumericPanelBinding,
+        sample: _CurveSample | _HistogramBinSample | None,
+    ) -> None:
+        binding.hover = sample
         if sample is None:
-            self._curve_hover_position = None
+            binding.hover_position = None
+
+    def _active_numeric_binding(self) -> _NumericPanelBinding | None:
+        hold = self._selector_hold
+        if hold is None:
+            return None
+        return self._numeric_bindings.get(hold.panel_id)
 
     def _held_panel_from_target(self, target) -> _HeldPanelFront:
         frame, panel, prepared = target[1], target[2], target[3]
@@ -2577,6 +2995,23 @@ class QtRasterBoard(QtWidgets.QWidget):
             ),
         )
 
+    def _held_panel_from_numeric_target(
+        self,
+        target: _NumericTarget,
+    ) -> _HeldPanelFront:
+        return _HeldPanelFront(
+            panel_id=target.panel.panel_id,
+            board_id=target.frame.board_id,
+            layout_generation=target.frame.layout_generation,
+            sequence=target.frame.sequence,
+            coherence_group=target.panel.coherence_group,
+            source_identity=target.panel.source_identity,
+            presentation=_panel_presentation(target.panel),
+            raster_geometry=_raster_geometry(target.panel),
+            prepared=target.prepared,
+            display_payload=target.payload,
+        )
+
     @staticmethod
     def _panel_semantics_changed(old: PanelFrame, new: PanelFrame) -> bool:
         old_presentation = _panel_presentation(old)
@@ -2589,6 +3024,12 @@ class QtRasterBoard(QtWidgets.QWidget):
                 return (ImagePanelPayload, payload.viewport.axes)
             if isinstance(payload, CurvePanelPayload):
                 return (CurvePanelPayload, payload.viewport.x_axis)
+            if isinstance(payload, HistogramPanelPayload):
+                return (
+                    HistogramPanelPayload,
+                    payload.value_unit,
+                    payload.series_labels,
+                )
             if isinstance(payload, SiteMapPanelPayload):
                 return (
                     SiteMapPanelPayload,
@@ -2639,6 +3080,12 @@ class QtRasterBoard(QtWidgets.QWidget):
             payload_matches = (
                 isinstance(current_payload, CurvePanelPayload)
                 and current_payload.viewport.x_axis == held_payload.viewport.x_axis
+            )
+        elif isinstance(held_payload, HistogramPanelPayload):
+            payload_matches = (
+                isinstance(current_payload, HistogramPanelPayload)
+                and current_payload.value_unit == held_payload.value_unit
+                and current_payload.series_labels == held_payload.series_labels
             )
         elif isinstance(held_payload, SiteMapPanelPayload):
             payload_matches = (
@@ -3008,14 +3455,31 @@ class QtRasterBoard(QtWidgets.QWidget):
             )
         painter.restore()
 
-    def _paint_curve_overlays(self, painter: QtGui.QPainter) -> None:
-        target = self._curve_target()
+    def _paint_numeric_overlays(self, painter: QtGui.QPainter) -> None:
+        for binding in self._numeric_bindings.values():
+            self._paint_numeric_binding_overlay(painter, binding)
+
+    def _paint_numeric_binding_overlay(
+        self,
+        painter: QtGui.QPainter,
+        binding: _NumericPanelBinding,
+    ) -> None:
+        target = self._numeric_target(binding)
         if target is None:
             return
-        plot, payload, bounds = target[0], target[4], target[5]
+        plot, payload, bounds = target.plot, target.payload, target.bounds
         viewport = payload.viewport
-        x_unit = "" if viewport.x_axis.unit is None else f" {viewport.x_axis.unit}"
-        y_unit = "" if payload.value_unit is None else f" {payload.value_unit}"
+        x_unit_value = (
+            viewport.x_axis.unit
+            if isinstance(viewport, CurveViewportTransform)
+            else payload.value_unit
+        )
+        x_unit = "" if x_unit_value is None else f" {x_unit_value}"
+        y_unit = (
+            ""
+            if isinstance(payload, HistogramPanelPayload)
+            else "" if payload.value_unit is None else f" {payload.value_unit}"
+        )
 
         def widget_point(x: float, y: float) -> QtCore.QPointF:
             normalized = viewport.data_to_widget_normalized(x, y)
@@ -3027,10 +3491,15 @@ class QtRasterBoard(QtWidgets.QWidget):
         painter.save()
         try:
             painter.setClipRect(plot)
-            span = self._curve_span_candidate or self._curve_applied_span
+            span = binding.span_candidate or binding.applied_span
             if span is not None:
-                left = widget_point(span[0], viewport.y_limits[0]).x()
-                right = widget_point(span[1], viewport.y_limits[0]).x()
+                y_low = (
+                    viewport.y_limits[0]
+                    if isinstance(viewport, CurveViewportTransform)
+                    else viewport.count_limits[0]
+                )
+                left = widget_point(span[0], y_low).x()
+                right = widget_point(span[1], y_low).x()
                 rectangle = QtCore.QRectF(
                     min(left, right),
                     plot.top(),
@@ -3043,7 +3512,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 painter.setPen(pen)
                 painter.drawRect(rectangle)
 
-            cross = self._curve_cross
+            cross = binding.cross
             if cross is not None:
                 point = widget_point(cross.x, cross.y)
                 if plot.contains(point):
@@ -3058,26 +3527,44 @@ class QtRasterBoard(QtWidgets.QWidget):
                     )
                 self._paint_curve_label(
                     painter,
-                    f"x={cross.x:.6g}{x_unit}  y={cross.y:.6g}{y_unit}",
+                    (
+                        f"x={cross.x:.6g}{x_unit}  count={cross.y:.6g}"
+                        if isinstance(payload, HistogramPanelPayload)
+                        else f"x={cross.x:.6g}{x_unit}  y={cross.y:.6g}{y_unit}"
+                    ),
                     plot,
                     QtGui.QColor(GREEN),
                     top_right=True,
                 )
 
-            sample = self._curve_hover
-            position = self._curve_hover_position
+            sample = binding.hover
+            position = binding.hover_position
             if sample is not None and position is not None:
-                point = widget_point(sample.x, sample.y)
-                if plot.contains(point):
+                point = None
+                try:
+                    point = widget_point(sample.x, sample.y)
+                except ValueError:
+                    pass
+                if point is not None and plot.contains(point):
                     painter.setPen(QtGui.QPen(QtGui.QColor(ORANGE), 1.5))
                     painter.setBrush(QtGui.QBrush(QtGui.QColor(ORANGE)))
                     painter.drawEllipse(point, 3.5, 3.5)
-                self._paint_curve_label(
-                    painter,
+                label = (
                     (
+                        f"{sample.series_label}  "
+                        f"[{sample.left:.6g}, {sample.right:.6g}"
+                        f"{']' if sample.right_closed else ')'}{x_unit}  "
+                        f"count={sample.count}"
+                    )
+                    if isinstance(sample, _HistogramBinSample)
+                    else (
                         f"{sample.series_label}  x={sample.x:.6g}{x_unit}  "
                         f"y={sample.y:.6g}{y_unit}"
-                    ),
+                    )
+                )
+                self._paint_curve_label(
+                    painter,
+                    label,
                     plot,
                     QtGui.QColor(ORANGE),
                     anchor=position,
@@ -3357,27 +3844,52 @@ class QtRasterBoard(QtWidgets.QWidget):
         if clear_draft:
             self._selector_draft_bounds = None
 
-    def _cancel_curve_gesture(self, *, clear_span: bool) -> None:
-        self._curve_span_anchor = None
-        self._curve_pan_anchor = None
-        self._curve_pan_origin = None
-        self._curve_pan_candidate = None
+    def _cancel_numeric_gesture(
+        self,
+        binding: _NumericPanelBinding,
+        *,
+        clear_span: bool,
+    ) -> None:
+        binding.span_anchor = None
+        binding.pan_anchor = None
+        binding.pan_origin = None
+        binding.pan_candidate = None
         if (
             self._selector_hold is not None
-            and self._selector_hold.panel_id == self._curve_panel_id
+            and self._selector_hold.panel_id == binding.panel_id
         ):
             self._selector_hold = None
         if clear_span:
-            self._curve_span_candidate = None
+            binding.span_candidate = None
+
+    def _clear_numeric_transient(
+        self,
+        binding: _NumericPanelBinding,
+        *,
+        clear_applied_span: bool,
+        clear_pending: bool,
+    ) -> None:
+        self._cancel_numeric_gesture(binding, clear_span=True)
+        if clear_applied_span:
+            binding.applied_span = None
+        if clear_pending:
+            binding.pending_viewport = None
+            binding.pending_origin = None
+        binding.cross = None
+        self._set_numeric_hover(binding, None)
 
     def _cancel_active_gesture(
         self,
         *,
         clear_image_draft: bool,
-        clear_curve_span: bool,
+        clear_numeric_spans: bool,
     ) -> None:
         self._cancel_image_gesture(clear_draft=clear_image_draft)
-        self._cancel_curve_gesture(clear_span=clear_curve_span)
+        for binding in self._numeric_bindings.values():
+            self._cancel_numeric_gesture(
+                binding,
+                clear_span=clear_numeric_spans,
+            )
         self._selector_hold = None
 
     def _reset_rectangle_selector(self) -> None:
@@ -3394,23 +3906,27 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._selector_viewport = None
         self._selector_callback = None
         self._interaction_callback = None
-        if self._curve_panel_id is None:
+        if not self._numeric_bindings:
             self._selector_enabled = False
 
-    def _reset_curve_binding(self) -> None:
-        self._cancel_curve_gesture(clear_span=True)
-        self._curve_applied_span = None
-        self._curve_pending_viewport = None
-        self._curve_pending_origin = None
-        self._set_curve_cross(None)
-        self._set_curve_hover(None)
-        self._curve_binding_enabled = False
-        self._curve_interaction_ready = False
-        self._curve_panel_id = None
-        self._curve_viewport = None
-        self._curve_callback = None
-        if self._selector_panel_id is None:
+    def _reset_numeric_binding(self, panel_id: str) -> None:
+        binding = self._numeric_bindings.get(panel_id)
+        if binding is None:
+            return
+        self._clear_numeric_transient(
+            binding,
+            clear_applied_span=True,
+            clear_pending=True,
+        )
+        binding.binding_enabled = False
+        binding.interaction_ready = False
+        del self._numeric_bindings[panel_id]
+        if self._selector_panel_id is None and not self._numeric_bindings:
             self._selector_enabled = False
+
+    def _reset_all_numeric_bindings(self) -> None:
+        for panel_id in tuple(self._numeric_bindings):
+            self._reset_numeric_binding(panel_id)
 
     def _require_owner(self) -> None:
         if QtCore.QThread.currentThread() != self.thread():

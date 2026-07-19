@@ -657,7 +657,10 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
         )
         window._set_curve_range_candidate(curve_origin, selected_span)
         assert window._curve_range_candidate == (curve_origin, selected_span)
-        assert board._curve_applied_span == selected_span
+        assert (
+            board._numeric_bindings["camera-monitor-roi-curve"].applied_span
+            == selected_span
+        )
 
         reconfigure_observations = []
         real_reconfigure_scalar = live.reconfigure_scalar
@@ -761,20 +764,31 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
         )
         assert window._projection_status.text().endswith(" pending")
         assert window._curve_range_candidate is None
-        assert board._curve_applied_span is None
+        assert (
+            board._numeric_bindings["camera-monitor-roi-curve"].applied_span
+            is None
+        )
         assert not window._visible_curve_matches_current_state()
         assert not window._edit_curve_display.isEnabled()
         assert window._edit_image_display.isEnabled()
         assert window._selector_switch.isChecked()
         assert window._selector_switch.isEnabled()
         assert board._image_interaction_armed()
-        assert not board._curve_interaction_armed()
+        assert not board._numeric_interaction_armed(
+            board._numeric_bindings["camera-monitor-roi-curve"]
+        )
         stale_curve_viewport = board.visible_curve_payload().viewport
-        stale_curve_event = _wheel_down(board, board._curve_target()[0])
+        curve_binding = board._numeric_bindings["camera-monitor-roi-curve"]
+        curve_target = board._numeric_target(curve_binding)
+        assert curve_target is not None
+        stale_curve_event = _wheel_down(board, curve_target.plot)
         assert not stale_curve_event.isAccepted()
         assert board.visible_curve_payload().viewport == stale_curve_viewport
         assert board.curve_selector_fault is None
-        assert board._curve_pending_viewport is None
+        assert (
+            board._numeric_bindings["camera-monitor-roi-curve"].pending_viewport
+            is None
+        )
         _until(
             application,
             lambda: (
@@ -830,8 +844,8 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
             reset_mode,
         ) = reconfigure_observations[0]
         assert (
-            live_module._curve_semantic_identity(previous_configuration)
-            != live_module._curve_semantic_identity(current_configuration)
+            live_module._scalar_semantic_identity(previous_configuration)
+            != live_module._scalar_semantic_identity(current_configuration)
         )
         assert (
             previous_configuration.scalar_binding_fingerprint
@@ -853,7 +867,9 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
         assert reset_range is None and reset_mode is None
         assert window._visible_curve_matches_current_state()
         assert window._edit_curve_display.isEnabled()
-        assert board._curve_interaction_armed()
+        assert board._numeric_interaction_armed(
+            board._numeric_bindings["camera-monitor-roi-curve"]
+        )
         assert board.curve_selector_fault is None
         new_frame = board.front_frame
         assert (

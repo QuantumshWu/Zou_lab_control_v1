@@ -31,6 +31,10 @@ from zlc_frontend.figure import (
 )
 from zlc_frontend.curve_display import CurveDisplayState
 from zlc_frontend.display_range import DisplayRange, RelimMode
+from zlc_frontend.histogram_display import (
+    HistogramCountScale,
+    HistogramDisplayState,
+)
 from zlc_frontend.image_display import (
     ImageDisplayState,
     image_viewport_for_display_state,
@@ -42,6 +46,7 @@ from zlc_frontend.render import (
     CoherenceStamp,
     CurvePanelPayload,
     DisplayPayload,
+    HistogramPanelPayload,
     ImagePanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
@@ -108,6 +113,8 @@ class LiveFrontStatus:
     image_color_limits: tuple[float, float] | None = None
     curve_display_revision: int | None = None
     curve_y_limits: DisplayRange | None = None
+    histogram_display_revision: int | None = None
+    histogram_count_limits: DisplayRange | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +131,7 @@ class _LiveRenderConfiguration:
     image_display: ImageDisplayState | None
     image_viewport: ImageViewportTransform | None
     curve_display: CurveDisplayState | None
+    histogram_display: HistogramDisplayState | None
     scalar_dataset_id: DatasetId | None
     scalar_documents: tuple[FigureDocument, ...]
     scalar_block_id: BlockId | None
@@ -551,6 +559,7 @@ class LiveBoardController:
         image_display: ImageDisplayState,
         image_viewport: ImageViewportTransform,
         curve_display: CurveDisplayState | None = None,
+        histogram_display: HistogramDisplayState | None = None,
         scalar_documents: tuple[FigureDocument, ...] = (),
         scalar_raster_size: tuple[int, int] = (800, 520),
         worker_thread_affine: bool = False,
@@ -579,9 +588,18 @@ class LiveBoardController:
             CurveDisplayState,
         ):
             raise TypeError("curve_display must be CurveDisplayState or None")
-        if bool(scalar_documents) != (curve_display is not None):
+        if histogram_display is not None and not isinstance(
+            histogram_display,
+            HistogramDisplayState,
+        ):
+            raise TypeError(
+                "histogram_display must be HistogramDisplayState or None"
+            )
+        if bool(scalar_documents) != (
+            curve_display is not None and histogram_display is not None
+        ):
             raise ValueError(
-                "curve display state must match the admitted scalar panel set"
+                "curve and histogram display states must match the scalar panel set"
             )
         if scalar_documents and not worker_thread_affine:
             raise ValueError("live scalar Agg panels require a thread-affine worker lane")
@@ -614,6 +632,7 @@ class LiveBoardController:
             image_display=image_display,
             image_viewport=image_viewport,
             curve_display=curve_display,
+            histogram_display=histogram_display,
             scalar_dataset_id=slot.scalar_dataset_id,
             scalar_documents=scalar_documents,
             scalar_block_id=scalar_block_id,
@@ -653,6 +672,9 @@ class LiveBoardController:
         self._image_relim_mode: RelimMode | None = None
         self._curve_y_limits: DisplayRange | None = None
         self._curve_relim_mode: RelimMode | None = None
+        self._histogram_count_limits: DisplayRange | None = None
+        self._histogram_relim_mode: RelimMode | None = None
+        self._histogram_count_scale: HistogramCountScale | None = None
         self._front_invalidated = False
         self._presentation_frozen = False
         self._closed = False
@@ -677,6 +699,7 @@ class LiveBoardController:
         scalar_dataset_id: DatasetId | None,
         scalar_documents: tuple[FigureDocument, ...],
         curve_display: CurveDisplayState | None,
+        histogram_display: HistogramDisplayState | None,
     ) -> None:
         """Owner-thread switch to one applied scalar branch without clearing front."""
 
@@ -692,6 +715,10 @@ class LiveBoardController:
         if active:
             if not isinstance(curve_display, CurveDisplayState):
                 raise TypeError("an applied ROI branch requires curve_display")
+            if not isinstance(histogram_display, HistogramDisplayState):
+                raise TypeError(
+                    "an applied ROI branch requires histogram_display"
+                )
             if not isinstance(scalar_dataset_id, DatasetId):
                 raise TypeError("an applied ROI branch requires scalar_dataset_id")
             if not self._worker_thread_affine:
@@ -726,6 +753,10 @@ class LiveBoardController:
         else:
             if curve_display is not None:
                 raise ValueError("raw-only ROI state cannot have curve_display")
+            if histogram_display is not None:
+                raise ValueError(
+                    "raw-only ROI state cannot have histogram_display"
+                )
             if scalar_dataset_id is not None:
                 raise ValueError("raw-only ROI state cannot have scalar_dataset_id")
             if scalar_documents:
@@ -763,6 +794,7 @@ class LiveBoardController:
             image_display=previous.image_display,
             image_viewport=previous.image_viewport,
             curve_display=curve_display,
+            histogram_display=histogram_display,
             scalar_dataset_id=scalar_dataset_id,
             scalar_documents=scalar_documents,
             scalar_block_id=state.scalar_block_id,
@@ -774,9 +806,9 @@ class LiveBoardController:
             scalar_control_revision=state.control_revision,
             strict_scalar_identity=True,
         )
-        curve_semantics_changed = _curve_semantic_identity(
+        scalar_semantics_changed = _scalar_semantic_identity(
             previous
-        ) != _curve_semantic_identity(configuration)
+        ) != _scalar_semantic_identity(configuration)
         with self._lock:
             if self._closed:
                 raise RuntimeError("live board controller is closed")
@@ -816,9 +848,12 @@ class LiveBoardController:
                 previous_sources if replacement_port is not None else None
             )
             self._dirty = True
-            if curve_semantics_changed:
+            if scalar_semantics_changed:
                 self._curve_y_limits = None
                 self._curve_relim_mode = None
+                self._histogram_count_limits = None
+                self._histogram_relim_mode = None
+                self._histogram_count_scale = None
             if candidate_waiting:
                 self._active = False
             request_now = not self._presentation_frozen and not self._active
@@ -887,6 +922,7 @@ class LiveBoardController:
             image_display=state,
             image_viewport=viewport,
             curve_display=previous.curve_display,
+            histogram_display=previous.histogram_display,
             scalar_dataset_id=previous.scalar_dataset_id,
             scalar_documents=previous.scalar_documents,
             scalar_block_id=previous.scalar_block_id,
@@ -950,6 +986,7 @@ class LiveBoardController:
             image_display=previous.image_display,
             image_viewport=previous.image_viewport,
             curve_display=state,
+            histogram_display=previous.histogram_display,
             scalar_dataset_id=previous.scalar_dataset_id,
             scalar_documents=previous.scalar_documents,
             scalar_block_id=previous.scalar_block_id,
@@ -967,6 +1004,75 @@ class LiveBoardController:
             previous_port=previous_port,
             previous_sources=previous_sources,
             operation="curve display",
+        )
+        if request_now:
+            self._request_snapshot()
+
+    def reconfigure_histogram_display(
+        self,
+        state: HistogramDisplayState,
+    ) -> None:
+        """Replace one HISTOGRAM presentation without touching its source."""
+
+        self._require_owner()
+        if not isinstance(state, HistogramDisplayState):
+            raise TypeError("state must be HistogramDisplayState")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("live board controller is closed")
+            if self._fault is not None:
+                raise RuntimeError("live board controller is faulted")
+            if self._slot.failure is not None or self._slot.withdrawn:
+                raise RuntimeError("live source is no longer available")
+            previous = self._configuration
+            previous_state = previous.histogram_display
+            previous_port = self._port
+            previous_sources = self._sources
+            epoch = self._configuration_epoch + 1
+        if previous_state is None:
+            raise RuntimeError(
+                "live board has no interactive HISTOGRAM presentation"
+            )
+        if state == previous_state:
+            return
+        if state.revision != previous_state.revision + 1:
+            raise ValueError(
+                "histogram display revision must advance exactly once"
+            )
+        target_model = self._board.model
+        if (
+            target_model.board_id != previous.board_id
+            or target_model.layout_generation != previous.layout_generation
+            or target_model.panels != previous.panels
+        ):
+            raise RuntimeError(
+                "histogram display reconfiguration cannot cross a board topology change"
+            )
+        configuration = _build_live_configuration(
+            epoch=epoch,
+            model=target_model,
+            image_document=previous.image_document,
+            image_display=previous.image_display,
+            image_viewport=previous.image_viewport,
+            curve_display=previous.curve_display,
+            histogram_display=state,
+            scalar_dataset_id=previous.scalar_dataset_id,
+            scalar_documents=previous.scalar_documents,
+            scalar_block_id=previous.scalar_block_id,
+            scalar_dataset_edge=previous.scalar_dataset_edge,
+            scalar_generation=previous.scalar_generation,
+            scalar_binding_fingerprint=previous.scalar_binding_fingerprint,
+            scalar_control_revision=previous.scalar_control_revision,
+            strict_scalar_identity=previous.strict_scalar_identity,
+            scalar_renderers=previous.scalar_renderers,
+        )
+        request_now = self._install_display_configuration(
+            previous=previous,
+            configuration=configuration,
+            epoch=epoch,
+            previous_port=previous_port,
+            previous_sources=previous_sources,
+            operation="histogram display",
         )
         if request_now:
             self._request_snapshot()
@@ -1390,6 +1496,8 @@ class LiveBoardController:
             latest_scalar_valid = None
             curve_y_limits: DisplayRange | None = None
             curve_has_valid_samples = False
+            histogram_count_limits: DisplayRange | None = None
+            histogram_has_valid_samples = False
             if configuration.scalar_documents:
                 if (
                     scalar_snapshot is None
@@ -1493,6 +1601,37 @@ class LiveBoardController:
                     )
                     rasters.append(curve_raster)
                     payloads.append(curve_payload)
+                elif intent is ViewIntent.HISTOGRAM:
+                    histogram_display = configuration.histogram_display
+                    if histogram_display is None:
+                        raise RuntimeError(
+                            "live HISTOGRAM document has no display configuration"
+                        )
+                    with self._lock:
+                        if self._configuration is not configuration:
+                            return
+                        accepted_count_limits = self._histogram_count_limits
+                        accepted_relim_mode = self._histogram_relim_mode
+                        accepted_count_scale = self._histogram_count_scale
+                    histogram_raster, histogram_payload = (
+                        renderer.render_interactive_histogram(
+                            scalar_evaluated,
+                            histogram_display,
+                            current_count_limits=accepted_count_limits,
+                            previous_relim_mode=accepted_relim_mode,
+                            previous_count_scale=accepted_count_scale,
+                        )
+                    )
+                    histogram_count_limits = (
+                        histogram_payload.viewport.count_limits
+                    )
+                    histogram_has_valid_samples = any(
+                        len(series.data.samples) > 0
+                        for series in scalar_series
+                        if isinstance(series.data, EvaluatedHistogram)
+                    )
+                    rasters.append(histogram_raster)
+                    payloads.append(histogram_payload)
                 else:
                     rasters.append(renderer.render(scalar_evaluated))
                     payloads.append(None)
@@ -1553,6 +1692,12 @@ class LiveBoardController:
                         else configuration.curve_display.revision
                     ),
                     curve_y_limits=curve_y_limits,
+                    histogram_display_revision=(
+                        None
+                        if configuration.histogram_display is None
+                        else configuration.histogram_display.revision
+                    ),
+                    histogram_count_limits=histogram_count_limits,
                 )
                 published = job.port.publish(job.token, frame)
                 if published:
@@ -1589,6 +1734,23 @@ class LiveBoardController:
                                         if curve_has_valid_samples
                                         else None
                                     ),
+                                )
+                            histogram_display = configuration.histogram_display
+                            if histogram_display is not None:
+                                assert histogram_count_limits is not None
+                                if (
+                                    histogram_has_valid_samples
+                                    or histogram_display.relim_mode
+                                    is RelimMode.FIXED
+                                ):
+                                    self._histogram_count_limits = (
+                                        histogram_count_limits
+                                    )
+                                self._histogram_relim_mode = (
+                                    histogram_display.relim_mode
+                                )
+                                self._histogram_count_scale = (
+                                    histogram_display.count_scale
                                 )
                             accepted_status = True
                     if accepted_status:
@@ -1901,18 +2063,19 @@ def _validate_scalar_documents(
             )
 
 
-def _curve_semantic_identity(
+def _scalar_semantic_identity(
     configuration: _LiveRenderConfiguration,
 ) -> tuple[object, ...] | None:
-    """Identity whose change invalidates accepted CURVE range history."""
+    """Identity whose change invalidates accepted scalar display history."""
 
     if not configuration.scalar_documents:
         return None
-    document = configuration.scalar_documents[0]
     return (
         configuration.scalar_dataset_id,
-        document.document_id,
-        document.revision,
+        tuple(
+            (document.document_id, document.revision)
+            for document in configuration.scalar_documents
+        ),
         configuration.scalar_binding_fingerprint,
         configuration.scalar_control_revision,
     )
@@ -1926,6 +2089,7 @@ def _build_live_configuration(
     image_display: ImageDisplayState | None,
     image_viewport: ImageViewportTransform | None,
     curve_display: CurveDisplayState | None,
+    histogram_display: HistogramDisplayState | None,
     scalar_dataset_id: DatasetId | None,
     scalar_documents: tuple[FigureDocument, ...],
     scalar_block_id: BlockId | None,
@@ -1953,10 +2117,21 @@ def _build_live_configuration(
         CurveDisplayState,
     ):
         raise TypeError("curve_display must be CurveDisplayState or None")
+    if histogram_display is not None and not isinstance(
+        histogram_display,
+        HistogramDisplayState,
+    ):
+        raise TypeError(
+            "histogram_display must be HistogramDisplayState or None"
+        )
     panels = model.panels
     documents = (image_document, *scalar_documents)
-    if bool(scalar_documents) != (curve_display is not None):
-        raise ValueError("curve display state must match scalar documents")
+    if bool(scalar_documents) != (
+        curve_display is not None and histogram_display is not None
+    ):
+        raise ValueError(
+            "curve and histogram display states must match scalar documents"
+        )
     if len(panels) != len(documents):
         raise ValueError("live board panel count does not match its frozen documents")
     coherence_groups = {panel.coherence_group for panel in panels}
@@ -1978,7 +2153,11 @@ def _build_live_configuration(
                 else (
                     curve_display.revision
                     if index == 1 and curve_display is not None
-                    else 0
+                    else (
+                        histogram_display.revision
+                        if index == 2 and histogram_display is not None
+                        else 0
+                    )
                 )
             ),
         )
@@ -2004,6 +2183,7 @@ def _build_live_configuration(
         image_display,
         image_viewport,
         curve_display,
+        histogram_display,
         scalar_dataset_id,
         scalar_documents,
         scalar_block_id,

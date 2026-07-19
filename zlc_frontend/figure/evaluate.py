@@ -1176,6 +1176,8 @@ def _histogram(
     working: _WorkingData,
     view,
     guard: _EvaluationGuard,
+    *,
+    value_unit: str | None,
 ) -> EvaluatedHistogram:
     sample_ids = {
         binding.axis_id for binding in view.axis_bindings if binding.role is AxisViewRole.SAMPLE
@@ -1221,6 +1223,7 @@ def _histogram(
         flat_values[keep],
         tuple(coordinates),
         int(len(flat_values) - np.count_nonzero(keep)),
+        value_unit,
     )
 
 
@@ -1419,7 +1422,12 @@ class FigureEvaluator:
                         value_unit=block.schema.cell_schema.value_unit,
                     )
                 elif view.intent is ViewIntent.HISTOGRAM:
-                    data = _histogram(working, view, guard)
+                    data = _histogram(
+                        working,
+                        view,
+                        guard,
+                        value_unit=block.schema.cell_schema.value_unit,
+                    )
                 else:
                     data = _meter(working)
                 series.append(

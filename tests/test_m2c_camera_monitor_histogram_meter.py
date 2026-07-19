@@ -15,6 +15,7 @@ import pytest
 
 import Zou_lab_control.notebook as zlc
 from Zou_lab_control.workbench._camera_monitor import CameraMonitorWorkbenchWindow
+from Zou_lab_control.workbench._camera_monitor import _scalar_presentation_peak
 from zlc_data import (
     MONITOR_HISTORY,
     REPEAT,
@@ -52,9 +53,15 @@ from zlc_frontend.figure import (
     ViewSpec,
 )
 from zlc_frontend.curve_display import CurveDisplayState
+from zlc_frontend.histogram_display import (
+    MAX_HISTOGRAM_BINS,
+    HistogramBinProjection,
+    HistogramCountScale,
+    HistogramDisplayState,
+)
 from zlc_frontend.matplotlib_render import (
     SinglePanelAggRenderer,
-    histogram_bin_counts,
+    estimate_live_panel_raster_peak_nbytes,
 )
 from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
 from zlc_frontend.image_display import (
@@ -63,6 +70,7 @@ from zlc_frontend.image_display import (
     image_viewport_for_display_state,
 )
 from zlc_frontend.qt_widgets import QtRasterBoard
+from zlc_frontend.render import HistogramPanelPayload
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_workbench.live import LiveFrontStatus
 
@@ -169,6 +177,17 @@ def test_four_panel_board_uses_one_scalar_revision_and_typed_view_semantics(
             document.layers[0].view.intent
             for document in window._live._configuration.scalar_documents
         ) == (ViewIntent.CURVE, ViewIntent.HISTOGRAM, ViewIntent.METER)
+        histogram_payload = frame.panels[2].display_payload
+        assert isinstance(histogram_payload, HistogramPanelPayload)
+        assert (
+            histogram_payload.evaluated_input
+            == frame.panels[1].display_payload.evaluated_input
+        )
+        assert histogram_payload.viewport.display_revision == 0
+        assert len(histogram_payload.bin_counts) == 1
+        assert int(histogram_payload.bin_counts[0].sum()) == len(
+            histogram_payload.series[0].data.samples
+        )
 
         status = window._live.front_status
         assert status is not None and status.sequence == frame.sequence
@@ -215,6 +234,100 @@ def test_four_panel_board_uses_one_scalar_revision_and_typed_view_semantics(
         )
         assert meter.value == scalar.block.values[0, 0]
         assert meter.valid is bool(validity[0])
+    finally:
+        if window.isVisible():
+            _close_window(application, window)
+
+
+def test_histogram_display_reconfigure_preserves_run_source_and_roi_authority(
+    experiment,
+    application,
+):
+    request = experiment.readout.camera_monitor_request(
+        history_capacity=3,
+        roi=_typed_roi(experiment),
+        roi_reduction=ReductionMethod.MEAN,
+        scalar_history_capacity=12,
+    )
+    window = experiment.readout.camera_monitor_gui(request)
+    try:
+        start = window.findChild(QtWidgets.QPushButton, "startButton")
+        board = window.findChild(QtRasterBoard, "cameraMonitorImageBoard")
+        _until(application, start.isEnabled)
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: (
+                board.has_front
+                and window._live is not None
+                and window._live.front_status is not None
+                and window._live.front_status.sequence == board.front_frame.sequence
+                and window._live.front_status.histogram_display_revision
+                == window._histogram_display.revision
+            ),
+        )
+
+        handle = window._handle
+        slot = window._slot
+        live = window._live
+        controller = window._board
+        assert handle is not None and slot is not None and live is not None
+        assert controller is not None
+        generation = window._run_owner.generation
+        control_revision = window._applied_control_revision
+        binding = window._running_binding
+        before = board.front_frame
+        assert before is not None
+        before_sources = tuple(panel.source_identity for panel in before.panels)
+        before_presentations = before.panels[0].coherence_stamp.presentations
+
+        candidate = replace(
+            window._histogram_display,
+            revision=window._histogram_display.revision + 1,
+            bin_count=17,
+            count_scale=HistogramCountScale.LOG,
+        )
+        window._commit_histogram_display(candidate)
+        assert window._handle is handle
+        assert window._slot is slot
+        assert window._live is live
+        assert window._board is controller
+        assert window._run_owner.generation == generation
+        assert window._applied_control_revision == control_revision
+        assert window._running_binding == binding
+
+        _until(
+            application,
+            lambda: (
+                live.front_status is not None
+                and live.front_status.histogram_display_revision
+                == candidate.revision
+                and board.front_frame is not None
+                and board.front_frame.sequence > before.sequence
+                and board.visible_histogram_payload() is not None
+                and board.visible_histogram_payload().viewport.display_revision
+                == candidate.revision
+            ),
+        )
+        after = board.front_frame
+        payload = board.visible_histogram_payload()
+        assert after is not None and payload is not None
+        assert tuple(panel.source_identity for panel in after.panels) == before_sources
+        assert payload.viewport.count_scale is HistogramCountScale.LOG
+        assert payload.viewport.count_limits[0] > 0.0
+        assert len(payload.bin_counts[0]) == 17
+        assert live.front_status.scalar_control_revision == control_revision
+        assert window._edit_histogram_display.base_revision == candidate.revision
+        assert window._setting_histogram_display.base_revision == candidate.revision
+        # Only the Histogram panel's presentation revision changes; source,
+        # ROI control and the sibling display states remain untouched.
+        after_presentations = after.panels[0].coherence_stamp.presentations
+        assert after_presentations[0] == before_presentations[0]
+        assert after_presentations[1] == before_presentations[1]
+        assert after_presentations[2].panel_revision == candidate.revision
+        assert after_presentations[3] == before_presentations[3]
+        assert window._image_display.revision == 0
+        assert window._curve_display.revision == 0
     finally:
         if window.isVisible():
             _close_window(application, window)
@@ -345,22 +458,25 @@ def test_valid_nonfinite_curve_and_meter_fail_instead_of_changing_validity():
 
 
 def test_histogram_binning_is_deterministic_and_never_fakes_empty_data():
-    counts, edges = histogram_bin_counts(np.array([], dtype=np.float64))
+    projection = HistogramBinProjection((np.array([], dtype=np.float64),))
+    counts, edges = projection.bin_counts[0], projection.bin_edges
     assert counts.shape == (60,) and not np.any(counts)
     assert edges.shape == (61,)
 
-    counts, edges = histogram_bin_counts(np.array([0.0, 1.0, 2.0]), bins=2)
-    np.testing.assert_array_equal(counts, [1, 2])
-    np.testing.assert_array_equal(edges, [0.0, 1.0, 2.0])
+    projection = HistogramBinProjection((np.array([0.0, 1.0, 2.0]),), bins=5)
+    counts, edges = projection.bin_counts[0], projection.bin_edges
+    np.testing.assert_array_equal(counts, [1, 0, 1, 0, 1])
+    np.testing.assert_allclose(edges, [0.0, 0.4, 0.8, 1.2, 1.6, 2.0])
 
-    counts, edges = histogram_bin_counts(np.array([False, True, True]), bins=500)
+    projection = HistogramBinProjection((np.array([False, True, True]),), bins=500)
+    counts, edges = projection.bin_counts[0], projection.bin_edges
     np.testing.assert_array_equal(counts, [1, 2])
     np.testing.assert_array_equal(edges, [-0.5, 0.5, 1.5])
 
-    counts, _edges = histogram_bin_counts(np.full(5, 3.0))
+    counts = HistogramBinProjection((np.full(5, 3.0),)).bin_counts[0]
     assert int(counts.sum()) == 5
     with pytest.raises(ValueError, match="finite"):
-        histogram_bin_counts(np.array([1.0, np.nan]))
+        HistogramBinProjection((np.array([1.0, np.nan]),))
 
 
 def test_scalar_display_budget_rejects_before_monitor_arm(experiment, application):
@@ -406,6 +522,28 @@ def test_scalar_display_budget_rejects_before_monitor_arm(experiment, applicatio
             )
             == held_bytes
         )
+        scalar_total, scalar_evaluation_peaks, scalar_hold_extra = (
+            _scalar_presentation_peak(
+                prepared.command.roi_control_schemas[0]
+            )
+        )
+        histogram_evaluation_peak = scalar_evaluation_peaks[1]
+        histogram_base = estimate_live_panel_raster_peak_nbytes(
+            800,
+            520,
+            evaluated_data_upper_bound_bytes=histogram_evaluation_peak,
+            histogram_bins=MAX_HISTOGRAM_BINS,
+        )
+        histogram_held = estimate_live_panel_raster_peak_nbytes(
+            800,
+            520,
+            evaluated_data_upper_bound_bytes=histogram_evaluation_peak,
+            histogram_bins=MAX_HISTOGRAM_BINS,
+            extra_retained_fronts=1,
+            extra_retained_evaluated_data_bytes=histogram_evaluation_peak,
+        )
+        assert scalar_total > 0
+        assert scalar_hold_extra >= histogram_held - histogram_base
     finally:
         if window.isVisible():
             _close_window(application, window)
@@ -414,7 +552,7 @@ def test_scalar_display_budget_rejects_before_monitor_arm(experiment, applicatio
         history_capacity=2,
         roi=roi,
         scalar_history_capacity=8,
-        memory_limit_bytes=required_peak - held_bytes,
+        memory_limit_bytes=required_peak - 1,
     )
     window = experiment.readout.camera_monitor_gui(request)
     try:
@@ -502,6 +640,23 @@ def test_image_reconfigure_shares_first_scalar_renderer_holder_across_worker_rac
                 state,
                 current_y_limits=current_y_limits,
                 previous_relim_mode=previous_relim_mode,
+            )
+
+        def render_interactive_histogram(
+            self,
+            evaluated,
+            state,
+            *,
+            current_count_limits,
+            previous_relim_mode,
+            previous_count_scale,
+        ):
+            return self._inner.render_interactive_histogram(
+                evaluated,
+                state,
+                current_count_limits=current_count_limits,
+                previous_relim_mode=previous_relim_mode,
+                previous_count_scale=previous_count_scale,
             )
 
         def close(self):
@@ -644,14 +799,17 @@ def test_owner_presents_before_next_admission_and_status_is_sequence_gated():
         _roi_presentation_failure=None,
         _image_display=ImageDisplayState(),
         _curve_display=CurveDisplayState(),
+        _histogram_display=HistogramDisplayState(),
         _running_binding=None,
         _pending_image_interaction_origin=None,
         _pending_curve_interaction_origin=None,
+        _pending_histogram_interaction_origin=None,
         _view_status=label,
         _handle=None,
         _reconcile_visible_roi=lambda _status: True,
         _sync_image_display_editors=lambda: None,
         _sync_curve_display_editors=lambda: None,
+        _sync_histogram_display_editors=lambda: None,
         _update_roi_controls=lambda: None,
     )
     CameraMonitorWorkbenchWindow._refresh_view_status(status_harness)
@@ -686,6 +844,7 @@ def test_close_failure_after_front_clear_immediately_drops_visible_label():
         _projection_text="target projection",
         _projection_status=projection_label,
         _clear_curve_range_candidate=lambda: None,
+        _clear_histogram_range_candidate=lambda: None,
     )
     harness._show_projection_target = lambda: (
         CameraMonitorWorkbenchWindow._show_projection_target(harness)

@@ -1720,12 +1720,15 @@ def _assert_occupancy_scan_window(exp, request, monkeypatch):
         assert initial_payload.evaluated_input in initial_panel.coherence_stamp.inputs
         initial_run_id = initial_panel.coherence_stamp.run_id
         initial_source_ref = initial_payload.evaluated_input.ref
+        numeric_binding = board._numeric_bindings[initial_panel.panel_id]
         assert window.final_reference is None
 
         try:
             selector.setChecked(True)
             application.processEvents()
-            plot = board._curve_target()[0]
+            numeric_target = board._numeric_target(numeric_binding)
+            assert numeric_target is not None
+            plot = numeric_target.plot
             center = QtCore.QPoint(
                 int(round(plot.center().x())),
                 int(round(plot.center().y())),
@@ -1733,9 +1736,9 @@ def _assert_occupancy_scan_window(exp, request, monkeypatch):
 
             # H/C/A are exercised on the exact painted real-product payload.
             QtTest.QTest.mouseMove(board, center)
-            assert board._curve_hover is not None
+            assert numeric_binding.hover is not None
             QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=center)
-            assert board._curve_cross is not None
+            assert numeric_binding.cross is not None
             left = QtCore.QPoint(
                 int(round(plot.left() + 0.25 * plot.width())),
                 center.y(),
@@ -1828,7 +1831,7 @@ def _assert_occupancy_scan_window(exp, request, monkeypatch):
             def reject_curve_intent(_command):
                 raise RuntimeError("W3 callback fault oracle")
 
-            board._curve_callback = reject_curve_intent
+            numeric_binding.callback = reject_curve_intent
             fault_wheel = QtGui.QWheelEvent(
                 QtCore.QPointF(center),
                 QtCore.QPointF(board.mapToGlobal(center)),

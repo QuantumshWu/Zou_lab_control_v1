@@ -919,14 +919,18 @@ def test_boolean_histogram_keeps_false_and_true_as_two_categories(
     )
     assert isinstance(figure.evaluated.layers[0].cells[0].series[0].data, EvaluatedHistogram)
     observed_bins = []
-    original_counts = render_module.histogram_bin_counts
+    original_projection = render_module.HistogramBinProjection
 
-    def traced_counts(values, *, bins=60):
-        counts, edges = original_counts(values, bins=bins)
-        observed_bins.append(tuple(edges))
-        return counts, edges
+    def traced_projection(values, bins=60):
+        projection = original_projection(values, bins=bins)
+        observed_bins.append(tuple(projection.bin_edges))
+        return projection
 
-    monkeypatch.setattr(render_module, "histogram_bin_counts", traced_counts)
+    monkeypatch.setattr(
+        render_module,
+        "HistogramBinProjection",
+        traced_projection,
+    )
     rendered = figure.render()
     try:
         assert observed_bins == [(-0.5, 0.5, 1.5)]

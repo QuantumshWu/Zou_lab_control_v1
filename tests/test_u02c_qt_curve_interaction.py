@@ -219,6 +219,14 @@ def _board(frame, curve_commands, image_commands):
     return application, board
 
 
+def _curve_target(board):
+    binding = board._numeric_binding_for_kind("curve")
+    assert binding is not None
+    target = board._numeric_target(binding)
+    assert target is not None
+    return target
+
+
 def _point(rect, x_fraction: float, y_fraction: float):
     from PyQt5 import QtCore
 
@@ -296,7 +304,7 @@ def test_curve_uses_draw_frozen_bbox_and_horizontal_span() -> None:
     commands: list[object] = []
     application, board = _board(_frame(1), commands, [])
     try:
-        plot = board._curve_target()[0]
+        plot = _curve_target(board).plot
         assert plot.left() == 480.0
         assert plot.top() == 30.0
         assert plot.width() == pytest.approx(240.0)
@@ -311,8 +319,16 @@ def test_curve_uses_draw_frozen_bbox_and_horizontal_span() -> None:
         assert isinstance(commands[-1], CurveRangeGesture)
         assert commands[-1].x_span == pytest.approx((0.5, 2.5))
         board.set_curve_range_candidate(commands[-1].x_span)
-        assert board._curve_applied_span == pytest.approx((0.5, 2.5))
+        assert board._numeric_bindings["curve"].applied_span == pytest.approx(
+            (0.5, 2.5)
+        )
         assert board._selector_hold is None
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=start)
+        clear = commands[-1]
+        assert isinstance(clear, CurveRangeGesture) and clear.x_span is None
+        board.set_curve_range_candidate(clear.x_span)
+        assert board._numeric_bindings["curve"].applied_span is None
     finally:
         board.close()
         application.processEvents()
@@ -323,17 +339,18 @@ def test_curve_hover_all_series_and_continuous_cross() -> None:
 
     application, board = _board(_frame(1), [], [])
     try:
-        plot = board._curve_target()[0]
+        plot = _curve_target(board).plot
         # data (2, 1) is invalid in site 0 but exact and valid in site 1.
         position = _point(plot, 0.625, 0.40)
         QtTest.QTest.mouseMove(board, position)
-        assert board._curve_hover is not None
-        assert board._curve_hover.series_label == "site 1"
-        assert (board._curve_hover.x, board._curve_hover.y) == (2.0, 1.0)
+        binding = board._numeric_bindings["curve"]
+        assert binding.hover is not None
+        assert binding.hover.series_label == "site 1"
+        assert (binding.hover.x, binding.hover.y) == (2.0, 1.0)
 
         arbitrary = _point(plot, 0.33, 0.61)
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=arbitrary)
-        cross = board._curve_cross
+        cross = binding.cross
         assert cross is not None
         assert cross.x != round(cross.x)
         board.mouseDoubleClickEvent(
@@ -345,7 +362,7 @@ def test_curve_hover_all_series_and_continuous_cross() -> None:
                 QtCore.Qt.NoModifier,
             )
         )
-        assert board._curve_cross is None
+        assert binding.cross is None
     finally:
         board.close()
         application.processEvents()
@@ -357,10 +374,11 @@ def test_curve_cross_and_hover_overlay_show_both_axis_units(monkeypatch) -> None
     curve_commands = []
     application, board = _board(_frame(0), curve_commands, [])
     try:
-        plot = board._curve_target()[0]
+        plot = _curve_target(board).plot
         position = _point(plot, 0.55, 0.45)
         QtTest.QTest.mouseMove(board, position)
-        assert board._curve_hover is not None
+        binding = board._numeric_bindings["curve"]
+        assert binding.hover is not None
 
         labels = []
 
@@ -378,14 +396,14 @@ def test_curve_cross_and_hover_overlay_show_both_axis_units(monkeypatch) -> None
         )
         painter = QtGui.QPainter(image)
         try:
-            board._paint_curve_overlays(painter)
+            board._paint_numeric_binding_overlay(painter, binding)
         finally:
             painter.end()
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=position)
-        assert board._curve_cross is not None
+        assert binding.cross is not None
         painter = QtGui.QPainter(image)
         try:
-            board._paint_curve_overlays(painter)
+            board._paint_numeric_binding_overlay(painter, binding)
         finally:
             painter.end()
         assert len(labels) == 2
@@ -403,10 +421,10 @@ def test_curve_x_only_wheel_pan_and_area_home() -> None:
     commands: list[object] = []
     application, board = _board(_frame(1), commands, [])
     try:
-        target = board._curve_target()
-        plot = target[0]
+        target = _curve_target(board)
+        plot = target.plot
         center = _point(plot, 0.5, 0.5)
-        initial_y = target[4].viewport.y_limits
+        initial_y = target.payload.viewport.y_limits
         assert _wheel(board, center, -120).isAccepted()
         zoom = commands[-1]
         assert isinstance(zoom, CurveViewportCommit)
@@ -415,8 +433,8 @@ def test_curve_x_only_wheel_pan_and_area_home() -> None:
 
         # Paint the exact accepted revision before issuing another command.
         board.present(_accepted_curve_frame(2, zoom))
-        target = board._curve_target()
-        plot = target[0]
+        target = _curve_target(board)
+        plot = target.plot
         press = _point(plot, 0.50, 0.50)
         move = _point(plot, 0.60, 0.50)
         QtTest.QTest.mousePress(board, QtCore.Qt.MiddleButton, pos=press)
@@ -424,20 +442,20 @@ def test_curve_x_only_wheel_pan_and_area_home() -> None:
         QtTest.QTest.mouseRelease(board, QtCore.Qt.MiddleButton, pos=move)
         pan = commands[-1]
         assert isinstance(pan, CurveViewportCommit)
-        assert pan.viewport.y_limits == target[4].viewport.y_limits
+        assert pan.viewport.y_limits == target.payload.viewport.y_limits
         assert pan.viewport.x_limits[0] < zoom.viewport.x_limits[0]
 
         board.present(_accepted_curve_frame(3, pan))
-        target = board._curve_target()
-        plot = target[0]
+        target = _curve_target(board)
+        plot = target.plot
         _double_click(board, _point(plot, 0.5, 0.5), QtCore.Qt.MiddleButton)
         home = commands[-1]
         assert isinstance(home, CurveViewportCommit)
-        assert home.viewport.x_limits == target[4].viewport.home_x_limits
-        assert home.viewport.y_limits == target[4].viewport.y_limits
+        assert home.viewport.x_limits == target.payload.viewport.home_x_limits
+        assert home.viewport.y_limits == target.payload.viewport.y_limits
 
         board.present(_accepted_curve_frame(4, home))
-        plot = board._curve_target()[0]
+        plot = _curve_target(board).plot
         start = _point(plot, 0.25, 0.5)
         end = _point(plot, 0.75, 0.5)
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
@@ -446,13 +464,13 @@ def test_curve_x_only_wheel_pan_and_area_home() -> None:
         range_gesture = commands[-1]
         assert isinstance(range_gesture, CurveRangeGesture)
         board.set_curve_range_candidate(range_gesture.x_span)
-        span = board._curve_applied_span
+        span = board._numeric_bindings["curve"].applied_span
         assert span is not None
         _double_click(board, _point(plot, 0.5, 0.5), QtCore.Qt.MiddleButton)
         area = commands[-1]
         assert isinstance(area, CurveViewportCommit)
         assert area.viewport.x_limits == span
-        assert area.viewport.y_limits == board._curve_target()[4].viewport.y_limits
+        assert area.viewport.y_limits == _curve_target(board).payload.viewport.y_limits
     finally:
         board.close()
         application.processEvents()
@@ -466,10 +484,10 @@ def test_curve_pending_is_panel_local_and_exact_discard() -> None:
     image_commands: list[object] = []
     application, board = _board(_frame(1), curve_commands, image_commands)
     try:
-        curve_plot = board._curve_target()[0]
+        curve_plot = _curve_target(board).plot
         _wheel(board, _point(curve_plot, 0.5, 0.5), -120)
         curve_origin = curve_commands[-1].origin
-        assert board._curve_pending_viewport is not None
+        assert board._numeric_bindings["curve"].pending_viewport is not None
 
         image_target = board._selector_target()[0]
         assert _wheel(board, _point(image_target, 0.5, 0.5), -120).isAccepted()
@@ -489,12 +507,12 @@ def test_panel_readiness_parks_stale_curve_without_faulting_healthy_image() -> N
     application, board = _board(_frame(1), curve_commands, image_commands)
     try:
         board.set_interaction_readiness(image=True, curve=False)
-        curve_plot = board._curve_target()[0]
+        curve_plot = _curve_target(board).plot
         stale_event = _wheel(board, _point(curve_plot, 0.5, 0.5), -120)
         assert not stale_event.isAccepted()
         assert curve_commands == []
         assert board.curve_selector_fault is None
-        assert board._curve_binding_enabled
+        assert board._numeric_bindings["curve"].binding_enabled
 
         image_target = board._selector_target()[0]
         assert _wheel(board, _point(image_target, 0.5, 0.5), -120).isAccepted()
@@ -515,7 +533,7 @@ def test_curve_hold_freezes_target_while_sibling_and_front_advance() -> None:
 
     application, board = _board(_frame(1), [], [])
     try:
-        plot = board._curve_target()[0]
+        plot = _curve_target(board).plot
         start = _point(plot, 0.25, 0.5)
         end = _point(plot, 0.75, 0.5)
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
@@ -554,7 +572,7 @@ def test_extreme_curve_transform_is_rejected_inside_qt_event_boundary() -> None:
     commands: list[object] = []
     application, board = _board(frame, commands, [])
     try:
-        plot = board._curve_target()[0]
+        plot = _curve_target(board).plot
         assert _wheel(board, _point(plot, 0.5, 0.5), 120).isAccepted()
         assert commands == []
         assert board.curve_selector_fault is None
@@ -566,7 +584,7 @@ def test_extreme_curve_transform_is_rejected_inside_qt_event_boundary() -> None:
         )
         overflow_point = _point(plot, 2.0, 0.5)
         _drag_move(board, overflow_point, QtCore.Qt.MiddleButton)
-        assert board._curve_pan_candidate is None
+        assert board._numeric_bindings["curve"].pan_candidate is None
         QtTest.QTest.mouseRelease(
             board,
             QtCore.Qt.MiddleButton,
@@ -585,22 +603,22 @@ def test_curve_lifecycle_and_callback_fault_are_local() -> None:
 
     application, board = _board(_frame(1), [], [])
     try:
-        plot = board._curve_target()[0]
+        plot = _curve_target(board).plot
         start = _point(plot, 0.2, 0.5)
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
         QtTest.QTest.keyClick(board, QtCore.Qt.Key_Escape)
         assert board._selector_hold is None
-        assert board._curve_span_candidate is None
+        assert board._numeric_bindings["curve"].span_candidate is None
 
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
         assert board._selector_hold is not None
         QtWidgets.QApplication.sendEvent(board, QtGui.QHideEvent())
         assert board._selector_hold is None
-        assert board._curve_span_candidate is None
+        assert board._numeric_bindings["curve"].span_candidate is None
 
         board.show()
         application.processEvents()
-        plot = board._curve_target()[0]
+        plot = _curve_target(board).plot
         QtTest.QTest.mousePress(
             board,
             QtCore.Qt.LeftButton,
@@ -610,7 +628,7 @@ def test_curve_lifecycle_and_callback_fault_are_local() -> None:
         assert board._selector_hold is None
 
         board.bind_curve_interaction("curve", lambda _command: None)
-        plot = board._curve_target()[0]
+        plot = _curve_target(board).plot
         QtTest.QTest.mousePress(
             board,
             QtCore.Qt.LeftButton,
@@ -630,9 +648,13 @@ def test_curve_lifecycle_and_callback_fault_are_local() -> None:
             "curve",
             lambda _command: (_ for _ in ()).throw(RuntimeError("curve boom")),
         )
-        assert _wheel(board, _point(board._curve_target()[0], 0.5, 0.5), -120).isAccepted()
+        assert _wheel(
+            board,
+            _point(_curve_target(board).plot, 0.5, 0.5),
+            -120,
+        ).isAccepted()
         assert board.curve_selector_fault is not None
-        assert not board._curve_binding_enabled
+        assert not board._numeric_bindings["curve"].binding_enabled
         assert board._image_binding_enabled
     finally:
         board.close()

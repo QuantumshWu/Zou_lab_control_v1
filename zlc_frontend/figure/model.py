@@ -593,6 +593,7 @@ class EvaluatedHistogram:
     samples: np.ndarray
     sample_coordinates: tuple[SampleCoordinates, ...]
     dropped_count: int
+    value_unit: str | None = None
 
     def __post_init__(self) -> None:
         samples = _immutable_evaluated_array(self.samples, ndim=1)
@@ -604,6 +605,12 @@ class EvaluatedHistogram:
         object.__setattr__(self, "samples", samples)
         object.__setattr__(self, "sample_coordinates", coordinates)
         object.__setattr__(self, "dropped_count", _nonnegative(self.dropped_count, "dropped_count"))
+        if self.value_unit is not None:
+            object.__setattr__(
+                self,
+                "value_unit",
+                _text(self.value_unit, "histogram value unit"),
+            )
 
 
 @dataclass(frozen=True)

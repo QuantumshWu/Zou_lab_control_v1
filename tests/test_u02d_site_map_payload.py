@@ -31,6 +31,7 @@ from zlc_frontend.render import (
     CoherenceStamp,
     CurvePanelPayload,
     DisplayPayload,
+    HistogramPanelPayload,
     ImagePanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
@@ -185,7 +186,7 @@ def _raster(*, width: int = 3, height: int = 2) -> RasterBuffer:
     )
 
 
-def test_site_map_is_the_third_closed_payload_and_owns_exact_site_arrays() -> None:
+def test_site_map_remains_a_closed_payload_and_owns_exact_site_arrays() -> None:
     centers = np.asarray(((20.25, 10.25), (21.75, 10.75)), dtype=np.float32)
     occupied = np.asarray((True, False), dtype=bool)
     validity = np.asarray((True, False), dtype=bool)
@@ -200,6 +201,7 @@ def test_site_map_is_the_third_closed_payload_and_owns_exact_site_arrays() -> No
     assert get_args(DisplayPayload) == (
         ImagePanelPayload,
         CurvePanelPayload,
+        HistogramPanelPayload,
         SiteMapPanelPayload,
     )
     assert payload.centers_xy.dtype == np.dtype("<f8")

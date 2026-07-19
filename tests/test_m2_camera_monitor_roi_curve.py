@@ -88,6 +88,14 @@ def _wheel_down(
     return event
 
 
+def _curve_plot(board: QtRasterBoard):
+    binding = board._numeric_binding_for_kind("curve")
+    assert binding is not None
+    target = board._numeric_target(binding)
+    assert target is not None
+    return target.plot
+
+
 def test_typed_roi_curve_preserves_raw_axes_and_presents_one_coherent_board(
     experiment,
     application,
@@ -327,7 +335,7 @@ def test_curve_selector_and_form_change_only_the_monitor_presentation(
         raw_revision = slot.freeze_camera_current()[2].raw.snapshot.ref.revision
 
         selector.setChecked(True)
-        curve_target = board._curve_target()[0]
+        curve_target = _curve_plot(board)
         start_point = QtCore.QPoint(
             int(curve_target.left() + 0.2 * curve_target.width()),
             int(curve_target.center().y()),
@@ -349,20 +357,26 @@ def test_curve_selector_and_form_change_only_the_monitor_presentation(
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end_point)
         assert window._curve_range_candidate is not None
         assert (
-            board._curve_applied_span
+            board._numeric_bindings["camera-monitor-roi-curve"].applied_span
             == window._curve_range_candidate[1]
         )
         assert window._curve_display.revision == initial_curve_revision
 
-        assert _wheel_down(board, board._curve_target()[0]).isAccepted()
+        assert _wheel_down(board, _curve_plot(board)).isAccepted()
         authored = window._curve_display
         assert (
             authored.revision == initial_curve_revision + 1
             and authored.x_view is not None
         )
-        assert board._curve_applied_span == window._curve_range_candidate[1]
+        assert (
+            board._numeric_bindings["camera-monitor-roi-curve"].applied_span
+            == window._curve_range_candidate[1]
+        )
         assert selector.isChecked() and selector.isEnabled()
-        assert board._curve_pending_viewport is not None
+        assert (
+            board._numeric_bindings["camera-monitor-roi-curve"].pending_viewport
+            is not None
+        )
         _until(
             application,
             lambda: (
@@ -425,7 +439,7 @@ def test_curve_selector_and_form_change_only_the_monitor_presentation(
         assert selector.isChecked() and selector.isEnabled()
         assert not window._edit_image_display.isEnabled()
         assert window._edit_curve_display.isEnabled()
-        curve_plot = board._curve_target()[0]
+        curve_plot = _curve_plot(board)
         QtTest.QTest.mouseClick(
             board,
             QtCore.Qt.RightButton,
@@ -434,7 +448,7 @@ def test_curve_selector_and_form_change_only_the_monitor_presentation(
                 int(curve_plot.center().y()),
             ),
         )
-        assert board._curve_cross is not None
+        assert board._numeric_bindings["camera-monitor-roi-curve"].cross is not None
         _until(
             application,
             lambda: (

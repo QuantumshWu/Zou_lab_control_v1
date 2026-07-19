@@ -555,6 +555,7 @@ def test_scalar_control_change_reuses_layout_when_panel_ids_are_unchanged(monkey
         None,
         (),
         None,
+        None,
     )
 
     assert controller._configuration is replacement

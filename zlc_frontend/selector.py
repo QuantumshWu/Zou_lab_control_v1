@@ -15,7 +15,8 @@ from zlc_storage import canonical_text, nonnegative_integer
 
 from .figure import EvaluatedInput
 from .curve_display import CurveViewportTransform
-from .display_range import validated_display_range
+from .display_range import optional_display_range, validated_display_range
+from .histogram_display import HistogramViewportTransform
 from .image_view import (
     ImageViewportTransform,
     NormalizedRectangle,
@@ -151,10 +152,50 @@ class CurveViewportCommit:
 
 @dataclass(frozen=True, slots=True)
 class CurveRangeGesture:
-    """One exact display-only x-span candidate; it is not an authority Selection."""
+    """Set or clear one display-only x span; never an authority Selection."""
 
     origin: PanelInteractionOrigin
-    x_span: tuple[float, float]
+    x_span: tuple[float, float] | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
+        object.__setattr__(
+            self, "x_span", optional_display_range(self.x_span, "curve x_span")
+        )
+
+
+CurveInteractionIntent: TypeAlias = CurveViewportCommit | CurveRangeGesture
+
+
+@dataclass(frozen=True, slots=True)
+class HistogramViewportCommit:
+    """Request one display-only HISTOGRAM x viewport from an exact front."""
+
+    origin: PanelInteractionOrigin
+    viewport: HistogramViewportTransform
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
+        if not isinstance(self.viewport, HistogramViewportTransform):
+            raise TypeError("viewport must be HistogramViewportTransform")
+        if self.viewport.display_revision <= self.origin.presentation.panel_revision:
+            raise ValueError(
+                "histogram viewport commit revision must exceed its painted origin"
+            )
+        if self.viewport.x_limits_are_auto:
+            raise ValueError(
+                "histogram viewport commit must carry an explicit authored x pin"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class HistogramRangeGesture:
+    """Set or clear one display-only value span; never an analysis threshold."""
+
+    origin: PanelInteractionOrigin
+    x_span: tuple[float, float] | None
 
     def __post_init__(self) -> None:
         if not isinstance(self.origin, PanelInteractionOrigin):
@@ -162,17 +203,22 @@ class CurveRangeGesture:
         object.__setattr__(
             self,
             "x_span",
-            validated_display_range(self.x_span, "curve x_span"),
+            optional_display_range(self.x_span, "histogram x_span"),
         )
 
 
-CurveInteractionIntent: TypeAlias = CurveViewportCommit | CurveRangeGesture
+HistogramInteractionIntent: TypeAlias = (
+    HistogramViewportCommit | HistogramRangeGesture
+)
 
 
 __all__ = [
     "CurveInteractionIntent",
     "CurveRangeGesture",
     "CurveViewportCommit",
+    "HistogramInteractionIntent",
+    "HistogramRangeGesture",
+    "HistogramViewportCommit",
     "ImageColorLimitsCommit",
     "ImageInteractionCommit",
     "ImageViewportCommit",

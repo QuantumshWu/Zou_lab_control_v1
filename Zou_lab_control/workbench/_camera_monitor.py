@@ -39,6 +39,15 @@ from zlc_frontend.curve_display import (
     curve_display_with_x_view,
 )
 from zlc_frontend.display_range import RelimMode
+from zlc_frontend.histogram_display import (
+    DEFAULT_HISTOGRAM_BINS,
+    MAX_HISTOGRAM_BINS,
+    HistogramDisplayState,
+    histogram_display_form_spec,
+    histogram_display_form_values,
+    histogram_display_from_form,
+    histogram_display_with_x_view,
+)
 from zlc_frontend.image_display import (
     ImageDisplayState,
     image_display_for_viewport,
@@ -49,10 +58,7 @@ from zlc_frontend.image_display import (
 )
 from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
 from zlc_frontend.image_view import ImageViewportTransform
-from zlc_frontend.matplotlib_render import (
-    DEFAULT_HISTOGRAM_BINS,
-    estimate_live_panel_raster_peak_nbytes,
-)
+from zlc_frontend.matplotlib_render import estimate_live_panel_raster_peak_nbytes
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentComboBox,
@@ -84,6 +90,9 @@ from zlc_frontend.selector import (
     CurveInteractionIntent,
     CurveRangeGesture,
     CurveViewportCommit,
+    HistogramInteractionIntent,
+    HistogramRangeGesture,
+    HistogramViewportCommit,
     ImageColorLimitsCommit,
     ImageInteractionCommit,
     ImageViewportCommit,
@@ -180,7 +189,8 @@ def _roi_scalar_views(schema, binding):
         f"[{description}] · binding {binding.fingerprint[:12]} · "
         f"validity {binding.validity_policy.value.lower()} · "
         f"scalar history 0..{history[0].size - 1} (0 newest) · "
-        f"curve + {DEFAULT_HISTOGRAM_BINS}-bin histogram + latest meter · "
+        f"curve + histogram (default {DEFAULT_HISTOGRAM_BINS} bins) + "
+        "latest meter · "
         "MONITOR DERIVED / DISPLAY ONLY"
     )
     return views, summary
@@ -203,29 +213,33 @@ def _scalar_presentation_peak(
         estimate_view_evaluation_peak_nbytes(schema, view) for view in views
     )
     total = 0
-    curve_hold_extra = 0
+    numeric_hold_extras: list[int] = []
     for view, evaluation_peak in zip(views, evaluation_peaks, strict=True):
+        histogram_bins = (
+            MAX_HISTOGRAM_BINS
+            if view.intent is ViewIntent.HISTOGRAM
+            else None
+        )
         raster_peak = estimate_live_panel_raster_peak_nbytes(
             *_SCALAR_RASTER_SIZE,
             evaluated_data_upper_bound_bytes=evaluation_peak,
-            histogram_bins=(
-                DEFAULT_HISTOGRAM_BINS
-                if view.intent is ViewIntent.HISTOGRAM
-                else None
-            ),
+            histogram_bins=histogram_bins,
         )
         total += evaluation_peak + raster_peak
-        if view.intent is ViewIntent.CURVE:
+        if view.intent in (ViewIntent.CURVE, ViewIntent.HISTOGRAM):
             held_peak = estimate_live_panel_raster_peak_nbytes(
                 *_SCALAR_RASTER_SIZE,
                 evaluated_data_upper_bound_bytes=evaluation_peak,
+                histogram_bins=histogram_bins,
                 extra_retained_fronts=1,
                 extra_retained_evaluated_data_bytes=evaluation_peak,
             )
-            curve_hold_extra = held_peak - raster_peak
-    if curve_hold_extra <= 0:
-        raise RuntimeError("scalar presentation has no curve hold reserve")
-    return total, evaluation_peaks, curve_hold_extra
+            numeric_hold_extras.append(held_peak - raster_peak)
+    if not numeric_hold_extras or any(value <= 0 for value in numeric_hold_extras):
+        raise RuntimeError("scalar presentation has no numeric-panel hold reserve")
+    # QtRasterBoard permits one pointer hold across the entire board.  Reserve
+    # the larger exact CURVE/HISTOGRAM hold, never their impossible sum.
+    return total, evaluation_peaks, max(numeric_hold_extras)
 
 
 def _scalar_documents(
@@ -361,8 +375,9 @@ def _prepare_monitor_view(
         total for total, _peaks, _hold_extra in possible_scalar_reserves
     )
     # QtRasterBoard owns at most one pointer hold across the whole board.  The
-    # reserve therefore admits the larger exact IMAGE/CURVE hold once, rather
-    # than pretending both can coexist or undercounting retained curve arrays.
+    # reserve therefore admits the larger exact IMAGE/CURVE/HISTOGRAM hold
+    # once, rather than summing mutually exclusive pointer captures or
+    # undercounting retained evaluated samples and histogram counts/edges.
     downstream_peak += max(
         image_hold_extra,
         *(hold_extra for _total, _peaks, hold_extra in possible_scalar_reserves),
@@ -479,10 +494,16 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._draft_selection: Selection | None = None
         self._image_display = ImageDisplayState()
         self._curve_display = CurveDisplayState()
+        self._histogram_display = HistogramDisplayState()
         self._image_viewport: ImageViewportTransform | None = None
         self._pending_image_interaction_origin: PanelInteractionOrigin | None = None
         self._pending_curve_interaction_origin: PanelInteractionOrigin | None = None
+        self._pending_histogram_interaction_origin: PanelInteractionOrigin | None = None
         self._curve_range_candidate: tuple[PanelInteractionOrigin, tuple[float, float]] | None = None
+        self._histogram_range_candidate: tuple[
+            PanelInteractionOrigin,
+            tuple[float, float],
+        ] | None = None
         self._slot: LiveDatasetSlot | None = None
         self._live: LiveBoardController | None = None
         self._board: BoardController | None = None
@@ -582,8 +603,16 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             parent=self._edit_display_tabs,
         )
         self._edit_curve_display.setObjectName("curveDisplayEditEditor")
+        self._edit_histogram_display = FluentRevisionedFormEditor(
+            histogram_display_form_spec(),
+            "histogram display",
+            runtime_placeholder_fields=("count_min", "count_max"),
+            parent=self._edit_display_tabs,
+        )
+        self._edit_histogram_display.setObjectName("histogramDisplayEditEditor")
         self._edit_display_tabs.addTab(self._edit_image_display, "Image")
         self._edit_display_tabs.addTab(self._edit_curve_display, "Curve")
+        self._edit_display_tabs.addTab(self._edit_histogram_display, "Histogram")
         self._tabs.addTab(self._live_page, "Live")
         self._tabs.addTab(self._edit_display_tabs, "Edit")
 
@@ -607,13 +636,27 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             parent=self._setting_display_tabs,
         )
         self._setting_curve_display.setObjectName("curveDisplaySettingEditor")
+        self._setting_histogram_display = FluentRevisionedFormEditor(
+            histogram_display_form_spec(),
+            "histogram display",
+            runtime_placeholder_fields=("count_min", "count_max"),
+            parent=self._setting_display_tabs,
+        )
+        self._setting_histogram_display.setObjectName(
+            "histogramDisplaySettingEditor"
+        )
         self._setting_display_tabs.addTab(self._setting_image_display, "Image")
         self._setting_display_tabs.addTab(self._setting_curve_display, "Curve")
+        self._setting_display_tabs.addTab(
+            self._setting_histogram_display,
+            "Histogram",
+        )
         settings_layout.addWidget(self._setting_display_tabs)
         self._settings_dismissed_at = float("-inf")
         self._settings_popup._on_hidden = self._record_settings_dismissed
         self._sync_image_display_editors()
         self._sync_curve_display_editors()
+        self._sync_histogram_display_editors()
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self._run_status)
@@ -669,6 +712,20 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 values,
             )
         )
+        self._edit_histogram_display.applyRequested.connect(
+            lambda revision, values: self._apply_histogram_display_form(
+                self._edit_histogram_display,
+                revision,
+                values,
+            )
+        )
+        self._setting_histogram_display.applyRequested.connect(
+            lambda revision, values: self._apply_histogram_display_form(
+                self._setting_histogram_display,
+                revision,
+                values,
+            )
+        )
         self._edit_image_display.cancelRequested.connect(
             lambda: self._reload_image_display_editor(self._edit_image_display)
         )
@@ -680,6 +737,16 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         )
         self._setting_curve_display.cancelRequested.connect(
             lambda: self._reload_curve_display_editor(self._setting_curve_display)
+        )
+        self._edit_histogram_display.cancelRequested.connect(
+            lambda: self._reload_histogram_display_editor(
+                self._edit_histogram_display
+            )
+        )
+        self._setting_histogram_display.cancelRequested.connect(
+            lambda: self._reload_histogram_display_editor(
+                self._setting_histogram_display
+            )
         )
         self._update_display_controls()
         self._submit_prepare()
@@ -714,6 +781,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             return
         self._reload_image_display_editor(self._setting_image_display)
         self._reload_curve_display_editor(self._setting_curve_display)
+        self._reload_histogram_display_editor(self._setting_histogram_display)
         show_fluent_popup_for_anchor(
             popup,
             self._setting_button,
@@ -741,11 +809,21 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             and live_healthy
             and self._visible_curve_matches_current_state()
         )
-        self._setting_button.setEnabled(image_enabled or curve_enabled)
+        histogram_enabled = (
+            not self._closing
+            and not self._view_attach_inflight
+            and live_healthy
+            and self._visible_histogram_matches_current_state()
+        )
+        self._setting_button.setEnabled(
+            image_enabled or curve_enabled or histogram_enabled
+        )
         self._edit_image_display.setEnabled(image_enabled)
         self._setting_image_display.setEnabled(image_enabled)
         self._edit_curve_display.setEnabled(curve_enabled)
         self._setting_curve_display.setEnabled(curve_enabled)
+        self._edit_histogram_display.setEnabled(histogram_enabled)
+        self._setting_histogram_display.setEnabled(histogram_enabled)
 
     def _visible_image_color_limits(self) -> tuple[float, float] | None:
         board = self._board_widget
@@ -797,6 +875,40 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             origin is not None
             and origin.panel_id == _CURVE_PANEL_ID
             and origin.presentation.panel_revision == self._curve_display.revision
+            and front is not None
+            and status is not None
+            and status.sequence == front.sequence
+            and binding is not None
+            and status.scalar_binding_fingerprint == binding.fingerprint
+            and self._applied_control_revision is not None
+            and status.scalar_control_revision == self._applied_control_revision
+        )
+
+    def _visible_histogram_count_limits(self) -> tuple[float, float] | None:
+        board = self._board_widget
+        if not isinstance(board, QtRasterBoard):
+            return None
+        if self._live is not None and not self._visible_histogram_matches_current_state():
+            return None
+        payload = board.visible_histogram_payload()
+        return None if payload is None else payload.viewport.count_limits
+
+    def _visible_histogram_matches_current_state(self) -> bool:
+        """Require painted histogram presentation and ROI provenance to be current."""
+
+        board = self._board_widget
+        if not isinstance(board, QtRasterBoard):
+            return False
+        origin = board.visible_histogram_origin()
+        front = board.front_frame
+        live = self._live
+        status = None if live is None else live.front_status
+        binding = self._running_binding
+        return (
+            origin is not None
+            and origin.panel_id == _HISTOGRAM_PANEL_ID
+            and origin.presentation.panel_revision
+            == self._histogram_display.revision
             and front is not None
             and status is not None
             and status.sequence == front.sequence
@@ -885,6 +997,51 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             (self._edit_curve_display, self._setting_curve_display),
             revision=self._curve_display.revision,
             semantic_identity=self._curve_display,
+            values=values,
+            runtime_placeholders=placeholders,
+            accepted_editor=accepted_editor,
+            accepted_base_revision=accepted_base_revision,
+        )
+
+    def _reload_histogram_display_editor(
+        self,
+        editor: FluentRevisionedFormEditor,
+    ) -> None:
+        editors = (
+            self._edit_histogram_display,
+            self._setting_histogram_display,
+        )
+        self._require_display_editor(editor, editors, "histogram")
+        editor.load(
+            revision=self._histogram_display.revision,
+            semantic_identity=self._histogram_display,
+            values=histogram_display_form_values(self._histogram_display),
+            runtime_placeholders=runtime_range_placeholders(
+                self._visible_histogram_count_limits(),
+                "count_min",
+                "count_max",
+            ),
+        )
+
+    def _sync_histogram_display_editors(
+        self,
+        *,
+        accepted_editor: FluentRevisionedFormEditor | None = None,
+        accepted_base_revision: int | None = None,
+    ) -> None:
+        values = histogram_display_form_values(self._histogram_display)
+        placeholders = runtime_range_placeholders(
+            self._visible_histogram_count_limits(),
+            "count_min",
+            "count_max",
+        )
+        sync_revisioned_form_editors(
+            (
+                self._edit_histogram_display,
+                self._setting_histogram_display,
+            ),
+            revision=self._histogram_display.revision,
+            semantic_identity=self._histogram_display,
             values=values,
             runtime_placeholders=placeholders,
             accepted_editor=accepted_editor,
@@ -983,6 +1140,55 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         except Exception as error:
             self._record_local_failure(
                 f"Curve display edit rejected: {type(error).__name__}: {error}"
+            )
+
+    def _apply_histogram_display_form(
+        self,
+        editor: FluentRevisionedFormEditor,
+        base_revision: int,
+        values: object,
+    ) -> None:
+        if editor not in (
+            self._edit_histogram_display,
+            self._setting_histogram_display,
+        ):
+            raise ValueError(
+                "histogram display editor does not belong to this window"
+            )
+        try:
+            if self._closing or self._view_attach_inflight:
+                raise RuntimeError(
+                    "histogram display cannot change while the live view is attaching"
+                )
+            if (
+                self._live is not None
+                and not self._visible_histogram_matches_current_state()
+            ):
+                raise RuntimeError(
+                    "histogram display cannot change until the current ROI front "
+                    "is visible"
+                )
+            if base_revision != self._histogram_display.revision:
+                raise RuntimeError(
+                    f"histogram display edit base r{base_revision} is stale; "
+                    f"current revision is r{self._histogram_display.revision}"
+                )
+            if not isinstance(values, dict):
+                raise TypeError("histogram display form must emit one exact mapping")
+            candidate = histogram_display_from_form(
+                self._histogram_display,
+                values,
+                current_count_limits=self._visible_histogram_count_limits(),
+            )
+            self._commit_histogram_display(
+                candidate,
+                accepted_editor=editor,
+                accepted_base_revision=base_revision,
+            )
+        except Exception as error:
+            self._record_local_failure(
+                "Histogram display edit rejected: "
+                f"{type(error).__name__}: {error}"
             )
 
     def _viewport_for_image_display(
@@ -1126,11 +1332,15 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         if origin.presentation.panel_revision != self._curve_display.revision:
             raise RuntimeError("curve interaction origin is stale")
         if isinstance(command, CurveRangeGesture):
-            self._set_curve_range_candidate(origin, command.x_span)
-            self._roi_status.setText(
-                "Curve: DISPLAY ONLY x span "
-                f"{command.x_span[0]:.6g}..{command.x_span[1]:.6g}"
-            )
+            if command.x_span is None:
+                self._clear_curve_range_candidate()
+                self._roi_status.setText("Curve: DISPLAY ONLY x span cleared")
+            else:
+                self._set_curve_range_candidate(origin, command.x_span)
+                self._roi_status.setText(
+                    "Curve: DISPLAY ONLY x span "
+                    f"{command.x_span[0]:.6g}..{command.x_span[1]:.6g}"
+                )
             return
         if command.viewport.display_revision != self._curve_display.revision + 1:
             raise RuntimeError("curve viewport interaction must advance once")
@@ -1180,6 +1390,96 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._update_roi_controls()
         self._update_display_controls()
 
+    def _accept_histogram_interaction(
+        self,
+        command: HistogramInteractionIntent,
+    ) -> None:
+        if not isinstance(
+            command,
+            (HistogramViewportCommit, HistogramRangeGesture),
+        ):
+            raise TypeError(
+                "histogram interaction callback received an unknown command"
+            )
+        board = self._board_widget
+        if not isinstance(board, QtRasterBoard):
+            raise RuntimeError("histogram interaction has no raster board")
+        origin = command.origin
+        if origin.panel_id != _HISTOGRAM_PANEL_ID:
+            raise RuntimeError("histogram interaction belongs to another panel")
+        if not self._visible_histogram_matches_current_state():
+            raise RuntimeError("histogram interaction ROI provenance is stale")
+        if board.visible_histogram_origin() != origin:
+            raise RuntimeError("histogram interaction origin is no longer painted")
+        if origin.presentation.panel_revision != self._histogram_display.revision:
+            raise RuntimeError("histogram interaction origin is stale")
+        if isinstance(command, HistogramRangeGesture):
+            if command.x_span is None:
+                self._clear_histogram_range_candidate()
+                self._roi_status.setText(
+                    "Histogram: DISPLAY ONLY value span cleared"
+                )
+            else:
+                self._set_histogram_range_candidate(origin, command.x_span)
+                self._roi_status.setText(
+                    "Histogram: DISPLAY ONLY value span "
+                    f"{command.x_span[0]:.6g}..{command.x_span[1]:.6g}"
+                )
+            return
+        if command.viewport.display_revision != self._histogram_display.revision + 1:
+            raise RuntimeError("histogram viewport interaction must advance once")
+        candidate = histogram_display_with_x_view(
+            self._histogram_display,
+            command.viewport.x_limits,
+        )
+        self._commit_histogram_display(
+            candidate,
+            interaction_origin=origin,
+        )
+
+    def _commit_histogram_display(
+        self,
+        state: HistogramDisplayState,
+        *,
+        accepted_editor: FluentRevisionedFormEditor | None = None,
+        accepted_base_revision: int | None = None,
+        interaction_origin: PanelInteractionOrigin | None = None,
+    ) -> None:
+        current = self._histogram_display
+        if not isinstance(state, HistogramDisplayState):
+            raise TypeError("state must be HistogramDisplayState")
+        changed = state != current
+        if changed and state.revision != current.revision + 1:
+            raise ValueError("histogram display commit must advance exactly once")
+        if not changed and state.revision != current.revision:
+            raise ValueError("histogram display no-op changed revision")
+        if accepted_editor is not None:
+            if accepted_base_revision != current.revision:
+                raise ValueError(
+                    "accepted histogram editor base differs from current revision"
+                )
+            if accepted_editor.base_revision != accepted_base_revision:
+                raise ValueError(
+                    "accepted histogram editor no longer owns its emitted base"
+                )
+        if interaction_origin is not None and not changed:
+            raise ValueError("histogram interaction cannot commit a semantic no-op")
+
+        live = self._live
+        if changed and live is not None:
+            # Presentation-only mutation: source Run, dataset generation, ROI
+            # binding and board topology remain immutable.
+            live.reconfigure_histogram_display(state)
+        if changed:
+            self._histogram_display = state
+            self._pending_histogram_interaction_origin = interaction_origin
+        self._sync_histogram_display_editors(
+            accepted_editor=accepted_editor,
+            accepted_base_revision=accepted_base_revision,
+        )
+        self._update_roi_controls()
+        self._update_display_controls()
+
     def _discard_pending_image_interaction(self) -> None:
         origin = self._pending_image_interaction_origin
         if origin is None:
@@ -1197,6 +1497,15 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         if isinstance(board, QtRasterBoard):
             board.discard_pending_curve_interaction(origin)
         self._pending_curve_interaction_origin = None
+
+    def _discard_pending_histogram_interaction(self) -> None:
+        origin = self._pending_histogram_interaction_origin
+        if origin is None:
+            return
+        board = self._board_widget
+        if isinstance(board, QtRasterBoard):
+            board.discard_pending_histogram_interaction(origin)
+        self._pending_histogram_interaction_origin = None
 
     def _set_curve_range_candidate(
         self,
@@ -1216,6 +1525,27 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         board = self._board_widget
         if isinstance(board, QtRasterBoard):
             board.set_curve_range_candidate(None)
+
+    def _set_histogram_range_candidate(
+        self,
+        origin: PanelInteractionOrigin,
+        x_span: tuple[float, float],
+    ) -> None:
+        board = self._board_widget
+        if not isinstance(board, QtRasterBoard):
+            raise RuntimeError("histogram range candidate has no raster board")
+        if board.visible_histogram_origin() != origin:
+            raise RuntimeError(
+                "histogram range candidate origin is no longer painted"
+            )
+        self._histogram_range_candidate = (origin, x_span)
+        board.set_histogram_range_candidate(x_span)
+
+    def _clear_histogram_range_candidate(self) -> None:
+        self._histogram_range_candidate = None
+        board = self._board_widget
+        if isinstance(board, QtRasterBoard):
+            board.set_histogram_range_candidate(None)
 
     def _accept_rectangle_gesture(self, gesture: RectangleGesture) -> None:
         if not isinstance(gesture, RectangleGesture):
@@ -1267,6 +1597,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         )
         image_interaction_ready = False
         curve_interaction_ready = False
+        histogram_interaction_ready = False
         if isinstance(self._board_widget, QtRasterBoard):
             image_interaction_ready = (
                 self._board_widget.selector_fault is None
@@ -1276,11 +1607,20 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 self._board_widget.curve_selector_fault is None
                 and self._visible_curve_matches_current_state()
             )
+            histogram_interaction_ready = (
+                self._board_widget.histogram_selector_fault is None
+                and self._visible_histogram_matches_current_state()
+            )
             self._board_widget.set_interaction_readiness(
                 image=image_interaction_ready,
                 curve=curve_interaction_ready,
+                histogram=histogram_interaction_ready,
             )
-        selector_healthy = image_interaction_ready or curve_interaction_ready
+        selector_healthy = (
+            image_interaction_ready
+            or curve_interaction_ready
+            or histogram_interaction_ready
+        )
         active = (
             self._handle is not None
             and not self._handle.snapshot().state.terminal
@@ -1393,7 +1733,9 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._board_panel_ids = panel_ids
         self._pending_image_interaction_origin = None
         self._pending_curve_interaction_origin = None
+        self._pending_histogram_interaction_origin = None
         self._clear_curve_range_candidate()
+        self._clear_histogram_range_candidate()
         self._visible_binding_fingerprint = None
         self._visible_projection_text = None
 
@@ -1464,8 +1806,14 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     self._accept_curve_interaction,
                     enabled=False,
                 )
+                selector_board.bind_histogram_interaction(
+                    _HISTOGRAM_PANEL_ID,
+                    self._accept_histogram_interaction,
+                    enabled=False,
+                )
             else:
                 selector_board.unbind_curve_interaction()
+                selector_board.unbind_histogram_interaction()
             if not selector_board.has_front:
                 selector_board.set_selector_applied_selection(None)
             selector_board.set_selector_draft_selection(self._draft_selection)
@@ -1664,6 +2012,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     self._update_start_button()
                     self._update_roi_controls()
                     self._sync_image_display_editors()
+                    self._sync_curve_display_editors()
+                    self._sync_histogram_display_editors()
                 continue
             if kind == "start":
                 try:
@@ -2110,6 +2460,9 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     curve_display=(
                         self._curve_display if scalar_documents else None
                     ),
+                    histogram_display=(
+                        self._histogram_display if scalar_documents else None
+                    ),
                 )
             except BaseException as error:
                 rollback_errors = []
@@ -2153,6 +2506,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         )
         if next_curve_semantics != previous_curve_semantics:
             self._clear_curve_range_candidate()
+            self._clear_histogram_range_candidate()
         self._running_binding = state.binding
         self._applied_control_revision = state.control_revision
         self._observed_roi_state_revision = state.state_revision
@@ -2223,6 +2577,9 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                     curve_display=(
                         self._curve_display if scalar_documents else None
                     ),
+                    histogram_display=(
+                        self._histogram_display if scalar_documents else None
+                    ),
                 )
                 self._slot = slot
                 self._board = board
@@ -2276,6 +2633,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         if failure is not None or fault is not None:
             self._discard_pending_image_interaction()
             self._discard_pending_curve_interaction()
+            self._discard_pending_histogram_interaction()
             detail = failure if failure is not None else str(fault)
             self._view_status.setText(f"View: FAILED · {detail}")
             self._update_roi_controls()
@@ -2284,6 +2642,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         if isinstance(board_widget, QtRasterBoard):
             image_selector_fault = board_widget.selector_fault
             curve_selector_fault = board_widget.curve_selector_fault
+            histogram_selector_fault = board_widget.histogram_selector_fault
             image_selector_healthy = (
                 image_selector_fault is None
                 and board_widget.visible_image_origin() is not None
@@ -2292,12 +2651,18 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 curve_selector_fault is None
                 and board_widget.visible_curve_origin() is not None
             )
+            histogram_selector_healthy = (
+                histogram_selector_fault is None
+                and board_widget.visible_histogram_origin() is not None
+            )
             if (
                 not image_selector_healthy
                 and not curve_selector_healthy
+                and not histogram_selector_healthy
                 and (
                     image_selector_fault is not None
                     or curve_selector_fault is not None
+                    or histogram_selector_fault is not None
                 )
             ):
                 self._selector_switch.setChecked(False)
@@ -2308,6 +2673,11 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             elif curve_selector_fault is not None:
                 self._roi_status.setText(
                     f"Curve interaction disabled: {curve_selector_fault}"
+                )
+            elif histogram_selector_fault is not None:
+                self._roi_status.setText(
+                    "Histogram interaction disabled: "
+                    f"{histogram_selector_fault}"
                 )
         if live is not None and board_widget is not None and board_widget.has_front:
             front = board_widget.front_frame
@@ -2362,6 +2732,26 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 )
                 self._sync_image_display_editors()
                 self._sync_curve_display_editors()
+                self._sync_histogram_display_editors()
+                self._update_roi_controls()
+                return
+            if (
+                self._running_binding is not None
+                and status.histogram_display_revision
+                != self._histogram_display.revision
+            ):
+                shown = (
+                    "unknown"
+                    if status.histogram_display_revision is None
+                    else f"r{status.histogram_display_revision}"
+                )
+                self._view_status.setText(
+                    "View: WAITING · previous histogram display retained "
+                    f"({shown}) · target r{self._histogram_display.revision}"
+                )
+                self._sync_image_display_editors()
+                self._sync_curve_display_editors()
+                self._sync_histogram_display_editors()
                 self._update_roi_controls()
                 return
             pending_origin = self._pending_image_interaction_origin
@@ -2378,8 +2768,16 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 > pending_curve_origin.presentation.panel_revision
             ):
                 self._pending_curve_interaction_origin = None
+            pending_histogram_origin = self._pending_histogram_interaction_origin
+            if (
+                pending_histogram_origin is not None
+                and self._histogram_display.revision
+                > pending_histogram_origin.presentation.panel_revision
+            ):
+                self._pending_histogram_interaction_origin = None
             self._sync_image_display_editors()
             self._sync_curve_display_editors()
+            self._sync_histogram_display_editors()
             coverage = status.raw_coverage
             scalar_coverage = status.scalar_coverage
             histogram_valid = status.histogram_valid_samples
@@ -2436,6 +2834,17 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                         f" · curve r{status.curve_display_revision} "
                         f"{self._curve_display.relim_mode.value} "
                         f"y={status.curve_y_limits}"
+                    )
+                )
+                + (
+                    ""
+                    if status.histogram_display_revision is None
+                    else (
+                        f" · histogram r{status.histogram_display_revision} "
+                        f"{self._histogram_display.relim_mode.value}/"
+                        f"{self._histogram_display.count_scale.value} "
+                        f"bins={self._histogram_display.bin_count} "
+                        f"count={status.histogram_count_limits}"
                     )
                 )
                 + f" · {suffix}"
@@ -2505,6 +2914,12 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             board_widget.bind_curve_interaction(
                 _CURVE_PANEL_ID,
                 self._accept_curve_interaction,
+                enabled=board_widget.selectors_enabled,
+            )
+        if board_widget.visible_histogram_origin() is None:
+            board_widget.bind_histogram_interaction(
+                _HISTOGRAM_PANEL_ID,
+                self._accept_histogram_interaction,
                 enabled=board_widget.selectors_enabled,
             )
         if self._visible_binding_fingerprint != binding.fingerprint:
@@ -2608,13 +3023,17 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         if isinstance(board_widget, QtRasterBoard):
             board_widget.unbind_rectangle_selector()
             board_widget.unbind_curve_interaction()
+            board_widget.unbind_histogram_interaction()
         self._pending_image_interaction_origin = None
         self._pending_curve_interaction_origin = None
+        self._pending_histogram_interaction_origin = None
         self._clear_curve_range_candidate()
+        self._clear_histogram_range_candidate()
         live = self._live
         if live is None:
             self._sync_image_display_editors()
             self._sync_curve_display_editors()
+            self._sync_histogram_display_editors()
             self._update_display_controls()
             return
         self._fold_roi_state_for_detach()
@@ -2639,6 +3058,7 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._board = None
         self._sync_image_display_editors()
         self._sync_curve_display_editors()
+        self._sync_histogram_display_editors()
         self._update_display_controls()
 
     def _fold_roi_state_for_detach(self) -> None:

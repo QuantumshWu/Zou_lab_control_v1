@@ -528,7 +528,9 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         if origin.presentation.panel_revision != self._curve_display.revision:
             raise RuntimeError("curve interaction origin is stale")
         if isinstance(command, CurveRangeGesture):
-            self._curve_range_candidate = (origin, command.x_span)
+            self._curve_range_candidate = (
+                None if command.x_span is None else (origin, command.x_span)
+            )
             self._provisional_board.set_curve_range_candidate(command.x_span)
             self._update_projection_label(self._controller.view_model)
             return

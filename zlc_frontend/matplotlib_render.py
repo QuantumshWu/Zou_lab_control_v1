@@ -30,13 +30,27 @@ from .curve_display import (
     curve_home_x_limits,
     numeric_curve_coordinates,
 )
+from .histogram_display import (
+    DEFAULT_HISTOGRAM_BINS,
+    HistogramBinProjection,
+    HistogramCountScale,
+    HistogramDisplayState,
+    HistogramViewportTransform,
+    histogram_count_limits,
+    histogram_home_x_limits,
+)
 from .data_figure import FigurePanelRegion
 from .display_range import (
     RelimMode,
     deadband_display_range,
     validated_display_range,
 )
-from .render import CurvePanelPayload, PixelFormat, RasterBuffer
+from .render import (
+    CurvePanelPayload,
+    HistogramPanelPayload,
+    PixelFormat,
+    RasterBuffer,
+)
 from .render_style import (
     ANNOTATION_FONT_SIZE,
     CURVE_LINESTYLE,
@@ -53,7 +67,6 @@ from .render_style import (
 _RASTER_FIXED_BYTES = 8 << 20
 _RASTER_BUFFER_MULTIPLIER = 8
 _ARTIST_ARRAY_MULTIPLIER = 8
-DEFAULT_HISTOGRAM_BINS = 60
 
 
 def _render_dpi(value: float) -> float:
@@ -117,10 +130,11 @@ def estimate_live_panel_raster_peak_nbytes(
     A live renderer retains the previous artist arrays while Matplotlib copies
     the next evaluated revision into those artists.  The bound also covers the
     persistent Agg canvas plus queued/visible immutable raster fronts.  A live
-    histogram additionally admits its bounded counts, edges, and closed-step
+    histogram additionally admits its bounded counts, edges, and filled-step
     vertices; ``None`` means that the panel is a curve or meter.  Pointer-hold
-    retention is explicit: every extra immutable RGBA front and older exact
-    evaluated payload is added directly rather than hidden in a multiplier.
+    retention is explicit: every extra immutable RGBA front, bin payload, and
+    older exact evaluated payload is added directly rather than hidden in a
+    multiplier.
     """
 
     width = positive_integer(width, "width")
@@ -138,20 +152,23 @@ def estimate_live_panel_raster_peak_nbytes(
         "extra_retained_evaluated_data_bytes",
     )
     histogram_geometry_bytes = 0
+    histogram_payload_bytes = 0
     if histogram_bins is not None:
         bins = positive_integer(histogram_bins, "histogram_bins")
-        counts_bytes = bins * np.dtype(np.intp).itemsize
+        counts_bytes = bins * np.dtype("<i8").itemsize
         edges_bytes = (bins + 1) * np.dtype(np.float64).itemsize
         vertices_bytes = 2 * (2 * bins + 2) * np.dtype(np.float64).itemsize
         histogram_geometry_bytes = (
             counts_bytes + edges_bytes + vertices_bytes
         )
+        histogram_payload_bytes = counts_bytes + edges_bytes
     return (
         _RASTER_FIXED_BYTES
         + _RASTER_BUFFER_MULTIPLIER * width * height * 4
         + _ARTIST_ARRAY_MULTIPLIER
         * (data_bytes + histogram_geometry_bytes)
         + extra_fronts * width * height * 4
+        + extra_fronts * histogram_payload_bytes
         + extra_data_bytes
     )
 
@@ -387,77 +404,50 @@ def _image(axis, figure, layer, cell, series, fit_result):
                 )
 
 
-def histogram_bin_counts(
-    samples: np.ndarray,
-    bins: int = DEFAULT_HISTOGRAM_BINS,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return deterministic NumPy histogram counts and edges for one sample set.
-
-    Boolean samples are the two categorical states regardless of ``bins``.
-    Numeric samples use ``numpy.histogram`` directly, including its final-bin
-    right-edge rule.  Empty numeric input therefore has ``bins`` zero counts on
-    NumPy's canonical ``[0, 1]`` range.  Non-finite values are rejected rather
-    than silently changing automatically inferred bounds.
-    """
-
-    values = np.asarray(samples)
-    if values.ndim != 1:
-        raise ValueError("histogram samples must be one-dimensional")
-    bins = positive_integer(bins, "histogram bins")
-    if values.dtype.kind not in "biuf":
-        raise TypeError("histogram samples must have a real numeric or boolean dtype")
-    if values.dtype.kind == "b":
-        counts, edges = np.histogram(
-            values.astype(np.uint8, copy=False),
-            bins=np.asarray((-0.5, 0.5, 1.5), dtype=np.float64),
-        )
-    else:
-        if values.size and not bool(np.all(np.isfinite(values))):
-            raise ValueError("valid histogram samples must all be finite")
-        counts, edges = np.histogram(values, bins=bins)
-    return (
-        np.asarray(counts, dtype=np.intp),
-        np.asarray(edges, dtype=np.float64),
+def _histogram_projection(series_group, bins: int):
+    return HistogramBinProjection(
+        tuple(series.data.samples for series in series_group), bins=bins
     )
 
 
-def _histogram_step_vertices(
-    counts: np.ndarray,
-    edges: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build one closed step outline without changing NumPy bin semantics."""
+def _histogram(
+    axis,
+    series_group,
+    *,
+    bins: int = DEFAULT_HISTOGRAM_BINS,
+    projection=None,
+):
+    """Draw filled, shared-edge distributions and return their exact bins."""
 
-    counts = np.asarray(counts, dtype=np.float64)
-    edges = np.asarray(edges, dtype=np.float64)
-    if counts.ndim != 1 or edges.shape != (len(counts) + 1,):
-        raise ValueError("histogram counts and edges do not align")
-    x = np.repeat(edges, 2)
-    y = np.empty(2 * len(counts) + 2, dtype=np.float64)
-    y[0] = 0.0
-    y[-1] = 0.0
-    y[1:-1:2] = counts
-    y[2:-1:2] = counts
-    return x, y
-
-
-def _histogram(axis, series_group):
     multiple_series = len(series_group) > 1
     all_boolean = all(
         isinstance(series.data, EvaluatedHistogram)
         and np.issubdtype(series.data.samples.dtype, np.bool_)
         for series in series_group
     )
-    for series in series_group:
+    bin_projection = (
+        _histogram_projection(series_group, bins)
+        if projection is None
+        else projection
+    )
+    counts_group = bin_projection.bin_counts
+    edges = bin_projection.bin_edges
+    for series, counts in zip(series_group, counts_group, strict=True):
         data = series.data
         assert isinstance(data, EvaluatedHistogram)
         label = _series_label(series, include_reductions=multiple_series)
-        counts, edges = histogram_bin_counts(data.samples)
-        x, y = _histogram_step_vertices(counts, edges)
-        axis.plot(x, y, label=label)
+        axis.stairs(
+            counts,
+            edges,
+            fill=True,
+            alpha=0.4,
+            label=label,
+        )
     if all_boolean:
         axis.set_xticks((0, 1), ("false", "true"))
     if len(series_group) > 1 or any(series.batch_address for series in series_group):
         axis.legend(fontsize=ANNOTATION_FONT_SIZE)
+    return counts_group, edges
 
 
 def _meter_text(series_group) -> str:
@@ -977,7 +967,132 @@ class SinglePanelAggRenderer:
             labels,
         )
 
-    def _prepare_panel(self, evaluated: EvaluatedFigureData):
+    def render_interactive_histogram(
+        self,
+        evaluated: EvaluatedFigureData,
+        state: HistogramDisplayState,
+        *,
+        current_count_limits: tuple[float, float] | None,
+        previous_relim_mode: RelimMode | None,
+        previous_count_scale: HistogramCountScale | None,
+    ) -> tuple[RasterBuffer, HistogramPanelPayload]:
+        """Render one front-bound shared-bin Histogram projection."""
+
+        with render_style_context():
+            return self._render_interactive_histogram(
+                evaluated,
+                state,
+                current_count_limits=current_count_limits,
+                previous_relim_mode=previous_relim_mode,
+                previous_count_scale=previous_count_scale,
+            )
+
+    def _render_interactive_histogram(
+        self,
+        evaluated: EvaluatedFigureData,
+        state: HistogramDisplayState,
+        *,
+        current_count_limits: tuple[float, float] | None,
+        previous_relim_mode: RelimMode | None,
+        previous_count_scale: HistogramCountScale | None,
+    ) -> tuple[RasterBuffer, HistogramPanelPayload]:
+        if not isinstance(state, HistogramDisplayState):
+            raise TypeError("state must be HistogramDisplayState")
+        pre_layer, _pre_cell, pre_series_group = self._one_panel(evaluated)
+        histograms = tuple(series.data for series in pre_series_group)
+        if any(not isinstance(item, EvaluatedHistogram) for item in histograms):
+            raise ValueError("interactive render requires one HISTOGRAM panel")
+        value_unit = histograms[0].value_unit
+        if any(item.value_unit != value_unit for item in histograms[1:]):
+            raise ValueError("interactive histogram series must share value_unit")
+        # Validate finite samples and freeze one common edge vector before this
+        # persistent Agg surface is changed.
+        bin_projection = HistogramBinProjection(
+            tuple(item.samples for item in histograms),
+            bins=state.bin_count,
+        )
+        figure, axis, layer, _cell, series_group = self._prepare_panel(
+            evaluated,
+            histogram_bins=state.bin_count,
+            histogram_projection=bin_projection,
+        )
+        if layer is not pre_layer or series_group is not pre_series_group:
+            raise RuntimeError("interactive panel identity changed during preparation")
+
+        home_x_limits = histogram_home_x_limits(bin_projection.bin_edges)
+        x_limits = state.x_view or home_x_limits
+        peak_count = max(
+            (
+                int(np.max(counts)) if counts.size else 0
+                for counts in bin_projection.bin_counts
+            ),
+            default=0,
+        )
+        count_limits = histogram_count_limits(
+            state,
+            peak_count,
+            current_count_limits=current_count_limits,
+            previous_relim_mode=previous_relim_mode,
+            previous_count_scale=previous_count_scale,
+        )
+        axis.set_yscale(state.count_scale.value)
+        axis.set_xlim(*x_limits)
+        axis.set_ylim(*count_limits)
+        raster = self._draw_raster(figure)
+        actual_x_limits = validated_display_range(
+            tuple(float(value) for value in axis.get_xlim()),
+            "drawn histogram x limits",
+        )
+        actual_count_limits = validated_display_range(
+            tuple(float(value) for value in axis.get_ylim()),
+            "drawn histogram count limits",
+        )
+        x0, y0, width, height = (float(value) for value in axis.bbox.bounds)
+        plot_bounds = (
+            x0 / raster.width,
+            1.0 - (y0 + height) / raster.height,
+            (x0 + width) / raster.width,
+            1.0 - y0 / raster.height,
+        )
+        viewport = HistogramViewportTransform(
+            state.revision,
+            plot_bounds,
+            actual_x_limits,
+            actual_count_limits,
+            home_x_limits,
+            state.count_scale,
+            state.relim_mode,
+            state.x_view is None,
+            state.bin_count,
+        )
+        try:
+            evaluated_input = next(
+                item for item in evaluated.inputs if item.dataset_id == layer.dataset_id
+            )
+        except StopIteration as exc:
+            raise ValueError(
+                "interactive histogram layer dataset is absent from evaluated inputs"
+            ) from exc
+        if sum(item.dataset_id == layer.dataset_id for item in evaluated.inputs) != 1:
+            raise ValueError(
+                "interactive histogram layer requires one exact evaluated input"
+            )
+        labels = self._curve_series_labels(layer.layer_id, series_group)
+        return raster, HistogramPanelPayload(
+            evaluated_input,
+            viewport,
+            tuple(series_group),
+            labels,
+            bin_projection,
+        )
+
+    def _prepare_panel(
+        self,
+        evaluated: EvaluatedFigureData,
+        *,
+        histogram_bins: int = DEFAULT_HISTOGRAM_BINS,
+        histogram_projection=None,
+    ):
         self._require_owner()
         figure = self._figure
         axis = self._axis
@@ -1018,8 +1133,13 @@ class SinglePanelAggRenderer:
                 _curve(axis, layer, cell, series_group, None)
                 self._artists = tuple(axis.lines)
             elif isinstance(first, EvaluatedHistogram):
-                _histogram(axis, series_group)
-                self._artists = tuple(axis.lines)
+                _histogram(
+                    axis,
+                    series_group,
+                    bins=histogram_bins,
+                    projection=histogram_projection,
+                )
+                self._artists = tuple(axis.patches)
             else:
                 _meter(axis, series_group)
                 self._artists = tuple(axis.texts)
@@ -1040,11 +1160,17 @@ class SinglePanelAggRenderer:
                         _curve_values(series),
                     )
             elif isinstance(first, EvaluatedHistogram):
-                for line, series in zip(self._artists, series_group, strict=True):
-                    data = series.data
-                    assert isinstance(data, EvaluatedHistogram)
-                    counts, edges = histogram_bin_counts(data.samples)
-                    line.set_data(*_histogram_step_vertices(counts, edges))
+                bin_projection = (
+                    _histogram_projection(series_group, histogram_bins)
+                    if histogram_projection is None
+                    else histogram_projection
+                )
+                for artist, counts in zip(
+                    self._artists,
+                    bin_projection.bin_counts,
+                    strict=True,
+                ):
+                    artist.set_data(counts, bin_projection.bin_edges)
             else:
                 assert isinstance(first, EvaluatedMeter)
                 self._artists[0].set_text(_meter_text(series_group))
@@ -1069,6 +1195,13 @@ class SinglePanelAggRenderer:
                 if first.value_unit is None
                 else f"Value [{first.value_unit}]"
             )
+        elif isinstance(first, EvaluatedHistogram):
+            axis.set_xlabel(
+                "Value"
+                if first.value_unit is None
+                else f"Value [{first.value_unit}]"
+            )
+            axis.set_ylabel("Count")
         axis.set_title(_panel_title(self._document, layer, cell, series_group))
         if isinstance(first, (EvaluatedCurve, EvaluatedHistogram)) and (
             multiple_series or any(series.batch_address for series in series_group)
@@ -1152,11 +1285,9 @@ class SinglePanelAggRenderer:
 
 
 __all__ = [
-    "DEFAULT_HISTOGRAM_BINS",
     "encode_evaluated_figure_with_panel_regions",
     "estimate_live_panel_raster_peak_nbytes",
     "estimate_render_peak_nbytes",
-    "histogram_bin_counts",
     "render_evaluated_figure",
     "release_agg_figure",
     "save_evaluated_figure",

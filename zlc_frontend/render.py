@@ -37,9 +37,11 @@ from zlc_storage import (
 
 from .curve_display import CurveViewportTransform
 from .display_range import validated_display_range
+from .histogram_display import HistogramBinProjection, HistogramViewportTransform
 from .figure import (
     DatasetId,
     EvaluatedCurve,
+    EvaluatedHistogram,
     EvaluatedImage,
     EvaluatedInput,
     EvaluatedSeries,
@@ -385,6 +387,122 @@ class CurvePanelPayload:
         return curve.value_unit
 
 
+@dataclass(frozen=True, slots=True)
+class HistogramPanelPayload:
+    """Exact samples plus one shared, immutable display bin projection.
+
+    Binning is presentation-only.  ``series`` retains the evaluator's exact
+    samples, sample-axis coordinates, component-validity filtering and dropped
+    counts; the shared counts/edges never become a fit or threshold authority.
+    """
+
+    evaluated_input: EvaluatedInput
+    viewport: HistogramViewportTransform
+    series: tuple[EvaluatedSeries, ...]
+    series_labels: tuple[str, ...]
+    bin_projection: HistogramBinProjection
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.evaluated_input, EvaluatedInput):
+            raise TypeError("histogram payload requires one EvaluatedInput")
+        if not isinstance(self.viewport, HistogramViewportTransform):
+            raise TypeError(
+                "histogram payload requires HistogramViewportTransform"
+            )
+        series = tuple(self.series)
+        if not series or any(not isinstance(item, EvaluatedSeries) for item in series):
+            raise ValueError("histogram payload requires EvaluatedSeries values")
+        histograms = tuple(item.data for item in series)
+        if any(not isinstance(item, EvaluatedHistogram) for item in histograms):
+            raise TypeError(
+                "histogram payload series must all contain EvaluatedHistogram"
+            )
+        value_unit = histograms[0].value_unit
+        if any(item.value_unit != value_unit for item in histograms[1:]):
+            raise ValueError("histogram payload series must share value_unit")
+        projection = self.bin_projection
+        if not isinstance(projection, HistogramBinProjection):
+            raise TypeError(
+                "histogram payload requires one computed HistogramBinProjection"
+            )
+        if len(projection.series_samples) != len(histograms) or any(
+            projected is not histogram.samples
+            for projected, histogram in zip(
+                projection.series_samples,
+                histograms,
+                strict=True,
+            )
+        ):
+            raise ValueError(
+                "histogram display projection is not bound to these exact samples"
+            )
+        if projection.requested_bin_count != self.viewport.bin_count:
+            raise ValueError(
+                "histogram projection bin count differs from its authored viewport"
+            )
+
+        labels = tuple(
+            _text(label, f"histogram series label {index}")
+            for index, label in enumerate(self.series_labels)
+        )
+        if len(labels) != len(series):
+            raise ValueError("histogram series labels must align with series")
+
+        edge_source = np.asarray(projection.bin_edges)
+        if edge_source.ndim != 1 or edge_source.size < 2:
+            raise ValueError("histogram bin_edges must contain at least two edges")
+        if edge_source.dtype.kind not in "biuf" or not bool(
+            np.all(np.isfinite(edge_source))
+        ):
+            raise ValueError("histogram bin_edges must be finite real values")
+        edges = projection.bin_edges
+        if edges.dtype != np.dtype("<f8") or edges.flags.writeable:
+            raise RuntimeError("histogram projection edges lost immutable <f8 form")
+        if not bool(np.all(np.diff(edges) > 0.0)):
+            raise ValueError("histogram bin_edges must be strictly increasing")
+
+        for index, (value, histogram) in enumerate(
+            zip(projection.bin_counts, histograms, strict=True)
+        ):
+            source = np.asarray(value)
+            if source.ndim != 1 or source.shape != (len(edges) - 1,):
+                raise ValueError(
+                    f"histogram bin_counts[{index}] does not align with edges"
+                )
+            if source.dtype.kind not in "iu" or bool(np.any(source < 0)):
+                raise ValueError("histogram bin counts must be nonnegative integers")
+            counts = value
+            if counts.dtype != np.dtype("<i8") or counts.flags.writeable:
+                raise RuntimeError(
+                    "histogram projection counts lost immutable <i8 form"
+                )
+            if int(np.sum(counts, dtype=np.int64)) != len(histogram.samples):
+                raise ValueError(
+                    "histogram display bins silently lost or invented valid samples"
+                )
+        if len(projection.bin_counts) != len(series):
+            raise ValueError("histogram bin_counts must align with series")
+        if self.viewport.home_x_limits != (float(edges[0]), float(edges[-1])):
+            raise ValueError(
+                "histogram viewport home range differs from shared bin edges"
+        )
+        object.__setattr__(self, "series", series)
+        object.__setattr__(self, "series_labels", labels)
+
+    @property
+    def value_unit(self) -> str | None:
+        histogram = self.series[0].data
+        assert isinstance(histogram, EvaluatedHistogram)
+        return histogram.value_unit
+
+    @property
+    def bin_counts(self) -> tuple[np.ndarray, ...]:
+        return self.bin_projection.bin_counts
+
+    @property
+    def bin_edges(self) -> np.ndarray:
+        return self.bin_projection.bin_edges
+
 @dataclass(frozen=True, slots=True, eq=False)
 class SiteMapPanelPayload:
     """One IMAGE background plus calibrated, exact per-site occupancy state.
@@ -537,7 +655,12 @@ class SiteMapPanelPayload:
         return self._join_key_digest
 
 
-DisplayPayload = ImagePanelPayload | CurvePanelPayload | SiteMapPanelPayload
+DisplayPayload = (
+    ImagePanelPayload
+    | CurvePanelPayload
+    | HistogramPanelPayload
+    | SiteMapPanelPayload
+)
 
 
 @dataclass(frozen=True)
@@ -566,11 +689,17 @@ class PanelFrame:
         if payload is not None:
             if not isinstance(
                 payload,
-                (ImagePanelPayload, CurvePanelPayload, SiteMapPanelPayload),
+                (
+                    ImagePanelPayload,
+                    CurvePanelPayload,
+                    HistogramPanelPayload,
+                    SiteMapPanelPayload,
+                ),
             ):
                 raise TypeError(
                     "display_payload must be ImagePanelPayload, "
-                    "CurvePanelPayload, SiteMapPanelPayload, or None"
+                    "CurvePanelPayload, HistogramPanelPayload, "
+                    "SiteMapPanelPayload, or None"
                 )
             presentations = tuple(
                 presentation
@@ -592,6 +721,11 @@ class PanelFrame:
             elif isinstance(payload, CurvePanelPayload):
                 if self.raster.pixel_format is not PixelFormat.RGBA8888:
                     raise ValueError("curve payload requires an RGBA8888 raster")
+                payload_revision = payload.viewport.display_revision
+                source_input = payload.evaluated_input
+            elif isinstance(payload, HistogramPanelPayload):
+                if self.raster.pixel_format is not PixelFormat.RGBA8888:
+                    raise ValueError("histogram payload requires an RGBA8888 raster")
                 payload_revision = payload.viewport.display_revision
                 source_input = payload.evaluated_input
             else:
@@ -763,6 +897,7 @@ __all__ = [
     "AtomicBoardFront",
     "CoherenceStamp",
     "CurvePanelPayload",
+    "HistogramPanelPayload",
     "detached_render_fault",
     "DisplayPayload",
     "PanelPresentationIdentity",
