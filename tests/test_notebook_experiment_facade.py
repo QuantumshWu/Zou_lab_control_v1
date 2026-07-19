@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -17,20 +18,22 @@ import Zou_lab_control.notebook.facade as facade_impl
 from zlc_data import FitNumericPolicy, SPATIAL_X, SPATIAL_Y, encode_fit_result_batch
 from zlc_neutral_atom.artifacts import (
     CaptureArtifactRef,
-    CaptureFitResultArtifactRef,
-    CaptureFitResultRepository,
     CaptureRepository,
+    FitResultArtifactRef,
+    FitResultRepository,
 )
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.readout.calibration_repository import CalibrationRepository
 from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
 from zlc_neutral_atom.runtime.ports import BoundDevice
 from zlc_neutral_atom.runtime.run import RunPlan
+from zlc_pulse import FrozenScanTable, RepeatRegion, load_pulse_document
 from zlc_storage import RepositoryRootBusy
 
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+MOT_SCAN_PULSE = ROOT / "pulses" / "mot_field_template.json"
 
 
 def _expect(error_type, text: str, operation):
@@ -45,7 +48,7 @@ def _expect(error_type, text: str, operation):
 def _assert_repository_roots_released(root: Path) -> None:
     CaptureRepository(root / "captures").close()
     CalibrationRepository(root / "calibrations").close()
-    CaptureFitResultRepository(root / "fits").close()
+    FitResultRepository(root / "fits").close()
 
 
 def _case_capture_and_fit(root: Path) -> None:
@@ -102,11 +105,58 @@ def _case_capture_and_fit(root: Path) -> None:
         )
         assert len(execution.result.batch_axis_specs) == 2
 
+        # Notebook-first short path uses the repository's bounded installation
+        # default; interactive hosts still pass their exact residual budget.
         fit_ref = execution.save()
-        assert isinstance(fit_ref, CaptureFitResultArtifactRef)
+        assert isinstance(fit_ref, FitResultArtifactRef)
         admitted = exp.load_fit(fit_ref)
         assert admitted.reference == fit_ref
-        assert admitted.source_capture_ref == convenience_reference
+        assert admitted.source_artifact_ref == convenience_reference
+        assert encode_fit_result_batch(admitted.result) == encode_fit_result_batch(
+            execution.result
+        )
+
+
+def _case_scan_and_fit(root: Path) -> None:
+    document = load_pulse_document(MOT_SCAN_PULSE)
+    columns = tuple(item.parameter_id for item in document.scan_parameters)
+    document = replace(
+        document,
+        scan_table=FrozenScanTable(
+            columns,
+            ((0, 0, 0), (1, 0, 1), (0, 1, 1)),
+        ),
+        repeat=RepeatRegion(
+            document.periods[0].period_id,
+            document.periods[-1].period_id,
+            2,
+        ),
+    )
+    with zlc.connect("virtual", repository=root) as exp:
+        scan_ref = exp.scan(
+            exp.readout.scan_request(document, timeout_seconds=15.0)
+        )
+        source = exp.readout.materialize_scan(scan_ref)
+        with pytest.raises(MemoryError):
+            exp.fit(
+                scan_ref,
+                model="radial_gaussian_center",
+                memory_limit_bytes=1,
+            )
+        execution = exp.fit(
+            scan_ref,
+            model="radial_gaussian_center",
+            numeric_policy=FitNumericPolicy(
+                max_evaluations=500,
+                sample_budget_per_batch=512,
+                max_packed_observations=4_096,
+            ),
+        )
+        assert execution.source_artifact_ref == scan_ref
+        assert execution.result.source_ref == source.snapshot.ref
+        fit_ref = execution.save(operation_memory_limit_bytes=512 << 20)
+        admitted = exp.load_fit(fit_ref)
+        assert admitted.source_artifact_ref == scan_ref
         assert encode_fit_result_batch(admitted.result) == encode_fit_result_batch(
             execution.result
         )
@@ -163,7 +213,7 @@ def _case_public_authority_and_validation(root: Path) -> None:
         _expect(
             RepositoryRootBusy,
             "live owner",
-            lambda: CaptureFitResultRepository(root / "fits"),
+            lambda: FitResultRepository(root / "fits"),
         )
 
         bound = exp.readout.for_binding(ReadoutBindingKey("camera"))
@@ -241,6 +291,102 @@ def _case_close_race(root: Path, surface: str) -> None:
     assert backend_calls == []
 
 
+def _case_fit_close_drain(root: Path) -> None:
+    exp = zlc.connect("virtual", repository=root)
+    token = exp._authority_token
+    services = facade_impl._AUTHORITIES[token]
+    entered = threading.Barrier(3)
+    close_started = threading.Barrier(3)
+    releases = (threading.Event(), threading.Event())
+    fit_failures: list[BaseException] = []
+    close_failures: list[BaseException] = []
+
+    def fit_worker(index: int) -> None:
+        try:
+            with facade_impl._fit_service_guard(token):
+                entered.wait(timeout=2.0)
+                assert releases[index].wait(2.0)
+        except BaseException as error:
+            fit_failures.append(error)
+
+    def close_worker() -> None:
+        try:
+            close_started.wait(timeout=2.0)
+            exp.close()
+        except BaseException as error:
+            close_failures.append(error)
+
+    fit_threads = tuple(
+        threading.Thread(target=fit_worker, args=(index,), daemon=False)
+        for index in range(2)
+    )
+    for thread in fit_threads:
+        thread.start()
+    entered.wait(timeout=2.0)
+    with services.operation_lock:
+        assert services.active_fit_operations == 2
+
+    close_threads = tuple(
+        threading.Thread(target=close_worker, daemon=False) for _ in range(2)
+    )
+    for thread in close_threads:
+        thread.start()
+    close_started.wait(timeout=2.0)
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with services.operation_lock:
+            if services.state == "CLOSING":
+                break
+        time.sleep(0.005)
+    else:
+        raise AssertionError("concurrent close did not enter CLOSING")
+
+    def attempt_late_fit() -> None:
+        with facade_impl._fit_service_guard(token):
+            raise AssertionError("Fit entered after Experiment began closing")
+
+    _expect(RuntimeError, "closing or closed", attempt_late_fit)
+    assert all(thread.is_alive() for thread in close_threads)
+
+    releases[0].set()
+    fit_threads[0].join(2.0)
+    assert not fit_threads[0].is_alive()
+    assert all(thread.is_alive() for thread in close_threads)
+
+    releases[1].set()
+    for thread in (*fit_threads[1:], *close_threads):
+        thread.join(2.0)
+        assert not thread.is_alive()
+    assert close_failures == []
+    assert len(fit_failures) == 2
+    assert all(isinstance(error, facade_impl.FitCancelled) for error in fit_failures)
+    assert token not in facade_impl._AUTHORITIES
+    _assert_repository_roots_released(root)
+
+
+def _case_fit_reentrant_close(root: Path) -> None:
+    exp = zlc.connect("virtual", repository=root)
+    token = exp._authority_token
+    services = facade_impl._AUTHORITIES[token]
+    with facade_impl._fit_service_guard(token):
+        _expect(
+            RuntimeError,
+            "cannot close reentrantly",
+            exp.close,
+        )
+        with services.operation_lock:
+            assert services.state == "OPEN"
+            assert services.active_fit_operations == 1
+    with services.operation_lock:
+        assert services.state == "OPEN"
+        assert services.active_fit_operations == 0
+        assert services.fit_operations_drained.is_set()
+    exp.close()
+    assert token not in facade_impl._AUTHORITIES
+    _assert_repository_roots_released(root)
+
+
 def _case_failed_public_root(root: Path) -> None:
     authority_count = len(facade_impl._AUTHORITIES)
 
@@ -262,10 +408,13 @@ def _run_case(case: str, root_text: str) -> None:
     root = Path(root_text)
     cases = {
         "capture-and-fit": lambda: _case_capture_and_fit(root),
+        "scan-and-fit": lambda: _case_scan_and_fit(root),
         "public-authority": lambda: _case_public_authority_and_validation(root),
         "close-retry": lambda: _case_close_retry(root),
         "close-race-capture": lambda: _case_close_race(root, "capture"),
         "close-race-pulse": lambda: _case_close_race(root, "pulse"),
+        "fit-close-drain": lambda: _case_fit_close_drain(root),
+        "fit-reentrant-close": lambda: _case_fit_reentrant_close(root),
         "failed-public-root": lambda: _case_failed_public_root(root),
     }
     cases[case]()
@@ -293,10 +442,13 @@ def _run_isolated(case: str, root: Path) -> subprocess.CompletedProcess[str]:
     "case",
     (
         "capture-and-fit",
+        "scan-and-fit",
         "public-authority",
         "close-retry",
         "close-race-capture",
         "close-race-pulse",
+        "fit-close-drain",
+        "fit-reentrant-close",
         "failed-public-root",
     ),
 )

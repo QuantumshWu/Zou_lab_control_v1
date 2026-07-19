@@ -215,6 +215,22 @@ def _typed_front(window):
     return board, frame, payload
 
 
+def _initial_session_peak(figure: DataFigure, state: CurveDisplayState) -> int:
+    import Zou_lab_control.workbench._figure as figure_module
+
+    front = figure_module._render_typed_front(
+        figure,
+        state,
+        current_value_limits=None,
+        previous_relim_mode=None,
+        previous_count_scale=None,
+        sequence=0,
+        memory_limit_bytes=1 << 30,
+        cancelled=threading.Event(),
+    )
+    return front.session_peak_bytes
+
+
 def _wheel(board: QtRasterBoard, delta: int):
     binding = board._numeric_binding_for_kind(
         "curve",
@@ -349,7 +365,7 @@ def test_curve_front_preserves_all_series_axes_validity_and_interacts(
         ),
         pytest.param(
             _curve_figure(with_fit=True),
-            "authoritative fit overlays",
+            "exact caller-supplied result identity",
             id="fit-overlay",
         ),
     ),
@@ -375,10 +391,12 @@ def test_curve_typed_budget_has_exact_boundary(application) -> None:
     from Zou_lab_control.workbench import _figure as figure_module
 
     probe = _curve_figure()
-    required = figure_module._typed_front_required_peak_bytes(
+    render_required = figure_module._typed_front_required_peak_bytes(
         probe,
         CurveDisplayState(),
     )
+    required = _initial_session_peak(probe, CurveDisplayState())
+    assert required > render_required
     admitted = open_data_figure_workbench(probe, memory_limit_bytes=required)
     try:
         _until(application, lambda: admitted.raster_ready)
@@ -398,7 +416,7 @@ def test_curve_typed_budget_has_exact_boundary(application) -> None:
         _close(application, encoded)
 
     frozen = open_data_figure_workbench(
-        _curve_figure(render_memory_limit_bytes=required - 1),
+        _curve_figure(render_memory_limit_bytes=render_required - 1),
         memory_limit_bytes=required + 1,
     )
     try:

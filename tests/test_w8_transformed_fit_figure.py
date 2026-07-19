@@ -59,7 +59,7 @@ from zlc_frontend.figure import (
     SuggestionStatus,
     suggest_fit_view,
 )
-from zlc_neutral_atom.artifacts import CaptureFitResultRepository
+from zlc_neutral_atom.artifacts import FitResultRepository
 from Zou_lab_control.workbench._frozen_raster import FrozenRasterWindow
 
 
@@ -416,7 +416,7 @@ def test_public_execution_and_saved_ref_reopen_the_same_selection_transform(
                 application,
                 lambda: draft_window.closed and not draft_window.isVisible(),
             )
-        saved_ref = execution.save()
+        saved_ref = execution.save(operation_memory_limit_bytes=512 << 20)
         saved = experiment.load_fit(saved_ref)
         saved_figure = experiment.figure(saved_ref)
 
@@ -434,8 +434,8 @@ def test_public_execution_and_saved_ref_reopen_the_same_selection_transform(
             raise AssertionError("saved transformed Fit must never re-run the solver")
 
         monkeypatch.setattr(
-            CaptureFitResultRepository,
-            "execute",
+            FitResultRepository,
+            "execute_capture",
             forbidden_execute,
         )
         window = experiment.figure_gui(saved_ref)

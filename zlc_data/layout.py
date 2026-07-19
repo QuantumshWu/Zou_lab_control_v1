@@ -11,6 +11,11 @@ from typing import Mapping
 
 import numpy as np
 
+from ._diagnostic import (
+    bounded_index_tuple_diagnostic,
+    bounded_integer_diagnostic,
+)
+
 
 class AxisLayoutMode(str, Enum):
     RECT_C = "RECT_C"
@@ -255,7 +260,11 @@ class AxisLayout:
             try:
                 return self._multi_to_storage[multi]
             except KeyError as exc:
-                raise KeyError(f"logical point {multi} is not present in sparse layout") from exc
+                raise KeyError(
+                    "logical point "
+                    f"{bounded_index_tuple_diagnostic(multi)} is not present in "
+                    "sparse layout"
+                ) from exc
         if self.mode is AxisLayoutMode.PRODUCT:
             assert self.factors is not None
             offset = 0
@@ -352,7 +361,11 @@ class AxisLayout:
 
     def _validate_storage_index(self, index: int) -> None:
         if isinstance(index, bool) or not isinstance(index, Integral) or not 0 <= index < self.storage_size:
-            raise IndexError(f"storage index {index!r} is outside [0, {self.storage_size})")
+            raise IndexError(
+                "storage index "
+                f"{bounded_integer_diagnostic(index)} is outside [0, "
+                f"{bounded_integer_diagnostic(self.storage_size)})"
+            )
 
     def _validate_multi_index(self, multi: tuple[int, ...]) -> None:
         if len(multi) != len(self.logical_shape):
@@ -361,7 +374,11 @@ class AxisLayout:
             )
         for index, size in zip(multi, self.logical_shape):
             if isinstance(index, bool) or not isinstance(index, Integral) or not 0 <= index < size:
-                raise ValueError(f"multi-index {multi} is outside logical shape {self.logical_shape}")
+                raise ValueError(
+                    "multi-index "
+                    f"{bounded_index_tuple_diagnostic(multi)} is outside logical "
+                    f"shape {bounded_index_tuple_diagnostic(self.logical_shape)}"
+                )
 
 
 @dataclass(frozen=True, eq=False)

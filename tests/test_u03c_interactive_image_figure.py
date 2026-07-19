@@ -206,6 +206,22 @@ def _typed_front(window):
     return board, frame, payload
 
 
+def _initial_session_peak(figure: DataFigure, state: ImageDisplayState) -> int:
+    import Zou_lab_control.workbench._figure as figure_module
+
+    front = figure_module._render_typed_front(
+        figure,
+        state,
+        current_value_limits=None,
+        previous_relim_mode=None,
+        previous_count_scale=None,
+        sequence=0,
+        memory_limit_bytes=1 << 30,
+        cancelled=threading.Event(),
+    )
+    return front.session_peak_bytes
+
+
 def _image_target(board: QtRasterBoard):
     binding = board._image_bindings["generic-typed"]
     target = board._selector_target(binding)
@@ -385,7 +401,10 @@ def test_image_front_preserves_exact_axes_validity_and_all_display_interactions(
             _image_figure(x_coordinates=(0.0, 1.0, 3.0, 4.0, 5.0)),
             "not exactly regular",
         ),
-        (_image_figure(with_fit=True), "fit overlays"),
+        (
+            _image_figure(with_fit=True),
+            "exactly one layer, cell, and input",
+        ),
     ),
 )
 def test_image_authority_or_geometry_gaps_fail_to_whole_figure_encoded(
@@ -411,10 +430,12 @@ def test_image_frozen_budget_admits_exact_required_and_rejects_required_minus_on
     from Zou_lab_control.workbench import _figure as figure_module
 
     probe = _image_figure()
-    required = figure_module._typed_front_required_peak_bytes(
+    render_required = figure_module._typed_front_required_peak_bytes(
         probe,
         ImageDisplayState(),
     )
+    required = _initial_session_peak(probe, ImageDisplayState())
+    assert required > render_required
     admitted = open_window(probe, memory_limit_bytes=required)
     _until(application, lambda: admitted.raster_ready)
     assert admitted._view_family == "image"

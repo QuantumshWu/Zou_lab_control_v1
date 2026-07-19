@@ -7,14 +7,93 @@ from PyQt5 import QtCore, QtWidgets
 from zlc_data import AxisLayout, AxisSpec
 from zlc_storage import canonical_text
 
+from ..fit_grid import (
+    FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS,
+    bounded_coordinate_label,
+)
+
 from .fluent import (
     FluentButton,
     FluentFormGrid,
     FluentLabel,
+    FluentLineEdit,
     FluentSpinBox,
     GREY,
     signals_blocked,
 )
+
+
+_QT_SPINBOX_MAXIMUM = (1 << 31) - 1
+
+
+class _ExactIndexEdit(FluentLineEdit):
+    """A bounded text editor whose committed value remains a Python integer."""
+
+    valueChanged = QtCore.pyqtSignal(object)
+
+    def __init__(self, maximum: int, parent: QtWidgets.QWidget) -> None:
+        if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
+            raise ValueError("exact index maximum must be a non-negative integer")
+        super().__init__("", parent)
+        self._maximum = maximum
+        self._committed_value: int | None = None
+        self.setMaxLength(FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS)
+        self.setPlaceholderText("Select…")
+        self.textEdited.connect(self._edited)
+        self.editingFinished.connect(self._canonicalize_display)
+
+    @staticmethod
+    def _parse(text: str) -> int | None:
+        if not text:
+            return None
+        if len(text) > FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS:
+            return None
+        if text.startswith(("0x", "0X")):
+            digits = text[2:]
+            if not digits or any(character not in "0123456789abcdefABCDEF" for character in digits):
+                return None
+            return int(digits, 16)
+        if not text.isascii() or not text.isdecimal():
+            return None
+        # Python deliberately rejects extremely long decimal conversions.
+        # Direct decimal entry is capped below that interpreter limit; hex is
+        # available for larger exact values and physical navigation is always
+        # available without textifying the logical index.
+        if len(text) > min(4096, FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS):
+            return None
+        try:
+            return int(text, 10)
+        except ValueError:
+            return None
+
+    def _edited(self, text: str) -> None:
+        candidate = self._parse(text)
+        self._committed_value = (
+            candidate
+            if candidate is not None and candidate <= self._maximum
+            else None
+        )
+        self.valueChanged.emit(self._committed_value)
+
+    def _canonicalize_display(self) -> None:
+        value = self._committed_value
+        if value is None:
+            return
+        self.setText(bounded_coordinate_label(value))
+
+    def value(self) -> int | None:
+        return self._committed_value
+
+    def setValue(self, value: int) -> None:  # noqa: N802 - QSpinBox-compatible seam
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= self._maximum
+        ):
+            raise ValueError("exact index value is outside its axis")
+        self._committed_value = value
+        self.setText(bounded_coordinate_label(value))
+        self.valueChanged.emit(value)
 
 
 class AxisLayoutNavigator(QtWidgets.QWidget):
@@ -37,7 +116,6 @@ class AxisLayoutNavigator(QtWidgets.QWidget):
         action_text: str,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
         prepared_axes = tuple(axes)
         if any(not isinstance(axis, AxisSpec) for axis in prepared_axes):
             raise TypeError("axes must contain AxisSpec values")
@@ -47,6 +125,7 @@ class AxisLayoutNavigator(QtWidgets.QWidget):
             raise TypeError("layout must be AxisLayout")
         if layout.logical_shape != tuple(axis.size for axis in prepared_axes):
             raise ValueError("navigator layout shape differs from axes")
+        super().__init__(parent)
         self._axes = prepared_axes
         self._axis_layout = layout
         self._prefix = canonical_text(object_prefix, "object_prefix")
@@ -59,21 +138,27 @@ class AxisLayoutNavigator(QtWidgets.QWidget):
         form.setObjectName(f"{self._prefix}AxisForm")
         controls = []
         for position, axis in enumerate(prepared_axes):
-            spin = FluentSpinBox(form)
-            spin.setObjectName(f"{self._prefix}Axis_{position}")
-            spin.setProperty("axisId", axis.axis_id.value)
+            if axis.size - 1 <= _QT_SPINBOX_MAXIMUM:
+                control = FluentSpinBox(form)
+            else:
+                control = _ExactIndexEdit(axis.size - 1, form)
+            control.setObjectName(f"{self._prefix}Axis_{position}")
+            control.setProperty("axisId", axis.axis_id.value)
             coordinate = FluentLabel("", form)
             coordinate.setObjectName(f"{self._prefix}Coordinate_{position}")
             if axis.size == 1:
-                spin.setRange(0, 0)
-                spin.setValue(0)
-                spin.setEnabled(False)
+                assert isinstance(control, FluentSpinBox)
+                control.setRange(0, 0)
+                control.setValue(0)
+                control.setEnabled(False)
+            elif isinstance(control, FluentSpinBox):
+                control.setRange(-1, axis.size - 1)
+                control.setSpecialValueText("Select…")
+                control.setValue(-1)
             else:
-                spin.setRange(-1, axis.size - 1)
-                spin.setSpecialValueText("Select…")
-                spin.setValue(-1)
-            form.add_row(axis.name, spin, coordinate)
-            controls.append((axis, spin, coordinate))
+                control.setText("")
+            form.add_row(bounded_coordinate_label(axis.name), control, coordinate)
+            controls.append((axis, control, coordinate))
         self._controls = tuple(controls)
         outer.addWidget(form)
 
@@ -93,8 +178,8 @@ class AxisLayoutNavigator(QtWidgets.QWidget):
         buttons.addStretch(1)
         outer.addLayout(buttons)
 
-        for _axis, spin, _label in self._controls:
-            spin.valueChanged.connect(self._changed)
+        for _axis, control, _label in self._controls:
+            control.valueChanged.connect(self._changed)
         self.previous_button.clicked.connect(lambda: self._move(-1))
         self.action_button.clicked.connect(self._activate)
         self.next_button.clicked.connect(lambda: self._move(1))
@@ -102,8 +187,15 @@ class AxisLayoutNavigator(QtWidgets.QWidget):
 
     @property
     def indices(self) -> tuple[int, ...] | None:
-        values = tuple(spin.value() for _axis, spin, _label in self._controls)
-        return None if any(value < 0 for value in values) else values
+        values = tuple(
+            control.value()
+            for _axis, control, _label in self._controls
+        )
+        return (
+            None
+            if any(value is None or value < 0 for value in values)
+            else tuple(int(value) for value in values)
+        )
 
     @property
     def storage_index(self) -> int | None:
@@ -118,10 +210,10 @@ class AxisLayoutNavigator(QtWidgets.QWidget):
     def set_indices(self, indices: tuple[int, ...]) -> None:
         multi = tuple(indices)
         self._axis_layout.storage_index(multi)
-        spins = tuple(spin for _axis, spin, _label in self._controls)
-        with signals_blocked(*spins):
-            for spin, index in zip(spins, multi, strict=True):
-                spin.setValue(index)
+        controls = tuple(control for _axis, control, _label in self._controls)
+        with signals_blocked(*controls):
+            for control, index in zip(controls, multi, strict=True):
+                control.setValue(index)
         self._refresh()
         self.candidateChanged.emit()
 
@@ -132,19 +224,26 @@ class AxisLayoutNavigator(QtWidgets.QWidget):
         self._interaction_enabled = bool(enabled)
         self._refresh()
 
-    def _changed(self, _value: int) -> None:
+    def _changed(self, _value: object) -> None:
         self._refresh()
         self.candidateChanged.emit()
 
     def _refresh(self) -> None:
-        for axis, spin, label in self._controls:
-            index = spin.value()
-            if index < 0:
+        for axis, control, label in self._controls:
+            index = control.value()
+            if index is None or index < 0:
                 label.setText("not selected")
             else:
-                unit = "" if axis.unit is None else f" {axis.unit}"
-                label.setText(f"{axis.coordinate_at(index)}{unit} · index {index}")
-            spin.setEnabled(self._interaction_enabled and axis.size > 1)
+                unit = (
+                    ""
+                    if axis.unit is None
+                    else f" {bounded_coordinate_label(axis.unit)}"
+                )
+                label.setText(
+                    f"{bounded_coordinate_label(axis.coordinate_at(index))}{unit}"
+                    f" · index {bounded_coordinate_label(index)}"
+                )
+            control.setEnabled(self._interaction_enabled and axis.size > 1)
 
         indices = self.indices
         storage = None

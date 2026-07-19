@@ -31,6 +31,7 @@ from zlc_frontend import (
     PanelPresentationIdentity,
     RadialGaussianImageFitPanel,
     SourceIdentity,
+    radial_gaussian_image_fit_panel_retained_upper_bound_nbytes,
 )
 from zlc_frontend.encoded_raster import EncodedRasterDocument, EncodedRasterPage
 from zlc_frontend.display_range import RelimMode, deadband_display_range
@@ -71,7 +72,7 @@ from zlc_frontend.selector import (
     ImageViewportCommit,
     PanelInteractionOrigin,
 )
-from zlc_neutral_atom.capture_fit_reference import CaptureFitResultArtifactRef
+from zlc_neutral_atom.fit_reference import FitResultArtifactRef
 from zlc_storage import canonical_digest, positive_integer
 
 from ._frozen_raster import (
@@ -261,8 +262,12 @@ def _fit_grid_memory_bounds(
             width,
             value_itemsize=panel.image.values.dtype.itemsize,
         )
-        panel_retained = sample + 2 * pixels + (64 << 10)
-        panel_incremental = 2 * pixels + (64 << 10)
+        panel_metadata = (
+            radial_gaussian_image_fit_panel_retained_upper_bound_nbytes(panel)
+        )
+        raster_retained = sample + 2 * pixels + (64 << 10)
+        panel_retained = raster_retained + panel_metadata
+        panel_incremental = 2 * pixels + (64 << 10) + panel_metadata
         panel_peak = estimate_indexed8_raster_peak_nbytes(
             height,
             width,
@@ -272,7 +277,7 @@ def _fit_grid_memory_bounds(
         )
         retained += panel_retained
         incremental_retained += panel_incremental
-        largest_scratch = max(largest_scratch, panel_peak - panel_retained)
+        largest_scratch = max(largest_scratch, panel_peak - raster_retained)
     admitted_retained = (
         incremental_retained if samples_prebudgeted else retained
     )
@@ -504,7 +509,7 @@ def _rerasterize_grid_view(
 
 def _load_grid_view(
     view_loader,
-    reference: CaptureFitResultArtifactRef,
+    reference: FitResultArtifactRef,
     page_address: tuple[int, ...] | None,
     cell_selection: Selection | None,
     memory_limit_bytes: int,
@@ -564,6 +569,21 @@ def _load_grid_view(
             raise ValueError(
                 "saved-fit typed IMAGE explorer requires exactly one layer"
             )
+        projection_peak = (
+            figure.radial_gaussian_image_fit_panels_preflight_nbytes(
+                layers[0].layer_id,
+                artifact_identity=reference.target_ref,
+            )
+        )
+        projection_required = figure.retained_upper_bound_nbytes + projection_peak
+        if return_model:
+            projection_required += (
+                session_retained_bytes + model.retained_upper_bound_bytes
+            )
+        if projection_required > memory_limit_bytes:
+            raise MemoryError(
+                "saved-fit typed panel projection exceeds worker budget"
+            )
         panels = figure.radial_gaussian_image_fit_panels(
             layers[0].layer_id,
             artifact_identity=reference.target_ref,
@@ -594,6 +614,10 @@ def _load_grid_view(
                 raise ValueError(
                     "focused typed panel summary diverged from grid metadata"
                 )
+        # The typed panels retain their exact arrays and overlay facts.  Drop
+        # the broader DataFigure/document before allocating the raster front so
+        # unrelated metadata cannot overlap outside the worker budget.
+        del loaded, figure, layers
         frame_limit = memory_limit_bytes
         if return_model:
             frame_limit -= (
@@ -652,10 +676,10 @@ def _load_grid_view(
         if required > memory_limit_bytes:
             raise MemoryError("saved-fit session and raster exceed worker budget")
         projection = ("encoded", bundle, prepared_regions)
+        del loaded, figure
     _require_not_cancelled(cancelled)
     model_identity = model.identity
     returned_model = model if return_model else None
-    del loaded, figure
     if not return_model:
         del model
     return (
@@ -673,7 +697,7 @@ def _load_grid_view(
 
 def _export_grid_view(
     view_loader,
-    reference: CaptureFitResultArtifactRef,
+    reference: FitResultArtifactRef,
     expected_model_identity: object,
     page_address: tuple[int, ...] | None,
     cell_selection: Selection | None,
@@ -804,15 +828,19 @@ class SavedFitGridWindow(FrozenRasterWindow):
     def __init__(
         self,
         view_loader,
-        reference: CaptureFitResultArtifactRef,
+        refit_opener,
+        reference: FitResultArtifactRef,
         *,
         memory_limit_bytes: int,
     ) -> None:
         if not callable(view_loader):
             raise TypeError("saved-fit view_loader must be callable")
-        if not isinstance(reference, CaptureFitResultArtifactRef):
-            raise TypeError("reference must be CaptureFitResultArtifactRef")
+        if not callable(refit_opener):
+            raise TypeError("saved-fit refit_opener must be callable")
+        if not isinstance(reference, FitResultArtifactRef):
+            raise TypeError("reference must be FitResultArtifactRef")
         self._view_loader = view_loader
+        self._refit_opener = refit_opener
         self._reference = reference
         self._model: FitGridModel | None = None
         self._session_retained_bytes = 0
@@ -856,7 +884,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
         super().__init__(
             None,
             window_title="Saved Fit Grid",
-            mode_text="EXACT SAVED FIT · GRID EXPLORER · DISPLAY ONLY",
+            mode_text="EXACT SAVED FIT · GRID EXPLORER · EXPLICIT REFIT",
             loading_summary=f"Resolving {reference.target_ref}…",
             object_prefix="savedFitGrid",
             subject="SAVED FIT GRID",
@@ -929,6 +957,13 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._setting_button = FluentButton("Setting…", self, color=GREY)
         self._setting_button.setObjectName("savedFitGridDisplaySettingButton")
         self._setting_button.setEnabled(False)
+        self._analyze_button = FluentButton(
+            "Analyze → Fit/Refit",
+            self,
+            color=ORANGE,
+        )
+        self._analyze_button.setObjectName("savedFitGridAnalyzeFitButton")
+        self._analyze_button.setEnabled(False)
         self._export_button = FluentButton("Export image…", self, color=ORANGE)
         self._export_button.setObjectName("savedFitGridExport")
         actions = QtWidgets.QHBoxLayout()
@@ -941,6 +976,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             actions.addWidget(button)
         actions.addWidget(self._selector_switch)
         actions.addWidget(self._setting_button)
+        actions.addWidget(self._analyze_button)
         actions.addWidget(self._export_button)
         self._export_button.setEnabled(False)
         actions.addStretch(1)
@@ -965,6 +1001,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._export_button.clicked.connect(self._choose_export)
         self._selector_switch.toggled.connect(self._set_selector_enabled)
         self._setting_button.clicked.connect(self._open_display_settings)
+        self._analyze_button.clicked.connect(self._open_refit)
         self._board_widget.imagePanelLeftDoubleClicked.connect(
             self._focus_panel_id
         )
@@ -1500,6 +1537,15 @@ class SavedFitGridWindow(FrozenRasterWindow):
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         page = self._page
+        focused = False
+        if enabled and not self._showing_page and self._model is not None:
+            try:
+                self._model.resolve_selection(self._current_selection)
+            except (TypeError, ValueError):
+                pass
+            else:
+                focused = True
+        self._analyze_button.setEnabled(focused)
         if self._navigator is not None:
             self._navigator.set_interaction_enabled(enabled)
         self._previous_page_button.setEnabled(
@@ -1546,6 +1592,24 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._edit_image_display.setEnabled(front_ready)
         self._setting_image_display.setEnabled(front_ready)
         self._export_button.setEnabled(front_ready)
+
+    def _open_refit(self) -> None:
+        if (
+            self._future is not None
+            or self._closing
+            or self._showing_page
+            or self._model is None
+            or not self._analyze_button.isEnabled()
+        ):
+            return
+        selection = self._current_selection
+        try:
+            self._model.resolve_selection(selection)
+            self._refit_opener(self._reference, selection)
+        except BaseException as error:
+            self._status.setText("FIT/REFIT OPEN FAILED")
+            self._summary.setText("The exact saved artifact remains unchanged")
+            self._diagnostic.setText(error_summary(error))
 
     def _candidate_changed(self) -> None:
         navigator = self._navigator
@@ -2341,6 +2405,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._next_page_button,
             self._selector_switch,
             self._setting_button,
+            self._analyze_button,
             self._export_button,
         ):
             button.setEnabled(False)
@@ -2384,6 +2449,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
     def _finish_close_if_ready(self) -> None:
         if self._closing and self._future is None and not self._closed:
             self._view_loader = None
+            self._refit_opener = None
             self._model = None
             self._session_retained_bytes = 0
             self._navigator = None
@@ -2404,7 +2470,8 @@ class SavedFitGridWindow(FrozenRasterWindow):
 
 def open_saved_fit_grid_workbench(
     view_loader,
-    reference: CaptureFitResultArtifactRef,
+    refit_opener,
+    reference: FitResultArtifactRef,
     *,
     memory_limit_bytes: int = _DEFAULT_FIT_GRID_MEMORY_LIMIT_BYTES,
 ) -> SavedFitGridWindow:
@@ -2412,6 +2479,7 @@ def open_saved_fit_grid_workbench(
     return open_workbench_window(
         lambda: SavedFitGridWindow(
             view_loader,
+            refit_opener,
             reference,
             memory_limit_bytes=limit,
         )

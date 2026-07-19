@@ -246,7 +246,11 @@ def _sequence_indexer(indices: Sequence[int] | np.ndarray) -> slice | np.ndarray
 
     if isinstance(indices, range) and indices.step == 1:
         return slice(indices.start, indices.stop)
-    explicit = np.asarray(indices, dtype=np.intp)
+    explicit = (
+        np.asarray(indices, dtype=np.intp)
+        if isinstance(indices, np.ndarray)
+        else np.fromiter(indices, dtype=np.intp, count=len(indices))
+    )
     if explicit.ndim != 1:
         raise ValueError("axis indices must be one-dimensional")
     if explicit.size == 0:
@@ -278,12 +282,11 @@ def _select_axis(
 
 
 def _is_full_selection(indices: Sequence[int] | np.ndarray, size: int) -> bool:
-    indexer = _sequence_indexer(indices)
-    return (
-        isinstance(indexer, slice)
-        and indexer.start == 0
-        and indexer.stop == size
-    )
+    if len(indices) != size:
+        return False
+    if isinstance(indices, range):
+        return indices.step == 1 and indices.start == 0 and indices.stop == size
+    return all(int(index) == expected for expected, index in enumerate(indices))
 
 
 def _ordered_selection_axes(

@@ -36,10 +36,11 @@ from zlc_data import (
     ValueSchema,
     commit_transform,
     bind_fit,
+    dataset_schema_retained_upper_bound_nbytes,
     fit_result_retained_upper_bound_nbytes,
     fit_spec_for,
 )
-from zlc_frontend import DataFigure
+from zlc_frontend import DataFigure, figure_document_retained_upper_bound_nbytes
 from zlc_frontend.figure import (
     AxisViewRole,
     DatasetDescriptor,
@@ -372,16 +373,24 @@ def test_notebook_fit_figure_maps_each_visible_batch_and_skips_failure(monkeypat
         repeat_batch_axis = next(
             axis for axis in execution.result.batch_axis_specs if axis.role == REPEAT
         )
-        assert view.binding(repeat_batch_axis.axis_id).role in {
-            AxisViewRole.SELECTED,
-            AxisViewRole.SLIDER,
-        }
+        # Saved/result replay preserves repeat as an explicit visible facet;
+        # the unified Fit host may choose one labelled display cell later,
+        # but the authoritative Figure contract never selects repeat row 0.
+        assert (
+            view.binding(repeat_batch_axis.axis_id).role
+            is AxisViewRole.FACET
+        )
 
         render_limit = 512 << 20
         data_figure = exp.figure(execution, memory_limit_bytes=render_limit)
+        source_schema = exp.readout.load_capture(
+            capture_ref
+        ).frame_source.schema
         assert data_figure.render_memory_limit_bytes == (
             render_limit
             - fit_result_retained_upper_bound_nbytes(execution.result)
+            - dataset_schema_retained_upper_bound_nbytes(source_schema)
+            - figure_document_retained_upper_bound_nbytes(data_figure.document)
         )
         import zlc_frontend.matplotlib_render as render_module
 
@@ -414,14 +423,27 @@ def test_notebook_fit_figure_maps_each_visible_batch_and_skips_failure(monkeypat
             return original(self, index, coordinates)
 
         monkeypatch.setattr(type(execution.result), "evaluate_batch", traced)
-        data_figure.render()
+        rendered = data_figure.render()
         converged = [
             index
             for index in expected
             if execution.result.statuses[index] is FitBatchStatus.CONVERGED
         ]
-        assert [index for index, _shape in calls] == converged
-        assert all(len(shape) == 2 and shape[0] == shape[1] for _index, shape in calls)
+        # The 2-D radial product projects its already-published center/radius
+        # by parameter name.  Rendering the annotation must not allocate or
+        # evaluate a predicted image merely to recover the same geometry.
+        assert calls == []
+        from matplotlib.patches import Circle
+        from zlc_frontend.matplotlib_render import release_agg_figure
+
+        try:
+            data_axes = rendered.axes[: len(expected)]
+            assert sum(
+                any(isinstance(patch, Circle) for patch in axis.patches)
+                for axis in data_axes
+            ) == len(converged)
+        finally:
+            release_agg_figure(rendered)
 
         result = execution.result
         block, datasets = _resolved_capture(exp, capture_ref, document)
@@ -435,7 +457,7 @@ def test_notebook_fit_figure_maps_each_visible_batch_and_skips_failure(monkeypat
             result,
             spec=replace(result.spec, committed_transform=transformed_input),
         )
-        with pytest.raises(ValueError, match="transformed fit"):
+        with pytest.raises(ValueError, match="axes do not cover"):
             DataFigure(document, datasets, fit_results={"data": transformed})
 
         spoofed_batch_axes = (

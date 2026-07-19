@@ -176,6 +176,22 @@ def _typed_front(window):
     return board, frame, payload
 
 
+def _initial_session_peak(figure: DataFigure, state: HistogramDisplayState) -> int:
+    import Zou_lab_control.workbench._figure as figure_module
+
+    front = figure_module._render_typed_front(
+        figure,
+        state,
+        current_value_limits=None,
+        previous_relim_mode=None,
+        previous_count_scale=None,
+        sequence=0,
+        memory_limit_bytes=1 << 30,
+        cancelled=threading.Event(),
+    )
+    return front.session_peak_bytes
+
+
 def _wheel(board: QtRasterBoard, delta: int):
     binding = board._numeric_binding_for_kind(
         "histogram",
@@ -490,10 +506,12 @@ def test_histogram_typed_budget_has_exact_derived_boundary(application) -> None:
 
     figure = _histogram_figure()
     assert evaluated_figure_array_nbytes(figure.evaluated) == 88
-    required = figure_module._typed_front_required_peak_bytes(
+    render_required = figure_module._typed_front_required_peak_bytes(
         figure,
         HistogramDisplayState(),
     )
+    required = _initial_session_peak(figure, HistogramDisplayState())
+    assert required > render_required
 
     rejected = open_data_figure_workbench(
         figure,
@@ -520,18 +538,19 @@ def test_frozen_data_figure_budget_cannot_be_widened_by_window(application) -> N
     import Zou_lab_control.workbench._figure as figure_module
 
     probe = _histogram_figure()
-    required = figure_module._typed_front_required_peak_bytes(
+    render_required = figure_module._typed_front_required_peak_bytes(
         probe,
         HistogramDisplayState(),
     )
-    figure = _histogram_figure(render_memory_limit_bytes=required - 1)
+    aggregate_required = _initial_session_peak(probe, HistogramDisplayState())
+    figure = _histogram_figure(render_memory_limit_bytes=render_required - 1)
     assert figure_module._typed_front_required_peak_bytes(
         figure,
         HistogramDisplayState(),
-    ) == required
+    ) == render_required
     window = open_data_figure_workbench(
         figure,
-        memory_limit_bytes=required + (8 << 20),
+        memory_limit_bytes=aggregate_required + (8 << 20),
     )
     try:
         _assert_encoded_fallback(application, window)
@@ -550,24 +569,27 @@ def test_larger_histogram_rerender_is_rejected_before_agg_and_keeps_old_front(
 
     probe = _histogram_figure()
     initial_state = HistogramDisplayState()
-    required = figure_module._typed_front_required_peak_bytes(
+    render_required = figure_module._typed_front_required_peak_bytes(
         probe,
         initial_state,
     )
+    aggregate_required = _initial_session_peak(probe, initial_state)
     larger_state = replace(initial_state, revision=1, bin_count=500)
     assert figure_module._typed_front_required_peak_bytes(
         probe,
         larger_state,
-    ) > required
+    ) > render_required
     figure = _histogram_figure(
         render_memory_limit_bytes=(
-            required if limit_owner == "data-figure" else 64 << 20
+            render_required if limit_owner == "data-figure" else 64 << 20
         )
     )
     window = open_data_figure_workbench(
         figure,
         memory_limit_bytes=(
-            required + (8 << 20) if limit_owner == "data-figure" else required
+            aggregate_required + (8 << 20)
+            if limit_owner == "data-figure"
+            else aggregate_required
         ),
     )
     try:

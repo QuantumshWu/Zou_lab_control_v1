@@ -7,6 +7,8 @@ from .fit_codec import (
     decode_fit_spec,
     encode_fit_result_batch,
     encode_fit_spec,
+    fit_result_decode_additional_peak_upper_bound_nbytes,
+    fit_result_encode_additional_peak_upper_bound_nbytes,
     fit_spec_from_tree,
     fit_spec_to_tree,
 )
@@ -20,6 +22,7 @@ from .fit_contract import (
     FitParameterConstraint,
     FitResultBatch,
     FitSpec,
+    bound_fit_execution_peak_upper_bound_nbytes,
     fit_result_retained_upper_bound_nbytes,
 )
 from .fit_model import (
@@ -32,10 +35,24 @@ from .fit_model import (
 )
 from .fit_problem import (
     bind_fit,
+    fit_binding_additional_peak_upper_bound_nbytes,
+    fit_binding_retained_upper_bound_nbytes,
+    fit_transform_resolution_additional_peak_upper_bound_nbytes,
+    fit_result_source_validation_additional_peak_upper_bound_nbytes,
     validate_fit_result_source_binding,
 )
 from .schema import DatasetSchema
-from .transform import CommittedTransform, resolve_transformed_schema
+from .selection import (
+    CoordinateRangeSelection,
+    IndexRangeSelection,
+    Selection,
+)
+from .transform import (
+    CommittedTransform,
+    DataTransformSpec,
+    commit_transform,
+    resolve_transformed_schema,
+)
 
 
 def _unique_role_matching(model, effective_axes) -> tuple[AxisId, ...]:
@@ -79,7 +96,7 @@ def _unique_role_matching(model, effective_axes) -> tuple[AxisId, ...]:
     )
 
 
-def fit_spec_for(
+def _unbound_fit_spec_for(
     schema: DatasetSchema,
     model_id: str,
     *,
@@ -122,7 +139,7 @@ def fit_spec_for(
         for axis in effective_axes
         if axis.axis_id not in resolved_fit_axis_ids
     )
-    spec = FitSpec(
+    return FitSpec(
         input_schema_fingerprint=schema.fingerprint,
         committed_transform=committed_transform,
         fit_axis_ids=resolved_fit_axis_ids,
@@ -131,7 +148,150 @@ def fit_spec_for(
         constraints=constraints,
         numeric_policy=numeric_policy,
     )
+
+
+def _require_binding_budget(
+    spec: FitSpec,
+    schema: DatasetSchema,
+    memory_limit_bytes: int | None,
+) -> None:
+    if memory_limit_bytes is None:
+        return
+    if (
+        isinstance(memory_limit_bytes, bool)
+        or not isinstance(memory_limit_bytes, int)
+        or memory_limit_bytes <= 0
+    ):
+        raise ValueError("binding_memory_limit_bytes must be a positive integer or None")
+    required = fit_binding_additional_peak_upper_bound_nbytes(spec, schema)
+    if required > memory_limit_bytes:
+        raise MemoryError(
+            f"Fit binding requires {required} bytes; limit is {memory_limit_bytes}"
+        )
+
+
+def fit_spec_for(
+    schema: DatasetSchema,
+    model_id: str,
+    *,
+    committed_transform: CommittedTransform | None = None,
+    fit_axis_ids: tuple[AxisId, ...] | None = None,
+    constraints: tuple[FitParameterConstraint, ...] = (),
+    numeric_policy: FitNumericPolicy = FitNumericPolicy(),
+    binding_memory_limit_bytes: int | None = None,
+) -> FitSpec:
+    """Build and validate one total named-axis Fit request under an optional gate."""
+
+    if committed_transform is not None and binding_memory_limit_bytes is not None:
+        transform_peak = fit_transform_resolution_additional_peak_upper_bound_nbytes(
+            schema
+        )
+        if transform_peak > binding_memory_limit_bytes:
+            raise MemoryError(
+                "Fit transformed-schema resolution exceeds binding memory limit"
+            )
+    spec = _unbound_fit_spec_for(
+        schema,
+        model_id,
+        committed_transform=committed_transform,
+        fit_axis_ids=fit_axis_ids,
+        constraints=constraints,
+        numeric_policy=numeric_policy,
+    )
+    _require_binding_budget(spec, schema, binding_memory_limit_bytes)
     return bind_fit(spec, schema).spec
+
+
+def suggest_fit_draft(
+    schema: DatasetSchema,
+    model_id: str,
+    *,
+    fit_axis_ids: tuple[AxisId, ...],
+    selection: Selection | None = None,
+    constraints: tuple[FitParameterConstraint, ...] = (),
+    numeric_policy: FitNumericPolicy = FitNumericPolicy(),
+    binding_memory_limit_bytes: int | None = None,
+) -> BoundFit:
+    """Build one authoritative Fit draft from named axes and an optional ROI.
+
+    This is deliberately a data-owned pure function.  It accepts no view or
+    display-reduction state: every non-fit axis remains a named batch unless an
+    independently authored authority transform says otherwise.  The only
+    selector-derived transform admitted here is one range-preserving Selection
+    over axes that the caller explicitly designated as fit axes.
+    """
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    resolved_fit_axis_ids = tuple(fit_axis_ids)
+    if not resolved_fit_axis_ids or any(
+        not isinstance(axis_id, AxisId) for axis_id in resolved_fit_axis_ids
+    ):
+        raise ValueError("fit_axis_ids must explicitly contain named AxisId values")
+    if len(set(resolved_fit_axis_ids)) != len(resolved_fit_axis_ids):
+        raise ValueError("fit_axis_ids must be unique")
+
+    preliminary_spec = _unbound_fit_spec_for(
+        schema,
+        model_id,
+        fit_axis_ids=resolved_fit_axis_ids,
+        constraints=constraints,
+        numeric_policy=numeric_policy,
+    )
+    _require_binding_budget(
+        preliminary_spec,
+        schema,
+        binding_memory_limit_bytes,
+    )
+    # Reject an incompatible model before constructing selection-derived
+    # transformed metadata.  The temporary binding is released immediately.
+    bind_fit(preliminary_spec, schema)
+
+    committed_transform = None
+    if selection is not None:
+        if not isinstance(selection, Selection):
+            raise TypeError("selection must be zlc_data.Selection or None")
+        if any(
+            not isinstance(term, (IndexRangeSelection, CoordinateRangeSelection))
+            for term in selection.terms
+        ):
+            raise ValueError(
+                "Fit draft selection supports only range-preserving terms"
+            )
+        selected_axis_ids = {term.axis_id for term in selection.terms}
+        if not selected_axis_ids <= set(resolved_fit_axis_ids):
+            raise ValueError(
+                "Fit draft selection may name only explicit fit axes"
+            )
+        if binding_memory_limit_bytes is not None:
+            transform_construction = (
+                fit_binding_additional_peak_upper_bound_nbytes(
+                    preliminary_spec,
+                    schema,
+                )
+                + fit_transform_resolution_additional_peak_upper_bound_nbytes(
+                    schema
+                )
+            )
+            if transform_construction > binding_memory_limit_bytes:
+                raise MemoryError(
+                    "Fit selection transform exceeds binding memory limit"
+                )
+        committed_transform = commit_transform(
+            schema,
+            DataTransformSpec((selection,)),
+        )
+
+    spec = _unbound_fit_spec_for(
+        schema,
+        model_id,
+        committed_transform=committed_transform,
+        fit_axis_ids=resolved_fit_axis_ids,
+        constraints=constraints,
+        numeric_policy=numeric_policy,
+    )
+    _require_binding_budget(spec, schema, binding_memory_limit_bytes)
+    return bind_fit(spec, schema)
 
 
 __all__ = [
@@ -149,15 +309,23 @@ __all__ = [
     "FitSpec",
     "ParameterUnitRelation",
     "bind_fit",
+    "bound_fit_execution_peak_upper_bound_nbytes",
     "decode_fit_result_batch",
     "decode_fit_spec",
     "encode_fit_result_batch",
     "encode_fit_spec",
+    "fit_result_decode_additional_peak_upper_bound_nbytes",
+    "fit_result_encode_additional_peak_upper_bound_nbytes",
     "fit_model_catalog",
+    "fit_binding_additional_peak_upper_bound_nbytes",
+    "fit_binding_retained_upper_bound_nbytes",
+    "fit_transform_resolution_additional_peak_upper_bound_nbytes",
     "fit_model_definition",
     "fit_result_retained_upper_bound_nbytes",
+    "fit_result_source_validation_additional_peak_upper_bound_nbytes",
     "fit_spec_from_tree",
     "fit_spec_for",
+    "suggest_fit_draft",
     "fit_spec_to_tree",
     "validate_fit_result_source_binding",
 ]

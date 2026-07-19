@@ -18,7 +18,7 @@ from .fit_contract import (
     FitSpec,
 )
 from .layout import AxisLayout, AxisLayoutMode
-from .schema import DatasetSchema
+from .schema import DatasetSchema, dataset_schema_retained_upper_bound_nbytes
 from .transform import (
     TransformedSchema,
     apply_transform,
@@ -29,6 +29,184 @@ from .value import DatasetRevisionRef, OwnedSnapshot, expand_dataset_validity
 _SAMPLING_CHUNK_SIZE = 65_536
 _FEATURE_SAMPLE_LIMIT = 64
 _FEATURE_CANDIDATE_LIMIT = 512
+
+
+def _dataset_axes(schema: DatasetSchema):
+    yield schema.repeat_axis
+    yield from schema.point_axes
+    yield from schema.cell_schema.data_axes
+
+
+def _fit_schema_text_upper_bound_nbytes(schema: DatasetSchema) -> int:
+    total = 4 * (
+        0
+        if schema.cell_schema.value_unit is None
+        else len(schema.cell_schema.value_unit)
+    )
+    for axis in _dataset_axes(schema):
+        total += 4 * (
+            len(axis.axis_id.value)
+            + len(axis.name)
+            + len(axis.role.value)
+            + (0 if axis.unit is None else len(axis.unit))
+            + (
+                0
+                if axis.coordinate_frame is None
+                else len(axis.coordinate_frame.value)
+            )
+        )
+        if axis.coordinates is not None:
+            total += sum(
+                4 * len(value) if isinstance(value, str) else 64
+                for value in axis.coordinates
+            )
+    return int(total)
+
+
+def fit_binding_retained_upper_bound_nbytes(
+    spec: FitSpec,
+    source_schema: DatasetSchema,
+) -> int:
+    """Conservative live metadata retained by one completed ``BoundFit``."""
+
+    if not isinstance(spec, FitSpec):
+        raise TypeError("spec must be FitSpec")
+    if not isinstance(source_schema, DatasetSchema):
+        raise TypeError("source_schema must be DatasetSchema")
+    source_metadata = dataset_schema_retained_upper_bound_nbytes(source_schema)
+    transformed_layout = 0
+    if spec.committed_transform is not None:
+        transformed_layout = source_schema.cell_layout.storage_size * (
+            512 + 128 * (1 + len(source_schema.point_axes))
+        )
+    constraint_text = sum(
+        4 * len(constraint.parameter_name) + 512
+        for constraint in spec.constraints
+    )
+    return int(
+        64 * 1024
+        + 2 * source_metadata
+        + transformed_layout
+        + constraint_text
+        + 4096 * (len(spec.fit_axis_ids) + len(spec.batch_axis_ids))
+    )
+
+
+def fit_transform_resolution_additional_peak_upper_bound_nbytes(
+    source_schema: DatasetSchema,
+) -> int:
+    """Gate transform-schema construction before resolving a committed transform."""
+
+    if not isinstance(source_schema, DatasetSchema):
+        raise TypeError("source_schema must be DatasetSchema")
+    axis_count = 1 + len(source_schema.point_axes) + len(
+        source_schema.cell_schema.data_axes
+    )
+    coordinate_items = sum(
+        0 if axis.coordinates is None else axis.size
+        for axis in _dataset_axes(source_schema)
+    )
+    return int(
+        2 * 1024 * 1024
+        + source_schema.cell_layout.storage_size * (1024 + 128 * axis_count)
+        + coordinate_items * 512
+        + 32 * _fit_schema_text_upper_bound_nbytes(source_schema)
+        + dataset_schema_retained_upper_bound_nbytes(source_schema)
+    )
+
+
+def fit_binding_additional_peak_upper_bound_nbytes(
+    spec: FitSpec,
+    source_schema: DatasetSchema,
+) -> int:
+    """Integer-only bound for binding before ``BoundFit`` may rebuild layouts."""
+
+    if not isinstance(spec, FitSpec):
+        raise TypeError("spec must be FitSpec")
+    if not isinstance(source_schema, DatasetSchema):
+        raise TypeError("source_schema must be DatasetSchema")
+    row_count = source_schema.cell_layout.storage_size
+    axis_count = 1 + len(source_schema.point_axes) + len(
+        source_schema.cell_schema.data_axes
+    )
+    coordinate_items = sum(
+        0 if axis.coordinates is None else axis.size
+        for axis in _dataset_axes(source_schema)
+    )
+    schema_text_bytes = _fit_schema_text_upper_bound_nbytes(source_schema)
+    transform_schema_bytes = 0
+    if spec.committed_transform is not None:
+        transform_schema_bytes = (
+            row_count * (512 + 64 * axis_count)
+            + coordinate_items * 256
+        )
+    return int(
+        fit_binding_retained_upper_bound_nbytes(spec, source_schema)
+        + 2 * 1024 * 1024
+        + 2048 * axis_count
+        + 16 * schema_text_bytes
+        + transform_schema_bytes
+    )
+
+
+def fit_result_source_validation_additional_peak_upper_bound_nbytes(
+    result: FitResultBatch,
+    source_schema: DatasetSchema,
+) -> int:
+    """Data-free scratch bound for exact source/result lineage validation.
+
+    ``validate_fit_result_source_binding`` reconstructs sparse row groups and
+    batch addresses.  Interactive callers use this integer-only estimate before
+    that reconstruction, so a hostile or simply very large schema cannot make
+    the validation itself allocate ahead of the operation memory gate.
+    """
+
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("result must be FitResultBatch")
+    if not isinstance(source_schema, DatasetSchema):
+        raise TypeError("source_schema must be DatasetSchema")
+    policy = result.spec.numeric_policy
+    row_count = source_schema.cell_layout.storage_size
+    cell_axis_count = 1 + len(source_schema.point_axes)
+    source_axis_count = 1 + len(source_schema.point_axes) + len(
+        source_schema.cell_schema.data_axes
+    )
+    arity = len(result.spec.fit_axis_ids)
+    batch_axis_count = len(result.spec.batch_axis_ids)
+    batch_cells = 1
+    for axis_id in result.spec.batch_axis_ids:
+        size = next(
+            (
+                axis.size
+                for axis in _dataset_axes(source_schema)
+                if axis.axis_id == axis_id
+            ),
+            None,
+        )
+        if size is None:
+            batch_cells = policy.max_batch_cells
+            break
+        batch_cells = min(policy.max_batch_cells, batch_cells * size)
+    if row_count == 0:
+        batch_cells = 0
+    schema_plan_bytes = (
+        8 * row_count * (12 + 4 * arity + cell_axis_count)
+        + row_count * (256 + 32 * cell_axis_count)
+        + batch_cells * (2048 + 256 * batch_axis_count)
+    )
+    transform_schema_bytes = 0
+    if result.spec.committed_transform is not None:
+        coordinate_items = sum(
+            0 if axis.coordinates is None else axis.size
+            for axis in _dataset_axes(source_schema)
+        )
+        transform_schema_bytes = (
+            64 * 1024
+            + row_count * (512 + 64 * source_axis_count)
+            + coordinate_items * 256
+            + 32 * _fit_schema_text_upper_bound_nbytes(source_schema)
+        )
+    return int(2 * 1024 * 1024 + schema_plan_bytes + transform_schema_bytes)
 
 
 def bind_fit(spec: FitSpec, expected_schema: DatasetSchema) -> BoundFit:
@@ -967,5 +1145,9 @@ def _check_abort(abort_check: Callable[[], None] | None) -> None:
 
 __all__ = [
     "bind_fit",
+    "fit_binding_additional_peak_upper_bound_nbytes",
+    "fit_binding_retained_upper_bound_nbytes",
+    "fit_transform_resolution_additional_peak_upper_bound_nbytes",
+    "fit_result_source_validation_additional_peak_upper_bound_nbytes",
     "validate_fit_result_source_binding",
 ]

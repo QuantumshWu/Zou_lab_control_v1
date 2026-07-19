@@ -20,6 +20,7 @@ from zlc_data import (
     AxisSpec,
     CoordinateFrameId,
     CoordinateRangeSelection,
+    IndexRangeSelection,
     Selection,
     SPATIAL_X,
     SPATIAL_Y,
@@ -735,7 +736,8 @@ class ImageViewportTransform:
         terms = {term.axis_id: term for term in selection.terms}
         expected = {self.x_axis.axis_id, self.y_axis.axis_id}
         if set(terms) != expected or any(
-            not isinstance(term, CoordinateRangeSelection) for term in terms.values()
+            not isinstance(term, (CoordinateRangeSelection, IndexRangeSelection))
+            for term in terms.values()
         ):
             raise ValueError("image selection must be one typed spatial rectangle")
         x_indices, x_drop = resolve_selection_indices(

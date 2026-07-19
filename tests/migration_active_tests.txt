@@ -42,7 +42,6 @@ tests/test_w3_api_segmented_scan.py
 tests/test_w3_scan_panel_controller.py
 tests/test_w3_task_console.py
 tests/test_w4_figure_workbench.py
-tests/test_w5_capture_fit_workbench.py
 tests/test_w6_calibration_workbench.py
 tests/test_w7_saved_fit_grid.py
 tests/test_w7_fit_grid_overlay_geometry.py
@@ -54,7 +53,6 @@ tests/test_m2c_camera_monitor_histogram_meter.py
 tests/test_m2d_camera_monitor_roi_selector.py
 tests/test_m2e_camera_monitor_first_roi.py
 tests/test_w8_transformed_fit_figure.py
-tests/test_w8b_transformed_fit_workbench.py
 tests/test_zlc_calibration_commit.py
 tests/test_zlc_calibration_stream_contracts.py
 tests/test_zlc_camera_adapter_sdk.py
@@ -82,6 +80,11 @@ tests/test_u03a_interactive_histogram_figure.py
 tests/test_u03b_interactive_curve_figure.py
 tests/test_u03c_image_export.py
 tests/test_u03c_interactive_image_figure.py
+tests/test_u03d_fit_draft_contract.py
+tests/test_u03d_fit_single_panel_entry.py
+tests/test_u03d_saved_fit_refit_bridge.py
+tests/test_u03d_typed_fit_overlay_frontend.py
+tests/test_u03d_unified_figure_fit_workbench.py
 tests/test_zlc_site_map_geometry.py
 tests/test_zlc_occupancy_processor.py
 tests/test_zlc_pulse_authoring.py

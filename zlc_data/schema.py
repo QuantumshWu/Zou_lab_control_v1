@@ -29,6 +29,120 @@ def _ordered_subset(candidate: tuple[AxisId, ...], available: tuple[AxisId, ...]
     return positions == sorted(positions)
 
 
+def integer_retained_upper_bound_nbytes(value: int) -> int:
+    """Bound one Python integer without allocating its decimal spelling."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("value must be an integer")
+    integer = int(value)
+    # Cover CPython/PyPy bigint limbs and allocator slack without decimalizing.
+    return 128 + 4 * max(1, (abs(integer).bit_length() + 7) // 8)
+
+
+def axis_spec_retained_upper_bound_nbytes(axis: AxisSpec) -> int:
+    """Bound one immutable AxisSpec owner graph without materializing text."""
+
+    if not isinstance(axis, AxisSpec):
+        raise TypeError("axis must be AxisSpec")
+    text = (
+        len(axis.axis_id.value)
+        + len(axis.name)
+        + len(axis.role.value)
+        + (0 if axis.unit is None else len(axis.unit))
+        + (
+            0
+            if axis.coordinate_frame is None
+            else len(axis.coordinate_frame.value)
+        )
+    )
+    coordinates = 0
+    if axis.coordinates is not None:
+        coordinates = 128 + sum(
+            256
+            + (
+                4 * len(value)
+                if isinstance(value, str)
+                else (
+                    integer_retained_upper_bound_nbytes(value)
+                    if isinstance(value, int)
+                    else 64
+                )
+            )
+            for value in axis.coordinates
+        )
+    return int(
+        2048
+        + 4 * text
+        + coordinates
+        + integer_retained_upper_bound_nbytes(axis.size)
+        + integer_retained_upper_bound_nbytes(axis.index_origin)
+    )
+
+
+def axis_layout_retained_upper_bound_nbytes(layout: AxisLayout) -> int:
+    """Bound one AxisLayout, including its explicit reverse-index mapping."""
+
+    if not isinstance(layout, AxisLayout):
+        raise TypeError("layout must be AxisLayout")
+    retained = 4096 + sum(
+        256 + integer_retained_upper_bound_nbytes(size)
+        for size in layout.logical_shape
+    )
+    retained += integer_retained_upper_bound_nbytes(layout.storage_size)
+    if layout.storage_to_multi is not None:
+        # The canonical tuple table and its reverse MappingProxy/dict coexist.
+        # Every logical index is bounded by its declared shape; use that fact
+        # instead of rescanning a potentially million-row immutable table on
+        # every Workbench residual calculation.
+        per_row = (
+            1024
+            + sum(
+                256 + integer_retained_upper_bound_nbytes(size - 1)
+                for size in layout.logical_shape
+            )
+            + integer_retained_upper_bound_nbytes(layout.storage_size - 1)
+        )
+        retained += layout.storage_size * per_row
+    if layout.factors is not None:
+        retained += sum(
+            axis_layout_retained_upper_bound_nbytes(factor)
+            for factor in layout.factors
+        )
+    return int(retained)
+
+
+def dataset_schema_retained_upper_bound_nbytes(schema: "DatasetSchema") -> int:
+    """Conservatively bound one decoded schema/layout/coordinate owner graph."""
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    axes = (
+        schema.repeat_axis,
+        *schema.point_axes,
+        *schema.cell_schema.data_axes,
+    )
+    validity_text = sum(
+        4 * len(axis_id.value) + 512
+        for axis_id in schema.cell_schema.validity_contract.component_axis_ids
+    )
+    value_unit = (
+        0
+        if schema.cell_schema.value_unit is None
+        else 4 * len(schema.cell_schema.value_unit)
+    )
+    return int(
+        64 * 1024
+        + sum(axis_spec_retained_upper_bound_nbytes(axis) for axis in axes)
+        + axis_layout_retained_upper_bound_nbytes(schema.point_layout)
+        + axis_layout_retained_upper_bound_nbytes(schema.cell_layout)
+        + validity_text
+        + value_unit
+        + 4 * (
+            len(schema.fingerprint) + len(schema.cell_schema.fingerprint)
+        )
+    )
+
+
 @dataclass(frozen=True)
 class ValueSchema:
     data_axes: tuple[AxisSpec, ...]

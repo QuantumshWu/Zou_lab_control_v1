@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from numbers import Integral, Real
 from typing import Sequence
 
 from zlc_data import (
@@ -22,6 +24,7 @@ from zlc_data import (
     SPECTRAL,
     AxisSpec,
     DatasetSchema,
+    PointLayout,
     Selection,
     TransformedSchema,
     ValidityContract,
@@ -40,8 +43,87 @@ from .model import (
     RepeatViewMode,
     ViewContract,
     ViewIntent,
+    ViewPreferences,
     ViewSpec,
 )
+
+
+class _CoordinateSelectionIndices(Sequence[int]):
+    """Lazy non-contiguous display indices; materialization belongs to evaluation."""
+
+    __slots__ = ("_coordinates", "_lower", "_upper", "_count")
+
+    def __init__(self, coordinates, lower: float, upper: float, count: int) -> None:
+        self._coordinates = coordinates
+        self._lower = lower
+        self._upper = upper
+        self._count = count
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __iter__(self):
+        for index, value in enumerate(self._coordinates):
+            if self._lower <= value <= self._upper:
+                yield index
+
+    def __reversed__(self):
+        for index in range(len(self._coordinates) - 1, -1, -1):
+            value = self._coordinates[index]
+            if self._lower <= value <= self._upper:
+                yield index
+
+    def __contains__(self, item: object) -> bool:
+        if isinstance(item, bool) or not isinstance(item, Integral):
+            return False
+        index = int(item)
+        if index < 0 or index >= len(self._coordinates):
+            return False
+        value = self._coordinates[index]
+        return bool(self._lower <= value <= self._upper)
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            return tuple(self)[item]
+        index = int(item)
+        if index < 0:
+            index += self._count
+        if index < 0 or index >= self._count:
+            raise IndexError(index)
+        for position, resolved in enumerate(self):
+            if position == index:
+                return resolved
+        raise IndexError(index)
+
+
+def _coordinate_display_indices(
+    axis: AxisSpec,
+    term: CoordinateRangeSelection,
+) -> Sequence[int]:
+    coordinates = axis.coordinates
+    if coordinates is None:
+        raise ValueError(f"axis {axis.axis_id} has no coordinates for coordinate selection")
+    if axis.coordinate_frame != term.coordinate_frame:
+        raise ValueError(f"coordinate frame mismatch for axis {axis.axis_id}")
+    first = -1
+    last = -1
+    count = 0
+    contiguous = True
+    for index, value in enumerate(coordinates):
+        if value is None or isinstance(value, (bool, str)) or not isinstance(value, Real):
+            raise TypeError(f"axis {axis.axis_id} coordinates are not entirely numeric")
+        if term.lower <= value <= term.upper:
+            if first < 0:
+                first = index
+            elif index != last + 1:
+                contiguous = False
+            last = index
+            count += 1
+    if count == 0:
+        raise ValueError(f"coordinate selection is empty on axis {axis.axis_id}")
+    if contiguous:
+        return range(first, last + 1)
+    return _CoordinateSelectionIndices(coordinates, term.lower, term.upper, count)
 
 
 IMAGE_CONTRACT = ViewContract(
@@ -189,9 +271,10 @@ def _selection_transform_projection(
     """Validate and project the one displayable committed Fit ROI.
 
     This is a narrow authority-to-presentation contract, not a second transform
-    engine.  It accepts exactly one range-preserving Selection over spatial
-    data axes that remain fitted axes.  FigureEvaluator can then read the raw
-    snapshot through the identical selection without inventing a derived ref.
+    engine.  It accepts exactly one range-preserving Selection over scan or
+    spectral point fit axes and/or spatial data fit axes.  FigureEvaluator can
+    then read the raw snapshot through the identical selection without
+    inventing a derived ref.
     """
 
     if not isinstance(source_schema, DatasetSchema):
@@ -204,7 +287,7 @@ def _selection_transform_projection(
     operations = transform.spec.operations
     if len(operations) != 1 or not isinstance(operations[0], Selection):
         raise ValueError(
-            "transformed fit display requires exactly one spatial Selection"
+            "transformed fit display requires exactly one range Selection"
         )
     authority_selection = operations[0]
     if any(
@@ -214,41 +297,68 @@ def _selection_transform_projection(
         raise ValueError(
             "transformed fit display supports only range-preserving selections"
         )
+    source_points = {
+        axis.axis_id: axis for axis in source_schema.point_axes
+    }
     source_data = {
         axis.axis_id: axis for axis in source_schema.cell_schema.data_axes
     }
     selected_ids = {term.axis_id for term in authority_selection.terms}
-    if any(
-        axis_id not in source_data
-        or source_data[axis_id].role not in (SPATIAL_X, SPATIAL_Y)
-        for axis_id in selected_ids
-    ):
-        raise ValueError(
-            "transformed fit display selections must name spatial data axes"
-        )
     if not selected_ids <= set(fit_axis_ids):
         raise ValueError(
-            "every selected spatial axis must remain an explicit fit axis"
+            "every selected axis must remain an explicit fit axis"
+        )
+    for axis_id in selected_ids:
+        point_axis = source_points.get(axis_id)
+        data_axis = source_data.get(axis_id)
+        if point_axis is not None and point_axis.role in (SCAN_POINT, SPECTRAL):
+            continue
+        if data_axis is not None and data_axis.role in (SPATIAL_X, SPATIAL_Y):
+            continue
+        raise ValueError(
+            "transformed fit display range selections support only scan/spectral "
+            "point fit axes and spatial data fit axes"
         )
 
     resolved = resolve_transformed_schema(source_schema, transform)
-    source_cell_axes = (source_schema.repeat_axis, *source_schema.point_axes)
-    if (
-        resolved.cell_axes != source_cell_axes
-        or resolved.cell_layout != source_schema.cell_layout
-    ):
+    source_cell_ids = tuple(
+        axis.axis_id
+        for axis in (source_schema.repeat_axis, *source_schema.point_axes)
+    )
+    if tuple(axis.axis_id for axis in resolved.cell_axes) != source_cell_ids:
         raise ValueError(
-            "transformed fit display cannot select or reduce repeat/point axes"
+            "transformed fit display range selection changed cell-axis identity"
         )
+    repeat_axis = resolved.cell_axes[0]
+    point_axes = resolved.cell_axes[1:]
+    if repeat_axis.role != REPEAT:
+        raise ValueError("transformed fit display lost the logical repeat axis")
+    if resolved.cell_layout.storage_size == 0:
+        raise ValueError("transformed fit display selection contains no physical point")
+    if resolved.cell_layout.storage_size % repeat_axis.size:
+        raise ValueError("transformed fit display cell layout is not repeat-factorable")
+    point_storage_size = resolved.cell_layout.storage_size // repeat_axis.size
+    point_mapping = []
+    for storage_index in range(point_storage_size):
+        multi = resolved.cell_layout.multi_index(storage_index)
+        if multi[0] != 0:
+            raise ValueError(
+                "transformed fit display cell layout is not repeat-major"
+            )
+        point_mapping.append(multi[1:])
+    point_layout = PointLayout.from_mapping(
+        tuple(axis.size for axis in point_axes),
+        tuple(point_mapping),
+    )
     validity_contract = (
         ValidityContract.components(*resolved.validity_axis_ids)
         if resolved.validity_axis_ids
         else ValidityContract.value()
     )
     effective_schema = DatasetSchema(
-        source_schema.repeat_axis,
-        source_schema.point_axes,
-        source_schema.point_layout,
+        repeat_axis,
+        point_axes,
+        point_layout,
         ValueSchema(
             resolved.data_axes,
             validity_contract,
@@ -256,6 +366,10 @@ def _selection_transform_projection(
             resolved.value_unit,
         ),
     )
+    if effective_schema.cell_layout != resolved.cell_layout:
+        raise ValueError(
+            "transformed fit display cannot faithfully represent the resolved cell layout"
+        )
     return resolved, effective_schema, authority_selection
 
 
@@ -327,8 +441,138 @@ def display_axis_indices(
     term = terms[0] if terms else None
     if term is None:
         return range(axis.size)
+    if isinstance(term, CoordinateRangeSelection):
+        return _coordinate_display_indices(axis, term)
     indices, _drop = resolve_selection_indices(axis, term)
     return indices
+
+
+def fit_single_panel_presentation(
+    schema: DatasetSchema,
+    view: ViewSpec,
+    preferences: ViewPreferences | None = None,
+) -> tuple[Selection | None, ViewPreferences]:
+    """Freeze one labelled display cell for direct Figure-owned Fit authoring.
+
+    The returned ``Selection`` is presentation state only.  It collapses every
+    visible FACET/BATCH axis to one explicit logical index and replaces a
+    multi-element repeat display reduction with the same explicit cell.  It
+    never invents an X/IMAGE-axis selection (an existing display range is
+    preserved) and therefore must never be copied into a
+    :class:`zlc_data.FitSpec`.
+
+    Sparse point layouts are resolved as one physical tuple.  Choosing each
+    point axis independently (or assuming logical index zero exists) would
+    create a display cell that the source never published.
+    """
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(view, ViewSpec):
+        raise TypeError("view must be ViewSpec")
+    if view.schema_fingerprint != schema.fingerprint:
+        raise ValueError("ViewSpec schema fingerprint is stale")
+    preferences = ViewPreferences() if preferences is None else preferences
+    if not isinstance(preferences, ViewPreferences):
+        raise TypeError("preferences must be ViewPreferences or None")
+    validate_view_spec(schema, view, contract_for(view.intent))
+
+    axes = dataset_axes(schema)
+    axis_by_id = {axis.axis_id: axis for axis in axes}
+    terms = tuple(
+        term
+        for selection in view.display_selections
+        for term in selection.terms
+    )
+    existing_by_axis = {term.axis_id: term for term in terms}
+    if len(existing_by_axis) != len(terms):
+        raise ValueError("display selections constrain one axis more than once")
+    allowed = {
+        axis.axis_id: display_axis_indices(axis, view.display_selections)
+        for axis in axes
+    }
+    if any(len(indices) == 0 for indices in allowed.values()):
+        raise ValueError("display selection contains an empty axis")
+
+    collapse_ids = {
+        binding.axis_id
+        for binding in view.axis_bindings
+        if binding.role in (AxisViewRole.BATCH, AxisViewRole.FACET)
+        or (
+            binding.role is AxisViewRole.REDUCED
+            and axis_by_id[binding.axis_id].size > 1
+        )
+    }
+    reduced_ids = {
+        binding.axis_id
+        for binding in view.axis_bindings
+        if binding.role is AxisViewRole.REDUCED
+        and axis_by_id[binding.axis_id].size > 1
+    }
+    nonrepeat_reduced = reduced_ids - {schema.repeat_axis.axis_id}
+    if nonrepeat_reduced:
+        raise ValueError(
+            "direct Fit single-panel presentation cannot rewrite a non-repeat "
+            "display reduction"
+        )
+
+    fixed_indices = {
+        binding.axis_id: binding.selector.index
+        for binding in view.axis_bindings
+        if isinstance(binding.selector, FixedIndex)
+    }
+    point_tuple = _first_visible_point_tuple(schema, allowed, fixed_indices)
+    if point_tuple is None:
+        raise ValueError(
+            "display selections and selectors contain no physical point tuple"
+        )
+    point_index = {
+        axis.axis_id: index
+        for axis, index in zip(schema.point_axes, point_tuple)
+    }
+
+    merged_terms = {
+        axis_id: term
+        for axis_id, term in existing_by_axis.items()
+        if axis_id not in collapse_ids
+    }
+    for axis_id in sorted(collapse_ids, key=lambda value: value.value):
+        index = point_index.get(axis_id, allowed[axis_id][0])
+        if index not in allowed[axis_id]:
+            raise ValueError(
+                f"single-panel index {index} conflicts with display selection on {axis_id}"
+            )
+        merged_terms[axis_id] = Selection.index(axis_id, index).terms[0]
+
+    selection = (
+        None
+        if not merged_terms
+        else Selection(tuple(merged_terms.values()))
+    )
+    adjusted_preferences = replace(
+        preferences,
+        repeat_mode=(
+            RepeatViewMode.LATEST
+            if schema.repeat_axis.axis_id in reduced_ids
+            else preferences.repeat_mode
+        ),
+        batch_axis_ids=tuple(
+            axis_id
+            for axis_id in preferences.batch_axis_ids
+            if axis_id not in collapse_ids
+        ),
+        facet_axis_ids=tuple(
+            axis_id
+            for axis_id in preferences.facet_axis_ids
+            if axis_id not in collapse_ids
+        ),
+        sample_axis_ids=tuple(
+            axis_id
+            for axis_id in preferences.sample_axis_ids
+            if axis_id not in collapse_ids
+        ),
+    )
+    return selection, adjusted_preferences
 
 
 def _first_visible_point_tuple(
@@ -346,7 +590,9 @@ def _first_visible_point_tuple(
     for axis in point_axes:
         indices = allowed_indices[axis.axis_id]
         allowed_membership[axis.axis_id] = (
-            indices if isinstance(indices, range) else frozenset(indices)
+            indices
+            if isinstance(indices, (range, _CoordinateSelectionIndices))
+            else frozenset(indices)
         )
     layout = schema.point_layout
     if layout.storage_to_multi is None:
@@ -627,5 +873,6 @@ __all__ = [
     "contract_for",
     "dataset_axes",
     "display_axis_indices",
+    "fit_single_panel_presentation",
     "validate_view_spec",
 ]

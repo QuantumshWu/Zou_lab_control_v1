@@ -1,9 +1,9 @@
-"""Headless process-local authority for one interactive capture-fit draft.
+"""Headless process-local authority for one interactive fit draft.
 
 The Qt host may display ``FitDraftResult`` and request commands, but it never
 receives the ``FitExecution`` capability that can publish an artifact.  This
-owner is deliberately specific to the one committed-capture Fit product; it
-is not an analysis registry, workflow engine, executor, or persistence layer.
+owner accepts the one neutral-owned Fit execution capability; it is not an
+analysis registry, workflow engine, executor, or persistence layer.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import threading
 
 from zlc_data import FitCancelled, FitResultBatch, FitSpec
 from zlc_neutral_atom.artifacts import FitExecution
-from zlc_neutral_atom.capture_fit_reference import CaptureFitResultArtifactRef
+from zlc_neutral_atom.fit_reference import FitResultArtifactRef
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -33,7 +33,7 @@ class FitDraftResult:
             raise TypeError("fit draft result must be FitResultBatch")
 
 
-class CaptureFitDraftAuthority:
+class FitDraftAuthority:
     """Own exactly one unsaved ``FitExecution`` behind non-saving commands."""
 
     def __init__(
@@ -42,7 +42,7 @@ class CaptureFitDraftAuthority:
             [FitSpec, Callable[[], bool], float],
             FitExecution,
         ],
-        save_fit: Callable[[FitExecution], CaptureFitResultArtifactRef],
+        save_fit: Callable[[FitExecution], FitResultArtifactRef],
     ) -> None:
         if not callable(execute_fit):
             raise TypeError("execute_fit must be callable")
@@ -103,7 +103,7 @@ class CaptureFitDraftAuthority:
             self._execution = None
             return True
 
-    def save(self, draft: FitDraftResult) -> CaptureFitResultArtifactRef:
+    def save(self, draft: FitDraftResult) -> FitResultArtifactRef:
         """Publish the exact current draft, retaining it if publication fails."""
 
         with self._lock:
@@ -116,7 +116,7 @@ class CaptureFitDraftAuthority:
             if save_fit is None:
                 raise FitCancelled("fit draft authority is closed")
             reference = save_fit(execution)
-            if not isinstance(reference, CaptureFitResultArtifactRef):
+            if not isinstance(reference, FitResultArtifactRef):
                 raise TypeError("fit saver returned an invalid reference")
         except BaseException:
             with self._lock:
@@ -156,4 +156,4 @@ class CaptureFitDraftAuthority:
         return self._execution
 
 
-__all__ = ["CaptureFitDraftAuthority", "FitDraftResult"]
+__all__ = ["FitDraftAuthority", "FitDraftResult"]

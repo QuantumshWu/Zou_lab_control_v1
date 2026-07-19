@@ -1304,8 +1304,12 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
         with pytest.raises(MemoryError, match="figure render peak"):
             figure.to_png_bytes(memory_limit_bytes=1)
         assert figure.to_png_bytes().startswith(b"\x89PNG\r\n\x1a\n")
-        with pytest.raises(TypeError, match="CaptureArtifactRef"):
-            exp.fit(scan_ref, model="gaussian_offset")
+        scan_fit = exp.fit(
+            scan_ref,
+            model="radial_gaussian_center",
+        )
+        assert scan_fit.result.source_ref == data.snapshot.ref
+        assert scan_fit.result.spec.model_id == "radial_gaussian_center"
 
         _assert_public_occupancy_scan(exp, monkeypatch)
         _assert_scan_window(exp, document, monkeypatch)

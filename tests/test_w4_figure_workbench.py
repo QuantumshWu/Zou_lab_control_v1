@@ -269,7 +269,7 @@ def test_public_figure_gui_resolves_and_renders_off_the_qt_owner(
         _until(application, lambda: window.raster_ready)
         assert window.findChild(QtWidgets.QLabel, "figureViewerStatus").text() == "READY"
         assert window.findChild(QtWidgets.QLabel, "figureViewerMode").text() == (
-            "EXACT IMAGE · INTERACTIVE · DISPLAY ONLY"
+            "EXACT IMAGE · INTERACTIVE"
         )
         assert "image" in window.findChild(
             QtWidgets.QLabel,

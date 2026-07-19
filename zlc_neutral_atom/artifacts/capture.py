@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -24,7 +25,7 @@ from zlc_storage import (
     positive_integer,
     sha256_digest,
 )
-from zlc_data import OwnedSnapshot
+from zlc_data import DatasetRevisionRef, OwnedSnapshot
 
 from zlc_neutral_atom.acquisition import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
@@ -161,12 +162,15 @@ class CaptureArtifactInspection:
 
     reference: CaptureArtifactRef
     dataset_schema: DatasetSchema
+    dataset_revision_ref: DatasetRevisionRef
     readout_binding: ReadoutBindingKey
     event_count: int
     max_read_scratch_bytes: int
     inspection_retained_upper_bound_bytes: int
+    inspection_decode_peak_upper_bound_bytes: int
     admission_retained_upper_bound_bytes: int
     admission_decode_peak_upper_bound_bytes: int
+    materialization_peak_upper_bound_bytes: int
     pulse_runtime_summary: CompiledPulseRuntimeSummary | None
 
     def __post_init__(self) -> None:
@@ -177,20 +181,31 @@ class CaptureArtifactInspection:
             raise TypeError("reference must be CaptureArtifactRef")
         if not isinstance(self.dataset_schema, DatasetSchema):
             raise TypeError("dataset_schema must be DatasetSchema")
+        if not isinstance(self.dataset_revision_ref, DatasetRevisionRef):
+            raise TypeError("dataset_revision_ref must be DatasetRevisionRef")
+        if self.dataset_revision_ref.schema_fingerprint != self.dataset_schema.fingerprint:
+            raise ValueError("dataset_revision_ref differs from dataset_schema")
         if not isinstance(self.readout_binding, ReadoutBindingKey):
             raise TypeError("readout_binding must be ReadoutBindingKey")
         for field in (
             "event_count",
             "max_read_scratch_bytes",
             "inspection_retained_upper_bound_bytes",
+            "inspection_decode_peak_upper_bound_bytes",
             "admission_retained_upper_bound_bytes",
             "admission_decode_peak_upper_bound_bytes",
+            "materialization_peak_upper_bound_bytes",
         ):
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{field} must be a non-negative integer")
         if self.event_count == 0:
             raise ValueError("event_count must be positive")
+        if (
+            self.inspection_decode_peak_upper_bound_bytes
+            < self.inspection_retained_upper_bound_bytes
+        ):
+            raise ValueError("capture inspection peak is smaller than retained state")
         if (
             self.admission_decode_peak_upper_bound_bytes
             < self.admission_retained_upper_bound_bytes
@@ -201,6 +216,11 @@ class CaptureArtifactInspection:
             > self.admission_retained_upper_bound_bytes
         ):
             raise ValueError("capture inspection bound exceeds admitted state")
+        if (
+            self.materialization_peak_upper_bound_bytes
+            < self.admission_decode_peak_upper_bound_bytes
+        ):
+            raise ValueError("capture materialization peak omits full admission")
         if self.pulse_runtime_summary is not None and not isinstance(
             self.pulse_runtime_summary,
             CompiledPulseRuntimeSummary,
@@ -351,17 +371,146 @@ class AdmittedCapture:
         self,
         *,
         memory_limit_bytes: int,
+        abort_check: Callable[[], None] | None = None,
     ) -> OwnedSnapshot:
         """Materialize this admitted raw capture with its exact dataset identity."""
 
         self._require_authority()
         block = self._artifact.frame_source.materialize(
             memory_limit_bytes=memory_limit_bytes,
+            abort_check=abort_check,
         )
         return OwnedSnapshot(
             block.ref(self._artifact.provenance.generation),
             block,
         )
+
+
+def _validate_capture_metadata_contract(
+    *,
+    schema,
+    count: int,
+    provenance: DatasetSealProvenance,
+    terminal: CaptureTerminalAck,
+    camera_provenance: CameraCaptureProvenance,
+    camera_capability_evidence: CameraCapabilityEvidence,
+    camera_arm_spec: FrozenCaptureSpec,
+    safety_bundle_id: str,
+) -> None:
+    """Validate the typed cross-facts shared by inspection and full admission."""
+
+    from zlc_data import DatasetSchema
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    count = positive_integer(count, "capture event count")
+    if not isinstance(provenance, DatasetSealProvenance):
+        raise TypeError("provenance must be DatasetSealProvenance")
+    if provenance.derivation is not None:
+        raise ValueError(
+            "CaptureArtifact is the raw boundary and cannot persist processor output"
+        )
+    if not isinstance(terminal, CaptureTerminalAck):
+        raise TypeError("terminal must be CaptureTerminalAck")
+    if not isinstance(camera_provenance, CameraCaptureProvenance):
+        raise TypeError("camera_provenance must be CameraCaptureProvenance")
+    camera_provenance.validate_schema(schema)
+    if not isinstance(camera_capability_evidence, CameraCapabilityEvidence):
+        raise TypeError(
+            "camera_capability_evidence must be CameraCapabilityEvidence"
+        )
+    capability_evidence = camera_capability_evidence
+    if not isinstance(camera_arm_spec, FrozenCaptureSpec):
+        raise TypeError("camera_arm_spec must be FrozenCaptureSpec")
+    arm_spec = camera_arm_spec
+    if arm_spec.owner_fingerprint != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT:
+        raise ValueError("camera arm spec belongs to an unknown owner")
+    decoded_arm_spec = decode_camera_capture_spec(arm_spec.payload)
+    if freeze_camera_capture_spec(decoded_arm_spec) != arm_spec:
+        raise ValueError("camera arm spec is not the canonical owner encoding")
+    if decoded_arm_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
+        raise ValueError(
+            "finite raw CaptureArtifact requires EXTERNAL_TRIGGERED camera mode"
+        )
+    if len(
+        {
+            capability_evidence.fingerprint,
+            terminal.capability_fingerprint,
+            camera_provenance.capability_fingerprint,
+        }
+    ) != 1:
+        raise ValueError("camera capability lineage is inconsistent")
+    capability_evidence.physical_facts.validate_descriptor(
+        camera_provenance.descriptor
+    )
+    if (
+        capability_evidence.payload_contract_fingerprint
+        != CameraSampleContract(schema.cell_schema).fingerprint
+    ):
+        raise ValueError(
+            "camera capability payload contract differs from persisted DataBlock"
+        )
+    if (
+        capability_evidence.capture_spec_owner_fingerprint
+        != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
+    ):
+        raise ValueError(
+            "camera capability capture-spec owner is not the current camera owner"
+        )
+    if len(
+        {
+            arm_spec.digest,
+            terminal.capture_spec_fingerprint,
+            camera_provenance.camera_arm_spec_fingerprint,
+        }
+    ) != 1:
+        raise ValueError("camera arm-spec lineage is inconsistent")
+    if (
+        camera_provenance.binding_stamp.binding_instance_id
+        != terminal.binding_instance_id
+    ):
+        raise ValueError("camera binding lineage is inconsistent")
+    _canonical_text(safety_bundle_id, "safety_bundle_id")
+    if len(
+        {
+            camera_provenance.binding.value,
+            capability_evidence.source_id,
+            provenance.trace_binding.source_id,
+        }
+    ) != 1:
+        raise ValueError("camera source lineage is inconsistent")
+    physical_cells = schema.repeat_axis.size * schema.point_layout.storage_size
+    if count != physical_cells:
+        raise ValueError("capture metadata cardinality differs from DataBlock cells")
+    if decoded_arm_spec.expected_frames != count:
+        raise ValueError(
+            "camera arm expected_frames differs from persisted capture count"
+        )
+    if len(
+        {
+            decoded_arm_spec.settings_fingerprint,
+            capability_evidence.settings_fingerprint,
+            terminal.settings_fingerprint,
+            camera_provenance.active_settings_fingerprint,
+        }
+    ) != 1:
+        raise ValueError(
+            "camera arm settings differ from capability and terminal evidence"
+        )
+    if provenance.end_sequence - provenance.start_sequence != count:
+        raise ValueError("capture provenance interval differs from metadata cardinality")
+    metadata_contract = CameraFrameMetadataContract()
+    if provenance.metadata_contract_fingerprint != metadata_contract.fingerprint:
+        raise ValueError("capture metadata contract is not the current camera contract")
+    if (
+        terminal.produced_count != count
+        or terminal.drained_count != count
+        or terminal.ordered_metadata_digest != provenance.ordered_metadata_digest
+        or not terminal.source_stopped
+        or not terminal.no_more_frames
+        or not terminal.joined
+    ):
+        raise ValueError("capture terminal evidence differs from persisted dataset")
 
 
 @dataclass(frozen=True)
@@ -388,141 +537,36 @@ class CaptureArtifact:
         if not isinstance(self.frame_source, CaptureFrameSource):
             raise TypeError("frame_source must be CaptureFrameSource")
         schema = self.frame_source.schema
-        if not isinstance(self.provenance, DatasetSealProvenance):
-            raise TypeError("provenance must be DatasetSealProvenance")
-        if self.provenance.derivation is not None:
-            raise ValueError(
-                "CaptureArtifact is the raw boundary and cannot persist processor output"
-            )
-        if not isinstance(self.terminal, CaptureTerminalAck):
-            raise TypeError("terminal must be CaptureTerminalAck")
-        if not isinstance(self.camera_provenance, CameraCaptureProvenance):
-            raise TypeError("camera_provenance must be CameraCaptureProvenance")
-        self.camera_provenance.validate_schema(schema)
-        if not isinstance(
-            self.camera_capability_evidence,
-            CameraCapabilityEvidence,
-        ):
-            raise TypeError(
-                "camera_capability_evidence must be CameraCapabilityEvidence"
-            )
-        capability_evidence = self.camera_capability_evidence
-        if not isinstance(self.camera_arm_spec, FrozenCaptureSpec):
-            raise TypeError("camera_arm_spec must be FrozenCaptureSpec")
-        arm_spec = self.camera_arm_spec
-        if arm_spec.owner_fingerprint != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT:
-            raise ValueError("camera arm spec belongs to an unknown owner")
-        decoded_arm_spec = decode_camera_capture_spec(arm_spec.payload)
-        if freeze_camera_capture_spec(decoded_arm_spec) != arm_spec:
-            raise ValueError("camera arm spec is not the canonical owner encoding")
-        if decoded_arm_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
-            raise ValueError(
-                "finite raw CaptureArtifact requires EXTERNAL_TRIGGERED camera mode"
-            )
-        if len(
-            {
-                capability_evidence.fingerprint,
-                self.terminal.capability_fingerprint,
-                self.camera_provenance.capability_fingerprint,
-            }
-        ) != 1:
-            raise ValueError("camera capability lineage is inconsistent")
-        capability_evidence.physical_facts.validate_descriptor(
-            self.camera_provenance.descriptor
+        count = self.frame_source.event_count
+        _validate_capture_metadata_contract(
+            schema=schema,
+            count=count,
+            provenance=self.provenance,
+            terminal=self.terminal,
+            camera_provenance=self.camera_provenance,
+            camera_capability_evidence=self.camera_capability_evidence,
+            camera_arm_spec=self.camera_arm_spec,
+            safety_bundle_id=self.safety_bundle_id,
         )
-        expected_payload_contract = CameraSampleContract(schema.cell_schema)
-        if (
-            capability_evidence.payload_contract_fingerprint
-            != expected_payload_contract.fingerprint
-        ):
-            raise ValueError(
-                "camera capability payload contract differs from persisted DataBlock"
-            )
-        if (
-            capability_evidence.capture_spec_owner_fingerprint
-            != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
-        ):
-            raise ValueError(
-                "camera capability capture-spec owner is not the current camera owner"
-            )
-        if len(
-            {
-                arm_spec.digest,
-                self.terminal.capture_spec_fingerprint,
-                self.camera_provenance.camera_arm_spec_fingerprint,
-            }
-        ) != 1:
-            raise ValueError("camera arm-spec lineage is inconsistent")
-        if (
-            self.camera_provenance.binding_stamp.binding_instance_id
-            != self.terminal.binding_instance_id
-        ):
-            raise ValueError("camera binding lineage is inconsistent")
-        _canonical_text(self.safety_bundle_id, "safety_bundle_id")
-        if len(
-            {
-                self.camera_provenance.binding.value,
-                capability_evidence.source_id,
-                self.provenance.trace_binding.source_id,
-            }
-        ) != 1:
-            raise ValueError("camera source lineage is inconsistent")
         if self.pulse_evidence is not None and not isinstance(
             self.pulse_evidence,
             PulseCaptureEvidence,
         ):
             raise TypeError("pulse_evidence must be PulseCaptureEvidence or None")
-        count = self.frame_source.event_count
-        physical_cells = (
-            schema.repeat_axis.size
-            * schema.point_layout.storage_size
-        )
-        if count != physical_cells:
-            raise ValueError("capture metadata cardinality differs from DataBlock cells")
-        if decoded_arm_spec.expected_frames != count:
-            raise ValueError(
-                "camera arm expected_frames differs from persisted capture count"
-            )
-        if len(
-            {
-                decoded_arm_spec.settings_fingerprint,
-                capability_evidence.settings_fingerprint,
-                self.terminal.settings_fingerprint,
-                self.camera_provenance.active_settings_fingerprint,
-            }
-        ) != 1:
-            raise ValueError(
-                "camera arm settings differ from capability and terminal evidence"
-            )
-        if self.provenance.end_sequence - self.provenance.start_sequence != count:
-            raise ValueError("capture provenance interval differs from metadata cardinality")
         if self.frame_source.join_plan_digest != self.provenance.join_plan_digest:
             raise ValueError("source cell schedule differs from sealed join plan")
-        metadata_contract = CameraFrameMetadataContract()
-        if self.provenance.metadata_contract_fingerprint != metadata_contract.fingerprint:
-            raise ValueError("capture metadata contract is not the current camera contract")
         if (
             self.frame_source.ordered_metadata_digest
             != self.provenance.ordered_metadata_digest
         ):
             raise ValueError("capture metadata sequence digest differs from provenance")
         if (
-            self.terminal.produced_count != count
-            or self.terminal.drained_count != count
-            or self.terminal.ordered_metadata_digest
-            != self.provenance.ordered_metadata_digest
-            or not self.terminal.source_stopped
-            or not self.terminal.no_more_frames
-            or not self.terminal.joined
-        ):
-            raise ValueError("capture terminal evidence differs from persisted dataset")
-        if (
             self.pulse_evidence is not None
             and self.pulse_evidence.expected_trigger_count != count
         ):
             raise ValueError("pulse trigger count differs from persisted capture")
         if self.pulse_evidence is not None:
-            capability_evidence.physical_facts.require_single_capture_trigger_channel(
+            self.camera_capability_evidence.physical_facts.require_single_capture_trigger_channel(
                 self.pulse_evidence.trigger_channel
             )
             if (
@@ -646,11 +690,20 @@ class CaptureRepository:
         except BaseException:
             pass
 
-    def load(self, reference: CaptureArtifactRef) -> CaptureArtifact:
+    def load(
+        self,
+        reference: CaptureArtifactRef,
+        *,
+        abort_check: Callable[[], None] | None = None,
+    ) -> CaptureArtifact:
         """Fully validate a structurally visible artifact for inspection only."""
 
+        if abort_check is not None and not callable(abort_check):
+            raise TypeError("abort_check must be callable or None")
         with self._root_lease.borrow() as read_borrow:
             read_borrow.require_active()
+            if abort_check is not None:
+                abort_check()
             self._validate_ref(reference)
             try:
                 manifest_payload = self._store_authority.read_manifest(
@@ -668,6 +721,7 @@ class CaptureRepository:
                 store_authority=self._store_authority,
                 policy=self.resource_policy,
                 repository_id=self.repository_id,
+                abort_check=abort_check,
             )
 
     def _committed_intents(
@@ -722,7 +776,7 @@ class CaptureRepository:
             )
         with self._root_lease.borrow() as read_borrow:
             read_borrow.require_active()
-            self._committed_intents(reference)
+            matching = self._committed_intents(reference)
             try:
                 payload = self._store_authority.read_manifest(
                     CAPTURE_ARTIFACT_NAMESPACE,
@@ -806,8 +860,47 @@ class CaptureRepository:
                 raise CaptureResourceExceeded(
                     "capture frame storage exceeds repository resource policy"
                 ) from exc
-            provenance = camera_capture_provenance_from_tree(
+            dataset_provenance = raw_dataset_seal_provenance_from_tree(
+                data["provenance"]
+            )
+            camera_provenance = camera_capture_provenance_from_tree(
                 data["camera_provenance"]
+            )
+            terminal = capture_terminal_ack_from_tree(data["terminal"])
+            capability_evidence = camera_capability_evidence_from_tree(
+                data["camera_capability_evidence"]
+            )
+            arm_spec = frozen_capture_spec_from_tree(data["camera_arm_spec"])
+            _validate_capture_metadata_contract(
+                schema=frame.dataset_schema,
+                count=frame.event_count,
+                provenance=dataset_provenance,
+                terminal=terminal,
+                camera_provenance=camera_provenance,
+                camera_capability_evidence=capability_evidence,
+                camera_arm_spec=arm_spec,
+                safety_bundle_id=data["safety_bundle_id"],
+            )
+            persisted_run_id = dataset_provenance.trace_binding.run_id
+            persisted_safety_bundle_id = data["safety_bundle_id"]
+            for intent in matching:
+                if (
+                    intent.run_id != persisted_run_id
+                    or intent.safety_bundle_id != persisted_safety_bundle_id
+                    or intent.commit_id
+                    != (
+                        f"capture-final-{persisted_run_id}-"
+                        f"{reference.manifest_digest}"
+                    )
+                ):
+                    raise ValueError(
+                        "committed capture intent differs from persisted FINAL evidence"
+                    )
+            dataset_revision_ref = DatasetRevisionRef(
+                frame.block_id,
+                dataset_provenance.generation,
+                frame.dataset_schema.fingerprint,
+                frame.revision,
             )
             pulse_retained = (
                 0 if pulse_summary is None else pulse_summary.retained_upper_bound_bytes
@@ -823,6 +916,9 @@ class CaptureRepository:
             inspection_retained = (
                 _CAPTURE_ADMISSION_FIXED_BYTES + frame.retained_upper_bound
             )
+            inspection_decode_peak = (
+                manifest_peak + frame.inspection_peak_upper_bound
+            )
             decode_peak = max(
                 frame.decode_peak_upper_bound + pulse_retained,
                 frame.retained_upper_bound + pulse_decode,
@@ -830,19 +926,36 @@ class CaptureRepository:
                 _CAPTURE_ADMISSION_FIXED_BYTES
                 + _CAPTURE_MANIFEST_DECODE_MULTIPLIER * len(payload)
             )
-            if memory_limit is not None and max(retained, decode_peak) > memory_limit:
+            frame_materialization_peak = (
+                2 * frame.event_count * frame.geometry.frame_nbytes
+                + 2 * frame.event_count * frame.geometry.validity_nbytes
+                + frame.max_read_scratch_bytes
+            )
+            admission_decode_peak = max(retained, decode_peak)
+            materialization_peak = max(
+                inspection_decode_peak,
+                admission_decode_peak,
+                retained + frame_materialization_peak,
+            )
+            if (
+                memory_limit is not None
+                and inspection_decode_peak > memory_limit
+            ):
                 raise MemoryError(
-                    "capture admission exceeds caller memory limit"
+                    "capture inspection exceeds caller memory limit"
                 )
             return CaptureArtifactInspection(
                 reference,
                 frame.dataset_schema,
-                provenance.binding,
+                dataset_revision_ref,
+                camera_provenance.binding,
                 frame.event_count,
                 frame.max_read_scratch_bytes,
                 inspection_retained,
+                inspection_decode_peak,
                 retained,
-                max(retained, decode_peak),
+                admission_decode_peak,
+                materialization_peak,
                 pulse_summary,
             )
 
@@ -854,8 +967,13 @@ class CaptureRepository:
         store_authority: ContentStoreAuthority,
         policy: CaptureRepositoryResourcePolicy,
         repository_id: str,
+        abort_check: Callable[[], None] | None = None,
     ) -> CaptureArtifact:
         self._require_active()
+        if abort_check is not None and not callable(abort_check):
+            raise TypeError("abort_check must be callable or None")
+        if abort_check is not None:
+            abort_check()
         data = _decode_capture_manifest(manifest_payload, policy)
         if data["repository_id"] != repository_id:
             raise ValueError("CaptureArtifact belongs to another repository")
@@ -902,12 +1020,15 @@ class CaptureRepository:
                 max_canonical_container_entries=(
                     policy.max_canonical_container_entries
                 ),
+                abort_check=abort_check,
             )
         except (_FrameResourceExceeded, ContentSizeLimitError) as exc:
             raise CaptureResourceExceeded(
                 "capture frame storage exceeds repository resource policy"
             ) from exc
         try:
+            if abort_check is not None:
+                abort_check()
             compiled_pulse = (
                 None
                 if pulse_ref is None
@@ -918,6 +1039,8 @@ class CaptureRepository:
                     )
                 )
             )
+            if abort_check is not None:
+                abort_check()
         except ContentSizeLimitError as exc:
             raise CaptureResourceExceeded(
                 "capture lineage blob exceeds repository resource policy"
@@ -973,13 +1096,24 @@ class CaptureRepository:
             raise ValueError("CaptureArtifact manifest is not canonical")
         return artifact
 
-    def admit(self, reference: CaptureArtifactRef) -> AdmittedCapture:
+    def admit(
+        self,
+        reference: CaptureArtifactRef,
+        *,
+        abort_check: Callable[[], None] | None = None,
+    ) -> AdmittedCapture:
         """Mint authority only for an exact journal-committed capture target."""
 
+        if abort_check is not None and not callable(abort_check):
+            raise TypeError("abort_check must be callable or None")
         with self._root_lease.borrow() as admission_borrow:
             admission_borrow.require_active()
-            artifact = self.load(reference)
             matching = self._committed_intents(reference)
+            if abort_check is not None:
+                abort_check()
+            artifact = self.load(reference, abort_check=abort_check)
+            if abort_check is not None:
+                abort_check()
             for intent in matching:
                 expected_commit_id = (
                     f"capture-final-{artifact.run_id}-"
@@ -1001,6 +1135,50 @@ class CaptureRepository:
                 artifact=artifact,
                 commit_id=selected.commit_id,
             )
+
+    def materialize_final(
+        self,
+        reference: CaptureArtifactRef,
+        *,
+        memory_limit_bytes: int,
+        abort_check: Callable[[], None] | None = None,
+    ) -> OwnedSnapshot:
+        """Materialize one FINAL capture under one aggregate source budget.
+
+        Inspection proves the immutable manifest's full-admission bound before
+        the repository decodes it.  The admitted metadata remains charged while
+        frame arrays are allocated, then is released before the caller starts a
+        downstream operation.  Callers therefore never need to reproduce the
+        Capture owner's metadata/materialization overlap algebra.
+        """
+
+        limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
+        if abort_check is not None and not callable(abort_check):
+            raise TypeError("abort_check must be callable or None")
+        if abort_check is not None:
+            abort_check()
+        inspection = self.inspect_final(reference, memory_limit_bytes=limit)
+        if inspection.materialization_peak_upper_bound_bytes > limit:
+            raise MemoryError(
+                "capture ref-to-snapshot materialization exceeds the source budget"
+            )
+        if inspection.admission_decode_peak_upper_bound_bytes > limit:
+            raise MemoryError(
+                "capture full admission exceeds the source memory budget"
+            )
+        admitted_retained = inspection.admission_retained_upper_bound_bytes
+        if admitted_retained >= limit:
+            raise MemoryError(
+                "capture admitted metadata leaves no materialization budget"
+            )
+        del inspection
+        if abort_check is not None:
+            abort_check()
+        admitted = self.admit(reference, abort_check=abort_check)
+        return admitted.materialize_snapshot(
+            memory_limit_bytes=limit - admitted_retained,
+            abort_check=abort_check,
+        )
 
     def _final_commit(
         self,

@@ -71,7 +71,6 @@ TIMELINE_REPEAT = "#8B5CF6"
 RASTER_PLACEHOLDER_BACKGROUND = "#111111"
 RASTER_PLACEHOLDER_TEXT = "#BBBBBB"
 
-
 def raster_placeholder_stylesheet() -> str:
     """Return the one Qt placeholder-surface stylesheet."""
 

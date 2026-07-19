@@ -57,6 +57,8 @@ from zlc_data import (
     decode_fit_spec,
     encode_fit_result_batch,
     encode_fit_spec,
+    fit_result_decode_additional_peak_upper_bound_nbytes,
+    fit_result_encode_additional_peak_upper_bound_nbytes,
     fit_model_catalog,
     fit_model_definition,
     fit_spec_from_tree,
@@ -2138,6 +2140,26 @@ def test_fit_result_wire_format_has_one_frozen_current_golden():
     assert len(payload) == 2735
     assert hashlib.sha256(payload).hexdigest() == (
         "615906e94861e9e74fa84904f0bcfed183532b1cbd15febe472f25a6aa26e9a5"
+    )
+
+    tracemalloc.start()
+    try:
+        encode_fit_result_batch(result)
+        _current, encode_peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert encode_peak <= (
+        fit_result_encode_additional_peak_upper_bound_nbytes(result)
+    )
+
+    tracemalloc.start()
+    try:
+        decode_fit_result_batch(payload)
+        _current, decode_peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert decode_peak <= (
+        fit_result_decode_additional_peak_upper_bound_nbytes(len(payload))
     )
 
 

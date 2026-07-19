@@ -13,15 +13,15 @@ from .capture import (
     compile_capture_artifact_pipeline,
 )
 from .capture_frames import CaptureFrameSource
-from zlc_neutral_atom.capture_fit_reference import (
-    CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE,
-    CaptureFitResultArtifactRef,
+from zlc_neutral_atom.fit_reference import (
+    FIT_RESULT_ARTIFACT_NAMESPACE,
+    FitResultArtifactRef,
 )
-from .capture_fit import (
-    AdmittedCaptureFitResult,
-    CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA,
-    CaptureFitResultRepository,
+from .fit_result import (
+    AdmittedFitResult,
+    FIT_RESULT_ARTIFACT_SCHEMA,
     FitExecution,
+    FitResultRepository,
 )
 
 __all__ = [
@@ -36,10 +36,10 @@ __all__ = [
     "CaptureResourceExceeded",
     "DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY",
     "compile_capture_artifact_pipeline",
-    "AdmittedCaptureFitResult",
-    "CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA",
-    "CaptureFitResultRepository",
-    "CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE",
-    "CaptureFitResultArtifactRef",
+    "AdmittedFitResult",
+    "FIT_RESULT_ARTIFACT_SCHEMA",
+    "FIT_RESULT_ARTIFACT_NAMESPACE",
     "FitExecution",
+    "FitResultArtifactRef",
+    "FitResultRepository",
 ]

@@ -57,11 +57,13 @@ from .display_range import (
     validated_display_range,
 )
 from .render import (
+    CurveFitOverlay,
     CurvePanelPayload,
     HistogramPanelPayload,
     ImagePanelPayload,
     PixelFormat,
     RasterBuffer,
+    _validated_curve_fit_overlays,
 )
 from .render_style import (
     ANNOTATION_FONT_SIZE,
@@ -151,6 +153,8 @@ def estimate_live_panel_raster_peak_nbytes(
     histogram_series_count: int = 1,
     extra_retained_fronts: int = 0,
     extra_retained_evaluated_data_bytes: int = 0,
+    fit_overlay_retained_upper_bound_bytes: int = 0,
+    fit_prediction_upper_bound_bytes: int = 0,
 ) -> int:
     """Static preflight bound for one coalesced single-panel Agg front.
 
@@ -162,7 +166,9 @@ def estimate_live_panel_raster_peak_nbytes(
     vertices; ``None`` means that the panel is a curve or meter.  Pointer-hold
     retention is explicit: every extra immutable RGBA front, bin payload, and
     older exact evaluated payload is added directly rather than hidden in a
-    multiplier.
+    multiplier.  A curve fit front separately charges its already-owned DTO
+    retention and the prediction bytes copied through Matplotlib's artist
+    workspace; callers must not hide either term in a second render budget.
     """
 
     width = positive_integer(width, "width")
@@ -178,6 +184,14 @@ def estimate_live_panel_raster_peak_nbytes(
     extra_data_bytes = nonnegative_integer(
         extra_retained_evaluated_data_bytes,
         "extra_retained_evaluated_data_bytes",
+    )
+    fit_overlay_bytes = nonnegative_integer(
+        fit_overlay_retained_upper_bound_bytes,
+        "fit_overlay_retained_upper_bound_bytes",
+    )
+    fit_prediction_bytes = nonnegative_integer(
+        fit_prediction_upper_bound_bytes,
+        "fit_prediction_upper_bound_bytes",
     )
     histogram_geometry_bytes = 0
     histogram_payload_bytes = 0
@@ -207,6 +221,8 @@ def estimate_live_panel_raster_peak_nbytes(
         + extra_fronts * width * height * 4
         + extra_fronts * histogram_payload_bytes
         + extra_data_bytes
+        + fit_overlay_bytes
+        + _ARTIST_ARRAY_MULTIPLIER * fit_prediction_bytes
     )
 
 
@@ -728,6 +744,82 @@ def _validated_image_panel_export(
         raise ValueError("fixed image display limits differ from the exact payload front")
 
 
+def _image_panel_fit_annotation(
+    payload: ImagePanelPayload,
+) -> tuple[
+    tuple[float, float] | None,
+    float | None,
+    str | None,
+    str | None,
+]:
+    """Project one immutable radial-fit DTO through the exact payload view.
+
+    The Qt front and this headless export share the same authority boundary:
+    fit geometry is expressed in the declared coordinate frame and is mapped
+    by :class:`ImageViewportTransform`.  Mapping the resulting visible point
+    and span back through the imshow extent keeps descending axes, cropped
+    viewports, and half-cell edges exact without letting Matplotlib infer a
+    pixel convention from array shape.
+
+    The returned tuple is ``(center, radius, diagnostic, title)``.  Failed and
+    sparse cells intentionally return no geometry, so a diagnostic can never
+    inherit a successful centre/ring.
+    """
+
+    overlay = payload.fit_overlay
+    if overlay is None:
+        return None, None, None, None
+    status_label = (
+        "NOT_PRESENT" if overlay.status is None else overlay.status.value
+    )
+    title = f"{overlay.caption} $\\cdot$ {status_label}"
+    if overlay.status is not FitBatchStatus.CONVERGED:
+        return None, None, overlay.diagnostic or status_label, title
+
+    center = overlay.center_xy
+    radius = overlay.one_over_e_radius
+    if center is None or radius is None:
+        raise RuntimeError("converged radial fit overlay lost its geometry")
+    viewport = payload.viewport
+    visible_center = viewport.unbounded_visible_point_for_coordinate(
+        center,
+        coordinate_frame=overlay.coordinate_frame,
+    )
+    visible_diameter = viewport.visible_span_for_coordinate_span(
+        (2.0 * radius, 2.0 * radius),
+        coordinate_frame=overlay.coordinate_frame,
+    )
+
+    x_edges, _x_centers, _x_labels = _image_axis(payload.image.x_axis)
+    y_edges, _y_centers, _y_labels = _image_axis(payload.image.y_axis)
+    left, top, right, bottom = viewport.visible_bounds
+    x_full_start, x_full_stop = float(x_edges[0]), float(x_edges[-1])
+    y_full_start, y_full_stop = float(y_edges[0]), float(y_edges[-1])
+    x_view_start = x_full_start + left * (x_full_stop - x_full_start)
+    x_view_stop = x_full_start + right * (x_full_stop - x_full_start)
+    y_view_top = y_full_start + top * (y_full_stop - y_full_start)
+    y_view_bottom = y_full_start + bottom * (y_full_stop - y_full_start)
+    projected_center = (
+        x_view_start + visible_center[0] * (x_view_stop - x_view_start),
+        y_view_top + visible_center[1] * (y_view_bottom - y_view_top),
+    )
+    projected_diameters = (
+        visible_diameter[0] * abs(x_view_stop - x_view_start),
+        visible_diameter[1] * abs(y_view_bottom - y_view_top),
+    )
+    tolerance = 16.0 * math.ulp(
+        max(1.0, abs(projected_diameters[0]), abs(projected_diameters[1]))
+    )
+    if not math.isclose(
+        projected_diameters[0],
+        projected_diameters[1],
+        rel_tol=1e-12,
+        abs_tol=tolerance,
+    ):
+        raise ValueError("radial fit viewport mapping produced anisotropic geometry")
+    return projected_center, projected_diameters[0] / 2.0, None, title
+
+
 def save_image_panel_png(
     payload: ImagePanelPayload,
     display: ImageDisplayState,
@@ -739,17 +831,14 @@ def save_image_panel_png(
     """Save one exact current IMAGE front without re-evaluation or fit authority.
 
     The committed viewport, colormap, effective colour limits, and value unit
-    all come from the exact payload/display pair.  Fit-bearing IMAGE remains a
-    whole-figure product in this slice; pointer-drag rectangles are likewise
-    absent because they are transient Qt overlays, not committed display state.
+    all come from the exact payload/display pair.  An attached immutable radial
+    fit DTO is exported as its centre/radius and status only; no fitted image or
+    contour is synthesized.  Pointer-drag rectangles remain absent because
+    they are transient Qt overlays, not committed display state.
     """
 
     _validated_image_panel_export(payload, display)
-    if payload.fit_overlay is not None:
-        raise ValueError(
-            "generic IMAGE export refuses fit overlays; use the authoritative "
-            "whole-figure or saved-fit export path"
-        )
+    center, radius, diagnostic, title = _image_panel_fit_annotation(payload)
     dpi = _render_dpi(dpi)
     required = estimate_image_png_export_peak_nbytes(payload.image, dpi=dpi)
     if memory_limit_bytes is not None:
@@ -776,10 +865,12 @@ def save_image_panel_png(
                 color_limits=payload.color_limits,
                 visible_bounds=payload.viewport.visible_bounds,
                 regular_pixel_contract=True,
-                center=None,
-                radius=None,
-                diagnostic=None,
+                center=center,
+                radius=radius,
+                diagnostic=diagnostic,
             )
+            if title is not None:
+                axis.set_title(title)
             figure.savefig(destination, format="png", dpi=dpi)
     finally:
         if figure is not None:
@@ -1229,6 +1320,8 @@ class SinglePanelAggRenderer:
         "_document",
         "_figure",
         "_artists",
+        "_fit_artists",
+        "_fit_diagnostic_artists",
         "_owner_thread",
         "_topology",
     )
@@ -1271,6 +1364,8 @@ class SinglePanelAggRenderer:
         self._figure = figure
         self._axis = axis
         self._artists = ()
+        self._fit_artists = ()
+        self._fit_diagnostic_artists = ()
         self._topology = None
 
     def render(self, evaluated: EvaluatedFigureData) -> RasterBuffer:
@@ -1278,8 +1373,10 @@ class SinglePanelAggRenderer:
             return self._render(evaluated)
 
     def _render(self, evaluated: EvaluatedFigureData) -> RasterBuffer:
-        figure, axis, _layer, _cell, series_group = self._prepare_panel(evaluated)
+        figure, axis, layer, _cell, series_group = self._prepare_panel(evaluated)
         first = series_group[0].data
+        if isinstance(first, EvaluatedCurve):
+            self._update_curve_fit_artists(axis, layer, series_group, ())
         if isinstance(first, (EvaluatedCurve, EvaluatedHistogram)):
             axis.set_autoscalex_on(True)
             axis.set_autoscaley_on(True)
@@ -1294,6 +1391,7 @@ class SinglePanelAggRenderer:
         *,
         current_y_limits: tuple[float, float] | None,
         previous_relim_mode: RelimMode | None,
+        fit_overlays: tuple[CurveFitOverlay, ...] = (),
     ) -> tuple[RasterBuffer, CurvePanelPayload]:
         """Render one exact interactive curve front on this worker owner.
 
@@ -1308,6 +1406,7 @@ class SinglePanelAggRenderer:
                 state,
                 current_y_limits=current_y_limits,
                 previous_relim_mode=previous_relim_mode,
+                fit_overlays=fit_overlays,
             )
 
     def _render_interactive_curve(
@@ -1317,6 +1416,7 @@ class SinglePanelAggRenderer:
         *,
         current_y_limits: tuple[float, float] | None,
         previous_relim_mode: RelimMode | None,
+        fit_overlays: tuple[CurveFitOverlay, ...],
     ) -> tuple[RasterBuffer, CurvePanelPayload]:
         if not isinstance(state, CurveDisplayState):
             raise TypeError("state must be CurveDisplayState")
@@ -1342,10 +1442,22 @@ class SinglePanelAggRenderer:
             raise ValueError("interactive curve series must share value_unit")
         for series in pre_series_group:
             _curve_values(series)
+        evaluated_input = self._evaluated_input_for_layer(evaluated, pre_layer)
+        fit_overlays = _validated_curve_fit_overlays(
+            evaluated_input,
+            tuple(pre_series_group),
+            fit_overlays,
+        )
 
         figure, axis, layer, _cell, series_group = self._prepare_panel(evaluated)
         if layer is not pre_layer or series_group is not pre_series_group:
             raise RuntimeError("interactive panel identity changed during preparation")
+        self._update_curve_fit_artists(
+            axis,
+            layer,
+            series_group,
+            fit_overlays,
+        )
 
         finite_groups: list[np.ndarray] = []
         for series in series_group:
@@ -1413,26 +1525,13 @@ class SinglePanelAggRenderer:
             actual_y_limits,
             home_x_limits,
         )
-        try:
-            evaluated_input = next(
-                item for item in evaluated.inputs if item.dataset_id == layer.dataset_id
-            )
-        except StopIteration as exc:
-            raise ValueError(
-                "interactive curve layer dataset is absent from evaluated inputs"
-            ) from exc
-        if sum(
-            item.dataset_id == layer.dataset_id for item in evaluated.inputs
-        ) != 1:
-            raise ValueError(
-                "interactive curve layer requires one exact evaluated input"
-            )
         labels = self._curve_series_labels(layer.layer_id, series_group)
         return raster, CurvePanelPayload(
             evaluated_input,
             viewport,
             tuple(series_group),
             labels,
+            fit_overlays,
         )
 
     def render_interactive_histogram(
@@ -1600,6 +1699,31 @@ class SinglePanelAggRenderer:
             if isinstance(first, EvaluatedCurve):
                 _curve(axis, layer, cell, series_group, None)
                 self._artists = tuple(axis.lines)
+                fit_artists = []
+                diagnostic_artists = []
+                for index, source_artist in enumerate(self._artists):
+                    fit_artist, = axis.plot(
+                        (),
+                        (),
+                        color=source_artist.get_color(),
+                        linestyle=FIT_LINESTYLE,
+                        marker=None,
+                        label="_nolegend_",
+                    )
+                    fit_artists.append(fit_artist)
+                    diagnostic_artists.append(
+                        axis.text(
+                            0.02,
+                            0.98 - 0.06 * index,
+                            "",
+                            transform=axis.transAxes,
+                            va="top",
+                            color=FIT_FAILURE_COLOR,
+                            fontsize=ANNOTATION_FONT_SIZE,
+                        )
+                    )
+                self._fit_artists = tuple(fit_artists)
+                self._fit_diagnostic_artists = tuple(diagnostic_artists)
             elif isinstance(first, EvaluatedHistogram):
                 _histogram(
                     axis,
@@ -1620,6 +1744,11 @@ class SinglePanelAggRenderer:
             if topology != self._topology or len(self._artists) != expected_artists:
                 raise RuntimeError("progressive panel topology changed between revisions")
             if isinstance(first, EvaluatedCurve):
+                if (
+                    len(self._fit_artists) != len(series_group)
+                    or len(self._fit_diagnostic_artists) != len(series_group)
+                ):
+                    raise RuntimeError("progressive fit artist topology changed")
                 for line, series in zip(self._artists, series_group, strict=True):
                     data = series.data
                     assert isinstance(data, EvaluatedCurve)
@@ -1671,7 +1800,23 @@ class SinglePanelAggRenderer:
             )
             axis.set_ylabel("Count")
         axis.set_title(_panel_title(self._document, layer, cell, series_group))
-        if isinstance(first, (EvaluatedCurve, EvaluatedHistogram)) and (
+        if isinstance(first, EvaluatedCurve):
+            # A prior accepted overlay may have added fit handles.  Rebuild
+            # from the currently accepted source artists here, then let
+            # ``_update_curve_fit_artists`` add only this revision's converged
+            # fits.  This keeps legend state from becoming a hidden cache.
+            legend = axis.get_legend()
+            if legend is not None:
+                legend.remove()
+            if multiple_series or any(
+                series.batch_address for series in series_group
+            ):
+                axis.legend(
+                    handles=self._artists,
+                    labels=tuple(line.get_label() for line in self._artists),
+                    fontsize=ANNOTATION_FONT_SIZE,
+                )
+        elif isinstance(first, EvaluatedHistogram) and (
             multiple_series or any(series.batch_address for series in series_group)
         ):
             legend = axis.get_legend()
@@ -1684,6 +1829,86 @@ class SinglePanelAggRenderer:
                 for text, line in zip(texts, self._artists, strict=True):
                     text.set_text(line.get_label())
         return figure, axis, layer, cell, series_group
+
+    def _update_curve_fit_artists(
+        self,
+        axis,
+        layer,
+        series_group,
+        overlays: tuple[CurveFitOverlay, ...],
+    ) -> None:
+        """Replace the complete fit front; absent/failed rows clear old lines."""
+
+        overlays = tuple(overlays)
+        if overlays and len(overlays) != len(series_group):
+            raise ValueError("curve fit overlays must align one-for-one with series")
+        if (
+            len(self._fit_artists) != len(series_group)
+            or len(self._fit_diagnostic_artists) != len(series_group)
+        ):
+            raise RuntimeError("curve fit artist topology differs from its series")
+        labels = self._curve_series_labels(layer.layer_id, series_group)
+        active_fit_artists = []
+        for index, (fit_artist, diagnostic_artist, series, label) in enumerate(
+            zip(
+                self._fit_artists,
+                self._fit_diagnostic_artists,
+                series_group,
+                labels,
+                strict=True,
+            )
+        ):
+            overlay = None if not overlays else overlays[index]
+            if overlay is not None and overlay.status is FitBatchStatus.CONVERGED:
+                curve = series.data
+                assert isinstance(curve, EvaluatedCurve)
+                start, stop = overlay.source_sample_span
+                fit_artist.set_data(
+                    np.asarray(
+                        curve.x_axis.coordinates[start:stop],
+                        dtype=np.float64,
+                    ),
+                    overlay.predicted_y,
+                )
+                fit_artist.set_visible(True)
+                fit_artist.set_label(f"fit {label}")
+                diagnostic_artist.set_text("")
+                active_fit_artists.append(fit_artist)
+            else:
+                # Clearing both data and visibility is intentional: either fact
+                # alone is too easy for a later Matplotlib mutation to undo.
+                fit_artist.set_data((), ())
+                fit_artist.set_visible(False)
+                fit_artist.set_label("_nolegend_")
+                diagnostic_artist.set_text(
+                    ""
+                    if overlay is None
+                    else f"fit {label}: {overlay.diagnostic}"
+                )
+
+        legend = axis.get_legend()
+        if legend is not None:
+            legend.remove()
+        if len(series_group) > 1 or any(
+            series.batch_address for series in series_group
+        ):
+            handles = (*self._artists, *active_fit_artists)
+            axis.legend(
+                handles=handles,
+                labels=tuple(item.get_label() for item in handles),
+                fontsize=ANNOTATION_FONT_SIZE,
+            )
+
+    @staticmethod
+    def _evaluated_input_for_layer(evaluated: EvaluatedFigureData, layer):
+        matches = tuple(
+            item for item in evaluated.inputs if item.dataset_id == layer.dataset_id
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                "interactive curve layer requires one exact evaluated input"
+            )
+        return matches[0]
 
     @staticmethod
     def _curve_series_labels(layer_id: str, series_group) -> tuple[str, ...]:
@@ -1723,6 +1948,8 @@ class SinglePanelAggRenderer:
         self._figure = None
         self._axis = None
         self._artists = ()
+        self._fit_artists = ()
+        self._fit_diagnostic_artists = ()
         self._topology = None
         # Collect before the worker reports done so the FINAL renderer cannot
         # overlap a provisional Agg surface.

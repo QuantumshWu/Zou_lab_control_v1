@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 from zlc_storage.canonical import canonical_text as _nonempty_text
 
+from ._diagnostic import bounded_integer_diagnostic
+
 
 def _canonical_numeric_coordinate(value: Any, field: str) -> int | float:
     """Give numerically equal coordinates one in-memory and wire identity."""
@@ -130,7 +132,10 @@ class AxisSpec:
             raise TypeError("axis index must be an integer")
         index = int(index)
         if not 0 <= index < self.size:
-            raise IndexError(f"axis index {index} is outside [0, {self.size})")
+            raise IndexError(
+                f"axis index {bounded_integer_diagnostic(index)} is outside "
+                f"[0, {bounded_integer_diagnostic(self.size)})"
+            )
         if self.coordinates is None:
             return self.index_origin + index
         return self.coordinates[index]

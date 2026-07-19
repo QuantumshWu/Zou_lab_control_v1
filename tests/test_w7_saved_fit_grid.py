@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 import pytest
 
 import Zou_lab_control.notebook as zlc
@@ -32,8 +33,10 @@ from zlc_data import (
     DatasetSchema,
     FitBatchStatus,
     FitNumericPolicy,
+    IndexSelection,
     OwnedSnapshot,
     PointLayout,
+    Selection,
     StreamGenerationId,
     VALID,
     ValidityContract,
@@ -42,6 +45,7 @@ from zlc_data import (
     fit_model_catalog,
     fit_result_retained_upper_bound_nbytes,
     fit_spec_for,
+    resolve_selection_indices,
 )
 from zlc_data.fit_model import evaluate_fit_model
 from zlc_frontend import (
@@ -50,7 +54,9 @@ from zlc_frontend import (
     ImageDisplayState,
     ImagePanelPayload,
     PixelFormat,
+    radial_gaussian_image_fit_panel_retained_upper_bound_nbytes,
 )
+from zlc_frontend.fit_grid import FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS
 from zlc_frontend.image_display import ImageColormap
 from zlc_frontend.figure import (
     AxisViewRole,
@@ -65,11 +71,13 @@ from zlc_frontend.figure import (
     suggest_fit_view,
 )
 from zlc_frontend.qt_widgets import AxisLayoutNavigator, QtImageBoard, QtRasterBoard
-from zlc_neutral_atom.artifacts import AdmittedCapture, CaptureFitResultRepository
+from zlc_neutral_atom.artifacts import AdmittedCapture, FitResultRepository
+from zlc_neutral_atom.fit_reference import FitResultArtifactRef
 
 from Zou_lab_control.workbench._fit_grid import (
     _build_image_grid_frame,
     _fit_grid_memory_bounds,
+    _load_grid_view,
     _reframe_existing_image_panels,
     _rerasterize_grid_view,
 )
@@ -92,6 +100,10 @@ def _until(application, predicate, *, timeout: float = 45.0) -> None:
     deadline = time.monotonic() + timeout
     while not predicate() and time.monotonic() < deadline:
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        QtCore.QCoreApplication.sendPostedEvents(
+            None,
+            QtCore.QEvent.DeferredDelete,
+        )
         time.sleep(0.005)
     assert predicate()
 
@@ -247,7 +259,7 @@ def saved_fit_products(tmp_path_factory):
         radial_reference = experiment.fit(
             capture,
             model="radial_gaussian_center",
-        ).save()
+        ).save(operation_memory_limit_bytes=512 << 20)
         curve_capture = experiment.readout.capture(CURVE_PULSE)
         schema = experiment.readout.load_capture(curve_capture).frame_source.schema
         x_axis = next(
@@ -264,7 +276,7 @@ def saved_fit_products(tmp_path_factory):
                     sample_budget_per_batch=x_axis.size,
                     max_packed_observations=x_axis.size * 128,
                 ),
-            ).save()
+            ).save(operation_memory_limit_bytes=512 << 20)
             for model_id in ONE_DIMENSIONAL_MODELS
         }
         yield experiment, radial_reference, curve_references, workspace
@@ -306,9 +318,9 @@ def test_saved_fit_grid_public_imports_stay_headless_and_ref_has_exact_identity(
             (
                 "import sys; import zlc_frontend; import Zou_lab_control.notebook; "
                 "import Zou_lab_control.workbench; "
-                "from zlc_neutral_atom.capture_fit_reference import "
-                "CaptureFitResultArtifactRef; "
-                "r=CaptureFitResultArtifactRef('repo','f'*64); "
+                "from zlc_neutral_atom.fit_reference import "
+                "FitResultArtifactRef; "
+                "r=FitResultArtifactRef('repo','f'*64); "
                 "assert r.target_ref == 'fit-result/' + 'f'*64; "
                 "assert not any(n == 'PyQt5' or n.startswith('PyQt5.') "
                 "for n in sys.modules); "
@@ -542,6 +554,92 @@ def test_display_reraster_budgets_preexisting_exact_samples_only_once(
     assert result[3].sequence == 2
 
 
+def test_typed_panel_metadata_increases_peak_without_erasing_raster_scratch(
+    sparse_typed_page,
+) -> None:
+    panel = sparse_typed_page[4][0]
+    baseline_retained, baseline_peak = _fit_grid_memory_bounds((panel,))
+    expanded_overlay = replace(panel.fit_overlay, caption="c" * 6000)
+    expanded = replace(
+        panel,
+        summary="s" * 6000,
+        fit_overlay=expanded_overlay,
+    )
+    expanded_retained, expanded_peak = _fit_grid_memory_bounds((expanded,))
+    metadata_delta = (
+        radial_gaussian_image_fit_panel_retained_upper_bound_nbytes(expanded)
+        - radial_gaussian_image_fit_panel_retained_upper_bound_nbytes(panel)
+    )
+    assert metadata_delta > 0
+    assert baseline_peak > baseline_retained
+    assert expanded_retained - baseline_retained == metadata_delta
+    assert expanded_peak - baseline_peak == metadata_delta
+    assert (
+        expanded_peak - expanded_retained
+        == baseline_peak - baseline_retained
+        > 0
+    )
+
+
+def test_saved_grid_rejects_before_typed_panel_dto_allocation(
+    sparse_fit_grid,
+    monkeypatch,
+) -> None:
+    _result, model, page, _view, figure = sparse_fit_grid
+    reference = FitResultArtifactRef("w7-preflight", "f" * 64)
+    session_retained = 1
+    projection_peak = figure.radial_gaussian_image_fit_panels_preflight_nbytes(
+        "data",
+        artifact_identity=reference.target_ref,
+    )
+    required = (
+        figure.retained_upper_bound_nbytes
+        + projection_peak
+        + session_retained
+        + model.retained_upper_bound_bytes
+    )
+    projection_calls = []
+
+    def view_loader(
+        candidate,
+        *,
+        page_address,
+        cell_selection,
+        memory_limit_bytes,
+    ):
+        assert candidate == reference
+        assert page_address == page.address
+        assert cell_selection is None
+        assert memory_limit_bytes == required - 1
+        return figure, model, page, None, session_retained
+
+    def forbidden_projection(self, *args, **kwargs):
+        projection_calls.append((self, args, kwargs))
+        raise AssertionError("panel DTO allocation ran before aggregate admission")
+
+    monkeypatch.setattr(
+        DataFigure,
+        "radial_gaussian_image_fit_panels",
+        forbidden_projection,
+    )
+    with pytest.raises(MemoryError, match="panel projection"):
+        _load_grid_view(
+            view_loader,
+            reference,
+            page.address,
+            None,
+            required - 1,
+            1,
+            True,
+            ImageDisplayState(),
+            None,
+            None,
+            0,
+            threading.Event(),
+        )
+    assert projection_calls == []
+
+
 def test_grid_pages_are_bounded_and_axis_navigator_skips_sparse_holes(
     application,
     sparse_fit_grid,
@@ -554,6 +652,10 @@ def test_grid_pages_are_bounded_and_axis_navigator_skips_sparse_holes(
         action_text="Focus",
     )
     try:
+        assert all(
+            isinstance(control, QtWidgets.QSpinBox)
+            for _axis, control, _coordinate in navigator._controls
+        )
         navigator.set_storage_index(0)
         assert navigator.indices == model.layout.multi_index(0)
         navigator.next_button.click()
@@ -571,6 +673,113 @@ def test_grid_pages_are_bounded_and_axis_navigator_skips_sparse_holes(
     finally:
         navigator.deleteLater()
         application.processEvents()
+
+
+def test_axis_navigator_preserves_bigint_sparse_indices_and_physical_order(
+    application,
+) -> None:
+    first = (1 << 40) + 100
+    second = (1 << 31) + 7
+    size = first + 2
+    axis = AxisSpec(
+        AxisId("big.logical"),
+        "big logical index",
+        REPEAT,
+        size,
+        None,
+    )
+    layout = AxisLayout.explicit((size,), ((first,), (second,)))
+    navigator = AxisLayoutNavigator(
+        (axis,),
+        layout,
+        object_prefix="w7BigintOracle",
+        action_text="Focus",
+    )
+    try:
+        control = navigator._controls[0][1]
+        assert isinstance(control, QtWidgets.QLineEdit)
+        assert not isinstance(control, QtWidgets.QSpinBox)
+        assert control.maxLength() == FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS
+        control.setFocus()
+        QtTest.QTest.keyClicks(control, str(second))
+        application.processEvents()
+        assert navigator.indices == (second,)
+        assert navigator.storage_index == 1
+
+        navigator.set_storage_index(0)
+        assert navigator.indices == (first,)
+        navigator.next_button.click()
+        assert navigator.indices == (second,)
+        assert navigator.storage_index == 1
+        navigator.previous_button.click()
+        assert navigator.indices == (first,)
+        assert navigator.storage_index == 0
+    finally:
+        navigator.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None,
+            QtCore.QEvent.DeferredDelete,
+        )
+
+
+def test_axis_navigator_and_invalid_selection_bound_hostile_labels(
+    application,
+) -> None:
+    long_coordinate = "x" * 100_000
+    text_axis = AxisSpec(
+        AxisId("long.coordinate"),
+        "long coordinate",
+        REPEAT,
+        1,
+        (long_coordinate,),
+    )
+    text_navigator = AxisLayoutNavigator(
+        (text_axis,),
+        AxisLayout.rect_c((1,)),
+        object_prefix="w7LongCoordinateOracle",
+        action_text="Focus",
+    )
+    huge_index = 1 << 20_000
+    huge_axis = AxisSpec(
+        AxisId("huge.logical"),
+        "huge logical index",
+        REPEAT,
+        huge_index + 1,
+        None,
+    )
+    huge_navigator = AxisLayoutNavigator(
+        (huge_axis,),
+        AxisLayout.explicit((huge_axis.size,), ((huge_index,),)),
+        object_prefix="w7HugeCoordinateOracle",
+        action_text="Focus",
+    )
+    try:
+        text_label = text_navigator._controls[0][2].text()
+        assert len(text_label) <= 512
+        assert "[length=100000]" in text_label
+
+        huge_navigator.set_storage_index(0)
+        huge_label = huge_navigator._controls[0][2].text()
+        assert huge_navigator.indices == (huge_index,)
+        assert len(huge_label) <= 512
+        assert "20001 bits" in huge_label
+        assert len(huge_navigator._controls[0][1].text()) <= 512
+
+        hostile = 1 << 25_000
+        with pytest.raises(IndexError) as failure:
+            resolve_selection_indices(
+                huge_axis,
+                IndexSelection(huge_axis.axis_id, hostile),
+            )
+        assert len(str(failure.value)) <= 256
+        assert "25001 bits" in str(failure.value)
+    finally:
+        text_navigator.deleteLater()
+        huge_navigator.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None,
+            QtCore.QEvent.DeferredDelete,
+        )
 
 
 def test_large_grid_is_tiled_without_flattening_or_defaulting_repeat() -> None:
@@ -612,7 +821,7 @@ def test_saved_ref_uses_one_typed_board_cached_focus_display_and_exact_export(
     owner_thread = threading.get_ident()
     load_threads = []
     materialize_threads = []
-    original_load = CaptureFitResultRepository.load
+    original_load = FitResultRepository.load
     original_materialize = AdmittedCapture.materialize_snapshot
 
     def observed_load(self, *args, **kwargs):
@@ -626,8 +835,8 @@ def test_saved_ref_uses_one_typed_board_cached_focus_display_and_exact_export(
         materialize_threads.append(threading.get_ident())
         return original_materialize(self, *args, **kwargs)
 
-    monkeypatch.setattr(CaptureFitResultRepository, "load", observed_load)
-    monkeypatch.setattr(CaptureFitResultRepository, "execute", forbidden_execute)
+    monkeypatch.setattr(FitResultRepository, "load", observed_load)
+    monkeypatch.setattr(FitResultRepository, "execute_capture", forbidden_execute)
     monkeypatch.setattr(AdmittedCapture, "materialize_snapshot", observed_materialize)
     manifests_before = _manifest_count(workspace)
     window = experiment.figure_gui(reference)
@@ -811,7 +1020,7 @@ def test_every_saved_1d_catalog_model_reopens_focuses_and_exports_without_refit(
     owner_thread = threading.get_ident()
     load_threads = []
     materialize_threads = []
-    original_load = CaptureFitResultRepository.load
+    original_load = FitResultRepository.load
     original_materialize = AdmittedCapture.materialize_snapshot
 
     def observed_load(self, *args, **kwargs):
@@ -825,8 +1034,8 @@ def test_every_saved_1d_catalog_model_reopens_focuses_and_exports_without_refit(
         materialize_threads.append(threading.get_ident())
         return original_materialize(self, *args, **kwargs)
 
-    monkeypatch.setattr(CaptureFitResultRepository, "load", observed_load)
-    monkeypatch.setattr(CaptureFitResultRepository, "execute", forbidden_execute)
+    monkeypatch.setattr(FitResultRepository, "load", observed_load)
+    monkeypatch.setattr(FitResultRepository, "execute_capture", forbidden_execute)
     monkeypatch.setattr(AdmittedCapture, "materialize_snapshot", observed_materialize)
     immutable_store_before = _fit_store_state(workspace)
     manifests_before = _manifest_count(workspace)
@@ -889,21 +1098,21 @@ def test_saved_fit_grid_budget_and_close_are_fail_closed(
 ):
     experiment, reference, _workspace = saved_fit_product
 
-    import zlc_neutral_atom.artifacts.capture_fit as capture_fit_module
+    import zlc_neutral_atom.artifacts.fit_result as fit_result_module
 
     with monkeypatch.context() as budget_patch:
-        original_load = CaptureFitResultRepository.load
+        load_calls = []
 
-        def budgeted_load(self, *args, **kwargs):
-            assert kwargs["memory_limit_bytes"] == 1
-            return original_load(self, *args, **kwargs)
+        def forbidden_load(self, *args, **kwargs):
+            load_calls.append((args, kwargs))
+            raise AssertionError("tiny fixed-state budget reached fit-result load")
 
         def forbidden_decode(*_args, **_kwargs):
             raise AssertionError("tiny-budget load reached fit-result decode")
 
-        budget_patch.setattr(CaptureFitResultRepository, "load", budgeted_load)
+        budget_patch.setattr(FitResultRepository, "load", forbidden_load)
         budget_patch.setattr(
-            capture_fit_module,
+            fit_result_module,
             "decode_fit_result_batch",
             forbidden_decode,
         )
@@ -914,12 +1123,13 @@ def test_saved_fit_grid_budget_and_close_are_fail_closed(
             assert tiny._model is None
             assert tiny._status.text() == "SAVED FIT GRID FAILED"
             assert "MemoryError" in tiny._diagnostic.text()
+            assert load_calls == []
         finally:
             _close(application, tiny)
 
     entered = threading.Event()
     release = threading.Event()
-    original_load = CaptureFitResultRepository.load
+    original_load = FitResultRepository.load
 
     def blocked_load(self, *args, **kwargs):
         entered.set()
@@ -927,7 +1137,7 @@ def test_saved_fit_grid_budget_and_close_are_fail_closed(
             raise TimeoutError("test did not release saved-fit load")
         return original_load(self, *args, **kwargs)
 
-    monkeypatch.setattr(CaptureFitResultRepository, "load", blocked_load)
+    monkeypatch.setattr(FitResultRepository, "load", blocked_load)
     window = experiment.figure_gui(reference)
     try:
         _until(application, entered.is_set)

@@ -8,6 +8,7 @@ output itself and never delegates materialization back to a source repository.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -508,6 +509,8 @@ class ScanArtifactInspection:
     provenance: DatasetSealProvenance
     pulse_runtime_summaries: tuple[CompiledPulseRuntimeSummary, ...]
     safety_bundle_id: str
+    inspection_retained_upper_bound_bytes: int
+    inspection_decode_peak_upper_bound_bytes: int
     materialization_peak_upper_bound_bytes: int
 
     def __post_init__(self) -> None:
@@ -533,6 +536,19 @@ class ScanArtifactInspection:
             )
         object.__setattr__(self, "pulse_runtime_summaries", summaries)
         canonical_text(self.safety_bundle_id, "safety_bundle_id")
+        positive_integer(
+            self.inspection_retained_upper_bound_bytes,
+            "inspection_retained_upper_bound_bytes",
+        )
+        positive_integer(
+            self.inspection_decode_peak_upper_bound_bytes,
+            "inspection_decode_peak_upper_bound_bytes",
+        )
+        if (
+            self.inspection_decode_peak_upper_bound_bytes
+            < self.inspection_retained_upper_bound_bytes
+        ):
+            raise ValueError("scan inspection peak is smaller than retained state")
         positive_integer(
             self.materialization_peak_upper_bound_bytes,
             "materialization_peak_upper_bound_bytes",
@@ -1616,12 +1632,13 @@ class ScanRepository:
         intent: CommitIntent,
         *,
         metadata_size: int,
+        inspection_peak: int,
     ) -> ScanArtifactInspection:
         if index.provenance.trace_binding.run_id != intent.run_id or (
             index.safety_bundle_id != intent.safety_bundle_id
         ):
             raise ValueError("scan index differs from its FINAL commit intent")
-        peak = (
+        data_peak = (
             _FIXED_MATERIALIZATION_BYTES
             + _CANONICAL_DECODE_MULTIPLIER * metadata_size
             + 2 * index.values_blob.size
@@ -1636,7 +1653,9 @@ class ScanRepository:
             index.provenance,
             index.compiled_pulse_runtime_summaries,
             index.safety_bundle_id,
-            peak,
+            inspection_peak,
+            inspection_peak,
+            max(inspection_peak, data_peak),
         )
 
     def inspect_final(
@@ -1650,7 +1669,7 @@ class ScanRepository:
         with self._root_lease.borrow() as borrow:
             borrow.require_active()
             intent = self._require_final_commit(reference)
-            index, metadata_size, _inspection_peak = self._load_index(
+            index, metadata_size, inspection_peak = self._load_index(
                 reference,
                 memory_limit_bytes=memory_limit_bytes,
             )
@@ -1659,6 +1678,7 @@ class ScanRepository:
                 index,
                 intent,
                 metadata_size=metadata_size,
+                inspection_peak=inspection_peak,
             )
 
     def admit(self, reference: ScanArtifactRef) -> ScanArtifact:
@@ -1698,20 +1718,28 @@ class ScanRepository:
         reference: ScanArtifactRef,
         *,
         memory_limit_bytes: int,
+        abort_check: Callable[[], None] | None = None,
     ) -> MaterializedScanData:
+        if abort_check is not None and not callable(abort_check):
+            raise TypeError("abort_check must be callable or None")
+        if abort_check is not None:
+            abort_check()
         limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
         with self._root_lease.borrow() as borrow:
             borrow.require_active()
             intent = self._require_final_commit(reference)
-            index, metadata_size, _inspection_peak = self._load_index(
+            index, metadata_size, inspection_peak = self._load_index(
                 reference,
                 memory_limit_bytes=limit,
             )
+            if abort_check is not None:
+                abort_check()
             inspection = self._inspection_from_index(
                 reference,
                 index,
                 intent,
                 metadata_size=metadata_size,
+                inspection_peak=inspection_peak,
             )
             peak = inspection.materialization_peak_upper_bound_bytes
             if peak > limit:
@@ -1719,10 +1747,14 @@ class ScanRepository:
                     f"scan materialization peak {peak} exceeds limit {limit}"
                 )
             authority = self._content_authority()
+            if abort_check is not None:
+                abort_check()
             values_payload = authority.read_blob(
                 index.values_blob,
                 max_bytes=index.values_blob.size,
             )
+            if abort_check is not None:
+                abort_check()
             schema = inspection.output_schema
             values = np.frombuffer(
                 values_payload,
@@ -1732,10 +1764,14 @@ class ScanRepository:
                 index.validity_blob,
                 max_bytes=index.validity_blob.size,
             )
+            if abort_check is not None:
+                abort_check()
             validity = _decode_validity(
                 validity_payload,
                 max_array_bytes=index.validity_blob.size,
             )
+            if abort_check is not None:
+                abort_check()
             block = DataBlock(
                 inspection.output_dataset_ref.block_id,
                 inspection.output_dataset_ref.revision,

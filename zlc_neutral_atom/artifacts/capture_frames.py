@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import struct
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -115,6 +115,7 @@ class _CaptureFrameSourceInspection:
     used_canonical_container_entries: int
     max_read_scratch_bytes: int
     retained_upper_bound: int
+    inspection_peak_upper_bound: int
     decode_peak_upper_bound: int
 
 
@@ -889,9 +890,18 @@ class CaptureFrameSource:
                 assert payload is not None
                 yield cell, self._sample(ordinal, payload, metadata)
 
-    def materialize(self, *, memory_limit_bytes: int) -> DataBlock:
+    def materialize(
+        self,
+        *,
+        memory_limit_bytes: int,
+        abort_check: Callable[[], None] | None = None,
+    ) -> DataBlock:
+        if abort_check is not None and not callable(abort_check):
+            raise TypeError("abort_check must be callable or None")
         with self._root_lease.borrow() as read_borrow:
             read_borrow.require_active()
+            if abort_check is not None:
+                abort_check()
             limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
             cell_count = self._event_count
             values_nbytes = cell_count * self._geometry.frame_nbytes
@@ -929,6 +939,8 @@ class CaptureFrameSource:
                 )
             )
             for cell, sample in self.iter_event_order():
+                if abort_check is not None:
+                    abort_check()
                 location = (cell.repeat_index, cell.point_storage_index)
                 values[location] = sample.image.values
                 if self._validity_kind == "cell":
@@ -954,6 +966,8 @@ class CaptureFrameSource:
                     self._validity_axis_ids,
                     validity_values,
                 )
+            if abort_check is not None:
+                abort_check()
             return DataBlock(
                 self._block_id,
                 self._revision,
@@ -1221,6 +1235,7 @@ def _load_capture_frame_source(
     max_frame_index_blob_bytes: int,
     max_canonical_nodes: int,
     max_canonical_container_entries: int,
+    abort_check: Callable[[], None] | None = None,
 ) -> CaptureFrameSource:
     root_limit = min(
         _FRAME_INDEX_ROOT_MAX_BYTES,
@@ -1239,6 +1254,7 @@ def _load_capture_frame_source(
         max_frame_index_blob_bytes=max_frame_index_blob_bytes,
         max_canonical_nodes=max_canonical_nodes,
         max_canonical_container_entries=max_canonical_container_entries,
+        abort_check=abort_check,
     )
 
 
@@ -1517,10 +1533,11 @@ def _inspect_capture_frame_source(
         + inverse_ordinal_bytes
         + event_decode_scratch
     )
-    decode_peak = max(root_schema_decode_peak, full_load_decode_peak)
-    if memory_limit is not None and decode_peak > memory_limit:
+    inspection_peak = root_schema_decode_peak
+    decode_peak = max(inspection_peak, full_load_decode_peak)
+    if memory_limit is not None and inspection_peak > memory_limit:
         raise MemoryError(
-            "capture frame-source admission exceeds caller memory limit"
+            "capture frame-source inspection exceeds caller memory limit"
         )
     return _CaptureFrameSourceInspection(
         dataset_schema=schema,
@@ -1537,6 +1554,7 @@ def _inspect_capture_frame_source(
         used_canonical_container_entries=used_container_entries,
         max_read_scratch_bytes=max_read_scratch_bytes,
         retained_upper_bound=retained_upper_bound,
+        inspection_peak_upper_bound=inspection_peak,
         decode_peak_upper_bound=decode_peak,
     )
 
@@ -1552,7 +1570,12 @@ def _capture_frame_source_from_payload(
     max_frame_index_blob_bytes: int,
     max_canonical_nodes: int,
     max_canonical_container_entries: int,
+    abort_check: Callable[[], None] | None = None,
 ) -> CaptureFrameSource:
+    if abort_check is not None and not callable(abort_check):
+        raise TypeError("abort_check must be callable or None")
+    if abort_check is not None:
+        abort_check()
     inspection = _inspect_capture_frame_source(
         payload,
         store_authority=store_authority,
@@ -1579,6 +1602,8 @@ def _capture_frame_source_from_payload(
     def streamed_cells() -> Iterator[DatasetCellAddress]:
         nonlocal used_nodes, used_container_entries
         for chunk_index, reference in enumerate(event_chunk_refs):
+            if abort_check is not None:
+                abort_check()
             records, chunk_nodes, chunk_entries = _decode_frame_event_chunk(
                 reference=reference,
                 chunk_index=chunk_index,
@@ -1600,6 +1625,8 @@ def _capture_frame_source_from_payload(
                 )
             start = chunk_index * _FRAME_EVENT_CHUNK_MAX_EVENTS
             for offset, (cell, item) in enumerate(records):
+                if abort_check is not None and offset % 1024 == 0:
+                    abort_check()
                 ordinal = start + offset
                 metadata_hasher.update(metadata_contract.digest(item))
                 linear_cell = (
@@ -1616,6 +1643,8 @@ def _capture_frame_source_from_payload(
 
     join_plan_digest = dataset_cell_permutation_digest(schema, streamed_cells())
     ordered_metadata_digest = metadata_hasher.digest()
+    if abort_check is not None:
+        abort_check()
 
     source = CaptureFrameSource(
         _CAPTURE_FRAME_SOURCE_TOKEN,

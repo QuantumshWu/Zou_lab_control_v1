@@ -545,12 +545,20 @@ def _suggest_fit_view_for_effective_schema(
 
     repeat_axis = schema.repeat_axis
     batch_ids = {axis.axis_id for axis in result.batch_axis_specs}
-    selected = selection
     if repeat_axis.axis_id in batch_ids and preferences.repeat_mode is None:
-        terms = () if selection is None else selection.terms
-        if all(term.axis_id != repeat_axis.axis_id for term in terms):
-            selected = Selection((*terms, *Selection.index(repeat_axis.axis_id, 0).terms))
-        preferences = replace(preferences, repeat_mode=RepeatViewMode.LATEST)
+        # Fit replay must expose every authoritative repeat batch by default.
+        # Selecting index zero / LATEST here used to hide valid fit cells and
+        # made replay depend on a presentation-time accident.  Curves can carry
+        # repeat as series; images carry it as visible facets.  Contract limits
+        # below fail with NEEDS_INPUT instead of silently sampling one cell.
+        preferences = replace(
+            preferences,
+            repeat_mode=(
+                RepeatViewMode.BATCH
+                if arity == 1
+                else RepeatViewMode.FACET
+            ),
+        )
 
     if arity == 1:
         fit_axis_id = result.fit_axis_specs[0].axis_id
@@ -587,7 +595,7 @@ def _suggest_fit_view_for_effective_schema(
     suggestion = _suggest_view(
         schema,
         intent,
-        selected,
+        selection,
         preferences,
         contract=(
             CURVE_CONTRACT

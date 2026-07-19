@@ -41,6 +41,7 @@ from .curve_display import CurveViewportTransform
 from .display_range import validated_display_range
 from .histogram_display import HistogramBinProjection, HistogramViewportTransform
 from .figure import (
+    AxisAddress,
     DatasetId,
     EvaluatedCurve,
     EvaluatedHistogram,
@@ -284,6 +285,8 @@ class RadialGaussianImageFitOverlay:
             "artifact_identity",
             _text(self.artifact_identity, "fit overlay artifact_identity"),
         )
+        if len(self.artifact_identity) > 4096:
+            raise ValueError("fit overlay artifact_identity exceeds display bound")
         storage = self.batch_storage_index
         if storage is not None:
             storage = _nonnegative(storage, "fit overlay batch_storage_index")
@@ -299,8 +302,12 @@ class RadialGaussianImageFitOverlay:
         if not isinstance(self.coordinate_frame, CoordinateFrameId):
             raise TypeError("fit overlay coordinate_frame must be CoordinateFrameId")
         object.__setattr__(self, "caption", _text(self.caption, "fit overlay caption"))
+        if len(self.caption) > 8192:
+            raise ValueError("fit overlay caption exceeds display bound")
         if not isinstance(self.diagnostic, str):
             raise TypeError("fit overlay diagnostic must be str")
+        if len(self.diagnostic) > 1024:
+            raise ValueError("fit overlay diagnostic exceeds display bound")
         center = self.center_xy
         radius = self.one_over_e_radius
         if status is FitBatchStatus.CONVERGED:
@@ -320,6 +327,99 @@ class RadialGaussianImageFitOverlay:
             object.__setattr__(self, "one_over_e_radius", float(radius))
         elif center is not None or radius is not None:
             raise ValueError("non-converged or absent fit cells cannot carry geometry")
+
+    @property
+    def result_identity(self) -> str:
+        """Return the exact saved or draft result identity.
+
+        ``artifact_identity`` is retained as the stored field for the existing
+        saved-fit codec/UI boundary.  Typed replay also admits an unsaved draft
+        identity, so consumers use this neutral alias and never infer whether
+        the result has been published.
+        """
+
+        return self.artifact_identity
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class CurveFitOverlay:
+    """One immutable fitted prediction bound to one exact CURVE series.
+
+    The DTO deliberately carries no model, solver, repository, or mutable fit
+    result.  ``source_sample_span`` names the contiguous authority ROI inside
+    the unchanged cached curve; ``predicted_y`` exists only for a converged
+    stored row and only over that span.  Failed and sparse ``NOT_PRESENT`` rows
+    own the canonical empty array, which makes a newer failed result clear any
+    previously painted successful prediction.
+    """
+
+    source_ref: DatasetRevisionRef
+    result_identity: str
+    series_batch_address: tuple[AxisAddress, ...]
+    source_sample_span: tuple[int, int]
+    batch_storage_index: int | None
+    status: FitBatchStatus | None
+    diagnostic: str
+    predicted_y: np.ndarray
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_ref, DatasetRevisionRef):
+            raise TypeError("curve fit overlay source_ref must be DatasetRevisionRef")
+        identity = _text(self.result_identity, "curve fit result_identity")
+        if len(identity) > 4096:
+            raise ValueError("curve fit result_identity exceeds its display bound")
+        object.__setattr__(self, "result_identity", identity)
+
+        address = tuple(self.series_batch_address)
+        if any(not isinstance(item, AxisAddress) for item in address):
+            raise TypeError("curve fit series_batch_address requires AxisAddress values")
+        object.__setattr__(self, "series_batch_address", address)
+
+        span = tuple(self.source_sample_span)
+        if len(span) != 2:
+            raise ValueError("curve fit source_sample_span must contain start and stop")
+        start = _nonnegative(span[0], "curve fit source span start")
+        stop = _nonnegative(span[1], "curve fit source span stop")
+        if stop <= start:
+            raise ValueError("curve fit source_sample_span must be nonempty")
+        object.__setattr__(self, "source_sample_span", (start, stop))
+
+        storage = self.batch_storage_index
+        if storage is not None:
+            storage = _nonnegative(storage, "curve fit batch_storage_index")
+            object.__setattr__(self, "batch_storage_index", storage)
+        status = self.status
+        if status is not None and not isinstance(status, FitBatchStatus):
+            raise TypeError("curve fit overlay status must be FitBatchStatus or None")
+        if storage is None:
+            if status is not None:
+                raise ValueError("an absent curve fit cell cannot carry a status")
+        elif status is None:
+            raise ValueError("a stored curve fit cell requires a status")
+
+        if not isinstance(self.diagnostic, str):
+            raise TypeError("curve fit overlay diagnostic must be str")
+        if len(self.diagnostic) > 1024:
+            raise ValueError("curve fit overlay diagnostic exceeds its display bound")
+
+        predicted = np.asarray(self.predicted_y)
+        if predicted.dtype != np.dtype("<f8") or predicted.ndim != 1:
+            raise TypeError("curve fit predicted_y must be a one-dimensional float64 array")
+        # Immutable bytes are the ownership boundary.  Merely setting
+        # writeable=False on a caller-owned ndarray would still permit its base
+        # buffer to be changed behind this front.
+        owned = np.frombuffer(predicted.tobytes(order="C"), dtype=np.dtype("<f8"))
+        owned.setflags(write=False)
+        object.__setattr__(self, "predicted_y", owned)
+        if status is FitBatchStatus.CONVERGED:
+            if owned.size != stop - start or not bool(np.all(np.isfinite(owned))):
+                raise ValueError(
+                    "converged curve fit prediction must align with its span and be finite"
+                )
+        elif owned.size:
+            raise ValueError(
+                "failed or absent curve fit cells cannot retain a prediction"
+            )
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -438,6 +538,7 @@ class CurvePanelPayload:
     viewport: CurveViewportTransform
     series: tuple[EvaluatedSeries, ...]
     series_labels: tuple[str, ...]
+    fit_overlays: tuple[CurveFitOverlay, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.evaluated_input, EvaluatedInput):
@@ -463,8 +564,14 @@ class CurvePanelPayload:
         )
         if len(labels) != len(series):
             raise ValueError("curve series labels must align with series")
+        overlays = _validated_curve_fit_overlays(
+            self.evaluated_input,
+            series,
+            self.fit_overlays,
+        )
         object.__setattr__(self, "series", series)
         object.__setattr__(self, "series_labels", labels)
+        object.__setattr__(self, "fit_overlays", overlays)
 
     @property
     def value_unit(self) -> str | None:
@@ -473,6 +580,65 @@ class CurvePanelPayload:
         curve = self.series[0].data
         assert isinstance(curve, EvaluatedCurve)
         return curve.value_unit
+
+
+def _validated_curve_fit_overlays(
+    evaluated_input: EvaluatedInput,
+    series: tuple[EvaluatedSeries, ...],
+    overlays: tuple[CurveFitOverlay, ...],
+) -> tuple[CurveFitOverlay, ...]:
+    """Validate the exact series/result join used by payloads and Agg.
+
+    An empty tuple means that no fit result is currently attached.  A concrete
+    result is total over the displayed series: sparse and failed rows still
+    have one DTO, so omitting one row can never shift another row into it.
+    """
+
+    if not isinstance(evaluated_input, EvaluatedInput):
+        raise TypeError("curve overlay validation requires one EvaluatedInput")
+    series = tuple(series)
+    if not series or any(not isinstance(item, EvaluatedSeries) for item in series):
+        raise ValueError("curve overlay validation requires EvaluatedSeries values")
+    overlays = tuple(overlays)
+    if not overlays:
+        return ()
+    if len(overlays) != len(series) or any(
+        not isinstance(item, CurveFitOverlay) for item in overlays
+    ):
+        raise ValueError("curve fit overlays must align one-for-one with series")
+    identity = overlays[0].result_identity
+    source_ref = overlays[0].source_ref
+    source_span = overlays[0].source_sample_span
+    stored_indices = []
+    for position, (overlay, item) in enumerate(zip(overlays, series, strict=True)):
+        curve = item.data
+        if not isinstance(curve, EvaluatedCurve):
+            raise TypeError("curve fit overlays require EvaluatedCurve series")
+        if overlay.source_ref != evaluated_input.ref or overlay.source_ref != source_ref:
+            raise ValueError("curve fit overlay belongs to another source revision")
+        if overlay.result_identity != identity:
+            raise ValueError("curve payload cannot mix fit result identities")
+        if overlay.source_sample_span != source_span:
+            raise ValueError("curve payload cannot mix fit authority spans")
+        if overlay.series_batch_address != item.batch_address:
+            raise ValueError(
+                f"curve fit overlay {position} belongs to another series address"
+            )
+        start, stop = overlay.source_sample_span
+        if stop > curve.values.size:
+            raise ValueError("curve fit source span exceeds source samples")
+        if overlay.status is FitBatchStatus.CONVERGED:
+            if overlay.predicted_y.shape != (stop - start,):
+                raise ValueError("curve fit prediction does not align with source span")
+        elif overlay.predicted_y.size:
+            # The DTO already closes this invariant; keep it explicit at the
+            # join boundary so a future alternate DTO cannot weaken it.
+            raise ValueError("failed curve fit overlay retained stale prediction data")
+        if overlay.batch_storage_index is not None:
+            stored_indices.append(overlay.batch_storage_index)
+    if len(stored_indices) != len(set(stored_indices)):
+        raise ValueError("two displayed curve series map to one fit storage row")
+    return overlays
 
 
 @dataclass(frozen=True, slots=True)
@@ -984,6 +1150,7 @@ __all__ = [
     "BoardPresenter",
     "AtomicBoardFront",
     "CoherenceStamp",
+    "CurveFitOverlay",
     "CurvePanelPayload",
     "HistogramPanelPayload",
     "detached_render_fault",

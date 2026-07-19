@@ -27,7 +27,6 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     BlockId,
-    BoundFit,
     CommittedTransform,
     ComponentValidity,
     DataTransformSpec,
@@ -44,18 +43,24 @@ from zlc_data import (
     commit_transform,
     expand_value_validity,
     fit_model_catalog,
+    fit_binding_additional_peak_upper_bound_nbytes,
+    fit_binding_retained_upper_bound_nbytes,
+    fit_transform_resolution_additional_peak_upper_bound_nbytes,
+    fit_result_source_validation_additional_peak_upper_bound_nbytes,
     fit_result_retained_upper_bound_nbytes,
+    dataset_schema_retained_upper_bound_nbytes,
     fit_spec_for,
+    suggest_fit_draft,
     validate_fit_result_source_binding,
 )
 from zlc_neutral_atom.artifacts import (
-    AdmittedCaptureFitResult,
+    AdmittedFitResult,
     CaptureArtifact,
     CaptureArtifactRef,
-    CaptureFitResultRepository,
-    CaptureFitResultArtifactRef,
     CaptureRepository,
     FitExecution,
+    FitResultArtifactRef,
+    FitResultRepository,
 )
 from zlc_neutral_atom.capture_application import (
     CAPTURE_READOUT_EVENT_AXIS_ID,
@@ -166,6 +171,7 @@ _DEFAULT_OCCUPANCY_TIMEOUT_SECONDS = 300.0
 _DEFAULT_SCAN_MATERIALIZATION_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_FIT_GUI_TIMEOUT_SECONDS = 30.0
+_SAVED_FIT_GRID_FIXED_BYTES = 64 << 10
 _SCAN_REPEAT_AXIS_ID = AxisId("scan.repeat")
 _SCAN_READOUT_EVENT_AXIS_ID = AxisId("scan.readout_event")
 
@@ -437,9 +443,11 @@ class _ExperimentServices:
     calibration_repository: "CalibrationRepository | None"
     occupancy_repository_path: Path
     occupancy_repository: "OccupancyRepository | None"
-    fit_repository: CaptureFitResultRepository
+    fit_repository: FitResultRepository
     catalog: DeviceCatalogView
     operation_lock: threading.RLock
+    fit_operations_drained: threading.Event
+    fit_operation_thread_counts: dict[int, int]
     active_fit_operations: int = 0
     state: str = "OPEN"
 
@@ -482,7 +490,13 @@ def _fit_service_guard(
     with services.operation_lock:
         if services.state != "OPEN":
             raise RuntimeError("Experiment is closing or closed")
+        if services.active_fit_operations == 0:
+            services.fit_operations_drained.clear()
         services.active_fit_operations += 1
+        thread_id = threading.get_ident()
+        services.fit_operation_thread_counts[thread_id] = (
+            services.fit_operation_thread_counts.get(thread_id, 0) + 1
+        )
     completed = False
     try:
         yield services
@@ -492,6 +506,15 @@ def _fit_service_guard(
             if services.active_fit_operations <= 0:
                 raise RuntimeError("Experiment Fit operation count underflow")
             services.active_fit_operations -= 1
+            thread_count = services.fit_operation_thread_counts.get(thread_id, 0)
+            if thread_count <= 0:
+                raise RuntimeError("Experiment Fit thread count underflow")
+            if thread_count == 1:
+                services.fit_operation_thread_counts.pop(thread_id)
+            else:
+                services.fit_operation_thread_counts[thread_id] = thread_count - 1
+            if services.active_fit_operations == 0:
+                services.fit_operations_drained.set()
             remained_open = services.state == "OPEN"
     if completed and not remained_open:
         raise FitCancelled("Experiment began closing during Fit execution")
@@ -1944,6 +1967,8 @@ def _project_notebook_figure(
     memory_limit_bytes: int | None,
     draft_fit_result: FitResultBatch | None = None,
     preloaded_snapshot: OwnedSnapshot | None = None,
+    preinspected_schema=None,
+    preinspected_dataset_ref=None,
 ):
     """Composition-only ref dispatch; frontend never sees a neutral repository."""
 
@@ -1958,6 +1983,7 @@ def _project_notebook_figure(
         SuggestionStatus,
         ViewIntent,
         ViewPreferences,
+        estimate_view_evaluation_peak_nbytes,
         suggest_fit_view,
         suggest_view,
     )
@@ -1989,35 +2015,41 @@ def _project_notebook_figure(
         raise TypeError("preloaded_snapshot must be OwnedSnapshot or None")
     if preloaded_snapshot is not None and not isinstance(
         source,
-        AdmittedCaptureFitResult,
+        AdmittedFitResult,
     ):
         raise TypeError(
             "a preloaded figure snapshot is valid only for an admitted saved fit"
         )
+    if (preinspected_schema is None) != (preinspected_dataset_ref is None):
+        raise ValueError(
+            "preinspected_schema and preinspected_dataset_ref must be supplied together"
+        )
+    if preinspected_schema is not None:
+        if memory_limit_bytes is not None or preloaded_snapshot is not None:
+            raise ValueError(
+                "preinspected metadata is valid only for document-only projection"
+            )
+        if not isinstance(source, (CaptureArtifactRef, ScanArtifactRef)):
+            raise TypeError(
+                "preinspected metadata requires its capture or scan source"
+            )
+        if preinspected_dataset_ref.schema_fingerprint != preinspected_schema.fingerprint:
+            raise ValueError("preinspected dataset ref differs from its schema")
 
     fit_result = draft_fit_result
     snapshot = preloaded_snapshot
-    admitted = None
+    source_inspection = None
     selected_occupancy_output = None
     source_label = "capture"
     if draft_fit_result is not None:
-        if not isinstance(source, CaptureArtifactRef):
+        if not isinstance(source, (CaptureArtifactRef, ScanArtifactRef)):
             raise TypeError(
-                "a draft fit result can only be projected over its capture source"
+                "a draft fit result requires its capture or scan source"
             )
         source_ref = source
     elif isinstance(source, ScanArtifactRef):
         source_label = "scan"
-        if memory_limit_bytes is None:
-            schema = services.scan_repository.inspect_final(source).output_schema
-        else:
-            materialized = services.scan_repository.materialize(
-                source,
-                memory_limit_bytes=memory_limit_bytes,
-            )
-            schema = materialized.schema
-            snapshot = materialized.snapshot
-        source_ref = None
+        source_ref = source
     elif is_occupancy:
         selected_occupancy_output = (
             "occupied" if occupancy_output is None else occupancy_output
@@ -2054,39 +2086,100 @@ def _project_notebook_figure(
     elif isinstance(source, CaptureArtifactRef):
         source_ref = source
     elif isinstance(source, FitExecution):
-        source_ref = source.source_capture_ref
+        source_ref = source.source_artifact_ref
         fit_result = source.result
-    elif isinstance(source, CaptureFitResultArtifactRef):
+    elif isinstance(source, FitResultArtifactRef):
         admitted_fit = services.fit_repository.load(
             source,
-            services.capture_repository,
+            capture_repository=services.capture_repository,
+            scan_repository=services.scan_repository,
             memory_limit_bytes=memory_limit_bytes,
         )
-        source_ref = admitted_fit.source_capture_ref
+        source_ref = admitted_fit.source_artifact_ref
         fit_result = admitted_fit.result
-    elif isinstance(source, AdmittedCaptureFitResult):
-        source_ref = source.source_capture_ref
+    elif isinstance(source, AdmittedFitResult):
+        source_ref = source.source_artifact_ref
         fit_result = source.result
     else:
         raise TypeError(
             "figure source must be ScanArtifactRef, OccupancyArtifactRef, "
-            "CaptureArtifactRef, FitExecution, CaptureFitResultArtifactRef, "
-            "or AdmittedCaptureFitResult"
+            "CaptureArtifactRef, FitExecution, FitResultArtifactRef, "
+            "or AdmittedFitResult"
         )
 
     if source_ref is not None:
-        if snapshot is None:
-            admitted = services.capture_repository.admit(source_ref)
-            schema = admitted.artifact.frame_source.schema
+        inspection_limit = memory_limit_bytes
+        fit_retained = (
+            0
+            if fit_result is None
+            else fit_result_retained_upper_bound_nbytes(fit_result)
+        )
+        if inspection_limit is None and fit_result is not None:
+            inspection_limit = (
+                services.fit_repository.materialization_memory_limit_bytes
+            )
+        if inspection_limit is not None and snapshot is None:
+            inspection_limit -= fit_retained
+            if inspection_limit <= 0:
+                raise MemoryError("fit overlay leaves no source inspection budget")
+        if isinstance(source_ref, CaptureArtifactRef):
+            if snapshot is None:
+                if preinspected_schema is None:
+                    source_inspection = services.capture_repository.inspect_final(
+                        source_ref,
+                        memory_limit_bytes=inspection_limit,
+                    )
+                    schema = source_inspection.dataset_schema
+                    source_dataset_ref = source_inspection.dataset_revision_ref
+                else:
+                    schema = preinspected_schema
+                    source_dataset_ref = preinspected_dataset_ref
+            else:
+                schema = snapshot.block.schema
+                source_dataset_ref = snapshot.ref
+        elif isinstance(source_ref, ScanArtifactRef):
+            if snapshot is None:
+                if preinspected_schema is None:
+                    source_inspection = services.scan_repository.inspect_final(
+                        source_ref,
+                        memory_limit_bytes=inspection_limit,
+                    )
+                    schema = source_inspection.output_schema
+                    source_dataset_ref = source_inspection.output_dataset_ref
+                else:
+                    schema = preinspected_schema
+                    source_dataset_ref = preinspected_dataset_ref
+            else:
+                schema = snapshot.block.schema
+                source_dataset_ref = snapshot.ref
         else:
-            schema = snapshot.block.schema
-        if draft_fit_result is not None:
-            frame_source = admitted.artifact.frame_source
-            validate_fit_result_source_binding(
-                draft_fit_result,
-                frame_source.ref(admitted.artifact.provenance.generation),
+            raise TypeError("fit source artifact kind is not current")
+    if fit_result is not None:
+        validation_peak = (
+            fit_result_source_validation_additional_peak_upper_bound_nbytes(
+                fit_result,
                 schema,
             )
+        )
+        validation_limit = memory_limit_bytes
+        if validation_limit is None:
+            validation_limit = services.fit_repository.materialization_memory_limit_bytes
+        validation_required = validation_peak
+        if snapshot is None:
+            validation_required += fit_result_retained_upper_bound_nbytes(fit_result)
+            if source_inspection is not None:
+                validation_required += (
+                    source_inspection.inspection_retained_upper_bound_bytes
+                )
+        if validation_required > validation_limit:
+            raise MemoryError(
+                "Fit source validation exceeds the aggregate planning budget"
+            )
+        validate_fit_result_source_binding(
+            fit_result,
+            source_dataset_ref,
+            schema,
+        )
     if fit_result is None:
         if intent is None:
             roles = {
@@ -2128,6 +2221,38 @@ def _project_notebook_figure(
         )
         label = source_label
     else:
+        if fit_result.spec.committed_transform is not None:
+            transform_peak = (
+                fit_transform_resolution_additional_peak_upper_bound_nbytes(
+                    schema
+                )
+            )
+            if snapshot is None:
+                planning_limit = memory_limit_bytes
+                if planning_limit is None:
+                    planning_limit = (
+                        services.fit_repository.materialization_memory_limit_bytes
+                    )
+                inspection_retained = (
+                    0
+                    if source_inspection is None
+                    else source_inspection.inspection_retained_upper_bound_bytes
+                )
+                planning_required = (
+                    fit_result_retained_upper_bound_nbytes(fit_result)
+                    + inspection_retained
+                    + transform_peak
+                )
+            else:
+                planning_limit = memory_limit_bytes
+                planning_required = transform_peak
+            if (
+                planning_limit is not None
+                and planning_required > planning_limit
+            ):
+                raise MemoryError(
+                    "transformed Fit view planning exceeds the aggregate budget"
+                )
         suggestion = suggest_fit_view(
             schema,
             fit_result,
@@ -2151,16 +2276,65 @@ def _project_notebook_figure(
     )
     if memory_limit_bytes is None:
         return document, None, fit_result
+    if snapshot is None and source_ref is not None:
+        if source_inspection is None:
+            raise RuntimeError("figure source inspection was not retained for admission")
+        from zlc_frontend import figure_document_retained_upper_bound_nbytes
+
+        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        result_retained = (
+            0
+            if fit_result is None
+            else fit_result_retained_upper_bound_nbytes(fit_result)
+        )
+        schema_retained = dataset_schema_retained_upper_bound_nbytes(schema)
+        source_arrays = dataset_storage_nbytes(schema)
+        document_retained = figure_document_retained_upper_bound_nbytes(document)
+        validation_peak = (
+            0
+            if fit_result is None
+            else fit_result_source_validation_additional_peak_upper_bound_nbytes(
+                fit_result,
+                schema,
+            )
+        )
+        evaluation_peak = estimate_view_evaluation_peak_nbytes(
+            schema,
+            suggestion.spec,
+        )
+        source_peak = source_inspection.materialization_peak_upper_bound_bytes
+        required = (
+            result_retained
+            + document_retained
+            + max(
+                source_peak,
+                source_arrays
+                + schema_retained
+                + max(validation_peak, evaluation_peak),
+            )
+        )
+        if required > limit:
+            raise MemoryError(
+                f"figure aggregate construction peak {required} exceeds limit {limit}"
+            )
+        materialization_limit = limit - result_retained - document_retained
+        if materialization_limit <= 0:
+            raise MemoryError("figure metadata leaves no source materialization budget")
+        del source_inspection, schema, suggestion
+        if isinstance(source_ref, CaptureArtifactRef):
+            snapshot = services.capture_repository.materialize_final(
+                source_ref,
+                memory_limit_bytes=materialization_limit,
+            )
+        elif isinstance(source_ref, ScanArtifactRef):
+            snapshot = services.scan_repository.materialize(
+                source_ref,
+                memory_limit_bytes=materialization_limit,
+            ).snapshot
+        else:  # pragma: no cover - source kind is closed above
+            raise TypeError("fit source artifact kind is not current")
     if snapshot is None:
-        assert admitted is not None
-        source_limit = memory_limit_bytes
-        if fit_result is not None:
-            source_limit -= fit_result_retained_upper_bound_nbytes(fit_result)
-            if source_limit <= 0:
-                raise MemoryError(
-                    "fit overlay leaves no source materialization budget"
-                )
-        snapshot = admitted.materialize_snapshot(memory_limit_bytes=source_limit)
+        raise RuntimeError("figure source was not materialized under its budget")
     return (
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
@@ -2195,18 +2369,36 @@ def _data_figure_for_services(
         preloaded_snapshot=preloaded_snapshot,
     )
     assert datasets is not None
-    from zlc_frontend import DataFigure
+    from zlc_frontend import (
+        DataFigure,
+        figure_document_retained_upper_bound_nbytes,
+    )
+
+    document_retained = figure_document_retained_upper_bound_nbytes(document)
 
     if retained_inputs_prebudgeted:
         if preloaded_snapshot is None:
             raise ValueError(
                 "prebudgeted figure inputs require an explicit preloaded snapshot"
             )
-        evaluation_limit = memory_limit_bytes
-        render_limit = memory_limit_bytes
+        evaluation_limit = memory_limit_bytes - document_retained
+        if evaluation_limit <= 0:
+            raise MemoryError(
+                "prebudgeted Figure session leaves no document/evaluation budget"
+            )
+        # The caller already owns the source arrays/schema/result.  The
+        # newly-created document remains live while render validation builds
+        # its candidate, so it must still be reserved from this residual.
+        render_limit = memory_limit_bytes - document_retained
     else:
-        retained_input_bytes = sum(
+        retained_source_bytes = sum(
             dataset_storage_nbytes(entry.snapshot.block.schema)
+            for entry in datasets.entries
+        )
+        retained_schema_bytes = sum(
+            dataset_schema_retained_upper_bound_nbytes(
+                entry.snapshot.block.schema
+            )
             for entry in datasets.entries
         )
         retained_fit_bytes = (
@@ -2215,13 +2407,25 @@ def _data_figure_for_services(
             else fit_result_retained_upper_bound_nbytes(fit_result)
         )
         evaluation_limit = (
-            memory_limit_bytes - retained_input_bytes - retained_fit_bytes
+            memory_limit_bytes
+            - retained_source_bytes
+            - retained_schema_bytes
+            - retained_fit_bytes
+            - document_retained
         )
         if evaluation_limit <= 0:
             raise MemoryError(
                 "figure source and fit overlay leave no memory for view evaluation"
             )
-        render_limit = memory_limit_bytes - retained_fit_bytes
+        # Render validation accounts its evaluated arrays, but not the frozen
+        # FigureDocument, source schema metadata, or fit result which remain
+        # live after source-array evaluation ownership has been released.
+        render_limit = (
+            memory_limit_bytes
+            - retained_schema_bytes
+            - retained_fit_bytes
+            - document_retained
+        )
         if render_limit <= 0:
             raise MemoryError("fit overlay leaves no memory for figure rendering")
     return DataFigure(
@@ -2308,7 +2512,7 @@ class Experiment:
 
     def fit(
         self,
-        source: CaptureArtifactRef,
+        source: CaptureArtifactRef | ScanArtifactRef,
         spec: FitSpec | None = None,
         *,
         model: str | None = None,
@@ -2316,19 +2520,68 @@ class Experiment:
         fit_axis_ids: tuple[AxisId, ...] | None = None,
         constraints: tuple[FitParameterConstraint, ...] = (),
         numeric_policy: FitNumericPolicy | None = None,
+        memory_limit_bytes: int | None = None,
     ) -> FitExecution:
-        """Fit one committed capture without hiding any axis reduction."""
+        """Fit one committed capture or FINAL scan without hidden reduction."""
 
-        if not isinstance(source, CaptureArtifactRef):
-            raise TypeError("source must be CaptureArtifactRef")
+        if not isinstance(source, (CaptureArtifactRef, ScanArtifactRef)):
+            raise TypeError("source must be CaptureArtifactRef or ScanArtifactRef")
         if (spec is None) == (model is None):
             raise ValueError("provide exactly one of spec or model")
-        with _service_guard(self._authority_token) as services:
-            admitted = services.capture_repository.admit(source)
+        limit = (
+            None
+            if memory_limit_bytes is None
+            else _positive_int(memory_limit_bytes, "memory_limit_bytes")
+        )
+        with _fit_service_guard(self._authority_token) as services:
+            def closing_cancel_check() -> bool:
+                with services.operation_lock:
+                    return services.state != "OPEN"
+
+            effective_limit = (
+                services.fit_repository.materialization_memory_limit_bytes
+                if limit is None
+                else min(
+                    limit,
+                    services.fit_repository.materialization_memory_limit_bytes,
+                )
+            )
             if spec is None:
                 assert model is not None
+                source_materialization_limit = (
+                    services.fit_repository.source_materialization_memory_limit_bytes(
+                        effective_limit
+                    )
+                )
+                if isinstance(source, CaptureArtifactRef):
+                    inspection = services.capture_repository.inspect_final(
+                        source,
+                        memory_limit_bytes=source_materialization_limit,
+                    )
+                    schema = inspection.dataset_schema
+                else:
+                    inspection = services.scan_repository.inspect_final(
+                        source,
+                        memory_limit_bytes=source_materialization_limit,
+                    )
+                    schema = inspection.output_schema
+                if (
+                    inspection.materialization_peak_upper_bound_bytes
+                    > source_materialization_limit
+                ):
+                    raise MemoryError(
+                        "source cannot materialize inside the aggregate Fit budget"
+                    )
+                binding_limit = (
+                    source_materialization_limit
+                    - inspection.inspection_retained_upper_bound_bytes
+                )
+                if binding_limit <= 0:
+                    raise MemoryError(
+                        "source inspection leaves no Fit request binding budget"
+                    )
                 spec = fit_spec_for(
-                    admitted.artifact.frame_source.schema,
+                    schema,
                     model,
                     committed_transform=committed_transform,
                     fit_axis_ids=fit_axis_ids,
@@ -2338,7 +2591,9 @@ class Experiment:
                         if numeric_policy is None
                         else numeric_policy
                     ),
+                    binding_memory_limit_bytes=binding_limit,
                 )
+                del schema, inspection
             elif any(
                 value is not None
                 for value in (
@@ -2350,89 +2605,206 @@ class Experiment:
                 raise ValueError(
                     "spec cannot be combined with model convenience arguments"
                 )
-            return services.fit_repository.execute(admitted, spec)
+            if isinstance(source, CaptureArtifactRef):
+                return services.fit_repository.execute_capture(
+                    services.capture_repository,
+                    source,
+                    spec,
+                    memory_limit_bytes=effective_limit,
+                    cancel_check=closing_cancel_check,
+                )
+            return services.fit_repository.execute_scan(
+                services.scan_repository,
+                source,
+                spec,
+                memory_limit_bytes=effective_limit,
+                cancel_check=closing_cancel_check,
+            )
 
     def load_fit(
         self,
-        reference: CaptureFitResultArtifactRef,
-    ) -> AdmittedCaptureFitResult:
+        reference: FitResultArtifactRef,
+    ) -> AdmittedFitResult:
         with _service_guard(self._authority_token) as services:
             return services.fit_repository.load(
                 reference,
-                services.capture_repository,
+                capture_repository=services.capture_repository,
+                scan_repository=services.scan_repository,
             )
 
-    def fit_gui(
+    def _open_fit_capable_figure_gui(
         self,
-        source: CaptureArtifactRef,
+        display_source,
+        fit_source: CaptureArtifactRef | ScanArtifactRef,
         *,
-        model: str | None = None,
-        committed_transform: CommittedTransform | None = None,
-        memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
+        intent,
+        selection: Selection | None,
+        preferences,
+        occupancy_output: str | None,
+        memory_limit_bytes: int,
+        selected_model: str | None = None,
+        initial_fit_spec: FitSpec | None = None,
+        initial_selection: Selection | None = None,
+        open_analysis: bool = False,
         timeout_seconds: float = _DEFAULT_FIT_GUI_TIMEOUT_SECONDS,
+        initial_fit_result_identity: str | None = None,
+        direct_fit_single_panel: bool = False,
     ):
-        """Author, preview, and explicitly save one committed-capture fit.
+        """Compose the one Figure-owned Fit host without exposing repositories."""
 
-        A supplied transform is frozen before the window opens and must satisfy
-        the narrow selection-only Fit-display contract.  The GUI edits model
-        constraints only; it never derives authority from a current display or
-        selector.  Reduction and transform authoring remain explicit through
-        :meth:`fit`.
-        """
-
-        if not isinstance(source, CaptureArtifactRef):
-            raise TypeError("source must be CaptureArtifactRef")
-        if committed_transform is not None and not isinstance(
-            committed_transform,
-            CommittedTransform,
-        ):
-            raise TypeError(
-                "committed_transform must be CommittedTransform or None"
-            )
+        if not isinstance(fit_source, (CaptureArtifactRef, ScanArtifactRef)):
+            raise TypeError("fit_source must be CaptureArtifactRef or ScanArtifactRef")
         limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         timeout = _positive_real(timeout_seconds, "timeout_seconds")
-        selected_model = None if model is None else _text(model, "model")
-        frozen_transform = committed_transform
+        chosen_model = (
+            None if selected_model is None else _text(selected_model, "model")
+        )
+        if initial_fit_spec is not None and not isinstance(
+            initial_fit_spec,
+            FitSpec,
+        ):
+            raise TypeError("initial_fit_spec must be FitSpec or None")
+        if initial_fit_spec is not None:
+            if chosen_model is None:
+                chosen_model = initial_fit_spec.model_id
+            elif chosen_model != initial_fit_spec.model_id:
+                raise ValueError("selected model differs from the initial FitSpec")
 
-        from zlc_frontend import selection_fit_view_projection
-
-        def prepare_fit() -> tuple[BoundFit, ...]:
-            with _service_guard(self._authority_token) as services:
-                inspection = services.capture_repository.inspect_final(
-                    source,
-                    memory_limit_bytes=limit,
+        def inspect_source(services, operation_memory_limit_bytes: int):
+            operation_limit = _positive_int(
+                operation_memory_limit_bytes,
+                "operation_memory_limit_bytes",
+            )
+            if isinstance(fit_source, CaptureArtifactRef):
+                return services.capture_repository.inspect_final(
+                    fit_source,
+                    memory_limit_bytes=operation_limit,
                 )
-            schema = inspection.dataset_schema
-            options: list[BoundFit] = []
+            return services.scan_repository.inspect_final(
+                fit_source,
+                memory_limit_bytes=operation_limit,
+            )
+
+        def source_schema(services, operation_memory_limit_bytes: int):
+            inspected = inspect_source(services, operation_memory_limit_bytes)
+            if isinstance(fit_source, CaptureArtifactRef):
+                return inspected.dataset_schema
+            return inspected.output_schema
+
+        def prepare_fit(
+            fit_axis_ids: tuple[AxisId, ...],
+            authority_selection: Selection | None,
+            operation_memory_limit_bytes: int,
+        ):
+            if not fit_axis_ids or any(
+                not isinstance(axis_id, AxisId) for axis_id in fit_axis_ids
+            ):
+                raise ValueError("Figure Fit requires exact named display axes")
+            if authority_selection is not None and not isinstance(
+                authority_selection,
+                Selection,
+            ):
+                raise TypeError("Figure Fit selection must be Selection or None")
+            with _service_guard(self._authority_token) as services:
+                schema = source_schema(services, operation_memory_limit_bytes)
+            seed_spec = initial_fit_spec
+            if seed_spec is not None:
+                if seed_spec.input_schema_fingerprint != schema.fingerprint:
+                    raise ValueError("initial FitSpec belongs to another source schema")
+                if seed_spec.fit_axis_ids != tuple(fit_axis_ids):
+                    raise ValueError(
+                        "displayed named Fit axes differ from the initial FitSpec"
+                    )
+            from zlc_frontend import (
+                fit_authoring_option,
+                fit_authoring_option_additional_peak_upper_bound_nbytes,
+            )
+
+            options = []
+            retained_options = 0
             for definition in fit_model_catalog():
                 try:
-                    spec = fit_spec_for(
+                    remaining = operation_memory_limit_bytes - retained_options
+                    if remaining <= 0:
+                        raise MemoryError(
+                            "Fit authoring options exceed the operation memory limit"
+                        )
+                    bound = suggest_fit_draft(
                         schema,
                         definition.model_id,
-                        committed_transform=frozen_transform,
+                        fit_axis_ids=tuple(fit_axis_ids),
+                        selection=authority_selection,
+                        constraints=(
+                            seed_spec.constraints
+                            if seed_spec is not None
+                            and definition.model_id == seed_spec.model_id
+                            else ()
+                        ),
+                        numeric_policy=(
+                            seed_spec.numeric_policy
+                            if seed_spec is not None
+                            and definition.model_id == seed_spec.model_id
+                            else FitNumericPolicy()
+                        ),
+                        binding_memory_limit_bytes=remaining,
                     )
-                    bound = bind_fit(spec, schema)
-                    if frozen_transform is not None:
-                        selection_fit_view_projection(bound)
+                    if (
+                        seed_spec is not None
+                        and definition.model_id == seed_spec.model_id
+                        and bound.spec.committed_transform
+                        == seed_spec.committed_transform
+                    ):
+                        required = fit_binding_additional_peak_upper_bound_nbytes(
+                            seed_spec,
+                            schema,
+                        )
+                        incumbent_retained = (
+                            fit_binding_retained_upper_bound_nbytes(
+                                bound.spec,
+                                bound.expected_schema,
+                            )
+                        )
+                        if incumbent_retained + required > remaining:
+                            raise MemoryError(
+                                "initial FitSpec binding exceeds the operation memory limit"
+                            )
+                        del bound
+                        bound = bind_fit(seed_spec, schema)
                 except ValueError:
                     continue
-                if bound.spec.committed_transform != frozen_transform:
-                    raise RuntimeError(
-                        "fit option differs from the frozen transform authority"
+                bound_retained = fit_binding_retained_upper_bound_nbytes(
+                    bound.spec,
+                    bound.expected_schema,
+                )
+                option_peak = (
+                    fit_authoring_option_additional_peak_upper_bound_nbytes(
+                        bound
                     )
-                options.append(bound)
+                )
+                if (
+                    retained_options + bound_retained + option_peak
+                    > operation_memory_limit_bytes
+                ):
+                    raise MemoryError(
+                        "Fit authoring projection exceeds the operation memory limit"
+                    )
+                option = fit_authoring_option(bound)
+                retained_options += option.retained_upper_bound_bytes
+                if retained_options > operation_memory_limit_bytes:
+                    raise MemoryError(
+                        "Fit authoring options exceed the operation memory limit"
+                    )
+                options.append(option)
+                del bound
             if not options:
                 raise ValueError(
-                    "capture schema and committed transform have no unambiguous "
-                    "displayable current fit model; use fit() with explicit "
-                    "fit_axis_ids for non-displayable transforms"
+                    "the displayed named axes and selection have no compatible Fit model"
                 )
-            if selected_model is not None and selected_model not in {
+            if chosen_model is not None and chosen_model not in {
                 option.spec.model_id for option in options
             }:
                 raise ValueError(
-                    f"fit model {selected_model!r} is not unambiguous for this "
-                    "capture schema"
+                    f"Fit model {chosen_model!r} is not compatible with this panel"
                 )
             return tuple(options)
 
@@ -2440,74 +2812,213 @@ class Experiment:
             spec: FitSpec,
             cancel_check,
             deadline_monotonic: float,
+            operation_memory_limit_bytes: int,
         ) -> FitExecution:
             if not isinstance(spec, FitSpec):
-                raise TypeError("fit GUI execution requires FitSpec")
-            if spec.committed_transform != frozen_transform:
-                raise ValueError(
-                    "fit GUI spec differs from the frozen transform authority"
-                )
-            with _fit_service_guard(self._authority_token) as services:
-                admitted = services.capture_repository.admit(source)
-                schema = admitted.artifact.frame_source.schema
-                if spec.input_schema_fingerprint != schema.fingerprint:
-                    raise ValueError("fit GUI spec belongs to another source schema")
-                bound = bind_fit(spec, schema)
-                if frozen_transform is not None:
-                    selection_fit_view_projection(bound)
-                return services.fit_repository.execute(
-                    admitted,
-                    spec,
-                    cancel_check=cancel_check,
-                    deadline_monotonic=deadline_monotonic,
-                )
-
-        def preview_fit_result(
-            result: FitResultBatch,
-            *,
-            memory_limit_bytes: int,
-        ) -> "DataFigure":
-            preview_limit = _positive_int(
-                memory_limit_bytes,
-                "memory_limit_bytes",
+                raise TypeError("Figure Fit execution requires FitSpec")
+            operation_limit = _positive_int(
+                operation_memory_limit_bytes,
+                "operation_memory_limit_bytes",
             )
-            if not isinstance(result, FitResultBatch):
-                raise TypeError("fit preview requires FitResultBatch")
-            with _service_guard(self._authority_token) as services:
-                return _data_figure_for_services(
-                    services,
-                    source,
-                    intent=None,
-                    selection=None,
-                    preferences=None,
-                    occupancy_output=None,
-                    memory_limit_bytes=preview_limit,
-                    draft_fit_result=result,
+            with _fit_service_guard(self._authority_token) as services:
+                def combined_cancel_check() -> bool:
+                    with services.operation_lock:
+                        closing = services.state != "OPEN"
+                    return closing or bool(cancel_check())
+
+                if isinstance(fit_source, CaptureArtifactRef):
+                    return services.fit_repository.execute_capture(
+                        services.capture_repository,
+                        fit_source,
+                        spec,
+                        memory_limit_bytes=operation_limit,
+                        cancel_check=combined_cancel_check,
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                return services.fit_repository.execute_scan(
+                    services.scan_repository,
+                    fit_source,
+                    spec,
+                    memory_limit_bytes=operation_limit,
+                    cancel_check=combined_cancel_check,
+                    deadline_monotonic=deadline_monotonic,
                 )
 
         def save_fit_execution(
             execution: FitExecution,
-        ) -> CaptureFitResultArtifactRef:
+            operation_memory_limit_bytes: int,
+        ) -> FitResultArtifactRef:
             if not isinstance(execution, FitExecution):
-                raise TypeError("fit save requires FitExecution")
-            if execution.source_capture_ref != source:
-                raise ValueError("fit save execution belongs to another capture")
+                raise TypeError("Fit save requires FitExecution")
+            if execution.source_artifact_ref != fit_source:
+                raise ValueError("Fit execution belongs to another source artifact")
+            save_limit = _positive_int(
+                operation_memory_limit_bytes,
+                "operation_memory_limit_bytes",
+            )
             with _service_guard(self._authority_token):
-                return execution.save()
+                return execution.save(
+                    operation_memory_limit_bytes=save_limit,
+                )
 
-        from Zou_lab_control.workbench import open_capture_fit_workbench
+        def reload_fit_result(
+            reference: FitResultArtifactRef,
+            operation_memory_limit_bytes: int,
+        ) -> FitResultBatch:
+            reload_limit = _positive_int(
+                operation_memory_limit_bytes,
+                "operation_memory_limit_bytes",
+            )
+            with _service_guard(self._authority_token) as services:
+                admitted = services.fit_repository.load(
+                    reference,
+                    capture_repository=services.capture_repository,
+                    scan_repository=services.scan_repository,
+                    memory_limit_bytes=reload_limit,
+                )
+            if admitted.source_artifact_ref != fit_source:
+                raise ValueError("saved Fit reopened against another source artifact")
+            return admitted.result
 
-        return open_capture_fit_workbench(
-            self.figure,
-            preview_fit_result,
-            prepare_fit,
-            execute_fit,
-            save_fit_execution,
-            source,
-            selected_model=selected_model,
-            committed_transform=frozen_transform,
+        figure_factory = self.figure
+        if direct_fit_single_panel:
+            if display_source != fit_source:
+                raise ValueError(
+                    "direct Fit single-panel display requires its exact source artifact"
+                )
+
+            def figure_factory(
+                source,
+                *,
+                intent,
+                selection,
+                preferences,
+                occupancy_output=None,
+                memory_limit_bytes,
+            ):
+                """Resolve the labelled display cell on the Figure worker."""
+
+                if source != fit_source:
+                    raise ValueError("direct Fit Figure loader received another source")
+                figure_limit = _positive_int(
+                    memory_limit_bytes,
+                    "memory_limit_bytes",
+                )
+                with _service_guard(self._authority_token) as services:
+                    inspected = inspect_source(services, figure_limit)
+                    if isinstance(fit_source, CaptureArtifactRef):
+                        schema = inspected.dataset_schema
+                        dataset_ref = inspected.dataset_revision_ref
+                    else:
+                        schema = inspected.output_schema
+                        dataset_ref = inspected.output_dataset_ref
+                    del inspected
+                    seed_document, _datasets, _fit_result = (
+                        _project_notebook_figure(
+                            services,
+                            source,
+                            intent=intent,
+                            selection=selection,
+                            preferences=preferences,
+                            occupancy_output=occupancy_output,
+                            memory_limit_bytes=None,
+                            preinspected_schema=schema,
+                            preinspected_dataset_ref=dataset_ref,
+                        )
+                    )
+                    from zlc_frontend.figure import (
+                        fit_single_panel_presentation,
+                    )
+                    from zlc_frontend import (
+                        figure_document_retained_upper_bound_nbytes,
+                    )
+
+                    metadata_required = (
+                        dataset_schema_retained_upper_bound_nbytes(schema)
+                        + figure_document_retained_upper_bound_nbytes(seed_document)
+                    )
+                    if metadata_required > figure_limit:
+                        raise MemoryError(
+                            "direct Fit display metadata exceeds the Figure budget"
+                        )
+
+                    display_selection, display_preferences = (
+                        fit_single_panel_presentation(
+                            schema,
+                            seed_document.layers[0].view,
+                            preferences,
+                        )
+                    )
+                    del schema, dataset_ref, seed_document
+                    return _data_figure_for_services(
+                        services,
+                        source,
+                        intent=intent,
+                        selection=display_selection,
+                        preferences=display_preferences,
+                        occupancy_output=occupancy_output,
+                        memory_limit_bytes=figure_limit,
+                    )
+
+        from Zou_lab_control.workbench import open_figure_workbench
+
+        return open_figure_workbench(
+            figure_factory,
+            display_source,
+            intent=intent,
+            selection=selection,
+            preferences=preferences,
+            occupancy_output=occupancy_output,
             memory_limit_bytes=limit,
-            timeout_seconds=timeout,
+            fit_preparer=prepare_fit,
+            fit_executor=execute_fit,
+            fit_saver=save_fit_execution,
+            fit_reloader=reload_fit_result,
+            fit_selected_model=chosen_model,
+            fit_initial_selection=initial_selection,
+            open_fit_analysis=open_analysis,
+            fit_timeout_seconds=timeout,
+            initial_fit_result_identity=initial_fit_result_identity,
+        )
+
+    def fit_gui(
+        self,
+        source: CaptureArtifactRef | ScanArtifactRef,
+        *,
+        model: str | None = None,
+        committed_transform: CommittedTransform | None = None,
+        memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
+        timeout_seconds: float = _DEFAULT_FIT_GUI_TIMEOUT_SECONDS,
+    ):
+        """Open the same DataFigure host with its Analysis tab selected."""
+
+        if not isinstance(source, (CaptureArtifactRef, ScanArtifactRef)):
+            raise TypeError("source must be CaptureArtifactRef or ScanArtifactRef")
+        initial_selection = None
+        if committed_transform is not None:
+            if not isinstance(committed_transform, CommittedTransform):
+                raise TypeError(
+                    "committed_transform must be CommittedTransform or None"
+                )
+            operations = committed_transform.spec.operations
+            if len(operations) != 1 or not isinstance(operations[0], Selection):
+                raise ValueError(
+                    "fit_gui accepts only one range-preserving Selection transform"
+                )
+            initial_selection = operations[0]
+        return self._open_fit_capable_figure_gui(
+            source,
+            source,
+            intent=None,
+            selection=None,
+            preferences=None,
+            occupancy_output=None,
+            memory_limit_bytes=memory_limit_bytes,
+            selected_model=model,
+            initial_selection=initial_selection,
+            open_analysis=True,
+            timeout_seconds=timeout_seconds,
+            direct_fit_single_panel=True,
         )
 
     def figure_document(
@@ -2517,8 +3028,8 @@ class Experiment:
             | OccupancyArtifactRef
             | CaptureArtifactRef
             | FitExecution
-            | CaptureFitResultArtifactRef
-            | AdmittedCaptureFitResult
+            | FitResultArtifactRef
+            | AdmittedFitResult
         ),
         *,
         intent: "ViewIntent | None" = None,
@@ -2551,8 +3062,8 @@ class Experiment:
             | OccupancyArtifactRef
             | CaptureArtifactRef
             | FitExecution
-            | CaptureFitResultArtifactRef
-            | AdmittedCaptureFitResult
+            | FitResultArtifactRef
+            | AdmittedFitResult
         ),
         *,
         intent: "ViewIntent | None" = None,
@@ -2582,8 +3093,8 @@ class Experiment:
             | OccupancyArtifactRef
             | CaptureArtifactRef
             | FitExecution
-            | CaptureFitResultArtifactRef
-            | AdmittedCaptureFitResult
+            | FitResultArtifactRef
+            | AdmittedFitResult
         ),
         *,
         intent: "ViewIntent | None" = None,
@@ -2595,7 +3106,7 @@ class Experiment:
         """Resolve and show one frozen figure without blocking the notebook GUI."""
 
         if (
-            isinstance(source, CaptureFitResultArtifactRef)
+            isinstance(source, FitResultArtifactRef)
             and intent is None
             and selection is None
             and preferences is None
@@ -2635,45 +3146,256 @@ class Experiment:
                         "saved-fit view session changed worker thread"
                     )
                 with _service_guard(authority_token) as services:
-                    from zlc_frontend import FitGridModel
+                    from zlc_frontend import (
+                        FitGridModel,
+                        figure_document_retained_upper_bound_nbytes,
+                        fit_grid_model_retained_upper_bound_nbytes,
+                        fit_grid_navigation_retained_upper_bound_nbytes,
+                    )
+                    from zlc_frontend.figure import (
+                        estimate_view_evaluation_peak_nbytes,
+                    )
 
                     if session_admitted is None:
+                        if view_limit <= _SAVED_FIT_GRID_FIXED_BYTES:
+                            raise MemoryError(
+                                "saved-fit fixed session state exceeds the total budget"
+                            )
                         admitted = services.fit_repository.load(
                             reference,
-                            services.capture_repository,
-                            memory_limit_bytes=view_limit,
-                        )
-                        model = FitGridModel.from_result(
-                            reference.target_ref,
-                            admitted.result,
-                        )
-                        source_admitted = services.capture_repository.admit(
-                            admitted.source_capture_ref
+                            capture_repository=services.capture_repository,
+                            scan_repository=services.scan_repository,
+                            memory_limit_bytes=(
+                                view_limit - _SAVED_FIT_GRID_FIXED_BYTES
+                            ),
                         )
                         fit_bytes = fit_result_retained_upper_bound_nbytes(
                             admitted.result
                         )
-                        source_bytes = dataset_storage_nbytes(
-                            source_admitted.artifact.frame_source.schema
+                        model_bound = fit_grid_model_retained_upper_bound_nbytes(
+                            reference.target_ref,
+                            admitted.result,
                         )
-                        retained_bytes = fit_bytes + source_bytes + (64 << 10)
+                        navigation_bound = (
+                            fit_grid_navigation_retained_upper_bound_nbytes(
+                                admitted.result
+                            )
+                        )
+                        if (
+                            _SAVED_FIT_GRID_FIXED_BYTES
+                            + fit_bytes
+                            + model_bound
+                            + navigation_bound
+                            > view_limit
+                        ):
+                            raise MemoryError(
+                                "saved-fit result and compact model exceed the total budget"
+                            )
+                        model = FitGridModel.from_result(
+                            reference.target_ref,
+                            admitted.result,
+                        )
+                        if model.retained_upper_bound_bytes > model_bound:
+                            raise RuntimeError(
+                                "saved-fit compact model exceeded its preflight bound"
+                            )
+                        source_ref = admitted.source_artifact_ref
+                        if cell_selection is None:
+                            page = model.page(page_address)
+                            resolved_selection = page.selection
+                            resolved_preferences = page.preferences
+                            cell_summary = None
+                        else:
+                            if page_address is not None:
+                                raise ValueError(
+                                    "saved-fit view cannot request a page and cell together"
+                                )
+                            model.resolve_selection(cell_selection)
+                            page = None
+                            resolved_selection = cell_selection
+                            resolved_preferences = model.focus_preferences()
+                            cell_summary = model.cell_summary(
+                                admitted.result,
+                                cell_selection,
+                            )
+
+                        source_planning_limit = (
+                            view_limit
+                            - _SAVED_FIT_GRID_FIXED_BYTES
+                            - fit_bytes
+                            - model_bound
+                            - navigation_bound
+                        )
+                        if source_planning_limit <= 0:
+                            raise MemoryError(
+                                "saved-fit session leaves no source budget"
+                            )
+                        if isinstance(source_ref, CaptureArtifactRef):
+                            inspection = services.capture_repository.inspect_final(
+                                source_ref,
+                                memory_limit_bytes=source_planning_limit,
+                            )
+                            schema = inspection.dataset_schema
+                            dataset_ref = inspection.dataset_revision_ref
+                        elif isinstance(source_ref, ScanArtifactRef):
+                            inspection = services.scan_repository.inspect_final(
+                                source_ref,
+                                memory_limit_bytes=source_planning_limit,
+                            )
+                            schema = inspection.output_schema
+                            dataset_ref = inspection.output_dataset_ref
+                        else:
+                            raise TypeError("fit source artifact kind is not current")
+
+                        transform_peak = (
+                            0
+                            if admitted.result.spec.committed_transform is None
+                            else fit_transform_resolution_additional_peak_upper_bound_nbytes(
+                                schema
+                            )
+                        )
+                        validation_peak = (
+                            fit_result_source_validation_additional_peak_upper_bound_nbytes(
+                                admitted.result,
+                                schema,
+                            )
+                        )
+                        planning_required = (
+                            _SAVED_FIT_GRID_FIXED_BYTES
+                            + fit_bytes
+                            + model_bound
+                            + navigation_bound
+                            + inspection.inspection_retained_upper_bound_bytes
+                            + max(transform_peak, validation_peak)
+                        )
+                        if planning_required > view_limit:
+                            raise MemoryError(
+                                "saved-fit source/view planning exceeds the total budget"
+                            )
+                        provisional_document, _unused_datasets, _unused_fit = (
+                            _project_notebook_figure(
+                                services,
+                                source_ref,
+                                intent=None,
+                                selection=resolved_selection,
+                                preferences=resolved_preferences,
+                                occupancy_output=None,
+                                memory_limit_bytes=None,
+                                draft_fit_result=admitted.result,
+                                preinspected_schema=schema,
+                                preinspected_dataset_ref=dataset_ref,
+                            )
+                        )
+                        document_bytes = (
+                            figure_document_retained_upper_bound_nbytes(
+                                provisional_document
+                            )
+                        )
+                        document_planning_required = (
+                            _SAVED_FIT_GRID_FIXED_BYTES
+                            + fit_bytes
+                            + model_bound
+                            + navigation_bound
+                            + inspection.inspection_retained_upper_bound_bytes
+                            + document_bytes
+                        )
+                        if document_planning_required > view_limit:
+                            raise MemoryError(
+                                "saved-fit provisional Figure metadata exceeds the total budget"
+                            )
+                        evaluation_peak = estimate_view_evaluation_peak_nbytes(
+                            schema,
+                            provisional_document.layers[0].view,
+                        )
+                        source_bytes = dataset_storage_nbytes(schema)
+                        schema_bytes = dataset_schema_retained_upper_bound_nbytes(
+                            schema
+                        )
+                        figure_residual = (
+                            view_limit
+                            - _SAVED_FIT_GRID_FIXED_BYTES
+                            - fit_bytes
+                            - model_bound
+                            - navigation_bound
+                            - source_bytes
+                            - schema_bytes
+                        )
+                        figure_planning_peak = max(
+                            transform_peak,
+                            document_bytes
+                            + max(validation_peak, evaluation_peak),
+                        )
+                        if figure_residual < figure_planning_peak:
+                            raise MemoryError(
+                                "saved-fit source and metadata leave no bounded Figure view"
+                            )
+                        materialization_peak = (
+                            _SAVED_FIT_GRID_FIXED_BYTES
+                            + fit_bytes
+                            + model_bound
+                            + navigation_bound
+                            + inspection.materialization_peak_upper_bound_bytes
+                        )
+                        if materialization_peak > view_limit:
+                            raise MemoryError(
+                                "saved-fit source materialization exceeds the total budget"
+                            )
+                        del (
+                            provisional_document,
+                            inspection,
+                            schema,
+                            dataset_ref,
+                            _unused_datasets,
+                            _unused_fit,
+                        )
                         materialize_limit = (
                             view_limit
+                            - _SAVED_FIT_GRID_FIXED_BYTES
                             - fit_bytes
-                            - model.retained_upper_bound_bytes
+                            - model_bound
+                            - navigation_bound
+                        )
+                        if isinstance(source_ref, CaptureArtifactRef):
+                            snapshot = services.capture_repository.materialize_final(
+                                source_ref,
+                                memory_limit_bytes=materialize_limit,
+                            )
+                        else:
+                            snapshot = services.scan_repository.materialize(
+                                source_ref,
+                                memory_limit_bytes=materialize_limit,
+                            ).snapshot
+                        actual_source_bytes = dataset_storage_nbytes(
+                            snapshot.block.schema
+                        )
+                        actual_schema_bytes = (
+                            dataset_schema_retained_upper_bound_nbytes(
+                                snapshot.block.schema
+                            )
+                        )
+                        if (
+                            actual_source_bytes > source_bytes
+                            or actual_schema_bytes > schema_bytes
+                        ):
+                            raise RuntimeError(
+                                "saved-fit materialized source exceeded inspected bounds"
+                            )
+                        retained_bytes = (
+                            _SAVED_FIT_GRID_FIXED_BYTES
+                            + fit_bytes
+                            + source_bytes
+                            + schema_bytes
+                            + navigation_bound
                         )
                         figure_limit = (
                             view_limit
                             - retained_bytes
-                            - model.retained_upper_bound_bytes
+                            - model_bound
                         )
-                        if materialize_limit <= 0 or figure_limit <= 0:
+                        if figure_limit <= 0:
                             raise MemoryError(
-                                "saved-fit session leaves no source/view budget"
+                                "saved-fit session leaves no view budget"
                             )
-                        snapshot = source_admitted.materialize_snapshot(
-                            memory_limit_bytes=materialize_limit,
-                        )
                     else:
                         admitted = session_admitted
                         snapshot = session_snapshot
@@ -2681,24 +3403,24 @@ class Experiment:
                         retained_bytes = session_retained_bytes
                         figure_limit = view_limit
                         assert snapshot is not None and model is not None
-                    if cell_selection is None:
-                        page = model.page(page_address)
-                        resolved_selection = page.selection
-                        resolved_preferences = page.preferences
-                        cell_summary = None
-                    else:
-                        if page_address is not None:
-                            raise ValueError(
-                                "saved-fit view cannot request a page and cell together"
+                        if cell_selection is None:
+                            page = model.page(page_address)
+                            resolved_selection = page.selection
+                            resolved_preferences = page.preferences
+                            cell_summary = None
+                        else:
+                            if page_address is not None:
+                                raise ValueError(
+                                    "saved-fit view cannot request a page and cell together"
+                                )
+                            model.resolve_selection(cell_selection)
+                            page = None
+                            resolved_selection = cell_selection
+                            resolved_preferences = model.focus_preferences()
+                            cell_summary = model.cell_summary(
+                                admitted.result,
+                                cell_selection,
                             )
-                        model.resolve_selection(cell_selection)
-                        page = None
-                        resolved_selection = cell_selection
-                        resolved_preferences = model.focus_preferences()
-                        cell_summary = model.cell_summary(
-                            admitted.result,
-                            cell_selection,
-                        )
                     figure = _data_figure_for_services(
                         services,
                         admitted,
@@ -2717,16 +3439,107 @@ class Experiment:
                         session_retained_bytes = retained_bytes
                 return figure, model, page, cell_summary, retained_bytes
 
+            def open_saved_fit_refit(reference, cell_selection):
+                if reference != source:
+                    raise ValueError("saved-fit refit received another artifact ref")
+                admitted = session_admitted
+                model = session_model
+                if admitted is None or model is None:
+                    raise RuntimeError("saved-fit refit requires an admitted grid session")
+                model.resolve_selection(cell_selection)
+                result = admitted.result
+                fit_source = admitted.source_artifact_ref
+                transform = result.spec.committed_transform
+                authority_selection = None
+                if transform is not None:
+                    operations = transform.spec.operations
+                    if len(operations) != 1 or not isinstance(
+                        operations[0], Selection
+                    ):
+                        raise ValueError(
+                            "saved Fit refit requires its exact range-preserving "
+                            "Selection authority"
+                        )
+                    authority_selection = operations[0]
+                return self._open_fit_capable_figure_gui(
+                    fit_source,
+                    fit_source,
+                    intent=None,
+                    # The focused batch cell chooses only the displayed source panel.
+                    selection=cell_selection,
+                    preferences=model.focus_preferences(),
+                    occupancy_output=None,
+                    memory_limit_bytes=limit,
+                    selected_model=result.spec.model_id,
+                    initial_fit_spec=result.spec,
+                    initial_selection=authority_selection,
+                    open_analysis=True,
+                )
+
             from Zou_lab_control.workbench import open_saved_fit_grid_workbench
 
             return open_saved_fit_grid_workbench(
                 load_saved_fit_grid_view,
+                open_saved_fit_refit,
                 source,
                 memory_limit_bytes=limit,
             )
 
+        if isinstance(source, (CaptureArtifactRef, ScanArtifactRef)):
+            return self._open_fit_capable_figure_gui(
+                source,
+                source,
+                intent=intent,
+                selection=selection,
+                preferences=preferences,
+                occupancy_output=occupancy_output,
+                memory_limit_bytes=memory_limit_bytes,
+            )
+
+        if isinstance(source, (FitExecution, AdmittedFitResult)):
+            result = source.result
+            transform = result.spec.committed_transform
+            initial_authority_selection = None
+            if transform is not None:
+                operations = transform.spec.operations
+                if len(operations) != 1 or not isinstance(
+                    operations[0], Selection
+                ):
+                    raise ValueError(
+                        "Fit result analysis requires its exact range-preserving "
+                        "Selection authority"
+                    )
+                initial_authority_selection = operations[0]
+            if isinstance(source, AdmittedFitResult):
+                identity = (
+                    f"{source.reference.repository_id}:"
+                    f"{source.reference.manifest_digest}"
+                )
+                fit_source = source.source_artifact_ref
+            else:
+                identity = f"draft-execution:{id(source):x}"
+                fit_source = source.source_artifact_ref
+            return self._open_fit_capable_figure_gui(
+                source,
+                fit_source,
+                intent=intent,
+                selection=selection,
+                preferences=preferences,
+                occupancy_output=occupancy_output,
+                memory_limit_bytes=memory_limit_bytes,
+                selected_model=result.spec.model_id,
+                initial_fit_spec=result.spec,
+                initial_selection=initial_authority_selection,
+                initial_fit_result_identity=identity,
+            )
+
         from Zou_lab_control.workbench import open_figure_workbench
 
+        initial_identity = (
+            f"{source.repository_id}:{source.manifest_digest}"
+            if isinstance(source, FitResultArtifactRef)
+            else None
+        )
         return open_figure_workbench(
             self.figure,
             source,
@@ -2735,6 +3548,7 @@ class Experiment:
             preferences=preferences,
             occupancy_output=occupancy_output,
             memory_limit_bytes=memory_limit_bytes,
+            initial_fit_result_identity=initial_identity,
         )
 
     def close(self) -> None:
@@ -2745,12 +3559,23 @@ class Experiment:
         with services.operation_lock:
             if services.state == "CLOSED":
                 return
-            services.state = "CLOSING"
-            if services.active_fit_operations:
+            if services.fit_operation_thread_counts.get(threading.get_ident(), 0):
                 raise RuntimeError(
-                    "Experiment close is waiting for an active Fit operation "
-                    "to terminate"
+                    "Experiment cannot close reentrantly from its active Fit operation"
                 )
+            services.state = "CLOSING"
+            fit_operations_drained = services.fit_operations_drained
+        # A Figure Fit owns repository borrows outside the short composition
+        # lock.  Closing flips the state first (its cancel check observes that
+        # transition), then waits without holding the lock needed by the Fit's
+        # finally block.  One context-manager exit therefore completes cleanup;
+        # it never leaves a half-closed Experiment requiring a second close().
+        fit_operations_drained.wait()
+        with services.operation_lock:
+            if services.state == "CLOSED":
+                return
+            if services.active_fit_operations:
+                raise RuntimeError("Fit drain event disagrees with operation count")
             shutdown = services.runtime.shutdown(timeout=2.0)
             if not shutdown:
                 raise RuntimeError(
@@ -3389,7 +4214,7 @@ def connect(
         from zlc_neutral_atom.scan.repository import ScanRepository
 
         scan_repository = ScanRepository(repository_root / "scans")
-        fit_repository = CaptureFitResultRepository(repository_root / "fits")
+        fit_repository = FitResultRepository(repository_root / "fits")
         from zlc_neutral_atom.bootstrap._installation import (
             create_virtual_installation,
         )
@@ -3401,6 +4226,8 @@ def connect(
             seed=seed,
         )
         catalog = runtime.device_catalog
+        fit_operations_drained = threading.Event()
+        fit_operations_drained.set()
         services = _ExperimentServices(
             runtime=runtime,
             capture_repository=capture_repository,
@@ -3412,6 +4239,8 @@ def connect(
             fit_repository=fit_repository,
             catalog=catalog,
             operation_lock=threading.RLock(),
+            fit_operations_drained=fit_operations_drained,
+            fit_operation_thread_counts={},
         )
         token = object()
         experiment = Experiment(token, name=canonical_name, device_catalog=catalog)
@@ -3437,7 +4266,7 @@ def connect(
 
 
 __all__ = [
-    "AdmittedCaptureFitResult",
+    "AdmittedFitResult",
     "BackgroundMode",
     "BoxReducer",
     "CalibrationAnalysisRequest",
@@ -3447,7 +4276,7 @@ __all__ = [
     "CameraMonitorDescriptor",
     "CameraMonitorRequest",
     "CaptureArtifactRef",
-    "CaptureFitResultArtifactRef",
+    "FitResultArtifactRef",
     "CaptureRequest",
     "connect",
     "DetectionRequest",

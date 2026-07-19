@@ -1312,6 +1312,47 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise RuntimeError("rectangle gesture origin is stale for this panel binding")
         return viewport.selection_for_normalized_bounds(gesture.normalized_bounds)
 
+    def selection_for_curve_range_gesture(
+        self,
+        gesture: CurveRangeGesture,
+    ) -> Selection:
+        """Resolve one painted CURVE span while its exact origin is held.
+
+        Axis identity and coordinate frame come from the immutable payload that
+        was actually under the pointer.  The helper never infers an axis from
+        array rank, current zoom, or a later front, and a cleared span is not an
+        authority candidate.
+        """
+
+        self._require_owner()
+        if not isinstance(gesture, CurveRangeGesture):
+            raise TypeError("gesture must be CurveRangeGesture")
+        if gesture.x_span is None:
+            raise ValueError("a cleared curve span has no fit Selection")
+        hold = self._selector_hold
+        binding = self._numeric_bindings.get(gesture.origin.panel_id)
+        if (
+            hold is None
+            or binding is None
+            or binding.kind != "curve"
+            or binding.span_anchor is not None
+            or binding.pan_anchor is not None
+        ):
+            raise RuntimeError("curve range gesture has no completed held origin")
+        origin = self._numeric_interaction_origin(binding, hold=hold)
+        if gesture.origin != origin:
+            raise RuntimeError("curve range gesture differs from its held panel origin")
+        payload = hold.display_payload
+        if not isinstance(payload, CurvePanelPayload):
+            raise RuntimeError("curve range gesture lost its exact curve payload")
+        axis = payload.viewport.x_axis
+        return Selection.coordinate_range(
+            axis.axis_id,
+            gesture.x_span[0],
+            gesture.x_span[1],
+            coordinate_frame=axis.coordinate_frame,
+        )
+
     def bind_rectangle_selector(
         self,
         panel_id: str,

@@ -1,7 +1,11 @@
 """Target frontend public values with no implicit renderer or Qt import."""
 
 from .authority import describe_authoritative_transform
-from .data_figure import DataFigure, FigurePanelRegion
+from .data_figure import (
+    DataFigure,
+    FigurePanelRegion,
+    figure_document_retained_upper_bound_nbytes,
+)
 from .curve_display import (
     CurveDisplayState,
     CurveViewportTransform,
@@ -26,8 +30,19 @@ from .histogram_display import (
     histogram_display_with_x_view,
     histogram_home_x_limits,
 )
-from .fit_grid import FitGridCellSummary, FitGridModel, FitGridPage
-from .fit_image_projection import RadialGaussianImageFitPanel
+from .fit_grid import (
+    FitGridCellSummary,
+    FitGridModel,
+    FitGridPage,
+    bounded_coordinate_label,
+    fit_grid_model_retained_upper_bound_nbytes,
+    fit_grid_navigation_retained_upper_bound_nbytes,
+)
+from .fit_curve_projection import curve_fit_overlays_retained_nbytes
+from .fit_image_projection import (
+    RadialGaussianImageFitPanel,
+    radial_gaussian_image_fit_panel_retained_upper_bound_nbytes,
+)
 from .image_display import (
     ImageColormap,
     ImageDisplayState,
@@ -63,6 +78,9 @@ from .form import (
     parse_number_text,
 )
 from .fit_editor import (
+    FitAuthoringOption,
+    fit_authoring_option,
+    fit_authoring_option_additional_peak_upper_bound_nbytes,
     fit_authority_summary,
     fit_axis_summary,
     fit_constraint_form,
@@ -73,6 +91,7 @@ from .render import (
     BoardFrame,
     BoardPresenter,
     CoherenceStamp,
+    CurveFitOverlay,
     CurvePanelPayload,
     HistogramPanelPayload,
     ImagePanelPayload,
@@ -121,6 +140,7 @@ from .figure import (
     ViewSuggestion,
     contract_for,
     display_axis_indices,
+    fit_single_panel_presentation,
     decode_figure_document,
     decode_view_spec,
     encode_figure_document,
@@ -140,8 +160,10 @@ __all__ = [
     "AxisViewRole",
     "BoardFrame",
     "BoardPresenter",
+    "bounded_coordinate_label",
     "CoherenceStamp",
     "CurveDisplayState",
+    "CurveFitOverlay",
     "CurveInteractionIntent",
     "CurvePanelPayload",
     "CurveRangeGesture",
@@ -151,6 +173,7 @@ __all__ = [
     "DatasetDescriptor",
     "DatasetId",
     "DataFigure",
+    "figure_document_retained_upper_bound_nbytes",
     "DisplayReduction",
     "DisplayReductionMethod",
     "DisplayRange",
@@ -169,6 +192,7 @@ __all__ = [
     "FigureEvaluator",
     "FigureLayer",
     "FigurePanelRegion",
+    "FitAuthoringOption",
     "FigureSelection",
     "FixedIndex",
     "FormChoice",
@@ -178,10 +202,13 @@ __all__ = [
     "FitGridCellSummary",
     "FitGridModel",
     "FitGridPage",
+    "fit_grid_model_retained_upper_bound_nbytes",
+    "fit_grid_navigation_retained_upper_bound_nbytes",
     "ImageViewportTransform",
     "ImagePanelPayload",
     "RadialGaussianImageFitOverlay",
     "RadialGaussianImageFitPanel",
+    "radial_gaussian_image_fit_panel_retained_upper_bound_nbytes",
     "ImageColormap",
     "ImageColorLimitsCommit",
     "ImageDisplayState",
@@ -221,6 +248,7 @@ __all__ = [
     "contract_for",
     "describe_authoritative_transform",
     "display_axis_indices",
+    "fit_single_panel_presentation",
     "decode_figure_document",
     "decode_view_spec",
     "encode_figure_document",
@@ -230,6 +258,7 @@ __all__ = [
     "curve_display_form_values",
     "curve_display_from_form",
     "curve_display_with_x_view",
+    "curve_fit_overlays_retained_nbytes",
     "histogram_count_limits",
     "histogram_display_form_spec",
     "histogram_display_form_values",
@@ -244,6 +273,8 @@ __all__ = [
     "validated_display_range",
     "fit_axis_summary",
     "fit_authority_summary",
+    "fit_authoring_option",
+    "fit_authoring_option_additional_peak_upper_bound_nbytes",
     "fit_constraint_form",
     "fit_spec_from_form",
     "suggest_view",

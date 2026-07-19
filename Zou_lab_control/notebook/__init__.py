@@ -1,7 +1,7 @@
 """Notebook-first public API."""
 
 from .facade import (
-    AdmittedCaptureFitResult,
+    AdmittedFitResult,
     BackgroundMode,
     BoxReducer,
     CalibrationAnalysisRequest,
@@ -11,7 +11,7 @@ from .facade import (
     CameraMonitorDescriptor,
     CameraMonitorRequest,
     CaptureArtifactRef,
-    CaptureFitResultArtifactRef,
+    FitResultArtifactRef,
     CaptureRequest,
     connect,
     DetectionRequest,
@@ -38,7 +38,7 @@ from .facade import (
 )
 
 __all__ = [
-    "AdmittedCaptureFitResult",
+    "AdmittedFitResult",
     "BackgroundMode",
     "BoxReducer",
     "CalibrationAnalysisRequest",
@@ -48,7 +48,7 @@ __all__ = [
     "CameraMonitorDescriptor",
     "CameraMonitorRequest",
     "CaptureArtifactRef",
-    "CaptureFitResultArtifactRef",
+    "FitResultArtifactRef",
     "CaptureRequest",
     "connect",
     "DetectionRequest",

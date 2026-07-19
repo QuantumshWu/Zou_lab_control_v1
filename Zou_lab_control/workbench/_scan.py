@@ -171,7 +171,11 @@ class _FrozenScanApplication:
             summary += f" · selections={len(layer.view.display_selections)}"
         return FinalScanPresentation(
             source_ref,
-            figure.to_png_bytes(memory_limit_bytes=memory_limit_bytes),
+            # ``Experiment.figure`` has already partitioned the one operation
+            # budget across source/schema/document/evaluation and frozen the
+            # remaining render share.  Repassing the larger aggregate limit
+            # would attempt to weaken that admission contract.
+            figure.to_png_bytes(),
             summary,
         )
 

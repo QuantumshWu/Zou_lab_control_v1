@@ -19,42 +19,6 @@ def open_capture_workbench(experiment, request):
     return _open(experiment, request)
 
 
-def open_capture_fit_workbench(
-    figure_factory,
-    draft_figure_factory,
-    fit_preparer,
-    fit_executor,
-    fit_saver,
-    source,
-    *,
-    selected_model=None,
-    committed_transform=None,
-    memory_limit_bytes=None,
-    timeout_seconds=None,
-):
-    """Open typed committed-capture fit authoring without eager Qt imports."""
-
-    from ._fit import open_capture_fit_workbench as _open
-
-    keywords = {
-        "selected_model": selected_model,
-        "committed_transform": committed_transform,
-    }
-    if memory_limit_bytes is not None:
-        keywords["memory_limit_bytes"] = memory_limit_bytes
-    if timeout_seconds is not None:
-        keywords["timeout_seconds"] = timeout_seconds
-    return _open(
-        figure_factory,
-        draft_figure_factory,
-        fit_preparer,
-        fit_executor,
-        fit_saver,
-        source,
-        **keywords,
-    )
-
-
 def open_calibration_report_workbench(
     computation_loader,
     reference,
@@ -136,6 +100,15 @@ def open_figure_workbench(
     preferences=None,
     occupancy_output=None,
     memory_limit_bytes=None,
+    fit_preparer=None,
+    fit_executor=None,
+    fit_saver=None,
+    fit_reloader=None,
+    fit_selected_model=None,
+    fit_initial_selection=None,
+    open_fit_analysis=False,
+    fit_timeout_seconds=None,
+    initial_fit_result_identity=None,
 ):
     """Resolve and display one frozen artifact without blocking the Qt owner."""
 
@@ -150,11 +123,27 @@ def open_figure_workbench(
         options["occupancy_output"] = occupancy_output
     if memory_limit_bytes is not None:
         options["memory_limit_bytes"] = memory_limit_bytes
+    for name, value in (
+        ("fit_preparer", fit_preparer),
+        ("fit_executor", fit_executor),
+        ("fit_saver", fit_saver),
+        ("fit_reloader", fit_reloader),
+        ("fit_selected_model", fit_selected_model),
+        ("fit_initial_selection", fit_initial_selection),
+        ("initial_fit_result_identity", initial_fit_result_identity),
+    ):
+        if value is not None:
+            options[name] = value
+    if open_fit_analysis:
+        options["open_fit_analysis"] = True
+    if fit_timeout_seconds is not None:
+        options["fit_timeout_seconds"] = fit_timeout_seconds
     return _open(figure_factory, source, **options)
 
 
 def open_saved_fit_grid_workbench(
     view_loader,
+    refit_opener,
     reference,
     *,
     memory_limit_bytes=None,
@@ -164,9 +153,10 @@ def open_saved_fit_grid_workbench(
     from ._fit_grid import open_saved_fit_grid_workbench as _open
 
     if memory_limit_bytes is None:
-        return _open(view_loader, reference)
+        return _open(view_loader, refit_opener, reference)
     return _open(
         view_loader,
+        refit_opener,
         reference,
         memory_limit_bytes=memory_limit_bytes,
     )
@@ -219,7 +209,6 @@ __all__ = [
     "open_calibration_workbench",
     "open_calibration_report_workbench",
     "open_camera_monitor_workbench",
-    "open_capture_fit_workbench",
     "open_capture_workbench",
     "open_data_figure_workbench",
     "open_figure_workbench",

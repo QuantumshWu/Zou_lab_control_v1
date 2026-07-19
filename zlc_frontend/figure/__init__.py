@@ -19,6 +19,7 @@ from .contract import (
     contract_for,
     dataset_axes,
     display_axis_indices,
+    fit_single_panel_presentation,
     selection_fit_view_projection,
     validate_view_spec,
 )
@@ -88,7 +89,7 @@ __all__ = [
     "METER_CONTRACT", "ReductionResolution", "RepeatViewMode", "ResolvedDataset",
     "ResolvedDatasetMap", "SampleCoordinates", "SuggestionStatus", "VIEW_CONTRACTS",
     "ViewAlternative", "ViewContract", "ViewIntent", "ViewPreferences", "ViewSpec",
-    "ViewSuggestion", "contract_for", "dataset_axes", "display_axis_indices", "decode_figure_document",
+    "ViewSuggestion", "contract_for", "dataset_axes", "display_axis_indices", "fit_single_panel_presentation", "decode_figure_document",
     "decode_view_spec", "encode_figure_document", "encode_view_spec",
     "figure_document_from_tree", "figure_document_to_tree", "suggest_fit_view", "suggest_view",
     "estimate_view_evaluation_peak_nbytes",

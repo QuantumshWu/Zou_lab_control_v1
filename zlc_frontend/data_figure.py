@@ -4,17 +4,29 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from dataclasses import fields, is_dataclass
+from enum import Enum
 from io import BytesIO
 import math
 from numbers import Integral
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from zlc_data import FitResultBatch, Selection, validate_fit_result_source_binding
+import numpy as np
+
+from zlc_data import (
+    DatasetSchema,
+    FitResultBatch,
+    Selection,
+    dataset_schema_retained_upper_bound_nbytes,
+    fit_result_source_validation_additional_peak_upper_bound_nbytes,
+    validate_fit_result_source_binding,
+)
 from zlc_storage import canonical_text
 
 from .figure import (
     AxisViewRole,
+    DatasetId,
     FigureDocument,
     FigureEvaluator,
     FigureEvaluationPolicy,
@@ -24,7 +36,9 @@ from .figure import (
 from .figure.contract import _validate_selection_fit_view
 
 if TYPE_CHECKING:
+    from .fit_curve_projection import CurveFitOverlayPlan
     from .fit_image_projection import RadialGaussianImageFitPanel
+    from .render import RadialGaussianImageFitOverlay
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +89,193 @@ class FigurePanelRegion:
         )
 
 
+def _validated_fit_result_mapping(
+    document: FigureDocument,
+    evaluated,
+    source_schemas: tuple[tuple[DatasetId, DatasetSchema], ...],
+    fit_results: Mapping[str, FitResultBatch] | None,
+    *,
+    source_bindings_validated: bool = False,
+    selection_views_validated: bool = False,
+) -> tuple[tuple[str, FitResultBatch], ...]:
+    """Validate overlays entirely from frozen schema/ref/evaluation facts."""
+
+    supplied = {} if fit_results is None else dict(fit_results)
+    if any(not isinstance(key, str) or not key for key in supplied):
+        raise TypeError("fit_results keys must be non-empty layer ids")
+    if any(not isinstance(value, FitResultBatch) for value in supplied.values()):
+        raise TypeError("fit_results values must be FitResultBatch")
+    if (
+        document.document_id != evaluated.document_id
+        or document.revision != evaluated.document_revision
+    ):
+        raise ValueError("document and evaluated data identities differ")
+
+    layers = {layer.layer_id: layer for layer in document.layers}
+    evaluated_inputs = {item.dataset_id: item for item in evaluated.inputs}
+    schemas = dict(source_schemas)
+    fit_layers = {}
+    for layer_id, result in supplied.items():
+        try:
+            layer = layers[layer_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"fit overlay references unknown layer {layer_id!r}"
+            ) from exc
+        try:
+            evaluated_input = evaluated_inputs[layer.dataset_id]
+            source_schema = schemas[layer.dataset_id]
+        except KeyError as exc:
+            raise ValueError("fit layer source metadata is absent") from exc
+        if (
+            result.spec.committed_transform is not None
+            and not selection_views_validated
+        ):
+            try:
+                _validate_selection_fit_view(
+                    source_schema,
+                    result,
+                    layer.view,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "transformed fit overlay is not faithfully displayable: "
+                    f"{exc}"
+                ) from exc
+        if not source_bindings_validated:
+            validate_fit_result_source_binding(
+                result,
+                evaluated_input.ref,
+                source_schema,
+            )
+        fit_layers[layer_id] = (layer, result)
+
+    allowed_batch_roles = {
+        AxisViewRole.BATCH,
+        AxisViewRole.FACET,
+        AxisViewRole.SELECTED,
+        AxisViewRole.SLIDER,
+    }
+    for layer, result in fit_layers.values():
+        fit_axes = result.fit_axis_specs
+        if len(fit_axes) == 1:
+            if (
+                layer.view.intent is not ViewIntent.CURVE
+                or layer.view.binding(fit_axes[0].axis_id).role is not AxisViewRole.X
+            ):
+                raise ValueError("one-axis fit overlay requires its fitted axis as curve x")
+        elif len(fit_axes) == 2:
+            if (
+                layer.view.intent is not ViewIntent.IMAGE
+                or layer.view.binding(fit_axes[0].axis_id).role
+                is not AxisViewRole.IMAGE_X
+                or layer.view.binding(fit_axes[1].axis_id).role
+                is not AxisViewRole.IMAGE_Y
+            ):
+                raise ValueError(
+                    "two-axis fit overlay requires its fitted axes as image x/y"
+                )
+        else:
+            raise ValueError("only one- and two-axis fit overlays are supported")
+        for axis in result.batch_axis_specs:
+            if layer.view.binding(axis.axis_id).role not in allowed_batch_roles:
+                raise ValueError(
+                    f"fit batch axis {axis.axis_id} is not uniquely displayed or selected"
+                )
+    return tuple(sorted(supplied.items()))
+
+
+def _validate_fit_result_sources_before_evaluation(
+    document: FigureDocument,
+    source_refs,
+    source_schemas: tuple[tuple[DatasetId, DatasetSchema], ...],
+    fit_results: Mapping[str, FitResultBatch] | None,
+    *,
+    validation_memory_limit_bytes: int | None,
+) -> None:
+    """Gate and validate sparse source lineage before Figure evaluation."""
+
+    supplied = {} if fit_results is None else dict(fit_results)
+    if not supplied:
+        return
+    layers = {layer.layer_id: layer for layer in document.layers}
+    refs = dict(source_refs)
+    schemas = dict(source_schemas)
+    for layer_id, result in supplied.items():
+        if not isinstance(layer_id, str) or not layer_id:
+            raise TypeError("fit_results keys must be non-empty layer ids")
+        if not isinstance(result, FitResultBatch):
+            raise TypeError("fit_results values must be FitResultBatch")
+        try:
+            layer = layers[layer_id]
+            source_ref = refs[layer.dataset_id]
+            source_schema = schemas[layer.dataset_id]
+        except KeyError as exc:
+            raise ValueError("fit layer source metadata is absent") from exc
+        peak = fit_result_source_validation_additional_peak_upper_bound_nbytes(
+            result,
+            source_schema,
+        )
+        if (
+            validation_memory_limit_bytes is not None
+            and peak > validation_memory_limit_bytes
+        ):
+            raise MemoryError(
+                f"fit source validation requires {peak} bytes; limit is "
+                f"{validation_memory_limit_bytes}"
+            )
+        validate_fit_result_source_binding(result, source_ref, source_schema)
+        if result.spec.committed_transform is not None:
+            try:
+                _validate_selection_fit_view(source_schema, result, layer.view)
+            except ValueError as exc:
+                raise ValueError(
+                    "transformed fit overlay is not faithfully displayable: "
+                    f"{exc}"
+                ) from exc
+
+
+def _metadata_retained_upper_bound_nbytes(value: object) -> int:
+    """Conservatively charge immutable Python metadata, excluding ndarrays."""
+
+    if isinstance(value, np.ndarray):
+        return 0
+    if is_dataclass(value) and not isinstance(value, type):
+        return 512 + sum(
+            _metadata_retained_upper_bound_nbytes(getattr(value, item.name))
+            for item in fields(value)
+        )
+    if isinstance(value, Mapping):
+        return 256 + sum(
+            _metadata_retained_upper_bound_nbytes(key)
+            + _metadata_retained_upper_bound_nbytes(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (tuple, list)):
+        return 128 + sum(_metadata_retained_upper_bound_nbytes(item) for item in value)
+    if isinstance(value, str):
+        return 128 + 4 * len(value)
+    if isinstance(value, (bytes, bytearray)):
+        return 128 + len(value)
+    if isinstance(value, Enum):
+        return 128
+    if value is None or isinstance(value, (bool, int, float, complex)):
+        return 64
+    # Axis ids and other tiny canonical wrappers intentionally receive a
+    # generous fixed allowance without depending on their implementation.
+    return 256
+
+
+def figure_document_retained_upper_bound_nbytes(
+    document: FigureDocument,
+) -> int:
+    """Bound the immutable document graph before evaluator/source allocation."""
+
+    if not isinstance(document, FigureDocument):
+        raise TypeError("document must be FigureDocument")
+    return int(64 * 1024 + _metadata_retained_upper_bound_nbytes(document))
+
+
 class DataFigure:
     """Own one immutable, already-resolved notebook figure.
 
@@ -88,6 +289,7 @@ class DataFigure:
         "_evaluated",
         "_fit_results",
         "_render_memory_limit_bytes",
+        "_source_schemas",
     )
 
     def __init__(
@@ -103,40 +305,17 @@ class DataFigure:
             raise TypeError("document must be FigureDocument")
         if not isinstance(datasets, ResolvedDatasetMap):
             raise TypeError("datasets must be ResolvedDatasetMap")
-        supplied = {} if fit_results is None else dict(fit_results)
-        if any(not isinstance(key, str) or not key for key in supplied):
-            raise TypeError("fit_results keys must be non-empty layer ids")
-        if any(not isinstance(value, FitResultBatch) for value in supplied.values()):
-            raise TypeError("fit_results values must be FitResultBatch")
         render_limit = self._validated_memory_limit(
             render_memory_limit_bytes,
             "render_memory_limit_bytes",
         )
-
-        layers = {layer.layer_id: layer for layer in document.layers}
-        fit_layers = {}
-        for layer_id, result in supplied.items():
-            try:
-                layer = layers[layer_id]
-            except KeyError as exc:
-                raise ValueError(
-                    f"fit overlay references unknown layer {layer_id!r}"
-                ) from exc
-            snapshot = datasets.resolve(layer.dataset_id)
-            if result.spec.committed_transform is not None:
-                try:
-                    _validate_selection_fit_view(
-                        snapshot.block.schema,
-                        result,
-                        layer.view,
-                    )
-                except ValueError as exc:
-                    raise ValueError(
-                        "transformed fit overlay is not faithfully displayable: "
-                        f"{exc}"
-                    ) from exc
-            validate_fit_result_source_binding(result, snapshot.ref, snapshot.block.schema)
-            fit_layers[layer_id] = (layer, result)
+        source_schemas = tuple(
+            (
+                descriptor.dataset_id,
+                datasets.resolve(descriptor.dataset_id).block.schema,
+            )
+            for descriptor in document.datasets
+        )
 
         if evaluation_memory_limit_bytes is None:
             policy = FigureEvaluationPolicy()
@@ -153,44 +332,34 @@ class DataFigure:
                 FigureEvaluationPolicy(),
                 max_live_nbytes=int(evaluation_memory_limit_bytes),
             )
+        _validate_fit_result_sources_before_evaluation(
+            document,
+            tuple(
+                (
+                    descriptor.dataset_id,
+                    datasets.resolve(descriptor.dataset_id).ref,
+                )
+                for descriptor in document.datasets
+            ),
+            source_schemas,
+            fit_results,
+            validation_memory_limit_bytes=policy.max_live_nbytes,
+        )
         evaluated = FigureEvaluator(policy).evaluate(document, datasets)
-        allowed_batch_roles = {
-            AxisViewRole.BATCH,
-            AxisViewRole.FACET,
-            AxisViewRole.SELECTED,
-            AxisViewRole.SLIDER,
-        }
-        for layer, result in fit_layers.values():
-            fit_axes = result.fit_axis_specs
-            if len(fit_axes) == 1:
-                if (
-                    layer.view.intent is not ViewIntent.CURVE
-                    or layer.view.binding(fit_axes[0].axis_id).role is not AxisViewRole.X
-                ):
-                    raise ValueError("one-axis fit overlay requires its fitted axis as curve x")
-            elif len(fit_axes) == 2:
-                if (
-                    layer.view.intent is not ViewIntent.IMAGE
-                    or layer.view.binding(fit_axes[0].axis_id).role
-                    is not AxisViewRole.IMAGE_X
-                    or layer.view.binding(fit_axes[1].axis_id).role
-                    is not AxisViewRole.IMAGE_Y
-                ):
-                    raise ValueError(
-                        "two-axis fit overlay requires its fitted axes as image x/y"
-                    )
-            else:
-                raise ValueError("only one- and two-axis fit overlays are supported")
-            for axis in result.batch_axis_specs:
-                if layer.view.binding(axis.axis_id).role not in allowed_batch_roles:
-                    raise ValueError(
-                        f"fit batch axis {axis.axis_id} is not uniquely displayed or selected"
-                    )
+        validated_fit_results = _validated_fit_result_mapping(
+            document,
+            evaluated,
+            source_schemas,
+            fit_results,
+            source_bindings_validated=True,
+            selection_views_validated=True,
+        )
 
         self._document = document
         self._evaluated = evaluated
-        self._fit_results = tuple(sorted(supplied.items()))
+        self._fit_results = validated_fit_results
         self._render_memory_limit_bytes = render_limit
+        self._source_schemas = source_schemas
 
     @property
     def document(self) -> FigureDocument:
@@ -207,8 +376,82 @@ class DataFigure:
 
     @property
     def has_fit_overlays(self) -> bool:
-        """Whether this immutable figure carries authoritative fit overlays."""
+        """Whether this immutable figure carries an exact saved or draft fit."""
         return bool(self._fit_results)
+
+    @property
+    def fit_results_retained_upper_bound_nbytes(self) -> int:
+        """Bytes retained only by the immutable Fit-result mapping."""
+
+        from zlc_data import fit_result_retained_upper_bound_nbytes
+
+        return int(
+            sum(
+                fit_result_retained_upper_bound_nbytes(result)
+                for _layer_id, result in self._fit_results
+            )
+        )
+
+    @property
+    def retained_upper_bound_nbytes(self) -> int:
+        """Conservative bytes strongly retained by this frozen figure.
+
+        Composition roots subtract this value from the *one* operation budget
+        before admitting a solver or another render front.  It is not a second
+        independent allowance.
+        """
+
+        from .matplotlib_render import evaluated_figure_array_nbytes
+
+        metadata = _metadata_retained_upper_bound_nbytes(
+            (self._document, self._evaluated)
+        ) + sum(
+            dataset_schema_retained_upper_bound_nbytes(schema)
+            for _dataset_id, schema in self._source_schemas
+        )
+        fit_results = self.fit_results_retained_upper_bound_nbytes
+        return int(
+            evaluated_figure_array_nbytes(self._evaluated)
+            + metadata
+            + fit_results
+        )
+
+    def with_fit_results(
+        self,
+        fit_results: Mapping[str, FitResultBatch] | None,
+    ) -> DataFigure:
+        """Clone this frozen figure with another exact fit-result mapping.
+
+        Source materialization and view evaluation are intentionally *not*
+        repeated.  The clone reuses the identical immutable evaluated arrays,
+        while complete source-ref/schema, transform/view, fit-axis and sparse
+        batch-layout validation is repeated against the replacement result.
+        This is the only fit replay mutation seam: no repository or analysis
+        authority becomes reachable through ``DataFigure``.
+        """
+
+        _validate_fit_result_sources_before_evaluation(
+            self._document,
+            tuple((item.dataset_id, item.ref) for item in self._evaluated.inputs),
+            self._source_schemas,
+            fit_results,
+            validation_memory_limit_bytes=self._render_memory_limit_bytes,
+        )
+        validated = _validated_fit_result_mapping(
+            self._document,
+            self._evaluated,
+            self._source_schemas,
+            fit_results,
+            source_bindings_validated=True,
+            selection_views_validated=True,
+        )
+        clone = object.__new__(type(self))
+        clone._document = self._document
+        clone._evaluated = self._evaluated
+        clone._fit_results = validated
+        clone._render_memory_limit_bytes = self._render_memory_limit_bytes
+        clone._source_schemas = self._source_schemas
+        return clone
 
     def render(
         self,
@@ -295,13 +538,243 @@ class DataFigure:
 
         from .fit_image_projection import radial_gaussian_image_fit_panels
 
+        result = self._fit_result_for_layer(layer_id)
+
         return radial_gaussian_image_fit_panels(
             self._document,
             self._evaluated,
-            dict(self._fit_results),
+            result,
             layer_id,
             artifact_identity=artifact_identity,
         )
+
+    def radial_gaussian_image_fit_panels_preflight_nbytes(
+        self,
+        layer_id: str,
+        *,
+        artifact_identity: str,
+    ) -> int:
+        """Bound typed IMAGE projection before allocating panel DTOs or labels."""
+
+        from .fit_image_projection import (
+            radial_gaussian_image_fit_panels_additional_peak_upper_bound_nbytes,
+        )
+
+        result = self._fit_result_for_layer(layer_id)
+        return radial_gaussian_image_fit_panels_additional_peak_upper_bound_nbytes(
+            self._document,
+            self._evaluated,
+            result,
+            layer_id,
+            artifact_identity=artifact_identity,
+        )
+
+    def _fit_result_for_layer(self, layer_id: str) -> FitResultBatch:
+        resolved = canonical_text(layer_id, "fit layer_id")
+        for candidate, result in self._fit_results:
+            if candidate == resolved:
+                return result
+        raise ValueError(f"layer {resolved!r} has no saved fit result")
+
+    def single_panel_curve_fit_overlay_plan(
+        self,
+        *,
+        result_identity: str,
+    ) -> CurveFitOverlayPlan:
+        """Freeze canonical CURVE overlay work without evaluating a model."""
+
+        from .fit_curve_projection import single_panel_curve_fit_overlay_plan
+
+        return single_panel_curve_fit_overlay_plan(
+            self._document,
+            self._evaluated,
+            dict(self._fit_results),
+            self._single_panel_source_schema(),
+            result_identity=result_identity,
+        )
+
+    def single_panel_fit_overlay_preflight_nbytes(
+        self,
+        result: FitResultBatch | None = None,
+        *,
+        result_identity: str,
+    ) -> tuple[int, int, int, int]:
+        """Return validation, retained, prediction, and projection-peak bounds.
+
+        This method performs only bounded metadata reads and integer arithmetic.
+        The Workbench calls it before any sparse source validation, overlay plan,
+        selection-index expansion, model evaluation, or raster allocation.
+        """
+
+        identity = canonical_text(result_identity, "fit result identity")
+        if len(identity) > 4096:
+            raise ValueError("fit result identity exceeds its display bound")
+        if result is None:
+            if len(self._fit_results) != 1:
+                raise ValueError("canonical fit preflight requires one layer result")
+            result = self._fit_results[0][1]
+        elif not isinstance(result, FitResultBatch):
+            raise TypeError("result must be FitResultBatch or None")
+        source_schema = self._single_panel_source_schema()
+        validation = (
+            fit_result_source_validation_additional_peak_upper_bound_nbytes(
+                result,
+                source_schema,
+            )
+        )
+        if len(self._document.layers) != 1 or len(self._evaluated.layers) != 1:
+            raise ValueError("typed fit preflight requires one layer")
+        layer = self._evaluated.layers[0]
+        if len(layer.cells) != 1:
+            raise ValueError("typed fit preflight requires one displayed cell")
+        cell = layer.cells[0]
+        intent = self._document.layers[0].view.intent
+        identity_bytes = 4 * len(identity)
+        if intent is ViewIntent.CURVE:
+            from .figure import EvaluatedCurve
+
+            prediction_bytes = 0
+            retained = 4096
+            for series in cell.series:
+                if not isinstance(series.data, EvaluatedCurve):
+                    raise ValueError("CURVE fit preflight found another series type")
+                prediction_bytes += int(series.data.values.size) * 8
+                retained += (
+                    2048
+                    + identity_bytes
+                    + 4 * (512 + 32)
+                    + 256 * len(series.batch_address)
+                )
+            if not cell.series:
+                raise ValueError("CURVE fit preflight found no series")
+            retained += prediction_bytes
+            return (
+                validation,
+                retained,
+                prediction_bytes,
+                retained + 2 * 1024 * 1024,
+            )
+        if intent is ViewIntent.IMAGE:
+            from .figure import EvaluatedImage
+
+            if len(cell.series) != 1 or not isinstance(
+                cell.series[0].data,
+                EvaluatedImage,
+            ):
+                raise ValueError("IMAGE fit preflight requires one image series")
+            descriptor = self._document.descriptor(
+                self._document.layers[0].dataset_id
+            )
+            text_characters = len(descriptor.label)
+            addresses = (
+                *cell.facet_address,
+                *cell.series[0].batch_address,
+                *layer.resolutions,
+            )
+            for address in addresses:
+                text_characters += len(address.axis_id.value) + 4
+                coordinate = address.coordinate
+                text_characters += len(coordinate) if isinstance(coordinate, str) else 64
+            for reduction in cell.series[0].reductions:
+                text_characters += len(reduction.method.value) + 32
+                text_characters += sum(
+                    len(axis_id.value) + 2 for axis_id in reduction.axis_ids
+                )
+                # Contributor counters are policy-bounded integers; 128 chars
+                # covers both decimal renderings plus punctuation.
+                text_characters += 128
+            metadata_bytes = 4 * text_characters + 512 * (
+                1 + len(cell.series[0].reductions)
+            )
+            retained = (
+                64 * 1024
+                + identity_bytes
+                + metadata_bytes
+                + 4 * (512 + 32)
+            )
+            # ``figure_panel_title`` first owns address/reduction fragments,
+            # then their joins, then successive immutable title copies.  Four
+            # simultaneous Unicode-sized copies conservatively cover that
+            # construction before the bounded overlay becomes the retained one.
+            projection_peak = retained + 16 * text_characters + 256 * 1024
+            return validation, retained, 0, projection_peak
+        raise ValueError("typed Fit overlay requires CURVE or IMAGE")
+
+    def transient_single_panel_curve_fit_overlay_plan(
+        self,
+        result: FitResultBatch,
+        *,
+        result_identity: str,
+    ) -> CurveFitOverlayPlan:
+        """Freeze transient CURVE overlay work without evaluating a model."""
+
+        from .fit_curve_projection import (
+            transient_single_panel_curve_fit_overlay_plan,
+        )
+
+        return transient_single_panel_curve_fit_overlay_plan(
+            self._document,
+            self._evaluated,
+            self._single_panel_source_schema(),
+            result,
+            result_identity=result_identity,
+        )
+
+    def single_panel_radial_fit_overlay(
+        self,
+        *,
+        result_identity: str,
+    ) -> RadialGaussianImageFitOverlay:
+        """Return one exact radial IMAGE annotation for typed replay.
+
+        Generic two-dimensional model contours remain outside the typed IMAGE
+        contract.  This seam accepts only the existing named radial-Gaussian
+        projection and exactly one logical panel.
+        """
+
+        if len(self._document.layers) != 1 or len(self._evaluated.layers) != 1:
+            raise ValueError("typed radial fit projection requires exactly one layer")
+        if len(self._evaluated.inputs) != 1:
+            raise ValueError("typed radial fit projection requires exactly one input")
+        layer = self._document.layers[0]
+        if set(dict(self._fit_results)) != {layer.layer_id}:
+            raise ValueError("typed radial fit projection requires one exact layer result")
+        panels = self.radial_gaussian_image_fit_panels(
+            layer.layer_id,
+            artifact_identity=result_identity,
+        )
+        if len(panels) != 1:
+            raise ValueError("typed radial fit projection requires exactly one IMAGE panel")
+        return panels[0].fit_overlay
+
+    def transient_single_panel_radial_fit_overlay(
+        self,
+        result: FitResultBatch,
+        *,
+        result_identity: str,
+        check_cancelled=None,
+    ) -> RadialGaussianImageFitOverlay:
+        """Project one draft radial annotation over the unchanged full image."""
+
+        from .fit_image_projection import transient_single_panel_radial_fit_overlay
+
+        return transient_single_panel_radial_fit_overlay(
+            self._document,
+            self._evaluated,
+            self._single_panel_source_schema(),
+            result,
+            result_identity=result_identity,
+            check_cancelled=check_cancelled,
+        )
+
+    def _single_panel_source_schema(self) -> DatasetSchema:
+        if len(self._document.layers) != 1:
+            raise ValueError("typed fit projection requires exactly one layer")
+        dataset_id = self._document.layers[0].dataset_id
+        try:
+            return dict(self._source_schemas)[dataset_id]
+        except KeyError as exc:  # pragma: no cover - constructor closes this
+            raise RuntimeError("typed fit source schema is absent") from exc
 
     def _repr_png_(self) -> bytes:
         return self.to_png_bytes()
@@ -367,4 +840,8 @@ class DataFigure:
         return int(value)
 
 
-__all__ = ["DataFigure", "FigurePanelRegion"]
+__all__ = [
+    "DataFigure",
+    "FigurePanelRegion",
+    "figure_document_retained_upper_bound_nbytes",
+]

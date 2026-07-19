@@ -21,6 +21,7 @@ from ..selector import (
 from .axis_navigator import AxisLayoutNavigator
 from .board import QtImageBoard, QtOwnerWake, QtRasterBoard
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
+from .fit_authoring import FitAuthoringPane
 from .display_editor import (
     FluentRevisionedFormEditor,
     runtime_range_placeholders,
@@ -168,6 +169,7 @@ __all__ = [
     "FluentComboBox",
     "FluentDoubleSpinBox",
     "FluentFloatingEditor",
+    "FitAuthoringPane",
     "FluentFormGrid",
     "FluentFrame",
     "FluentGroupBox",
