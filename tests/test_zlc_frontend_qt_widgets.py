@@ -669,7 +669,7 @@ def test_qt_raster_board_cancels_a_hold_when_panel_semantics_change() -> None:
 
         assert board.front_frame is replacement
         assert board._selector_hold is None
-        assert board._selector_draft_bounds is None
+        assert board._image_bindings["image"].draft_bounds is None
         board.close()
     application.processEvents()
 
@@ -756,7 +756,7 @@ def test_qt_raster_board_releases_a_hold_when_a_new_front_is_rejected() -> None:
 
     assert board.front_frame is first
     assert board._selector_hold is None
-    assert board._selector_draft_bounds is None
+    assert board._image_bindings["image"].draft_bounds is None
     board.close()
     application.processEvents()
 
@@ -884,7 +884,7 @@ def test_qt_raster_board_releases_hold_after_selector_callback_fault() -> None:
 
     assert board._selector_hold is None
     assert board._selector_enabled is True
-    assert board._image_binding_enabled is False
+    assert board._image_bindings["image"].binding_enabled is False
     assert board.selector_fault is not None
     assert "selector callback failed" in str(board.selector_fault)
     board.close()

@@ -11,12 +11,10 @@ from numbers import Number
 
 import numpy as np
 
-from zlc_data import FitBatchStatus, FitResultBatch, IndexSelection, Selection
+from zlc_data import FitBatchStatus, FitResultBatch
 from zlc_storage import nonnegative_integer, positive_integer
 
 from .figure import (
-    AxisAddress,
-    AxisResolution,
     EvaluatedCurve,
     EvaluatedFigureData,
     EvaluatedHistogram,
@@ -24,6 +22,17 @@ from .figure import (
     EvaluatedMeter,
     FigureDocument,
 )
+from .fit_image_projection import (
+    RadialGaussianImageFitPanel,
+    address_label as _address_label,
+    evaluated_figure_panels as _panels,
+    figure_panel_title as _panel_title,
+    fit_batch_storage_index as _batch_storage_index,
+    fit_panel_selection as _panel_selection,
+    radial_gaussian_fit_geometry,
+    reduction_label as _reduction_label,
+)
+from .image_display import ImageDisplayState, image_viewport_for_display_state
 from .curve_display import (
     CurveDisplayState,
     CurveViewportTransform,
@@ -39,6 +48,7 @@ from .histogram_display import (
     histogram_count_limits,
     histogram_home_x_limits,
 )
+from .image_raster import evaluated_image_data_range
 from .data_figure import FigurePanelRegion
 from .display_range import (
     RelimMode,
@@ -173,25 +183,6 @@ def estimate_live_panel_raster_peak_nbytes(
     )
 
 
-def _address_label(items: tuple[AxisAddress, ...] | tuple[AxisResolution, ...]) -> str:
-    return ", ".join(f"{item.axis_id.value}={item.coordinate}" for item in items)
-
-
-def _reduction_label(reductions) -> str:
-    labels = []
-    for reduction in reductions:
-        axes = ",".join(axis_id.value for axis_id in reduction.axis_ids)
-        contributors = str(reduction.minimum_contributors)
-        if reduction.minimum_contributors != reduction.maximum_contributors:
-            contributors = (
-                f"{reduction.minimum_contributors}..{reduction.maximum_contributors}"
-            )
-        labels.append(
-            f"{reduction.method.value.lower()}({axes}, n={contributors})"
-        )
-    return "; ".join(labels)
-
-
 def _series_label(series, *, include_reductions: bool) -> str | None:
     parts = [_address_label(series.batch_address)]
     if include_reductions:
@@ -254,36 +245,6 @@ def _image_axis(axis):
              (centers[-1] + (centers[-1] - middle[-1]),))
         )
     return edges, centers, None
-
-
-def _batch_storage_index(result, layer, cell, series) -> int | None:
-    addresses = (*cell.facet_address, *series.batch_address)
-    by_axis = {item.axis_id: item.index for item in addresses}
-    if len(by_axis) != len(addresses):
-        raise RuntimeError("figure batch/facet addresses contain a duplicate axis")
-    for resolution in layer.resolutions:
-        incumbent = by_axis.setdefault(resolution.axis_id, resolution.index)
-        if incumbent != resolution.index:
-            raise RuntimeError("figure address and resolution disagree")
-    expected = {axis.axis_id for axis in result.batch_axis_specs}
-    extras = set(by_axis) - expected
-    if extras:
-        raise RuntimeError(f"figure resolved non-batch fit axes: {sorted(map(str, extras))}")
-    multi = []
-    for axis in result.batch_axis_specs:
-        if axis.axis_id in by_axis:
-            multi.append(by_axis[axis.axis_id])
-        elif axis.size == 1:
-            multi.append(0)
-        else:
-            raise RuntimeError(f"figure does not identify fit batch axis {axis.axis_id}")
-    try:
-        return result.batch_layout.storage_index(tuple(multi))
-    except KeyError:
-        # A sparse source may expose a logical gallery hole that has no
-        # authoritative fit row.  Keep later storage rows aligned and mark the
-        # hole; never substitute a neighbouring fit.
-        return None
 
 
 def _fit_status(axis, result: FitResultBatch, index: int | None) -> bool:
@@ -365,11 +326,137 @@ def _curve(axis, layer, cell, series_group, fit_result):
         axis.legend(fontsize=ANNOTATION_FONT_SIZE)
 
 
-def _image(axis, figure, layer, cell, series, fit_result):
+def _draw_radial_image(
+    axis,
+    figure,
+    data: EvaluatedImage,
+    *,
+    colormap: str,
+    color_limits: tuple[float, float],
+    visible_bounds=(0.0, 0.0, 1.0, 1.0),
+    center: tuple[float, float] | None,
+    radius: float | None,
+    diagnostic: str | None,
+):
+    """Draw the one radial IMAGE presentation used by canonical and typed export."""
+
+    x_edges, x_centers, x_labels = _image_axis(data.x_axis)
+    y_edges, y_centers, y_labels = _image_axis(data.y_axis)
+    invalid = np.logical_not(data.validity)
+    if data.values.dtype.kind == "f":
+        invalid = np.logical_or(invalid, ~np.isfinite(data.values))
+    values = np.ma.array(data.values, mask=invalid)
+    mesh = axis.pcolormesh(
+        x_edges,
+        y_edges,
+        values,
+        shading="flat",
+        cmap=colormap,
+        vmin=color_limits[0],
+        vmax=color_limits[1],
+        rasterized=True,
+    )
+    figure.colorbar(mesh, ax=axis)
+    if x_labels is not None:
+        axis.set_xticks(x_centers, x_labels)
+    if y_labels is not None:
+        axis.set_yticks(y_centers, y_labels)
+    axis.set_xlabel(_axis_label(data.x_axis))
+    axis.set_ylabel(_axis_label(data.y_axis))
+    left, top, right, bottom = visible_bounds
+    x_start, x_stop = float(x_edges[0]), float(x_edges[-1])
+    y_start, y_stop = float(y_edges[0]), float(y_edges[-1])
+    x_limits = (
+        x_start + left * (x_stop - x_start),
+        x_start + right * (x_stop - x_start),
+    )
+    # The first declared Y coordinate/raster row is always at the top.
+    y_limits = (
+        y_start + bottom * (y_stop - y_start),
+        y_start + top * (y_stop - y_start),
+    )
+    axis.set_xlim(*x_limits)
+    axis.set_ylim(*y_limits)
+    axis.set_aspect("equal", adjustable="box")
+    if center is not None:
+        from matplotlib.patches import Circle
+
+        assert radius is not None and diagnostic is None
+        axis.scatter(*center, color=PALETTE["fit_right"], s=8, clip_on=True)
+        axis.add_patch(
+            Circle(
+                center,
+                radius=radius,
+                edgecolor=PALETTE["fit_right"],
+                facecolor="none",
+                linewidth=1.8,
+                alpha=0.9,
+                clip_on=True,
+            )
+        )
+        # Off-screen saved geometry is annotation, never an autoscale input.
+        axis.set_xlim(*x_limits)
+        axis.set_ylim(*y_limits)
+    else:
+        assert radius is None and diagnostic is not None
+        axis.text(
+            0.02,
+            0.98,
+            f"fit {diagnostic}",
+            transform=axis.transAxes,
+            va="top",
+            color=FIT_FAILURE_COLOR,
+            fontsize=ANNOTATION_FONT_SIZE,
+        )
+
+
+def _image(
+    axis,
+    figure,
+    layer,
+    cell,
+    series,
+    fit_result,
+    *,
+    radial_color_limits: tuple[float, float] | None = None,
+):
     data = series.data
     assert isinstance(data, EvaluatedImage)
     if np.iscomplexobj(data.values):
         raise ValueError("complex images require an explicit real-valued display transform")
+    radial_fit = (
+        fit_result is not None
+        and fit_result.spec.model_id == "radial_gaussian_center"
+    )
+    if radial_fit:
+        if radial_color_limits is None:
+            raise RuntimeError("radial image grid omitted its shared color limits")
+        index = _batch_storage_index(fit_result, layer, cell, series)
+        center = None
+        radius = None
+        if index is None:
+            diagnostic = "NOT_PRESENT"
+        else:
+            status = fit_result.statuses[index]
+            if status is FitBatchStatus.CONVERGED:
+                center, radius = radial_gaussian_fit_geometry(fit_result, index)
+                diagnostic = None
+            else:
+                diagnostic = status.value
+                if fit_result.errors[index]:
+                    diagnostic = f"{diagnostic}: {fit_result.errors[index]}"
+        _draw_radial_image(
+            axis,
+            figure,
+            data,
+            colormap="gray",
+            color_limits=radial_color_limits,
+            center=center,
+            radius=radius,
+            diagnostic=diagnostic,
+        )
+        return
+
     x_edges, x_centers, x_labels = _image_axis(data.x_axis)
     y_edges, y_centers, y_labels = _image_axis(data.y_axis)
     values = np.ma.array(data.values, mask=~data.validity)
@@ -392,7 +479,9 @@ def _image(axis, figure, layer, cell, series, fit_result):
                 data.x_axis.axis_id: x_grid,
                 data.y_axis.axis_id: y_grid,
             }
-            coordinates = tuple(grids[item.axis_id] for item in fit_result.fit_axis_specs)
+            coordinates = tuple(
+                grids[item.axis_id] for item in fit_result.fit_axis_specs
+            )
             predicted = fit_result.evaluate_batch(index, coordinates)
             if np.ptp(predicted) > 0:
                 axis.contour(
@@ -402,6 +491,242 @@ def _image(axis, figure, layer, cell, series, fit_result):
                     colors=FIT_CONTOUR_COLOR,
                     linewidths=FIT_CONTOUR_LINEWIDTH,
                 )
+
+
+def _radial_image_color_limits_by_layer(
+    panels,
+    fit_results: dict[str, FitResultBatch],
+) -> dict[str, tuple[float, float]]:
+    """Resolve one default TIGHT range for every radial IMAGE grid layer."""
+
+    images_by_layer: dict[str, list[EvaluatedImage]] = {}
+    for layer, _cell, series_group in panels:
+        fit_result = fit_results.get(layer.layer_id)
+        if (
+            fit_result is None
+            or fit_result.spec.model_id != "radial_gaussian_center"
+        ):
+            continue
+        for series in series_group:
+            if not isinstance(series.data, EvaluatedImage):
+                raise ValueError("radial fit overlays require an IMAGE view")
+            images_by_layer.setdefault(layer.layer_id, []).append(series.data)
+
+    limits = {}
+    for layer_id, images in images_by_layer.items():
+        data_range = evaluated_image_data_range(images)
+        limits[layer_id] = (
+            (0.0, 1.0)
+            if data_range is None
+            else deadband_display_range(
+                RelimMode.TIGHT,
+                None,
+                data_range[0],
+                data_range[1],
+                force=True,
+            )
+        )
+    return limits
+
+
+def _radial_projected_image(
+    axis,
+    figure,
+    panel: RadialGaussianImageFitPanel,
+    display: ImageDisplayState,
+    color_limits: tuple[float, float],
+):
+    """Draw one already-projected saved-fit cell without fit authority."""
+
+    viewport = image_viewport_for_display_state(display, panel.home_viewport)
+    overlay = panel.fit_overlay
+    _draw_radial_image(
+        axis,
+        figure,
+        panel.image,
+        colormap=display.colormap.value,
+        color_limits=color_limits,
+        visible_bounds=viewport.visible_bounds,
+        center=overlay.center_xy,
+        radius=overlay.one_over_e_radius,
+        diagnostic=(
+            None
+            if overlay.status is FitBatchStatus.CONVERGED
+            else overlay.diagnostic
+        ),
+    )
+    status = "NOT_PRESENT" if overlay.status is None else overlay.status.value
+    # The canonical Helvetica face lacks U+00B7; mathtext preserves the same
+    # visual separator without dropping a glyph in PDF/SVG/JPEG export.
+    axis.set_title(f"{overlay.caption} $\\cdot$ {status}")
+
+
+def _validated_radial_panels(
+    panels: tuple[RadialGaussianImageFitPanel, ...],
+) -> tuple[RadialGaussianImageFitPanel, ...]:
+    if not isinstance(panels, tuple) or not panels or any(
+        not isinstance(panel, RadialGaussianImageFitPanel) for panel in panels
+    ):
+        raise TypeError("panels must be a non-empty radial panel tuple")
+    if len(panels) > 36:
+        raise ValueError("radial saved-fit export exceeded 36 panels")
+    first = panels[0].fit_overlay
+    if any(
+        panel.fit_overlay.artifact_identity != first.artifact_identity
+        or panel.fit_overlay.source_ref != first.source_ref
+        for panel in panels[1:]
+    ):
+        raise ValueError("radial saved-fit export cannot mix artifact revisions")
+    return panels
+
+
+def _validated_radial_grid_columns(columns: int, panel_count: int) -> int:
+    columns = positive_integer(columns, "columns")
+    if columns > panel_count:
+        raise ValueError("columns cannot exceed the radial panel count")
+    return columns
+
+
+def estimate_projected_radial_fit_render_peak_nbytes(
+    panels: tuple[RadialGaussianImageFitPanel, ...],
+    *,
+    dpi: float,
+    columns: int,
+) -> int:
+    """Bound incremental Agg export memory after source panels are retained.
+
+    The caller already owns the immutable image samples.  This estimate charges
+    the Agg canvas/encoder fronts and conservative artist/mask/coordinate copies
+    created specifically by the export.
+    """
+
+    prepared = _validated_radial_panels(panels)
+    dpi = _render_dpi(dpi)
+    columns = _validated_radial_grid_columns(columns, len(prepared))
+    rows = math.ceil(len(prepared) / columns)
+    width = math.ceil(5.0 * columns * dpi)
+    height = math.ceil(4.0 * rows * dpi)
+    rgba_bytes = width * height * 4
+    artist_input_bytes = sum(
+        panel.image.values.nbytes
+        + panel.image.validity.nbytes
+        + 8
+        * (
+            len(panel.image.x_axis.coordinates)
+            + len(panel.image.y_axis.coordinates)
+        )
+        for panel in prepared
+    )
+    return int(
+        _RASTER_FIXED_BYTES
+        + _RASTER_BUFFER_MULTIPLIER * rgba_bytes
+        + _ARTIST_ARRAY_MULTIPLIER * artist_input_bytes
+    )
+
+
+def render_radial_gaussian_image_fit_panels(
+    panels: tuple[RadialGaussianImageFitPanel, ...],
+    display: ImageDisplayState,
+    current_color_limits: tuple[float, float],
+    *,
+    columns: int,
+    dpi: float = 100.0,
+    memory_limit_bytes: int | None = None,
+):
+    """Render the current typed saved-fit IMAGE view from immutable projections.
+
+    No dataset lookup, view evaluation, predicted image, or solver is reachable
+    from this path.  The caller owns the returned Figure and must release it
+    with :func:`release_agg_figure`.
+    """
+
+    prepared = _validated_radial_panels(panels)
+    if not isinstance(display, ImageDisplayState):
+        raise TypeError("display must be ImageDisplayState")
+    limits = validated_display_range(
+        current_color_limits,
+        "current_color_limits",
+    )
+    dpi = _render_dpi(dpi)
+    columns = _validated_radial_grid_columns(columns, len(prepared))
+    if memory_limit_bytes is not None:
+        limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
+        required = estimate_projected_radial_fit_render_peak_nbytes(
+            prepared,
+            dpi=dpi,
+            columns=columns,
+        )
+        if required > limit:
+            raise MemoryError(
+                f"projected radial render peak {required} exceeds limit {limit}"
+            )
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    rows = math.ceil(len(prepared) / columns)
+    with render_style_context():
+        figure = Figure(
+            figsize=(5.0 * columns, 4.0 * rows),
+            dpi=dpi,
+            constrained_layout=True,
+        )
+        axes = None
+        try:
+            FigureCanvasAgg(figure)
+            axes = figure.subplots(rows, columns, squeeze=False).reshape(-1)
+            for axis, panel in zip(axes, prepared, strict=False):
+                _radial_projected_image(axis, figure, panel, display, limits)
+            for unused in axes[len(prepared):]:
+                unused.set_visible(False)
+            return figure
+        except BaseException:
+            release_agg_figure(figure)
+            figure = axes = None
+            gc.collect()
+            raise
+
+
+def save_radial_gaussian_image_fit_panels(
+    panels: tuple[RadialGaussianImageFitPanel, ...],
+    display: ImageDisplayState,
+    current_color_limits: tuple[float, float],
+    destination,
+    *,
+    image_format: str,
+    columns: int,
+    dpi: float = 100.0,
+    memory_limit_bytes: int | None = None,
+) -> None:
+    """Save the exact committed typed page/focus display.
+
+    Viewport, colormap, shared limits, saved-fit overlay, status, and frozen
+    board columns are preserved for PNG/PDF/SVG/JPEG.  A transient rectangle
+    selection candidate is intentionally absent: it is an uncommitted pointer
+    draft, not part of :class:`ImageDisplayState`.
+    """
+
+    if not isinstance(image_format, str):
+        raise TypeError("image_format must be str")
+    if image_format not in {"png", "pdf", "svg", "jpg", "jpeg"}:
+        raise ValueError("radial image export format must be png, pdf, svg, jpg, or jpeg")
+    figure = None
+    try:
+        figure = render_radial_gaussian_image_fit_panels(
+            panels,
+            display,
+            current_color_limits,
+            columns=columns,
+            dpi=dpi,
+            memory_limit_bytes=memory_limit_bytes,
+        )
+        with render_style_context():
+            figure.savefig(destination, format=image_format, dpi=dpi)
+    finally:
+        if figure is not None:
+            release_agg_figure(figure)
+        figure = None
+        gc.collect()
 
 
 def _histogram_projection(series_group, bins: int):
@@ -477,35 +802,6 @@ def _finite_numeric_scalar(value: Number) -> bool:
 def _meter(axis, series_group):
     axis.set_axis_off()
     axis.text(0.5, 0.5, _meter_text(series_group), ha="center", va="center")
-
-
-def _panels(evaluated: EvaluatedFigureData):
-    panels = []
-    for layer in evaluated.layers:
-        for cell in layer.cells:
-            if all(isinstance(series.data, EvaluatedImage) for series in cell.series):
-                panels.extend((layer, cell, (series,)) for series in cell.series)
-            else:
-                panels.append((layer, cell, cell.series))
-    return panels
-
-
-def _panel_title(document, layer, cell, series_group) -> str:
-    title = document.descriptor(layer.dataset_id).label
-    addresses = cell.facet_address
-    if len(series_group) == 1:
-        addresses = (*addresses, *series_group[0].batch_address)
-    details = _address_label(addresses)
-    resolved = _address_label(layer.resolutions)
-    if details:
-        title = f"{title} — {details}"
-    if resolved:
-        title = f"{title}\nview: {resolved}"
-    if len(series_group) == 1:
-        reduced = _reduction_label(series_group[0].reductions)
-        if reduced:
-            title = f"{title}\nreduce: {reduced}"
-    return title
 
 
 def _require_evaluated_identity(
@@ -600,33 +896,6 @@ def encode_evaluated_figure_with_panel_regions(
     return output.getvalue(), regions
 
 
-def _panel_selection(layer, cell, series_group, fit_result) -> Selection | None:
-    expected = (
-        set()
-        if fit_result is None
-        else {axis.axis_id for axis in fit_result.batch_axis_specs}
-    )
-    addresses = [*cell.facet_address]
-    if len(series_group) == 1:
-        addresses.extend(series_group[0].batch_address)
-    addresses.extend(layer.resolutions)
-    by_axis = {}
-    for address in addresses:
-        if expected and address.axis_id not in expected:
-            continue
-        incumbent = by_axis.setdefault(address.axis_id, address.index)
-        if incumbent != address.index:
-            raise RuntimeError("figure panel addresses disagree")
-    terms = tuple(
-        IndexSelection(axis_id, index)
-        for axis_id, index in sorted(
-            by_axis.items(),
-            key=lambda item: item[0].value,
-        )
-    )
-    return None if not terms else Selection(terms)
-
-
 def _figure_panel_regions(
     figure,
     evaluated: EvaluatedFigureData,
@@ -713,6 +982,10 @@ def _render_evaluated_figure(
 
     _require_evaluated_identity(document, evaluated)
     panels = _panels(evaluated)
+    radial_color_limits = _radial_image_color_limits_by_layer(
+        panels,
+        fit_results,
+    )
     columns = min(3, max(1, len(panels)))
     rows = math.ceil(len(panels) / columns)
     figure = Figure(
@@ -731,7 +1004,15 @@ def _render_evaluated_figure(
             if isinstance(kind, EvaluatedCurve):
                 _curve(target, layer, cell, series_group, fit_result)
             elif isinstance(kind, EvaluatedImage):
-                _image(target, figure, layer, cell, series_group[0], fit_result)
+                _image(
+                    target,
+                    figure,
+                    layer,
+                    cell,
+                    series_group[0],
+                    fit_result,
+                    radial_color_limits=radial_color_limits.get(layer.layer_id),
+                )
             elif isinstance(kind, EvaluatedHistogram):
                 if fit_result is not None:
                     raise ValueError("fit overlays require a curve or image view")
@@ -1287,9 +1568,12 @@ class SinglePanelAggRenderer:
 __all__ = [
     "encode_evaluated_figure_with_panel_regions",
     "estimate_live_panel_raster_peak_nbytes",
+    "estimate_projected_radial_fit_render_peak_nbytes",
     "estimate_render_peak_nbytes",
+    "render_radial_gaussian_image_fit_panels",
     "render_evaluated_figure",
     "release_agg_figure",
+    "save_radial_gaussian_image_fit_panels",
     "save_evaluated_figure",
     "SinglePanelAggRenderer",
 ]

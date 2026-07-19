@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import product
 import math
 
 from zlc_data import (
@@ -28,6 +29,86 @@ def _axis_address(axis: AxisSpec, index: int) -> str:
     coordinate = axis.coordinate_at(index)
     unit = "" if axis.unit is None else f" {axis.unit}"
     return f"{axis.name}={coordinate}{unit} [index {index}]"
+
+
+def _fit_cell_address(
+    axes: tuple[AxisSpec, ...],
+    multi_index: tuple[int, ...],
+) -> str:
+    if len(axes) != len(multi_index):
+        raise ValueError("fit cell address rank differs from its batch axes")
+    return " | ".join(
+        _axis_address(axis, index)
+        for axis, index in zip(axes, multi_index, strict=True)
+    ) or "scalar batch cell"
+
+
+def _fit_cell_summary_text(
+    result: FitResultBatch,
+    storage_index: int,
+    address: str,
+) -> str:
+    """Single formatter for saved-fit focus details in every frontend."""
+
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("result must be FitResultBatch")
+    if (
+        isinstance(storage_index, bool)
+        or not isinstance(storage_index, int)
+        or not 0 <= storage_index < result.batch_layout.storage_size
+    ):
+        raise IndexError("fit summary storage_index is outside the saved batch")
+    canonical_text(address, "fit cell address")
+    status = result.statuses[storage_index]
+    lines = [
+        address,
+        f"storage row {storage_index} · status {status.value}",
+        (
+            "observations present/valid/used "
+            f"{int(result.present_observation_counts[storage_index])}/"
+            f"{int(result.valid_observation_counts[storage_index])}/"
+            f"{int(result.used_observation_counts[storage_index])} · "
+            f"evaluations {int(result.evaluation_counts[storage_index])}"
+        ),
+    ]
+    if status is not FitBatchStatus.CONVERGED:
+        lines.append("parameters: N/A")
+        lines.append(
+            result.errors[storage_index] or "fit failed without diagnostic"
+        )
+        return "\n".join(lines)
+    parameter_parts = []
+    covariance_valid = bool(result.covariance_valid[storage_index])
+    for position, (definition, unit, value) in enumerate(
+        zip(
+            result.parameter_definitions,
+            result.parameter_units,
+            result.parameter_values[storage_index],
+            strict=True,
+        )
+    ):
+        text = f"{definition.name}={float(value):.7g} {unit}"
+        if covariance_valid:
+            uncertainty = math.sqrt(
+                float(result.covariance[storage_index, position, position])
+            )
+            text += f" ± {uncertainty:.3g} {unit}"
+        parameter_parts.append(text)
+    lines.append(" · ".join(parameter_parts))
+    used = int(result.used_observation_counts[storage_index])
+    rmse = math.sqrt(float(result.residual_sum_squares[storage_index]) / used)
+    quality = f"RMSE={rmse:.7g}"
+    if result.r_squared_valid[storage_index]:
+        quality += f" · R²={float(result.r_squared[storage_index]):.7g}"
+    else:
+        quality += " · R² unavailable"
+    quality += (
+        " · covariance valid"
+        if covariance_valid
+        else " · covariance unavailable"
+    )
+    lines.append(quality)
+    return "\n".join(lines)
 
 
 def _page_spans(axes: tuple[AxisSpec, ...]) -> tuple[int, ...]:
@@ -250,7 +331,6 @@ class FitGridModel:
         if any(axis_id not in known for axis_id in by_axis):
             raise ValueError("fit grid selection may name only saved batch axes")
         indices = []
-        labels = []
         for axis in self.axes:
             term = by_axis.get(axis.axis_id)
             if term is None:
@@ -269,7 +349,6 @@ class FitGridModel:
                     raise ValueError("fit cell selection must resolve one exact index")
                 index = resolved.start
             indices.append(index)
-            labels.append(_axis_address(axis, index))
         multi = tuple(indices)
         try:
             storage = self.layout.storage_index(multi)
@@ -277,7 +356,7 @@ class FitGridModel:
             raise ValueError(
                 f"selected logical fit cell {multi} is absent from the saved batch layout"
             ) from error
-        return storage, multi, " | ".join(labels)
+        return storage, multi, _fit_cell_address(self.axes, multi)
 
     def storage_index_or_none(self, selection: Selection | None) -> int | None:
         try:
@@ -363,6 +442,45 @@ class FitGridModel:
             " · ".join(bounds) or "scalar fit cell",
         )
 
+    def page_logical_selections(
+        self,
+        page: FitGridPage,
+    ) -> tuple[Selection | None, ...]:
+        """Return every logical tile cell in deterministic row-major order.
+
+        Unlike :meth:`selection_for_indices`, this intentionally includes
+        EXPLICIT-layout holes.  A renderer must preserve those positions as
+        ``NOT_PRESENT`` rather than compacting later physical rows forward.
+        """
+
+        if not isinstance(page, FitGridPage):
+            raise TypeError("page must be FitGridPage")
+        if page != self.page(page.address):
+            raise ValueError("fit grid page differs from compact model")
+        if not self.axes:
+            return (None,)
+        ranges = tuple(
+            range(
+                page_index * span,
+                min(axis.size, (page_index + 1) * span),
+            )
+            for axis, span, page_index in zip(
+                self.axes,
+                self.page_spans,
+                page.address,
+                strict=True,
+            )
+        )
+        return tuple(
+            Selection(
+                tuple(
+                    IndexSelection(axis.axis_id, index)
+                    for axis, index in zip(self.axes, multi, strict=True)
+                )
+            )
+            for multi in product(*ranges)
+        )
+
     def focus_preferences(self) -> ViewPreferences | None:
         if any(axis.role == REPEAT for axis in self.axes):
             return ViewPreferences(repeat_mode=RepeatViewMode.FACET)
@@ -386,51 +504,12 @@ class FitGridModel:
             raise ValueError("fit cell summary result differs from grid metadata")
         storage, _multi, address = self.resolve_selection(selection)
         status = result.statuses[storage]
-        lines = [
-            address,
-            f"storage row {storage} · status {status.value}",
-            (
-                "observations present/valid/used "
-                f"{int(result.present_observation_counts[storage])}/"
-                f"{int(result.valid_observation_counts[storage])}/"
-                f"{int(result.used_observation_counts[storage])} · "
-                f"evaluations {int(result.evaluation_counts[storage])}"
-            ),
-        ]
-        if status is not FitBatchStatus.CONVERGED:
-            lines.append("parameters: N/A")
-            lines.append(result.errors[storage] or "fit failed without diagnostic")
-            return FitGridCellSummary(selection, storage, status, "\n".join(lines))
-        parameter_parts = []
-        covariance_valid = bool(result.covariance_valid[storage])
-        for position, (definition, unit, value) in enumerate(
-            zip(
-                result.parameter_definitions,
-                result.parameter_units,
-                result.parameter_values[storage],
-                strict=True,
-            )
-        ):
-            text = f"{definition.name}={float(value):.7g} {unit}"
-            if covariance_valid:
-                uncertainty = math.sqrt(float(result.covariance[storage, position, position]))
-                text += f" ± {uncertainty:.3g} {unit}"
-            parameter_parts.append(text)
-        lines.append(" · ".join(parameter_parts))
-        used = int(result.used_observation_counts[storage])
-        rmse = math.sqrt(float(result.residual_sum_squares[storage]) / used)
-        quality = f"RMSE={rmse:.7g}"
-        if result.r_squared_valid[storage]:
-            quality += f" · R²={float(result.r_squared[storage]):.7g}"
-        else:
-            quality += " · R² unavailable"
-        quality += (
-            " · covariance valid"
-            if covariance_valid
-            else " · covariance unavailable"
+        return FitGridCellSummary(
+            selection,
+            storage,
+            status,
+            _fit_cell_summary_text(result, storage, address),
         )
-        lines.append(quality)
-        return FitGridCellSummary(selection, storage, status, "\n".join(lines))
 
 
 __all__ = ["FitGridCellSummary", "FitGridModel", "FitGridPage"]

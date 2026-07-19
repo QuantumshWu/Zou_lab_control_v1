@@ -56,6 +56,8 @@ def _viewport(
 def _frame(
     sequence: int,
     *,
+    panel_id: str = "image",
+    board_id: str = "camera-board",
     viewport=None,
     values=None,
     document_revision: int = 0,
@@ -149,8 +151,8 @@ def _frame(
         schema,
     )
     presentation = PanelPresentationIdentity(
-        "image",
-        "camera-document",
+        panel_id,
+        f"{panel_id}-document",
         document_revision,
         0,
         viewport.viewport_revision,
@@ -165,15 +167,19 @@ def _frame(
         (presentation,),
     )
     return BoardFrame(
-        "camera-board",
+        board_id,
         0,
         sequence,
-        (PanelFrame("image", "camera", source, stamp, raster, payload),),
+        (PanelFrame(panel_id, "camera", source, stamp, raster, payload),),
     )
 
 
-def _target(board):
-    return board._selector_target()[0]
+def _binding(board, panel_id: str = "image"):
+    return board._image_bindings[panel_id]
+
+
+def _target(board, panel_id: str = "image"):
+    return board._selector_target(_binding(board, panel_id))[0]
 
 
 def _point(target, x_fraction: float, y_fraction: float):
@@ -283,6 +289,415 @@ def _bound_board(frame, *, interaction_callback=None, selection_callback=None):
     return application, board
 
 
+def _two_image_frame(sequence: int, *, second_offset: float = 0.0):
+    from zlc_frontend.render import BoardFrame
+
+    first = replace(
+        _frame(
+            sequence,
+            panel_id="image-a",
+            board_id="two-image-board",
+            source_suffix="-a",
+            values=[[1.0, 2.0], [3.0, 4.0]],
+        ).panels[0],
+        coherence_group="image-a",
+    )
+    second = replace(
+        _frame(
+            sequence,
+            panel_id="image-b",
+            board_id="two-image-board",
+            source_suffix="-b",
+            values=np.asarray([[10.0, 20.0], [30.0, 40.0]]) + second_offset,
+            color_limits=(0.0, 100.0),
+        ).panels[0],
+        coherence_group="image-b",
+    )
+    return BoardFrame(
+        "two-image-board",
+        0,
+        sequence,
+        (first, second),
+    )
+
+
+def _with_radial_fit_overlay(
+    panel,
+    *,
+    status,
+    caption: str,
+    center=None,
+    radius=None,
+    diagnostic: str = "",
+):
+    from zlc_frontend.render import RadialGaussianImageFitOverlay
+
+    payload = panel.display_payload
+    overlay = RadialGaussianImageFitOverlay(
+        payload.evaluated_input.ref,
+        "saved-radial-fit-v1",
+        None if status is None else 0,
+        status,
+        payload.viewport.coordinate_frame,
+        caption,
+        diagnostic,
+        center,
+        radius,
+    )
+    return replace(panel, display_payload=replace(payload, fit_overlay=overlay))
+
+
+def test_radial_fit_overlay_geometry_uses_exact_view_without_clamping() -> None:
+    from PyQt5 import QtCore, QtGui
+    from zlc_data import FitBatchStatus
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+
+    _application = ensure_qt_app()
+    panel = _with_radial_fit_overlay(
+        _frame(1).panels[0],
+        status=FitBatchStatus.CONVERGED,
+        caption="repeat=0",
+        center=(10.5, 25.0),
+        radius=0.25,
+    )
+    target = QtCore.QRect(10, 20, 200, 100)
+    center, ring = QtRasterBoard._radial_fit_overlay_geometry(
+        panel.display_payload,
+        target,
+    )
+    assert (center.x(), center.y()) == pytest.approx((110.0, 70.0))
+    assert (ring.x(), ring.y(), ring.width(), ring.height()) == pytest.approx(
+        (85.0, 68.75, 50.0, 2.5)
+    )
+
+    zoomed = _viewport(bounds=(0.25, 0.25, 0.75, 0.75))
+    off_view = _with_radial_fit_overlay(
+        _frame(2, viewport=zoomed).panels[0],
+        status=FitBatchStatus.CONVERGED,
+        caption="repeat=1",
+        center=(8.0, 10.0),
+        radius=0.1,
+    ).display_payload
+    off_center, off_ring = QtRasterBoard._radial_fit_overlay_geometry(
+        off_view,
+        target,
+    )
+    assert off_center.x() < target.left()
+    assert off_center.y() < target.top()
+    assert off_ring.right() < target.left()
+    assert off_ring.bottom() < target.top()
+
+    canvas = QtGui.QImage(target.size(), QtGui.QImage.Format_ARGB32)
+    canvas.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(canvas)
+    try:
+        QtRasterBoard._paint_radial_fit_overlay(
+            painter,
+            off_view,
+            QtCore.QRect(QtCore.QPoint(), target.size()),
+        )
+    finally:
+        painter.end()
+    # Only the compact top caption is visible; the off-view geometry was not
+    # clamped into the image body.
+    assert any(
+        canvas.pixelColor(x, y).alpha() > 0
+        for x in range(canvas.width())
+        for y in range(min(32, canvas.height()))
+    )
+    assert not any(
+        canvas.pixelColor(x, y).alpha() > 0
+        for x in range(canvas.width())
+        for y in range(40, canvas.height())
+    )
+
+
+def test_radial_fit_board_target_preserves_physical_circle_aspect() -> None:
+    from PyQt5 import QtCore, QtGui
+    from zlc_data import FitBatchStatus
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+    from zlc_frontend.qt_widgets.board import _panel_image_geometry
+
+    _application = ensure_qt_app()
+    payload = _with_radial_fit_overlay(
+        _frame(1).panels[0],
+        status=FitBatchStatus.CONVERGED,
+        caption="repeat=0",
+        center=(10.5, 25.0),
+        radius=0.25,
+    ).display_payload
+    image = QtGui.QImage(2, 2, QtGui.QImage.Format_Indexed8)
+    target, _source, _rail = _panel_image_geometry(
+        QtCore.QRect(0, 0, 240, 200),
+        image,
+        payload,
+    )
+    _center, ring = QtRasterBoard._radial_fit_overlay_geometry(payload, target)
+
+    # X cells are 1 unit wide while Y cells are 10 units high.  The image
+    # body therefore becomes ten times taller than wide, and the physical
+    # radial contour remains circular on screen to integer-pixel tolerance.
+    assert target.height() / target.width() == pytest.approx(10.0, rel=0.06)
+    assert ring.width() == pytest.approx(ring.height(), abs=1.0)
+
+
+@pytest.mark.parametrize(
+    ("status", "diagnostic", "expected"),
+    (
+        (None, "NOT_PRESENT", "NOT_PRESENT"),
+        ("NO_VALID_DATA", "NO_VALID_DATA: dead site", "NO_VALID_DATA"),
+    ),
+)
+def test_sparse_and_failed_fit_cells_paint_status_but_no_geometry(
+    status,
+    diagnostic: str,
+    expected: str,
+) -> None:
+    from PyQt5 import QtCore, QtGui
+    from zlc_data import FitBatchStatus
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+
+    _application = ensure_qt_app()
+    typed_status = None if status is None else FitBatchStatus(status)
+    payload = _with_radial_fit_overlay(
+        _frame(1).panels[0],
+        status=typed_status,
+        caption="site=(2, 3)",
+        diagnostic=diagnostic,
+    ).display_payload
+    assert (
+        QtRasterBoard._radial_fit_overlay_geometry(
+            payload,
+            QtCore.QRect(0, 0, 220, 120),
+        )
+        is None
+    )
+    assert QtRasterBoard._radial_fit_caption_status(payload.fit_overlay) == (
+        f"site=(2, 3) · {expected}"
+    )
+
+    canvas = QtGui.QImage(220, 120, QtGui.QImage.Format_ARGB32)
+    canvas.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(canvas)
+    try:
+        QtRasterBoard._paint_radial_fit_overlay(
+            painter,
+            payload,
+            QtCore.QRect(0, 0, 220, 120),
+        )
+    finally:
+        painter.end()
+    assert any(
+        canvas.pixelColor(x, y).alpha() > 0
+        for x in range(canvas.width())
+        for y in range(32)
+    )
+    assert not any(
+        canvas.pixelColor(x, y).alpha() > 0
+        for x in range(canvas.width())
+        for y in range(40, canvas.height())
+    )
+
+
+def test_two_image_front_paints_fit_vectors_without_mutating_indexed8() -> None:
+    from PyQt5 import QtCore, QtGui
+    from zlc_data import FitBatchStatus
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+    from zlc_frontend.qt_widgets.style import ORANGE
+
+    application = ensure_qt_app()
+    base = _two_image_frame(1)
+    frame = replace(
+        base,
+        panels=(
+            _with_radial_fit_overlay(
+                base.panels[0],
+                status=FitBatchStatus.CONVERGED,
+                caption="repeat=0",
+                center=(10.5, 25.0),
+                radius=0.25,
+            ),
+            _with_radial_fit_overlay(
+                base.panels[1],
+                status=None,
+                caption="repeat=1",
+                diagnostic="NOT_PRESENT",
+            ),
+        ),
+    )
+    board = QtRasterBoard(("image-a", "image-b"), columns=2)
+    board.resize(480, 180)
+    board.show()
+    try:
+        board.present(frame)
+        for panel in frame.panels:
+            board.bind_rectangle_selector(
+                panel.panel_id,
+                panel.display_payload.viewport,
+                lambda _gesture: None,
+            )
+        application.processEvents()
+        for index, panel in enumerate(frame.panels):
+            owner, prepared = board._front[1][index]
+            assert owner is panel.raster.pixels
+            assert prepared.format() == QtGui.QImage.Format_Indexed8
+            assert bytes(owner) == panel.raster.pixels
+            assert board.visible_image_payload(panel.panel_id) is panel.display_payload
+
+        canvas = QtGui.QImage(board.size(), QtGui.QImage.Format_ARGB32)
+        canvas.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(canvas)
+        try:
+            board.render(painter)
+        finally:
+            painter.end()
+
+        orange = QtGui.QColor(ORANGE).name().upper()
+        targets = (_target(board, "image-a"), _target(board, "image-b"))
+
+        def body_orange(target):
+            return sum(
+                canvas.pixelColor(x, y).name().upper() == orange
+                for x in range(target.left(), target.right() + 1)
+                for y in range(target.top() + 40, target.bottom() + 1)
+            )
+
+        assert body_orange(targets[0]) > 0
+        assert body_orange(targets[1]) == 0
+    finally:
+        board.close()
+        application.processEvents()
+
+
+def test_two_image_bindings_isolate_front_hold_state_fault_and_left_double_click() -> None:
+    from PyQt5 import QtCore, QtTest
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+
+    application = ensure_qt_app()
+    first = _two_image_frame(1)
+    gestures = {"image-a": [], "image-b": []}
+    image_commands = {"image-a": [], "image-b": []}
+    board = QtRasterBoard(("image-a", "image-b"), columns=2)
+    board.resize(480, 180)
+    board.show()
+    board.present(first)
+    for panel in first.panels:
+        board.bind_rectangle_selector(
+            panel.panel_id,
+            panel.display_payload.viewport,
+            gestures[panel.panel_id].append,
+            interaction_callback=image_commands[panel.panel_id].append,
+        )
+    application.processEvents()
+    try:
+        a = _binding(board, "image-a")
+        b = _binding(board, "image-b")
+        target_a = _target(board, "image-a")
+        target_b = _target(board, "image-b")
+
+        QtTest.QTest.mouseClick(
+            board,
+            QtCore.Qt.RightButton,
+            pos=_point(target_b, 0.75, 0.75),
+        )
+        assert b.cross is not None and a.cross is None
+        board.set_image_interaction_readiness("image-b", False)
+        assert board._image_interaction_armed(a)
+        assert not board._image_interaction_armed(b)
+        board.set_image_interaction_readiness("image-b", True)
+        _drag_move(board, _point(target_b, 0.25, 0.25), QtCore.Qt.NoButton)
+        assert b.hover is not None and a.hover is None
+        _drag_move(board, _point(target_a, 0.25, 0.25), QtCore.Qt.NoButton)
+        assert a.hover is not None and b.hover is None
+
+        QtTest.QTest.mousePress(
+            board,
+            QtCore.Qt.LeftButton,
+            pos=_point(target_a, 0.1, 0.1),
+        )
+        _drag_move(board, _point(target_a, 0.8, 0.8), QtCore.Qt.LeftButton)
+        assert board._selector_hold is not None
+        assert board._selector_hold.panel_id == "image-a"
+        held_a = board.visible_image_payload("image-a")
+        old_b = board.visible_image_payload("image-b")
+
+        board.present(_two_image_frame(2, second_offset=100.0))
+        assert board.front_frame.sequence == 2
+        assert board.visible_image_payload("image-a") is held_a
+        assert board.visible_image_payload("image-b") is not old_b
+        assert board.visible_image_payload("image-b").image.values[1, 1] == 140.0
+        assert b.cross is not None
+
+        QtTest.QTest.mouseRelease(
+            board,
+            QtCore.Qt.LeftButton,
+            pos=_point(target_a, 0.8, 0.8),
+        )
+        assert len(gestures["image-a"]) == 1
+        assert gestures["image-b"] == []
+        assert board._selector_hold is None
+
+        assert _wheel(
+            board,
+            _point(_target(board, "image-b"), 0.5, 0.5),
+            -120,
+        ).isAccepted()
+        b_command = image_commands["image-b"][-1]
+        assert b.pending_viewport is not None
+        assert a.pending_viewport is None and a.pending_color_limits is None
+        QtTest.QTest.mouseClick(
+            board,
+            QtCore.Qt.RightButton,
+            pos=_point(_target(board, "image-a"), 0.25, 0.25),
+        )
+        assert a.cross is not None and b.cross is not None
+        assert board.discard_pending_image_interaction(b_command.origin)
+        assert b.pending_viewport is None
+
+        area = a.draft_bounds
+        assert area is not None
+        board.set_image_rectangle_candidate(area, panel_id="image-a")
+        assert b.applied_bounds is None
+        board.set_selector_draft_selection(None, panel_id="image-a")
+        visible_a = board.visible_image_payload("image-a")
+        assert visible_a is not None
+        a_viewport = visible_a.viewport
+        a_color_limits = visible_a.color_limits
+        a_cross = a.cross
+        double_clicked = []
+        board.imagePanelLeftDoubleClicked.connect(double_clicked.append)
+        QtTest.QTest.mouseDClick(
+            board,
+            QtCore.Qt.LeftButton,
+            pos=_point(_target(board, "image-a"), 0.5, 0.5),
+        )
+        assert double_clicked == ["image-a"]
+        assert a.applied_bounds == area
+        assert a.draft_bounds is None
+        assert a.pending_viewport is None and a.pending_color_limits is None
+        assert board.visible_image_payload("image-a") is visible_a
+        assert visible_a.viewport == a_viewport
+        assert visible_a.color_limits == a_color_limits
+        assert a.cross is a_cross
+
+        def fail(_command) -> None:
+            raise RuntimeError("image-b display failure")
+
+        board.bind_rectangle_selector(
+            "image-b",
+            b.viewport,
+            gestures["image-b"].append,
+            interaction_callback=fail,
+        )
+        assert _wheel(board, _point(_target(board, "image-b"), 0.5, 0.5), -120).isAccepted()
+        assert board.image_selector_fault("image-b") is not None
+        assert board.image_selector_fault("image-a") is None
+        assert a.binding_enabled
+    finally:
+        board.close()
+        application.processEvents()
+
+
 def test_indexed_lut_and_exact_cross_never_infer_z_from_display_code() -> None:
     from PyQt5 import QtCore, QtGui, QtTest
 
@@ -296,7 +711,7 @@ def test_indexed_lut_and_exact_cross_never_infer_z_from_display_code() -> None:
 
         position = _point(_target(board), 0.75, 0.25)
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=position)
-        sample = board._cross_sample
+        sample = _binding(board).cross
         assert sample is not None
         assert (sample.x_index, sample.y_index) == (1, 0)
         assert (sample.x_coordinate, sample.y_coordinate) == (11.0, 20.0)
@@ -310,7 +725,7 @@ def test_indexed_lut_and_exact_cross_never_infer_z_from_display_code() -> None:
             QtCore.Qt.RightButton,
             pos=invalid_position,
         )
-        invalid = board._cross_sample
+        invalid = _binding(board).cross
         assert invalid is not None and np.isnan(invalid.value) and not invalid.valid
     finally:
         board.close()
@@ -404,29 +819,29 @@ def test_hover_is_exact_and_ephemeral_on_leave_disable_and_hide() -> None:
 
         position = _point(_target(board), 0.75, 0.75)
         hover_at(position)
-        sample = board._hover_sample
+        sample = _binding(board).hover
         assert sample is not None and sample.value == 4000.0 and sample.valid
 
         # A stationary pointer remains useful on a live image: every promoted
         # front re-evaluates it against the new exact payload/provenance.
         board.present(_frame(2, values=[[1.0, 2.0], [3.0, 8.0]]))
         application.processEvents()
-        sample = board._hover_sample
+        sample = _binding(board).hover
         assert sample is not None and sample.value == 8.0 and sample.valid
 
         QtWidgets.QApplication.sendEvent(board, QtCore.QEvent(QtCore.QEvent.Leave))
-        assert board._hover_sample is None
+        assert _binding(board).hover is None
         hover_at(position)
-        assert board._hover_sample is not None
+        assert _binding(board).hover is not None
         board.set_selectors_enabled(False)
-        assert board._hover_sample is None
+        assert _binding(board).hover is None
         assert not _wheel(board, position, -120).isAccepted()
 
         board.set_selectors_enabled(True)
         hover_at(position)
-        assert board._hover_sample is not None
+        assert _binding(board).hover is not None
         QtWidgets.QApplication.sendEvent(board, QtGui.QHideEvent())
-        assert board._hover_sample is None
+        assert _binding(board).hover is None
     finally:
         board.close()
         application.processEvents()
@@ -446,9 +861,9 @@ def test_area_drag_exposes_and_persists_snapped_endpoint_label_from_visible_axis
             pos=_point(target, 0.05, 0.05),
         )
         _drag_move(board, _point(target, 0.95, 0.95), QtCore.Qt.LeftButton)
-        bounds = board._selector_draft_bounds
+        bounds = _binding(board).draft_bounds
         assert bounds is not None
-        label = board._selection_endpoint_label(bounds)
+        label = board._selection_endpoint_label(_binding(board), bounds)
         assert label.count("\n") == 1
         assert label.startswith("(") and ")\n(" in label and label.endswith(")")
         # Visible spans are x=1 and y=10, matching main's span/1000 rule.
@@ -459,9 +874,9 @@ def test_area_drag_exposes_and_persists_snapped_endpoint_label_from_visible_axis
             QtCore.Qt.LeftButton,
             pos=_point(target, 0.95, 0.95),
         )
-        selection = board._require_selector_viewport().selection_for_normalized_bounds(
-            bounds
-        )
+        selection = board._require_selector_viewport(
+            _binding(board)
+        ).selection_for_normalized_bounds(bounds)
         board.set_selector_applied_selection(selection)
         board.set_selector_draft_selection(None)
 
@@ -494,7 +909,10 @@ def test_selection_endpoint_label_supports_singleton_spatial_axes(
     values = np.arange(width * height, dtype=np.float64).reshape(height, width)
     application, board = _bound_board(_frame(1, viewport=viewport, values=values))
     try:
-        label = board._selection_endpoint_label((0.0, 0.0, 1.0, 1.0))
+        label = board._selection_endpoint_label(
+            _binding(board),
+            (0.0, 0.0, 1.0, 1.0),
+        )
         first, second = label.splitlines()
         assert first.startswith("(") and second.startswith("(")
         if width == 1:
@@ -517,7 +935,7 @@ def test_selection_endpoint_label_survives_a_non_cell_aligned_zoom() -> None:
     application, board = _bound_board(_frame(1, viewport=viewport))
     try:
         bounds = viewport.snapped_bounds_for_drag((0.1, 0.1), (0.9, 0.9))
-        label = board._selection_endpoint_label(bounds)
+        label = board._selection_endpoint_label(_binding(board), bounds)
         assert label.count("\n") == 1
         board.set_selector_draft_selection(
             viewport.selection_for_normalized_bounds(bounds)
@@ -600,16 +1018,16 @@ def test_one_active_gesture_blocks_chords_and_pending_only_gates_image_hit() -> 
         end = _point(target, 0.8, 0.8)
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
         hold = board._selector_hold
-        anchor = board._selector_drag_anchor
+        anchor = _binding(board).drag_anchor
         assert hold is not None and anchor is not None
 
         assert _wheel(board, _point(target, 0.5, 0.5), -120).isAccepted()
         _mouse_press(board, _point(target, 0.5, 0.5), QtCore.Qt.MiddleButton)
         _mouse_press(board, _point(target, 0.5, 0.5), QtCore.Qt.RightButton)
-        assert commands == [] and board._cross_sample is None
+        assert commands == [] and _binding(board).cross is None
         assert board._selector_hold is hold
-        assert board._selector_drag_anchor == anchor
-        assert board._pan_anchor is None and board._clim_drag is None
+        assert _binding(board).drag_anchor == anchor
+        assert _binding(board).pan_anchor is None and _binding(board).clim_drag is None
 
         _drag_move(board, end, QtCore.Qt.LeftButton)
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
@@ -617,7 +1035,9 @@ def test_one_active_gesture_blocks_chords_and_pending_only_gates_image_hit() -> 
 
         target = _target(board)
         assert _wheel(board, _point(target, 0.5, 0.5), -120).isAccepted()
-        assert len(commands) == 1 and board._image_interaction_is_pending()
+        assert len(commands) == 1 and board._image_interaction_is_pending(
+            _binding(board)
+        )
         # The pending IMAGE CAS is local to the image/rail. Black margin (or a
         # sibling cell in a larger board) must still bubble to its parent.
         assert not _wheel(board, QtCore.QPoint(1, 1), -120).isAccepted()
@@ -699,9 +1119,9 @@ def test_middle_double_click_prefers_area_then_home_and_right_double_clears_cros
 
         board.present(_frame(3, viewport=committed[-1].viewport))
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=center)
-        assert board._cross_sample is not None
+        assert _binding(board).cross is not None
         QtTest.QTest.mouseDClick(board, QtCore.Qt.RightButton, pos=center)
-        assert board._cross_sample is None
+        assert _binding(board).cross is None
     finally:
         board.close()
         application.processEvents()
@@ -716,7 +1136,7 @@ def test_clim_handle_holds_exact_front_and_commits_without_a_temporary_lut() -> 
     first = _frame(1)
     application, board = _bound_board(first, interaction_callback=committed.append)
     try:
-        rail, *_rest, payload = board._clim_rail_target()
+        rail, *_rest, payload = board._clim_rail_target(_binding(board))
         original_lut = tuple(board._front[1][0][1].colorTable())
         domain = board._color_rail_domain(payload)
         start = QtCore.QPoint(
@@ -733,7 +1153,7 @@ def test_clim_handle_holds_exact_front_and_commits_without_a_temporary_lut() -> 
         _drag_move(board, end, QtCore.Qt.LeftButton)
         assert committed == []
         assert tuple(board._front[1][0][1].colorTable()) == original_lut
-        candidate_label = board._clim_candidate_label(payload)
+        candidate_label = board._clim_candidate_label(_binding(board), payload)
         assert candidate_label.startswith("H low=")
         assert "high=3500" in candidate_label
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
@@ -758,12 +1178,12 @@ def test_clim_handle_holds_exact_front_and_commits_without_a_temporary_lut() -> 
                 color_limits=command.color_limits,
             )
         )
-        assert not board._image_interaction_is_pending()
+        assert not board._image_interaction_is_pending(_binding(board))
         assert tuple(board._front[1][0][1].colorTable()) == original_lut
         assert board.front_frame.panels[0].raster.pixels != original_pixels
 
         # Every non-release lifecycle exit uses the same hold cleanup.
-        rail, *_rest, payload = board._clim_rail_target()
+        rail, *_rest, payload = board._clim_rail_target(_binding(board))
         domain = board._color_rail_domain(payload)
         start = QtCore.QPoint(
             rail.center().x(),
@@ -772,7 +1192,7 @@ def test_clim_handle_holds_exact_front_and_commits_without_a_temporary_lut() -> 
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
         assert board._selector_hold is not None
         board.set_selectors_enabled(False)
-        assert board._selector_hold is None and board._clim_drag is None
+        assert board._selector_hold is None and _binding(board).clim_drag is None
     finally:
         board.close()
         application.processEvents()
@@ -821,7 +1241,7 @@ def test_hold_badge_does_not_cover_a_locked_cross_value() -> None:
         target = _target(board)
         center = _point(target, 0.5, 0.5)
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=center)
-        assert board._cross_sample is not None
+        assert _binding(board).cross is not None
         QtTest.QTest.mousePress(
             board,
             QtCore.Qt.LeftButton,
@@ -839,7 +1259,8 @@ def test_hold_badge_does_not_cover_a_locked_cross_value() -> None:
         cross_painter = RecordingPainter(board.fontMetrics())
         board._paint_cross_sample(
             cross_painter,
-            board._cross_sample,
+            _binding(board),
+            _binding(board).cross,
             target,
         )
         assert len(hold_painter.filled) == len(cross_painter.filled) == 1
@@ -864,7 +1285,7 @@ def test_locked_cross_value_remains_visible_when_zoom_moves_point_off_view() -> 
             QtCore.Qt.RightButton,
             pos=_point(target, 0.75, 0.75),
         )
-        sample = board._cross_sample
+        sample = _binding(board).cross
         assert sample is not None
         viewport = ImageViewportTransform(
             first.panels[0].display_payload.viewport.axes,
@@ -872,11 +1293,16 @@ def test_locked_cross_value_remains_visible_when_zoom_moves_point_off_view() -> 
             (0.0, 0.0, 0.5, 0.5),
         )
         board.present(_frame(2, viewport=viewport))
-        assert board._cross_sample is sample
+        assert _binding(board).cross is sample
 
         painter = Mock()
         painter.fontMetrics.return_value = board.fontMetrics()
-        board._paint_cross_sample(painter, sample, _target(board))
+        board._paint_cross_sample(
+            painter,
+            _binding(board),
+            sample,
+            _target(board),
+        )
         painter.drawLine.assert_not_called()
         painter.drawEllipse.assert_not_called()
         painter.fillRect.assert_called_once()
@@ -887,7 +1313,7 @@ def test_locked_cross_value_remains_visible_when_zoom_moves_point_off_view() -> 
             QtCore.Qt.RightButton,
             pos=_point(_target(board), 0.5, 0.5),
         )
-        assert board._cross_sample is None
+        assert _binding(board).cross is None
     finally:
         board.close()
         application.processEvents()
@@ -903,7 +1329,7 @@ def test_terminal_fault_discards_only_the_exact_pending_origin() -> None:
         _wheel(board, _point(_target(board), 0.5, 0.5), -120)
         origin = committed[0].origin
         assert origin.evaluated_input is board.visible_image_payload().evaluated_input
-        assert board._image_interaction_is_pending()
+        assert board._image_interaction_is_pending(_binding(board))
         with pytest.raises(ValueError, match="pending image viewport revision"):
             board.present(
                 _frame(
@@ -915,13 +1341,13 @@ def test_terminal_fault_discards_only_the_exact_pending_origin() -> None:
                 )
             )
         assert board.front_frame.sequence == 1
-        assert board._image_interaction_is_pending()
+        assert board._image_interaction_is_pending(_binding(board))
         assert not board.discard_pending_image_interaction(
             replace(origin, sequence=origin.sequence + 1)
         )
-        assert board._image_interaction_is_pending()
+        assert board._image_interaction_is_pending(_binding(board))
         assert board.discard_pending_image_interaction(origin)
-        assert not board._image_interaction_is_pending()
+        assert not board._image_interaction_is_pending(_binding(board))
         assert not board.discard_pending_image_interaction(origin)
     finally:
         board.close()
@@ -938,8 +1364,8 @@ def test_interaction_callback_fault_disables_and_releases_pending_state() -> Non
         assert board.selector_fault is not None
         assert "display commit failed" in str(board.selector_fault)
         assert board._selector_enabled
-        assert not board._image_binding_enabled
-        assert not board._image_interaction_is_pending()
+        assert not _binding(board).binding_enabled
+        assert not board._image_interaction_is_pending(_binding(board))
         assert board._selector_hold is None
     finally:
         board.close()
@@ -983,7 +1409,7 @@ def test_panel_revision_preserves_applied_and_cross_but_rejects_stale_front() ->
         target = _target(board)
         center = _point(target, 0.75, 0.75)
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=center)
-        cross = board._cross_sample
+        cross = _binding(board).cross
 
         # An active draft is tied to revision 0 and must be cancelled when the
         # display-only panel revision changes.
@@ -996,10 +1422,10 @@ def test_panel_revision_preserves_applied_and_cross_but_rejects_stale_front() ->
         replacement = _frame(2, viewport=replacement_viewport)
         board.present(replacement)
         assert board._selector_hold is None
-        assert board._selector_draft_bounds is None
-        assert board._selector_applied_bounds is not None
-        assert board._cross_sample is cross
-        assert board._selector_viewport == replacement_viewport
+        assert _binding(board).draft_bounds is None
+        assert _binding(board).applied_bounds is not None
+        assert _binding(board).cross is cross
+        assert _binding(board).viewport == replacement_viewport
 
         with pytest.raises(ValueError, match="stale image viewport revision"):
             board.present(_frame(3, viewport=_viewport(revision=0)))
@@ -1014,8 +1440,8 @@ def test_panel_revision_preserves_applied_and_cross_but_rejects_stale_front() ->
                 document_revision=1,
             )
         )
-        assert board._selector_applied_bounds is None
-        assert board._cross_sample is None
+        assert _binding(board).applied_bounds is None
+        assert _binding(board).cross is None
     finally:
         board.close()
         application.processEvents()

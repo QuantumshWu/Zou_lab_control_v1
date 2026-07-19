@@ -57,6 +57,11 @@ def _board(window) -> QtRasterBoard:
     return board
 
 
+def _raw_image_binding(board: QtRasterBoard):
+    assert tuple(board._image_bindings) == _RAW_PANELS
+    return board._image_bindings[_RAW_PANELS[0]]
+
+
 def _close_window(application, window) -> None:
     window.close()
     _until(application, lambda: not window.isVisible(), timeout=10.0)
@@ -372,12 +377,12 @@ def test_first_roi_clear_and_recreate_only_migrate_the_scalar_branch(
         assert window._running_binding.selection == candidates[0].selection
         first_scalar_generation = first_scalar.scalar.ref.stream_generation
         first_scalar_block = first_scalar.scalar.ref.block_id
-        assert scalar_board._selector_applied_bounds == (
-            scalar_board._selector_viewport.normalized_bounds_for_selection(
+        assert _raw_image_binding(scalar_board).applied_bounds == (
+            _raw_image_binding(scalar_board).viewport.normalized_bounds_for_selection(
                 candidates[0].selection
             )
         )
-        assert scalar_board._selector_draft_bounds is None
+        assert _raw_image_binding(scalar_board).draft_bounds is None
 
         clear = window.findChild(QtWidgets.QPushButton, "clearRoiButton")
         assert clear is not None and clear.isEnabled()
@@ -722,8 +727,10 @@ def test_visible_roi_stop_restart_reuses_widget_and_reearns_applied_overlay(
                 and status.sequence == front.sequence
                 and window._visible_binding_fingerprint == binding.fingerprint
                 and window._visible_projection_text == window._projection_text
-                and board._selector_applied_bounds
-                == board._selector_viewport.normalized_bounds_for_selection(initial_roi)
+                and _raw_image_binding(board).applied_bounds
+                == _raw_image_binding(board).viewport.normalized_bounds_for_selection(
+                    initial_roi
+                )
             )
 
         _until(application, scalar_front_is_visible)
@@ -753,7 +760,7 @@ def test_visible_roi_stop_restart_reuses_widget_and_reearns_applied_overlay(
         QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
         _until(application, scalar_front_is_visible, timeout=20.0)
         assert window._board_widget is board
-        assert board._selector_draft_bounds is None
+        assert _raw_image_binding(board).draft_bounds is None
         assert window._local_diagnostic == ""
         assert _manifest_files(workspace) == before_manifests
     finally:
@@ -933,7 +940,9 @@ def test_close_terminalizes_a_pending_roi_revision_without_stale_layout_promotio
         _draw_first_roi(window, board)
         assert len(receipts) == 1
         _until(application, projection_entered.is_set)
-        second_selection = board._selector_viewport.selection_for_normalized_bounds(
+        second_selection = _raw_image_binding(
+            board
+        ).viewport.selection_for_normalized_bounds(
             (0.1, 0.1, 0.4, 0.4)
         )
         publish_started = time.perf_counter()

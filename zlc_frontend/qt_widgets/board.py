@@ -9,7 +9,7 @@ from typing import Callable, Literal, TypeAlias
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from zlc_data import Selection
+from zlc_data import FitBatchStatus, Selection
 from zlc_storage import canonical_text, nonnegative_integer
 
 from ..curve_display import CurveViewportTransform
@@ -26,6 +26,7 @@ from ..render import (
     PanelFrame,
     PanelPresentationIdentity,
     PixelFormat,
+    RadialGaussianImageFitOverlay,
     SiteMapPanelPayload,
     SourceIdentity,
     detached_render_fault,
@@ -178,13 +179,20 @@ def _panel_image_geometry(
         max(1, bounds.width() - rail_width - gap),
         bounds.height(),
     )
+    fit_aspect = None
+    if payload.fit_overlay is not None:
+        unit_span = payload.viewport.visible_span_for_coordinate_span(
+            (1.0, 1.0),
+            coordinate_frame=payload.fit_overlay.coordinate_frame,
+        )
+        fit_aspect = unit_span[1] / unit_span[0]
     target = _aspect_target_for_source(
         image_bounds,
         source,
         aspect_ratio=(
-            None
-            if site_map_payload is None
-            else site_map_payload.visible_coordinate_aspect_ratio
+            site_map_payload.visible_coordinate_aspect_ratio
+            if site_map_payload is not None
+            else fit_aspect
         ),
         anchor_west=site_map_payload is not None,
     )
@@ -428,6 +436,37 @@ class _HeldPanelFront:
 
 
 @dataclass(slots=True)
+class _ImagePanelBinding:
+    """The sole mutable owner for one bound image-family panel."""
+
+    panel_id: str
+    viewport: ImageViewportTransform
+    selection_callback: Callable[[RectangleGesture], object]
+    interaction_callback: Callable[[ImageInteractionCommit], object] | None = None
+    binding_enabled: bool = True
+    interaction_ready: bool = False
+    applied_bounds: NormalizedRectangle | None = None
+    draft_bounds: NormalizedRectangle | None = None
+    drag_anchor: tuple[float, float] | None = None
+    drag_prior_draft: NormalizedRectangle | None = None
+    pan_anchor: QtCore.QPointF | None = None
+    pan_origin: ImageViewportTransform | None = None
+    pan_target_size: tuple[int, int] | None = None
+    pan_candidate: ImageViewportTransform | None = None
+    pending_viewport: ImageViewportTransform | None = None
+    pending_color_limits: tuple[float, float] | None = None
+    pending_origin: PanelInteractionOrigin | None = None
+    clim_drag: str | None = None
+    clim_origin_limits: tuple[float, float] | None = None
+    clim_candidate: tuple[float, float] | None = None
+    clim_domain: tuple[float, float] | None = None
+    cross: _ImageSample | None = None
+    hover: _ImageSample | None = None
+    hover_position: QtCore.QPointF | None = None
+    fault: RuntimeError | None = None
+
+
+@dataclass(slots=True)
 class _NumericPanelBinding:
     """The sole mutable owner for one bound numeric panel."""
 
@@ -621,6 +660,8 @@ class QtImageBoard(QtWidgets.QWidget):
 class QtRasterBoard(QtWidgets.QWidget):
     """Atomic multi-panel presenter for immutable worker-owned raster fronts."""
 
+    imagePanelLeftDoubleClicked = QtCore.pyqtSignal(str)
+
     def __init__(
         self,
         panel_ids: tuple[str, ...],
@@ -635,32 +676,9 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._staged_layout: tuple[str, int, tuple[str, ...], int] | None = None
         self._empty_text = str(empty_text)
         self._front: tuple[BoardFrame, tuple[tuple[bytes, QtGui.QImage], ...]] | None = None
-        self._selector_panel_id: str | None = None
-        self._selector_viewport: ImageViewportTransform | None = None
-        self._selector_callback: Callable[[RectangleGesture], object] | None = None
-        self._interaction_callback: Callable[[ImageInteractionCommit], object] | None = None
         self._selector_enabled = False
-        self._image_binding_enabled = False
-        self._image_interaction_ready = False
-        self._selector_applied_bounds: NormalizedRectangle | None = None
-        self._selector_draft_bounds: NormalizedRectangle | None = None
-        self._selector_drag_anchor: tuple[float, float] | None = None
-        self._pan_anchor: QtCore.QPointF | None = None
-        self._pan_origin: ImageViewportTransform | None = None
-        self._pan_target_size: tuple[int, int] | None = None
-        self._pan_candidate: ImageViewportTransform | None = None
-        self._pending_viewport: ImageViewportTransform | None = None
-        self._pending_color_limits: tuple[float, float] | None = None
-        self._pending_origin: PanelInteractionOrigin | None = None
-        self._clim_drag: str | None = None
-        self._clim_origin_limits: tuple[float, float] | None = None
-        self._clim_candidate: tuple[float, float] | None = None
-        self._clim_domain: tuple[float, float] | None = None
         self._selector_hold: _HeldPanelFront | None = None
-        self._cross_sample: _ImageSample | None = None
-        self._hover_sample: _ImageSample | None = None
-        self._hover_position: QtCore.QPointF | None = None
-        self._selector_fault: RuntimeError | None = None
+        self._image_bindings: dict[str, _ImagePanelBinding] = {}
         self._numeric_bindings: dict[str, _NumericPanelBinding] = {}
         self._closed = False
         self.setMouseTracking(True)
@@ -746,7 +764,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         target_panel_ids = self._panel_ids
         target_columns = self._columns
         target_identity = self._active_layout_identity
-        target_viewport = self._selector_viewport
+        target_image_viewports: dict[str, ImageViewportTransform] = {}
         target_numeric_viewports: dict[str, _NumericViewport] = {}
         try:
             if not isinstance(frame, BoardFrame):
@@ -777,30 +795,28 @@ class QtRasterBoard(QtWidgets.QWidget):
                 )
             else:
                 target_identity = frame_identity
-            if (
-                self._selector_panel_id is not None
-                and self._selector_panel_id in target_panel_ids
-                and self._selector_viewport is not None
-            ):
+            for panel_id, binding in self._image_bindings.items():
+                if panel_id not in target_panel_ids:
+                    continue
                 target_viewport = self._viewport_for_presented_panel(
-                    self._selector_panel_id,
-                    self._selector_viewport,
+                    binding,
                     frame,
                     panel_ids=target_panel_ids,
                 )
                 self._validate_selector_binding(
-                    self._selector_panel_id,
+                    panel_id,
                     target_viewport,
                     frame,
                     panel_ids=target_panel_ids,
                 )
-                pending_origin = self._pending_origin
-                pending_limits = self._pending_color_limits
+                target_image_viewports[panel_id] = target_viewport
+                pending_origin = binding.pending_origin
+                pending_limits = binding.pending_color_limits
                 target_panel = frame.panels[
-                    target_panel_ids.index(self._selector_panel_id)
+                    target_panel_ids.index(panel_id)
                 ]
                 if (
-                    self._interaction_callback is not None
+                    binding.interaction_callback is not None
                     and _image_payload(target_panel) is None
                 ):
                     raise ValueError(
@@ -851,23 +867,21 @@ class QtRasterBoard(QtWidgets.QWidget):
                 self.update()
             raise
         previous = self._front
-        if self._selector_panel_id is not None:
-            panel_id = self._selector_panel_id
+        for panel_id, binding in tuple(self._image_bindings.items()):
             if panel_id not in target_panel_ids:
-                self._reset_rectangle_selector()
-            elif previous is not None:
+                self._reset_image_binding(panel_id)
+            elif previous is not None and panel_id in self._panel_ids:
                 old_index = self._panel_ids.index(panel_id)
                 new_index = target_panel_ids.index(panel_id)
                 old_panel = previous[0].panels[old_index]
                 new_panel = frame.panels[new_index]
                 if self._panel_semantics_changed(old_panel, new_panel):
-                    self._selector_applied_bounds = None
-                    self._selector_draft_bounds = None
-                    self._set_cross_sample(None)
-                    self._pending_viewport = None
-                    self._pending_color_limits = None
-                    self._pending_origin = None
-                    cancel_interaction = (
+                    self._clear_image_transient(
+                        binding,
+                        clear_applied_bounds=True,
+                        clear_pending=True,
+                    )
+                    cancel_interaction = cancel_interaction or (
                         interaction_was_active
                         and self._selector_hold is not None
                         and self._selector_hold.panel_id == panel_id
@@ -884,7 +898,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                         clear_applied_span=True,
                         clear_pending=True,
                     )
-                    cancel_interaction = (
+                    cancel_interaction = cancel_interaction or (
                         interaction_was_active
                         and self._selector_hold is not None
                         and self._selector_hold.panel_id == panel_id
@@ -899,31 +913,34 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._columns = target_columns
             self._staged_layout = None
         self._active_layout_identity = target_identity
-        self._selector_viewport = (
-            target_viewport if self._selector_panel_id is not None else None
-        )
+        for panel_id, viewport in target_image_viewports.items():
+            binding = self._image_bindings.get(panel_id)
+            if binding is not None:
+                binding.viewport = viewport
         for panel_id, viewport in target_numeric_viewports.items():
             binding = self._numeric_bindings.get(panel_id)
             if binding is not None:
                 binding.viewport = viewport
-        pending = self._pending_viewport
-        if pending is not None and target_viewport is not None:
+        for panel_id, binding in self._image_bindings.items():
+            target_viewport = target_image_viewports.get(panel_id)
+            pending = binding.pending_viewport
+            if pending is not None and target_viewport is not None:
+                if (
+                    target_viewport == pending
+                    or target_viewport.viewport_revision > pending.viewport_revision
+                ):
+                    binding.pending_viewport = None
+            pending_origin = binding.pending_origin
             if (
-                target_viewport == pending
-                or target_viewport.viewport_revision > pending.viewport_revision
+                binding.pending_color_limits is not None
+                and target_viewport is not None
+                and pending_origin is not None
+                and target_viewport.viewport_revision
+                > pending_origin.presentation.panel_revision
             ):
-                self._pending_viewport = None
-        pending_origin = self._pending_origin
-        if (
-            self._pending_color_limits is not None
-            and target_viewport is not None
-            and pending_origin is not None
-            and target_viewport.viewport_revision
-            > pending_origin.presentation.panel_revision
-        ):
-            self._pending_color_limits = None
-        if not self._image_interaction_is_pending():
-            self._pending_origin = None
+                binding.pending_color_limits = None
+            if not self._image_interaction_is_pending(binding):
+                binding.pending_origin = None
         for panel_id, binding in self._numeric_bindings.items():
             pending = binding.pending_viewport
             candidate = target_numeric_viewports.get(panel_id)
@@ -935,28 +952,30 @@ class QtRasterBoard(QtWidgets.QWidget):
                 binding.pending_viewport = None
             if binding.pending_viewport is None:
                 binding.pending_origin = None
-        hover_position = self._hover_position
+        image_hover_positions = {
+            panel_id: binding.hover_position
+            for panel_id, binding in self._image_bindings.items()
+        }
         numeric_hover_positions = {
             panel_id: binding.hover_position
             for panel_id, binding in self._numeric_bindings.items()
         }
         self._front = (frame, prepared)
-        if (
-            self._image_interaction_armed()
-            and not self._image_interaction_is_pending()
-            and hover_position is not None
-        ):
-            target = self._selector_target()
-            sample = (
-                None
-                if target is None or not target[0].contains(hover_position.toPoint())
-                else self._sample_for_target(target, hover_position)
-            )
-            if sample is not None:
-                self._hover_position = QtCore.QPointF(hover_position)
-            self._set_hover_sample(sample)
-        else:
-            self._set_hover_sample(None)
+        for panel_id, binding in self._image_bindings.items():
+            hover_position = image_hover_positions.get(panel_id)
+            target = self._selector_target(binding)
+            sample = None
+            if (
+                self._image_interaction_armed(binding)
+                and not self._image_interaction_is_pending(binding)
+                and hover_position is not None
+                and target is not None
+                and target[0].contains(hover_position.toPoint())
+            ):
+                sample = self._sample_for_target(target, hover_position)
+            if sample is not None and hover_position is not None:
+                binding.hover_position = QtCore.QPointF(hover_position)
+            self._set_hover_sample(binding, sample)
         for panel_id, binding in self._numeric_bindings.items():
             position = numeric_hover_positions.get(panel_id)
             target = self._numeric_target(binding)
@@ -983,12 +1002,12 @@ class QtRasterBoard(QtWidgets.QWidget):
             clear_image_draft=True,
             clear_numeric_spans=True,
         )
-        self._pending_viewport = None
-        self._pending_color_limits = None
-        self._pending_origin = None
-        self._selector_applied_bounds = None
-        self._set_cross_sample(None)
-        self._set_hover_sample(None)
+        for binding in self._image_bindings.values():
+            self._clear_image_transient(
+                binding,
+                clear_applied_bounds=True,
+                clear_pending=True,
+            )
         for binding in self._numeric_bindings.values():
             self._clear_numeric_transient(
                 binding,
@@ -1008,7 +1027,18 @@ class QtRasterBoard(QtWidgets.QWidget):
     @property
     def selector_fault(self) -> RuntimeError | None:
         self._require_owner()
-        return self._selector_fault
+        binding = self._image_binding()
+        return None if binding is None else binding.fault
+
+    def image_selector_fault(
+        self,
+        panel_id: str | None = None,
+    ) -> RuntimeError | None:
+        """Return one image panel's isolated interaction fault."""
+
+        self._require_owner()
+        binding = self._image_binding(panel_id)
+        return None if binding is None else binding.fault
 
     @property
     def curve_selector_fault(self) -> RuntimeError | None:
@@ -1070,7 +1100,10 @@ class QtRasterBoard(QtWidgets.QWidget):
             _payload_input(payload),
         )
 
-    def visible_image_payload(self) -> ImagePanelPayload | None:
+    def visible_image_payload(
+        self,
+        panel_id: str | None = None,
+    ) -> ImagePanelPayload | None:
         """Return the exact samples paired with the currently painted IMAGE.
 
         During A/pan interaction this is the held target payload, not the
@@ -1079,30 +1112,39 @@ class QtRasterBoard(QtWidgets.QWidget):
         """
 
         self._require_owner()
+        binding = self._image_binding(panel_id)
         payload, _origin = self._visible_display(
-            self._selector_panel_id,
+            None if binding is None else binding.panel_id,
             (ImagePanelPayload, SiteMapPanelPayload),
         )
         if isinstance(payload, SiteMapPanelPayload):
             return payload.background
         return payload if isinstance(payload, ImagePanelPayload) else None
 
-    def visible_image_origin(self) -> PanelInteractionOrigin | None:
+    def visible_image_origin(
+        self,
+        panel_id: str | None = None,
+    ) -> PanelInteractionOrigin | None:
         """Return provenance for the exact held/current IMAGE being painted."""
 
         self._require_owner()
+        binding = self._image_binding(panel_id)
         _payload, origin = self._visible_display(
-            self._selector_panel_id,
+            None if binding is None else binding.panel_id,
             (ImagePanelPayload, SiteMapPanelPayload),
         )
         return origin
 
-    def visible_site_map_payload(self) -> SiteMapPanelPayload | None:
+    def visible_site_map_payload(
+        self,
+        panel_id: str | None = None,
+    ) -> SiteMapPanelPayload | None:
         """Return the exact composite payload painted by the image-family panel."""
 
         self._require_owner()
+        binding = self._image_binding(panel_id)
         payload, _origin = self._visible_display(
-            self._selector_panel_id,
+            None if binding is None else binding.panel_id,
             SiteMapPanelPayload,
         )
         return payload if isinstance(payload, SiteMapPanelPayload) else None
@@ -1122,11 +1164,16 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._require_owner()
         if not isinstance(origin, PanelInteractionOrigin):
             raise TypeError("origin must be PanelInteractionOrigin")
-        if not self._image_interaction_is_pending() or origin != self._pending_origin:
+        binding = self._image_bindings.get(origin.panel_id)
+        if (
+            binding is None
+            or not self._image_interaction_is_pending(binding)
+            or origin != binding.pending_origin
+        ):
             return False
-        self._pending_viewport = None
-        self._pending_color_limits = None
-        self._pending_origin = None
+        binding.pending_viewport = None
+        binding.pending_color_limits = None
+        binding.pending_origin = None
         self.update()
         return True
 
@@ -1233,10 +1280,12 @@ class QtRasterBoard(QtWidgets.QWidget):
         if not isinstance(gesture, RectangleGesture):
             raise TypeError("gesture must be RectangleGesture")
         hold = self._selector_hold
+        binding = self._image_bindings.get(gesture.panel_id)
         if (
             hold is None
-            or self._selector_drag_anchor is not None
-            or self._pan_anchor is not None
+            or binding is None
+            or binding.drag_anchor is not None
+            or binding.pan_anchor is not None
         ):
             raise RuntimeError("rectangle gesture has no completed held origin")
         if gesture.panel_id != hold.panel_id or (
@@ -1251,7 +1300,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 "site-map rectangles are display-only candidates; "
                 "a spatial box cannot be promoted to authoritative SITE selection"
             )
-        viewport = self._require_selector_viewport()
+        viewport = self._require_selector_viewport(binding)
         if viewport.viewport_revision != gesture.viewport_revision:
             raise RuntimeError("rectangle gesture viewport changed before dispatch")
         front = self._front
@@ -1286,7 +1335,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise TypeError("interaction_callback must be callable or None")
         if not isinstance(enabled, bool):
             raise TypeError("selector enabled must be bool")
-        if self._numeric_bindings and enabled != self._selector_enabled:
+        has_other_binding = bool(
+            self._numeric_bindings
+            or any(bound_id != panel_id for bound_id in self._image_bindings)
+        )
+        if has_other_binding and enabled != self._selector_enabled:
             raise ValueError(
                 "a second selector family must match the board-wide enabled state; "
                 "call set_selectors_enabled explicitly"
@@ -1303,18 +1356,16 @@ class QtRasterBoard(QtWidgets.QWidget):
                     raise ValueError(
                         "image interaction callback requires exact ImagePanelPayload"
                     )
-        self._reset_rectangle_selector()
-        self._selector_fault = None
-        self._selector_panel_id = panel_id
-        self._selector_viewport = viewport
-        self._selector_callback = callback
-        self._interaction_callback = interaction_callback
-        self._pending_viewport = None
-        self._pending_color_limits = None
-        self._pending_origin = None
-        self._image_binding_enabled = True
-        self._image_interaction_ready = enabled
-        if not self._numeric_bindings:
+        if panel_id in self._image_bindings:
+            self._reset_image_binding(panel_id)
+        self._image_bindings[panel_id] = _ImagePanelBinding(
+            panel_id,
+            viewport,
+            callback,
+            interaction_callback=interaction_callback,
+            interaction_ready=enabled,
+        )
+        if not has_other_binding:
             self._selector_enabled = enabled
         self.update()
 
@@ -1341,10 +1392,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             or not isinstance(histogram, bool)
         ):
             raise TypeError("interaction readiness values must be bool")
-        if not image and self._image_interaction_ready:
-            self._cancel_image_gesture(clear_draft=True)
-            self._set_hover_sample(None)
-        self._image_interaction_ready = image
+        for binding in self._image_bindings.values():
+            if not image and binding.interaction_ready:
+                self._cancel_image_gesture(binding, clear_draft=True)
+                self._set_hover_sample(binding, None)
+            binding.interaction_ready = image
         readiness = {"curve": curve, "histogram": histogram}
         for binding in self._numeric_bindings.values():
             ready = readiness[binding.kind]
@@ -1360,13 +1412,11 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._require_owner()
         if not isinstance(enabled, bool):
             raise TypeError("selector enabled must be bool")
-        healthy_image = (
-            self._image_binding_enabled
-            and self._image_interaction_ready
-            and self._selector_panel_id is not None
-            and self._selector_viewport is not None
-            and self._selector_callback is not None
-            and self._selector_fault is None
+        healthy_image = any(
+            binding.binding_enabled
+            and binding.interaction_ready
+            and binding.fault is None
+            for binding in self._image_bindings.values()
         )
         healthy_numeric = any(
             binding.binding_enabled
@@ -1383,17 +1433,36 @@ class QtRasterBoard(QtWidgets.QWidget):
                 clear_image_draft=True,
                 clear_numeric_spans=True,
             )
-            self._set_hover_sample(None)
+            for binding in self._image_bindings.values():
+                self._set_hover_sample(binding, None)
             for binding in self._numeric_bindings.values():
                 self._set_numeric_hover(binding, None)
         self.update()
 
-    def _image_interaction_armed(self) -> bool:
+    def _image_interaction_armed(self, binding: _ImagePanelBinding) -> bool:
         return (
             self._selector_enabled
-            and self._image_binding_enabled
-            and self._image_interaction_ready
+            and binding.binding_enabled
+            and binding.interaction_ready
+            and binding.fault is None
         )
+
+    def set_image_interaction_readiness(
+        self,
+        panel_id: str,
+        ready: bool,
+    ) -> None:
+        """Set readiness for exactly one bound image-family panel."""
+
+        self._require_owner()
+        if not isinstance(ready, bool):
+            raise TypeError("image interaction readiness must be bool")
+        binding = self._require_image_binding(panel_id)
+        if not ready and binding.interaction_ready:
+            self._cancel_image_gesture(binding, clear_draft=True)
+            self._set_hover_sample(binding, None)
+        binding.interaction_ready = ready
+        self.update()
 
     def _numeric_interaction_armed(self, binding: _NumericPanelBinding) -> bool:
         return (
@@ -1430,34 +1499,48 @@ class QtRasterBoard(QtWidgets.QWidget):
             "histogram", panel_id, callback, enabled=enabled
         )
 
-    def set_selector_applied_selection(self, selection: Selection | None) -> None:
+    def set_selector_applied_selection(
+        self,
+        selection: Selection | None,
+        *,
+        panel_id: str | None = None,
+    ) -> None:
         self._require_owner()
-        viewport = self._require_selector_viewport()
+        binding = self._require_image_binding(panel_id)
+        viewport = self._require_selector_viewport(binding)
         if selection is not None and not isinstance(selection, Selection):
             raise TypeError("applied selection must be zlc_data.Selection or None")
-        self._selector_applied_bounds = (
+        binding.applied_bounds = (
             None
             if selection is None
             else viewport.normalized_bounds_for_selection(selection)
         )
         self.update()
 
-    def set_selector_draft_selection(self, selection: Selection | None) -> None:
+    def set_selector_draft_selection(
+        self,
+        selection: Selection | None,
+        *,
+        panel_id: str | None = None,
+    ) -> None:
         self._require_owner()
-        viewport = self._require_selector_viewport()
+        binding = self._require_image_binding(panel_id)
+        viewport = self._require_selector_viewport(binding)
         if selection is not None and not isinstance(selection, Selection):
             raise TypeError("draft selection must be zlc_data.Selection or None")
-        self._selector_draft_bounds = (
+        binding.draft_bounds = (
             None
             if selection is None
             else viewport.normalized_bounds_for_selection(selection)
         )
-        self._cancel_image_gesture(clear_draft=False)
+        self._cancel_image_gesture(binding, clear_draft=False)
         self.update()
 
     def set_image_rectangle_candidate(
         self,
         bounds: NormalizedRectangle | None,
+        *,
+        panel_id: str | None = None,
     ) -> None:
         """Retain one image-family rectangle without forging data authority.
 
@@ -1467,12 +1550,13 @@ class QtRasterBoard(QtWidgets.QWidget):
         """
 
         self._require_owner()
-        if self.visible_image_payload() is None:
+        binding = self._require_image_binding(panel_id)
+        if self.visible_image_payload(binding.panel_id) is None:
             raise RuntimeError("no exact image-family payload is currently painted")
-        self._selector_applied_bounds = (
+        binding.applied_bounds = (
             None if bounds is None else validate_normalized_rectangle(bounds)
         )
-        self._cancel_image_gesture(clear_draft=True)
+        self._cancel_image_gesture(binding, clear_draft=True)
         self.update()
 
     def set_curve_range_candidate(
@@ -1517,9 +1601,11 @@ class QtRasterBoard(QtWidgets.QWidget):
         )
         self.update()
 
-    def unbind_rectangle_selector(self) -> None:
+    def unbind_rectangle_selector(self, panel_id: str | None = None) -> None:
         self._require_owner()
-        self._reset_rectangle_selector()
+        binding = self._image_binding(panel_id)
+        if binding is not None:
+            self._reset_image_binding(binding.panel_id)
         self.update()
 
     def unbind_curve_interaction(self, panel_id: str | None = None) -> None:
@@ -1603,10 +1689,17 @@ class QtRasterBoard(QtWidgets.QWidget):
                     ),
                 )
             painter.drawImage(QtCore.QRectF(target), image, source)
+            if isinstance(payload, ImagePanelPayload):
+                self._paint_radial_fit_overlay(painter, payload, target)
             if isinstance(payload, SiteMapPanelPayload):
                 self._paint_site_map_rings(painter, payload, target)
             if image_payload is not None and rail is not None:
-                self._paint_color_rail(painter, image_payload, rail)
+                self._paint_color_rail(
+                    painter,
+                    image_payload,
+                    rail,
+                    self._image_bindings.get(panel_id),
+                )
             if hold is not None and hold.panel_id == panel_id:
                 held_target = target
         if hold is not None and held_target is not None:
@@ -1669,14 +1762,17 @@ class QtRasterBoard(QtWidgets.QWidget):
                 return
             super().mousePressEvent(event)
             return
-        if not self._image_interaction_armed():
+        image_hit = self._image_target_at(event.localPos(), include_rail=True)
+        if image_hit is None:
             super().mousePressEvent(event)
             return
-        target = self._selector_target()
-        rail_target = self._clim_rail_target()
+        binding, target, rail_target = image_hit
+        if not self._image_interaction_armed(binding):
+            super().mousePressEvent(event)
+            return
         hits_image = target is not None and target[0].contains(event.pos())
         hits_rail = rail_target is not None and rail_target[0].contains(event.pos())
-        if self._image_interaction_is_pending() or self._selector_hold is not None:
+        if self._image_interaction_is_pending(binding) or self._selector_hold is not None:
             if hits_image or hits_rail:
                 event.accept()
             else:
@@ -1686,17 +1782,17 @@ class QtRasterBoard(QtWidgets.QWidget):
             target is not None
             and rail_target is not None
             and event.button() == QtCore.Qt.LeftButton
-            and self._interaction_callback is not None
+            and binding.interaction_callback is not None
             and rail_target[0].contains(event.pos())
         ):
             handle = self._clim_handle_at(event.pos(), rail_target[0], rail_target[4])
             if handle is not None:
                 self._selector_hold = self._held_panel_from_target(target)
-                self._clim_drag = handle
-                self._clim_origin_limits = rail_target[4].color_limits
-                self._clim_candidate = rail_target[4].color_limits
-                self._clim_domain = self._color_rail_domain(rail_target[4])
-                self._set_hover_sample(None)
+                binding.clim_drag = handle
+                binding.clim_origin_limits = rail_target[4].color_limits
+                binding.clim_candidate = rail_target[4].color_limits
+                binding.clim_domain = self._color_rail_domain(rail_target[4])
+                self._set_hover_sample(binding, None)
                 self.update()
                 event.accept()
                 return
@@ -1708,24 +1804,24 @@ class QtRasterBoard(QtWidgets.QWidget):
             if sample is None:
                 super().mousePressEvent(event)
                 return
-            self._set_cross_sample(sample)
-            self._set_hover_sample(None)
+            self._set_cross_sample(binding, sample)
+            self._set_hover_sample(binding, None)
             self.update()
             event.accept()
             return
         if event.button() == QtCore.Qt.MiddleButton:
-            if self._interaction_callback is None:
+            if binding.interaction_callback is None:
                 super().mousePressEvent(event)
                 return
             self._selector_hold = self._held_panel_from_target(target)
-            self._pan_anchor = QtCore.QPointF(event.localPos())
-            self._pan_origin = self._viewport_for_target(target)
-            self._pan_target_size = (
+            binding.pan_anchor = QtCore.QPointF(event.localPos())
+            binding.pan_origin = self._viewport_for_target(binding, target)
+            binding.pan_target_size = (
                 max(1, target[0].width()),
                 max(1, target[0].height()),
             )
-            self._pan_candidate = self._pan_origin
-            self._set_hover_sample(None)
+            binding.pan_candidate = binding.pan_origin
+            self._set_hover_sample(binding, None)
             self.update()
             event.accept()
             return
@@ -1734,10 +1830,17 @@ class QtRasterBoard(QtWidgets.QWidget):
             return
         image_target = target[0]
         point = self._normalized_point(event.localPos(), image_target, clamp=False)
-        bounds = self._selector_draft_bounds or self._selector_applied_bounds
-        handle = None if bounds is None else self._hit_corner_handle(event.pos(), bounds, image_target)
-        self._selector_drag_anchor = (
-            point if handle is None else self._opposite_corner_anchor(bounds, handle)
+        bounds = binding.draft_bounds or binding.applied_bounds
+        handle = (
+            None
+            if bounds is None
+            else self._hit_corner_handle(binding, event.pos(), bounds, image_target)
+        )
+        binding.drag_prior_draft = binding.draft_bounds
+        binding.drag_anchor = (
+            point
+            if handle is None
+            else self._opposite_corner_anchor(binding, bounds, handle)
         )
         self._selector_hold = self._held_panel_from_target(target)
         self.update()
@@ -1787,38 +1890,41 @@ class QtRasterBoard(QtWidgets.QWidget):
                     numeric_binding.pan_candidate = None
             event.accept()
             return
-        if self._clim_drag is not None:
-            rail_target = self._clim_rail_target()
+        image_binding = self._active_image_binding()
+        if image_binding is not None and image_binding.clim_drag is not None:
+            rail_target = self._clim_rail_target(image_binding)
             if (
                 rail_target is not None
-                and self._clim_origin_limits is not None
-                and self._clim_domain is not None
+                and image_binding.clim_origin_limits is not None
+                and image_binding.clim_domain is not None
             ):
                 value = self._rail_value(
                     float(event.localPos().y()),
-                    self._clim_domain,
+                    image_binding.clim_domain,
                     rail_target[0],
                 )
-                low, high = self._clim_origin_limits
-                if self._clim_drag == "low":
+                low, high = image_binding.clim_origin_limits
+                if image_binding.clim_drag == "low":
                     low = min(value, math.nextafter(high, -math.inf))
                 else:
                     high = max(value, math.nextafter(low, math.inf))
-                self._clim_candidate = (low, high)
+                image_binding.clim_candidate = (low, high)
                 self.update()
             event.accept()
             return
-        anchor = self._selector_drag_anchor
+        anchor = None if image_binding is None else image_binding.drag_anchor
         if anchor is not None:
-            target = self._selector_target()
+            target = self._selector_target(image_binding)
             if target is None:
                 event.accept()
                 return
             point = self._normalized_point(event.localPos(), target[0], clamp=True)
             if point[0] == anchor[0] or point[1] == anchor[1]:
-                self._selector_draft_bounds = None
+                image_binding.draft_bounds = image_binding.drag_prior_draft
             else:
-                self._selector_draft_bounds = self._require_selector_viewport().snapped_bounds_for_drag(
+                image_binding.draft_bounds = self._require_selector_viewport(
+                    image_binding
+                ).snapped_bounds_for_drag(
                     anchor,
                     point,
                 )
@@ -1826,15 +1932,15 @@ class QtRasterBoard(QtWidgets.QWidget):
             event.accept()
             return
 
-        pan_anchor = self._pan_anchor
-        pan_origin = self._pan_origin
-        pan_size = self._pan_target_size
+        pan_anchor = None if image_binding is None else image_binding.pan_anchor
+        pan_origin = None if image_binding is None else image_binding.pan_origin
+        pan_size = None if image_binding is None else image_binding.pan_target_size
         if pan_anchor is not None and pan_origin is not None and pan_size is not None:
             delta = (
                 float(event.localPos().x() - pan_anchor.x()),
                 float(event.localPos().y() - pan_anchor.y()),
             )
-            self._pan_candidate = pan_origin.panned_by_pixels(delta, pan_size)
+            image_binding.pan_candidate = pan_origin.panned_by_pixels(delta, pan_size)
             event.accept()
             return
 
@@ -1854,7 +1960,8 @@ class QtRasterBoard(QtWidgets.QWidget):
                 None if sample is None else QtCore.QPointF(event.localPos())
             )
             self._set_numeric_hover(hovered_numeric, sample)
-            self._set_hover_sample(None)
+            for binding in self._image_bindings.values():
+                self._set_hover_sample(binding, None)
         for binding in self._numeric_bindings.values():
             if binding is not hovered_numeric:
                 self._set_numeric_hover(binding, None)
@@ -1862,21 +1969,32 @@ class QtRasterBoard(QtWidgets.QWidget):
             self.update()
             super().mouseMoveEvent(event)
             return
-        if (
-            self._image_interaction_armed()
-            and not self._image_interaction_is_pending()
-        ):
-            target = self._selector_target()
+        hovered_image = self._image_target_at(event.localPos())
+        if hovered_image is not None:
+            binding, target, _rail = hovered_image
             sample = (
                 None
-                if target is None or not target[0].contains(event.pos())
+                if not self._image_interaction_armed(binding)
+                or self._image_interaction_is_pending(binding)
+                or target is None
+                or not target[0].contains(event.pos())
                 else self._sample_for_target(target, event.localPos())
             )
-            self._hover_position = (
+            binding.hover_position = (
                 None if sample is None else QtCore.QPointF(event.localPos())
             )
-            self._set_hover_sample(sample)
+            self._set_hover_sample(binding, sample)
+            for other in self._image_bindings.values():
+                if other is not binding:
+                    self._set_hover_sample(other, None)
             self.update()
+        else:
+            changed = False
+            for binding in self._image_bindings.values():
+                changed = changed or binding.hover is not None
+                self._set_hover_sample(binding, None)
+            if changed:
+                self.update()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -1935,51 +2053,64 @@ class QtRasterBoard(QtWidgets.QWidget):
                 self.update()
             event.accept()
             return
-        if self._clim_drag is not None and event.button() == QtCore.Qt.LeftButton:
-            candidate = self._clim_candidate
+        image_binding = self._active_image_binding()
+        if (
+            image_binding is not None
+            and image_binding.clim_drag is not None
+            and event.button() == QtCore.Qt.LeftButton
+        ):
+            candidate = image_binding.clim_candidate
             hold = self._selector_hold
             try:
                 if candidate is not None and hold is not None:
-                    self._commit_color_limits(candidate, hold=hold)
+                    self._commit_color_limits(image_binding, candidate, hold=hold)
             finally:
-                self._cancel_image_gesture(clear_draft=False)
+                self._cancel_image_gesture(image_binding, clear_draft=False)
                 self.update()
             event.accept()
             return
-        if self._pan_anchor is not None and event.button() == QtCore.Qt.MiddleButton:
-            candidate = self._pan_candidate
+        if (
+            image_binding is not None
+            and image_binding.pan_anchor is not None
+            and event.button() == QtCore.Qt.MiddleButton
+        ):
+            candidate = image_binding.pan_candidate
             hold = self._selector_hold
             try:
                 if candidate is not None and hold is not None:
-                    self._commit_viewport(candidate, hold=hold)
+                    self._commit_viewport(image_binding, candidate, hold=hold)
             finally:
-                self._cancel_image_gesture(clear_draft=False)
+                self._cancel_image_gesture(image_binding, clear_draft=False)
                 self.update()
             event.accept()
             return
-        anchor = self._selector_drag_anchor
+        anchor = None if image_binding is None else image_binding.drag_anchor
         if anchor is None or event.button() != QtCore.Qt.LeftButton:
             super().mouseReleaseEvent(event)
             return
-        target = self._selector_target()
+        target = self._selector_target(image_binding)
+        completed_bounds: NormalizedRectangle | None = None
         if target is not None:
             point = self._normalized_point(event.localPos(), target[0], clamp=True)
             if point[0] == anchor[0] or point[1] == anchor[1]:
-                self._selector_draft_bounds = None
+                image_binding.draft_bounds = image_binding.drag_prior_draft
             else:
-                self._selector_draft_bounds = self._require_selector_viewport().snapped_bounds_for_drag(
+                completed_bounds = self._require_selector_viewport(
+                    image_binding
+                ).snapped_bounds_for_drag(
                     anchor,
                     point,
                 )
+                image_binding.draft_bounds = completed_bounds
         hold = self._selector_hold
-        bounds = self._selector_draft_bounds
-        callback = self._selector_callback
+        bounds = completed_bounds
+        callback = image_binding.selection_callback
         delivered = False
         # Geometry is complete before the consumer callback runs, but the
         # synchronous held origin remains alive until that callback returns.
         # A re-entrant PREPARING/disable transition must therefore preserve
         # this completed draft rather than classify it as a partial drag.
-        self._selector_drag_anchor = None
+        image_binding.drag_anchor = None
         try:
             if bounds is not None and hold is not None and callback is not None:
                 gesture = RectangleGesture(
@@ -1989,16 +2120,19 @@ class QtRasterBoard(QtWidgets.QWidget):
                     sequence=hold.sequence,
                     source_identity=hold.source_identity,
                     normalized_bounds=bounds,
-                    viewport_revision=self._require_selector_viewport().viewport_revision,
+                    viewport_revision=self._require_selector_viewport(
+                        image_binding
+                    ).viewport_revision,
                 )
                 callback(gesture)
                 delivered = True
         except BaseException as error:
-            if self._selector_fault is None:
-                self._selector_fault = detached_render_fault(error)
-            self._image_binding_enabled = False
+            if image_binding.fault is None:
+                image_binding.fault = detached_render_fault(error)
+            image_binding.binding_enabled = False
         finally:
             self._cancel_image_gesture(
+                image_binding,
                 clear_draft=(bounds is not None and not delivered)
             )
             self.update()
@@ -2038,15 +2172,21 @@ class QtRasterBoard(QtWidgets.QWidget):
             self.update()
             event.accept()
             return
-        if not self._image_interaction_armed() or self._interaction_callback is None:
+        image_hit = self._image_target_at(event.posF(), include_rail=True)
+        if image_hit is None:
             super().wheelEvent(event)
             return
-        target = self._selector_target()
-        rail_target = self._clim_rail_target()
+        binding, target, rail_target = image_hit
+        if (
+            not self._image_interaction_armed(binding)
+            or binding.interaction_callback is None
+        ):
+            super().wheelEvent(event)
+            return
         position = event.pos()
         hits_image = target is not None and target[0].contains(position)
         hits_rail = rail_target is not None and rail_target[0].contains(position)
-        if self._image_interaction_is_pending() or self._selector_hold is not None:
+        if self._image_interaction_is_pending(binding) or self._selector_hold is not None:
             if hits_image or hits_rail:
                 event.accept()
             else:
@@ -2063,13 +2203,33 @@ class QtRasterBoard(QtWidgets.QWidget):
         # Preserve the established lab convention: wheel DOWN zooms in and
         # wheel UP zooms out.
         scale = 1.0 / 1.1 if delta < 0 else 1.1
-        candidate = self._viewport_for_target(target).centered_zoom(point, scale)
-        self._commit_viewport(candidate)
-        self._set_hover_sample(None)
+        candidate = self._viewport_for_target(binding, target).centered_zoom(
+            point,
+            scale,
+        )
+        self._commit_viewport(binding, candidate)
+        self._set_hover_sample(binding, None)
         self.update()
         event.accept()
 
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            panel_id = self._painted_image_panel_id_at(event.localPos())
+            if panel_id is not None:
+                binding = self._image_bindings.get(panel_id)
+                if (
+                    binding is not None
+                    and self._selector_hold is not None
+                    and self._selector_hold.panel_id == panel_id
+                ):
+                    # Qt sends a press before the double-click event.  Release
+                    # only that incomplete gesture; the already-authored area,
+                    # color limits, cross and viewport remain untouched.
+                    self._cancel_image_gesture(binding, clear_draft=False)
+                self.imagePanelLeftDoubleClicked.emit(panel_id)
+                self.update()
+                event.accept()
+                return
         if not self._selector_enabled:
             super().mouseDoubleClickEvent(event)
             return
@@ -2107,14 +2267,17 @@ class QtRasterBoard(QtWidgets.QWidget):
                 return
             super().mouseDoubleClickEvent(event)
             return
-        if not self._image_interaction_armed():
+        image_hit = self._image_target_at(event.localPos(), include_rail=True)
+        if image_hit is None:
             super().mouseDoubleClickEvent(event)
             return
-        target = self._selector_target()
-        rail_target = self._clim_rail_target()
+        binding, target, rail_target = image_hit
+        if not self._image_interaction_armed(binding):
+            super().mouseDoubleClickEvent(event)
+            return
         hits_image = target is not None and target[0].contains(event.pos())
         hits_rail = rail_target is not None and rail_target[0].contains(event.pos())
-        if self._image_interaction_is_pending() or self._selector_hold is not None:
+        if self._image_interaction_is_pending(binding) or self._selector_hold is not None:
             if hits_image or hits_rail:
                 event.accept()
             else:
@@ -2124,27 +2287,30 @@ class QtRasterBoard(QtWidgets.QWidget):
             super().mouseDoubleClickEvent(event)
             return
         if event.button() == QtCore.Qt.RightButton:
-            self._set_cross_sample(None)
-            self._set_hover_sample(None)
+            self._set_cross_sample(binding, None)
+            self._set_hover_sample(binding, None)
             self.update()
             event.accept()
             return
-        if event.button() == QtCore.Qt.MiddleButton and self._interaction_callback is not None:
-            viewport = self._viewport_for_target(target)
-            area = self._selector_draft_bounds or self._selector_applied_bounds
+        if (
+            event.button() == QtCore.Qt.MiddleButton
+            and binding.interaction_callback is not None
+        ):
+            viewport = self._viewport_for_target(binding, target)
+            area = binding.draft_bounds or binding.applied_bounds
             candidate = viewport.with_visible_bounds(
                 (0.0, 0.0, 1.0, 1.0) if area is None else area
             )
-            self._commit_viewport(candidate)
-            self._set_hover_sample(None)
+            self._commit_viewport(binding, candidate)
+            self._set_hover_sample(binding, None)
             self.update()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
 
     def leaveEvent(self, event: QtCore.QEvent) -> None:
-        self._set_hover_sample(None)
-        self._hover_position = None
+        for binding in self._image_bindings.values():
+            self._set_hover_sample(binding, None)
         for binding in self._numeric_bindings.values():
             self._set_numeric_hover(binding, None)
         self.update()
@@ -2167,14 +2333,14 @@ class QtRasterBoard(QtWidgets.QWidget):
                 clear_image_draft=True,
                 clear_numeric_spans=True,
             )
-        self._set_hover_sample(None)
-        self._hover_position = None
+        for binding in self._image_bindings.values():
+            self._set_hover_sample(binding, None)
         for binding in self._numeric_bindings.values():
             self._set_numeric_hover(binding, None)
         super().resizeEvent(event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self._reset_rectangle_selector()
+        self._reset_all_image_bindings()
         self._reset_all_numeric_bindings()
         self._front = None
         self._active_layout_identity = None
@@ -2184,7 +2350,7 @@ class QtRasterBoard(QtWidgets.QWidget):
 
     def event(self, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.DeferredDelete:
-            self._reset_rectangle_selector()
+            self._reset_all_image_bindings()
             self._reset_all_numeric_bindings()
             self._front = None
             self._active_layout_identity = None
@@ -2201,9 +2367,10 @@ class QtRasterBoard(QtWidgets.QWidget):
                     clear_image_draft=True,
                     clear_numeric_spans=True,
                 )
-            if getattr(self, "_hover_sample", None) is not None:
-                self._set_hover_sample(None)
-                changed = True
+            for binding in getattr(self, "_image_bindings", {}).values():
+                if binding.hover is not None:
+                    self._set_hover_sample(binding, None)
+                    changed = True
             for binding in getattr(self, "_numeric_bindings", {}).values():
                 if binding.hover is not None:
                     self._set_numeric_hover(binding, None)
@@ -2212,11 +2379,32 @@ class QtRasterBoard(QtWidgets.QWidget):
                 self.update()
         return super().event(event)
 
-    def _require_selector_viewport(self) -> ImageViewportTransform:
-        viewport = self._selector_viewport
-        if viewport is None:
-            raise RuntimeError("rectangle selector is not bound")
-        return viewport
+    def _image_binding(
+        self,
+        panel_id: str | None = None,
+    ) -> _ImagePanelBinding | None:
+        if panel_id is not None:
+            panel_id = canonical_text(panel_id, "image panel_id")
+            return self._image_bindings.get(panel_id)
+        matches = tuple(self._image_bindings.values())
+        if len(matches) > 1:
+            raise ValueError("multiple image panels are bound; panel_id is required")
+        return None if not matches else matches[0]
+
+    def _require_image_binding(
+        self,
+        panel_id: str | None = None,
+    ) -> _ImagePanelBinding:
+        binding = self._image_binding(panel_id)
+        if binding is None:
+            raise RuntimeError("image panel is not bound")
+        return binding
+
+    @staticmethod
+    def _require_selector_viewport(
+        binding: _ImagePanelBinding,
+    ) -> ImageViewportTransform:
+        return binding.viewport
 
     def _validate_selector_binding(
         self,
@@ -2244,12 +2432,13 @@ class QtRasterBoard(QtWidgets.QWidget):
 
     def _viewport_for_presented_panel(
         self,
-        panel_id: str,
-        current: ImageViewportTransform,
+        binding: _ImagePanelBinding,
         frame: BoardFrame,
         *,
         panel_ids: tuple[str, ...],
     ) -> ImageViewportTransform:
+        panel_id = binding.panel_id
+        current = binding.viewport
         index = panel_ids.index(panel_id)
         panel = frame.panels[index]
         payload = _image_payload(panel)
@@ -2267,7 +2456,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise ValueError("image viewport axes changed without panel structure change")
         if candidate.viewport_revision < current.viewport_revision:
             raise ValueError("stale image viewport revision cannot replace the visible front")
-        pending = self._pending_viewport
+        pending = binding.pending_viewport
         if (
             pending is not None
             and candidate.viewport_revision == pending.viewport_revision
@@ -2317,7 +2506,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         if not isinstance(enabled, bool):
             raise TypeError("selector enabled must be bool")
         has_other_family = (
-            self._selector_panel_id is not None
+            bool(self._image_bindings)
             or any(value.panel_id != panel_id for value in self._numeric_bindings.values())
         )
         if has_other_family and enabled != self._selector_enabled:
@@ -2451,11 +2640,14 @@ class QtRasterBoard(QtWidgets.QWidget):
             # may legitimately advance at one authored display revision.
         return candidate
 
-    def _selector_target(self):
+    def _selector_target(self, binding: _ImagePanelBinding | None = None):
         front = self._front
-        panel_id = self._selector_panel_id
-        viewport = self._selector_viewport
-        if front is None or panel_id is None or viewport is None:
+        if binding is None:
+            binding = self._image_binding()
+        if front is None or binding is None:
+            return None
+        panel_id = binding.panel_id
+        if panel_id not in self._panel_ids:
             return None
         index = self._panel_ids.index(panel_id)
         hold = self._selector_hold
@@ -2488,6 +2680,58 @@ class QtRasterBoard(QtWidgets.QWidget):
             site_map_payload=composite,
         )
         return target, front[0], front[0].panels[index], prepared
+
+    def _image_target_at(
+        self,
+        point: QtCore.QPointF,
+        *,
+        include_rail: bool = False,
+    ):
+        for binding in self._image_bindings.values():
+            target = self._selector_target(binding)
+            if target is None:
+                continue
+            rail_target = self._clim_rail_target(binding)
+            integer_point = point.toPoint()
+            if target[0].contains(integer_point) or (
+                include_rail
+                and rail_target is not None
+                and rail_target[0].contains(integer_point)
+            ):
+                return binding, target, rail_target
+        return None
+
+    def _painted_image_panel_id_at(self, point: QtCore.QPointF) -> str | None:
+        front = self._front
+        if front is None:
+            return None
+        for index, panel in enumerate(front[0].panels):
+            payload = panel.display_payload
+            if not isinstance(payload, (ImagePanelPayload, SiteMapPanelPayload)):
+                continue
+            bounds = _panel_bounds(
+                self.rect(),
+                index=index,
+                count=len(front[0].panels),
+                columns=self._columns,
+            )
+            image = front[1][index][1]
+            image_payload = (
+                payload.background
+                if isinstance(payload, SiteMapPanelPayload)
+                else payload
+            )
+            target, _source, _rail = _panel_image_geometry(
+                bounds,
+                image,
+                image_payload,
+                site_map_payload=(
+                    payload if isinstance(payload, SiteMapPanelPayload) else None
+                ),
+            )
+            if target.contains(point.toPoint()):
+                return panel.panel_id
+        return None
 
     def _numeric_target(
         self,
@@ -2656,10 +2900,10 @@ class QtRasterBoard(QtWidgets.QWidget):
                 best = candidate
         return None if best is None else best[2]
 
-    def _clim_rail_target(self):
+    def _clim_rail_target(self, binding: _ImagePanelBinding):
         front = self._front
-        panel_id = self._selector_panel_id
-        if front is None or panel_id is None:
+        panel_id = binding.panel_id
+        if front is None or panel_id not in self._panel_ids:
             return None
         index = self._panel_ids.index(panel_id)
         hold = self._selector_hold
@@ -2697,7 +2941,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             return None
         return rail, front[0], panel, prepared, payload
 
-    def _viewport_for_target(self, target) -> ImageViewportTransform:
+    def _viewport_for_target(
+        self,
+        binding: _ImagePanelBinding,
+        target,
+    ) -> ImageViewportTransform:
         hold = self._selector_hold
         if hold is not None and hold.panel_id == target[2].panel_id:
             payload = _image_payload(hold)
@@ -2706,7 +2954,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         payload = _image_payload(target[2])
         if payload is not None:
             return payload.viewport
-        return self._require_selector_viewport()
+        return self._require_selector_viewport(binding)
 
     def _sample_for_target(
         self,
@@ -2751,18 +2999,19 @@ class QtRasterBoard(QtWidgets.QWidget):
 
     def _commit_viewport(
         self,
+        binding: _ImagePanelBinding,
         candidate: ImageViewportTransform,
         *,
         hold: _HeldPanelFront | None = None,
     ) -> bool:
-        current = self._require_selector_viewport()
+        current = self._require_selector_viewport(binding)
         if candidate == current:
             return False
         if candidate.axes != current.axes:
             raise ValueError("viewport commit cannot change image axes")
         if candidate.viewport_revision <= current.viewport_revision:
             raise ValueError("viewport commit revision must increase")
-        if self._image_interaction_is_pending():
+        if self._image_interaction_is_pending(binding):
             return False
         front = self._front
         if front is None:
@@ -2773,22 +3022,22 @@ class QtRasterBoard(QtWidgets.QWidget):
             panel_ids=self._panel_ids,
         ):
             return False
-        callback = self._interaction_callback
+        callback = binding.interaction_callback
         if callback is None:
             return False
-        origin = self._interaction_origin(hold=hold)
+        origin = self._interaction_origin(binding, hold=hold)
         command = ImageViewportCommit(origin, candidate)
-        self._pending_viewport = candidate
-        self._pending_origin = origin
+        binding.pending_viewport = candidate
+        binding.pending_origin = origin
         try:
             callback(command)
         except BaseException as error:
-            self._pending_viewport = None
-            self._pending_origin = None
-            if self._selector_fault is None:
-                self._selector_fault = detached_render_fault(error)
-            self._image_binding_enabled = False
-            self._set_hover_sample(None)
+            binding.pending_viewport = None
+            binding.pending_origin = None
+            if binding.fault is None:
+                binding.fault = detached_render_fault(error)
+            binding.binding_enabled = False
+            self._set_hover_sample(binding, None)
             return False
         return True
 
@@ -2869,6 +3118,7 @@ class QtRasterBoard(QtWidgets.QWidget):
 
     def _commit_color_limits(
         self,
+        binding: _ImagePanelBinding,
         limits: tuple[float, float],
         *,
         hold: _HeldPanelFront,
@@ -2876,7 +3126,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         payload = _image_payload(hold)
         if payload is None or limits == payload.color_limits:
             return False
-        if self._image_interaction_is_pending():
+        if self._image_interaction_is_pending(binding):
             return False
         front = self._front
         if front is None or not self._hold_matches_frame(
@@ -2885,38 +3135,40 @@ class QtRasterBoard(QtWidgets.QWidget):
             panel_ids=self._panel_ids,
         ):
             return False
-        callback = self._interaction_callback
+        callback = binding.interaction_callback
         if callback is None:
             return False
-        origin = self._interaction_origin(hold=hold)
+        origin = self._interaction_origin(binding, hold=hold)
         command = ImageColorLimitsCommit(origin, limits)
-        self._pending_color_limits = command.color_limits
-        self._pending_origin = origin
+        binding.pending_color_limits = command.color_limits
+        binding.pending_origin = origin
         try:
             callback(command)
         except BaseException as error:
-            self._pending_color_limits = None
-            self._pending_origin = None
-            if self._selector_fault is None:
-                self._selector_fault = detached_render_fault(error)
-            self._image_binding_enabled = False
-            self._set_hover_sample(None)
+            binding.pending_color_limits = None
+            binding.pending_origin = None
+            if binding.fault is None:
+                binding.fault = detached_render_fault(error)
+            binding.binding_enabled = False
+            self._set_hover_sample(binding, None)
             return False
         return True
 
-    def _image_interaction_is_pending(self) -> bool:
+    @staticmethod
+    def _image_interaction_is_pending(binding: _ImagePanelBinding) -> bool:
         return (
-            self._pending_viewport is not None
-            or self._pending_color_limits is not None
+            binding.pending_viewport is not None
+            or binding.pending_color_limits is not None
         )
 
     def _interaction_origin(
         self,
+        binding: _ImagePanelBinding,
         *,
         hold: _HeldPanelFront | None = None,
     ) -> PanelInteractionOrigin:
         return self._require_interaction_origin(
-            panel_id=self._selector_panel_id,
+            panel_id=binding.panel_id,
             payload_type=(ImagePanelPayload, SiteMapPanelPayload),
             hold=hold,
             kind="image",
@@ -2954,17 +3206,25 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise RuntimeError(f"{kind} interaction origin has no exact payload")
         return origin
 
-    def _set_cross_sample(self, sample: _ImageSample | None) -> None:
-        if sample is self._cross_sample:
+    @staticmethod
+    def _set_cross_sample(
+        binding: _ImagePanelBinding,
+        sample: _ImageSample | None,
+    ) -> None:
+        if sample is binding.cross:
             return
-        self._cross_sample = sample
+        binding.cross = sample
 
-    def _set_hover_sample(self, sample: _ImageSample | None) -> None:
-        if sample is self._hover_sample:
+    @staticmethod
+    def _set_hover_sample(
+        binding: _ImagePanelBinding,
+        sample: _ImageSample | None,
+    ) -> None:
+        if sample is binding.hover:
             return
-        self._hover_sample = sample
+        binding.hover = sample
         if sample is None:
-            self._hover_position = None
+            binding.hover_position = None
 
     def _set_numeric_hover(
         self,
@@ -2980,6 +3240,12 @@ class QtRasterBoard(QtWidgets.QWidget):
         if hold is None:
             return None
         return self._numeric_bindings.get(hold.panel_id)
+
+    def _active_image_binding(self) -> _ImagePanelBinding | None:
+        hold = self._selector_hold
+        if hold is None:
+            return None
+        return self._image_bindings.get(hold.panel_id)
 
     def _held_panel_from_target(self, target) -> _HeldPanelFront:
         frame, panel, prepared = target[1], target[2], target[3]
@@ -3201,6 +3467,106 @@ class QtRasterBoard(QtWidgets.QWidget):
             painter.restore()
 
     @staticmethod
+    def _radial_fit_overlay_geometry(
+        payload: ImagePanelPayload,
+        target: QtCore.QRect,
+    ) -> tuple[QtCore.QPointF, QtCore.QRectF] | None:
+        """Project saved radial-fit geometry into one exact image target.
+
+        The centre deliberately remains unbounded.  The painter clip, not a
+        coordinate clamp, decides whether an off-view centre or ring is
+        visible.  This preserves the physical location when the image is
+        zoomed or either declared spatial axis is descending.
+        """
+
+        overlay = payload.fit_overlay
+        if overlay is None or overlay.status is not FitBatchStatus.CONVERGED:
+            return None
+        center = overlay.center_xy
+        radius = overlay.one_over_e_radius
+        if center is None or radius is None:
+            raise RuntimeError("converged radial fit overlay lost its geometry")
+        visible_center = payload.viewport.unbounded_visible_point_for_coordinate(
+            center,
+            coordinate_frame=overlay.coordinate_frame,
+        )
+        visible_diameter = payload.viewport.visible_span_for_coordinate_span(
+            (2.0 * radius, 2.0 * radius),
+            coordinate_frame=overlay.coordinate_frame,
+        )
+        center_point = QtCore.QPointF(
+            target.left() + visible_center[0] * target.width(),
+            target.top() + visible_center[1] * target.height(),
+        )
+        ring_width = visible_diameter[0] * target.width()
+        ring_height = visible_diameter[1] * target.height()
+        return center_point, QtCore.QRectF(
+            center_point.x() - ring_width / 2.0,
+            center_point.y() - ring_height / 2.0,
+            ring_width,
+            ring_height,
+        )
+
+    @staticmethod
+    def _radial_fit_caption_status(
+        overlay: RadialGaussianImageFitOverlay,
+    ) -> str:
+        status = (
+            "NOT_PRESENT"
+            if overlay.status is None
+            else overlay.status.value
+        )
+        return f"{overlay.caption} · {status}"
+
+    @classmethod
+    def _paint_radial_fit_overlay(
+        cls,
+        painter: QtGui.QPainter,
+        payload: ImagePanelPayload,
+        target: QtCore.QRect,
+    ) -> None:
+        """Paint one saved fit as a vector dot/ring plus compact status.
+
+        No fitted image is evaluated here.  Sparse and failed cells retain
+        their caption/status but cannot acquire geometry by substitution.
+        """
+
+        overlay = payload.fit_overlay
+        if overlay is None:
+            return
+        painter.save()
+        try:
+            painter.setClipRect(target)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            geometry = cls._radial_fit_overlay_geometry(payload, target)
+            if geometry is not None:
+                center, ring = geometry
+                ring_color = QtGui.QColor(ORANGE)
+                ring_color.setAlphaF(0.9)
+                painter.setPen(QtGui.QPen(ring_color, 1.8))
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.drawEllipse(ring)
+                center_color = QtGui.QColor(ORANGE)
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.setBrush(QtGui.QBrush(center_color))
+                painter.drawEllipse(center, 2.25, 2.25)
+
+            metrics = painter.fontMetrics()
+            available_width = max(1, target.width() - 18)
+            label = metrics.elidedText(
+                cls._radial_fit_caption_status(overlay),
+                QtCore.Qt.ElideMiddle,
+                available_width,
+            )
+            label_bounds = metrics.boundingRect(label).adjusted(-5, -2, 5, 2)
+            label_bounds.moveTopLeft(target.topLeft() + QtCore.QPoint(4, 4))
+            painter.fillRect(label_bounds, QtGui.QColor(0, 0, 0, 190))
+            painter.setPen(QtGui.QColor(ORANGE))
+            painter.drawText(label_bounds, QtCore.Qt.AlignCenter, label)
+        finally:
+            painter.restore()
+
+    @staticmethod
     def _color_rail_domain(payload: ImagePanelPayload) -> tuple[float, float]:
         low, high = payload.color_limits
         span = high - low
@@ -3227,6 +3593,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         painter: QtGui.QPainter,
         payload: ImagePanelPayload,
         rail: QtCore.QRect,
+        binding: _ImagePanelBinding | None,
     ) -> None:
         painter.save()
         try:
@@ -3280,10 +3647,11 @@ class QtRasterBoard(QtWidgets.QWidget):
                     )
 
             limits = (
-                self._clim_candidate
+                binding.clim_candidate
                 if self._selector_hold is not None
                 and _image_payload(self._selector_hold) is payload
-                and self._clim_candidate is not None
+                and binding is not None
+                and binding.clim_candidate is not None
                 else payload.color_limits
             )
             for value in limits:
@@ -3320,10 +3688,11 @@ class QtRasterBoard(QtWidgets.QWidget):
 
     def _opposite_corner_anchor(
         self,
+        binding: _ImagePanelBinding,
         bounds: NormalizedRectangle,
         handle: int,
     ) -> tuple[float, float]:
-        viewport = self._require_selector_viewport()
+        viewport = self._require_selector_viewport(binding)
         left, top, right, bottom = viewport.visible_bounds_for_full_bounds(bounds)
         visible_left, visible_top, visible_right, visible_bottom = (
             viewport.visible_bounds
@@ -3358,12 +3727,15 @@ class QtRasterBoard(QtWidgets.QWidget):
 
     def _hit_corner_handle(
         self,
+        binding: _ImagePanelBinding,
         point: QtCore.QPoint,
         bounds: NormalizedRectangle,
         target: QtCore.QRect,
     ) -> int | None:
         try:
-            visible_bounds = self._require_selector_viewport().visible_bounds_for_full_bounds(
+            visible_bounds = self._require_selector_viewport(
+                binding
+            ).visible_bounds_for_full_bounds(
                 bounds
             )
         except ValueError:
@@ -3385,15 +3757,25 @@ class QtRasterBoard(QtWidgets.QWidget):
         return None
 
     def _paint_selector_overlays(self, painter: QtGui.QPainter) -> None:
-        target = self._selector_target()
+        for binding in self._image_bindings.values():
+            self._paint_image_binding_overlays(painter, binding)
+
+    def _paint_image_binding_overlays(
+        self,
+        painter: QtGui.QPainter,
+        binding: _ImagePanelBinding,
+    ) -> None:
+        target = self._selector_target(binding)
         if target is None:
             return
         image_target = target[0]
         painter.save()
         painter.setClipRect(image_target)
-        if self._selector_applied_bounds is not None:
-            visible = self._require_selector_viewport().clipped_visible_bounds_for_full_bounds(
-                self._selector_applied_bounds
+        if binding.applied_bounds is not None:
+            visible = self._require_selector_viewport(
+                binding
+            ).clipped_visible_bounds_for_full_bounds(
+                binding.applied_bounds
             )
             if visible is not None:
                 self._paint_selector_rectangle(
@@ -3401,23 +3783,27 @@ class QtRasterBoard(QtWidgets.QWidget):
                     visible,
                     image_target,
                     QtGui.QColor(GREEN),
+                    binding=binding,
                     dashed=False,
                     handles=(
-                        self._image_interaction_armed()
-                        and self._selector_draft_bounds is None
+                        self._image_interaction_armed(binding)
+                        and binding.draft_bounds is None
                         and self._rectangle_fully_visible(
-                            self._selector_applied_bounds
+                            binding,
+                            binding.applied_bounds,
                         )
                     ),
                     endpoint_bounds=(
-                        self._selector_applied_bounds
-                        if self._selector_draft_bounds is None
+                        binding.applied_bounds
+                        if binding.draft_bounds is None
                         else None
                     ),
                 )
-        if self._selector_draft_bounds is not None:
-            visible = self._require_selector_viewport().clipped_visible_bounds_for_full_bounds(
-                self._selector_draft_bounds
+        if binding.draft_bounds is not None:
+            visible = self._require_selector_viewport(
+                binding
+            ).clipped_visible_bounds_for_full_bounds(
+                binding.draft_bounds
             )
             if visible is not None:
                 self._paint_selector_rectangle(
@@ -3425,37 +3811,44 @@ class QtRasterBoard(QtWidgets.QWidget):
                     visible,
                     image_target,
                     QtGui.QColor(ORANGE),
+                    binding=binding,
                     dashed=True,
                     handles=(
-                        self._image_interaction_armed()
+                        self._image_interaction_armed(binding)
                         and self._rectangle_fully_visible(
-                            self._selector_draft_bounds
+                            binding,
+                            binding.draft_bounds,
                         )
                     ),
-                    endpoint_bounds=self._selector_draft_bounds,
+                    endpoint_bounds=binding.draft_bounds,
                 )
         hold = self._selector_hold
         held_image_payload = None if hold is None else _image_payload(hold)
         if (
             held_image_payload is not None
-            and self._clim_candidate is not None
+            and hold is not None
+            and hold.panel_id == binding.panel_id
+            and binding.clim_candidate is not None
         ):
             self._paint_clim_candidate_label(
                 painter,
+                binding,
                 held_image_payload,
                 image_target,
             )
-        if self._cross_sample is not None:
+        if binding.cross is not None:
             self._paint_cross_sample(
                 painter,
-                self._cross_sample,
+                binding,
+                binding.cross,
                 image_target,
             )
-        if self._hover_sample is not None and self._hover_position is not None:
+        if binding.hover is not None and binding.hover_position is not None:
             self._paint_hover_sample(
                 painter,
-                self._hover_sample,
-                self._hover_position,
+                binding,
+                binding.hover,
+                binding.hover_position,
                 image_target,
             )
         painter.restore()
@@ -3603,18 +3996,25 @@ class QtRasterBoard(QtWidgets.QWidget):
         painter.setPen(color)
         painter.drawText(label_bounds, QtCore.Qt.AlignCenter, label)
 
-    def _rectangle_fully_visible(self, bounds: NormalizedRectangle) -> bool:
+    def _rectangle_fully_visible(
+        self,
+        binding: _ImagePanelBinding,
+        bounds: NormalizedRectangle,
+    ) -> bool:
         try:
-            self._require_selector_viewport().visible_bounds_for_full_bounds(bounds)
+            self._require_selector_viewport(binding).visible_bounds_for_full_bounds(
+                bounds
+            )
         except ValueError:
             return False
         return True
 
     def _visible_point_for_sample(
         self,
+        binding: _ImagePanelBinding,
         sample: _ImageSample,
     ) -> tuple[float, float] | None:
-        viewport = self._require_selector_viewport()
+        viewport = self._require_selector_viewport(binding)
         if (
             sample.x_index >= viewport.x_axis.size
             or sample.y_index >= viewport.y_axis.size
@@ -3632,10 +4032,11 @@ class QtRasterBoard(QtWidgets.QWidget):
     def _paint_cross_sample(
         self,
         painter: QtGui.QPainter,
+        binding: _ImagePanelBinding,
         sample: _ImageSample,
         target: QtCore.QRect,
     ) -> None:
-        point = self._visible_point_for_sample(sample)
+        point = self._visible_point_for_sample(binding, sample)
         color = QtGui.QColor(GREEN)
         if point is not None:
             x = target.x() + point[0] * target.width()
@@ -3655,7 +4056,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         suffix = " · off-view" if point is None else ""
         label = (
             f"({sample.x_coordinate}, {sample.y_coordinate}){suffix}"
-            if self.visible_site_map_payload() is not None
+            if self.visible_site_map_payload(binding.panel_id) is not None
             else f"({sample.x_coordinate}, {sample.y_coordinate}, {value}){suffix}"
         )
         metrics = painter.fontMetrics()
@@ -3668,11 +4069,12 @@ class QtRasterBoard(QtWidgets.QWidget):
     def _paint_hover_sample(
         self,
         painter: QtGui.QPainter,
+        binding: _ImagePanelBinding,
         sample: _ImageSample,
         position: QtCore.QPointF,
         target: QtCore.QRect,
     ) -> None:
-        site_map = self.visible_site_map_payload()
+        site_map = self.visible_site_map_payload(binding.panel_id)
         if site_map is None:
             label = (
                 f"x={sample.x_coordinate}  y={sample.y_coordinate}  "
@@ -3710,10 +4112,11 @@ class QtRasterBoard(QtWidgets.QWidget):
     def _paint_clim_candidate_label(
         self,
         painter: QtGui.QPainter,
+        binding: _ImagePanelBinding,
         payload: ImagePanelPayload,
         target: QtCore.QRect,
     ) -> None:
-        label = self._clim_candidate_label(payload)
+        label = self._clim_candidate_label(binding, payload)
         metrics = painter.fontMetrics()
         bounds = metrics.boundingRect(label).adjusted(-6, -3, 6, 3)
         bounds.moveBottomLeft(target.bottomLeft() + QtCore.QPoint(7, -7))
@@ -3721,8 +4124,12 @@ class QtRasterBoard(QtWidgets.QWidget):
         painter.setPen(QtGui.QColor(ORANGE))
         painter.drawText(bounds, QtCore.Qt.AlignCenter, label)
 
-    def _clim_candidate_label(self, payload: ImagePanelPayload) -> str:
-        limits = self._clim_candidate
+    def _clim_candidate_label(
+        self,
+        binding: _ImagePanelBinding,
+        payload: ImagePanelPayload,
+    ) -> str:
+        limits = binding.clim_candidate
         if limits is None:
             raise RuntimeError("H candidate label requires an active limit draft")
         low, high = self._color_rail_domain(payload)
@@ -3755,6 +4162,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         target: QtCore.QRect,
         color: QtGui.QColor,
         *,
+        binding: _ImagePanelBinding,
         dashed: bool,
         handles: bool,
         endpoint_bounds: NormalizedRectangle | None,
@@ -3767,7 +4175,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         painter.setBrush(QtCore.Qt.NoBrush)
         painter.drawRect(rectangle)
         if endpoint_bounds is not None:
-            label = self._selection_endpoint_label(endpoint_bounds)
+            label = self._selection_endpoint_label(binding, endpoint_bounds)
             flags = QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop
             label_area = target.adjusted(7, 7, -7, -7)
             label_bounds = painter.fontMetrics().boundingRect(
@@ -3797,8 +4205,12 @@ class QtRasterBoard(QtWidgets.QWidget):
                     )
                 )
 
-    def _selection_endpoint_label(self, bounds: NormalizedRectangle) -> str:
-        viewport = self._require_selector_viewport()
+    def _selection_endpoint_label(
+        self,
+        binding: _ImagePanelBinding,
+        bounds: NormalizedRectangle,
+    ) -> str:
+        viewport = self._require_selector_viewport(binding)
         selected_terms = {
             term.axis_id: term
             for term in viewport.selection_for_normalized_bounds(bounds).terms
@@ -3831,23 +4243,46 @@ class QtRasterBoard(QtWidgets.QWidget):
             f"{float(selected_y.upper):.{y_precision}f})"
         )
 
-    def _cancel_image_gesture(self, *, clear_draft: bool) -> None:
-        self._selector_drag_anchor = None
-        self._pan_anchor = None
-        self._pan_origin = None
-        self._pan_target_size = None
-        self._pan_candidate = None
-        self._clim_drag = None
-        self._clim_origin_limits = None
-        self._clim_candidate = None
-        self._clim_domain = None
+    def _cancel_image_gesture(
+        self,
+        binding: _ImagePanelBinding,
+        *,
+        clear_draft: bool,
+    ) -> None:
+        binding.drag_anchor = None
+        binding.drag_prior_draft = None
+        binding.pan_anchor = None
+        binding.pan_origin = None
+        binding.pan_target_size = None
+        binding.pan_candidate = None
+        binding.clim_drag = None
+        binding.clim_origin_limits = None
+        binding.clim_candidate = None
+        binding.clim_domain = None
         if (
             self._selector_hold is not None
-            and self._selector_hold.panel_id == self._selector_panel_id
+            and self._selector_hold.panel_id == binding.panel_id
         ):
             self._selector_hold = None
         if clear_draft:
-            self._selector_draft_bounds = None
+            binding.draft_bounds = None
+
+    def _clear_image_transient(
+        self,
+        binding: _ImagePanelBinding,
+        *,
+        clear_applied_bounds: bool,
+        clear_pending: bool,
+    ) -> None:
+        self._cancel_image_gesture(binding, clear_draft=True)
+        if clear_applied_bounds:
+            binding.applied_bounds = None
+        if clear_pending:
+            binding.pending_viewport = None
+            binding.pending_color_limits = None
+            binding.pending_origin = None
+        binding.cross = None
+        self._set_hover_sample(binding, None)
 
     def _cancel_numeric_gesture(
         self,
@@ -3889,7 +4324,11 @@ class QtRasterBoard(QtWidgets.QWidget):
         clear_image_draft: bool,
         clear_numeric_spans: bool,
     ) -> None:
-        self._cancel_image_gesture(clear_draft=clear_image_draft)
+        for binding in self._image_bindings.values():
+            self._cancel_image_gesture(
+                binding,
+                clear_draft=clear_image_draft,
+            )
         for binding in self._numeric_bindings.values():
             self._cancel_numeric_gesture(
                 binding,
@@ -3897,22 +4336,24 @@ class QtRasterBoard(QtWidgets.QWidget):
             )
         self._selector_hold = None
 
-    def _reset_rectangle_selector(self) -> None:
-        self._cancel_image_gesture(clear_draft=True)
-        self._selector_applied_bounds = None
-        self._pending_viewport = None
-        self._pending_color_limits = None
-        self._pending_origin = None
-        self._set_cross_sample(None)
-        self._set_hover_sample(None)
-        self._image_binding_enabled = False
-        self._image_interaction_ready = False
-        self._selector_panel_id = None
-        self._selector_viewport = None
-        self._selector_callback = None
-        self._interaction_callback = None
-        if not self._numeric_bindings:
+    def _reset_image_binding(self, panel_id: str) -> None:
+        binding = self._image_bindings.get(panel_id)
+        if binding is None:
+            return
+        self._clear_image_transient(
+            binding,
+            clear_applied_bounds=True,
+            clear_pending=True,
+        )
+        binding.binding_enabled = False
+        binding.interaction_ready = False
+        del self._image_bindings[panel_id]
+        if not self._image_bindings and not self._numeric_bindings:
             self._selector_enabled = False
+
+    def _reset_all_image_bindings(self) -> None:
+        for panel_id in tuple(self._image_bindings):
+            self._reset_image_binding(panel_id)
 
     def _reset_numeric_binding(self, panel_id: str) -> None:
         binding = self._numeric_bindings.get(panel_id)
@@ -3926,7 +4367,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         binding.binding_enabled = False
         binding.interaction_ready = False
         del self._numeric_bindings[panel_id]
-        if self._selector_panel_id is None and not self._numeric_bindings:
+        if not self._image_bindings and not self._numeric_bindings:
             self._selector_enabled = False
 
     def _reset_all_numeric_bindings(self) -> None:

@@ -579,10 +579,15 @@ def _initial_roi(experiment):
     )
 
 
+def _raw_image_binding(board: QtRasterBoard):
+    assert tuple(board._image_bindings) == ("camera-monitor-image",)
+    return board._image_bindings["camera-monitor-image"]
+
+
 def _overlay_bounds(board: QtRasterBoard, selection: Selection | None):
     if selection is None:
         return None
-    return board._selector_viewport.normalized_bounds_for_selection(selection)
+    return _raw_image_binding(board).viewport.normalized_bounds_for_selection(selection)
 
 
 def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branch(
@@ -639,7 +644,9 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
         )
         old_visible_projection = window._visible_projection_text
         assert old_visible_projection is not None
-        assert board._selector_applied_bounds == _overlay_bounds(board, initial_roi)
+        assert _raw_image_binding(board).applied_bounds == _overlay_bounds(
+            board, initial_roi
+        )
         _until(
             application,
             lambda: (
@@ -757,8 +764,10 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
         )
         assert board.front_frame.sequence > old_board_sequence
         assert board._selector_hold is None
-        assert board._selector_applied_bounds == _overlay_bounds(board, initial_roi)
-        assert board._selector_draft_bounds == _overlay_bounds(board, draft)
+        assert _raw_image_binding(board).applied_bounds == _overlay_bounds(
+            board, initial_roi
+        )
+        assert _raw_image_binding(board).draft_bounds == _overlay_bounds(board, draft)
         assert window._projection_status.text().startswith(
             f"Display: {old_visible_projection} · target "
         )
@@ -773,7 +782,7 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
         assert window._edit_image_display.isEnabled()
         assert window._selector_switch.isChecked()
         assert window._selector_switch.isEnabled()
-        assert board._image_interaction_armed()
+        assert board._image_interaction_armed(_raw_image_binding(board))
         assert not board._numeric_interaction_armed(
             board._numeric_bindings["camera-monitor-roi-curve"]
         )
@@ -813,8 +822,8 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
         assert clear_calls == []
         assert staged_layouts == []
         assert window._board.model.layout_generation == old_layout_generation
-        assert board._selector_applied_bounds == _overlay_bounds(board, draft)
-        assert board._selector_draft_bounds is None
+        assert _raw_image_binding(board).applied_bounds == _overlay_bounds(board, draft)
+        assert _raw_image_binding(board).draft_bounds is None
         _run, _epoch, after_apply = old_slot.freeze_camera_current()
         assert after_apply.scalar is not None
         assert after_apply.raw.ref.block_id == old_joined.raw.ref.block_id
@@ -984,7 +993,9 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
             "publish",
             fail_before_real_publish,
         )
-        retryable_selection = board._selector_viewport.selection_for_normalized_bounds(
+        retryable_selection = _raw_image_binding(
+            board
+        ).viewport.selection_for_normalized_bounds(
             (0.05, 0.05, 0.3, 0.3)
         )
         window._submit_roi_control(retryable_selection)
@@ -1044,7 +1055,9 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
             "publish",
             publish_then_raise,
         )
-        committed_failure_selection = board._selector_viewport.selection_for_normalized_bounds(
+        committed_failure_selection = _raw_image_binding(
+            board
+        ).viewport.selection_for_normalized_bounds(
             (0.2, 0.2, 0.45, 0.45)
         )
         window._submit_roi_control(committed_failure_selection)
@@ -1246,7 +1259,9 @@ def test_stop_after_same_schema_commit_keeps_the_revision_applied(
             "commit_append_replacement",
             hold_after_irreversible_commit,
         )
-        target_selection = board._selector_viewport.selection_for_normalized_bounds(
+        target_selection = _raw_image_binding(
+            board
+        ).viewport.selection_for_normalized_bounds(
             (0.15, 0.15, 0.55, 0.55)
         )
         window._submit_roi_control(target_selection)

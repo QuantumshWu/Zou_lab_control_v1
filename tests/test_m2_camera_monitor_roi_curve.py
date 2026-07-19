@@ -96,6 +96,11 @@ def _curve_plot(board: QtRasterBoard):
     return target.plot
 
 
+def _raw_image_binding(board: QtRasterBoard):
+    assert tuple(board._image_bindings) == ("camera-monitor-image",)
+    return board._image_bindings["camera-monitor-image"]
+
+
 def test_typed_roi_curve_preserves_raw_axes_and_presents_one_coherent_board(
     experiment,
     application,
@@ -435,7 +440,7 @@ def test_curve_selector_and_form_change_only_the_monitor_presentation(
         assert _wheel_down(board, board._selector_target()[0]).isAccepted()
         image_revision = window._image_display.revision
         assert image_revision == initial_image_revision + 1
-        assert board._pending_viewport is not None
+        assert _raw_image_binding(board).pending_viewport is not None
         assert selector.isChecked() and selector.isEnabled()
         assert not window._edit_image_display.isEnabled()
         assert window._edit_curve_display.isEnabled()

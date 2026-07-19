@@ -82,8 +82,13 @@ def _widgets(window):
     )
 
 
+def _capture_image_binding(board: QtRasterBoard):
+    assert tuple(board._image_bindings) == ("capture-image",)
+    return board._image_bindings["capture-image"]
+
+
 def _image_target(board: QtRasterBoard) -> QtCore.QRect:
-    target = board._selector_target()
+    target = board._selector_target(_capture_image_binding(board))
     assert target is not None
     return target[0]
 
@@ -281,11 +286,11 @@ def test_final_preview_exposes_exact_image_handles_without_changing_authority(
 
         center = target.center()
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=center)
-        assert board._cross_sample is not None
+        assert _capture_image_binding(board).cross is not None
         _drag_move(board, center, QtCore.Qt.NoButton)
-        assert board._hover_sample is not None
+        assert _capture_image_binding(board).hover is not None
         QtTest.QTest.mouseDClick(board, QtCore.Qt.RightButton, pos=center)
-        assert board._cross_sample is None
+        assert _capture_image_binding(board).cross is None
 
         event = _wheel_image_down(board)
         assert event.isAccepted()
@@ -296,7 +301,7 @@ def test_final_preview_exposes_exact_image_handles_without_changing_authority(
             and board.visible_image_origin().presentation.panel_revision == 1,
         )
 
-        rail_target = board._clim_rail_target()
+        rail_target = board._clim_rail_target(_capture_image_binding(board))
         assert rail_target is not None
         rail, *_rest, painted = rail_target
         domain = board._color_rail_domain(painted)
@@ -410,12 +415,12 @@ def test_capture_setting_edit_share_cas_and_repeat_preserves_only_authored_displ
             QtCore.Qt.RightButton,
             pos=_image_target(board).center(),
         )
-        assert board._cross_sample is not None
+        assert _capture_image_binding(board).cross is not None
         _until(application, start.isEnabled)
         QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
         assert not selector.isChecked()
         assert window._rectangle_candidate is None
-        assert board._cross_sample is None
+        assert _capture_image_binding(board).cross is None
         _until(
             application,
             lambda: window.final_reference is not None
@@ -596,9 +601,11 @@ def test_display_rerender_fault_clears_only_pending_intent_and_preserves_final(
         selector.setChecked(True)
         _wheel_image_down(board)
         assert window._image_display.revision == 1
-        assert board._image_interaction_is_pending()
+        assert board._image_interaction_is_pending(_capture_image_binding(board))
         _until(application, lambda: preview.text().startswith("Preview: FAILED"))
-        assert not board._image_interaction_is_pending()
+        assert not board._image_interaction_is_pending(
+            _capture_image_binding(board)
+        )
         assert window._pending_image_interaction_origin is None
         assert not selector.isEnabled()
         assert capture.text().startswith("Capture: FINAL")

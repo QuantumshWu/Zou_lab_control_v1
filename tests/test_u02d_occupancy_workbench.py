@@ -177,7 +177,9 @@ def test_public_exact_front_freezes_both_inputs_and_display_only_rectangle(
             payload.background.viewport.viewport_revision,
         ))
         assert "DISPLAY ONLY rectangle" in window._summary.text()
-        board._selector_fault = RuntimeError("synthetic selector fault")
+        board._image_bindings["sites"].fault = RuntimeError(
+            "synthetic selector fault"
+        )
         window._owner_cycle()
         assert not selector.isChecked() and not selector.isEnabled()
         assert not board.selectors_enabled

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import numpy as np
 
 from zlc_storage import nonnegative_integer, positive_integer
@@ -19,6 +21,37 @@ from .render import PixelFormat, RasterBuffer
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _DISPLAY_COORDINATE_ENTRY_BYTES = 128
 _INDEXED8_VALID_CODE_SPAN = 254
+
+
+def evaluated_image_data_range(
+    images: Iterable[EvaluatedImage],
+) -> tuple[float, float] | None:
+    """Pool finite, valid IMAGE samples without concatenating their planes.
+
+    This is the toolkit-neutral data-range primitive shared by indexed live
+    rasterization and canonical multi-panel renderers.  Invalid components and
+    non-finite floating values cannot influence a display range.
+    """
+
+    low = high = None
+    for image in images:
+        if not isinstance(image, EvaluatedImage):
+            raise TypeError("images must contain only EvaluatedImage values")
+        values = image.values
+        if values.dtype.kind not in "biuf":
+            raise TypeError("image display values must be real numeric arrays")
+        if values.dtype.kind in "biu":
+            valid = image.validity
+        else:
+            valid = np.empty(values.shape, dtype=bool)
+            np.isfinite(values, out=valid)
+            np.logical_and(valid, image.validity, out=valid)
+        if not bool(np.any(valid)):
+            continue
+        cell_low, cell_high = _automatic_range(values, valid)
+        low = cell_low if low is None else min(low, cell_low)
+        high = cell_high if high is None else max(high, cell_high)
+    return None if low is None else (low, high)
 
 
 def indexed8_code_for_value(
@@ -285,6 +318,7 @@ def _automatic_range(values: np.ndarray, valid: np.ndarray) -> tuple[float, floa
 
 
 __all__ = [
+    "evaluated_image_data_range",
     "estimate_encoded_png_front_peak_nbytes",
     "estimate_evaluated_image_retained_nbytes",
     "estimate_indexed8_raster_peak_nbytes",

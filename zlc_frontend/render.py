@@ -22,6 +22,8 @@ from zlc_data import (
     AxisSpec,
     BlockId,
     CoordinateFrameId,
+    DatasetRevisionRef,
+    FitBatchStatus,
     SITE,
     StreamGenerationId,
     axis_to_tree,
@@ -253,6 +255,73 @@ class RasterBuffer:
             raise ValueError("pixels length must equal stride_bytes * height")
 
 
+@dataclass(frozen=True, slots=True)
+class RadialGaussianImageFitOverlay:
+    """Exact saved-fit annotation for one radial-Gaussian IMAGE cell.
+
+    The fit result remains owned by the analysis/artifact layer.  This small
+    presentation value carries only the already-published centre/radius facts,
+    their exact source/artifact identity, and a bounded status diagnostic.  It
+    can therefore be painted by Agg or Qt without either renderer seeing a
+    ``FitResultBatch`` or re-running a solver.
+    """
+
+    source_ref: DatasetRevisionRef
+    artifact_identity: str
+    batch_storage_index: int | None
+    status: FitBatchStatus | None
+    coordinate_frame: CoordinateFrameId
+    caption: str
+    diagnostic: str
+    center_xy: tuple[float, float] | None = None
+    one_over_e_radius: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_ref, DatasetRevisionRef):
+            raise TypeError("fit overlay source_ref must be DatasetRevisionRef")
+        object.__setattr__(
+            self,
+            "artifact_identity",
+            _text(self.artifact_identity, "fit overlay artifact_identity"),
+        )
+        storage = self.batch_storage_index
+        if storage is not None:
+            storage = _nonnegative(storage, "fit overlay batch_storage_index")
+            object.__setattr__(self, "batch_storage_index", storage)
+        status = self.status
+        if status is not None and not isinstance(status, FitBatchStatus):
+            raise TypeError("fit overlay status must be FitBatchStatus or None")
+        if storage is None:
+            if status is not None:
+                raise ValueError("an absent fit cell cannot carry a fit status")
+        elif status is None:
+            raise ValueError("a stored fit cell requires a fit status")
+        if not isinstance(self.coordinate_frame, CoordinateFrameId):
+            raise TypeError("fit overlay coordinate_frame must be CoordinateFrameId")
+        object.__setattr__(self, "caption", _text(self.caption, "fit overlay caption"))
+        if not isinstance(self.diagnostic, str):
+            raise TypeError("fit overlay diagnostic must be str")
+        center = self.center_xy
+        radius = self.one_over_e_radius
+        if status is FitBatchStatus.CONVERGED:
+            if not isinstance(center, tuple) or len(center) != 2:
+                raise TypeError("converged radial fit requires center_xy")
+            checked_center = tuple(float(value) for value in center)
+            if any(not np.isfinite(value) for value in checked_center):
+                raise ValueError("fit overlay center must be finite")
+            if (
+                isinstance(radius, bool)
+                or not isinstance(radius, (int, float, np.number))
+                or not np.isfinite(float(radius))
+                or float(radius) <= 0.0
+            ):
+                raise ValueError("converged radial fit radius must be finite and positive")
+            object.__setattr__(self, "center_xy", checked_center)
+            object.__setattr__(self, "one_over_e_radius", float(radius))
+        elif center is not None or radius is not None:
+            raise ValueError("non-converged or absent fit cells cannot carry geometry")
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class ImagePanelPayload:
     """Exact immutable samples and display mapping for one IMAGE raster front.
@@ -269,6 +338,7 @@ class ImagePanelPayload:
     histogram_counts: tuple[int, ...]
     base_palette: tuple[int, ...]
     color_limits: tuple[float, float]
+    fit_overlay: RadialGaussianImageFitOverlay | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.image, EvaluatedImage):
@@ -288,11 +358,13 @@ class ImagePanelPayload:
                 raise ValueError(f"image payload {name} axis identity changed")
             if evaluated.role != axis.role:
                 raise ValueError(f"image payload {name} axis role changed")
-            if len(evaluated.indices) != axis.size or any(
-                actual != expected
-                for expected, actual in enumerate(evaluated.indices)
+            if (
+                len(evaluated.indices) != axis.size
+                or len(set(evaluated.indices)) != axis.size
             ):
-                raise ValueError(f"image payload {name} axis is not the full raster")
+                raise ValueError(
+                    f"image payload {name} axis does not cover the projected raster"
+                )
             if len(evaluated.coordinates) != axis.size or any(
                 actual != axis.coordinate_at(index)
                 for index, actual in enumerate(evaluated.coordinates)
@@ -340,6 +412,16 @@ class ImagePanelPayload:
         ):
             raise ValueError("image base_palette must contain 256 unsigned ARGB32 values")
         object.__setattr__(self, "base_palette", tuple(int(color) for color in palette))
+        overlay = self.fit_overlay
+        if overlay is not None:
+            if not isinstance(overlay, RadialGaussianImageFitOverlay):
+                raise TypeError(
+                    "image fit_overlay must be RadialGaussianImageFitOverlay or None"
+                )
+            if overlay.source_ref != self.evaluated_input.ref:
+                raise ValueError("image fit overlay belongs to another evaluated input")
+            if overlay.coordinate_frame != self.viewport.coordinate_frame:
+                raise ValueError("image fit overlay belongs to another coordinate frame")
 
 
 @dataclass(frozen=True, slots=True)
@@ -904,6 +986,7 @@ __all__ = [
     "SourceIdentity",
     "PanelFrame",
     "ImagePanelPayload",
+    "RadialGaussianImageFitOverlay",
     "SiteMapPanelPayload",
     "PixelFormat",
     "RasterBuffer",

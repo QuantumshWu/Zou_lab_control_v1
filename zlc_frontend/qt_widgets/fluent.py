@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import threading
+import weakref
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -258,16 +259,24 @@ def retain_window(window: QtWidgets.QWidget, *extras) -> None:
         window._zlc_retained_extras = tuple(extras)   # live and die with the window
     if window not in registry:
         registry.append(window)
+    window_ref = weakref.ref(window)
 
     def _prune(*_args) -> None:
-        release_window(window)
+        candidate = window_ref()
+        if candidate is not None:
+            release_window(candidate)
 
     window.destroyed.connect(_prune)
     closed = getattr(window, "closed", None)
     connect_closed = getattr(closed, "connect", None)
     if callable(connect_closed) and not getattr(window, "_hide_on_close", False):
         def _prune_committed_close(*_args) -> None:
-            if getattr(window, "_zlc_close_committed", True):
+            candidate = window_ref()
+            if candidate is not None and getattr(
+                candidate,
+                "_zlc_close_committed",
+                True,
+            ):
                 _prune()
 
         connect_closed(_prune_committed_close)

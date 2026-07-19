@@ -27,6 +27,7 @@ from .histogram_display import (
     histogram_home_x_limits,
 )
 from .fit_grid import FitGridCellSummary, FitGridModel, FitGridPage
+from .fit_image_projection import RadialGaussianImageFitPanel
 from .image_display import (
     ImageColormap,
     ImageDisplayState,
@@ -78,6 +79,7 @@ from .render import (
     PanelFrame,
     PanelPresentationIdentity,
     PixelFormat,
+    RadialGaussianImageFitOverlay,
     RasterBuffer,
     RenderSurface,
     SourceIdentity,
@@ -178,6 +180,8 @@ __all__ = [
     "FitGridPage",
     "ImageViewportTransform",
     "ImagePanelPayload",
+    "RadialGaussianImageFitOverlay",
+    "RadialGaussianImageFitPanel",
     "ImageColormap",
     "ImageColorLimitsCommit",
     "ImageDisplayState",

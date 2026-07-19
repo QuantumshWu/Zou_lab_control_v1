@@ -45,6 +45,8 @@ tests/test_w4_figure_workbench.py
 tests/test_w5_capture_fit_workbench.py
 tests/test_w6_calibration_workbench.py
 tests/test_w7_saved_fit_grid.py
+tests/test_w7_fit_grid_overlay_geometry.py
+tests/test_w7_radial_fit_projection.py
 tests/test_m1_camera_monitor.py
 tests/test_m2_camera_monitor_roi_curve.py
 tests/test_m2b_camera_monitor_scalar_history.py

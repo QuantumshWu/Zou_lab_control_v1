@@ -8,6 +8,7 @@ from io import BytesIO
 import math
 from numbers import Integral
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from zlc_data import FitResultBatch, Selection, validate_fit_result_source_binding
 from zlc_storage import canonical_text
@@ -21,6 +22,9 @@ from .figure import (
     ViewIntent,
 )
 from .figure.contract import _validate_selection_fit_view
+
+if TYPE_CHECKING:
+    from .fit_image_projection import RadialGaussianImageFitPanel
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +273,30 @@ class DataFigure:
         if effective_limit is not None and len(payload) > effective_limit:
             raise MemoryError("PNG payload exceeds figure render memory limit")
         return payload, regions
+
+    def radial_gaussian_image_fit_panels(
+        self,
+        layer_id: str,
+        *,
+        artifact_identity: str,
+    ) -> tuple[RadialGaussianImageFitPanel, ...]:
+        """Return typed saved-fit IMAGE panels without exposing fit authority.
+
+        The immutable projections retain exact source/artifact identity, sparse
+        logical holes, authoritative axis metadata, focus summaries, and only
+        the published centre/radius annotation.  No solver or predicted image
+        is evaluated on this path.
+        """
+
+        from .fit_image_projection import radial_gaussian_image_fit_panels
+
+        return radial_gaussian_image_fit_panels(
+            self._document,
+            self._evaluated,
+            dict(self._fit_results),
+            layer_id,
+            artifact_identity=artifact_identity,
+        )
 
     def _repr_png_(self) -> bytes:
         return self.to_png_bytes()

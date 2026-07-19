@@ -8,11 +8,18 @@ from math import prod
 from zlc_data import (
     DatasetSchema,
     FitResultBatch,
+    MONITOR_HISTORY,
     REPEAT,
+    SCAN_POINT,
+    SPATIAL_X,
+    SPATIAL_Y,
+    SPECTRAL,
     Selection,
 )
 
 from .contract import (
+    CURVE_CONTRACT,
+    IMAGE_CONTRACT,
     _first_visible_point_tuple,
     _selection_fit_projection,
     contract_for,
@@ -24,6 +31,7 @@ from .model import (
     AxisViewBinding,
     AxisViewRole,
     DecisionReason,
+    DisplaySlot,
     DisplayReduction,
     DisplayReductionMethod,
     FixedIndex,
@@ -35,6 +43,21 @@ from .model import (
     ViewPreferences,
     ViewSpec,
     ViewSuggestion,
+)
+
+
+_AUTO_CURVE_CONTRACT = replace(
+    CURVE_CONTRACT,
+    display_slots=(
+        DisplaySlot(
+            AxisViewRole.X,
+            (
+                SPECTRAL,
+                SCAN_POINT,
+                MONITOR_HISTORY,
+            ),
+        ),
+    ),
 )
 
 
@@ -183,11 +206,13 @@ def _plan_automatic_bindings(
     return {binding.axis_id: binding for binding in planned}
 
 
-def suggest_view(
+def _suggest_view(
     schema: DatasetSchema,
     intent: ViewIntent,
     selection: Selection | None = None,
     preferences: ViewPreferences | None = None,
+    *,
+    contract,
 ) -> ViewSuggestion:
     """Suggest one safe presentation using schema metadata only.
 
@@ -202,7 +227,6 @@ def suggest_view(
     preferences = ViewPreferences() if preferences is None else preferences
     if not isinstance(preferences, ViewPreferences):
         raise TypeError("preferences must be ViewPreferences or None")
-    contract = contract_for(intent)
     axes = dataset_axes(schema)
     axis_by_id = {axis.axis_id: axis for axis in axes}
     if selection is not None:
@@ -480,6 +504,27 @@ def suggest_view(
     )
 
 
+def suggest_view(
+    schema: DatasetSchema,
+    intent: ViewIntent,
+    selection: Selection | None = None,
+    preferences: ViewPreferences | None = None,
+) -> ViewSuggestion:
+    """Suggest one safe presentation using the ordinary public contract."""
+
+    return _suggest_view(
+        schema,
+        intent,
+        selection,
+        preferences,
+        contract=(
+            _AUTO_CURVE_CONTRACT
+            if intent is ViewIntent.CURVE
+            else contract_for(intent)
+        ),
+    )
+
+
 def _suggest_fit_view_for_effective_schema(
     schema: DatasetSchema,
     result: FitResultBatch,
@@ -539,7 +584,17 @@ def _suggest_fit_view_for_effective_schema(
         )
         intent = ViewIntent.IMAGE
 
-    suggestion = suggest_view(schema, intent, selected, preferences)
+    suggestion = _suggest_view(
+        schema,
+        intent,
+        selected,
+        preferences,
+        contract=(
+            CURVE_CONTRACT
+            if arity == 1
+            else IMAGE_CONTRACT
+        ),
+    )
     if suggestion.spec is None:
         return suggestion
     allowed_batch_roles = {

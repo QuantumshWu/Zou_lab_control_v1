@@ -75,7 +75,18 @@ IMAGE_CONTRACT = ViewContract(
 
 CURVE_CONTRACT = ViewContract(
     ViewIntent.CURVE,
-    (DisplaySlot(AxisViewRole.X, (SPECTRAL, SCAN_POINT, MONITOR_HISTORY)),),
+    (
+        DisplaySlot(
+            AxisViewRole.X,
+            (
+                SPECTRAL,
+                SCAN_POINT,
+                MONITOR_HISTORY,
+                SPATIAL_X,
+                SPATIAL_Y,
+            ),
+        ),
+    ),
     (
         AxisRolePolicy(SCAN_POINT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
         AxisRolePolicy(SPECTRAL, (AxisViewRole.FACET, AxisViewRole.SLIDER)),

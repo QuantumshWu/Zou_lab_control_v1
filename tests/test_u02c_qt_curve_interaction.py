@@ -655,7 +655,7 @@ def test_curve_lifecycle_and_callback_fault_are_local() -> None:
         ).isAccepted()
         assert board.curve_selector_fault is not None
         assert not board._numeric_bindings["curve"].binding_enabled
-        assert board._image_binding_enabled
+        assert board._image_bindings["image"].binding_enabled
     finally:
         board.close()
         application.processEvents()

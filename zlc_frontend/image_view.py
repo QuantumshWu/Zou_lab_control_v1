@@ -380,6 +380,45 @@ class ImageViewportTransform:
             min(1.0, max(0.0, (y - top) / (bottom - top))),
         )
 
+    def unbounded_visible_point_for_coordinate(
+        self,
+        coordinate_xy: object,
+        *,
+        coordinate_frame: CoordinateFrameId,
+    ) -> tuple[float, float]:
+        """Map one physical point through this view without clipping it.
+
+        The returned values use the visible window as ``[0, 1] x [0, 1]``,
+        but may lie outside that square.  This is the geometry needed for a
+        vector overlay whose center can be off-screen while the raster remains
+        clipped by the presentation surface.  Axis direction and half-cell
+        edges come from the same exact affine geometry as the bounded APIs.
+        """
+
+        if not isinstance(coordinate_xy, tuple) or len(coordinate_xy) != 2:
+            raise TypeError("coordinate_xy must be a two-item tuple")
+        if not isinstance(coordinate_frame, CoordinateFrameId):
+            raise TypeError("coordinate_frame must be CoordinateFrameId")
+        if coordinate_frame != self.coordinate_frame:
+            raise ValueError("coordinate belongs to another coordinate frame")
+        coordinate_x = _finite_number(coordinate_xy[0], "x coordinate")
+        coordinate_y = _finite_number(coordinate_xy[1], "y coordinate")
+        x_start, x_stop = _axis_edge_coordinates(self.x_axis)
+        y_start, y_stop = _axis_edge_coordinates(self.y_axis)
+        left, top, right, bottom = self.visible_bounds
+        visible_x = (
+            (coordinate_x - x_start) / (x_stop - x_start) - left
+        ) / (right - left)
+        visible_y = (
+            (coordinate_y - y_start) / (y_stop - y_start) - top
+        ) / (bottom - top)
+        if not math.isfinite(visible_x) or not math.isfinite(visible_y):
+            raise ValueError("coordinate mapping must be finite")
+        return (
+            0.0 if visible_x == 0.0 else visible_x,
+            0.0 if visible_y == 0.0 else visible_y,
+        )
+
     def full_points_for_coordinates(
         self,
         coordinates_xy: object,

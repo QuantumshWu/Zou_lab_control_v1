@@ -341,7 +341,10 @@ def test_site_map_reuses_image_gestures_but_keeps_area_display_only():
         assert len(gestures) == 1
         gesture = gestures[0]
         board.set_image_rectangle_candidate(gesture.normalized_bounds)
-        assert board._selector_applied_bounds == gesture.normalized_bounds
+        assert (
+            board._image_bindings["sites"].applied_bounds
+            == gesture.normalized_bounds
+        )
         assert board.visible_image_origin().evaluated_input == payload.occupancy_input
 
         _wheel(board, _point(target, 0.5, 0.5), -120)

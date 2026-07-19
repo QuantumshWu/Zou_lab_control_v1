@@ -68,6 +68,11 @@ def _widgets(window):
     )
 
 
+def _raw_image_binding(board: QtRasterBoard):
+    assert tuple(board._image_bindings) == ("camera-monitor-image",)
+    return board._image_bindings["camera-monitor-image"]
+
+
 def _close_window(application, window) -> None:
     window.close()
     _until(application, lambda: not window.isVisible(), timeout=5.0)
@@ -252,7 +257,7 @@ def test_display_gesture_and_form_reconfigure_only_the_live_presentation(
         # is restored automatically when the exact r1 front is painted.
         assert selector.isChecked() and not selector.isEnabled()
         assert not board._selector_enabled
-        assert board._image_interaction_is_pending()
+        assert board._image_interaction_is_pending(_raw_image_binding(board))
         assert board.visible_image_origin().presentation.panel_revision == 0
         _until(
             application,
@@ -264,7 +269,7 @@ def test_display_gesture_and_form_reconfigure_only_the_live_presentation(
         )
         _until(application, selector.isEnabled)
         assert selector.isChecked() and board._selector_enabled
-        assert not board._image_interaction_is_pending()
+        assert not board._image_interaction_is_pending(_raw_image_binding(board))
         assert board.selector_fault is None
         _until(application, lambda: _raw_revision(window) > first_raw_revision)
         assert _live_display_identity(window) == stable_identity
