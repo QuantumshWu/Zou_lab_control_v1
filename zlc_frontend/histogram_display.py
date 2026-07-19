@@ -538,6 +538,51 @@ def _histogram_series(series_samples: object) -> tuple[np.ndarray, ...]:
     return tuple(result)
 
 
+def _histogram_projection_edges(
+    values_by_series: tuple[np.ndarray, ...],
+    bins: int,
+    value_range: DisplayRange | None,
+) -> np.ndarray:
+    if all(values.dtype.kind == "b" for values in values_by_series):
+        if value_range is not None and validated_display_range(
+            value_range,
+            "histogram projection value_range",
+        ) != (-0.5, 1.5):
+            raise ValueError(
+                "boolean histogram value_range must preserve false/true bins"
+            )
+        return np.asarray((-0.5, 0.5, 1.5), dtype=np.float64)
+    if value_range is not None:
+        low, high = validated_display_range(
+            value_range,
+            "histogram projection value_range",
+        )
+        return np.linspace(low, high, bins + 1, dtype=np.float64)
+    nonempty = tuple(values for values in values_by_series if values.size)
+    if not nonempty:
+        representative = np.asarray((), dtype=np.float64)
+    else:
+        minima = tuple(values.min().item() for values in nonempty)
+        maxima = tuple(values.max().item() for values in nonempty)
+        representative = np.asarray((min(minima), max(maxima)))
+    return np.histogram_bin_edges(representative, bins=bins)
+
+
+def histogram_projection_home_x_limits(
+    series_samples: tuple[np.ndarray, ...],
+    bins: int = DEFAULT_HISTOGRAM_BINS,
+    *,
+    value_range: DisplayRange | None = None,
+) -> DisplayRange:
+    """Derive the exact owner-defined bin domain without materializing counts."""
+
+    values_by_series = _histogram_series(series_samples)
+    bins = _histogram_bin_count(bins)
+    return histogram_home_x_limits(
+        _histogram_projection_edges(values_by_series, bins, value_range)
+    )
+
+
 @dataclass(frozen=True, slots=True, eq=False, init=False)
 class HistogramBinProjection:
     """One exact-sample-bound, shared-edge display projection.
@@ -557,20 +602,12 @@ class HistogramBinProjection:
         self,
         series_samples: tuple[np.ndarray, ...],
         bins: int = DEFAULT_HISTOGRAM_BINS,
+        *,
+        value_range: DisplayRange | None = None,
     ) -> None:
         values_by_series = _histogram_series(series_samples)
         bins = _histogram_bin_count(bins)
-        if all(values.dtype.kind == "b" for values in values_by_series):
-            edges = np.asarray((-0.5, 0.5, 1.5), dtype=np.float64)
-        else:
-            nonempty = tuple(values for values in values_by_series if values.size)
-            if not nonempty:
-                representative = np.asarray((), dtype=np.float64)
-            else:
-                minima = tuple(values.min().item() for values in nonempty)
-                maxima = tuple(values.max().item() for values in nonempty)
-                representative = np.asarray((min(minima), max(maxima)))
-            edges = np.histogram_bin_edges(representative, bins=bins)
+        edges = _histogram_projection_edges(values_by_series, bins, value_range)
 
         immutable_edges = _immutable_histogram_array(
             np.asarray(edges, dtype=np.float64),
@@ -589,7 +626,7 @@ class HistogramBinProjection:
             )[0]
             if int(np.sum(series_counts, dtype=np.int64)) != int(values.size):
                 raise ValueError(
-                    "automatic histogram edges did not retain every sample"
+                    "histogram projection range did not retain every sample"
                 )
             counts.append(
                 _immutable_histogram_array(
@@ -633,4 +670,5 @@ __all__ = [
     "histogram_display_from_form",
     "histogram_display_with_x_view",
     "histogram_home_x_limits",
+    "histogram_projection_home_x_limits",
 ]

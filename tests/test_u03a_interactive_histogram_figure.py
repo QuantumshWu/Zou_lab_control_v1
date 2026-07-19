@@ -488,14 +488,22 @@ def _assert_encoded_fallback(application, window) -> None:
     assert window._export_button.isHidden()
 
 
-def test_multi_cell_histogram_uses_encoded_fallback(application) -> None:
+def test_multi_cell_histogram_uses_typed_grid_overview(application) -> None:
     figure = _histogram_figure(site_role=AxisViewRole.FACET)
     window = open_data_figure_workbench(
         figure,
         memory_limit_bytes=64 << 20,
     )
     try:
-        _assert_encoded_fallback(application, window)
+        _until(application, lambda: window.worker_idle and window.raster_ready)
+        assert window._view_family == "histogram-overview"
+        assert window._grid_overview is not None
+        assert window._grid_overview.intent is ViewIntent.HISTOGRAM
+        assert len(window._grid_overview.regions) == 2
+        assert window._board_widget.front_frame is None
+        assert window.findChild(QtWidgets.QLabel, "figureViewerMode").text() == (
+            "EXACT HISTOGRAM GRID · DISPLAY ONLY"
+        )
     finally:
         _close(application, window)
 

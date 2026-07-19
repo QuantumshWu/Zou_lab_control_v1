@@ -159,13 +159,17 @@ def test_meter_unit_validity_and_exact_focus_are_preserved():
 
     _png, regions = figure.to_png_bytes_with_panel_regions()
     selected_series = cells[1].series[0]
-    focused = figure.focused_meter_panel(
+    focused = figure.focused_typed_panel(
         1,
         expected_selection=regions[1].selection,
+        expected_intent=ViewIntent.METER,
     )
     assert (
         focused.retained_upper_bound_nbytes
-        <= figure.focused_meter_panel_retained_upper_bound_nbytes(1)
+        <= figure.focused_typed_panel_retained_upper_bound_nbytes(
+            1,
+            expected_intent=ViewIntent.METER,
+        )
     )
     assert focused.document.document_id != figure.document.document_id
     assert len(focused.document.layers) == len(focused.evaluated.layers) == 1
@@ -181,15 +185,17 @@ def test_meter_unit_validity_and_exact_focus_are_preserved():
     assert resolutions[AxisId("site")].index == 1
     assert resolutions[AxisId("site")].coordinate == "B"
     with pytest.raises(ValueError, match="selection differs"):
-        figure.focused_meter_panel(
+        figure.focused_typed_panel(
             1,
             expected_selection=regions[0].selection,
+            expected_intent=ViewIntent.METER,
         )
     updated = _meter_figure(revision=8)
     _updated_png, updated_regions = updated.to_png_bytes_with_panel_regions()
-    updated_focus = updated.focused_meter_panel(
+    updated_focus = updated.focused_typed_panel(
         1,
         expected_selection=updated_regions[1].selection,
+        expected_intent=ViewIntent.METER,
     )
     assert updated_focus.document.document_id != focused.document.document_id
     assert len(figure.evaluated.layers[0].cells) == 3
@@ -198,9 +204,10 @@ def test_meter_unit_validity_and_exact_focus_are_preserved():
 def test_typed_meter_payload_is_exact_and_rejects_semantic_drift():
     figure = _meter_figure()
     _png, regions = figure.to_png_bytes_with_panel_regions()
-    focused = figure.focused_meter_panel(
+    focused = figure.focused_typed_panel(
         2,
         expected_selection=regions[2].selection,
+        expected_intent=ViewIntent.METER,
     )
     renderer = SinglePanelAggRenderer(focused.document, width=800, height=520)
     try:
@@ -278,7 +285,11 @@ def test_sparse_meter_layout_keeps_the_hole_in_its_logical_cell():
     assert tuple(meter.value for meter in meters) == (10.0, 30.0, 20.0, 0.0)
     assert tuple(meter.valid for meter in meters) == (True, True, True, False)
     _png, regions = figure.to_png_bytes_with_panel_regions()
-    hole = figure.focused_meter_panel(3, expected_selection=regions[3].selection)
+    hole = figure.focused_typed_panel(
+        3,
+        expected_selection=regions[3].selection,
+        expected_intent=ViewIntent.METER,
+    )
     assert hole.evaluated.layers[0].cells[0].series[0].data.valid is False
     assert tuple(
         (term.axis_id, term.index) for term in regions[3].selection.terms
@@ -292,9 +303,10 @@ def test_sparse_meter_layout_keeps_the_hole_in_its_logical_cell():
 def test_valid_nonfinite_meter_fails_before_mutating_agg_surface():
     figure = _meter_figure()
     _png, regions = figure.to_png_bytes_with_panel_regions()
-    focused = figure.focused_meter_panel(
+    focused = figure.focused_typed_panel(
         0,
         expected_selection=regions[0].selection,
+        expected_intent=ViewIntent.METER,
     )
     renderer = SinglePanelAggRenderer(focused.document, width=800, height=520)
     try:
@@ -333,16 +345,16 @@ def test_meter_grid_overview_focus_back_escape_and_atomic_exports(
         _until(application, lambda: window.raster_ready and window.worker_idle)
         assert window._view_family == "meter-overview"
         assert window._board_widget.front_frame is None
-        overview = window._meter_overview
+        overview = window._grid_overview
         assert overview is not None and len(overview.regions) == 3
         original_png = window._bundle.pages[0].png_bytes
         blank = _blank_point(overview.regions)
-        window._focus_meter_region(*blank)
+        window._focus_grid_region(*blank)
         assert window._view_family == "meter-overview"
         assert window._future is None
 
         region = overview.regions[1]
-        window._focus_meter_region(
+        window._focus_grid_region(
             (region.left + region.right) / 2.0,
             (region.top + region.bottom) / 2.0,
         )
@@ -373,7 +385,7 @@ def test_meter_grid_overview_focus_back_escape_and_atomic_exports(
             )
             assert rgba.tobytes() == focused_frame.panels[0].raster.pixels
 
-        window._show_meter_overview()
+        window._show_grid_overview()
         assert window._view_family == "meter-overview"
         assert window._board_widget.front_frame is None
         assert window._bundle.pages[0].png_bytes is original_png
@@ -383,7 +395,7 @@ def test_meter_grid_overview_focus_back_escape_and_atomic_exports(
         assert overview_path.read_bytes() == original_png
 
         region = overview.regions[2]
-        window._focus_meter_region(
+        window._focus_grid_region(
             (region.left + region.right) / 2.0,
             (region.top + region.bottom) / 2.0,
         )
@@ -402,9 +414,10 @@ def test_meter_focus_required_minus_one_rejects_before_renderer_allocation(
 ):
     figure = _meter_figure()
     _png, regions = figure.to_png_bytes_with_panel_regions()
-    focused = figure.focused_meter_panel(
+    focused = figure.focused_typed_panel(
         0,
         expected_selection=regions[0].selection,
+        expected_intent=ViewIntent.METER,
     )
     state = figure_workbench._MeterDisplayState(0, regions[0].selection)
     required = figure_workbench._typed_front_required_peak_bytes(focused, state)
@@ -437,16 +450,21 @@ def test_meter_focus_budget_rejects_before_deriving_panel(
     window = figure_workbench.open_data_figure_workbench(figure)
     try:
         _until(application, lambda: window.raster_ready and window.worker_idle)
-        overview = window._meter_overview
+        overview = window._grid_overview
         assert overview is not None
         external = (
             overview.external_retained_upper_bound_bytes
-            + window._meter_overview_presentation_bytes
+            + window._grid_overview_presentation_bytes
         )
         _focused, _render, aggregate = (
-            figure_workbench._meter_focus_preflight_nbytes(
+            figure_workbench._typed_focus_preflight_nbytes(
                 figure,
                 0,
+                expected_intent=ViewIntent.METER,
+                display=figure_workbench._MeterDisplayState(
+                    0,
+                    overview.regions[0].selection,
+                ),
                 external_session_retained_bytes=external,
             )
         )
@@ -457,10 +475,10 @@ def test_meter_focus_budget_rejects_before_deriving_panel(
             calls += 1
             raise AssertionError("focused panel was derived before aggregate admission")
 
-        monkeypatch.setattr(DataFigure, "focused_meter_panel", forbidden)
+        monkeypatch.setattr(DataFigure, "focused_typed_panel", forbidden)
         window._memory_limit_bytes = aggregate - 1
         region = overview.regions[0]
-        window._focus_meter_region(
+        window._focus_grid_region(
             (region.left + region.right) / 2.0,
             (region.top + region.bottom) / 2.0,
         )
@@ -481,7 +499,7 @@ def test_close_during_meter_focus_cannot_present_a_late_front(
     figure = _meter_figure()
     entered = threading.Event()
     release = threading.Event()
-    original = DataFigure.focused_meter_panel
+    original = DataFigure.focused_typed_panel
 
     def blocked(self, *args, **kwargs):
         entered.set()
@@ -489,13 +507,13 @@ def test_close_during_meter_focus_cannot_present_a_late_front(
             raise TimeoutError("test did not release focused panel derivation")
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(DataFigure, "focused_meter_panel", blocked)
+    monkeypatch.setattr(DataFigure, "focused_typed_panel", blocked)
     window = figure_workbench.open_data_figure_workbench(figure)
     _until(application, lambda: window.raster_ready and window.worker_idle)
-    overview = window._meter_overview
+    overview = window._grid_overview
     assert overview is not None
     region = overview.regions[1]
-    window._focus_meter_region(
+    window._focus_grid_region(
         (region.left + region.right) / 2.0,
         (region.top + region.bottom) / 2.0,
     )
@@ -509,7 +527,7 @@ def test_close_during_meter_focus_cannot_present_a_late_front(
 def test_multi_layer_meter_is_not_promoted_to_the_single_layer_explorer():
     figure = _meter_figure(layers=2)
     assert figure_workbench._classify_single_typed(figure)[0] is None
-    count, reason = figure_workbench._classify_meter_grid(figure)
+    _intent, count, reason = figure_workbench._classify_typed_grid(figure)
     assert count is None
     assert "one layer" in reason
 

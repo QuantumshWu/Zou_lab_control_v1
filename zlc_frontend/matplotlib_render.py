@@ -123,6 +123,30 @@ def evaluated_figure_array_nbytes(evaluated: EvaluatedFigureData) -> int:
     return _array_nbytes(evaluated)
 
 
+def _histogram_render_geometry_nbytes(
+    evaluated: EvaluatedFigureData,
+    *,
+    bins: int = DEFAULT_HISTOGRAM_BINS,
+) -> int:
+    """Conservatively charge bounded histogram counts/edges/step vertices."""
+
+    total = 0
+    for _layer, _cell, series_group in _panels(evaluated):
+        if not isinstance(series_group[0].data, EvaluatedHistogram):
+            continue
+        series_count = len(series_group)
+        counts_bytes = series_count * bins * np.dtype("<i8").itemsize
+        edges_bytes = (bins + 1) * np.dtype(np.float64).itemsize
+        vertices_bytes = (
+            series_count
+            * 2
+            * (2 * bins + 2)
+            * np.dtype(np.float64).itemsize
+        )
+        total += counts_bytes + edges_bytes + vertices_bytes
+    return int(total)
+
+
 def estimate_render_peak_nbytes(
     evaluated: EvaluatedFigureData,
     *,
@@ -142,7 +166,11 @@ def estimate_render_peak_nbytes(
     return int(
         _RASTER_FIXED_BYTES
         + _RASTER_BUFFER_MULTIPLIER * rgba_bytes
-        + _ARTIST_ARRAY_MULTIPLIER * _array_nbytes(evaluated)
+        + _ARTIST_ARRAY_MULTIPLIER
+        * (
+            _array_nbytes(evaluated)
+            + _histogram_render_geometry_nbytes(evaluated)
+        )
     )
 
 
@@ -1024,12 +1052,6 @@ def _histogram(
 ):
     """Draw filled, shared-edge distributions and return their exact bins."""
 
-    multiple_series = len(series_group) > 1
-    all_boolean = all(
-        isinstance(series.data, EvaluatedHistogram)
-        and np.issubdtype(series.data.samples.dtype, np.bool_)
-        for series in series_group
-    )
     bin_projection = (
         _histogram_projection(series_group, bins)
         if projection is None
@@ -1037,6 +1059,19 @@ def _histogram(
     )
     counts_group = bin_projection.bin_counts
     edges = bin_projection.bin_edges
+    _draw_histogram_projection(axis, series_group, counts_group, edges)
+    return counts_group, edges
+
+
+def _draw_histogram_projection(axis, series_group, counts_group, edges) -> None:
+    """Draw one panel from already-frozen shared histogram geometry."""
+
+    multiple_series = len(series_group) > 1
+    all_boolean = all(
+        isinstance(series.data, EvaluatedHistogram)
+        and np.issubdtype(series.data.samples.dtype, np.bool_)
+        for series in series_group
+    )
     for series, counts in zip(series_group, counts_group, strict=True):
         data = series.data
         assert isinstance(data, EvaluatedHistogram)
@@ -1052,7 +1087,6 @@ def _histogram(
         axis.set_xticks((0, 1), ("false", "true"))
     if len(series_group) > 1 or any(series.batch_address for series in series_group):
         axis.legend(fontsize=ANNOTATION_FONT_SIZE)
-    return counts_group, edges
 
 
 def _meter_text(series_group) -> str:
@@ -1277,6 +1311,38 @@ def _render_evaluated_figure(
 
     _require_evaluated_identity(document, evaluated)
     panels = _panels(evaluated)
+    shared_histogram_projection = None
+    shared_histogram_x_limits = None
+    shared_histogram_count_limits = None
+    if (
+        len({layer.layer_id for layer, _cell, _series in panels}) == 1
+        and all(
+            isinstance(series.data, EvaluatedHistogram)
+            for _layer, _cell, series_group in panels
+            for series in series_group
+        )
+    ):
+        shared_histogram_projection = HistogramBinProjection(
+            tuple(
+                series.data.samples
+                for _layer, _cell, series_group in panels
+                for series in series_group
+            ),
+            bins=DEFAULT_HISTOGRAM_BINS,
+        )
+        shared_histogram_x_limits = histogram_home_x_limits(
+            shared_histogram_projection.bin_edges
+        )
+        shared_histogram_count_limits = histogram_count_limits(
+            HistogramDisplayState(),
+            max(
+                (
+                    int(np.max(counts, initial=0))
+                    for counts in shared_histogram_projection.bin_counts
+                ),
+                default=0,
+            ),
+        )
     radial_color_limits = _radial_image_color_limits_by_layer(
         panels,
         fit_results,
@@ -1293,6 +1359,7 @@ def _render_evaluated_figure(
         FigureCanvasAgg(figure)
         axes = figure.subplots(rows, columns, squeeze=False).reshape(-1)
 
+        histogram_series_offset = 0
         for target, (layer, cell, series_group) in zip(axes, panels):
             fit_result = fit_results.get(layer.layer_id)
             kind = series_group[0].data
@@ -1311,7 +1378,23 @@ def _render_evaluated_figure(
             elif isinstance(kind, EvaluatedHistogram):
                 if fit_result is not None:
                     raise ValueError("fit overlays require a curve or image view")
-                _histogram(target, series_group)
+                if shared_histogram_projection is None:
+                    _histogram(target, series_group)
+                else:
+                    next_offset = histogram_series_offset + len(series_group)
+                    _draw_histogram_projection(
+                        target,
+                        series_group,
+                        shared_histogram_projection.bin_counts[
+                            histogram_series_offset:next_offset
+                        ],
+                        shared_histogram_projection.bin_edges,
+                    )
+                    histogram_series_offset = next_offset
+                    assert shared_histogram_x_limits is not None
+                    assert shared_histogram_count_limits is not None
+                    target.set_xlim(*shared_histogram_x_limits)
+                    target.set_ylim(*shared_histogram_count_limits)
             elif isinstance(kind, EvaluatedMeter):
                 if fit_result is not None:
                     raise ValueError("fit overlays require a curve or image view")
@@ -1599,6 +1682,7 @@ class SinglePanelAggRenderer:
         current_count_limits: tuple[float, float] | None,
         previous_relim_mode: RelimMode | None,
         previous_count_scale: HistogramCountScale | None,
+        projection_value_range: tuple[float, float] | None = None,
     ) -> tuple[RasterBuffer, HistogramPanelPayload]:
         """Render one front-bound shared-bin Histogram projection."""
 
@@ -1609,6 +1693,7 @@ class SinglePanelAggRenderer:
                 current_count_limits=current_count_limits,
                 previous_relim_mode=previous_relim_mode,
                 previous_count_scale=previous_count_scale,
+                projection_value_range=projection_value_range,
             )
 
     def _render_interactive_histogram(
@@ -1619,6 +1704,7 @@ class SinglePanelAggRenderer:
         current_count_limits: tuple[float, float] | None,
         previous_relim_mode: RelimMode | None,
         previous_count_scale: HistogramCountScale | None,
+        projection_value_range: tuple[float, float] | None,
     ) -> tuple[RasterBuffer, HistogramPanelPayload]:
         if not isinstance(state, HistogramDisplayState):
             raise TypeError("state must be HistogramDisplayState")
@@ -1634,6 +1720,7 @@ class SinglePanelAggRenderer:
         bin_projection = HistogramBinProjection(
             tuple(item.samples for item in histograms),
             bins=state.bin_count,
+            value_range=projection_value_range,
         )
         figure, axis, layer, _cell, series_group = self._prepare_panel(
             evaluated,

@@ -50,6 +50,7 @@ from zlc_frontend.histogram_display import (
     histogram_display_from_form,
     histogram_display_with_x_view,
     histogram_home_x_limits,
+    histogram_projection_home_x_limits,
 )
 from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
 from zlc_frontend.render import HistogramPanelPayload
@@ -212,6 +213,10 @@ def test_shared_histogram_binning_is_common_lossless_and_immutable() -> None:
     assert counts[1].sum() == len(second)
     assert edges[0] <= first.min() and edges[-1] >= second.max()
     assert histogram_home_x_limits(edges) == (edges[0], edges[-1])
+    assert histogram_projection_home_x_limits((first, second), bins=5) == (
+        edges[0],
+        edges[-1],
+    )
     assert not counts[0].flags.writeable and not edges.flags.writeable
     with pytest.raises(ValueError):
         counts[0][0] = 99
@@ -244,6 +249,37 @@ def test_shared_histogram_binning_is_common_lossless_and_immutable() -> None:
         HistogramBinProjection((np.asarray((1.0, np.nan)),), bins=5)
     with pytest.raises(ValueError, match="one-dimensional"):
         HistogramBinProjection((np.zeros((2, 2)),), bins=5)
+
+    fixed_projection = HistogramBinProjection(
+        (first, second),
+        bins=5,
+        value_range=(-20.0, 30.0),
+    )
+    np.testing.assert_array_equal(
+        fixed_projection.bin_edges,
+        np.linspace(-20.0, 30.0, 6),
+    )
+    assert tuple(int(counts.sum()) for counts in fixed_projection.bin_counts) == (
+        len(first),
+        len(second),
+    )
+    assert histogram_projection_home_x_limits(
+        (first, second),
+        bins=5,
+        value_range=(-20.0, 30.0),
+    ) == (-20.0, 30.0)
+    with pytest.raises(ValueError, match="did not retain every sample"):
+        HistogramBinProjection(
+            (first, second),
+            bins=5,
+            value_range=(-6.0, 30.0),
+        )
+    with pytest.raises(ValueError, match="false/true bins"):
+        HistogramBinProjection(
+            (np.asarray((False, True)),),
+            bins=5,
+            value_range=(0.0, 1.0),
+        )
 
 
 def test_histogram_evaluator_preserves_unit_coordinates_and_component_validity() -> None:
