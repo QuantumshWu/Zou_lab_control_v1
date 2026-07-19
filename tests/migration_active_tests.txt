@@ -112,3 +112,4 @@ tests/test_zlc_readout_validity.py
 tests/test_zlc_storage_canonical.py
 tests/test_u04_settings_popup_anchor.py
 tests/test_u04_catalog_projection.py
+tests/test_u04_workspace_bootstrap.py

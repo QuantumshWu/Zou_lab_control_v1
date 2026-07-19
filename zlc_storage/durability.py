@@ -125,8 +125,38 @@ def durable_mkdir(directory: str | os.PathLike[str]) -> Path:
     return target
 
 
+def durable_makedirs(directory: str | os.PathLike[str]) -> Path:
+    """Create every missing level of one path, durably, one level at a time.
+
+    :func:`durable_mkdir` stays single-level on purpose so a visible child can
+    never look durable while the entry that names it went unflushed.  A caller
+    that owns a whole hierarchy still has to walk it, so this is that walk in
+    one place rather than copied into every workspace owner: collect the
+    missing levels up to the first existing ancestor, then create and flush
+    them from the top down.  Nothing is created above an ancestor that does
+    not exist, which keeps a mistyped root a loud failure instead of a new
+    tree of empty directories.
+    """
+
+    target = Path(directory).expanduser().resolve()
+    missing: list[Path] = []
+    probe = target
+    while not probe.exists():
+        missing.append(probe)
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    for level in reversed(missing):
+        durable_mkdir(level)
+    if not missing:
+        durable_mkdir(target)
+    return target
+
+
 __all__ = [
     "DirectoryDurabilityError",
+    "durable_makedirs",
     "durable_mkdir",
     "flush_directory",
 ]

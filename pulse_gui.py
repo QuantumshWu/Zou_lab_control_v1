@@ -71,7 +71,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         from Zou_lab_control.notebook import connect
+        from zlc_storage import durable_makedirs
 
+        # Own the workspace levels above the repository the composition
+        # root creates, so a first run with no ~/.zlc still starts.
+        durable_makedirs(args.repository.expanduser().parent)
         experiment = connect(
             "virtual",
             repository=args.repository,

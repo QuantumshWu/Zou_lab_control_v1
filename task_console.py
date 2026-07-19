@@ -60,6 +60,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from Zou_lab_control.notebook import connect
     from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_storage import durable_makedirs
     from zlc_workbench.task_console import load_task_console_scan_intent
 
     application = ensure_qt_app()
@@ -71,6 +72,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     experiment = None
     window = None
     try:
+        # The composition root owns one repository below an existing
+        # parent, so this launcher owns the workspace levels above it:
+        # a first run on a machine with no ~/.zlc must not die.
+        durable_makedirs(args.repository.expanduser().parent)
         experiment = connect(
             "virtual",
             repository=args.repository,
