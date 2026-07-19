@@ -33,6 +33,7 @@ from .fit_image_projection import (
     reduction_label as _reduction_label,
 )
 from .image_display import ImageDisplayState, image_viewport_for_display_state
+from .image_view import image_viewport_for_evaluated_image
 from .curve_display import (
     CurveDisplayState,
     CurveViewportTransform,
@@ -58,6 +59,7 @@ from .display_range import (
 from .render import (
     CurvePanelPayload,
     HistogramPanelPayload,
+    ImagePanelPayload,
     PixelFormat,
     RasterBuffer,
 )
@@ -70,6 +72,7 @@ from .render_style import (
     FIT_FAILURE_COLOR,
     FIT_LINESTYLE,
     PALETTE,
+    indexed_colormap,
     render_style_context,
 )
 
@@ -350,7 +353,7 @@ def _curve(axis, layer, cell, series_group, fit_result):
         axis.legend(fontsize=ANNOTATION_FONT_SIZE)
 
 
-def _draw_radial_image(
+def _draw_projected_image(
     axis,
     figure,
     data: EvaluatedImage,
@@ -358,33 +361,64 @@ def _draw_radial_image(
     colormap: str,
     color_limits: tuple[float, float],
     visible_bounds=(0.0, 0.0, 1.0, 1.0),
+    regular_pixel_contract: bool,
     center: tuple[float, float] | None,
     radius: float | None,
     diagnostic: str | None,
 ):
-    """Draw the one radial IMAGE presentation used by canonical and typed export."""
+    """Draw one exact IMAGE projection with an optional radial-fit annotation."""
 
-    x_edges, x_centers, x_labels = _image_axis(data.x_axis)
-    y_edges, y_centers, y_labels = _image_axis(data.y_axis)
+    if np.iscomplexobj(data.values):
+        raise ValueError("complex images require an explicit real-valued display transform")
+    x_edges, _x_centers, x_labels = _image_axis(data.x_axis)
+    y_edges, _y_centers, y_labels = _image_axis(data.y_axis)
     invalid = np.logical_not(data.validity)
     if data.values.dtype.kind == "f":
         invalid = np.logical_or(invalid, ~np.isfinite(data.values))
     values = np.ma.array(data.values, mask=invalid)
-    mesh = axis.pcolormesh(
-        x_edges,
-        y_edges,
-        values,
-        shading="flat",
-        cmap=colormap,
-        vmin=color_limits[0],
-        vmax=color_limits[1],
-        rasterized=True,
+    if not isinstance(regular_pixel_contract, bool):
+        raise TypeError("regular_pixel_contract must be bool")
+    if regular_pixel_contract:
+        # Typed IMAGE and saved-fit panels have already crossed the strict
+        # regular-pixel viewport boundary.  Revalidate that declared contract
+        # here before taking the low-memory path; never infer it from shape.
+        image_viewport_for_evaluated_image(data)
+        if x_labels is not None or y_labels is not None:
+            raise ValueError("projected IMAGE export requires numeric pixel axes")
+        image_artist = axis.imshow(
+            values,
+            origin="upper",
+            extent=(x_edges[0], x_edges[-1], y_edges[-1], y_edges[0]),
+            interpolation="nearest",
+            cmap=colormap,
+            vmin=color_limits[0],
+            vmax=color_limits[1],
+            rasterized=True,
+        )
+        colorbar = figure.colorbar(image_artist, ax=axis)
+    else:
+        # Canonical/encoded radial figures also admit irregular coordinates.
+        # Their geometry must remain cell-edge exact even though QuadMesh is
+        # more expensive; silently spreading those cells uniformly would move
+        # the physical image underneath an otherwise correct fit overlay.
+        image_artist = axis.pcolormesh(
+            x_edges,
+            y_edges,
+            values,
+            shading="flat",
+            cmap=colormap,
+            vmin=color_limits[0],
+            vmax=color_limits[1],
+            rasterized=True,
+        )
+        colorbar = figure.colorbar(image_artist, ax=axis)
+        if x_labels is not None:
+            axis.set_xticks(_x_centers, x_labels)
+        if y_labels is not None:
+            axis.set_yticks(_y_centers, y_labels)
+    colorbar.set_label(
+        "Value" if data.value_unit is None else f"Value [{data.value_unit}]"
     )
-    figure.colorbar(mesh, ax=axis)
-    if x_labels is not None:
-        axis.set_xticks(x_centers, x_labels)
-    if y_labels is not None:
-        axis.set_yticks(y_centers, y_labels)
     axis.set_xlabel(_axis_label(data.x_axis))
     axis.set_ylabel(_axis_label(data.y_axis))
     left, top, right, bottom = visible_bounds
@@ -421,8 +455,8 @@ def _draw_radial_image(
         # Off-screen saved geometry is annotation, never an autoscale input.
         axis.set_xlim(*x_limits)
         axis.set_ylim(*y_limits)
-    else:
-        assert radius is None and diagnostic is not None
+    elif diagnostic is not None:
+        assert radius is None
         axis.text(
             0.02,
             0.98,
@@ -432,6 +466,8 @@ def _draw_radial_image(
             color=FIT_FAILURE_COLOR,
             fontsize=ANNOTATION_FONT_SIZE,
         )
+    else:
+        assert radius is None
 
 
 def _image(
@@ -469,12 +505,13 @@ def _image(
                 diagnostic = status.value
                 if fit_result.errors[index]:
                     diagnostic = f"{diagnostic}: {fit_result.errors[index]}"
-        _draw_radial_image(
+        _draw_projected_image(
             axis,
             figure,
             data,
             colormap="gray",
             color_limits=radial_color_limits,
+            regular_pixel_contract=False,
             center=center,
             radius=radius,
             diagnostic=diagnostic,
@@ -564,13 +601,14 @@ def _radial_projected_image(
 
     viewport = image_viewport_for_display_state(display, panel.home_viewport)
     overlay = panel.fit_overlay
-    _draw_radial_image(
+    _draw_projected_image(
         axis,
         figure,
         panel.image,
         colormap=display.colormap.value,
         color_limits=color_limits,
         visible_bounds=viewport.visible_bounds,
+        regular_pixel_contract=True,
         center=overlay.center_xy,
         radius=overlay.one_over_e_radius,
         diagnostic=(
@@ -611,6 +649,145 @@ def _validated_radial_grid_columns(columns: int, panel_count: int) -> int:
     return columns
 
 
+def _estimate_projected_image_agg_peak_nbytes(
+    images: tuple[EvaluatedImage, ...],
+    *,
+    dpi: float,
+    columns: int,
+) -> int:
+    """Shared conservative Agg/encoder peak after exact images are retained."""
+
+    images = tuple(images)
+    if not images or any(not isinstance(image, EvaluatedImage) for image in images):
+        raise TypeError("images must be a non-empty EvaluatedImage tuple")
+    dpi = _render_dpi(dpi)
+    columns = positive_integer(columns, "columns")
+    if columns > len(images):
+        raise ValueError("columns cannot exceed the image count")
+    rows = math.ceil(len(images) / columns)
+    width = math.ceil(5.0 * columns * dpi)
+    height = math.ceil(4.0 * rows * dpi)
+    rgba_bytes = width * height * 4
+    # The exact values/validity planes are retained by the caller and are not
+    # charged again here.  The strict regular-pixel ``imshow`` path still owns
+    # dtype-independent per-cell mask, normalization/resampling, RGBA and
+    # backend workspaces.  Keep that measured term separate from the Agg/PNG
+    # canvas fronts and the small one-dimensional edge arrays.  A 2304-square
+    # uint16 witness peaked at 373,728,906 incremental bytes; this formula
+    # admits it below the 512 MiB product limit with a conservative margin.
+    cell_count = sum(image.values.size for image in images)
+    axis_coordinate_count = sum(
+        len(image.x_axis.coordinates) + len(image.y_axis.coordinates)
+        for image in images
+    )
+    return int(
+        _RASTER_FIXED_BYTES
+        + _RASTER_BUFFER_MULTIPLIER * rgba_bytes
+        + 88 * cell_count
+        + 16 * axis_coordinate_count
+    )
+
+
+def estimate_image_png_export_peak_nbytes(
+    image: EvaluatedImage,
+    *,
+    dpi: float = 100.0,
+) -> int:
+    """Bound incremental PNG export memory after one exact IMAGE is retained."""
+
+    if not isinstance(image, EvaluatedImage):
+        raise TypeError("image must be EvaluatedImage")
+    image_viewport_for_evaluated_image(image)
+    if np.iscomplexobj(image.values):
+        raise ValueError("complex images require an explicit real-valued display transform")
+    return _estimate_projected_image_agg_peak_nbytes(
+        (image,),
+        dpi=dpi,
+        columns=1,
+    )
+
+
+def _validated_image_panel_export(
+    payload: ImagePanelPayload,
+    display: ImageDisplayState,
+) -> None:
+    if not isinstance(payload, ImagePanelPayload):
+        raise TypeError("payload must be ImagePanelPayload")
+    if not isinstance(display, ImageDisplayState):
+        raise TypeError("display must be ImageDisplayState")
+    home_viewport = image_viewport_for_evaluated_image(payload.image)
+    expected_viewport = image_viewport_for_display_state(display, home_viewport)
+    if expected_viewport != payload.viewport:
+        raise ValueError("image display state differs from the exact payload viewport")
+    if payload.base_palette != indexed_colormap(display.colormap.value):
+        raise ValueError("image display colormap differs from the exact payload palette")
+    if (
+        display.relim_mode is RelimMode.FIXED
+        and display.fixed_color_limits != payload.color_limits
+    ):
+        raise ValueError("fixed image display limits differ from the exact payload front")
+
+
+def save_image_panel_png(
+    payload: ImagePanelPayload,
+    display: ImageDisplayState,
+    destination,
+    *,
+    dpi: float = 100.0,
+    memory_limit_bytes: int | None = None,
+) -> None:
+    """Save one exact current IMAGE front without re-evaluation or fit authority.
+
+    The committed viewport, colormap, effective colour limits, and value unit
+    all come from the exact payload/display pair.  Fit-bearing IMAGE remains a
+    whole-figure product in this slice; pointer-drag rectangles are likewise
+    absent because they are transient Qt overlays, not committed display state.
+    """
+
+    _validated_image_panel_export(payload, display)
+    if payload.fit_overlay is not None:
+        raise ValueError(
+            "generic IMAGE export refuses fit overlays; use the authoritative "
+            "whole-figure or saved-fit export path"
+        )
+    dpi = _render_dpi(dpi)
+    required = estimate_image_png_export_peak_nbytes(payload.image, dpi=dpi)
+    if memory_limit_bytes is not None:
+        limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
+        if required > limit:
+            raise MemoryError(
+                f"image panel PNG export peak {required} exceeds limit {limit}"
+            )
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    figure = None
+    try:
+        with render_style_context():
+            figure = Figure(figsize=(5.0, 4.0), dpi=dpi, constrained_layout=True)
+            FigureCanvasAgg(figure)
+            axis = figure.subplots()
+            _draw_projected_image(
+                axis,
+                figure,
+                payload.image,
+                colormap=display.colormap.value,
+                color_limits=payload.color_limits,
+                visible_bounds=payload.viewport.visible_bounds,
+                regular_pixel_contract=True,
+                center=None,
+                radius=None,
+                diagnostic=None,
+            )
+            figure.savefig(destination, format="png", dpi=dpi)
+    finally:
+        if figure is not None:
+            release_agg_figure(figure)
+        figure = None
+        gc.collect()
+
+
 def estimate_projected_radial_fit_render_peak_nbytes(
     panels: tuple[RadialGaussianImageFitPanel, ...],
     *,
@@ -627,24 +804,10 @@ def estimate_projected_radial_fit_render_peak_nbytes(
     prepared = _validated_radial_panels(panels)
     dpi = _render_dpi(dpi)
     columns = _validated_radial_grid_columns(columns, len(prepared))
-    rows = math.ceil(len(prepared) / columns)
-    width = math.ceil(5.0 * columns * dpi)
-    height = math.ceil(4.0 * rows * dpi)
-    rgba_bytes = width * height * 4
-    artist_input_bytes = sum(
-        panel.image.values.nbytes
-        + panel.image.validity.nbytes
-        + 8
-        * (
-            len(panel.image.x_axis.coordinates)
-            + len(panel.image.y_axis.coordinates)
-        )
-        for panel in prepared
-    )
-    return int(
-        _RASTER_FIXED_BYTES
-        + _RASTER_BUFFER_MULTIPLIER * rgba_bytes
-        + _ARTIST_ARRAY_MULTIPLIER * artist_input_bytes
+    return _estimate_projected_image_agg_peak_nbytes(
+        tuple(panel.image for panel in prepared),
+        dpi=dpi,
+        columns=columns,
     )
 
 
@@ -1592,12 +1755,14 @@ class SinglePanelAggRenderer:
 __all__ = [
     "encode_evaluated_figure_with_panel_regions",
     "evaluated_figure_array_nbytes",
+    "estimate_image_png_export_peak_nbytes",
     "estimate_live_panel_raster_peak_nbytes",
     "estimate_projected_radial_fit_render_peak_nbytes",
     "estimate_render_peak_nbytes",
     "render_radial_gaussian_image_fit_panels",
     "render_evaluated_figure",
     "release_agg_figure",
+    "save_image_panel_png",
     "save_radial_gaussian_image_fit_panels",
     "save_evaluated_figure",
     "SinglePanelAggRenderer",

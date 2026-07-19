@@ -4355,6 +4355,31 @@ U0.3b Rule-6按parent `25deda7`的三个实际production owner（`_figure.py + c
 
 最终活动manifest为`104/104`文件、collect `1338`项；逐文件新进程实跑`1335 passed + 3 expected platform skipped = 1338`，零failed/error/xfailed/xpassed。focused为U0.3a `12 passed`、U0.3b `10 passed`、curve-display owner `12 passed`，W3/W4/W8分别隔离通过`5/24/3`；owned `py_compile`、fresh headless import、diff-check与shape-loss扫描通过。三路独立对抗先后抓到初始worker state自证、home范围自洽伪造、controls-before-front、unbound-ready/诊断覆盖、encoded无reason及准入前O(n) scratch，全部以反例关闭后复核为`P0=0/P1=0/P2=0/GO`。该GO只关闭**冻结、单layer/cell/input、无fit overlay的numeric CURVE**；generic IMAGE/METER、fit-bearing CURVE typed overlay与`Analyze -> Fit`、multi-cell/Grid、任意archive browser、报告zoom、完整TaskConsole/launcher仍未闭合。没有dependency-closed legacy删除；下一切片必须从最新Git与这些真实consumer重新选择，不能把本numeric seam扩成plot-kind framework或删除仍由旧Live/GridPlot/TaskConsole消费的producer。
 
+#### U0.3c generic single-panel IMAGE salvage gate（收口状态：`COMPLETED`）
+
+本纵切固定 `main@6c337d49c7086fa0ff21f879cd159bdf0e753f51` 的 `frontend/data_figure.py::DataFigure`、`frontend/live.py::Live2DDis` 与 `frontend/selectors.py::AreaSelector/CrossSelector/ZoomPan` 为旧行为权威；没有迁入旧mutable Matplotlib Figure、shape/rank推断、Qt线程拟合或Hub/latest机制。旧窗口“载入二维图后立即保留原始空间坐标与像素方向，Area/Cross/Zoom/Pan/Home、hover、cmap/clim/relim和保存作用于同一可见图”的日常契约，已经由既有唯一 `ImageDisplayState + ImageViewportTransform + rasterize_image_indexed8 + ImagePanelPayload + QtRasterBoard` 链恢复；没有第二image widget、selector、renderer、form或worker。
+
+| salvage字段 | U0.3c最终合同 | 收口证据 |
+|---|---|---|
+| typed资格 | 只接受一个document layer、一个evaluated layer、一个cell、一个resolved input、恰好一个real-numeric `EvaluatedImage`且无fit overlay；其它topology都完整走encoded fallback并显示具体`interaction unavailable`原因 | `CLOSED`：缺frame、非规则轴、fit-bearing与超预算反例均验证encoded，不会丢内容后假装typed |
+| 轴与多维保真 | evaluator把source `AxisSpec.coordinate_frame`原样保存在`EvaluatedAxis`，把cell schema的`value_unit`原样保存在`EvaluatedImage`；frontend唯一纯投影只认字段中声明的`SPATIAL_X/SPATIAL_Y`、exact indices/coordinates/unit/frame。缺frame、role不符、frame不一致、非数值/非有限/非精确规则几何都fail closed；不按rank/singleton/tuple位置猜轴，不flatten、index-0或隐式reduce | `CLOSED`：完整values/validity对象identity、轴方向、unit/frame与source revision都跨rerender保持 |
+| 无fit IMAGE UX | A/C/Z/H、hover/cross、双轴wheel zoom/middle-pan/Home、rectangle、clim rail、tight/normal/fixed、六种cmap、x/y/color pins、同源Setting/Edit和当前front PNG export全部作用于同一typed front | `CLOSED`：四种X/Y升降序都固定“首列在左、首行在顶”；rectangle/cross为可见overlay且不改数据 |
+| fit-bearing边界 | generic U0.3c不借W7 artifact-specific radial projection制造模型特例；任何fit overlay仍完整encoded，generic exporter也明确拒绝overlay。W7 saved-fit Grid继续自己的typed projection/export，不重跑solver | `CLOSED`：fit-bearing反例进入whole-figure fallback；W7回归保持。下一统一Fit纵切才同时接CURVE/IMAGE authority |
+| selection与authority | rectangle/cross只形成front-bound `DISPLAY ONLY` candidate；本切片不构造`SelectionCandidate`、`FitSpec`、CommittedTransform或artifact | `CLOSED`：拖框只更新Qt overlay/诊断，authored display与exact image不变；下一纵切把同一selector接入1D range与2D box Fit |
+| CAS与故障 | request sequence、authored display、exact image object、input/document/join、viewport axes/frame、fit确实不存在、pixel format、raster geometry及source provenance全部在present前独立校验；worker返回值不能自证 | `CLOSED`：伪造新array、axis/frame、viewport、pixel format/geometry、controls失败、blocked rerender+Close均保留或撤掉正确exact front，禁止late present |
+| 预算与导出 | admission显式保留evaluated values/validity、current RasterBuffer与Qt detached plane；唯一worker lane使candidate raster与PNG export不并发，因此加入二者incremental peak的较大值。导出逐字使用已提交viewport/cmap/current effective clim/value unit；动态NORMAL/TIGHT clim不重算，未提交rectangle不进入artifact | `CLOSED`：`required-1` encoded、exact required typed；strict regular-pixel export/W7走`imshow`，2304² uint16 measured incremental约374MB，静态估算482,002,944B；默认512MiB总预算仍覆盖held fronts。canonical/encoded radial显式走`pcolormesh`，非规则cell edges与fit overlay不会错位 |
+| 生命周期与复杂度 | 复用现有唯一window、capacity-one lane、board、revisioned editor、atomic export与Close；Close立即撤front、取消late-present并释放cached DataFigure | `CLOSED`：没有第二executor/renderer/selector/form framework、registry、plugin、plot-kind base hierarchy、单成员enum或单consumer wrapper |
+
+viewport的本源修复不是再放宽浮点容差，而是把display-only normalized bounds规范到40-bit binary fixed grid；公开的normalized→physical pins→normalized桥先做一次可表示性映射，再证明fixed point，不能稳定表示就拒绝。axis edge只是同一声明轴推导出的`compare=False` cache，不是第二权威。1e9坐标offset、升/降序及32轮zoom/pan逐轮exact round-trip通过；2304² pan构造从重复扫描axis的约16.32ms降到约1.86ms。
+
+内存对抗先用profile证伪了原`pcolormesh`低估（1024²真实峰值最高约为旧估算3.28倍），随后只在已经跨过严格规则像素合同的generic/W7 export改为低内存`imshow`并重测；canonical radial仍可接受非规则坐标，故明确保留cell-edge-exact `pcolormesh`。512/1024多dtype和2304² uint16冻结profile都低于新的source-retained incremental公式，generic fit与动态clim边界也各有直接反例。
+
+Rule-6按parent `a93de25`的七个实际production owner机械计数：`7364 -> 8079 physical`、`6657 -> 7327 nonblank`、`6466 -> 7095 token-NCLOC`，净`+715/+670/+629`，完整closure为`1.0971x/1.1007x/1.0973x`；classes `67 -> 67`、frozen dataclasses `50 -> 50`、enums `8 -> 8`、functions/methods `241 -> 257`。main严格IMAGE oracle `DataFigure + Live2DDis + AreaSelector + CrossSelector + ZoomPan`为`1357/1252/1078 physical/nonblank/token-NCLOC、5 classes、67 functions`，本轮净增仅为`0.5269x/0.5351x/0.5835x`，class净增0、function净增`0.2388x`；最大单owner倍率约`1.262x`，没有约3倍项。新增函数只支付声明轴投影、exact viewport canonicalization、IMAGE分支与export/预算；所有保留抽象均有generic viewer或W7现有consumer。
+
+focused foundation/export/U0.3a-b-c/W7回归在最终分流前后分别通过`104`与`52`项，独立数据/内存和Workbench事务审查最终均为`P0=0/P1=0/P2=0/GO`。活动manifest最终collect `106/106`文件、`1369`项；逐文件新进程实跑为`1366 passed + 3 expected platform skipped = 1369`，零failed/error/xfailed/xpassed。迁移期process-singleton测试必须继续按既有规则逐文件新进程执行，不能把同进程级联失败误修成runtime兼容层。
+
+排序裁决保持：下一纵切统一接通fit-bearing CURVE replay及CURVE/IMAGE `Analyze -> Fit`，复用现有`CaptureFitDraftAuthority`、frontend Fit form与zlc_data solver/save生命周期，不能先铸造1D-only主Fit。METER、multi-cell/Grid与archive browser依次后置。本切片没有dependency-closed legacy删除；旧Live/GridPlot/TaskConsole仍有真实IMAGE/fit/grid consumer。
+
 ### 22.2 终态验收清单
 
 架构：

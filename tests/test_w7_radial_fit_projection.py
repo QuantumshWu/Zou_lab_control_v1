@@ -214,7 +214,7 @@ def test_pooled_image_range_ignores_invalid_and_nonfinite_components():
 def test_canonical_agg_uses_same_center_ring_projection_without_model_evaluation(
     monkeypatch,
 ):
-    from matplotlib.collections import PathCollection
+    from matplotlib.collections import PathCollection, QuadMesh
     from matplotlib.patches import Circle
 
     from zlc_frontend.matplotlib_render import release_agg_figure
@@ -247,7 +247,14 @@ def test_canonical_agg_uses_same_center_ring_projection_without_model_evaluation
             )
             for axis in data_axes
         ) == len(data_axes) - expected_converged
-        image_meshes = tuple(axis.collections[0] for axis in data_axes)
+        image_meshes = tuple(
+            next(
+                collection
+                for collection in axis.collections
+                if isinstance(collection, QuadMesh)
+            )
+            for axis in data_axes
+        )
         assert {mesh.get_cmap().name for mesh in image_meshes} == {"gray"}
         assert all(mesh.get_rasterized() for mesh in image_meshes)
         assert len({mesh.get_clim() for mesh in image_meshes}) == 1
@@ -317,15 +324,14 @@ def test_projected_radial_export_honors_current_view_cmap_clim_and_formats(
 
         data_axes = rendered.axes[: len(panels)]
         assert all(axis.get_xlim() == (1.5, 5.5) for axis in data_axes)
-        assert all(axis.get_ylim() == (4.5, 0.5) for axis in data_axes)
+        assert all(
+            axis.get_ylim() == pytest.approx((4.5, 0.5), abs=1e-9)
+            for axis in data_axes
+        )
         assert all(axis.get_aspect() == 1.0 for axis in data_axes)
-        assert {
-            axis.collections[0].get_cmap().name for axis in data_axes
-        } == {"magma"}
-        assert all(axis.collections[0].get_rasterized() for axis in data_axes)
-        assert {
-            axis.collections[0].get_clim() for axis in data_axes
-        } == {limits}
+        assert {axis.images[0].get_cmap().name for axis in data_axes} == {"magma"}
+        assert all(axis.images[0].get_rasterized() for axis in data_axes)
+        assert {axis.images[0].get_clim() for axis in data_axes} == {limits}
         assert all(" $\\cdot$ " in axis.get_title() for axis in data_axes)
         # Pointer-drag rectangles are uncommitted interaction drafts and are
         # deliberately not part of an authored ImageDisplayState export.

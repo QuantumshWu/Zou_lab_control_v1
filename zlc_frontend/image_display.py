@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-import math
 from zlc_storage import exact_mapping, nonnegative_integer
 
 from .display_range import (
@@ -94,20 +93,14 @@ def image_viewport_for_display_state(
     )
     if state.revision < reference.viewport_revision:
         raise ValueError("image display revision cannot precede its viewport")
+    candidate = ImageViewportTransform(reference.axes, state.revision, expected)
     if state.revision == reference.viewport_revision:
-        if any(
-            not math.isclose(actual, wanted, rel_tol=0.0, abs_tol=1e-12)
-            for actual, wanted in zip(
-                reference.visible_bounds,
-                expected,
-                strict=True,
-            )
-        ):
+        if candidate != reference:
             raise ValueError(
                 "image display coordinate views differ from viewport bounds"
             )
         return reference
-    return ImageViewportTransform(reference.axes, state.revision, expected)
+    return candidate
 
 
 def image_display_for_viewport(

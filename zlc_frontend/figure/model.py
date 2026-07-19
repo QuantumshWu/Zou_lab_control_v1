@@ -17,6 +17,7 @@ import numpy as np
 from zlc_data import (
     AxisId,
     AxisRoleId,
+    CoordinateFrameId,
     DatasetRevisionRef,
     Selection,
     immutable_array,
@@ -509,6 +510,7 @@ class EvaluatedAxis:
     unit: str | None
     indices: tuple[int, ...]
     coordinates: tuple[Any, ...]
+    coordinate_frame: CoordinateFrameId | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.axis_id, AxisId):
@@ -522,6 +524,13 @@ class EvaluatedAxis:
             raise ValueError("evaluated axis indices and coordinates must align")
         if self.unit is not None:
             _text(self.unit, "evaluated axis unit")
+        if self.coordinate_frame is not None and not isinstance(
+            self.coordinate_frame,
+            CoordinateFrameId,
+        ):
+            raise TypeError(
+                "evaluated axis coordinate_frame must be CoordinateFrameId or None"
+            )
         object.__setattr__(self, "indices", indices)
         object.__setattr__(self, "coordinates", coordinates)
 
@@ -532,6 +541,7 @@ class EvaluatedImage:
     y_axis: EvaluatedAxis
     values: np.ndarray
     validity: np.ndarray
+    value_unit: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.x_axis, EvaluatedAxis) or not isinstance(self.y_axis, EvaluatedAxis):
@@ -545,6 +555,12 @@ class EvaluatedImage:
         expected = (len(self.y_axis.indices), len(self.x_axis.indices))
         if values.shape != expected or validity.shape != expected:
             raise ValueError("image arrays do not match y/x axes")
+        if self.value_unit is not None:
+            object.__setattr__(
+                self,
+                "value_unit",
+                _text(self.value_unit, "image value unit"),
+            )
         object.__setattr__(self, "values", values)
         object.__setattr__(self, "validity", validity)
 

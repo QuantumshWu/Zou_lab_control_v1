@@ -227,6 +227,7 @@ def _evaluated_axis(axis: AxisSpec, indices: tuple[int, ...]) -> EvaluatedAxis:
         axis.unit,
         indices,
         tuple(_axis_coordinate(axis, index) for index in indices),
+        axis.coordinate_frame,
     )
 
 
@@ -1057,7 +1058,13 @@ def _reduce(
     )
 
 
-def _image(working: _WorkingData, view, allowed) -> EvaluatedImage:
+def _image(
+    working: _WorkingData,
+    view,
+    allowed,
+    *,
+    value_unit: str | None,
+) -> EvaluatedImage:
     binding_x = next(binding for binding in view.axis_bindings if binding.role is AxisViewRole.IMAGE_X)
     binding_y = next(binding for binding in view.axis_bindings if binding.role is AxisViewRole.IMAGE_Y)
     axes = {axis.axis_id: axis for axis in working.cell_axes + working.data_axes}
@@ -1083,12 +1090,14 @@ def _image(working: _WorkingData, view, allowed) -> EvaluatedImage:
                 y_out,
                 np.transpose(row, permutation),
                 np.transpose(row_valid, permutation),
+                value_unit,
             )
         return EvaluatedImage(
             x_out,
             y_out,
             np.zeros((len(y_indices), len(x_indices)), dtype=working.values.dtype),
             np.zeros((len(y_indices), len(x_indices)), dtype=bool),
+            value_unit,
         )
 
     output = np.zeros((len(y_indices), len(x_indices)), dtype=working.values.dtype)
@@ -1118,7 +1127,7 @@ def _image(working: _WorkingData, view, allowed) -> EvaluatedImage:
                 valid[y_pos[ci], :] = working.validity[row]
         if data_axis.axis_id not in working.data_indices:
             raise FigureEvaluationError("mixed image data axis is absent")
-    return EvaluatedImage(x_out, y_out, output, valid)
+    return EvaluatedImage(x_out, y_out, output, valid, value_unit)
 
 
 def _curve(
@@ -1413,7 +1422,12 @@ class FigureEvaluator:
                     working, reduction_bindings, guard
                 )
                 if view.intent is ViewIntent.IMAGE:
-                    data = _image(working, view, allowed)
+                    data = _image(
+                        working,
+                        view,
+                        allowed,
+                        value_unit=block.schema.cell_schema.value_unit,
+                    )
                 elif view.intent is ViewIntent.CURVE:
                     data = _curve(
                         working,

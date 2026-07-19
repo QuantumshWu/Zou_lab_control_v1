@@ -207,7 +207,7 @@ def _curve_figure(
 
 
 def _typed_front(window):
-    board = window.findChild(QtRasterBoard, "figureViewerNumericBoard")
+    board = window.findChild(QtRasterBoard, "figureViewerTypedBoard")
     assert board is not None and board.front_frame is not None
     frame = board.front_frame
     payload = frame.panels[0].display_payload
@@ -218,7 +218,7 @@ def _typed_front(window):
 def _wheel(board: QtRasterBoard, delta: int):
     binding = board._numeric_binding_for_kind(
         "curve",
-        panel_id="generic-numeric",
+        panel_id="generic-typed",
     )
     assert binding is not None
     target = board._numeric_target(binding)
@@ -281,12 +281,12 @@ def test_curve_front_preserves_all_series_axes_validity_and_interacts(
         assert first_payload.viewport.x_axis.unit == "MHz"
         assert first_payload.value_unit == "photoelectron"
 
-        origin = board.visible_curve_origin("generic-numeric")
+        origin = board.visible_curve_origin("generic-typed")
         assert origin is not None
         window._accept_numeric_interaction(
             CurveRangeGesture(origin, (-0.75, 0.5))
         )
-        assert board._numeric_bindings["generic-numeric"].applied_span == (
+        assert board._numeric_bindings["generic-typed"].applied_span == (
             -0.75,
             0.5,
         )
@@ -364,7 +364,7 @@ def test_unsupported_or_authoritative_curve_content_stays_encoded(
         _until(application, lambda: window.raster_ready)
         assert window._view_family == "encoded"
         assert window.findChild(QtImageBoard, "figureViewerBoard") is not None
-        assert window.findChild(QtRasterBoard, "figureViewerNumericBoard").front_frame is None
+        assert window.findChild(QtRasterBoard, "figureViewerTypedBoard").front_frame is None
         assert "interaction unavailable:" in window._summary.text()
         assert reason_fragment in window._summary.text()
     finally:
@@ -375,7 +375,7 @@ def test_curve_typed_budget_has_exact_boundary(application) -> None:
     from Zou_lab_control.workbench import _figure as figure_module
 
     probe = _curve_figure()
-    required = figure_module._numeric_front_required_peak_bytes(
+    required = figure_module._typed_front_required_peak_bytes(
         probe,
         CurveDisplayState(),
     )
@@ -416,7 +416,7 @@ def test_curve_front_sequence_and_authored_state_are_compare_and_swap(
     try:
         _until(application, lambda: window.raster_ready)
         board, old_frame, _old_payload = _typed_front(window)
-        original_renderer = window._numeric_renderer
+        original_renderer = window._typed_renderer
         values = curve_display_form_values(window._display)
         values["x_min"] = -1.0
         values["x_max"] = 1.0
@@ -428,7 +428,7 @@ def test_curve_front_sequence_and_authored_state_are_compare_and_swap(
                 frame=replace(front.frame, sequence=front.frame.sequence + 1),
             )
 
-        window._numeric_renderer = wrong_sequence
+        window._typed_renderer = wrong_sequence
         window._apply_display_form(window._edit_display, 0, values)
         _until(application, lambda: window.worker_idle)
         assert board.front_frame is old_frame
@@ -440,7 +440,7 @@ def test_curve_front_sequence_and_authored_state_are_compare_and_swap(
             front = original_renderer(*args, **kwargs)
             return replace(front, state=CurveDisplayState())
 
-        window._numeric_renderer = wrong_authored_state
+        window._typed_renderer = wrong_authored_state
         window._apply_display_form(window._setting_display, 0, values)
         _until(application, lambda: window.worker_idle)
         assert board.front_frame is old_frame
@@ -469,7 +469,7 @@ def test_curve_front_sequence_and_authored_state_are_compare_and_swap(
                 ),
             )
 
-        window._numeric_renderer = wrong_home_range
+        window._typed_renderer = wrong_home_range
         window._apply_display_form(window._edit_display, 0, values)
         _until(application, lambda: window.worker_idle)
         assert board.front_frame is old_frame
@@ -486,7 +486,7 @@ def test_initial_curve_state_is_checked_against_gui_owned_default(
 ) -> None:
     from Zou_lab_control.workbench import _figure as figure_module
 
-    original_render = figure_module._render_numeric_front
+    original_render = figure_module._render_typed_front
 
     def forged_initial_state(*args, **kwargs):
         front = original_render(*args, **kwargs)
@@ -497,13 +497,13 @@ def test_initial_curve_state_is_checked_against_gui_owned_default(
 
     monkeypatch.setattr(
         figure_module,
-        "_render_numeric_front",
+        "_render_typed_front",
         forged_initial_state,
     )
     window = open_data_figure_workbench(_curve_figure())
     try:
         _until(application, lambda: window.worker_idle)
-        board = window.findChild(QtRasterBoard, "figureViewerNumericBoard")
+        board = window.findChild(QtRasterBoard, "figureViewerTypedBoard")
         assert board.front_frame is None
         assert window._view_family is None
         assert not window.raster_ready
@@ -539,7 +539,7 @@ def test_control_construction_fault_keeps_the_admitted_curve_visible(
         assert window._edit_display is None
         assert not window._settings_button.isEnabled()
         assert not window._export_button.isEnabled()
-        assert window._status.text() == "NUMERIC CONTROLS FAILED"
+        assert window._status.text() == "TYPED CONTROLS FAILED"
         assert "injected numeric editor construction fault" in window._diagnostic.text()
     finally:
         _close(application, window)

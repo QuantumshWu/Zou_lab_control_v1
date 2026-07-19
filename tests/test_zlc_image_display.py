@@ -261,11 +261,12 @@ def test_deadband_never_clips_and_avoids_normal_or_tight_jitter() -> None:
 def _evaluated_image(values, validity):
     import numpy as np
 
-    from zlc_data import AxisId, SPATIAL_X, SPATIAL_Y
+    from zlc_data import AxisId, CoordinateFrameId, SPATIAL_X, SPATIAL_Y
     from zlc_frontend.figure import EvaluatedAxis, EvaluatedImage
 
     array = np.asarray(values)
     height, width = array.shape
+    frame = CoordinateFrameId("indexed-test.camera")
     return EvaluatedImage(
         EvaluatedAxis(
             AxisId("indexed-test.x"),
@@ -274,6 +275,7 @@ def _evaluated_image(values, validity):
             "pixel",
             tuple(range(width)),
             tuple(range(width)),
+            frame,
         ),
         EvaluatedAxis(
             AxisId("indexed-test.y"),
@@ -282,9 +284,11 @@ def _evaluated_image(values, validity):
             "pixel",
             tuple(range(height)),
             tuple(range(height)),
+            frame,
         ),
         array,
         np.asarray(validity, dtype=bool),
+        "photoelectron",
     )
 
 
@@ -298,6 +302,116 @@ def _rasterize(image, state=None):
         current_color_limits=None,
         previous_relim_mode=None,
     )
+
+
+def test_evaluated_image_metadata_builds_one_exact_read_only_payload() -> None:
+    from zlc_data import (
+        BlockId,
+        DatasetRevision,
+        DatasetRevisionRef,
+        StreamGenerationId,
+    )
+    from zlc_frontend.figure import DatasetId, EvaluatedInput
+    from zlc_frontend.image_view import image_viewport_for_evaluated_image
+    from zlc_frontend.render import ImagePanelPayload
+
+    image = _evaluated_image(
+        [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]],
+        [[True, True, True], [True, True, True]],
+    )
+    viewport = image_viewport_for_evaluated_image(image)
+    _raster, data_range, histogram, color_limits = _rasterize(image)
+    payload = ImagePanelPayload(
+        image=image,
+        evaluated_input=EvaluatedInput(
+            DatasetId("image-fidelity"),
+            DatasetRevisionRef(
+                BlockId("image-fidelity-block"),
+                StreamGenerationId("image-fidelity-generation"),
+                "a" * 64,
+                DatasetRevision(1),
+            ),
+        ),
+        viewport=viewport,
+        data_range=data_range,
+        histogram_counts=histogram,
+        base_palette=tuple(range(256)),
+        color_limits=color_limits,
+    )
+
+    assert viewport.x_axis.axis_id == image.x_axis.axis_id
+    assert viewport.y_axis.axis_id == image.y_axis.axis_id
+    assert viewport.x_axis.coordinates == image.x_axis.coordinates
+    assert viewport.y_axis.coordinates == image.y_axis.coordinates
+    assert viewport.coordinate_frame is image.x_axis.coordinate_frame
+    assert payload.value_unit == "photoelectron"
+    assert ImagePanelPayload.value_unit.fset is None
+
+
+def test_evaluated_image_viewport_fails_closed_without_spatial_axis_truth() -> None:
+    from dataclasses import replace
+
+    from zlc_data import CoordinateFrameId, SCAN_POINT
+    from zlc_frontend.figure import EvaluatedImage
+    from zlc_frontend.image_view import image_viewport_for_evaluated_image
+
+    image = _evaluated_image(
+        [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]],
+        [[True, True, True], [True, True, True]],
+    )
+
+    missing_frame = EvaluatedImage(
+        replace(image.x_axis, coordinate_frame=None),
+        image.y_axis,
+        image.values,
+        image.validity,
+        image.value_unit,
+    )
+    with pytest.raises(ValueError, match="explicit coordinate frame"):
+        image_viewport_for_evaluated_image(missing_frame)
+
+    irregular = EvaluatedImage(
+        replace(image.x_axis, coordinates=(0, 1, 3)),
+        image.y_axis,
+        image.values,
+        image.validity,
+        image.value_unit,
+    )
+    with pytest.raises(ValueError, match="not exactly regular"):
+        image_viewport_for_evaluated_image(irregular)
+
+    nonnumeric = EvaluatedImage(
+        replace(image.x_axis, coordinates=("left", "middle", "right")),
+        image.y_axis,
+        image.values,
+        image.validity,
+        image.value_unit,
+    )
+    with pytest.raises(TypeError, match="finite numeric coordinates"):
+        image_viewport_for_evaluated_image(nonnumeric)
+
+    unnamed = EvaluatedImage(
+        replace(image.x_axis, role=SCAN_POINT),
+        image.y_axis,
+        image.values,
+        image.validity,
+        image.value_unit,
+    )
+    with pytest.raises(ValueError, match="x_axis=SPATIAL_X"):
+        image_viewport_for_evaluated_image(unnamed)
+
+    mismatched_frame = EvaluatedImage(
+        image.x_axis,
+        replace(
+            image.y_axis,
+            coordinate_frame=CoordinateFrameId("another-camera"),
+        ),
+        image.values,
+        image.validity,
+        image.value_unit,
+    )
+    with pytest.raises(ValueError, match="shared, explicit coordinate frame"):
+        image_viewport_for_evaluated_image(mismatched_frame)
 
 
 def test_indexed_raster_reserves_zero_for_invalid_and_reports_exact_codebook() -> None:
@@ -542,11 +656,79 @@ def test_display_state_and_viewport_are_one_revisioned_view_truth() -> None:
     assert authored.x_view is not None and authored.y_view is not None
     rebuilt = image_viewport_for_display_state(authored, home)
     assert rebuilt.viewport_revision == 1
-    assert rebuilt.visible_bounds == pytest.approx(zoomed.visible_bounds)
+    assert rebuilt == zoomed
 
     mismatched = ImageDisplayState(revision=1, x_view=(9.0, 25.0))
     with pytest.raises(ValueError, match="coordinate views differ"):
         image_viewport_for_display_state(mismatched, zoomed)
+
+
+@pytest.mark.parametrize("descending", (False, True))
+def test_viewport_coordinate_state_round_trip_is_exact_across_gestures(
+    descending: bool,
+) -> None:
+    from zlc_data import (
+        AxisId,
+        AxisSpec,
+        CoordinateFrameId,
+        SPATIAL_X,
+        SPATIAL_Y,
+    )
+    from zlc_frontend.image_display import (
+        ImageDisplayState,
+        image_display_for_viewport,
+        image_viewport_for_display_state,
+    )
+    from zlc_frontend.image_view import ImageViewportTransform
+
+    frame = CoordinateFrameId("large-offset-camera")
+    x_coordinates = tuple(1_000_000_000 + 2 * index for index in range(257))
+    y_coordinates = tuple(2_000_000_000 + 3 * index for index in range(193))
+    if descending:
+        x_coordinates = tuple(reversed(x_coordinates))
+        y_coordinates = tuple(reversed(y_coordinates))
+    home = ImageViewportTransform(
+        (
+            AxisSpec(
+                AxisId("large-offset.x"),
+                "x",
+                SPATIAL_X,
+                len(x_coordinates),
+                x_coordinates,
+                "pixel",
+                frame,
+            ),
+            AxisSpec(
+                AxisId("large-offset.y"),
+                "y",
+                SPATIAL_Y,
+                len(y_coordinates),
+                y_coordinates,
+                "pixel",
+                frame,
+            ),
+        )
+    )
+    state = ImageDisplayState()
+    viewport = home
+
+    for cycle in range(1, 33):
+        if cycle % 2:
+            pending = viewport.centered_zoom(
+                (0.3141592653589793, 0.7182818284590452),
+                0.97,
+                viewport_revision=cycle,
+            )
+        else:
+            pending = viewport.panned_by_pixels(
+                (3.25, -2.75),
+                (997, 613),
+                viewport_revision=cycle,
+            )
+        state = image_display_for_viewport(state, pending)
+        rebuilt = image_viewport_for_display_state(state, home)
+        assert rebuilt == pending
+        viewport = rebuilt
 
 
 def test_unpinned_singleton_axis_never_needs_an_invented_coordinate_span() -> None:

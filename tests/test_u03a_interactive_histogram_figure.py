@@ -168,7 +168,7 @@ def _histogram_figure(
 
 
 def _typed_front(window):
-    board = window.findChild(QtRasterBoard, "figureViewerNumericBoard")
+    board = window.findChild(QtRasterBoard, "figureViewerTypedBoard")
     assert board is not None and board.front_frame is not None
     frame = board.front_frame
     payload = frame.panels[0].display_payload
@@ -179,7 +179,7 @@ def _typed_front(window):
 def _wheel(board: QtRasterBoard, delta: int):
     binding = board._numeric_binding_for_kind(
         "histogram",
-        panel_id="generic-numeric",
+        panel_id="generic-typed",
     )
     assert binding is not None
     target = board._numeric_target(binding)
@@ -294,7 +294,7 @@ def test_generic_histogram_uses_typed_front_edits_and_exact_export(
         assert not window._settings_button.isHidden()
         assert not window._export_button.isHidden()
 
-        origin = board.visible_histogram_origin("generic-numeric")
+        origin = board.visible_histogram_origin("generic-typed")
         assert origin is not None
         window._accept_numeric_interaction(
             HistogramRangeGesture(origin, (2.5, 12.5))
@@ -307,7 +307,7 @@ def test_generic_histogram_uses_typed_front_edits_and_exact_export(
         _until(application, rerender_started.is_set)
         assert not window.raster_ready
         assert not window._interaction_switch.isEnabled()
-        assert not board._numeric_bindings["generic-numeric"].interaction_ready
+        assert not board._numeric_bindings["generic-typed"].interaction_ready
         assert not _wheel(board, -120).isAccepted()
         assert board.histogram_selector_fault is None
         assert board.front_frame is first_frame
@@ -331,14 +331,14 @@ def test_generic_histogram_uses_typed_front_edits_and_exact_export(
                 strict=True,
             )
         )
-        assert board._numeric_bindings["generic-numeric"].applied_span == (
+        assert board._numeric_bindings["generic-typed"].applied_span == (
             2.5,
             12.5,
         )
         editors = window.findChildren(FluentRevisionedFormEditor)
         assert len(editors) == 2
         assert {editor.base_revision for editor in editors} == {1}
-        assert board._numeric_bindings["generic-numeric"].interaction_ready
+        assert board._numeric_bindings["generic-typed"].interaction_ready
         assert _wheel(board, -120).isAccepted()
         assert not window.raster_ready
         _until(application, lambda: window.worker_idle and window.raster_ready)
@@ -405,7 +405,7 @@ def test_failed_histogram_rerender_preserves_exact_old_front(
         window._apply_display_form(window._setting_display, 0, values)
         _until(application, lambda: window.worker_idle)
         assert board.front_frame is old_frame
-        assert board.visible_histogram_payload("generic-numeric") is old_payload
+        assert board.visible_histogram_payload("generic-typed") is old_payload
         assert window._display.revision == 0
         assert window.raster_ready
         assert window._interaction_switch.isEnabled()
@@ -435,7 +435,7 @@ def test_histogram_budget_rejects_before_agg_or_qt_front(
     window = open_data_figure_workbench(figure, memory_limit_bytes=1)
     try:
         _until(application, lambda: window.worker_idle)
-        board = window.findChild(QtRasterBoard, "figureViewerNumericBoard")
+        board = window.findChild(QtRasterBoard, "figureViewerTypedBoard")
         assert board is not None and board.front_frame is None
         assert not window.raster_ready
         assert window.findChild(QtWidgets.QLabel, "figureViewerStatus").text() == (
@@ -490,7 +490,7 @@ def test_histogram_typed_budget_has_exact_derived_boundary(application) -> None:
 
     figure = _histogram_figure()
     assert evaluated_figure_array_nbytes(figure.evaluated) == 88
-    required = figure_module._numeric_front_required_peak_bytes(
+    required = figure_module._typed_front_required_peak_bytes(
         figure,
         HistogramDisplayState(),
     )
@@ -520,12 +520,12 @@ def test_frozen_data_figure_budget_cannot_be_widened_by_window(application) -> N
     import Zou_lab_control.workbench._figure as figure_module
 
     probe = _histogram_figure()
-    required = figure_module._numeric_front_required_peak_bytes(
+    required = figure_module._typed_front_required_peak_bytes(
         probe,
         HistogramDisplayState(),
     )
     figure = _histogram_figure(render_memory_limit_bytes=required - 1)
-    assert figure_module._numeric_front_required_peak_bytes(
+    assert figure_module._typed_front_required_peak_bytes(
         figure,
         HistogramDisplayState(),
     ) == required
@@ -550,12 +550,12 @@ def test_larger_histogram_rerender_is_rejected_before_agg_and_keeps_old_front(
 
     probe = _histogram_figure()
     initial_state = HistogramDisplayState()
-    required = figure_module._numeric_front_required_peak_bytes(
+    required = figure_module._typed_front_required_peak_bytes(
         probe,
         initial_state,
     )
     larger_state = replace(initial_state, revision=1, bin_count=500)
-    assert figure_module._numeric_front_required_peak_bytes(
+    assert figure_module._typed_front_required_peak_bytes(
         probe,
         larger_state,
     ) > required
@@ -617,7 +617,7 @@ def test_histogram_front_request_and_authored_state_are_compare_and_swap(
     try:
         _until(application, lambda: window.worker_idle and window.raster_ready)
         board, old_frame, _old_payload = _typed_front(window)
-        original_renderer = window._numeric_renderer
+        original_renderer = window._typed_renderer
 
         def wrong_sequence(*args, **kwargs):
             front = original_renderer(*args, **kwargs)
@@ -626,7 +626,7 @@ def test_histogram_front_request_and_authored_state_are_compare_and_swap(
                 frame=replace(front.frame, sequence=front.frame.sequence + 1),
             )
 
-        window._numeric_renderer = wrong_sequence
+        window._typed_renderer = wrong_sequence
         values = histogram_display_form_values(window._display)
         values["bin_count"] = 23
         window._apply_display_form(window._edit_display, 0, values)
@@ -656,7 +656,7 @@ def test_histogram_front_request_and_authored_state_are_compare_and_swap(
                 ),
             )
 
-        window._numeric_renderer = wrong_authored_state
+        window._typed_renderer = wrong_authored_state
         window._apply_display_form(window._setting_display, 0, values)
         _until(application, lambda: window.worker_idle)
         assert board.front_frame is old_frame
@@ -686,7 +686,7 @@ def test_histogram_front_request_and_authored_state_are_compare_and_swap(
                 ),
             )
 
-        window._numeric_renderer = wrong_provenance
+        window._typed_renderer = wrong_provenance
         window._apply_display_form(window._edit_display, 0, values)
         _until(application, lambda: window.worker_idle)
         assert board.front_frame is old_frame
@@ -719,13 +719,13 @@ def test_histogram_front_request_and_authored_state_are_compare_and_swap(
                 ),
             )
 
-        window._numeric_renderer = wrong_exact_series
+        window._typed_renderer = wrong_exact_series
         window._apply_display_form(window._setting_display, 0, values)
         _until(application, lambda: window.worker_idle)
         assert board.front_frame is old_frame
         assert window._display.revision == 0
         assert window.raster_ready
-        assert "changed frozen evaluated series" in window.findChild(
+        assert "changed frozen evaluated data" in window.findChild(
             QtWidgets.QLabel,
             "figureViewerDiagnostic",
         ).text()
@@ -749,7 +749,7 @@ def test_histogram_front_request_and_authored_state_are_compare_and_swap(
                 ),
             )
 
-        window._numeric_renderer = wrong_raster_geometry
+        window._typed_renderer = wrong_raster_geometry
         window._apply_display_form(window._edit_display, 0, values)
         _until(application, lambda: window.worker_idle)
         assert board.front_frame is old_frame

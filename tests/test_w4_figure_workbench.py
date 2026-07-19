@@ -209,6 +209,8 @@ def test_public_figure_gui_resolves_and_renders_off_the_qt_owner(
     capture_product,
     monkeypatch,
 ):
+    import Zou_lab_control.workbench._figure as figure_workbench
+
     experiment, capture_ref = capture_product
     owner_thread = threading.get_ident()
     resolution_started = threading.Event()
@@ -218,7 +220,7 @@ def test_public_figure_gui_resolves_and_renders_off_the_qt_owner(
     resolution_calls = []
     render_threads: list[int] = []
     original_figure = type(experiment).figure
-    original_render = DataFigure.to_png_bytes
+    original_render = figure_workbench._render_typed_front
 
     def gated_resolution(self, source, *args, **kwargs):
         resolution_calls.append((threading.get_ident(), source, args, kwargs))
@@ -227,15 +229,15 @@ def test_public_figure_gui_resolves_and_renders_off_the_qt_owner(
             raise TimeoutError("test did not release figure resolution")
         return original_figure(self, source, *args, **kwargs)
 
-    def gated_render(self, *args, **kwargs):
+    def gated_render(*args, **kwargs):
         render_threads.append(threading.get_ident())
         render_started.set()
         if not release_render.wait(2.0):
             raise TimeoutError("test did not release figure render")
-        return original_render(self, *args, **kwargs)
+        return original_render(*args, **kwargs)
 
     monkeypatch.setattr(type(experiment), "figure", gated_resolution)
-    monkeypatch.setattr(DataFigure, "to_png_bytes", gated_render)
+    monkeypatch.setattr(figure_workbench, "_render_typed_front", gated_render)
     preferences = ViewPreferences()
     render_limit = 96 << 20
     window = None
@@ -267,7 +269,7 @@ def test_public_figure_gui_resolves_and_renders_off_the_qt_owner(
         _until(application, lambda: window.raster_ready)
         assert window.findChild(QtWidgets.QLabel, "figureViewerStatus").text() == "READY"
         assert window.findChild(QtWidgets.QLabel, "figureViewerMode").text() == (
-            "FROZEN DATA FIGURE · DISPLAY ONLY"
+            "EXACT IMAGE · INTERACTIVE · DISPLAY ONLY"
         )
         assert "image" in window.findChild(
             QtWidgets.QLabel,

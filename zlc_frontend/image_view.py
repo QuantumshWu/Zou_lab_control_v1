@@ -8,7 +8,7 @@ therefore share one exact mapping without sharing a Figure, artist, or widget.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from numbers import Real
 from typing import TypeAlias
@@ -16,6 +16,7 @@ from typing import TypeAlias
 import numpy as np
 
 from zlc_data import (
+    AxisRoleId,
     AxisSpec,
     CoordinateFrameId,
     CoordinateRangeSelection,
@@ -27,10 +28,21 @@ from zlc_data import (
 )
 from zlc_storage import nonnegative_integer, positive_integer
 
+from .figure.model import EvaluatedAxis, EvaluatedImage
+
 
 NormalizedPoint: TypeAlias = tuple[float, float]
 NormalizedRectangle: TypeAlias = tuple[float, float, float, float]
 CoordinateView: TypeAlias = tuple[float, float]
+
+
+# Viewports are display geometry, not measurement coordinates.  A fixed
+# binary grid makes their equality stable across the public
+# normalized -> coordinate-view -> normalized bridge while remaining far
+# below one source pixel for the admitted camera rasters.  Forty fractional
+# bits are deterministic and exactly representable by binary64.
+_VIEWPORT_FRACTION_BITS = 40
+_VIEWPORT_TICKS = 1 << _VIEWPORT_FRACTION_BITS
 
 
 def _finite_number(value: object, name: str) -> float:
@@ -129,15 +141,15 @@ def _axis_step(axis: AxisSpec) -> int | float:
     return step
 
 
-def _axis_edge_coordinates(axis: AxisSpec) -> tuple[float, float]:
-    """Return index-edge coordinates without inventing singleton spacing."""
-
+def _axis_edge_coordinates_from_step(
+    axis: AxisSpec,
+    step: float,
+) -> tuple[float, float]:
     if axis.size < 2:
         raise ValueError(
             f"axis {axis.axis_id} needs at least two coordinates to define "
             "a coordinate viewport"
         )
-    step = float(_axis_step(axis))
     first = float(axis.coordinate_at(0))
     start = first - 0.5 * step
     stop = start + axis.size * step
@@ -146,13 +158,25 @@ def _axis_edge_coordinates(axis: AxisSpec) -> tuple[float, float]:
     return start, stop
 
 
+def _axis_edge_coordinates(axis: AxisSpec) -> tuple[float, float]:
+    """Return index-edge coordinates without inventing singleton spacing."""
+
+    return _axis_edge_coordinates_from_step(axis, float(_axis_step(axis)))
+
+
 def _normalized_interval_for_coordinate_view(
     axis: AxisSpec,
     view: object,
     name: str,
+    *,
+    edge_coordinates: tuple[float, float] | None = None,
 ) -> tuple[float, float]:
     low, high = _coordinate_view(view, name)
-    start, stop = _axis_edge_coordinates(axis)
+    start, stop = (
+        _axis_edge_coordinates(axis)
+        if edge_coordinates is None
+        else edge_coordinates
+    )
     domain_low, domain_high = sorted((start, stop))
     # Absorb only arithmetic round-off at the domain's magnitude.  A relative
     # tolerance would become a physically meaningful out-of-bounds allowance
@@ -181,8 +205,14 @@ def _coordinate_view_for_normalized_interval(
     axis: AxisSpec,
     low: float,
     high: float,
+    *,
+    edge_coordinates: tuple[float, float] | None = None,
 ) -> CoordinateView:
-    start, stop = _axis_edge_coordinates(axis)
+    start, stop = (
+        _axis_edge_coordinates(axis)
+        if edge_coordinates is None
+        else edge_coordinates
+    )
     first = start + low * (stop - start)
     second = start + high * (stop - start)
     coordinate_low, coordinate_high = sorted((first, second))
@@ -190,6 +220,87 @@ def _coordinate_view_for_normalized_interval(
         0.0 if coordinate_low == 0.0 else coordinate_low,
         0.0 if coordinate_high == 0.0 else coordinate_high,
     )
+
+
+def _quantized_normalized_edge(value: float) -> float:
+    ticks = min(_VIEWPORT_TICKS, max(0, round(value * _VIEWPORT_TICKS)))
+    return ticks / _VIEWPORT_TICKS
+
+
+def _quantized_normalized_bounds(
+    bounds: NormalizedRectangle,
+) -> NormalizedRectangle:
+    return validate_normalized_rectangle(
+        tuple(_quantized_normalized_edge(value) for value in bounds)
+    )
+
+
+def _coordinate_round_trip_interval(
+    axis: AxisSpec,
+    interval: tuple[float, float],
+    name: str,
+    edge_coordinates: tuple[float, float] | None,
+) -> tuple[float, float]:
+    if interval == (0.0, 1.0):
+        return interval
+    coordinate_view = _coordinate_view_for_normalized_interval(
+        axis,
+        *interval,
+        edge_coordinates=edge_coordinates,
+    )
+    return _normalized_interval_for_coordinate_view(
+        axis,
+        coordinate_view,
+        name,
+        edge_coordinates=edge_coordinates,
+    )
+
+
+def _canonical_viewport_bounds(
+    x_axis: AxisSpec,
+    y_axis: AxisSpec,
+    bounds: NormalizedRectangle,
+    x_edge_coordinates: tuple[float, float] | None,
+    y_edge_coordinates: tuple[float, float] | None,
+) -> NormalizedRectangle:
+    """Return one fixed-grid rectangle stable through authored coordinates.
+
+    Absolute camera ROI coordinates can be much larger than the visible span,
+    so converting normalized bounds to public coordinate pins may lose a few
+    binary64 low bits.  One representability pass selects the fixed-grid value
+    those pins actually encode; a second pass proves it is a fixed point.  A
+    viewport that cannot be represented stably fails closed instead of giving
+    one revision two subtly different rectangles.
+    """
+
+    candidate = _quantized_normalized_bounds(
+        validate_normalized_rectangle(bounds)
+    )
+
+    def represented(value: NormalizedRectangle) -> NormalizedRectangle:
+        left, top, right, bottom = value
+        x_interval = _coordinate_round_trip_interval(
+            x_axis,
+            (left, right),
+            "x_view",
+            x_edge_coordinates,
+        )
+        y_interval = _coordinate_round_trip_interval(
+            y_axis,
+            (top, bottom),
+            "y_view",
+            y_edge_coordinates,
+        )
+        return _quantized_normalized_bounds(
+            (x_interval[0], y_interval[0], x_interval[1], y_interval[1])
+        )
+
+    canonical = represented(candidate)
+    if represented(canonical) != canonical:
+        raise ValueError(
+            "image viewport bounds have no stable coordinate-view representation"
+        )
+    return canonical
 
 
 def _edge_index(value: float, size: int, name: str) -> int:
@@ -235,6 +346,16 @@ class ImageViewportTransform:
     axes: tuple[AxisSpec, AxisSpec]
     viewport_revision: int = 0
     visible_bounds: NormalizedRectangle = (0.0, 0.0, 1.0, 1.0)
+    _x_edge_coordinates: tuple[float, float] | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _y_edge_coordinates: tuple[float, float] | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         axes = tuple(self.axes)
@@ -255,9 +376,25 @@ class ImageViewportTransform:
             or x_axis.coordinate_frame != y_axis.coordinate_frame
         ):
             raise ValueError("image axes require one shared, explicit coordinate frame")
-        _axis_step(x_axis)
-        _axis_step(y_axis)
-        bounds = validate_normalized_rectangle(self.visible_bounds)
+        x_step = float(_axis_step(x_axis))
+        y_step = float(_axis_step(y_axis))
+        x_edge_coordinates = (
+            None
+            if x_axis.size == 1
+            else _axis_edge_coordinates_from_step(x_axis, x_step)
+        )
+        y_edge_coordinates = (
+            None
+            if y_axis.size == 1
+            else _axis_edge_coordinates_from_step(y_axis, y_step)
+        )
+        bounds = _canonical_viewport_bounds(
+            x_axis,
+            y_axis,
+            validate_normalized_rectangle(self.visible_bounds),
+            x_edge_coordinates,
+            y_edge_coordinates,
+        )
         if (bounds[2] - bounds[0]) * x_axis.size < 1.0 - 1e-12:
             raise ValueError("visible x bounds must contain at least one raster cell")
         if (bounds[3] - bounds[1]) * y_axis.size < 1.0 - 1e-12:
@@ -269,6 +406,8 @@ class ImageViewportTransform:
             nonnegative_integer(self.viewport_revision, "viewport_revision"),
         )
         object.__setattr__(self, "visible_bounds", bounds)
+        object.__setattr__(self, "_x_edge_coordinates", x_edge_coordinates)
+        object.__setattr__(self, "_y_edge_coordinates", y_edge_coordinates)
 
     @property
     def x_axis(self) -> AxisSpec:
@@ -307,6 +446,7 @@ class ImageViewportTransform:
                 self.x_axis,
                 x_view,
                 "x_view",
+                edge_coordinates=self._x_edge_coordinates,
             )
         )
         top, bottom = (
@@ -316,6 +456,7 @@ class ImageViewportTransform:
                 self.y_axis,
                 y_view,
                 "y_view",
+                edge_coordinates=self._y_edge_coordinates,
             )
         )
         return validate_normalized_rectangle((left, top, right, bottom))
@@ -337,12 +478,22 @@ class ImageViewportTransform:
         x_view = (
             None
             if (left, right) == (0.0, 1.0)
-            else _coordinate_view_for_normalized_interval(self.x_axis, left, right)
+            else _coordinate_view_for_normalized_interval(
+                self.x_axis,
+                left,
+                right,
+                edge_coordinates=self._x_edge_coordinates,
+            )
         )
         y_view = (
             None
             if (top, bottom) == (0.0, 1.0)
-            else _coordinate_view_for_normalized_interval(self.y_axis, top, bottom)
+            else _coordinate_view_for_normalized_interval(
+                self.y_axis,
+                top,
+                bottom,
+                edge_coordinates=self._y_edge_coordinates,
+            )
         )
         return x_view, y_view
 
@@ -666,7 +817,13 @@ class ImageViewportTransform:
     ) -> ImageViewportTransform:
         """Commit another visible window, increasing its revision if it changed."""
 
-        checked = validate_normalized_rectangle(bounds)
+        checked = _canonical_viewport_bounds(
+            self.x_axis,
+            self.y_axis,
+            validate_normalized_rectangle(bounds),
+            self._x_edge_coordinates,
+            self._y_edge_coordinates,
+        )
         if checked == self.visible_bounds:
             return self
         revision = self._replacement_revision(viewport_revision)
@@ -757,11 +914,55 @@ class ImageViewportTransform:
         return checked
 
 
+def _effective_image_axis(axis: EvaluatedAxis, role: AxisRoleId) -> AxisSpec:
+    if axis.role != role:
+        raise ValueError(
+            "evaluated IMAGE requires x_axis=SPATIAL_X and y_axis=SPATIAL_Y"
+        )
+    if axis.coordinate_frame is None:
+        raise ValueError(
+            f"evaluated IMAGE axis {axis.axis_id} requires an explicit coordinate frame"
+        )
+    if len(set(axis.indices)) != len(axis.indices):
+        raise ValueError(
+            f"evaluated IMAGE axis {axis.axis_id} contains duplicate source indices"
+        )
+    return AxisSpec(
+        axis_id=axis.axis_id,
+        name=axis.name,
+        role=axis.role,
+        size=len(axis.indices),
+        coordinates=axis.coordinates,
+        unit=axis.unit,
+        coordinate_frame=axis.coordinate_frame,
+    )
+
+
+def image_viewport_for_evaluated_image(
+    image: EvaluatedImage,
+) -> ImageViewportTransform:
+    """Build the one exact spatial-pixel viewport admitted by an IMAGE DTO.
+
+    Axis field names and declared roles are authoritative.  The projection
+    never infers roles or a coordinate frame from rank, shape, tuple order, or
+    fit metadata.  :class:`AxisSpec` and :class:`ImageViewportTransform` then
+    fail closed on nonnumeric, non-pixel, nonfinite, irregular, or mismatched
+    coordinate metadata.
+    """
+
+    if not isinstance(image, EvaluatedImage):
+        raise TypeError("image must be EvaluatedImage")
+    x_axis = _effective_image_axis(image.x_axis, SPATIAL_X)
+    y_axis = _effective_image_axis(image.y_axis, SPATIAL_Y)
+    return ImageViewportTransform((x_axis, y_axis))
+
+
 __all__ = [
     "CoordinateView",
     "ImageViewportTransform",
     "NormalizedPoint",
     "NormalizedRectangle",
+    "image_viewport_for_evaluated_image",
     "validate_normalized_point",
     "validate_normalized_rectangle",
 ]

@@ -103,6 +103,7 @@ def make_block(
     data_axes=(),
     validity=VALID,
     component_axes=(),
+    value_unit=None,
     revision=4,
 ):
     contract = (
@@ -114,7 +115,12 @@ def make_block(
         repeat_axis,
         tuple(point_axes),
         point_layout,
-        ValueSchema(tuple(data_axes), contract, np.asarray(values).dtype),
+        ValueSchema(
+            tuple(data_axes),
+            contract,
+            np.asarray(values).dtype,
+            value_unit,
+        ),
     )
     return DataBlock(
         BlockId("block-a"),
@@ -677,6 +683,47 @@ def test_rect_f_product_layout_recovers_image_axes_before_repeat_mean():
         [[50, 51], [60, 61], [70, 71]],
     )
     np.testing.assert_array_equal(image.validity, np.ones((3, 2), dtype=bool))
+
+
+def test_image_evaluator_preserves_axis_frames_and_value_unit() -> None:
+    frame = CoordinateFrameId("camera-fidelity")
+    repeat = axis("fidelity-repeat", REPEAT, 1)
+    point = axis("fidelity-point", SCAN_POINT, 1)
+    y = AxisSpec(
+        AxisId("fidelity-y"),
+        "sensor row",
+        SPATIAL_Y,
+        2,
+        (20, 22),
+        "pixel",
+        frame,
+    )
+    x = AxisSpec(
+        AxisId("fidelity-x"),
+        "sensor column",
+        SPATIAL_X,
+        3,
+        (10, 12, 14),
+        "pixel",
+        frame,
+    )
+    block = make_block(
+        np.arange(6, dtype=np.uint16).reshape(1, 1, 2, 3),
+        repeat_axis=repeat,
+        point_axes=(point,),
+        point_layout=PointLayout.rect_c((1,)),
+        data_axes=(y, x),
+        value_unit="photoelectron",
+    )
+
+    image = only_series(
+        evaluated_data(block, suggest_view(block.schema, ViewIntent.IMAGE).spec)
+    ).data
+
+    assert isinstance(image, EvaluatedImage)
+    assert image.x_axis.coordinate_frame is frame
+    assert image.y_axis.coordinate_frame is frame
+    assert image.value_unit == "photoelectron"
 
 
 def test_explicit_sparse_image_preserves_hole_as_invalid():

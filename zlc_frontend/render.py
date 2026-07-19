@@ -423,6 +423,12 @@ class ImagePanelPayload:
             if overlay.coordinate_frame != self.viewport.coordinate_frame:
                 raise ValueError("image fit overlay belongs to another coordinate frame")
 
+    @property
+    def value_unit(self) -> str | None:
+        """Return the evaluator-owned image value unit without copying it."""
+
+        return self.image.value_unit
+
 
 @dataclass(frozen=True, slots=True)
 class CurvePanelPayload:
