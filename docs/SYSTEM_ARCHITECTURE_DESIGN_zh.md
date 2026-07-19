@@ -4571,6 +4571,67 @@ Pulse/FPGA：
 - 用户上机第一天清单按“真实launcher GUI日常流程 -> virtual scan/fit/save/reopen -> qCMOS只读identity/working point -> 已批准qualification -> resident真机Formal”排序，任何fail-closed gate不得靠手工改状态绕过；
 - >4096/9999点扫描若在交付时仍受真机资格化约束，runbook必须单列`AUTONOMOUS_REFILLED`启用步骤：冻结全schedule/chunk digest、单I/O owner、refill硬上界、每个seam时间观测与residual证据、配置/命令、9999点压力实验、underflow/gap/late-chunk拒绝判据、关闭条件与resident回退。host只供应预先冻结chunk，FPGA继续决定全部精密edge时序；未通过时typed拒绝而不退化为host stepping。
 
+#### 清单4 TaskConsole 完整迁移 salvage gate（开工冻结证据，状态：`OPEN`）
+
+**exact oracle 口径（先于任何实现固定）：** 本清单每一条 `main` 行为一律引用 `git show main:<path>`，`main` 头为 `6c337d4`，`Zou_lab_control/frontend/task_console.py` 为 `9461` 行。**本分支 HEAD 上的同名 legacy 文件已被迁移改动（`10036` 行），它不是 oracle**；任何 salvage 引用若落在 HEAD 副本上一律作废重取。规则8 口径同时固定：清单4 的每个 commit 都跑完整活动白名单（逐文件新进程实跑全绿，错误清单只减不增），这条覆盖“只跑改动边界测试”的一般习惯，因为清单4 每片都会同时触及多个已在白名单内的窗口 owner。
+
+**开工时的真实闸门（已逐条机械复核，非转述）：** `Zou_lab_control/workbench/_task_console.py:1231-1241` 在建第二张卡时 `raise RuntimeError("TaskConsole currently owns exactly one card")` 并在建卡后 `self._add.setEnabled(False); self._catalog.setEnabled(False)`；`zlc_workbench/task_console.py:89-96` 只合成三条 Definition，`:106-117` 在 `actual != expected` 时直接 `ValueError`，因此**新 Definition 目前不是“零 GUI 改动即入 catalog”，而是会硬报错**。`tests/migration_active_tests.txt` 有 `tests/test_w3_task_console.py`，但 `main` 的 `tests/test_task_console_*.py` 七个旧守卫**不在活动白名单**，所以旧行为在新树当前**没有任何机械守卫**：本清单每片必须自带等价守卫，否则“不缩窄用户面”只剩人眼。
+
+**旧行为清单（49 条，逐条 `main@6c337d4` 锚定，按纵切分配）：**
+
+| 组 | main 真实行为（收口判据） | 归属切片 | 开工状态 |
+|---|---|---|---|
+| 窗口骨架 | header(9 件控件，`_lockable_header` 恰为 kind_combo/Add/Save image/Save/Load/name_edit，Pause/Selectors/Devices **故意不锁**) + 常驻状态条 + Monitor/Logic 两个不可关 tab + Edit 一律可关；embedded 模式的裁剪面（无 Logic tab/无 Pause/Save/Load/Devices，改 setMinimumSize 让重力板反流多列）(`task_console.py:6603-6636/6647-6754/6773-6832/6490-6496`) | S4-1(骨架)、S4-6(状态条) | `MUST_CLOSE` |
+| Add Panel = **4 类** | Plot(六种 `panel=True` kind) / Measurement(首项为 `camera_spec().name`) / Processor / Task；plot 默认 title=indexed_unique_name、size=1x2、**source 空白**，grid 默认 facet=repeat；加 logic 行后立即 focus 打开其 Edit (`:6668-6691/7811-7845/182-191`) | S4-1(Plot)、S4-2(其余三类) | `MUST_CLOSE` |
+| VIEW/LOGIC 解耦 | plot 面板永不 build/own/start 任何节点（`PanelEditor.meas_panel` 恒 None）；`logic_nodes`(行) 与 `running_nodes`(在跑节点) 是两个必须分开的集合 (`:1754-1760`) | S4-1 立、S4-2 保 | `MUST_CLOSE` |
+| 面板卡片 | FluentGroupBox，标题条左=kind+来源图例、右=Setting 按钮（resize 重定位）；卡边框即拖拽把手(OpenHandCursor)；构造末尾 `waiting for data…` (`:1937-1958/3127-3129`) | S4-1、S4-5 | `MUST_CLOSE` |
+| 拖拽布局 | 拖动=改序；松手先 `drop_index`（落在已有卡槽上=插到它前面把它挤下去，落在末尾之后=追加）再 `pack()` 严格 NW 重力压实；**卡序列是布局唯一真相源**，pack 宽度=滚动视口实时宽度；视口宽变自动重排 + 首次 show 后一次性重排 (`:3097-3125/7767-7808/1397-1449/7753-7765`)。注意 `docs/task_console_design` 仍写 `_compact/_pos_to_slot`，**该处文档陈旧，以代码为准** | S4-5 | `MUST_CLOSE` |
+| Logic 行 | 状态点(stopped 灰/running 绿/error 红)+名称+kind+状态文本+Start/Stop/Edit/Remove；`set_state` 变更门控；publishes 图例逐信号一行“名+形状”，形状由真实值抽取、含义进 tooltip、文本真变才 setText (`:6265-6372/7344-7358`) | S4-2 | `MUST_CLOSE` |
+| 未启动即可绑定 | `_declared_signal_keys` 与运行后的 `published_signals()` **逐字相同**，因此“先接线后 Start”与存档载入的绑定都能在生产者一发布时自动接上；prefix 一经 Start 即锁死为实例身份；task 为 off-hub，显示 `<mid_run_key> (mid-run)` (`:7379-7392/7360-7377/162-164`) | S4-2 | `MUST_CLOSE` |
+| catalog 自动发现 | console 只吃 measurements/processors/tasks 三个 spec 序列，下拉项与 Edit 表单全部由 spec 派生，新 `@measurement/@processor/@task` 零 GUI 改动即出现 (`:6684-6691/7866-7881`, `operations/_spec.py:68-160`) | S4-2 | `MUST_CLOSE`（当前新树硬 `ValueError`） |
+| Start 顺序刚性 | BUILD(表单值优先合并，保住表单看不见的键如 ROI selection) → 反应环校验 → 按 `occupied_devices()` 交集停冲突节点(不相交硬件共存) → schema 所有权交接 → `start()` → **成功才 COMMIT**；build 失败绝不动正在跑的 (`:8329-8474`) | S4-2 | `MUST_CLOSE` |
+| Stop vs Remove | Stop 只停节点、**信号留在 hub**（跑完的扫描仍可画、面板可预先接线）；Remove 才 purge 该节点发过且无其它在跑节点拥有的信号 (`:8688-8766`) | S4-2 | `MUST_CLOSE` |
+| 节点轮询终点单源 | 每 base tick 轮询 error/finished/进度；自行结束或出错一律走 `_stop_logic_node(_silent=True)` 这唯一终点，否则僵尸节点冻住全板 shot clock (`:8768-8820`) | S4-2、S4-6 | `MUST_CLOSE` |
+| Setting 弹窗 | 五段竖排 Source/Display/[Analysis]/Panel，**除 Source 的表达式 Apply 外没有全局 Apply，一切即时生效**；label 列宽按本弹窗最长标签测量；真 toggle 带 0.25s 去抖 (`:1961-2271`) | S4-1(Source/Display/Panel)、S4-3(全 kind 参数) | `MUST_CLOSE` |
+| 树形 signal picker | 每 slot 一个按产出节点分组的可折叠 `FluentTreeComboBox`（含 `(none)`、含已声明未运行输出）；多 slot kind 有 `+/- signal`，单 slot kind 由 `PANEL_SINGLE_SLOT_KINDS` 数据驱动地没有；面板顶部显示 `accepts <input_format>` (`:2055-2126/221-260/2531-2542`) | S4-1 | `MUST_CLOSE` |
+| Display 控件 | size 预设、该 kind `display=True` 的声明式参数(cmap/length/show_dist/bins/fit 三态/ylog…)、relim(tight/normal/fixed 单源 `_RELIM_PARAM`)、repeat_mode、fixed lo/hi(仅 fixed 时显示)、grid 的 facet + sub plot 两个下拉 (`:2128-2225/815-872/1458-1483`) | S4-1(通用)、S4-4(grid) | `MUST_CLOSE` |
+| Analysis 段 | `AnalysisControls` 是 Setting 与 Edit 共用的**唯一**构件(surface 参数区分)，action 下拉统管 none/curve fit/ROI 并按面板 kind 能力过滤；所有控件每次 derive 都从 `params['fit_request']/['selection_*']` 重新播种 (`:1109-1197/2227-2235/5240-5258`) | S4-3(与 U0.3d Fit owner 对接) | `MUST_CLOSE` |
+| 参数即时生效三路径 | `_set_param` 单一写入口：值没变直接 return；先取 render barrier；relim 走活体路径不重建（进 fixed 时用 `current_lims()` 冻结当前视图）；plotter 能就地吃的不重建；其余结构类旋钮打 `_force_rebuild` 并用 **90ms 单发定时器合并成一次 build-then-swap**，失败保留旧图、卡片永不空白 (`:3345-3426/1492-1497/1874-1889`) | S4-1 | `MUST_CLOSE` |
+| PanelEditor 段落 | Panel→Acquisition(产出节点自报参数，预填当前值 + `now: X` + Apply)→Source→Parameters→Display→Processing(冻结快照+Refresh)→Analysis→Limits→Save；Edit 快照照搬卡片 size、build-then-swap、保持放大 cell (`:4988-5546`) | S4-1(骨架)、S4-2(Acquisition/Source)、S4-3(Limits) | `MUST_CLOSE` |
+| 框选写回采集参数 | 2d 面板 area 与 zoom 都经 `region_to_acquisition_parameters` 把选区填进 Acquisition 输入框并提示 `Apply to use it`（**只填表不改采集**）；1d 仅 area 框选写回 spec 声明的 `axis_range`(必要时自动打开该节点的 Logic Edit) (`:5557-5574/5710-5770/6999-7030`) | S4-2 | `MUST_CLOSE` |
+| `now:` 运行值 + Apply 不重启 | 每拍只刷新当前可见 PanelEditor 的 `now:` 标签与灰色 placeholder（**永不覆盖用户输入**）；Apply 走 `apply_acquisition_parameters`，运行中由采集环在两帧之间自己应用，**绝不从 GUI 线程停/启采集线程** (`:5090-5100/5772-5784/7636-7656`) | S4-2 | `MUST_CLOSE` |
+| 自动表单 | `ParamDecl → PARAM_WIDGETS` 单循环(13 种 kind)，`display=False` 为不进表单的黑名单但保存值原样保留；标签列宽统一；required 未填则禁用 Start (`:4712-4791/4915-4941`, `param_widgets.py:894-913`) | S4-2 | `MUST_CLOSE` |
+| repeat 自动注入 | `repeat`(0=∞) 是唯一自动注入的采集旋钮，仅 measurement/camera 注入(camera 默认 0、扫描默认 1)，processor/task 不注入；plot 侧只有 repeat_mode，**永不能反过来命令 measurement 跑几次** (`:4536-4553/6411-6419/8593-8604`) | S4-2 | `MUST_CLOSE` |
+| tab 切换统一刷新 | `currentChanged` → 当前 widget 若实现 `refresh_on_show()` 就调一次，无类型特判；新编辑器实现该方法即自动参与 (`:7732-7745`) | S4-1 | `MUST_CLOSE` |
+| task 接管 | Start 一个 task 即造一张**普通** PanelConfig 的 mid-run 面板（扫描类→grid+facet 到最后扫描轴，0/1 维退化成 1d），走与手加面板完全相同的建卡路径，source 固定 `value = __task_frame__`；`_apply_task_lock` 禁用六件 header 并在状态条给出 Stop task；Pause/Selectors/Devices 不锁；所有变更入口逐个 short-circuit (`:8471-8548`) | S4-6 | `MUST_CLOSE` |
+| task 数据不经 hub | `__task_frame__` 每拍由 console 从 `node.output.latest_tensor(mid_run_key)` 注入表达式命名空间，不 bump hub version，因此在 `_tick` 的 version 门之前无条件跑；渲染忙则跳过下一拍补 (`:149-160/8569-8591/9066-9068`) | S4-6 | `MUST_CLOSE` |
+| 错误三层 + 状态条优先级 | 节点行红点红字 → 该节点 Edit 的长文 → 常驻状态条按 **error > task > warning(display-behind) > idle** (`:8354-8440/8785-8789/9185-9234`) | S4-6 | `MUST_CLOSE` |
+| workspace 存什么 | `{schema, version:3, name, interval_ms, panels[], logic[]}`；panel 存 kind/title/row/col/size/source/params/inputs/role，logic 存 kind/name/title/values；**row/col 只是重力压实的种子**，真正 round-trip 的是阅读顺序；schema 不符直接报错 (`:1650-1707/1585-1613`) | S4-7 | `MUST_CLOSE` |
+| 存前 flush、载入后一律 STOPPED | `read_state` 先把打开的 Logic Edit 表单回灌 `row.node.values`（从未 Start 过的节点参数也能存）；`load_state` 建行后**一律 STOPPED**，Start 永远手动，并**重放每个面板持久化的 region 控制信号**，否则 Analysis 派生关联与“载入后一 Start 就用当年选区”会静默丢失 (`:6835-6892`) | S4-7 | `MUST_CLOSE` |
+| 面板↔Analysis 关联是持久化派生 | `params['region_signal']`(跨库唯一名) + `params['region']` 是单源，关联由名字而非运行期 id 成立，故存/载自动重连、两个面板不可能串线；清除统一走 `_remove_panel_analysis` (`:6531-6537/8020-8092/8284-8290`) | S4-7 | `MUST_CLOSE` |
+| 采集永不被显示限速 | `UPDATE_INTERVALS=(100,200,400,800)` 是谐波集合，定时器 base=所有面板 update_ms 的最小值，每面板每 `update_ms//base` 拍重画；**acquisition 端从不设上限**，落后只在状态条给 amber 提醒 (`:1475-1483/8963-8972`) | S4-1、S4-6 | `MUST_CLOSE` |
+| 全板一个 shot clock | `_display_shot` = 所有“被面板绑定且生产者仍在跑”的信号最新 provenance 的 **min**（排除已停节点与故障节点，自由标量不约束）；`_panel_frame_key` 一变全板一起脏，所以一发脉冲的多帧不可能停在不同 shot (`:8830-8871/9040-9058`) | S4-1 | `MUST_CLOSE` |
+| 渲染在 worker + barrier + 欠拍公平 | `_tick` 只收集并提交，worker 建共享 namespace 并 compose，整批一起 present；**所有 GUI 线程触图路径必须先取 render barrier**；渲染忙或该面板正在交互则本拍不提交但置 `_beat_owed`，下一个空闲拍无视模数优先服务（取代已删的 rotor） (`:9060-9157/3768-3774/9076-9106`) | S4-1、S4-4 | `MUST_CLOSE`（新架构等价物=BoardFrame + CoherenceStamp + layout_generation + 单调 sequence） |
+| Pause / Selectors 语义 | Pause 只冻显示（`_tick` 只做轮询与状态条就 return），因为上一拍是 compose-all→present-all，冻住的板是一个一致 shot；Selectors 开关逐卡就地武装/停用选择器层，**零重建、不碰采集**，新加/载入的卡自动继承开关态 (`:8974-8993/6695-6707/6933-6937`) | S4-1、S4-3 | `MUST_CLOSE` |
+| 什么必须即时生效 | source Apply、每个声明式参数、size、title、unit、relim/fixed lo-hi、facet/sub plot、Setting 里的一切编辑都即时作用到活面板（生产者已停也用 `_last_namespace` 重画）；size 改动是 `setUpdatesEnabled(False)` 内的一次原子事务，避免出现一帧空白大卡 (`:1890-1896/3151-3178/3463-3489`) | S4-1、S4-5 | `MUST_CLOSE` |
+| 关窗语义 | `hide_on_close=True`(notebook) 把 X 接到 `stop_all_nodes`：逐行走 `_stop_logic_node` 停干净（**绝不用裸 `node.stop()`**，否则僵尸节点冻住 shot clock 且行仍显示 running），但保留面板与编辑器；独立窗 closed→shutdown 完全拆除 (`:9277-9301/9333-9372/9419-9451`) | S4-1、S4-2 | `MUST_CLOSE` |
+| 存取文件 | Save/Load 默认目录 = 上次地址或 `ZLC_TASK_DIR`/`<repo>/tasks`(自动建)；任何配置改动把 Save 点亮 YELLOW；`show_task_console(task=)` 支持 `.json` 路径或 `tasks/<name>.json`；默认开局是**空板** (`:9237-9268/1710-1729`) | S4-7 | `MUST_CLOSE` |
+
+**纵切序列（依赖有序，每片自身行为闭合、独立验收、独立 commit；片内可分阶段 commit，但每个 commit 都过完整白名单）：**
+
+1. **S4-0 口径冻结**（本节，无用户面变更）。
+2. **S4-1 通用 N 面板 live board**——破 one-card。必须最先：one-card 是硬 `raise` 而非缺功能，拖拽布局、rolling grid、workspace 几何与 §18.4「拖拽一个 panel 期间其它 panel 继续 present」全部建立在 ≥2 面板之上；同时先用可运行代码钉死 VIEW/LOGIC 解耦，S4-2 才有正确落点。本片只把 `LiveBoardController` 的固定拓扑参数化，**保留** spec 类型断言，不碰 catalog 与 neutral 数据面。
+3. **S4-2 catalog 驱动的 Logic 行**——破 one-Task（当前 `task_console_catalog_items` 对非预期 key 直接 `ValueError`）。必须同时接通三种真实 Definition 的表单，**不得**先建通用 schema→Form 引擎、`BoundOperation` 协议、Analysis registry 或 `DatasetInputSlot/AnalysisStep`（后两者在当前生产树零命中，本清单不得引入）。
+4. **S4-3 全 plot-kind live 覆盖与非空交互句柄**：每个已显示 panel 必须给出适用的 zoom/pan/crosshair/hover/selector；不适用者只能以 `NOT_APPLICABLE_WITH_EVIDENCE` + main 行号立案，**禁止返回空句柄冒充完成**。
+5. **S4-4 live rolling grid**：facet 与 sub plot 两个下拉即时生效；overview/exact-cell focus/返回复用 U0.3f-h 已交付的同一层（不暗选第一格、稀疏 hole 原位）；per-tick 渲染预算与公平跳帧取代旧 rotor/`_beat_owed`。
+6. **S4-5 拖拽布局与几何**：drop_index + 严格 NW 压实 + 视口宽变重排 + size 原子事务。
+7. **S4-6 task / monitor / status**：状态条四级优先级、task 锁与 mid-run 面板、display-behind amber 计量。
+8. **S4-7 workspace save/load 与清单4 收口**：codec round-trip、region 重放、收口对照表逐条 PASS/FAIL，并交付真实 launcher 的 tutorial E2E（UX-005 的关闭证据）。
+
+**禁止复制机制（本清单全程）：** 不得迁入旧 `SignalHub` 的全局名空间/latest-value join/gap→latest fallback；不得把 node-owned worker/thread 或运行期动态 pipeline edge 带进新架构；不得复制 console-wide `RenderLoop`/`_zlc_interacting`/`_beat_owed`/`_display_shot` 手写相干快门（等价物是 BoardFrame + CoherenceStamp + layout_generation + 单调 sequence）；不得按 rank/singleton/index-0/global-nanmean/anonymous-flatten 猜轴；不得让 GUI 与 worker 无确认共享同一 Figure/artist。
+
+**删除边界：** 清单4 迁完之前**禁止**整文件删除 legacy `Zou_lab_control/frontend/task_console.py`（它仍是 API_SLOT segmented、其它 Measurement/Processor、rolling/gridplot/selector/calibration/temperature/MOT panel 与旧入口的共同宿主）；U0.1 表的「保存/恢复」验收项不得删除，必须由 S4-7 正面交付。可删项按最后 consumer 逐项记账，留待清单9 Z0。
+
 ## 23. 核心结论
 
 系统不需要一个通用异步工作流编排器。它需要的是：
