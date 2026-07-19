@@ -498,7 +498,7 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         ):
             raise RuntimeError("site-map rectangle origin is stale")
         self._rectangle_candidate = gesture.normalized_bounds
-        self._board.set_site_map_rectangle_candidate(gesture.normalized_bounds)
+        self._board.set_image_rectangle_candidate(gesture.normalized_bounds)
         self._refresh_summary()
 
     def _accept_interaction(self, command: ImageInteractionCommit):

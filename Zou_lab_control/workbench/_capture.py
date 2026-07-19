@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import threading
+import time
 import uuid
 
 from PyQt5 import QtCore, QtWidgets
@@ -24,25 +26,49 @@ from zlc_frontend.figure import (
     estimate_view_evaluation_peak_nbytes,
     suggest_view,
 )
-from zlc_frontend.image_display import ImageDisplayState
+from zlc_frontend.display_range import RelimMode
+from zlc_frontend.image_display import (
+    ImageDisplayState,
+    image_display_for_viewport,
+    image_display_form_spec,
+    image_display_form_values,
+    image_display_from_form,
+    image_viewport_for_display_state,
+)
 from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
 from zlc_frontend.image_view import ImageViewportTransform
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentLabel,
+    FluentPopup,
+    FluentRevisionedFormEditor,
+    FluentSwitch,
+    FluentTabWidget,
     GREEN,
+    GREY,
     ORANGE,
-    QtImageBoard,
     QtOwnerWake,
+    QtRasterBoard,
+    RectangleGesture,
     WINDOW_SCREEN_FRACTION,
     center_window_on_primary_screen,
     ensure_qt_app,
     release_window,
     retain_window,
+    runtime_range_placeholders,
     screen_fit_window_size,
+    scaled_px,
     set_fluent_scale,
+    show_fluent_popup_for_anchor,
+    sync_revisioned_form_editors,
 )
 from zlc_frontend.render import RenderSurface
+from zlc_frontend.selector import (
+    ImageColorLimitsCommit,
+    ImageInteractionCommit,
+    ImageViewportCommit,
+    PanelInteractionOrigin,
+)
 from zlc_neutral_atom.capture_application import PreparedFiniteCapture
 from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
 from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot, RunState
@@ -51,7 +77,8 @@ from zlc_workbench.run_owner import QtRunOwnerMailbox
 from zlc_workbench.workspace import BoardController, BoardModel, PanelSlot
 
 
-_PROJECTION_TEXT = "latest rendered raw frame · per-frame auto contrast"
+_IMAGE_PANEL_ID = "capture-image"
+_PROJECTION_TEXT = "latest rendered raw frame · DISPLAY ONLY"
 
 
 class CaptureWorkbenchWindow(QtWidgets.QWidget):
@@ -73,6 +100,11 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         self._slot: LiveDatasetSlot | None = None
         self._live: LiveBoardController | None = None
         self._board: BoardController | None = None
+        self._image_display = ImageDisplayState()
+        self._image_viewport: ImageViewportTransform | None = None
+        self._pending_image_interaction_origin: PanelInteractionOrigin | None = None
+        self._rectangle_candidate = None
+        self._view_attach_inflight = False
         self._last_snapshot: RunSnapshot | None = None
         self._final_reference = None
         self._attempt_failed = False
@@ -94,18 +126,72 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         )
         self._projection_status.setObjectName("projectionStatus")
         self._projection_status.setWordWrap(True)
+        self._interaction_status = FluentLabel(
+            "Area: DISPLAY ONLY · Selectors are parked"
+        )
+        self._interaction_status.setObjectName("captureInteractionStatus")
+        self._interaction_status.setWordWrap(True)
         self._diagnostics = FluentLabel("")
         self._diagnostics.setObjectName("diagnostics")
         self._diagnostics.setWordWrap(True)
-        self._board_widget = QtImageBoard("capture-image", self)
+        self._board_widget = QtRasterBoard(
+            (_IMAGE_PANEL_ID,),
+            self,
+            columns=1,
+            empty_text="No capture preview",
+        )
         self._board_widget.setObjectName("captureImageBoard")
+        self._selector_switch = FluentSwitch("Selectors", self)
+        self._selector_switch.setObjectName("captureSelectorSwitch")
+        self._selector_switch.setChecked(False)
+        self._selector_switch.setEnabled(False)
+        self._setting_button = FluentButton("Setting…", self, color=GREY)
+        self._setting_button.setObjectName("captureDisplaySettingButton")
+        self._setting_button.setEnabled(False)
         self._start_button = FluentButton("Start", self, color=GREEN)
         self._start_button.setObjectName("startButton")
         self._start_button.setEnabled(False)
         self._stop_button = FluentButton("Stop", self, color=ORANGE)
         self._stop_button.setObjectName("stopButton")
         self._stop_button.setEnabled(False)
+
+        self._tabs = FluentTabWidget(self)
+        self._tabs.setObjectName("captureTabs")
+        self._live_page = QtWidgets.QWidget(self._tabs)
+        live_layout = QtWidgets.QVBoxLayout(self._live_page)
+        live_layout.setContentsMargins(0, 0, 0, 0)
+        live_layout.addWidget(self._board_widget, 1)
+        self._edit_image_display = FluentRevisionedFormEditor(
+            image_display_form_spec(),
+            "image display",
+            runtime_placeholder_fields=("color_min", "color_max"),
+            parent=self._tabs,
+        )
+        self._edit_image_display.setObjectName("captureImageDisplayEditEditor")
+        self._tabs.addTab(self._live_page, "Live")
+        self._tabs.addTab(self._edit_image_display, "Edit")
+
+        self._settings_popup = FluentPopup(self)
+        self._settings_popup.setObjectName("captureDisplaySettingsPopup")
+        settings_layout = QtWidgets.QVBoxLayout(self._settings_popup)
+        settings_layout.setContentsMargins(*(scaled_px(10, minimum=8),) * 4)
+        self._setting_image_display = FluentRevisionedFormEditor(
+            image_display_form_spec(),
+            "image display",
+            runtime_placeholder_fields=("color_min", "color_max"),
+            parent=self._settings_popup,
+        )
+        self._setting_image_display.setObjectName(
+            "captureImageDisplaySettingEditor"
+        )
+        settings_layout.addWidget(self._setting_image_display)
+        self._settings_dismissed_at = float("-inf")
+        self._settings_popup._on_hidden = self._record_settings_dismissed
+        self._sync_image_display_editors()
+
         controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(self._selector_switch)
+        controls.addWidget(self._setting_button)
         controls.addWidget(self._start_button)
         controls.addWidget(self._stop_button)
         controls.addStretch(1)
@@ -113,7 +199,8 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         layout.addWidget(self._capture_status)
         layout.addWidget(self._preview_status)
         layout.addWidget(self._projection_status)
-        layout.addWidget(self._board_widget, 1)
+        layout.addWidget(self._interaction_status)
+        layout.addWidget(self._tabs, 1)
         layout.addWidget(self._diagnostics)
         layout.addLayout(controls)
 
@@ -129,6 +216,29 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         self._timer.start()
         self._start_button.clicked.connect(self._start_capture)
         self._stop_button.clicked.connect(self._cancel_capture)
+        self._selector_switch.toggled.connect(self._set_selector_enabled)
+        self._setting_button.clicked.connect(self._open_display_settings)
+        self._edit_image_display.applyRequested.connect(
+            lambda revision, values: self._apply_image_display_form(
+                self._edit_image_display,
+                revision,
+                values,
+            )
+        )
+        self._setting_image_display.applyRequested.connect(
+            lambda revision, values: self._apply_image_display_form(
+                self._setting_image_display,
+                revision,
+                values,
+            )
+        )
+        self._edit_image_display.cancelRequested.connect(
+            lambda: self._reload_image_display_editor(self._edit_image_display)
+        )
+        self._setting_image_display.cancelRequested.connect(
+            lambda: self._reload_image_display_editor(self._setting_image_display)
+        )
+        self._update_interaction_controls()
         self._submit_prepare()
 
     @property
@@ -145,8 +255,303 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
     def worker_idle(self) -> bool:
         return self._run_owner.worker_idle
 
-    def _submit_worker(self, work):
-        return self._run_owner.submit_render(work)
+    def _set_selector_enabled(self, enabled: bool) -> None:
+        self._board_widget.set_selectors_enabled(bool(enabled))
+        if enabled:
+            self._interaction_status.setText(
+                "Area: DISPLAY ONLY · A/C/Z/H and exact hover armed"
+            )
+        elif self._board_widget.selector_fault is not None:
+            self._interaction_status.setText(
+                f"Image interaction disabled: {self._board_widget.selector_fault}"
+            )
+        elif self._rectangle_candidate is None:
+            self._interaction_status.setText(
+                "Area: DISPLAY ONLY · Selectors are parked"
+            )
+
+    def _open_display_settings(self) -> None:
+        if not self._setting_button.isEnabled():
+            return
+        popup = self._settings_popup
+        if popup.isVisible():
+            popup.hide()
+            return
+        if time.monotonic() - self._settings_dismissed_at < 0.25:
+            return
+        self._reload_image_display_editor(self._setting_image_display)
+        show_fluent_popup_for_anchor(
+            popup,
+            self._setting_button,
+            self._setting_image_display,
+        )
+
+    def _record_settings_dismissed(self) -> None:
+        self._settings_dismissed_at = time.monotonic()
+
+    def _visible_image_matches_display_revision(self) -> bool:
+        origin = self._board_widget.visible_image_origin()
+        front = self._board_widget.front_frame
+        live = self._live
+        status = None if live is None else live.front_status
+        return (
+            origin is not None
+            and origin.panel_id == _IMAGE_PANEL_ID
+            and origin.presentation.panel_revision == self._image_display.revision
+            and front is not None
+            and status is not None
+            and status.sequence == front.sequence
+            and status.image_display_revision == self._image_display.revision
+        )
+
+    def _visible_image_color_limits(self):
+        if not self._visible_image_matches_display_revision():
+            return None
+        payload = self._board_widget.visible_image_payload()
+        return None if payload is None else payload.color_limits
+
+    def _reload_image_display_editor(
+        self,
+        editor: FluentRevisionedFormEditor,
+    ) -> None:
+        if editor not in (
+            self._edit_image_display,
+            self._setting_image_display,
+        ):
+            raise ValueError("image display editor does not belong to this window")
+        editor.load(
+            revision=self._image_display.revision,
+            semantic_identity=self._image_display,
+            values=image_display_form_values(self._image_display),
+            runtime_placeholders=runtime_range_placeholders(
+                self._visible_image_color_limits(),
+                "color_min",
+                "color_max",
+            ),
+        )
+
+    def _sync_image_display_editors(
+        self,
+        *,
+        accepted_editor: FluentRevisionedFormEditor | None = None,
+        accepted_base_revision: int | None = None,
+    ) -> None:
+        sync_revisioned_form_editors(
+            (self._edit_image_display, self._setting_image_display),
+            revision=self._image_display.revision,
+            semantic_identity=self._image_display,
+            values=image_display_form_values(self._image_display),
+            runtime_placeholders=runtime_range_placeholders(
+                self._visible_image_color_limits(),
+                "color_min",
+                "color_max",
+            ),
+            accepted_editor=accepted_editor,
+            accepted_base_revision=accepted_base_revision,
+        )
+
+    def _apply_image_display_form(
+        self,
+        editor: FluentRevisionedFormEditor,
+        base_revision: int,
+        values: object,
+    ) -> None:
+        if editor not in (
+            self._edit_image_display,
+            self._setting_image_display,
+        ):
+            raise ValueError("image display editor does not belong to this window")
+        try:
+            if self._closing or self._view_attach_inflight:
+                raise RuntimeError(
+                    "image display cannot change while the preview is attaching"
+                )
+            if self._live is not None and not self._visible_image_matches_display_revision():
+                raise RuntimeError(
+                    "image display cannot change until its current front is visible"
+                )
+            if base_revision != self._image_display.revision:
+                raise RuntimeError(
+                    f"image display edit base r{base_revision} is stale; "
+                    f"current revision is r{self._image_display.revision}"
+                )
+            if not isinstance(values, dict):
+                raise TypeError("image display form must emit one exact mapping")
+            candidate = image_display_from_form(
+                self._image_display,
+                values,
+                current_color_limits=self._visible_image_color_limits(),
+            )
+            reference = self._image_viewport
+            if reference is None:
+                raise RuntimeError("finite capture image axes are not prepared")
+            self._commit_image_display(
+                candidate,
+                image_viewport_for_display_state(candidate, reference),
+                accepted_editor=editor,
+                accepted_base_revision=base_revision,
+            )
+        except Exception as error:
+            self._record_local_failure(
+                f"Image display edit rejected: {type(error).__name__}: {error}"
+            )
+
+    def _accept_rectangle_gesture(self, gesture: RectangleGesture) -> None:
+        if not isinstance(gesture, RectangleGesture):
+            raise TypeError("finite image area callback requires RectangleGesture")
+        origin = self._board_widget.visible_image_origin()
+        if origin is None or not self._visible_image_matches_display_revision():
+            raise RuntimeError("finite image area origin is stale")
+        if gesture.panel_id != _IMAGE_PANEL_ID or (
+            gesture.board_id,
+            gesture.layout_generation,
+            gesture.sequence,
+            gesture.source_identity,
+            gesture.viewport_revision,
+        ) != (
+            origin.board_id,
+            origin.layout_generation,
+            origin.sequence,
+            origin.source_identity,
+            self._image_display.revision,
+        ):
+            raise RuntimeError("finite image area differs from its painted origin")
+        self._rectangle_candidate = gesture.normalized_bounds
+        self._board_widget.set_image_rectangle_candidate(gesture.normalized_bounds)
+        left, top, right, bottom = gesture.normalized_bounds
+        self._interaction_status.setText(
+            "Area: DISPLAY ONLY · full-raster "
+            f"({left:.4f}, {top:.4f})..({right:.4f}, {bottom:.4f})"
+        )
+
+    def _accept_image_interaction(
+        self,
+        command: ImageInteractionCommit,
+    ) -> None:
+        if not isinstance(command, (ImageViewportCommit, ImageColorLimitsCommit)):
+            raise TypeError("image interaction callback received an unknown command")
+        origin = command.origin
+        if origin.panel_id != _IMAGE_PANEL_ID:
+            raise RuntimeError("image interaction belongs to another panel")
+        if (
+            not self._visible_image_matches_display_revision()
+            or self._board_widget.visible_image_origin() != origin
+            or origin.presentation.panel_revision != self._image_display.revision
+        ):
+            raise RuntimeError("image interaction origin is stale")
+        current_viewport = self._image_viewport
+        if current_viewport is None:
+            raise RuntimeError("image interaction has no committed viewport")
+        if isinstance(command, ImageViewportCommit):
+            if command.viewport.viewport_revision != self._image_display.revision + 1:
+                raise RuntimeError("image viewport interaction must advance once")
+            candidate = image_display_for_viewport(
+                self._image_display,
+                command.viewport,
+            )
+            viewport = command.viewport
+        else:
+            candidate = replace(
+                self._image_display,
+                revision=self._image_display.revision + 1,
+                relim_mode=RelimMode.FIXED,
+                fixed_color_limits=command.color_limits,
+            )
+            viewport = image_viewport_for_display_state(
+                candidate,
+                current_viewport,
+            )
+        self._commit_image_display(
+            candidate,
+            viewport,
+            interaction_origin=origin,
+        )
+
+    def _commit_image_display(
+        self,
+        state: ImageDisplayState,
+        viewport: ImageViewportTransform,
+        *,
+        accepted_editor: FluentRevisionedFormEditor | None = None,
+        accepted_base_revision: int | None = None,
+        interaction_origin: PanelInteractionOrigin | None = None,
+    ) -> None:
+        current = self._image_display
+        if not isinstance(state, ImageDisplayState):
+            raise TypeError("state must be ImageDisplayState")
+        if not isinstance(viewport, ImageViewportTransform):
+            raise TypeError("viewport must be ImageViewportTransform")
+        if viewport.viewport_revision != state.revision:
+            raise ValueError("image display and viewport revisions differ")
+        changed = state != current
+        if changed and state.revision != current.revision + 1:
+            raise ValueError("image display commit must advance exactly once")
+        if not changed and state.revision != current.revision:
+            raise ValueError("image display no-op changed revision")
+        if accepted_editor is not None:
+            if accepted_base_revision != current.revision:
+                raise ValueError("accepted editor base differs from current revision")
+            if accepted_editor.base_revision != accepted_base_revision:
+                raise ValueError("accepted editor no longer owns its emitted base")
+        if interaction_origin is not None and not changed:
+            raise ValueError("image interaction cannot commit a semantic no-op")
+
+        live = self._live
+        if changed and live is not None:
+            live.reconfigure_image_display(state, viewport)
+        if changed:
+            self._image_display = state
+            self._image_viewport = viewport
+            self._pending_image_interaction_origin = interaction_origin
+        self._sync_image_display_editors(
+            accepted_editor=accepted_editor,
+            accepted_base_revision=accepted_base_revision,
+        )
+        self._update_interaction_controls()
+
+    def _discard_pending_image_interaction(self) -> None:
+        origin = self._pending_image_interaction_origin
+        if origin is None:
+            return
+        self._board_widget.discard_pending_image_interaction(origin)
+        self._pending_image_interaction_origin = None
+
+    def _update_interaction_controls(self) -> None:
+        live = self._live
+        slot = self._slot
+        board = self._board
+        ready = (
+            not self._closing
+            and not self._view_attach_inflight
+            and live is not None
+            and live.fault is None
+            and slot is not None
+            and slot.failure is None
+            and board is not None
+            and board.fault is None
+            and self._board_widget.selector_fault is None
+            and self._visible_image_matches_display_revision()
+        )
+        self._board_widget.set_interaction_readiness(
+            image=ready,
+            curve=False,
+            histogram=False,
+        )
+        if self._board_widget.selector_fault is not None:
+            self._selector_switch.setChecked(False)
+        self._selector_switch.setEnabled(ready)
+        self._board_widget.set_selectors_enabled(
+            self._selector_switch.isChecked() and ready
+        )
+        display_enabled = (
+            not self._closing
+            and not self._view_attach_inflight
+            and self._image_viewport is not None
+            and (live is None or ready)
+        )
+        self._setting_button.setEnabled(display_enabled)
+        self._edit_image_display.setEnabled(display_enabled)
+        self._setting_image_display.setEnabled(display_enabled)
 
     def _submit_prepare(self) -> None:
         if self._closing or self._prepare_inflight or self._prepared is not None:
@@ -169,15 +574,109 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             return
         if self._handle is not None and not self._handle.snapshot().state.terminal:
             return
+        if not self._run_owner.owner_reaped:
+            return
+        if not self._run_owner.worker_idle:
+            return
+
+        command = self._prepared
+        next_generation = self._run_owner.generation + 1
         try:
-            self._close_live()
+            schema = command.preview_schema
+            y_axes = tuple(
+                axis
+                for axis in schema.cell_schema.data_axes
+                if axis.role == SPATIAL_Y
+            )
+            x_axes = tuple(
+                axis
+                for axis in schema.cell_schema.data_axes
+                if axis.role == SPATIAL_X
+            )
+            if (
+                len(y_axes) != 1
+                or len(x_axes) != 1
+                or len(schema.cell_schema.data_axes) != 2
+            ):
+                raise ValueError(
+                    "finite capture image requires exactly one declared "
+                    "SPATIAL_Y and SPATIAL_X axis"
+                )
+            suggestion = suggest_view(schema, ViewIntent.IMAGE)
+            if (
+                suggestion.status is SuggestionStatus.NEEDS_INPUT
+                or suggestion.spec is None
+            ):
+                raise ValueError("IMAGE view needs an explicit axis choice")
+            view = suggestion.spec
+            evaluation_peak = estimate_view_evaluation_peak_nbytes(schema, view)
+            # A finite preview publishes one immutable source event.  A display
+            # commit updates the target revision and _update_interaction_controls
+            # synchronously marks the painted revision unready, releasing the
+            # pointer hold before the commit returns.  Even if worker evaluation
+            # has already started, the hold and current front are aliases of one
+            # distinct retained raster/sample.  The finite topology therefore
+            # retains one old front, unlike an advancing camera monitor where a
+            # newer current source may coexist with an older held one.
+            downstream_peak = (
+                evaluation_peak
+                + estimate_indexed8_raster_peak_nbytes(
+                    y_axes[0].size,
+                    x_axes[0].size,
+                    value_itemsize=schema.cell_schema.dtype.itemsize,
+                    retained_fronts=1,
+                    retained_sample_fronts=1,
+                )
+            )
+            policy = FigureEvaluationPolicy(max_live_nbytes=evaluation_peak)
+            dataset_id = DatasetId(f"capture-preview-{next_generation}")
+            document = FigureDocument(
+                f"capture-preview-{next_generation}",
+                0,
+                (
+                    DatasetDescriptor(
+                        dataset_id,
+                        "Raw camera frame",
+                        schema.fingerprint,
+                    ),
+                ),
+                (FigureLayer(_IMAGE_PANEL_ID, dataset_id, view),),
+            )
+            image_display = self._image_display
+            image_viewport = image_viewport_for_display_state(
+                image_display,
+                ImageViewportTransform((y_axes[0], x_axes[0])),
+            )
         except BaseException as error:
             self._record_local_failure(
-                f"Previous preview close failed: {type(error).__name__}: {error}"
+                f"Preview preflight failed: {type(error).__name__}: {error}"
             )
             return
+
+        try:
+            self._close_live()
+            self._selector_switch.setChecked(False)
+            self._board_widget.bind_rectangle_selector(
+                _IMAGE_PANEL_ID,
+                image_viewport,
+                self._accept_rectangle_gesture,
+                enabled=False,
+                interaction_callback=self._accept_image_interaction,
+            )
+        except BaseException as error:
+            self._record_local_failure(
+                f"Preview interaction setup failed: {type(error).__name__}: {error}"
+            )
+            return
+
         generation = self._run_owner.begin_generation()
-        command, self._prepared = self._prepared, None
+        if generation != next_generation:
+            raise RuntimeError("capture generation changed during GUI preflight")
+        self._prepared = None
+        self._image_viewport = image_viewport
+        self._rectangle_candidate = None
+        self._pending_image_interaction_origin = None
+        self._view_attach_inflight = True
         self._last_snapshot = None
         self._final_reference = None
         self._local_diagnostic = ""
@@ -190,40 +689,12 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         self._preview_status.setText(
             f"Preview: PROVISIONAL · {_PROJECTION_TEXT}"
         )
-
-        schema = command.preview_schema
-        y_axes = tuple(axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_Y)
-        x_axes = tuple(axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_X)
-        if len(y_axes) != 1 or len(x_axes) != 1 or len(schema.cell_schema.data_axes) != 2:
-            self._record_local_failure(
-                "finite capture image requires exactly one declared SPATIAL_Y and SPATIAL_X axis"
-            )
-            self._submit_prepare()
-            return
-        suggestion = suggest_view(schema, ViewIntent.IMAGE)
-        if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
-            self._record_local_failure("IMAGE view needs an explicit axis choice")
-            self._submit_prepare()
-            return
-        view = suggestion.spec
-        evaluation_peak = estimate_view_evaluation_peak_nbytes(schema, view)
-        downstream_peak = evaluation_peak + estimate_indexed8_raster_peak_nbytes(
-            y_axes[0].size,
-            x_axes[0].size,
-            value_itemsize=schema.cell_schema.dtype.itemsize,
-            retained_sample_fronts=1,
+        self._interaction_status.setText(
+            "Area: DISPLAY ONLY · Selectors reset OFF for this capture"
         )
-        policy = FigureEvaluationPolicy(max_live_nbytes=evaluation_peak)
-        dataset_id = DatasetId(f"capture-preview-{generation}")
-        document = FigureDocument(
-            f"capture-preview-{generation}",
-            0,
-            (DatasetDescriptor(dataset_id, "Raw camera frame", schema.fingerprint),),
-            (FigureLayer("capture-image", dataset_id, view),),
-        )
+        self._sync_image_display_editors()
+        self._update_interaction_controls()
         block_id = BlockId(f"capture-preview-{uuid.uuid4().hex}")
-        image_display = ImageDisplayState()
-        image_viewport = ImageViewportTransform((y_axes[0], x_axes[0]))
 
         def factory(spec: CapturePreviewSpec):
             slot = LiveDatasetSlot(
@@ -296,10 +767,12 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             self._drain_worker_results()
             self._drain_attachments()
             try:
+                live = self._live
+                if live is not None:
+                    live.reconcile_faults()
                 board = self._board
                 if board is not None and board.fault is None:
                     board.present_pending()
-                live = self._live
                 if live is not None:
                     live.admit_pending()
             except BaseException as error:
@@ -327,6 +800,12 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         except BaseException as error:
             self._record_local_failure(f"{type(error).__name__}: {error}")
             self._maybe_finish_close()
+        finally:
+            # A result/prepare completion may make the next Run eligible and
+            # live.admit_pending() may then enqueue the old generation's final
+            # raster in the same owner cycle.  Recompute after both actions so
+            # a repeated finite Run cannot overlap that retained exact work.
+            self._update_start_button()
 
     def _drain_worker_results(self) -> None:
         for completion in self._run_owner.drain_completions():
@@ -337,9 +816,11 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                 try:
                     future.result()
                 except BaseException as error:
+                    self._discard_pending_image_interaction()
                     self._record_local_failure(
                         f"Preview worker failed: {type(error).__name__}: {error}"
                     )
+                self._update_interaction_controls()
                 continue
             if kind == "prepare":
                 if generation != self._run_owner.generation:
@@ -397,6 +878,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                     handle = future.result()
                 except BaseException as error:
                     if generation == self._run_owner.generation:
+                        self._view_attach_inflight = False
                         self._run_owner.mark_owner_reaped()
                         self._attempt_failed = True
                         self._capture_status.setText("Capture: FAILED · NOT FINAL")
@@ -404,6 +886,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                             f"Start failed: {type(error).__name__}: {error}"
                         )
                         self._submit_prepare()
+                        self._update_interaction_controls()
                     continue
                 if self._closing or generation != self._run_owner.generation:
                     if self._closing:
@@ -465,17 +948,24 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                 attached,
                 response,
             ) = payload
+            board = None
+            live = None
             try:
                 if self._closing or generation != self._run_owner.generation:
                     raise RuntimeError("Workbench no longer accepts this preview")
                 if slot.terminal:
                     raise RuntimeError("preview became terminal before GUI attachment")
-                self._close_live()
+                if self._live is not None or self._board is not None or self._slot is not None:
+                    raise RuntimeError("finite preview already has a presentation owner")
+                if image_display != self._image_display:
+                    raise RuntimeError("preview display state changed before attachment")
+                if image_viewport != self._image_viewport:
+                    raise RuntimeError("preview viewport changed before attachment")
                 model = BoardModel(
                     "capture-board",
                     generation,
                     RenderSurface.WORKER_RASTER_LIVE,
-                    (PanelSlot("capture-image", "finite-capture", "capture"),),
+                    (PanelSlot(_IMAGE_PANEL_ID, "finite-capture", "capture"),),
                 )
                 board = BoardController(
                     model,
@@ -486,7 +976,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                     slot,
                     document,
                     board,
-                    submit_worker=self._submit_worker,
+                    submit_worker=self._run_owner.submit_render,
                     request_owner_wake=self._wake.request_owner_wake,
                     image_display=image_display,
                     image_viewport=image_viewport,
@@ -494,14 +984,26 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                 self._slot = slot
                 self._board = board
                 self._live = live
+                self._view_attach_inflight = False
+                self._sync_image_display_editors()
+                self._update_interaction_controls()
                 response["accepted"] = True
             except BaseException as error:
+                self._view_attach_inflight = False
                 response["accepted"] = False
                 response["error"] = f"{type(error).__name__}: {error}"
+                try:
+                    if live is not None:
+                        live.close()
+                    elif board is not None:
+                        board.close()
+                except BaseException:
+                    pass
                 try:
                     slot.fail(str(response["error"]))
                 except BaseException:
                     pass
+                self._update_interaction_controls()
             finally:
                 attached.set()
 
@@ -557,9 +1059,16 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         if fault is None and board is not None:
             fault = board.fault
         if failure is not None or fault is not None:
+            self._discard_pending_image_interaction()
             detail = failure if failure is not None else str(fault)
             self._preview_status.setText(f"Preview: FAILED · {detail}")
+            self._update_interaction_controls()
             return
+        selector_fault = self._board_widget.selector_fault
+        if selector_fault is not None:
+            self._interaction_status.setText(
+                f"Image interaction disabled: {selector_fault}"
+            )
         snapshot = self._last_snapshot
         if (
             snapshot is not None
@@ -569,18 +1078,56 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             self._preview_status.setText(
                 f"Preview: NOT FINAL · capture {snapshot.state.value}"
             )
+            self._update_interaction_controls()
             return
-        if (
-            snapshot is not None
-            and snapshot.state is RunState.SUCCEEDED
-            and snapshot.final_committed
-            and self._board_widget.has_front
-        ):
-            self._preview_status.setText(
-                f"Preview: DISPLAY ONLY · capture FINAL · {_PROJECTION_TEXT}"
+        if live is not None and self._board_widget.has_front:
+            front = self._board_widget.front_frame
+            status = live.front_status
+            if front is None or status is None or status.sequence != front.sequence:
+                self._preview_status.setText(
+                    "Preview: WAITING · previous coherent front retained"
+                )
+                self._update_interaction_controls()
+                return
+            if status.image_display_revision != self._image_display.revision:
+                shown = (
+                    "unknown"
+                    if status.image_display_revision is None
+                    else f"r{status.image_display_revision}"
+                )
+                self._preview_status.setText(
+                    "Preview: WAITING · previous display retained "
+                    f"({shown}) · target r{self._image_display.revision}"
+                )
+                self._sync_image_display_editors()
+                self._update_interaction_controls()
+                return
+            pending = self._pending_image_interaction_origin
+            if (
+                pending is not None
+                and self._image_display.revision
+                > pending.presentation.panel_revision
+            ):
+                self._pending_image_interaction_origin = None
+            self._sync_image_display_editors()
+            self._projection_status.setText(
+                f"Display: r{self._image_display.revision} · "
+                f"{self._image_display.relim_mode.value}/"
+                f"{self._image_display.colormap.value} · {_PROJECTION_TEXT}"
             )
-        elif self._board_widget.has_front:
-            self._preview_status.setText(f"Preview: PROVISIONAL · {_PROJECTION_TEXT}")
+            if (
+                snapshot is not None
+                and snapshot.state is RunState.SUCCEEDED
+                and snapshot.final_committed
+            ):
+                self._preview_status.setText(
+                    f"Preview: DISPLAY ONLY · capture FINAL · {_PROJECTION_TEXT}"
+                )
+            else:
+                self._preview_status.setText(
+                    f"Preview: PROVISIONAL · {_PROJECTION_TEXT}"
+                )
+        self._update_interaction_controls()
 
     def _refresh_diagnostics(self, snapshot: RunSnapshot | None) -> None:
         parts = [self._local_diagnostic] if self._local_diagnostic else []
@@ -607,16 +1154,26 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             not self._closing
             and self._prepared is not None
             and previous_settled
+            and self._run_owner.worker_idle
         )
 
     def _close_live(self) -> None:
+        self._view_attach_inflight = False
+        self._selector_switch.setChecked(False)
+        self._board_widget.unbind_rectangle_selector()
+        self._pending_image_interaction_origin = None
+        self._rectangle_candidate = None
         live = self._live
         if live is None:
+            self._sync_image_display_editors()
+            self._update_interaction_controls()
             return
         live.close()
         self._live = None
         self._slot = None
         self._board = None
+        self._sync_image_display_editors()
+        self._update_interaction_controls()
 
     def closeEvent(self, event) -> None:
         if self._allow_close:

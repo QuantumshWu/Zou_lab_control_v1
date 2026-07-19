@@ -20,13 +20,26 @@ import Zou_lab_control.notebook as zlc
 from Zou_lab_control.notebook.facade import _prepare_capture_for_workbench
 from Zou_lab_control.workbench import open_capture_workbench
 from zlc_data import BlockId, SPATIAL_X, SPATIAL_Y
-from zlc_frontend.figure import DatasetId, FigureEvaluationPolicy
-from zlc_frontend.qt_widgets import GREEN, ORANGE, QtImageBoard
+from zlc_frontend.figure import (
+    DatasetId,
+    FigureEvaluationPolicy,
+    ViewIntent,
+    estimate_view_evaluation_peak_nbytes,
+    suggest_view,
+)
+from zlc_frontend.display_range import RelimMode
+from zlc_frontend.image_display import ImageColormap
+from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
+from zlc_frontend.qt_widgets import GREEN, ORANGE, QtRasterBoard
 from zlc_neutral_atom.monitor_application import (
     CameraMonitorLiveDataset,
     CameraMonitorRoiState,
 )
 from zlc_neutral_atom.runtime.control import ControlAckStatus, create_control_topic
+from zlc_neutral_atom.runtime.pipeline import (
+    CapturePreviewSpec,
+    estimate_pipeline_peak_bytes,
+)
 import zlc_workbench.live as live_module
 from zlc_workbench.live import LiveBoardController, LiveDatasetSlot
 
@@ -65,7 +78,92 @@ def _widgets(window):
         window.findChild(QtWidgets.QLabel, "captureStatus"),
         window.findChild(QtWidgets.QLabel, "previewStatus"),
         window.findChild(QtWidgets.QLabel, "diagnostics"),
-        window.findChild(QtImageBoard, "captureImageBoard"),
+        window.findChild(QtRasterBoard, "captureImageBoard"),
+    )
+
+
+def _image_target(board: QtRasterBoard) -> QtCore.QRect:
+    target = board._selector_target()
+    assert target is not None
+    return target[0]
+
+
+def _point(target: QtCore.QRect, x_fraction: float, y_fraction: float) -> QtCore.QPoint:
+    return QtCore.QPoint(
+        target.left() + int(x_fraction * max(1, target.width() - 1)),
+        target.top() + int(y_fraction * max(1, target.height() - 1)),
+    )
+
+
+def _drag_move(board: QtRasterBoard, position: QtCore.QPoint, button) -> None:
+    board.mouseMoveEvent(
+        QtGui.QMouseEvent(
+            QtCore.QEvent.MouseMove,
+            QtCore.QPointF(position),
+            QtCore.Qt.NoButton,
+            button,
+            QtCore.Qt.NoModifier,
+        )
+    )
+
+
+def _wheel_image_down(board: QtRasterBoard) -> QtGui.QWheelEvent:
+    position = _image_target(board).center()
+    event = QtGui.QWheelEvent(
+        QtCore.QPointF(position),
+        QtCore.QPointF(board.mapToGlobal(position)),
+        QtCore.QPoint(),
+        QtCore.QPoint(0, -120),
+        QtCore.Qt.NoButton,
+        QtCore.Qt.NoModifier,
+        QtCore.Qt.ScrollUpdate,
+        False,
+    )
+    board.wheelEvent(event)
+    return event
+
+
+def _choose_image_display_value(editor, key: str, value: object) -> None:
+    widget = editor._form.widget_for(key)
+    assert isinstance(widget, QtWidgets.QComboBox)
+    index = widget.findData(value)
+    assert index >= 0
+    widget.setCurrentIndex(index)
+    editor._form.changed.emit(key)
+
+
+def _finite_required_peak(prepared) -> int:
+    schema = prepared.preview_schema
+    y_axes = tuple(
+        axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_Y
+    )
+    x_axes = tuple(
+        axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_X
+    )
+    assert len(y_axes) == len(x_axes) == 1
+    suggestion = suggest_view(schema, ViewIntent.IMAGE)
+    assert suggestion.spec is not None
+    downstream = estimate_view_evaluation_peak_nbytes(
+        schema,
+        suggestion.spec,
+    ) + estimate_indexed8_raster_peak_nbytes(
+        y_axes[0].size,
+        x_axes[0].size,
+        value_itemsize=schema.cell_schema.dtype.itemsize,
+        retained_fronts=1,
+        retained_sample_fronts=1,
+    )
+    preview = CapturePreviewSpec(
+        BlockId("w1-exact-budget-preview"),
+        prepared._preview_edge,
+        downstream,
+    )
+    assert prepared.descriptor.estimated_peak_bytes == estimate_pipeline_peak_bytes(
+        prepared._triggered.capture
+    )
+    return estimate_pipeline_peak_bytes(
+        prepared._triggered.capture,
+        preview_spec=preview,
     )
 
 
@@ -128,6 +226,493 @@ def test_public_workbench_repeats_with_new_preview_and_loads_exact_artifact(
     )
 
 
+def test_final_preview_exposes_exact_image_handles_without_changing_authority(
+    experiment,
+    application,
+):
+    window = None
+    try:
+        request = experiment.readout.capture_request(SINGLE_EVENT_PULSE)
+        window = open_capture_workbench(experiment, request)
+        start, _capture, _preview, diagnostics, board = _widgets(window)
+        selector = window.findChild(
+            QtWidgets.QAbstractButton,
+            "captureSelectorSwitch",
+        )
+        assert selector is not None and not selector.isChecked()
+        _until(application, start.isEnabled)
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: window.final_reference is not None
+            and board.has_front
+            and selector.isEnabled(),
+        )
+        final_ref = window.final_reference
+        handle = window._handle
+        slot = window._slot
+        live = window._live
+        controller = window._board
+        assert handle is not None and slot is not None
+        assert live is not None and controller is not None
+        model = controller.model
+        front = board.front_frame
+        payload = board.visible_image_payload()
+        assert front is not None and payload is not None
+        source = front.panels[0].source_identity
+        evaluated_input = payload.evaluated_input
+
+        selector.setChecked(True)
+        assert board.selectors_enabled
+        target = _image_target(board)
+        drag_start = _point(target, 0.20, 0.25)
+        drag_end = _point(target, 0.65, 0.70)
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=drag_start)
+        assert board._selector_hold is not None
+        assert board._selector_hold.prepared is board._front[1][0]
+        assert board._selector_hold.display_payload is payload
+        held_revision = slot.freeze_current()[2].snapshot.ref.revision
+        _drag_move(board, drag_end, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=drag_end)
+        assert board._selector_hold is None
+        assert slot.freeze_current()[2].snapshot.ref.revision == held_revision
+        assert window._rectangle_candidate is not None
+        assert "DISPLAY ONLY" in window._interaction_status.text()
+
+        center = target.center()
+        QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=center)
+        assert board._cross_sample is not None
+        _drag_move(board, center, QtCore.Qt.NoButton)
+        assert board._hover_sample is not None
+        QtTest.QTest.mouseDClick(board, QtCore.Qt.RightButton, pos=center)
+        assert board._cross_sample is None
+
+        event = _wheel_image_down(board)
+        assert event.isAccepted()
+        _until(
+            application,
+            lambda: window._image_display.revision == 1
+            and board.visible_image_origin() is not None
+            and board.visible_image_origin().presentation.panel_revision == 1,
+        )
+
+        rail_target = board._clim_rail_target()
+        assert rail_target is not None
+        rail, *_rest, painted = rail_target
+        domain = board._color_rail_domain(painted)
+        low, high = painted.color_limits
+        start_y = board._rail_y(low, domain, rail)
+        target_value = low + 0.20 * (high - low)
+        end_y = board._rail_y(target_value, domain, rail)
+        clim_start = QtCore.QPoint(rail.center().x(), int(round(start_y)))
+        clim_end = QtCore.QPoint(rail.center().x(), int(round(end_y)))
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=clim_start)
+        _drag_move(board, clim_end, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=clim_end)
+        _until(
+            application,
+            lambda: window._image_display.revision == 2
+            and board.visible_image_origin() is not None
+            and board.visible_image_origin().presentation.panel_revision == 2,
+        )
+        assert window._image_display.relim_mode is RelimMode.FIXED
+
+        current = board.front_frame
+        current_payload = board.visible_image_payload()
+        assert current is not None and current_payload is not None
+        assert window.final_reference == final_ref
+        assert window._handle is handle
+        assert window._slot is slot and window._live is live
+        assert window._board is controller and controller.model == model
+        assert current.panels[0].source_identity == source
+        assert current_payload.evaluated_input == evaluated_input
+        assert diagnostics.text() == ""
+        assert experiment.readout.load_capture(final_ref).frame_source.schema.physical_shape == (
+            1,
+            1,
+            96,
+            128,
+        )
+    finally:
+        if window is not None:
+            _close_window(application, window)
+
+
+def test_capture_setting_edit_share_cas_and_repeat_preserves_only_authored_display(
+    experiment,
+    application,
+):
+    window = None
+    try:
+        request = experiment.readout.capture_request(SINGLE_EVENT_PULSE)
+        window = open_capture_workbench(experiment, request)
+        start, _capture, _preview, diagnostics, board = _widgets(window)
+        selector = window.findChild(
+            QtWidgets.QAbstractButton,
+            "captureSelectorSwitch",
+        )
+        _until(application, start.isEnabled)
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: window.final_reference is not None
+            and selector is not None
+            and selector.isEnabled(),
+        )
+        first_ref = window.final_reference
+        first_source = board.front_frame.panels[0].source_identity
+        first_origin = board.visible_image_origin()
+        assert first_origin is not None
+        edit = window._edit_image_display
+        setting = window._setting_image_display
+        assert edit._form.spec is setting._form.spec
+        assert edit.base_revision == setting.base_revision == 0
+
+        setting._form.widget_for("x_min").setText("10")
+        assert setting._dirty and not setting._stale
+        setting_draft = setting._form.read_all()
+        selector.setChecked(True)
+        hold_point = _point(_image_target(board), 0.40, 0.45)
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=hold_point)
+        held = board._selector_hold
+        assert held is not None
+        slot = window._slot
+        assert slot is not None
+        frozen_before = slot.freeze_current()[2]
+        _choose_image_display_value(edit, "colormap", ImageColormap.MAGMA)
+        edit._apply_button.click()
+        assert window._image_display.revision == 1
+        assert window._image_display.colormap is ImageColormap.MAGMA
+        # Advancing the target display revision synchronously makes the painted
+        # revision unready and releases the old hold before the commit returns.
+        # A worker that starts earlier still sees hold/current as one aliased old
+        # front.  This is the concrete R1/S1 topology used by the estimator; the
+        # immutable source itself never advances.
+        assert board._selector_hold is None
+        assert board.front_frame.panels[0].source_identity == first_source
+        frozen_after = slot.freeze_current()[2]
+        assert frozen_after.snapshot.ref == frozen_before.snapshot.ref
+        assert frozen_after.event_refs == frozen_before.event_refs
+        assert setting.base_revision == 0 and setting._dirty and setting._stale
+        assert setting._form.read_all() == setting_draft
+        _until(
+            application,
+            lambda: board.visible_image_origin() is not None
+            and board.visible_image_origin().presentation.panel_revision == 1,
+        )
+        setting._cancel_button.click()
+        assert setting.base_revision == 1
+        authored = window._image_display
+
+        selector.setChecked(True)
+        QtTest.QTest.mouseClick(
+            board,
+            QtCore.Qt.RightButton,
+            pos=_image_target(board).center(),
+        )
+        assert board._cross_sample is not None
+        _until(application, start.isEnabled)
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        assert not selector.isChecked()
+        assert window._rectangle_candidate is None
+        assert board._cross_sample is None
+        _until(
+            application,
+            lambda: window.final_reference is not None
+            and window.final_reference != first_ref
+            and board.has_front,
+        )
+        second_ref = window.final_reference
+        payload = board.visible_image_payload()
+        assert payload is not None
+        assert window._image_display == authored
+        assert payload.viewport.viewport_revision == authored.revision
+        assert board.front_frame.panels[0].source_identity != first_source
+        assert window._pending_image_interaction_origin is None
+        from zlc_frontend.selector import ImageViewportCommit
+
+        stale_viewport = payload.viewport.centered_zoom((0.5, 0.5), 0.9)
+        with pytest.raises(RuntimeError, match="stale"):
+            window._accept_image_interaction(
+                ImageViewportCommit(first_origin, stale_viewport)
+            )
+        assert diagnostics.text() == ""
+        assert experiment.readout.load_capture(second_ref).frame_source.schema.physical_shape == (
+            1,
+            1,
+            96,
+            128,
+        )
+    finally:
+        if window is not None:
+            _close_window(application, window)
+
+
+def test_repeat_waits_for_the_previous_exact_raster_worker(
+    experiment,
+    application,
+    monkeypatch,
+):
+    original = live_module.rasterize_image_indexed8
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_raster(*args, **kwargs):
+        entered.set()
+        if not release.wait(5.0):
+            raise TimeoutError("test did not release finite raster worker")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(live_module, "rasterize_image_indexed8", blocked_raster)
+    window = None
+    try:
+        request = experiment.readout.capture_request(SINGLE_EVENT_PULSE)
+        window = open_capture_workbench(experiment, request)
+        start, capture, _preview, diagnostics, board = _widgets(window)
+        _until(application, start.isEnabled)
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        _until(application, entered.is_set)
+        _until(application, lambda: window.final_reference is not None)
+        first_ref = window.final_reference
+        first_generation = window._run_owner.generation
+        assert capture.text().startswith("Capture: FINAL")
+        assert not window.worker_idle
+        assert not start.isEnabled()
+
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        application.processEvents()
+        assert window._run_owner.generation == first_generation
+        assert window.final_reference == first_ref
+
+        release.set()
+        _until(
+            application,
+            lambda: window.worker_idle and start.isEnabled() and board.has_front,
+        )
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: window.final_reference is not None
+            and window.final_reference != first_ref,
+        )
+        assert window._run_owner.generation == first_generation + 1
+        assert diagnostics.text() == ""
+    finally:
+        release.set()
+        if window is not None:
+            _close_window(application, window)
+
+
+def test_capture_rejects_stale_and_failed_display_commits_without_touching_final(
+    experiment,
+    application,
+    monkeypatch,
+):
+    window = None
+    try:
+        request = experiment.readout.capture_request(SINGLE_EVENT_PULSE)
+        window = open_capture_workbench(experiment, request)
+        start, _capture, _preview, diagnostics, board = _widgets(window)
+        _until(application, start.isEnabled)
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: window.final_reference is not None and board.has_front,
+        )
+        final_ref = window.final_reference
+        origin = board.visible_image_origin()
+        payload = board.visible_image_payload()
+        assert origin is not None and payload is not None
+
+        editor = window._edit_image_display
+        _choose_image_display_value(editor, "colormap", ImageColormap.PLASMA)
+        editor._apply_button.click()
+        assert window._image_display.revision == 1
+        stale_viewport = payload.viewport.centered_zoom((0.5, 0.5), 0.9)
+        from zlc_frontend.selector import ImageViewportCommit
+
+        with pytest.raises(RuntimeError, match="stale"):
+            window._accept_image_interaction(
+                ImageViewportCommit(origin, stale_viewport)
+            )
+        _until(
+            application,
+            lambda: board.visible_image_origin() is not None
+            and board.visible_image_origin().presentation.panel_revision == 1,
+        )
+
+        before = window._image_display
+        assert window._live is not None
+        monkeypatch.setattr(
+            window._live,
+            "reconfigure_image_display",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("reconfigure rejected")),
+        )
+        _choose_image_display_value(editor, "colormap", ImageColormap.INFERNO)
+        editor._apply_button.click()
+        assert window._image_display == before
+        assert "reconfigure rejected" in diagnostics.text()
+        assert window.final_reference == final_ref
+        assert experiment.readout.load_capture(final_ref).frame_source.schema.physical_shape == (
+            1,
+            1,
+            96,
+            128,
+        )
+    finally:
+        if window is not None:
+            _close_window(application, window)
+
+
+def test_display_rerender_fault_clears_only_pending_intent_and_preserves_final(
+    experiment,
+    application,
+    monkeypatch,
+):
+    window = None
+    try:
+        request = experiment.readout.capture_request(SINGLE_EVENT_PULSE)
+        window = open_capture_workbench(experiment, request)
+        start, capture, preview, _diagnostics, board = _widgets(window)
+        selector = window.findChild(
+            QtWidgets.QAbstractButton,
+            "captureSelectorSwitch",
+        )
+        _until(application, start.isEnabled)
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: window.final_reference is not None
+            and selector is not None
+            and selector.isEnabled(),
+        )
+        final_ref = window.final_reference
+        source = board.front_frame.panels[0].source_identity
+
+        def fail_raster(*_args, **_kwargs):
+            raise RuntimeError("injected display rerender failure")
+
+        monkeypatch.setattr(live_module, "rasterize_image_indexed8", fail_raster)
+        selector.setChecked(True)
+        _wheel_image_down(board)
+        assert window._image_display.revision == 1
+        assert board._image_interaction_is_pending()
+        _until(application, lambda: preview.text().startswith("Preview: FAILED"))
+        assert not board._image_interaction_is_pending()
+        assert window._pending_image_interaction_origin is None
+        assert not selector.isEnabled()
+        assert capture.text().startswith("Capture: FINAL")
+        assert window.final_reference == final_ref
+        assert board.front_frame.panels[0].source_identity == source
+        assert experiment.readout.load_capture(final_ref).frame_source.schema.physical_shape == (
+            1,
+            1,
+            96,
+            128,
+        )
+    finally:
+        if window is not None:
+            _close_window(application, window)
+
+
+def test_close_releases_an_active_finite_image_hold_nonblocking(
+    experiment,
+    application,
+):
+    request = experiment.readout.capture_request(SINGLE_EVENT_PULSE)
+    window = open_capture_workbench(experiment, request)
+    try:
+        start, _capture, _preview, _diagnostics, board = _widgets(window)
+        selector = window.findChild(
+            QtWidgets.QAbstractButton,
+            "captureSelectorSwitch",
+        )
+        _until(application, start.isEnabled)
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: window.final_reference is not None
+            and selector is not None
+            and selector.isEnabled(),
+        )
+        selector.setChecked(True)
+        QtTest.QTest.mousePress(
+            board,
+            QtCore.Qt.LeftButton,
+            pos=_point(_image_target(board), 0.25, 0.25),
+        )
+        assert board._selector_hold is not None
+        began = time.monotonic()
+        window.close()
+        assert time.monotonic() - began < 0.1
+        assert board._selector_hold is None
+        _until(application, lambda: not window.isVisible(), timeout=5.0)
+        assert not board.has_front
+        assert window._pending_image_interaction_origin is None
+    finally:
+        if window.isVisible():
+            _close_window(application, window)
+
+
+def test_close_during_pending_finite_rerender_never_late_publishes(
+    experiment,
+    application,
+    monkeypatch,
+):
+    window = None
+    release = threading.Event()
+    try:
+        request = experiment.readout.capture_request(SINGLE_EVENT_PULSE)
+        window = open_capture_workbench(experiment, request)
+        start, capture, _preview, _diagnostics, board = _widgets(window)
+        selector = window.findChild(
+            QtWidgets.QAbstractButton,
+            "captureSelectorSwitch",
+        )
+        _until(application, start.isEnabled)
+        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: window.final_reference is not None
+            and selector is not None
+            and selector.isEnabled(),
+        )
+        final_ref = window.final_reference
+        original = live_module.rasterize_image_indexed8
+        entered = threading.Event()
+
+        def blocked_raster(*args, **kwargs):
+            entered.set()
+            if not release.wait(5.0):
+                raise TimeoutError("test did not release finite rerender")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(live_module, "rasterize_image_indexed8", blocked_raster)
+        selector.setChecked(True)
+        _wheel_image_down(board)
+        _until(application, entered.is_set)
+        assert not window.worker_idle
+
+        began = time.monotonic()
+        window.close()
+        assert time.monotonic() - began < 0.1
+        assert window.isVisible()
+        assert not board.has_front
+        assert window.final_reference == final_ref
+        application.processEvents()
+        assert not board.has_front
+
+        release.set()
+        _until(application, lambda: not window.isVisible(), timeout=5.0)
+        assert window.worker_idle
+        assert not board.has_front
+        assert capture.text().startswith("Capture: CLOSING")
+    finally:
+        release.set()
+        if window is not None and window.isVisible():
+            _close_window(application, window)
+
+
 def test_multi_event_capture_is_rejected_before_start(experiment, application):
     window = None
     try:
@@ -183,14 +768,32 @@ def test_render_failure_does_not_change_final_capture(
 def test_preview_budget_failure_is_visible_and_next_legal_window_succeeds(
     experiment,
     application,
+    monkeypatch,
 ):
     bad_window = None
     good_window = None
     try:
         request = experiment.readout.capture_request(SINGLE_EVENT_PULSE)
+        required = _finite_required_peak(
+            _prepare_capture_for_workbench(experiment, request)
+        )
+        # Independent frozen witness for the default 96x128 virtual topology.
+        # Any estimator/topology change must update this value deliberately,
+        # not make required-1/exact pass by changing both sides together.
+        assert required == 1_359_561
+        from zlc_neutral_atom.bootstrap import _virtual_hardware
+
+        arm_calls = []
+        original_arm = _virtual_hardware.VirtualCamera.arm
+
+        def traced_arm(camera, *args, **kwargs):
+            arm_calls.append((args, kwargs))
+            return original_arm(camera, *args, **kwargs)
+
+        monkeypatch.setattr(_virtual_hardware.VirtualCamera, "arm", traced_arm)
         bad_window = open_capture_workbench(
             experiment,
-            replace(request, pipeline_memory_limit_bytes=1),
+            replace(request, pipeline_memory_limit_bytes=required - 1),
         )
         start, capture, preview, diagnostics, board = _widgets(bad_window)
         _until(application, start.isEnabled)
@@ -199,14 +802,19 @@ def test_preview_budget_failure_is_visible_and_next_legal_window_succeeds(
         assert "FAILED" in capture.text() and "NOT FINAL" in capture.text()
         assert preview.text().startswith("Preview: FAILED")
         assert not board.has_front
+        assert arm_calls == []
         _close_window(application, bad_window)
 
-        good_window = open_capture_workbench(experiment, request)
+        good_window = open_capture_workbench(
+            experiment,
+            replace(request, pipeline_memory_limit_bytes=required),
+        )
         start, capture, _preview, _diagnostics, board = _widgets(good_window)
         _until(application, start.isEnabled)
         QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
         _until(application, lambda: good_window.final_reference is not None)
         assert capture.text().startswith("Capture: FINAL") and board.has_front
+        assert len(arm_calls) == 1
     finally:
         if bad_window is not None and bad_window.isVisible():
             _close_window(application, bad_window)

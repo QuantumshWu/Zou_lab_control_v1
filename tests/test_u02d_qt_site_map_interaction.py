@@ -340,7 +340,7 @@ def test_site_map_reuses_image_gestures_but_keeps_area_display_only():
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
         assert len(gestures) == 1
         gesture = gestures[0]
-        board.set_site_map_rectangle_candidate(gesture.normalized_bounds)
+        board.set_image_rectangle_candidate(gesture.normalized_bounds)
         assert board._selector_applied_bounds == gesture.normalized_bounds
         assert board.visible_image_origin().evaluated_input == payload.occupancy_input
 

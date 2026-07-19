@@ -1455,15 +1455,20 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._cancel_image_gesture(clear_draft=False)
         self.update()
 
-    def set_site_map_rectangle_candidate(
+    def set_image_rectangle_candidate(
         self,
         bounds: NormalizedRectangle | None,
     ) -> None:
-        """Retain one display-only spatial candidate without forging SITE authority."""
+        """Retain one image-family rectangle without forging data authority.
+
+        The candidate is complete-raster normalized display state.  It is
+        suitable for IMAGE and Sites zoom-to-area UX, but deliberately never
+        becomes :class:`zlc_data.Selection` inside the Qt leaf.
+        """
 
         self._require_owner()
-        if self.visible_site_map_payload() is None:
-            raise RuntimeError("no exact SiteMap payload is currently painted")
+        if self.visible_image_payload() is None:
+            raise RuntimeError("no exact image-family payload is currently painted")
         self._selector_applied_bounds = (
             None if bounds is None else validate_normalized_rectangle(bounds)
         )
