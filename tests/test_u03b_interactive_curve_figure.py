@@ -359,11 +359,6 @@ def test_curve_front_preserves_all_series_axes_validity_and_interacts(
             id="nonmonotonic-x",
         ),
         pytest.param(
-            _curve_figure(site_role=AxisViewRole.FACET),
-            "exactly one layer, cell, and input",
-            id="multi-cell",
-        ),
-        pytest.param(
             _curve_figure(with_fit=True),
             "exact caller-supplied result identity",
             id="fit-overlay",

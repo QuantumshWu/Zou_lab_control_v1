@@ -400,7 +400,9 @@ def test_close_does_not_wait_for_an_inflight_render(
     release = threading.Event()
     present_calls = []
     render_calls = []
-    original = DataFigure.to_png_bytes
+    # A faceted CURVE figure renders its multi-panel overview through the typed
+    # grid entry point, so gate that renderer rather than the single-panel one.
+    original = DataFigure.to_png_bytes_with_panel_regions
     original_present = QtImageBoard.present_encoded
 
     def gated_render(self, *args, **kwargs):
@@ -410,7 +412,11 @@ def test_close_does_not_wait_for_an_inflight_render(
             raise TimeoutError("test did not release closing render")
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(DataFigure, "to_png_bytes", gated_render)
+    monkeypatch.setattr(
+        DataFigure,
+        "to_png_bytes_with_panel_regions",
+        gated_render,
+    )
 
     def traced_present(self, payload, *, image_format="PNG"):
         present_calls.append((payload, image_format))

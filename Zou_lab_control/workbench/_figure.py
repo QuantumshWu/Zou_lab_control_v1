@@ -251,6 +251,7 @@ def _classify_typed_grid(
         return None, None, "typed grid requires exactly one layer and input"
     intent = figure.document.layers[0].view.intent
     data_type = {
+        ViewIntent.CURVE: EvaluatedCurve,
         ViewIntent.METER: EvaluatedMeter,
         ViewIntent.HISTOGRAM: EvaluatedHistogram,
     }.get(intent)
@@ -259,6 +260,8 @@ def _classify_typed_grid(
     cells = figure.evaluated.layers[0].cells
     if len(cells) <= 1:
         return None, None, "typed grid requires more than one logical panel"
+    grid_curve_axis = None
+    grid_value_unit = None
     for cell in cells:
         series_group = cell.series
         if not series_group or any(
@@ -268,6 +271,26 @@ def _classify_typed_grid(
             return None, None, "typed grid contains another evaluated data kind"
         if len({series.data.value_unit for series in series_group}) != 1:
             return None, None, "typed grid panel mixes value units"
+        if intent is ViewIntent.CURVE:
+            first_curve = series_group[0].data
+            assert isinstance(first_curve, EvaluatedCurve)
+            try:
+                numeric_curve_coordinates(first_curve.x_axis)
+            except (TypeError, ValueError) as error:
+                return None, None, str(error)
+            if any(
+                series.data.x_axis != first_curve.x_axis
+                for series in series_group[1:]
+            ):
+                return None, None, "typed CURVE grid panel mixes exact x axes"
+            if grid_curve_axis is None:
+                grid_curve_axis = first_curve.x_axis
+                grid_value_unit = first_curve.value_unit
+            elif (
+                first_curve.x_axis != grid_curve_axis
+                or first_curve.value_unit != grid_value_unit
+            ):
+                return None, None, "typed CURVE grid cells do not share x axis and unit"
     return intent, len(cells), None
 
 
@@ -345,8 +368,12 @@ class _TypedGridOverview:
     external_retained_upper_bound_bytes: int
 
     def __post_init__(self) -> None:
-        if self.intent not in (ViewIntent.METER, ViewIntent.HISTOGRAM):
-            raise ValueError("typed grid overview requires METER or HISTOGRAM")
+        if self.intent not in (
+            ViewIntent.CURVE,
+            ViewIntent.METER,
+            ViewIntent.HISTOGRAM,
+        ):
+            raise ValueError("typed grid overview requires CURVE, METER, or HISTOGRAM")
         if not isinstance(self.bundle, EncodedRasterDocument):
             raise TypeError("typed grid overview requires EncodedRasterDocument")
         if len(self.bundle.pages) != 1:
@@ -489,10 +516,11 @@ class _GridFocusRequest:
         if not isinstance(self.expected_selection, Selection):
             raise TypeError("grid focus requires one exact Selection")
         if _state_intent(self.display) not in (
+            ViewIntent.CURVE,
             ViewIntent.METER,
             ViewIntent.HISTOGRAM,
         ):
-            raise ValueError("grid focus supports METER or HISTOGRAM display state")
+            raise ValueError("grid focus supports CURVE, METER, or HISTOGRAM display state")
         home = self.histogram_home_x_limits
         if isinstance(self.display, HistogramDisplayState):
             if home is None:
@@ -1388,6 +1416,11 @@ def _typed_focus_preflight_nbytes(
         for series in cell.series
         if isinstance(series.data, EvaluatedHistogram)
     )
+    evaluated_bytes += sum(
+        int(series.data.values.nbytes + series.data.validity.nbytes)
+        for series in cell.series
+        if isinstance(series.data, EvaluatedCurve)
+    )
     metadata_bytes = max(0, focused_retained - evaluated_bytes)
     options = {
         "evaluated_data_upper_bound_bytes": evaluated_bytes,
@@ -1929,6 +1962,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._grid_overview: _TypedGridOverview | None = None
         self._grid_overview_presentation_bytes = 0
         self._grid_overview_admission_retained_bytes = 0
+        self._grid_focus_cache_charge_bytes = 0
         self._grid_focus_pending: _GridFocusRequest | None = None
         self._discard_grid_focus_sequence: int | None = None
 
@@ -2129,7 +2163,7 @@ class DataFigureWindow(FrozenRasterWindow):
         display: _TypedDisplayState = (
             _MeterDisplayState(panel_index, region.selection)
             if overview.intent is ViewIntent.METER
-            else HistogramDisplayState()
+            else _default_typed_state(overview.intent)
         )
         request = _GridFocusRequest(
             panel_index,
@@ -2179,7 +2213,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._board_widget.clear()
         self._display = None
         self._typed_contract = None
-        self._current_front_peak_bytes = 0
+        self._current_front_peak_bytes = self._grid_focus_cache_charge_bytes
         self._visible_fit_overlay_retained_bytes = 0
         self._visible_fit_result_identity = None
         self._visible_transient_fit_result_owner = None
@@ -2545,6 +2579,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._analyze_button.setEnabled(
             active
             and self._fit_bindings is not None
+            and self._grid_overview is None
             and self._view_family in ("curve", "image")
         )
         self._interaction_switch.setEnabled(active)
@@ -2569,6 +2604,15 @@ class DataFigureWindow(FrozenRasterWindow):
     def _fit_analysis_is_open(self) -> bool:
         pane = self._fit_pane
         return pane is not None and self._tabs.indexOf(pane) >= 0
+
+    def _fit_available_for_intent(self, intent: ViewIntent) -> bool:
+        """Keep display-faceted grid focus outside authority Fit preparation."""
+
+        return bool(
+            self._fit_bindings is not None
+            and self._grid_overview is None
+            and intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
+        )
 
     def _fit_authoring_busy_kind(self) -> str | None:
         kind = self._fit_job_kind
@@ -2597,10 +2641,18 @@ class DataFigureWindow(FrozenRasterWindow):
 
     def _open_fit_analysis(self) -> None:
         pane = self._fit_pane
+        intent = (
+            ViewIntent.CURVE
+            if self._view_family == "curve"
+            else ViewIntent.IMAGE
+            if self._view_family == "image"
+            else None
+        )
         if (
             pane is None
             or self._closing
-            or self._view_family not in ("curve", "image")
+            or intent is None
+            or not self._fit_available_for_intent(intent)
         ):
             return
         if self._tabs.indexOf(pane) < 0:
@@ -3027,7 +3079,14 @@ class DataFigureWindow(FrozenRasterWindow):
         origin: PanelInteractionOrigin,
         selection: Selection | None,
     ) -> None:
-        if self._fit_bindings is None:
+        intent = (
+            ViewIntent.CURVE
+            if self._view_family == "curve"
+            else ViewIntent.IMAGE
+            if self._view_family == "image"
+            else None
+        )
+        if intent is None or not self._fit_available_for_intent(intent):
             return
         self._fit_candidate = (
             None
@@ -3127,7 +3186,7 @@ class DataFigureWindow(FrozenRasterWindow):
         ):
             raise RuntimeError("IMAGE rectangle origin is stale")
         selection = None
-        if self._fit_bindings is not None:
+        if self._fit_available_for_intent(ViewIntent.IMAGE):
             # Resolve authority while QtRasterBoard still holds the exact front
             # on which this gesture was completed.  Painting the candidate first
             # would release that proof and make a later conversion racy.
@@ -3196,7 +3255,11 @@ class DataFigureWindow(FrozenRasterWindow):
             raise RuntimeError("numeric interaction origin is stale")
         if isinstance(command, (CurveRangeGesture, HistogramRangeGesture)):
             selection = None
-            if is_curve and self._fit_bindings is not None and command.x_span is not None:
+            if (
+                is_curve
+                and self._fit_available_for_intent(ViewIntent.CURVE)
+                and command.x_span is not None
+            ):
                 # As with IMAGE, the exact held origin must be consumed before
                 # set_curve_range_candidate finalizes the display-only gesture.
                 selection = self._board_widget.selection_for_curve_range_gesture(
@@ -3208,7 +3271,7 @@ class DataFigureWindow(FrozenRasterWindow):
                 else self._board_widget.set_histogram_range_candidate
             )
             setter(command.x_span, panel_id=_TYPED_PANEL_ID)
-            if is_curve and self._fit_bindings is not None:
+            if is_curve and self._fit_available_for_intent(ViewIntent.CURVE):
                 self._accept_fit_selection_candidate(origin, selection)
                 return
             self._diagnostic.setText(
@@ -3418,6 +3481,10 @@ class DataFigureWindow(FrozenRasterWindow):
         self._visible_transient_fit_result_retained_bytes = (
             front.transient_fit_result_retained_bytes
         )
+        if self._grid_overview is not None:
+            self._grid_focus_cache_charge_bytes = (
+                front.retained_figure_upper_bound_bytes
+            )
         if front.intent is not ViewIntent.METER and self._fit_overlay_desired is None:
             self._fit_overlay_desired = _FitOverlayRequest(
                 self._fit_analysis_revision,
@@ -3439,10 +3506,7 @@ class DataFigureWindow(FrozenRasterWindow):
                 self._typed_page.show()
                 self._typed_pages_admitted = True
             self._tabs.setCurrentWidget(self._typed_page)
-            fit_capable = (
-                self._fit_bindings is not None
-                and front.intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
-            )
+            fit_capable = self._fit_available_for_intent(front.intent)
             self._mode.setText(
                 f"EXACT {front.intent.value} · DISPLAY ONLY"
                 if front.intent is ViewIntent.METER
@@ -3484,10 +3548,7 @@ class DataFigureWindow(FrozenRasterWindow):
             ):
                 widget.show()
             self._overview_button.setVisible(self._grid_overview is not None)
-            if (
-                self._fit_bindings is not None
-                and front.intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
-            ):
+            if self._fit_available_for_intent(front.intent):
                 self._analyze_button.show()
                 if not self._fit_initial_selection_consumed:
                     initial = self._fit_bindings.initial_selection
@@ -3504,6 +3565,15 @@ class DataFigureWindow(FrozenRasterWindow):
                     self._open_fit_analysis()
             else:
                 self._analyze_button.hide()
+                if (
+                    self._grid_overview is not None
+                    and self._fit_bindings is not None
+                    and front.intent is ViewIntent.CURVE
+                ):
+                    self._diagnostic.setText(
+                        "Analyze unavailable: grid focus is a display projection; "
+                        "Fit authority requires an axis-complete source view."
+                    )
         except BaseException as error:
             self._typed_ui_faulted = True
             self._set_typed_controls_enabled(False)
@@ -3764,6 +3834,16 @@ class DataFigureWindow(FrozenRasterWindow):
         if kind == "grid_focus":
             if not isinstance(result, _TypedFigureFront):
                 raise TypeError("typed grid focus worker returned another result")
+            # The worker cache exists before Qt attempts its CAS/present.  Charge
+            # that capacity-one owner even if GUI validation or presentation
+            # rejects the completed front; a later focus replaces it atomically.
+            self._grid_focus_cache_charge_bytes = (
+                result.retained_figure_upper_bound_bytes
+            )
+            self._current_front_peak_bytes = max(
+                self._current_front_peak_bytes,
+                self._grid_focus_cache_charge_bytes,
+            )
             pending = self._grid_focus_pending
             if pending is None:
                 raise RuntimeError("typed grid focus completed without a pending panel")
@@ -3971,14 +4051,9 @@ class DataFigureWindow(FrozenRasterWindow):
         if (
             self._future is not None
             or self._closing
-            or self._view_family
-            not in (
-                "image",
-                "curve",
-                "histogram",
-                "meter",
-                "histogram-overview",
-                "meter-overview",
+            or (
+                self._view_family not in ("image", "curve", "histogram", "meter")
+                and self._view_family != overview_family
             )
             or not (overview_ready or typed_ready)
         ):
@@ -4070,6 +4145,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._grid_overview = None
         self._grid_overview_presentation_bytes = 0
         self._grid_overview_admission_retained_bytes = 0
+        self._grid_focus_cache_charge_bytes = 0
         self._grid_focus_pending = None
         self._discard_grid_focus_sequence = None
 
@@ -4363,10 +4439,10 @@ def _figure_window_factory(
             )
             if focused.retained_upper_bound_nbytes > focused_bound:
                 raise RuntimeError("focused typed panel exceeded its preflight bound")
-            cached_typed = focused
-            cached_base = focused
-            cached_grid_histogram_home_x_limits = state.histogram_home_x_limits
-            return _render_typed_front(
+            # Keep focus derivation transactional: a failed/cancelled Agg must
+            # release the local DTO instead of publishing it into the worker
+            # closure without a matching Qt-side cache charge.
+            front = _render_typed_front(
                 focused,
                 display,
                 current_value_limits=None,
@@ -4379,9 +4455,13 @@ def _figure_window_factory(
                 external_session_retained_bytes=external_retained,
                 post_commit_external_session_retained_bytes=external_retained,
                 histogram_projection_value_range=(
-                    cached_grid_histogram_home_x_limits
+                    state.histogram_home_x_limits
                 ),
             )
+            cached_typed = focused
+            cached_base = focused
+            cached_grid_histogram_home_x_limits = state.histogram_home_x_limits
+            return front
         figure = cached_typed
         base = cached_base
         if base is None:

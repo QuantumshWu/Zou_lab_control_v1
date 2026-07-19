@@ -87,6 +87,7 @@ tests/test_u03d_typed_fit_overlay_frontend.py
 tests/test_u03d_unified_figure_fit_workbench.py
 tests/test_u03f_meter_grid_figure.py
 tests/test_u03g_histogram_grid_figure.py
+tests/test_u03h_curve_grid_figure.py
 tests/test_zlc_site_map_geometry.py
 tests/test_zlc_occupancy_processor.py
 tests/test_zlc_pulse_authoring.py

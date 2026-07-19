@@ -399,6 +399,72 @@ def _curve(axis, layer, cell, series_group, fit_result):
         axis.legend(fontsize=ANNOTATION_FONT_SIZE)
 
 
+def _shared_curve_limits(
+    panels,
+    fit_results,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Return comparison x/y ranges for a homogeneous source-only curve grid.
+
+    The standalone focused panel deliberately does not consume this range: it
+    keeps the ordinary Curve relim policy, matching main's LineCell/GridPlot
+    split between comparable thumbnails and a detailed focus view.
+    """
+
+    if fit_results or len(panels) <= 1:
+        return None
+    if len({layer.layer_id for layer, _cell, _series in panels}) != 1:
+        return None
+    curves = tuple(
+        series.data
+        for _layer, _cell, series_group in panels
+        for series in series_group
+    )
+    if not curves or any(not isinstance(curve, EvaluatedCurve) for curve in curves):
+        return None
+    first = curves[0]
+    if any(
+        curve.x_axis != first.x_axis or curve.value_unit != first.value_unit
+        for curve in curves[1:]
+    ):
+        return None
+    try:
+        shared_x_limits = curve_home_x_limits(first.x_axis)
+    except (TypeError, ValueError):
+        # Numeric/strictly-monotonic X is an interactive-CURVE requirement,
+        # not a generic Figure requirement.  Categorical/repeated/nonmonotonic
+        # curves remain complete encoded panels with ordinary Matplotlib relim.
+        return None
+
+    data_min = math.inf
+    data_max = -math.inf
+    for curve in curves:
+        values = np.asarray(curve.values)
+        if np.iscomplexobj(values):
+            raise ValueError(
+                "complex curves require an explicit real-valued display transform"
+            )
+        valid = np.asarray(curve.validity, dtype=bool)
+        if not bool(np.any(valid)):
+            continue
+        selected = values[valid]
+        if not bool(np.all(np.isfinite(selected))):
+            raise ValueError("valid curve values must all be finite")
+        data_min = min(data_min, float(np.min(selected)))
+        data_max = max(data_max, float(np.max(selected)))
+    y_limits = (
+        (0.0, 1.0)
+        if not math.isfinite(data_min)
+        else deadband_display_range(
+            RelimMode.TIGHT,
+            None,
+            data_min,
+            data_max,
+            force=True,
+        )
+    )
+    return shared_x_limits, y_limits
+
+
 def _draw_projected_image(
     axis,
     figure,
@@ -1343,6 +1409,7 @@ def _render_evaluated_figure(
                 default=0,
             ),
         )
+    shared_curve_limits = _shared_curve_limits(panels, fit_results)
     radial_color_limits = _radial_image_color_limits_by_layer(
         panels,
         fit_results,
@@ -1365,6 +1432,10 @@ def _render_evaluated_figure(
             kind = series_group[0].data
             if isinstance(kind, EvaluatedCurve):
                 _curve(target, layer, cell, series_group, fit_result)
+                if shared_curve_limits is not None:
+                    shared_x_limits, shared_y_limits = shared_curve_limits
+                    target.set_xlim(*shared_x_limits)
+                    target.set_ylim(*shared_y_limits)
             elif isinstance(kind, EvaluatedImage):
                 _image(
                     target,

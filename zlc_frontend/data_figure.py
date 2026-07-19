@@ -31,6 +31,7 @@ from .figure import (
     AxisViewRole,
     DatasetId,
     EvaluatedCell,
+    EvaluatedCurve,
     EvaluatedFigureData,
     EvaluatedHistogram,
     EvaluatedLayer,
@@ -44,6 +45,7 @@ from .figure import (
     ViewIntent,
 )
 from .figure.contract import _validate_selection_fit_view
+from .curve_display import numeric_curve_coordinates
 
 if TYPE_CHECKING:
     from .fit_curve_projection import CurveFitOverlayPlan
@@ -476,12 +478,13 @@ class DataFigure:
         if not isinstance(expected_intent, ViewIntent):
             raise TypeError("expected_intent must be ViewIntent")
         data_type = {
+            ViewIntent.CURVE: EvaluatedCurve,
             ViewIntent.METER: EvaluatedMeter,
             ViewIntent.HISTOGRAM: EvaluatedHistogram,
         }.get(expected_intent)
         if data_type is None:
             raise ValueError(
-                "focused typed panels currently support METER or HISTOGRAM"
+                "focused typed panels currently support CURVE, METER, or HISTOGRAM"
             )
         if self._fit_results:
             raise ValueError("focused typed display does not accept fit overlays")
@@ -511,6 +514,11 @@ class DataFigure:
         value_units = {series.data.value_unit for series in cell.series}
         if len(value_units) != 1:
             raise ValueError("focused typed panel mixes value units")
+        if expected_intent is ViewIntent.CURVE:
+            first_axis = cell.series[0].data.x_axis
+            numeric_curve_coordinates(first_axis)
+            if any(series.data.x_axis != first_axis for series in cell.series[1:]):
+                raise ValueError("focused CURVE series do not share one exact x axis")
         source_schemas = tuple(
             item for item in self._source_schemas if item[0] == layer.dataset_id
         )
@@ -529,6 +537,11 @@ class DataFigure:
             int(series.data.samples.nbytes)
             for series in cell.series
             if isinstance(series.data, EvaluatedHistogram)
+        )
+        array_bytes += sum(
+            int(series.data.values.nbytes + series.data.validity.nbytes)
+            for series in cell.series
+            if isinstance(series.data, EvaluatedCurve)
         )
         metadata_seed = (
             self._document.descriptor(layer.dataset_id),
