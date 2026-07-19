@@ -82,7 +82,7 @@ from zlc_frontend.qt_widgets import (
     screen_fit_window_size,
     scaled_px,
     set_fluent_scale,
-    show_fluent_popup_for_anchor,
+    FluentSettingsPopupAnchor,
     sync_revisioned_form_editors,
 )
 from zlc_frontend.render import RenderSurface
@@ -652,8 +652,10 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             "Histogram",
         )
         settings_layout.addWidget(self._setting_display_tabs)
-        self._settings_dismissed_at = float("-inf")
-        self._settings_popup._on_hidden = self._record_settings_dismissed
+        self._settings_anchor = FluentSettingsPopupAnchor(
+            self._settings_popup,
+            self._setting_button,
+        )
         self._sync_image_display_editors()
         self._sync_curve_display_editors()
         self._sync_histogram_display_editors()
@@ -771,25 +773,15 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             setter(bool(enabled))
 
     def _open_display_settings(self) -> None:
-        if not self._setting_button.isEnabled():
-            return
-        popup = self._settings_popup
-        if popup.isVisible():
-            popup.hide()
-            return
-        if time.monotonic() - self._settings_dismissed_at < 0.25:
-            return
-        self._reload_image_display_editor(self._setting_image_display)
-        self._reload_curve_display_editor(self._setting_curve_display)
-        self._reload_histogram_display_editor(self._setting_histogram_display)
-        show_fluent_popup_for_anchor(
-            popup,
-            self._setting_button,
-            self._setting_display_tabs,
-        )
+        def reseed() -> None:
+            self._reload_image_display_editor(self._setting_image_display)
+            self._reload_curve_display_editor(self._setting_curve_display)
+            self._reload_histogram_display_editor(self._setting_histogram_display)
 
-    def _record_settings_dismissed(self) -> None:
-        self._settings_dismissed_at = time.monotonic()
+        self._settings_anchor.toggle(
+            self._setting_display_tabs,
+            prepare=reseed,
+        )
 
     def _update_display_controls(self) -> None:
         live_healthy = self._live is None or self._live.fault is None

@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import threading
+import time
 import weakref
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -776,6 +777,78 @@ def show_fluent_popup_for_anchor(
     popup.move(left, top)
     popup.show()
     popup.raise_()
+
+
+class FluentSettingsPopupAnchor:
+    """Own the true-toggle contract between one Setting button and its popup.
+
+    A ``Qt.Popup`` auto-closes on any outside mouse press, including the press
+    on the very button that opened it.  Without a dismissal record the release
+    of that same click reopens the popup, so the button stops behaving like a
+    toggle.  This owner records every hide through :attr:`FluentPopup._on_hidden`
+    and refuses to reopen inside ``reopen_debounce_s`` of it, which is the
+    single source of that debounce for every Workbench Setting surface.
+
+    ``prepare`` runs only on the branch that actually shows the popup, so the
+    editors a window reseeds before display are never reseeded on the hide or
+    debounce branches.
+    """
+
+    def __init__(
+        self,
+        popup: FluentPopup,
+        anchor: QtWidgets.QWidget,
+        *,
+        reopen_debounce_s: float = 0.25,
+    ) -> None:
+        if not isinstance(popup, FluentPopup):
+            raise TypeError("popup must be FluentPopup")
+        if not isinstance(anchor, QtWidgets.QWidget):
+            raise TypeError("anchor must be QWidget")
+        if isinstance(reopen_debounce_s, bool) or not isinstance(
+            reopen_debounce_s, (int, float)
+        ):
+            raise TypeError("reopen_debounce_s must be a real number")
+        if not math.isfinite(reopen_debounce_s) or reopen_debounce_s < 0.0:
+            raise ValueError("reopen_debounce_s must be finite and non-negative")
+        self._popup = popup
+        self._anchor = anchor
+        self._reopen_debounce_s = float(reopen_debounce_s)
+        self._dismissed_at = float("-inf")
+        popup._on_hidden = self._record_dismissed
+
+    def _record_dismissed(self) -> None:
+        self._dismissed_at = time.monotonic()
+
+    def toggle(
+        self,
+        content: QtWidgets.QWidget,
+        *,
+        prepare=None,
+        minimum_width: int = 360,
+        minimum_height: int = 300,
+    ) -> None:
+        """Close a visible popup, otherwise prepare and show it beside the anchor."""
+
+        if prepare is not None and not callable(prepare):
+            raise TypeError("prepare must be callable or None")
+        if not self._anchor.isEnabled():
+            return
+        popup = self._popup
+        if popup.isVisible():
+            popup.hide()
+            return
+        if time.monotonic() - self._dismissed_at < self._reopen_debounce_s:
+            return
+        if prepare is not None:
+            prepare()
+        show_fluent_popup_for_anchor(
+            popup,
+            self._anchor,
+            content,
+            minimum_width=minimum_width,
+            minimum_height=minimum_height,
+        )
 
 
 class FluentGroupBox(QtWidgets.QGroupBox):

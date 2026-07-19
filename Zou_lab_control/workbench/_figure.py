@@ -106,7 +106,7 @@ from zlc_frontend.qt_widgets import (
     QtRasterBoard,
     QtImageBoard,
     runtime_range_placeholders,
-    show_fluent_popup_for_anchor,
+    FluentSettingsPopupAnchor,
     sync_revisioned_form_editors,
 )
 from zlc_neutral_atom.artifacts import FitExecution, FitResultArtifactRef
@@ -2057,12 +2057,11 @@ class DataFigureWindow(FrozenRasterWindow):
         ):
             widget.hide()
 
-        self._settings_button.clicked.connect(
-            lambda: show_fluent_popup_for_anchor(
-                self._settings_popup,
-                self._settings_button,
-            )
+        self._settings_anchor = FluentSettingsPopupAnchor(
+            self._settings_popup,
+            self._settings_button,
         )
+        self._settings_button.clicked.connect(self._open_display_settings)
         self._export_button.clicked.connect(self._choose_export)
         self._analyze_button.clicked.connect(self._open_fit_analysis)
         self._overview_button.clicked.connect(self._show_grid_overview)
@@ -2506,6 +2505,15 @@ class DataFigureWindow(FrozenRasterWindow):
                 pass
             self._status.setText("TYPED CONTROLS FAILED")
             self._diagnostic.setText(error_summary(error))
+
+    def _open_display_settings(self) -> None:
+        setting = self._setting_display
+        if setting is None:
+            return
+        self._settings_anchor.toggle(
+            setting,
+            prepare=lambda: self._reload_editor(setting),
+        )
 
     def _reload_editor(self, editor: FluentRevisionedFormEditor) -> None:
         if editor not in self._editors():

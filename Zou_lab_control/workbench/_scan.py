@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 
 from PyQt5 import QtCore, QtWidgets
 
@@ -35,7 +34,7 @@ from zlc_frontend.qt_widgets import (
     screen_fit_window_size,
     scaled_px,
     set_fluent_scale,
-    show_fluent_popup_for_anchor,
+    FluentSettingsPopupAnchor,
     sync_revisioned_form_editors,
 )
 from zlc_frontend.curve_display import (
@@ -209,7 +208,6 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             tuple[float, float],
         ] | None = None
         self._curve_binding_active = False
-        self._settings_dismissed_at = float("-inf")
         self._local_display_diagnostic = ""
         self._reported_final_reference = None
 
@@ -317,7 +315,10 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         )
         self._setting_curve_display.setObjectName("scanCurveSettingEditor")
         settings_layout.addWidget(self._setting_curve_display)
-        self._settings_popup._on_hidden = self._record_settings_dismissed
+        self._settings_anchor = FluentSettingsPopupAnchor(
+            self._settings_popup,
+            self._setting_button,
+        )
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self._mode)
         layout.addWidget(self._status)
@@ -647,23 +648,12 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._refresh_diagnostics(model)
 
     def _open_display_settings(self) -> None:
-        if not self._setting_button.isEnabled():
-            return
-        popup = self._settings_popup
-        if popup.isVisible():
-            popup.hide()
-            return
-        if time.monotonic() - self._settings_dismissed_at < 0.25:
-            return
-        self._reload_curve_display_editor(self._setting_curve_display)
-        show_fluent_popup_for_anchor(
-            popup,
-            self._setting_button,
+        self._settings_anchor.toggle(
             self._setting_curve_display,
+            prepare=lambda: self._reload_curve_display_editor(
+                self._setting_curve_display
+            ),
         )
-
-    def _record_settings_dismissed(self) -> None:
-        self._settings_dismissed_at = time.monotonic()
 
     def _record_display_failure(self, message: str) -> None:
         self._local_display_diagnostic = str(message).strip()

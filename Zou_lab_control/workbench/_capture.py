@@ -59,7 +59,7 @@ from zlc_frontend.qt_widgets import (
     screen_fit_window_size,
     scaled_px,
     set_fluent_scale,
-    show_fluent_popup_for_anchor,
+    FluentSettingsPopupAnchor,
     sync_revisioned_form_editors,
 )
 from zlc_frontend.render import RenderSurface
@@ -185,8 +185,10 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             "captureImageDisplaySettingEditor"
         )
         settings_layout.addWidget(self._setting_image_display)
-        self._settings_dismissed_at = float("-inf")
-        self._settings_popup._on_hidden = self._record_settings_dismissed
+        self._settings_anchor = FluentSettingsPopupAnchor(
+            self._settings_popup,
+            self._setting_button,
+        )
         self._sync_image_display_editors()
 
         controls = QtWidgets.QHBoxLayout()
@@ -271,23 +273,12 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             )
 
     def _open_display_settings(self) -> None:
-        if not self._setting_button.isEnabled():
-            return
-        popup = self._settings_popup
-        if popup.isVisible():
-            popup.hide()
-            return
-        if time.monotonic() - self._settings_dismissed_at < 0.25:
-            return
-        self._reload_image_display_editor(self._setting_image_display)
-        show_fluent_popup_for_anchor(
-            popup,
-            self._setting_button,
+        self._settings_anchor.toggle(
             self._setting_image_display,
+            prepare=lambda: self._reload_image_display_editor(
+                self._setting_image_display
+            ),
         )
-
-    def _record_settings_dismissed(self) -> None:
-        self._settings_dismissed_at = time.monotonic()
 
     def _visible_image_matches_display_revision(self) -> bool:
         origin = self._board_widget.visible_image_origin()

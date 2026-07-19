@@ -7,7 +7,6 @@ from dataclasses import replace
 import math
 from pathlib import Path
 import threading
-import time
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -61,7 +60,7 @@ from zlc_frontend.qt_widgets import (
     QtRasterBoard,
     RectangleGesture,
     runtime_range_placeholders,
-    show_fluent_popup_for_anchor,
+    FluentSettingsPopupAnchor,
     signals_blocked,
     sync_revisioned_form_editors,
 )
@@ -937,8 +936,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             "savedFitGridImageDisplaySettingEditor"
         )
         settings_layout.addWidget(self._setting_image_display)
-        self._settings_dismissed_at = float("-inf")
-        self._settings_popup._on_hidden = self._record_settings_dismissed
 
         self._previous_page_button = FluentButton(
             "Previous page",
@@ -957,6 +954,10 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._setting_button = FluentButton("Setting…", self, color=GREY)
         self._setting_button.setObjectName("savedFitGridDisplaySettingButton")
         self._setting_button.setEnabled(False)
+        self._settings_anchor = FluentSettingsPopupAnchor(
+            self._settings_popup,
+            self._setting_button,
+        )
         self._analyze_button = FluentButton(
             "Analyze → Fit/Refit",
             self,
@@ -1049,23 +1050,12 @@ class SavedFitGridWindow(FrozenRasterWindow):
             and self._board_widget.front_frame is self._current_frame
         )
 
-    def _record_settings_dismissed(self) -> None:
-        self._settings_dismissed_at = time.monotonic()
-
     def _open_display_settings(self) -> None:
-        if not self._setting_button.isEnabled():
-            return
-        popup = self._settings_popup
-        if popup.isVisible():
-            popup.hide()
-            return
-        if time.monotonic() - self._settings_dismissed_at < 0.25:
-            return
-        self._reload_image_display_editor(self._setting_image_display)
-        show_fluent_popup_for_anchor(
-            popup,
-            self._setting_button,
+        self._settings_anchor.toggle(
             self._setting_image_display,
+            prepare=lambda: self._reload_image_display_editor(
+                self._setting_image_display
+            ),
         )
 
     def _install_model(self, model: FitGridModel) -> None:

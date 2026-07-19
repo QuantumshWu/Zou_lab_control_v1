@@ -21,7 +21,7 @@ from zlc_frontend.qt_widgets import (
     AxisLayoutNavigator, FluentButton, FluentLabel, FluentPopup, FluentSwitch,
     FluentRevisionedFormEditor, FluentTabWidget, GREY, QtOwnerWake,
     QtRasterBoard, RectangleGesture,
-    runtime_range_placeholders, show_fluent_popup_for_anchor, signals_blocked,
+    FluentSettingsPopupAnchor, runtime_range_placeholders, signals_blocked,
     sync_revisioned_form_editors,
 )
 from zlc_frontend.render import (
@@ -250,6 +250,10 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         )
         self._setting_display.setObjectName("occupancyCellSettingEditor")
         popup_layout.addWidget(self._setting_display)
+        self._settings_anchor = FluentSettingsPopupAnchor(
+            self._settings_popup,
+            self._setting_button,
+        )
 
         self._wake = QtOwnerWake(self)
         self._wake.bind(self._owner_cycle)
@@ -586,14 +590,9 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         self._start_next()
 
     def _open_display_settings(self):
-        if not self._setting_button.isEnabled():
-            return
-        if self._settings_popup.isVisible():
-            self._settings_popup.hide()
-            return
-        self._reload_editor(self._setting_display)
-        show_fluent_popup_for_anchor(
-            self._settings_popup, self._setting_button, self._setting_display,
+        self._settings_anchor.toggle(
+            self._setting_display,
+            prepare=lambda: self._reload_editor(self._setting_display),
         )
 
     def _update_controls(self):
