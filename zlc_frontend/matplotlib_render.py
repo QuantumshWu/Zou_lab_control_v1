@@ -102,6 +102,20 @@ def _array_nbytes(value: object) -> int:
     return 0
 
 
+def evaluated_figure_array_nbytes(evaluated: EvaluatedFigureData) -> int:
+    """Return the exact ndarray bytes retained by one frozen evaluation.
+
+    The value is intentionally narrower than a render-peak estimate: product
+    composition uses it as the data term of
+    :func:`estimate_live_panel_raster_peak_nbytes`, so the same immutable
+    arrays are not guessed again from rank or dtype at the Workbench boundary.
+    """
+
+    if not isinstance(evaluated, EvaluatedFigureData):
+        raise TypeError("evaluated must be EvaluatedFigureData")
+    return _array_nbytes(evaluated)
+
+
 def estimate_render_peak_nbytes(
     evaluated: EvaluatedFigureData,
     *,
@@ -131,6 +145,7 @@ def estimate_live_panel_raster_peak_nbytes(
     *,
     evaluated_data_upper_bound_bytes: int = 0,
     histogram_bins: int | None = None,
+    histogram_series_count: int = 1,
     extra_retained_fronts: int = 0,
     extra_retained_evaluated_data_bytes: int = 0,
 ) -> int:
@@ -165,9 +180,18 @@ def estimate_live_panel_raster_peak_nbytes(
     histogram_payload_bytes = 0
     if histogram_bins is not None:
         bins = positive_integer(histogram_bins, "histogram_bins")
-        counts_bytes = bins * np.dtype("<i8").itemsize
+        series_count = positive_integer(
+            histogram_series_count,
+            "histogram_series_count",
+        )
+        counts_bytes = series_count * bins * np.dtype("<i8").itemsize
         edges_bytes = (bins + 1) * np.dtype(np.float64).itemsize
-        vertices_bytes = 2 * (2 * bins + 2) * np.dtype(np.float64).itemsize
+        vertices_bytes = (
+            series_count
+            * 2
+            * (2 * bins + 2)
+            * np.dtype(np.float64).itemsize
+        )
         histogram_geometry_bytes = (
             counts_bytes + edges_bytes + vertices_bytes
         )
@@ -1567,6 +1591,7 @@ class SinglePanelAggRenderer:
 
 __all__ = [
     "encode_evaluated_figure_with_panel_regions",
+    "evaluated_figure_array_nbytes",
     "estimate_live_panel_raster_peak_nbytes",
     "estimate_projected_radial_fit_render_peak_nbytes",
     "estimate_render_peak_nbytes",

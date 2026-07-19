@@ -60,6 +60,7 @@ from zlc_frontend.figure import (
     suggest_fit_view,
 )
 from zlc_neutral_atom.artifacts import CaptureFitResultRepository
+from Zou_lab_control.workbench._frozen_raster import FrozenRasterWindow
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -407,7 +408,8 @@ def test_public_execution_and_saved_ref_reopen_the_same_selection_transform(
                 application,
                 lambda: draft_window.worker_idle and draft_window.raster_ready,
             )
-            assert type(draft_window).__name__ == "FrozenRasterWindow"
+            assert isinstance(draft_window, FrozenRasterWindow)
+            assert draft_window._view_family == "encoded"
         finally:
             draft_window.close()
             _until(

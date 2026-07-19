@@ -95,6 +95,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         controls = QtWidgets.QHBoxLayout()
         controls.addStretch(1)
         controls.addWidget(self._close_button)
+        self._controls = controls
         self._layout = QtWidgets.QVBoxLayout(self)
         self._layout.addWidget(self._mode)
         self._layout.addWidget(self._status)

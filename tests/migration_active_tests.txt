@@ -78,6 +78,7 @@ tests/test_u02d_site_map_viewport.py
 tests/test_u02d_site_map_payload.py
 tests/test_u02d_qt_site_map_interaction.py
 tests/test_u02e_qt_histogram_interaction.py
+tests/test_u03a_interactive_histogram_figure.py
 tests/test_zlc_site_map_geometry.py
 tests/test_zlc_occupancy_processor.py
 tests/test_zlc_pulse_authoring.py
