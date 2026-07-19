@@ -2554,7 +2554,6 @@ class DataFigureWindow(FrozenRasterWindow):
             and self._view_family == overview.intent.value.lower()
             and self._future is None
         )
-        self._overview_button.setEnabled(False)
         for editor in (self._edit_display, self._setting_display):
             if editor is not None:
                 editor.setEnabled(active)
@@ -3782,6 +3781,11 @@ class DataFigureWindow(FrozenRasterWindow):
                 expected_state=pending.display,
                 request_revision=self._request_revision,
             )
+            if (
+                result.intent is not ViewIntent.METER
+                and not self._typed_ui_faulted
+            ):
+                self._sync_committed_typed_controls()
             return
         if kind == "typed":
             if not isinstance(result, _TypedFigureFront):

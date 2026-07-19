@@ -391,6 +391,8 @@ def test_histogram_grid_overview_focus_interaction_back_and_exports(
         assert tuple(
             window._tabs.tabText(index) for index in range(window._tabs.count())
         ) == ("Histogram", "Edit")
+        assert window._overview_button.isVisible()
+        assert window._overview_button.isEnabled()
         assert _wheel_histogram(window._board_widget, -120).isAccepted()
         _until(application, lambda: window.worker_idle and window.raster_ready)
         assert window._display.revision == 1
@@ -428,7 +430,8 @@ def test_histogram_grid_overview_focus_interaction_back_and_exports(
             )
             assert rgba.tobytes() == focused_frame.panels[0].raster.pixels
 
-        window._show_grid_overview()
+        window._overview_button.click()
+        application.processEvents()
         assert window._view_family == "histogram-overview"
         assert window._tabs.currentWidget() is window._boards[0]
         assert not window._tabs.tabBar().isVisible()
