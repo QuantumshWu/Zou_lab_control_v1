@@ -183,6 +183,8 @@ class _FrozenScanApplication:
 class ScanWorkbenchWindow(QtWidgets.QWidget):
     """Progressive occupancy/final scan panel; rendering never blocks Qt."""
 
+    finalReferenceChanged = QtCore.pyqtSignal(object)
+
     def __init__(
         self,
         experiment: Experiment,
@@ -209,6 +211,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._curve_binding_active = False
         self._settings_dismissed_at = float("-inf")
         self._local_display_diagnostic = ""
+        self._reported_final_reference = None
 
         occupancy = isinstance(request, OccupancyScanRequest)
         progressive = occupancy and isinstance(
@@ -773,6 +776,9 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(0, self.close)
 
     def _apply_model(self, model: ScanPanelViewModel) -> None:
+        if model.artifact_ref != self._reported_final_reference:
+            self._reported_final_reference = model.artifact_ref
+            self.finalReferenceChanged.emit(model.artifact_ref)
         progressive_mode = self._progressive_requested and model.artifact_ref is None and (
             model.can_start
             or model.status.startswith("PREPARING")

@@ -162,7 +162,7 @@ hardware_change_review_allowed :=
 | `UX-001` | 修改已有 ROI 时 raw camera source 与可见 raw 画面不断流；running downstream 在 drag 完成后直接 retarget | M2d/M2e 以 immutable whole-Run replacement 重启 source/stream/history，且 draft 还需额外 `Apply ROI` | 为避免首个 consumer 前置 ControlTopic 而选了较小实现 | **待用户批准 / 默认必须修复**：drag release 自动提交 revisioned ROI ControlTopic，事务边界 APPLIED 后才显示 applied；新建/删除只替换下游 generation；source Run、raw front、tap topology 不变的 E2E |
 | `UX-002` | live plot 的 selector、zoom/pan、十字、hover 读值、relim 与 cmap/limits 覆盖旧 plot contract；拖动只冻结当前 panel，其它 panel 不停流，松手补拍。旧 1D/Monitor 的 Area 实际画二维矩形却只消费 x，纯水平拖会被误清 | U0.2b 已在 free-running camera monitor IMAGE 恢复完整 A/C/Z/H/hover、ViewportTransform、三种 relim、六种 cmap、同源 Setting/Edit 与 per-panel hold；U0.2c 又让 rolling Monitor 与真实 occupancy progressive `SCAN_POINT` 共用原生 x-span、continuous cross、真实 sample hover、x-only zoom/pan/home、三态 y relim、同源 Setting/Edit 与 panel-local hold；U0.2d 已在exact occupancy cell恢复Sites的双轴A/C/Z/H、nearest-site hover、clim、Setting/Edit与display-only rectangle；U0.2e 已在同一camera ROI scalar history的live Histogram恢复A/C/Z/H/pan/hover、linear/log count axis、shared bins、x pin、三态count relim、同源Setting/Edit与panel-local hold；U0.2f 又让finite exact capture IMAGE复用同一IMAGE owner取得完整A/C/Z/H/hover、clim/cmap、Setting/Edit和display-only rectangle。live Sites、generic Distribution/Grid及真实 launcher 的全 plot-kind handle 仍未闭合 | 早期窄 leaf 被误当作可长期冻结产品面；旧 1D selector 的视觉维度与实际 authority 维度不一致 | **待用户批准 / 默认必须继续修复**：剩余live plot kind的非空交互句柄、各自relim/axis语义、grid focus与launcher E2E；已经共用唯一强类型owner的finite/live IMAGE、CURVE/SCAN_POINT、current ROI scalar Histogram与exact Sites行为不得回退，display-only rectangle/range不得静默升级为Analysis authority |
 | `UX-003` | figure viewer 载入后是可交互 panel，可 zoom/pan、重新 fit 与导出；GridPlot 可 focus/返回 | U0.3a-b-c-d 已把单panel HISTOGRAM/CURVE/IMAGE 与 fit-bearing CURVE/IMAGE 接入同一 typed board；range/cross/zoom/pan/home、relim/cmap/limits、Setting/Edit、原子导出、即时 fit overlay 已恢复。exact saved-fit GridPlot 保留 focus/返回/导出，并且只有聚焦真实 cell 后才启用显式 `Analyze -> Fit/Refit`；Overview/hole 不暗选第一格。尚未闭合的是 generic METER、多cell/多layer DataFigure 与非 Fit 的其它 archive plot kind；报告类多页仍是 frozen raster | 先以 immutable raster 闭合线程/内存所有权，再按真实consumer逐个恢复typed交互面；typed资格不足时保留完整whole-figure renderer，不以丢fit/轴/series换交互 | **待用户批准 / 默认必须继续修复**：剩余 generic METER、多cell/多layer与其它archive plot kind；U0.3a-d及W7已恢复的typed交互、explicit-cell Refit与报告导出不得回退，报告类多页至少补zoom |
-| `UX-004` | plot/panel 内直接发起 fit，框选与 fit selection 联动，普通 Fit 一步生效；2D box ROI fit 可见 | U0.3d 已闭合通用 Figure 的 `Analyze -> Fit`、1D range、2D box ROI、一键authority draft、Capture/Scan exact source、即时CURVE/IMAGE overlay、Save/reopen/Refit和`fit_gui`委托同一host；尚缺 TaskConsole catalog 的 `Add Analysis -> Fit` formal post-materialization入口 | 先交付typed solver/editor与exact artifact，再将独立W5 host物理删除并并入DataFigure | **待用户批准 / 默认必须继续修复**：TaskConsole `Add Analysis -> Fit` 与真实launcher E2E；U0.3d已闭合的普通Fit一步提交、selector预填、双空间轴fit和唯一host不得回退 |
+| `UX-004` | plot/panel 内直接发起 fit，框选与 fit selection 联动，普通 Fit 一步生效；2D box ROI fit 可见 | U0.3d 已闭合通用 Figure 的 `Analyze -> Fit`、1D range、2D box ROI、一键authority draft、Capture/Scan exact source、即时CURVE/IMAGE overlay、Save/reopen/Refit和`fit_gui`委托同一host；U0.3e 又让真实 current TaskConsole 在当前 card 产生精确 FINAL `ScanArtifactRef` 后开放 `Add Analysis -> Fit`，委托同一 DataFigure/Fit host，并把根 launcher 从旧 SignalHub/registry UI 切到同一 Workbench | 先交付typed solver/editor与exact artifact，再将独立W5 host物理删除并并入DataFigure；TaskConsole只桥接已提交artifact，不为无人消费的自动分析预建第二生命周期 | **CLOSED**：Figure与TaskConsole两入口、真实launcher、selector预填、双空间轴fit、显式Save/reopen和唯一host均有current E2E；不得回退或把display selection升级为authority |
 | `UX-005` | TaskConsole 支持全部 addable plot kind、Monitor board、Logic rows、Start/Stop、统一 Setting/Edit、树形 signal picker、布局与 workspace | 当前 target TaskConsole 仍是 one-card/one-Task 窄产品，不能完成旧 tutorial 日常流程 | 纵向迁移尚未接完，而窄 checkpoint 容易被误读为产品完成 | **待用户批准 / 默认必须修复**：U0#4 全清单与真实 launcher tutorial E2E 零代码走通 |
 | `UX-006` | calibration/site-map/occupancy 图沿统一交互 viewer/GridPlot 获得 focus、selector、zoom 与 export | 已提交 calibration report 与 exact occupancy cell viewer 是静态 frozen raster；未提交工作树不能作为闭合证据 | 先闭合 immutable report/exact-address 与预算/线程所有权 | **待用户批准 / 默认必须修复**：报告类多页至少 zoom；通用 calibration/occupancy 查看路径按旧 surface 补适用的 focus/selector/export，或逐项提交用户裁决 |
 | `UX-007` | 旧实现可能按 first/flatten/trailing mean 直接把非标量送入权威结果 | 新设计只让显示层 role-driven auto；fit/scan-y/derived artifact 必须显式冻结 `CommittedTransform` | 防止静默丢轴和错误物理结论 | **待用户批准；安全边界不可回退**：默认视图低摩擦、当前投影始终可见可改、authority draft 由视图预填但明确提交 |
@@ -301,7 +301,7 @@ FitResultBatch 的 canonical payload codec 属于 `zlc_data`，但 durable ident
 
 “selector”必须拆开看：`Selection` 是可保存、可供 fit/processor 共同消费的数据语义，属于 zlc_data；鼠标手势、RectangleSelector、handle、overlay 和 interaction state 属于 frontend。`DataFigure` 明确属于 frontend，因为它是 render/public presentation facade。fit editor/overlay 属于 frontend，但它们调用 zlc_data 的唯一 fit 实现，不复制模型和结果 schema。editor 只能从 public immutable `fit_model_catalog()`/`fit_model_definition()` 取得模型与参数 metadata，并从 BoundFit 的 `parameter_definitions/parameter_units` 取得绑定后单位；不能导入 fit implementation submodule 或在 frontend 硬编码第二份模型表。
 
-zlc_data 用 `bind_fit(FitSpec, expected DatasetSchema) -> BoundFit` 冻结并验证 fit/batch axes、CommittedTransform、model 与数值策略，但不捕获尚未产生的数据。`BoundFit.run(OwnedSnapshot) -> FitResultBatch` 是 formal、interactive 与 offline 三条路径共享的唯一执行值；OwnedSnapshot 同时持有 frozen DataBlock 与 exact DatasetRevisionRef，禁止 adapter 只传裸 block 丢掉 lineage。neutral runtime 只把 `BoundFit + DatasetInputSlot` 放进无 Fit 语义的通用 `AnalysisStep`。baseline 不再建立 `FitAnalysisDescriptor -> DataAnalysisProgram` 两层通用分析框架；出现第二个确实需要相同跨 context bind/replay 语义的领域中立 Analysis 后再提取。neutral 不得定义 `FitProcessor`、`FitOperator` 或 neutral-owned `FitAnalysisDefinition`，Workbench 只把 zlc_data 的 FitSpec/editor capability 投影进 `Add Analysis`。
+zlc_data 用 `bind_fit(FitSpec, expected DatasetSchema) -> BoundFit` 冻结并验证 fit/batch axes、CommittedTransform、model 与数值策略，但不捕获尚未产生的数据。`BoundFit.run(OwnedSnapshot) -> FitResultBatch` 是当前 interactive、offline/artifact 与未来确有消费者的 formal 路径共享的唯一执行值；OwnedSnapshot 同时持有 frozen DataBlock 与 exact DatasetRevisionRef，禁止 adapter 只传裸 block 丢掉 lineage。当前 baseline 不建立 `DatasetInputSlot`、generic `AnalysisStep`、`FitAnalysisDescriptor -> DataAnalysisProgram` 或 post-materialization workflow：真实用户需求只是对已提交 FINAL Capture/Scan artifact 明确打开Fit并显式保存结果，现有 `FitResultRepository` 已完整拥有这条边界。只有出现自动/headless preset或正式下游消费者后，才先实现“FINAL dataset artifact -> 独立 flat analysis Run -> 自己的一次 FinalCommit”；只有真实领域要求 scan 与 analysis 成为不可分割的一个提交结果时，才另行设计 composite commit。neutral 不得定义 `FitProcessor`、`FitOperator` 或 neutral-owned `FitAnalysisDefinition`，Workbench 的 `Add Analysis -> Fit` 只是 current zlc_data Fit capability 的本地产品入口。
 
 `zlc_data.codec` 是该 bounded context 内 typed canonical-byte admission 的唯一 owner；当前只有确有 durable consumer 的 FitSpec/FitResultBatch 暴露 standalone current canonical bytes，并复用这一处 canonical round-trip 判定。Axis/DatasetSchema、Selection 与 CommittedTransform 只公开供外层 artifact 嵌入的 owner tree projector/parser；它们不各自预建无人消费的 bytes wrapper。大型 Value/DataBlock 更不经过通用 JSON/tree codec，真实持久化边界使用 bounded binary chunk/CAS。已排期的 AnalysisPreset/保存 FitSpec 通过 public `fit_spec_to_tree/from_tree` 或 `encode/decode_fit_spec` 委托同一 schema owner；FitResultBatch 的 tree projector 仍为 codec 私有，公开面只给 current canonical bytes，不能顺势恢复 generic result tree/ref codec。各领域类型仍由自己的 projector/parser 负责，primitive bytes 继续委托 `zlc_storage.canonical`。
 
@@ -664,7 +664,7 @@ neutral domain Result
 
 当前纵切已实现 `connect(config="virtual", repository=...)`、immutable `device_catalog`、`.pulse.target`、declarative capture request、`start/run/inspect`、capture load、capture-fit save/load，以及三条显式分析链：“已提交 `CaptureArtifactRef` -> `CalibrationArtifactRequest` -> 原子提交/重开 `CalibrationArtifactRef`”、“已提交单event `CaptureArtifactRef` + `CalibrationArtifactRef` -> `DetectionRequest` -> 原子提交/重开 `OccupancyArtifactRef`”和virtual/offline短`exp.readout.sitemap(frames=...) -> CalibrationArtifactRef`。W2a 进一步接通 `.pulse.request/inspect/start/run`：finite pulse 返回轻量 `PulseRunResult`；continuous HOLD 没有伪造 logical terminal，只能 `start()` 后由同一个 `RunHandle.cancel()` 进入已有 interrupt、session close、SAFE verification 与 safety journal 路径，GUI 不得到 public prepare/fire/safe。W2b 已交付 current Qt PulseWorkbench：Edit/Preview/Scan、current-only New/Open/Save、精确 QPainter timeline、static/scan/HOLD 执行与显式 API 输入由同一窗口组合；preview/load/save/start/reap 在有界 worker 上运行，Qt owner 只按 `(editor_generation, revision)` 接受最新结果，并分别显示 editor revision 与正在运行的 immutable revision。online 窗口只接收既有 `PulseFacade + PulseTargetDescriptor`，Stop/Close 只调用同一 `RunHandle.cancel()` 并异步 reap；offline 窗口不伪造安装/设备身份且禁用执行。W3a 已接通 `.figure_document(capture/fit)` 与 `.figure(capture/fit)`：composition 只把 admitted capture 物化为 `OwnedSnapshot`，frontend-owned DataFigure 一次求值后释放 source snapshot；1D curve、2D image、site/event batch gallery、ComponentValidity、per-cell fit failure 与 overlay 都从具名 evaluated address 求值，模型曲线/面只调用 `FitResultBatch.evaluate_batch()`。W4a在同一产品上增加 `.figure_gui(...)`：notebook只把绑定后的`.figure`窄callable、source与显式view/budget参数交给Workbench；viewer module的唯一capacity-one lane顺序完成repository准入、DataFigure求值与一次Agg/PNG compose，Qt owner在decode前同时准入PNG source与当前物理board front，只接收一张immutable PNG做整板present；close立即撤销发布且不等待worker，也不关闭Experiment。该surface明确为`FROZEN / DISPLAY ONLY`，不取得raw runtime、repository resolver、Figure/artist或第二份fit/projection语义。普通 capture 使用 role 驱动默认视图；generic fit-aware view仍要求repeat具名选择且所有fit batch axis必须是facet/batch/selected/slider；W7对未携自定义view参数的exact saved-fit ref改走专用GridPlot explorer，把repeat明确显示为FACET、每页最多36个逻辑panel，并保留EXPLICIT sparse hole。W8a已把现有公开`exp.fit(capture_ref, committed_transform=...) -> figure/save/exact-ref/W7`认作第一个真实transformed-fit显示consumer，但只接受**恰好一个**作用于仍为fit axis的具名`SPATIAL_X/SPATIAL_Y`数据轴、且由`IndexRangeSelection`或`CoordinateRangeSelection`表达的权威Selection；frontend先按transform解析effective metadata来建议视图，再把同一Selection逐项提升到raw `ViewSpec`，FigureEvaluator仍直接读原`OwnedSnapshot`的精确投影，不造derived dataset/ref、不执行第二遍transform。W8b把完全相同的窄合同接进`exp.fit_gui(..., committed_transform=...)`：transform由调用者在开窗时显式冻结，初始与Clear后的source预览只使用其中同一个Selection，constraint form只替换`FitSpec.constraints`，draft/direct fit/save exact ref继续携带逐值相同的CommittedTransform；窗口从不读取viewport、monitor selector或display reducer来铸造权威。任何`ReductionSpec`、多operation、drop-index、非空间轴、repeat/point/cell-axis变换或display reduction继续在Figure/Agg之前fail-closed。ScanArtifact仍等下一Scan application slice由scan owner提供合法output snapshot后接入，notebook不reshape/伪造lineage。短sitemap的installation profile自动预填同一个trap/camera grid registration并冻结camera、sequencer、trigger、target与坐标身份；真实qCMOS profile/qualification、live GUI site-map/gridplot、旧嵌入式 PulseGUI 最后consumer删除仍未交付，不能把virtual闭环改写成这些产品面或整个 S0.5/H1 已完成。导入 `Zou_lab_control.notebook` 不加载Qt、Matplotlib、SciPy、serial/RPyC、旧 `Zou_lab_control.neutral_atom` umbrella或concrete bootstrap；`connect()`才惰性导入virtual composition，compile capture request才惰性导入triggered binding，calibration/occupancy repository按第一次使用惰性构造，SciPy只在真正执行calibration analysis时进入。request构造只读取FINAL manifest、frame schema与小型runtime summary，不解码pulse IR、calibration arrays或raw frame chunks；完整input admission只发生在formal Run preflight。`CalibrationAnalysisRequest`由轻量`readout.calibration`唯一拥有并由notebook重导出，旧`readout.analysis`路径不保留alias。`pyproject.toml`是依赖的唯一真相，base只含NumPy，analysis/render/notebook/workbench/hardware/docs按能力拆成extras；安装脚本直接安装这些extras，删除平行`requirements.txt`。
 
-**当前Fit/figure事实覆盖上一段的历史W4/W5/W7/W8枚举：** ScanArtifact已经是FitResultRepository、headless `.fit()`、DataFigure、`figure_gui/fit_gui`与exact saved-grid的正式source；generic单panelCURVE/IMAGE及fit-bearing replay均为typed interactive，不再是`FROZEN / DISPLAY ONLY`；独立W5 `_fit.py`与Capture-only ref/repository均已物理删除。唯一未完成的Fit主入口是TaskConsole `Add Analysis -> Fit` formal AnalysisStep，不能把上一段的历史措辞用于新实现。
+**当前Fit/figure事实覆盖上一段的历史W4/W5/W7/W8枚举：** ScanArtifact已经是FitResultRepository、headless `.fit()`、DataFigure、`figure_gui/fit_gui`与exact saved-grid的正式source；generic单panelCURVE/IMAGE及fit-bearing replay均为typed interactive，不再是`FROZEN / DISPLAY ONLY`；独立W5 `_fit.py`与Capture-only ref/repository均已物理删除。U0.3e又让TaskConsole的`Add Analysis -> Fit`只在当前card拥有精确FINAL ScanArtifact时委托同一host；它不是尚未实现的formal AnalysisStep，也不保存自动重跑preset。不能把上一段的历史措辞用于新实现。
 
 W4b在这个边界上交付`.readout.load_calibration_computation(ref)`与`.readout.calibration_report_gui(ref)`：repository一次解码并成对返回已经互相校验的`CalibrationArtifact + CalibrationReport`，worker只投影和绘制已经保存的site、threshold、fidelity、validity与empirical PSF事实，Qt只接收多页owned immutable PNG。报告不重新拟合、不重新阈值化、不把canonical site向量reshape成二维数据，也不为了复用DataFigure而伪造`DatasetSchema`。它与W4a共用一个capacity-one frozen-raster executor、同一Qt window lifecycle和同一encoded-page DTO；关闭窗口只撤销未开始/阶段间工作，已进入repository或Agg的调用诚实排空且不发布stale结果。该窗口只是static frozen calibration report；大阵列的交互focus/zoom/export、live site-map/gridplot仍属于后续明确consumer，不能用本纵切的缩放PNG冒充已交付。W6已在同一paired loader/renderer上补交显式request edit/recalibrate，仍不把静态PNG冒充live grid或几何selector。
 
@@ -1236,12 +1236,11 @@ RunController.start(plan) -> RunHandle   # 后台，workbench
 task owner builder(TaskDefinition key, request, immutable bindings) -> RunPlan[Result]
 resolve MeasurementDefinition metadata + domain composition binder -> BoundMeasurement
 processor owner binder(StreamProcessorDefinition key, config, contracts) -> BoundStreamProcessor
-analysis owner binder(DomainAnalysisDefinition key, config, typed input slots/refs) -> AnalysisStep
+domain analysis owner builder(typed request, immutable artifact refs) -> flat RunPlan[Result]
 zlc_data.bind_fit(FitSpec, expected DatasetSchema) -> BoundFit
-neutral.bind_analysis(BoundFit, DatasetInputSlot) -> AnalysisStep
 ```
 
-Measurement、StreamProcessor 与 AnalysisStep 都不是独立 lifecycle owner，不直接返回 RunPlan；它们由静态 PipelineSpec 编译进一个顶层 RunPlan。用户“单独 Start Measurement”也编译成一个 source + DatasetBuilder/明确 sink 的最小 PipelineSpec，而不是特殊启动路径。这样不会为了统一方法签名而让它们冒充 Task。
+Measurement 与 StreamProcessor 都不是独立 lifecycle owner，不直接返回 RunPlan；它们由静态 PipelineSpec 编译进一个顶层 RunPlan。用户“单独 Start Measurement”也编译成一个 source + DatasetBuilder/明确 sink 的最小 PipelineSpec，而不是特殊启动路径。已提交 artifact 上的 calibration/detection 等领域 Analysis 由自己的 typed request 直接编译成一个 flat RunPlan；generic post-materialization AnalysisStep 不是当前 baseline。这样不会为了统一方法签名而让不同语义冒充 Task，也不会为一个UI入口预建第二套生命周期。
 
 MeasurementDefinition只含DefinitionKey、title、request/binding schema id与capture-spec owner fingerprint等递归声明式字段；动态 output schema/cardinality/budget 只属于 BoundMeasurement 的 capture contract。StreamProcessorDefinition同样只含DefinitionKey、title与config schema id；input/output/join contracts、operator、deadlines与artifact inputs全部属于BoundStreamProcessor并进入其fingerprint。DefinitionCatalog机械拒绝callback、raw driver、mutable cache或其它非声明式field。generic runtime不调用Definition.bind，也不接收任意`request: object/bindings: object`；各领域composition在自己的typed request/typed bindings边界完成纯验证并直接构造Bound值，bindings只含Bound Port和immutable config。compile_pipeline 是无硬件 I/O 的确定性构造，可做schema、owner、完整schedule和静态预算校验。Notebook 可以在调用线程直接构造；Workbench 把同一个同步函数投递给其普通 application worker，结果再交给 RunController.start。runtime 不定义专用 command/build lane、第二套队列协议或额外 Service；若 profiling 证明某个编译器本身很重，只把该纯函数放入现有 bounded CPU worker，不改变领域合同。RunController.start 只接收已经构造好的 RunPlan，因此不会持有 ResourceClaims 等待纯编译。
 
@@ -1549,34 +1548,23 @@ StreamReducerDefinition 必须提供 state factory 与 update/finalize contract�
 ### 10.5 Analysis
 
 ```text
-AnalysisStep[Result]:                  # neutral runtime 的已绑定执行值，不是算法 owner
-  typed input slots/refs + expected contracts
-  frozen config/spec
-  deterministic bound operation
-  output contract
-  resource/compute budget
-
-DomainAnalysisDefinition[Config, Result]:
-  stable DefinitionKey
-  input contract: DataBlock snapshot | typed ArtifactRef(s)
-  output result/artifact contract
-  deterministic analysis function
-  resource/compute budget
-  bind(config) -> AnalysisStep
-
 BoundFit:                              # zlc_data-owned，不含 runtime slot/ref
   frozen FitSpec + expected DatasetSchema fingerprint
   resolved fit/batch axes + model/numeric policy
   run(OwnedSnapshot) -> FitResultBatch
+
+DomainAnalysisRequest[Result]:         # 仅在领域物理语义需要时定义
+  exact immutable ArtifactRef inputs
+  frozen domain config/policy
+  resource/compute budget
+  compile -> one flat RunPlan[Result]
 ```
 
-Analysis 不访问 Device、Hub/latest、QWidget 或 mutable DatasetBuilder。它消费 OwnedSnapshot（exact DatasetRevisionRef + frozen DataBlock）或 immutable artifact，产生 FitResultBatch、CalibrationArtifact、report 等 typed result。`FitSpec/BoundFit/FitResultBatch` 与 `BoundFit.run()` 全部由 zlc_data 拥有；Calibration/ReadoutFidelity 等带 neutral 物理语义的算法才使用 `DomainAnalysisDefinition`。Workbench 的 `Add Analysis` 只把明确的 zlc_data Fit capability 与 neutral DomainAnalysisDefinition 合并成只读 CatalogView，neutral 的 DefinitionCatalog 不重新注册或包装通用 fit。
+Analysis 不访问 Device、Hub/latest、QWidget 或 mutable DatasetBuilder。它消费携 exact DatasetRevisionRef 的 OwnedSnapshot或immutable artifact，产生 FitResultBatch、CalibrationArtifact、report 等 typed result。`FitSpec/BoundFit/FitResultBatch` 与 `BoundFit.run()` 全部由 zlc_data 拥有；Calibration/ReadoutFidelity 等带 neutral 物理语义的算法使用自己的typed request/compiler，不以generic Fit wrapper冒充领域判断。neutral 的 DefinitionCatalog不重新注册或包装通用Fit；当前Workbench只投影一个本地`Add Analysis -> Fit` capability。
 
-neutral runtime 用一个无 Fit 语义的 `bind_analysis(bound_operation, DatasetInputSlot) -> AnalysisStep` 适配器托管执行；baseline 的 data-owned bound operation 只有 BoundFit。Pipeline 编译时 slot 只有 expected DatasetSchema；DatasetBuilder finalize 后，runtime 把该 slot恰好一次解析为携带冻结 block 与 exact revision ref 的 OwnedSnapshot，再调用 `BoundFit.run`。它负责 cancellation、compute lane、terminal propagation 与 result handoff，但不根据字符串 analysis id 选择算法，也不定义 zlc_data result schema。interactive/offline frontend 可以把同一个 BoundFit 与当前 OwnedSnapshot 投递到自己的 executor。依赖方向始终是 neutral/frontend -> zlc_data，不产生新的 fit owner，也不假装未来 dataset 在 bind 时已经存在。只有出现第二个确实共享此绑定合同的通用 Analysis 后，才把 `BoundOperation` 提升成公共泛型/Protocol；当前不为它预建 registry、descriptor hierarchy 或 program DSL。
+当前有两个挣得起的hosting路径：interactive/offline adapter把已冻结snapshot交给同一个BoundFit；需要durable领域artifact的typed request从已提交输入编译一个flat RunPlan并拥有自己的一次FinalCommit。二者都不是StreamProcessor，也不通过伪造“累计DataBlock event”接入sample stream。
 
-正式 Analysis 是同一个 flat RunPlan 的 materialization/EOS 之后阶段；interactive plot Analysis 则由 workbench/frontend adapter 对当前冻结 revision 发起，使用不同 QoS，但调用相同函数。两者都不是 StreamProcessor，也不通过伪造一个“累计 DataBlock event”接入 sample stream。
-
-对已保存 Capture/Data artifact 单独运行 calibration/report 时，composition 提供 `compile_analysis_run(step, resolved_inputs) -> flat RunPlan`；它只做输入解析、claim/compute budget和artifact commit hosting，不要求用户伪装成 Task，也不引入 Analysis workflow engine。
+`DatasetInputSlot -> AnalysisStep -> post-materialization pipeline`明确是**延后设计**，不是baseline。重开它必须先给出至少一个真实自动/headless或下游consumer、其失败/cancel语义以及artifact原子性需求。默认优先选择“输入FINAL artifact -> 独立flat analysis Run”，因为它复用immutable replay边界且不改scan提交；只有明确要求scan+analysis不可分割成功时，才设计同一FinalCommit可恢复的composite result。不得先建`BoundOperation Protocol`、Analysis registry、descriptor hierarchy、program DSL或child Run。
 
 ### 10.6 Pipeline composition
 
@@ -1588,7 +1576,6 @@ PipelineSpec:
   bound_stream_processors
   typed event edges
   dataset_materializers
-  post_materialization AnalysisSteps
   artifact/result sinks
   delivery/QoS per edge
   criticality = REQUIRED | BEST_EFFORT_MONITOR
@@ -1596,15 +1583,15 @@ PipelineSpec:
 compile_pipeline(spec, immutable bindings) -> RunPlan[PipelineResult]
 ```
 
-编译阶段完成：DefinitionKey/descriptor binding、event payload/schema/axis 校验、无环校验、ResourceClaims 并集、exact/monitor edge 分类、buffer budget、JoinPolicy、DatasetBuilder key coverage、AnalysisStep input revision、criticality 和 terminal propagation。当前不支持 feedback data cycle；需要反馈控制时使用 revisioned ControlTopic，不把回路伪装成数据边。
+编译阶段完成：DefinitionKey/descriptor binding、event payload/schema/axis 校验、无环校验、ResourceClaims 并集、exact/monitor edge 分类、buffer budget、JoinPolicy、DatasetBuilder key coverage、criticality 和 terminal propagation。当前不支持 feedback data cycle；需要反馈控制时使用 revisioned ControlTopic，不把回路伪装成数据边。
 
 REQUIRED source/processor/sink failure 使整个 Run 失败。BEST_EFFORT_MONITOR 只能出现在 monitor-only 叶子分支；其失败产生 panel/branch error、missed telemetry 和 Run diagnostic warning，但不反向终止仍健康的 formal exact run。required outputs 完整时 Run 仍是 SUCCEEDED，但 Result/Event snapshot 含 structured warnings，且失败 panel 不能标成成功。Compiler 禁止 BEST_EFFORT_MONITOR 输出再连接 exact、fit authority、calibration 或 artifact，也不自动 restart 失败 branch。
 
-编译结果仍是一个扁平顶层 RunPlan：一个 RunHandle 依次拥有 online acquisition graph、DatasetBuilder finalization、post-materialization Analyses、artifact commit 和 cleanup。节点不能嵌套 start Run、动态新增边或各自成为 terminal-state owner。PipelineSpec 是静态阶段合同，不是 child-plan workflow DAG。
+编译结果仍是一个扁平顶层 RunPlan：一个 RunHandle 依次拥有 online acquisition graph、DatasetBuilder finalization、artifact commit 和 cleanup。节点不能嵌套 start Run、动态新增边或各自成为 terminal-state owner。PipelineSpec 是静态阶段合同，不是 child-plan workflow DAG。未来真实consumer若挣得post-materialization Analysis，也必须先解决同一commit结果与ambiguous recovery，而不能把callback塞到finalize之后假装原子。
 
 F0/S1 的首个 compiler 只接受 `1 BoundMeasurement -> 1 DatasetMaterializerSpec -> opaque in-memory PipelineResult`：没有 processor、analysis、feedback、持久sink callback、可选 child 或通用 node/edge DSL。它在 `RunController.start()` 取得 claim 之前完成 DefinitionKey、FrozenCaptureSpec owner、payload/adapter/schema、完整 cell permutation 与保守 event/byte budget 校验；RunPlan.preflight只用真实run_id创建software TraceBinding、CaptureSession、唯一exact reservation、cursor和DatasetBuilder，不发送任何device command；execute在prepared state完整返回后才prepare/start。CaptureSession自己从冻结`expected_cells[source_ordinal]`派生join key，不接受execute层传入另一个key；只有该reservation已经ACTIVE且持有绑定schema/adapter/完整schedule的ExactDatasetReadiness后，start才可触达设备。
 
-`BoundCapturePort`只接受DeviceBroker针对当前BoundDevice/binding/generation执行endpoint-owned capability probe后mint的opaque attestation，不能把普通`CaptureCapabilitySnapshot`拼到真实设备上；probe全程持有broker probing token并与Run open、binding invalidation、recovery互斥，跨过任何activity epoch的结果不得发布。FrozenCaptureSpec在进入runtime前已由领域owner生成canonical bytes，runtime自行重算SHA-256并要求definition/contract/capability/spec owner fingerprint四者一致，prepare阶段没有替换或回调入口。CaptureSession创建线程就是其owner I/O lane，prepare/start/read/complete/termination/cleanup跨线程调用一律拒绝。普通整数、字符串或任意格式正确的digest不构成物理证明；正常terminal必须同时核对generation、spec/settings/capability binding、全部source ordinal、produced/drained、ordered metadata digest、source stopped、no-more-frame和真实join，才可mint不可伪造的CaptureCompletion。取消后普通execution capability会被撤销，因此BoundCapturePort必须提供thread-safe ABORT/DISARM与有限blocking-call bound；该bound写入每个prepare/start/read/complete/session-close command，adapter必须把它交给SDK wait/poll或自己的有界等待，不能只把它留作描述字段。cleanup phase发送绑定本session的`SessionCloseCommand`；wrong-session、stop/drain/join未知或超时都返回UNSAFE/quarantine，不能靠safe-state布尔值跳过join。formal compiler只消费该session拥有的CaptureCompletion，再取其中EOS交给DatasetBuilder seal，并交叉验证sealed artifact与terminal的metadata fingerprint/digest；PipelineResult由compiler私有authority mint并再次核对coverage/count/digest，调用方不能拼接另一个terminal伪造成功。裸EOS不构成pipeline成功。DatasetBuilder是exact reservation teardown的唯一owner：success seal、preflight/execute/cancel失败都在独立finally中close，最终reservation必须RELEASED且registry为空，前一步cleanup失败不能阻止它。未来post-safety persistent sink只接受storage-owned staged FinalCommit，不接受“任意 callback + requires_commit bool”。后续 S3/S4 加 processor/analysis 时扩展静态 PipelineSpec 合同，不把这个最小直线偷偷演化成递归工作流引擎。
+`BoundCapturePort`只接受DeviceBroker针对当前BoundDevice/binding/generation执行endpoint-owned capability probe后mint的opaque attestation，不能把普通`CaptureCapabilitySnapshot`拼到真实设备上；probe全程持有broker probing token并与Run open、binding invalidation、recovery互斥，跨过任何activity epoch的结果不得发布。FrozenCaptureSpec在进入runtime前已由领域owner生成canonical bytes，runtime自行重算SHA-256并要求definition/contract/capability/spec owner fingerprint四者一致，prepare阶段没有替换或回调入口。CaptureSession创建线程就是其owner I/O lane，prepare/start/read/complete/termination/cleanup跨线程调用一律拒绝。普通整数、字符串或任意格式正确的digest不构成物理证明；正常terminal必须同时核对generation、spec/settings/capability binding、全部source ordinal、produced/drained、ordered metadata digest、source stopped、no-more-frame和真实join，才可mint不可伪造的CaptureCompletion。取消后普通execution capability会被撤销，因此BoundCapturePort必须提供thread-safe ABORT/DISARM与有限blocking-call bound；该bound写入每个prepare/start/read/complete/session-close command，adapter必须把它交给SDK wait/poll或自己的有界等待，不能只把它留作描述字段。cleanup phase发送绑定本session的`SessionCloseCommand`；wrong-session、stop/drain/join未知或超时都返回UNSAFE/quarantine，不能靠safe-state布尔值跳过join。formal compiler只消费该session拥有的CaptureCompletion，再取其中EOS交给DatasetBuilder seal，并交叉验证sealed artifact与terminal的metadata fingerprint/digest；PipelineResult由compiler私有authority mint并再次核对coverage/count/digest，调用方不能拼接另一个terminal伪造成功。裸EOS不构成pipeline成功。DatasetBuilder是exact reservation teardown的唯一owner：success seal、preflight/execute/cancel失败都在独立finally中close，最终reservation必须RELEASED且registry为空，前一步cleanup失败不能阻止它。未来post-safety persistent sink只接受storage-owned staged FinalCommit，不接受“任意 callback + requires_commit bool”。后续S3/S4只为已存在的processor或领域typed Analysis扩展静态合同；generic post-materialization Analysis仍受§10.5 consumer/commit门槛，不把这个最小直线偷偷演化成递归工作流引擎。
 
 PipelineResult 只汇总 required sink 的 typed results/artifact refs、structured warnings、event/missed metrics 和 terminal lineage；不暴露 worker、cursor、mutable buffer 或第二套 TaskOutput。
 
@@ -1889,23 +1876,25 @@ FitResultBatch 是当前一等需求，不延后：gridplot、site grid 和任�
 
 BoundFit 对 batch cell 使用确定性迭代顺序，并在 packing chunk、cell 边界和 model evaluation 间检查 host cancellation/deadline；单次 solver call 只有确定性的 max-evaluation/memory/sample budget。取消或 deadline 使整个 formal Analysis 失败且不提交成功 artifact；interactive stale result 按 DatasetRevisionRef 丢弃。该最小 seam 不引入 workflow engine。
 
-### 11.8 Formal/权威 Fit Analysis 路径
+### 11.8 权威 Fit Analysis 路径
+
+当前已经实现且有真实consumer的路径是：
 
 ```text
-PipelineSpec post-materialization FitAnalysis(FitSpec)
--> zlc_data bind_fit(FitSpec, expected schema) -> BoundFit
--> neutral binds BoundFit + DatasetInputSlot as AnalysisStep
--> DatasetBuilder finalize -> immutable DataBlock revision
--> neutral resolves the slot and executes BoundFit once
+FINAL CaptureArtifactRef | ScanArtifactRef
+-> owner repository inspect/materialize exact DatasetRevisionRef + schema
+-> zlc_data.bind_fit(FitSpec, expected schema) -> BoundFit
 -> resolve FitProblem
--> BoundFit.run()
--> FitResultBatch
--> PipelineResult / optional typed artifact
+-> BoundFit.run(exact OwnedSnapshot) exactly once
+-> FitResultBatch / FitExecution
+-> explicit FitResultRepository.save -> FitResultArtifactRef
 ```
 
-FitSpec 必须包含 input_schema_fingerprint 与显式 fit/batch axes；发生选择/降维时 committed_transform 必须存在，identity path 可以为空。Fit Analysis 只在 DatasetBuilder 完成 EOS/key/validity coverage 并冻结输入 revision 后运行，验证 schema fingerprint、解析 FitProblem 后执行相同的 zlc_data transform/reduction/fit 函数。它不在每个 sample/update 到达时把累计 DataBlock 重新拟合一遍。
+FitSpec 必须包含 input_schema_fingerprint 与显式 fit/batch axes；发生选择/降维时 committed_transform 必须存在，identity path 可以为空。Fit只消费已经通过EOS/key/validity coverage并提交的immutable revision，验证schema fingerprint后执行相同的zlc_data transform/reduction/fit函数；它不在每个sample/update到达时把累计DataBlock重新拟合一遍。TaskConsole的当前入口也必须先取得当前card的精确FINAL ScanArtifactRef，再进入同一路径。
 
-Formal Fit step 返回完整 FitResultBatch；下游参数引用、校准更新、scan 决策或“成功物理结论”必须在自己的领域 AnalysisSpec 中解释 numeric status、covariance/counts/RSS/R²并声明哪些具名 batch 必须满足何种物理 policy。generic fit core 只报告数值事实，不能替领域 consumer 发明统一 acceptance。
+若未来真实consumer要求无人工操作的formal Fit，优先把该FINAL artifact作为独立flat analysis Run的输入，并让Fit artifact由该Run自己的一次FinalCommit提交。当前Scan Run只有一个ScanRepository FinalCommit；不得在其commit后直接保存第二artifact却仍宣称原子，也不得在recovery时重跑solver。只有确有“scan与fit必须共同成功/共同恢复”的领域consumer时，才引入可持久恢复的composite commit/result；在此之前不实现DatasetInputSlot或AnalysisStep。
+
+Fit返回完整FitResultBatch；下游参数引用、校准更新、scan决策或“成功物理结论”必须在自己的领域AnalysisSpec中解释numeric status、covariance/counts/RSS/R²并声明哪些具名batch必须满足何种物理policy。generic fit core只报告数值事实，不能替领域consumer发明统一acceptance。
 
 ### 11.9 Interactive Fit 路径
 
@@ -1918,7 +1907,7 @@ Plot card AnalysisCommand[WorkbenchFitRequest]
 -> revision-checked overlay/ViewModel
 ```
 
-interactive Fit 使用 workbench application adapter 提供的独立 bounded Fit executor；frontend.figure 只拥有 Figure DTO、View 求值和 overlay 投影，不成为 executor/lifecycle owner。同一 panel 的 stale queued request 可 coalesce、已运行的不可中断 solver 返回后按 revision 丢弃。它执行 zlc_data `bind_fit` 产生的同一个 BoundFit，不创建隐藏 StreamProcessor node、不发布正式 measurement signal，也不占用 exact `StreamProcessorWorker` 或 view-evaluation 队列。用户要让 fit result 进入下游正式 pipeline，必须显式添加 Fit AnalysisStep；保存 interactive 派生结果时按 §16 materialize 输入 revision 与完整 lineage。
+interactive Fit 使用 workbench application adapter 提供的独立 bounded Fit executor；frontend.figure 只拥有 Figure DTO、View 求值和 overlay 投影，不成为 executor/lifecycle owner。同一 panel 的 stale queued request 可 coalesce、已运行的不可中断 solver 返回后按 revision 丢弃。它执行 zlc_data `bind_fit` 产生的同一个 BoundFit，不创建隐藏 StreamProcessor node、不发布正式 measurement signal，也不占用 exact `StreamProcessorWorker` 或 view-evaluation 队列。用户要让fit result进入下游权威流程，必须显式保存FitResultArtifact并由下游typed request引用；未来若出现自动analysis consumer，再按§10.5建立独立flat Run，不能用隐藏AnalysisStep升级当前交互动作。
 
 interactive 只意味着 QoS/入口不同，不降低输入 integrity：若输入 DatasetRevisionRef 属于 Formal epoch 且仍为 PROVISIONAL，可以为即时观察运行临时 fit，但 overlay 必须带 `PROVISIONAL` 标记且不能保存为`FitResultArtifact`、不能成为后续 authority input。epoch 转 INVALID 时相关queued/running result按epoch lifetime token丢弃并从正常overlay撤销；只有独立 EpochValidationRecord 证明该revision为 VALID 后，才允许 materialize为正式派生结果。
 
@@ -1944,7 +1933,7 @@ Selection 值及其坐标/geometry 语义属于 zlc_data；frontend selector con
 
 ### 11.12 Analysis 不建立 god processor
 
-纯算法只有一层命名：`zlc_data.apply_transform`、`reduce_data`、private `build_fit_problem`、`bind_fit` 与唯一公开执行入口 `BoundFit.run()`。formal、interactive、offline 三条路径都执行同一个 BoundFit；neutral runtime 只执行通用 `AnalysisStep`，不定义任何 Fit-named class。`OccupancyStreamProcessorDefinition` 属于 neutral_atom，因为它包含逐帧领域物理语义；`CalibrationAnalysisDefinition`、`ReadoutFidelityAnalysisDefinition` 属于 neutral_atom，因为它们消费完整 dataset/artifact。简单的、无领域语义的逐 event 变换若确需进入在线图，可由 zlc_data 提供纯函数，neutral pipeline 在 composition 时绑定为普通 StreamProcessor operator，但不复制实现。
+纯算法只有一层命名：`zlc_data.apply_transform`、`reduce_data`、private `build_fit_problem`、`bind_fit` 与唯一公开执行入口 `BoundFit.run()`。interactive、offline/artifact以及未来挣得的formal路径都执行同一个BoundFit；neutral当前不定义generic AnalysisStep或任何Fit-named class。`OccupancyStreamProcessorDefinition` 属于 neutral_atom，因为它包含逐帧领域物理语义；Calibration/ReadoutFidelity等完整dataset/artifact算法的typed request与compiler属于neutral_atom，因为它们承担领域物理判断。简单的、无领域语义的逐event变换若确需进入在线图，可由zlc_data提供纯函数，neutral pipeline在composition时绑定为普通StreamProcessor operator，但不复制实现。
 
 zlc_data 的 solver 是同步纯调用，不注册 frontend 提供的 GUI-thread guard、不读取环境变量来判断调用线程，也不持有 executor。是否在 GUI thread 之外执行是 frontend/neutral hosting adapter 的合同，并由真实入口测试证明；把线程策略注入数学 kernel 会形成隐藏全局反向依赖。
 
@@ -2110,9 +2099,11 @@ Add Analysis -> Fit
 Plot card -> Analyze -> Fit
 ```
 
-前者用 zlc_data `bind_fit(FitSpec, expected schema) -> BoundFit`，再由 composition/runtime 与 DatasetInputSlot 包成 PipelineSpec 的 post-materialization AnalysisStep，在冻结 Dataset revision 后产生正式 FitResultBatch/result artifact；它随 TaskConsole 完整迁移交付。后者已经由 U0.3d 落在唯一 `DataFigureWindow`：普通 `figure_gui(CaptureArtifactRef|ScanArtifactRef)` 的 typed CURVE/IMAGE panel 显示 `Analyze -> Fit`，`fit_gui(...)` 只把同一窗口的 Analysis tab 初始打开，不能保留第二个Fit窗口、第二套editor或第二条save/reload路径。
+两个入口现在都落在唯一`DataFigureWindow`。`Plot card -> Analyze -> Fit`由U0.3d交付；U0.3e的TaskConsole按钮只在当前card拥有精确FINAL `ScanArtifactRef`时启用，点击瞬间重新读取该ref并调用同一个`fit_gui(ref)` composition seam。重复点击同一ref只聚焦既有窗口；新Run或Load/reconfigure撤销旧入口，旧窗口仍只是自己冻结artifact的独立viewer。按钮不持FitSpec preset、不加入neutral DefinitionCatalog、不创建FitProcessor/AnalysisStep，也不把TaskConsole的SITE等display selection复制进FitSpec。只有用户在共享Fit pane中明确点击Fit才求解，只有明确Save才产生FitResultArtifactRef。
 
-Figure Fit 的 composition capability 只冻结 exact `CaptureArtifactRef | ScanArtifactRef`、source schema inspector、prepare/execute/save/reload 四个窄command与总预算；Qt/workbench不取得repository、Experiment或`FitExecution`保存能力。`FitDraftAuthority`是唯一未保存execution owner，Qt只持`FitDraftResult`。执行与overlay raster分别使用容量一的既有Figure lane和窄Fit lane，不建立async engine；revision/CAS规则保证旧prepare/solver/overlay/reload completion不能覆盖更新后的selector、约束或viewport。
+这不是把formal能力降格为GUI：当前真实consumer就是人对已提交ScanArtifact做交互分析与显式保存，artifact边界已经权威且可复现。自动/headless preset或下游consumer出现时按§10.5/§11.8另建以FINAL artifact为输入的flat analysis Run；不能为了保持“Add Analysis”这个按钮文字而预建DatasetInputSlot、generic Analysis registry或修改Scan的单FinalCommit语义。
+
+Figure Fit 的 composition capability 只冻结 exact `CaptureArtifactRef | ScanArtifactRef`、source schema inspector、prepare/execute/save/reload 四个窄command与总预算；DataFigure不取得repository或`FitExecution`保存能力，TaskConsole也只通过既有Experiment facade发起开窗而不获得另一套执行接口。`FitDraftAuthority`是唯一未保存execution owner，Qt只持`FitDraftResult`。执行与overlay raster分别使用容量一的既有Figure lane和窄Fit lane，不建立async engine；revision/CAS规则保证旧prepare/solver/overlay/reload completion不能覆盖更新后的selector、约束或viewport。
 
 UI 明确展示 input、fit axes、batch axes、selection authority、model、initial/bounds、status、result、save identity 和 overlay。`suggest_fit_draft(schema, model, fit_axis_ids, selection)`只从schema声明的轴role与当前typed panel的具名显示轴生成候选：repeat及所有非fit point/data轴默认完整保留为batch；显示层为得到单panel可以带标签选择一个真实physical cell，但这个display selection绝不能进入FitSpec。不存在按rank/singleton猜role、`flatten`、取第0个权威batch cell或对trailing axes `nanmean`。
 
@@ -3022,7 +3013,7 @@ Architecture：
 - frontend.figure 可以依赖 zlc_data 的 DataTransformSpec/Selection，但 ViewSpec/suggestion policy 不进入 zlc_data 或 neutral_atom；
 - zlc_data 的 FitSpec/FitProblem/FitResultBatch 不包含 application/neutral InputRef/EventRef/ArtifactRef；
 - FitSpec/BoundFit/FitResultBatch/Selection 与 `BoundFit.run()` 只在 zlc_data 定义；DataFigure/selector controller 只在 frontend 定义；neutral_atom 中任何 `FitProcessor`、`FitOperator`、`FitAnalysisDefinition` symbol 或复制 solver/model schema 都由 architecture test 拒绝；
-- zlc_data `BoundFit` 不引用 neutral `AnalysisStep`/DatasetInputSlot；只有 neutral-side generic adapter 执行 BoundFit+slot -> step 映射。AnalysisStep 对 data fit 与 neutral calibration 使用同一 hosting contract，但算法 id/codec/result owner 仍属于 zlc_data/neutral 各自 bounded context；baseline 不存在 DataAnalysisDescriptor/Program registry；
+- zlc_data `BoundFit` 不引用neutral runtime slot或artifact owner；当前不存在neutral-side generic AnalysisStep/slot adapter，artifact Fit由现有repository host，领域Analysis由各自typed request编译flat RunPlan；baseline不存在DataAnalysisDescriptor/Program registry；
 - zlc_data solver 不含 Qt/thread guard 注册、executor、环境变量线程策略或 callable/FQCN 序列化；frontend/neutral 各自在 hosting contract test 中证明 fit 不运行于 GUI/I/O lane；
 - ViewContract 只有一套，plot/render 不复制 role/repeat 判断表；
 - DefinitionCatalog 只由显式 imports 组装，重复 id fail，禁止 package scan/global registry；
@@ -3273,7 +3264,7 @@ producer/adapter
 
 1. **Monitor/ROI 生命周期纠正。** 相机 source Run/raw front 永不因 ROI/threshold retarget、新建或删除而重启或 gap；已有 downstream processor 由 revisioned `ControlTopic` 在事务边界 `APPLIED`，新建/删除只迁移该 downstream stream/generation。以 `main:frontend/task_console.py::_apply_panel_analysis/_publish_region` 的“retarget can never gap a running consumer”为 UX oracle，并用真实 launcher E2E 证明 source run id/generation/tap topology 与 raw sequence 连续。
 2. **补齐 full live interaction。** 为全部 `main` 声明可交互的 live plot kind 交付 `ViewportTransform + Qt overlay` 的 zoom/pan/crosshair/hover/selector；拖拽一个 panel 时其它 panel 不停流，被拖 panel 松手补拍；Setting/Edit 恢复 `normal/tight/fixed` relim、cmap 与 limits。shown plot 返回空 interaction handle 一律验收失败。
-3. **纠正已暴露 figure/viewer/Fit 产品面并建立唯一交互 owner。** 先让现有 W4 generic `figure_gui`、W7 saved-fit grid、calibration/occupancy 已暴露路径恢复适用的zoom/pan、selector、显式re-fit与export；frozen raster只允许报告类多页使用且必须可zoom。本纠正建立后续复用的唯一 viewer interaction/Fit owner，但只验收当前已经公开的source/ref类型，不在此处预建“任意artifact catalog/browser”。panel/figure 的 `Add Analysis -> Fit` / `Analyze -> Fit` 是主入口，普通 Fit 一键提交 authority draft，selector 直接预填同一 draft，并同时交付 1D range 与 2D box ROI fit；独立 `fit_gui` 只保留为直达入口。
+3. **纠正已暴露 figure/viewer/Fit 产品面并建立唯一交互 owner。** 先让现有 W4 generic `figure_gui`、W7 saved-fit grid、calibration/occupancy 已暴露路径恢复适用的zoom/pan、selector、显式re-fit与export；frozen raster只允许报告类多页使用且必须可zoom。本纠正建立后续复用的唯一 viewer interaction/Fit owner，但只验收当前已经公开的source/ref类型，不在此处预建“任意artifact catalog/browser”。panel/figure 的 `Add Analysis -> Fit` / `Analyze -> Fit` 是主入口，普通 Fit 一键提交 authority draft，selector 直接预填同一 draft，并同时交付 1D range 与 2D box ROI fit；独立 `fit_gui` 只保留为直达入口。TaskConsole的`Add Analysis`只桥接当前FINAL artifact，不因按钮命名预建formal workflow。
 
 #### U0.1 Monitor/ROI salvage gate（开工冻结证据）
 
@@ -3616,7 +3607,7 @@ H2默认不排期。只有以下任一证据成立才可创建提案：
 
 1. 在 zlc_data 完成 Selection、DataTransform/Reduction/CommittedTransform、FitSpec/BoundFit/FitResultBatch；在 frontend 完成 ViewContract/ViewSpec/ViewSuggestion、FigureDocument/codec、selector controller、DataFigure/render。
 2. 以“冻结 Capture/DataBlock -> curve/gridplot -> fit -> overlay -> FigureArtifact”为真实路径，同时验证 scalar、site grid、多 batch axes、component validity 和 per-cell failure。
-3. formal 路径由 zlc_data `bind_fit` 产生 BoundFit、再由 neutral generic adapter 与 DatasetInputSlot 包成 AnalysisStep；interactive/offline 路径直接把同一个 BoundFit 与冻结 snapshot 投递到各自 QoS executor，三者调用同一 `BoundFit.run()`。
+3. 当前interactive/offline/artifact路径都由zlc_data `bind_fit`产生同一个BoundFit并对冻结snapshot调用`BoundFit.run()`；TaskConsole只桥接FINAL ScanArtifact。未来确有自动formal consumer时优先编译“FINAL artifact -> flat analysis Run -> one FinalCommit”，不在S2预建DatasetInputSlot、generic AnalysisStep或composite scan commit。
 4. 验证 display ViewSpec 无 authority 字段，Selection candidate 只有在 FitSpec/CommittedTransform 中重建后才进入结果 lineage。
 5. 新路径不再增加旧 `core.selection/fitting/facet/raster` consumer；这些模块、scalar fit signals 和 neutral Fit-named implementation 只在其最后一个旧 frontend/ROI/Analysis consumer 迁走的切片物理删除，通常为 S3/S5/Z0，不能在 S2 提前断开 opaque legacy island。
 6. W3a先交付Capture/identity-Fit notebook surface，W3b由scan owner接通`ScanArtifactRef -> canonical output OwnedSnapshot -> DataFigure`。output BlockId由logical document、exact source DatasetRevisionRef与ScanOutputContract共同派生，generation/revision继承exact source dataset，schema fingerprint来自output DatasetSchema；含values/provenance/safety bundle的ScanArtifact manifest content-addressed。zlc_data用同一峰值函数做pre-FIRE schema估算与实际CommittedTransform，并一次冻结最终DataBlock；scan/notebook不重做reshape、validity映射或lineage。U0.3d已让`fit(scan_ref)`与Capture走同一个BoundFit、FitResultRepository和Figure host，source union仍是closed两类；它没有建立ScanFit框架、第二solver或generic Analysis registry。
@@ -3645,7 +3636,7 @@ W3d/W3e兑现S4中不依赖Q0/real composition的source-neutral软件纵切与cu
 ### S5：Workbench、其余 use cases 与用户兼容
 
 1. 在 S0.5 宿主上迁剩余 WorkspaceModel/RunCoordinator/controllers；Setting/Edit 使用共享 EditorSession/schema widgets/base-revision conflict，catalog 只做各 bounded context capability/definition 的本地投影。
-2. Fit 保持 zlc_data 单一算法 owner；W5已交付raw committed-capture的独立`.fit_gui()` editor/draft overlay/explicit Save/reopen/Clear纵切，W8b又把调用者显式冻结的W8a selection-only CommittedTransform接入同一窗口，仍不从display/selector生成权威。后续由同一headless presenter与draft authority接入TaskConsole明确的`Add Analysis -> Fit` / `Analyze -> Fit`，不得复制模型表、solver或把display transform升级为权威；Pulse prepare/fire/safe继续后台托管。
+2. Fit 保持 zlc_data 单一算法 owner；U0.3d已把旧独立`.fit_gui()` host并入唯一DataFigure/Fit editor、draft overlay与explicit Save/reopen/Clear路径，W8b的selection-only CommittedTransform也由同一authority消费；U0.3e已让TaskConsole的`Add Analysis -> Fit`从当前FINAL ScanArtifact进入该host，仍不从display/selector生成权威、不复制模型表/solver、不建立formal workflow。未来自动分析只按§10.5真实consumer门槛另立flat Run；Pulse prepare/fire/safe继续后台托管。
 3. 所有 panel 使用 S1/S2 的 render/evaluation lanes；完成 acknowledgement-driven shutdown、persistent quarantine 和 ControlTopic terminal/superseded ack。
 4. 逐条迁 temperature、MOT、readout、device manager 和 notebook convenience；W4a-W4e、W5-W8与M1-M2e只记录各自已经证明的data/authority/预算/线程/lifecycle子合同，不再被解释为终态用户面。whole-Run ROI replacement、永久 frozen generic viewer、缺 selector/zoom/re-fit 与独立 `fit_gui` 作为主入口均先按U0三项纠正关闭；随后再完成通用live grid/动态layout、TaskConsole/scan/live Fit、ROI/transform authoring、可zoom/export的live calibration/occupancy grid、跨artifact saved gallery、real Pylon qualification及其它 convenience。每条按最后 consumer 做dependency-closed删除，不能提前删共享producer，也不能以“不重开旧审查”为由拒绝补齐缺失UX。
 5. 真实入口 E2E 覆盖 fit/gridplot、calibration/occupancy、PulseScan、save/load、cancel/quarantine、shutdown 和 virtual/real adapter parity。
@@ -4393,11 +4384,23 @@ focused foundation/export/U0.3a-b-c/W7回归在最终分流前后分别通过`10
 | saved-grid 与超大轴 | Overview不隐式挑第一格，只有用户聚焦真实cell后启用Refit；每页最多36格。普通范围用既有spinbox，超过Qt `INT_MAX`改用2048字符上限的exact decimal/hex editor；Previous/Next按`AxisLayout` physical order而非数值排序。坐标、summary、page label与错误诊断均有字符/内存上界 | 20,001-bit index、100,000字符坐标、sparse hole、物理顺序逆于数值顺序均通过；不存在Python大整数转十进制限制把领域`IndexError`替换成ambient `ValueError` |
 | 单一总内存包络 | source inspect/materialize、binding、solver、result、DataFigure、typed projection、旧/新overlay、raster/Qt detached front、authoring option与export都从调用者的一份aggregate limit扣除。阶段互斥才取`max`，同时存活必相加；DataFigure frozen render limit只是总预算中的不可放宽子上限。saved-grid在panel DTO/label/selection创建前先做projection upper-bound，导出只对已保留panel计Agg增量 | `required-1`在source decode、Fit bind/execute、overlay prediction、saved-grid projection与raster前拒绝；metadata增量不能抹掉64KiB raster scratch。U0.3a-c旧测试曾把raster增量当窗口总额，本轮改为分别验证session aggregate与render sub-limit |
 | 并发、CAS 与关闭 | worker返回值不能用自己携带的旧token自证：Qt从当前frame重建bounded provenance token，稳定source与可变fit join分开比较，并用immutable object identity验证exact evaluated owner；display字段做有界二次核验，不在GUI线程扫描整轴。revision/request CAS、fresh-turn completion handoff与DeferredDelete charge继续生效 | 对替换values、axis/frame、viewport/home range、request sequence和join的反例全部保留旧front。关闭先撤Qt front、取消late present，再清renderer/commit closure/fit bindings；双active Fit + 双concurrent close安全drain，active Fit内reentrant close明确拒绝，关闭后无DataFigure/array残留 |
-| 删除与下一真实consumer | Capture-only artifact/ref/draft名、独立Fit host和旧manifest项均dependency-closed删除，没有保留adapter、alias、deprecated branch或“以后也许用”的零consumer路径 | 旧Live/GridPlot/TaskConsole仍拥有尚未迁走的live、Logic、workspace及完整panel consumer，故不能提前删；下一纵切只接TaskConsole catalog 的 formal `Add Analysis -> Fit`，不再铸造Fit便利窗口 |
+| 删除与下一真实consumer | Capture-only artifact/ref/draft名、独立Fit host和旧manifest项均dependency-closed删除，没有保留adapter、alias、deprecated branch或“以后也许用”的零consumer路径 | 旧Live/GridPlot/TaskConsole仍拥有尚未迁走的live、Logic、workspace及完整panel consumer，故不能提前删；下一纵切只把TaskConsole `Add Analysis -> Fit`接到同一FINAL-artifact host，不再铸造Fit便利窗口或预建formal AnalysisStep |
 
 U0.3d Rule-6按45个实际受影响production Python owner相对parent `9150a92`机械计数：`32376 -> 38673 physical`、`29880 -> 35788 nonblank`、`29404 -> 35032 token-NCLOC`，净`+6297/+5908/+5628`，完整dependency-closed closure为`1.1945x/1.1977x/1.1914x`；classes `115 -> 124`、dataclasses `71 -> 78`、enums `5 -> 5`、functions/methods `1033 -> 1171`。既有owner最大约`2.1x`，没有超过约3倍项；五个新leaf均有已存在、非假设的职责或consumer：`fit_result.py`取代414行Capture-only owner并同时服务Capture/Scan，`fit_curve_projection.py`隔离headless projection/worker materialization，`fit_authoring.py`被统一Figure host消费，`_diagnostic.py`被axis/layout/selection三处共用，`fit_reference.py`一比一取代旧typed ref。三个旧owner同时删除，enum零增长。以main最严格且不含巨大TaskConsole的五个真实oracle文件为分母（`4366/3888/3195 physical/nonblank/token-NCLOC`），本轮净增为`1.442x/1.520x/1.762x`，仍低于3倍；差量支付exact artifact、Scan第二source、multi-batch/sparse grid、强异常安全、异步GUI与可证明内存包络，而不是manager/plugin/workflow engine。
 
-当前活动authority为`109/109`文件、collect `1409`项。一次逐文件fresh-process全量sweep先定位出U0.3a-b-c的17项真实/过期合同混合失败；修复current-frame CAS与close closure后，三文件分别`12/12、10/10、12/12`。最终独立审查又复现“viewport rerender返回自洽但非提交态的Fit identity”这一P1，补上提交态identity CAS及直接反例后，所有直接消费`_figure`的W4/U0.3d闭包按文件独立复跑为`43/43`。最终账本为`1406 passed + 3 expected platform skipped = 1409`，零failed/error/xfailed/xpassed；owned compile、fresh headless/import-DAG `25/25`、旧Fit符号扫描与`git diff --check`通过。多路独立复核对大整数导航、projection preflight、Fit close drain、动态overlay identity和saved-grid内存最终均判`P0=0/P1=0`；完整迁移仍为NO-GO，下一步回到TaskConsole `Add Analysis -> Fit`，随后才是generic METER、多cell/多layer与剩余archive plot kind。
+当前活动authority为`109/109`文件、collect `1409`项。一次逐文件fresh-process全量sweep先定位出U0.3a-b-c的17项真实/过期合同混合失败；修复current-frame CAS与close closure后，三文件分别`12/12、10/10、12/12`。最终独立审查又复现“viewport rerender返回自洽但非提交态的Fit identity”这一P1，补上提交态identity CAS及直接反例后，所有直接消费`_figure`的W4/U0.3d闭包按文件独立复跑为`43/43`。最终账本为`1406 passed + 3 expected platform skipped = 1409`，零failed/error/xfailed/xpassed；owned compile、fresh headless/import-DAG `25/25`、旧Fit符号扫描与`git diff --check`通过。多路独立复核对大整数导航、projection preflight、Fit close drain、动态overlay identity和saved-grid内存最终均判`P0=0/P1=0`；该checkpoint后的TaskConsole入口由U0.3e承接，generic METER、多cell/多layer与剩余archive plot kind仍未完成。
+
+#### U0.3e TaskConsole FINAL-artifact Fit entry（收口状态：`COMPLETED`）
+
+本纵切先以`main@6c337d49`的TaskConsole `AnalysisControls/_FitFixSeedEditor/_apply_panel_analysis`为用户入口与Setting/Edit行为oracle，再以current U0.3d的`DataFigureWindow + FitAuthoringPane + FitResultRepository`为唯一实现owner。三条候选路线经过本地与两路独立对抗：A是“当前card的FINAL ScanArtifact -> 同一DataFigure/Fit host”，B是“FINAL artifact -> 独立flat analysis Run”，C是“Scan Run内post-materialization AnalysisStep/composite commit”。当前唯一真实consumer是用户查看已提交scan、明确Fit并显式Save；B没有headless/preset/downstream consumer，C还会推翻Scan Run的单FinalCommit及ambiguous-recovery语义。因此baseline选择A，B只在真实自动consumer出现后启用，C只在领域明确要求scan+analysis不可分割提交时重开。
+
+`TaskConsoleWindow`只新增一个`Add Analysis -> Fit`动作，不建单项catalog class、Analysis definition、preset codec、第二editor/solver/repository/worker/window。`ScanWorkbenchWindow.finalReferenceChanged`在owner-thread每次model reconcile中按精确`ScanArtifactRef | None`变化发出；TaskScanCard再用一层相等gate转发，因此Run start与reconfigure在同一Qt调用栈撤销旧入口，不等待100ms轮询。按钮只在非closing且当前ref存在时启用，点击时仍重新读取card ref；同ref且原DataFigure未关闭时只聚焦，不同ref重新调用既有`Experiment.fit_gui(ref)`。共享Fit pane继续让所有repeat/point/data轴成为具名batch，TaskConsole的SITE/display selection不进入CommittedTransform；求解与Save仍分别由显式Fit/Save动作触发。已打开viewer冻结自己的exact artifact并可独立于console关闭，DataFigure close按U0.3d释放重型owner。
+
+根`task_console.py`同步物理删除旧SignalHub/TaskConsoleState/registry、自校准、`--task/--config/--grid/--no-connect`分支，改为current `connect("virtual", repository=...) -> Experiment.task_console(initial_intent)`，并以bounded window-close后再关Experiment；`task_console.bat`继续只委托该脚本。该launcher当前明确只是virtual current product，不冒充尚未交付的real composition；未知旧参数由argparse拒绝，不fallback。U0.3d已经交付的IMAGE fit-overlay export测试也在本提交恢复为current oracle：导出真实overlay并验证viewport坐标换算、动态clim和failed/sparse cell不画成功geometry，旧“必须拒绝overlay”断言物理删除。
+
+Rule-6按parent`284fe63`的三个实际production owner（`_scan.py + _task_console.py + task_console.py`）机械计数：`2326 -> 2356 physical`、`2138 -> 2170 nonblank`、`2069 -> 2142 token-NCLOC`，净`+30/+32/+73`，完整closure为`1.0129x/1.0150x/1.0353x`；classes保持`5`，dataclasses/enums保持`0/0`，functions/methods`90 -> 96`。根launcher自身由`139/117` physical/nonblank压到`97/84`；其余差量只支付artifact signal、card forwarding、exact source gate、唯一host focus/open与bounded launcher close。六个净函数各自承担不同边界；没有新增class、enum、manager、registry、wrapper、codec、Analysis runtime或约3倍海拔项。
+
+定向current合同为TaskConsole`10 passed`、U0.3c current export`16 passed`、U0.3d direct Scan Fit`4 passed`、统一Figure Fit`9 passed`、Qt widgets`19 passed`与import-DAG`25 passed`；owned `py_compile`与`git diff --check`通过。活动manifest仍为`109/109`文件，isolated staged snapshot完整collect为`1410`项；按每文件fresh pytest process执行得到`1407 passed + 3 expected platform skips = 1410`，零failed/error/xfailed/xpassed。最终独立复核确认immediate rerun/reconfigure/close、重复signal、exact ref、display-authority、唯一host与launcher lifecycle均为`P0=0/P1=0/GO`。这只关闭UX-004与current virtual launcher分叉；real hardware launcher、完整TaskConsole workspace/Logic/其它panel、generic METER、多cell/多layer和剩余archive plot kind仍未完成，完整迁移继续NO-GO。
 
 ### 22.2 终态验收清单
 
@@ -4408,7 +4411,7 @@ U0.3d Rule-6按45个实际受影响production Python owner相对parent `9150a92`
 - concrete construction 只在 allowlisted bootstrap；
 - DefinitionCatalog 由显式 imports 组装，PipelineSpec 只有一个顶层 Run owner；
 - zlc_data 不引用 runtime/presentation 类型，frontend FigureDocument 不引用 neutral runtime live ref；
-- Fit/Selection/FitResultBatch/BoundFit 只有 zlc_data owner，DataFigure/selector controller 只有 frontend owner；BoundFit + DatasetInputSlot -> AnalysisStep 的适配只发生在 neutral/composition 侧；
+- Fit/Selection/FitResultBatch/BoundFit 只有 zlc_data owner，DataFigure/selector controller 只有 frontend owner；当前不存在DatasetInputSlot/generic AnalysisStep，TaskConsole只把FINAL artifact交给同一Fit host；未来真实自动consumer只能在neutral/composition侧以flat Run托管，不得产生第二Fit owner；
 - sample event、materialized dataset、analysis result、presentation 四个平面之间只有声明的三处边界；
 - 每个事实有唯一 owner；
 - physical device 在 Workbench/notebook/standalone/remote 入口间只有一个process-lifetime InstallationRuntime和backend可验证physical-owner proof；迁移期legacy runtime也不能绕过同一ResourceArbiter、DeviceBroker或startup/shutdown lifecycle gate；

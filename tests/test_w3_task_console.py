@@ -390,6 +390,7 @@ def test_site_display_choice_changes_only_view_and_never_authoritative_axes():
 
 def _run_task_console_product_e2e(tmp_path: Path):
     from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
+    from Zou_lab_control.workbench._figure import DataFigureWindow
     from Zou_lab_control.workbench._task_console import ScanIntentForm
     from zlc_frontend.qt_widgets import GREEN, ORANGE
 
@@ -406,6 +407,7 @@ def _run_task_console_product_e2e(tmp_path: Path):
     unconfigured = None
     blank = None
     window = None
+    analysis = None
     try:
         unconfigured = exp.task_console()
         add = unconfigured.findChild(
@@ -425,6 +427,13 @@ def _run_task_console_product_e2e(tmp_path: Path):
 
         blank = exp.task_console()
         add = blank.findChild(QtWidgets.QPushButton, "addTaskPanelButton")
+        add_analysis = blank.findChild(
+            QtWidgets.QPushButton,
+            "addTaskAnalysisButton",
+        )
+        assert add_analysis is not None
+        assert add_analysis.text() == "Add Analysis → Fit"
+        assert not add_analysis.isEnabled()
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         assert blank.scan_card is not None
         blank_edit = blank.findChild(ScanIntentForm, "editScanIntentForm")
@@ -525,6 +534,53 @@ def _run_task_console_product_e2e(tmp_path: Path):
         api_result = exp.readout.materialize_scan(api_panel.final_reference)
         assert api_result.values.shape[:2] == (2, 2)
         until(lambda: api_panel.worker_idle)
+        until(add_analysis.isEnabled)
+
+        QtTest.QTest.mouseClick(add_analysis, QtCore.Qt.LeftButton)
+        analysis = blank.analysis_window
+        assert isinstance(analysis, DataFigureWindow)
+        until(
+            lambda: analysis.worker_idle
+            and analysis.raster_ready
+            and bool(analysis.fit_models),
+            timeout=45.0,
+        )
+        pane = analysis._fit_pane
+        assert pane is not None and analysis._tabs.currentWidget() is pane
+        assert pane.current_option().spec.committed_transform is None
+
+        # Repeated activation of the same exact FINAL artifact focuses the one
+        # shared DataFigure/Fit host instead of constructing a second Fit UI.
+        QtTest.QTest.mouseClick(add_analysis, QtCore.Qt.LeftButton)
+        assert blank.analysis_window is analysis
+        QtTest.QTest.mouseClick(pane.fit_button, QtCore.Qt.LeftButton)
+        until(
+            lambda: analysis.worker_idle
+            and analysis.draft_ready
+            and analysis.raster_ready,
+            timeout=45.0,
+        )
+        QtTest.QTest.mouseClick(pane.save_button, QtCore.Qt.LeftButton)
+        until(
+            lambda: analysis.worker_idle
+            and analysis.saved_reference is not None
+            and analysis.raster_ready,
+            timeout=45.0,
+        )
+        saved_fit = exp.load_fit(analysis.saved_reference)
+        assert saved_fit.source_artifact_ref == api_panel.final_reference
+        analysis.close()
+        until(lambda: analysis.closed and not analysis.isVisible(), timeout=10.0)
+        analysis = None
+
+        # A new Run revokes the old artifact action in the same Qt turn; the
+        # previous FINAL ref must never remain an enabled implicit source.
+        QtTest.QTest.mouseClick(api_start, QtCore.Qt.LeftButton)
+        assert api_panel.final_reference is None
+        assert not add_analysis.isEnabled()
+        until(lambda: api_panel.final_reference is not None)
+        until(lambda: api_panel.worker_idle)
+        until(add_analysis.isEnabled)
 
         direct_document = _occupancy_document()
         direct_intent = TaskConsoleScanIntent(
@@ -543,6 +599,7 @@ def _run_task_console_product_e2e(tmp_path: Path):
         calibration_digest.setText("d" * 64)
         model.setCurrentIndex(model.findData(ReadoutModelKind.PER_SITE_PSF))
         blank.scan_card.load_intent(direct_intent)
+        assert not add_analysis.isEnabled()
         assert source.currentData() == "direct"
         assert not calibration_repository.text()
         assert not calibration_digest.text()
@@ -659,6 +716,9 @@ def _run_task_console_product_e2e(tmp_path: Path):
             unconfigured.close()
         if blank is not None and blank.isVisible():
             blank.close()
+        if analysis is not None:
+            analysis.close()
+            until(lambda: analysis.closed and not analysis.isVisible(), timeout=10.0)
         if window is not None:
             window.close()
             until(lambda: not window.isVisible(), timeout=10.0)
@@ -684,5 +744,41 @@ def test_task_console_add_edit_run_save_load_and_close_current_product(tmp_path)
     )
     assert completed.returncode == 0, (
         f"TaskConsole product subprocess failed ({completed.returncode})\n"
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+
+
+def test_standalone_task_console_launcher_owns_current_virtual_product(tmp_path):
+    source = (ROOT / "task_console.py").read_text(encoding="utf-8")
+    assert "experiment.task_console(initial_intent)" in source
+    for forbidden in (
+        "Zou_lab_control.frontend.task_console",
+        "SignalHub",
+        "show_task_console",
+        "TaskConsoleState",
+        "default_console_state",
+        "resolve_task_state",
+    ):
+        assert forbidden not in source
+
+    environment = dict(os.environ)
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    environment["ZLC_TASK_CONSOLE_AUTO_CLOSE_MS"] = "20"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "task_console.py"),
+            "--repository",
+            str(tmp_path / "standalone"),
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"TaskConsole launcher failed ({completed.returncode})\n"
         f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
     )

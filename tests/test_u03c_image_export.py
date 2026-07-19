@@ -336,22 +336,83 @@ def test_canonical_irregular_radial_projection_keeps_exact_cell_edges() -> None:
         owner.release_agg_figure(figure)
 
 
-def test_generic_image_export_rejects_fit_overlay_and_preserves_dynamic_clim(
+def test_generic_image_export_draws_fit_overlay_and_preserves_dynamic_clim(
     monkeypatch,
 ) -> None:
     import zlc_frontend.matplotlib_render as owner
+    from matplotlib.axes import Axes
 
     raw_payload, fixed_display = _current_image_payload()
     fit_payload, _ = _current_image_payload(fit_overlay=True)
     required = estimate_image_png_export_peak_nbytes(raw_payload.image, dpi=72.0)
-    with pytest.raises(ValueError, match="refuses fit overlays"):
-        save_image_panel_png(
-            fit_payload,
-            fixed_display,
-            BytesIO(),
-            dpi=72.0,
-            memory_limit_bytes=required,
+
+    viewport_type = type(fit_payload.viewport)
+    point_calls = []
+    span_calls = []
+
+    def projected_point(self, coordinate_xy, *, coordinate_frame):
+        point_calls.append((self, coordinate_xy, coordinate_frame))
+        return 0.25, 0.75
+
+    def projected_span(self, span_xy, *, coordinate_frame):
+        span_calls.append((self, span_xy, coordinate_frame))
+        return 0.4, 0.4
+
+    monkeypatch.setattr(
+        viewport_type,
+        "unbounded_visible_point_for_coordinate",
+        projected_point,
+    )
+    monkeypatch.setattr(
+        viewport_type,
+        "visible_span_for_coordinate_span",
+        projected_span,
+    )
+
+    def contour_is_not_a_radial_overlay(*_args, **_kwargs):
+        raise AssertionError("radial IMAGE export must not synthesize a contour")
+
+    monkeypatch.setattr(Axes, "contour", contour_is_not_a_radial_overlay)
+    observed_draws = []
+    original_draw = owner._draw_projected_image
+
+    def recording_draw(axis, figure, data, **kwargs):
+        observed_draws.append(dict(kwargs))
+        return original_draw(axis, figure, data, **kwargs)
+
+    monkeypatch.setattr(owner, "_draw_projected_image", recording_draw)
+    output = BytesIO()
+    save_image_panel_png(
+        fit_payload,
+        fixed_display,
+        output,
+        dpi=72.0,
+        memory_limit_bytes=required,
+    )
+    assert output.getvalue().startswith(b"\x89PNG\r\n\x1a\n")
+    overlay = fit_payload.fit_overlay
+    assert overlay is not None
+    assert point_calls == [
+        (fit_payload.viewport, overlay.center_xy, overlay.coordinate_frame)
+    ]
+    assert span_calls == [
+        (
+            fit_payload.viewport,
+            (2.0 * overlay.one_over_e_radius, 2.0 * overlay.one_over_e_radius),
+            overlay.coordinate_frame,
         )
+    ]
+    assert len(observed_draws) == 1
+    fit_draw = observed_draws[0]
+    assert fit_draw["colormap"] == fixed_display.colormap.value
+    assert fit_draw["color_limits"] == fit_payload.color_limits
+    assert fit_draw["visible_bounds"] == fit_payload.viewport.visible_bounds
+    assert fit_draw["regular_pixel_contract"] is True
+    # Forced viewport coordinates prove the export does not pass the
+    # authority DTO's physical values straight to Matplotlib.
+    assert fit_draw["center"] == pytest.approx((11.0, 21.0))
+    assert fit_draw["radius"] == pytest.approx(0.4)
+    assert fit_draw["diagnostic"] is None
 
     dynamic_display = replace(
         fixed_display,
@@ -372,14 +433,7 @@ def test_generic_image_export_rejects_fit_overlay_and_preserves_dynamic_clim(
         histogram_counts=histogram,
         color_limits=dynamic_limits,
     )
-    observed_limits = []
-    original_draw = owner._draw_projected_image
-
-    def recording_draw(axis, figure, data, **kwargs):
-        observed_limits.append(kwargs["color_limits"])
-        return original_draw(axis, figure, data, **kwargs)
-
-    monkeypatch.setattr(owner, "_draw_projected_image", recording_draw)
+    observed_draws.clear()
     output = BytesIO()
     save_image_panel_png(
         dynamic_payload,
@@ -389,7 +443,66 @@ def test_generic_image_export_rejects_fit_overlay_and_preserves_dynamic_clim(
         memory_limit_bytes=required,
     )
     assert output.getvalue().startswith(b"\x89PNG\r\n\x1a\n")
-    assert observed_limits == [dynamic_limits]
+    assert observed_draws[0]["color_limits"] == dynamic_limits
+    assert observed_draws[0]["center"] is None
+    assert observed_draws[0]["radius"] is None
+
+
+@pytest.mark.parametrize(
+    ("status", "diagnostic"),
+    (
+        (None, "NOT_PRESENT"),
+        (FitBatchStatus.NO_VALID_DATA, "NO_VALID_DATA: masked ROI"),
+    ),
+)
+def test_image_fit_export_failure_or_sparse_cell_has_no_success_geometry(
+    monkeypatch,
+    status: FitBatchStatus | None,
+    diagnostic: str,
+) -> None:
+    import zlc_frontend.matplotlib_render as owner
+    from matplotlib.axes import Axes
+
+    payload, display = _current_image_payload(fit_overlay=True)
+    converged = payload.fit_overlay
+    assert converged is not None
+    overlay = replace(
+        converged,
+        batch_storage_index=None if status is None else 0,
+        status=status,
+        diagnostic=diagnostic,
+        center_xy=None,
+        one_over_e_radius=None,
+    )
+    payload = replace(payload, fit_overlay=overlay)
+    required = estimate_image_png_export_peak_nbytes(payload.image, dpi=72.0)
+
+    def forbidden_geometry(*_args, **_kwargs):
+        raise AssertionError("failed/sparse fit export retained success geometry")
+
+    monkeypatch.setattr(Axes, "scatter", forbidden_geometry)
+    monkeypatch.setattr(Axes, "contour", forbidden_geometry)
+    observed = []
+    original_draw = owner._draw_projected_image
+
+    def recording_draw(axis, figure, data, **kwargs):
+        observed.append(dict(kwargs))
+        return original_draw(axis, figure, data, **kwargs)
+
+    monkeypatch.setattr(owner, "_draw_projected_image", recording_draw)
+    output = BytesIO()
+    save_image_panel_png(
+        payload,
+        display,
+        output,
+        dpi=72.0,
+        memory_limit_bytes=required,
+    )
+    assert output.getvalue().startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(observed) == 1
+    assert observed[0]["center"] is None
+    assert observed[0]["radius"] is None
+    assert observed[0]["diagnostic"] == diagnostic
 
 
 def _profile_witness_image(size: int, dtype) -> EvaluatedImage:

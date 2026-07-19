@@ -906,6 +906,8 @@ class ScanIntentForm(QtWidgets.QWidget):
 class TaskScanCard(QtWidgets.QWidget):
     """One stopped/configurable card around the existing scan panel."""
 
+    finalReferenceChanged = QtCore.pyqtSignal(object)
+
     def __init__(
         self,
         experiment: Experiment,
@@ -917,6 +919,7 @@ class TaskScanCard(QtWidgets.QWidget):
         self._experiment = experiment
         self._session: ScanEditorSession | None = None
         self._panel: ScanWorkbenchWindow | None = None
+        self._reported_final_reference = None
 
         title = FluentLabel("Task: Pulse scan", self)
         title.setObjectName("taskCardTitle")
@@ -991,6 +994,10 @@ class TaskScanCard(QtWidgets.QWidget):
         return self._panel
 
     @property
+    def final_reference(self):
+        return None if self._panel is None else self._panel.final_reference
+
+    @property
     def idle(self) -> bool:
         return self._panel is None or self._panel.can_reconfigure
 
@@ -1035,6 +1042,7 @@ class TaskScanCard(QtWidgets.QWidget):
 
         self._diagnostics.clear()
         self._state.setText("STOPPED")
+        self._refresh_state()
         return snapshot.revision
 
     def load_intent(self, intent: TaskConsoleScanIntent) -> None:
@@ -1059,6 +1067,7 @@ class TaskScanCard(QtWidgets.QWidget):
         self._settings_form.begin_edit()
         self._diagnostics.clear()
         self._state.setText("STOPPED")
+        self._refresh_state()
 
     def shutdown(self) -> None:
         self._state_timer.stop()
@@ -1069,11 +1078,17 @@ class TaskScanCard(QtWidgets.QWidget):
         if self._panel is not None:
             raise RuntimeError("scan card already owns a panel")
         self._panel = panel
+        panel.finalReferenceChanged.connect(self._forward_final_reference)
         panel.setObjectName("embeddedScanWorkbench")
         self._run_layout.removeWidget(self._placeholder)
         self._placeholder.hide()
         self._run_layout.addWidget(panel, 1)
         panel.show()
+
+    def _forward_final_reference(self, reference) -> None:
+        if reference != self._reported_final_reference:
+            self._reported_final_reference = reference
+            self.finalReferenceChanged.emit(reference)
 
     def _open_settings(self) -> None:
         self._settings_form.begin_edit()
@@ -1098,6 +1113,7 @@ class TaskScanCard(QtWidgets.QWidget):
             self._state.setText("STOPPED")
         else:
             self._state.setText("ACTIVE")
+        self._forward_final_reference(self.final_reference)
 
 
 class TaskConsoleWindow(QtWidgets.QWidget):
@@ -1121,6 +1137,8 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         self._experiment = experiment
         self._card: TaskScanCard | None = None
         self._closing = False
+        self._analysis_window = None
+        self._analysis_source = None
 
         self._catalog = FluentComboBox(self)
         self._catalog.setObjectName("taskCatalogCombo")
@@ -1132,6 +1150,9 @@ class TaskConsoleWindow(QtWidgets.QWidget):
             self._catalog.addItem(f"{item.group}: {item.title}", item.key)
         self._add = FluentButton("Add Panel", self)
         self._add.setObjectName("addTaskPanelButton")
+        self._add_analysis = FluentButton("Add Analysis → Fit", self, color=GREEN)
+        self._add_analysis.setObjectName("addTaskAnalysisButton")
+        self._add_analysis.setEnabled(False)
         self._save = FluentButton("Save", self)
         self._save.setObjectName("saveTaskIntentButton")
         self._load = FluentButton("Load", self, color=ORANGE)
@@ -1139,6 +1160,7 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         controls = QtWidgets.QHBoxLayout()
         controls.addWidget(self._catalog, 1)
         controls.addWidget(self._add)
+        controls.addWidget(self._add_analysis)
         controls.addStretch(1)
         controls.addWidget(self._save)
         controls.addWidget(self._load)
@@ -1159,6 +1181,7 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         layout.addWidget(self._status)
 
         self._add.clicked.connect(self._add_card)
+        self._add_analysis.clicked.connect(self._open_analysis)
         self._save.clicked.connect(self._save_dialog)
         self._load.clicked.connect(self._load_dialog)
         self._close_timer = QtCore.QTimer(self)
@@ -1175,6 +1198,10 @@ class TaskConsoleWindow(QtWidgets.QWidget):
     @property
     def current_intent(self) -> TaskConsoleScanIntent | None:
         return None if self._card is None else self._card.current_intent
+
+    @property
+    def analysis_window(self):
+        return self._analysis_window
 
     def save_intent(self, path: str | Path) -> Path:
         intent = self.current_intent
@@ -1206,12 +1233,50 @@ class TaskConsoleWindow(QtWidgets.QWidget):
             raise RuntimeError("TaskConsole currently owns exactly one card")
         card = TaskScanCard(self._experiment, intent, self._card_host)
         self._card = card
+        card.finalReferenceChanged.connect(self._sync_analysis_entry)
         self._card_layout.removeWidget(self._empty)
         self._empty.hide()
         self._card_layout.addWidget(card, 1)
         self._add.setEnabled(False)
         self._catalog.setEnabled(False)
+        self._sync_analysis_entry(card.final_reference)
         self._status.clear()
+
+    def _sync_analysis_entry(self, reference) -> None:
+        self._add_analysis.setEnabled(
+            not self._closing
+            and reference is not None
+        )
+
+    def _open_analysis(self) -> None:
+        card = self._card
+        reference = None if card is None else card.final_reference
+        if reference is None:
+            self._status.setText(
+                "Fit Analysis requires this card's current FINAL scan artifact"
+            )
+            self._sync_analysis_entry(None)
+            return
+        current = self._analysis_window
+        if (
+            current is not None
+            and self._analysis_source == reference
+            and not current.closed
+        ):
+            current.show()
+            current.raise_()
+            current.activateWindow()
+            return
+        try:
+            window = self._experiment.fit_gui(reference)
+        except BaseException as error:
+            self._show_error(error)
+            return
+        self._analysis_window = window
+        self._analysis_source = reference
+        self._status.setText(
+            "Opened exact Fit Analysis for the current FINAL scan artifact"
+        )
 
     def _save_dialog(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -1248,6 +1313,7 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         panel = None if self._card is None else self._card.panel
         if not self._closing:
             self._closing = True
+            self._add_analysis.setEnabled(False)
             if self._card is not None:
                 self._card.shutdown()
         if panel is None or panel.closed:
