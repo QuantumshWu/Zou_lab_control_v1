@@ -170,7 +170,9 @@ def test_curve_form_freezes_painted_fixed_limits_and_noop_keeps_revision() -> No
 )
 def test_curve_axis_accepts_monotonic_irregular_and_singleton(coordinates) -> None:
     axis = _axis(coordinates)
-    assert numeric_curve_coordinates(axis) == coordinates
+    validated = numeric_curve_coordinates(axis)
+    assert validated is axis.coordinates
+    assert validated == coordinates
     low, high = curve_home_x_limits(axis)
     assert low < min(coordinates) <= max(coordinates) < high
 

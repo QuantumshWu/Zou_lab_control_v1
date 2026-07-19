@@ -205,6 +205,11 @@ class DataFigure:
         """Frozen default admission limit for every later render/export."""
         return self._render_memory_limit_bytes
 
+    @property
+    def has_fit_overlays(self) -> bool:
+        """Whether this immutable figure carries authoritative fit overlays."""
+        return bool(self._fit_results)
+
     def render(
         self,
         *,

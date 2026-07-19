@@ -183,7 +183,7 @@ def _normalized_plot_bounds(value: object) -> tuple[float, float, float, float]:
     return left, top, right, bottom
 
 
-def numeric_curve_coordinates(axis: EvaluatedAxis) -> tuple[float, ...]:
+def numeric_curve_coordinates(axis: EvaluatedAxis) -> tuple[Real, ...]:
     """Return finite strictly monotonic numeric curve coordinates.
 
     Uniform spacing is deliberately not required.  Non-numeric, repeated, or
@@ -193,7 +193,8 @@ def numeric_curve_coordinates(axis: EvaluatedAxis) -> tuple[float, ...]:
 
     if not isinstance(axis, EvaluatedAxis):
         raise TypeError("axis must be EvaluatedAxis")
-    coordinates: list[float] = []
+    direction = 0
+    previous: float | None = None
     for index, value in enumerate(axis.coordinates):
         scalar = value.item() if isinstance(value, np.generic) else value
         if isinstance(scalar, bool) or not isinstance(scalar, Real):
@@ -203,16 +204,25 @@ def numeric_curve_coordinates(axis: EvaluatedAxis) -> tuple[float, ...]:
         numeric = float(scalar)
         if not math.isfinite(numeric):
             raise ValueError(f"curve x coordinate {index} must be finite")
-        coordinates.append(numeric)
-    if not coordinates:
+        if previous is not None:
+            delta = numeric - previous
+            if delta == 0.0:
+                raise ValueError(
+                    "interactive curve x coordinates must be strictly monotonic"
+                )
+            step_direction = 1 if delta > 0.0 else -1
+            if direction and step_direction != direction:
+                raise ValueError(
+                    "interactive curve x coordinates must be strictly monotonic"
+                )
+            direction = step_direction
+        previous = numeric
+    if previous is None:
         raise ValueError("interactive curve axis must not be empty")
-    if len(coordinates) > 1:
-        deltas = np.diff(np.asarray(coordinates, dtype=np.float64))
-        if not (bool(np.all(deltas > 0.0)) or bool(np.all(deltas < 0.0))):
-            raise ValueError(
-                "interactive curve x coordinates must be strictly monotonic"
-            )
-    return tuple(coordinates)
+    # EvaluatedAxis already owns an immutable tuple.  Return that exact owner
+    # after validation rather than allocating list/tuple/np.diff scratch before
+    # the caller's memory-admission boundary.
+    return axis.coordinates
 
 
 def curve_home_x_limits(axis: EvaluatedAxis) -> DisplayRange:
