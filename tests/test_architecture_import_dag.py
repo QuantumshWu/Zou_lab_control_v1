@@ -127,6 +127,10 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
     (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget._render_program"),
     (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget.rebuild"),
     (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget.values_dict"),
+    # The panel record sank into zlc_data (S5-shell(t)).  Its one normalisation point reads
+    # the ``value = ...`` expression a HUMAN typed into the Setting, so the named entry
+    # follows the code rather than the guard being widened.
+    (Path("zlc_data/console_records.py"), "PanelConfig.set_source"),
         (Path("zlc_frontend/live_plot/live.py"), "general_fit_models"),
         (Path("zlc_frontend/live_plot/live.py"), "facet_cell_labels"),
         (Path("zlc_frontend/live_plot/plot_figure.py"), "SavedFigure.axis_labels"),

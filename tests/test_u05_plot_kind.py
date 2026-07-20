@@ -184,7 +184,10 @@ def test_the_vocabulary_module_reaches_for_no_renderer_and_no_toolkit():
 
 
 @pytest.mark.parametrize("relative, expected", [
-    ("Zou_lab_control/frontend/task_console.py", {"PLOT_KIND_SPECS", "PLOT_KIND_SPEC_BY_KEY"}),
+    # The console used to name these directly.  Its per-kind PANEL_* tables moved into
+    # zlc_data.console_records with PanelConfig, so the derivation -- and with it this
+    # import -- now sits one layer down; the console reads the PANEL vocabulary instead.
+    ("zlc_data/console_records.py", {"PLOT_KIND_SPECS", "PLOT_KIND_SPEC_BY_KEY"}),
     ("zlc_frontend/live_plot/plot_figure.py", {"PLOT_KIND_SPECS", "PLOT_KIND_SPEC_BY_KEY"}),
     ("Zou_lab_control/frontend/figure_viewer.py", {"PLOT_KIND_SPEC_BY_KEY"}),
 ])

@@ -87,15 +87,20 @@ def test_the_vocabulary_module_imports_nothing():
     assert not imports, f"repeat_modes.py grew imports: {[ast.dump(n) for n in imports]}"
 
 
-def test_the_shell_reads_the_vocabulary_from_its_new_home():
+def test_the_reader_takes_the_vocabulary_from_its_new_home():
     """Structural, so this file keeps no legacy-tree dependency of its own.
 
-    A shell still importing it from the figure module would work today - the re-export
-    is the same object - which is exactly why only the import graph can catch it.
+    A reader still importing it from the figure module would work today - the re-export
+    was the same object - which is exactly why only the import graph can catch it.
+
+    The reader used to be the console shell itself, which held the per-kind fallback.
+    That fallback moved into ``zlc_data.console_records.repeat_modes_for_kind`` along with
+    PanelConfig, so the console no longer names these tuples at all; the claim is the same
+    one, made about the file that actually reads them now.
     """
 
     root = pathlib.Path(__file__).resolve().parents[1]
-    text = (root / "Zou_lab_control" / "frontend" / "task_console.py").read_text(encoding="utf-8")
+    text = (root / "zlc_data" / "console_records.py").read_text(encoding="utf-8")
     tree = ast.parse(text)
     sources = {node.module for node in ast.walk(tree)
                if isinstance(node, ast.ImportFrom)

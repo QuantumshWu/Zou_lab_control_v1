@@ -63,13 +63,24 @@ from .live import (
 )
 from zlc_frontend.render_style import PALETTE  # the ONE render colour owner
 from zlc_frontend import board_layout as _layout
-from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY, PLOT_KIND_SPECS
-from zlc_data.repeat_modes import IMAGE_REPEAT_MODES
-from zlc_data.logic_node import (
+from zlc_data.console_records import (
+    ADDABLE_PANEL_KINDS,
+    BLANK_SOURCE as _BLANK_SOURCE,
+    DEFAULT_UPDATE_MS,
     LOGIC_KINDS,
     LOGIC_NODE_CONFIG_FIELDS as _LOGIC_NODE_CONFIG_FIELDS,
     LogicNodeConfig as _LogicNodeConfig,
+    PANEL_INPUT_FORMAT,
+    PANEL_INPUT_SLOTS,
+    PANEL_KINDS,
+    PANEL_SINGLE_SLOT_KINDS,
+    PanelConfig as _PanelConfig,
+    UPDATE_INTERVALS,
     layout_record,
+    panel_allows_multi_slot,
+    panel_input_slots,
+    repeat_mode_for_kind as _repeat_mode_for_kind,
+    repeat_modes_for_kind as _repeat_modes_for_kind,
 )
 from zlc_frontend.qt_widgets import LogicNodeRow as _LogicNodeRow
 from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
@@ -181,48 +192,6 @@ MID_RUN_TAG = " (mid-run)"
 # authority turns into EXCLUSIVE claims while observe-only references receive OBSERVE claims.
 # There is no second frontend kind-string table and no global "stop everything" rule.
 
-# Console PANEL kinds.  EVERY plot kind in the ONE vocabulary ``zlc_data.plot_kind`` is a console panel
-# kind -- it renders through the SAME ``PanelCard`` (``_build_plot`` dispatches on the kind: a 2D
-# frame, a site map, a histogram, a 1-D curve, a pulse timeline ...), so a saved figure of ANY kind
-# seeds a normal ``PanelCard`` and reads its ``value`` off a hub signal.  The ``panel`` flag is NOT
-# "can this be a panel"; it is ONLY "is this offered in the live Add-Panel dropdown" (see
-# ADDABLE_PANEL_KINDS below) -- ``pulse`` is ``panel=False`` because you do not add a blank pulse
-# panel live (it is reproduced from a saved recipe / a fired sequence), but it IS a real panel kind
-# that seeds + renders through PanelCard exactly like every other.  All the per-kind panel tables
-# below are derived from the WHOLE table so pulse (and any future kind) works on the seed path with
-# no parallel literal to keep in sync.  Every table below reads the VOCABULARY, which needs no
-# renderer -- knowing that "Site map" is a kind and what shape it accepts is not a drawing question.
-_PANEL_KINDS: tuple = tuple(PLOT_KIND_SPECS)
-
-
-def _repeat_modes_for_kind(kind: str) -> tuple[str, ...]:
-    spec = PLOT_KIND_SPEC_BY_KEY.get(str(kind))
-    return tuple(spec.repeat_modes) if spec and spec.repeat_modes else tuple(IMAGE_REPEAT_MODES)
-
-
-_MISSING_REPEAT_MODE = object()
-
-
-def _repeat_mode_for_kind(kind: str, value: object = _MISSING_REPEAT_MODE) -> str:
-    modes = _repeat_modes_for_kind(kind)
-    if value is _MISSING_REPEAT_MODE:
-        return modes[0]
-    if not isinstance(value, str) or value not in modes:
-        raise ValueError(
-            f"invalid repeat_mode {value!r} for panel kind {kind!r}; "
-            f"choose from {list(modes)}"
-        )
-    return value
-
-#: ``key -> label`` for EVERY console panel kind -- the panel/card/frame title + ``PanelConfig`` kind
-#: validation (so a saved ``pulse`` figure seeds a normal panel).  Insertion order = the table order.
-PANEL_KINDS: dict[str, str] = {pk.key: pk.label for pk in _PANEL_KINDS}
-
-#: The subset offered in the live Add-Panel dropdown (``panel=True``): the kinds you add a BLANK panel
-#: of and then wire to a signal.  ``pulse`` is excluded (you do not add a blank pulse panel live), but
-#: it is still a full panel kind on the SEED path (a saved pulse figure).  Insertion order = menu order.
-ADDABLE_PANEL_KINDS: dict[str, str] = {pk.key: pk.label for pk in _PANEL_KINDS if pk.panel}
-
 #: Every panel + logic-node name is "<base> #N" with N counting from 1 (G1), so two panels /
 #: nodes of the same kind are always told apart -- in the card title, the Edit tab, the frame
 #: title, and the signal-flow grouping.  ONE source of that scheme for panels and nodes alike.
@@ -250,48 +219,6 @@ def _safe_float(text, fallback: float) -> float:
         return float(str(text).strip())
     except (TypeError, ValueError):
         return float(fallback)
-
-# What signal SHAPE each plot kind expects as its ``value`` -- shown in the panel's Setting so
-# it is clear which signals fit (e.g. a Site map wants a per-site vector, a 2D image wants a
-# frame).  DERIVED from each ``PlotKind.input_format`` in the ONE table; the per-kind contract
-# is declared THERE (everything else about the source -- the multi-slot picker + ``value = ...``
-# expression -- is universal and kind-agnostic).  Shown in the Setting + enforced in _coerce.
-PANEL_INPUT_FORMAT: dict[str, str] = {pk.key: pk.input_format for pk in _PANEL_KINDS}
-
-# The STARTING slot(s) each plot kind opens with (label, default-signal, tooltip).  Every kind
-# uses the SAME source MECHANISM (a signal picker + a ``value = ...`` expression box); whether a
-# kind can GROW extra slots (+signal / −signal) is declared by PANEL_SINGLE_SLOT_KINDS below
-# (the site map is single-slot).  A plot reads its picked input(s) as ``signal`` / ``signal[i]``.
-# Each slot = (label, default-signal-name, tooltip).  The DEFAULT (a single blank ``signal``
-# slot) lives here; the per-kind overrides (e.g. the site map's "occupancy" slot) come from each
-# ``PlotKind.input_slots`` in the ONE table, so PANEL_INPUT_SLOTS is derived, not hand-listed.
-_DEFAULT_SLOTS = (("signal", "", "the hub signal to plot"),)
-PANEL_INPUT_SLOTS: dict[str, tuple[tuple[str, str, str], ...]] = {
-    pk.key: pk.input_slots for pk in _PANEL_KINDS if pk.input_slots
-}
-
-# The per-kind declaration of which plot kinds take EXACTLY ONE signal (no +signal / −signal
-# slot-growing).  The signal-expression MECHANISM (the picker + ``value = ...`` box + evaluator)
-# is universal -- every kind has it -- but a SINGLE-slot kind cannot add more slots because its
-# auxiliary data is resolved from signal[0]: the site map pulls its ring centres + frame underlay
-# from signal[0]'s producing node, so a 2nd signal slot would be meaningless.  DERIVED from each
-# ``PlotKind.single_slot`` flag in the ONE table; PanelCard reads it (no inline per-kind check).
-PANEL_SINGLE_SLOT_KINDS: frozenset = frozenset(pk.key for pk in _PANEL_KINDS if pk.single_slot)
-
-
-def panel_input_slots(kind: str) -> tuple[tuple[str, str, str], ...]:
-    """The input slots for a plot kind -- ``[(label, default_signal, tooltip)]``.  The
-    SINGLE source of how many signals a plot consumes and what each means."""
-    return PANEL_INPUT_SLOTS.get(str(kind), _DEFAULT_SLOTS)
-
-
-def panel_allows_multi_slot(kind: str) -> bool:
-    """Whether a plot kind can grow extra signal slots (+signal / −signal).  Data-driven from
-    ``PANEL_SINGLE_SLOT_KINDS`` -- the site map is single-slot (its centres/underlay come from
-    signal[0]); every other kind is multi-slot.  Read by PanelCard so the slot UI is declared
-    in ONE place, never an inline ``kind == 'sites'`` check scattered through the widget."""
-    return str(kind) not in PANEL_SINGLE_SLOT_KINDS
-
 
 # The grouped-signal-picker helper cluster (signal_state / grouped_signal_items /
 # signal_tree_groups / fill_grouped_signal_combo / read_editable_combo / coerce_short_labels,
@@ -957,16 +884,6 @@ _RELIM_PARAM = ParamDecl(
             "  normal = autoscale with the matplotlib default margin\n"
             "  fixed  = pin the y-axis / colour-limit to the lo/hi below")
 
-#: Per-panel display refresh intervals (ms) the operator can pick from.  A FIXED, harmonic set
-#: (100·{1,2,4,8}) so the SMALLEST selected interval divides every other -- the console timer
-#: runs at that base (the GCD) and each panel refreshes every ``update_ms // base`` ticks.  The
-#: payoff is PHASE ALIGNMENT: panels that share a beat fire on the SAME tick and read the SAME
-#: hub snapshot, so a 2-D frame and its site-map stay shot-coherent; a fast panel (100 ms) just
-#: refreshes more often in between (a live-1D alignment monitor).  Limiting the choices to this
-#: set is what makes the synchronisation exact -- arbitrary per-panel rates could never co-align.
-UPDATE_INTERVALS = (100, 200, 400, 800)
-DEFAULT_UPDATE_MS = 400
-
 #: Image containers the Edit-tab Save offers, in menu order (first = default).  A DATA-layer choice of
 #: the output FILE FORMAT (not an art knob): the figure's geometry / dpi / typography are unchanged; only
 #: the container the ``DataFigure.save(image_ext=...)`` writes changes.  Lowercase to match matplotlib's
@@ -996,16 +913,6 @@ def _unit_df_for(plotter):
 
 
 # ====================================================================== state
-_PANEL_CONFIG_FIELDS = {
-    "kind": str,
-    "title": str,
-    "row": int,
-    "col": int,
-    "size": str,
-    "source": str,
-    "params": dict,
-    "inputs": list,
-}
 _TASK_CONSOLE_STATE_FIELDS = {
     "schema": str,
     "name": str,
@@ -1015,117 +922,14 @@ _TASK_CONSOLE_STATE_FIELDS = {
 }
 
 
-#: The ONE console-record validator now lives in :mod:`zlc_data.logic_node`;
+#: The ONE console-record validator now lives in :mod:`zlc_data.console_records`;
 #: panel, logic-node and console-state records all read it from there.
 _layout_record = layout_record
 
 
-class PanelConfig:
-    """One panel: kind + a size PRESET + its pixel top-left on the board (``col`` = pixel x,
-    ``row`` = pixel y).  ``_compact`` re-packs these top-left under gravity (no column grid)."""
-
-    def __init__(
-        self,
-        *,
-        kind: str,
-        title: str = "",
-        row: int = 0,
-        col: int = 0,
-        size: str = "2x2",
-        source: str | None = None,
-        params: Mapping[str, object] | None = None,
-        inputs: Sequence[str] | None = None,
-    ):
-        if kind not in PANEL_KINDS:
-            raise ValueError(f"unknown panel kind {kind!r}; choose from {sorted(PANEL_KINDS)}.")
-        panel_size_cells(size)              # validate against the limited preset list
-        self.kind = str(kind)
-        self.title = str(title)
-        self.row = max(0, int(row))    # pixel y of the card top-left (no column grid)
-        self.col = max(0, int(col))    # pixel x of the card top-left (no column grid)
-        self.size = str(size)
-        # The per-slot signal names (signal[0], signal[1], ...): one hub signal per input
-        # slot of this plot kind.  Defaults to each slot's default signal so a freshly
-        # added panel already names what it wants; a saved layout restores its picks.
-        slots = panel_input_slots(self.kind)
-        if inputs is None:
-            self.inputs = [d for _, d, _ in slots]
-        else:
-            self.inputs = [str(s) for s in inputs]
-            if len(self.inputs) < len(slots):       # pad to the kind's slot count
-                self.inputs += [d for _, d, _ in slots[len(self.inputs):]]
-        # A pure-view plot is BLANK until a signal is picked (decoupled from acquisition).
-        # When the input already names a signal, the default source is ``value = signal``;
-        # an empty input leaves it blank ("pick a signal").  A saved layout keeps its
-        # stored source verbatim.
-        if source is None:
-            source = "value = signal" if self.inputs and self.inputs[0] else _BLANK_SOURCE
-        self.set_source(source)
-        self.params = dict(params or {})
-        if "repeat_mode" in self.params:
-            self.params["repeat_mode"] = _repeat_mode_for_kind(
-                self.kind,
-                self.params["repeat_mode"],
-            )
-
-    def set_source(self, source: str) -> None:
-        """Set the expression and keep a single-slot bare-name binding canonical.
-
-        ``value = <hub signal>`` names the sole input, whereas ``value = signal``
-        reads the existing picker binding and multi-slot/custom expressions leave
-        the inputs untouched.  Constructor, GUI edit and slot mutations all pass
-        through this owner so the layout writer cannot emit a record its reader
-        would normalize differently.
-        """
-        from zlc_data.signal_expr import IDENTITY_SOURCE_RE
-
-        self.source = str(source)
-        match = IDENTITY_SOURCE_RE.fullmatch(self.source.strip())
-        if match and match.group(1) != "signal" and len(self.inputs) == 1:
-            self.inputs[0] = match.group(1)
-
-    @property
-    def update_ms(self) -> int:
-        """This panel's display refresh interval (ms), one of :data:`UPDATE_INTERVALS`.
-        Stored in ``params`` (so it round-trips with the saved layout); an out-of-set value
-        falls back to :data:`DEFAULT_UPDATE_MS` so the timer base stays harmonic."""
-        ms = int(self.params.get("update_ms", DEFAULT_UPDATE_MS) or DEFAULT_UPDATE_MS)
-        return ms if ms in UPDATE_INTERVALS else DEFAULT_UPDATE_MS
-
-    def to_dict(self) -> dict[str, object]:
-        # ``row``/``col`` are the card's pixel top-left (no column grid).  They are only a SEED for
-        # the gravity packer, which re-packs the whole board on load, so a layout's reading order
-        # (top-to-bottom, left-to-right) is what round-trips -- exact pixels are recomputed.
-        return {
-            "kind": self.kind,
-            "title": self.title,
-            "row": self.row,
-            "col": self.col,
-            "size": self.size,
-            "source": self.source,
-            "params": dict(self.params),
-            "inputs": list(self.inputs),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "PanelConfig":
-        data = _layout_record(
-            payload,
-            _PANEL_CONFIG_FIELDS,
-            "PanelConfig",
-            discriminator=None,
-        )
-        if data["row"] < 0 or data["col"] < 0:
-            raise ValueError("panel row and col must be non-negative")
-        if any(type(name) is not str for name in data["inputs"]):
-            raise TypeError("panel inputs must contain strings")
-        result = cls(**data)
-        if result.source != data["source"] or result.inputs != data["inputs"]:
-            raise ValueError("PanelConfig is not in current canonical form")
-        return result
-
-
-#: Now :class:`zlc_data.logic_node.LogicNodeConfig`; old name kept as a plain alias.
+#: Both console records now live in :mod:`zlc_data.console_records`; the old names
+#: stay as plain aliases, so every existing caller and export keeps working.
+PanelConfig = _PanelConfig
 LogicNodeConfig = _LogicNodeConfig
 
 

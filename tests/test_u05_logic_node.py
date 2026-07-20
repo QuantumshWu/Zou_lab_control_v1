@@ -26,7 +26,7 @@ import pathlib
 import pytest
 from PyQt5 import QtWidgets
 
-from zlc_data.logic_node import LOGIC_KINDS, LogicNodeConfig, layout_record
+from zlc_data.console_records import LOGIC_KINDS, LogicNodeConfig, layout_record
 from zlc_frontend.qt_widgets import LogicNodeRow, ensure_qt_app
 
 ROW_GOLDEN = {
@@ -112,7 +112,7 @@ def test_the_shared_validator_refuses_a_wrong_type_rather_than_coercing():
 
 
 def test_the_record_module_reaches_for_no_toolkit_and_no_renderer():
-    import zlc_data.logic_node as record
+    import zlc_data.console_records as record
 
     tree = ast.parse(pathlib.Path(record.__file__).read_text(encoding="utf-8"))
     modules = set()
@@ -135,6 +135,6 @@ def test_the_shell_reads_all_three_names_back_from_their_new_homes():
         if isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 sources.setdefault(alias.name, set()).add(node.module)
-    assert sources.get("LogicNodeConfig") == {"zlc_data.logic_node"}
-    assert sources.get("layout_record") == {"zlc_data.logic_node"}
+    assert sources.get("LogicNodeConfig") == {"zlc_data.console_records"}
+    assert sources.get("layout_record") == {"zlc_data.console_records"}
     assert sources.get("LogicNodeRow") == {"zlc_frontend.qt_widgets"}

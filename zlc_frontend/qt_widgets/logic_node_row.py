@@ -1,6 +1,6 @@
 """The Logic tab's row card: one node, its state dot, publishes, and four buttons.
 
-Displays a :class:`zlc_data.logic_node.LogicNodeConfig` and emits what the operator
+Displays a :class:`zlc_data.console_records.LogicNodeConfig` and emits what the operator
 asked for; it owns no lifecycle itself, which is why it can live here while the
 console keeps the start/stop/edit/remove decisions.
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from PyQt5 import QtCore, QtWidgets
 
-from zlc_data.logic_node import LogicNodeConfig
+from zlc_data.console_records import LogicNodeConfig
 
 from .fluent import FluentButton, FluentFrame, FluentLabel, FluentStatusDot, scaled_px
 from .style import ACCENT, GREEN, GREY, ORANGE, RED
