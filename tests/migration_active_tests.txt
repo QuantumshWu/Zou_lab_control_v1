@@ -118,3 +118,4 @@ tests/test_u04_status_strip_priority.py
 tests/test_u04_scan_capacity_refusal.py
 tests/test_u04_meter_display_owner.py
 tests/test_u04_display_revision_by_intent.py
+tests/test_u04_signal_picker_owner.py

@@ -54,6 +54,10 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         (Path("zlc_frontend/qt_widgets/fluent.py"), "align_to_resolution"),
         (Path("zlc_frontend/qt_widgets/fluent.py"), "FluentPathEdit._dialog_start"),
         (Path("zlc_frontend/qt_widgets/fluent.py"), "FluentTreeComboBox.current_signal"),
+        # Same concern as the line above: this reads what a human TYPED into an
+        # editable combo, which is exactly the named-adapter boundary this guard
+        # reserves .strip() for.
+        (Path("zlc_frontend/qt_widgets/signal_picker.py"), "read_editable_combo"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_TextHandler.is_empty"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.read"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.is_empty"),

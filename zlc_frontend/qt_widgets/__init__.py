@@ -22,6 +22,14 @@ from .axis_navigator import AxisLayoutNavigator
 from .board import QtImageBoard, QtOwnerWake, QtRasterBoard
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
 from .fit_authoring import FitAuthoringPane
+from .signal_picker import (
+    coerce_short_labels,
+    fill_grouped_signal_combo,
+    grouped_signal_items,
+    read_editable_combo,
+    signal_state,
+    signal_tree_groups,
+)
 from .display_editor import (
     FluentRevisionedFormEditor,
     runtime_range_placeholders,
@@ -282,6 +290,12 @@ __all__ = [
     "set_fluent_scale",
     "setting_label_width",
     "signals_blocked",
+    "coerce_short_labels",
+    "fill_grouped_signal_combo",
+    "grouped_signal_items",
+    "read_editable_combo",
+    "signal_state",
+    "signal_tree_groups",
     "status_dot_stylesheet",
     "stroke_card_border",
     "window_pad",
