@@ -4,15 +4,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from .analysis import AtomDetection, FidelityEstimate, estimate_threshold_fidelity
 from .calibration import TrapCalibration
 from .utils import html_summary, site_index
-from ..timing import PulseSequence
-from ..timing.verilog import VerilogBuild
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    # ``timing.sequence`` imports ``core.analysis``, so core <-> timing is a real
+    # cycle; these two names are used ONLY as dataclass field annotations, and
+    # this module already has ``from __future__ import annotations``, so the
+    # dependency is type-level and must not be a runtime import.  It used to
+    # survive on import ORDER alone - the legacy frontend happened to pull
+    # ``core`` in first - which is not a property any module may rely on.
+    from ..timing import PulseSequence
+    from ..timing.verilog import VerilogBuild
 from ..views.plots import plot_detection_image, plot_site_values, plot_threshold_hist
 
 

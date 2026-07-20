@@ -62,6 +62,9 @@ MOVES = {
     "Zou_lab_control.neutral_atom.operations.figure_capture": "zlc_data.figure_capture",
     # H1d - the live-plot family's array poller.
     "Zou_lab_control.frontend._watcher": "zlc_frontend.live_plot._watcher",
+    # H1e - the shell itself, plus the figure object it hands back.
+    "Zou_lab_control.frontend.data_figure": "zlc_frontend.live_plot.plot_figure",
+    "Zou_lab_control.frontend.live": "zlc_frontend.live_plot.live",
 }
 
 _MODULE_INFRA = {
@@ -117,7 +120,7 @@ def test_moved_modules_import_no_legacy_code():
 
 # ---------------------------------------------------------------- tendril ledger
 
-#: Every domain import inside the two shells, machine-verified below.  This is
+#: Every domain import inside the remaining shell, machine-verified below.  This is
 #: the PORT SPECIFICATION for checklist 4: wiring the new data plane means
 #: cutting these seams one group at a time; each cut deletes its rows here.
 TENDRILS = {
@@ -157,7 +160,6 @@ TENDRILS = {
     # answers for its own waveform (``PulseTableState.analog_bus_samples``) and the
     # render surface asks the object it was already handed - an OBJECT port, pinned
     # by ``test_u06_shell_domain_ports``.  Relocate what is pure; invert what is not.
-    "Zou_lab_control/frontend/live.py": set(),
 }
 
 
