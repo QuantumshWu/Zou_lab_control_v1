@@ -34,7 +34,7 @@ from zlc_data import (
     ValidityContract,
     ValueSchema,
 )
-from zlc_frontend import DataFigure, MeterPanelPayload
+from zlc_frontend import DataFigure, MeterDisplayState, MeterPanelPayload
 from zlc_frontend.figure import (
     AxisViewRole,
     DatasetDescriptor,
@@ -419,7 +419,7 @@ def test_meter_focus_required_minus_one_rejects_before_renderer_allocation(
         expected_selection=regions[0].selection,
         expected_intent=ViewIntent.METER,
     )
-    state = figure_workbench._MeterDisplayState(0, regions[0].selection)
+    state = MeterDisplayState(0, regions[0].selection)
     required = figure_workbench._typed_front_required_peak_bytes(focused, state)
 
     class ForbiddenRenderer:
@@ -461,7 +461,7 @@ def test_meter_focus_budget_rejects_before_deriving_panel(
                 figure,
                 0,
                 expected_intent=ViewIntent.METER,
-                display=figure_workbench._MeterDisplayState(
+                display=MeterDisplayState(
                     0,
                     overview.regions[0].selection,
                 ),

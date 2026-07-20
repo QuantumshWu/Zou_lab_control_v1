@@ -15,6 +15,7 @@ from .curve_display import (
     curve_display_with_x_view,
 )
 from .display_range import DisplayRange, RelimMode, validated_display_range
+from .meter_display import MeterDisplayState
 from .histogram_display import (
     DEFAULT_HISTOGRAM_BINS,
     MAX_HISTOGRAM_BINS,
@@ -219,6 +220,7 @@ __all__ = [
     "HistogramBinProjection",
     "HistogramCountScale",
     "HistogramDisplayState",
+    "MeterDisplayState",
     "HistogramInteractionIntent",
     "HistogramPanelPayload",
     "HistogramRangeGesture",

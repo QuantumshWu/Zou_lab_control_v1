@@ -41,6 +41,7 @@ from zlc_frontend import (
     FitAuthoringOption,
     HistogramPanelPayload,
     ImagePanelPayload,
+    MeterDisplayState,
     MeterPanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
@@ -337,29 +338,6 @@ def _render_figure(
 
 
 @dataclass(frozen=True, slots=True)
-class _MeterDisplayState:
-    panel_index: int
-    expected_selection: Selection | None
-    revision: int = 0
-
-    def __post_init__(self) -> None:
-        if isinstance(self.panel_index, bool) or not isinstance(self.panel_index, int):
-            raise TypeError("meter panel_index must be a non-negative integer")
-        if self.panel_index < 0:
-            raise ValueError("meter panel_index must be a non-negative integer")
-        if self.expected_selection is not None and not isinstance(
-            self.expected_selection,
-            Selection,
-        ):
-            raise TypeError("meter expected_selection must be Selection or None")
-        object.__setattr__(
-            self,
-            "revision",
-            nonnegative_integer(self.revision, "meter display revision"),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class _TypedGridOverview:
     intent: ViewIntent
     bundle: EncodedRasterDocument
@@ -491,7 +469,7 @@ _TypedDisplayState = (
     ImageDisplayState
     | CurveDisplayState
     | HistogramDisplayState
-    | _MeterDisplayState
+    | MeterDisplayState
 )
 _TypedPanelPayload = (
     ImagePanelPayload
@@ -756,7 +734,7 @@ def _state_intent(state: _TypedDisplayState) -> ViewIntent:
         return ViewIntent.CURVE
     if isinstance(state, HistogramDisplayState):
         return ViewIntent.HISTOGRAM
-    if isinstance(state, _MeterDisplayState):
+    if isinstance(state, MeterDisplayState):
         return ViewIntent.METER
     raise TypeError("typed display state must be IMAGE, CURVE, HISTOGRAM, or METER")
 
@@ -769,7 +747,7 @@ def _default_typed_state(intent: ViewIntent) -> _TypedDisplayState:
     if intent is ViewIntent.HISTOGRAM:
         return HistogramDisplayState()
     if intent is ViewIntent.METER:
-        return _MeterDisplayState(0, None)
+        return MeterDisplayState(0, None)
     raise ValueError("typed intent must be IMAGE, CURVE, HISTOGRAM, or METER")
 
 
@@ -780,7 +758,7 @@ def _typed_form_spec(state: _TypedDisplayState):
         return curve_display_form_spec()
     if isinstance(state, HistogramDisplayState):
         return histogram_display_form_spec()
-    if isinstance(state, _MeterDisplayState):
+    if isinstance(state, MeterDisplayState):
         raise ValueError("METER has no authored display form")
     raise TypeError("unknown typed display state")
 
@@ -792,7 +770,7 @@ def _typed_form_values(state: _TypedDisplayState) -> dict[str, object]:
         return curve_display_form_values(state)
     if isinstance(state, HistogramDisplayState):
         return histogram_display_form_values(state)
-    if isinstance(state, _MeterDisplayState):
+    if isinstance(state, MeterDisplayState):
         raise ValueError("METER has no authored display form")
     raise TypeError("unknown typed display state")
 
@@ -821,7 +799,7 @@ def _typed_state_from_form(
             values,
             current_count_limits=current_value_limits,
         )
-    if isinstance(state, _MeterDisplayState):
+    if isinstance(state, MeterDisplayState):
         raise ValueError("METER has no authored display form")
     raise TypeError("unknown typed display state")
 
@@ -1229,7 +1207,7 @@ def _validate_rendered_authored_payload(
 ) -> None:
     """Perform data-sized authored-state proof on the render worker."""
 
-    if isinstance(expected_state, _MeterDisplayState):
+    if isinstance(expected_state, MeterDisplayState):
         if not isinstance(payload, MeterPanelPayload):
             raise ValueError("METER worker returned another payload kind")
         if fit_result_identity is not None:
@@ -1729,7 +1707,7 @@ def _render_typed_front(
                     **histogram_options,
                 )
             else:
-                assert isinstance(state, _MeterDisplayState)
+                assert isinstance(state, MeterDisplayState)
                 raster, payload = renderer.render_meter(
                     figure.evaluated,
                     display_revision=state.revision,
@@ -2160,7 +2138,7 @@ class DataFigureWindow(FrozenRasterWindow):
         if region.selection is None:
             raise RuntimeError("typed grid region lost its exact selection")
         display: _TypedDisplayState = (
-            _MeterDisplayState(panel_index, region.selection)
+            MeterDisplayState(panel_index, region.selection)
             if overview.intent is ViewIntent.METER
             else _default_typed_state(overview.intent)
         )
