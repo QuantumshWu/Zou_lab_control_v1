@@ -86,6 +86,7 @@ tests/test_w8_transformed_fit_figure.py
 tests/test_workbench_endpoint_binding.py
 tests/test_workbench_host_contract.py
 tests/test_z0_import_targets_resolve.py
+tests/test_z0_zero_residue.py
 tests/test_zlc_calibration_commit.py
 tests/test_zlc_calibration_stream_contracts.py
 tests/test_zlc_camera_adapter_sdk.py

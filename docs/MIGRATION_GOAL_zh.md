@@ -128,32 +128,34 @@ zoom/pan/crosshair/hover/selector;不适用的 plot kind 必须有旧行为证�
 
 ---
 
-## 四、零残余的机械定义(`tests/test_z0_zero_residue.py`)
+## 四、零残余的机械定义(`tests/test_z0_zero_residue.py` ✅ 已落地)
 
-**每条断言都是对 `git ls-files` 的属性计算,绝不是硬编码名字清单**;失败必须打印
-`sorted(offenders)` + 修复命令。本文件进白名单。
+**每条断言都是对 `git ls-files` 的属性计算,绝不是硬编码名字清单**;失败打印 offenders + 修复指引。
+**预算全部实测,不是估计**,只减不增;代码里的数字与本表由
+`test_every_budget_is_mirrored_in_the_goal_document` 机械绑定——改一处不改另一处直接红。
 
-| id | 断言 | 今天 |
-|---|---|---|
-| Z1 | `Zou_lab_control/{frontend,neutral_atom}/` 目录与 tracked 前缀均不存在 | FAIL(预算制) |
-| Z2 | 无文件 import `Zou_lab_control.frontend` / `.neutral_atom`(allowlist 只减不增) | **FAIL**:`_gui.py`、`content/manuals.py`、`notes.py`、`docs/task_console_design/build.py:31,33`、`fpga/pulse_streamer/sim/_gen_replay_t.py:9-10` |
-| Z3 | 无转发壳(兜底子句:≤40 行且只有 import + `globals().update`) | FAIL(18) |
-| Z4 | 六包 AST 无 `Zou_lab_control` 根 | **PASS → 今天就落成棘轮**,并给 `FORBIDDEN` 补 `zlc_workbench` 与 `fpga` 两个缺失 key |
-| Z5 | `test_u05_shell_salvage.py` / `test_u04_console_ui_parity.py` **被删除**(非清空) | 末期 |
-| Z6 | `CatalogRouter`/`SerializedLegacyAggBridge` 零定义零引用(**只列真存在的两个**——见 §三 F4:`LegacyPanelHost` 从未存在,`LegacyRuntimeFence` 只是概念名) | FAIL(`zlc_workbench/legacy.py:45,87`) |
-| Z7 | `Zou_lab_control/workbench/**` 只剩裁定保留件;每个窗口类全仓仅 1 处定义 | FAIL(预算制) |
-| Z8 | **白名单 == 全部 `tests/test_*.py`** | **FAIL(125/301)**;反作弊:让"把红测试移出白名单"不可能 |
-| Z9 | `test_migration_manifest_gate.py` 删除、`conftest.py` 无 collection 过滤 | 末期,**必须在 Z8 之后** |
-| Z10 | §2.2 每行状态 = CLOSED 或 APPROVED+日期 | FAIL(14 行中 13 待批) |
-| Z12 | 每个入口 `inspect.getsourcefile` 落在 `zlc_frontend/` 或 `zlc_workbench/` | FAIL(14 入口) |
+| id | 断言 | 形态 | 今天 |
+|---|---|---|---|
+| **Z4** | **六包无一 import 旧树** | **SHARP 棘轮** | ✅ **0**——已经成立,冻住不许丢 |
+| Z1 | 旧树 tracked 文件数 | 预算 | **122** |
+| Z2a | 旧树**之外**的生产代码 importer | 具名台账 | **3**:`docs/task_console_design/build.py`、根启动器 `figure_viewer.py`、`fpga/pulse_streamer/sim/_gen_replay_t.py` |
+| Z2b | 白名单测试 importer | 预算 | **6**(今天合法:对账/salvage 账本必须构造旧窗口来比;随账本在 Z0 删除归零) |
+| Z2c | 冻结测试 importer | 预算 | **168**(只能靠删文件降) |
+| Z3 | 转发壳 | 预算 | **18** |
+| Z6 | 真存在的迁移桥(`CatalogRouter`/`SerializedLegacyAggBridge`)定义数 | 预算 | **2**;另附幽灵断言:`LegacyPanelHost`/`LegacyRuntimeFence` 一旦真出现类定义即红(见 §三 F4) |
+| Z7 | 重画 workbench 模块数 | 预算 | **12**(每个窗口 UX 恢复 + 入口切换的**同一个 commit** 里降 1) |
+| Z8 | 白名单外的测试文件数 | 预算 | **176**(反作弊:只能靠删冻结文件、或让它通过并列入白名单来降,**绝不能把红测试移出去**) |
 
-**预算棘轮**:今天就落 Z1/Z2/Z3/Z4/Z6/Z7/Z8/Z10/Z12,写成 `assert len(offenders) <= BUDGET`,
-`BUDGET` **只减不增**,并有一条测试断言文档记录值 == 代码值。**残余从此是一个每 commit
-只降不升的数字。** Z5/Z9 末期落。
+**尚未落地、故意不装样子**:Z10(§2.2 每行 CLOSED/APPROVED)需要解析设计文档表格;
+Z12(每个入口 `getsourcefile` 不在 `Zou_lab_control/workbench/`)需要在测试期真 import 产品入口。
+两者随让它们有意义的窗口工作一起落。
 
-**同时补**:`test_migration_manifest_gate.py` 增一条——每个**未列**的 `tests/test_*.py`
-必须能 import(`py_compile`+`importlib` 冒烟,不跑用例)。今天就会红
-(`test_legacy_runtime_fence.py:38` 早已 dead-on-import),红得有价值。
+**另一条已落的守卫**:`tests/test_z0_import_targets_resolve.py`(见 §三 F3)——
+first-party import 目标必须存在;生产 2 条具名、白名单 0 条、冻结测试预算 165。
+
+**FORBIDDEN 为什么不补 `zlc_workbench`/`fpga` key**:"任何包不得 import 旧树"这条由 **Z4 单源拥有**
+(而且覆盖全部六包,比逐个加 key 更完整);`test_architecture_import_dag.py::FORBIDDEN`
+拥有的是**包与包之间的方向**(如 `zlc_frontend` 不得 import `zlc_pulse`)。两者不重叠,不设双源。
 
 ---
 
