@@ -2087,6 +2087,36 @@ def _scalar_semantic_identity(
     )
 
 
+def _display_revisions_by_intent(
+    image_display: ImageDisplayState | None,
+    curve_display: CurveDisplayState | None,
+    histogram_display: HistogramDisplayState | None,
+) -> dict[ViewIntent, int]:
+    """Map each panel's OWN view intent to the display revision that governs it.
+
+    This used to be keyed by panel position - index 0 got the image revision,
+    1 the curve, 2 the histogram.  That is only correct while the board is
+    frozen to one topology in one order; the moment panels may be reordered or
+    mixed, a CURVE sitting at index 0 would silently be stamped with the image's
+    revision and stop invalidating when its own display state changed.  Keying
+    on the panel's intent is position-independent, so opening up the topology
+    cannot introduce that class of stale front.
+
+    METER maps to 0 because there is no meter display state threaded through
+    this call yet; `zlc_frontend.MeterDisplayState` now exists to carry one, and
+    adding it here is the remaining half of the topology work.
+    """
+
+    revisions: dict[ViewIntent, int] = {}
+    if image_display is not None:
+        revisions[ViewIntent.IMAGE] = image_display.revision
+    if curve_display is not None:
+        revisions[ViewIntent.CURVE] = curve_display.revision
+    if histogram_display is not None:
+        revisions[ViewIntent.HISTOGRAM] = histogram_display.revision
+    return revisions
+
+
 def _build_live_configuration(
     *,
     epoch: int,
@@ -2147,29 +2177,20 @@ def _build_live_configuration(
         panel_document.layers[0].layer_id for panel_document in documents
     ):
         raise ValueError("live board panels must match frozen document layers in order")
+    display_revisions = _display_revisions_by_intent(
+        image_display,
+        curve_display,
+        histogram_display,
+    )
     presentations = tuple(
         PanelPresentationIdentity(
             panel.panel_id,
             panel_document.document_id,
             panel_document.revision,
             0,
-            (
-                image_display.revision
-                if index == 0 and image_display is not None
-                else (
-                    curve_display.revision
-                    if index == 1 and curve_display is not None
-                    else (
-                        histogram_display.revision
-                        if index == 2 and histogram_display is not None
-                        else 0
-                    )
-                )
-            ),
+            display_revisions.get(panel_document.layers[0].view.intent, 0),
         )
-        for index, (panel, panel_document) in enumerate(
-            zip(panels, documents, strict=True)
-        )
+        for panel, panel_document in zip(panels, documents, strict=True)
     )
     renderers = (
         [None for _document in scalar_documents]
