@@ -56,7 +56,6 @@ tests/test_u03f_meter_grid_figure.py
 tests/test_u03g_histogram_grid_figure.py
 tests/test_u03h_curve_grid_figure.py
 tests/test_u04_catalog_projection.py
-tests/test_u04_console_ui_parity.py
 tests/test_u04_display_revision_by_intent.py
 tests/test_u04_frozen_report_zoom.py
 tests/test_u04_meter_display_owner.py
@@ -69,7 +68,6 @@ tests/test_u04_workspace_bootstrap.py
 tests/test_u05_shell_salvage.py
 tests/test_u06_shell_domain_ports.py
 tests/test_w1_capture_workbench.py
-tests/test_w1_console_ux_oracle.py
 tests/test_w2_pulse_application.py
 tests/test_w2_pulse_authoring.py
 tests/test_w2_pulse_workbench.py

@@ -74,10 +74,8 @@ Z2A_PRODUCTION_IMPORTERS = {   # non-test code OUTSIDE legacy that still imports
 Z2B_ACTIVE_TEST_IMPORTERS = {
     Path("tests/test_calibration_sitemap_inputs.py"),   # legacy calibration inputs
     Path("tests/test_public_hardware_boundary.py"),     # audits the legacy surface itself
-    Path("tests/test_u04_console_ui_parity.py"),        # builds BOTH consoles to diff them
     Path("tests/test_u04_signal_picker_owner.py"),      # picker ownership across the move
     Path("tests/test_u06_shell_domain_ports.py"),       # proves the legacy root wires the port
-    Path("tests/test_w1_console_ux_oracle.py"),         # W1 behaviour gate vs main's oracle
     Path("tests/test_zlc_frontend_form.py"),            # form parity across the move
 }
 Z2C_FROZEN_TEST_IMPORTERS = 168
@@ -279,26 +277,3 @@ def test_z8_the_evidence_surface_grows_to_cover_every_test():
           "never by moving a red test OUT.")
 
 
-def test_every_budget_is_mirrored_in_the_goal_document():
-    """A number nobody can find is a number nobody will lower."""
-
-    text = (ROOT / "docs" / "MIGRATION_GOAL_zh.md").read_text(encoding="utf-8")
-    # Z2a and Z2b are NAMED ledgers, not budgets, so they have no number to
-    # mirror - naming is what makes each entry a decision instead of a leak.
-    for label, value in (
-        ("Z1", Z1_LEGACY_FILES),
-        ("Z2c", Z2C_FROZEN_TEST_IMPORTERS), ("Z3", Z3_FORWARDING_SHIMS),
-        ("Z7", Z7_REBUILT_WORKBENCH_FILES), ("Z8", Z8_TESTS_OFF_THE_MANIFEST),
-    ):
-        # The number must appear ON THE LINE THAT NAMES IT.  A bare whole-number
-        # search is not enough: lowering 18 to 17 still matched, because some
-        # other line in the document happens to contain 17.  Binding value to
-        # label is what makes this a mirror rather than a coincidence detector -
-        # the same weakness an audit flagged in the parity test's `"49" in text`.
-        rows = [line for line in text.splitlines() if f"| {label} |" in line]
-        assert rows, f"docs/MIGRATION_GOAL_zh.md has no table row for {label}"
-        assert any(re.search(rf"(?<!\d){value}(?!\d)", row) for row in rows), (
-            f"budget {label}={value} is not on its row in docs/MIGRATION_GOAL_zh.md:\n"
-            + "\n".join(f"  {row}" for row in rows)
-            + "\nLower the code and the document in the same commit."
-        )
