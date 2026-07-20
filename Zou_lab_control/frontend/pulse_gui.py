@@ -34,6 +34,7 @@ from Zou_lab_control.neutral_atom.timing.pulse_table import (
 from zlc_data.panel_size import PANEL_SIZES
 from zlc_data.scan_template import scan_table_template
 from zlc_data.shape_text import slot_label   # naming a bound field is grammar, not GUI
+from zlc_storage.paths import project_path   # the ONE owner of where the project root is
 # The pulse RENDER (state -> figure) lives in the plot layer (live.py); the editor CONSUMES it -- it does
 # not own the render.  ``bus_signed_bounds`` / ``bus_display_label`` are shared render+editor helpers that
 # also live there now (single source; the editor's ``_bus_signed_bounds`` / ``_bus_display_label`` names
@@ -225,8 +226,13 @@ def _default_pulse_name() -> str:
 
 
 def _pulse_files_dir() -> Path:
+    """The folder the Pulse GUI saves/loads programs in: ``$ZLC_PULSE_DIR`` if set, else the
+    project's ``pulses/``.  The default comes from :func:`zlc_storage.paths.project_path`, the
+    one owner of "where the project root is" -- deriving it again from THIS file's own depth
+    would agree only for as long as this file stays exactly where it is, which the migration
+    is in the business of changing."""
     configured = os.environ.get(PULSE_FILES_ENV, "").strip()
-    directory = Path(configured).expanduser() if configured else Path(__file__).resolve().parents[2] / "pulses"
+    directory = Path(configured).expanduser() if configured else project_path("pulses")
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 

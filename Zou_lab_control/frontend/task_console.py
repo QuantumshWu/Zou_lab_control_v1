@@ -87,6 +87,7 @@ from zlc_data.console_records import (
 from zlc_frontend.qt_widgets import LogicNodeRow as _LogicNodeRow
 from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
 from zlc_data.shape_text import slot_label   # the ONE human slot-label formatter (period/channel)
+from zlc_storage.paths import project_path   # the ONE owner of where the project root is
 from zlc_frontend.qt_widgets import PulseSlotsWidget, SignalExprWidget
 from zlc_frontend.qt_widgets import (
     ACCENT,
@@ -863,8 +864,17 @@ def drop_index(cfg, others: Sequence["PanelConfig"], board_w: int | None = None)
 
 
 def _task_files_dir() -> Path:
-    root = os.environ.get(TASK_FILES_ENV)
-    path = Path(root) if root else Path(__file__).resolve().parents[2] / "tasks"
+    """The folder saved console layouts live in: ``$ZLC_TASK_DIR`` if set, else the project's
+    ``tasks/``.  The default comes from :func:`zlc_storage.paths.project_path`, the one owner of
+    "where the project root is" -- deriving it again from THIS file's own depth would agree only
+    for as long as this file stays exactly where it is, which the migration is in the business
+    of changing.
+
+    A whitespace-only override falls back rather than crashing: it is a human typo in an
+    environment variable, and ``Path("   ").mkdir()`` raised FileNotFoundError.  The sibling
+    ``pulse_gui._pulse_files_dir`` already stripped; the two now agree."""
+    root = os.environ.get(TASK_FILES_ENV, "").strip()
+    path = Path(root).expanduser() if root else project_path("tasks")
     path.mkdir(parents=True, exist_ok=True)
     return path
 

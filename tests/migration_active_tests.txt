@@ -72,6 +72,7 @@ tests/test_u05_logic_node.py
 tests/test_u05_panel_config.py
 tests/test_u05_panel_size_vocabulary.py
 tests/test_u05_plot_kind.py
+tests/test_u05_project_root_single_source.py
 tests/test_u05_pulse_slots_widget.py
 tests/test_u05_raster_front.py
 tests/test_u05_render_island.py
