@@ -44,11 +44,40 @@ done < tests/migration_active_tests.txt
 ```
 一文件一进程是硬约束(InstallationRuntime 进程级单例)。
 
+## 【H1 已闭合(2026-07-20,commit 0ac4b79→626bf40)】
+
+live.py **已搬完**,缝清零。五个 commit 的可复用结论:
+
+- **两种切缝法,判据是"能不能搬"而非"想不想搬"**。纯函数/描述/声明 → 整模块下沉 `zlc_data`
+  (H1a/H1b/H1c 共下沉 10 个模块:readout_math/facet/signal_tensor/param_decl/raster/
+  plot_region/curve_fitting/figure_capture…)。搬不动的两类必须**反转依赖**:
+  ① 需要"活对象回答自己"→ 让领域对象长出方法(`PulseTableState.analog_bus_samples`,
+  渲染层问它已经拿在手里的 state,零 import);
+  ② 需要"构造一个活对象"→ 构造期注入(`zlc_frontend/domain_ports.py`,组合根注册工厂,
+  未注册给 typed 拒绝)。**H2 的端口就加在 `domain_ports.py`,别新开文件**;该文件顶部
+  写死了准入规则(只收"渲染层需要但造不出的活对象")。
+- **交接文档原来写错一条**:「`.data_figure`/`._watcher` 随壳留旧侧,live 搬走后经转发壳回引」
+  是**违反 DAG 的**——`zlc_frontend` 禁 import `Zou_lab_control`,搬过去的件绝不能回引旧树。
+  正确顺序:一个文件的**所有前端依赖必须先于它搬**。H2 同理:task_console 依赖的
+  `pulse_gui`/`figure_viewer`/`qt_fluent`/`render_loop` 等要先排依赖序。
+- **同名不同概念已出现两次**(`Selection`→`plot_region`、`data_figure`→`plot_figure`)。
+  撞名一律**按概念给模块改名**,不改类名,并在移动件开头写 NAME WARNING;别让一个名字担两个意思。
+- **搬家会暴露旧树里靠 import 顺序遮住的真实循环**。H1e 就撞上 `core` ↔ `timing`
+  (results.py 顶层 import PulseSequence,而 timing.sequence import core.analysis;
+  旧 data_figure 顶层 import `core.*` 恰好让 core 先初始化)。根因修=**纯类型依赖降为
+  `TYPE_CHECKING`**,不是调 import 顺序。同类症状再现按此处理。
+- 新守卫两条:`zlc_data/zlc_storage/zlc_pulse/zlc_neutral_atom/zlc_workbench` **一律不得
+  import matplotlib/PyQt5/PySide/tkinter**(五包今天全清白,是棘轮);
+  `tests/test_u06_shell_domain_ports.py` = 对象端口契约的家,H2 的端口测试写这里。
+- **教训(我犯的)**:`git checkout <path>` 会连未提交改动一起回滚。清理试探性改动只用
+  精确逆向 patch,绝不在复合命令里放 `git checkout`。
+
 ## 【当前状态(2026-07-20)】
 
-- **已搬家**(`tests/test_u05_shell_salvage.py` 守卫):
-  `zlc_frontend/live_plot/{canvas,selectors,ticks,_validate}`、
-  `zlc_frontend/qt_widgets/param_widgets.py`(包属性可达,不进 `__all__`)、`zlc_storage/paths.py`。
+- **已搬家 17 个模块**(权威=`tests/test_u05_shell_salvage.py::MOVES`,别照抄本文列表):
+  `zlc_frontend/live_plot/{canvas,selectors,ticks,_validate,_watcher,plot_figure,live}`、
+  `zlc_frontend/qt_widgets/param_widgets.py`(包属性可达,不进 `__all__`)、`zlc_storage/paths.py`、
+  `zlc_data/{readout_math,facet,signal_tensor,param_decl,raster,plot_region,curve_fitting,figure_capture}`。
   旧 console 已实测跑在这份代码上(9 按钮/Monitor+Logic 双 tab 原样)。
 - **放置公理(守卫机械强制,搬任何 GUI 文件前先对号)**:
   ① `zlc_frontend` 内**只有** `qt_widgets/` 可 import PyQt5(`test_zlc_frontend_qt_widgets` qt_leaks 条款);
@@ -57,9 +86,9 @@ done < tests/migration_active_tests.txt
      子模块收编走「`__init__` 末尾 `from . import X`+属性访问」先例(param_widgets 即样板);
   ④ 纯 mpl 件 → `live_plot/`;纯 Qt 件 → `qt_widgets/`;Qt+mpl 联姻件(`render_loop/qt_canvas`)
      **留旧树**,直到壳改用 worker-raster(S12.5)才有合法新家。
-- **两大壳未搬**:`Zou_lab_control/frontend/task_console.py`(10036 行,38 条领域缝)、
-  `frontend/live.py`(6321 行,23 条缝)。缝台账在 `test_u05_shell_salvage.py::TENDRILS`,
-  **双向棘轮**:长新缝立即红;接掉一条必须同 commit 删行。
+- **只剩一个壳未搬**:`Zou_lab_control/frontend/task_console.py`(10036 行,**26 条**领域缝)。
+  缝台账在 `test_u05_shell_salvage.py::TENDRILS`,**双向棘轮**:长新缝立即红;
+  接掉一条必须同 commit 删行。live.py 已闭合并搬走。
 - **workbench 新组件保留**(`Zou_lab_control/workbench/_task_console.py` 等):
   N 面板/状态条/METER owner/display-revision-by-intent 已落,最终由 shell 接管入口后按依赖闭合处置。
 - `tests/test_u04_console_ui_parity.py`:新 workbench console vs 旧 console 的控件对账棘轮,
@@ -69,29 +98,17 @@ done < tests/migration_active_tests.txt
 
 ## 【封闭清单(按序做完即终点)】
 
-**H1. live.py 搬家**——把 23 条缝按台账分组接掉:
-   a. 纯数学组(dependency-free,整模块下沉 `zlc_data`,旧模块变转发壳,同款配方):
-      `_readout_math`(2 条)、`core.facet`(7 条,自身只依赖 `_readout_math`)、
-      `core.signal_tensor`(1 条,numpy-only)、`core.fitting`+它依赖的 `core.selection`/`core.raster`
-      (fitting 4 条 + selection 5 条 + raster 1 条;先确认 selection/raster 的依赖闭包,
-      若纯 numpy/stdlib 就整体下沉,否则只下沉 live.py 用到的函数族并保单源回引)。
-      注意:`ParamDecl`(`core/params.py`,165 行纯 dataclass)也一并下沉 `zlc_data`,
-      task_console 的缝表里有它。
-   b. 剩余缝:`figure_capture.capture_rich_info`(1 条)、`timing.pulse_table` 两函数、
-      `.data_figure`/`._watcher` 相对引(随壳留旧侧,live 搬走后经转发壳回引即可,不算领域缝)。
-      figure_capture/pulse_table 若依赖闭包干净同样下沉,否则改为构造期注入的回调(port)。
-   c. 缝清零后 `git mv live.py → zlc_frontend/live_plot/live.py`(live.py 无 PyQt5 import 则合法;若有,先按公理④拆),旧路径转发壳,
-      `MOVES` 表加行,`TENDRILS` 删 live 段。DAG 测试自动接管。
-**H2. task_console.py 搬家**——38 条缝分两类:
-   a. 与 H1 同源的数学/声明缝(fitting/selection/raster/signal_tensor/params/facet)随 H1 自动消失;
+**H1. live.py 搬家——已闭合**(见上「H1 已闭合」节;`test_u05_shell_salvage.MOVES` 17 项为准)。
+**H2. task_console.py 搬家**——26 条缝分两类:
+   a. 与 H1 同源的数学/声明缝(fitting/selection/raster/signal_tensor/params/facet)**已随 H1 消失**;
    b. 真领域缝(signal_expr 8 条、logic 5 条、measurement(s) 6 条、processors 3 条、timing 2 条、
-      signals.NO_LINEAGE、task.DEFAULT_MID_RUN_KEY):在 `zlc_frontend/console_ports.py` 定义
-      Protocol/常量端口,壳改为构造期注入;旧入口 `show_task_console` 在旧侧组装旧实现作默认注入
+      signals.NO_LINEAGE、task.DEFAULT_MID_RUN_KEY):在**已存在的** `zlc_frontend/domain_ports.py` 加
+      Protocol/常量端口(H1d 已立此文件与准入规则,勿另开 console_ports.py),壳改为构造期注入;旧入口 `show_task_console` 在旧侧组装旧实现作默认注入
       (行为零变),新入口由 `zlc_workbench` 适配层用新数据面(DefinitionCatalog/LiveDatasetSlot 等)实现同一端口。
       **判据:凡是"读文本/常量/纯函数"直接下沉;凡是"活对象(hub/node/spec)"走端口注入。**
    c. 搬家后 `Zou_lab_control/workbench` 的入口(`exp.task_console()`/launcher `task_console.py`)
       切到 shell + 新适配层;`test_u04_console_ui_parity.py` 改为恒等断言。
-**H3. 其余 GUI 同配方**:`pulse_gui.py`(4503 行)、`data_figure.py`、`figure_viewer.py`、
+**H3. 其余 GUI 同配方**:`pulse_gui.py`(4503 行)、`figure_viewer.py`、
    `device_manager.py`、`session.py`/`jupyter.py` 按依赖顺序搬;每个先跑缝扫描
    (`test_u05` 里的 `_scan_tendrils` 即工具),小缝直接接,活对象走端口。
 **H4. 原 goal 清单 5–7**:figure_viewer 通用存档浏览器、device manager + launcher 切换、
