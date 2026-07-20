@@ -373,12 +373,15 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             if child is not None:
                 _PulseSlotsWidget._drop_layout(child)
 
-    def rebuild(self, api_rows, scan_rows, *, hardware_program: str = "",
-                program_id: str = "") -> None:
+    def rebuild(self, api_rows, scan_rows, *, api_columns=(), scan_columns=(),
+                hardware_program: str = "", program_id: str = "") -> None:
         """Rebuild from one pulse template.
 
         ``api_rows`` entries are ``(handle, coordinate, kind, target, unit, current)``;
         ``scan_rows`` entries are ``(coordinate, kind, target, unit, label)``.
+        ``*_columns`` are the matching ``ScanColumnSpec`` per slot, already derived
+        by the domain -- their per-kind default sweep needs the bus signed range and
+        the clock tick, which this layer may not reach.
         """
 
         program_id = str(program_id or "")
@@ -426,25 +429,18 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
             self._api_box.addWidget(note)
 
-        from ..neutral_atom.timing import scan_column_spec
         self._columns[self._api_slot_kind] = [
             (coordinate, slot_label(kind, target), str(unit or ""))
             for _handle, coordinate, kind, target, unit, _current in api_rows
         ]
-        self._specs[self._api_slot_kind] = [
-            scan_column_spec(coordinate, "dac" if kind == "dac" else "duration",
-                             unit=(unit or "ns"))
-            for _handle, coordinate, kind, _target, unit, _current in api_rows
-        ]
+        self._specs[self._api_slot_kind] = list(api_columns)
         self._columns[self._scan_slot_kind] = []
-        self._specs[self._scan_slot_kind] = []
+        self._specs[self._scan_slot_kind] = list(scan_columns)
         for coordinate, kind, target, unit, stored_label in scan_rows:
             display = stored_label or slot_label(kind, target)
             display_unit = "ns ticks" if kind == "duration" else (
                 "integer code (LSB)" if kind == "dac" else str(unit or ""))
             self._columns[self._scan_slot_kind].append((coordinate, display, display_unit))
-            self._specs[self._scan_slot_kind].append(
-                scan_column_spec(coordinate, kind, unit=(unit or "ns")))
 
         self._available = {
             self._scan_slot_kind: bool(scan_rows),
@@ -4875,6 +4871,7 @@ class MeasurementPanel(QtWidgets.QWidget):
             widget.rebuild([], [], program_id="")
             return
         widget.rebuild(list(rows.api_rows), list(rows.scan_rows),
+                       api_columns=rows.api_columns, scan_columns=rows.scan_columns,
                        hardware_program=rows.program, program_id=rows.program_id)
 
     # ------------------------------------------------------------- value read

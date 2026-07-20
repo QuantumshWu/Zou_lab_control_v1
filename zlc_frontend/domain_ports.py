@@ -108,6 +108,10 @@ class PulseTemplateRows:
 
     ``api_rows``  : (handle, coordinate, kind, target, unit, current)
     ``scan_rows`` : (coordinate, kind, target, unit, stored_label)
+    ``*_columns`` : the finished ``ScanColumnSpec`` per slot.  Building one needs
+                    the bus signed range, the unit table and the clock tick, so it
+                    is derived DOMAIN-side; the form receives the columns and only
+                    hands them to the (pure) template writer.
     ``program``   : the hardware scan program text, or the array literal a stored
                     scan table falls back to.
     ``program_id``: a digest of the resolved template, so the form can tell a
@@ -116,6 +120,8 @@ class PulseTemplateRows:
 
     api_rows: tuple = ()
     scan_rows: tuple = ()
+    api_columns: tuple = ()
+    scan_columns: tuple = ()
     program: str = ""
     program_id: str = ""
 

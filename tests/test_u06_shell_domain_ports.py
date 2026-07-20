@@ -354,3 +354,50 @@ def test_the_template_reader_returns_rows_the_gui_can_draw_without_pulse_types()
     for row in rows.scan_rows:
         coordinate, kind, target, unit, _label = row
         assert all(isinstance(x, str) for x in (coordinate, kind, target, unit))
+
+
+def test_the_template_port_hands_over_columns_the_gui_could_not_have_built():
+    """The DAC-vs-duration sweep default is derived DOMAIN-side, and stays right.
+
+    ``scan_column_spec`` reads the bus signed range, the unit table and the clock
+    tick, so the render layer cannot run it - ``zlc_frontend`` may not import the
+    pulse package at all.  The port therefore carries finished columns.  What must
+    survive that move is the per-KIND default: a DAC column sweeps its signed code
+    range (0 = 0 V), a duration column sweeps time.  Seeding a +-512 DAC column
+    with a duration's ns range is the operator-visible bug this distinction exists
+    to prevent, so it is pinned here rather than trusted.
+
+    The fixture deliberately BINDS one slot of each kind: the older row assertions
+    above run over a template with no slots at all, and an empty tuple would make
+    any claim about columns vacuously true.
+    """
+
+    import json
+    import tempfile
+
+    import Zou_lab_control.frontend  # noqa: F401  - registers the reader
+    from zlc_data.scan_template import ScanColumnSpec
+    from zlc_frontend.domain_ports import pulse_template_rows
+    from Zou_lab_control.neutral_atom.timing.pulse_table import ApiSlot, ScanSlot
+
+    state = _state([{"mode": "edge", "value": 20},
+                    {"mode": "hold", "value": None},
+                    {"mode": "hold", "value": None}])
+    last = len(state.periods) - 1
+    state.scan_slots.append(ScanSlot(kind="dac", target=f"{BUS}@{last}", label="bus", unit="code"))
+    state.scan_slots.append(ScanSlot(kind="duration", target=str(last), label="dur", unit="us"))
+    state.api_slots.append(ApiSlot(name="a1", kind="duration", target=str(last), unit="us"))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "template.json"
+        path.write_text(json.dumps(state.to_dict(), default=str), encoding="utf-8")
+        rows = pulse_template_rows(str(path))
+
+    assert len(rows.scan_columns) == len(rows.scan_rows) == 2, "fixture must bind both kinds"
+    assert len(rows.api_columns) == len(rows.api_rows) == 1
+    assert all(isinstance(c, ScanColumnSpec) for c in rows.scan_columns + rows.api_columns)
+
+    dac, duration = rows.scan_columns
+    assert dac.is_dac and (dac.lo, dac.hi) == (-512.0, 511.0)
+    assert not duration.is_dac and duration.lo < duration.hi
+    # The distinction itself: a DAC column never inherits the time column's range.
+    assert (dac.lo, dac.hi) != (duration.lo, duration.hi)

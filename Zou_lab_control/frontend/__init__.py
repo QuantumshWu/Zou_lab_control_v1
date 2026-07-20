@@ -319,7 +319,22 @@ def _read_pulse_template(path):
     program_id = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     ).hexdigest()
+    # The per-slot sweep default needs pulse geometry (bus signed range, unit
+    # table, clock tick), so it is derived HERE.  Same expressions the form used
+    # to run itself, moved to the side of the seam that may import the compiler.
+    from Zou_lab_control.neutral_atom.timing import scan_column_spec
+
+    api_columns = tuple(
+        scan_column_spec(coordinate, "dac" if kind == "dac" else "duration",
+                         unit=(unit or "ns"))
+        for _handle, coordinate, kind, _target, unit, _current in api_rows
+    )
+    scan_columns = tuple(
+        scan_column_spec(coordinate, kind, unit=(unit or "ns"))
+        for coordinate, kind, _target, unit, _label in scan_rows
+    )
     return _PulseTemplateRows(api_rows=api_rows, scan_rows=scan_rows,
+                              api_columns=api_columns, scan_columns=scan_columns,
                               program=code, program_id=program_id)
 
 

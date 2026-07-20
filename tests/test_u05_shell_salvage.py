@@ -130,7 +130,6 @@ TENDRILS = {
         ("neutral_atom.operations.logic", "Processor"),
         ("neutral_atom.operations.logic", "ProcessorRun"),
         ("neutral_atom.operations.processors.fit", "FitProcessor"),
-        ("neutral_atom.timing", "scan_column_spec"),
     },
     # live.py: EMPTY.  Its last two seams were cut differently and the contrast is
     # the whole lesson.  ``figure_capture`` was pure description over duck-typed
