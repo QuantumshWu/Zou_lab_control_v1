@@ -32,6 +32,7 @@ from Zou_lab_control.neutral_atom.timing.pulse_table import (
     analog_bus_ticks as _analog_bus_ticks,
 )
 from zlc_data.scan_template import scan_table_template
+from zlc_data.shape_text import slot_label   # naming a bound field is grammar, not GUI
 # The pulse RENDER (state -> figure) lives in the plot layer (live.py); the editor CONSUMES it -- it does
 # not own the render.  ``bus_signed_bounds`` / ``bus_display_label`` are shared render+editor helpers that
 # also live there now (single source; the editor's ``_bus_signed_bounds`` / ``_bus_display_label`` names
@@ -265,37 +266,6 @@ def _api_number(name: object) -> int:
     return int(digits) if digits else 1
 
 
-def slot_label(kind: str, target: str, *, base_1: bool = True) -> str:
-    """The STATE-FREE, INDEX-based label for a bound pulse field from (kind, target) ALONE.
-
-    The raw ``target`` is an INTERNAL handle -- a 0-based period index (``duration``),
-    ``"<bus>@<period_index>"`` (``dac``), or a channel/bus name (``delay``) -- meaningless to
-    show verbatim (the user's "a1  duration @ 1" complaint: "what is 1?").  This names the PERIOD
-    by its 1-based INDEX (``Period 3``, matching the 'Period N/M' on the card) / channel / bus
-    WITHOUT a ``PulseTableState``, so it works on the flat row tuples the pulse editor + the
-    task-console pulse-scan form carry where no state object is in hand.  The COMPLEMENT is
-    ``timing.pulse_table.scan_target_label`` -- the STATE-FUL, NAME-based label (``probe duration``)
-    for callers that DO hold a state.  The two are NOT duplicates: same question, different input
-    (index vs name)."""
-
-    target = str(target)
-    off = 1 if base_1 else 0
-    if kind == "duration":
-        try:
-            return f"Period {int(target) + off} duration"
-        except ValueError:
-            return f"Period {target} duration"
-    if kind == "dac":
-        bus, sep, period = target.partition("@")
-        if sep:
-            try:
-                return f"{bus} (Period {int(period) + off})"
-            except ValueError:
-                return f"{bus} (Period {period})"
-        return f"{bus} DAC"
-    if kind == "delay":
-        return f"{target} delay"            # the channel / bus name is the information
-    return target
 
 
 def _scan_slot_label(state: PulseTableState, index: int) -> str:

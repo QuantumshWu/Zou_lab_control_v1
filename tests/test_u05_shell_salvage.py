@@ -120,6 +120,46 @@ def test_moved_modules_import_no_legacy_code():
                     )
 
 
+#: The two salvaged shells.  Neither may import the other: they are siblings that
+#: will move independently, and a symbol one of them needs from the other is by
+#: definition shared, so it belongs BELOW both rather than inside whichever shell
+#: happened to define it first.
+SHELLS = {
+    "task_console": "Zou_lab_control/frontend/task_console.py",
+    "pulse_gui": "Zou_lab_control/frontend/pulse_gui.py",
+}
+
+
+def test_neither_shell_imports_the_other():
+    """The coupling that made ``slot_label`` a shared name rather than pulse_gui's.
+
+    The console reached into the pulse editor for one pure formatter, which quietly
+    made the whole 6k-line editor a prerequisite for opening the console and tied
+    the two shells' relocation order together.  The formatter now lives in
+    ``zlc_data.shape_text`` and both shells read it from there.
+
+    Checked by parsing rather than importing, so this file keeps its own promise of
+    being a structural guard with no legacy dependency of its own.
+    """
+
+    for name, relative in SHELLS.items():
+        others = {n for n in SHELLS if n != name}
+        tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            targets = []
+            if isinstance(node, ast.ImportFrom):
+                # relative (``from .pulse_gui import x``) and absolute alike
+                targets = [node.module or ""]
+            elif isinstance(node, ast.Import):
+                targets = [alias.name for alias in node.names]
+            for target in targets:
+                tail = str(target).rsplit(".", 1)[-1]
+                assert tail not in others, (
+                    f"{name} imports the sibling shell {tail} (line {node.lineno}); "
+                    "a symbol both shells need belongs below both, not inside one."
+                )
+
+
 # ---------------------------------------------------------------- tendril ledger
 
 #: Every domain import inside the remaining shell, machine-verified below.  This is

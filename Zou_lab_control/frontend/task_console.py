@@ -67,7 +67,7 @@ from .live import (
     site_ring_radius,
 )
 from zlc_frontend.render_style import PALETTE  # the ONE render colour owner
-from .pulse_gui import slot_label   # the ONE human slot-label formatter (period/channel, #H3s-F2)
+from zlc_data.shape_text import slot_label   # the ONE human slot-label formatter (period/channel)
 from zlc_frontend.qt_widgets import (
     ACCENT,
     CARD_PAD,

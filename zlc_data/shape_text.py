@@ -1,4 +1,4 @@
-"""The ONE spelling of a signal's shape and a camera's frame names.
+"""The ONE spelling of a signal's shape, a camera's frame names, and a bound pulse field.
 
 Both surfaces have to say the same thing about the same signal.  The domain
 publishes ``frame_0 .. frame_{N-1}`` and the console's picker offers those names
@@ -14,10 +14,13 @@ from ``operations/logic.py``, which cannot move (it reaches devices and the sign
 hub); the legacy module imports them back, so every existing caller keeps
 resolving the SAME function objects.
 
-Admission rule: a pure derivation of TEXT THAT BOTH SURFACES MUST AGREE ON - a
-shape's spelling, or the spelling of a name the domain publishes and the GUI has
-to reproduce.  No knowledge of who is asking.  Anything needing a running node belongs in
-``zlc_frontend.domain_ports`` instead.
+Admission rule: a pure derivation of TEXT THAT MORE THAN ONE SURFACE MUST AGREE
+ON.  That started as domain-publishes / GUI-reproduces (a shape's spelling, a
+published signal's name) and now also covers text two SHELLS must spell alike:
+``slot_label`` names a bound pulse field and both the pulse editor and the task
+console's pulse-scan form show it, so it belongs at the bottom rather than inside
+whichever shell happened to define it first.  No knowledge of who is asking.
+Anything needing a running node belongs in ``zlc_frontend.domain_ports`` instead.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ __all__ = [
     "format_dims",
     "grid_for_points",
     "measurement_slug",
+    "slot_label",
 ]
 
 
@@ -119,3 +123,36 @@ def measurement_slug(name: str) -> str:
     called the same thing in the Add-Panel list, the signal-flow legend, and the hub
     signal names -- never a separately hand-typed abbreviation that drifts."""
     return re.sub(r"_+", "_", re.sub(r"[^0-9a-z]+", "_", str(name).lower())).strip("_")
+
+
+def slot_label(kind: str, target: str, *, base_1: bool = True) -> str:
+    """The STATE-FREE, INDEX-based label for a bound pulse field from (kind, target) ALONE.
+
+    The raw ``target`` is an INTERNAL handle -- a 0-based period index (``duration``),
+    ``"<bus>@<period_index>"`` (``dac``), or a channel/bus name (``delay``) -- meaningless to
+    show verbatim (the user's "a1  duration @ 1" complaint: "what is 1?").  This names the PERIOD
+    by its 1-based INDEX (``Period 3``, matching the 'Period N/M' on the card) / channel / bus
+    WITHOUT a ``PulseTableState``, so it works on the flat row tuples the pulse editor + the
+    task-console pulse-scan form carry where no state object is in hand.  The COMPLEMENT is
+    ``timing.pulse_table.scan_target_label`` -- the STATE-FUL, NAME-based label (``probe duration``)
+    for callers that DO hold a state.  The two are NOT duplicates: same question, different input
+    (index vs name)."""
+
+    target = str(target)
+    off = 1 if base_1 else 0
+    if kind == "duration":
+        try:
+            return f"Period {int(target) + off} duration"
+        except ValueError:
+            return f"Period {target} duration"
+    if kind == "dac":
+        bus, sep, period = target.partition("@")
+        if sep:
+            try:
+                return f"{bus} (Period {int(period) + off})"
+            except ValueError:
+                return f"{bus} (Period {period})"
+        return f"{bus} DAC"
+    if kind == "delay":
+        return f"{target} delay"            # the channel / bus name is the information
+    return target
