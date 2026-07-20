@@ -66,6 +66,7 @@ tests/test_u04_status_strip_priority.py
 tests/test_u04_task_console_multi_card.py
 tests/test_u04_workspace_bootstrap.py
 tests/test_u05_board_layout.py
+tests/test_u05_console_state_format.py
 tests/test_u05_declaration_not_class.py
 tests/test_u05_logic_node.py
 tests/test_u05_panel_config.py

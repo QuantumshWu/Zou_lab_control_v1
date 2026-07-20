@@ -65,6 +65,7 @@ from zlc_frontend.render_style import PALETTE  # the ONE render colour owner
 from zlc_frontend import board_layout as _layout
 from zlc_data.console_records import (
     ADDABLE_PANEL_KINDS,
+    CONSOLE_STATE_SCHEMA,
     BLANK_SOURCE as _BLANK_SOURCE,
     DEFAULT_UPDATE_MS,
     LOGIC_KINDS,
@@ -75,6 +76,7 @@ from zlc_data.console_records import (
     PANEL_KINDS,
     PANEL_SINGLE_SLOT_KINDS,
     PanelConfig as _PanelConfig,
+    TASK_CONSOLE_STATE_FIELDS as _TASK_CONSOLE_STATE_FIELDS,
     UPDATE_INTERVALS,
     layout_record,
     panel_allows_multi_slot,
@@ -913,13 +915,6 @@ def _unit_df_for(plotter):
 
 
 # ====================================================================== state
-_TASK_CONSOLE_STATE_FIELDS = {
-    "schema": str,
-    "name": str,
-    "interval_ms": int,
-    "panels": list,
-    "logic": list,
-}
 
 
 #: The ONE console-record validator now lives in :mod:`zlc_data.console_records`;
@@ -936,7 +931,10 @@ LogicNodeConfig = _LogicNodeConfig
 class TaskConsoleState:
     """The whole console layout: serialised as ONE machine-portable JSON file."""
 
-    schema = "Zou_lab_control.frontend.TaskConsoleState"
+    #: The PERSISTED discriminator, defined in :mod:`zlc_data.console_records`.  It reads
+    #: like this module's path and must NOT track it: see CONSOLE_STATE_SCHEMA for why
+    #: re-deriving it would make every already-saved layout unopenable.
+    schema = CONSOLE_STATE_SCHEMA
 
     def __init__(
         self,

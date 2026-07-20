@@ -68,7 +68,7 @@ Z2A_PRODUCTION_IMPORTERS = {   # non-test code OUTSIDE legacy that still imports
 }
 #: Whitelisted tests that reach into the legacy tree, NAMED rather than counted.
 #: A count would let one more slip in unnoticed; naming each makes every addition
-#: a decision.  All seven are legitimate today and all die with what they guard:
+#: a decision.  Every entry is legitimate today and all die with what they guard:
 #: the migration ledgers must build the legacy windows in order to compare
 #: against them, which is the whole point of a parity oracle.
 Z2B_ACTIVE_TEST_IMPORTERS = {
@@ -81,6 +81,7 @@ Z2B_ACTIVE_TEST_IMPORTERS = {
     Path("tests/test_u05_signal_expr_widget.py"),       # asserts the shell alias IS the moved class
     Path("tests/test_u05_pulse_slots_widget.py"),       # same, for the last composite
     Path("tests/test_u05_panel_config.py"),             # same, for the panel record the frontend re-exports
+    Path("tests/test_u05_console_state_format.py"),     # demonstrates the schema break on the real record
     Path("tests/test_u06_shell_domain_ports.py"),       # proves the legacy root wires the port
     Path("tests/test_zlc_frontend_form.py"),            # form parity across the move
 }

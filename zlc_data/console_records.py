@@ -30,7 +30,8 @@ from zlc_storage.canonical import exact_mapping
 __all__ = ["ADDABLE_PANEL_KINDS", "BLANK_SOURCE", "DEFAULT_INPUT_SLOTS", "DEFAULT_UPDATE_MS",
            "LOGIC_KINDS", "LOGIC_NODE_CONFIG_FIELDS", "LogicNodeConfig",
            "PANEL_CONFIG_FIELDS", "PANEL_INPUT_FORMAT", "PANEL_INPUT_SLOTS", "PANEL_KINDS",
-           "PANEL_SINGLE_SLOT_KINDS", "PanelConfig", "UPDATE_INTERVALS", "layout_record",
+           "CONSOLE_STATE_SCHEMA", "PANEL_SINGLE_SLOT_KINDS", "PanelConfig",
+           "TASK_CONSOLE_STATE_FIELDS", "UPDATE_INTERVALS", "layout_record",
            "panel_allows_multi_slot", "panel_input_slots", "repeat_mode_for_kind",
            "repeat_modes_for_kind"]
 
@@ -306,3 +307,28 @@ class PanelConfig:
         if result.source != data["source"] or result.inputs != data["inputs"]:
             raise ValueError("PanelConfig is not in current canonical form")
         return result
+
+
+# ---------------------------------------------------------------- console-state format
+#: The persisted DISCRIMINATOR of a saved console layout, written into every layout file as
+#: its ``schema`` key and required to match exactly on load.
+#:
+#: It reads like a module path and it is NOT one.  It is a FORMAT NAME that happens to have
+#: been minted from the class's location at the time, and it must NOT follow the class as the
+#: class moves: every layout a user has already saved carries this exact string, and
+#: ``exact_mapping`` refuses a payload whose discriminator differs.  Re-deriving it from the
+#: new module path would make every saved dashboard unopenable, and would do so silently at
+#: the moment the operator tries to load their work rather than at any point a test would
+#: notice.  Pinned by test_u05_console_state_format so a later tidy-up cannot quietly do it.
+CONSOLE_STATE_SCHEMA = "Zou_lab_control.frontend.TaskConsoleState"
+
+#: The third console record's field spec, beside the other two.  ``schema`` is a field here
+#: (not just a check) because it round-trips: a layout file carries it, and the exact-key rule
+#: means a payload without it is refused rather than defaulted.
+TASK_CONSOLE_STATE_FIELDS = {
+    "schema": str,
+    "name": str,
+    "interval_ms": int,
+    "panels": list,
+    "logic": list,
+}
