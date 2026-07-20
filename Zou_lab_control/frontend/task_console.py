@@ -53,7 +53,6 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from .live import (
     DEFAULT_HIST_FIT,
     IMAGE_REPEAT_MODES,
-    PANEL_SIZES,
     PLOT_KIND_BY_KEY,
     PLOT_KINDS,
     coerce_panel_value,
@@ -61,12 +60,12 @@ from .live import (
     normalize_facet,
     panel_display_size,
     panel_plot,
-    panel_size_cells,
     recommended_grid_size,
     region_binding,
     site_ring_radius,
 )
 from zlc_frontend.render_style import PALETTE  # the ONE render colour owner
+from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
 from zlc_data.shape_text import slot_label   # the ONE human slot-label formatter (period/channel)
 from zlc_frontend.qt_widgets import (
     ACCENT,

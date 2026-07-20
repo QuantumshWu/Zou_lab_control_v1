@@ -117,7 +117,7 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         # H1e - the salvaged live-plot shell.  Each reads text a HUMAN typed or a
         # saved figure recorded: a panel size ("2x3"), a fit-model key, an axis
         # name, a saved axis label.
-        (Path("zlc_frontend/live_plot/live.py"), "panel_size_cells"),
+        (Path("zlc_data/panel_size.py"), "panel_size_cells"),
         (Path("zlc_frontend/live_plot/live.py"), "general_fit_models"),
         (Path("zlc_frontend/live_plot/live.py"), "facet_cell_labels"),
         (Path("zlc_frontend/live_plot/plot_figure.py"), "SavedFigure.axis_labels"),

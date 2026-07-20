@@ -40,6 +40,7 @@ from zlc_frontend.render_style import (
 from ._validate import positive_float
 from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, display_figure, fit_grid_shape_for_aspect, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
+from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
 from zlc_data.readout_math import confidence_weighted_fidelity, finite_mean
 from zlc_data.curve_fitting import fit_histogram
 from zlc_data.signal_tensor import canonical_physical_shape
@@ -2202,7 +2203,6 @@ def pulse_plot_channels(
 #
 # The geometry below is NOT a public knob: hosts pick a kind and a size preset,
 # nothing else -- the visual language is owned here.
-PANEL_SIZES = ("1x2", "2x2", "4x2", "1x4", "2x4", "4x4", "4x8", "8x4", "8x8")
 PANEL_UNIT_PX = (180, 240)     # (height, width) of one half-unit of the stock region
 PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 96, 80, TITLE_SLOT_PX)   # stock margins (L, R, B, T).
                                          # L = STOCK_MARGINS_PX[0] (confocal's left, 110) and
@@ -2228,14 +2228,6 @@ PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 96, 80, TITLE_SLOT_PX)   # stock margin
 # at the top of this module, re-exported below); panel_display_size reads it -- never re-typed here.
 
 
-def panel_size_cells(size: str) -> tuple[int, int]:
-    """Parse a panel size ("rows x cols" in half-units) against the preset list."""
-
-    key = str(size).strip().lower().replace(" ", "")
-    if key not in PANEL_SIZES:
-        raise ValueError(f"unknown panel size {size!r}; choose from {', '.join(PANEL_SIZES)}.")
-    rows, cols = key.split("x")
-    return int(rows), int(cols)
 
 
 def panel_margins_px(kind: str = "default") -> tuple[int, int, int, int]:

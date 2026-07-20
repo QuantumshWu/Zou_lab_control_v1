@@ -31,6 +31,7 @@ from Zou_lab_control.neutral_atom.timing.pulse_table import (
     _analog_bus_value_at_tick,
     analog_bus_ticks as _analog_bus_ticks,
 )
+from zlc_data.panel_size import PANEL_SIZES
 from zlc_data.scan_template import scan_table_template
 from zlc_data.shape_text import slot_label   # naming a bound field is grammar, not GUI
 # The pulse RENDER (state -> figure) lives in the plot layer (live.py); the editor CONSUMES it -- it does
@@ -44,7 +45,6 @@ from .live import (
     pulse_repeat_notation,
     build_pulse_preview_plot,
     default_pulse_size,
-    PANEL_SIZES,
     analog_bus_traces as _analog_bus_traces,
     annotate_pulse_variable_regions,
     bus_signed_bounds as _bus_signed_bounds,
