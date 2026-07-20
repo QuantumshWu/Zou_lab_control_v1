@@ -273,3 +273,54 @@ def _pulse_state_from_dict(data):
 
 
 _register_pulse_state_factory(_pulse_state_from_dict)
+
+
+# The pulse-slots form's template reader.  Same composition-root role as the
+# state factory above: the derivation is pulse-domain, the console gets rows.
+from zlc_frontend.domain_ports import (
+    PulseTemplateRows as _PulseTemplateRows,
+    register_pulse_template_reader as _register_pulse_template_reader,
+)
+
+
+def _read_pulse_template(path):
+    """Resolve a saved template and describe its slots as plain rows.
+
+    Body lifted verbatim from the console call site it replaces, so the form
+    draws exactly what it drew before; only the LOCATION changed.
+    """
+
+    import hashlib
+    import json
+
+    from Zou_lab_control.neutral_atom.operations.measurements.pulse_scan import (
+        _resolve_probe_template,
+        _semantic_api_names,
+        _semantic_scan_names,
+    )
+
+    state = _resolve_probe_template(path)
+    api_names = _semantic_api_names(state)
+    api_rows = tuple(
+        (slot.name, api_names[index], str(slot.kind), str(slot.target), str(slot.unit),
+         float(state._read_api_field(slot)))
+        for index, slot in enumerate(state.api_slots)
+    )
+    scan_names = _semantic_scan_names(state)
+    scan_rows = tuple(
+        (scan_names[i], str(s.kind), str(s.target), str(s.unit), s.label)
+        for i, s in enumerate(state.scan_slots)
+    )
+    code = str(getattr(state, "scan_code", "") or "")
+    if not code.strip() and getattr(state, "scan_table", None):
+        code = ("scan_table = np.array("
+                + repr([list(row) for row in state.scan_table]) + ", dtype=float)")
+    payload = state.to_dict()
+    program_id = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+    return _PulseTemplateRows(api_rows=api_rows, scan_rows=scan_rows,
+                              program=code, program_id=program_id)
+
+
+_register_pulse_template_reader(_read_pulse_template)

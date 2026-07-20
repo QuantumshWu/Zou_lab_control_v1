@@ -286,3 +286,71 @@ def test_a_second_conflicting_factory_is_refused():
     with pytest.raises(RuntimeError, match="ONE source"):
         domain_ports.register_pulse_state_factory(lambda data: None)
     assert domain_ports._PULSE_STATE_FACTORY is current
+
+
+# ---------------------------------------------- the pulse-template row port
+
+
+def test_an_unwired_process_refuses_to_read_a_pulse_template():
+    """Refusal, not an empty form: a blank slots table would look like a template
+    with no slots, which is a lie the operator cannot see through."""
+
+    import subprocess
+    import sys
+
+    code = (
+        "from zlc_frontend.domain_ports import (PulseTemplateUnavailable,\n"
+        "    pulse_template_rows, pulse_template_reader_is_registered)\n"
+        "assert not pulse_template_reader_is_registered()\n"
+        "try:\n"
+        "    pulse_template_rows('anything.json')\n"
+        "except PulseTemplateUnavailable as exc:\n"
+        "    assert 'register_pulse_template_reader' in str(exc), str(exc)\n"
+        "else:\n"
+        "    raise AssertionError('an unwired template read must refuse')\n"
+    )
+    subprocess.run([sys.executable, "-c", code], cwd=str(REPO_ROOT), check=True)
+
+
+def test_the_template_reader_returns_rows_the_gui_can_draw_without_pulse_types():
+    """The port's whole point: what comes back is a DESCRIPTION.
+
+    Every field is a plain str/float/tuple, so the slots form can be drawn by a
+    process that never imported the pulse compiler - which is what lets the
+    console stop reaching into a live PulseTableState.
+    """
+
+    import Zou_lab_control.frontend  # noqa: F401  - today's composition root
+    from zlc_frontend.domain_ports import (
+        PulseTemplateRows,
+        pulse_template_reader_is_registered,
+        pulse_template_rows,
+    )
+
+    assert pulse_template_reader_is_registered()
+
+    # Written by this test rather than read from pulses/probe_template.json: that
+    # SHIPPED default is still in the pre-rename schema and cannot be loaded at
+    # all (api_parameters / scan_recipe / target vs api_slots / scan_slots /
+    # scan_code).  The console swallows the failure into an empty slots form, so
+    # the breakage is invisible there; it is recorded in MIGRATION_GOAL_zh.md and
+    # is NOT frozen here as expected behaviour.
+    import json
+    import tempfile
+
+    state = _state([{"mode": "edge", "value": 20},
+                    {"mode": "hold", "value": None},
+                    {"mode": "hold", "value": None}])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "template.json"
+        path.write_text(json.dumps(state.to_dict(), default=str), encoding="utf-8")
+        rows = pulse_template_rows(str(path))
+    assert isinstance(rows, PulseTemplateRows)
+    assert isinstance(rows.program, str) and isinstance(rows.program_id, str)
+    for row in rows.api_rows:
+        handle, coordinate, kind, target, unit, current = row
+        assert all(isinstance(x, str) for x in (handle, coordinate, kind, target, unit))
+        assert isinstance(current, float)
+    for row in rows.scan_rows:
+        coordinate, kind, target, unit, _label = row
+        assert all(isinstance(x, str) for x in (coordinate, kind, target, unit))

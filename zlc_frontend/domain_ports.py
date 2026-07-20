@@ -26,13 +26,19 @@ instead - see ``test_u05_shell_salvage`` for that route.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 __all__ = [
     "PulseReplayUnavailable",
+    "PulseTemplateRows",
+    "PulseTemplateUnavailable",
     "pulse_state_from_dict",
     "pulse_state_factory_is_registered",
+    "pulse_template_reader_is_registered",
+    "pulse_template_rows",
     "register_pulse_state_factory",
+    "register_pulse_template_reader",
 ]
 
 
@@ -85,3 +91,80 @@ def pulse_state_from_dict(data: Mapping[str, Any]) -> Any:
     if not isinstance(data, Mapping):
         raise TypeError("a saved pulse state must be a mapping")
     return _PULSE_STATE_FACTORY(data)
+
+
+# ------------------------------------------------- the pulse-template row port
+
+@dataclass(frozen=True)
+class PulseTemplateRows:
+    """Everything the pulse-slots form needs to draw ONE saved template.
+
+    Plain tuples and strings only.  The console used to reach into a live
+    ``PulseTableState`` for this - ``api_slots``, ``scan_slots``, the private
+    ``_read_api_field``, ``scan_code``, ``scan_table``, ``to_dict`` - which put
+    the whole pulse vocabulary inside the render layer.  The derivation now runs
+    domain-side and the GUI receives a DESCRIPTION, so the form can be drawn by a
+    process that has never imported the pulse compiler.
+
+    ``api_rows``  : (handle, coordinate, kind, target, unit, current)
+    ``scan_rows`` : (coordinate, kind, target, unit, stored_label)
+    ``program``   : the hardware scan program text, or the array literal a stored
+                    scan table falls back to.
+    ``program_id``: a digest of the resolved template, so the form can tell a
+                    reload of the SAME program from a different one.
+    """
+
+    api_rows: tuple = ()
+    scan_rows: tuple = ()
+    program: str = ""
+    program_id: str = ""
+
+
+class PulseTemplateUnavailable(RuntimeError):
+    """Raised when a pulse template is read with no pulse domain wired in."""
+
+
+_TEMPLATE_REFUSAL = (
+    "reading a saved pulse template needs the pulse domain, which the render "
+    "layer is not allowed to import.  The composition root must call "
+    "zlc_frontend.domain_ports.register_pulse_template_reader(...) with a "
+    "callable that turns a template path into a PulseTemplateRows."
+)
+
+_PULSE_TEMPLATE_READER: Callable[[str], PulseTemplateRows] | None = None
+
+
+def register_pulse_template_reader(reader: Callable[[str], PulseTemplateRows]) -> None:
+    """Hand the render layer its pulse-template reader.
+
+    Same single-source rule as the state factory: idempotent for the SAME
+    callable, and a second DIFFERENT reader is refused, because two readers would
+    mean two answers to "what is in this template".
+    """
+
+    global _PULSE_TEMPLATE_READER
+    if not callable(reader):
+        raise TypeError("the pulse-template reader must be callable")
+    if _PULSE_TEMPLATE_READER is not None and _PULSE_TEMPLATE_READER is not reader:
+        raise RuntimeError(
+            "a different pulse-template reader is already registered; a saved "
+            "template has ONE reading"
+        )
+    _PULSE_TEMPLATE_READER = reader
+
+
+def pulse_template_reader_is_registered() -> bool:
+    """Whether a pulse template can be read in this process."""
+
+    return _PULSE_TEMPLATE_READER is not None
+
+
+def pulse_template_rows(path) -> PulseTemplateRows:
+    """The rows a saved pulse template contributes to the slots form."""
+
+    if _PULSE_TEMPLATE_READER is None:
+        raise PulseTemplateUnavailable(_TEMPLATE_REFUSAL)
+    rows = _PULSE_TEMPLATE_READER(str(path or ""))
+    if not isinstance(rows, PulseTemplateRows):
+        raise TypeError("the pulse-template reader must return PulseTemplateRows")
+    return rows

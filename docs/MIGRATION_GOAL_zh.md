@@ -221,6 +221,14 @@ ViewportTransform/交互 selector**。不是删,也不是原样留。
 5. **三个顶层 seam** `_clock.py`/`_streamer_geometry.py`/`_viewer_registry.py`:无账、10 处活跃 consumer。
 6. **根启动器 `figure_viewer.py` + `.bat`**:发布的双击入口,直连 legacy,不在任何账上。
 7. **`README.md:89-90`** 仍教用户跑 legacy 命令。
+8. **🔴 `pulses/probe_template.json` 装不进去**(W1 端口工作中实测发现,**不是本次引入**):
+   该文件仍是改名前的 schema(`api_parameters`/`scan_recipe`/`target`/`repeat`),而 loader 要求
+   当前 schema(`api_slots`/`scan_slots`/`scan_code`/`repeat_count`…),`_serialization.require_exact_fields`
+   直接 `ValueError`。它是 `DEFAULT_PROBE_TEMPLATE`,**console 的 pulse-scan 表单用 try/except 兜底
+   → 用户看到的是一张空的 slot 表,而不是错误**。同类嫌疑:`pulses/` 下其它模板需一并核。
+   修法二选一(需一手核实哪个是真相):要么该文件本就该升级到当前 schema,要么
+   `resolve_fireable_template` 该套用 legacy JSON 升级 shim(任务 #494 记录过有这么个 shim)。
+   **不在 W1 范围内,但会让用户的 pulse-scan 表单看起来是空的,优先级高。**
 
 ---
 

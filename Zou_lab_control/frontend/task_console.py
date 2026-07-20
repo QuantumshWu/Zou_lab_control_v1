@@ -4866,33 +4866,16 @@ class MeasurementPanel(QtWidgets.QWidget):
             return
         src = self._sibling_path_widget(decl)
         path = src.text() if src is not None else ""
+        # The template is READ by the domain and arrives as plain rows: the render
+        # layer may not import the pulse compiler (see zlc_frontend.domain_ports).
+        from zlc_frontend.domain_ports import pulse_template_rows
         try:
-            from ..neutral_atom.operations.measurements.pulse_scan import (
-                _resolve_probe_template,
-                _semantic_api_names,
-                _semantic_scan_names,
-            )
-            state = _resolve_probe_template(path)
+            rows = pulse_template_rows(path)
         except Exception:
             widget.rebuild([], [], program_id="")
             return
-        api_names = _semantic_api_names(state)
-        api_rows = [
-            (slot.name, api_names[index], str(slot.kind), str(slot.target), str(slot.unit),
-             float(state._read_api_field(slot)))
-            for index, slot in enumerate(state.api_slots)
-        ]
-        scan_names = _semantic_scan_names(state)
-        scan_rows = [(scan_names[i], str(s.kind), str(s.target), str(s.unit), s.label)
-                     for i, s in enumerate(state.scan_slots)]
-        code = str(getattr(state, "scan_code", "") or "")
-        if not code.strip() and getattr(state, "scan_table", None):
-            code = "scan_table = np.array(" + repr([list(row) for row in state.scan_table]) + ", dtype=float)"
-        payload = state.to_dict()
-        program_id = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-        ).hexdigest()
-        widget.rebuild(api_rows, scan_rows, hardware_program=code, program_id=program_id)
+        widget.rebuild(list(rows.api_rows), list(rows.scan_rows),
+                       hardware_program=rows.program, program_id=rows.program_id)
 
     # ------------------------------------------------------------- value read
     def collect_values(self) -> dict[str, object]:
