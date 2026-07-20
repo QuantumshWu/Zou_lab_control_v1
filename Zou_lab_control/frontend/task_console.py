@@ -6371,7 +6371,7 @@ class LogicNodeRow(FluentFrame):
 
         The per-signal MEANING goes in the label's tooltip (hover), NOT inline -- so the card never
         grows wider than its column and the Logic list needs no horizontal scroll (#2).  ``rows`` is
-        ``[(name, shape, description)]`` (shapes AUTO-EXTRACTED via ``logic.describe_shape``; meanings
+        ``[(name, shape, description)]`` (shapes AUTO-EXTRACTED via ``shape_text.describe_shape``; meanings
         from the node's ``output_specs``); a pending shape (``—``) just means no value yet."""
         rows = list(rows)
         if rows:
@@ -7244,11 +7244,11 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _signal_formats(self) -> dict:
         """``name -> standardized array shape`` for every LIVE hub signal, read straight
-        off the most recent published VALUE (``logic.describe_shape``) -- AUTO from real
+        off the most recent published VALUE (``shape_text.describe_shape``) -- AUTO from real
         data, never a hand-typed name->format map that could drift from what a node
         actually emits.  Lets the signal picker show each signal's SHAPE, not just its
         name (e.g. ``occupied  [(35,)]``)."""
-        from Zou_lab_control.neutral_atom.operations.logic import describe_shape
+        from zlc_data.shape_text import describe_shape
         out: dict[str, str] = {}
         for name in self.hub.names():
             try:
@@ -7390,12 +7390,12 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _live_node_formats(self, node) -> list[tuple[str, str, str]]:
         """``[(name, shape, description)]`` for a RUNNING node -- one ROW per output, each
-        shape read off a real value via ``logic.describe_shape`` (auto, never hand-typed)
+        shape read off a real value via ``shape_text.describe_shape`` (auto, never hand-typed)
         and each description from the node's ``output_specs`` (what the signal MEANS).  A
         measurement / processor publishes to the hub under its prefix; a TASK is OFF the
         hub, so it documents what it streams mid-run (its ``output`` buffer) + what it
         produces (its ``result`` keys), shapes filled in as the values appear."""
-        from Zou_lab_control.neutral_atom.operations.logic import describe_shape
+        from zlc_data.shape_text import describe_shape
         specs = {s.name: s for s in node.output_specs()} if hasattr(node, "output_specs") else {}
 
         def desc(name: str) -> str:
@@ -7448,7 +7448,7 @@ class TaskConsole(QtWidgets.QWidget):
     def _update_row_publishes(self, row: "LogicNodeRow") -> None:
         """Fill a Logic-tab row's "publishes:" legend (ONE signal per line: name, shape,
         meaning).  Shapes are AUTO-EXTRACTED from the real published VALUES
-        (``logic.describe_shape``) and the meaning from the node's ``output_specs`` --
+        (``shape_text.describe_shape``) and the meaning from the node's ``output_specs`` --
         never a hand-typed map.  Running node: live shapes off the hub (measurement /
         processor) or its mid-run buffer + result (task).  Stopped node: the NAMES it
         will produce (shape ``—`` until it runs)."""
@@ -7579,7 +7579,7 @@ class TaskConsole(QtWidgets.QWidget):
         (issue #12: calibration / mot-field task rows).  A canonical block's leading axis is R;
         with no value yet, R is the schema's declared repeat capacity.  No schema -> the raw
         value-only ``describe_shape`` (a scalar result still reads ``scalar``)."""
-        from Zou_lab_control.neutral_atom.operations.logic import contract_shape_label, describe_shape
+        from zlc_data.shape_text import contract_shape_label, describe_shape
         if schema is None:
             return describe_shape(value)
         st = self._schema_structure(schema)
@@ -8142,7 +8142,7 @@ class TaskConsole(QtWidgets.QWidget):
         if not keys and node.kind == "measurement":
             keys = [k for k in (getattr(spec, "x_key", ""), getattr(spec, "y_key", "")) if k]
         if not keys and node.kind == "camera":
-            from Zou_lab_control.neutral_atom.operations.logic import camera_frame_keys
+            from zlc_data.shape_text import camera_frame_keys
             keys = camera_frame_keys((node.values or {}).get("frames_per_cycle", 1))
         return keys
 

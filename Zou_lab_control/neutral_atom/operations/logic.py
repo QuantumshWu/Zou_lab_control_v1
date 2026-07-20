@@ -35,6 +35,14 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from zlc_data.shape_text import (  # the one spelling of a shape / frame name
+    camera_frame_keys,
+    contract_shape_label,
+    describe_shape,
+    format_dims,
+    grid_for_points,
+)
+
 from ..devices.base import EXCLUSIVE, OBSERVE
 from ..core.signals import (
     NO_LINEAGE,
@@ -157,71 +165,12 @@ class SignalSpec:
         )
 
 
-def grid_for_points(grid, points) -> tuple:
-    """Validate an optional display grid against logical point geometry.
-
-    ``SignalSchema.point_shape`` is authoritative and the physical P axis is its
-    product.  A separate ``grid`` is only a presentation alias and is accepted
-    when it has the same point count; it never reshapes ``data_shape``.
-    """
-    pts = tuple(int(n) for n in (points or ()))
-    g = tuple(int(n) for n in (grid or ()))
-    if pts and g and int(np.prod(g)) == int(np.prod(pts)):
-        return g
-    return ()
 
 
-def format_dims(dims) -> str:
-    """The ONE spelling of a dims tuple for the GUI: axes joined by the ``×`` glyph
-    (``40×20``), and ``"1"`` for an empty/scalar shape.  EVERY surface that turns a
-    signal's shape into a display string routes through here, so ``(40, 20)`` (numpy-tuple
-    spelling) can never appear beside ``40×20`` again -- the single source :func:`describe_shape`
-    and the flow-graph / picker labels all share."""
-    parts = tuple(str(int(n)) for n in (dims or ()))
-    return "×".join(parts) if parts else "1"
 
 
-def contract_shape_label(repeat, points_shape, data_shape, grid_shape=None) -> str:
-    """The ONE spelling of the canonical ``repeat × points × (data)`` contract shape.  A ``grid_shape``
-    reshapes ONLY the swept points (never the data), and only when it divides them (:func:`grid_for_points`).
-    Shared by :func:`describe_shape` (value-driven, R = the real block's leading axis) and the console's
-    schema-driven declared path (R = the schema's repeat capacity), so a signal reads IDENTICALLY whether
-    a value is buffered yet -- the grammar literal lives here alone and can never drift between surfaces."""
-    ps = tuple(int(n) for n in (points_shape or ()))
-    ds = tuple(int(n) for n in (data_shape or ()))
-    gs = grid_for_points(grid_shape, ps)
-    return f"{int(repeat)} × {format_dims(gs or ps)} × ({format_dims(ds)})"
 
 
-def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None) -> str:
-    """A standardized shape string read straight from a published VALUE -- the SINGLE
-    way the GUI says what a signal looks like, AUTO-EXTRACTED from real data rather
-    than a hand-typed name->format map (which silently drifts from what a node really
-    emits).  ``scalar`` for a 0-d / Python number; ``None`` -> ``"—"`` (no value yet).
-
-    When the value is a registered signal tensor (its shape matches the declared
-    physical ``(repeat, prod(points_shape), *data_shape)``) it is shown in contract form
-    ``repeat × points × (data)`` -- ALWAYS all three groups (the physical P axis is mandatory, never
-    dropped): a 1-D scan ``5 × 8 × (3)``; a 2-D scan ``5 × (4×5) × (1)`` via ``grid_shape`` reshaping the
-    SWEPT POINTS; a no-scan single-point signal is ``5 × 1 × (...)`` -- a camera/judged frame
-    ``5 × 1 × (96×128)``, per-site occupancy ``5 × 1 × (35)``.  ``grid_shape`` is ONLY a 2-D SCAN's
-    points reshape -- it is NEVER applied to the DATA (the 35 sites read ``(35)``, not ``5×7``: that
-    layout is the sitemap's display concern, #H3v-3).  Otherwise the raw numpy shape (``(35,)`` /
-    ``(96, 128)``)."""
-    if value is None:
-        return "—"
-    shape = tuple(int(n) for n in np.shape(value))
-    if shape == ():
-        return "scalar"
-    ps = tuple(int(n) for n in (points_shape or ()))
-    dsh = tuple(int(n) for n in (data_shape or ()))
-    if ps and dsh and len(shape) == 2 + len(dsh) \
-            and shape[1] == int(np.prod(ps, dtype=np.int64)) \
-            and tuple(shape[2:]) == dsh:
-        return contract_shape_label(shape[0], ps, dsh, grid_shape)   # R × P × (data), one grammar
-    # Raw shape (schema unknown): the SAME ``×`` spelling as the contract form and the flow-graph
-    # labels -- never the numpy-tuple ``(96, 128)`` that made the same signal read two different ways.
-    return f"({format_dims(shape)})"
 
 
 class LogicNode:
@@ -1199,13 +1148,6 @@ class Task(OneShotNode):
         return self._bare_output_specs()
 
 
-def camera_frame_keys(frames_per_cycle, prefix=""):
-    """The SINGLE source of a camera's published signal names: ONE ``frame_i`` per emCCD event,
-    ``frame_0 .. frame_{N-1}`` (NO lumped ``frame``).  Used by BOTH ``CameraMeasurement.published_signals``
-    (live, with the node prefix) and the console's declared-signal picker (bare, before the node starts) so
-    the two can never drift -- a declared 'waiting' name always equals what the running camera will emit."""
-    n = max(1, int(frames_per_cycle or 1))
-    return [f"{prefix}frame_{i}" for i in range(n)]
 
 
 #: The camera's FIRST emCCD event signal -- the default frame every consumer binds.  Derived
