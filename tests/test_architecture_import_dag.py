@@ -13,6 +13,69 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+#: Every top-level directory holding code this file audits.  Keeping the list in
+#: ONE place is what makes :func:`_source_files` able to prove it complete; a new
+#: top-level package must be registered here or it is born exempt (which is how
+#: ``zlc_workbench`` and ``fpga`` came to be governed by no import rule at all).
+SOURCE_ROOTS = (
+    "fpga",
+    "Zou_lab_control",
+    "zlc_data",
+    "zlc_frontend",
+    "zlc_neutral_atom",
+    "zlc_pulse",
+    "zlc_storage",
+    "zlc_workbench",
+)
+
+
+def _source_files(roots=SOURCE_ROOTS):
+    """Every ``.py`` under the code roots, with the roots proven to exist first.
+
+    ``Path.rglob`` on a missing directory yields nothing and raises nothing, so a
+    guard that names a root keeps PASSING while silently auditing less the moment
+    that root is renamed or deleted.  During a migration that renames roots for a
+    living, a guard going quietly vacuous is worse than no guard: it reads as
+    evidence.  Proving the roots exist converts that into a red test.
+    """
+
+    missing = [root for root in roots if not (ROOT / root).is_dir()]
+    assert not missing, (
+        f"source roots {missing} no longer exist, so every guard scanning them has "
+        "been auditing nothing. Update SOURCE_ROOTS in the SAME commit that removes "
+        "a root, so the deletion is a decision rather than a silent gap."
+    )
+    for root in roots:
+        yield from sorted((ROOT / root).rglob("*.py"))
+
+
+def _sole_definition(name, node_type=ast.ClassDef):
+    """Locate the ONE definition of ``name`` by property rather than by path.
+
+    A guard keyed to a hard-coded file goes vacuous the instant that file moves.
+    That is not hypothetical: this module used to scan
+    ``Zou_lab_control/frontend/data_figure.py`` for a forbidden version field, and
+    when the salvage turned that path into a forwarding shim the check kept
+    passing against a file which by construction could no longer contain what it
+    was looking for.  Searching for the definition follows the code across the
+    migration, and requiring EXACTLY ONE site proves in passing that nobody forked
+    it into a second copy.
+    """
+
+    sites = []
+    for path in _source_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in tree.body:
+            if isinstance(node, node_type) and node.name == name:
+                sites.append((path, node))
+    assert len(sites) == 1, (
+        f"expected exactly one definition of {name!r}, found "
+        f"{[str(path.relative_to(ROOT)) for path, _ in sites]}. Zero means the guard "
+        "below is auditing nothing; more than one means the owner was forked."
+    )
+    return sites[0]
+
+
 FORBIDDEN = {
     "zlc_data": ("Zou_lab_control", "zlc_frontend", "zlc_neutral_atom", "zlc_pulse", "zlc_workbench"),
     "zlc_storage": ("Zou_lab_control", "zlc_data", "zlc_frontend", "zlc_neutral_atom", "zlc_pulse", "zlc_workbench"),
@@ -617,90 +680,90 @@ def test_headless_notebook_import_does_not_load_frontend_renderer():
     subprocess.run([sys.executable, "-c", code], cwd=ROOT, check=True)
 
 
+#: The declared single owner of the ContentRef tree and CAS addressing.  It is
+#: named -- and therefore skipped -- rather than left outside the scan: the guard
+#: below shipped without ``zlc_storage`` among its roots, so "storage has ONE
+#: owner" was asserted while the storage package was never looked at.  An owner
+#: you exempt is a decision; an owner you forget to scan is a hole.
+CONTENT_REF_OWNER = Path("zlc_storage/content_store.py")
+
+
 def test_content_ref_codec_and_cas_address_have_one_storage_owner():
     violations = []
-    package_roots = (
-        "fpga",
-        "Zou_lab_control",
-        "zlc_data",
-        "zlc_frontend",
-        "zlc_neutral_atom",
-        "zlc_pulse",
-        "zlc_workbench",
-    )
-    for package_root in package_roots:
-        for source in (ROOT / package_root).rglob("*.py"):
-            relative = source.relative_to(ROOT)
-            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(relative))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Dict):
-                    literal_keys = {
-                        key.value
-                        for key in node.keys
-                        if isinstance(key, ast.Constant)
-                        and isinstance(key.value, str)
-                    }
-                    if len(node.keys) == 2 and literal_keys == {"digest", "size"}:
-                        violations.append(
-                            f"{relative}:{node.lineno} duplicates the ContentRef tree"
-                        )
-                if isinstance(node, ast.Set):
-                    literal_fields = {
-                        item.value
-                        for item in node.elts
-                        if isinstance(item, ast.Constant)
-                        and isinstance(item.value, str)
-                    }
-                    if len(node.elts) == 2 and literal_fields == {"digest", "size"}:
-                        violations.append(
-                            f"{relative}:{node.lineno} duplicates the ContentRef field set"
-                        )
-                if (
-                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name
-                    in {
-                        "content_ref_to_tree",
-                        "content_ref_from_tree",
-                        "_content_ref_to_tree",
-                        "_content_ref_from_tree",
-                    }
-                ):
-                    violations.append(
-                        f"{relative}:{node.lineno} redefines the storage ContentRef codec"
-                    )
-                if not isinstance(node, ast.Call) or len(node.args) < 2:
-                    continue
-                function_name = (
-                    node.func.id
-                    if isinstance(node.func, ast.Name)
-                    else node.func.attr
-                    if isinstance(node.func, ast.Attribute)
-                    else None
-                )
-                if function_name != "ContentRef":
-                    continue
-                digest_call, size_call = node.args[:2]
-                digest_function_names = {
-                    call.func.id
-                    if isinstance(call.func, ast.Name)
-                    else call.func.attr
-                    if isinstance(call.func, ast.Attribute)
-                    else ""
-                    for call in ast.walk(digest_call)
-                    if isinstance(call, ast.Call)
+    for source in _source_files():
+        relative = source.relative_to(ROOT)
+        if relative == CONTENT_REF_OWNER:
+            continue
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(relative))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                literal_keys = {
+                    key.value
+                    for key in node.keys
+                    if isinstance(key, ast.Constant)
+                    and isinstance(key.value, str)
                 }
-                size_uses_len = any(
-                    isinstance(call.func, ast.Name) and call.func.id == "len"
-                    for call in ast.walk(size_call)
-                    if isinstance(call, ast.Call)
-                )
-                if (
-                    any("sha256" in name.lower() for name in digest_function_names)
-                    and size_uses_len
-                ):
+                if len(node.keys) == 2 and literal_keys == {"digest", "size"}:
                     violations.append(
-                        f"{relative}:{node.lineno} mints a CAS address outside storage"
+                        f"{relative}:{node.lineno} duplicates the ContentRef tree"
                     )
+            if isinstance(node, ast.Set):
+                literal_fields = {
+                    item.value
+                    for item in node.elts
+                    if isinstance(item, ast.Constant)
+                    and isinstance(item.value, str)
+                }
+                if len(node.elts) == 2 and literal_fields == {"digest", "size"}:
+                    violations.append(
+                        f"{relative}:{node.lineno} duplicates the ContentRef field set"
+                    )
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name
+                in {
+                    "content_ref_to_tree",
+                    "content_ref_from_tree",
+                    "_content_ref_to_tree",
+                    "_content_ref_from_tree",
+                }
+            ):
+                violations.append(
+                    f"{relative}:{node.lineno} redefines the storage ContentRef codec"
+                )
+            if not isinstance(node, ast.Call) or len(node.args) < 2:
+                continue
+            function_name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else None
+            )
+            if function_name != "ContentRef":
+                continue
+            digest_call, size_call = node.args[:2]
+            digest_function_names = {
+                call.func.id
+                if isinstance(call.func, ast.Name)
+                else call.func.attr
+                if isinstance(call.func, ast.Attribute)
+                else ""
+                for call in ast.walk(digest_call)
+                if isinstance(call, ast.Call)
+            }
+            size_uses_len = any(
+                isinstance(call.func, ast.Name) and call.func.id == "len"
+                for call in ast.walk(size_call)
+                if isinstance(call, ast.Call)
+            )
+            if (
+                any("sha256" in name.lower() for name in digest_function_names)
+                and size_uses_len
+            ):
+                violations.append(
+                    f"{relative}:{node.lineno} mints a CAS address outside storage"
+                )
 
     for relative in (
         Path("zlc_neutral_atom/artifacts/capture.py"),
@@ -905,32 +968,33 @@ def test_pulse_software_formats_have_no_upgrade_or_edit_counter():
 
 
 def test_legacy_frontend_persisted_formats_have_no_edit_counter_or_single_role():
+    """Owners are resolved by DEFINITION SITE, never by path -- see ``_sole_definition``.
+
+    The saved-figure format follows whichever module defines the ``SavedFigure``
+    record (today ``zlc_frontend/live_plot/plot_figure.py``, formerly the legacy
+    ``frontend/data_figure.py``), and the two console records follow their class
+    definitions.  So the guard survives the salvage instead of being silently
+    orphaned by it.
+
+    The anchor is the RECORD, not the ``load_figure`` reader: that name is
+    legitimately reused by the notebook sugar at
+    ``Zou_lab_control/neutral_atom/_gui.py`` which merely delegates.  Anchoring a
+    single-owner check on a name that a facade may reasonably re-export would make
+    the guard fail on a design that is fine.
+    """
+
+    figure_module, _ = _sole_definition("SavedFigure")
+    console_state_path, console_state_node = _sole_definition("TaskConsoleState")
+    panel_config_path, panel_config_node = _sole_definition("PanelConfig")
+
     owners = (
-        (
-            ROOT / "Zou_lab_control" / "frontend" / "data_figure.py",
-            None,
-            {"_SAVED_FIGURE_VERSION", "version"},
-        ),
-        (
-            ROOT / "Zou_lab_control" / "frontend" / "task_console.py",
-            "TaskConsoleState",
-            {"version"},
-        ),
-        (
-            ROOT / "Zou_lab_control" / "frontend" / "task_console.py",
-            "PanelConfig",
-            {"role"},
-        ),
+        (figure_module, ast.parse(figure_module.read_text(encoding="utf-8")),
+         {"_SAVED_FIGURE_VERSION", "version"}),
+        (console_state_path, console_state_node, {"version"}),
+        (panel_config_path, panel_config_node, {"role"}),
     )
     violations = []
-    for path, class_name, forbidden in owners:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        root = tree
-        if class_name is not None:
-            root = next(
-                node for node in tree.body
-                if isinstance(node, ast.ClassDef) and node.name == class_name
-            )
+    for path, root, forbidden in owners:
         for node in ast.walk(root):
             candidate = None
             if isinstance(node, ast.Name):
