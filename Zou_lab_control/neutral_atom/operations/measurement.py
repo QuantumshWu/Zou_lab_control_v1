@@ -53,9 +53,11 @@ PULSE_SCAN_NODE = "pulse_scan"
 #: complete table; an API slot is resolved and submitted as one finite pulse per point.  Keeping
 #: this discriminator beside the shared execution helpers gives the measurement factory, logic
 #: node, and frontend one source instead of parallel mode vocabularies.
-SWEEP_SCAN_SLOT = "scan_slot"
-SWEEP_API_SLOT = "api_slot"
-PULSE_SWEEP_KINDS: tuple[str, str] = (SWEEP_SCAN_SLOT, SWEEP_API_SLOT)
+from zlc_data.vocabulary import (  # one spelling, shared with the render layer
+    PULSE_SWEEP_KINDS,
+    SWEEP_API_SLOT,
+    SWEEP_SCAN_SLOT,
+)
 
 #: The metadata marker every COUPLED-tier measurement (temperature / fidelity-vs-duration /
 #: grey-molasses-detuning -- the pulse-scan special cases whose y is reduced INLINE over a loading's

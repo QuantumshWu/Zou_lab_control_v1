@@ -32,10 +32,8 @@ from .roi import ROI_REDUCERS, RoiProcessor
 
 
 #: The catalog/spec display name -- the ONE string the console resolves the analysis spec by.
-ANALYSIS_SPEC_NAME = "Analysis"
-#: The action vocabulary -- single source for the node's dispatch, the ParamDecl choices AND the
-#: panel Setting's Analysis combo (the frontend imports THIS, never a retyped copy).
-ANALYSIS_ACTIONS = ("roi", "fit")
+#: (both live in zlc_data.vocabulary -- the frontend reads them without importing this module)
+from zlc_data.vocabulary import ANALYSIS_ACTIONS, ANALYSIS_SPEC_NAME
 #: Manual-form region kinds -> the binding constructors (axes = a contiguous axis crop on the last
 #: two block axes; value = a distribution's sample-value mask).
 ANALYSIS_REGION_KINDS = ("axes", "value")

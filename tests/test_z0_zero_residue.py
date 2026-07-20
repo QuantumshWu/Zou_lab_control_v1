@@ -58,7 +58,7 @@ TARGET_PACKAGES = ("zlc_data/", "zlc_storage/", "zlc_pulse/", "zlc_neutral_atom/
 
 # --------------------------------------------------------------------- budgets
 # Every number below was MEASURED, not estimated, and is mirrored in
-# docs/MIGRATION_GOAL_zh.md section 4.  They may only be lowered.
+# the design doc's S4 progress ledger.  They may only be lowered.
 
 Z1_LEGACY_FILES = 122          # tracked files under the two legacy trees
 Z2A_PRODUCTION_IMPORTERS = {   # non-test code OUTSIDE legacy that still imports it
@@ -85,7 +85,7 @@ Z8_TESTS_OFF_THE_MANIFEST = 176
 
 #: The S0.5 bridges that were actually BUILT.  The design document names four
 #: symbols; two of them (``LegacyPanelHost``, ``LegacyRuntimeFence``) have zero
-#: class definitions in the repository and never did - see MIGRATION_GOAL_zh.md
+#: class definitions in the repository and never did - see the design doc
 #: section 3 F4.  Asserting on the two real ones keeps Z0 from hunting ghosts.
 Z6_BRIDGES = ("CatalogRouter", "SerializedLegacyAggBridge")
 Z6_BRIDGE_DEFINITIONS = 2
@@ -166,7 +166,7 @@ def test_z1_the_legacy_trees_shrink():
     files = [p for p in _tracked() if p.startswith(LEGACY_TREES)]
     _fail("Z1 legacy tracked files", files, Z1_LEGACY_FILES,
           "Files leave these trees by being salvaged into a target package "
-          "(section 6 of MIGRATION_GOAL_zh.md), never by being copied.")
+          "(design doc L4648, shell salvage), never by being copied.")
 
 
 def test_z2a_production_code_outside_legacy_has_a_named_ledger():
@@ -250,7 +250,7 @@ def test_z6_only_the_bridges_that_exist_are_tracked():
     )
     assert not ghosts, (
         f"{ghosts} now exist as classes. They never did - the design document "
-        "names them but nobody wrote them (MIGRATION_GOAL_zh.md section 3 F4). "
+        "names them but nobody wrote them (design doc, S4 ledger). "
         "If one is genuinely being built, move it into Z6_BRIDGES."
     )
 

@@ -127,15 +127,9 @@ def test_moved_modules_import_no_legacy_code():
 #: cutting these seams one group at a time; each cut deletes its rows here.
 TENDRILS = {
     "Zou_lab_control/frontend/task_console.py": {
-        ("neutral_atom.core.signals", "NO_LINEAGE"),
         ("neutral_atom.operations.logic", "Processor"),
         ("neutral_atom.operations.logic", "ProcessorRun"),
-        ("neutral_atom.operations.measurement", "SWEEP_API_SLOT"),
-        ("neutral_atom.operations.measurement", "SWEEP_SCAN_SLOT"),
-        ("neutral_atom.operations.processors.analysis", "ANALYSIS_ACTIONS"),
-        ("neutral_atom.operations.processors.analysis", "ANALYSIS_SPEC_NAME"),
         ("neutral_atom.operations.processors.fit", "FitProcessor"),
-        ("neutral_atom.operations.task", "DEFAULT_MID_RUN_KEY"),
         ("neutral_atom.timing", "scan_column_spec"),
         ("neutral_atom.timing", "scan_table_template"),
     },

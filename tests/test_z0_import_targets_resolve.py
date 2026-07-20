@@ -54,7 +54,7 @@ KNOWN_DEAD_PRODUCTION = {
 #: Broken imports inside FROZEN (non-manifest) test files.  Overwhelmingly
 #: ``Zou_lab_control.frontend.qt_fluent`` and ``.style``, which moved into
 #: ``zlc_frontend`` in earlier slices; the frozen tests still name the old paths.
-#: MAY ONLY DECREASE.  Recorded in docs/MIGRATION_GOAL_zh.md alongside the other
+#: MAY ONLY DECREASE.  Recorded in the design doc's S4 ledger alongside the other
 #: residue budgets.
 FROZEN_TEST_BUDGET = 165
 

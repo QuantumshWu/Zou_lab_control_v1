@@ -146,7 +146,7 @@ from zlc_data.param_decl import ParamDecl
 
 # The default mid-run buffer key -- the spec layer's ONE spelling (TaskSpec.mid_run_key's
 # default), imported so the console's spec-less fallbacks can never drift from it.
-from Zou_lab_control.neutral_atom.operations.task import DEFAULT_MID_RUN_KEY
+from zlc_data.vocabulary import DEFAULT_MID_RUN_KEY
 from zlc_storage import exact_mapping
 
 
@@ -330,7 +330,7 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._api_widgets: dict[str, QtWidgets.QWidget] = {}
-        from ..neutral_atom.operations.measurement import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
+        from zlc_data.vocabulary import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
         self._scan_slot_kind = SWEEP_SCAN_SLOT
         self._api_slot_kind = SWEEP_API_SLOT
         self._program_code = None
@@ -1158,7 +1158,7 @@ class AnalysisControls(QtWidgets.QWidget):
             return
         # action combo (both surfaces) -- the action VOCABULARY is the AnalysisProcessor's own
         # ANALYSIS_ACTIONS (single source), each entry gated by this panel kind's capability.
-        from ..neutral_atom.operations.processors.analysis import ANALYSIS_ACTIONS
+        from zlc_data.vocabulary import ANALYSIS_ACTIONS
         self.action_combo = FluentComboBox()
         self.action_combo.addItem("none", "none")
         labels = {"fit": "curve fit", "roi": "ROI"}
@@ -8437,7 +8437,7 @@ class TaskConsole(QtWidgets.QWidget):
         The old delete-and-recreate branches (which silently destroyed a user-stopped row, purged
         its lingering signals, and re-started against their intent) are gone: fit<->roi is a
         parameter switch on the SAME node/row/region."""
-        from ..neutral_atom.operations.processors.analysis import ANALYSIS_SPEC_NAME
+        from zlc_data.vocabulary import ANALYSIS_SPEC_NAME
         from zlc_data.signal_expr import DEFAULT_SOURCE
         signal = str(card.config.inputs[0]) if card.config.inputs else ""
         if not signal:
@@ -9275,7 +9275,7 @@ class TaskConsole(QtWidgets.QWidget):
         signal of a STOPPED node is excluded (it would freeze the clock at its last shot), and a free-running
         :data:`NO_LINEAGE` scalar (a loading rate) never constrains.  ``None`` (-> latest of each, i.e.
         :meth:`snapshot_latest`) when nothing displayed carries a lineage yet."""
-        from ..neutral_atom.core.signals import NO_LINEAGE     # single source of the sentinel (lazy: off na import graph)
+        from zlc_data.vocabulary import NO_LINEAGE             # single source of the sentinel
         live: set[str] = set()
         for node in self.running_nodes:
             # Exclude a FAULTED node's straggling signals from the min, the SAME principle as the
@@ -9482,7 +9482,7 @@ class TaskConsole(QtWidgets.QWidget):
         already published stayed frozen a shot behind while a slower co-displayed producer advanced the
         clock -> the reported "the three frames are not one shot" desync.  Blit makes recomposing every
         panel on a clock tick cheap, so coherence costs nothing.)"""
-        from ..neutral_atom.core.signals import NO_LINEAGE     # single source of the sentinel (lazy)
+        from zlc_data.vocabulary import NO_LINEAGE             # single source of the sentinel
         inputs = card.config.inputs or ()
         free = tuple((str(n), sigvers.get(str(n), 0)) for n in inputs
                      if self.hub.latest_provenance(str(n)) == NO_LINEAGE)

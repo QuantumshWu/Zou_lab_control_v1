@@ -32,7 +32,7 @@ from ._spec import REQUIRED, CatalogSpec
 #: The default mid-run buffer key a task streams (``TaskSpec.mid_run_key``'s default) -- the ONE
 #: spelling of ``"frame"``.  A consumer that must fall back without a spec in hand (the console's
 #: spec-less paths) imports this instead of re-typing the literal.
-DEFAULT_MID_RUN_KEY = "frame"
+from zlc_data.vocabulary import DEFAULT_MID_RUN_KEY
 
 
 @dataclass(frozen=True)

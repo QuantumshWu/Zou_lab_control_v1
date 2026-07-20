@@ -333,7 +333,7 @@ def test_the_template_reader_returns_rows_the_gui_can_draw_without_pulse_types()
     # SHIPPED default is still in the pre-rename schema and cannot be loaded at
     # all (api_parameters / scan_recipe / target vs api_slots / scan_slots /
     # scan_code).  The console swallows the failure into an empty slots form, so
-    # the breakage is invisible there; it is recorded in MIGRATION_GOAL_zh.md and
+    # the breakage is invisible there; it is recorded in the design doc's S4 ledger and
     # is NOT frozen here as expected behaviour.
     import json
     import tempfile

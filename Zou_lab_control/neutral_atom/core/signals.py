@@ -37,10 +37,9 @@ from .signal_tensor import (
 
 DEFAULT_HISTORY = 2048
 
-#: A value that joins no physical acquisition lineage (static metadata or a
-#: free-running external value).  Data-plane producers should normally provide
-#: a real source-shot id; the sentinel remains explicit rather than inferred.
-NO_LINEAGE = -1
+# The lineage sentinel is shared vocabulary, not a signal-hub concept: the
+# render layer reads it too.  Defined once in zlc_data, imported here.
+from zlc_data.vocabulary import NO_LINEAGE
 
 
 @dataclass(frozen=True)
