@@ -72,6 +72,12 @@ MOVES = {
 _MODULE_INFRA = {
     "__name__", "__file__", "__loader__", "__spec__", "__package__",
     "__builtins__", "__cached__", "__doc__",
+    # Module infrastructure, same category as the six above: a module's own
+    # ``__annotations__`` is created for ITS annotated globals, so a forwarding shim
+    # legitimately has its own (empty) one.  The old eager copy matched only because
+    # ``vars(_moved)`` happened to carry it, never because the two files share
+    # annotations -- they do not, the shim declares none.
+    "__annotations__",
 }
 
 
@@ -93,6 +99,37 @@ def test_every_name_resolves_to_the_identical_object():
             if key in _MODULE_INFRA:
                 continue
             assert getattr(old_module, key) is value, f"{old}.{key} diverged"
+
+
+def test_a_shim_follows_a_name_the_moved_module_REBINDS_later():
+    """The identity test above only sees names that exist at import time.
+
+    That blind spot was a real bug, not a hypothetical: the shims used to forward by
+    ``globals().update(vars(moved))``, an import-time snapshot of BINDINGS.  Any global
+    the moved module later rebinds left the legacy copy frozen -- and
+    ``zlc_data.curve_fitting._solve_thread_guard`` is exactly that: ``None`` until the
+    frontend calls ``register_solve_thread_guard``, after which the canonical module had
+    the real guard while the legacy path still answered ``None`` forever.
+
+    Rebinding is the only way to catch this, so this test does it on the real pair and
+    restores the original value.
+    """
+
+    moved = importlib.import_module("zlc_data.curve_fitting")
+    shim = importlib.import_module("Zou_lab_control.neutral_atom.core.fitting")
+    original = moved._solve_thread_guard
+
+    def _sentinel():
+        return None
+
+    try:
+        moved.register_solve_thread_guard(_sentinel)
+        assert shim._solve_thread_guard is _sentinel, (
+            "the legacy path went stale: it is forwarding a COPY, not the module")
+        moved.register_solve_thread_guard(None)
+        assert shim._solve_thread_guard is None, "clearing the guard must be visible too"
+    finally:
+        moved.register_solve_thread_guard(original)
 
 
 def test_validator_renames_keep_the_old_names_alive_in_the_shim():
