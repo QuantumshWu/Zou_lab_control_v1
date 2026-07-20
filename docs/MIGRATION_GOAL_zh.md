@@ -97,9 +97,16 @@ zoom/pan/crosshair/hover/selector;不适用的 plot kind 必须有旧行为证�
 - 已落守卫:`test_u06::test_the_product_surface_reaches_no_legacy_module` ——
   产品面(Z0 后存活)legacy import 恒为 0,变异测试证明会咬。
 
-**F3 两条已断的死引用**:`neutral_atom/session.py:596` → `zlc_workbench.legacy_neutral_atom`、
-`_gui.py:113` → `zlc_workbench.pulse_control`,**两模块都不存在**,lazy import 调用才炸,
-后者在 pulse GUI 路径上。
+**F3 死引用** —— ✅ 已闭合(守卫 `tests/test_z0_import_targets_resolve.py`)。实测结论:
+- `Zou_lab_control.neutral_atom.session.connect('virtual')` **今天就是断的**
+  (`ModuleNotFoundError: zlc_workbench.legacy_neutral_atom`);`na.connect` 连属性都没有。
+  仅存消费者是冻结测试与旧树自身,产品入口 `notebook.connect` 不受影响。
+- **不复活那个桥**:旧 session 根是「完成态不存在」项(唯一 headless 根 = `notebook.connect`),
+  这两行随文件死(`_gui.py`→W2,`session.py`→Z0)。
+- 守卫三分断言:**生产代码恰好 2 条已登记** · **白名单测试恒为 0** ·
+  **冻结测试预算 `FROZEN_TEST_BUDGET = 165`(只减不增)**——后者是白名单闸门一直藏着的腐烂
+  (139×`frontend.qt_fluent` + 14×`frontend.style` + 12×`zlc_workbench.*`,散在 60 个冻结文件),
+  按纪律不修不碰,**只能靠 Z0 删文件把它降到 0**。
 
 **F4 设计文档的幽灵与过期**:`LegacyPanelHost` 在 Z0 删除清单里但全仓 0 命中;§2.2 与
 §22 的缝数(38/23/26)全部过期。→ 修正为"数字以测试为准",删幽灵条目。
