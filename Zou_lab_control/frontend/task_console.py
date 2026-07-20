@@ -6634,8 +6634,14 @@ class TaskConsole(QtWidgets.QWidget):
         # frame rate, never the UI's responsiveness (see frontend/render_loop.py for the ownership
         # protocol).  Structural builds (Qt widgets) come back to the GUI via _on_render_batch.
         # Created BEFORE the UI build: load_state constructs panel cards, which take the barrier.
+        # L596: an un-migrated shared-Figure RenderLoop is only allowed to live INSIDE the
+        # SerializedLegacyAggBridge island, so the shell never holds the raw loop.  The bridge is
+        # fail-closed: a handoff that does not settle raises instead of letting this thread touch a
+        # Figure the worker may still own.  Every access below goes through _render_barrier().
+        from zlc_workbench.legacy import SerializedLegacyAggBridge
+
         from .render_loop import RenderLoop
-        self._render_loop = RenderLoop(self._on_render_batch, parent=self)
+        self._render = SerializedLegacyAggBridge(RenderLoop(self._on_render_batch, parent=self))
 
         self._build_ui()
         self.load_state(self.state)
@@ -7000,7 +7006,7 @@ class TaskConsole(QtWidgets.QWidget):
             structure_provider=self._signal_structure, pulse_state_provider=self._pulse_state,
             grid_recipe_provider=self._grid_recipe,
             short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace,
-            render_barrier=self._render_loop.barrier, area_select_sink=self._on_panel_area_select,
+            render_barrier=self._render_barrier, area_select_sink=self._on_panel_area_select,
             selection_clear_sink=self._on_panel_selection_clear, fit_node_sink=self._sync_fit_node)
 
     def _attach_card(self, card: PanelCard) -> None:
@@ -7851,7 +7857,9 @@ class TaskConsole(QtWidgets.QWidget):
         if card is None or self._task_locked:
             return
         # the Edit snapshot reads the live plotter's data arrays -- own the figure first
-        self._render_loop.barrier()
+        if not self._render_barrier():
+            self._render_handoff_failed("Edit")
+            return
         existing = self._panel_editors.get(id(card))
         if existing is not None:
             self.tabs.setCurrentWidget(existing)
@@ -8048,10 +8056,7 @@ class TaskConsole(QtWidgets.QWidget):
         if card not in self.cards and "removed" not in phases:
             return False
         if not render_already_stopped:
-            try:
-                if self._render_loop.barrier(max(0.0, float(timeout))) is not True:
-                    return False
-            except BaseException:
+            if not self._render_barrier(max(0.0, float(timeout))):
                 return False
         if "analysis" not in phases:
             self._remove_panel_analysis(card)  # analysis row + region signal go with the panel (#1/#7)
@@ -8867,7 +8872,7 @@ class TaskConsole(QtWidgets.QWidget):
         # self.cards -- but the full-hub snapshot + single-card render must not overlap a batch).
         # While busy, simply skip: the task's output buffer keeps the latest frame and the very
         # next idle tick catches up.
-        if not self._render_loop.busy:
+        if not self._render.busy:
             self._task_card.refresh(self._expression_namespace())
         # NB: leaving task-run mode on finish is handled in ONE place -- _poll_logic_nodes
         # (the canonical node-lifecycle tick, which runs every tick regardless of whether
@@ -8967,6 +8972,36 @@ class TaskConsole(QtWidgets.QWidget):
         if kind == "task":
             return spec.build(self.hub, **values)
         raise RuntimeError(f"unknown logic kind {kind!r}")
+
+    def _render_barrier(self, timeout: float = 5.0) -> bool:
+        """Own every Figure, or say NO -- the one door to the render island.
+
+        The bridge raises when the handoff does not settle; the panels were handed a
+        bool-returning callable long before the bridge existed, so the exception is
+        turned back into False HERE rather than at nine call sites.  What changes is
+        what the console does with a False: it now aborts the operation instead of
+        proceeding to touch a Figure the render worker may still own.
+        """
+
+        from zlc_workbench.legacy import LegacyHandoffTimeout
+
+        try:
+            self._render.settle(timeout)
+        except LegacyHandoffTimeout:
+            return False
+        except BaseException:                      # bridge poisoned/closed, owner-thread misuse
+            return False
+        return True
+
+    def _render_handoff_failed(self, what: str) -> None:
+        """Tell the operator WHICH action was refused, on the permanent status strip."""
+
+        try:
+            self.status_strip.show_message(
+                f"{what} cancelled: the render worker did not hand back the figures in time.",
+                severity="error")
+        except BaseException:
+            pass
 
     @staticmethod
     def _supports_bounded_stop(node) -> bool:
@@ -9458,7 +9493,9 @@ class TaskConsole(QtWidgets.QWidget):
         # panels.  Clamp to the board so the sub-rect is valid; empty board -> the whole (tiny) board.
         # board.grab() forces a synchronous paint of EVERY canvas -- settle the render loop first
         # (the file dialog above kept ticks running, so a batch may be in flight right now).
-        self._render_loop.barrier()
+        if not self._render_barrier():
+            self._render_handoff_failed("Save image")
+            return
         cards = list(self.cards)
         if cards:
             rect = cards[0].geometry()
@@ -9516,7 +9553,7 @@ class TaskConsole(QtWidgets.QWidget):
         # regardless of the modulo.  Without that, submissions phase-lock -- a heavy fast-beat panel
         # occupies exactly the ticks a slow-beat panel's beats land on, starving it FOREVER under
         # sustained overload (the fairness the deleted rotor used to provide).
-        busy = self._render_loop.busy
+        busy = self._render.busy
         disp = self._display_shot()            # the ONE coherent display shot for the whole board this tick
         sigvers = self.hub.signal_versions()   # ONE per-signal-counter snapshot for the whole tick
         elapsed = self._tick_count * self._base_interval_ms
@@ -9544,7 +9581,7 @@ class TaskConsole(QtWidgets.QWidget):
             # The worker builds the shared namespace ITSELF (the full-hub snapshot copy is real
             # work -- off the GUI thread with everything else) and composes each panel in place;
             # panels needing a STRUCTURAL build come back untouched for the GUI pass.
-            self._render_loop.submit(
+            self._render.submit(
                 lambda b=batch, d=disp: self._compose_batch(b, d))
         # keep the visible Edit tab's 'now:' acquisition references live, so a queued
         # parameter edit shows as applied once the loop picks it up.
@@ -9597,7 +9634,9 @@ class TaskConsole(QtWidgets.QWidget):
         ONE coherent snapshot, then PRESENT them all together -- the same two-phase coherence as the live
         tick, just unconditional (ignores per-panel beat and the frame-key gate).  Holds the render
         barrier first: this GUI-thread compose must own every figure."""
-        self._render_loop.barrier()
+        if not self._render_barrier():
+            self._render_handoff_failed("Refresh")
+            return
         self._poll_logic_nodes()
         self._refresh_signal_info()
         self._refresh_task_panel()
@@ -9862,7 +9901,8 @@ class TaskConsole(QtWidgets.QWidget):
             self._shutdown_state = "BLOCKED_RENDER_OWNERSHIP"
             return False
         try:
-            render_stopped = self._render_loop.stop(remaining) is True
+            self._render.close(max(0.0, float(remaining)))
+            render_stopped = bool(self._render.closed)
         except BaseException as exc:
             render_stopped = False
             self._shutdown_error = exc

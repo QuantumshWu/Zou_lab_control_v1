@@ -10,7 +10,7 @@ from typing import Callable
 from zlc_storage import (
     canonical_text as _text,
     normalized_text,
-    positive_real,
+    finite_real,
 )
 
 
@@ -80,6 +80,23 @@ class CatalogRouter:
             raise KeyError(f"use case {key!r} has no explicit catalog route") from exc
 
 
+def _handoff_timeout(value: object) -> float:
+    """A handoff budget in seconds, where ZERO is a legitimate answer.
+
+    ``positive_real`` rejects 0.0, but "do not wait at all" is exactly what a
+    caller means while tearing a panel down on a spent budget, or when polling
+    whether the worker has already finished.  Refusing it would have forced that
+    caller to keep a raw reference to the render loop and bypass this bridge,
+    which is the one thing the bridge exists to prevent.  Negative is still a
+    programming error.
+    """
+
+    seconds = finite_real(value, "timeout")
+    if seconds < 0:
+        raise ValueError("timeout must be >= 0 seconds")
+    return float(seconds)
+
+
 class LegacyHandoffTimeout(RuntimeError):
     pass
 
@@ -95,6 +112,19 @@ class SerializedLegacyAggBridge:
         self._owner_thread = threading.get_ident()
         self._poisoned = False
         self._closed = False
+
+    @property
+    def busy(self) -> bool:
+        """Whether a compose is in flight, for a caller deciding to SKIP a beat.
+
+        A read-only query: it claims nothing about ownership and hands out no
+        Figure, so unlike ``submit``/``settle`` it needs neither the owner thread
+        nor a usable bridge.  A shell that must ask this is asking about pacing,
+        not about access, and had to reach past the bridge to the raw loop before
+        this existed.
+        """
+
+        return bool(getattr(self._render_loop, "busy", False))
 
     @property
     def poisoned(self) -> bool:
@@ -114,7 +144,7 @@ class SerializedLegacyAggBridge:
     def settle(self, timeout: float = 5.0) -> None:
         self._require_owner()
         self._ensure_usable()
-        timeout = positive_real(timeout, "timeout")
+        timeout = _handoff_timeout(timeout)
         try:
             settled = self._render_loop.barrier(timeout)
         except BaseException as exc:
@@ -130,7 +160,7 @@ class SerializedLegacyAggBridge:
 
     def close(self, timeout: float = 5.0) -> None:
         self._require_owner()
-        timeout = positive_real(timeout, "timeout")
+        timeout = _handoff_timeout(timeout)
         if self._closed:
             return
         if not self._poisoned:
