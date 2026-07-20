@@ -32,6 +32,7 @@ import logging
 import threading
 
 from zlc_frontend.render_style import DESIGN_DPI
+from zlc_frontend.render import RasterBuffer
 from .render_loop import RENDER_THREAD_NAME
 
 try:
@@ -209,16 +210,34 @@ else:
         # FRONT-buffer protocol (render-thread decoupling): while the render thread owns a live
         # panel's figure, the GUI paintEvent must not read (or lazily re-render) the Agg buffer the
         # worker is writing.  present() therefore deep-copies the finished buffer into ``_zlc_front``
-        # (a QImage -- plain data, thread-agnostic) and paintEvent blits THAT.  Interaction drags
-        # (selector blits bypass draw()/present()) drop the front first so the live Agg buffer shows
-        # again -- the figure is GUI-owned for the whole drag (see selectors.begin_figure_interaction).
+        # and paintEvent blits THAT.  Interaction drags (selector blits bypass draw()/present()) drop
+        # the front first so the live Agg buffer shows again -- the figure is GUI-owned for the whole
+        # drag (see selectors.begin_figure_interaction).
+        #
+        # The front is a ``RasterBuffer``, which is the ONE value the target architecture lets cross a
+        # worker/GUI boundary; ``zlc_frontend/render.py`` names the alternative this used to be --
+        # "No live Figure, Artist, mutable or aliased ndarray view, or QImage storage crosses this
+        # module's boundary".  A stored QImage is not merely off-vocabulary: it is a Qt object owned by
+        # whichever thread built it, so it could never be the hand-off once the renderer stops being
+        # this very widget.  Owned bytes can.  paintEvent images them for the duration of one blit.
         def _zlc_snapshot_front(self) -> None:
             renderer = getattr(self, "renderer", None)
             if renderer is None:
                 return
-            w, h = int(renderer.width), int(renderer.height)
-            self._zlc_front = QtGui.QImage(
-                self.buffer_rgba(), w, h, QtGui.QImage.Format_RGBA8888).copy()
+            self._zlc_front = RasterBuffer.from_agg_rgba(
+                int(renderer.width), int(renderer.height), self.buffer_rgba())
+
+        @staticmethod
+        def _zlc_front_image(front) -> "QtGui.QImage":
+            """Image one owned raster for exactly one blit.
+
+            The QImage does not copy: it VIEWS ``front.pixels``, which is immutable and outlives the
+            paint because the caller holds the RasterBuffer.  Passing the stride explicitly keeps this
+            honest for any future non-tight raster instead of silently mis-reading rows.
+            """
+
+            return QtGui.QImage(front.pixels, front.width, front.height,
+                                front.stride_bytes, QtGui.QImage.Format_RGBA8888)
 
         def _zlc_drop_front(self) -> None:
             self._zlc_front = None
@@ -284,7 +303,7 @@ else:
                 # -- the render thread may be composing the next frame into it right now.
                 painter = QtGui.QPainter(self)
                 painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
-                painter.drawImage(self.rect(), front)
+                painter.drawImage(self.rect(), self._zlc_front_image(front))
                 painter.end()
                 return
             # Fallback path (no front image -- a GUI-thread-only host, or before the first present):
@@ -298,10 +317,11 @@ else:
                 return
             self._zlc_draw_if_needed()          # render the buffer only if it is out of date (else reuse)
             renderer = self.renderer
-            w, h = int(renderer.width), int(renderer.height)
-            # ``.copy()`` so the QImage OWNS its pixels -- never a live view into the Agg buffer that a
-            # subsequent compose could overwrite mid-blit.
-            image = QtGui.QImage(self.buffer_rgba(), w, h, QtGui.QImage.Format_RGBA8888).copy()
+            # Own a copy first -- never a live view into the Agg buffer that a subsequent compose could
+            # overwrite mid-blit.  Same construction as the front, so the two paths cannot drift.
+            owned = RasterBuffer.from_agg_rgba(
+                int(renderer.width), int(renderer.height), self.buffer_rgba())
+            image = self._zlc_front_image(owned)
             painter = QtGui.QPainter(self)
             painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
             painter.drawImage(self.rect(), image)

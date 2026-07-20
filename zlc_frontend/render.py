@@ -256,6 +256,22 @@ class RasterBuffer:
         if len(self.pixels) != stride * height:
             raise ValueError("pixels length must equal stride_bytes * height")
 
+    @classmethod
+    def from_agg_rgba(cls, width: int, height: int, buffer) -> "RasterBuffer":
+        """Own a copy of one Agg RGBA buffer as a tight-stride RGBA8888 raster.
+
+        Every Agg surface hands over the same three facts -- the layout is
+        ``RGBA8888``, the stride is tight, and the worker's live buffer must be
+        COPIED rather than aliased -- so they are stated here once.  A caller that
+        re-typed them could drift on any of the three, and the third is the one
+        that corrupts pixels rather than raising: ``memoryview`` and ``bytearray``
+        both satisfy a length check while still aliasing the buffer the worker is
+        about to overwrite.
+        """
+
+        return cls(width, height, width * PixelFormat.RGBA8888.channels,
+                   PixelFormat.RGBA8888, bytes(buffer))
+
 
 @dataclass(frozen=True, slots=True)
 class RadialGaussianImageFitOverlay:

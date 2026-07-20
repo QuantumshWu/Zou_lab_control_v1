@@ -2146,13 +2146,8 @@ class SinglePanelAggRenderer:
     def _draw_raster(figure) -> RasterBuffer:
         figure.canvas.draw()
         actual_width, actual_height = figure.canvas.get_width_height()
-        return RasterBuffer(
-            actual_width,
-            actual_height,
-            actual_width * 4,
-            PixelFormat.RGBA8888,
-            bytes(figure.canvas.buffer_rgba()),
-        )
+        return RasterBuffer.from_agg_rgba(
+            actual_width, actual_height, figure.canvas.buffer_rgba())
 
     def close(self) -> None:
         with render_style_context():
