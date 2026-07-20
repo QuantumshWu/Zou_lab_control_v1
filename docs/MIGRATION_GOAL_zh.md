@@ -108,9 +108,23 @@ zoom/pan/crosshair/hover/selector;不适用的 plot kind 必须有旧行为证�
   (139×`frontend.qt_fluent` + 14×`frontend.style` + 12×`zlc_workbench.*`,散在 60 个冻结文件),
   按纪律不修不碰,**只能靠 Z0 删文件把它降到 0**。
 
-**F4 设计文档的幽灵与过期**:`LegacyPanelHost` 在 Z0 删除清单里但全仓 0 命中;§2.2 与
-§22 的缝数(38/23/26)全部过期。→ 修正为"数字以测试为准",删幽灵条目。
-**不要动 §2.1/§12.5 的条款本身。**
+**F4 幽灵条目与过期数字** —— ✅ 已闭合(只**记录实测事实**,不改设计文档条款)。
+
+设计文档 §2091/§3533/§3753 把 S0.5 描述为"三个互不冒充的迁移桥",Z0 删除清单也照抄了这三个名字。
+实测(`grep` 类定义 vs 全部引用):
+
+| 名字 | 类定义 | 引用 | 判定 |
+|---|---|---|---|
+| `LegacyPanelHost` | **0** | **0** | **纯幽灵**,从未被建成 |
+| `CatalogRouter`(其配对) | 1 (`zlc_workbench/legacy.py:45`) | 6 | 真实存在 |
+| `LegacyRuntimeFence` | **0** | 15 | 只作为**概念名**活在 `task_console.py`/`operations/logic.py` 的注释与 3 个冻结测试名里,**没有这个类** |
+| `SerializedLegacyAggBridge` | 1 (`zlc_workbench/legacy.py:87`) | 9 | 真实存在 |
+
+→ **Z0 只需删 `CatalogRouter` 与 `SerializedLegacyAggBridge` 两个真类**;另两个名字不必去找,
+它们随注释与冻结测试一起消失。§四 Z6 已按此收窄。
+
+**过期数字**:不逐个追,由 §〇 的常设规则解决——**数字一律以测试文件为准,文档数字视为过期**。
+`docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` 的 §2.1/§12.5/§2.2/§22.1 **条款本身一个字都不动**。
 
 ---
 
@@ -126,7 +140,7 @@ zoom/pan/crosshair/hover/selector;不适用的 plot kind 必须有旧行为证�
 | Z3 | 无转发壳(兜底子句:≤40 行且只有 import + `globals().update`) | FAIL(18) |
 | Z4 | 六包 AST 无 `Zou_lab_control` 根 | **PASS → 今天就落成棘轮**,并给 `FORBIDDEN` 补 `zlc_workbench` 与 `fpga` 两个缺失 key |
 | Z5 | `test_u05_shell_salvage.py` / `test_u04_console_ui_parity.py` **被删除**(非清空) | 末期 |
-| Z6 | `LegacyRuntimeFence`/`SerializedLegacyAggBridge` 零定义零引用 | FAIL(`zlc_workbench/legacy.py:87`) |
+| Z6 | `CatalogRouter`/`SerializedLegacyAggBridge` 零定义零引用(**只列真存在的两个**——见 §三 F4:`LegacyPanelHost` 从未存在,`LegacyRuntimeFence` 只是概念名) | FAIL(`zlc_workbench/legacy.py:45,87`) |
 | Z7 | `Zou_lab_control/workbench/**` 只剩裁定保留件;每个窗口类全仓仅 1 处定义 | FAIL(预算制) |
 | Z8 | **白名单 == 全部 `tests/test_*.py`** | **FAIL(125/301)**;反作弊:让"把红测试移出白名单"不可能 |
 | Z9 | `test_migration_manifest_gate.py` 删除、`conftest.py` 无 collection 过滤 | 末期,**必须在 Z8 之后** |
