@@ -524,7 +524,7 @@ class DataFigure:
         the Flow tab of even a plain ``plot(arr).save()`` has a tree to draw.  No blanket ``except`` here:
         soft-fail is each capture's own documented contract, so a raising capture is contract drift that
         must surface (a swallowed one once saved every grid npz with NO flow graph)."""
-        from Zou_lab_control.neutral_atom.operations.figure_capture import capture_rich_info
+        from zlc_data.figure_capture import capture_rich_info
         return capture_rich_info(self._figure_source)
 
     def save(

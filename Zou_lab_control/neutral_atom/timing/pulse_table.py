@@ -1503,6 +1503,40 @@ class PulseTableState:
             resolved.append({"mode": entry.get("mode", "hold"), "value": value})
         return resolved
 
+    def analog_bus_samples(
+        self,
+        bus_name: str,
+        *,
+        slots: Mapping[str, float] | None = None,
+        starts: Sequence[int] | None = None,
+        looping: bool = True,
+    ) -> tuple[list[int], list[int]]:
+        """Breakpoint ticks of ONE DAC bus plus the SIGNED level held from each one --
+        ``(ticks, values)`` with ``len(values) == len(ticks) - 1`` (the last tick closes the
+        final segment).  Slot-referenced (scanned) values are resolved to their reference value,
+        so a preview shows a concrete trace instead of failing on ``int("s2")``.
+
+        ``looping=True`` (the default, and what a preview wants) reports the STEADY STATE the
+        forever-running loop converges to: a looping ``[ramp V, hold V]`` reads FLAT V, matching
+        the bench output.
+
+        Exists so a RENDER surface can draw the analog trace without importing the pulse
+        compiler: the state it already holds answers for its own waveform.  ``slots`` / ``starts``
+        are accepted so a caller folding every bus in one pass computes the reference slots and
+        the period prefix-sum ONCE; omitted, each is derived here."""
+
+        if slots is None:
+            slots = self._reference_slots()
+        if starts is None:
+            starts = self.period_start_steps(slots=slots, time_step_ns=self.time_step_ns)
+        plan = self._resolved_bus_plan(str(bus_name), slots)
+        ticks = analog_bus_ticks(plan, starts)
+        values = [
+            _analog_bus_value_at_tick(plan, starts, tick, looping=looping)
+            for tick in ticks[:-1]
+        ]
+        return ticks, values
+
     def analog_bus_value_at_period_start(self, period_index: int, bus_name: str) -> int:
         slots = self._reference_slots()
         starts = self.period_start_steps(slots=slots, time_step_ns=self.time_step_ns)

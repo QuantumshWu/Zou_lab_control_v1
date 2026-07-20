@@ -122,3 +122,4 @@ tests/test_u04_signal_picker_owner.py
 tests/test_u04_frozen_report_zoom.py
 tests/test_u04_console_ui_parity.py
 tests/test_u05_shell_salvage.py
+tests/test_u06_shell_domain_ports.py

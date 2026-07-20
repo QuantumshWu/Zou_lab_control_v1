@@ -2731,15 +2731,14 @@ def analog_bus_traces(state, *, include_always_off: bool = True) -> "tuple[list[
     """Fold each DAC bus into ONE signed analog trace row (starts + step values), and return
     ``(traces, folded_members)`` -- the member bit-channels that must NOT leak into the digital plot as
     their own rows.  A pure function of the ``PulseTableState`` (the render layer owns this)."""
-    from ..neutral_atom.timing.pulse_table import analog_bus_ticks, _analog_bus_value_at_tick
-
     buses = state.bus_channels()
     if not buses:
         return [], set()
-    starts_steps = [0]
+    # The state answers for its own waveform (``analog_bus_samples``): a render surface never
+    # imports the pulse compiler.  slots + the period prefix-sum are computed ONCE and handed
+    # down, so folding N buses stays one pass over the periods.
     slots = state._reference_slots()
-    for period in state.periods:
-        starts_steps.append(starts_steps[-1] + period.duration_steps(slots=slots, time_step_ns=state.time_step_ns))
+    starts_steps = state.period_start_steps(slots=slots, time_step_ns=state.time_step_ns)
     traces: list[dict[str, object]] = []
     folded_members: set[str] = set()
     for bus_name, members in buses.items():
@@ -2749,10 +2748,11 @@ def analog_bus_traces(state, *, include_always_off: bool = True) -> "tuple[list[
         # "Show off rows" off -> hide idle (all-zero / hold) DAC buses, like an always-off TTL channel.
         if not include_always_off and not _bus_has_signal(state, bus_name):
             continue
-        # Resolve scanned (slot-referenced) DAC values to their reference value so the preview shows a
-        # concrete trace instead of crashing on int("s2").
-        plan = state._resolved_bus_plan(bus_name, slots)
-        bus_ticks = analog_bus_ticks(plan, starts_steps)
+        # looping=True: the GUI runs the pulse forever, so the preview shows the STEADY STATE the
+        # loop converges to (a looping [ramp V, hold V] reads FLAT V, matching the bench output).
+        bus_ticks, bus_values = state.analog_bus_samples(
+            bus_name, slots=slots, starts=starts_steps, looping=True
+        )
         lo_signed, hi_signed = _bus_signed_bounds((1 << len(members)) - 1)
         traces.append(
             {
@@ -2764,12 +2764,7 @@ def analog_bus_traces(state, *, include_always_off: bool = True) -> "tuple[list[
                 "min": lo_signed,
                 "max": hi_signed,
                 "starts": [tick * state.time_step_ns * 1e-9 for tick in bus_ticks],
-                # looping=True: the GUI runs the pulse forever, so the preview shows the STEADY STATE the
-                # loop converges to (a looping [ramp V, hold V] reads FLAT V, matching the bench output).
-                "values": [
-                    _analog_bus_value_at_tick(plan, starts_steps, tick, looping=True)
-                    for tick in bus_ticks[:-1]
-                ],
+                "values": bus_values,
             }
         )
     return traces, folded_members
@@ -5012,7 +5007,7 @@ class _GridData:
         rich blocks.  A hand-rolled second copy here once mis-called ``capture_flow_graph`` and -- behind
         a blanket ``except`` -- silently saved every grid npz with NO flow graph; the delegation (plus the
         no-direct-import contract test) makes that divergence impossible."""
-        from Zou_lab_control.neutral_atom.operations.figure_capture import capture_rich_info
+        from zlc_data.figure_capture import capture_rich_info
         return capture_rich_info(self._figure_source)
 
 

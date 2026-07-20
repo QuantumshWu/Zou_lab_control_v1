@@ -535,6 +535,40 @@ def test_readout_artifacts_do_not_restore_edit_counter_metadata():
     )
 
 
+GUI_TOOLKITS = frozenset({"matplotlib", "PyQt5", "PySide2", "PySide6", "tkinter"})
+
+#: Only ``zlc_frontend`` renders.  Everything else describes, computes or moves
+#: data, and must stay importable in a headless process (a server, a notebook
+#: kernel with no display, a CI worker) without dragging a GUI toolkit in.
+GUI_FREE_PACKAGES = ("zlc_data", "zlc_storage", "zlc_pulse", "zlc_neutral_atom", "zlc_workbench")
+
+
+@pytest.mark.parametrize("package", GUI_FREE_PACKAGES)
+def test_only_the_frontend_package_may_import_a_gui_toolkit(package):
+    """The frontend-neutrality promise, mechanised.
+
+    ``figure_capture`` - what a saved figure records about where its data came
+    from - carried exactly this promise as prose plus one legacy test that read
+    the module by ``__file__``.  When the module moved into ``zlc_data`` that
+    test would have kept passing while checking nothing.  A property worth a
+    guard is worth a guard that does not depend on where the file lives, so it
+    is stated here once, over every non-rendering package.
+    """
+
+    root = ROOT / package
+    if not root.exists():
+        pytest.skip(f"{package} has not entered its migration slice")
+    violations = []
+    for path in sorted(root.rglob("*.py")):
+        for imported in _imports(path):
+            if imported.split(".")[0] in GUI_TOOLKITS:
+                violations.append(f"{path.relative_to(ROOT)} imports {imported}")
+    assert not violations, (
+        f"{package} must stay headless-importable; only zlc_frontend may render: "
+        + "; ".join(violations)
+    )
+
+
 def test_notebook_facade_has_no_implicit_current_calibration_state():
     source = (ROOT / "Zou_lab_control/notebook/facade.py").read_text(
         encoding="utf-8"

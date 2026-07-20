@@ -58,6 +58,8 @@ MOVES = {
     "Zou_lab_control.neutral_atom.core.raster": "zlc_data.raster",
     "Zou_lab_control.neutral_atom.core.selection": "zlc_data.plot_region",
     "Zou_lab_control.neutral_atom.core.fitting": "zlc_data.curve_fitting",
+    # H1c - what a saved figure records about where its data came from.
+    "Zou_lab_control.neutral_atom.operations.figure_capture": "zlc_data.figure_capture",
 }
 
 _MODULE_INFRA = {
@@ -145,11 +147,15 @@ TENDRILS = {
         ("neutral_atom.timing", "scan_column_spec"),
         ("neutral_atom.timing", "scan_table_template"),
     },
-    "Zou_lab_control/frontend/live.py": {
-        ("neutral_atom.operations.figure_capture", "capture_rich_info"),
-        ("neutral_atom.timing.pulse_table", "_analog_bus_value_at_tick"),
-        ("neutral_atom.timing.pulse_table", "analog_bus_ticks"),
-    },
+    # live.py: EMPTY.  Its last two seams were cut differently and the contrast is
+    # the whole lesson.  ``figure_capture`` was pure description over duck-typed
+    # inputs, so it MOVED (see MOVES above).  The DAC-waveform helpers could not:
+    # ``pulse_table`` is 3k lines over the port catalog and the streamer geometry,
+    # and ``zlc_frontend`` may never import ``zlc_pulse`` at all.  So the STATE now
+    # answers for its own waveform (``PulseTableState.analog_bus_samples``) and the
+    # render surface asks the object it was already handed - an OBJECT port, pinned
+    # by ``test_u06_shell_domain_ports``.  Relocate what is pure; invert what is not.
+    "Zou_lab_control/frontend/live.py": set(),
 }
 
 
