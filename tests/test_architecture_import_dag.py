@@ -82,6 +82,11 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         (Path("zlc_data/curve_fitting.py"), "fit_models"),
         (Path("zlc_data/curve_fitting.py"), "fit_histogram"),
         (Path("zlc_data/plot_region.py"), "AxisRange.__post_init__"),
+        # H2a - the value-expression language.  Every one of these reads the
+        # expression text a HUMAN typed into a panel or a logic-node source box.
+        (Path("zlc_data/signal_expr.py"), "is_identity_source"),
+        (Path("zlc_data/signal_expr.py"), "seed_source_for_slots"),
+        (Path("zlc_data/signal_expr.py"), "SignalExpr.__init__"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_TextHandler.is_empty"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.read"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.is_empty"),

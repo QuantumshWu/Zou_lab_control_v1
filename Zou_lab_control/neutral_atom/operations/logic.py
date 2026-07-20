@@ -52,7 +52,7 @@ from .measurement import (
     program_completion_timeout,
     reducer_data_shape,
 )
-from .signal_expr import ProcessorSignalSnapshot, SignalExpr
+from zlc_data.signal_expr import ProcessorSignalSnapshot, SignalExpr
 
 # The background loop's ONLY two time constants -- and NEITHER is an acquisition-rate cap.  A pass that
 # published (an acquiring measurement, a reactive processor whose input advanced) loops immediately, so

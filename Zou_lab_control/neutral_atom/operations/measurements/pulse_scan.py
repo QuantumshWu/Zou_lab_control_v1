@@ -41,7 +41,7 @@ from ..measurement import (
 )
 from ..measurement import measurement_slug
 from ..measurement_registry import measurement
-from ..signal_expr import DEFAULT_SOURCE, SignalExpr
+from zlc_data.signal_expr import DEFAULT_SOURCE, SignalExpr
 
 #: The generic scan needs a compact, inspectable pulse program to sweep.  The shipped probe
 #: template is that default; acquiring and reducing the external y signal remain the independent

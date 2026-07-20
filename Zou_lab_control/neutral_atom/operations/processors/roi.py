@@ -109,7 +109,7 @@ class RoiProcessor(RegionProcessor):
 
     # ------------------------------------------------------------------ transform
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:
-        from ..signal_expr import hub_namespace
+        from zlc_data.signal_expr import hub_namespace
 
         value = self.source_expr.evaluate(hub_namespace(self.hub, inputs))
         block = np.asarray(value)

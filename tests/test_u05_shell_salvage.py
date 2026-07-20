@@ -65,6 +65,8 @@ MOVES = {
     # H1e - the shell itself, plus the figure object it hands back.
     "Zou_lab_control.frontend.data_figure": "zlc_frontend.live_plot.plot_figure",
     "Zou_lab_control.frontend.live": "zlc_frontend.live_plot.live",
+    # H2a - the value-expression language the console and the nodes share.
+    "Zou_lab_control.neutral_atom.operations.signal_expr": "zlc_data.signal_expr",
 }
 
 _MODULE_INFRA = {
@@ -140,14 +142,6 @@ TENDRILS = {
         ("neutral_atom.operations.processors.analysis", "ANALYSIS_ACTIONS"),
         ("neutral_atom.operations.processors.analysis", "ANALYSIS_SPEC_NAME"),
         ("neutral_atom.operations.processors.fit", "FitProcessor"),
-        ("neutral_atom.operations.signal_expr", "DEFAULT_SOURCE"),
-        ("neutral_atom.operations.signal_expr", "IDENTITY_SOURCE_RE"),
-        ("neutral_atom.operations.signal_expr", "NAMESPACE_HELPERS"),
-        ("neutral_atom.operations.signal_expr", "SIGNAL_EXPR_HELP"),
-        ("neutral_atom.operations.signal_expr", "SignalExpr"),
-        ("neutral_atom.operations.signal_expr", "hub_namespace"),
-        ("neutral_atom.operations.signal_expr", "is_identity_source"),
-        ("neutral_atom.operations.signal_expr", "seed_source_for_slots"),
         ("neutral_atom.operations.task", "DEFAULT_MID_RUN_KEY"),
         ("neutral_atom.timing", "scan_column_spec"),
         ("neutral_atom.timing", "scan_table_template"),

@@ -594,7 +594,7 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._pending_program = str(value.get("program") or "")
         self._pending_program_id = str(value.get("program_id") or "")
 
-# The ONE description of a source expression's namespace -- owned by operations.signal_expr
+# The ONE description of a source expression's namespace -- owned by zlc_data.signal_expr
 # (the single source the analysis layer + GUI share), fetched lazily so the frontend module
 # import stays off neutral_atom's import graph (every other neutral_atom use here is lazy too).
 _SOURCE_EXPR_HELP_CACHE: str | None = None
@@ -602,10 +602,10 @@ _SOURCE_EXPR_HELP_CACHE: str | None = None
 
 def SOURCE_EXPR_HELP() -> str:
     """The expression-namespace help text (a callable so it stays a single source -- the literal
-    lives once in ``operations.signal_expr.SIGNAL_EXPR_HELP``)."""
+    lives once in ``zlc_data.signal_expr.SIGNAL_EXPR_HELP``)."""
     global _SOURCE_EXPR_HELP_CACHE
     if _SOURCE_EXPR_HELP_CACHE is None:
-        from ..neutral_atom.operations.signal_expr import SIGNAL_EXPR_HELP
+        from zlc_data.signal_expr import SIGNAL_EXPR_HELP
         _SOURCE_EXPR_HELP_CACHE = SIGNAL_EXPR_HELP
     return _SOURCE_EXPR_HELP_CACHE
 
@@ -745,7 +745,7 @@ class _SignalExprWidget(QtWidgets.QWidget):
         self.changed.emit()
 
     def _add_slot(self) -> None:
-        from ..neutral_atom.operations.signal_expr import seed_source_for_slots
+        from zlc_data.signal_expr import seed_source_for_slots
         self._collect_inputs()
         self._inputs.append("")
         self._source_edit.blockSignals(True)
@@ -757,7 +757,7 @@ class _SignalExprWidget(QtWidgets.QWidget):
     def _remove_slot(self) -> None:
         if len(self._inputs) <= 1:
             return
-        from ..neutral_atom.operations.signal_expr import seed_source_for_slots
+        from zlc_data.signal_expr import seed_source_for_slots
         self._collect_inputs()
         self._inputs.pop()
         self._source_edit.blockSignals(True)
@@ -794,7 +794,7 @@ class _SignalExprWidget(QtWidgets.QWidget):
 
     def set_value(self, value) -> None:
         """Seed from a ``{"inputs", "source"}`` dict (a default / saved value)."""
-        from ..neutral_atom.operations.signal_expr import SignalExpr
+        from zlc_data.signal_expr import SignalExpr
         expr = SignalExpr.from_value(value)
         self._inputs = list(expr.inputs) or ["frame_0"]
         self._source_edit.blockSignals(True)
@@ -1628,7 +1628,7 @@ class PanelConfig:
         through this owner so the layout writer cannot emit a record its reader
         would normalize differently.
         """
-        from ..neutral_atom.operations.signal_expr import IDENTITY_SOURCE_RE
+        from zlc_data.signal_expr import IDENTITY_SOURCE_RE
 
         self.source = str(source)
         match = IDENTITY_SOURCE_RE.fullmatch(self.source.strip())
@@ -3637,7 +3637,7 @@ class PanelCard(FluentGroupBox):
         ``value = ...`` contract live there, shared with processors / pulse-scan).  Lazy import
         keeps the frontend module off neutral_atom's import graph (every neutral_atom use here
         is lazy)."""
-        from ..neutral_atom.operations.signal_expr import SignalExpr
+        from zlc_data.signal_expr import SignalExpr
         return SignalExpr(self.config.inputs, self._compiled_source)
 
     def _signal_then_repeat(self, namespace: Mapping[str, object]):
@@ -3745,7 +3745,7 @@ class PanelCard(FluentGroupBox):
         passes it through unchanged so the node's declared structure still describes it.  A transforming
         expression (``value = signal[0]-signal[1]``, ``value = np.log(f)``) rewrites the core shape (#H3o),
         so it returns ``None`` and the reshape falls back to shape inference."""
-        from ..neutral_atom.operations.signal_expr import is_identity_source
+        from zlc_data.signal_expr import is_identity_source
         if not is_identity_source(self._compiled_source, self.config.inputs):
             return None
         if not (self.config.inputs and callable(self.structure_provider)):
@@ -7058,7 +7058,7 @@ class TaskConsole(QtWidgets.QWidget):
         not namespace helpers, and are excluded separately."""
         import ast
 
-        from Zou_lab_control.neutral_atom.operations.signal_expr import NAMESPACE_HELPERS
+        from zlc_data.signal_expr import NAMESPACE_HELPERS
         try:
             tree = ast.parse(str(source or ""), mode="exec")
         except SyntaxError:
@@ -8455,7 +8455,7 @@ class TaskConsole(QtWidgets.QWidget):
         its lingering signals, and re-started against their intent) are gone: fit<->roi is a
         parameter switch on the SAME node/row/region."""
         from ..neutral_atom.operations.processors.analysis import ANALYSIS_SPEC_NAME
-        from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
+        from zlc_data.signal_expr import DEFAULT_SOURCE
         signal = str(card.config.inputs[0]) if card.config.inputs else ""
         if not signal:
             card.set_status("pick a signal in Setting before an analysis", error=True)
@@ -9336,7 +9336,7 @@ class TaskConsole(QtWidgets.QWidget):
         # The helpers (np/numpy/math/history/latest/names/shot) come from the ONE signal_expr builder
         # layered on this view's snapshot -- a panel expression and a node-side expression (pulse-scan
         # y, processor source) can never diverge in capability (GUI == node).
-        from Zou_lab_control.neutral_atom.operations.signal_expr import hub_namespace
+        from zlc_data.signal_expr import hub_namespace
         from zlc_data.signal_tensor import SignalHistoryGap
         try:
             tensors = self.hub.snapshot_at(disp, tensors=True)
