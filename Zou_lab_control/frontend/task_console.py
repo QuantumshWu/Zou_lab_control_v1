@@ -52,8 +52,6 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .live import (
     DEFAULT_HIST_FIT,
-    PLOT_KIND_BY_KEY,
-    PLOT_KINDS,
     coerce_panel_value,
     kind_supports_roi,
     normalize_facet,
@@ -65,6 +63,7 @@ from .live import (
 )
 from zlc_frontend.render_style import PALETTE  # the ONE render colour owner
 from zlc_frontend import board_layout as _layout
+from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY, PLOT_KIND_SPECS
 from zlc_data.repeat_modes import IMAGE_REPEAT_MODES
 from zlc_data.logic_node import (
     LOGIC_KINDS,
@@ -182,7 +181,7 @@ MID_RUN_TAG = " (mid-run)"
 # authority turns into EXCLUSIVE claims while observe-only references receive OBSERVE claims.
 # There is no second frontend kind-string table and no global "stop everything" rule.
 
-# Console PANEL kinds.  EVERY plot kind in the ONE table ``live.PLOT_KINDS`` is a console panel
+# Console PANEL kinds.  EVERY plot kind in the ONE vocabulary ``zlc_data.plot_kind`` is a console panel
 # kind -- it renders through the SAME ``PanelCard`` (``_build_plot`` dispatches on the kind: a 2D
 # frame, a site map, a histogram, a 1-D curve, a pulse timeline ...), so a saved figure of ANY kind
 # seeds a normal ``PanelCard`` and reads its ``value`` off a hub signal.  The ``panel`` flag is NOT
@@ -191,12 +190,13 @@ MID_RUN_TAG = " (mid-run)"
 # panel live (it is reproduced from a saved recipe / a fired sequence), but it IS a real panel kind
 # that seeds + renders through PanelCard exactly like every other.  All the per-kind panel tables
 # below are derived from the WHOLE table so pulse (and any future kind) works on the seed path with
-# no parallel literal to keep in sync.
-_PANEL_KINDS: tuple = tuple(PLOT_KINDS)
+# no parallel literal to keep in sync.  Every table below reads the VOCABULARY, which needs no
+# renderer -- knowing that "Site map" is a kind and what shape it accepts is not a drawing question.
+_PANEL_KINDS: tuple = tuple(PLOT_KIND_SPECS)
 
 
 def _repeat_modes_for_kind(kind: str) -> tuple[str, ...]:
-    spec = PLOT_KIND_BY_KEY.get(str(kind))
+    spec = PLOT_KIND_SPEC_BY_KEY.get(str(kind))
     return tuple(spec.repeat_modes) if spec and spec.repeat_modes else tuple(IMAGE_REPEAT_MODES)
 
 

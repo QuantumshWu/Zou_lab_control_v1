@@ -5,10 +5,9 @@ module because they are a SPELLING, not a rendering: the console builds its
 repeat-mode combo from them, the measurement layer validates against them, and the
 figure layer applies them - three surfaces that must agree on the same words.
 
-This is the first layer of the plot-kind vocabulary split.  The rest of ``PlotKind``
-cannot follow yet: it carries ``cls``, a live renderer class, and the table is built
-in TWO steps (a literal plus a later append for the ``grid`` kind), so separating the
-vocabulary from the renderer binding is its own slice.
+These were the first layer of the plot-kind vocabulary split; the rest followed into
+:mod:`zlc_data.plot_kind`, which CITES these tuples per kind rather than restating them
+(the same three verbs serve a 2-D frame and a site map, so they are their own fact).
 """
 
 from __future__ import annotations

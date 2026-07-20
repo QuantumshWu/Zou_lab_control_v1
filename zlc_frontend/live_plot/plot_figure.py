@@ -28,6 +28,7 @@ from zlc_data.curve_fitting import (
     fit_image,
     fit_model,
 )
+from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY, PLOT_KIND_SPECS
 from zlc_data.raster import RegularRaster
 from zlc_data.plot_region import Selection, SelectedData, select_rows
 from zlc_data.signal_tensor import canonical_physical_shape
@@ -154,11 +155,10 @@ def _validate_plot_record(value: object) -> dict[str, Any]:
                 or not isinstance(fit["popt"], list):
             raise TypeError("saved figure plot.fit must contain func:str, names:list[str], popt:list.")
         plot["fit"] = dict(fit)
-    from .live import PLOT_KIND_BY_KEY
-    if plot["kind"] not in PLOT_KIND_BY_KEY:
+    if plot["kind"] not in PLOT_KIND_SPEC_BY_KEY:
         raise ValueError(
             f"saved figure plot.kind {plot['kind']!r} is not registered; "
-            f"choose from {sorted(PLOT_KIND_BY_KEY)}.")
+            f"choose from {sorted(PLOT_KIND_SPEC_BY_KEY)}.")
     return plot
 
 
@@ -1217,8 +1217,6 @@ class SavedFigure:
         A STRUCTURED figure (one carrying a ``figure_recipe``) offers ONLY its recipe kind: its
         ``data_x`` / ``data_y`` are a lossy fallback, so re-interpreting them as a line / hist would
         NOT be a faithful view -- the recipe kind is the one true way to draw it."""
-        from .live import PLOT_KINDS
-
         recipe = self.figure_recipe
         if recipe is not None:
             return [str(recipe.get("kind"))]
@@ -1226,7 +1224,7 @@ class SavedFigure:
         is_2d = self.data_x.ndim == 2 and self.data_x.shape[1] >= 2
         want = "2D" if is_2d else "1D"
         kinds: list[str] = []
-        for pk in PLOT_KINDS:
+        for pk in PLOT_KIND_SPECS:
             if not pk.panel:
                 continue
             # The site map declares ``render_family="auto"`` (image-only when it has a frame), but it
@@ -1251,13 +1249,11 @@ class SavedFigure:
         (``build_grid_figure`` reads them), NOT the top-level ``labels``.  The colour-bar test reads the
         ONE ``PLOT_KINDS`` ``render_family`` source (``"2D"`` / ``"auto"``), never a hard-coded kind list --
         so a hist never shows a phantom "z" and a grid shows its recipe's axes instead of nothing."""
-        from .live import PLOT_KIND_BY_KEY
-
         recipe = self.figure_recipe
         source = (recipe.get("labels") if recipe is not None else self.labels) or ()
         labels = [str(x) for x in source]
         names = ["x label", "y label"]
-        pk = PLOT_KIND_BY_KEY.get(str(self.kind or ""))
+        pk = PLOT_KIND_SPEC_BY_KEY.get(str(self.kind or ""))
         if pk is not None and pk.render_family in ("2D", "auto"):
             names.append("colour bar")
         return [(n, labels[i]) for i, n in enumerate(names) if i < len(labels) and labels[i].strip()]

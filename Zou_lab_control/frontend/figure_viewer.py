@@ -146,13 +146,13 @@ def _stored_shape(entry: Mapping, key: str, signal_name: str) -> tuple[int, ...]
 
 
 def _kind_label(key: str | None) -> str:
-    """The human plot-kind label from the ONE ``PLOT_KINDS`` table (never a hand-typed name), so the
+    """The human plot-kind label from the ONE vocabulary (never a hand-typed name), so the
     Info panel reads 'Distribution' not 'hist'; falls back to the raw key for an unknown kind."""
     if not key:
         return ""
-    from .live import PLOT_KIND_BY_KEY
-    pk = PLOT_KIND_BY_KEY.get(str(key))
-    return pk.label if pk is not None else str(key)
+    from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY
+    spec = PLOT_KIND_SPEC_BY_KEY.get(str(key))
+    return spec.label if spec is not None else str(key)
 
 
 class LoadedFigureNode(LogicNode):

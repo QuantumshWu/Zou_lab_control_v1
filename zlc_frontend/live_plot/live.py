@@ -41,6 +41,7 @@ from ._validate import positive_float
 from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, display_figure, fit_grid_shape_for_aspect, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
 from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
+from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY, PLOT_KIND_SPECS, PlotKindSpec
 from zlc_data.readout_math import confidence_weighted_fidelity, finite_mean
 from zlc_data.curve_fitting import fit_histogram
 from zlc_data.signal_tensor import canonical_physical_shape
@@ -3787,119 +3788,83 @@ def _is_watch_update(update) -> bool:
 
 @dataclass(frozen=True)
 class PlotKind:
-    """ONE declarative record per plot kind -- the single source both ``live.plot()``
-    and the task_console Add-Panel / PANEL_* lookups READ.
+    """ONE table row: a plot kind's VOCABULARY paired with the renderer that draws it.
 
-    Adding a plot kind means adding ONE ``PlotKind`` to :data:`PLOT_KINDS`; the
-    ``plot()`` dispatch, the kind->class lookup, the panel label, the accepted
-    ``value`` format, the starting signal slots and the single-vs-multi-slot rule
-    all derive from it -- no parallel dicts to keep in sync.
+    Adding a plot kind means adding ONE :class:`~zlc_data.plot_kind.PlotKindSpec` to
+    :data:`~zlc_data.plot_kind.PLOT_KIND_SPECS` and naming its class here; the ``plot()``
+    dispatch, the kind->class lookup, the panel label, the accepted ``value`` format, the
+    starting signal slots and the single-vs-multi-slot rule all derive from it -- no
+    parallel dicts to keep in sync.
 
-    Fields
-    ------
-    key            the canonical kind string (``"1d"``, ``"2d"``, ...).
-    cls            the :class:`BaseLivePlot` subclass ``plot()`` instantiates.
-    label          the human Add-Panel / panel-title label.
-    render_family  the DataFigure fitting family ("1D" / "2D"), mirroring
-                   ``cls.render_family``.  The sentinel ``"auto"`` means "resolve
-                   per-figure from the artists" (the site map: image-family only
-                   when a background frame is supplied) -- DataFigure then keeps
-                   its legacy artist heuristic for that kind.
-    panel          True if this kind is offered in the live console ADD-PANEL
-                   dropdown (you add a blank panel of it and wire it to a signal).
-                   ``pulse`` is ``panel=False`` -- you do not add a blank pulse
-                   panel live -- but it is STILL a full panel kind: a saved pulse
-                   figure SEEDS a ``kind="pulse"`` PanelCard (the seed path does not
-                   gate on this flag), rendered by PanelCard's ``pulse`` branch.
-                   So the flag means "addable live", NOT "can be a panel".
-    input_format   one-line description of the accepted ``value`` shape (shown in
-                   the Setting; ``""`` for a non-panel kind).
-    input_slots    the STARTING signal slot(s) a fresh panel opens with --
-                   ``((label, default_signal, tooltip), ...)``; empty = the
-                   universal single ``signal`` slot.
-    single_slot    True if the kind takes EXACTLY ONE signal (no +/- slot growing).
-    repeat_modes   the repeat-DISPLAY modes that are MEANINGFUL for this kind, in menu order
-                   (the first is the default).  A TRACE/IMAGE reduces its repeats
-                   (``average``/``add``/``replace``/``roll``, plus ``create`` = one line per repeat
-                   for 1-D); a DISTRIBUTION instead chooses how to BIN the repeats' samples
-                   (``pool`` = all repeats in one histogram -- the only distribution mode).
-                   Empty = a non-repeat kind (no repeat_mode control).  This is what stops a
-                   trace verb like ``roll`` being offered on a histogram (where it is meaningless)
-                   and stops a histogram silently ignoring the control (#issue-1).
+    ``cls`` is the :class:`BaseLivePlot` subclass ``plot()`` instantiates, and it is the
+    ONLY thing this layer adds.  The eight vocabulary fields stay readable as
+    ``pk.key`` / ``pk.label`` / ``pk.input_slots`` / ... , but they DELEGATE to the spec
+    rather than being copied into this record -- so a row whose label disagrees with the
+    vocabulary is not merely unlikely, it cannot be constructed.
     """
 
-    key: str
+    spec: PlotKindSpec
     cls: type
-    label: str
-    render_family: str = "1D"
-    panel: bool = True
-    input_format: str = ""
-    input_slots: tuple[tuple[str, str, str], ...] = ()
-    single_slot: bool = False
-    repeat_modes: tuple[str, ...] = ()
+
+    @property
+    def key(self) -> str:
+        return self.spec.key
+
+    @property
+    def label(self) -> str:
+        return self.spec.label
+
+    @property
+    def render_family(self) -> str:
+        return self.spec.render_family
+
+    @property
+    def panel(self) -> bool:
+        return self.spec.panel
+
+    @property
+    def input_format(self) -> str:
+        return self.spec.input_format
+
+    @property
+    def input_slots(self) -> tuple[tuple[str, str, str], ...]:
+        return self.spec.input_slots
+
+    @property
+    def single_slot(self) -> bool:
+        return self.spec.single_slot
+
+    @property
+    def repeat_modes(self) -> tuple[str, ...]:
+        return self.spec.repeat_modes
 
 
-# The ONE plot-kind table.  ``plot()`` looks the class up here (no if/elif ladder)
-# and the task_console derives PANEL_KINDS / PANEL_INPUT_FORMAT / PANEL_INPUT_SLOTS /
-# PANEL_SINGLE_SLOT_KINDS from it (no parallel literals).  Order is the Add-Panel
-# menu order.  ``monitor`` lists its DEFAULT class (LiveLiveDis, show_dist=True); the
-# bare LiveLive variant is the show_dist=False toggle, still inside plot().
-# The repeat-display vocabularies moved to zlc_data.repeat_modes -- three surfaces must
-# spell them identically, and they carry no rendering.  Read back so this stays one source.
-from zlc_data.repeat_modes import (
-    BASE_REPEAT_MODES as _BASE_REPEAT_MODES,
-    HIST_REPEAT_MODES,
-    IMAGE_REPEAT_MODES,
-    ROLLING_REPEAT_MODES,
-    TRACE_REPEAT_MODES,
+#: ``key -> renderer class``.  ``monitor`` names its DEFAULT class (LiveLiveDis, show_dist=True);
+#: the bare LiveLive variant is the show_dist=False toggle, still inside plot().  Every spec in
+#: PLOT_KIND_SPECS must be either here or in _LATE_BOUND_KEYS -- a spec that is in neither raises
+#: KeyError building the table below, which is the point: a new kind cannot be silently dropped.
+_CLS_BY_KEY: dict[str, type] = {
+    "2d": Live2DDis,
+    "sites": LiveSiteMap,
+    "1d": Live1D,
+    "monitor": LiveLiveDis,
+    "hist": HistogramFigure,
+    "pulse": PulseSequenceFigure,
+}
+
+#: The kinds whose renderer Python has not DEFINED yet at this point in the module, so their
+#: rows are built by :func:`_bind_late_plot_kinds` further down.  Nothing about the vocabulary
+#: is late -- ``grid`` sits in the one ``PLOT_KIND_SPECS`` literal with the other six.
+_LATE_BOUND_KEYS: tuple[str, ...] = ("grid",)
+
+# The ONE plot-kind table.  ``plot()`` looks the class up here (no if/elif ladder) and the
+# task_console derives its PANEL_* tables from the vocabulary directly (no parallel literals).
+PLOT_KINDS: tuple[PlotKind, ...] = tuple(
+    PlotKind(spec, _CLS_BY_KEY[spec.key])
+    for spec in PLOT_KIND_SPECS if spec.key not in _LATE_BOUND_KEYS
 )
 
-PLOT_KINDS: tuple[PlotKind, ...] = (
-    PlotKind(
-        key="2d", cls=Live2DDis, label="2D image", render_family="2D",
-        input_format="value must be a 2D array / camera frame (H×W)",
-        repeat_modes=IMAGE_REPEAT_MODES,
-    ),
-    PlotKind(
-        key="sites", cls=LiveSiteMap, label="Site map", render_family="auto",
-        single_slot=True, repeat_modes=IMAGE_REPEAT_MODES,
-        input_format=(
-            "value must be a per-site (N,) vector -- one number per tweezer (e.g. occupancy "
-            "0/1 or loading rate); signal[0]'s producing node also supplies the ring centres "
-            "+ frame underlay"),
-        input_slots=(
-            # BLANK default (like every other plot) -- a fresh site-map panel must NOT auto-bind
-            # to a running "occupied" signal on open; the user picks the occupancy signal in the
-            # Setting, and only THEN do the centres + frame underlay auto-resolve from that signal's
-            # producing node (_sites_inputs).  A non-blank default here was the "opens already
-            # connected" bug.
-            ("occupancy", "", "per-site (N,) occupancy vector (signal[0]) -- colours the rings; its "
-                              "producing node also supplies the centres + frame underlay"),
-        ),
-    ),
-    PlotKind(
-        key="1d", cls=Live1D, label="1D vector", render_family="1D",
-        input_format="value must be a 1D vector (N,) or per-site array",
-        repeat_modes=TRACE_REPEAT_MODES,
-    ),
-    PlotKind(
-        key="monitor", cls=LiveLiveDis, label="Rolling trace", render_family="1D",
-        input_format="value must be a scalar per shot (rolling trace)",
-        repeat_modes=ROLLING_REPEAT_MODES,                  # rolling trace is the ONLY kind with 'roll'
-    ),
-    PlotKind(
-        key="hist", cls=HistogramFigure, label="Distribution", render_family="1D",
-        input_format="value must be a 1D sample vector",
-        repeat_modes=HIST_REPEAT_MODES,
-    ),
-    # Notebook-only static timing diagram -- NOT a console Add-Panel kind.
-    PlotKind(key="pulse", cls=PulseSequenceFigure, label="Pulse sequence", render_family="1D", panel=False),
-    # NOTE: the per-site GRID kind (``key="grid"``, ``cls=GridPlot``) is APPENDED to this table right
-    # after ``GridPlot`` is defined below (``_append_grid_plot_kind``) -- ``GridPlot`` does not exist yet
-    # at this point in the module, so it cannot go in this literal.  It is still a single-source entry.
-)
-
-#: ``key -> PlotKind`` for O(1) dispatch.  Rebuilt by ``_append_grid_plot_kind`` once ``grid`` lands.
+#: ``key -> PlotKind`` for O(1) dispatch.  Rebuilt by ``_bind_late_plot_kinds`` once ``grid`` lands.
 PLOT_KIND_BY_KEY: dict[str, PlotKind] = {pk.key: pk for pk in PLOT_KINDS}
 
 
@@ -5763,28 +5728,28 @@ class SiteHistogramGrid(GridPlot):
         return self.cell_renderer.classify(k, values)
 
 
-def _append_grid_plot_kind() -> None:
-    """Register the per-site GRID kind in the ONE ``PLOT_KINDS`` table, now that ``GridPlot`` exists.
+def _bind_late_plot_kinds() -> None:
+    """Pair the ``_LATE_BOUND_KEYS`` specs with the renderers that only now exist.
 
-    ``grid`` is a first-class LOADABLE panel kind, seeded from a saved grid figure the SAME way ``pulse``
-    is (``panel=False`` = not offered in the live Add-Panel dropdown, but a real panel kind on the SEED
-    path).  Its cell content (hist / image) is carried in the saved ``figure_recipe`` and rebuilt by
-    :func:`build_grid_figure`.  It cannot live in the ``PLOT_KINDS`` literal above because ``GridPlot`` is
-    defined AFTER that literal, so it is appended here (still a single-source entry -- ``PLOT_KIND_BY_KEY``
-    is rebuilt so the two stay in lock-step)."""
+    ``GridPlot`` is defined AFTER the ``PLOT_KINDS`` table, so its row cannot be built up
+    there.  What is late is ONLY the class: the ``grid`` vocabulary sits in the one
+    ``PLOT_KIND_SPECS`` literal with every other kind, so no reader of the vocabulary
+    depends on this call having run, and no kind can go missing from the menu by being
+    forgotten here -- the lookup below raises rather than skipping.
+
+    Idempotent: the module calls it once, and a re-import (or a test that calls it again)
+    must not append a duplicate row."""
     global PLOT_KINDS, PLOT_KIND_BY_KEY
-    if "grid" in PLOT_KIND_BY_KEY:
+    if all(key in PLOT_KIND_BY_KEY for key in _LATE_BOUND_KEYS):
         return
-    PLOT_KINDS = PLOT_KINDS + (
-        # panel=True: since the FACET design a grid is a live Add-Panel kind like any other -- bind a
-        # measurement block signal and pick the facet axis in Setting (the recipe/snapshot path is the
-        # non-faceted case, it no longer makes the grid seed-only).
-        PlotKind(key="grid", cls=GridPlot, label="Site grid", render_family="1D", panel=True),
+    late_cls: dict[str, type] = {"grid": GridPlot}
+    PLOT_KINDS = PLOT_KINDS + tuple(
+        PlotKind(PLOT_KIND_SPEC_BY_KEY[key], late_cls[key]) for key in _LATE_BOUND_KEYS
     )
     PLOT_KIND_BY_KEY = {pk.key: pk for pk in PLOT_KINDS}
 
 
-_append_grid_plot_kind()
+_bind_late_plot_kinds()
 
 
 #: ``sub_plot_kind -> GridCell class`` -- the SINGLE source that turns a grid's declared per-site plot kind

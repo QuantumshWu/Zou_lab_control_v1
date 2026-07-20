@@ -6,11 +6,9 @@ them.  They are pure string tuples with no rendering in them at all, yet they li
 inside the Matplotlib figure module, so anything that merely wanted to KNOW the words
 had to import the whole render stack.
 
-This is the FIRST layer of the plot-kind vocabulary split, not the whole of it.  The
-rest of ``PlotKind`` cannot follow yet for a reason worth writing down: it carries
-``cls``, a live renderer class, AND the table is assembled in TWO steps - a literal
-plus a later ``PLOT_KINDS = PLOT_KINDS + (...)`` append for the ``grid`` kind - so
-separating vocabulary from renderer there is its own slice with its own golden.
+This was the FIRST layer of the plot-kind vocabulary split; the rest followed in the next
+slice (see test_u05_plot_kind.py), and the two-step assembly warned about here turned out
+to be exactly the trap it looked like.
 
 Every test that covers this table - test_plot_kind_table.py, test_frontend_plot_contract.py,
 test_scan_repeat.py - sits outside ``tests/migration_active_tests.txt`` and is frozen:
@@ -41,15 +39,22 @@ def test_every_vocabulary_is_reproduced_exactly():
         assert getattr(canonical, name) == expected, name
 
 
-def test_the_render_layer_reads_back_the_same_objects():
-    """Not copies - the same tuples, so the two can never disagree."""
+def test_the_kinds_that_offer_these_verbs_cite_the_same_objects():
+    """Not copies - the same tuples, so the two can never disagree.
 
-    from zlc_frontend.live_plot import live
+    This assertion used to name ``live.IMAGE_REPEAT_MODES`` and friends, because the
+    figure module re-exported them for its own table.  That table is now the vocabulary in
+    ``zlc_data.plot_kind``, so the re-export was deleted rather than kept alive to satisfy
+    a test: the claim is the same one, made about the surface that actually exists.
+    """
 
-    assert live.IMAGE_REPEAT_MODES is canonical.IMAGE_REPEAT_MODES
-    assert live.HIST_REPEAT_MODES is canonical.HIST_REPEAT_MODES
-    assert live.TRACE_REPEAT_MODES is canonical.TRACE_REPEAT_MODES
-    assert live.ROLLING_REPEAT_MODES is canonical.ROLLING_REPEAT_MODES
+    from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY as by_key
+
+    assert by_key["2d"].repeat_modes is canonical.IMAGE_REPEAT_MODES
+    assert by_key["sites"].repeat_modes is canonical.IMAGE_REPEAT_MODES
+    assert by_key["hist"].repeat_modes is canonical.HIST_REPEAT_MODES
+    assert by_key["1d"].repeat_modes is canonical.TRACE_REPEAT_MODES
+    assert by_key["monitor"].repeat_modes is canonical.ROLLING_REPEAT_MODES
 
 
 def test_the_specialisations_extend_the_base_rather_than_restating_it():
