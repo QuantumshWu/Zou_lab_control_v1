@@ -23,6 +23,7 @@ from .board import QtImageBoard, QtOwnerWake, QtRasterBoard
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
 from .fit_authoring import FitAuthoringPane
 from .signal_expr_widget import SignalExprWidget
+from .pulse_slots_widget import PulseSlotsWidget
 from .signal_picker import (
     coerce_short_labels,
     fill_grouped_signal_combo,
@@ -157,6 +158,7 @@ from .style import (
 
 
 __all__ = [
+    "PulseSlotsWidget",
     "SignalExprWidget",
     "ACCENT",
     "API_VIOLET",

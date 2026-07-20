@@ -68,9 +68,10 @@ def test_the_context_no_longer_carries_a_factory_for_it():
 
     fields = set(ParamWidgetContext.__dataclass_fields__)
     assert "signal_expr_factory" not in fields
-    # The other composite has NOT moved yet, so its port must still be here; asserting
-    # that keeps this test honest about what was actually achieved.
-    assert "pulse_slots_factory" in fields
+    # This test once also asserted that pulse_slots_factory was STILL here, to stay honest
+    # that only one composite had moved.  It has since moved too (S5-shell(p)), so that
+    # half is now the newer file's job - keeping it would have been a stale claim, which
+    # is precisely what the two-way assertion existed to surface.
 
 
 def test_the_handler_builds_the_widget_itself():

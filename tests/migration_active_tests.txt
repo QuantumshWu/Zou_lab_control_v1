@@ -68,6 +68,7 @@ tests/test_u04_workspace_bootstrap.py
 tests/test_u05_board_layout.py
 tests/test_u05_declaration_not_class.py
 tests/test_u05_panel_size_vocabulary.py
+tests/test_u05_pulse_slots_widget.py
 tests/test_u05_raster_front.py
 tests/test_u05_render_island.py
 tests/test_u05_shell_salvage.py

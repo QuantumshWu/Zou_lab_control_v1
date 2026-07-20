@@ -122,6 +122,11 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
     # normalisation points came with it, so the named entries follow the code.
     (Path("zlc_frontend/qt_widgets/signal_expr_widget.py"), "SignalExprWidget._open_editor"),
     (Path("zlc_frontend/qt_widgets/signal_expr_widget.py"), "SignalExprWidget.values_dict"),
+    # The pulse-slot composite moved into qt_widgets (S5-shell(p)); its normalisation
+    # points came with it, so the named entries follow the code.
+    (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget._render_program"),
+    (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget.rebuild"),
+    (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget.values_dict"),
         (Path("zlc_frontend/live_plot/live.py"), "general_fit_models"),
         (Path("zlc_frontend/live_plot/live.py"), "facet_cell_labels"),
         (Path("zlc_frontend/live_plot/plot_figure.py"), "SavedFigure.axis_labels"),
