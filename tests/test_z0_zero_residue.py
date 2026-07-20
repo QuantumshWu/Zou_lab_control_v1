@@ -66,7 +66,20 @@ Z2A_PRODUCTION_IMPORTERS = {   # non-test code OUTSIDE legacy that still imports
     Path("figure_viewer.py"),                        # published double-click launcher
     Path("fpga/pulse_streamer/sim/_gen_replay_t.py"),  # fpga -> legacy, and zlc_pulse -> fpga
 }
-Z2B_ACTIVE_TEST_IMPORTERS = 6  # whitelisted tests that still reach into legacy
+#: Whitelisted tests that reach into the legacy tree, NAMED rather than counted.
+#: A count would let one more slip in unnoticed; naming each makes every addition
+#: a decision.  All seven are legitimate today and all die with what they guard:
+#: the migration ledgers must build the legacy windows in order to compare
+#: against them, which is the whole point of a parity oracle.
+Z2B_ACTIVE_TEST_IMPORTERS = {
+    Path("tests/test_calibration_sitemap_inputs.py"),   # legacy calibration inputs
+    Path("tests/test_public_hardware_boundary.py"),     # audits the legacy surface itself
+    Path("tests/test_u04_console_ui_parity.py"),        # builds BOTH consoles to diff them
+    Path("tests/test_u04_signal_picker_owner.py"),      # picker ownership across the move
+    Path("tests/test_u06_shell_domain_ports.py"),       # proves the legacy root wires the port
+    Path("tests/test_w1_console_ux_oracle.py"),         # W1 behaviour gate vs main's oracle
+    Path("tests/test_zlc_frontend_form.py"),            # form parity across the move
+}
 Z2C_FROZEN_TEST_IMPORTERS = 168
 Z3_FORWARDING_SHIMS = 18
 Z7_REBUILT_WORKBENCH_FILES = 12
@@ -194,10 +207,20 @@ def test_z2bc_test_dependence_on_legacy_shrinks():
     active = {p for p in importers if p in manifest}
     frozen = importers - active
 
-    _fail("Z2b whitelisted tests importing legacy", active, Z2B_ACTIVE_TEST_IMPORTERS,
-          "These are legitimate today - the parity and salvage ledgers must build "
-          "the legacy windows to compare against - and go to zero when those "
-          "ledgers are deleted at Z0.")
+    named = {Path(path) for path in active}
+    grew = named - Z2B_ACTIVE_TEST_IMPORTERS
+    assert not grew, (
+        "a whitelisted test started reaching into the legacy tree:\n"
+        + "\n".join(f"  {item}" for item in sorted(grew))
+        + "\nIf it genuinely must build a legacy window to compare against, add it "
+          "to Z2B_ACTIVE_TEST_IMPORTERS with the reason - a NAMED dependency is a "
+          "decision, a counted one is a leak."
+    )
+    gone = Z2B_ACTIVE_TEST_IMPORTERS - named
+    assert not gone, (
+        f"{sorted(str(p) for p in gone)} no longer reach legacy; delete those rows "
+        "from Z2B_ACTIVE_TEST_IMPORTERS in the same commit."
+    )
     _fail("Z2c frozen tests importing legacy", frozen, Z2C_FROZEN_TEST_IMPORTERS,
           "Frozen files are never edited; this budget falls only by DELETING them.")
 
@@ -260,8 +283,10 @@ def test_every_budget_is_mirrored_in_the_goal_document():
     """A number nobody can find is a number nobody will lower."""
 
     text = (ROOT / "docs" / "MIGRATION_GOAL_zh.md").read_text(encoding="utf-8")
+    # Z2a and Z2b are NAMED ledgers, not budgets, so they have no number to
+    # mirror - naming is what makes each entry a decision instead of a leak.
     for label, value in (
-        ("Z1", Z1_LEGACY_FILES), ("Z2b", Z2B_ACTIVE_TEST_IMPORTERS),
+        ("Z1", Z1_LEGACY_FILES),
         ("Z2c", Z2C_FROZEN_TEST_IMPORTERS), ("Z3", Z3_FORWARDING_SHIMS),
         ("Z7", Z7_REBUILT_WORKBENCH_FILES), ("Z8", Z8_TESTS_OFF_THE_MANIFEST),
     ):

@@ -69,6 +69,7 @@ tests/test_u04_workspace_bootstrap.py
 tests/test_u05_shell_salvage.py
 tests/test_u06_shell_domain_ports.py
 tests/test_w1_capture_workbench.py
+tests/test_w1_console_ux_oracle.py
 tests/test_w2_pulse_application.py
 tests/test_w2_pulse_authoring.py
 tests/test_w2_pulse_workbench.py

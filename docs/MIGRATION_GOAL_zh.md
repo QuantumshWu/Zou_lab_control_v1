@@ -139,7 +139,7 @@ zoom/pan/crosshair/hover/selector;不适用的 plot kind 必须有旧行为证�
 | **Z4** | **六包无一 import 旧树** | **SHARP 棘轮** | ✅ **0**——已经成立,冻住不许丢 |
 | Z1 | 旧树 tracked 文件数 | 预算 | **122** |
 | Z2a | 旧树**之外**的生产代码 importer | 具名台账 | **3**:`docs/task_console_design/build.py`、根启动器 `figure_viewer.py`、`fpga/pulse_streamer/sim/_gen_replay_t.py` |
-| Z2b | 白名单测试 importer | 预算 | **6**(今天合法:对账/salvage 账本必须构造旧窗口来比;随账本在 Z0 删除归零) |
+| Z2b | 白名单测试 importer | **具名台账** | **7 条,逐条写明理由**。计数会让人偷偷再加一条,**具名让每次新增都是一次决定**——W1 行为 gate 就是这样被守卫当场拦下、然后正式登记的。全部随其守卫的账本在 Z0 一起消失 |
 | Z2c | 冻结测试 importer | 预算 | **168**(只能靠删文件降) |
 | Z3 | 转发壳 | 预算 | **18** |
 | Z6 | 真存在的迁移桥(`CatalogRouter`/`SerializedLegacyAggBridge`)定义数 | 预算 | **2**;另附幽灵断言:`LegacyPanelHost`/`LegacyRuntimeFence` 一旦真出现类定义即红(见 §三 F4) |
