@@ -142,7 +142,7 @@ from .param_widgets import (
 # panels use (PANEL_PARAMS).  Importing it here (frontend -> neutral_atom is allowed; the
 # reverse is not) lets the panel params be real ParamDecls validated by the kind whitelist,
 # instead of a parallel ParamSpec class with its own smaller ladder.
-from Zou_lab_control.neutral_atom.core.params import ParamDecl
+from zlc_data.param_decl import ParamDecl
 
 # The default mid-run buffer key -- the spec layer's ONE spelling (TaskSpec.mid_run_key's
 # default), imported so the console's spec-less fallbacks can never drift from it.
@@ -3675,7 +3675,7 @@ class PanelCard(FluentGroupBox):
 
     @staticmethod
     def _validate_canonical_block(value, structure, name="signal") -> np.ndarray:
-        from ..neutral_atom.core.signal_tensor import canonical_physical_shape
+        from zlc_data.signal_tensor import canonical_physical_shape
         array = np.asarray(value)
         point_shape = tuple(int(n) for n in structure["points_shape"])
         data_shape = tuple(int(n) for n in structure["data_shape"])
@@ -4618,7 +4618,7 @@ def _acquisition_param_decls(repeat_default: int = 0) -> tuple:
     is 0 for a CAMERA (a live monitor streams forever by default -- set Repeat=N to take exactly N
     photos) and 1 for a scan (run the sweep once; set 0 to keep re-running it live).  A real ``ParamDecl``
     so it auto-renders through the SAME form path as every measurement param."""
-    from ..neutral_atom.core.params import ParamDecl
+    from zlc_data.param_decl import ParamDecl
     return (
         ParamDecl(key="repeat", label="Repeat (0 = ∞)", kind="int", default=max(0, int(repeat_default)),
                   lo=0, hi=100000,
@@ -8510,7 +8510,7 @@ class TaskConsole(QtWidgets.QWidget):
         req = FitRequest.from_dict(request) if isinstance(request, Mapping) else request
         payload = _dc_replace(req, selection=Selection()).to_dict()
         # A facet grid fit is the SAME per-panel node, made facet-aware: the node slices with the ONE
-        # shared rule (core.facet.facet_cells) GridPlot displays and fits every cell on its worker, and
+        # shared rule (zlc_data.facet.facet_cells) GridPlot displays and fits every cell on its worker, and
         # the panel reconstructs the published per-cell params for DISPLAY (no in-place solve, #6b).
         extra = {"fit_request": payload}
         if card.config.kind == "grid" and card._facet() is not None:
@@ -9337,7 +9337,7 @@ class TaskConsole(QtWidgets.QWidget):
         # layered on this view's snapshot -- a panel expression and a node-side expression (pulse-scan
         # y, processor source) can never diverge in capability (GUI == node).
         from Zou_lab_control.neutral_atom.operations.signal_expr import hub_namespace
-        from Zou_lab_control.neutral_atom.core.signal_tensor import SignalHistoryGap
+        from zlc_data.signal_tensor import SignalHistoryGap
         try:
             tensors = self.hub.snapshot_at(disp, tensors=True)
         except SignalHistoryGap:

@@ -16,7 +16,8 @@ Moved this slice (zero body edits beyond the two seam cuts named below):
     frontend/param_widgets.py -> zlc_frontend/qt_widgets/param_widgets.py [seam 2]
     Zou_lab_control/_paths.py -> zlc_storage/paths.py
 
-Seam: ``display_path`` now comes from ``zlc_storage.paths``.
+Seams: ``display_path`` now comes from ``zlc_storage.paths``; ``facet``'s one
+cross-package import follows ``_readout_math`` into ``zlc_data``.
 NOT moved: ``render_loop.py``/``qt_canvas.py`` - zlc_frontend's guards make
 qt_widgets the only Qt owner AND matplotlib-free, so the legacy Qt+matplotlib
 render model has no legal home there; both stay legacy-side until the shells
@@ -48,6 +49,11 @@ MOVES = {
     "Zou_lab_control.frontend._validate": "zlc_frontend.live_plot._validate",
     "Zou_lab_control.frontend.param_widgets": "zlc_frontend.qt_widgets.param_widgets",
     "Zou_lab_control._paths": "zlc_storage.paths",
+    # H1a - the pure numeric/declarative core the shells lazily import.
+    "Zou_lab_control._readout_math": "zlc_data.readout_math",
+    "Zou_lab_control.neutral_atom.core.facet": "zlc_data.facet",
+    "Zou_lab_control.neutral_atom.core.signal_tensor": "zlc_data.signal_tensor",
+    "Zou_lab_control.neutral_atom.core.params": "zlc_data.param_decl",
 }
 
 _MODULE_INFRA = {
@@ -111,15 +117,12 @@ TENDRILS = {
         ("neutral_atom.core.fitting", "FitRequest"),
         ("neutral_atom.core.fitting", "FitResult"),
         ("neutral_atom.core.fitting", "fit_model"),
-        ("neutral_atom.core.params", "ParamDecl"),
         ("neutral_atom.core.raster", "RegularRaster"),
         ("neutral_atom.core.selection", "CONTROL_ROLE"),
         ("neutral_atom.core.selection", "Selection"),
         ("neutral_atom.core.selection", "region_bins"),
         ("neutral_atom.core.selection", "region_doc"),
         ("neutral_atom.core.selection", "region_tensor"),
-        ("neutral_atom.core.signal_tensor", "SignalHistoryGap"),
-        ("neutral_atom.core.signal_tensor", "canonical_physical_shape"),
         ("neutral_atom.core.signals", "NO_LINEAGE"),
         ("neutral_atom.operations.logic", "Processor"),
         ("neutral_atom.operations.logic", "ProcessorRun"),
@@ -148,15 +151,6 @@ TENDRILS = {
         ("neutral_atom.timing", "scan_table_template"),
     },
     "Zou_lab_control/frontend/live.py": {
-        ("_readout_math", "confidence_weighted_fidelity"),
-        ("_readout_math", "finite_mean"),
-        ("neutral_atom.core.facet", "_FacetCellLayout"),
-        ("neutral_atom.core.facet", "_classify_facet_cell"),
-        ("neutral_atom.core.facet", "_collapse_repeat"),
-        ("neutral_atom.core.facet", "_facet_remainder_shapes"),
-        ("neutral_atom.core.facet", "default_sub_plot_kind"),
-        ("neutral_atom.core.facet", "facet_cells"),
-        ("neutral_atom.core.facet", "normalize_facet"),
         ("neutral_atom.core.fitting", "FitRequest"),
         ("neutral_atom.core.fitting", "fit_histogram"),
         ("neutral_atom.core.fitting", "fit_model"),
@@ -167,7 +161,6 @@ TENDRILS = {
         ("neutral_atom.core.selection", "axis_crop_binding"),
         ("neutral_atom.core.selection", "scatter_mask_binding"),
         ("neutral_atom.core.selection", "value_mask_binding"),
-        ("neutral_atom.core.signal_tensor", "canonical_physical_shape"),
         ("neutral_atom.operations.figure_capture", "capture_rich_info"),
         ("neutral_atom.timing.pulse_table", "_analog_bus_value_at_tick"),
         ("neutral_atom.timing.pulse_table", "analog_bus_ticks"),

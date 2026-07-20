@@ -40,9 +40,9 @@ from zlc_frontend.render_style import (
 from ._validate import _positive_float
 from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, display_figure, fit_grid_shape_for_aspect, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
-from Zou_lab_control._readout_math import confidence_weighted_fidelity, finite_mean
+from zlc_data.readout_math import confidence_weighted_fidelity, finite_mean
 from ..neutral_atom.core.fitting import fit_histogram
-from ..neutral_atom.core.signal_tensor import canonical_physical_shape
+from zlc_data.signal_tensor import canonical_physical_shape
 from .ticks import apply_smart_ticks
 # The pulse RENDER lives here (the plot layer owns every plot kind's rendering): building the timeline
 # figure from a PulseTableState, folding the analog DAC buses into their own rows and shading the scanned
@@ -3350,7 +3350,7 @@ class HistogramFigure(BaseLivePlot):
     Fidelity note (#1b): when fed the live ``counts`` signal this POOLS every site's readout into ONE
     histogram and reports the two-Gaussian fidelity about ONE global cut.  That number is EXPECTED to
     read a few tenths of a percent BELOW the readout calibration's reported fidelity -- not a bug, and
-    the overlap math is single-sourced (``_readout_math``).  The calibration scores each site against
+    the overlap math is single-sourced (``zlc_data.readout_math``).  The calibration scores each site against
     its OWN threshold and averages (per-site-centred calibration), so each
     per-site distribution is tight; pooling N sites that each have a different dark/bright mean widens
     both peaks, so a single global cut overlaps more.  The pooled number is the honest "all sites, one
@@ -3714,7 +3714,7 @@ class HistogramFigure(BaseLivePlot):
     def _out_of_fit_fraction(self) -> float | None:
         """Fraction of the histogram mass NOT explained by the fitted curve (the overlap-coefficient
         complement: ``1 - sum(min(counts, fitted)) / sum(counts)``).  Uses the single-Gaussian fit when
-        there is one, else the two-Gaussian sum; the gaussian math is the single-source _readout_math."""
+        there is one, else the two-Gaussian sum; the gaussian math is the single-source zlc_data.readout_math."""
         n = getattr(self, "n", None)
         if n is None or float(np.sum(n)) <= 0 or getattr(self, "bins", None) is None:
             return None
@@ -4023,9 +4023,9 @@ def _as_per_site_list(per_site_values, n_sites: int | None = None):
 # so "which axis becomes the cells and what each cell shows" is defined in exactly one place.
 
 # The facet SLICER is a headless numpy rule shared with the FitProcessor (a faceted grid fits per-cell
-# on the worker), so it lives in neutral_atom.core.facet -- ONE source, imported here.  ``facet_cell_labels``
+# on the worker), so it lives in zlc_data.facet -- ONE source, imported here.  ``facet_cell_labels``
 # / ``facet_axis_labels`` below stay in the frontend (they are display strings) and read the parsers from it.
-from ..neutral_atom.core.facet import (  # noqa: E402 - re-exported for the frontend's grid callers
+from zlc_data.facet import (  # noqa: E402 - re-exported for the frontend's grid callers
     normalize_facet, default_sub_plot_kind, facet_cells,
     _FacetCellLayout, _classify_facet_cell, _facet_remainder_shapes, _collapse_repeat)
 
