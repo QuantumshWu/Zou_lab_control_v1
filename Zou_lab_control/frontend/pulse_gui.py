@@ -25,13 +25,13 @@ from Zou_lab_control.neutral_atom.timing.pulse_table import (
     default_pulse_name,
     is_slot_ref,
     load_scan_table,
-    scan_table_template,
     slot_ref_index,
     slot_var,
     snap_scan_table,
     _analog_bus_value_at_tick,
     analog_bus_ticks as _analog_bus_ticks,
 )
+from zlc_data.scan_template import scan_table_template
 # The pulse RENDER (state -> figure) lives in the plot layer (live.py); the editor CONSUMES it -- it does
 # not own the render.  ``bus_signed_bounds`` / ``bus_display_label`` are shared render+editor helpers that
 # also live there now (single source; the editor's ``_bus_signed_bounds`` / ``_bus_display_label`` names

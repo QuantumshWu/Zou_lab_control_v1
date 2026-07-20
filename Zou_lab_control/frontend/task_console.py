@@ -543,7 +543,7 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         btn_row.addStretch(1)
         self._program_box.addLayout(btn_row)
 
-        from ..neutral_atom.timing import scan_table_template
+        from zlc_data.scan_template import scan_table_template
         seed = str(self._program_buffers[self._sweep_kind] or "").strip()
         if not seed:
             seed = scan_table_template("column_stack", self._specs[self._sweep_kind])
@@ -558,7 +558,7 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._program_code = editor
 
     def _insert_template(self, template: str) -> None:
-        from ..neutral_atom.timing import scan_table_template
+        from zlc_data.scan_template import scan_table_template
         if self._program_code is not None and self._sweep_kind:
             self._program_code.setPlainText(
                 scan_table_template(template, self._specs[self._sweep_kind]))
