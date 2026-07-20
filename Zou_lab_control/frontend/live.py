@@ -41,7 +41,7 @@ from ._validate import _positive_float
 from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, display_figure, fit_grid_shape_for_aspect, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
 from zlc_data.readout_math import confidence_weighted_fidelity, finite_mean
-from ..neutral_atom.core.fitting import fit_histogram
+from zlc_data.curve_fitting import fit_histogram
 from zlc_data.signal_tensor import canonical_physical_shape
 from .ticks import apply_smart_ticks
 # The pulse RENDER lives here (the plot layer owns every plot kind's rendering): building the timeline
@@ -610,7 +610,7 @@ class BaseLivePlot:
         self.ylabel = self.labels[1] if len(self.labels) > 1 else "Y"
         self.zlabel = self.labels[-1]
         self.title = "" if title is None else str(title)
-        from ..neutral_atom.core.raster import RegularRaster
+        from zlc_data.raster import RegularRaster
         self.raster_grid = data_x if isinstance(data_x, RegularRaster) else None
         if self.raster_grid is None:
             self.data_x = _as_data_x(data_x)
@@ -1303,7 +1303,7 @@ class BaseLivePlot:
         set_radius); they are created/deleted only on a valid<->invalid flip.  Removes any prior overlay
         first (1-D curve, or a family switch), so a re-push replaces exactly one overlay."""
         from .data_figure import _CENTER_DOT_SIZE, _CENTER_RING_LW, _CENTER_RING_ALPHA
-        from ..neutral_atom.core.fitting import fit_model
+        from zlc_data.curve_fitting import fit_model
         ax = getattr(self, "ax", None)
         if ax is None or result is None or not result.valid:
             self._clear_fit_overlay()
@@ -2538,7 +2538,7 @@ def region_binding(kind, selection, *, structure=None, coordinates=None, origin=
       axis, matching ``coerce_panel_value``): a plain integer index is a contiguous crop; an explicit
       scan x-axis is a scatter mask on those coordinates.
     """
-    from ..neutral_atom.core.selection import (
+    from zlc_data.plot_region import (
         Selection, axis_crop_binding, value_mask_binding, scatter_mask_binding)
 
     sel = selection if isinstance(selection, Selection) else Selection.from_dict(selection)
@@ -3928,7 +3928,7 @@ def general_fit_models(render_family: str) -> list:
     'x_array'``).  This is INDEPENDENT of whether the kind ALSO carries a built-in domain fit: a
     histogram declares ``render_family='1d'`` and so is offered the 1-D family HERE *alongside* its
     own bimodal ``fit`` knob (they are two parallel fits, no longer either/or)."""
-    from ..neutral_atom.core.fitting import fit_models
+    from zlc_data.curve_fitting import fit_models
     family = str(render_family).strip().lower()
     if family in ("1d", "2d"):
         return list(fit_models(family=family))
@@ -4812,7 +4812,7 @@ class ImageCell(GridCell):
     def _pixel_coords(self, k: int):
         """The image cell's compact regular grid plus its row-major value column."""
         im = self.images[k]
-        from ..neutral_atom.core.raster import RegularRaster
+        from zlc_data.raster import RegularRaster
         return RegularRaster(tuple(im.shape)), im.ravel()
 
     def data_figure(self, fig, ax, k: int, *, tools=None, scope=()):
@@ -4861,7 +4861,7 @@ def apply_fit_to_figure(df, request, *, is_display: bool = True):
     headless core.  This frontend primitive only clears/draws the returned
     result; it never evals an argument string or owns a model.
     """
-    from ..neutral_atom.core.fitting import FitRequest
+    from zlc_data.curve_fitting import FitRequest
 
     if request in (None, "", "none"):
         df.clear()
@@ -4879,7 +4879,7 @@ def _fit_request_for_cell(request, cell_index: int):
     """Return a request only when its optional cell scope matches."""
     if request is None:
         return None
-    from ..neutral_atom.core.fitting import FitRequest
+    from zlc_data.curve_fitting import FitRequest
     parsed = FitRequest.from_dict(request) if isinstance(request, Mapping) else request
     tags = [item for item in parsed.selection.scope if item.startswith("cell:")]
     if tags and tags[-1] != f"cell:{int(cell_index)}":
@@ -4922,12 +4922,12 @@ class _GridData:
 
     def selection(self):
         """No cell gesture means an intentional unscoped all-cell selection."""
-        from ..neutral_atom.core.selection import Selection
+        from zlc_data.plot_region import Selection
         return Selection(frame="grid")
 
     def selected_data(self, selection=None):
         """Materialize one scoped cell or concatenate an unscoped grid selection."""
-        from ..neutral_atom.core.selection import SelectedData
+        from zlc_data.plot_region import SelectedData
 
         selection = selection or self.selection()
         tags = [item for item in selection.scope if item.startswith("cell:")]
@@ -5652,7 +5652,7 @@ class GridPlot(BaseLivePlot):
         """Turn a cell's fit request into a DISPLAY-only reconstruction of ``popt``: seed the params as the
         full initial vector and set ``solve=False``, so ``apply_fit_to_figure`` draws that exact curve over
         the cell's own domain WITHOUT ever calling the solver (#6b -- the fit already ran on the node)."""
-        from ..neutral_atom.core.fitting import FitRequest
+        from zlc_data.curve_fitting import FitRequest
         req = FitRequest.from_dict(request) if isinstance(request, Mapping) else request
         from dataclasses import replace as _dc_replace
         return _dc_replace(req, initial=tuple(float(v) for v in popt), solve=False)
@@ -6204,7 +6204,7 @@ def plot(
         labels = tuple(labels or ("Time (s)", "", "State"))
         plotter = PLOT_KIND_BY_KEY["pulse"].cls(data_x, labels=labels, **kwargs).show(display=display)
     else:
-        from ..neutral_atom.core.raster import RegularRaster
+        from zlc_data.raster import RegularRaster
         if isinstance(data_x, RegularRaster):
             x = data_x
             y = _as_data_y(data_y, x.point_count)

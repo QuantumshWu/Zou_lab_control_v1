@@ -990,7 +990,7 @@ def build_fit_request(model, selection, *, fixed=None, initial=None, coordinate_
     model, the current selection, and the optional per-parameter ``fixed`` clamps / full-vector
     ``initial`` seeds -- NO free-text argument string is ever evaluated.  ``coordinate_frame`` defaults
     to the selection's own frame."""
-    from ..neutral_atom.core.fitting import FitRequest
+    from zlc_data.curve_fitting import FitRequest
     return FitRequest(
         str(model),
         selection=selection,
@@ -1035,7 +1035,7 @@ class _FitFixSeedEditor(QtWidgets.QWidget):
         self._rows = {}
         if not model:
             return
-        from ..neutral_atom.core.fitting import fit_model
+        from zlc_data.curve_fitting import fit_model
         try:
             names = fit_model(model).names
         except Exception:
@@ -1081,7 +1081,7 @@ class _FitFixSeedEditor(QtWidgets.QWidget):
 
     def seed_from_request(self, request) -> None:
         """Re-seed the fields from a stored request's ``fixed`` / ``initial`` (blocking signals)."""
-        from ..neutral_atom.core.fitting import FitRequest
+        from zlc_data.curve_fitting import FitRequest
         req = (FitRequest.from_dict(request) if isinstance(request, Mapping)
                else request if isinstance(request, FitRequest) else None)
         initial = None if req is None else req.initial
@@ -3257,7 +3257,7 @@ class PanelCard(FluentGroupBox):
     def current_selection(self):
         """Return this panel's selection in the displayed coordinate frame."""
 
-        from ..neutral_atom.core.selection import Selection
+        from zlc_data.plot_region import Selection
 
         selection = self._active_selection
         if selection is None:
@@ -3336,7 +3336,7 @@ class PanelCard(FluentGroupBox):
     def _retarget_fit_request(self, selection):
         """Rebuild the ACTIVE fit's request onto a NEW selection, preserving its model + fixed/initial
         (the stored request is the single source) -- the drag-to-retarget path."""
-        from ..neutral_atom.core.fitting import FitRequest
+        from zlc_data.curve_fitting import FitRequest
         saved = self.config.params.get("fit_request")
         req = FitRequest.from_dict(saved) if isinstance(saved, Mapping) else None
         model = req.model if req is not None else self._default_fit_model()
@@ -4245,7 +4245,7 @@ class PanelCard(FluentGroupBox):
             else:
                 x0, y0 = 0.0, 0.0
                 xlabel, ylabel = "X (px)", "Y (px)"
-            from ..neutral_atom.core.raster import RegularRaster
+            from zlc_data.raster import RegularRaster
             data_x = RegularRaster((ny, nx), origin=(x0, y0))
             plotter = panel_plot(
                 data_x, arr.ravel(), kind="2d", size=size, interactions=True,
@@ -6979,7 +6979,7 @@ class TaskConsole(QtWidgets.QWidget):
             # Replay every panel's persisted REGION as its control signal, so a loaded Analysis row
             # (still STOPPED) sees the saved selection the moment the user Starts it -- never a silent
             # whole-frame fallback -- and the derived panel<->row association is live immediately.
-            from ..neutral_atom.core.selection import Selection, region_bins, region_tensor
+            from zlc_data.plot_region import Selection, region_bins, region_tensor
             for card in self.cards:
                 name = str(card.config.params.get("region_signal") or "")
                 payload = card.config.params.get("region")
@@ -7225,7 +7225,7 @@ class TaskConsole(QtWidgets.QWidget):
         """Whether ``name`` is a CONTROL-plane hub signal (a panel's drawn region) -- classified by
         the schema role the ONE region encoder stamps (``core.selection.CONTROL_ROLE``), the single
         choke point the picker pool filter AND the orphan-GC exemption both read."""
-        from ..neutral_atom.core.selection import CONTROL_ROLE
+        from zlc_data.plot_region import CONTROL_ROLE
         try:
             schema = self.hub.schema(str(name))
         except KeyError:
@@ -8311,7 +8311,7 @@ class TaskConsole(QtWidgets.QWidget):
         (both persist with the panel, so save/load replays the region and re-associates the row).  A
         re-drag republishes the SAME name with a byte-stable schema (:func:`region_tensor` -- fixed
         shape, ``role='control'``), so a retarget can never fork the schema or gap a running consumer."""
-        from ..neutral_atom.core.selection import region_doc, region_tensor
+        from zlc_data.plot_region import region_doc, region_tensor
         from ..neutral_atom.operations.measurement import measurement_slug
         name = str(card.config.params.get("region_signal") or "")
         if not name:
@@ -8334,7 +8334,7 @@ class TaskConsole(QtWidgets.QWidget):
         """Build a :class:`FitResult` from a FitProcessor's PUBLISHED parameters on the hub (its first
         cell) so the panel overlay DRAWS from solved params with no Qt-thread solve (#6).  ``None`` when
         the node has no published result yet."""
-        from ..neutral_atom.core.fitting import FitResult, fit_model
+        from zlc_data.curve_fitting import FitResult, fit_model
         model = fit_model(node.fit_request.model)
         prefix = node.prefix
 
@@ -8421,7 +8421,7 @@ class TaskConsole(QtWidgets.QWidget):
         {cell_index: (p0, p1, ...)})`` in the model's parameter order -- the per-cell counterpart of
         :meth:`_published_fit_result`, so a grid draws every cell from solved params with no Qt solve
         (#6b).  A cell whose fit is invalid (NaN / not converged) is omitted (that cell draws nothing)."""
-        from ..neutral_atom.core.fitting import fit_model
+        from zlc_data.curve_fitting import fit_model
         model = fit_model(node.fit_request.model)
         prefix = node.prefix
         try:
@@ -8504,9 +8504,9 @@ class TaskConsole(QtWidgets.QWidget):
         1-D peak, hist gaussian, AND a facet grid (which the node fits PER CELL and publishes as
         ``(1,1,N)`` param vectors) -- so no fit ever solves on the Qt thread (#6b).  The drawn selection
         travels on the panel's region signal; the config request carries only model + fixed/initial."""
-        from ..neutral_atom.core.fitting import FitRequest
+        from zlc_data.curve_fitting import FitRequest
         from dataclasses import replace as _dc_replace
-        from ..neutral_atom.core.selection import Selection
+        from zlc_data.plot_region import Selection
         req = FitRequest.from_dict(request) if isinstance(request, Mapping) else request
         payload = _dc_replace(req, selection=Selection()).to_dict()
         # A facet grid fit is the SAME per-panel node, made facet-aware: the node slices with the ONE

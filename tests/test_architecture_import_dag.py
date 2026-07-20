@@ -66,6 +66,15 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         (Path("zlc_frontend/qt_widgets/param_widgets.py"), "DeviceRefHandler.is_empty"),
         (Path("zlc_frontend/qt_widgets/param_widgets.py"), "PathHandler.is_empty"),
         (Path("zlc_frontend/qt_widgets/param_widgets.py"), "PulseSlotsHandler.is_empty"),
+        # Salvaged fit/region core: each of these canonicalises a model key or
+        # an axis name that a human typed into a form or a saved recipe - the
+        # same named-adapter boundary .strip() is reserved for.
+        (Path("zlc_data/curve_fitting.py"), "FitRequest.__post_init__"),
+        (Path("zlc_data/curve_fitting.py"), "HistogramFitResult.__post_init__"),
+        (Path("zlc_data/curve_fitting.py"), "fit_model"),
+        (Path("zlc_data/curve_fitting.py"), "fit_models"),
+        (Path("zlc_data/curve_fitting.py"), "fit_histogram"),
+        (Path("zlc_data/plot_region.py"), "AxisRange.__post_init__"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_TextHandler.is_empty"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.read"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.is_empty"),

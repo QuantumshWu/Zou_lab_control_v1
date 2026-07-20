@@ -54,6 +54,10 @@ MOVES = {
     "Zou_lab_control.neutral_atom.core.facet": "zlc_data.facet",
     "Zou_lab_control.neutral_atom.core.signal_tensor": "zlc_data.signal_tensor",
     "Zou_lab_control.neutral_atom.core.params": "zlc_data.param_decl",
+    # H1b - the fit/region core; note plot_region vs the top-level Selection.
+    "Zou_lab_control.neutral_atom.core.raster": "zlc_data.raster",
+    "Zou_lab_control.neutral_atom.core.selection": "zlc_data.plot_region",
+    "Zou_lab_control.neutral_atom.core.fitting": "zlc_data.curve_fitting",
 }
 
 _MODULE_INFRA = {
@@ -114,15 +118,6 @@ def test_moved_modules_import_no_legacy_code():
 #: cutting these seams one group at a time; each cut deletes its rows here.
 TENDRILS = {
     "Zou_lab_control/frontend/task_console.py": {
-        ("neutral_atom.core.fitting", "FitRequest"),
-        ("neutral_atom.core.fitting", "FitResult"),
-        ("neutral_atom.core.fitting", "fit_model"),
-        ("neutral_atom.core.raster", "RegularRaster"),
-        ("neutral_atom.core.selection", "CONTROL_ROLE"),
-        ("neutral_atom.core.selection", "Selection"),
-        ("neutral_atom.core.selection", "region_bins"),
-        ("neutral_atom.core.selection", "region_doc"),
-        ("neutral_atom.core.selection", "region_tensor"),
         ("neutral_atom.core.signals", "NO_LINEAGE"),
         ("neutral_atom.operations.logic", "Processor"),
         ("neutral_atom.operations.logic", "ProcessorRun"),
@@ -151,16 +146,6 @@ TENDRILS = {
         ("neutral_atom.timing", "scan_table_template"),
     },
     "Zou_lab_control/frontend/live.py": {
-        ("neutral_atom.core.fitting", "FitRequest"),
-        ("neutral_atom.core.fitting", "fit_histogram"),
-        ("neutral_atom.core.fitting", "fit_model"),
-        ("neutral_atom.core.fitting", "fit_models"),
-        ("neutral_atom.core.raster", "RegularRaster"),
-        ("neutral_atom.core.selection", "SelectedData"),
-        ("neutral_atom.core.selection", "Selection"),
-        ("neutral_atom.core.selection", "axis_crop_binding"),
-        ("neutral_atom.core.selection", "scatter_mask_binding"),
-        ("neutral_atom.core.selection", "value_mask_binding"),
         ("neutral_atom.operations.figure_capture", "capture_rich_info"),
         ("neutral_atom.timing.pulse_table", "_analog_bus_value_at_tick"),
         ("neutral_atom.timing.pulse_table", "analog_bus_ticks"),
