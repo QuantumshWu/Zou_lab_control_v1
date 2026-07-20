@@ -130,7 +130,9 @@ def test_remove_refuses_a_running_card_instead_of_killing_it(console):
 
     assert console.cards == (card,)
     assert panel.shutdown_calls == 0
-    status = console.findChild(QtWidgets.QLabel, "taskConsoleDiagnostics")
+    from zlc_frontend.qt_widgets import FluentStatusStrip
+
+    status = console.findChild(FluentStatusStrip, "taskConsoleStatusStrip")
     assert "must be stopped and idle before Remove" in status.text()
 
     # Once the panel goes idle the very same click removes it.

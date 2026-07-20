@@ -172,6 +172,8 @@ hardware_change_review_allowed :=
 | `UX-011` | 历史软件 artifact 可能由同一 reader 猜格式或宽松升级 | 普通软件只接受 current plain schema；历史转换为独立离线工具 | 删除升级链和双 reader 历史残余 | **待用户批准其错误/转换 UX；current-only边界不可回退**：拒绝信息与离线转换 runbook |
 | `UX-012` | monitor 为实时性可跳中间显示帧，重型操作曾阻塞 GUI 或由 GUI/worker 共享 Figure | 新 monitor 仍允许显示丢帧但同一 board coherent；compose/fit/calibration 在有界 worker，GUI 保持响应 | 保持交互性能同时消除 shot 混合和线程竞态 | **待用户批准 / 默认匹配旧手感**：profile + coherent board + GUI event latency E2E，不能把 monitor skip 泄漏到 formal exact |
 
+| `UX-013` | `main` 的 console `_message()` 在真实 GUI 下把「Saved / Load failed / …」这类一次性告知走 `fluent_message` 弹窗，只有 offscreen 时才写进常驻状态条；状态条本身只承载 error/task/display-behind 三级 | 迁移后的 console 把这类告知作为常驻状态条的**最低一级**（`info`）显示，不弹窗 | 迁移后的 console 每一步（Add/Remove/Save/Load/Analysis）都会产生这类告知，逐条弹窗会把日常操作变成点确认；状态条本身是常驻固定高度，显示它不挤动布局 | **待用户批准**：若用户要求恢复弹窗，改回 `fluent_message` 即可，状态条的 error>task>warning 三级排序与常驻性不受影响 |
+
 只有用户明确批准的偏离才可把状态改为 `APPROVED`，并必须记录批准范围、日期与替代验收；实现者、测试通过或局部架构审查都无权自行批准。
 
 ## 3. 当前实现的根本问题
@@ -4636,7 +4638,8 @@ Pulse/FPGA：
 | --- | --- | --- | --- |
 | S4-0 口径冻结 | `COMPLETED` | oracle 口径、49 条行为表、纵切序列、禁止机制、删除边界 | 本节 |
 | S4-1a 破 one-card | `COMPLETED` | Add Panel 每次真的再加一块板（旧实现第二次 Add 直接 `RuntimeError("TaskConsole currently owns exactly one card")` 且 Add/catalog 自禁用）；每块板自带 Remove，**Remove 拒绝未 idle 的板而不是杀掉它**（沿用 `load_intent` 既有的「must be stopped and idle」判据）；板名 `Pulse scan #N` 对齐 main 的 indexed_unique_name；`scan_card` 收敛为「最新一块板」，Analysis 目标收敛为「最新一块持有 FINAL artifact 的板」；关窗等待**每一块**板的嵌入面板排空 | `tests/test_u04_task_console_multi_card.py`（7 项 oracle，含拒绝语义与关窗等待） |
-| S4-1b 拓扑参数化 | `OPEN` | 面板卡片、树形 signal picker、Display 控件、参数即时生效三路径、shot clock、Pause/Selectors、tab 刷新 | — |
+| S4-1b 常驻状态条 | `COMPLETED` | 「窗口骨架」行的常驻状态条:一条永远挂载、固定高度、按 error>task>warning>notice 排序的 `FluentStatusStrip`(旧实现是每 tick 一条 ladder;迁移后的 console 退化成了会随文本长高的裸 `FluentLabel`)。ladder 落成 `zlc_frontend.qt_widgets.arbitrate_status_line` 单源,任何窗口共享同一排序;卡片 `stateChanged` 变更门控驱动 task 级 | `tests/test_u04_status_strip_priority.py`(6 项);偏离登记 `UX-013` |
+| S4-1c 拓扑参数化 | `OPEN` | 面板卡片、树形 signal picker、Display 控件、参数即时生效三路径、shot clock、Pause/Selectors、tab 刷新 | — |
 
 **删除边界：** 清单4 迁完之前**禁止**整文件删除 legacy `Zou_lab_control/frontend/task_console.py`（它仍是 API_SLOT segmented、其它 Measurement/Processor、rolling/gridplot/selector/calibration/temperature/MOT panel 与旧入口的共同宿主）；U0.1 表的「保存/恢复」验收项不得删除，必须由 S4-7 正面交付。可删项按最后 consumer 逐项记账，留待清单9 Z0。
 

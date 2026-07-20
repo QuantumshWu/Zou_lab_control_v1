@@ -1,4 +1,4 @@
-"""Qt composition for the current single-card pulse-scan TaskConsole.
+"""Qt composition for the pulse-scan TaskConsole board.
 
 The domain values, edit revision, catalog projection, and persistence codec live
 in :mod:`zlc_workbench.task_console`.  This module only owns Qt widgets and the
@@ -24,12 +24,14 @@ from zlc_frontend.qt_widgets import (
     FluentScrollArea,
     FluentSettingRow,
     FluentSpinBox,
+    FluentStatusStrip,
     FluentTabWidget,
     GREEN,
     GREY,
     ORANGE,
     WINDOW_SCREEN_FRACTION,
     apply_fluent_scrollbars,
+    arbitrate_status_line,
     center_window_on_primary_screen,
     ensure_qt_app,
     release_window,
@@ -908,6 +910,7 @@ class TaskScanCard(QtWidgets.QWidget):
 
     finalReferenceChanged = QtCore.pyqtSignal(object)
     removeRequested = QtCore.pyqtSignal(object)
+    stateChanged = QtCore.pyqtSignal(str)
 
     def __init__(
         self,
@@ -1055,7 +1058,8 @@ class TaskScanCard(QtWidgets.QWidget):
             snapshot = self._session.apply(draft)
 
         self._diagnostics.clear()
-        self._state.setText("STOPPED")
+        # _refresh_state is the single writer of the state label, so the
+        # change-gated stateChanged signal cannot be silently pre-empted here.
         self._refresh_state()
         return snapshot.revision
 
@@ -1080,7 +1084,8 @@ class TaskScanCard(QtWidgets.QWidget):
         self._edit_form.begin_edit()
         self._settings_form.begin_edit()
         self._diagnostics.clear()
-        self._state.setText("STOPPED")
+        # _refresh_state is the single writer of the state label, so the
+        # change-gated stateChanged signal cannot be silently pre-empted here.
         self._refresh_state()
 
     def shutdown(self) -> None:
@@ -1123,15 +1128,25 @@ class TaskScanCard(QtWidgets.QWidget):
         if self._tabs.widget(index) is self._edit_form:
             self._edit_form.begin_edit()
 
-    def _refresh_state(self) -> None:
+    @property
+    def run_state(self) -> str:
+        """One word for what this card's panel is doing, as the header shows it."""
+
         if self._panel is None:
-            self._state.setText("STOPPED · CONFIGURATION REQUIRED")
-        elif self._panel.closed:
-            self._state.setText("CLOSED")
-        elif self._panel.can_reconfigure:
-            self._state.setText("STOPPED")
-        else:
-            self._state.setText("ACTIVE")
+            return "STOPPED · CONFIGURATION REQUIRED"
+        if self._panel.closed:
+            return "CLOSED"
+        if self._panel.can_reconfigure:
+            return "STOPPED"
+        return "ACTIVE"
+
+    def _refresh_state(self) -> None:
+        state = self.run_state
+        # Change-gated: this runs every 100 ms, and an unchanged setText still
+        # costs a Qt relayout pass on every card of the board.
+        if state != self._state.text():
+            self._state.setText(state)
+            self.stateChanged.emit(state)
         self._forward_final_reference(self.final_reference)
 
 
@@ -1192,9 +1207,14 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         self._empty.setObjectName("taskConsoleEmptyState")
         self._empty.setAlignment(QtCore.Qt.AlignCenter)
         self._card_layout.addWidget(self._empty, 1)
-        self._status = FluentLabel("", self)
-        self._status.setObjectName("taskConsoleDiagnostics")
-        self._status.setWordWrap(True)
+        # The PERSISTENT status surface: always mounted at a fixed height so a
+        # message never shifts the board under the pointer, with one priority
+        # ladder deciding which of the console's inputs it shows.
+        self._status = FluentStatusStrip(self)
+        self._status.setObjectName("taskConsoleStatusStrip")
+        self._status_error = ""
+        self._status_task = ""
+        self._status_notice = ""
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(controls)
         layout.addWidget(self._card_host, 1)
@@ -1235,7 +1255,7 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         if intent is None:
             raise RuntimeError("there is no applied TaskConsole intent to save")
         destination = save_task_console_scan_intent(intent, path)
-        self._status.setText(f"Saved current intent: {destination}")
+        self._notice(f"Saved current intent: {destination}")
         return destination
 
     def load_intent(self, path: str | Path) -> TaskConsoleScanIntent:
@@ -1247,12 +1267,12 @@ class TaskConsoleWindow(QtWidgets.QWidget):
             self._create_card(intent)
         else:
             card.load_intent(intent)
-        self._status.setText(f"Loaded current intent stopped: {Path(path)}")
+        self._notice(f"Loaded current intent stopped: {Path(path)}")
         return intent
 
     def _add_card(self) -> None:
         if self._catalog.currentData() != PULSE_SCAN_TASK_KEY:
-            self._status.setText("Only Pulse scan is available")
+            self._refuse("Only Pulse scan is available")
             return
         self._create_card(None)
 
@@ -1268,13 +1288,14 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         )
         card.finalReferenceChanged.connect(self._card_final_reference_changed)
         card.removeRequested.connect(self._remove_card)
+        card.stateChanged.connect(self._card_state_changed)
         if not self._cards:
             self._card_layout.removeWidget(self._empty)
             self._empty.hide()
         self._cards.append(card)
         self._card_layout.addWidget(card, 1)
         self._sync_analysis_entry()
-        self._status.clear()
+        self._notice("")
 
     def _remove_card(self, card: TaskScanCard) -> None:
         """Remove one stopped card; a running panel is refused, never killed."""
@@ -1282,15 +1303,14 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         if card not in self._cards:
             raise ValueError("card does not belong to this TaskConsole")
         if not card.idle:
-            self._status.setText(
-                f"{card.name} must be stopped and idle before Remove"
-            )
+            self._refuse(f"{card.name} must be stopped and idle before Remove")
             return
         name = card.name
         # Disconnect before shutdown so a teardown-time reference change cannot
         # re-enter the console about a card it has already decided to discard.
         card.finalReferenceChanged.disconnect(self._card_final_reference_changed)
         card.removeRequested.disconnect(self._remove_card)
+        card.stateChanged.disconnect(self._card_state_changed)
         card.shutdown()
         self._cards.remove(card)
         self._card_layout.removeWidget(card)
@@ -1300,7 +1320,7 @@ class TaskConsoleWindow(QtWidgets.QWidget):
             self._card_layout.addWidget(self._empty, 1)
             self._empty.show()
         self._sync_analysis_entry()
-        self._status.setText(f"Removed {name}")
+        self._notice(f"Removed {name}")
 
     def _card_final_reference_changed(self, reference) -> None:
         self._sync_analysis_entry()
@@ -1322,9 +1342,7 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         card = self._analysis_card()
         reference = None if card is None else card.final_reference
         if reference is None:
-            self._status.setText(
-                "Fit Analysis requires a card's current FINAL scan artifact"
-            )
+            self._refuse("Fit Analysis requires a card's current FINAL scan artifact")
             self._sync_analysis_entry()
             return
         current = self._analysis_window
@@ -1344,9 +1362,7 @@ class TaskConsoleWindow(QtWidgets.QWidget):
             return
         self._analysis_window = window
         self._analysis_source = reference
-        self._status.setText(
-            "Opened exact Fit Analysis for the current FINAL scan artifact"
-        )
+        self._notice("Opened exact Fit Analysis for the current FINAL scan artifact")
 
     def _save_dialog(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -1377,7 +1393,49 @@ class TaskConsoleWindow(QtWidgets.QWidget):
             self._show_error(error)
 
     def _show_error(self, error: BaseException) -> None:
-        self._status.setText(f"{type(error).__name__}: {error}")
+        self._refuse(f"{type(error).__name__}: {error}")
+
+    def _refuse(self, text: str) -> None:
+        """Report that the action the operator just took did NOT happen.
+
+        This rides the error tier on purpose.  A refusal answers a click, so
+        burying it under the ambient running-task line would turn "Remove while
+        the scan runs" into a button that silently does nothing - which is
+        exactly what the notice tier did before.
+        """
+
+        self._status_error = str(text)
+        self._status_notice = ""
+        self._refresh_status()
+
+    def _notice(self, text: str) -> None:
+        """Report one successful outcome, which also retires the last failure.
+
+        A notice is only ever emitted by an action that completed, so leaving a
+        stale error above it would keep showing a failure the operator has
+        already moved past.  It still ranks below a running task.
+        """
+
+        self._status_notice = str(text)
+        self._status_error = ""
+        self._refresh_status()
+
+    def _card_state_changed(self, _state: str) -> None:
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        """Recompute the one strip line from every console input at once."""
+
+        active = [card.name for card in self._cards if card.run_state == "ACTIVE"]
+        self._status_task = (
+            f"Running: {', '.join(active)}" if active else ""
+        )
+        text, severity = arbitrate_status_line(
+            error=self._status_error,
+            task=self._status_task,
+            notice=self._status_notice,
+        )
+        self._status.show_message(text, severity=severity)
 
     def _panels_closed(self) -> bool:
         """Every embedded panel of every card has finished closing."""
@@ -1402,7 +1460,7 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         event.ignore()
         if not self._close_timer.isActive():
             self.setEnabled(False)
-            self._status.setText("Closing embedded scan panels…")
+            self._notice("Closing embedded scan panels…")
             self._close_timer.start()
 
     def _poll_close(self) -> None:

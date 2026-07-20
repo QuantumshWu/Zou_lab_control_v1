@@ -3360,6 +3360,39 @@ class ElidedLabel(QtWidgets.QLabel):
         super().setText(shown)
 
 
+def arbitrate_status_line(
+    *,
+    error: str = "",
+    task: str = "",
+    warning: str = "",
+    notice: str = "",
+) -> tuple[str, str]:
+    """THE priority ladder every persistent status strip shares.
+
+    A wedged component must never fail silently, so a red error outranks even a
+    running task's progress line; the display-behind advisory is amber because
+    the RUN is unaffected (acquisition is never throttled by the display); a
+    plain notice is the lowest tier; nothing at all leaves the strip empty at
+    its fixed height so the layout never jumps.  Windows differ in where their
+    four inputs come from, never in how they rank, which is why the ranking
+    lives here instead of being retyped per window.
+
+    Returns ``(text, severity)`` ready for :meth:`FluentStatusStrip.show_message`.
+    """
+
+    for text, severity in (
+        (error, "error"),
+        (task, "task"),
+        (warning, "warning"),
+        (notice, "info"),
+    ):
+        if not isinstance(text, str):
+            raise TypeError("status inputs must be str")
+        if text:
+            return text, severity
+    return "", "info"
+
+
 class FluentStatusStrip(FluentFrame):
     """The PERSISTENT one-line status surface a GUI mounts once and feeds forever.
 

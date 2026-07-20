@@ -114,3 +114,4 @@ tests/test_u04_settings_popup_anchor.py
 tests/test_u04_catalog_projection.py
 tests/test_u04_workspace_bootstrap.py
 tests/test_u04_task_console_multi_card.py
+tests/test_u04_status_strip_priority.py
