@@ -81,12 +81,21 @@ zoom/pan/crosshair/hover/selector;不适用的 plot kind 必须有旧行为证�
 `zlc_frontend/live_plot/plot_figure.py`。→ repoint,**并把所有"按路径钉死"的守卫改成
 按属性扫描**;同类嫌疑 `dag:632`(对不存在目录 `rglob` 返回 `[]` 不报错)。
 
-**F2 pulse-replay 端口只由 legacy 注册**:唯一注册点
-`Zou_lab_control/frontend/__init__.py:275`,消费者却是新包 `live_plot/plot_figure.py`;
-端口严格单源(第二个不同工厂直接 raise)→ **只能搬不能加**。搬到 `zlc_workbench` 组合根,
-并在 `test_u06` 加"产品入口进程里 `pulse_state_factory_is_registered()` 必须为 True"。
-否则删旧树后存档 pulse 图静默打不开,而唯一还绿的断言(`test_u06:175`)断言的恰恰是
-"回放已坏"。
+**F2 pulse-replay 端口** —— ✅ 已闭合(commit `4604eb8`),但**结论与原计划相反,别再按原计划做**:
+
+- 事实(真实存档实测,非 import 图推断):唯一注册点是 legacy `frontend/__init__.py:275`;
+  真造一个 pulse npz,在只 import `Zou_lab_control.notebook` 的干净进程里回放
+  → `PulseReplayUnavailable`。
+- **但不在这里修**:① 产品面与 `zlc_workbench` **没有任何代码载入 npz `SavedFigure`**,
+  `SavedFigure.pulse_state` 今天只有旧树 `na.load_figure` 一个调用者,产品路径够不到,
+  真正需要它是 **W3**(存档查看器 salvage)之时;
+  ② 原计划"搬到 `zlc_workbench`"**不可行**——`zlc_pulse` 没有编辑器状态类,工厂必须够到
+  legacy `pulse_table`,而 DAG 禁止任何 `zlc_*` 包这么做;放到产品面又必须**懒到渲染路径上**,
+  在包 import 期接线会拉进渲染器,直接违反
+  `test_headless_notebook_import_does_not_load_frontend_renderer`(该守卫已在全量门里抓住我)。
+- **W3 的动作**:注册随存档查看器一起接入,**懒注册在渲染路径上,绝不在包 import 期**。
+- 已落守卫:`test_u06::test_the_product_surface_reaches_no_legacy_module` ——
+  产品面(Z0 后存活)legacy import 恒为 0,变异测试证明会咬。
 
 **F3 两条已断的死引用**:`neutral_atom/session.py:596` → `zlc_workbench.legacy_neutral_atom`、
 `_gui.py:113` → `zlc_workbench.pulse_control`,**两模块都不存在**,lazy import 调用才炸,
