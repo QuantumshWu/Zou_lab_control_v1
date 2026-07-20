@@ -4640,7 +4640,9 @@ Pulse/FPGA：
 | S4-0 口径冻结 | `COMPLETED` | oracle 口径、49 条行为表、纵切序列、禁止机制、删除边界 | 本节 |
 | S4-1a 破 one-card | `COMPLETED` | Add Panel 每次真的再加一块板（旧实现第二次 Add 直接 `RuntimeError("TaskConsole currently owns exactly one card")` 且 Add/catalog 自禁用）；每块板自带 Remove，**Remove 拒绝未 idle 的板而不是杀掉它**（沿用 `load_intent` 既有的「must be stopped and idle」判据）；板名 `Pulse scan #N` 对齐 main 的 indexed_unique_name；`scan_card` 收敛为「最新一块板」，Analysis 目标收敛为「最新一块持有 FINAL artifact 的板」；关窗等待**每一块**板的嵌入面板排空 | `tests/test_u04_task_console_multi_card.py`（7 项 oracle，含拒绝语义与关窗等待） |
 | S4-1b 常驻状态条 | `COMPLETED` | 「窗口骨架」行的常驻状态条:一条永远挂载、固定高度、按 error>task>warning>notice 排序的 `FluentStatusStrip`(旧实现是每 tick 一条 ladder;迁移后的 console 退化成了会随文本长高的裸 `FluentLabel`)。ladder 落成 `zlc_frontend.qt_widgets.arbitrate_status_line` 单源,任何窗口共享同一排序;卡片 `stateChanged` 变更门控驱动 task 级 | `tests/test_u04_status_strip_priority.py`(6 项);偏离登记 `UX-013` |
-| S4-1c 拓扑参数化 | `OPEN` | 面板卡片、树形 signal picker、Display 控件、参数即时生效三路径、shot clock、Pause/Selectors、tab 刷新 | — |
+| S4-1c(a) METER display owner | `COMPLETED` | 异构面板的前置依赖:`ViewIntent` 四成员中 METER 的 display state 原先私有在 `workbench/_figure.py`,导致 `LiveBoardController` 的 panel→revision 映射结构上没有 METER 槽位。已提升为 `zlc_frontend/meter_display.py::MeterDisplayState`(**不**造空 form spec,理由写在模块里) | `tests/test_u04_meter_display_owner.py`(6 项,含「每个 ViewIntent 都有 owner」机械守卫) |
+| S4-1c(b) 拓扑参数化 | `OPEN` | `LiveBoardController` 目前只能表达两种拓扑(1×IMAGE,或 IMAGE+CURVE+HISTOGRAM+METER 定序四联),`live.py` 有四处硬断言(scalars 全有全无、panel 0 必须 IMAGE、恰好三个 scalar、必须按 CURVE/HISTOGRAM/METER 排序)与一处按 index 写死的 display-revision 阶梯。需换成有序 `PanelSpec` 元组 + intent→renderer 表 | — |
+| S4-1c(c) 面板卡片与 Setting | `OPEN` | 面板卡片、树形 signal picker(`FluentTreeComboBox` 已迁但其数据 helper 仍在旧树 `frontend/param_widgets.py`)、Display 控件、参数即时生效三路径、shot clock、Pause/Selectors、tab 刷新 | — |
 
 **删除边界：** 清单4 迁完之前**禁止**整文件删除 legacy `Zou_lab_control/frontend/task_console.py`（它仍是 API_SLOT segmented、其它 Measurement/Processor、rolling/gridplot/selector/calibration/temperature/MOT panel 与旧入口的共同宿主）；U0.1 表的「保存/恢复」验收项不得删除，必须由 S4-7 正面交付。可删项按最后 consumer 逐项记账，留待清单9 Z0。
 
