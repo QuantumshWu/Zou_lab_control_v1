@@ -3844,16 +3844,15 @@ class PlotKind:
 # PANEL_SINGLE_SLOT_KINDS from it (no parallel literals).  Order is the Add-Panel
 # menu order.  ``monitor`` lists its DEFAULT class (LiveLiveDis, show_dist=True); the
 # bare LiveLive variant is the show_dist=False toggle, still inside plot().
-# Repeat-display vocabularies (single source).  The BASE verbs (average/add/replace) are GENERIC --
-# ``reduce_repeat`` collapses the repeat axis the same way for ANY plot kind -- so every kind offers
-# them.  Only two specialisations: ``create`` (one line / one sub-distribution per repeat) is for the
-# 1-D families incl. the distribution, but NOT 2d/sites (an image has no per-repeat-line meaning);
-# ``pool`` (bin EVERY repeat's samples into ONE histogram) is the distribution's own extra mode.
-_BASE_REPEAT_MODES: tuple[str, ...] = ("average", "add", "replace")
-TRACE_REPEAT_MODES: tuple[str, ...] = _BASE_REPEAT_MODES + ("create",)                 # 1-D vector: base + per-repeat lines (NO roll)
-ROLLING_REPEAT_MODES: tuple[str, ...] = _BASE_REPEAT_MODES + ("roll", "create")        # rolling trace ONLY adds 'roll' (a rolling buffer)
-IMAGE_REPEAT_MODES: tuple[str, ...] = _BASE_REPEAT_MODES                               # a frame: mean/sum/latest, no create/roll
-HIST_REPEAT_MODES: tuple[str, ...] = ("pool",) + _BASE_REPEAT_MODES + ("create",)      # pool (default) + base + create (one overlaid histogram per repeat)
+# The repeat-display vocabularies moved to zlc_data.repeat_modes -- three surfaces must
+# spell them identically, and they carry no rendering.  Read back so this stays one source.
+from zlc_data.repeat_modes import (
+    BASE_REPEAT_MODES as _BASE_REPEAT_MODES,
+    HIST_REPEAT_MODES,
+    IMAGE_REPEAT_MODES,
+    ROLLING_REPEAT_MODES,
+    TRACE_REPEAT_MODES,
+)
 
 PLOT_KINDS: tuple[PlotKind, ...] = (
     PlotKind(

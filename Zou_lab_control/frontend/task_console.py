@@ -52,7 +52,6 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .live import (
     DEFAULT_HIST_FIT,
-    IMAGE_REPEAT_MODES,
     PLOT_KIND_BY_KEY,
     PLOT_KINDS,
     coerce_panel_value,
@@ -66,6 +65,7 @@ from .live import (
 )
 from zlc_frontend.render_style import PALETTE  # the ONE render colour owner
 from zlc_frontend import board_layout as _layout
+from zlc_data.repeat_modes import IMAGE_REPEAT_MODES
 from zlc_data.logic_node import (
     LOGIC_KINDS,
     LOGIC_NODE_CONFIG_FIELDS as _LOGIC_NODE_CONFIG_FIELDS,
