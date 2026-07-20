@@ -4572,6 +4572,7 @@ Pulse/FPGA：
 - 《真机bring-up runbook》给出上电/唯一owner/AssetMap与fingerprint检查、camera工作点与Q0资格化、virtual scan、resident Formal、EndAttestation/reject-and-redo、安全停止/断线/quarantine的顺序、命令、预期结果、通过/失败判据与恢复动作；
 - 用户上机第一天清单按“真实launcher GUI日常流程 -> virtual scan/fit/save/reopen -> qCMOS只读identity/working point -> 已批准qualification -> resident真机Formal”排序，任何fail-closed gate不得靠手工改状态绕过；
 - >4096/9999点扫描若在交付时仍受真机资格化约束，runbook必须单列`AUTONOMOUS_REFILLED`启用步骤：冻结全schedule/chunk digest、单I/O owner、refill硬上界、每个seam时间观测与residual证据、配置/命令、9999点压力实验、underflow/gap/late-chunk拒绝判据、关闭条件与resident回退。host只供应预先冻结chunk，FPGA继续决定全部精密edge时序；未通过时typed拒绝而不退化为host stepping。
+  - **状态 `COMPLETED`（typed fail-closed 部分）：** 拒绝已从裸 `ValueError` 升级为 §15.4 要求的 `FormalScanCapacityExceeded(requested_points, resident_limit, capability_unavailable_reason)`（`zlc_pulse/deployment.py`，仍继承 `ValueError` 以免既有 caller 语义漂移）。`AUTONOMOUS_REFILLED_UNAVAILABLE_REASON` 是缺失证据的**唯一**表述，逐条点名三个未闭合 gate 并明说「冻结 bitstream 本来就有 ping-pong refill 硬件，缺的是证据不是硅片」，避免误读成硬件能力不足。两处并列判据（展开前 logical R×P 与 deployment 边界）此前各写一份措辞，现已收敛到同一异常类型与同一常量。资格化实验 R1–R6、启用/回退与「host 只供应冻结 chunk」不变量写入 `docs/REAL_HARDWARE_BRINGUP_zh.md` §5，`tests/test_u04_scan_capacity_refusal.py` 机械守卫「两处判据不得给出两个理由」与「runbook 不得把 host stepping 写成出路」。**剩余为纯真机部分**：R1–R6 证据与常量翻转。
 
 #### 清单4 TaskConsole 完整迁移 salvage gate（开工冻结证据，状态：`OPEN`）
 

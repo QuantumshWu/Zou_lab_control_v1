@@ -106,3 +106,68 @@ python task_console.py --config remote_template.json --grid 5x7
 
 > 真机出问题先翻 memory 根因记录(`register-layout-handshake` / `stale-bus-delay` / `prefetch-pipeline-depth`
 > / `fire-seed-stale-count` 等)与 `docs/MAINTAINER_NOTES.md`,多数历史坑已在那里定位过。
+
+---
+
+## 5. >4096 点扫描(9999 点级):`AUTONOMOUS_REFILLED` 资格化
+
+### 5.1 现在会看到什么
+
+超过常驻窗口的扫描在 **fire 之前**被 typed 拒绝,不会退化成 host 逐点驱动:
+
+```
+zlc_pulse.FormalScanCapacityExceeded:
+  formal autonomous scan exceeds the frozen bitstream's fully resident
+  capacity: 9999 points > 4096. AUTONOMOUS_REFILLED is not published ...
+```
+
+异常对象带三个字段,GUI/notebook 直接读,不用抠字符串:
+
+| 字段 | 含义 |
+|---|---|
+| `requested_points` | 本次请求的物理 scan 行数(已含 repeat 展开) |
+| `resident_limit` | `2 * bank_size`,当前 `fpga/board_config/streamer_config.json` 里 `bank_size=2048` → **4096** |
+| `capability_unavailable_reason` | 缺哪几项证据(单源常量 `AUTONOMOUS_REFILLED_UNAVAILABLE_REASON`) |
+
+**这不是"硬件做不到"。** 冻结 bitstream 里 ping-pong bank refill 硬件本来就在,
+`zlc_edge_streamer.v` 的流式 scan 与无缝 wrap 都已验证过。缺的是**证据**,
+不是硅片,所以本节是一份资格化实验清单,不是硬件改动申请。
+
+### 5.2 必须先成立的三件事(§15.4 强 gate)
+
+1. **单一 I/O owner。** 一个 `FiniteScanStreamer` 同时负责 status、cursor、bank refill、
+   progress、cancel、completion。今天 `zlc_pulse/transport/session.py` 的 worker 只读
+   STATUS/CURSOR,没有 refill 写方;绝不允许再开第二个线程去写同一 transport。
+2. **refill 事务的保守硬上界。** 要的是上界,不是 measured worst / p99。
+   "measured worst refill + Windows/Python 调度余量"**不是**确定性上界,不可用来发布能力。
+3. **每个 seam 的硬件时间观测 + 全 schedule residual。**
+   当前 RTL 的 `STATUS_UNDERFLOW` 在 bank 恢复后会**自己清零**(非 sticky),
+   所以最终 `STATUS_DONE`、局部 camera timestamp、`scan_progress()` 镜像
+   **都不能**证明"从未 stall"。没有 camera edge 的区段、最后一个 trigger 之后的 seam、
+   任何不可观测的 stall,只要有一个,能力就不可发布。
+
+### 5.3 资格化实验(按顺序;每步不过就停在这一步)
+
+| # | 实验 | 命令/配置 | 判据(全部满足才算过) |
+|---|---|---|---|
+| R1 | 常驻基线复核 | 4096 点 SCAN_SLOT,走现有 `AUTONOMOUS_RESIDENT` | 一次 fire 跑完;terminal evidence 合法;camera 帧数 == `expected_trigger_total_from_completed_schedule` |
+| R2 | refill 事务上界测量 | 单 I/O owner 下,反复写满一个 bank,记录每次事务耗时分布与**理论上界推导** | 有书面上界(transport 字节数 × 最坏 per-word 时间 + 协议开销),且实测最大值 < 上界;只有分布没有推导 = 不过 |
+| R3 | seam 时间观测分辨率 | 在每个 bank 边界安排一个 camera trigger,读回硬件时间戳 | 每个潜在 seam 都落在一个可观测区间内;**存在无 edge 的 seam 即判不过** |
+| R4 | 全 schedule residual | R3 的逐 seam 观测与 compiled schedule 做残差比对 | 残差 ≤ 由 R2 上界推出的允许值;无未解释异常点 |
+| R5 | 9999 点压力实验 | 9999 点 SCAN_SLOT,连续 ≥20 次 | 每次:无 underflow、无 late chunk、terminal 合法、帧数与 schedule 完全一致;**一次不过即整轮不过** |
+| R6 | 拒绝路径反证 | 人为把 refill 延迟到超上界 | 必须 fail closed(拒绝/INVALID),不得"看起来跑完了" |
+
+### 5.4 启用与回退
+
+- **启用**:R1–R6 全过后,把 `zlc_pulse/deployment.py` 的
+  `AUTONOMOUS_REFILLED_UNAVAILABLE_REASON` 单源常量连同容量判据一起改成
+  "已发布 + 本 deployment 的 capability 记录",并把 R2–R4 的证据 digest 写进 capability 记录。
+  **只改这一个常量**——判据本身在 `validate_resident_scan_capacity` /
+  `require_autonomous_scan_resident_capacity` 两处共用同一个错误类型,不会漂移。
+- **回退**:任何一次实验不过、或换 transport/换机器/改 `bank_size`,立即把常量改回未发布,
+  实验退回 `AUTONOMOUS_RESIDENT`(≤4096 点)。分批扫描是合法的临时办法;
+  **host 逐点驱动不是**。
+- **不变量**:即使能力发布,host 也只**供应预先冻结的 chunk**,
+  全部精密 edge 时序仍由 FPGA 自主决定;host 不选下一个 point、不调度 edge。
+  单次 run 的 Formal 资格另由 Q0 qualification、association proof、exact 链与
+  EndAttestation 独立决定,与装载方式名称无关。

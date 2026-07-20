@@ -69,6 +69,8 @@ from .validation import (
 )
 from .deployment import (
     APPROVED_DEPLOYED_TARGET_ABI,
+    AUTONOMOUS_REFILLED_UNAVAILABLE_REASON,
+    FormalScanCapacityExceeded,
     expand_autonomous_scan_repeats,
     resident_scan_point_capacity,
     require_autonomous_scan_resident_capacity,
@@ -192,6 +194,8 @@ __all__ = [
     "MAX_MATERIALIZED_TRIGGER_EDGES",
     "MAX_MATERIALIZED_PLAYBACK_PULSES",
     "APPROVED_DEPLOYED_TARGET_ABI",
+    "AUTONOMOUS_REFILLED_UNAVAILABLE_REASON",
+    "FormalScanCapacityExceeded",
     "AUTONOMOUS_TABLE_READ_RECIPE",
     "COMPILER_ID",
     "CompiledPulseArtifact",
