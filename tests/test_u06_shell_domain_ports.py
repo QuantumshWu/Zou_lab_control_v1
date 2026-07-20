@@ -25,6 +25,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
@@ -195,6 +197,55 @@ def test_the_render_layer_refuses_a_pulse_replay_it_cannot_build():
         "    raise AssertionError('an unwired replay must refuse')\n"
     )
     subprocess.run([sys.executable, "-c", code], cwd=str(REPO_ROOT), check=True)
+
+
+def test_the_product_surface_reaches_no_legacy_module():
+    """The product surface is already legacy-free, and must stay that way.
+
+    ``Zou_lab_control/notebook`` and ``Zou_lab_control/workbench`` survive Z0 as
+    the user's entry points, so every legacy import they hold is one the deletion
+    would have to resolve.  Today there are none - a property worth a ratchet
+    rather than a coincidence worth discovering later.
+
+    This guard was written after an attempt to wire the pulse-replay port from
+    here.  ``zlc_pulse`` has no editor-state class yet, so such a factory must
+    reach the legacy ``pulse_table``; wiring it at package import ALSO loaded the
+    renderer and broke the headless guarantee
+    (``test_headless_notebook_import_does_not_load_frontend_renderer``).  The
+    port is not reachable from the product anyway: nothing in the product surface
+    or ``zlc_workbench`` loads a saved npz figure, so ``SavedFigure.pulse_state``
+    has no product caller until the saved-figure viewer is salvaged.  The
+    registration moves then - lazily, on the render-touching path, never at
+    import - and this set is where a premature attempt shows up.
+    """
+
+    import ast
+
+    expected: set[Path] = set()
+    found = set()
+    for root in ("Zou_lab_control/notebook", "Zou_lab_control/workbench"):
+        for path in sorted((REPO_ROOT / root).rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                names = []
+                if isinstance(node, ast.ImportFrom) and node.level == 0:
+                    names = [node.module or ""]
+                elif isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                if any(
+                    name.startswith(("Zou_lab_control.frontend",
+                                     "Zou_lab_control.neutral_atom"))
+                    for name in names
+                ):
+                    found.add(path.relative_to(REPO_ROOT))
+
+    assert found == expected, (
+        "the product surface's legacy reach changed.\n"
+        f"  now      : {sorted(str(p) for p in found)}\n"
+        f"  ledgered : {sorted(str(p) for p in expected)}\n"
+        "A new one is a regression; removing the last one means the pulse state "
+        "has migrated - empty this set in the same commit."
+    )
 
 
 def test_importing_the_legacy_frontend_wires_the_pulse_replay_port():
