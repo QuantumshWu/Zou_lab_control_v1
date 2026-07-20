@@ -71,6 +71,7 @@ tests/test_u05_panel_size_vocabulary.py
 tests/test_u05_raster_front.py
 tests/test_u05_render_island.py
 tests/test_u05_shell_salvage.py
+tests/test_u05_signal_expr_widget.py
 tests/test_u06_shell_domain_ports.py
 tests/test_w1_capture_workbench.py
 tests/test_w2_pulse_application.py

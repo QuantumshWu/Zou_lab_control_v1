@@ -78,6 +78,7 @@ Z2B_ACTIVE_TEST_IMPORTERS = {
     Path("tests/test_u05_declaration_not_class.py"),    # pins predicates ON legacy console/domain nodes
     Path("tests/test_u05_render_island.py"),            # proves the legacy console reaches the loop only via the island
     Path("tests/test_u05_raster_front.py"),             # pins the legacy canvas' worker/GUI hand-off to the documented raster
+    Path("tests/test_u05_signal_expr_widget.py"),       # asserts the shell alias IS the moved class
     Path("tests/test_u06_shell_domain_ports.py"),       # proves the legacy root wires the port
     Path("tests/test_zlc_frontend_form.py"),            # form parity across the move
 }

@@ -51,6 +51,7 @@ from PyQt5 import QtCore, QtWidgets
 
 from zlc_storage.paths import display_path
 
+from zlc_frontend.qt_widgets.signal_expr_widget import SignalExprWidget
 from zlc_frontend.form import FormChoice, FormFieldProps
 from zlc_frontend.qt_widgets import (
     FORM_WIDGET_HANDLERS,
@@ -108,11 +109,11 @@ class ParamWidgetContext:
     ``signals_provider`` / ``sources_provider`` / ``formats_provider``
                        the live-hub-signal name list + producer / format maps the
                        grouped signal pickers (kinds ``signal`` / ``signal_expr``) need.
-    ``signal_expr_factory`` / ``pulse_slots_factory``
-                       zero-arg factories that build the two COMPOSITE widgets that
-                       live in ``task_console`` (``_SignalExprWidget`` /
-                       ``_PulseSlotsWidget``) -- injected so this module needn't import
-                       them (it stays a leaf the console depends on, not vice versa).
+    ``pulse_slots_factory``
+                       a zero-arg factory for the one COMPOSITE widget still living in
+                       ``task_console`` (``_PulseSlotsWidget``) -- injected so this module
+                       needn't import it (it stays a leaf the console depends on, not vice
+                       versa).  ``signal_expr`` no longer needs one: its widget moved here.
     """
 
     on_change: Callable[[], None] = _noop
@@ -121,7 +122,6 @@ class ParamWidgetContext:
     sources_provider: Optional[Callable[[], Any]] = None
     formats_provider: Optional[Callable[[], Any]] = None
     labels_provider: Optional[Callable[[], Any]] = None
-    signal_expr_factory: Optional[Callable[[str], QtWidgets.QWidget]] = None
     pulse_slots_factory: Optional[Callable[[], QtWidgets.QWidget]] = None
 
     def names(self) -> list[str]:
@@ -679,9 +679,12 @@ class SignalExprHandler(ParamWidgetHandler):
     ``_SignalExprWidget``).  Value is ``{"inputs": [...], "source": "value = ..."}``."""
 
     def build(self, decl, value, ctx):
-        if ctx.signal_expr_factory is None:
-            raise RuntimeError("signal_expr kind needs ctx.signal_expr_factory")
-        widget = ctx.signal_expr_factory(decl.row_label())      # single source: label + (unit) [+ *]
+        # Built HERE, not through an injected factory: the widget now lives beside this
+        # handler, so the inversion that existed only to reach into the legacy shell is gone.
+        widget = SignalExprWidget(
+            signals_provider=ctx.signals_provider, sources_provider=ctx.sources_provider,
+            formats_provider=ctx.formats_provider, labels_provider=ctx.labels_provider,
+            title=decl.row_label())                             # single source: label + (unit) [+ *]
         seed = value if value is not None else (decl.default if decl.default is not None else {})
         widget.set_value(seed)
         widget.setToolTip(decl.tooltip)
