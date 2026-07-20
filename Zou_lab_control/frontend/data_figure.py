@@ -1362,9 +1362,12 @@ class SavedFigure:
         recipe = self.figure_recipe
         if recipe is None or str(recipe.get("kind") or "") != "pulse":
             return None
-        from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+        # The renderer may not import the pulse compiler (the import DAG makes
+        # zlc_frontend a leaf over zlc_data), so the composition root hands the
+        # constructor down; see zlc_frontend.domain_ports.
+        from zlc_frontend.domain_ports import pulse_state_from_dict
 
-        state = PulseTableState.from_dict(self._pulse_state_dict(recipe))
+        state = pulse_state_from_dict(self._pulse_state_dict(recipe))
         return state, bool(recipe.get("include_always_off", True))
 
     def _replay_pulse(self, recipe: Mapping[str, Any]) -> "DataFigure":

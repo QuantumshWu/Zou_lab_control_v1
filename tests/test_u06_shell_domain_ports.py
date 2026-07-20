@@ -70,9 +70,9 @@ def test_an_all_edge_plan_samples_exactly_at_the_period_boundaries():
 
     state = _state(
         [
-            {"mode": "edge", "value": 100},
+            {"mode": "edge", "value": 20},
             {"mode": "hold", "value": None},
-            {"mode": "edge", "value": -250},
+            {"mode": "edge", "value": -30},
         ]
     )
     starts = _appended_starts(state)
@@ -83,7 +83,7 @@ def test_an_all_edge_plan_samples_exactly_at_the_period_boundaries():
     assert ticks == starts, "an all-edge bus breaks exactly at the period boundaries"
     assert len(values) == len(ticks) - 1, "the last tick closes the final segment"
     # The seeded periods hold at idle; then edge 100, a hold carrying it, then -250.
-    assert values[-3:] == [100, 100, -250]
+    assert values[-3:] == [20, 20, -30]
     assert set(values[:-3]) == {0}
 
 
@@ -97,17 +97,17 @@ def test_a_looping_ramp_then_hold_reads_flat_but_a_single_fire_climbs():
     """
 
     plan = [
-        {"mode": "ramp", "value": 400},
+        {"mode": "ramp", "value": 31},
         {"mode": "hold", "value": None},
         {"mode": "hold", "value": None},
     ]
 
     _ticks, looping = _state(plan).analog_bus_samples(BUS, looping=True)
-    assert set(looping) == {400}, "a looping ramp->hold converges to a flat level"
+    assert set(looping) == {31}, "a looping ramp->hold converges to a flat level"
 
     _ticks, single = _state(plan).analog_bus_samples(BUS, looping=False)
     assert single[0] == 0, "a single fire enters at idle 0 V"
-    assert single[-1] == 400, "and finishes on the ramp target"
+    assert single[-1] == 31, "and finishes on the ramp target"
     assert single == sorted(single), "the one-shot ramp is monotonic to the target"
     assert len(set(single)) > 2, "a ramp is sampled inside the period, not just at its ends"
 
@@ -117,13 +117,13 @@ def test_a_scanned_slot_value_previews_at_its_reference_instead_of_failing():
     still draw something, so slot references resolve to the slot's nominal value.
 
     Bound through the real editor path (``bind_field``), which rewrites the plan
-    entry to ``s0`` and remembers 180 as its nominal - so this is the state a user
+    entry to ``s0`` and remembers 25 as its nominal - so this is the state a user
     who ticked "scan this DAC" actually previews.
     """
 
     state = _state(
         [
-            {"mode": "edge", "value": 180},
+            {"mode": "edge", "value": 25},
             {"mode": "hold", "value": None},
             {"mode": "hold", "value": None},
         ]
@@ -135,7 +135,7 @@ def test_a_scanned_slot_value_previews_at_its_reference_instead_of_failing():
     )
 
     _ticks, values = state.analog_bus_samples(BUS, looping=False)
-    assert values[-3:] == [180, 180, 180], (
+    assert values[-3:] == [25, 25, 25], (
         "an unresolved slot previews at its nominal value, not as a crash on int('s0')"
     )
 
@@ -153,8 +153,8 @@ def test_the_render_surface_has_no_private_copy_of_the_sampler():
 
     state = _state(
         [
-            {"mode": "edge", "value": 120},
-            {"mode": "ramp", "value": -80},
+            {"mode": "edge", "value": 20},
+            {"mode": "ramp", "value": -30},
             {"mode": "hold", "value": None},
         ]
     )
@@ -167,3 +167,71 @@ def test_the_render_surface_has_no_private_copy_of_the_sampler():
     assert drawn[BUS]["starts"] == [tick * state.time_step_ns * 1e-9 for tick in ticks], (
         "the render converts the state's ticks to seconds and nothing else"
     )
+
+
+# ------------------------------------------------- the pulse-replay object port
+
+
+def test_the_render_layer_refuses_a_pulse_replay_it_cannot_build():
+    """An unwired process must say so, not draw half a figure.
+
+    Checked in a SEPARATE interpreter: this test suite imports the legacy
+    frontend package, which registers the factory, so the unregistered state
+    cannot be observed in-process without tearing down a global.
+    """
+
+    import subprocess
+    import sys
+
+    code = (
+        "from zlc_frontend.domain_ports import PulseReplayUnavailable, "
+        "pulse_state_from_dict, pulse_state_factory_is_registered\n"
+        "assert not pulse_state_factory_is_registered()\n"
+        "try:\n"
+        "    pulse_state_from_dict({})\n"
+        "except PulseReplayUnavailable as exc:\n"
+        "    assert 'register_pulse_state_factory' in str(exc), str(exc)\n"
+        "else:\n"
+        "    raise AssertionError('an unwired replay must refuse')\n"
+    )
+    subprocess.run([sys.executable, "-c", code], cwd=str(REPO_ROOT), check=True)
+
+
+def test_importing_the_legacy_frontend_wires_the_pulse_replay_port():
+    """Today's composition root.  Importing ANY frontend submodule runs the
+    package __init__, so a saved pulse figure always replays - the behaviour the
+    lazy `from ...pulse_table import PulseTableState` used to give for free."""
+
+    import Zou_lab_control.frontend  # noqa: F401
+    from zlc_frontend.domain_ports import (
+        pulse_state_factory_is_registered,
+        pulse_state_from_dict,
+    )
+
+    assert pulse_state_factory_is_registered()
+
+    state = _state([{"mode": "edge", "value": 20}, {"mode": "hold", "value": None},
+                    {"mode": "hold", "value": None}])
+    rebuilt = pulse_state_from_dict(state.to_dict())
+    assert type(rebuilt) is type(state), "the port rebuilds the real state class"
+    assert rebuilt.analog_bus_samples(BUS) == state.analog_bus_samples(BUS), (
+        "a round trip through the port preserves what the figure will draw"
+    )
+
+
+def test_a_second_conflicting_factory_is_refused():
+    """Two constructors would mean two answers to 'what did this pulse look
+    like'.  Re-registering the SAME callable stays fine - composition roots get
+    imported more than once."""
+
+    import pytest
+
+    from zlc_frontend import domain_ports
+
+    current = domain_ports._PULSE_STATE_FACTORY
+    assert current is not None
+    domain_ports.register_pulse_state_factory(current)  # idempotent
+
+    with pytest.raises(RuntimeError, match="ONE source"):
+        domain_ports.register_pulse_state_factory(lambda data: None)
+    assert domain_ports._PULSE_STATE_FACTORY is current

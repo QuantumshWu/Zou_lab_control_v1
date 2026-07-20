@@ -251,3 +251,25 @@ __all__ = [
     "write_notebook",
     "write_notes_tex",
 ]
+
+
+# ---------------------------------------------------------------- domain ports
+# This package is the legacy COMPOSITION ROOT for the render layer: it is the
+# one module that already sees both the frontend and the pulse domain, so it is
+# where the render layer's domain ports get wired.  Importing any submodule runs
+# this file first, so a saved pulse figure always replays.  At Z0, when
+# data_figure lives in zlc_frontend and this package is gone, zlc_workbench
+# inherits exactly this call.
+from zlc_frontend.domain_ports import register_pulse_state_factory as _register_pulse_state_factory
+
+
+def _pulse_state_from_dict(data):
+    """Kept lazy on purpose: importing the 3k-line pulse compiler is not the
+    price of importing a plotting package."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+
+    return PulseTableState.from_dict(data)
+
+
+_register_pulse_state_factory(_pulse_state_from_dict)

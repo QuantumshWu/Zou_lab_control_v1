@@ -60,6 +60,8 @@ MOVES = {
     "Zou_lab_control.neutral_atom.core.fitting": "zlc_data.curve_fitting",
     # H1c - what a saved figure records about where its data came from.
     "Zou_lab_control.neutral_atom.operations.figure_capture": "zlc_data.figure_capture",
+    # H1d - the live-plot family's array poller.
+    "Zou_lab_control.frontend._watcher": "zlc_frontend.live_plot._watcher",
 }
 
 _MODULE_INFRA = {
