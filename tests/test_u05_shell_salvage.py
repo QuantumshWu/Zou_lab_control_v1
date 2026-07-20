@@ -126,9 +126,17 @@ def test_moved_modules_import_no_legacy_code():
 #: the PORT SPECIFICATION for checklist 4: wiring the new data plane means
 #: cutting these seams one group at a time; each cut deletes its rows here.
 TENDRILS = {
-    "Zou_lab_control/frontend/task_console.py": {
-        ("neutral_atom.operations.logic", "ProcessorRun"),
-    },
+    # task_console.py: EMPTY, as of S5-shell(h).  Eleven domain imports came out in
+    # five slices and each needed a DIFFERENT answer, which is the record worth
+    # keeping: pure vocabulary and the starter-program writer SANK into ``zlc_data``;
+    # the per-slot sweep default could not sink (bus range + clock tick) so the
+    # template port hands over finished columns; two isinstance checks became
+    # questions about what a node DECLARES, matching the base's own "probed by
+    # attribute, not by type"; and the last one was a constructor, so the SPEC grew
+    # ``make_run`` beside its existing ``make_node`` and the shell stopped naming a
+    # node class at all.  Written as ``set()`` on purpose - a bare ``{}`` is an empty
+    # dict, and this ledger must stay a set as it empties.
+    "Zou_lab_control/frontend/task_console.py": set(),
     # live.py: EMPTY.  Its last two seams were cut differently and the contrast is
     # the whole lesson.  ``figure_capture`` was pure description over duck-typed
     # inputs, so it MOVED (see MOVES above).  The DAC-waveform helpers could not:

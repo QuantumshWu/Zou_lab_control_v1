@@ -8895,7 +8895,7 @@ class TaskConsole(QtWidgets.QWidget):
           * camera      -> readout.camera_spec().build(hub, ...)
           * measurement -> spec.make_node(hub, prefix=, repeat=, **values)  (the spec's scan tier
                            picks PulseScanNode vs ScannedMeasurementNode)
-          * processor   -> spec.make_node(...) (reactive) or a ProcessorRun (one-shot)
+          * processor   -> spec.make_node(...) (reactive) or spec.make_run(...) (one-shot)
           * task        -> spec.build(hub, **values)
         None of these ever opens a matplotlib plot -- they only publish to the hub."""
         kind = node.kind
@@ -8944,8 +8944,6 @@ class TaskConsole(QtWidgets.QWidget):
             # saved-data action (devices=(), e.g. Readout fidelity over a folder)
             # receives None for both, so it occupies nothing and starting it can never
             # stop an unrelated live node through the device-occupancy exclusion.
-            from Zou_lab_control.neutral_atom.operations.logic import ProcessorRun
-
             def _borrow(role: str):
                 # A ProcessorRun DRIVES its declared roles.  Borrow only an instance the
                 # source node itself holds EXCLUSIVE; a lifecycle/wiring record or OBSERVE
@@ -8961,7 +8959,8 @@ class TaskConsole(QtWidgets.QWidget):
 
             roles = {str(r) for r in (getattr(spec, "devices", ()) or ())}
             readout = getattr(self.session, "readout", None)
-            return ProcessorRun(self.hub, spec, readout=readout,
+            # Symmetric with the reactive branch above: the SPEC builds its own node.
+            return spec.make_run(self.hub, readout=readout,
                                  camera=_borrow("camera") if "camera" in roles else None,
                                  sequencer=_borrow("sequencer") if "sequencer" in roles else None,
                                  params=values)

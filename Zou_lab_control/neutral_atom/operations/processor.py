@@ -117,6 +117,31 @@ class ProcessorSpec(CatalogSpec):
     #: :class:`ProcessorContext` device fields (single vocabulary, validated below).
     CTX_DEVICE_ROLES: ClassVar[tuple[str, ...]] = ("camera", "sequencer")
 
+    def make_run(self, hub, *, readout, camera=None, sequencer=None,
+                 params: dict | None = None, prefix: str = ""):
+        """Build the one-shot node that DRIVES this spec's ``run``.
+
+        The reactive half of this class already owns its construction through
+        ``make_node``; this is the missing other half.  Without it a caller that
+        merely HOLDS a spec had to know which node class wraps a one-shot run,
+        which put the logic layer's class into the render layer's import graph for
+        no reason -- the console owns which devices to lend, never what to build.
+
+        Hardware is passed in rather than discovered: only the caller knows which
+        running node currently holds a device exclusively.  ``devices`` still says
+        which roles this spec may drive, and a saved-data action (``devices=()``)
+        is simply handed ``None`` for both.
+        """
+
+        from .logic import ProcessorRun          # the node layer builds on specs, not vice versa
+
+        if self.run is None:
+            raise ValueError(
+                f"ProcessorSpec {self.name!r} is reactive (make_node); a one-shot run "
+                "node needs a spec that sets run(ctx).")
+        return ProcessorRun(hub, self, readout=readout, camera=camera,
+                            sequencer=sequencer, params=params, prefix=prefix)
+
     def __post_init__(self) -> None:
         super().__post_init__()
         # Exactly one execution style -- a processor is reactive OR one-shot, never
