@@ -7490,9 +7490,13 @@ class TaskConsole(QtWidgets.QWidget):
         one in.  Stopped rows deliberately contribute nothing: their stored values may be stale
         against what their next Start will actually build (rejecting a legal start on stale
         edges is worse than re-checking honestly at that later start).  The DIRECT self-loop is
-        rejected at the base (Processor.__init__) -- one guard per scope."""
-        from ..neutral_atom.operations.logic import Processor
-        if not isinstance(start_node, Processor) or not getattr(start_node, "consumes", ()):
+        rejected at the base (Processor.__init__) -- one guard per scope.
+
+        A reactive node is recognised by what it DECLARES, not by its class: ``consumes``
+        is assigned by ``Processor.__init__`` alone, and the base already probes it the
+        same way (``LogicNode._collect_provenance``: "probed by attribute, not by type").
+        So the ring walk asks the node, and this layer needs no logic import at all."""
+        if not getattr(start_node, "consumes", ()):
             return None
         producer = {}
         for node in self.running_nodes:
@@ -7512,7 +7516,7 @@ class TaskConsole(QtWidgets.QWidget):
             if node is None or id(node) in seen:
                 continue
             seen.add(id(node))
-            inputs = node.consumes if isinstance(node, Processor) else ()
+            inputs = getattr(node, "consumes", ())
             for nxt in (str(n) for n in inputs):
                 if nxt in targets:
                     return [*path, nxt]          # the ring closes on this node's own output

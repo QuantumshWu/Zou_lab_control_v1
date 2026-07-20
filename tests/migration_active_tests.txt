@@ -65,6 +65,7 @@ tests/test_u04_signal_picker_owner.py
 tests/test_u04_status_strip_priority.py
 tests/test_u04_task_console_multi_card.py
 tests/test_u04_workspace_bootstrap.py
+tests/test_u05_reactive_ring_oracle.py
 tests/test_u05_shell_salvage.py
 tests/test_u06_shell_domain_ports.py
 tests/test_w1_capture_workbench.py
