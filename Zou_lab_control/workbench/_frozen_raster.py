@@ -151,6 +151,9 @@ class FrozenRasterWindow(QtWidgets.QWidget):
                 f"{self._prefix}-{page.key}",
                 self._tabs,
                 empty_text="Raster unavailable",
+                # A frozen report page is the ONE raster the operator cannot ask
+                # the system to re-render larger, so it must at least magnify.
+                zoomable=True,
             )
             board.setMinimumSize(320, 240)
             board.setObjectName(
