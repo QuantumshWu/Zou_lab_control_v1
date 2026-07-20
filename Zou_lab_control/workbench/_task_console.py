@@ -907,31 +907,40 @@ class TaskScanCard(QtWidgets.QWidget):
     """One stopped/configurable card around the existing scan panel."""
 
     finalReferenceChanged = QtCore.pyqtSignal(object)
+    removeRequested = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
         experiment: Experiment,
         initial_intent: TaskConsoleScanIntent | None = None,
         parent=None,
+        *,
+        name: str = "Pulse scan",
     ) -> None:
         super().__init__(parent)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("card name must be a non-empty string")
         self.setObjectName("taskConsoleScanCard")
         self._experiment = experiment
+        self._name = name
         self._session: ScanEditorSession | None = None
         self._panel: ScanWorkbenchWindow | None = None
         self._reported_final_reference = None
 
-        title = FluentLabel("Task: Pulse scan", self)
+        title = FluentLabel(f"Task: {name}", self)
         title.setObjectName("taskCardTitle")
         self._state = FluentLabel("STOPPED · CONFIGURATION REQUIRED", self)
         self._state.setObjectName("taskCardState")
         self._settings = FluentButton("Setting…", self, color=GREY)
         self._settings.setObjectName("taskSettingsButton")
+        self._remove = FluentButton("Remove", self, color=ORANGE)
+        self._remove.setObjectName("taskCardRemoveButton")
         header = QtWidgets.QHBoxLayout()
         header.addWidget(title)
         header.addWidget(self._state)
         header.addStretch(1)
         header.addWidget(self._settings)
+        header.addWidget(self._remove)
 
         self._tabs = FluentTabWidget(self)
         self._tabs.setObjectName("taskCardTabs")
@@ -966,6 +975,7 @@ class TaskScanCard(QtWidgets.QWidget):
         layout.addWidget(self._diagnostics)
 
         self._settings.clicked.connect(self._open_settings)
+        self._remove.clicked.connect(self._request_remove)
         self._tabs.currentChanged.connect(self._tab_changed)
         self._state_timer = QtCore.QTimer(self)
         self._state_timer.setInterval(100)
@@ -976,6 +986,10 @@ class TaskScanCard(QtWidgets.QWidget):
             self.load_intent(initial_intent)
         else:
             self._tabs.setCurrentWidget(self._edit_form)
+
+    @property
+    def name(self) -> str:
+        return self._name
 
     @property
     def device_catalog(self):
@@ -1074,6 +1088,11 @@ class TaskScanCard(QtWidgets.QWidget):
         if self._panel is not None:
             self._panel.shutdown()
 
+    def _request_remove(self) -> None:
+        # The card only asks; the console owns the card list and therefore owns
+        # the idle refusal, so the answer cannot differ between the two paths.
+        self.removeRequested.emit(self)
+
     def _install_panel(self, panel: ScanWorkbenchWindow) -> None:
         if self._panel is not None:
             raise RuntimeError("scan card already owns a panel")
@@ -1117,7 +1136,7 @@ class TaskScanCard(QtWidgets.QWidget):
 
 
 class TaskConsoleWindow(QtWidgets.QWidget):
-    """Current one-card TaskConsole; no legacy registry or generic graph."""
+    """TaskConsole board holding N independently removable scan cards."""
 
     def __init__(
         self,
@@ -1135,7 +1154,8 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         self.setObjectName("taskConsoleWindow")
         self.setWindowTitle("Task Console")
         self._experiment = experiment
-        self._card: TaskScanCard | None = None
+        self._cards: list[TaskScanCard] = []
+        self._created_cards = 0
         self._closing = False
         self._analysis_window = None
         self._analysis_source = None
@@ -1192,12 +1212,19 @@ class TaskConsoleWindow(QtWidgets.QWidget):
             self._create_card(initial_intent)
 
     @property
+    def cards(self) -> tuple[TaskScanCard, ...]:
+        return tuple(self._cards)
+
+    @property
     def scan_card(self) -> TaskScanCard | None:
-        return self._card
+        """The most recently added card, i.e. the one Save/Load acts on."""
+
+        return self._cards[-1] if self._cards else None
 
     @property
     def current_intent(self) -> TaskConsoleScanIntent | None:
-        return None if self._card is None else self._card.current_intent
+        card = self.scan_card
+        return None if card is None else card.current_intent
 
     @property
     def analysis_window(self):
@@ -1212,13 +1239,14 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         return destination
 
     def load_intent(self, path: str | Path) -> TaskConsoleScanIntent:
-        if self._card is not None and not self._card.idle:
+        card = self.scan_card
+        if card is not None and not card.idle:
             raise RuntimeError("scan panel must be stopped and idle before Load")
         intent = load_task_console_scan_intent(path)
-        if self._card is None:
+        if card is None:
             self._create_card(intent)
         else:
-            self._card.load_intent(intent)
+            card.load_intent(intent)
         self._status.setText(f"Loaded current intent stopped: {Path(path)}")
         return intent
 
@@ -1229,33 +1257,75 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         self._create_card(None)
 
     def _create_card(self, intent: TaskConsoleScanIntent | None) -> None:
-        if self._card is not None:
-            raise RuntimeError("TaskConsole currently owns exactly one card")
-        card = TaskScanCard(self._experiment, intent, self._card_host)
-        self._card = card
-        card.finalReferenceChanged.connect(self._sync_analysis_entry)
-        self._card_layout.removeWidget(self._empty)
-        self._empty.hide()
+        if self._closing:
+            raise RuntimeError("TaskConsole is closing and cannot add a card")
+        self._created_cards += 1
+        card = TaskScanCard(
+            self._experiment,
+            intent,
+            self._card_host,
+            name=f"Pulse scan #{self._created_cards}",
+        )
+        card.finalReferenceChanged.connect(self._card_final_reference_changed)
+        card.removeRequested.connect(self._remove_card)
+        if not self._cards:
+            self._card_layout.removeWidget(self._empty)
+            self._empty.hide()
+        self._cards.append(card)
         self._card_layout.addWidget(card, 1)
-        self._add.setEnabled(False)
-        self._catalog.setEnabled(False)
-        self._sync_analysis_entry(card.final_reference)
+        self._sync_analysis_entry()
         self._status.clear()
 
-    def _sync_analysis_entry(self, reference) -> None:
+    def _remove_card(self, card: TaskScanCard) -> None:
+        """Remove one stopped card; a running panel is refused, never killed."""
+
+        if card not in self._cards:
+            raise ValueError("card does not belong to this TaskConsole")
+        if not card.idle:
+            self._status.setText(
+                f"{card.name} must be stopped and idle before Remove"
+            )
+            return
+        name = card.name
+        # Disconnect before shutdown so a teardown-time reference change cannot
+        # re-enter the console about a card it has already decided to discard.
+        card.finalReferenceChanged.disconnect(self._card_final_reference_changed)
+        card.removeRequested.disconnect(self._remove_card)
+        card.shutdown()
+        self._cards.remove(card)
+        self._card_layout.removeWidget(card)
+        card.setParent(None)
+        card.deleteLater()
+        if not self._cards:
+            self._card_layout.addWidget(self._empty, 1)
+            self._empty.show()
+        self._sync_analysis_entry()
+        self._status.setText(f"Removed {name}")
+
+    def _card_final_reference_changed(self, reference) -> None:
+        self._sync_analysis_entry()
+
+    def _analysis_card(self) -> TaskScanCard | None:
+        """The most recent card that currently owns a FINAL scan artifact."""
+
+        for card in reversed(self._cards):
+            if card.final_reference is not None:
+                return card
+        return None
+
+    def _sync_analysis_entry(self) -> None:
         self._add_analysis.setEnabled(
-            not self._closing
-            and reference is not None
+            not self._closing and self._analysis_card() is not None
         )
 
     def _open_analysis(self) -> None:
-        card = self._card
+        card = self._analysis_card()
         reference = None if card is None else card.final_reference
         if reference is None:
             self._status.setText(
-                "Fit Analysis requires this card's current FINAL scan artifact"
+                "Fit Analysis requires a card's current FINAL scan artifact"
             )
-            self._sync_analysis_entry(None)
+            self._sync_analysis_entry()
             return
         current = self._analysis_window
         if (
@@ -1309,14 +1379,22 @@ class TaskConsoleWindow(QtWidgets.QWidget):
     def _show_error(self, error: BaseException) -> None:
         self._status.setText(f"{type(error).__name__}: {error}")
 
+    def _panels_closed(self) -> bool:
+        """Every embedded panel of every card has finished closing."""
+
+        for card in self._cards:
+            panel = card.panel
+            if panel is not None and not panel.closed:
+                return False
+        return True
+
     def closeEvent(self, event) -> None:
-        panel = None if self._card is None else self._card.panel
         if not self._closing:
             self._closing = True
             self._add_analysis.setEnabled(False)
-            if self._card is not None:
-                self._card.shutdown()
-        if panel is None or panel.closed:
+            for card in self._cards:
+                card.shutdown()
+        if self._panels_closed():
             self._close_timer.stop()
             release_window(self)
             event.accept()
@@ -1324,12 +1402,11 @@ class TaskConsoleWindow(QtWidgets.QWidget):
         event.ignore()
         if not self._close_timer.isActive():
             self.setEnabled(False)
-            self._status.setText("Closing embedded scan panel…")
+            self._status.setText("Closing embedded scan panels…")
             self._close_timer.start()
 
     def _poll_close(self) -> None:
-        panel = None if self._card is None else self._card.panel
-        if panel is None or panel.closed:
+        if self._panels_closed():
             self._close_timer.stop()
             QtCore.QTimer.singleShot(0, self.close)
 

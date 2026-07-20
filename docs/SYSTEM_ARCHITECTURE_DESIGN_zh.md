@@ -4630,6 +4630,14 @@ Pulse/FPGA：
 
 **禁止复制机制（本清单全程）：** 不得迁入旧 `SignalHub` 的全局名空间/latest-value join/gap→latest fallback；不得把 node-owned worker/thread 或运行期动态 pipeline edge 带进新架构；不得复制 console-wide `RenderLoop`/`_zlc_interacting`/`_beat_owed`/`_display_shot` 手写相干快门（等价物是 BoardFrame + CoherenceStamp + layout_generation + 单调 sequence）；不得按 rank/singleton/index-0/global-nanmean/anonymous-flatten 猜轴；不得让 GUI 与 worker 无确认共享同一 Figure/artist。
 
+**S4 进度账本（每片收口时追加一行，不写 changelog，只写状态与证据）：**
+
+| 片 | 状态 | 已闭合的冻结行为 | 证据 |
+| --- | --- | --- | --- |
+| S4-0 口径冻结 | `COMPLETED` | oracle 口径、49 条行为表、纵切序列、禁止机制、删除边界 | 本节 |
+| S4-1a 破 one-card | `COMPLETED` | Add Panel 每次真的再加一块板（旧实现第二次 Add 直接 `RuntimeError("TaskConsole currently owns exactly one card")` 且 Add/catalog 自禁用）；每块板自带 Remove，**Remove 拒绝未 idle 的板而不是杀掉它**（沿用 `load_intent` 既有的「must be stopped and idle」判据）；板名 `Pulse scan #N` 对齐 main 的 indexed_unique_name；`scan_card` 收敛为「最新一块板」，Analysis 目标收敛为「最新一块持有 FINAL artifact 的板」；关窗等待**每一块**板的嵌入面板排空 | `tests/test_u04_task_console_multi_card.py`（7 项 oracle，含拒绝语义与关窗等待） |
+| S4-1b 拓扑参数化 | `OPEN` | 面板卡片、树形 signal picker、Display 控件、参数即时生效三路径、shot clock、Pause/Selectors、tab 刷新 | — |
+
 **删除边界：** 清单4 迁完之前**禁止**整文件删除 legacy `Zou_lab_control/frontend/task_console.py`（它仍是 API_SLOT segmented、其它 Measurement/Processor、rolling/gridplot/selector/calibration/temperature/MOT panel 与旧入口的共同宿主）；U0.1 表的「保存/恢复」验收项不得删除，必须由 S4-7 正面交付。可删项按最后 consumer 逐项记账，留待清单9 Z0。
 
 ## 23. 核心结论
