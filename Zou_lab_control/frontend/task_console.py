@@ -65,6 +65,7 @@ from .live import (
     site_ring_radius,
 )
 from zlc_frontend.render_style import PALETTE  # the ONE render colour owner
+from zlc_frontend import board_layout as _layout
 from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
 from zlc_data.shape_text import slot_label   # the ONE human slot-label formatter (period/channel)
 from zlc_frontend.qt_widgets import (
@@ -1295,6 +1296,18 @@ GRID_UNIT = 8
 # spacing.
 GAP = GRID_UNIT
 
+
+def _board_metrics() -> "_layout.BoardMetrics":
+    """The two facts the moved packer cannot derive, read LIVE on every call.
+
+    ``_card_size`` stays here because it is the bridge between the FIGURE size (render
+    layer) and the card CHROME (Qt tokens) -- neither of which the packer may import.
+    Built fresh rather than cached: card pixels follow the current Qt scale, and a value
+    captured once would go stale exactly the way a snapshot shim does.
+    """
+
+    return _layout.BoardMetrics(gap=GAP, card_size=_card_size)
+
 def _cell_size() -> tuple[int, int]:
     """The base CARD WIDTH unit = a 1x2 panel's card: the figure (1 row x 2 cols) plus the card
     chrome (L/R border + grey title strip + bottom border).  Every card width is a whole number of
@@ -1339,131 +1352,42 @@ def _opaque_white_composite(pm):
 
 
 def _aabb(cfg) -> tuple[int, int, int, int]:
-    """The card's pixel AABB ``(x0, y0, x1, y1)`` -- top-left ``(col, row)`` plus its size."""
-    w, h = _card_size(cfg.size)
-    return (cfg.col, cfg.row, cfg.col + w, cfg.row + h)
+    """The card's pixel AABB -- see :func:`zlc_frontend.board_layout._aabb`."""
+    return _layout._aabb(cfg, _board_metrics())
 
 
 def _overlaps_with_gap(box: tuple[int, int, int, int], placed) -> bool:
-    """True when ``box`` (an ``(x0, y0, x1, y1)`` AABB), EXPANDED by ``GAP`` on all sides, intersects
-    any already-placed card.  Equivalently: the clear distance between ``box`` and a placed card is
-    < GAP on the axis where they overlap, so leaving a card exactly GAP away counts as clear."""
-    x0, y0, x1, y1 = box
-    for p in placed:
-        px0, py0, px1, py1 = _aabb(p)
-        if x0 < px1 + GAP and px0 < x1 + GAP and y0 < py1 + GAP and py0 < y1 + GAP:
-            return True
-    return False
+    """See :func:`zlc_frontend.board_layout._overlaps_with_gap`."""
+    return _layout._overlaps_with_gap(box, placed, _board_metrics())
 
 
-class _GeomProxy:
-    """A throwaway geometry stand-in (size + packed pixel top-left) that :func:`pack` can place
-    WITHOUT mutating a real ``PanelConfig``.  :func:`drop_index` packs proxies to probe where a
-    trial order would put a card, so the ONE packer is also the drag oracle (no second rule)."""
-
-    __slots__ = ("size", "col", "row")
-
-    def __init__(self, size: str, col: int = 0, row: int = 0):
-        self.size, self.col, self.row = str(size), int(col), int(row)
+#: The placement-only stand-in now lives with the packer it serves.
+_GeomProxy = _layout.GeomProxy
 
 
 def _first_free_slot(cfg, placed, board_w: int) -> tuple[int, int]:
-    """The TOP-MOST then LEFT-MOST free ``(col, row)`` where ``cfg`` fits clear of every ``placed`` card
-    (GAP apart, inside ``board_w``) -- the per-card north-west placement :func:`pack` applies to EVERY
-    card in order (so the board tiles the top row left-to-right, wraps to the next shelf, and never
-    leaves a middle hole).  Candidate points are GAP (origin) + each placed card's right/bottom edge
-    (``+GAP``) and its left/top edge (so a card can tuck under a wider one); swept by y then x, first
-    feasible wins."""
-    w, _h = _card_size(cfg.size)
-    xs = {GAP}
-    ys = {GAP}
-    for p in placed:
-        px0, py0, px1, py1 = _aabb(p)
-        xs.add(px1 + GAP)
-        ys.add(py1 + GAP)
-        xs.add(px0)            # also align left edges, so a card can tuck under a wider one
-        ys.add(py0)
-    max_x = max(GAP, board_w - GAP - w)
-    cand_x = sorted(x for x in xs if GAP <= x <= max_x) or [GAP]
-    for y in sorted(ys):
-        for x in cand_x:
-            if not _overlaps_with_gap((x, y, x + w, y + _h), placed):
-                return (x, y)
-    # No candidate fit (should not happen -- placing past the lowest card always clears).
-    bottom = max((py1 for *_rest, py1 in (_aabb(p) for p in placed)), default=0)
-    return (GAP, bottom + GAP if placed else GAP)
+    """See :func:`zlc_frontend.board_layout.first_free_slot`."""
+    return _layout.first_free_slot(cfg, placed, board_w, _board_metrics())
 
 
 def _min_board_width(configs: Sequence["PanelConfig"]) -> int:
-    """The NARROWEST a board may pack to: one WIDEST card plus both GAP margins.  A viewport thinner
-    than this still has to fit the widest card, so we clamp up to it -- but NOT to the cards' current
-    right-extent: clamping to the extent would RATCHET (once cards spread wide the board could never
-    pack narrower), so narrowing the window would never reflow into a single column.  At one-card
-    width the gravity packer simply stacks every card in one column, which is the correct reflow."""
-    widest = max((_card_size(c.size)[0] for c in configs), default=_card_size("1x2")[0])
-    return widest + 2 * GAP
+    """See :func:`zlc_frontend.board_layout.min_board_width`."""
+    return _layout.min_board_width(configs, _board_metrics())
 
 
 def _board_width(configs: Sequence["PanelConfig"]) -> int:
-    """A fallback packing width for callers without a live viewport (the pure-function tests): two
-    of the WIDEST card side by side plus the GAP margins, so cards CAN pack side by side.  The real
-    GUI passes the scroll viewport width to :func:`pack` instead, so the board wraps at the edge."""
-    widest = max((_card_size(c.size)[0] for c in configs), default=_card_size("1x2")[0])
-    return max(2 * widest + 3 * GAP, _min_board_width(configs))
+    """See :func:`zlc_frontend.board_layout.board_width`."""
+    return _layout.board_width(configs, _board_metrics())
 
 
 def pack(order: Sequence["PanelConfig"], board_w: int | None = None) -> bool:
-    """The ONE board packer: place each card, IN THE GIVEN LIST ORDER, at the TOP-MOST then LEFT-MOST
-    GAP-clear slot (:func:`_first_free_slot`).  Strict north-west gravity as a PURE function of the
-    ORDER (the board's single source of truth), the sizes, and ``board_w`` -- it does NOT read any
-    card's current pixel position, so it is deterministic and idempotent.
-
-    That is what fixes issue #2.  The old packer floated each card up-left from WHERE IT WAS, gated by
-    a fuzzy majority-overlap test and seeded from a pixel-sorted reading order -- so a resize/click
-    could converge to a DIFFERENT fixed point (a surprising "reflow" that read as violating top-left
-    gravity), and an Add seeded into the first middle HOLE.  Here placement depends only on order:
-    the first card lands at ``(GAP, GAP)``; every later card fills the first free NW slot clearing all
-    already-placed cards by GAP within ``board_w`` (else drops to a new shelf below).  An Add appended
-    LAST therefore always lands in the next bottom slot -- never a middle hole -- and re-packing a
-    settled board moves nothing.  A drop REORDERS the list (:func:`drop_index`); pack recomputes every
-    pixel from the new order.  ``board_w`` None -> a two-wide headless fallback; a given width is
-    honoured but clamped up to one-card-wide.  Returns True if any card's ``(col, row)`` changed."""
-    order = list(order)
-    board_w = _board_width(order) if board_w is None else max(board_w, _min_board_width(order))
-    placed: list = []
-    moved = False
-    for cfg in order:
-        col, row = _first_free_slot(cfg, placed, board_w)
-        if (cfg.col, cfg.row) != (col, row):
-            cfg.col, cfg.row = col, row
-            moved = True
-        placed.append(cfg)
-    return moved
+    """See :func:`zlc_frontend.board_layout.pack` -- the ONE board packer, now in the target package."""
+    return _layout.pack(order, _board_metrics(), board_w)
 
 
 def drop_index(cfg, others: Sequence["PanelConfig"], board_w: int | None = None) -> int:
-    """The ORDER index at which to insert a card DROPPED at its raw pixel ``(cfg.col, cfg.row)`` among
-    ``others`` (already in order), so it lands NEAREST the drop point under :func:`pack` gravity.
-
-    This is the user's Z1 rule expressed through the ONE packer instead of a separate placement math:
-    for every candidate insertion index we pack a trial order (proxies, so the real configs are never
-    mutated) and measure where the dropped card ends up; the index whose resulting top-left is closest
-    to the raw drop wins.  A drop near an existing card's slot lands ON it (index before it -> that card
-    and everything after shift DOWN the order and re-pack = "displace"); a drop past the last card lands
-    at the bottom (append).  Ties -> the earliest index, so dropping squarely onto a card displaces it.
-    Pure geometry (no Qt).  Board width None -> the same headless fallback :func:`pack` uses."""
-    board_w = _board_width(list(others) + [cfg]) if board_w is None else board_w
-    drop_x, drop_y = int(round(cfg.col)), int(round(cfg.row))
-    proxies = [_GeomProxy(o.size) for o in others]
-    best_i, best_d = 0, None
-    for k in range(len(proxies) + 1):
-        probe = _GeomProxy(cfg.size)
-        trial = proxies[:k] + [probe] + proxies[k:]
-        pack(trial, board_w)
-        d = (probe.col - drop_x) ** 2 + (probe.row - drop_y) ** 2
-        if best_d is None or d < best_d:
-            best_d, best_i = d, k
-    return best_i
+    """See :func:`zlc_frontend.board_layout.drop_index`."""
+    return _layout.drop_index(cfg, others, _board_metrics(), board_w)
 
 
 def _task_files_dir() -> Path:
