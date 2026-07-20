@@ -1,4 +1,6 @@
-"""The console's signal-ring guard, recognised by DECLARATION rather than by class.
+"""Console predicates that ask what a node DECLARES instead of what class it is.
+
+Two seams left the shell ledger on this principle, and both are pinned here.
 
 ``TaskConsole._reactive_ring`` refuses a Start that would close a feedback loop
 through the hub: node A consumes what node B publishes, B consumes what A
@@ -19,7 +21,7 @@ instances rather than duck-typed stand-ins: a guard that recognises nodes by
 declaration would be trivially satisfied by fakes shaped to please it, which
 proves nothing about the objects the console actually receives.
 
-This file is the independent oracle for the seam cut in S5-shell(f).  The older
+This file is the independent oracle for the seams cut in S5-shell(f) and (g).  The older
 ``tests/test_signal_cycle_guard.py`` covers the same method but is outside
 ``tests/migration_active_tests.txt`` and therefore frozen: not run, not modified,
 and not evidence for this branch.
@@ -145,3 +147,47 @@ def test_a_node_that_declares_no_inputs_is_not_walked(monkeypatch):
     console.running_nodes = []
     assert console._reactive_ring(_Source("raw")) is None
     assert console._reactive_ring(object()) is None
+
+
+def test_publishing_a_fit_is_a_declaration_not_a_class():
+    """Why the ``FitProcessor`` row could leave the ledger above.
+
+    The console pushes a fit overlay for every panel whose analysis node is
+    currently fitting.  It used to ask ``isinstance(node, FitProcessor) and
+    node.action == "fit"`` - a domain import in the render layer.  It now asks
+    whether the node DECLARES ``<prefix>fit_valid``, which is legitimate only if
+    the two predicates agree on every real node shape.
+
+    They agree because ``AnalysisProcessor.provides`` dispatches on the live
+    action and the domain keeps declared == published per action, so a node that
+    has switched to "roi" stops declaring the fit keys.  This test is the proof,
+    not the prose: it evaluates BOTH predicates on the three shapes that exist and
+    requires them to match, and requires the outcomes to differ across the shapes
+    so a predicate that answered a constant could not pass.
+
+    There is no other coverage of ``_push_fit_overlays`` in the repository -
+    active or frozen - so this equivalence is the only thing standing between the
+    seam removal and a silent behaviour change.
+    """
+
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.processors.analysis import AnalysisProcessor
+    from Zou_lab_control.neutral_atom.operations.processors.fit import FitProcessor
+
+    hub = SignalHub()
+    nodes = {
+        "bare fit": FitProcessor(hub, source_expr="src", prefix="f_"),
+        "analysis fitting": AnalysisProcessor(hub, action="fit", source_expr="src", prefix="af_"),
+        "analysis roi": AnalysisProcessor(hub, action="roi", source_expr="src", prefix="ar_"),
+    }
+
+    def was_fitting(node):                      # the predicate the console used to run
+        return isinstance(node, FitProcessor) and getattr(node, "action", "fit") == "fit"
+
+    def declares_fit(node):                     # the predicate it runs now
+        return f"{node.prefix}fit_valid" in node.published_signals()
+
+    verdicts = {label: (was_fitting(n), declares_fit(n)) for label, n in nodes.items()}
+    for label, (old, new) in verdicts.items():
+        assert old == new, f"{label}: type test said {old}, declaration said {new}"
+    assert {old for old, _ in verdicts.values()} == {True, False},         "the fixture must contain both a fitting and a non-fitting node"

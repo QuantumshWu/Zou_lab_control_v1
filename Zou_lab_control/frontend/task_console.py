@@ -8353,7 +8353,6 @@ class TaskConsole(QtWidgets.QWidget):
         reconstructs the curve/dot from published parameters, never solving on the Qt thread (#6).  Gated
         on the node's published version so an unchanged fit costs nothing (and the result labels are
         change-gated on top, so no per-tick setText thrash)."""
-        from ..neutral_atom.operations.processors.fit import FitProcessor
         from .live import GridPlot
         for card in self.cards:
             plotter = card.plotter
@@ -8362,11 +8361,17 @@ class TaskConsole(QtWidgets.QWidget):
                 continue
             row = self._panel_analysis_row(card)
             node = self._logic_nodes.get(id(row)) if row is not None else None
-            # An Analysis node inherits BOTH strategies -- only its CURRENT action decides whether it
-            # publishes fit params (a bare FitProcessor without .action defaults to "fit").
-            if not isinstance(node, FitProcessor) or getattr(node, "action", "fit") != "fit":
+            # A node publishes fit parameters when it SAYS it does.  An Analysis node inherits BOTH
+            # strategies and its ``provides`` dispatches on the CURRENT action (analysis.py keeps
+            # declared == published per action), so the declaration already answers "is this fitting
+            # right now" -- and it names the very signal the version gate below reads, so the test and
+            # the gate cannot drift apart.
+            if node is None:                       # no analysis node bound to this panel yet
                 continue
-            version = self.hub.signal_versions().get(node.prefix + "fit_valid", -1)
+            fit_valid = f"{node.prefix}fit_valid"   # every LogicNode carries prefix/published_signals
+            if fit_valid not in node.published_signals():
+                continue
+            version = self.hub.signal_versions().get(fit_valid, -1)
             if is_grid:
                 # #6b: a facet grid fit is the SAME worker node, publishing per-cell params.  Push them
                 # to the grid, which reconstructs each cell's curve (solve=False) -- so a grid fit NEVER

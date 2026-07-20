@@ -75,7 +75,7 @@ Z2B_ACTIVE_TEST_IMPORTERS = {
     Path("tests/test_calibration_sitemap_inputs.py"),   # legacy calibration inputs
     Path("tests/test_public_hardware_boundary.py"),     # audits the legacy surface itself
     Path("tests/test_u04_signal_picker_owner.py"),      # picker ownership across the move
-    Path("tests/test_u05_reactive_ring_oracle.py"),     # the ring guard IS a legacy-console method
+    Path("tests/test_u05_declaration_not_class.py"),    # pins predicates ON legacy console/domain nodes
     Path("tests/test_u06_shell_domain_ports.py"),       # proves the legacy root wires the port
     Path("tests/test_zlc_frontend_form.py"),            # form parity across the move
 }

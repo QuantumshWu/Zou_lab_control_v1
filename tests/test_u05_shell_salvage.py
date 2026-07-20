@@ -128,7 +128,6 @@ def test_moved_modules_import_no_legacy_code():
 TENDRILS = {
     "Zou_lab_control/frontend/task_console.py": {
         ("neutral_atom.operations.logic", "ProcessorRun"),
-        ("neutral_atom.operations.processors.fit", "FitProcessor"),
     },
     # live.py: EMPTY.  Its last two seams were cut differently and the contrast is
     # the whole lesson.  ``figure_capture`` was pure description over duck-typed
