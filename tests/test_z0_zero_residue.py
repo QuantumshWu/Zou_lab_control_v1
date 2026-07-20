@@ -83,6 +83,7 @@ Z2B_ACTIVE_TEST_IMPORTERS = {
     Path("tests/test_u05_panel_config.py"),             # same, for the panel record the frontend re-exports
     Path("tests/test_u05_console_state_format.py"),     # demonstrates the schema break on the real record
     Path("tests/test_u05_project_root_single_source.py"),  # pins both shells onto the storage path seam
+    Path("tests/test_u05_console_state_module.py"),      # asserts the shell names ARE the moved objects
     Path("tests/test_u06_shell_domain_ports.py"),       # proves the legacy root wires the port
     Path("tests/test_zlc_frontend_form.py"),            # form parity across the move
 }

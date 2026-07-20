@@ -131,6 +131,11 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
     # the ``value = ...`` expression a HUMAN typed into the Setting, so the named entry
     # follows the code rather than the guard being widened.
     (Path("zlc_data/console_records.py"), "PanelConfig.set_source"),
+    # The saved-layout record moved into zlc_frontend (S5-shell(w)).  Both normalisation
+    # points are exactly the boundary this guard reserves .strip() for: an environment
+    # variable a human typed, and a task NAME a human typed on the CLI or in the GUI.
+    (Path("zlc_frontend/console_state.py"), "task_files_dir"),
+    (Path("zlc_frontend/console_state.py"), "resolve_task_state"),
         (Path("zlc_frontend/live_plot/live.py"), "general_fit_models"),
         (Path("zlc_frontend/live_plot/live.py"), "facet_cell_labels"),
         (Path("zlc_frontend/live_plot/plot_figure.py"), "SavedFigure.axis_labels"),

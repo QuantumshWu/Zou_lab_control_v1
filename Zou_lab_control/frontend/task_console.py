@@ -34,8 +34,6 @@ frontend.panel_plot and never part of the layout.
 
 from __future__ import annotations
 
-import copy
-import json
 import hashlib
 import inspect
 import math as _math
@@ -87,7 +85,13 @@ from zlc_data.console_records import (
 from zlc_frontend.qt_widgets import LogicNodeRow as _LogicNodeRow
 from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
 from zlc_data.shape_text import slot_label   # the ONE human slot-label formatter (period/channel)
-from zlc_storage.paths import project_path   # the ONE owner of where the project root is
+from zlc_frontend.console_state import (
+    TASK_FILES_ENV as _TASK_FILES_ENV,
+    TaskConsoleState as _TaskConsoleState,
+    default_console_state as _default_console_state,
+    resolve_task_state as _resolve_task_state,
+    task_files_dir as _task_files_dir,
+)
 from zlc_frontend.qt_widgets import PulseSlotsWidget, SignalExprWidget
 from zlc_frontend.qt_widgets import (
     ACCENT,
@@ -171,7 +175,8 @@ from zlc_data.vocabulary import DEFAULT_MID_RUN_KEY
 from zlc_storage import exact_mapping
 
 
-TASK_FILES_ENV = "ZLC_TASK_DIR"
+#: Now :data:`zlc_frontend.console_state.TASK_FILES_ENV`; the old name stays an alias.
+TASK_FILES_ENV = _TASK_FILES_ENV
 
 # ---- RESERVED expression-namespace keys (each spelled ONCE; every writer/reader shares these).
 #: The running task's typed mid-run tensor: injected off-hub by the console each tick, read by the
@@ -863,20 +868,6 @@ def drop_index(cfg, others: Sequence["PanelConfig"], board_w: int | None = None)
     return _layout.drop_index(cfg, others, _board_metrics(), board_w)
 
 
-def _task_files_dir() -> Path:
-    """The folder saved console layouts live in: ``$ZLC_TASK_DIR`` if set, else the project's
-    ``tasks/``.  The default comes from :func:`zlc_storage.paths.project_path`, the one owner of
-    "where the project root is" -- deriving it again from THIS file's own depth would agree only
-    for as long as this file stays exactly where it is, which the migration is in the business
-    of changing.
-
-    A whitespace-only override falls back rather than crashing: it is a human typo in an
-    environment variable, and ``Path("   ").mkdir()`` raised FileNotFoundError.  The sibling
-    ``pulse_gui._pulse_files_dir`` already stripped; the two now agree."""
-    root = os.environ.get(TASK_FILES_ENV, "").strip()
-    path = Path(root).expanduser() if root else project_path("tasks")
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 #: relim modes (confocal_gui combo_relim naming) -- the SINGLE source for both the Setting
@@ -938,100 +929,12 @@ PanelConfig = _PanelConfig
 LogicNodeConfig = _LogicNodeConfig
 
 
-class TaskConsoleState:
-    """The whole console layout: serialised as ONE machine-portable JSON file."""
-
-    #: The PERSISTED discriminator, defined in :mod:`zlc_data.console_records`.  It reads
-    #: like this module's path and must NOT track it: see CONSOLE_STATE_SCHEMA for why
-    #: re-deriving it would make every already-saved layout unopenable.
-    schema = CONSOLE_STATE_SCHEMA
-
-    def __init__(
-        self,
-        *,
-        name: str = "task",
-        interval_ms: int = 400,
-        panels: Sequence[PanelConfig | Mapping[str, object]] | None = None,
-        logic: Sequence[LogicNodeConfig | Mapping[str, object]] | None = None,
-    ):
-        self.name = str(name)
-        self.interval_ms = max(50, int(interval_ms))
-        self.panels = [
-            PanelConfig.from_dict(
-                copy.deepcopy(
-                    panel.to_dict()
-                    if isinstance(panel, PanelConfig)
-                    else panel
-                )
-            )
-            for panel in (panels or [])
-        ]
-        # The Logic-tab nodes (measurement / processor / task), saved alongside the
-        # plot panels so a layout restores the whole dashboard -- nodes always come
-        # back STOPPED (the layout records what to build, not a running thread).
-        self.logic = [
-            LogicNodeConfig.from_dict(
-                copy.deepcopy(
-                    node.to_dict()
-                    if isinstance(node, LogicNodeConfig)
-                    else node
-                )
-            )
-            for node in (logic or [])
-        ]
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "schema": self.schema,
-            "name": self.name,
-            "interval_ms": self.interval_ms,
-            "panels": [panel.to_dict() for panel in self.panels],
-            "logic": [node.to_dict() for node in self.logic],
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "TaskConsoleState":
-        data = _layout_record(payload, _TASK_CONSOLE_STATE_FIELDS, cls.schema)
-        if data["interval_ms"] < 50:
-            raise ValueError("interval_ms must be at least 50")
-        return cls(
-            name=data["name"],
-            interval_ms=data["interval_ms"],
-            panels=data["panels"],
-            logic=data["logic"],
-        )
-
-    def save(self, path: str | Path) -> Path:
-        path = Path(path)
-        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
-        return path
-
-    @classmethod
-    def load(cls, path: str | Path) -> "TaskConsoleState":
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls.from_dict(payload)
-
-
-def default_console_state() -> TaskConsoleState:
-    """The console opens EMPTY.  You build the dashboard yourself (Add Panel) and
-    Save it to a file; you reuse it by Loading that file back (the Load button /
-    ``--task`` / ``show_task_console(task=)``)."""
-
-    return TaskConsoleState(name="task", panels=[])
-
-
-def resolve_task_state(task: str) -> TaskConsoleState:
-    """Resolve a task layout by FILE PATH or a saved tasks/<name>.json."""
-
-    text = str(task).strip()
-    path = Path(text)
-    if path.suffix.lower() == ".json" and path.exists():
-        return TaskConsoleState.load(path)
-    saved = _task_files_dir() / f"{text}.json"
-    if saved.exists():
-        return TaskConsoleState.load(saved)
-    raise ValueError(
-        f"unknown task {task!r}: not a layout file and not a saved layout in {_task_files_dir()}.")
+#: The saved-layout record, its JSON file and the name->layout resolver now live in
+#: :mod:`zlc_frontend.console_state` (L315 keeps a domain-schema reader out of storage;
+#: L327 lets the frontend depend on storage).  The old names stay as plain aliases.
+TaskConsoleState = _TaskConsoleState
+default_console_state = _default_console_state
+resolve_task_state = _resolve_task_state
 
 
 # ====================================================================== panels

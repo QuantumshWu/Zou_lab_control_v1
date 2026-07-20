@@ -40,8 +40,12 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 
 #: (module path, helper name, env var name, folder) for the two shells that keep a
 #: user-facing folder of saved files.
+#: The tasks entry named ``task_console._task_files_dir`` until S5-shell(w) moved the whole
+#: saved-layout cluster into ``zlc_frontend.console_state``.  The claim is unchanged -- ask
+#: the seam, never count your own parents -- so it follows the function rather than being
+#: deleted along with the shell that used to hold it.
 SHELLS = [
-    ("Zou_lab_control/frontend/task_console.py", "_task_files_dir", "TASK_FILES_ENV", "tasks"),
+    ("zlc_frontend/console_state.py", "task_files_dir", "TASK_FILES_ENV", "tasks"),
     ("Zou_lab_control/frontend/pulse_gui.py", "_pulse_files_dir", "PULSE_FILES_ENV", "pulses"),
 ]
 
