@@ -300,3 +300,10 @@ __all__ = [
     "stroke_card_border",
     "window_pad",
 ]
+
+# The salvaged legacy param-form module lives INSIDE this package (it is Qt
+# code, and qt_widgets is the package's one Qt owner).  Imported LAST so its
+# own `from zlc_frontend.qt_widgets import ...` finds every facade name bound.
+# Reachable as an attribute like `fluent`/`board`; deliberately NOT in
+# __all__ - the legacy shim is its only sanctioned outside consumer.
+from . import param_widgets  # noqa: E402,F401

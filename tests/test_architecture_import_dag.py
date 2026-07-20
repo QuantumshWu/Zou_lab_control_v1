@@ -58,6 +58,14 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         # editable combo, which is exactly the named-adapter boundary this guard
         # reserves .strip() for.
         (Path("zlc_frontend/qt_widgets/signal_picker.py"), "read_editable_combo"),
+        # Salvaged legacy param-form handlers: every one of these reads what a
+        # human TYPED into a form field (JSON body, device ref, path, pulse-slot
+        # program text) - the exact named-adapter boundary .strip() is reserved for.
+        (Path("zlc_frontend/qt_widgets/param_widgets.py"), "JsonHandler.read"),
+        (Path("zlc_frontend/qt_widgets/param_widgets.py"), "JsonHandler.is_empty"),
+        (Path("zlc_frontend/qt_widgets/param_widgets.py"), "DeviceRefHandler.is_empty"),
+        (Path("zlc_frontend/qt_widgets/param_widgets.py"), "PathHandler.is_empty"),
+        (Path("zlc_frontend/qt_widgets/param_widgets.py"), "PulseSlotsHandler.is_empty"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_TextHandler.is_empty"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.read"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.is_empty"),

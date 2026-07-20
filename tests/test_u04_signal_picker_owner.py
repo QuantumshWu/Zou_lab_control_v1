@@ -58,7 +58,11 @@ def test_the_old_module_re_exports_rather_than_copying():
     source = (
         ROOT / "Zou_lab_control" / "frontend" / "param_widgets.py"
     ).read_text(encoding="utf-8")
-    assert "from zlc_frontend.qt_widgets import (" in source
+    # Since the shell salvage the whole legacy module is a forwarding shim onto
+    # zlc_frontend.qt_widgets.param_widgets - a STRONGER form of the original
+    # "re-export, never copy" requirement this test was written to pin.
+    assert "zlc_frontend.qt_widgets.param_widgets" in source
+    assert "MOVED to" in source
     for name in PUBLIC:
         assert f"def {name}(" not in source, f"{name} still has a second definition"
 

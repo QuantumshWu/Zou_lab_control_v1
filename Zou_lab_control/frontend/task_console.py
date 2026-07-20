@@ -124,7 +124,7 @@ except Exception:  # pragma: no cover - depends on the local matplotlib install
 # Single source for turning a path param into an unambiguous, project-anchored display
 # string (an absolute path, never a bare CWD-relative name) -- the same seam the analysis
 # layer uses to resolve paths, so the field shows exactly the file/folder that is used.
-from Zou_lab_control._paths import display_path
+from zlc_storage.paths import display_path
 
 # The ONE param-kind -> widget registry every form in this module dispatches through: a
 # ParamDecl of kind K is built / read / seeded / validated / refreshed by PARAM_WIDGETS[K].
