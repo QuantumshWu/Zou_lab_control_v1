@@ -14,12 +14,15 @@ from ``operations/logic.py``, which cannot move (it reaches devices and the sign
 hub); the legacy module imports them back, so every existing caller keeps
 resolving the SAME function objects.
 
-Admission rule: a pure function from shapes/counts to text, with no knowledge of
-who is asking.  Anything needing a running node belongs in
+Admission rule: a pure derivation of TEXT THAT BOTH SURFACES MUST AGREE ON - a
+shape's spelling, or the spelling of a name the domain publishes and the GUI has
+to reproduce.  No knowledge of who is asking.  Anything needing a running node belongs in
 ``zlc_frontend.domain_ports`` instead.
 """
 
 from __future__ import annotations
+
+import re
 
 import numpy as np
 
@@ -29,6 +32,7 @@ __all__ = [
     "describe_shape",
     "format_dims",
     "grid_for_points",
+    "measurement_slug",
 ]
 
 
@@ -106,3 +110,12 @@ def camera_frame_keys(frames_per_cycle, prefix=""):
     the two can never drift -- a declared 'waiting' name always equals what the running camera will emit."""
     n = max(1, int(frames_per_cycle or 1))
     return [f"{prefix}frame_{i}" for i in range(n)]
+
+
+def measurement_slug(name: str) -> str:
+    """Canonical machine token for a measurement, derived from its display ``name``
+    (lower-case, non-alphanumeric runs -> single ``_``, trimmed).  ONE source: the
+    node prefix + every published signal name derive from this, so the measurement is
+    called the same thing in the Add-Panel list, the signal-flow legend, and the hub
+    signal names -- never a separately hand-typed abbreviation that drifts."""
+    return re.sub(r"_+", "_", re.sub(r"[^0-9a-z]+", "_", str(name).lower())).strip("_")

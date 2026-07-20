@@ -25,6 +25,8 @@ from typing import Any, Callable, ClassVar, Protocol, runtime_checkable
 
 import numpy as np
 
+from zlc_data.shape_text import measurement_slug  # one spelling of a node's token
+
 from Zou_lab_control._readout_math import finite_mean
 from Zou_lab_control._viewer_registry import active_plotter
 
@@ -304,14 +306,6 @@ def device_params_for(roles, device_set):
         for key, domain, opts in normalize_device_roles(roles))
 
 
-def measurement_slug(name: str) -> str:
-    """Canonical machine token for a measurement, derived from its display ``name``
-    (lower-case, non-alphanumeric runs -> single ``_``, trimmed).  ONE source: the
-    node prefix + every published signal name derive from this, so the measurement is
-    called the same thing in the Add-Panel list, the signal-flow legend, and the hub
-    signal names -- never a separately hand-typed abbreviation that drifts."""
-    import re
-    return re.sub(r"_+", "_", re.sub(r"[^0-9a-z]+", "_", str(name).lower())).strip("_")
 
 
 def axis_range_tuple(value, name: str) -> tuple[float, float, int]:

@@ -8191,7 +8191,7 @@ class TaskConsole(QtWidgets.QWidget):
                     pass
         if not keys or not any((base + key) in running for key in keys):
             return base                              # no collision (incl. own restart) -> the base names
-        from Zou_lab_control.neutral_atom.operations.measurement import measurement_slug
+        from zlc_data.shape_text import measurement_slug
         slug = measurement_slug(node.title or node.name) or str(node.kind) or "node"
         prefix, k = f"{slug}_", 2
         while prefix in {getattr(n, "prefix", "") for n in self.running_nodes} \
@@ -8312,7 +8312,7 @@ class TaskConsole(QtWidgets.QWidget):
         re-drag republishes the SAME name with a byte-stable schema (:func:`region_tensor` -- fixed
         shape, ``role='control'``), so a retarget can never fork the schema or gap a running consumer."""
         from zlc_data.plot_region import region_doc, region_tensor
-        from ..neutral_atom.operations.measurement import measurement_slug
+        from zlc_data.shape_text import measurement_slug
         name = str(card.config.params.get("region_signal") or "")
         if not name:
             slug = measurement_slug(card.config.title) or "panel"

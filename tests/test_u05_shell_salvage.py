@@ -132,7 +132,6 @@ TENDRILS = {
         ("neutral_atom.operations.logic", "ProcessorRun"),
         ("neutral_atom.operations.measurement", "SWEEP_API_SLOT"),
         ("neutral_atom.operations.measurement", "SWEEP_SCAN_SLOT"),
-        ("neutral_atom.operations.measurement", "measurement_slug"),
         ("neutral_atom.operations.measurements.pulse_scan", "_resolve_probe_template"),
         ("neutral_atom.operations.measurements.pulse_scan", "_semantic_api_names"),
         ("neutral_atom.operations.measurements.pulse_scan", "_semantic_scan_names"),

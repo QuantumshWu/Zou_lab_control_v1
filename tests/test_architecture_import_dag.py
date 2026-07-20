@@ -145,6 +145,10 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         (Path("zlc_data/curve_fitting.py"), "fit_models"),
         (Path("zlc_data/curve_fitting.py"), "fit_histogram"),
         (Path("zlc_data/plot_region.py"), "AxisRange.__post_init__"),
+        # W1 - canonicalises the DISPLAY NAME a human typed into the machine token
+        # every published signal name derives from: the same named human-input
+        # adapter boundary .strip() is reserved for.
+        (Path("zlc_data/shape_text.py"), "measurement_slug"),
         # H2a - the value-expression language.  Every one of these reads the
         # expression text a HUMAN typed into a panel or a logic-node source box.
         (Path("zlc_data/signal_expr.py"), "is_identity_source"),
