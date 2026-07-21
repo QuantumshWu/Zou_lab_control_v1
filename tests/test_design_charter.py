@@ -162,8 +162,10 @@ def test_no_file_marries_qt_to_matplotlib_outside_the_sanctioned_zones():
     offenders = []
     for path in ROOT.rglob("*.py"):
         rel = path.relative_to(ROOT).as_posix()
-        if ("__pycache__" in rel or rel.startswith(("tests/", "fpga/", "docs/", "_output/",
-                                                    "results/", "mot_field/"))):
+        # tools/ carries dev probes (e.g. the window-fingerprint harness); they are not product
+        # code, and a probe that builds real windows inevitably touches both toolkits.
+        if ("__pycache__" in rel or rel.startswith(("tests/", "tools/", "fpga/", "docs/",
+                                                    "_output/", "results/", "mot_field/"))):
             continue
         if rel.startswith("Zou_lab_control/frontend/") or "/plot_bridge" in rel:
             continue
