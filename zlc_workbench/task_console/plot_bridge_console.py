@@ -1738,6 +1738,14 @@ class TaskConsole(QtWidgets.QWidget):
             card.set_fit_request(card._retarget_fit_request(selection))
             return
         action = str(card.config.params.get("selection_action") or "none")
+        # An armed action is only honoured while the catalog still offers the definition behind
+        # it.  The Setting chooser is built from that same judgement, but a saved layout keeps
+        # whatever was armed when it was written (``params`` round-trips verbatim), so a board
+        # from a session that HAD the definition can arm an action this one cannot perform.
+        # Saying so is the honest answer; reaching the analysis path anyway is not.
+        if action != "none" and action not in self._available_analysis_actions():
+            card.set_status(f"this console offers no {action} analysis", error=True)
+            return
         if action == "roi":
             self._apply_roi_selection(card, selection)
         else:
