@@ -13,7 +13,8 @@ import re
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from zlc_neutral_atom.timing.clock import default_clock_hz as _default_hardware_clock_hz
+from zlc_neutral_atom.timing.clock import (DEFAULT_TIME_STEP_NS,
+                                           default_clock_hz as _default_hardware_clock_hz)
 from zlc_neutral_atom.timing.ports import PORT_CLOCK, PORT_DAC, PortCatalog
 from zlc_neutral_atom.timing.pulse_table import (
     DELAY_MAX_TICKS,
@@ -139,7 +140,8 @@ CHANNEL_ROW_SPACING = 4
 PERIOD_CARD_WIDTH = 158
 DEFAULT_WINDOW_RATIO = WINDOW_SCREEN_FRACTION   # the ONE shared screen-fraction (qt_widgets), == task console
 DEFAULT_HARDWARE_CLOCK_HZ = _default_hardware_clock_hz()  # single source: streamer_config.json (via the dependency-free _clock seam)
-DEFAULT_TIME_STEP_NS = 1_000_000_000.0 / DEFAULT_HARDWARE_CLOCK_HZ
+# The tick is the SAME fact as the rate; it is derived beside it in the clock seam, not
+# re-derived here.  (Imported above, re-exported for this module's readers.)
 SUMMARY_DEBOUNCE_MS = 90
 PREVIEW_DEBOUNCE_MS = 160
 PULSE_FILES_ENV = "ZLC_PULSE_DIR"
