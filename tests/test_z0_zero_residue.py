@@ -71,6 +71,10 @@ Z2A_PRODUCTION_IMPORTERS = {   # non-test code OUTSIDE legacy that still imports
     # 1033-line shell is dismantled.  Dies with the shell (C20/C25).  The root
     # figure_viewer.py launcher left this table when it was re-pointed at this root.
     Path("zlc_workbench/figure_viewer/app.py"),
+    # The viewer BODY + flow-graph view (whole-file moves); only the DOMAIN layer still
+    # crosses, and it goes when that layer reaches zlc_neutral_atom (C20/C25).
+    Path("zlc_workbench/figure_viewer/plot_bridge_figure_viewer.py"),
+    Path("zlc_workbench/figure_viewer/flow_graph_view.py"),
     Path("fpga/pulse_streamer/sim/_gen_replay_t.py"),  # fpga -> legacy, and zlc_pulse -> fpga
     # The task console's composition root, delegating the WHOLE window to the legacy shell
     # while the shell is taken apart widget by widget.  Transitional by construction: every
@@ -113,11 +117,13 @@ Z2C_FROZEN_TEST_IMPORTERS = 0
 #: 19 as of the render-loop move: ``frontend/render_loop.py`` became a shim when the module
 #: itself went to ``zlc_frontend/qt_widgets``.  The count is allowed to RISE only when a move
 #: creates the shim -- which is the one legitimate reason -- and it must fall back to zero at Z0.
-Z3_FORWARDING_SHIMS = 28   # +7: the pulse domain (pulse_table/sequence/ports/_serialization/
+Z3_FORWARDING_SHIMS = 30   # +7: the pulse domain (pulse_table/sequence/ports/_serialization/
                            # _clock/_streamer_geometry -> zlc_neutral_atom.timing) and
                            # _viewer_registry (-> zlc_data) left shims behind
                            # +1: frontend/pulse_gui.py became the alias shell of
                            # zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py
+                           # +2: frontend/figure_viewer.py + flow_graph_view.py became
+                           # shims of the zlc_workbench/figure_viewer package
 Z7_REBUILT_WORKBENCH_FILES = 12
 #: 0 forever: after the cull the manifest IS the suite.  A test file not on the manifest is no
 #: longer a frozen archive entry -- it is a mistake, and this guard says so immediately.
@@ -201,6 +207,12 @@ Z4_COMPOSITION_ROOTS = {
     Path("zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py"),
     # The figure viewer's composition root: same transitional delegation (C20/C25).
     Path("zlc_workbench/figure_viewer/app.py"),
+    # The viewer BODY and its flow-graph view, moved whole out of the legacy shell.
+    # Remaining legacy imports are the DOMAIN layer only (SignalHub/signal_tensor/
+    # operations.logic; format_dims lazily) - they die when that layer reaches
+    # zlc_neutral_atom, and the body graduates from plot_bridge at P5 (C20/C25).
+    Path("zlc_workbench/figure_viewer/plot_bridge_figure_viewer.py"),
+    Path("zlc_workbench/figure_viewer/flow_graph_view.py"),
 }
 
 

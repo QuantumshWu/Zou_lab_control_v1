@@ -11,7 +11,7 @@
 | --- | --- |
 | 两巨石行数 | `frontend/task_console.py` **393(0 def,纯别名壳)** + `frontend/pulse_gui.py` **86(0 def,显式别名壳)——双巨石解体完成**;pulse 编辑器本体在 `zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py`(4475 行,P5 毕业拆分) |
 | 删除台账剩余 | 承 20(目标包待定 17)/ 内 68 / 死 19,共 107;pulse 域四件已搬空成壳 |
-| 当前窗口 | **task_console+pulse_gui 两壳均 0 def**;**figure_viewer 入口已切 `zlc_workbench/figure_viewer/app.py`(A/B vs main 零差异)**;下一步=figure_viewer 壳解体(1033 行)或 P3 设备层/operations 清剿(交替) |
+| 当前窗口 | **task_console+pulse_gui+figure_viewer 三壳均 0 def(解体完成)**;下一步=**device_manager 入口先行**(P2 最后窗口)或 P3 设备层/operations 清剿(交替) |
 
 ## 22. 最终验收
 
@@ -976,14 +976,14 @@ Pulse/FPGA：
 | `Zou_lab_control/frontend/device_manager.py` | 1234 | 2 |
 | `Zou_lab_control/neutral_atom/devices/qcmos.py` | 1176 | 1 |
 | `Zou_lab_control/neutral_atom/devices/fpga_pulse_streamer.py` | 1073 | 3 |
-| `Zou_lab_control/frontend/figure_viewer.py` | 1033 | 1 |
+| `Zou_lab_control/frontend/figure_viewer.py` | 1033 | 1(已搬空→`zlc_workbench/figure_viewer/plot_bridge_figure_viewer.py`,此路径=壳) |
 | `Zou_lab_control/neutral_atom/subsystems/readout.py` | 891 | 1 |
 | `Zou_lab_control/neutral_atom/operations/measurement.py` | 869 | 10 |
 | `Zou_lab_control/neutral_atom/devices/drivers/dcam/dcam.py` | 747 | 1 |
 | `Zou_lab_control/neutral_atom/timing/sequence.py` | 683 | 6(已搬空→`zlc_neutral_atom/timing/sequence_model.py`,此路径=壳) |
 | `Zou_lab_control/neutral_atom/session.py` | 634 | 4 |
 | `Zou_lab_control/neutral_atom/core/calibration.py` | 604 | 10 |
-| `Zou_lab_control/frontend/flow_graph_view.py` | 557 | 1 |
+| `Zou_lab_control/frontend/flow_graph_view.py` | 557 | 1(已搬空→`zlc_workbench/figure_viewer/flow_graph_view.py`,此路径=壳) |
 | `Zou_lab_control/neutral_atom/content/manuals.py` | 536 | 1 |
 | `Zou_lab_control/neutral_atom/core/analysis.py` | 480 | 20 |
 | `Zou_lab_control/neutral_atom/devices/registry.py` | 447 | 9 |
@@ -1059,3 +1059,4 @@ Pulse/FPGA：
 | 2026-07-20 | P3·pulse 领域搬迁(壳解体阻塞已除) | `DONE` | 六件 4321 行整搬 `zlc_neutral_atom/timing/`(pulse_table/sequence_model/ports/serialization/clock/streamer_geometry);_viewer_registry→zlc_data,五个校验函数→`zlc_data/validation.py`。**当轮新测量·DAG 裁决**:守卫禁 zlc_pulse import zlc_data 且禁 legacy 拓扑 token,故目的地=zlc_neutral_atom(C13)。compile/compile_scan 注册表反转,devices/sequencer 模块尾注册;未武装报接线错,VirtualSequencer 链武装后编译真跑成功。七旧路径=PEP562 壳(Z3 20→27,C25);strip 豁免 22 条随代码登记;owner 钉双家覆盖(C5);C24 未决 18→17(C6) | A 组 99+DAG 30+z0 8;B 组 5 文件独立进程绿;两入口 rc=0 |
 | 2026-07-20 | P2·pulse_gui 壳解体(终局一批) | `DONE` | 4475 行整搬 `zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py`(C20 过渡区,C14 豁免路径);6 组 import 改写指真源(领域→zlc_neutral_atom.timing、.live→zlc_frontend.live_plot、qt_canvas→plot_bridge_canvas);壳=86 行显式别名壳(0 def,72 名+PANEL_SIZES 词汇钉)。**当轮新测量**:七前置类耦合判定(4 纯 Qt/3 领域/1 mpl)支持整簇随 editor 走,P5 分拣毕业(C23);自 A/B 指纹唯一 diff=默认文件名时间戳(脚本内随机量,C42);Z4/Z2A 具名登记本体(死亡条件=设备层搬迁+P5 毕业);Z3 27→28(C25);project_root 钉随函数迁(C5)。**两壳均 0 def=P2 双巨石解体完成** | 起窗 rc=0;受影响 A 组 57+11+47 绿 |
 | 2026-07-20 | P2·figure_viewer 入口先行 | `DONE` | `zlc_workbench/figure_viewer/app.py` 组合根委托旧 `_gui.open_figure_viewer`(复用其 session 单例/无 session 双路,C22;Z4/Z2A 具名登记,C20/C25);根启动器 `figure_viewer.py` 同 commit 改指组合根,从 Z2A 表摘除(它不再 import 旧树);探针教 `viewer_app` marker+build 分支。**当轮新测量**:A/B vs ZLC_main 指纹零结构差异;自 A/B(HEAD legacy 入口 vs 工作树组合根入口)零结构差异(时间戳默认名按 C42 归一);比对脚本固化 `fp_diff.py` 归一 in-script 随机量 | 起窗 rc=0;z0+charter+qt_widgets+plot_kind 49 绿 |
+| 2026-07-20 | P2·figure_viewer 壳解体(终局一批,三壳归零) | `DONE` | 两文件整搬 `zlc_workbench/figure_viewer/`:本体 1033 行→`plot_bridge_figure_viewer.py`(持 DataFigure 链,C20/C14 豁免路径),FlowGraphView 557 行→`flow_graph_view.py`(纯 Qt 无 mpl,非 bridge 名)。import 改写指真源:`.task_console` 三名逐名拆(PanelConfig→zlc_data.console_records、TaskConsoleState→zlc_frontend.console_state、TaskConsole→plot_bridge_console),`.data_figure`→live_plot.plot_figure,`_paths`→zlc_storage.paths;领域三条(SignalHub/signal_tensor/logic+惰性 format_dims)=Z4/Z2A 具名越界,死亡条件=领域层搬迁(C20/C25)。壳=24 行显式别名壳(0 def,13 名)+PEP562 壳;Z3 28→30;plot_kind 钉随代码迁(C5)。**三壳均 0 def** | 壳同一性+门面转发 OK;起窗 rc=0;自 A/B 零结构差异;受影响 99 绿 |
