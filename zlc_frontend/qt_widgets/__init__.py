@@ -319,3 +319,9 @@ from . import param_widgets  # noqa: E402,F401
 # ATTRIBUTE of the package rather than importing the submodule path, which the package's own
 # guard forbids from outside.
 from . import render_loop  # noqa: E402,F401
+
+# The per-panel Analysis controls (fit + ROI), salvaged out of the console shell.  Pure Qt, so
+# qt_widgets is where the placement axiom puts them; bound as an attribute for the same reason
+# as the two above -- the package's own guard forbids outside consumers from deep-importing a
+# submodule path.
+from . import analysis_controls  # noqa: E402,F401

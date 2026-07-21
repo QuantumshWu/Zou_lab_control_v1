@@ -9,9 +9,9 @@
 
 | 项 | 现值 |
 | --- | --- |
-| 两巨石行数 | `frontend/task_console.py` 8869 + `frontend/pulse_gui.py` 4475(解体未开始) |
+| 两巨石行数 | `frontend/task_console.py` **8607**(顶层 def 25→21) + `frontend/pulse_gui.py` 4475(未开始) |
 | 删除台账剩余 | 承 20(目标包待定 20)/ 内 68 / 死 19,共 107 |
-| 当前窗口 | task_console(**入口已切 `zlc_workbench/task_console/app.py`;自 A/B 与 main 指纹全等 49 widget / `TaskConsole` / by_class 零差异**;下一步=按控件解体) |
+| 当前窗口 | task_console(入口已切 `zlc_workbench/task_console/app.py`,与 main 指纹全等;**解体第 1 批 = Analysis 控件簇 → `qt_widgets/analysis_controls.py` 317 行**) |
 
 ## 22. 最终验收
 
@@ -1051,3 +1051,4 @@ Pulse/FPGA：
 | 2026-07-20 | 测试大清洗 | `DONE` | 176 条冻结测试全删(C41;删除安全实测:零 active import/零 conftest 引用);Z8/Z2C 预算归零改等值(C6) | 143 文件=清单;两门 17 passed |
 | 2026-07-20 | 基础设施+入口真相 | `DONE` | 指纹探针 `tools/window_fingerprint.py` 建成:从每棵树自己的启动器源码推导入口(不硬编码,改指后自动跟随),子进程 offscreen 起窗出 JSON。**当轮新测量**:main 启动器走 `show_task_console(hub=)` 得 `TaskConsole` 49 widget(含 FluentTabWidget/_PanelBoard),本分支启动器走 `experiment.task_console()` 只得 `TaskConsoleWindow` 19 widget、无 tab——旧 8869 行 console 已无任何 consumer(`_gui`/`show_task_console` 全仓零引用),是死码而非在用壳,故 C22 的复原对象是它。删除台账建成:旧树 107 个 .py,承 20/内 68/死 19(C24 指标=承表 `?` 数,现 20 只准降)。相对 import 必须解析到绝对名,否则 `session.py`/`devices/base.py` 被误判死件(C5) | 探针两树 A/B 输出;`test_the_deletion_ledger_covers_every_legacy_file`;47 passed |
 | 2026-07-20 | task_console 入口先行 | `DONE` | `zlc_workbench/task_console/` 建包(`intent.py` 原文件 + `app.py` = 唯一 Qt composition root),根启动器与 `Experiment.task_console()` 同 commit 改指 `app.open_task_console`(C20)。**当轮新测量**:自 A/B 指纹与 main 全等——49 widget / `TaskConsole` / by_class 零差异,用户双击 .bat 即得 main 的 console。`ReadoutFacade` 尚无 `measurement_specs/processor_specs/task_specs`,故 catalog 走鸭子型 seam(后端长出即自动填,现为 `--no-connect` 形态)。Z4 由绝对禁令改为**具名 composition root**——它此前为真只因 console 被废弃,用放弃操作员窗口换的绿不算不变量(C5/C25)。窄窗口留作组件,三个测试改指它。承表 console 目标包已定,C24 未决 20→19 | 探针两树 diff;启动器 rc=0;u04×2/w3/z0/charter 全绿 |
+| 2026-07-20 | 壳解体 1:Analysis 控件簇 | `DONE` | `AnalysisControls`/`_FitFixSeedEditor`/`_apply_analysis_state_to_widgets`/`_general_fit_models_for_kind` 四件整批搬入 `zlc_frontend/qt_widgets/analysis_controls.py`(317 行,C21 600 上限内),壳留别名走包门面(C20)。**当轮新测量**:自 A/B 指纹(工作树 vs `git archive HEAD`)root 树逐字节相等、49 widget、by_class 零差异;运行时验证别名 `is` 移动后对象本体。板 packer 早已搬走(6 个 3 行委托),故本批不是几何簇。两处渲染层能力查询(`kind_supports_roi`/`general_fit_models`)保持函数体内惰性 import 并改指真 owner `zlc_frontend.live_plot.live`,模块级 import 图不含渲染层(C13);面板 kind 能力声明缺无工具包之家 = P5 待办。`.strip()` 豁免随文本迁移(与 §22 同款,C5);census 棘轮 25→21(C6) | 启动器 rc=0;指纹 diff 空;63 守卫 passed |
