@@ -58,7 +58,7 @@ SHELLS = ["Zou_lab_control/frontend/task_console.py",
 RENDER_FREE_TOP_LEVEL_DEFS = 1
 #: 25 after the test cull exposed _min_board_width: its ONLY referencer was a frozen test,
 #: so deleting the archive turned a delegation stub into a corpse this very guard then caught.
-TOTAL_TOP_LEVEL_DEFS = 6
+TOTAL_TOP_LEVEL_DEFS = 3
 
 RENDER_PACKAGES = ("PyQt5", "matplotlib", "zlc_frontend.render_style", "zlc_frontend.qt_widgets",
                    "zlc_frontend.live_plot", "zlc_frontend.qt_canvas", "zlc_frontend.render")

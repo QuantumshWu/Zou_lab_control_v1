@@ -9,9 +9,9 @@
 
 | 项 | 现值 |
 | --- | --- |
-| 两巨石行数 | `frontend/task_console.py` **5646**(顶层 def **6**:MeasurementPanel/PanelEditor/LogicNodeEditor/_StopAttempt/TaskConsole/show_task_console) + `frontend/pulse_gui.py` 4475(未开始) |
+| 两巨石行数 | `frontend/task_console.py` **3979**(顶层 def **3**:_StopAttempt/TaskConsole/show_task_console) + `frontend/pulse_gui.py` 4475(未开始) |
 | 删除台账剩余 | 承 20(目标包待定 20)/ 内 68 / 死 19,共 107 |
-| 当前窗口 | task_console(入口已切,指纹与 main 全等;第 1 批 Analysis 簇→qt_widgets;**第 2 批 = PanelCard 簇+几何桥+qt_canvas 整体 → `zlc_workbench/task_console/plot_bridge*.py`**(3080+396 行);余 6 def 待拆) |
+| 当前窗口 | task_console(入口已切,指纹与 main 全等;批1 Analysis→qt_widgets;批2 PanelCard 簇+qt_canvas→plot_bridge*;**批3 编辑器簇:MeasurementPanel/LogicNodeEditor→qt_widgets 一件一档,PanelEditor→plot_bridge_editor**;壳只余 TaskConsole 本体) |
 
 ## 22. 最终验收
 
@@ -1053,3 +1053,4 @@ Pulse/FPGA：
 | 2026-07-20 | task_console 入口先行 | `DONE` | `zlc_workbench/task_console/` 建包(`intent.py` 原文件 + `app.py` = 唯一 Qt composition root),根启动器与 `Experiment.task_console()` 同 commit 改指 `app.open_task_console`(C20)。**当轮新测量**:自 A/B 指纹与 main 全等——49 widget / `TaskConsole` / by_class 零差异,用户双击 .bat 即得 main 的 console。`ReadoutFacade` 尚无 `measurement_specs/processor_specs/task_specs`,故 catalog 走鸭子型 seam(后端长出即自动填,现为 `--no-connect` 形态)。Z4 由绝对禁令改为**具名 composition root**——它此前为真只因 console 被废弃,用放弃操作员窗口换的绿不算不变量(C5/C25)。窄窗口留作组件,三个测试改指它。承表 console 目标包已定,C24 未决 20→19 | 探针两树 diff;启动器 rc=0;u04×2/w3/z0/charter 全绿 |
 | 2026-07-20 | 壳解体 1:Analysis 控件簇 | `DONE` | `AnalysisControls`/`_FitFixSeedEditor`/`_apply_analysis_state_to_widgets`/`_general_fit_models_for_kind` 四件整批搬入 `zlc_frontend/qt_widgets/analysis_controls.py`(317 行,C21 600 上限内),壳留别名走包门面(C20)。**当轮新测量**:自 A/B 指纹(工作树 vs `git archive HEAD`)root 树逐字节相等、49 widget、by_class 零差异;运行时验证别名 `is` 移动后对象本体。板 packer 早已搬走(6 个 3 行委托),故本批不是几何簇。两处渲染层能力查询(`kind_supports_roi`/`general_fit_models`)保持函数体内惰性 import 并改指真 owner `zlc_frontend.live_plot.live`,模块级 import 图不含渲染层(C13);面板 kind 能力声明缺无工具包之家 = P5 待办。`.strip()` 豁免随文本迁移(与 §22 同款,C5);census 棘轮 25→21(C6) | 启动器 rc=0;指纹 diff 空;63 守卫 passed |
 | 2026-07-20 | 壳解体 2:PanelCard 簇+qt_canvas 整体进 plot_bridge | `DONE` | 硬骨头一次端走:PanelCard(2779 行)+_GridFocus+_PanelBoard+几何桥(_cell_size/_card_size/_board_metrics+六转发)+10 常量 = 2921 行 → `plot_bridge.py`(C20);qt_canvas.py 整文件→ `plot_bridge_canvas.py`,旧路径留 PEP 562 壳(Z3 20,C25)。**当轮新测量**:批次对 6 个留守 def 零依赖(AST 全闭包,含 try 块内 import——上轮扫描漏 try 是真坑);12 处体内相对 import 改指真 owner(`.live`→live_plot.live,`.data_figure`→plot_figure);_BLANK_SOURCE 壳内影子字面量死于搬迁,单源回 console_records。壳 8607→5646 行、def 21→6(census 等值推进);23 个悬空 import 机械清除。自 A/B root 树逐字节相等 49 widget;别名 is 本体;四守卫跟随(married-neighbour/raster_front 钉点随代码、DAG headless 豁免具名 /plot_bridge、C6) | 启动器 rc=0;80 守卫 passed;指纹 diff 空 |
+| 2026-07-20 | 壳解体 3:编辑器簇三件分流 | `DONE` | MeasurementPanel(353L,纯 Qt 零依赖)→`qt_widgets/measurement_panel.py`,LogicNodeEditor(90L)→`qt_widgets/logic_node_editor.py`(均<600,C21;facade 尾部导入防 param_widgets 环),PanelEditor(1248L,持 plt/canvas/DataFigure)→`plot_bridge_editor.py`(C20)。**当轮新测量**:三件对留守 TaskConsole 零依赖;PanelEditor 读plot_bridge 四名(_RELIM_PARAM 等)走包内 sibling import。壳 5646→3979 行、def 6→3(census 等值);别名 is 本体;指纹自 A/B root 相等 | 启动器 rc=0;127 守卫 passed |

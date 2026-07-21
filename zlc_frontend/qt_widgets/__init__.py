@@ -160,6 +160,8 @@ from .style import (
 
 __all__ = [
     "LogicNodeRow",
+    "LogicNodeEditor",
+    "MeasurementPanel",
     "PulseSlotsWidget",
     "SignalExprWidget",
     "ACCENT",
@@ -325,3 +327,9 @@ from . import render_loop  # noqa: E402,F401
 # as the two above -- the package's own guard forbids outside consumers from deep-importing a
 # submodule path.
 from . import analysis_controls  # noqa: E402,F401
+
+# The two editor widgets salvaged from the console shell.  Imported AFTER ``param_widgets``:
+# they reach it via ``from . import param_widgets``, which needs the registry importable, and
+# the registry itself reads facade names -- so these must sit at the tail like it does.
+from .measurement_panel import MeasurementPanel  # noqa: E402
+from .logic_node_editor import LogicNodeEditor  # noqa: E402
