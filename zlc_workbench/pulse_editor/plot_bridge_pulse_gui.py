@@ -3913,31 +3913,205 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             image_path = Path(path)
             if image_path.suffix == "":
                 image_path = image_path.with_suffix(".png")
-            # The Save-Figure button writes through the SAME generic figure save the
-            # notebook / console panels use (DataFigure.save): a <stem>.png image PLUS
-            # a matching <stem>.npz that ``na.load_figure`` / ``show_figure_viewer`` can
-            # reopen.  The pulse preview is not a hub signal (no producing node), so the
-            # DataFigure is unbound => the save DEGRADES to the basic figure+npz (no
-            # signals / provenance) -- exactly the "info is sparse but structurally
-            # valid" round-trip the viewer expects.
-            include_always_off = bool(getattr(self, "preview_include_off", None) and self.preview_include_off.isChecked())
-            df = self._preview_data_figure(state, include_always_off=include_always_off)
-            out = df.save(str(image_path))
-            if plt is not None:
-                plt.close(df.fig)
-            data_name = Path(out.get("data", image_path.with_suffix(".npz"))).name
-            self.preview_status.setText(f"Saved figure: {image_path.name} (+ {data_name})")
+            # Save Figure writes the picture, and only the picture.  The old
+            # twin .npz came from a DataFigure.save that no longer exists: data
+            # persistence belongs to the run repository, and a preview is not a
+            # run -- it is a drawing of the table currently being edited.
+            image_path.write_bytes(self.preview_png_bytes(state))
+            self.preview_status.setText(f"Saved figure: {image_path.name}")
         except Exception as exc:
             self._message(str(exc))
 
 
+    # ------------------------------------------------------------------ preview
+    def _preview_snapshot(self, state: PulseTableState, *, include_always_off: bool):
+        """The compiled sequence as one dataset: time across, one component per channel.
+
+        The compiler is the single source for what the hardware will do, so the
+        preview draws the SAME ``to_sequence`` result the run path uploads rather
+        than re-deriving levels from the table.  Samples sit ON the pulse
+        boundaries, twice each: a digital line is piecewise constant, and the two
+        samples at one boundary are what make the transition draw vertical
+        instead of as a ramp.
+
+        Returns ``(snapshot, channels)``.
+        """
+
+        import numpy as np
+        from zlc_data import (
+            AxisId, AxisSpec, BlockId, COMPONENT, ComponentValidity, DataBlock,
+            DatasetRevision, DatasetSchema, PointLayout, REPEAT, SCAN_POINT,
+            StreamGenerationId, ValidityContract, ValueSchema,
+        )
+        from zlc_data.value import OwnedSnapshot
+
+        sequence = state.to_sequence()
+        pulses = list(getattr(sequence, "pulses", ()) or ())
+        active = {str(pulse.channel) for pulse in pulses}
+        channels = [str(name) for name in sequence.channels
+                    if include_always_off or name in active]
+        if not channels:
+            channels = [str(name) for name in sequence.channels]
+        if not channels:
+            return None, []
+
+        total = float(getattr(sequence, "duration", 0.0) or 0.0)
+        boundaries = {0.0, total}
+        for pulse in pulses:
+            boundaries.add(float(pulse.start))
+            boundaries.add(float(pulse.start) + float(pulse.duration))
+        times = sorted(moment for moment in boundaries if 0.0 <= moment <= max(total, 0.0))
+        if len(times) < 2:
+            times = [0.0, max(total, 1e-9)]
+        samples: list[float] = []
+        for index, moment in enumerate(times):
+            samples.append(moment)
+            if index + 1 < len(times):
+                samples.append(times[index + 1])
+
+        index_of = {name: position for position, name in enumerate(channels)}
+        values = np.zeros((1, len(samples), len(channels)), dtype=np.float64)
+        for pulse in pulses:
+            position = index_of.get(str(pulse.channel))
+            if position is None:
+                continue
+            start = float(pulse.start)
+            stop = start + float(pulse.duration)
+            level = float(getattr(pulse, "value", 1) or 0)
+            for sample_index, moment in enumerate(samples):
+                if start <= moment < stop:
+                    values[0, sample_index, position] = level
+        # Offset the rows so lines never overlap: the operator has to read WHICH
+        # channel, and a shared baseline makes identical lines indistinguishable.
+        for position in range(len(channels)):
+            values[0, :, position] += float(len(channels) - 1 - position) * 1.5
+
+        repeat = AxisSpec(AxisId("pulse.preview.repeat"), "Repeat", REPEAT, 1, (0,))
+        time_axis = AxisSpec(
+            AxisId("pulse.preview.time"), "Time", SCAN_POINT, len(samples),
+            tuple(value * 1e6 for value in samples), "us")
+        channel_axis = AxisSpec(
+            AxisId("pulse.preview.channel"), "Channel", COMPONENT,
+            len(channels), tuple(channels))
+        schema = DatasetSchema(
+            repeat,
+            (time_axis,),
+            PointLayout.rect_c((len(samples),)),
+            ValueSchema(
+                (channel_axis,),
+                ValidityContract.components(channel_axis.axis_id),
+                values.dtype,
+                # Rows are stacked for legibility, so the number on the axis is a
+                # display level, not a voltage the hardware would produce.
+                value_unit="level",
+            ),
+        )
+        block = DataBlock(
+            BlockId("pulse-preview-block"),
+            DatasetRevision(max(1, int(getattr(self, "_preview_revision", 1)))),
+            values,
+            ComponentValidity((channel_axis.axis_id,), np.ones(values.shape, dtype=np.bool_)),
+            schema,
+        )
+        # The generation names where this data came from -- the editor's own
+        # table, not a run.  A preview has no acquisition lineage and must not
+        # claim one; saying so plainly is what keeps the provenance honest.
+        return OwnedSnapshot(block.ref(StreamGenerationId("pulse-editor-preview")), block), channels
+
+    def _preview_data_figure(self, state: PulseTableState, *, include_always_off: bool = False):
+        """The preview as a :class:`DataFigure` -- document + dataset, no canvas."""
+
+        from zlc_frontend.data_figure import DataFigure
+        from zlc_frontend.figure import (
+            DatasetDescriptor, DatasetId, FigureDocument, FigureLayer,
+            ResolvedDataset, ResolvedDatasetMap, ViewIntent,
+        )
+        from zlc_frontend.panel_render import view_for_schema
+
+        snapshot, _channels = self._preview_snapshot(
+            state, include_always_off=include_always_off)
+        if snapshot is None:
+            raise ValueError("this pulse program has no channels to preview")
+        schema = snapshot.block.schema
+        dataset_id = DatasetId("pulse-preview")
+        document = FigureDocument(
+            "pulse-preview",
+            1,
+            (DatasetDescriptor(dataset_id, "Pulse preview", schema.fingerprint),),
+            (FigureLayer("pulse-preview-layer", dataset_id,
+                         view_for_schema(schema, ViewIntent.CURVE, None)),),
+        )
+        return DataFigure(
+            document,
+            ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
+        )
+
+    def preview_png_bytes(self, state: PulseTableState | None = None, *,
+                          include_always_off: bool | None = None) -> bytes:
+        """The preview as PNG bytes -- the ONE place pixels are produced.
+
+        Display, Save Figure and Save Image all go through here, so what is
+        written to disk is the same picture that was on screen rather than a
+        second rendering that could differ.
+        """
+
+        if state is None:
+            state = self.read_state()
+        if include_always_off is None:
+            include_always_off = bool(
+                getattr(self, "preview_include_off", None)
+                and self.preview_include_off.isChecked())
+        figure = self._preview_data_figure(state, include_always_off=include_always_off)
+        return figure.to_png_bytes()
+
+    def refresh_preview(self) -> None:
+        """Redraw the Preview tab from the CURRENT table.
+
+        Pixels arrive as bytes, rasterised clear of the Qt objects, so this side
+        never owns a canvas whose lifetime it would have to manage.  A program
+        that cannot be previewed says why in the status line rather than leaving
+        the previous image up -- a stale picture reads as "this is your pulse".
+        """
+
+        if not hasattr(self, "preview_body_layout"):
+            return
+        self._preview_revision = int(getattr(self, "_preview_revision", 0)) + 1
+        try:
+            state = self.read_state()
+            png = self.preview_png_bytes(state)
+        except Exception as exc:
+            self.preview_status.setText(
+                f"Preview unavailable: {str(exc).splitlines()[0][:120]}")
+            return
+        self._preview_png = png
+        pixmap = QtGui.QPixmap()
+        pixmap.loadFromData(png)
+        if getattr(self, "preview_image", None) is None:
+            self.preview_image = QtWidgets.QLabel()
+            self.preview_image.setAlignment(QtCore.Qt.AlignCenter)
+            self.preview_body_layout.addWidget(self.preview_image)
+        self.preview_placeholder.hide()
+        self.preview_image.setPixmap(pixmap)
+        self.preview_image.show()
+        self._preview_dirty = False
+        self.preview_status.setText(
+            f"{state.total_duration_ns() / 1000.0:.4g} us, {len(state.periods)} periods")
+
+    def _apply_scan_state_in_place(self, state: PulseTableState) -> bool:
+        """Whether a scan toggle can be absorbed without rebuilding the cards.
+
+        Always False.  A scan binding changes which fields are slot-bound, and a
+        card renders that at build time; the caller already falls back to
+        ``load_state``, which is correct.  A fast path that refreshed the wrong
+        subset of widgets would show a binding the table does not have, and a
+        wrong picture of the sequence costs more than the rebuild does.
+        """
+
+        return False
+
     def _save_preview_image(self, state: PulseTableState, image_path: Path) -> Path:
         image_path.parent.mkdir(parents=True, exist_ok=True)
-        include_always_off = bool(getattr(self, "preview_include_off", None) and self.preview_include_off.isChecked())
-        plotter, _channels, _repeat = self._create_preview_plot(state, include_always_off=include_always_off)
-        plotter.fig.savefig(image_path, bbox_inches="tight")
-        if plt is not None:
-            plt.close(plotter.fig)
+        image_path.write_bytes(self.preview_png_bytes(state))
         return image_path
 
     def _on_tab_changed(self, _index: int) -> None:
