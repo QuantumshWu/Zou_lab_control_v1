@@ -33,13 +33,25 @@ class ConsoleSignalValue:
 
     name: str
     source: str                     # the node title that produced it
-    block: object                   # zlc_data DataBlock -- shape/dtype/schema live here
+    snapshot: object                # OwnedSnapshot -- the (ref, block) pair a render needs
     version: int                    # the producing stream's sequence at freeze time
     coverage: object | None         # MonitorCoverage, or None for a scalar-less signal
     coherent: bool                  # derived alongside the same raw event
+    # Lineage, carried because only the freeze knows it: a renderer stamps what
+    # it drew with the run and event it came from, and a value that lost these
+    # on the way to a panel could only be presented with an invented one.
+    run_id: object
+    epoch_id: object                # causation domain the run belongs to
+    join_digest: str                # payload digest of the event this froze
 
     # The block is the value; these read off it rather than copying, so a panel
     # and a legend describing "the same signal" cannot describe different data.
+    @property
+    def block(self):
+        """The snapshot's DataBlock -- shape/dtype/schema live here."""
+
+        return getattr(self.snapshot, "block", None)
+
     @property
     def schema(self):
         return getattr(self.block, "schema", None)
@@ -170,12 +182,13 @@ class ConsoleDataPlane:
         than against names invented here.
         """
 
-        _run_id, _causation, snapshot = slot.freeze_camera_current()
+        run_id, causation, snapshot = slot.freeze_camera_current()
         declared = tuple(
             str(decl.name)
             for decl in getattr(getattr(node, "spec", None), "declared_outputs", ()) or ()
         )
         raw = snapshot.raw
+        head = None if raw is None else raw.head
         scalar = snapshot.scalar
         metadata = snapshot.scalar_metadata
         # Same-transaction check, the presentation-layer half of coherence: the
@@ -188,14 +201,20 @@ class ConsoleDataPlane:
         out: dict[str, ConsoleSignalValue] = {}
         if raw is not None and declared:
             out[declared[0]] = ConsoleSignalValue(
-                name=declared[0], source=title, block=raw.snapshot.block,
+                name=declared[0], source=title, snapshot=raw.snapshot,
                 version=self._sequence(raw), coverage=raw.coverage, coherent=True,
+                run_id=run_id, epoch_id=causation,
+                join_digest=str(getattr(head, "payload_digest", "") or ""),
             )
         if scalar is not None and len(declared) > 1:
             out[declared[1]] = ConsoleSignalValue(
-                name=declared[1], source=title, block=scalar.snapshot.block,
+                name=declared[1], source=title, snapshot=scalar.snapshot,
                 version=self._sequence(scalar), coverage=scalar.coverage,
                 coherent=bool(coherent),
+                run_id=run_id, epoch_id=causation,
+                # A derived scalar names the raw event it reduced, so its join
+                # digest is that event's -- not a second digest of its own.
+                join_digest=str(getattr(head, "payload_digest", "") or ""),
             )
         return out
 

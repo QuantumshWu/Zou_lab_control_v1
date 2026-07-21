@@ -2106,7 +2106,7 @@ class TaskConsole(QtWidgets.QWidget):
         self._update_task_status_text(node)
         # The mid-run panel refresh touches its figure on the GUI thread, which owns every
         # figure now that rendering is synchronous.
-        self._task_card.refresh(self._expression_namespace())
+        self._task_card.refresh(self._tick_data)
         # NB: leaving task-run mode on finish is handled in ONE place -- _poll_logic_nodes
         # (the canonical node-lifecycle tick, which runs every tick regardless of whether
         # a mid-run panel exists), so a self-finishing task always releases the lock.
@@ -2573,15 +2573,15 @@ class TaskConsole(QtWidgets.QWidget):
         Returns the per-panel outcome for the present pass.  All panels in a
         batch share the frozen tick, so a batch is coherent by construction.
         """
-        namespace = self._expression_namespace()
+        snapshot = self._tick_data
         composed, structural = [], []
         for card, key in batch:
             try:
-                done = card.compose(namespace, offthread=True)
+                done = card.compose(snapshot, offthread=True)
             except Exception:
                 done = True            # compose() latches errors itself; never kill the batch
             (composed if done else structural).append((card, key))
-        return {"namespace": namespace, "composed": composed, "structural": structural}
+        return {"snapshot": snapshot, "composed": composed, "structural": structural}
 
     def _on_render_batch(self, result) -> None:
         """GUI THREAD (queued from the render thread): finish the batch -- run the structural
@@ -2589,7 +2589,7 @@ class TaskConsole(QtWidgets.QWidget):
         coherent shot (never frame_0 at shot S beside frame_2 at S-1)."""
         if not isinstance(result, dict):
             return                     # a job that raised whole (already latched per panel) -- drop
-        namespace = result["namespace"]
+        snapshot = result["snapshot"]
         # Membership gate FIRST: a card removed (or shut down) while the batch was in flight must
         # not get a structural compose / status flush either -- composing into a torn-down card
         # resurrects Qt widgets its removal already deleted.
@@ -2598,7 +2598,7 @@ class TaskConsole(QtWidgets.QWidget):
         composed = [(c, k) for c, k in result["composed"] if alive(c)]
         for card, _key in structural:
             try:
-                card.compose(namespace)          # the full GUI compose: builds plotter + canvas
+                card.compose(snapshot)           # the GUI-thread compose (a card that needs Qt)
             except Exception:
                 pass                             # compose latches its own status
         for card, _key in composed:
@@ -2622,9 +2622,8 @@ class TaskConsole(QtWidgets.QWidget):
         versions = self._tick_data.versions()
         # compose EVERY card from the one frozen tick, THEN present them together (tests /
         # notebooks / Resume catch-up) so a refreshed board is one consistent instant.
-        namespace = self._expression_namespace()
         for card in self.cards:
-            card.compose(namespace)
+            card.compose(self._tick_data)
             card._render_version = self._panel_frame_key(card, versions)
         for card in self.cards:
             card.present()
