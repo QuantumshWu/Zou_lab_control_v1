@@ -245,15 +245,6 @@ def strip_node_prefix(full: str, prefix: str) -> str:
     return full[len(prefix):] if (prefix and full.startswith(prefix) and len(full) > len(prefix)) else full
 
 
-def _is_number(v) -> bool:
-    """True when ``v`` can be read as a finite float (a saved numeric param), else False."""
-    try:
-        float(v)
-        return True
-    except (TypeError, ValueError):
-        return False
-
-
 #: Now :class:`zlc_frontend.qt_widgets.PulseSlotsWidget`; the old name stays a plain
 #: alias so nothing that referenced it has to learn a new one.
 _PulseSlotsWidget = PulseSlotsWidget

@@ -178,10 +178,6 @@ def _font_metrics() -> QtGui.QFontMetrics:
     return QtGui.QFontMetrics(QtGui.QFont(FONT, fluent_font_size()))
 
 
-def _text_width(text: str) -> int:
-    return fluent_text_width(_font_metrics(), text)
-
-
 def _row_height() -> int:
     return _px(ROW_HEIGHT, minimum=22)
 
