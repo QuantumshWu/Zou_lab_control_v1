@@ -7,6 +7,8 @@ tests/test_capture_fit_artifact.py
 tests/test_capture_repository_authority.py
 tests/test_compiled_capture_cell_plan.py
 tests/test_compiled_pulse_artifact.py
+tests/test_console_catalog_bridge.py
+tests/test_console_run_bridge.py
 tests/test_definition_catalog.py
 tests/test_design_charter.py
 tests/test_m1_camera_monitor.py
@@ -137,4 +139,3 @@ tests/test_zlc_readout_physical_context.py
 tests/test_zlc_readout_validity.py
 tests/test_zlc_site_map_geometry.py
 tests/test_zlc_storage_canonical.py
-tests/test_console_catalog_bridge.py

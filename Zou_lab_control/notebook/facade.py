@@ -3681,6 +3681,23 @@ def _prepare_camera_monitor_for_services(
     )
 
 
+def _prepare_camera_monitor_for_workbench(
+    experiment: Experiment,
+    request: CameraMonitorRequest,
+) -> PreparedCameraMonitor:
+    """Private friend seam; no notebook authority escapes to the Workbench.
+
+    The Workbench needs the PREPARED monitor rather than a started one: it owns
+    the view factory (its LiveDatasetSlot) and passes it to ``start_with_view``,
+    which the notebook's own ``camera_monitor`` entry point never does.
+    """
+
+    if not isinstance(experiment, Experiment):
+        raise TypeError("experiment must be Experiment")
+    with _service_guard(experiment._authority_token) as services:
+        return _prepare_camera_monitor_for_services(services, request)
+
+
 def _prepare_pulse_for_services(
     services: _ExperimentServices,
     request: PulseRunRequest,

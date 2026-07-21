@@ -145,8 +145,17 @@ def _role_form_field(
     key: str,
     label: str,
     domain: str,
-    preferred: str,
+    preferred: str | None,
 ) -> FormFieldProps:
+    """A role picker.  ``preferred=None`` means: leave it to the installation.
+
+    Some requests carry their own role-resolution rule in the domain (a camera
+    MONITOR prefers the free-running camera, which a capture does not).  Naming a
+    default here would copy that rule into the form, where it would silently rot
+    the day the domain's preference changes -- so an unset field submits nothing
+    and the installation resolves the role from its own single source.
+    """
+
     values = tuple(roles)
     if not values:
         raise ValueError(f"{domain} roles must not be empty")
@@ -154,6 +163,16 @@ def _role_form_field(
         raise ValueError(f"{domain} roles must be unique")
     for role in values:
         canonical_text(role, f"{domain} role")
+    if preferred is None:
+        return FormFieldProps(
+            key,
+            "choice",
+            label,
+            default=None,
+            required=False,
+            choices=tuple(FormChoice(role, role) for role in values),
+            description=f"{domain} role; leave blank to let the installation resolve it",
+        )
     default = preferred if preferred in values else values[0]
     return FormFieldProps(
         key,

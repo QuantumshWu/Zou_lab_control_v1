@@ -85,9 +85,11 @@ def _camera_monitor_form(camera_roles: tuple[str, ...]) -> FormSpec:
     choices = camera_roles or (SCAN_INTENT_DEFAULT_CAMERA_ROLE,)
     return FormSpec(
         (
+            # No preferred default: a monitor wants the FREE-RUNNING camera, and
+            # which role that is belongs to the installation's own resolution.
             _role_form_field(
                 choices, key="camera_role", label="Camera role",
-                domain="camera", preferred=SCAN_INTENT_DEFAULT_CAMERA_ROLE,
+                domain="camera", preferred=None,
             ),
             FormFieldProps(
                 "history_capacity", "int", "Frame history", default=8,
