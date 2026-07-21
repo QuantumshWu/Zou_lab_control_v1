@@ -147,3 +147,37 @@ def test_the_manifest_is_the_suite():
     files = {p.name for p in (ROOT / "tests").glob("test_*.py")}
     assert manifest == files, (
         f"manifest-only: {sorted(manifest - files)}; file-only: {sorted(files - manifest)}")
+
+
+def test_no_file_marries_qt_to_matplotlib_outside_the_sanctioned_zones():
+    """C14 -- the render end state, enforced from today.  Qt sees pixels; matplotlib lives in
+    the headless render leaf; the ONLY places allowed to touch both are the legacy frontend
+    tree (which Z0 deletes wholesale) and the workbench plot_bridge transitional zone (which
+    the post-migration worker-raster rework empties).  Measured at adoption: exactly five
+    dual importers, all inside the legacy tree -- so a sixth anywhere else is a new marriage,
+    not an inherited one."""
+
+    import ast as _ast
+
+    offenders = []
+    for path in ROOT.rglob("*.py"):
+        rel = path.relative_to(ROOT).as_posix()
+        if ("__pycache__" in rel or rel.startswith(("tests/", "fpga/", "docs/", "_output/",
+                                                    "results/", "mot_field/"))):
+            continue
+        if rel.startswith("Zou_lab_control/frontend/") or "/plot_bridge" in rel:
+            continue
+        try:
+            tree = _ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        roots = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                roots.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, _ast.ImportFrom) and node.module and node.level == 0:
+                roots.add(node.module.split(".")[0])
+        if "PyQt5" in roots and "matplotlib" in roots:
+            offenders.append(rel)
+    listing = "".join(f"\n  {item}" for item in offenders)
+    assert not offenders, "new Qt+matplotlib marriages outside the sanctioned zones:" + listing
