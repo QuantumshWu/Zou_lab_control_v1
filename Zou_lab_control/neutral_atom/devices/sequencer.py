@@ -2871,3 +2871,13 @@ __all__ = [
     "compile_runtime_program_for_payload",
     "serve_runtime_sequencer",
 ]
+
+# The domain's PulseTableState.compile/compile_scan reach the runtime compilers through a
+# registry (the domain package may not import the device layer).  This module IS the device
+# layer, so loading it arms the registry -- the same inversion the frontend uses for the
+# solve-thread guard.
+from zlc_neutral_atom.timing.pulse_table import register_runtime_compilers as _register_runtime_compilers
+
+_register_runtime_compilers(compile_pulse_table_runtime_program,
+                            compile_pulse_table_scan_runtime_program)
+

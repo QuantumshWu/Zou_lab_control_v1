@@ -105,7 +105,9 @@ Z2C_FROZEN_TEST_IMPORTERS = 0
 #: 19 as of the render-loop move: ``frontend/render_loop.py`` became a shim when the module
 #: itself went to ``zlc_frontend/qt_widgets``.  The count is allowed to RISE only when a move
 #: creates the shim -- which is the one legitimate reason -- and it must fall back to zero at Z0.
-Z3_FORWARDING_SHIMS = 20   # +qt_canvas.py: its body moved to the plot_bridge zone
+Z3_FORWARDING_SHIMS = 27   # +7: the pulse domain (pulse_table/sequence/ports/_serialization/
+                           # _clock/_streamer_geometry -> zlc_neutral_atom.timing) and
+                           # _viewer_registry (-> zlc_data) left shims behind
 Z7_REBUILT_WORKBENCH_FILES = 12
 #: 0 forever: after the cull the manifest IS the suite.  A test file not on the manifest is no
 #: longer a frozen archive entry -- it is a mistake, and this guard says so immediately.

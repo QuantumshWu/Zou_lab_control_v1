@@ -10,8 +10,8 @@
 | 项 | 现值 |
 | --- | --- |
 | 两巨石行数 | `frontend/task_console.py` **393(0 def,纯别名壳——解体完成)** + `frontend/pulse_gui.py` 4475(未开始) |
-| 删除台账剩余 | 承 20(目标包待定 20)/ 内 68 / 死 19,共 107 |
-| 当前窗口 | **task_console 壳解体完成(0 def)**:批1 Analysis→qt_widgets;批2 PanelCard 簇+qt_canvas→plot_bridge*;批3 编辑器三件分流;批4 TaskConsole 本体+show_task_console+_StopAttempt→`plot_bridge_console.py`(3685 行);**pulse_gui 入口已切 `zlc_workbench/pulse_editor/app.py`,A/B vs main 零差异(260 widget)**,下一步=pulse_gui 壳解体 |
+| 删除台账剩余 | 承 20(目标包待定 17)/ 内 68 / 死 19,共 107;pulse 域四件已搬空成壳 |
+| 当前窗口 | **task_console 壳解体完成(0 def)**;**pulse_gui 入口已切 `zlc_workbench/pulse_editor/app.py`(A/B vs main 零差异)**;**P3 pulse 领域已搬 `zlc_neutral_atom/timing/`**(pulse_table/sequence_model/ports/serialization/clock/streamer_geometry,compile 桥=注册表反转;_viewer_registry→zlc_data),下一步=pulse_gui 壳解体(领域阻塞已除) |
 
 ## 22. 最终验收
 
@@ -920,7 +920,7 @@ Pulse/FPGA：
 | 旧树文件 | 行 | 旧树之外的 consumer | 目标包 |
 | --- | ---: | --- | --- |
 | `Zou_lab_control/frontend/task_console.py` | 8869 | `zlc_workbench/task_console/app.py`(唯一生产 consumer,Z4 具名 composition root)+ 8 处测试 | 解体进 `zlc_frontend/qt_widgets` + `zlc_workbench/task_console` |
-| `Zou_lab_control/neutral_atom/timing/pulse_table.py` | 3029 | `tests/test_u06_shell_domain_ports.py` | ? |
+| `Zou_lab_control/neutral_atom/timing/pulse_table.py` | 3029 | 已搬空:本体在 `zlc_neutral_atom/timing/pulse_table.py`,此路径=PEP 562 转发壳(Z0 死);compile/compile_scan 经注册表由设备层注入 | 已定:zlc_neutral_atom(done) |
 | `Zou_lab_control/neutral_atom/devices/sequencer.py` | 2873 | `fpga/pulse_streamer/sim/_gen_replay_t.py` | ? |
 | `Zou_lab_control/neutral_atom/devices/virtual.py` | 2723 | `tests/test_u06_shell_domain_ports.py` | ? |
 | `Zou_lab_control/neutral_atom/operations/logic.py` | 2273 | `tests/test_u05_declaration_not_class.py` | ? |
@@ -980,14 +980,14 @@ Pulse/FPGA：
 | `Zou_lab_control/neutral_atom/subsystems/readout.py` | 891 | 1 |
 | `Zou_lab_control/neutral_atom/operations/measurement.py` | 869 | 10 |
 | `Zou_lab_control/neutral_atom/devices/drivers/dcam/dcam.py` | 747 | 1 |
-| `Zou_lab_control/neutral_atom/timing/sequence.py` | 683 | 6 |
+| `Zou_lab_control/neutral_atom/timing/sequence.py` | 683 | 6(已搬空→`zlc_neutral_atom/timing/sequence_model.py`,此路径=壳) |
 | `Zou_lab_control/neutral_atom/session.py` | 634 | 4 |
 | `Zou_lab_control/neutral_atom/core/calibration.py` | 604 | 10 |
 | `Zou_lab_control/frontend/flow_graph_view.py` | 557 | 1 |
 | `Zou_lab_control/neutral_atom/content/manuals.py` | 536 | 1 |
 | `Zou_lab_control/neutral_atom/core/analysis.py` | 480 | 20 |
 | `Zou_lab_control/neutral_atom/devices/registry.py` | 447 | 9 |
-| `Zou_lab_control/neutral_atom/ports.py` | 445 | 7 |
+| `Zou_lab_control/neutral_atom/ports.py` | 445 | 7(已搬空→`zlc_neutral_atom/timing/ports.py`,此路径=壳) |
 | `Zou_lab_control/neutral_atom/operations/temperature.py` | 421 | 4 |
 | `Zou_lab_control/neutral_atom/operations/fidelity.py` | 401 | 3 |
 | `Zou_lab_control/neutral_atom/operations/imageio.py` | 375 | 4 |
@@ -1015,7 +1015,7 @@ Pulse/FPGA：
 | `Zou_lab_control/neutral_atom/subsystems/timing.py` | 121 | 1 |
 | `Zou_lab_control/neutral_atom/timing/__init__.py` | 109 | 17 |
 | `Zou_lab_control/neutral_atom/operations/measurements/_coupled_template.py` | 103 | 2 |
-| `Zou_lab_control/neutral_atom/_serialization.py` | 91 | 6 |
+| `Zou_lab_control/neutral_atom/_serialization.py` | 91 | 6(已搬空→`zlc_neutral_atom/timing/serialization.py`,此路径=壳) |
 | `Zou_lab_control/frontend/content/tutorials.py` | 78 | 1 |
 | `Zou_lab_control/neutral_atom/operations/task.py` | 75 | 2 |
 | `Zou_lab_control/neutral_atom/core/utils.py` | 52 | 6 |
@@ -1056,3 +1056,4 @@ Pulse/FPGA：
 | 2026-07-20 | 壳解体 3:编辑器簇三件分流 | `DONE` | MeasurementPanel(353L,纯 Qt 零依赖)→`qt_widgets/measurement_panel.py`,LogicNodeEditor(90L)→`qt_widgets/logic_node_editor.py`(均<600,C21;facade 尾部导入防 param_widgets 环),PanelEditor(1248L,持 plt/canvas/DataFigure)→`plot_bridge_editor.py`(C20)。**当轮新测量**:三件对留守 TaskConsole 零依赖;PanelEditor 读plot_bridge 四名(_RELIM_PARAM 等)走包内 sibling import。壳 5646→3979 行、def 6→3(census 等值);别名 is 本体;指纹自 A/B root 相等 | 启动器 rc=0;127 守卫 passed |
 | 2026-07-20 | 壳解体 4(终局):TaskConsole 本体整体搬迁,壳归零 | `DONE` | TaskConsole(3493L)+show_task_console+_StopAttempt+两字面量(TASK_FRAME_KEY/MID_RUN_TAG)→`zlc_workbench/task_console/plot_bridge_console.py`(C20 过渡区;P5 时接线沉 app.py、控件毕业qt_widgets)。壳 3979→**393 行、0 顶层 def**=单窗口解体完成判据达成(census 0/0 等值,C6)。**当轮新测量**:三件闭包全部经真源解析(consts 来自 plot_bridge/console_state/console_records,唯二字面量随行);体内 `.live import GridPlot` 改指 live_plot.live | 启动器 rc=0;51 守卫 passed;自 A/B 指纹 root 相等;全量收口进行中 |
 | 2026-07-20 | pulse_gui 入口先行 | `DONE` | `zlc_workbench/pulse_editor/app.py` 组合根委托旧`_gui.open_pulse_gui`(复用其 offline/session 双路,Z4/Z2A 具名,C20);根启动器+`Experiment.pulse_gui` 同 commit 改指;窄 PulseWorkbench 留组件(测试按名取,零影响)。**当轮新测量**:A/B vs ZLC_main 指纹零差异(260 widget/`PulseSequenceEditor`);已记漂移(C22):main `show_pulse_gui(sequencer=)` vs 本树 `target_descriptor=/command_port=`,接口先前已重构,不追。三个入口钉随语义跟随(composes/workspace-bootstrap/launcher-subprocess)。**机制修复:loop 改由 recurring cron 驱动(5 分钟自愈),弃单发 wakeup(错过即死是停摆根因)** | 启动器 rc=0;A 组 81 passed;B 0/2 |
+| 2026-07-20 | P3·pulse 领域搬迁(壳解体阻塞已除) | `DONE` | 六件 4321 行整搬 `zlc_neutral_atom/timing/`(pulse_table/sequence_model/ports/serialization/clock/streamer_geometry);_viewer_registry→zlc_data,五个校验函数→`zlc_data/validation.py`。**当轮新测量·DAG 裁决**:守卫禁 zlc_pulse import zlc_data 且禁 legacy 拓扑 token,故目的地=zlc_neutral_atom(C13)。compile/compile_scan 注册表反转,devices/sequencer 模块尾注册;未武装报接线错,VirtualSequencer 链武装后编译真跑成功。七旧路径=PEP562 壳(Z3 20→27,C25);strip 豁免 22 条随代码登记;owner 钉双家覆盖(C5);C24 未决 18→17(C6) | A 组 99+DAG 30+z0 8;B 组 5 文件独立进程绿;两入口 rc=0 |

@@ -197,6 +197,33 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         (Path("zlc_frontend/qt_widgets/form.py"), "_FloatHandler.is_empty"),
         (Path("zlc_pulse/document.py"), "ScanRecipeProvenance.__post_init__"),
         (Path("zlc_pulse/transport/axi.py"), "VivadoAxiRegisterTransport._parse_read"),
+        # The legacy pulse domain moved into zlc_neutral_atom.timing (shims stay behind);
+        # the named entries follow the code.  Every one reads text a HUMAN typed - channel
+        # labels from config/GUI, scan-slot / API-slot names, a period field's nominal
+        # text, a bus-target token, an analog-bus mode word - exactly the named
+        # input-adapter boundary .strip() is reserved for.
+        (Path("zlc_neutral_atom/timing/ports.py"), "PortSpec.__post_init__"),
+        (Path("zlc_neutral_atom/timing/ports.py"), "PortCatalog.__post_init__"),
+        (Path("zlc_neutral_atom/timing/ports.py"), "PortCatalog.with_label"),
+        (Path("zlc_neutral_atom/timing/ports.py"), "PortCatalog.from_channels"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "_default_scan_name"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "ScanSlot.__post_init__"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "PulseTableState._read_field_nominal"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "PulseTableState._set_bus_target"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "PulseTableState._clear_slot_binding"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "PulseTableState._normalize_analog_bus_modes"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "PulseTableState.set_analog_bus_mode"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "_SafeEval.affine"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "_coerce_bus_value"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "_period_display"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "bus_period_levels"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "eval_time_expr"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "evaluate_scan_table_code"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "is_slot_ref"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "load_scan_table"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "period_index_by_name"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "resolve_pulse_template"),
+        (Path("zlc_neutral_atom/timing/pulse_table.py"), "slot_ref_index"),
     }
 )
 
@@ -982,13 +1009,19 @@ def test_pulse_software_formats_have_no_upgrade_or_edit_counter():
     ABI and the deployed runtime wire version are intentionally out of scope.
     """
 
-    timing_root = ROOT / "Zou_lab_control" / "neutral_atom" / "timing"
-    upgrader = timing_root / "legacy_pulse_upgrade.py"
-    assert not upgrader.exists(), "historical pulse upgrade code must stay deleted"
+    # The pulse domain moved to zlc_neutral_atom.timing (shims stay behind); the
+    # owner pins follow the code, and the deleted-upgrader ratchet covers BOTH homes.
+    for timing_root in (
+        ROOT / "Zou_lab_control" / "neutral_atom" / "timing",
+        ROOT / "zlc_neutral_atom" / "timing",
+    ):
+        upgrader = timing_root / "legacy_pulse_upgrade.py"
+        assert not upgrader.exists(), "historical pulse upgrade code must stay deleted"
 
+    timing_root = ROOT / "zlc_neutral_atom" / "timing"
     owners = (
-        (ROOT / "Zou_lab_control" / "neutral_atom" / "ports.py", "PortCatalog"),
-        (timing_root / "sequence.py", "PulseSequence"),
+        (timing_root / "ports.py", "PortCatalog"),
+        (timing_root / "sequence_model.py", "PulseSequence"),
         (timing_root / "pulse_table.py", "PulseTableState"),
     )
     violations = []

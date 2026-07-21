@@ -401,41 +401,23 @@ def normalize_ordering(ordering: str) -> str:
     return aliases[name]
 
 
-def finite_float(value, name: str) -> float:
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be finite, not a boolean.")
-    out = float(value)
-    if not np.isfinite(out):
-        raise ValueError(f"{name} must be finite.")
-    return out
+# The five strict numeric validators moved to ``zlc_data.validation`` (one
+# rejection vocabulary for every layer); these names ARE the moved objects.
+from zlc_data.validation import (  # noqa: E402
+    finite_float,
+    nonnegative_int,
+    positive_int,
+    positive_float,
+    nonnegative_float,
+)
 
 
-def nonnegative_int(value, name: str) -> int:
-    out = finite_float(value, name)
-    if int(out) != out or out < 0:
-        raise ValueError(f"{name} must be a non-negative integer.")
-    return int(out)
 
 
-def positive_int(value, name: str) -> int:
-    out = nonnegative_int(value, name)
-    if out <= 0:
-        raise ValueError(f"{name} must be a positive integer.")
-    return out
 
 
-def positive_float(value, name: str) -> float:
-    out = finite_float(value, name)
-    if out <= 0:
-        raise ValueError(f"{name} must be > 0.")
-    return out
 
 
-def nonnegative_float(value, name: str) -> float:
-    out = finite_float(value, name)
-    if out < 0:
-        raise ValueError(f"{name} must be >= 0.")
-    return out
 
 
 def probability(value, name: str) -> float:
