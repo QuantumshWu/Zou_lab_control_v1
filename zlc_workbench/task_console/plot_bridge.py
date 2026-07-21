@@ -1,14 +1,15 @@
-"""The task console's Qt x matplotlib zone: the panel card, its board, and the card geometry.
+"""The console's panel card: its raster surface, its Setting, and the card geometry.
 
-Everything here HOLDS both worlds at once -- a card owns its matplotlib plotter and canvas
-inside a Fluent Qt group box; the geometry bridge sizes Qt card chrome from figure pixels.
-Neither ``zlc_frontend/qt_widgets`` (may not import matplotlib) nor ``zlc_data`` (no toolkit
-at all) may hold that marriage, which is exactly what this transitional zone exists for: it
-empties in the render-purification pass, when the worker rasterises off-thread and Qt sees
-only pixels.
+A card owns NO plotting object.  Its surface is a raster board painted from
+immutable bytes, and every picture on it was composed on a worker from one
+frozen snapshot (:mod:`zlc_frontend.panel_render`).  That is what keeps a
+megapixel frame off the thread that also has to stay responsive, and it is why
+the display knobs here are stored FACTS (``config.params``) rather than pushes
+into a live figure: the knobs are read back on the next compose, so what is
+stored and what is drawn cannot drift.
 
-Every import names a TRUE owner -- nothing in this module touches the legacy tree, so
-deleting ``Zou_lab_control`` cannot orphan it.
+Every import names a TRUE owner -- nothing in this module touches the legacy
+tree, so deleting ``Zou_lab_control`` cannot orphan it.
 """
 
 from __future__ import annotations
@@ -79,8 +80,6 @@ ParamWidgetContext = _qt_widgets.param_widgets.ParamWidgetContext
 coerce_short_labels = _qt_widgets.param_widgets.coerce_short_labels
 fill_grouped_signal_combo = _qt_widgets.param_widgets.fill_grouped_signal_combo
 
-# Mirrors the legacy shell's guard: a matplotlib install without the Qt backend still lets the
-# headless documents import; only actually BUILDING a panel canvas needs the backend.
 
 
 #: Per-signal publish counters ({name: version}) so a rolling monitor tells a new sample of
@@ -122,6 +121,11 @@ def _panel_view_intents():
         "hist": ViewIntent.HISTOGRAM,
         "grid": ViewIntent.IMAGE,
     }
+
+#: Sentinel for "this panel has never stored a repeat mode".  A stored ``None``
+#: is a CHOICE the operator made; absence is not, and the kind's default only
+#: applies to absence.
+_MISSING_REPEAT_MODE = object()
 
 GRID_UNIT = 8
 
@@ -228,47 +232,22 @@ _RELIM_MODES = ("tight", "normal", "fixed")
 #: The relim mode as a declarative ``ParamDecl`` -- so every panel's relim chooser renders
 #: through the SAME _make_param_widget / PARAM_WIDGETS path every other plot param uses (one source,
 #: auto-injected into BOTH the Setting popup and the Edit tab, #H3v-4b).  Edits route through
-#: ``_set_param`` (which pushes the mode onto the live plotter + reveals the fixed lo/hi row).
+#: ``_set_param`` (which stores the mode and reveals the fixed lo/hi row).
 _RELIM_PARAM = ParamDecl(
     key="relim", label="relim", kind="choice", default="tight", choices=_RELIM_MODES, display=True,
     tooltip="Relim mode (confocal_gui combo_relim naming):\n"
             "  tight  = autoscale hugs the data\n"
-            "  normal = autoscale with the matplotlib default margin\n"
+            "  normal = autoscale, holding the window until the data leaves it\n"
             "  fixed  = pin the y-axis / colour-limit to the lo/hi below")
-
-#: Debounce window (ms) for coalescing a burst of STRUCTURE-knob edits into ONE plotter rebuild.  A
-#: fast scroll on a rebuild-class param (history length, colormap, ...) fires many _set_param calls; each
-#: restarts this timer, so the (heavy) teardown+rebuild runs ONCE after the burst settles, on the latest
-#: values -- removing the per-tick rebuild race.  Short enough that a single deliberate edit still feels
-#: instant; long enough that a wheel spin coalesces.
-REBUILD_DEBOUNCE_MS = 90
-
 
 # ====================================================================== panels
 _MONITOR_UNSET = object()   # sentinel: a monitor panel that has never rolled yet
-
-class _GridFocus:
-    """Parked GRID state while one of its cells is ENLARGED into a standalone plot-kind figure in the
-    console.  Holds the grid plotter + its (detached, not closed) canvas so :meth:`PanelCard._unfocus_grid_cell`
-    can swap the grid back, the focused cell index (to mirror a threshold drag back onto it), and the mpl
-    callback ids on the focus canvas so they are disconnected on return / teardown."""
-
-    def __init__(self, *, grid, grid_canvas, k: int):
-        self.grid = grid
-        self.grid_canvas = grid_canvas
-        self.k = int(k)
-        self.click_cid = None
-        self.key_cid = None
-        #: A Setting edit was persisted onto the (parked) grid while it was zoomed -> its buffer is stale,
-        #: so unfocus must re-render.  Left False the common "just look and go back" case keeps the grid's
-        #: already-rendered buffer (fit + thumbnails) and unfocus is an instant re-blit, never a re-render.
-        self.dirty = False
 
 class PanelCard(FluentGroupBox):
     """One dashboard panel: a TITLED frame (title strip = the panel KIND + the signal-source
     legend, top-left) holding the frontend canvas, and a text
     "Setting" button on the title strip (top-right).  The frame border is the DRAG
-    HANDLE (the matplotlib canvas keeps all its own interactions); the card
+    HANDLE (the board keeps all its own pointer interactions); the card
     spans whole layout slots -- a 2-row card is exactly two
     1-row cards plus the gap."""
 
@@ -366,8 +345,6 @@ class PanelCard(FluentGroupBox):
         # Bumped by every display-knob edit.  The renderer reads it to tell a
         # genuinely new display from a repeat of the same one.
         self._display_revision = 0
-        self.plotter = None      # no Matplotlib object lives on a card any more
-        self.canvas = None
         # The console header's "Selectors" switch state for THIS card (set via
         # ``set_selectors_enabled``; default OFF = the historical display-only Monitor board).
         # Every plotter (re)build parks its selector layer to this flag (``_apply_selectors_state``),
@@ -377,52 +354,11 @@ class PanelCard(FluentGroupBox):
         # serializable; selecting never implies an ROI or a fit.  The explicit
         # ``selection_action`` config decides what a later release does.
         self._active_selection = None
-        # GRID focus-zoom state (console path).  A GRID panel is display-only (interactions=False), so its
-        # own double-click handler is dormant; THIS card catches the double-click on the grid canvas and
-        # swaps ``self.plotter`` / ``self.canvas`` to a STANDALONE plot-kind figure of the clicked cell
-        # (``GridPlot.build_focus_plotter`` -- the SAME builder the notebook path uses).  While focused,
-        # ``self.plotter`` IS that standalone figure, so a lim / fit / relim edit reaches it through the
-        # ORDINARY _set_param / _apply_lim_to_plotter path (no bespoke code) and the live tick is gated OFF
-        # so the grid never rebuilds over it (no bounce-back).  ``None`` = showing the grid; else a
-        # ``_GridFocus`` holding the parked grid plotter/canvas + the focused cell index + the click/key cids.
-        self._grid_focus = None
-        # The TOP spacer that centres the stock-size (2x2) enlarged cell vertically inside a larger grid
-        # region while focused -- inserted by _focus_grid_cell, removed on unfocus/teardown.
-        self._focus_top_stretch = None
-        # The cell index to AUTO RE-FOCUS after a teardown+rebuild (size / source / structure-param
-        # change) that happened WHILE a grid cell was enlarged: _teardown_plot records the focused index
-        # here, _build_plot's grid branch re-focuses it -- so a rebuild-class edit lands the operator back
-        # on the SAME enlarged cell (at the new size/params) instead of silently bouncing to the main
-        # grid view (#no-focus-bounce).  ``None`` = nothing to restore.  An EXPLICIT unfocus (double-click
-        # / Esc) never passes through _teardown_plot, so it never re-focuses.
-        self._pending_refocus_k: int | None = None
+        # {param key: declared kind} for each rendered row, so reopening the Setting
+        # re-seeds a control through its OWN kind's writer instead of guessing from
+        # the stored value's Python type.
+        self._param_kinds: dict[str, str] = {}
         self._value_shape: tuple[int, ...] | None = None
-        # A STRUCTURE knob (bins / colormap / fit ...) sets this to force the NEXT _render to REBUILD
-        # the plotter -- WITHOUT pre-tearing it down.  _build_plot build-then-swaps, so a failed rebuild
-        # keeps the OLD figure (the card never goes blank) -- the root fix for the "scroll bins and the
-        # figure occasionally vanishes" race, where a pre-null teardown could latch plotter=None.
-        self._force_rebuild = False
-        # ANTI-RACING rebuild debounce: a STRUCTURE-knob edit that needs a rebuild schedules it on this
-        # single-shot timer instead of rebuilding inline.  A fast burst of edits (scrolling the history
-        # spin / a colormap combo) RESTARTS the timer, so only ONE rebuild runs after the burst settles
-        # -- the latest config.params values.  This is GENERAL (every rebuild-class param, not history
-        # only): coalescing the rebuilds removes the race where per-tick teardown+rebuild outran the Qt
-        # holder reflow (the figure flickered / grew / vanished).  _build_plot itself is atomic
-        # build-then-swap at a fixed canvas size, so even a rebuild that DOES run never blanks the card.
-        self._rebuild_timer = QtCore.QTimer(self)
-        self._rebuild_timer.setSingleShot(True)
-        self._rebuild_timer.setInterval(REBUILD_DEBOUNCE_MS)
-        self._rebuild_timer.timeout.connect(self._run_pending_rebuild)
-        # The LAST namespace this panel rendered from (a reference to the hub
-        # snapshot of that tick).  A display-only change (cmap / relim / source pick)
-        # tears the plotter down and normally waits for the NEXT hub tick to rebuild --
-        # but a STOPPED measurement freezes hub.version, so _tick's gate never calls
-        # refresh again and the panel would stay blank (white).  Re-rendering from this
-        # cached namespace makes such a change take effect immediately, stopped or not.
-        self._last_namespace: Mapping[str, object] | None = None
-        # ``_repeat_cur`` = how many repeats of the measurement's block currently have data (drives
-        # the plotter's "xN" ylabel); set by _signal_then_repeat when it reduces the repeat axis.
-        self._repeat_cur: int = 1
         # The hub version at this panel's LAST render -- the per-panel multi-rate refresh
         # (see TaskConsole._tick) skips a panel on its beat when nothing new was published
         # since, so a slow panel does not redraw stale data and a fast one only when needed.
@@ -565,25 +501,6 @@ class PanelCard(FluentGroupBox):
             lay.addWidget(label, 0)
         row = FluentSettingRow("unit", host, label_width=label_w)
         return row, button, label
-
-    def _apply_lim_to_plotter(self) -> None:
-        """Push the relim mode + fixed lo/hi onto the LIVE plotter through the ONE in-place entry
-        every surface uses -- ``apply_param``'s relim family (BaseLivePlot applies mode + lo/hi and
-        re-relims now; a GridPlot stores them and fans out to its THUMBNAILS and any focused cell) --
-        never a bare attribute poke, which a grid would silently ignore.  Shared by the declarative
-        relim edit (_set_param) and the rebuild-time re-apply (_apply_display_params)."""
-        if self.plotter is None:
-            return
-        # Coalesce: each apply_param ends in BaseLivePlot.draw() (a SYNCHRONOUS draw_idle+flush_events, and
-        # for a grid a whole-N-cell thumbnail rebuild), so three back-to-back applies did three full renders
-        # of the same final state.  suspend_draws makes those inner draws no-ops; the ONE trailing
-        # canvas.draw_idle() below paints the final result once (identical pixels, ~3x fewer renders).
-        with self.plotter.suspend_draws():
-            self.plotter.apply_param("relim", self._relim())
-            self.plotter.apply_param("fixed_lo", float(self.config.params.get("fixed_lo", 0.0)))
-            self.plotter.apply_param("fixed_hi", float(self.config.params.get("fixed_hi", 1.0)))
-        if self.canvas is not None:
-            self.canvas.draw_idle()
 
     def _kind_repeat_modes(self) -> list:
         """The repeat modes THIS plot kind offers (its ``PLOT_KINDS`` entry, else the image
@@ -770,9 +687,13 @@ class PanelCard(FluentGroupBox):
         from zlc_frontend.figure import ViewIntent
 
         params = self.config.params
-        mode = RelimMode.NORMAL if str(self._relim()) == "normal" else RelimMode.TIGHT
+        # The panel's relim vocabulary IS the renderer's: tight / normal / fixed.
+        # Converting rather than re-deciding keeps one set of names, so a mode
+        # the renderer grows is a mode the Setting can offer with no mapping to
+        # update in between.
+        mode = RelimMode(str(self._relim()))
         fixed = None
-        if str(params.get("relim", "")) == "fixed":
+        if mode is RelimMode.FIXED:
             fixed = (float(params.get("fixed_lo", 0.0)),
                      float(params.get("fixed_hi", 1.0)))
         intent = _panel_view_intents().get(self.config.kind, ViewIntent.IMAGE)
@@ -851,7 +772,6 @@ class PanelCard(FluentGroupBox):
         self.refresh_on_show()          # Setting controls are a VIEW of config.params -- refresh on open (#6)
         self._refresh_analysis_controls()   # the Analysis section derives on every open too (#6 result-row fix)
         self._refresh_signal_combo()
-        self._refresh_facet_combo()     # facet choices re-derive from the CURRENT node structure
         self._refresh_sub_kind_combo()
         anchor = self.setting_button.mapToGlobal(
             QtCore.QPoint(self.setting_button.width(), self.setting_button.height()))
@@ -986,49 +906,35 @@ class PanelCard(FluentGroupBox):
             return
         self._rebuild_settings_popup(reopen=self.settings_popup.isVisible())
 
-    # ------------------------------------------------ basic display toggles
     def _current_unit_text(self) -> str:
-        n = int(self.config.params.get("unit_index", 0) or 0)
-        return "unit" if n == 0 else f"unit x{n}"
+        """The bound signal's declared unit, or a neutral placeholder."""
+
+        value = self._last_value
+        unit = "" if value is None else (value.unit or "")
+        return unit or "unit"
 
     def _on_unit_cycle(self) -> None:
-        """Cycle the x-axis unit ONE step on the live panel and remember the new
-        index (reuses DataFigure.change_unit).  Cycling once on the current axis
-        (rather than re-applying index-from-original) keeps repeated clicks
-        correct; a rebuild re-derives the same state from the stored index.  When
-        the axis label carries no convertible unit the cycle is a no-op."""
-        if self.plotter is None:
-            return
-        self._wait_render_idle()       # change_unit rewrites live x data/labels: own the figure first
-        df = self._unit_df()
-        length = len(df.conversion_map) if getattr(df, "conversion_map", None) else 0
-        if length:
-            df.change_unit()
-            self.config.params["unit_index"] = (
-                int(self.config.params.get("unit_index", 0) or 0) + 1) % length
-            self.changed.emit()
-        if hasattr(self, "unit_label"):
-            self.unit_label.setText(self._current_unit_text())
-        if self.canvas is not None:
-            self.canvas.draw_idle()
+        """Refresh the unit readout.
+
+        The unit is the PRODUCER's declared fact (``cell_schema.value_unit`` and
+        each axis's own unit), carried on the data and printed by the renderer.
+        A panel cannot cycle it: rewriting the unit here would make the picture
+        disagree with the schema every other reader trusts.  The row stays as
+        the readout of what the bound signal actually declares.
+        """
+
+        self.unit_label.setText(self._current_unit_text()) if hasattr(self, "unit_label") else None
 
     def apply_fixed_lims(self, lo: float, hi: float) -> None:
-        """Persist + apply the fixed lo/hi NOW through the ONE in-place entry every surface uses
-        (``apply_param``'s relim family): on a ZOOMED grid the pin is ALSO stored on the parked grid
-        (thumbnails carry it when the zoom returns); otherwise it lands on the live plotter directly
-        (a GridPlot fans it out to its thumbnails itself).  The Setting popup's lo/hi inputs and the
-        Edit tab's both route here -- no second hand-copied push path."""
-        self._wait_render_idle()       # relim + axis mutation on the live plotter: own the figure first
+        """Persist the fixed lo/hi and re-compose with them NOW.
+
+        The Setting popup's inputs and the Edit tab's both route here, so the
+        pinned window has ONE writer; the rasteriser reads it back out of the
+        display state on the next compose.
+        """
+
         self.config.params["fixed_lo"], self.config.params["fixed_hi"] = float(lo), float(hi)
-        if self._grid_focus is not None:
-            self._set_focused_grid_param("fixed_lo", float(lo))
-            self._set_focused_grid_param("fixed_hi", float(hi))
-        elif self.plotter is not None:
-            with self.plotter.suspend_draws():   # both applies paint the SAME final state -> one render below
-                self.plotter.apply_param("fixed_lo", float(lo))
-                self.plotter.apply_param("fixed_hi", float(hi))
-        if self.canvas is not None:
-            self.canvas.draw_idle()
+        self._rerender_now()
         self.changed.emit()
 
     def _on_fixed_lim_edited(self) -> None:
@@ -1047,22 +953,21 @@ class PanelCard(FluentGroupBox):
         self.update_interval_changed.emit()    # console re-bases the shared timer
         self.changed.emit()                    # mark the layout dirty
 
-    # --------------------------------------------- basic display application
     def _param_kind(self) -> str:
         """The plot kind whose :data:`PANEL_PARAMS` drive THIS panel's Setting / Edit param UI.
 
-        For every ordinary kind that is ``config.kind``.  For a GRID panel it is the grid's per-site
-        ``sub_plot_kind`` -- so a hist grid shows the ``"hist"`` bins/fit/ylog knobs and a 2d (kernel) grid
-        shows the ``"2d"`` colormap chooser, INSTEAD of the one hard-coded hist set a fixed ``"grid"`` entry
-        used to give every grid regardless of what its cells actually were (#4).  Resolved from the built grid
-        (``plotter.sub_plot_kind``); before the grid is built, peeked off its producing node's recipe."""
+        For every ordinary kind that is ``config.kind``.  A GRID panel's knobs are
+        its per-cell kind (``sub_plot_kind``): a histogram grid must offer bins /
+        fit, an image grid a colormap.  That choice is a stored panel param, so
+        the Setting rows follow it without asking a figure what it turned out to
+        be.
+        """
+
         if self.config.kind != "grid":
             return self.config.kind
-        sub = getattr(self.plotter, "sub_plot_kind", None)
+        sub = self.config.params.get("sub_plot_kind")
         if sub:
             return str(sub)
-        if self._facet():
-            return self._resolved_sub_kind()     # a facet grid's kind derives from the slice, not a recipe
         recipe = self._grid_recipe_or_none()
         if recipe:
             return str(recipe.get("sub_plot_kind") or "hist")
@@ -1095,7 +1000,7 @@ class PanelCard(FluentGroupBox):
         # card's recipe rebuild and the Edit snapshot rebuild pick up the edited title.
         out["title"] = self.config.title or out.get("title") or ""
         display = dict(out.get("display_params") or {})
-        for decl in _panel_display_decls(self.config.kind, self._param_kind()):   # sub-kind knobs + grid title (#5)
+        for decl in _panel_display_decls(self.config.kind, self._param_kind()):   # sub-kind knobs + grid title
             if decl.key in self.config.params:
                 display[decl.key] = self.config.params[decl.key]
         # The relim family is display state too (it lives beside PANEL_PARAMS as _RELIM_PARAM + the
@@ -1110,41 +1015,6 @@ class PanelCard(FluentGroupBox):
         return out
 
     # --------------------------------------------------------------- facet (the grid as an axis-expander)
-
-    def _facet_value_shapes(self) -> tuple[tuple, tuple]:
-        """(points multi-D shape, data shape) from the producing node's declared structure (#H3o) --
-        the points axis is stored FLAT, its multi-D form lives in ``grid_shape`` when the scan
-        declared one.  The ONE source the facet choices, the auto sub-kind and the slicer share."""
-        st = self._bound_structure() or {}
-        gs = tuple(int(n) for n in (st.get("grid_shape") or ()))
-        ps = tuple(int(n) for n in (st.get("points_shape") or ()))
-        ds = tuple(int(n) for n in (st.get("data_shape") or ()))
-        return (gs or ps), ds
-
-
-
-
-
-    def _refresh_facet_combo(self) -> None:
-        """Refill the facet dropdown from the CURRENT node structure (a Setting open re-derives it,
-        like the signal combo) keeping the stored pick selected; over-limit axes come out greyed."""
-        combo = getattr(self, "facet_combo", None)
-        if combo is None:
-            return
-        current = self._facet()
-        with _signals_blocked(combo):
-            combo.clear()
-            index = 0
-            for j, (value, text, enabled) in enumerate(self._facet_choices()):
-                combo.addItem(text, value)
-                if not enabled:
-                    item = combo.model().item(combo.count() - 1)
-                    if item is not None:
-                        item.setEnabled(False)
-                if value == current:
-                    index = j
-            combo.setCurrentIndex(index)
-
 
     def _refresh_sub_kind_combo(self) -> None:
         """Re-select the stored ``sub_plot_kind`` pick ("" = auto) on the Setting's sub-plot chooser."""
@@ -1168,80 +1038,20 @@ class PanelCard(FluentGroupBox):
             self.config.params.pop("sub_plot_kind", None)      # auto: derive from the slice
         self._reset_plot()
         self._render_version = -1
-        self._rerender_last()
+        self._rerender_now()
         self._sync_settings_param_rows()
         self.changed.emit()
 
     def _apply_display_params(self) -> None:
-        """Apply the persisted Setting toggles (relim mode + unit cycle) to
-        the current plotter -- called after every rebuild and on each edit.
+        """Re-assert every stored display knob by re-composing this panel.
 
-        The persisted knobs: ``config.params["relim"]`` (confocal naming:
-        ``tight`` / ``normal``), ``config.params["unit_index"]`` (the x-axis unit
-        cycle count), and the view-window pins ``view_xlim`` / ``view_ylim`` (the
-        Edit tab's range rows, #3) -- re-applied here so a rebuild / reopen keeps
-        the operator's window instead of snapping back to autoscale.  (The y VALUE
-        axis of a 1d panel is relim-owned; ``view_ylim`` exists only on the image
-        family, whose ``apply_param`` gates it on ``y_is_view_axis``.)"""
-        if self.plotter is None:
-            return
-        self._apply_lim_to_plotter()                     # relim family via the ONE in-place entry
-        self._apply_unit()
-        self._apply_view_lims()
-        if "fit_request" in self.config.params:
-            self.plotter.apply_param("fit_request", self.config.params.get("fit_request"))
+        There is no second push path: the knobs ARE ``config.params``, the
+        composer reads them through :meth:`_display_state`, and re-composing is
+        how they take effect.  A panel whose producer has stopped still updates,
+        because the last frozen value is what it re-composes from.
+        """
 
-    def _apply_view_lims(self) -> None:
-        """Re-apply the persisted view-window pins (#3) to the LIVE plotter through the SAME
-        ``apply_param`` entry every display knob uses -- a grid stores them and re-asserts them on every
-        cell after each tick (:meth:`GridPlot._apply_view_knobs`), a flat panel sets its one axes -- so
-        the operator's Apply survives a rebuild / reopen AND sticks across the live autoscale (never the
-        old one-shot ``to_data_figure().xlim`` the next redraw wiped).  Absent (the default) leaves the
-        plot's own autoscale untouched; a ``view_ylim`` on a non-image kind (a stale recipe) is refused
-        by the plot's own ``y_is_view_axis`` gate."""
-        if self.plotter is None:
-            return
-        for key in ("view_xlim", "view_ylim"):
-            pin = self.config.params.get(key)
-            if not pin:
-                continue
-            try:
-                self.plotter.apply_param(key, (float(pin[0]), float(pin[1])))
-            except Exception:
-                pass                                      # a stale pin from a re-interpreted kind: ignore
-
-    def _unit_df(self):
-        """A DataFigure bound to the live card's figure/axes for the x-axis unit cycle
-        (shared impl: :func:`_unit_df_for`)."""
-        return _unit_df_for(self.plotter)
-
-    def _unit_cycle_len(self) -> int:
-        """Length of the x-axis unit cycle for the CURRENT plotter (0 if none)."""
-        if self.plotter is None:
-            return 0
-        try:
-            cmap = getattr(self._unit_df(), "conversion_map", None)
-        except Exception:
-            return 0
-        return len(cmap) if cmap else 0
-
-    def _apply_unit(self) -> bool:
-        """Cycle the x-axis unit ``unit_index`` times from its original (reuse
-        DataFigure.change_unit).  Returns True if any conversion was applied."""
-        if self.plotter is None:
-            return False
-        index = int(self.config.params.get("unit_index", 0) or 0)
-        if index <= 0:
-            return False
-        try:
-            df = self._unit_df()
-            if not getattr(df, "conversion_map", None):
-                return False
-            for _ in range(index % max(1, len(df.conversion_map))):
-                df.change_unit()
-            return True
-        except Exception:
-            return False
+        self._rerender_now()
 
     def _refresh_title(self) -> None:
         """Compose the grey frame TITLE: the panel KIND + WHERE its signal comes from (the
@@ -1323,40 +1133,30 @@ class PanelCard(FluentGroupBox):
         super().resizeEvent(event)
         self._place_setting_button()
 
-    # ------------------------------------------------------------- config edits
     def _on_title(self, text: str) -> None:
-        """Update the plot title via the FRONTEND'S sealed title API.
+        """Rename the panel.  The title is the card's, and the figure's label.
 
-        ``BaseLivePlot.title`` is the single source of truth and
-        ``BaseLivePlot._apply_title`` routes through ``style.apply_title``,
-        which paints the title at ``title_fontsize()`` with the correct pad.
-        Calling ``ax.set_title(text)`` directly bypasses both -- matplotlib
-        then uses its OWN ``axes.titlesize`` rcParam (NOT the frontend's
-        ``axes.labelsize``-derived size), so the title visibly shrinks /
-        grows after every edit.  Always go through the sealed API."""
+        One string: the frame header shows it and the composer carries it as the
+        dataset label, so the picture and the card can never be captioned
+        differently.
+        """
+
         self.config.title = str(text)
-        if self.plotter is not None and getattr(self.plotter, "ax", None) is not None:
-            self._wait_render_idle()   # in-place artist mutation: own the figure first
-            self.plotter.title = self.config.title
-            self.plotter._apply_title()
-            if self.canvas is not None:
-                self.canvas.draw_idle()
+        self._compose_key = None          # the label is part of the composer's identity
+        self._rerender_now()
         self.changed.emit()
 
     def _on_size(self, size: str) -> None:
-        self._wait_render_idle()   # the teardown+regrow+rebuild below must own the figure
+        self._wait_render_idle()   # the worker must not be composing into the surface being replaced
         self.config.size = str(size)
-        # ATOMIC relayout transaction.  A size change is THREE synchronous steps: _reset_plot tears the
-        # plotter down (canvas -> None, the holder goes momentarily EMPTY), _apply_fixed_size grows the
-        # card to the new preset, _rerender_last rebuilds the canvas.  If ANY event-loop slice runs
-        # between the grow and the rebuild -- a closing size-combo popup, matplotlib's own draw() -- the
-        # user sees one frame of a BIG EMPTY card before the image lands = the "resize jump" (reproduced:
-        # a 994x653 card with only the title strip painted, canvas still None).  Freezing THIS card's
-        # repaints for the whole mutation (updates disabled -> the Agg buffer still renders, only the Qt
-        # blit defers) makes the paint system composite one clean final frame: card at the new size WITH
-        # the new-size canvas in place (verified: zero intermediate paintEvents).  The layout_changed
-        # emit -- and so the sibling gravity repack it drives -- runs INSIDE the freeze, so this card's
-        # final POSITION + size + image all land together; finally re-enables even if a rebuild raises.
+        # ATOMIC relayout transaction.  A size change is three synchronous steps: drop the surface,
+        # grow the card to the new preset, re-compose.  If any event-loop slice runs between the grow
+        # and the re-compose -- a closing size-combo popup, a deferred paint -- the operator sees one
+        # frame of a BIG EMPTY card before the picture lands, which is what the "resize jump" was.
+        # Freezing this card's repaints for the whole mutation makes the paint system composite ONE
+        # clean final frame.  The layout_changed emit -- and the sibling repack it drives -- runs
+        # INSIDE the freeze, so position, size and picture all land together; the finally re-enables
+        # even if the re-compose raises.
         self.setUpdatesEnabled(False)
         try:
             self._reset_plot()
@@ -1365,7 +1165,7 @@ class PanelCard(FluentGroupBox):
             # the high-water mark means a SMALLER size never snaps it shorter (#H3i-2).
             if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
                 self._size_settings_popup()
-            self._rerender_last()   # re-draw at the new size NOW, even if the source is stopped (else the
+            self._rerender_now()   # re-draw at the new size NOW, even if the source is stopped (else the
                                     # torn-down panel stays blank until the next hub tick -- same as _set_param)
             self.changed.emit()
             self.layout_changed.emit()
@@ -1373,7 +1173,12 @@ class PanelCard(FluentGroupBox):
             self.setUpdatesEnabled(True)
 
     def current_selection(self):
-        """Return this panel's selection in the displayed coordinate frame."""
+        """This panel's stored data selection -- plot-independent and serializable.
+
+        A selection is DATA, not a figure state: it survives a re-compose, a
+        source re-pick and a saved layout, and it is what an ROI or a fit is
+        later asked to act on.  Selecting never implies either.
+        """
 
         from zlc_data.plot_region import Selection
 
@@ -1382,34 +1187,28 @@ class PanelCard(FluentGroupBox):
             payload = self.config.params.get("selection")
             if isinstance(payload, Mapping):
                 selection = Selection.from_dict(payload)
-        if selection is None and self.plotter is not None:
-            selection = self.plotter.to_data_figure().selection()
         if selection is None:
             selection = Selection()
         metadata = dict(selection.metadata)
         roi = getattr(self, "_roi_built", None)
         if roi and len(roi) >= 4:
             metadata["origin"] = [float(roi[0]), float(roi[2])]
-        scope = selection.scope
-        if self._grid_focus is not None:
-            scope = (*scope, f"cell:{int(self._grid_focus.k)}")
-        return Selection(selection.ranges, frame=selection.frame, scope=scope, metadata=metadata)
+        return Selection(selection.ranges, frame=selection.frame,
+                         scope=selection.scope, metadata=metadata)
 
     def _selection_coordinates_for_binding(self) -> dict:
-        """The plot's per-axis selection COORDINATES (a site map's centres, a 1-D panel's curve x) that
-        :func:`live.region_binding` needs to bind an ROI drag to the consumed block's axes -- read from
-        the SAME DataFigure adapter the selection itself comes from.  Empty when there is no plotter (a
-        2-D / hist ROI needs none: pixel index / sample value carry no extra coordinate)."""
-        if self.plotter is None:
-            return {}
-        try:
-            df = self.plotter.to_data_figure()
-        except Exception:
-            return {}
-        return {str(key): np.asarray(value)
-                for key, value in dict(getattr(df, "_selection_coordinates", {})).items()}
+        """Per-axis coordinates an ROI binding needs, from the composed front.
 
-    # ---- Analysis (curve fit + ROI): ONE state, ONE mutator --------------------------------------
+        The front's typed payload carries the viewport that maps a pointer
+        rectangle back onto the declared axes; reading them from the SAME front
+        the operator dragged on is what keeps a box drawn on screen and the
+        block it crops in the same coordinate system.  Empty until this card's
+        surface exposes a selector (a 2-D / histogram ROI needs no extra
+        coordinate: pixel index and sample value carry themselves).
+        """
+
+        return {}
+
     def _build_analysis_section(self, section_box, label_w) -> None:
         """Build the Setting popup's "Analysis" section through the ONE :class:`AnalysisControls` builder
         (shared VERBATIM with the Edit tab, ``surface='setting'``).  The composite owns the action / model
@@ -1432,6 +1231,21 @@ class PanelCard(FluentGroupBox):
         self.fit_fix_seed = controls.fix_seed
         self.fit_result_label = controls.result_label
 
+
+    def _default_fit_model(self) -> str:
+        """The model a fit starts from when no surface has chosen one yet.
+
+        Taken from the catalog rather than a literal here: the definitions know
+        which models exist and what each one renders as, so a panel that gains a
+        new admissible model does not need a second list updating to offer it.
+        """
+
+        from zlc_data.fit_model import fit_model_catalog
+
+        catalog = fit_model_catalog()
+        if not catalog:
+            raise RuntimeError("no fit model is defined")
+        return str(catalog[0].model_id)
 
     def _build_fit_request_from_widgets(self, model_combo, fix_seed, selection):
         """Build a fresh fit request from a surface's OWN model combo + fix/seed editor + the selection
@@ -1456,29 +1270,22 @@ class PanelCard(FluentGroupBox):
                                  coordinate_frame=selection.frame)
 
     def set_fit_request(self, request) -> None:
-        """The ONE fit mutator.  Its argument's presence is the single 'fit is on' state: it stores the
-        request (or None) as ``config.params['fit_request']``, applies it to the live plotter overlay in
-        place, re-derives any open Analysis control from that key (Setting + result line), and syncs the
-        console's hub FitProcessor node -- create/retarget for a 2-D image fit, remove otherwise.  Every
-        fit path (the Analysis combo, an Edit Fit action, a drag retarget) funnels through here, so the
-        overlay, the two surfaces, and the hub node can never hold divergent fit state (#8)."""
+        """The ONE mutator for this panel's fit: store it, then tell the console.
+
+        A fit is a PROCESSOR's job -- it consumes the same signal and publishes
+        its parameters -- so this stores what was asked for and hands it to the
+        console's fit-node sink.  Clearing removes the node the fit created,
+        rather than leaving it republishing after the operator turned it off.
+        """
+
         payload = request.to_dict() if request is not None else None
-        # A console-attached facet grid fits per-cell on its worker node (below) and only DISPLAYS the
-        # published params: put it in display-only mode BEFORE apply_param, so the arming _set_param never
-        # solves in place on the Qt thread (#6b).  ``fit_node_sink`` set == a console (a notebook grid has
-        # none and keeps its in-place solve).
-        plotter = self.plotter
-        if request is not None and callable(self.fit_node_sink) \
-                and hasattr(plotter, "apply_published_cell_fits") \
-                and getattr(plotter, "_published_cell_popt", None) is None:
-            plotter._published_cell_popt = {}
-        self._set_param("fit_request", payload)          # store + apply overlay in place (apply_param)
+        self._set_param("fit_request", payload)
         self._refresh_analysis_controls()
         if request is None:
             if callable(self.selection_clear_sink):
-                self.selection_clear_sink(self, "fit")   # remove the hub FitProcessor this fit created
+                self.selection_clear_sink(self, "fit")
         elif callable(self.fit_node_sink):
-            self.fit_node_sink(self, request)            # create/retarget the hub node (2-D image only)
+            self.fit_node_sink(self, request)
 
     def _select_analysis_action(self, action, *, model_combo=None, fix_seed=None) -> None:
         """Apply a chosen post-drag action from EITHER surface: ``fit`` turns the curve fit ON (build +
@@ -1511,9 +1318,13 @@ class PanelCard(FluentGroupBox):
             self._size_settings_popup()
 
     def _fit_result_text(self, result=None) -> str:
-        """The one-line fit-result string -- shared VERBATIM by the Setting AND the Edit result label
-        (both surfaces are refreshed from it by :meth:`_set_fit_result_text` / the console's overlay push)."""
-        result = result if result is not None else getattr(self.plotter, "_last_fit_result", None)
+        """The one-line fit-result string, shared VERBATIM by Setting and Edit.
+
+        ``result`` comes from the fit processor's published output; there is no
+        figure to interrogate for one, because the panel displays a fit rather
+        than owning it.
+        """
+
         if result is None:
             return "not fitted"
         if result.valid:
@@ -1530,86 +1341,67 @@ class PanelCard(FluentGroupBox):
             controls.set_result(self._fit_result_text(result))
 
     def _set_param(self, key: str, value) -> None:
-        """A declarative parameter edit: store, apply, mark dirty.
+        """The ONE writer for a display knob: store it, then re-compose.
 
-        Most params (colormap / bins / toggles …) change the plot's STRUCTURE, so they tear the plotter
-        down + re-render.  ``relim`` is the exception: it is a LIVE axis adjustment (the dead-band-aware
-        autoscale mode), so it pushes onto the existing plotter WITHOUT a teardown and reveals the fixed
-        lo/hi row only in ``fixed`` mode -- the SAME effect the old hand-wired ``_on_relim_mode`` had,
-        now reached through this one declarative path (#H3v-4b)."""
+        Every surface that edits this panel (the Setting popup, the Edit tab, a
+        drag that arms an analysis) comes through here, so a knob has one home
+        -- ``config.params``, which is also what the saved layout persists.  The
+        composer reads them back through :meth:`_display_state`, so what is
+        stored and what is drawn cannot drift.
+        """
+
         if self.config.params.get(key) == value:
             return
-        self._wait_render_idle()
         self.config.params[key] = value
         if key == "relim":
-            # Flipping INTO ``fixed`` FREEZES the current view: seed lo/hi from what the plot shows
-            # NOW (the plotter's live limits), never the stale/default 0..1 pair -- pinning a counts
-            # histogram or a camera image to 0..1 empties it (every bar/pixel outside the range),
-            # which reads as "the enlarged plot just died".  The operator then types exact bounds.
-            if str(value) == "fixed" and self.plotter is not None \
-                    and hasattr(self.plotter, "current_lims"):
-                lo, hi = self.plotter.current_lims()
-                self.config.params["fixed_lo"], self.config.params["fixed_hi"] = lo, hi
-                for edit, val in ((getattr(self, "fixed_lo_edit", None), lo),
-                                  (getattr(self, "fixed_hi_edit", None), hi)):
-                    if edit is not None:
-                        edit.setText(f"{val:g}")     # setText does NOT re-fire editingFinished
+            # Flipping INTO ``fixed`` FREEZES the window currently on screen.
+            # Seeding from the composed front's own limits (never the default
+            # 0..1 pair) is what keeps the picture: pinning a counts histogram
+            # or a camera frame to 0..1 empties it, which reads as "the panel
+            # just died".  The operator then types exact bounds.
+            if str(value) == "fixed":
+                shown = self._shown_limits()
+                if shown is not None:
+                    lo, hi = shown
+                    self.config.params["fixed_lo"], self.config.params["fixed_hi"] = lo, hi
+                    for edit, val in ((getattr(self, "fixed_lo_edit", None), lo),
+                                      (getattr(self, "fixed_hi_edit", None), hi)):
+                        if edit is not None:
+                            edit.setText(f"{val:g}")   # setText does NOT re-fire editingFinished
             if getattr(self, "fixed_lim_row", None) is not None:        # the Setting popup's lo/hi row
                 self.fixed_lim_row.setVisible(str(value) == "fixed")    # (the Edit tab toggles its own)
-                # Revealing/hiding the lo/hi row CHANGES the popup's content height.  The Setting popup
-                # is a free-floating top-level Qt.Popup whose window size is fixed at open time, so a bare
-                # setVisible reflows the rows INSIDE that fixed window -> the layout "jumps".  Re-run the
-                # ONE sizing rule (_size_settings_popup: top-left anchored, grow-down, never re-position,
-                # high-water so it never snaps shorter) so the window grows DOWNWARD to fit the new row --
-                # smooth single-direction expand, not a jump (#fixed-lim-row-jump).
+                # Revealing/hiding the row changes the popup's content height, and the popup is a
+                # free-floating Qt.Popup whose window size was fixed at open time -- re-run the ONE
+                # sizing rule so the window grows DOWNWARD to fit instead of reflowing inside a
+                # fixed frame (which reads as a jump).
                 if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
                     self._size_settings_popup()
-            # A ZOOMED grid: route through the focused-param path so the mode lands on the enlarged
-            # view AND is stored on the parked grid (the thumbnails carry it when the zoom returns);
-            # otherwise apply to the live plotter directly (a GridPlot fans out to its cells itself).
-            if self._grid_focus is not None:
-                self._set_focused_grid_param(key, value)
-                if str(value) == "fixed":
-                    # land the just-seeded lo/hi on the parked grid too: its own flip-seed could only
-                    # use the cells' auto envelope, but the operator froze the ENLARGED view -- the
-                    # config values (read from that view above) are the authority.
-                    self._set_focused_grid_param("fixed_lo", float(self.config.params.get("fixed_lo", 0.0)))
-                    self._set_focused_grid_param("fixed_hi", float(self.config.params.get("fixed_hi", 1.0)))
-            else:
-                self._apply_lim_to_plotter()
-            self.changed.emit()
-            return
-        # A GRID cell is currently ENLARGED (``_grid_focus`` set): a param edit must apply to the FOCUS view
-        # and persist onto the PARKED grid, and NEVER mark a grid rebuild -- a grid rebuild swaps the focus
-        # canvas out and bounces back to the thumbnail (the "adjusting a param jumps back to the main grid
-        # view instead of staying zoomed" bug, #4).  Route through the dedicated focus-param path.
-        if self._grid_focus is not None:
-            self._set_focused_grid_param(key, value)
-            self.changed.emit()
-            return
-        # Display-only knobs the plotter applies IN PLACE (e.g. log y-scale / bimodal-fit toggle): like
-        # ``relim``, NO teardown -- a teardown + rebuild reflows the Qt holder so the plot visibly
-        # resizes/flashes (#dis-resize).  Fall back to the rebuild path only for knobs it doesn't handle.
-        if self.plotter is not None and self.plotter.apply_param(key, value):
-            self.changed.emit()
-            return
-        # A STRUCTURE knob the plotter can't apply in place (e.g. a 2D colormap, a new history length):
-        # mark a rebuild and schedule it on the DEBOUNCE timer rather than rebuilding inline.  A fast
-        # burst of edits (scroll) restarts the timer, so the heavy teardown+rebuild runs ONCE after the
-        # burst on the latest config.params -- not once per tick (the race source).  _build_plot itself
-        # build-then-swaps at a fixed canvas size, so even the single rebuild never blanks the card.
-        self._force_rebuild = True
-        self._rebuild_timer.start()   # coalesce; _run_pending_rebuild fires after the burst settles
+        self._rerender_now()
         self.changed.emit()
 
-    def _run_pending_rebuild(self) -> None:
-        """The debounce timer fired: perform the ONE coalesced rebuild for the latest config.params.
-        Re-renders from the live/last namespace (so a stopped producer still rebuilds) -- _build_plot
-        build-then-swaps atomically, so the card never blanks even if this rebuild raises."""
-        if not self._force_rebuild:
-            return
-        self._wait_render_idle()
-        self._rerender_last()
+    def _shown_limits(self):
+        """The value window the last composed front actually used, or None.
+
+        Read off the front rather than recomputed: the whole point of pinning is
+        to freeze WHAT IS ON SCREEN, and a freshly derived envelope is a
+        different number the moment the data moved.
+        """
+
+        payload = getattr(self._pending_frame, "panels", None)
+        front = getattr(self.board, "front_frame", None)
+        panels = payload or getattr(front, "panels", ())
+        for panel in panels or ():
+            display = panel.display_payload
+            for attr in ("color_limits",):
+                limits = getattr(display, attr, None)
+                if limits:
+                    return (float(limits[0]), float(limits[1]))
+            viewport = getattr(display, "viewport", None)
+            for attr in ("y_limits", "count_limits"):
+                limits = getattr(viewport, attr, None)
+                if limits:
+                    return (float(limits[0]), float(limits[1]))
+        return None
 
     def _apply_source(self) -> None:
         self._wait_render_idle()
@@ -1623,7 +1415,7 @@ class PanelCard(FluentGroupBox):
         # version gate honours -1), so re-picking a signal recovers a panel that previously errored
         # on a now-available signal -- never "remove the panel to recover" (#H3w-2).
         self._render_version = -1
-        self._rerender_last()   # also re-evaluate on the last GOOD data at once (stopped node)
+        self._rerender_now()   # also re-evaluate on the last GOOD data at once (stopped node)
         self.apply_button.set_dirty(False)
         self.changed.emit()
 
@@ -1650,31 +1442,23 @@ class PanelCard(FluentGroupBox):
         self._expr_editor = editor
         editor.show()
 
-    def _rerender_last(self) -> None:
-        """Re-render from the LAST namespace instead of waiting for the next hub tick.
+    def _rerender_now(self) -> None:
+        """Re-compose + present from the LAST frozen value, now.
 
-        A display-only change (colormap / relim / a new source pick) tears the plotter
-        down via :meth:`_reset_plot`; normally the next refresh rebuilds it.  But when the
-        producing measurement is STOPPED the hub version is frozen, so ``_tick`` never calls
-        ``refresh`` again -- the torn-down panel would stay blank (white).  Replaying the
-        cached namespace rebuilds the plot at once.  No-op before the first render.
+        Every display edit lands here.  The display revision advances first so
+        the rasteriser can tell a genuinely new display from a repeat of the
+        same one -- that distinction is what lets ``normal`` relim hold the
+        window it already resolved instead of re-resolving it every edit.
 
-        Prefer the console's CURRENT shared namespace (a fresh hub snapshot = the SAME shot every
-        other panel is on this tick) over this panel's own ``_last_namespace`` (a PAST tick): after a
-        SIGNAL SWITCH or Stop/Start, replaying the stale cache would draw an OLDER shot than the
-        siblings, so a 2D image and the sitemap would show different shots (#shot-coherence-on-switch).
-        Fall back to the cached namespace only when no live one is available (or it lacks the new
-        source -- e.g. a stopped producer whose frozen value lives only in the cache)."""
-        live = None
-        if callable(self.live_namespace_provider):
-            try:
-                live = self.live_namespace_provider()
-            except Exception:
-                live = None
-        if live is not None and all(name in live for name in (self.config.inputs or ()) if name):
-            self.refresh(live)
-        elif self._last_namespace is not None:
-            self.refresh(self._last_namespace)
+        A stopped producer publishes no new tick, so re-composing the value this
+        panel last drew is the only way a display edit can show up at all.
+        """
+
+        self._display_revision += 1
+        if self._last_value is None:
+            return
+        if self.compose_signal_value(self._last_value):
+            self.present()
 
     def compose(self, snapshot, *, offthread: bool = False) -> bool:
         """Rasterise this panel from ONE frozen tick.  Phase 1 of the board's render.
@@ -1867,72 +1651,16 @@ class PanelCard(FluentGroupBox):
                 self.selection_clear_sink(self, "selectors")
 
     def _apply_selectors_state(self) -> None:
-        """Gate the current plotter's selector layer to the card's switch state (the ONE apply
-        point every build / focus / tick path converges on).  Delegates to
-        ``BaseLivePlot.set_selectors_active`` -- a safe no-op for a tool-less plot (the grid
-        thumbnails) -- and aligns the canvas WHEEL policy with it: selectors ON isolates the
-        wheel (in-plot scroll-zoom, the Edit-tab behaviour), OFF returns it to the board scroll.
-        Only a plotter that actually HAS tools flips the wheel, so a grid card keeps scrolling
-        the board either way."""
-        plotter = self.plotter
-        if plotter is None or not hasattr(plotter, "set_selectors_active"):
-            return
-        on = bool(self._selectors_on)
-        plotter.set_selectors_active(on)
-        canvas = self.canvas
-        if canvas is not None and hasattr(canvas, "_zlc_isolate_wheel"):
-            canvas._zlc_isolate_wheel = on and bool(plotter.interaction_handles())
-        if canvas is not None:
-            # Ownership barrier for every mouse path into this canvas (press / double-click /
-            # wheel): wait for the render worker's in-flight batch before selector callbacks
-            # mutate artists.  Hung here because this is the ONE apply point every build / focus
-            # swap converges on, so a fresh or enlarged canvas always carries it (idempotent).
-            canvas._zlc_render_barrier = self.render_barrier
-        # Every family exposes the same DATA-selection callback.  Its DataFigure
-        # adapter determines whether the gesture means x, xy, or value bounds;
-        # selecting alone never implies either fit or ROI.
-        bundles = list(getattr(getattr(plotter, "fig", None), "_zlc_grid_tools", ()) or ())
-        if bundles:
-            for cell_index, bundle in enumerate(bundles):
-                area = getattr(bundle, "area", None)
-                if area is not None:
-                    area.callback = (lambda k=cell_index: self._forward_area_select(k)) \
-                        if on and callable(self.area_select_sink) else None
-        else:
-            tools = getattr(getattr(plotter, "fig", None), "_zlc_tools", None)
-            area = getattr(tools, "area", None)
-            if area is not None:
-                area.callback = self._forward_area_select \
-                    if on and callable(self.area_select_sink) else None
+        """Carry the board header's Selectors switch onto this card's surface.
 
-    def _forward_area_select(self, cell_index: int | None = None) -> None:
-        """Persist and forward one plot-independent selection.
-
-        The displayed coordinate frame is retained for fitting.  Conversion to
-        local frame indices belongs exclusively to the explicit ROI action.
+        The switch is the card's state, not the surface's: it is stored here so
+        a surface built (or rebuilt) later comes up matching the switch instead
+        of coming up live behind the operator's back.
         """
-        bundles = list(getattr(getattr(self.plotter, "fig", None), "_zlc_grid_tools", ()) or ())
-        tools = bundles[int(cell_index)] if cell_index is not None and int(cell_index) < len(bundles) \
-            else getattr(getattr(self.plotter, "fig", None), "_zlc_tools", None)
-        rng = list(getattr(getattr(tools, "area", None), "range", None) or [None] * 4)
-        if any(v is None for v in rng):
-            return
-        data_figure = self.plotter.to_data_figure()
-        target = data_figure.cell(int(cell_index)) if cell_index is not None else data_figure
-        selection = target.selection()
-        metadata = dict(selection.metadata)
-        roi = self._roi_built
-        if roi and len(roi) >= 4:
-            metadata["origin"] = [float(roi[0]), float(roi[2])]
-        scope = selection.scope
-        if self._grid_focus is not None and not any(
-                item == f"cell:{int(self._grid_focus.k)}" for item in scope):
-            scope = (*scope, f"cell:{int(self._grid_focus.k)}")
-        self._active_selection = type(selection)(
-            selection.ranges, frame=selection.frame, scope=scope, metadata=metadata)
-        self.config.params["selection"] = self._active_selection.to_dict()
-        self.changed.emit()
-        self.area_select_sink(self, self._active_selection)
+
+        board = self.board
+        if board is not None and hasattr(board, "set_selectors_enabled"):
+            board.set_selectors_enabled(bool(self._selectors_on))
 
     def _source_axis_label(self) -> str | None:
         """The y-axis label for this panel's sourced signal, taken from the PRODUCING
@@ -1992,230 +1720,34 @@ class PanelCard(FluentGroupBox):
         return {"relim_mode": self._relim(), **self._fixed_lim_kwargs()}
 
 
-    def _connect_grid_focus_click(self, grid) -> None:
-        """Wire a double-click on the GRID canvas to enlarge the clicked cell into its standalone plot-kind
-        figure (and Esc / another double-click to return).  The grid panel is display-only, so it has no
-        selectors; this is the ONE handler the console adds for the focus-zoom -- it reuses the grid's own
-        ``site_axes`` for hit-testing and :meth:`GridPlot.build_focus_plotter` for the enlarged view."""
-        canvas = getattr(grid.fig, "canvas", None)
-        if canvas is None:
-            return
-        self._grid_click_cid = canvas.mpl_connect("button_press_event", self._on_grid_canvas_click)
-
-    def _on_grid_canvas_click(self, event) -> None:
-        # Only a LEFT double-click toggles focus (mirror GridPlot._on_click -- some backends emit wheel /
-        # middle as dblclick button 2/4/5).
-        if not getattr(event, "dblclick", False) or getattr(event, "button", 1) != 1:
-            return
-        if self._grid_focus is None:
-            grid = self.plotter
-            axes = list(getattr(grid, "site_axes", []) or [])
-            if event.inaxes in axes:
-                self._focus_grid_cell(grid, axes.index(event.inaxes))
-        else:
-            self._unfocus_grid_cell()
-
-    def _on_grid_focus_key(self, event) -> None:
-        if getattr(event, "key", None) == "escape" and self._grid_focus is not None:
-            self._unfocus_grid_cell()
-
-    def _focus_grid_cell(self, grid, k: int) -> None:
-        """Enlarge grid cell ``k`` into its STANDALONE plot-kind figure and SWAP it into this card's canvas,
-        parking the grid (plotter + canvas) to swap back on unfocus.  The enlarged view is the STOCK ``2x2``
-        panel of the cell's kind -- the SAME size the notebook path (:meth:`GridPlot.focus`) enlarges to,
-        never the grid's own (possibly larger) preset -- CENTRED in the card's plot region, with the
-        STANDARD relim view kwargs so a subsequent lim / fit / relim edit reaches it through the ordinary
-        _set_param / _apply_lim_to_plotter path; the live tick is gated off (``_grid_focus`` set), so it
-        never bounces back to the thumbnail."""
-        if panel_canvas is None:
-            return
-        # the enlarged view is a standalone panel of the cell's per-site kind -> its standard relim view
-        # kwargs.  interactions=True builds its selector layer; _apply_selectors_state (below) parks it
-        # to the header's "Selectors" switch -- OFF (default) keeps the enlarged view display-only as
-        # before, ON arms zoom / area / cross / the threshold drag (the same rule every _build_plot
-        # branch applies).  The Edit tab stays the always-interactive surface.
-        sub_kind = str(getattr(grid, "sub_plot_kind", "hist"))
-        focus = grid.build_focus_plotter(
-            k, size="2x2", interactions=True, **self._view_kwargs(sub_kind))
-        focus_canvas = panel_canvas(focus.fig, isolate_wheel=False)
-        # atomic swap-in (mirror _build_plot): insert the focus canvas, remove the grid canvas but do NOT
-        # close the grid figure -- it is parked for the return.  A TOP stretch balances the holder's
-        # trailing one, so the stock-size enlarged view sits at the CENTRE of the (larger) grid region
-        # instead of pinned to the top-left.
-        grid_canvas = self.canvas
-        self.canvas_holder.insertWidget(0, focus_canvas, alignment=QtCore.Qt.AlignHCenter)
-        # SAME stretch factor (1) as the holder's trailing addStretch(1): equal factors split the
-        # spare height evenly above/below -- a factor-0 spacer would win nothing against the
-        # trailing factor-1 stretch and the enlarged view would pin to the top, not the centre.
-        self.canvas_holder.insertStretch(0, 1)
-        self._focus_top_stretch = self.canvas_holder.itemAt(0)
-        if grid_canvas is not None:
-            self.canvas_holder.removeWidget(grid_canvas)
-            grid_canvas.setParent(None)
-        self.plotter = focus
-        self.canvas = focus_canvas
-        self._grid_focus = _GridFocus(grid=grid, grid_canvas=grid_canvas, k=int(k))
-        self._grid_focus.key_cid = focus_canvas.mpl_connect("key_press_event", self._on_grid_focus_key)
-        self._grid_focus.click_cid = focus_canvas.mpl_connect("button_press_event", self._on_grid_canvas_click)
-        self._apply_display_params()        # re-apply unit / manual lims to the fresh focus plotter
-        self._apply_selectors_state()       # park/arm the enlarged view's selectors to the switch
-        focus_canvas.draw()
-        self._place_setting_button()
-
-    def _set_focused_grid_param(self, key: str, value) -> None:
-        """Apply a param edit while a grid cell is ENLARGED (#4): keep it on the FOCUS view AND persist it onto
-        the parked grid, and NEVER rebuild the grid (which would swap the focus canvas out and bounce back to
-        the thumbnail).  The focus plotter (``self.plotter``) applies the sub-kind's knob in place; a knob it
-        can't apply in place re-focuses the SAME cell -- rebuilding ONLY the enlarged view, staying zoomed."""
-        parked = self._grid_focus
-        if parked is None:
-            return
-        # Persist on the parked grid WITHOUT drawing (store_display_param): the stored params travel into
-        # the save recipe and re-seed build_focus_plotter; the (invisible) thumbnails are NOT synchronously
-        # repainted here -- _unfocus_grid_cell redraws them on return, so a Setting edit while zoomed costs
-        # only the enlarged view's own in-place apply, never an N-cell repaint stall.
-        try:
-            if parked.grid.store_display_param(str(key), value):
-                parked.dirty = True         # a thumbnail-affecting knob changed -> unfocus must repaint the grid
-        except Exception:
-            pass
-        # Apply to the enlarged view in place.  A knob it can't apply live re-focuses the same cell ONLY
-        # when the knob actually belongs to the per-site kind's own param set (bins/fit/ylog/cmap ...) --
-        # an unrelated panel knob (e.g. ``repeat_mode``, which has no effect on a snapshot grid's enlarged
-        # cell) is just stored, so it never triggers a visible rebuild/flash of the enlarged view.
-        if self.plotter is not None and not self.plotter.apply_param(str(key), value):
-            if any(d.key == str(key) for d in _panel_display_decls(self.config.kind, self._param_kind())):
-                self._refocus_current_cell()   # rebuild ONLY the enlarged view, staying zoomed
-        elif self.canvas is not None:
-            self.canvas.draw_idle()
-
-    def _remove_focus_stretch(self) -> None:
-        """Drop the TOP spacer that centred the enlarged cell in the grid region (no-op when absent)."""
-        stretch = self._focus_top_stretch
-        self._focus_top_stretch = None
-        if stretch is not None:
-            self.canvas_holder.removeItem(stretch)
-
-    def _refocus_current_cell(self) -> None:
-        """Rebuild the ENLARGED cell view in place (same cell, current display params) -- used when the focus
-        plotter cannot apply a knob live.  Swaps ONLY the focus canvas; the grid stays parked and
-        ``_grid_focus`` stays set, so the view never bounces back to the thumbnail."""
-        parked = self._grid_focus
-        if parked is None or panel_canvas is None:
-            return
-        grid, k = parked.grid, parked.k
-        old_focus, old_canvas = self.plotter, self.canvas
-        sub_kind = str(getattr(grid, "sub_plot_kind", "hist"))
-        focus = grid.build_focus_plotter(k, size="2x2", interactions=True,
-                                         **self._view_kwargs(sub_kind))    # reads grid._display_params
-        # (interactions=True + _apply_selectors_state below: the rebuilt enlarged view parks/arms its
-        # selector layer to the header's "Selectors" switch, same as _focus_grid_cell)
-        focus_canvas = panel_canvas(focus.fig, isolate_wheel=False)
-        # replace the old focus canvas IN PLACE (the centring top stretch stays where it is)
-        at = self.canvas_holder.indexOf(old_canvas) if old_canvas is not None else 0
-        self.canvas_holder.insertWidget(max(0, at), focus_canvas, alignment=QtCore.Qt.AlignHCenter)
-        if old_canvas is not None:
-            self.canvas_holder.removeWidget(old_canvas)
-            old_canvas.setParent(None)
-            old_canvas.deleteLater()
-        self.plotter = focus
-        self.canvas = focus_canvas
-        parked.key_cid = focus_canvas.mpl_connect("key_press_event", self._on_grid_focus_key)
-        parked.click_cid = focus_canvas.mpl_connect("button_press_event", self._on_grid_canvas_click)
-        self._apply_display_params()
-        self._apply_selectors_state()
-        focus_canvas.draw()
-        if old_focus is not None and plt is not None and getattr(old_focus, "fig", None) is not None:
-            plt.close(old_focus.fig)
-        self._place_setting_button()
-
-    def _unfocus_grid_cell(self) -> None:
-        """Return from the enlarged cell to the grid: mirror any threshold drag back onto the grid cell, swap
-        the parked grid canvas back in, and close the focus figure."""
-        parked = self._grid_focus
-        if parked is None:
-            return
-        grid, grid_canvas, k = parked.grid, parked.grid_canvas, parked.k
-        focus, focus_canvas = self.plotter, self.canvas
-        # copy an enlarged-view threshold cut back onto the grid cell (the grid thumbnail + save recipe read
-        # it), noting whether it ACTUALLY changed -- an unfocus that edited nothing needs no repaint.
-        cell = getattr(grid, "cell_renderer", None)
-        threshold_changed = False
-        if cell is not None and hasattr(cell, "sync_threshold_from_focus"):
-            try:
-                threshold_changed = bool(cell.sync_threshold_from_focus(k, focus))
-            except Exception:
-                pass
-        # The parked grid kept its FULLY-RENDERED buffer (fit + x-window + thumbnails) untouched while zoomed,
-        # so swapping it back shows it AS IT WAS.  Re-render ONLY when the zoom changed something the grid
-        # shows -- a Setting edit persisted onto it (parked.dirty) or a threshold dragged in the focus view.
-        # Otherwise just re-blit the valid buffer: the fit STAYS (fixing the "fit vanished after zoom-in-and-
-        # back" bug the old unconditional redraw caused) AND unfocus is instant, never an N-cell re-render.
-        needs_redraw = bool(parked.dirty) or threshold_changed
-        self._grid_focus = None
-        self._remove_focus_stretch()
-        # swap the grid canvas back in FIRST (never a blank holder), then retire the focus canvas + figure
-        if grid_canvas is not None:
-            self.canvas_holder.insertWidget(0, grid_canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
-        self.plotter = grid
-        self.canvas = grid_canvas
-        if focus_canvas is not None:
-            self.canvas_holder.removeWidget(focus_canvas)
-            focus_canvas.setParent(None)
-            focus_canvas.deleteLater()
-        if focus is not None and plt is not None and focus.fig is not None:
-            plt.close(focus.fig)
-        if hasattr(grid, "discard_focus_fit"):
-            grid.discard_focus_fit()        # release the (now-closed) enlarged cell's fit tracker entry
-        if grid_canvas is not None:
-            if needs_redraw and hasattr(grid, "_redraw_thumbnails"):
-                try:
-                    grid._redraw_thumbnails()       # self-contained: re-applies the fit / x-window too
-                except Exception:
-                    pass
-                grid_canvas.draw()
-            else:
-                grid_canvas.update()                # valid buffer -> re-blit only (fit preserved, instant)
-        self._place_setting_button()
-
     def _reset_plot(self) -> None:
         """Drop the plot so the next refresh rebuilds it (size/params/source changed)."""
         self._teardown_plot()
         self._value_shape = None
 
     def _teardown_plot(self) -> None:
-        # If a grid cell is ENLARGED, the parked grid holds a SECOND figure/canvas -- close it too so a
-        # teardown while focused leaks neither figure (self.plotter/self.canvas are the FOCUS view here).
-        # Record the focused index so the NEXT _build_plot re-focuses the SAME cell: a rebuild-class edit
-        # (size / source / structure param) made while zoomed lands back on the enlarged cell, never
-        # silently bouncing to the main grid (#no-focus-bounce).
-        parked = self._grid_focus
-        self._grid_focus = None
-        if parked is not None:
-            self._pending_refocus_k = int(parked.k)
-            self._remove_focus_stretch()
-            if parked.grid_canvas is not None:
-                parked.grid_canvas.setParent(None)
-                parked.grid_canvas.deleteLater()
-            if parked.grid is not None and plt is not None and getattr(parked.grid, "fig", None) is not None:
-                plt.close(parked.grid.fig)
-        canvas, plotter = self.canvas, self.plotter
-        self.canvas = None
-        self.plotter = None
-        if canvas is not None:
-            self.canvas_holder.removeWidget(canvas)
-            # setParent(None) BEFORE deleteLater: removeWidget only detaches from the LAYOUT -- the
-            # widget stays parented (and painted!) until the deferred delete runs, so the old figure
-            # lingered on screen under the replacement (the ghost/overlap the size-change showed).
-            canvas.setParent(None)
-            canvas.deleteLater()
-        if plotter is not None and plt is not None and plotter.fig is not None:
-            plt.close(plotter.fig)
+        """Drop this card's surface, leaving nothing painted behind it.
+
+        ``setParent(None)`` before the deferred delete: removing a widget from
+        the layout only detaches it from the LAYOUT -- it stays parented, and
+        painted, until the delete actually runs, which is how a replaced surface
+        used to linger under its successor.
+        """
+
+        board = self.board
+        self.board = None
+        self._pending_frame = None
+        self._composer_obj = None
+        self._compose_key = None
+        if board is not None:
+            self.canvas_holder.removeWidget(board)
+            board.setParent(None)
+            board.deleteLater()
 
     def shutdown(self) -> None:
-        self._wait_render_idle()            # the worker must not be composing into this figure
-        self._rebuild_timer.stop()          # never fire a coalesced rebuild into a torn-down card
-        self._force_rebuild = False
+        """Release this card's surface.  The worker must not be composing into it."""
+
+        self._wait_render_idle()
         self._teardown_plot()
 
 class _PanelBoard(QtWidgets.QWidget):

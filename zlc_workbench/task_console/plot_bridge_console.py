@@ -1686,8 +1686,8 @@ class TaskConsole(QtWidgets.QWidget):
             self._apply_roi_selection(card, selection)
         else:
             try:
-                count = card.plotter.to_data_figure().selected_data(selection).count
-                card.set_status(f"selected {count} data points", error=False)
+                count = len(selection.ranges)
+                card.set_status(f"selected {count} range(s)", error=False)
             except Exception as exc:
                 card.set_status(f"selection invalid: {str(exc).splitlines()[0][:100]}", error=True)
 
@@ -1728,8 +1728,9 @@ class TaskConsole(QtWidgets.QWidget):
         card.config.params.pop("region_signal", None)
         card.config.params.pop("region", None)
         self._fit_overlay_pushed.pop(id(card), None)   # a fresh fit re-pushes from version -1
-        if card.plotter is not None and hasattr(card.plotter, "apply_published_fit"):
-            card.plotter.apply_published_fit(None)     # drop any live fit overlay too
+        # The overlay is drawn from the fit the panel holds, so clearing the fit
+        # IS clearing the overlay: the next compose has nothing to draw.
+        card.config.params.pop("fit_request", None)
 
     def _region_signal_names_in_use(self) -> set:
         """Every region name that may NOT be handed to a new panel: live hub names, every Logic row's
@@ -2550,8 +2551,9 @@ class TaskConsole(QtWidgets.QWidget):
                 continue                       # nothing this panel shows changed
             if elapsed % card.config.update_ms != 0 and not card._beat_owed:
                 continue                       # beat not due (and none owed)
-            fig = getattr(card.plotter, "fig", None)
-            if busy or (fig is not None and getattr(fig, "_zlc_interacting", False)):
+            # A card mid-gesture is skipped whole: recomposing under a drag would
+            # replace the very front the pointer is measuring against.
+            if busy or bool(getattr(card, "_interacting", False)):
                 card._beat_owed = True         # due but unservable this tick -> next idle tick serves it
                 continue
             card._beat_owed = False
