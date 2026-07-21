@@ -1136,7 +1136,10 @@ class TaskConsole(QtWidgets.QWidget):
         """The TaskOutput schema, available both before and after its first numeric publish."""
 
         node = self._task_output_node
-        if node is None:
+        # A run node exposes spec / request / handle / snapshot; the mid-run OUTPUT channel is
+        # not wired to the monitor seam yet, and a node without one has no declared schema to
+        # report.  Saying so lets the panel open and wait; reaching for it aborts the process.
+        if node is None or not hasattr(node, "output"):
             return None
         try:
             return node.output.schema(self._task_mid_key)
@@ -2106,6 +2109,11 @@ class TaskConsole(QtWidgets.QWidget):
         row = self._running_task_row
         if row is None:
             return
+        if not hasattr(node, "output"):
+            # No mid-run output channel on this node: report that it is running rather than
+            # inventing a percentage.  Wiring that channel to the monitor seam is its own piece.
+            self._task_status_text = f"⏳  Task running: {row.node.title}"
+            return
         pct = int(round(float(getattr(node.output, "progress", 0.0)) * 100))
         # the task's current STAGE (e.g. "reference frame 23/30", "fitting per-site
         # thresholds") so the operator sees what step the calibration is on, not just %.
@@ -2165,7 +2173,8 @@ class TaskConsole(QtWidgets.QWidget):
         if node is None:
             return
         try:
-            self._task_card_tensor = node.output.latest_tensor(self._task_mid_key)
+            self._task_card_tensor = (node.output.latest_tensor(self._task_mid_key)
+                                      if hasattr(node, "output") else None)
         except KeyError:
             pass
         self._update_task_status_text(node)
