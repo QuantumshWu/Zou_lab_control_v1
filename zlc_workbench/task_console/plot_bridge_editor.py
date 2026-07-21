@@ -808,9 +808,8 @@ class PanelEditor(QtWidgets.QWidget):
         # box (= Auto) still tells the operator what range the image is using -- the clim counterpart of
         # the x-window hint below.  Non-destructive: Qt draws a placeholder only while the box is empty,
         # so a pinned/typed value is never overwritten.
-        if getattr(self, "clo", None) is not None and self.card is not None \
-                and self.card.plotter is not None and hasattr(self.card.plotter, "current_lims"):
-            shown = self.card._shown_limits() if self.card is not None else None
+        if getattr(self, "clo", None) is not None and self.card is not None:
+            shown = self.card._shown_limits()      # None until something has been composed
             if shown is not None:
                 self.clo.setPlaceholderText(f"{shown[0]:.6g}")
                 self.chi.setPlaceholderText(f"{shown[1]:.6g}")
