@@ -168,6 +168,53 @@ class FigureViewer(QtWidgets.QWidget):
     """
 
 
+    def __init__(self, path: str | Path | None = None, *, scale: float | None = None,
+                 window_ratio: float = WINDOW_SCREEN_FRACTION, parent=None) -> None:
+        """Build the two-pane body: the Info column beside an embedded console board.
+
+        The scale is set BEFORE any widget is constructed -- every Fluent metric
+        is read at build time, so a later change would leave this window's
+        controls sized against a different rule than the rest of the GUI.
+
+        The right pane is a ``TaskConsole(embedded=True)``: that mode exists for
+        this window (see its constructor), which is why a loaded figure gets the
+        board, Add Panel, the picker and re-wiring for free instead of this file
+        growing a second display of its own.
+        """
+
+        ensure_qt_app()          # metrics below need a QApplication to measure against
+        set_fluent_scale(scale)
+        super().__init__(parent)
+        self.window_ratio = float(window_ratio)
+        self._current_path: Path | None = None
+        self.node = None
+        # The Info column is FIXED-width: the board beside it is what should absorb a
+        # resize, and a fact column that grew would just stretch its value fields.
+        self._info_col_w = scaled_px(340, minimum=250)
+        # One label column for every Info row, from the widest label any filler writes
+        # -- so the rows align across all three rows-tabs rather than per-tab.
+        self._label_w = setting_label_width(
+            ("calibration", "data_shape", "points_shape", "captured_at"))
+
+        root = QtWidgets.QHBoxLayout(self)
+        root.setContentsMargins(0, window_pad(1), 0, window_pad(1))
+        root.setSpacing(0)
+        root.addWidget(self._build_info_column(), 0)
+
+        # The console lives in its own layout so a reload can swap it out (see
+        # ``_teardown_console``) without disturbing the Info column beside it.
+        holder = QtWidgets.QWidget()
+        holder.setStyleSheet("background: transparent;")
+        self._console_holder = QtWidgets.QVBoxLayout(holder)
+        self._console_holder.setContentsMargins(0, 0, 0, 0)
+        self._console_holder.setSpacing(0)
+        self.console = TaskConsole(embedded=True, window_ratio=window_ratio)
+        self._console_holder.addWidget(self.console)
+        root.addWidget(holder, 1)
+
+        if path is not None:
+            self.open_path(path)
+
     # ------------------------------------------------------------------ layout
     def _build_info_column(self) -> QtWidgets.QWidget:
         # The Info column MIRRORS the console beside it: a plain header bar (the path picker) ABOVE a
@@ -302,6 +349,23 @@ class FigureViewer(QtWidgets.QWidget):
                                      f"(expected {npz.name})", severity="warning")
             return
         self._load_npz(npz)
+
+    def _load_npz(self, npz: Path) -> None:
+        """Put a picked file on the board.
+
+        NOT YET WIRED, and it says so rather than looking like it worked.  The
+        old path published the file as hub signals; the hub is gone, and a
+        figure is now a view projected from a data artifact (``exp.figure(ref)``)
+        rather than a file that gets reopened.  Reconnecting this to the current
+        data plane is the next step, tracked in the migration ledger -- until
+        then, silently doing nothing would read as "this file is empty".
+        """
+
+        self._current_path = npz
+        self.status.show_message(
+            f"{display_path(str(npz))}: loading is not reconnected yet -- "
+            "a figure is now projected from a run artifact, not reopened from a file.",
+            severity="warning")
 
     # ------------------------------------------------------------- file / load
     def _on_path_changed(self, text: str) -> None:
@@ -482,4 +546,4 @@ def show_figure_viewer(path: str | Path | None = None, *, scale: float | None = 
     return viewer
 
 
-__all__ = ["FigureViewer", "LoadedFigureNode", "show_figure_viewer"]
+__all__ = ["FigureViewer", "show_figure_viewer"]
