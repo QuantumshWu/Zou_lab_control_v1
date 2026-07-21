@@ -1178,6 +1178,37 @@ class TaskConsole(QtWidgets.QWidget):
             result["points_coords"] = coordinates
         return result
 
+    def _task_mid_run_config(self, *, title: str) -> PanelConfig:
+        """The dedicated Monitor panel a running task's mid-run buffer is shown in (#5/#8).
+
+        A task publishes NOTHING to the hub, so this panel cannot be bound the ordinary
+        way: its source names the reserved off-hub key the console injects each tick, and
+        ``PanelConfig.set_source`` binds the single input slot to that same key -- ONE
+        spelling of the binding instead of a source and an input that could disagree.
+
+        The kind is READ from what the task declared it streams, through the same
+        by-dimensionality rule the console's 'auto' sub-plot kind uses: a buffer of camera
+        frames opens an image, a scalar per scan point opens a curve.  When the task
+        declares no readable shape the buffer's default key is ``frame``, so an image is
+        the honest default rather than a guess.
+        """
+
+        from zlc_data.facet import default_sub_plot_kind
+
+        structure = self._task_mid_run_structure()
+        kind = "2d"                    # no readable declaration -> the buffer's default key is `frame`
+        if structure:
+            try:
+                kind = default_sub_plot_kind(
+                    "repeat",
+                    points_shape=tuple(structure.get("points_shape") or ()),
+                    data_shape=tuple(structure.get("data_shape") or ()),
+                )
+            except ValueError:
+                kind = "2d"            # ambiguous retained axes -- show the frame, not nothing
+        return PanelConfig(kind=kind, title=title, row=GAP, col=GAP, size="1x2",
+                           source=f"value = {TASK_FRAME_KEY}")
+
     def _signal_structure(self, name: str):
         """Read the authoritative Hub or TaskOutput ``SignalSchema`` for plotting."""
 
@@ -2050,7 +2081,7 @@ class TaskConsole(QtWidgets.QWidget):
         # structure provider for the declared schema before the task's first numeric publish.
         self._task_output_node = node
         self._task_card_tensor = None
-        config = self._task_mid_run_config(spec, node, title=f"Task: {row.node.title}")
+        config = self._task_mid_run_config(title=f"Task: {row.node.title}")
         card = self._new_panel_card(config)
         self._attach_card(card)
         self._task_card = card
