@@ -240,6 +240,20 @@ _RELIM_PARAM = ParamDecl(
             "  normal = autoscale, holding the window until the data leaves it\n"
             "  fixed  = pin the y-axis / colour-limit to the lo/hi below")
 
+def panel_input_slots_is_single(kind: str) -> bool:
+    """Whether a plot kind takes EXACTLY one signal, so no slot grows beside it.
+
+    Read from the kind's own declaration (:data:`zlc_data.plot_kind.PLOT_KIND_SPEC_BY_KEY`)
+    rather than listed here: a site map states its single-slot nature once, and the Setting
+    popup asks.
+    """
+
+    from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY
+
+    spec = PLOT_KIND_SPEC_BY_KEY.get(str(kind or ""))
+    return bool(spec is not None and spec.single_slot)
+
+
 # ====================================================================== panels
 _MONITOR_UNSET = object()   # sentinel: a monitor panel that has never rolled yet
 
@@ -264,7 +278,8 @@ class PanelCard(FluentGroupBox):
                  structure_provider=None, short_names_provider=None,
                  live_namespace_provider=None, pulse_state_provider=None,
                  grid_recipe_provider=None, render_barrier=None, area_select_sink=None,
-                 selection_clear_sink=None, fit_node_sink=None):
+                 selection_clear_sink=None, fit_node_sink=None,
+                 analysis_actions_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent)
@@ -332,6 +347,12 @@ class PanelCard(FluentGroupBox):
         # non-grid image case.  Its teardown counterpart is ``selection_clear_sink(card, "fit")``.  The
         # ONE mutator :meth:`set_fit_request` calls this, so the overlay + the hub node stay in lockstep.
         self.fit_node_sink = fit_node_sink
+        # callable() -> the analysis actions this host can actually carry out, as a subset of
+        # ``zlc_data.vocabulary.ANALYSIS_ACTIONS``.  The panel asks rather than assumes: the
+        # host owns the catalog and therefore knows whether the seam each action needs is
+        # present, and an action absent here is one the Setting popup never offers.  None =
+        # ask nothing and offer nothing beyond plain selection.
+        self.analysis_actions_provider = analysis_actions_provider
         # The card's display surface: an immutable-bytes raster board (contract 4).
         # The panel's stable identity: the board, its composer and every frame
         # they exchange are keyed on it, so a presented frame can only ever land
@@ -354,6 +375,11 @@ class PanelCard(FluentGroupBox):
         # serializable; selecting never implies an ROI or a fit.  The explicit
         # ``selection_action`` config decides what a later release does.
         self._active_selection = None
+        # When the Setting popup last dismissed itself.  The button re-opens it, and a
+        # click that DISMISSED the popup would otherwise arrive here as "open" a moment
+        # later -- the popup would flicker shut and straight back open.  Zero means it
+        # has never been dismissed, which is safely outside any debounce window.
+        self._settings_dismissed_at = 0.0
         # {param key: declared kind} for each rendered row, so reopening the Setting
         # re-seeds a control through its OWN kind's writer instead of guessing from
         # the stored value's Python type.
@@ -740,12 +766,12 @@ class PanelCard(FluentGroupBox):
         self.board.present(frame)
 
     def _build_settings(self) -> None:
-        """The Setting popup's shell: the card that holds the sections.
+        """The Setting popup: the sections the operator tunes this panel through.
 
-        The sections themselves are rebuilt from the panel's declared params as
-        the display state lands (contract 4); this builds the popup, its scroll
-        viewport and the geometry bookkeeping the open path reads, so a card is
-        constructible and its gear opens.
+        Everything here is a VIEW of ``config.params`` / ``config.inputs``.  No control
+        owns state of its own: each writes through the card's one writer and is re-seeded
+        from the stored value on open, which is what stops this popup and the Edit tab --
+        which renders the same declarations -- from drifting apart.
         """
 
         popup = FluentPopup(self)
@@ -764,6 +790,114 @@ class PanelCard(FluentGroupBox):
         outer.addWidget(self._settings_scroll)
         self.settings_popup = popup
         self._settings_h_hwm = 0
+
+        label_w = scaled_px(96, minimum=72)
+
+        def section_box(title):
+            box = FluentGroupBox(title, content)
+            layout = QtWidgets.QVBoxLayout(box)
+            layout.setContentsMargins(popup_gap(), popup_gap(), popup_gap(), popup_gap())
+            layout.setSpacing(scaled_px(4, minimum=2))
+            self._settings_col.addWidget(box)
+            return layout
+
+        # ---- Source: which signal(s) this panel reads, and the expression over them.
+        # The picker IS the "plot this" control; the expression is the advanced override,
+        # which is why picking a slot rewrites the canonical expression for a single-slot
+        # panel and leaves a hand-authored multi-slot one alone.
+        source = section_box("Source")
+        self.slot_combos = []
+        slots = list(self.config.inputs) or [""]
+        for index in range(len(slots)):
+            combo = FluentTreeComboBox()
+            combo.setToolTip("The signal this slot reads, grouped by the node that produces it.")
+            combo.currentIndexChanged.connect(lambda _i, idx=index: self._on_slot_pick(idx))
+            self.slot_combos.append(combo)
+            name = "signal" if len(slots) == 1 else "signal[%d]" % index
+            source.addWidget(FluentSettingRow(name, combo, label_width=label_w))
+        if not panel_input_slots_is_single(self.config.kind):
+            grow = QtWidgets.QWidget()
+            grow_row = QtWidgets.QHBoxLayout(grow)
+            grow_row.setContentsMargins(0, 0, 0, 0)
+            grow_row.setSpacing(scaled_px(6, minimum=4))
+            add_slot = FluentButton("+", color=GREY)
+            add_slot.setToolTip("Add a signal slot so the expression can combine more signals")
+            add_slot.clicked.connect(self._add_signal_slot)
+            drop_slot = FluentButton("-", color=GREY)
+            drop_slot.setToolTip("Remove the last signal slot")
+            drop_slot.clicked.connect(self._remove_signal_slot)
+            grow_row.addWidget(add_slot, 0)
+            grow_row.addWidget(drop_slot, 0)
+            grow_row.addStretch(1)
+            source.addWidget(FluentSettingRow("slots", grow, label_width=label_w))
+        self.source_edit = FluentLineEdit(self.config.source)
+        self.source_edit.setPlaceholderText(_BLANK_SOURCE)
+        self.source_edit.setToolTip("value = <expression over the slots above>.  Click to edit in full.")
+        self.source_edit.textChanged.connect(lambda *_: self.apply_button.set_dirty(True))
+        self.source_edit.returnPressed.connect(self._apply_source)
+        self.source_edit.mouseDoubleClickEvent = lambda _e: self._open_expr_editor()
+        source.addWidget(FluentSettingRow("value", self.source_edit, label_width=label_w))
+        self.apply_button = FluentButton("Apply", color=ACCENT)
+        self.apply_button.setToolTip("Apply the expression (a slot pick applies on its own)")
+        self.apply_button.clicked.connect(self._apply_source)
+        source.addWidget(self.apply_button)
+
+        # ---- Display: the declared view knobs for this kind, emitted through the SHARED
+        # row builder, so a kind that gains a knob shows it in both surfaces with no
+        # wiring here.
+        display = section_box("Display")
+        display_specs = ([spec for spec in _panel_display_decls(self.config.kind, self._param_kind())
+                          if spec.display] + [_RELIM_PARAM] + list(self._repeat_param_specs()))
+        self.param_widgets = self._emit_param_rows(
+            display_specs, display.addWidget, self._set_param, label_w)
+        self.fixed_lim_row, self.fixed_lo_edit, self.fixed_hi_edit = self._make_fixed_lim_row(
+            self._on_fixed_lim_edited, label_w)
+        display.addWidget(self.fixed_lim_row)
+        self.fixed_lim_row.setVisible(self._relim() == "fixed")
+        unit_row, self.unit_button, self.unit_label = self._make_unit_cycle_row(
+            self._on_unit_cycle, label_w, with_label=True)
+        display.addWidget(unit_row)
+
+        # ---- Analysis: what a drag on this panel means (the shared composite).
+        self._build_analysis_section(section_box, label_w)
+
+        # ---- Panel: the card itself -- its name, its footprint, and how often it redraws.
+        panel = section_box("Panel")
+        self.title_edit = FluentLineEdit(self.config.title)
+        self.title_edit.setToolTip("Rename this panel (also the default save name)")
+        self.title_edit.textChanged.connect(self._on_title)
+        panel.addWidget(FluentSettingRow("title", self.title_edit, label_width=label_w))
+        self.size_combo = FluentComboBox()
+        for preset in PANEL_SIZES:
+            self.size_combo.addItem(preset, preset)
+        index = self.size_combo.findData(self.config.size)
+        if index >= 0:
+            self.size_combo.setCurrentIndex(index)
+        self.size_combo.setToolTip("Card footprint in layout half-units (rows x columns)")
+        self.size_combo.currentIndexChanged.connect(
+            lambda _i: self._on_size(str(self.size_combo.currentData() or self.config.size)))
+        panel.addWidget(FluentSettingRow("size", self.size_combo, label_width=label_w))
+        self.update_combo = FluentComboBox()
+        for interval in UPDATE_INTERVALS:
+            self.update_combo.addItem("%d ms" % interval, interval)
+        index = self.update_combo.findData(
+            int(self.config.params.get("update_ms", DEFAULT_UPDATE_MS) or DEFAULT_UPDATE_MS))
+        if index >= 0:
+            self.update_combo.setCurrentIndex(index)
+        self.update_combo.setToolTip(
+            "How often THIS panel redraws.  Acquisition is unaffected -- this is a display rate.")
+        self.update_combo.currentIndexChanged.connect(self._on_update_interval)
+        panel.addWidget(FluentSettingRow("update", self.update_combo, label_width=label_w))
+
+        # The status line lives at the bottom of the popup, where a message about the panel
+        # belongs; the card's own title strip stays clean.
+        self.status = FluentLabel(self._status_text)
+        self.status.setStyleSheet("color: %s; background: transparent; border: none;" % GREY)
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self._settings_col.addWidget(self.status)
+        self._settings_col.addStretch(1)
+
+        self._refresh_signal_combo()
 
     def _open_settings(self) -> None:
         # Click-to-open / click-again-to-close TOGGLE.  A Qt.Popup already auto-closes

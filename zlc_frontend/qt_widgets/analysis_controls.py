@@ -29,6 +29,8 @@ from typing import Mapping
 
 from PyQt5 import QtCore, QtWidgets
 
+from zlc_data.vocabulary import ANALYSIS_ACTIONS
+
 from .fluent import (
     FluentButton,
     FluentComboBox,
@@ -48,6 +50,70 @@ __all__ = [
 ]
 
 
+
+
+#: How each action of the shared vocabulary reads in the menu.  The vocabulary
+#: itself lives in :data:`zlc_data.vocabulary.ANALYSIS_ACTIONS` -- which names this
+#: menu as its consumer -- so this maps wording only and can never offer a verb the
+#: dispatch side does not know.
+_ACTION_LABELS = {"fit": "curve fit", "roi": "ROI crop"}
+
+#: Always offered, and the only action every panel can honour on its own: a drag
+#: marks a region and nothing consumes it.
+_NO_ACTION = ("none", "none")
+
+
+def _wired_analysis_actions(card) -> tuple[tuple[str, str], ...]:
+    """The analysis actions this panel can actually carry out, as (value, label).
+
+    The card is ASKED (``analysis_actions_provider``) rather than assumed: the host
+    owns the catalog, so only the host knows whether the seam an action needs is
+    present.  A menu entry that fails on click is worse than an absent one -- the
+    operator would discover the capability is missing exactly when relying on it.
+
+    Order comes from the vocabulary, not from the host's answer, so the menu reads
+    the same everywhere no matter what a given host supports.
+    """
+
+    provider = getattr(card, "analysis_actions_provider", None)
+    available = set(provider() or ()) if callable(provider) else set()
+    return (_NO_ACTION,) + tuple(
+        (action, _ACTION_LABELS.get(action, action))
+        for action in ANALYSIS_ACTIONS if action in available)
+
+
+def _general_fit_models_for_kind(kind: str):
+    """The fit models a plot kind admits, as ``(model_id, display_name)`` pairs.
+
+    Both halves are declared data, so this only PAIRS them -- it holds no list of
+    model names of its own.  A kind states its ``render_family``
+    (:data:`zlc_data.plot_kind.PLOT_KIND_SPEC_BY_KEY`); a model states how many
+    independent axes it needs (:attr:`FitModelDefinition.axis_requirements`, which
+    its own validator restricts to one or two).  One axis is a curve, two is an
+    image -- that is the whole rule, and a model added to the catalogue appears
+    here without this function changing.
+
+    ``render_family == "auto"`` (the site map, which is image-family only when a
+    background frame is supplied) offers BOTH: which one it turns out to be is a
+    property of the figure, not of the kind, and the fit itself re-checks the
+    requirement against the real axes.  Offering too much and letting the fit
+    refuse is honest; hiding a model the data would have accepted is not.
+
+    Imports are LAZY on purpose -- see this module's docstring: the top-level
+    import graph must stay free of anything but Qt.
+    """
+
+    from zlc_data.fit_model import fit_model_catalog
+    from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY
+
+    spec = PLOT_KIND_SPEC_BY_KEY.get(str(kind or ""))
+    family = "auto" if spec is None else str(spec.render_family)
+    wanted = {1} if family == "1D" else {2} if family == "2D" else {1, 2}
+    return tuple(
+        (definition.model_id, definition.display_name)
+        for definition in fit_model_catalog()
+        if len(definition.axis_requirements) in wanted
+    )
 
 
 class _FitFixSeedEditor(QtWidgets.QWidget):
@@ -190,6 +256,94 @@ class AnalysisControls(QtWidgets.QWidget):
     panel family offers no fit / ROI); the host aliases the test-keyed attribute names onto these
     (``analysis_combo`` / ``fit_model_combo`` / ``fit_fix_seed`` / ``fit_result_label`` on the card,
     ``fit_combo`` / ``ed_fix_seed`` on the editor)."""
+
+    def __init__(self, card, *, surface: str = "setting", label_w: int | None = None,
+                 parent=None) -> None:
+        super().__init__(parent)
+        self.card = card
+        self.surface = str(surface)
+        self.action_combo = None
+        self.model_combo = None
+        self.fix_seed = None
+        self.result_label = None
+        self.fit_button = None
+        self.clear_button = None
+
+        label_w = scaled_px(96, minimum=72) if label_w is None else int(label_w)
+        column = QtWidgets.QVBoxLayout(self)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(scaled_px(4, minimum=2))
+
+        kind = str(getattr(getattr(card, "config", None), "kind", "") or "")
+        models = _general_fit_models_for_kind(kind)
+
+        # What a drag on this panel MEANS.  Every entry carries the action string the
+        # card's one mutator acts on, so the menu cannot offer a verb the handler does
+        # not know.
+        self.action_combo = FluentComboBox()
+        for value, label in _wired_analysis_actions(card):
+            if value == "fit" and not models:
+                continue            # a kind with no admissible model cannot offer "fit"
+            self.action_combo.addItem(label, value)
+        self.action_combo.setToolTip(
+            "What a drag-selection on this panel does:\n"
+            "  none = select only (the selection is still recorded)\n"
+            "  curve fit = fit the model below over the selection\n"
+            "  ROI crop = crop the source to the selection")
+        self.action_combo.currentIndexChanged.connect(self._on_action)
+        column.addWidget(FluentSettingRow("analysis", self.action_combo, label_width=label_w))
+
+        if models:
+            self.model_combo = FluentComboBox()
+            for model_id, display_name in models:
+                self.model_combo.addItem(display_name, model_id)
+            self.model_combo.setToolTip(
+                "The fit model.  Stays editable whether or not the fit is on, so a seed\n"
+                "can be entered BEFORE turning it on.")
+            self.model_combo.currentIndexChanged.connect(self._on_model)
+            column.addWidget(FluentSettingRow("fit model", self.model_combo, label_width=label_w))
+
+            self.fix_seed = _FitFixSeedEditor()
+            self.fix_seed.changed.connect(self._on_fix_seed)
+            column.addWidget(FluentSettingRow("fix / seed", self.fix_seed, label_width=label_w))
+
+            # The Edit tab gets explicit buttons; the Setting popup drives the fit from the
+            # action chooser alone.  This is the ONLY thing surface changes -- the controls,
+            # their state and their handlers are identical, which is what keeps the two
+            # surfaces views of one fit rather than two.
+            if self.surface == "edit":
+                self.fit_button = FluentButton("Fit", color=ACCENT)
+                self.fit_button.clicked.connect(self.do_fit)
+                self.clear_button = FluentButton("Clear", color=GREY)
+                self.clear_button.clicked.connect(self.clear_fit)
+                buttons = QtWidgets.QWidget()
+                row = QtWidgets.QHBoxLayout(buttons)
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(scaled_px(6, minimum=4))
+                row.addWidget(self.fit_button, 0)
+                row.addWidget(self.clear_button, 0)
+                row.addStretch(1)
+                column.addWidget(FluentSettingRow("", buttons, label_width=label_w))
+
+            self.result_label = FluentLabel("")
+            self.result_label.setStyleSheet(
+                "color: %s; background: transparent; border: none;" % GREY)
+            self.result_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                            QtWidgets.QSizePolicy.Preferred)
+            column.addWidget(FluentSettingRow("result", self.result_label, label_width=label_w))
+
+        self.derive()
+
+    @property
+    def empty(self) -> bool:
+        """True when this panel kind offers no analysis at all, so the host can drop us.
+
+        With only ``none`` on offer there is nothing to choose, so the section is
+        not worth a row: the host drops it rather than showing a chooser whose
+        single entry means "do nothing".
+        """
+
+        return self.action_combo is None or self.action_combo.count() <= 1
 
 
     def derive(self) -> None:

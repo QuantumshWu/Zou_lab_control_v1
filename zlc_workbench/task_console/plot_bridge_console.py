@@ -570,7 +570,30 @@ class TaskConsole(QtWidgets.QWidget):
             grid_recipe_provider=self._grid_recipe,
             short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace,
             render_barrier=self._render_barrier, area_select_sink=self._on_panel_area_select,
-            selection_clear_sink=self._on_panel_selection_clear, fit_node_sink=self._sync_fit_node)
+            selection_clear_sink=self._on_panel_selection_clear, fit_node_sink=self._sync_fit_node,
+            analysis_actions_provider=self._available_analysis_actions)
+
+    def _available_analysis_actions(self) -> tuple:
+        """Which per-panel analyses this console can currently carry out.
+
+        Both ``fit`` and ``roi`` are performed by giving the panel its own Analysis
+        node (:meth:`_apply_panel_analysis`), so both stand or fall with the catalog
+        offering that definition.  Today it offers none, and the design document is
+        explicit that it should not: neutral must not define a ``FitProcessor`` or a
+        neutral-owned ``FitAnalysisDefinition`` -- fit belongs to the ``zlc_data``
+        ``bind_fit -> BoundFit`` capability that the Workbench opens locally.
+
+        So this returns empty until the panel path is rebuilt on that capability,
+        and the Setting popup shows no analysis chooser rather than one whose
+        entries cannot be honoured.  The per-panel Analysis-node family below is
+        the old model awaiting that rework, not a seam with a missing piece.
+        """
+
+        from zlc_data.vocabulary import ANALYSIS_SPEC_NAME
+        if self._catalog is None or self._catalog.spec_named(ANALYSIS_SPEC_NAME) is None:
+            return ()
+        from zlc_data.vocabulary import ANALYSIS_ACTIONS
+        return tuple(ANALYSIS_ACTIONS)
 
     def _attach_card(self, card: PanelCard) -> None:
         card.setParent(self.board)
