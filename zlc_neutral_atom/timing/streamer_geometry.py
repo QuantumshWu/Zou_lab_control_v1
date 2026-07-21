@@ -36,3 +36,52 @@ __all__ = [
     "default_coeff_frac_bits", "default_slot_mul_width",
     "DEFAULT_COEFF_FRAC_BITS", "DEFAULT_SLOT_MUL_WIDTH",
 ]
+
+
+# ---- Channel/bus geometry the pulse editor derives its rows from ------------------
+# Same config single source (fpga/board_config/streamer_config.json); the except arm
+# mirrors the shipped-config literals exactly as the StreamerParams airbag does.
+try:  # pragma: no cover - exercised whenever the fpga package is importable (the norm)
+    from fpga.pulse_streamer.host.image import load_streamer_config as _load_streamer_config
+
+    _CFG_PARAMS = _load_streamer_config()["params"]
+    DEFAULT_FPGA_CHANNEL_COUNT = int(_CFG_PARAMS.channel_count)
+    DEFAULT_BUS_COUNT = int(_CFG_PARAMS.bus_count)
+    DEFAULT_BUS_WIDTH = int(_CFG_PARAMS.bus_width)
+    EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "evt_fifo_depth", 64))
+    BUS_EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "bus_evt_fifo_depth", 32))
+except Exception:  # pragma: no cover - fpga package not importable
+    DEFAULT_FPGA_CHANNEL_COUNT = 62
+    DEFAULT_BUS_COUNT = 4
+    DEFAULT_BUS_WIDTH = 10
+    EVT_FIFO_DEPTH = 64
+    BUS_EVT_FIFO_DEPTH = 32
+
+
+def hardware_channel_names(count: int = DEFAULT_FPGA_CHANNEL_COUNT) -> list[str]:
+    """Return hardware channel names in FPGA bit order."""
+
+    count = int(count)
+    if count <= 0:
+        raise ValueError("count must be positive.")
+    return [f"ch{index:02d}" for index in range(count)]
+
+
+def delay_eligible_channel_count(channel_count: int, bus_count: int = DEFAULT_BUS_COUNT,
+                                 bus_width: int = DEFAULT_BUS_WIDTH) -> int:
+    """Number of leading channels that can carry a TTL output delay.
+
+    A channel is delay-eligible iff its engine bit drives a real TTL pin -- i.e. it is
+    NOT a bus-member bit (``bus_count*bus_width`` of them, pins driven by ``bus_out``)
+    and NOT a per-bus ``da_clk`` pin (``bus_count`` of them).  The board lays the real
+    TTL outputs out FIRST, so the eligible set is the leading
+    ``channel_count - bus_count*(bus_width+1)`` indices -- matching the RTL's compacted
+    (identity) event-FIFO map."""
+    return max(0, int(channel_count) - int(bus_count) * (int(bus_width) + 1))
+
+
+__all__ += [
+    "DEFAULT_FPGA_CHANNEL_COUNT", "DEFAULT_BUS_COUNT", "DEFAULT_BUS_WIDTH",
+    "EVT_FIFO_DEPTH", "BUS_EVT_FIFO_DEPTH",
+    "hardware_channel_names", "delay_eligible_channel_count",
+]

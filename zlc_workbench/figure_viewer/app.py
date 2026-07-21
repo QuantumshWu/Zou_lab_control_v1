@@ -1,14 +1,10 @@
 """The figure viewer's composition root -- the one place that opens the viewer window.
 
-Every entry goes through :func:`open_figure_viewer`: the double-clickable
-``figure_viewer.bat``, the root ``figure_viewer.py`` launcher, and a session's
-``figure_viewer()`` sugar.  One composition root keeps "the thing the user opens" a
-single object, exactly as the task console's and pulse editor's ``app.py`` do.
-
-**Today this delegates to the legacy viewer stack** (``Zou_lab_control.neutral_atom._gui``
--> ``frontend.figure_viewer``).  That is the transitional state, registered by name in the
-Z4 table, and it dies as the 1033-line shell is taken apart into ``zlc_frontend/qt_widgets``
-and this app's plot_bridge zone (C20/C25).
+The window is the ORIGINAL saved-figure viewer UI -- Browse/gallery, re-plot,
+re-edit, Flow tab, Fluent chrome -- hosted in :mod:`.plot_bridge_figure_viewer`
+(the UI skeleton is kept BY DIRECTIVE 2026-07-21; it is never redesigned).  Its
+remaining legacy-tree imports are a listed rewiring debt being replaced by the
+zlc_* stack, tracked to zero by ``tests/test_workbench_zero_legacy.py``.
 """
 
 from __future__ import annotations
@@ -16,18 +12,9 @@ from __future__ import annotations
 __all__ = ["open_figure_viewer"]
 
 
-def open_figure_viewer(session=None, *, path=None, scale=None, **kwargs):
-    """Open the saved-figure viewer and return the viewer widget.
+def open_figure_viewer(path=None, *, scale=None, **kwargs):
+    """Open the saved-figure viewer and return the viewer widget."""
 
-    ``session`` may be ``None`` (the launcher path: a fresh window per call, reads files
-    only, needs no experiment).  A live session gets the ONE-per-session reshow behaviour
-    the legacy sugar already owns, so this root reuses proven logic instead of duplicating
-    the singleton wiring (C22: the legacy window is the behaviour authority).
-    """
+    from .plot_bridge_figure_viewer import show_figure_viewer
 
-    # The ONE named crossing into the legacy tree for this window (Z4).
-    from Zou_lab_control.neutral_atom._gui import open_figure_viewer as _legacy_open
-
-    if scale is not None:
-        kwargs["scale"] = scale
-    return _legacy_open(session, path=path, **kwargs)
+    return show_figure_viewer(path=path, scale=scale, **kwargs)

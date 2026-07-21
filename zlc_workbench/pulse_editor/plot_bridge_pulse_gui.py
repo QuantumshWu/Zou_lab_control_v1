@@ -135,7 +135,7 @@ def _delay_eligible_position(channel_key: str) -> int | None:
 
 
 try:  # the eligible-channel count is a fixed hardware fact (board layout)
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+    from zlc_neutral_atom.timing.streamer_geometry import (
         DEFAULT_FPGA_CHANNEL_COUNT as _FPGA_CH, delay_eligible_channel_count as _elig_count,
         hardware_channel_names as _hw_channel_names)
     NUM_DELAY_CHANNELS = _elig_count(_FPGA_CH)
@@ -145,7 +145,7 @@ except Exception:  # pragma: no cover - host tooling optional
     DEFAULT_CHANNEL_NAMES = []      # unknown board -> caller must supply channels explicitly
 
 try:  # the configured event-FIFO depths (changes-in-flight caps); shown in delay tips
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+    from zlc_neutral_atom.timing.streamer_geometry import (
         EVT_FIFO_DEPTH as _EVT_DEPTH,           # per TTL channel
         BUS_EVT_FIFO_DEPTH as _BUS_EVT_DEPTH,   # per DA bus bit
     )
@@ -3898,7 +3898,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 try:
                     import json
 
-                    from Zou_lab_control.neutral_atom.devices.sequencer import (
+                    from zlc_neutral_atom.timing.runtime_compiler import (
                         compile_runtime_program_for_payload,
                     )
 

@@ -92,8 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             name=args.name,
             seed=args.seed,
         )
-        window = open_task_console(experiment, state=args.state,
-                                   task=args.task)
+        window = open_task_console(experiment, state=args.state, task=args.task)
         auto_close_ms = os.environ.get("ZLC_TASK_CONSOLE_AUTO_CLOSE_MS")
         if auto_close_ms:
             QtCore.QTimer.singleShot(

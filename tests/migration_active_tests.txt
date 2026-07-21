@@ -36,6 +36,7 @@ tests/test_storage_file_lock.py
 tests/test_storage_framed_journal.py
 tests/test_storage_repository_lease.py
 tests/test_stream_processor_worker.py
+tests/test_timing_pulse_boundary.py
 tests/test_triggered_capture_pipeline.py
 tests/test_u02c_qt_curve_interaction.py
 tests/test_u02d_occupancy_workbench.py
@@ -102,6 +103,7 @@ tests/test_w7_saved_fit_grid.py
 tests/test_w8_transformed_fit_figure.py
 tests/test_workbench_endpoint_binding.py
 tests/test_workbench_host_contract.py
+tests/test_workbench_zero_legacy.py
 tests/test_z0_import_targets_resolve.py
 tests/test_z0_zero_residue.py
 tests/test_zlc_calibration_commit.py

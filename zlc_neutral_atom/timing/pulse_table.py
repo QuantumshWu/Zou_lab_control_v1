@@ -101,29 +101,10 @@ DELAY_MAX_TICKS = (1 << 31) - 1
 from .streamer_geometry import DEFAULT_COEFF_FRAC_BITS as _DEFAULT_COEFF_FRAC_BITS
 
 
-#: The runtime compilers are DEVICE-layer functions (they emit the sequencer's runtime
-#: program), so this headless domain module cannot import them -- the device layer
-#: REGISTERS them at its own import time, exactly as the frontend registers the
-#: solve-thread guard.  Until it does, ``compile``/``compile_scan`` raise with the wiring
-#: instruction instead of silently importing across the boundary.
-_RUNTIME_COMPILERS: dict = {}
 
 
-def register_runtime_compilers(compile_program, compile_scan_program) -> None:
-    """Called by the device layer (``devices.sequencer``) when it loads."""
-
-    _RUNTIME_COMPILERS["program"] = compile_program
-    _RUNTIME_COMPILERS["scan"] = compile_scan_program
 
 
-def _runtime_compiler(kind: str):
-    try:
-        return _RUNTIME_COMPILERS[kind]
-    except KeyError:
-        raise RuntimeError(
-            "the runtime compilers are provided by the device layer; import "
-            "Zou_lab_control.neutral_atom.devices.sequencer (or its successor) first"
-        ) from None
 
 
 @dataclass(frozen=True)
@@ -1966,7 +1947,7 @@ class PulseTableState:
         slots: Mapping[str, float] | None = None,
         repeat_forever: bool | None = None,
     ):
-        compile_pulse_table_runtime_program = _runtime_compiler("program")
+        from .runtime_compiler import compile_pulse_table_runtime_program
 
         clock_hz = positive_float(clock_hz, "clock_hz")
         return compile_pulse_table_runtime_program(
@@ -1983,7 +1964,7 @@ class PulseTableState:
         scan_table: Sequence[Sequence[float]] | None = None,
         repeat_forever: bool | None = None,
     ):
-        compile_pulse_table_scan_runtime_program = _runtime_compiler("scan")
+        from .runtime_compiler import compile_pulse_table_scan_runtime_program
 
         clock_hz = positive_float(clock_hz, "clock_hz")
         step_ns = 1_000_000_000.0 / clock_hz
