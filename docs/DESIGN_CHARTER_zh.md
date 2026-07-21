@@ -28,7 +28,7 @@
 
 - **C20 巨石死刑**:GUI 按三层落位——纯 Qt 控件一件一档进 `zlc_frontend/qt_widgets`;应用接线进 `zlc_workbench/<app>/app.py`(目标 <1k 行);持 mpl 对象的控件暂进 `zlc_workbench/<app>/plot_bridge`。`Zou_lab_control/frontend/task_console.py` 与 `pulse_gui.py` 的终态是**删除**,不是搬家。
 - **C21 文件行数棘轮**(等值,守卫机械强制):qt_widgets 新文件 ≤600 行;存量超限件(board.py/fluent.py/param_widgets.py)记录现值**只准降**。放置事实不只看 import——**持有**活 Qt/mpl 对象的记录,其家在对象所在层(血训:`_GridFocus`/`_StopAttempt` 按 import 判是 render-free,实持 canvas/线程)。
-- **C22 行为权威 = main**:UX 逐项继承 `ZLC_main`(独立 clone)的真实窗口行为,验收 = **两棵活树 A/B 真窗口对比**并记录 main 当日 HEAD;偏离只能进 UX 偏离台账待用户批准(L129/§2.2),默认动作是恢复 main 行为。
+- **C22 行为权威 = main**:UX 逐项继承 `ZLC_main`(独立 clone)的真实窗口行为,验收 = **两棵活树 A/B 真窗口对比**并记录 main 当日 HEAD;偏离只能进 UX 偏离台账待用户批准(L129/§2.2),默认动作是恢复 main 行为。**取到 A 树的方式(C44 修宪后)= 从 `ZLC_main` 目录起进程**(cwd 优先),不是 import——editable 现在指本仓库,任何目录 import 拿到的都是 B 树。
 - **C23** §12.5 worker-raster 是**迁移完成后的独立质量项**,不是迁移前置;其前置 = 先建交互验收矩阵(逐 plot kind × 逐手势的行为表,因交互栈曾零活动覆盖);完成后 plot_bridge 控件提纯毕业进 qt_widgets。
 - **C24 后端清剿指标**:迁移进度 = 删除台账上"不能删的旧树文件数"单调降,每个不能删的文件点名最后 consumer 与目标包;不用"壳掉了多少行"作指标。
 - **C25 删除边界**:两壳在解体完成前不得整文件删除(仍是行为骨架宿主);旧树后端文件在其最后 consumer 断开的同一批次删除;转发壳计数(Z3)只在搬迁产生新壳时上升,Z0 归零。
@@ -46,5 +46,5 @@
 - **C41 测试体系**:套件 == 清单(`migration_active_tests.txt`,Z8=0 等值守卫)——不存在"冻结测试",不要的测试**删除**(git 留底)。脚手架测试必须声明 `DIES_WITH = "<守护的旧物路径>"`,其守护物删除的同一 commit 删它(守卫扫描:守护物已消失而测试还在 = 红)。新增测试只有两类:宪法强制 / 新结构行为契约。GUI smoke flaky——非 GUI 改动不跑。commit 前只跑改动边界 + 棘轮;收口跑全套(A 组单进程,B 组=import `Zou_lab_control.notebook` 的文件各自进程,进程级不变量所迫)。
 - **C42 操作安全**:回退变异用事先 `cp` 的副本,**绝不 `git checkout -- <file>`**;大段删改用内容锚点 + `assert start < end`,绝不靠行号,动手前全量校验锚点;golden 抓完必须检查**有没有鉴别力**,脚本内随机量(tmpdir 名)要归一;纯搬迁靠 A/B 窗口等同验收,只有行为件才抓 golden。
 - **C43** 可机械强制的准则**必须写成测试**,散文与 regex hook 只是提醒不是强制。
-- **C44 环境单源**:pip editable 指向 `ZLC_main`(实验从任何目录 import 拿到 main);迁移开发一律从本仓库根目录起进程(sys.path[0] 使本地包胜出)。改 editable 指向 = 修宪。
+- **C44 环境单源**(2026-07-21 修宪,用户批准):pip editable 指向**本仓库**——迁移树就是这个包的家,从任何目录 import 拿到的是迁移架构(含 `zlc_workbench`/`zlc_frontend`/`zlc_data`/`zlc_neutral_atom`/`zlc_storage` 五个兄弟包;ZLC_main 的 pyproject 只声明 `Zou_lab_control` 一个,装它拿不到这些)。**ZLC_main 仍是活的行为权威树**,但拿到它的方式是**从 ZLC_main 目录起进程**(cwd 优先于 editable finder),不再靠 import 解析。**修宪起因**:editable 指 main 时,notebook 的 `exp.task_console()` 开的是迁移前的旧窗口(main@6c337d4),而 `task_console.bat`(先 `cd` 到本仓库根)开的是新窗口——同一句 API 在两个入口给出两个窗口,操作者没有任何提示能分辨。改 editable 指向 = 修宪。
 - **C45** 全中文回复(代码/commit/token 除外);"完成"的唯一定义是用户真实验收路径可复现,测试绿只是代理指标;猜错 ≥2 次先确认再动手。
