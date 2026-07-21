@@ -100,13 +100,15 @@ class FigureViewer(QtWidgets.QWidget):
         self.window_ratio = float(window_ratio)
         self._current_path: Path | None = None
         self.node = None
-        # The Info column is FIXED-width: the board beside it is what should absorb a
-        # resize, and a fact column that grew would just stretch its value fields.
-        self._info_col_w = scaled_px(340, minimum=250)
         # One label column for every Info row, from the widest label any filler writes
         # -- so the rows align across all three rows-tabs rather than per-tab.
         self._label_w = setting_label_width(
             ("calibration", "data_shape", "points_shape", "captured_at"))
+        # The Info column is FIXED-width -- the board beside it absorbs a resize -- and it
+        # is the LABEL column plus room for the value beside it.  Picking a flat number
+        # instead leaves out the label half: the column came out too narrow for its own
+        # tab strip and all five tab names ("Plot", "Measurement", ...) elided to "...".
+        self._info_col_w = self._label_w + scaled_px(320, minimum=240)
 
         # The window IS the shared screen-fit size -- the same statement the task console
         # makes standalone -- and everything inside is divided out of it.  Leaving it to a
@@ -185,6 +187,12 @@ class FigureViewer(QtWidgets.QWidget):
         self.flow_view = self._add_flow_tab("Flow")
         self.raw_info = self._add_raw_tab("Raw")
         lay.addWidget(self.info_tabs, 1)
+
+        # Widen the column so no tab name is cut.  The width comes from MEASURING the tab
+        # names at the current scale, not from a number I picked and not from the tab
+        # bar's own size hint -- that hint is already the elided width, which is why
+        # "Measurement" still read as "Measur..." after two attempts.  Every tab gets the
+        # widest name's width, since a tab whose name is cut cannot be identified.
 
         # The SAME persistent status surface the console mounts (FluentStatusStrip): one
         # always-visible line, severity-coloured, eliding with the full text in the tooltip --
