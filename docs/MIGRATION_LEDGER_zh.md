@@ -11,7 +11,7 @@
 | --- | --- |
 | 两巨石行数 | `frontend/task_console.py` **393(0 def,纯别名壳)** + `frontend/pulse_gui.py` **86(0 def,显式别名壳)——双巨石解体完成**;pulse 编辑器本体在 `zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py`(4475 行,P5 毕业拆分) |
 | 删除台账剩余 | 承 20(目标包待定 17)/ 内 68 / 死 19,共 107;pulse 域四件已搬空成壳 |
-| 当前窗口 | **task_console+pulse_gui 两壳均 0 def(解体完成)**;pulse 领域在 `zlc_neutral_atom/timing/`;下一步=**figure_viewer 入口先行**(P2 窗口 3),与 P3 设备层/operations 清剿交替 |
+| 当前窗口 | **task_console+pulse_gui 两壳均 0 def**;**figure_viewer 入口已切 `zlc_workbench/figure_viewer/app.py`(A/B vs main 零差异)**;下一步=figure_viewer 壳解体(1033 行)或 P3 设备层/operations 清剿(交替) |
 
 ## 22. 最终验收
 
@@ -1058,3 +1058,4 @@ Pulse/FPGA：
 | 2026-07-20 | pulse_gui 入口先行 | `DONE` | `zlc_workbench/pulse_editor/app.py` 组合根委托旧`_gui.open_pulse_gui`(复用其 offline/session 双路,Z4/Z2A 具名,C20);根启动器+`Experiment.pulse_gui` 同 commit 改指;窄 PulseWorkbench 留组件(测试按名取,零影响)。**当轮新测量**:A/B vs ZLC_main 指纹零差异(260 widget/`PulseSequenceEditor`);已记漂移(C22):main `show_pulse_gui(sequencer=)` vs 本树 `target_descriptor=/command_port=`,接口先前已重构,不追。三个入口钉随语义跟随(composes/workspace-bootstrap/launcher-subprocess)。**机制修复:loop 改由 recurring cron 驱动(5 分钟自愈),弃单发 wakeup(错过即死是停摆根因)** | 启动器 rc=0;A 组 81 passed;B 0/2 |
 | 2026-07-20 | P3·pulse 领域搬迁(壳解体阻塞已除) | `DONE` | 六件 4321 行整搬 `zlc_neutral_atom/timing/`(pulse_table/sequence_model/ports/serialization/clock/streamer_geometry);_viewer_registry→zlc_data,五个校验函数→`zlc_data/validation.py`。**当轮新测量·DAG 裁决**:守卫禁 zlc_pulse import zlc_data 且禁 legacy 拓扑 token,故目的地=zlc_neutral_atom(C13)。compile/compile_scan 注册表反转,devices/sequencer 模块尾注册;未武装报接线错,VirtualSequencer 链武装后编译真跑成功。七旧路径=PEP562 壳(Z3 20→27,C25);strip 豁免 22 条随代码登记;owner 钉双家覆盖(C5);C24 未决 18→17(C6) | A 组 99+DAG 30+z0 8;B 组 5 文件独立进程绿;两入口 rc=0 |
 | 2026-07-20 | P2·pulse_gui 壳解体(终局一批) | `DONE` | 4475 行整搬 `zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py`(C20 过渡区,C14 豁免路径);6 组 import 改写指真源(领域→zlc_neutral_atom.timing、.live→zlc_frontend.live_plot、qt_canvas→plot_bridge_canvas);壳=86 行显式别名壳(0 def,72 名+PANEL_SIZES 词汇钉)。**当轮新测量**:七前置类耦合判定(4 纯 Qt/3 领域/1 mpl)支持整簇随 editor 走,P5 分拣毕业(C23);自 A/B 指纹唯一 diff=默认文件名时间戳(脚本内随机量,C42);Z4/Z2A 具名登记本体(死亡条件=设备层搬迁+P5 毕业);Z3 27→28(C25);project_root 钉随函数迁(C5)。**两壳均 0 def=P2 双巨石解体完成** | 起窗 rc=0;受影响 A 组 57+11+47 绿 |
+| 2026-07-20 | P2·figure_viewer 入口先行 | `DONE` | `zlc_workbench/figure_viewer/app.py` 组合根委托旧 `_gui.open_figure_viewer`(复用其 session 单例/无 session 双路,C22;Z4/Z2A 具名登记,C20/C25);根启动器 `figure_viewer.py` 同 commit 改指组合根,从 Z2A 表摘除(它不再 import 旧树);探针教 `viewer_app` marker+build 分支。**当轮新测量**:A/B vs ZLC_main 指纹零结构差异;自 A/B(HEAD legacy 入口 vs 工作树组合根入口)零结构差异(时间戳默认名按 C42 归一);比对脚本固化 `fp_diff.py` 归一 in-script 随机量 | 起窗 rc=0;z0+charter+qt_widgets+plot_kind 49 绿 |

@@ -51,7 +51,8 @@ ENTRY_MARKERS = {
     "pulse_gui": (("show_pulse_gui(", "legacy"),
                   ("open_pulse_workbench(", "workbench"),
                   ("open_pulse_editor(", "editor_app")),
-    "figure_viewer": (("show_figure_viewer(", "legacy"),),
+    "figure_viewer": (("show_figure_viewer(", "legacy"),
+                      ("open_figure_viewer(", "viewer_app")),
 }
 
 #: Run the child in a headless, deterministic environment.  ``MPLBACKEND=Agg`` matters even
@@ -108,6 +109,10 @@ def build(name, kind, connect_devices):
     app = qt_app()
     room = pathlib.Path(tempfile.mkdtemp(prefix="zlc-fingerprint-"))
     if name == "figure_viewer":
+        if kind == "viewer_app":
+            # The launcher opens the viewer through the composition root; so does the probe.
+            from zlc_workbench.figure_viewer.app import open_figure_viewer
+            return app, open_figure_viewer(path=None), None
         from Zou_lab_control.frontend import show_figure_viewer
         return app, show_figure_viewer(path=None), None
 

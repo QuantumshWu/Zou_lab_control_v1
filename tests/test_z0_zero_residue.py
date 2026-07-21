@@ -67,7 +67,10 @@ TARGET_PACKAGES = ("zlc_data/", "zlc_storage/", "zlc_pulse/", "zlc_neutral_atom/
 Z1_LEGACY_FILES = 122          # tracked files under the two legacy trees
 Z2A_PRODUCTION_IMPORTERS = {   # non-test code OUTSIDE legacy that still imports it
     Path("docs/task_console_design/build.py"),
-    Path("figure_viewer.py"),                        # published double-click launcher
+    # The figure-viewer composition root: delegates to the legacy viewer stack while the
+    # 1033-line shell is dismantled.  Dies with the shell (C20/C25).  The root
+    # figure_viewer.py launcher left this table when it was re-pointed at this root.
+    Path("zlc_workbench/figure_viewer/app.py"),
     Path("fpga/pulse_streamer/sim/_gen_replay_t.py"),  # fpga -> legacy, and zlc_pulse -> fpga
     # The task console's composition root, delegating the WHOLE window to the legacy shell
     # while the shell is taken apart widget by widget.  Transitional by construction: every
@@ -196,6 +199,8 @@ Z4_COMPOSITION_ROOTS = {
     # lazy runtime compiler in save_to_file.  The crossing dies when the device layer
     # moves to zlc_neutral_atom; the file graduates from plot_bridge at P5 (C20/C25).
     Path("zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py"),
+    # The figure viewer's composition root: same transitional delegation (C20/C25).
+    Path("zlc_workbench/figure_viewer/app.py"),
 }
 
 
@@ -235,12 +240,14 @@ def test_z1_the_legacy_trees_shrink():
 
 
 def test_z2a_production_code_outside_legacy_has_a_named_ledger():
-    """Sharp on identity, not just count: three files, each with a known fate.
+    """Sharp on identity, not just count: every file has a known fate.
 
-    build.py is a documentation builder, figure_viewer.py is the published
-    double-click launcher (window W3), and _gen_replay_t.py is the fpga->legacy
+    build.py is a documentation builder, _gen_replay_t.py is the fpga->legacy
     edge that matters because eleven modules in zlc_pulse/zlc_neutral_atom import
-    fpga - so the new pulse stack depends transitively on the legacy tree.
+    fpga - so the new pulse stack depends transitively on the legacy tree.  The
+    rest are the window composition roots / moved window bodies, each transitional
+    by construction (C20/C25); the root launchers themselves now import only their
+    composition roots and left this table.
     """
 
     found = {

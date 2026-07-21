@@ -34,10 +34,10 @@ def main(argv: list[str] | None = None) -> int:
     from PyQt5 import QtCore
 
     from zlc_frontend.qt_widgets import ensure_qt_app
-    from Zou_lab_control.frontend import show_figure_viewer
+    from zlc_workbench.figure_viewer.app import open_figure_viewer
 
     app = ensure_qt_app()
-    show_figure_viewer(path=args.path, scale=args.scale)
+    open_figure_viewer(path=args.path, scale=args.scale)
 
     auto_close_ms = os.environ.get("ZLC_FIGURE_VIEWER_AUTO_CLOSE_MS")
     if auto_close_ms:
