@@ -352,14 +352,16 @@ class TaskConsole(QtWidgets.QWidget):
             self.pause_button.clicked.connect(self._toggle_pause)
             self.save_image_button = FluentButton("Save image", color=ACCENT)
             self.save_image_button.clicked.connect(self._save_board_image)
-            # The READ-ONLY device viewer: one tab per loaded device (its snapshot + live runtime
-            # read-backs), NO config editor / add / remove -- the console must not let an operator
-            # mutate the running device set (the full editor is the notebook's exp.device_manager()).
-            # A launcher (like Selectors/Pause), OUT of the running-task lockout: viewing is read-only.
+            # The READ-ONLY device viewer: one tab per loaded device, no config editing -- the
+            # console must never let an operator mutate the running device set.  The viewer has not
+            # been rebuilt on the current data plane, so the button is DISABLED and says why: an
+            # enabled button whose handler resolves to nothing reads as a broken window, which is
+            # worse than one that admits the view is missing.
             self.devices_button = FluentButton("Devices", color=GREY)
-            self.devices_button.setToolTip("Open the read-only device viewer: each loaded device's "
-                                           "snapshot + live state (no editing -- use the notebook's "
-                                           "device manager to change devices).")
+            self.devices_button.setEnabled(False)
+            self.devices_button.setToolTip("The read-only device viewer has not been rebuilt on this "
+                                           "data plane yet.  The device list is available from a "
+                                           "notebook as exp.device_catalog.")
             self.devices_button.clicked.connect(self._open_device_viewer)
 
         for widget in (self.status_dot, self.name_edit):
@@ -2476,16 +2478,19 @@ class TaskConsole(QtWidgets.QWidget):
             card.set_selectors_enabled(bool(on))
 
     def _open_device_viewer(self) -> None:
-        """Header "Devices" button: open the READ-ONLY device viewer (one tab per loaded device --
-        its snapshot + live runtime read-backs, NO config editing / add / remove).  Routes through
-        the session's ONE-per-session ``device_viewer()`` facade (``na._gui.open_device_viewer`` ->
-        ``show_device_viewer``): the console offers only a safe look at the running device set, never
-        the full config editor (that is the notebook's ``exp.device_manager()`` entry) -- so a
-        running experiment's devices can never be mutated from here."""
-        session = getattr(self, "session", None)
-        opener = getattr(session, "device_viewer", None)
-        if callable(opener):
-            opener()
+        """Header "Devices" button -- currently disabled, and this says why in the status line.
+
+        The viewer used to open through a session facade (``device_viewer()`` ->
+        ``show_device_viewer``); neither that facade nor this console's ``session``
+        attribute exists on the current data plane, so the old body resolved to
+        nothing and returned silently.  A button that quietly does nothing is
+        read as a broken window, so the button is disabled at build time and
+        this states the position if it is ever reached programmatically."""
+
+        self.status_strip.show_message(
+            "The read-only device viewer has not been rebuilt on this data plane yet -- "
+            "the device list is available from a notebook as exp.device_catalog.",
+            severity="warning")
 
     def _save_board_image(self) -> None:
         """Save the WHOLE monitor board (every panel, composited in its laid-out position) to a PNG.

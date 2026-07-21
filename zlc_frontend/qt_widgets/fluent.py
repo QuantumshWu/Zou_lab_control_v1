@@ -3252,15 +3252,16 @@ def launch_fluent_window(
     teardown, title propagation), size it, centre it on the primary screen, show it, and retain it
     on the ONE app registry (:func:`retain_window`).
 
-    EVERY ``show_*`` entry point (pulse editor / task console / figure viewer / device manager)
-    routes through here -- the fourth hand-copied launcher (the device manager) had silently
-    dropped ensure_qt_app / the shared scale / centring / retention, exactly the drift class this
-    helper removes (same failure family as the duplicated scale rule, commit 57a1d25).
+    EVERY ``show_*`` entry point (pulse editor / task console / figure viewer) routes through
+    here.  It exists because hand-copied launchers drift: one of them had silently dropped
+    ensure_qt_app / the shared scale / centring / retention, the same failure family as the
+    duplicated scale rule (commit 57a1d25).  A device-manager window is not built on the current
+    data plane; when it is, it joins this sequence rather than growing a fourth copy.
 
     ``fixed_size=True`` locks the window to its content hint (these GUIs size their own body from
     the screen, so the window must not be user-resizable past it); ``size=(w, h)`` (with
-    ``fixed_size=False``) is the explicit-size path for a body whose hint would collapse (the
-    device manager's scrolling list).  The caller must still :func:`ensure_qt_app` BEFORE
+    ``fixed_size=False``) is the explicit-size path for a body whose hint would collapse
+    (a scrolling list, which reports its content height rather than a usable window size).  The caller must still :func:`ensure_qt_app` BEFORE
     constructing ``widget`` (a QWidget needs the QApplication; the widget ctor also resolves the
     shared fluent scale) -- it is re-asserted here so the sequence stays safe for a caller that
     forgot."""

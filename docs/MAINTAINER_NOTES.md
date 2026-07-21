@@ -1360,8 +1360,11 @@ new device DOMAIN (RF, DAQ, …) is one `register_device_domain(key, base_type)`
 by hand. Readout-locked measurements (temperature / readout-fidelity) intentionally do NOT declare a
 role (they image single atoms and must run on the science camera, not a MOT monitor). Guard:
 `tests/test_device_role_injection_contract.py` (Pin A: no hand-rolled camera dropdown via AST; Pin B:
-declared roles → real choice params; Pin C: injection passes a device, not a string). The GUI face of
-the device-DOMAIN registry is `exp.device_manager()` / the task-console "Devices" button.
+declared roles → real choice params; Pin C: injection passes a device, not a string). The registry is
+read through `exp.device_catalog` (role -> `DeviceInfo`: adapter kind, availability, health, and no
+adapter or drive verb). It has no GUI face at present: the device-manager window and the console's
+read-only device viewer are both unbuilt on the current data plane, and the console's "Devices"
+button is disabled saying so.
 
 `ScannedMeasurementNode` (`operations/logic.py`) wraps a measurement as a console logic node.
 Each `shot()` advances one point and publishes typed coordinate/result `TensorPatch` updates into
