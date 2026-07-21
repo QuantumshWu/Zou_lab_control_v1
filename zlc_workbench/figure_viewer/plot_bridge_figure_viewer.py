@@ -1,50 +1,28 @@
-"""Reopen a saved figure ``.npz`` INTO the Task console -- ``exp.figure_viewer()``.
+"""The saved-figure viewer window -- ``figure_viewer.py`` / ``open_figure_viewer``.
 
-A saved panel / overnight scan writes a current-schema ``<name>_<time>.npz`` artifact
-next to its ``.png`` (see :meth:`~.data_figure.DataFigure.save`).  This window is the GUI
-counterpart of the notebook one-liner ``na.load_figure('scan.npz')`` -- but instead of a bespoke
-viewer, the loaded figure becomes ONE hub SIGNAL and the whole reuse is the Task console board:
+A read-only **Info** column on the left, a board on the right.  The Info column
+groups everything known about what is on the board into tabs -- **Plot** (how it
+draws), **Measurement** (its shapes and source), **Device** (the run's
+provenance), **Flow** (the upstream graph of how the data was produced) and
+**Raw** (the whole record verbatim) -- so "what is this?" is always answerable
+next to the picture rather than in a separate dialog.
 
-* a :class:`LoadedFigureNode` publishes the saved data as static hub signals (``fig_value`` plus, for a
-  1-D save its companion ``fig_x``; for a site map its ``fig_centers`` and ``fig_frame`` underlay),
-  declaring the SAME ``output_specs`` / ``published_signals`` / ``x_signal`` / ``sitemap_*`` a live
-  producer does -- so a panel wired to it reads the right axis label, unit, x-coordinates AND the
-  site-map background frame.  Every save records the full producer blocks under ``info['signals']`` (each
-  a native ``(repeat, *points, *data)`` array + ``points_shape`` / ``data_shape`` + a ``role``), which
-  the node re-publishes VERBATIM (a faithful round-trip); missing or malformed typed blocks reject the
-  artifact instead of being reconstructed from ndarray rank;
-* the window SEEDS one panel with the SAVED ``kind`` + ``view`` (``PanelConfig(kind=sf.kind,
-  source="value = fig_value", params=sf.info["view"])``) so it opens reproducing the original figure;
-* the panel lives on a real :class:`~.task_console.TaskConsole`, so the user gets the board, Add Panel,
-  the signal picker, re-wiring and the light processing for free -- add MORE panels reading the same
-  ``fig_value`` under a different kind, or fit / relim / re-save through the panel's own Edit tab.
+**Opening a stored figure is not connected yet, and the window says so.**  It
+used to read a saved ``.npz``, publish it as hub signals and seed a panel bound
+to them.  All three of those are gone: nothing writes those files, the hub was
+deleted, and a figure is now a view PROJECTED from a data artifact
+(``Experiment.figure(ref)``) rather than a document reopened from disk.
 
-A PULSE figure (one whose save carries an ``info['figure_recipe']`` of kind ``pulse`` -- a timeline
-rendered from a period table + analog buses, which cannot be expressed as ``data_x`` / ``data_y``) takes
-the EXACT SAME path as every other kind, no special case: ``LoadedFigureNode`` publishes its reproduction
-OBJECT (a ``PulseTableState``, resolved via :meth:`~.data_figure.SavedFigure.pulse_state`) as ``fig_value``
--- a hub value may be any object, not just an array -- and :func:`_seed_state` seeds a ``kind="pulse"``
-panel bound to it, so the SAME :class:`~.task_console.PanelCard` reproduces the full timeline through its
-``pulse`` branch (every digital channel / analog trace / bracket).  ``pulse`` is ``panel=False`` ONLY in
-the sense that it is not offered in the live Add-Panel dropdown (you do not add a blank pulse panel and
-wire it) -- it is a full panel kind on this SEED path.  So the loaded pulse card is a normal PanelCard on
-the same board, and the Monitor tab / Add Panel / re-wire reuse is identical to a hist or a site map.
+Restoring it is a product decision rather than a wiring one, and the design note
+already places it: the current step must not pre-build an artifact
+catalog/browser, and extending catalog/browse/open over arbitrary stored
+artifacts is a later step of the migration.  Building that browser here would be
+building the thing the plan says not to build yet, so the File field reports
+where it stands instead of quietly doing nothing -- which would read as "this
+file is empty".
 
-A read-only **Info** column on the left lists EVERY key the npz stored, grouped into tabs -- **Plot**
-(name / kind / labels / unit / saved / the view sub-dict / any fit), **Measurement** (source / data_x /
-data_y shapes / points / repeat / the stored signal blocks), **Device** (the run's provenance expanded
-per device), **Flow** (the upstream DAG of how the data was produced -- raw data / a measurement signal /
-through which processor(s), drawn as a branching node-link tree, since one panel can consume several
-signals each from a different upstream source) and **Raw** (the whole ``info`` dict verbatim, multi-line
-+ scrollable) -- so "what is in this file" is always fully visible next to the board.  Browse (or typing a valid path) loads it
-automatically -- there is no separate Load button.  Browse lists the saved-figure IMAGES (``.png`` /
-``.jpg``) alongside the ``.npz``, so the operator can eye-ball the thumbnail to find the right run and
-picking the image loads its SIBLING ``.npz`` data (the save writes the pair under one ``<name>_<time>``
-base); picking the ``.npz`` directly still works.
-
-It is session-INDEPENDENT: it only reads a file, no hardware, no acquisition -- the ``LoadedFigureNode``
-re-publishes the same stored arrays every shot.  The window chrome (Fluent frameless shell, one shared
-display-scale rule, centred on the primary screen) mirrors ``show_pulse_gui`` / ``show_task_console``.
+The window chrome (Fluent frameless shell, one shared display-scale rule, centred
+on the primary screen) mirrors ``show_pulse_gui`` / ``show_task_console``.
 """
 
 from __future__ import annotations
@@ -58,16 +36,12 @@ from PyQt5 import QtCore, QtWidgets
 from zlc_storage.paths import display_path
 
 from zlc_frontend.qt_widgets import FlowGraphView
-from zlc_data.console_records import PanelConfig
-from zlc_frontend.console_state import TaskConsoleState
 from zlc_workbench.task_console.plot_bridge_console import TaskConsole
 
 from zlc_frontend.qt_widgets import (
     CARD_PAD,
-    GREY,
     FluentCodeEdit,
     FluentFrame,
-    FluentLabel,
     FluentPathEdit,
     FluentReadoutMultiline,
     FluentScrollArea,
@@ -83,88 +57,26 @@ from zlc_frontend.qt_widgets import (
     screen_fit_window_size,
     set_fluent_scale,
     setting_label_width,
-    signals_blocked as _signals_blocked,
 )
-
-
-#: The hub signal name the loaded figure's PRIMARY data is published under -- the panel the window
-#: seeds is wired to it (``value = fig_value``), and any further panel the user adds picks it too.
-FIG_VALUE_KEY = "value"
-#: The companion x-axis signal (1-D saves) -- lets a 1-D panel draw its curve vs the saved data_x with
-#: the saved x-axis label/unit (the console's ``curve_x_provider`` resolves it from THIS node).
-FIG_X_KEY = "x"
-#: The per-tweezer centres signal (site-map saves) -- a site-map panel resolves its ring centres from
-#: this node via ``sitemap_centers_key``.
-FIG_CENTERS_KEY = "centers"
-#: The camera-frame underlay signal for site-map/2-D saves.  A site-map
-#: panel resolves it from the producer through ``sitemap_image_key``.
-FIG_FRAME_KEY = "frame"
-
-#: The node prefix -- so the published hub names are ``fig_value`` / ``fig_x`` / ``fig_centers`` /
-#: ``fig_frame`` and the seeded panel's ``inputs`` name ``fig_value``.
-FIG_PREFIX = "fig_"
-
-#: The saved-figure IMAGE suffixes ``DataFigure.save`` may write beside the data ``.npz`` (its default is
-#: ``.png``; ``image_ext=`` can pick ``.jpg`` / ``.jpeg``).  Browsing/typing one of these loads the
-#: SIBLING ``<image>.with_suffix('.npz')`` -- the save writes the pair under the same ``<name>_<time>``
-#: base, so the mapping is exact.  Kept next to the data param, not baked into ``FluentPathEdit`` (which
-#: stays a generic path field -- the sibling mapping is the viewer's job).
-FIGURE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
-
-
-def _resolve_npz(path: Path) -> Path:
-    """Map a picked path to the ``.npz`` to load: a saved-figure IMAGE (``.png`` / ``.jpg`` / ``.jpeg``)
-    resolves to its SIBLING ``<image>.with_suffix('.npz')`` (the save writes the image + npz as a same-base
-    pair); a ``.npz`` (or anything else) is returned unchanged.  The caller checks the result exists."""
-    if path.suffix.lower() in FIGURE_IMAGE_SUFFIXES:
-        return path.with_suffix(".npz")
-    return path
-
-
-def _stored_shape(entry: Mapping, key: str, signal_name: str) -> tuple[int, ...]:
-    """Read one mandatory non-empty stored tensor shape.
-
-    ``info['signals']`` is the faithful typed path, so a present entry is never allowed to fall back to
-    ndarray-rank inference.  Array-only saves use the separate ``_build_from_arrays`` boundary; a typed
-    entry with a missing shape is malformed and must say so explicitly.
-    """
-    raw = entry.get(key)
-    if raw is None:
-        raise ValueError(f"saved signal {signal_name!r} is missing required {key}.")
-    shape = tuple(int(n) for n in raw)
-    if not shape or any(n < 1 for n in shape):
-        raise ValueError(
-            f"saved signal {signal_name!r} has invalid {key}={raw!r}; "
-            "stored tensor shapes must be non-empty and positive.")
-    return shape
-
-
-def _kind_label(key: str | None) -> str:
-    """The human plot-kind label from the ONE vocabulary (never a hand-typed name), so the
-    Info panel reads 'Distribution' not 'hist'; falls back to the raw key for an unknown kind."""
-    if not key:
-        return ""
-    from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY
-    spec = PLOT_KIND_SPEC_BY_KEY.get(str(key))
-    return spec.label if spec is not None else str(key)
-
-
 
 
 
 
 class FigureViewer(QtWidgets.QWidget):
-    """The reopen-into-the-console body (wrapped in a :class:`FluentWindow` by :func:`show_figure_viewer`).
+    """The viewer body (wrapped in a :class:`FluentWindow` by :func:`show_figure_viewer`).
 
-    Left:  a read-only **Info** column -- a path field (Browse auto-loads a picked ``.npz``, no Load
-           button) over a TAB set that groups the stored facts: **Plot** (how it draws) / **Measurement**
-           (its data shapes / source / stored signal blocks) / **Device** (the run's provenance) / **Raw**
-           (the whole ``info`` dict, multi-line + scrollable), so the entire npz is visible next to the
-           board without one crushed column.
-    Right: a live embedded :class:`~.task_console.TaskConsole` (size-Expanding, so it FILLS the pane and
-           reflows into 2+ columns) whose seeded panel reproduces the saved figure and on which the user
-           can Add more panels / re-wire / process the loaded ``fig_value`` signal.  The Info card and the
+    Left:  a read-only **Info** column -- a path field (Browse, no separate Load button) over a
+           TAB set that groups what is known about the figure on the board: **Plot** (how it
+           draws) / **Measurement** (its shapes and source) / **Device** (the run's provenance) /
+           **Flow** (how the data was produced) / **Raw** (the whole record verbatim), so the
+           facts sit beside the picture instead of in one crushed column.
+    Right: an embedded :class:`~.task_console.TaskConsole` (size-Expanding, so it FILLS the pane
+           and reflows into 2+ columns), where the operator gets the board, Add Panel, the signal
+           picker and re-wiring without this window growing its own.  The Info card and the
            console share one root layout with equal margins + spacing, so their outer edges line up.
+
+    Opening a STORED figure is not connected on the current data plane -- see the module
+    docstring for why that is a deferred product decision rather than missing wiring.
     """
 
 
@@ -231,12 +143,10 @@ class FigureViewer(QtWidgets.QWidget):
         lay.setSpacing(window_pad(0.5))                              # == console header<->tab gap
 
         # --- File header card: FLAT (like the console header), a single bar "File" + path picker --------
-        # Browse (or typing a valid .npz) AUTO-LOADS -- no separate Load button: FluentPathEdit.changed
-        # fires when Browse picks a file (or the user finishes typing one) and _on_path_changed loads it.
-        # Browse lists the saved-figure IMAGES (png / jpg) too, so the operator can eye-ball a thumbnail;
-        # picking the image loads its SIBLING ``<image>.with_suffix('.npz')`` data (the save writes the
-        # pair).  A FLAT header (no shadow) mirrors the console header, which is flat so its shadow's soft
-        # bottom edge never draws a thin line into the gap above the tab strip.
+        # Browse (or a typed path) acts immediately -- no separate Load button: FluentPathEdit.changed
+        # fires when Browse picks a file, or when the user finishes typing one, and _on_path_changed
+        # takes it from there.  A FLAT header (no shadow) mirrors the console header, which is flat so
+        # its shadow's soft bottom edge never draws a thin line into the gap above the tab strip.
         header_frame = FluentFrame(bordered=False)
         header_frame.setFixedHeight(scaled_px(48, minimum=38))
         header = QtWidgets.QHBoxLayout(header_frame)
@@ -244,10 +154,10 @@ class FigureViewer(QtWidgets.QWidget):
         header.setSpacing(scaled_px(8, minimum=5))
         header.addWidget(FluentSectionLabel("File"))
         self.path_edit = FluentPathEdit(
-            "", mode="file", caption="Open a saved figure (image or .npz)",
-            file_filter="Saved figures (*.png *.jpg *.jpeg *.npz);;All files (*)")
-        self.path_edit.setToolTip("A saved figure -- Browse (or type a full path).  Pick the image "
-                                  "(.png / .jpg) or the .npz and it loads onto the board automatically.")
+            "", mode="file", caption="Open a stored figure",
+            file_filter="All files (*)")
+        self.path_edit.setToolTip("Browse to a stored figure, or type a full path.  Opening one is "
+                                  "not connected yet -- the status line below says so when you pick.")
         self.path_edit.changed.connect(self._on_path_changed)
         header.addWidget(self.path_edit, 1)
         lay.addWidget(header_frame)
@@ -273,7 +183,7 @@ class FigureViewer(QtWidgets.QWidget):
         # always-visible line, severity-coloured, eliding with the full text in the tooltip --
         # a load failure turns it red instead of hiding as grey prose.
         self.status = FluentStatusStrip()
-        self.status.show_message("Load a saved figure (.npz) to view it on the board.")
+        self.status.show_message("Opening a stored figure is not connected on this data plane yet.")
         lay.addWidget(self.status)
         return col
 
@@ -325,7 +235,7 @@ class FigureViewer(QtWidgets.QWidget):
         m = scaled_px(CARD_PAD, minimum=6)
         vbox.setContentsMargins(m, m, m, m)
         raw = FluentCodeEdit("", read_only=True)
-        raw.setToolTip("The full info dict stored in the npz -- read-only, select to copy.")
+        raw.setToolTip("Everything recorded about this figure, verbatim -- read-only, select to copy.")
         vbox.addWidget(raw)
         self.info_tabs.add_permanent_tab(body, title)
         return raw
@@ -335,60 +245,56 @@ class FigureViewer(QtWidgets.QWidget):
         return getattr(self, "_zlc_window", None)
 
     def open_path(self, path: str | Path) -> None:
-        """Load a saved figure: publish its data as ``fig_value`` and seed a console reproducing it.
+        """Show ``path`` in the File field and try to put it on the board.
 
-        ``path`` may be the data ``.npz`` OR its sibling IMAGE (``.png`` / ``.jpg`` / ``.jpeg``) -- picking
-        the image loads the same-base ``.npz`` beside it (see :func:`_resolve_npz`).  A picked image with
-        no sibling ``.npz`` is reported in the status line (nothing is loaded), never a crash."""
+        A blank path is a cleared field, not an error, so it is simply ignored.
+        Anything else goes to :meth:`_open_stored_figure`, which reports that
+        opening stored figures is not connected on the current data plane."""
+
         p = Path(str(path).strip())
         if str(p) in ("", "."):
             return
-        npz = _resolve_npz(p)
-        if p.suffix.lower() in FIGURE_IMAGE_SUFFIXES and not npz.is_file():
-            self.status.show_message(f"no matching .npz data next to {display_path(str(p))} "
-                                     f"(expected {npz.name})", severity="warning")
-            return
-        self._load_npz(npz)
+        self._open_stored_figure(p)
 
-    def _load_npz(self, npz: Path) -> None:
+    def _open_stored_figure(self, picked: Path) -> None:
         """Put a picked file on the board.
 
         NOT YET WIRED, and it says so rather than looking like it worked.  The
-        old path published the file as hub signals; the hub is gone, and a
-        figure is now a view projected from a data artifact (``exp.figure(ref)``)
-        rather than a file that gets reopened.  Reconnecting this to the current
-        data plane is the next step, tracked in the migration ledger -- until
-        then, silently doing nothing would read as "this file is empty".
+        old path published the file as hub signals; the hub is gone, nothing
+        writes those files any more, and a figure is now a view projected from a
+        data artifact (``Experiment.figure(ref)``) rather than a document
+        reopened from disk.
+
+        What replaces it is a product decision the plan has already placed: the
+        current step must not pre-build an artifact catalog/browser, and
+        catalog/browse/open over arbitrary stored artifacts is a later step.
+        Building it here would be building what the plan says to defer, so this
+        reports where it stands.  Silently doing nothing would read as "this
+        file is empty", which is worse than an admitted gap.
         """
 
-        self._current_path = npz
+        self._current_path = picked
         self.status.show_message(
-            f"{display_path(str(npz))}: loading is not reconnected yet -- "
+            f"{display_path(str(picked))}: opening stored figures is not connected yet -- "
             "a figure is now projected from a run artifact, not reopened from a file.",
             severity="warning")
 
     # ------------------------------------------------------------- file / load
     def _on_path_changed(self, text: str) -> None:
-        """Browse (or typed) path -> AUTO-LOAD.  ``changed`` fires on every keystroke too, so we only act
-        on a real EXISTING file (mid-type garbage / a folder is ignored, no error spam) whose suffix is a
-        saved-figure one -- a ``.npz`` loads directly; a saved-figure IMAGE (``.png`` / ``.jpg`` /
-        ``.jpeg``) loads its SIBLING ``.npz`` (see :func:`_resolve_npz`).  Browse always yields a real
-        file, so picking the image OR the npz loads immediately; an image with no sibling npz reports it in
-        the status (never a crash)."""
+        """Browse (or a typed path) -> open it, with no separate Load button.
+
+        ``changed`` fires on every keystroke, so this only acts on a path that
+        is a real EXISTING file: half-typed text and folders are ignored rather
+        than reported, which is what keeps a person typing from being told off
+        once per character.  Re-reporting the file already shown is skipped too,
+        since setting the field echoes back through this same signal."""
+
         p = Path(str(text).strip())
-        suffix = p.suffix.lower()
         if str(p) in ("", ".") or not p.is_file():
             return
-        if suffix != ".npz" and suffix not in FIGURE_IMAGE_SUFFIXES:
-            return                                       # mid-type / unrelated file -- no error spam
-        npz = _resolve_npz(p)
-        if not npz.is_file():
-            self.status.show_message(f"no matching .npz data next to {display_path(str(p))} "
-                                     f"(expected {npz.name})", severity="warning")
+        if self._current_path is not None and p == self._current_path:
             return
-        if self._current_path is not None and npz == self._current_path:
-            return                                       # already loaded (the setText echo below re-fires)
-        self._load_npz(npz)
+        self._open_stored_figure(p)
 
 
     def _clear_layout(self, layout: QtWidgets.QVBoxLayout) -> None:
@@ -446,7 +352,7 @@ class FigureViewer(QtWidgets.QWidget):
         Info column, easy to read: a 'Provenance' section header, then the top-level scalar facts
         (node / layer / captured_at / calibration fingerprint) as rows, then ONE sub-section per held
         device (``camera`` / ``sequencer``) listing its snapshot keys one per row.  ``provenance`` may
-        be ``None`` (old npz, or nothing to record) -> nothing is added; a non-dict is shown verbatim."""
+        be ``None`` (nothing was recorded) -> nothing is added; a non-dict is shown verbatim."""
         if not provenance:
             return
         self.info_layout.addWidget(FluentSectionLabel("Provenance"))
@@ -514,12 +420,13 @@ class FigureViewer(QtWidgets.QWidget):
 def show_figure_viewer(path: str | Path | None = None, *, scale: float | None = None,
                        window_ratio: float = WINDOW_SCREEN_FRACTION,
                        hide_on_close: bool = False) -> FigureViewer:
-    """Open the saved-figure viewer in a Fluent window (mirrors ``show_pulse_gui`` /
-    ``show_task_console``: the body sizes from the primary screen, the window wraps it, and the shared
-    auto-scale rule owns the on-screen control size).  ``path`` loads a ``.npz`` on launch -- its data
-    becomes the ``fig_value`` hub signal and a panel of the saved kind opens reproducing it on a real
-    Task console board; omit it to open empty and Browse from inside.  Closing the window tears the
-    embedded console down (its refresh timer + the loaded-figure node)."""
+    """Open the figure viewer in a Fluent window.
+
+    Mirrors ``show_pulse_gui`` / ``show_task_console``: the body sizes from the primary screen, the
+    window wraps it, and the shared auto-scale rule owns the on-screen control size.  ``path``
+    prefills the File field on launch; opening a stored figure is not connected on the current data
+    plane, so the window reports that rather than loading (see the module docstring).  Closing the
+    window tears the embedded console down."""
     ensure_qt_app()          # the viewer is a QWidget: the app must exist BEFORE its ctor
     viewer = FigureViewer(path, scale=scale, window_ratio=window_ratio)
     # ONE launcher sequence (launch_fluent_window: wrap -> wire -> size -> centre -> show ->

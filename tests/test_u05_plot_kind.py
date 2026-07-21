@@ -119,8 +119,11 @@ def test_the_vocabulary_module_reaches_for_no_renderer_and_no_toolkit():
     # zlc_data.console_records with PanelConfig, so the derivation -- and with it this
     # import -- now sits one layer down; the console reads the PANEL vocabulary instead.
     ("zlc_data/console_records.py", {"PLOT_KIND_SPECS", "PLOT_KIND_SPEC_BY_KEY"}),
-    # The viewer body moved whole into the workbench app package; the pin follows the code.
-    ("zlc_workbench/figure_viewer/plot_bridge_figure_viewer.py", {"PLOT_KIND_SPEC_BY_KEY"}),
+    # The figure viewer was pinned here too, for the helper that turned a stored kind key
+    # into its display label.  Opening a stored figure is not connected on the current data
+    # plane, so nothing calls that helper and it went with the rest of the load path; a
+    # reader that reads nothing cannot be pinned to a single source.  The row comes back
+    # with the Info column's kind label, and it is this list that has to grow again then.
 ])
 def test_each_vocabulary_reader_names_the_new_home(relative, expected):
     """Structural, so this file keeps no legacy-tree dependency of its own.

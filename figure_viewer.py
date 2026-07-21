@@ -1,17 +1,14 @@
 """Standalone launcher for the saved-figure viewer.
 
 Double-click ``figure_viewer.bat`` (or run ``python figure_viewer.py``) to open the
-window that RE-OPENS a saved figure: load its ``.npz`` (the data + the full snapshot
-``info`` a Save wrote), see exactly what was stored, re-plot the SAME data with a
-DIFFERENT plotter, re-edit (relim / fit / limits) and re-save.  It is
-session-INDEPENDENT -- it only reads files, so it needs no connected experiment::
+viewer window: the Info column and the board, with no session and no hardware.
 
-    python figure_viewer.py                          # open empty; Browse to a .npz
-    python figure_viewer.py path\\to\\snap.npz        # open that saved figure
-    python figure_viewer.py path\\to\\run_folder      # open the folder as a gallery
-
-The window is the SAME as ``exp.figure_viewer(path)`` from a notebook / a running
-session; this launcher is just the double-click entry that needs no session.
+**Opening a stored figure is not connected yet.**  The window used to read a saved
+``.npz`` written beside its image; nothing writes those files now, and a figure is
+a view projected from a data artifact rather than a document reopened from disk.
+Restoring it means deciding how an operator picks a stored artifact, which the
+migration plan defers to a later step -- so the window opens and reports the gap
+rather than pretending to load.
 """
 
 from __future__ import annotations
@@ -24,8 +21,8 @@ import sys
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Zou-lab saved-figure viewer.")
     parser.add_argument("path", nargs="?", default=None,
-                        help="a saved figure .npz (or a folder of saved .npz files) to open on "
-                             "start; omit to open empty and Browse to one.")
+                        help="a path to show in the File field on start; opening stored "
+                             "figures is not connected yet, so this only prefills the field.")
     parser.add_argument("--scale", type=float, default=None, help="UI scale factor (default: auto).")
     args = parser.parse_args(argv)
 
