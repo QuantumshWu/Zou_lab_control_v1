@@ -3585,6 +3585,17 @@ class FluentScanLineEdit(FluentLineEdit):
         self._bound = False
         self._reserve_right()
 
+    @property
+    def dot(self) -> "FluentScanDot":
+        """The embedded toggle, for hosts that bind it to their own handler.
+
+        ``scanClicked`` covers the common case; a host that needs the button
+        itself -- to set its slot number, or to connect ``clicked`` alongside
+        other dots -- gets it here rather than reaching for the private field.
+        """
+
+        return self._dot
+
     def _dot_size(self) -> int:
         return Metrics.dot()
 
