@@ -31,6 +31,7 @@ from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 
+from .clock import DEFAULT_TIME_STEP_NS
 from .sequence_model import (CLOCK_GRID_ATOL_TICKS as GRID_ATOL_STEPS,
                        CLOCK_GRID_RTOL as GRID_RTOL, DEFAULT_CLOCK_HZ,
                        READOUT_GAP_SECONDS,
@@ -341,7 +342,11 @@ class PulsePeriod:
             raise ValueError(f"unsupported pulse duration unit {unit!r}.")
         return value, unit, value * UNITS_TO_NS[unit]
 
-    def duration_steps(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float = 1.0) -> int:
+    def duration_steps(self, *, slots: Mapping[str, float] | None = None,
+                       time_step_ns: float | None = None) -> int:
+        # Default = the configured board tick, never a bare literal: quantising to a grid the
+        # hardware does not have is silent, and wrong by the ratio of the two clocks.
+        time_step_ns = DEFAULT_TIME_STEP_NS if time_step_ns is None else time_step_ns
         value, unit, out = self._duration_ns_unquantized(slots=slots)
         # A NEGATIVE literal period duration is almost always an input error; raise instead of
         # silently snapping it up to one tick.  (Scan-table durations are clamped UI-side by
@@ -395,7 +400,7 @@ class PulseTableState:
         scan_table: Sequence[Sequence[float]] | None = None,
         scan_code: str = "",
         api_slots: Sequence[ApiSlot | Mapping[str, object]] | None = None,
-        time_step_ns: float = 1.0,
+        time_step_ns: float | None = None,     # None -> the configured board tick
         repeat_start: int | None = None,
         repeat_end: int | None = None,
         repeat_count: int = 1,
@@ -413,7 +418,8 @@ class PulseTableState:
         # called per period x channel x rebuild from the GUI, so list.index() there is wasteful.
         self._channel_index = {lane: index for index, lane in enumerate(raw_lanes)}
         self.name = str(name) if name is not None else default_pulse_name()
-        self.time_step_ns = positive_time_step_ns(time_step_ns)
+        self.time_step_ns = positive_time_step_ns(
+            DEFAULT_TIME_STEP_NS if time_step_ns is None else time_step_ns)
         # Programmatic construction may use keyword mappings with the dataclass's documented optional
         # fields.  Serialized documents do not pass this seam: ``from_dict`` validates their complete
         # current exact shape first and supplies typed ScanSlot objects.
@@ -2819,7 +2825,7 @@ def affine_coeffs(
     *,
     slot_vars: Sequence[str],
     unit: str = "ns",
-    time_step_ns: float = 1.0,
+    time_step_ns: float | None = None,                # None -> the configured board tick
     coeff_frac_bits: int = _DEFAULT_COEFF_FRAC_BITS,   # config single source (bitstream-affecting)
 ) -> tuple[int, list[int]]:
     """Return ``(base_ticks, [coeff_fixed per slot var])`` for scan timing.
@@ -2829,6 +2835,7 @@ def affine_coeffs(
     so the hardware tick is ``base + (sum(coeff_j * slot_tick_j) >> frac_bits)``.
     """
 
+    time_step_ns = DEFAULT_TIME_STEP_NS if time_step_ns is None else time_step_ns
     if unit not in UNITS_TO_NS:
         raise ValueError(f"unsupported time unit {unit!r}.")
     base, coeff_map = _SafeEval(None).affine(value)

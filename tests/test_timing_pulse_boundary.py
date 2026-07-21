@@ -29,8 +29,12 @@ TIMING = REPO / "zlc_neutral_atom" / "timing"
 TARGET_SIDE = {"pulse.py", "capture.py", "capture_plan.py", "lineage.py",
                "occupancy.py", "segmented.py", "_coordination.py"}
 #: The production pipeline's side: authoring model + the machine-verified compiler.
+#: ``board_config.py`` joins ``ports.py``/``clock.py``/``streamer_geometry.py``: all four read
+#: ONE hardware fact (pin map / port topology / tick rate / capacity) that the authoring model
+#: and the production compiler both quantise against.  It is not a third pulse representation.
 PRODUCTION_SIDE = {"pulse_table.py", "sequence_model.py", "runtime_compiler.py",
-                   "ports.py", "serialization.py", "clock.py", "streamer_geometry.py"}
+                   "ports.py", "serialization.py", "clock.py", "streamer_geometry.py",
+                   "board_config.py"}
 
 
 def _imported_modules(path: pathlib.Path) -> set[str]:

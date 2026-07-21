@@ -123,6 +123,11 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         # Scan-tab editor (or a template file carries) -- exactly the external
         # input boundary this guard reserves .strip() for.
         (Path("zlc_workbench/_domain_wiring.py"), "_read_pulse_template"),
+        # The board pin map reads the platform's XDC -- a Tcl constraints file written by a
+        # human and by Vivado, with arbitrary leading whitespace on every line.  Turning that
+        # text into lane identities IS the external input boundary; the identities it yields
+        # (lane keys, port labels, pin names) are canonical from here on.
+        (Path("zlc_neutral_atom/timing/board_config.py"), "load_board_config"),
         # The runtime compiler (moved whole from the legacy device layer) parses
         # slot REFERENCES ("s0") that a human's plan entries and saved documents
         # carry as text, plus the wire-codec payload fields that mirror them.
