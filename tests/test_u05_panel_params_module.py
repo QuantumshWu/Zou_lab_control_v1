@@ -26,6 +26,12 @@ shell immediately before the move and diffed against it afterwards (904 lines, i
 
 from __future__ import annotations
 
+#: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
+#: file guards the NEW structure and is permanent (swept by test_design_charter).
+DIES_WITH_PARTIAL = {
+    "test_the_shell_takes_every_catalog_name_from_the_new_home": 'Zou_lab_control/frontend/task_console.py',
+}
+
 import ast
 import pathlib
 

@@ -9,6 +9,7 @@ tests/test_capture_repository_authority.py
 tests/test_compiled_capture_cell_plan.py
 tests/test_compiled_pulse_artifact.py
 tests/test_definition_catalog.py
+tests/test_design_charter.py
 tests/test_m1_camera_monitor.py
 tests/test_m2_camera_monitor_roi_curve.py
 tests/test_m2b_camera_monitor_scalar_history.py

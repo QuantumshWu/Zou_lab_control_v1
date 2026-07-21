@@ -16,6 +16,12 @@ move, including the empty and ``None`` cases that fall back to a one-slot defaul
 
 from __future__ import annotations
 
+#: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
+#: file guards the NEW structure and is permanent (swept by test_design_charter).
+DIES_WITH_PARTIAL = {
+    "test_the_legacy_name_is_the_same_class": 'Zou_lab_control/frontend/task_console.py',
+}
+
 import ast
 import pathlib
 

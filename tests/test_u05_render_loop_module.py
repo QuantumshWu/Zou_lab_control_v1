@@ -23,6 +23,15 @@ exists to catch.  It now imports the real owner and does not swallow.
 
 from __future__ import annotations
 
+#: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
+#: file guards the NEW structure and is permanent (swept by test_design_charter).
+DIES_WITH_PARTIAL = {
+    "test_the_legacy_path_resolves_to_the_same_objects": 'Zou_lab_control/frontend/render_loop.py',
+    "test_the_shim_forwards_live_rather_than_copying_bindings_once": 'Zou_lab_control/frontend/render_loop.py',
+    "test_the_two_real_consumers_import_the_owner_not_the_shim": ('Zou_lab_control/frontend/qt_canvas.py', 'Zou_lab_control/frontend/task_console.py'),
+    "test_its_neighbour_really_is_married_which_is_why_it_stayed": 'Zou_lab_control/frontend/qt_canvas.py',
+}
+
 import ast
 import pathlib
 import threading

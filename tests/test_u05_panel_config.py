@@ -26,6 +26,13 @@ This file is the oracle.
 
 from __future__ import annotations
 
+#: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
+#: file guards the NEW structure and is permanent (swept by test_design_charter).
+DIES_WITH_PARTIAL = {
+    "test_the_shell_reads_both_records_and_the_panel_vocabulary_from_the_new_home": 'Zou_lab_control/frontend/task_console.py',
+    "test_the_legacy_name_is_the_same_class": 'Zou_lab_control/frontend/task_console.py',
+}
+
 import ast
 import pathlib
 

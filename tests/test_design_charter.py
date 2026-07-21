@@ -1,0 +1,149 @@
+"""The charter is law only while a machine holds it to its own words.
+
+Every clause here exists because prose alone already failed once in this repository: the sole
+authority grew a 900-line changelog, the executor started quoting its own old ledger rows as if
+they were the document, and a false premise ("the shell must enter zlc_frontend") survived 25
+rounds without anyone re-reading the source.  The charter (docs/DESIGN_CHARTER_zh.md) is the
+structural fix; this file is what keeps the fix from rotting the same way.
+"""
+
+from __future__ import annotations
+
+import ast
+import pathlib
+import re
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+CHARTER = ROOT / "docs" / "DESIGN_CHARTER_zh.md"
+LEDGER = ROOT / "docs" / "MIGRATION_LEDGER_zh.md"
+DESIGN = ROOT / "docs" / "SYSTEM_ARCHITECTURE_DESIGN_zh.md"
+QT_WIDGETS = ROOT / "zlc_frontend" / "qt_widgets"
+
+#: C21 -- the line ratchet.  EXACT recorded sizes for the grandfathered monoliths (they may only
+#: FALL: lower the number in the same commit that shrinks the file); everything else, and every
+#: new file, obeys the hard cap.  Equalities on purpose (C6): a ceiling that only notices growth
+#: stops ratcheting the moment someone forgets to lower it.
+QT_WIDGETS_LINE_CAP = 600
+GRANDFATHERED = {"board.py": 4624, "fluent.py": 3736, "param_widgets.py": 774}
+
+
+def test_the_charter_stays_short_enough_to_actually_read_every_round():
+    """The whole root-cause theory is that a 4700-line authority cannot be re-read per round and
+    therefore gets imagined instead.  300 lines is the promise the charter makes about itself."""
+
+    lines = CHARTER.read_text(encoding="utf-8").splitlines()
+    assert len(lines) <= 300, f"charter grew to {len(lines)} lines -- it is becoming the old doc"
+
+
+def test_the_law_numbers_are_unique_and_the_hierarchy_is_declared():
+    text = CHARTER.read_text(encoding="utf-8")
+    numbers = re.findall(r"\*\*C(\d+)", text)
+    assert numbers, "no numbered laws found"
+    assert len(numbers) == len(set(numbers)), sorted(
+        n for n in set(numbers) if numbers.count(n) > 1)
+    for name in ("MIGRATION_LEDGER_zh.md", "SYSTEM_ARCHITECTURE_DESIGN_zh.md"):
+        assert name in text, f"the charter must declare where {name} sits in the hierarchy"
+
+
+def test_the_design_docs_section_22_stays_a_frozen_pointer():
+    """The ledger was moved OUT because law drowned in it.  If rows start accreting in the design
+    doc again, the disease is back regardless of what the charter says."""
+
+    text = DESIGN.read_text(encoding="utf-8")
+    start = text.index("## 22.")
+    end = text.index("## 23.")
+    body = text[start:end]
+    assert "MIGRATION_LEDGER_zh.md" in body and "DESIGN_CHARTER_zh.md" in body
+    assert len(body.splitlines()) < 15, "section 22 is growing again -- rows belong in the ledger"
+    assert "| S5-shell" not in body
+
+
+def test_new_ledger_rows_obey_the_cap_and_cite_the_law():
+    """C2, mechanically.  Applies only to the capped section -- the historical rows above it are
+    the disease being quarantined, not a standard to meet."""
+
+    text = LEDGER.read_text(encoding="utf-8")
+    marker = "## 新台账"
+    assert marker in text, "the capped section is gone"
+    section = text[text.index(marker):]
+    rows = [line for line in section.splitlines()
+            if line.startswith("|") and "---" not in line and "| 日期 |" not in line]
+    assert rows, "the capped section has no rows yet the pivot was recorded there"
+    offenders = []
+    for row in rows:
+        if len(row) > 700:
+            offenders.append(f"row too long ({len(row)} chars): {row[:60]}...")
+        if not re.search(r"C\d+", row):
+            offenders.append(f"row cites no charter law: {row[:60]}...")
+    assert not offenders, "\n".join(offenders)
+
+
+def test_the_qt_widgets_line_ratchet_holds_exactly():
+    """C21.  Grandfathered files match their recorded size exactly (shrink the file -> lower the
+    number, same commit); everything else stays under the cap.  This is the mechanical form of
+    'no more 10k-line GUI files'."""
+
+    offenders = []
+    for path in sorted(QT_WIDGETS.glob("*.py")):
+        n = len(path.read_text(encoding="utf-8").splitlines())
+        recorded = GRANDFATHERED.get(path.name)
+        if recorded is not None:
+            if n != recorded:
+                offenders.append(f"{path.name}: {n} lines, recorded {recorded} "
+                                 f"({'update the record downward' if n < recorded else 'GREW'})")
+        elif n > QT_WIDGETS_LINE_CAP:
+            offenders.append(f"{path.name}: {n} lines exceeds the {QT_WIDGETS_LINE_CAP} cap")
+    assert not offenders, "\n".join(offenders)
+
+
+def test_every_scaffolding_test_dies_with_an_artifact_that_still_exists():
+    """C41.  A test declaring ``DIES_WITH = <path>`` guards a legacy artifact and must be deleted
+    in the same commit that deletes the artifact.  This sweep is the enforcement: a declaring
+    test whose artifact is GONE is residue pretending to be coverage."""
+
+    def paths_of(value):
+        if isinstance(value, ast.Constant):
+            return [str(value.value)]
+        if isinstance(value, (ast.Tuple, ast.List)):
+            return [str(e.value) for e in value.elts if isinstance(e, ast.Constant)]
+        return []
+
+    stale, declared = [], 0
+    for path in sorted((ROOT / "tests").glob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        test_names = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            names = {t.id for t in node.targets if isinstance(t, ast.Name)}
+            if "DIES_WITH" in names:
+                declared += 1
+                for rel in paths_of(node.value):
+                    if not (ROOT / rel).exists():
+                        stale.append(f"{path.name} dies with {rel}, which is gone")
+            elif "DIES_WITH_PARTIAL" in names and isinstance(node.value, ast.Dict):
+                declared += 1
+                for key, value in zip(node.value.keys, node.value.values):
+                    test = str(key.value)
+                    if test not in test_names:
+                        stale.append(f"{path.name}: DIES_WITH_PARTIAL names unknown test {test!r}")
+                    for rel in paths_of(value):
+                        if not (ROOT / rel).exists():
+                            stale.append(f"{path.name}::{test} dies with {rel}, which is gone "
+                                         f"-- delete the test and its map entry")
+    assert not stale, "\n".join(stale)
+    assert declared >= 10, (
+        f"only {declared} tests declare DIES_WITH/DIES_WITH_PARTIAL -- the scaffolding oracles "
+        f"are supposed to carry their expiry (see the ledger's 测试大清洗 row)")
+
+
+def test_the_manifest_is_the_suite():
+    """C41 -- there is no third state.  Every test file is on the manifest and every manifest
+    entry exists (Z8=0 in test_z0_zero_residue asserts the same from the other side)."""
+
+    manifest = {line.strip().replace("tests/", "") for line in
+                (ROOT / "tests" / "migration_active_tests.txt").read_text(encoding="utf-8")
+                .replace("\r", "").splitlines() if line.strip()}
+    files = {p.name for p in (ROOT / "tests").glob("test_*.py")}
+    assert manifest == files, (
+        f"manifest-only: {sorted(manifest - files)}; file-only: {sorted(files - manifest)}")

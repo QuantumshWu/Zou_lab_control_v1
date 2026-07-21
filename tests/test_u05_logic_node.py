@@ -20,6 +20,12 @@ actually sees.
 
 from __future__ import annotations
 
+#: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
+#: file guards the NEW structure and is permanent (swept by test_design_charter).
+DIES_WITH_PARTIAL = {
+    "test_the_shell_reads_all_three_names_back_from_their_new_homes": 'Zou_lab_control/frontend/task_console.py',
+}
+
 import ast
 import pathlib
 

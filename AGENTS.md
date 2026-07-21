@@ -2,7 +2,7 @@
 
 ## 权威边界
 
-- 当前目标架构与迁移 gate 的唯一权威是 `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md`。
+- 权威链(2026-07-20 起):法条=`docs/DESIGN_CHARTER_zh.md`(宪法,每轮全文必读)→ 进度=`docs/MIGRATION_LEDGER_zh.md`(台账)→ 叙事=`docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md`。冲突以宪法为准;绝不新建计划/goal 文档。
 - `tests/README.md` 只说明测试入口；其它旧 roadmap、TaskConsole v2 设计及历史记录都不能反向定义目标架构。
 - 用户已经授权仓库内正常实现与验证；不要为普通命令重复索要权限或额外的继续确认。
 - `Zou_lab_control/` 中尚未迁走的 GUI/runtime 是 `SerializedLegacyAggBridge` legacy island。它的测试只约束该岛在 dependency-closed cut 前保持既有行为，不能约束 `zlc_frontend`、`zlc_workbench` 或其它目标包的架构。

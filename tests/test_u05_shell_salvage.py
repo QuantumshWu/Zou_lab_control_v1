@@ -36,6 +36,10 @@ import in a shell fails here immediately; porting one away must delete its row.
 
 from __future__ import annotations
 
+#: C41 -- this oracle guards a legacy artifact and is deleted in the same commit that
+#: deletes it (swept by test_design_charter).
+DIES_WITH = ('Zou_lab_control/frontend/task_console.py', 'Zou_lab_control/frontend/pulse_gui.py')
+
 import ast
 import importlib
 from pathlib import Path

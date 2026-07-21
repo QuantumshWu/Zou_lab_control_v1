@@ -30,6 +30,10 @@ below were captured from the shell immediately before the change.
 
 from __future__ import annotations
 
+#: C41 -- this oracle guards a legacy artifact and is deleted in the same commit that
+#: deletes it (swept by test_design_charter).
+DIES_WITH = 'Zou_lab_control/frontend/task_console.py'
+
 import ast
 import pathlib
 
