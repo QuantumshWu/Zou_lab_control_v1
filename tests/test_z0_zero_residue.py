@@ -69,6 +69,10 @@ Z2A_PRODUCTION_IMPORTERS = {   # non-test code OUTSIDE legacy that still imports
     Path("docs/task_console_design/build.py"),
     Path("figure_viewer.py"),                        # published double-click launcher
     Path("fpga/pulse_streamer/sim/_gen_replay_t.py"),  # fpga -> legacy, and zlc_pulse -> fpga
+    # The task console's composition root, delegating the WHOLE window to the legacy shell
+    # while the shell is taken apart widget by widget.  Transitional by construction: every
+    # class that moves out shrinks this crossing, and it goes with the shell (C20/C25).
+    Path("zlc_workbench/task_console/app.py"),
 }
 #: Whitelisted tests that reach into the legacy tree, NAMED rather than counted.
 #: A count would let one more slip in unnoticed; naming each makes every addition
@@ -162,16 +166,33 @@ def _fail(label: str, offenders, budget: int, remedy: str):
 # ------------------------------------------------------------------ the ratchet
 
 
-def test_z4_no_target_package_imports_the_legacy_tree():
-    """SHARP. The one property already true, and the one worth never losing.
+#: The ONLY files in the six packages allowed to reach into the legacy tree, named one by one.
+#:
+#: This began as an absolute ban and it was green -- but only because the entry had been
+#: re-pointed away from the operator's console, leaving the legacy shell with no importer at
+#: all.  Greenness bought by abandoning the window the user opens is not an invariant worth
+#: keeping.  Restoring the entry means ONE file knows both worlds, so the rule becomes: the
+#: crossing lives in a composition root and nowhere else, by name, with a death condition.
+Z4_COMPOSITION_ROOTS = {
+    # Delegates the whole task console window to the legacy shell while that shell is taken
+    # apart widget by widget.  Shrinks every round; deleted with the shell (C20/C25).
+    Path("zlc_workbench/task_console/app.py"),
+}
 
-    A single lazy import from any of the six into the legacy tree would make the
-    new architecture undeletable, and it would not show up until that line ran.
+
+def test_z4_only_named_composition_roots_import_the_legacy_tree():
+    """SHARP on identity, not on count.
+
+    A single lazy import from any of the six into the legacy tree would make the new
+    architecture undeletable, and it would not show up until that line ran.  Naming the
+    exceptions keeps that force: a crossing anywhere else is still a hard failure, and each
+    named one carries what has to become true for it to go away.
     """
 
     offenders = sorted(
         f"{path} -> {name}"
-        for path in _tracked("*.py") if path.startswith(TARGET_PACKAGES)
+        for path in _tracked("*.py")
+        if path.startswith(TARGET_PACKAGES) and Path(path) not in Z4_COMPOSITION_ROOTS
         for name in _imported_roots(path)
         if name == "Zou_lab_control" or name.startswith("Zou_lab_control.")
     )
@@ -180,8 +201,11 @@ def test_z4_no_target_package_imports_the_legacy_tree():
         + "\n".join(f"  {item}" for item in offenders)
         + "\nThe six packages must be deletable-independent of Zou_lab_control. "
           "If a live domain object is genuinely needed, add a port in "
-          "zlc_frontend/domain_ports.py and inject it from a composition root."
+          "zlc_frontend/domain_ports.py and inject it from a composition root -- and only "
+          "a root named in Z4_COMPOSITION_ROOTS may hold the crossing itself."
     )
+    stale = sorted(str(item) for item in Z4_COMPOSITION_ROOTS if not (ROOT / item).exists())
+    assert not stale, f"Z4_COMPOSITION_ROOTS names files that are gone: {stale}"
 
 
 def test_z1_the_legacy_trees_shrink():

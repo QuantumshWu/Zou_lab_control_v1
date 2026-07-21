@@ -2476,12 +2476,18 @@ class Experiment:
 
         return open_scan_workbench(self, request)
 
-    def task_console(self, initial_intent=None):
-        """Lazily open the current SCAN_SLOT TaskConsole."""
+    def task_console(self, *, task=None, state=None, **kwargs):
+        """Lazily open the task console bound to this experiment.
 
-        from Zou_lab_control.workbench import open_task_console
+        One composition root owns the window (``zlc_workbench.task_console.app``), so a
+        notebook and the double-clickable launcher open the SAME console.  The narrow
+        scan-intent editor this used to return is still reachable as a component:
+        ``Zou_lab_control.workbench.open_task_console(experiment, intent)``.
+        """
 
-        return open_task_console(self, initial_intent)
+        from zlc_workbench.task_console.app import open_task_console
+
+        return open_task_console(self, task=task, state=state, **kwargs)
 
     def start(self, request: CaptureRequest) -> RunHandle:
         return _start(self._authority_token, request)

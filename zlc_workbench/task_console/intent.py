@@ -60,7 +60,8 @@ from zlc_storage import (
     positive_real,
 )
 
-from .progressive_scan import ScanDisplayIntent
+# One package deeper than it used to live: the siblings stayed in ``zlc_workbench``.
+from ..progressive_scan import ScanDisplayIntent
 
 
 TASK_CONSOLE_SCAN_INTENT_FORMAT = "zlc_workbench.TaskConsoleScanIntent"

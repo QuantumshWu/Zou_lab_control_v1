@@ -408,8 +408,13 @@ def _run_task_console_product_e2e(tmp_path: Path):
     blank = None
     window = None
     analysis = None
+    # The scan-intent editor is no longer what ``Experiment.task_console()`` opens -- that
+    # entry now gives the operator's full console (C22).  This window survives as a
+    # COMPONENT, so the tests that pin its behaviour ask for it by name.
+    from Zou_lab_control.workbench import open_task_console
+
     try:
-        unconfigured = exp.task_console()
+        unconfigured = open_task_console(exp)
         add = unconfigured.findChild(
             QtWidgets.QPushButton,
             "addTaskPanelButton",
@@ -425,7 +430,7 @@ def _run_task_console_product_e2e(tmp_path: Path):
         assert all(not timer.isActive() for timer in unconfigured_timers)
         unconfigured = None
 
-        blank = exp.task_console()
+        blank = open_task_console(exp)
         add = blank.findChild(QtWidgets.QPushButton, "addTaskPanelButton")
         add_analysis = blank.findChild(
             QtWidgets.QPushButton,
@@ -632,7 +637,7 @@ def _run_task_console_product_e2e(tmp_path: Path):
             display_intent=ScanDisplayIntent("select", 1),
             timeout_seconds=20.0,
         )
-        window = exp.task_console(intent)
+        window = open_task_console(exp, intent)
         card = window.scan_card
         assert card is not None and card.current_intent == intent
         edit = window.findChild(ScanIntentForm, "editScanIntentForm")
@@ -750,7 +755,10 @@ def test_task_console_add_edit_run_save_load_and_close_current_product(tmp_path)
 
 def test_standalone_task_console_launcher_owns_current_virtual_product(tmp_path):
     source = (ROOT / "task_console.py").read_text(encoding="utf-8")
-    assert "experiment.task_console(initial_intent)" in source
+    # The launcher goes through the ONE composition root, and knows nothing of how the window
+    # is assembled -- which is what lets the assembly be rewritten without touching entries.
+    assert "from zlc_workbench.task_console.app import open_task_console" in source
+    assert "window = open_task_console(experiment, state=args.state," in source
     for forbidden in (
         "Zou_lab_control.frontend.task_console",
         "SignalHub",

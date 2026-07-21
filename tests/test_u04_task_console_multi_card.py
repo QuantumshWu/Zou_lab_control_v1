@@ -55,7 +55,12 @@ def experiment(tmp_path_factory):
 
 @pytest.fixture
 def console(experiment):
-    window = experiment.task_console()
+    # The scan-intent editor is no longer what ``Experiment.task_console()`` opens --
+    # that entry now gives the operator's full console (C22).  This window survives as
+    # a COMPONENT, so the tests that pin its behaviour ask for it by name.
+    from Zou_lab_control.workbench import open_task_console
+
+    window = open_task_console(experiment)
     try:
         yield window
     finally:

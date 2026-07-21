@@ -18,7 +18,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state",
         type=Path,
-        help="Load one current TaskConsole scan-intent JSON file, stopped.",
+        help="Open with a saved console layout (a tasks/<name>.json path).",
+    )
+    parser.add_argument(
+        "--task",
+        help="Open with a saved console layout BY NAME from the workspace's tasks/.",
     )
     parser.add_argument(
         "--repository",
@@ -41,7 +45,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _close_window(application, window, *, timeout_seconds: float = 10.0) -> None:
-    if window is None or not window.isVisible():
+    """Close the console's TOP-LEVEL window and wait for it to actually go.
+
+    ``open_task_console`` returns the console BODY, not the frame around it (the body's
+    ``isWindow()`` is False; its ``window()`` is the Fluent frame).  Closing the body leaves
+    the frame open, the app keeps running, and the launcher hangs forever in ``exec_()`` --
+    which is exactly what happened the first time this entry was switched.
+    """
+
+    if window is None:
+        return
+    window = window.window()
+    if not window.isVisible():
         return
     window.close()
     deadline = time.monotonic() + timeout_seconds
@@ -61,14 +76,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     from Zou_lab_control.notebook import connect
     from zlc_frontend.qt_widgets import ensure_qt_app
     from zlc_storage import durable_makedirs
-    from zlc_workbench.task_console import load_task_console_scan_intent
+    from zlc_workbench.task_console.app import open_task_console
 
     application = ensure_qt_app()
-    initial_intent = (
-        None
-        if args.state is None
-        else load_task_console_scan_intent(args.state)
-    )
     experiment = None
     window = None
     try:
@@ -82,12 +92,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             name=args.name,
             seed=args.seed,
         )
-        window = experiment.task_console(initial_intent)
+        window = open_task_console(experiment, state=args.state,
+                                   task=args.task)
         auto_close_ms = os.environ.get("ZLC_TASK_CONSOLE_AUTO_CLOSE_MS")
         if auto_close_ms:
             QtCore.QTimer.singleShot(
                 max(0, int(auto_close_ms)),
-                window.close,
+                window.window().close,
             )
         return int(application.exec_())
     finally:

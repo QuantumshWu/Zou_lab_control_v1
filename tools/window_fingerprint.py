@@ -46,7 +46,8 @@ WINDOWS = ("task_console", "pulse_gui", "figure_viewer")
 #: round a launcher is re-pointed, instead of silently comparing old to new.
 ENTRY_MARKERS = {
     "task_console": (("show_task_console(", "legacy"),
-                     ("experiment.task_console(", "facade")),
+                     ("experiment.task_console(", "facade"),
+                     ("open_task_console(", "workbench_app")),
     "pulse_gui": (("show_pulse_gui(", "legacy"),
                   ("open_pulse_workbench(", "workbench")),
     "figure_viewer": (("show_figure_viewer(", "legacy"),),
@@ -136,8 +137,11 @@ def build(name, kind, connect_devices):
 
     from Zou_lab_control.notebook import connect
     experiment = connect("virtual", repository=room / "repo", name="fingerprint", seed=0)
-    if name == "task_console":
-        window = experiment.task_console(None)
+    if kind == "workbench_app":
+        from zlc_workbench.task_console.app import open_task_console
+        window = open_task_console(experiment)
+    elif name == "task_console":
+        window = experiment.task_console()
     elif kind == "workbench":
         from Zou_lab_control.workbench import open_pulse_workbench
         window = open_pulse_workbench(experiment, path=None)
@@ -159,7 +163,8 @@ try:
         sort_keys=True))
 finally:
     try:
-        window.close()
+        # ``window`` may be a BODY inside a frame; closing the body would leak the frame.
+        window.window().close()
     finally:
         if experiment is not None:
             experiment.close()
