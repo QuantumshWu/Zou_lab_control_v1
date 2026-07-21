@@ -1,20 +1,27 @@
 """The two pulse representations in ``zlc_neutral_atom/timing`` are a NAMED boundary.
 
-Adjudicated 2026-07-21 (ledger row "timing 双源裁决"; the transitional death
-condition was superseded the same day -- both sides are permanent).  ``pulse.py``
-is the target pipeline's execution-session protocol; ``pulse_table.py``/
-``sequence_model.py``/``runtime_compiler.py`` are the authoring model + production
-compiler of the machine-verified pipeline (C22).  Their zero cross-references are
-the boundary itself: an import in either direction would silently marry the two
-pipelines before the authoring bridge exists, and a THIRD pulse representation
-slipping into the package would recreate the very dual source the adjudication
-resolved.  Hence three mechanical clamps:
+``pulse.py`` is the target pipeline's execution-session protocol.  ``pulse_table.py``
+/ ``sequence_model.py`` / ``runtime_compiler.py`` are a LEGACY authoring model plus
+the production compiler that still emits the machine-verified wire bytes (C22).
+
+Legacy, not permanent: the design keeps exactly one authoring contract,
+``schema="zlc_pulse.PulseDocument"`` (SYSTEM_ARCHITECTURE_DESIGN_zh §15.1), and
+prescribes retirement by migrating each remaining consumer to that document in its
+own dependency-closed slice.  An earlier version of this docstring claimed "both
+sides are permanent" and cited a ledger row that does not exist; under C2 a ledger
+row could not have made law anyway, and the design says the opposite.
+
+The zero cross-references are the boundary itself, and a converter is NOT the way
+across: the design forbids a ``PulseDocument <-> PulseTableState`` converter by
+name, because bridging duplicates entrenches them.  Hence four mechanical clamps:
 
 1. the two sides never import each other (either direction, lazy included);
 2. the package's file list is an EXACT roster - a new module must come here and be
    placed on one side of the boundary (or outside it) by name;
-3. the adjudication text itself (the missing authoring bridge) stays in the
-   package docstring, so the boundary cannot outlive its rationale unnoticed.
+3. the retirement condition stays in the package docstring, so the boundary cannot
+   outlive its rationale unnoticed;
+4. no module anywhere may import BOTH the legacy authoring model and the pulse
+   document/authoring API -- which is precisely what a converter must do.
 """
 
 from __future__ import annotations
@@ -46,6 +53,44 @@ def _imported_modules(path: pathlib.Path) -> set[str]:
         elif isinstance(node, ast.Import):
             out.update(alias.name for alias in node.names)
     return out
+
+
+#: The legacy authoring model, and the one sanctioned document API.  A converter is
+#: definitionally a module that reaches for both.
+_LEGACY_AUTHORING = "zlc_neutral_atom.timing.pulse_table"
+_DOCUMENT_API = ("zlc_pulse.document", "zlc_pulse.authoring")
+#: Production packages; a test may legitimately import both to compare them.
+_PRODUCTION_ROOTS = ("zlc_neutral_atom", "zlc_pulse", "zlc_workbench", "zlc_frontend",
+                     "zlc_data", "zlc_storage", "Zou_lab_control")
+
+
+def test_no_module_bridges_the_legacy_model_to_the_document_api():
+    """A ``PulseDocument <-> PulseTableState`` converter is forbidden by the design.
+
+    Prose cannot enforce that, and the prohibition is easy to breach with good
+    intentions -- the bridge deleted in this commit was written to "connect a missing
+    seam".  The mechanical signature of a converter is reaching for both sides at once,
+    so that is what is refused here.  The way across the boundary is migrating a
+    consumer onto the document, after which its legacy reader dies with it (C25).
+    """
+
+    offenders = []
+    for root in _PRODUCTION_ROOTS:
+        base = REPO / root
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*.py"):
+            imported = _imported_modules(path)
+            reaches_legacy = any(name.startswith(_LEGACY_AUTHORING) for name in imported)
+            reaches_document = any(
+                name.startswith(api) for name in imported for api in _DOCUMENT_API)
+            if reaches_legacy and reaches_document:
+                offenders.append(str(path.relative_to(REPO)))
+    assert not offenders, (
+        "these modules import BOTH the legacy authoring model and the document API, "
+        "which is what a converter does -- the design forbids one by name:\n"
+        + "\n".join(sorted(offenders))
+    )
 
 
 def test_the_package_roster_is_exact():
