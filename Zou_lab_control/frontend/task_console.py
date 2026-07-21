@@ -201,30 +201,24 @@ MID_RUN_TAG = " (mid-run)"
 #: Every panel + logic-node name is "<base> #N" with N counting from 1 (G1), so two panels /
 #: nodes of the same kind are always told apart -- in the card title, the Edit tab, the frame
 #: title, and the signal-flow grouping.  ONE source of that scheme for panels and nodes alike.
-_INDEX_SUFFIX_RE = re.compile(r"^(.*?)\s*#\d+$")
+# The six pure value/text helpers this module used to define now live with their owners
+# (S5-shell(z)); the names below are the shell's plain aliases for them.  ``_GridFocus`` and
+# ``_StopAttempt`` deliberately did NOT go: the census calls them render-free because it reads
+# IMPORTS, but they HOLD live objects (a grid plotter + its canvas + mpl callback ids; a running
+# daemon thread), so their home is wherever those objects live.
+from zlc_data.shape_text import indexed_unique_name, strip_node_prefix  # noqa: E402
+from zlc_data.curve_fitting import build_fit_request  # noqa: E402
+from zlc_data.param_decl import acquisition_param_decls as _acquisition_param_decls  # noqa: E402
+from zlc_frontend.form import (  # noqa: E402
+    lenient_float as _safe_float,
+    python_to_text as _py_to_text,
+    text_to_python as _text_to_py,
+)
+#: The expression-namespace help text, read straight from its owner.  The shell used to wrap it in
+#: a function guarding a module-level cache -- an indirection whose only job was to memoise an
+#: imported CONSTANT, which is not a thing that needs memoising.
+from zlc_data.signal_expr import SIGNAL_EXPR_HELP  # noqa: E402
 
-
-def indexed_unique_name(base: str, taken) -> str:
-    """``"<root> #N"`` with the smallest ``N >= 1`` not already in ``taken``.  Any ``#k`` already
-    on ``base`` is stripped first, so re-indexing a loaded ``"1D vector #2"`` re-derives a clean
-    number rather than nesting (idempotent for an already-clean layout)."""
-    text = str(base or "panel").strip() or "panel"
-    m = _INDEX_SUFFIX_RE.match(text)
-    root = (m.group(1).strip() if m else text) or "panel"
-    taken = set(taken)
-    n = 1
-    while f"{root} #{n}" in taken:
-        n += 1
-    return f"{root} #{n}"
-
-
-def _safe_float(text, fallback: float) -> float:
-    """Parse a numeric line-edit, falling back on blank/garbage (the ONE parser the fixed-lim
-    lo/hi inputs share between the Setting popup and the Edit tab)."""
-    try:
-        return float(str(text).strip())
-    except (TypeError, ValueError):
-        return float(fallback)
 
 # The grouped-signal-picker helper cluster (signal_state / grouped_signal_items /
 # signal_tree_groups / fill_grouped_signal_combo / read_editable_combo / coerce_short_labels,
@@ -233,34 +227,9 @@ def _safe_float(text, fallback: float) -> float:
 # it is the Logic tab's rule (shared vocabulary, not a picker widget helper).
 
 
-def strip_node_prefix(full: str, prefix: str) -> str:
-    """The SHORT signal name = the hub name minus its producing node's disambiguating prefix
-    (``analysis_rate`` -> ``rate``, ``temperature_survival`` -> ``survival``, ``frame`` ->
-    ``frame``).  The ONE rule the Logic tab AND the signal picker share, so the nest leaf is ALWAYS the
-    short name -- never the full prefixed key, never the verbose axis label."""
-    full = str(full)
-    prefix = str(prefix or "")
-    return full[len(prefix):] if (prefix and full.startswith(prefix) and len(full) > len(prefix)) else full
-
-
 #: Now :class:`zlc_frontend.qt_widgets.PulseSlotsWidget`; the old name stays a plain
 #: alias so nothing that referenced it has to learn a new one.
 _PulseSlotsWidget = PulseSlotsWidget
-
-# The ONE description of a source expression's namespace -- owned by zlc_data.signal_expr
-# (the single source the analysis layer + GUI share), fetched lazily so the frontend module
-# import stays off neutral_atom's import graph (every other neutral_atom use here is lazy too).
-_SOURCE_EXPR_HELP_CACHE: str | None = None
-
-
-def SOURCE_EXPR_HELP() -> str:
-    """The expression-namespace help text (a callable so it stays a single source -- the literal
-    lives once in ``zlc_data.signal_expr.SIGNAL_EXPR_HELP``)."""
-    global _SOURCE_EXPR_HELP_CACHE
-    if _SOURCE_EXPR_HELP_CACHE is None:
-        from zlc_data.signal_expr import SIGNAL_EXPR_HELP
-        _SOURCE_EXPR_HELP_CACHE = SIGNAL_EXPR_HELP
-    return _SOURCE_EXPR_HELP_CACHE
 
 #: Now :class:`zlc_frontend.qt_widgets.SignalExprWidget`; the old name stays a
 #: plain alias so nothing that referenced it has to learn a new one.
@@ -333,21 +302,6 @@ def _general_fit_models_for_kind(kind: str) -> list:
     pk = PLOT_KIND_BY_KEY.get(str(kind))
     return general_fit_models(pk.render_family) if pk is not None else []
 
-
-def build_fit_request(model, selection, *, fixed=None, initial=None, coordinate_frame=None):
-    """The ONE structured-fit-request builder every surface funnels through (the Setting Analysis
-    section, the Edit Analysis section, a drag retarget): a typed :class:`core.FitRequest` carrying the
-    model, the current selection, and the optional per-parameter ``fixed`` clamps / full-vector
-    ``initial`` seeds -- NO free-text argument string is ever evaluated.  ``coordinate_frame`` defaults
-    to the selection's own frame."""
-    from zlc_data.curve_fitting import FitRequest
-    return FitRequest(
-        str(model),
-        selection=selection,
-        fixed=dict(fixed or {}),
-        initial=None if not initial else tuple(float(v) for v in initial),
-        coordinate_frame=coordinate_frame or getattr(selection, "frame", "data"),
-    )
 
 
 class _FitFixSeedEditor(QtWidgets.QWidget):
@@ -607,30 +561,6 @@ class AnalysisControls(QtWidgets.QWidget):
     def clear_fit(self) -> None:
         self.card.set_fit_request(None)
 
-
-def _py_to_text(value) -> str:
-    """A Python value as an editable one-line string (confocal python2str): a
-    tuple/list keeps its literal form, scalars use repr.  Round-trips through
-    ``_text_to_py``."""
-    if value is None:
-        return ""
-    return repr(value)
-
-
-def _text_to_py(text: str):
-    """Parse an edited acquisition-parameter field back to a Python value
-    (confocal str2python): literal first, then a plain float, else the string."""
-    import ast
-    raw = str(text).strip()
-    if not raw:
-        return None
-    try:
-        return ast.literal_eval(raw)
-    except (ValueError, SyntaxError):
-        try:
-            return float(raw)
-        except ValueError:
-            return raw
 
 # Board layout (raw px).  The board is a pure PIXEL plane of card AABBs -- there is NO column
 # grid.  WIDTH still scales with the size (``cols // 2`` base-widths so 1x4 is wider than 1x2);
@@ -1182,7 +1112,7 @@ class PanelCard(FluentGroupBox):
         self.source_edit.setMinimumWidth(scaled_px(280, minimum=220))
         self.source_edit.setStyleSheet(
             self.source_edit.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
-        self.source_edit.setToolTip(SOURCE_EXPR_HELP())
+        self.source_edit.setToolTip(SIGNAL_EXPR_HELP)
         # An inline one-liner is cramped for a real expression; "Edit…" pops a LARGE floating
         # multi-line editor (a modal card, so it does NOT reflow the panel layout) prefilled
         # with the source -- comfortable for typing math across signals -- and writes it back.
@@ -2532,7 +2462,7 @@ class PanelCard(FluentGroupBox):
         existing = getattr(self, "_expr_editor", None)
         if existing is not None:
             existing.raise_(); existing.activateWindow(); return
-        editor = FluentFloatingEditor(SOURCE_EXPR_HELP(), self.source_edit.text(), self.window(),
+        editor = FluentFloatingEditor(SIGNAL_EXPR_HELP, self.source_edit.text(), self.window(),
                                       title="Edit panel source expression")
 
         def _apply(text: str) -> None:
@@ -3615,25 +3545,6 @@ class PanelCard(FluentGroupBox):
         self._force_rebuild = False
         self._teardown_plot()
 
-
-def _acquisition_param_decls(repeat_default: int = 0) -> tuple:
-    """The ONE acquisition knob EVERY measurement-layer node owns, declared ONCE (#H3n): ``Repeat`` =
-    the depth of the repeat axis = how many passes/photos the data block keeps and AVERAGES, then STOPS
-    -- with ``0`` = ∞ (roll forever, a live monitor showing the latest).  ONE number, 0 = infinite (the
-    SAME semantics as the scan-repeat count) -- there is NO separate Free-run toggle.  ``repeat_default``
-    is 0 for a CAMERA (a live monitor streams forever by default -- set Repeat=N to take exactly N
-    photos) and 1 for a scan (run the sweep once; set 0 to keep re-running it live).  A real ``ParamDecl``
-    so it auto-renders through the SAME form path as every measurement param."""
-    from zlc_data.param_decl import ParamDecl
-    return (
-        ParamDecl(key="repeat", label="Repeat (0 = ∞)", kind="int", default=max(0, int(repeat_default)),
-                  lo=0, hi=100000,
-                  tooltip="How many passes/photos to keep & AVERAGE then STOP, or 0 = ∞ (roll forever, "
-                          "a live monitor showing the latest).  A scan re-runs the whole sweep this many "
-                          "times; a camera takes this many photos -- averaging them is a long exposure "
-                          "that recovers the full site map.  How the repeats are DISPLAYED is the plot "
-                          "panel's 'repeat mode' Setting (average / add / replace / roll / create)."),
-    )
 
 
 class MeasurementPanel(QtWidgets.QWidget):
@@ -5538,7 +5449,8 @@ class TaskConsole(QtWidgets.QWidget):
         # Figure the worker may still own.  Every access below goes through _render_barrier().
         from zlc_workbench.legacy import SerializedLegacyAggBridge
 
-        from .render_loop import RenderLoop
+        import zlc_frontend.qt_widgets as _qt_widgets
+        RenderLoop = _qt_widgets.render_loop.RenderLoop
         self._render = SerializedLegacyAggBridge(RenderLoop(self._on_render_batch, parent=self))
 
         self._build_ui()

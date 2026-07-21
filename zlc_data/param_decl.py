@@ -162,4 +162,23 @@ class ParamDecl:
         return text
 
 
-__all__ = ["DEVICE_REF_PREFIX", "ParamDecl", "is_device_ref"]
+def acquisition_param_decls(repeat_default: int = 0) -> tuple:
+    """The ONE acquisition knob EVERY measurement-layer node owns, declared ONCE (#H3n): ``Repeat`` =
+    the depth of the repeat axis = how many passes/photos the data block keeps and AVERAGES, then STOPS
+    -- with ``0`` = infinite (roll forever, a live monitor showing the latest).  ONE number, 0 = infinite
+    (the SAME semantics as the scan-repeat count) -- there is NO separate Free-run toggle.
+    ``repeat_default`` is 0 for a CAMERA (a live monitor streams forever by default -- set Repeat=N to
+    take exactly N photos) and 1 for a scan (run the sweep once; set 0 to keep re-running it live).  A
+    real ``ParamDecl`` so it auto-renders through the SAME form path as every measurement param."""
+    return (
+        ParamDecl(key="repeat", label="Repeat (0 = \u221e)", kind="int",
+                  default=max(0, int(repeat_default)), lo=0, hi=100000,
+                  tooltip="How many passes/photos to keep & AVERAGE then STOP, or 0 = \u221e (roll forever, "
+                          "a live monitor showing the latest).  A scan re-runs the whole sweep this many "
+                          "times; a camera takes this many photos -- averaging them is a long exposure "
+                          "that recovers the full site map.  How the repeats are DISPLAYED is the plot "
+                          "panel's 'repeat mode' Setting (average / add / replace / roll / create)."),
+    )
+
+
+__all__ = ["DEVICE_REF_PREFIX", "ParamDecl", "acquisition_param_decls", "is_device_ref"]

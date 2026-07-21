@@ -78,6 +78,7 @@ tests/test_u05_project_root_single_source.py
 tests/test_u05_pulse_slots_widget.py
 tests/test_u05_raster_front.py
 tests/test_u05_render_island.py
+tests/test_u05_render_loop_module.py
 tests/test_u05_repeat_modes.py
 tests/test_u05_shell_census.py
 tests/test_u05_shell_salvage.py

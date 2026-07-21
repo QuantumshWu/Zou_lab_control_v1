@@ -85,11 +85,15 @@ Z2B_ACTIVE_TEST_IMPORTERS = {
     Path("tests/test_u05_project_root_single_source.py"),  # pins both shells onto the storage path seam
     Path("tests/test_u05_console_state_module.py"),      # asserts the shell names ARE the moved objects
     Path("tests/test_u05_panel_params_module.py"),       # same, for the panel-param catalog
+    Path("tests/test_u05_render_loop_module.py"),        # asserts the shim forwards to the moved worker
     Path("tests/test_u06_shell_domain_ports.py"),       # proves the legacy root wires the port
     Path("tests/test_zlc_frontend_form.py"),            # form parity across the move
 }
 Z2C_FROZEN_TEST_IMPORTERS = 168
-Z3_FORWARDING_SHIMS = 18
+#: 19 as of the render-loop move: ``frontend/render_loop.py`` became a shim when the module
+#: itself went to ``zlc_frontend/qt_widgets``.  The count is allowed to RISE only when a move
+#: creates the shim -- which is the one legitimate reason -- and it must fall back to zero at Z0.
+Z3_FORWARDING_SHIMS = 19
 Z7_REBUILT_WORKBENCH_FILES = 12
 Z8_TESTS_OFF_THE_MANIFEST = 176
 

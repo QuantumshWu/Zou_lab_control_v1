@@ -243,5 +243,61 @@ __all__ = [
     "FormFieldKind",
     "FormFieldProps",
     "FormSpec",
+    "lenient_float",
     "parse_number_text",
+    "python_to_text",
+    "text_to_python",
 ]
+
+
+# --- editable-field codec -------------------------------------------------------------------
+#
+# These sit beside :func:`parse_number_text` and are DELIBERATELY not merged with it, because the
+# two answer different questions and a caller picks one on purpose:
+#
+#   parse_number_text  VALIDATES.  Blank or malformed RAISES, naming the field, and the caller is
+#                      expected to show that message.  It also preserves authored int-vs-float.
+#   lenient_float      DISPLAYS.  A half-typed or emptied box must not throw while the operator is
+#                      still typing, so anything unreadable falls back to the value already in use.
+#
+# Collapsing them would force one of those behaviours onto the other surface: either a live plot
+# limit box that raises mid-keystroke, or a form that silently accepts garbage.  Recorded here
+# rather than resolved, because they are two contracts, not one duplicated.
+
+
+def lenient_float(text, fallback: float) -> float:
+    """Parse a numeric line-edit, falling back on blank/garbage (the ONE parser the fixed-lim
+    lo/hi inputs share between the Setting popup and the Edit tab)."""
+    try:
+        return float(str(text).strip())
+    except (TypeError, ValueError):
+        return float(fallback)
+
+
+def python_to_text(value) -> str:
+    """A Python value as an editable one-line string (confocal python2str): a
+    tuple/list keeps its literal form, scalars use repr.  Round-trips through
+    :func:`text_to_python`."""
+    if value is None:
+        return ""
+    return repr(value)
+
+
+def text_to_python(text: str):
+    """Parse an edited acquisition-parameter field back to a Python value
+    (confocal str2python): literal first, then a plain float, else the string.
+
+    A value whose ``repr`` is not a literal (``range(0, 3)``) therefore comes BACK as that
+    string rather than the object -- the round trip is lossy for non-literals by construction,
+    which is why the form only stores literals."""
+    import ast
+    raw = str(text).strip()
+    if not raw:
+        return None
+    try:
+        return ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+        try:
+            return float(raw)
+        except ValueError:
+            return raw

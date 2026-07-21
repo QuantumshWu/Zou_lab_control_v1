@@ -33,7 +33,8 @@ import threading
 
 from zlc_frontend.render_style import DESIGN_DPI
 from zlc_frontend.render import RasterBuffer
-from .render_loop import RENDER_THREAD_NAME
+import zlc_frontend.qt_widgets as _qt_widgets
+RENDER_THREAD_NAME = _qt_widgets.render_loop.RENDER_THREAD_NAME
 
 try:
     from PyQt5 import QtCore, QtGui, QtWidgets

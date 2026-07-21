@@ -882,7 +882,22 @@ def fit_image(
 
 
 __all__ = [
-    "DEFAULT_HISTOGRAM_FIT", "HISTOGRAM_FIT_MODES",
+    "DEFAULT_HISTOGRAM_FIT", "HISTOGRAM_FIT_MODES", "build_fit_request",
     "FitModel", "FitRequest", "FitResult", "HistogramFitResult", "fit_data", "fit_histogram",
     "fit_image", "fit_model", "fit_models", "fit_selected",
 ]
+
+
+def build_fit_request(model, selection, *, fixed=None, initial=None, coordinate_frame=None):
+    """The ONE structured-fit-request builder every surface funnels through (the Setting Analysis
+    section, the Edit Analysis section, a drag retarget): a typed :class:`FitRequest` carrying the
+    model, the current selection, and the optional per-parameter ``fixed`` clamps / full-vector
+    ``initial`` seeds -- NO free-text argument string is ever evaluated.  ``coordinate_frame`` defaults
+    to the selection's own frame."""
+    return FitRequest(
+        str(model),
+        selection=selection,
+        fixed=dict(fixed or {}),
+        initial=None if not initial else tuple(float(v) for v in initial),
+        coordinate_frame=coordinate_frame or getattr(selection, "frame", "data"),
+    )

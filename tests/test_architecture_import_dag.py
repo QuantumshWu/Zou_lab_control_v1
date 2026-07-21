@@ -140,6 +140,12 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
     # point reads the colormap NAME a human picked in the Setting combo, so the named entry
     # follows the code rather than the guard being widened.
     (Path("zlc_frontend/panel_params.py"), "resolved_cmap"),
+    # The six pure helpers left the shell (S5-shell(z)); their normalisation points came with
+    # them, and each is the boundary this guard reserves .strip() for -- a panel/logic-node TITLE
+    # a human typed (or a saved layout carries), and two line-edit parsers.
+    (Path("zlc_data/shape_text.py"), "indexed_unique_name"),
+    (Path("zlc_frontend/form.py"), "lenient_float"),
+    (Path("zlc_frontend/form.py"), "text_to_python"),
         (Path("zlc_frontend/live_plot/live.py"), "general_fit_models"),
         (Path("zlc_frontend/live_plot/live.py"), "facet_cell_labels"),
         (Path("zlc_frontend/live_plot/plot_figure.py"), "SavedFigure.axis_labels"),

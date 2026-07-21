@@ -313,3 +313,9 @@ __all__ = [
 # Reachable as an attribute like `fluent`/`board`; deliberately NOT in
 # __all__ - the legacy shim is its only sanctioned outside consumer.
 from . import param_widgets  # noqa: E402,F401
+
+# The console's background render worker.  Qt-only (no Matplotlib), so qt_widgets is where the
+# placement axiom puts it; bound here like ``param_widgets`` so consumers reach it as an
+# ATTRIBUTE of the package rather than importing the submodule path, which the package's own
+# guard forbids from outside.
+from . import render_loop  # noqa: E402,F401

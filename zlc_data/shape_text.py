@@ -31,6 +31,8 @@ import numpy as np
 
 __all__ = [
     "camera_frame_keys",
+    "indexed_unique_name",
+    "strip_node_prefix",
     "contract_shape_label",
     "describe_shape",
     "format_dims",
@@ -156,3 +158,35 @@ def slot_label(kind: str, target: str, *, base_1: bool = True) -> str:
     if kind == "delay":
         return f"{target} delay"            # the channel / bus name is the information
     return target
+
+
+#: A trailing ``" #N"`` index, so re-indexing a name strips the old number instead of nesting.
+_INDEX_SUFFIX_RE = re.compile(r"^(.*?)\s*#\d+$")
+
+
+def indexed_unique_name(base: str, taken) -> str:
+    """``"<root> #N"`` with the smallest ``N >= 1`` not already in ``taken``.  Any ``#k`` already
+    on ``base`` is stripped first, so re-indexing a loaded ``"1D vector #2"`` re-derives a clean
+    number rather than nesting (idempotent for an already-clean layout).
+
+    Admission: panel titles, logic-node titles and Edit-tab titles must agree on this spelling --
+    three surfaces, one rule.
+    """
+    text = str(base or "panel").strip() or "panel"
+    m = _INDEX_SUFFIX_RE.match(text)
+    root = (m.group(1).strip() if m else text) or "panel"
+    taken = set(taken)
+    n = 1
+    while f"{root} #{n}" in taken:
+        n += 1
+    return f"{root} #{n}"
+
+
+def strip_node_prefix(full: str, prefix: str) -> str:
+    """The SHORT signal name = the hub name minus its producing node's disambiguating prefix
+    (``analysis_rate`` -> ``rate``, ``temperature_survival`` -> ``survival``, ``frame`` ->
+    ``frame``).  The ONE rule the Logic tab AND the signal picker share, so the nest leaf is ALWAYS the
+    short name -- never the full prefixed key, never the verbose axis label."""
+    full = str(full)
+    prefix = str(prefix or "")
+    return full[len(prefix):] if (prefix and full.startswith(prefix) and len(full) > len(prefix)) else full

@@ -34,10 +34,25 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 SHELLS = ["Zou_lab_control/frontend/task_console.py",
           "Zou_lab_control/frontend/pulse_gui.py"]
 
-#: Measured 2026-07-20 on the post-S5-shell(w) tree.  Both may only FALL: the migration takes
-#: defs out of the shell, so a rise means something was added back to a file being emptied.
-RENDER_FREE_TOP_LEVEL_DEFS = 15
-TOTAL_TOP_LEVEL_DEFS = 39
+#: Measured on the current tree.  These are EXACT, not ceilings.
+#:
+#: They were ceilings (``<=``) for one slice, and that was a mistake worth recording: when
+#: S5-shell(y) moved the panel-param catalog out, the real numbers fell 39/15 -> 34/10 while
+#: the constants stayed at 39/15 and every assertion still passed.  A ratchet that only
+#: notices growth stops ratcheting the moment you forget to lower it -- it had silently
+#: acquired five defs of slack.  Equality means a slice that empties the shell MUST come here
+#: and write the new number down, which is the whole point of keeping a count at all.
+#:
+#: 2 is the FLOOR, and it is worth saying why rather than waiting for someone to try.  The two
+#: survivors are ``_GridFocus`` and ``_StopAttempt``.  This census calls them render-free because
+#: it reads IMPORTS -- and neither imports a renderer.  But ``_GridFocus`` HOLDS a grid plotter,
+#: its detached canvas and the mpl callback ids to disconnect, and ``_StopAttempt`` HOLDS a
+#: running daemon thread.  What a record holds is as much a placement fact as what its module
+#: imports, and this criterion cannot see it; moving either into ``zlc_data`` would put a live
+#: Qt/Matplotlib object behind a rule that says the package holds serialisable values (L303).
+#: So: the shell's movable surface is exhausted, and what is left is not small -- it is bound.
+RENDER_FREE_TOP_LEVEL_DEFS = 2
+TOTAL_TOP_LEVEL_DEFS = 26
 
 RENDER_PACKAGES = ("PyQt5", "matplotlib", "zlc_frontend.render_style", "zlc_frontend.qt_widgets",
                    "zlc_frontend.live_plot", "zlc_frontend.qt_canvas", "zlc_frontend.render")
@@ -103,13 +118,18 @@ def _census(relative: str):
     return tree, tops, tainted, used
 
 
-def test_the_render_free_count_may_only_fall():
+def test_the_recorded_counts_are_what_the_shell_actually_holds():
+    """Exact on purpose -- see the note on the constants.  A slice that moves defs out is
+    supposed to come back here and write the smaller number down; being told to is the point."""
+
     tree, tops, tainted, _ = _census(SHELLS[0])
-    free = [n.name for n in tops if n.name not in tainted]
-    assert len(tops) <= TOTAL_TOP_LEVEL_DEFS, (
-        f"task_console grew to {len(tops)} top-level defs; it is being emptied, not filled")
-    assert len(free) <= RENDER_FREE_TOP_LEVEL_DEFS, (
-        f"{len(free)} render-free defs, recorded {RENDER_FREE_TOP_LEVEL_DEFS}: {sorted(free)}")
+    free = sorted(n.name for n in tops if n.name not in tainted)
+    assert len(tops) == TOTAL_TOP_LEVEL_DEFS, (
+        f"task_console holds {len(tops)} top-level defs, recorded {TOTAL_TOP_LEVEL_DEFS}. "
+        f"If a slice just emptied it, lower the constant; if it GREW, the shell is being "
+        f"filled instead of emptied and that is the bug.")
+    assert len(free) == RENDER_FREE_TOP_LEVEL_DEFS, (
+        f"{len(free)} render-free defs, recorded {RENDER_FREE_TOP_LEVEL_DEFS}: {free}")
 
 
 def test_the_relative_import_of_the_render_module_is_seen_as_render():
