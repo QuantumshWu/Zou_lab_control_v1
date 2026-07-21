@@ -271,8 +271,10 @@ def test_the_two_real_consumers_import_the_owner_not_the_shim():
 
     # qt_canvas moved wholesale into the plot_bridge zone (its legacy path is a PEP 562
     # shim); the consumer proof follows the code.
+    # The console body (and with it the render-loop wiring) moved to plot_bridge_console;
+    # the consumer proof follows the code, as it did for the canvas.
     for relative in ("zlc_workbench/task_console/plot_bridge_canvas.py",
-                     "Zou_lab_control/frontend/task_console.py"):
+                     "zlc_workbench/task_console/plot_bridge_console.py"):
         source = (REPO / relative).read_text(encoding="utf-8")
         tree = ast.parse(source)
         facade = [node for node in ast.walk(tree)
