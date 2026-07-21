@@ -9,9 +9,9 @@
 
 | 项 | 现值 |
 | --- | --- |
-| 两巨石行数 | `frontend/task_console.py` **393(0 def,纯别名壳)** + `frontend/pulse_gui.py` **86(0 def,显式别名壳)——双巨石解体完成**;pulse 编辑器本体在 `zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py`(4475 行,P5 毕业拆分) |
-| 删除台账剩余 | 承 20(目标包待定 17)/ 内 68 / 死 19,共 107;pulse 域四件已搬空成壳 |
-| 当前窗口 | **task_console+pulse_gui+figure_viewer 三壳均 0 def(解体完成)**;下一步=**device_manager 入口先行**(P2 最后窗口)或 P3 设备层/operations 清剿(交替) |
+| 旧树 | **0 文件(b68fc81 一次性删除完成,-53,985 行)**:两 legacy 树+五 seam+live_plot 渲染暂存+render_loop/canvas/legacy 桥+DIES_WITH 测试全灭;守卫=test_z0_zero_residue(零路径/零 import/零桥/零壳)+test_z0_import_targets_resolve(全仓 import 零死名) |
+| 删除台账 | 普查完成,承/内/死 分类历史使命结束;守卫塌缩为零 legacy 等值断言 |
+| 当前阶段 | **接线恢复**:旧 UI 骨架(三 plot_bridge 窗)数据面逐窗接新架构——目录=DefinitionCatalog→CatalogView;运行=PipelineSpec→RunPlan/RunController;监视=MonitorTap→LiveDatasetSlot;渲染=worker-raster/encoded_raster/QtRasterBoard(§10/§12.5,不留渲染暂存);消费示范=Zou_lab_control/workbench 12 窄窗 |
 
 ## 22. 最终验收
 
@@ -1060,3 +1060,4 @@ Pulse/FPGA：
 | 2026-07-20 | P2·pulse_gui 壳解体(终局一批) | `DONE` | 4475 行整搬 `zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py`(C20 过渡区,C14 豁免路径);6 组 import 改写指真源(领域→zlc_neutral_atom.timing、.live→zlc_frontend.live_plot、qt_canvas→plot_bridge_canvas);壳=86 行显式别名壳(0 def,72 名+PANEL_SIZES 词汇钉)。**当轮新测量**:七前置类耦合判定(4 纯 Qt/3 领域/1 mpl)支持整簇随 editor 走,P5 分拣毕业(C23);自 A/B 指纹唯一 diff=默认文件名时间戳(脚本内随机量,C42);Z4/Z2A 具名登记本体(死亡条件=设备层搬迁+P5 毕业);Z3 27→28(C25);project_root 钉随函数迁(C5)。**两壳均 0 def=P2 双巨石解体完成** | 起窗 rc=0;受影响 A 组 57+11+47 绿 |
 | 2026-07-20 | P2·figure_viewer 入口先行 | `DONE` | `zlc_workbench/figure_viewer/app.py` 组合根委托旧 `_gui.open_figure_viewer`(复用其 session 单例/无 session 双路,C22;Z4/Z2A 具名登记,C20/C25);根启动器 `figure_viewer.py` 同 commit 改指组合根,从 Z2A 表摘除(它不再 import 旧树);探针教 `viewer_app` marker+build 分支。**当轮新测量**:A/B vs ZLC_main 指纹零结构差异;自 A/B(HEAD legacy 入口 vs 工作树组合根入口)零结构差异(时间戳默认名按 C42 归一);比对脚本固化 `fp_diff.py` 归一 in-script 随机量 | 起窗 rc=0;z0+charter+qt_widgets+plot_kind 49 绿 |
 | 2026-07-20 | P2·figure_viewer 壳解体(终局一批,三壳归零) | `DONE` | 两文件整搬 `zlc_workbench/figure_viewer/`:本体 1033 行→`plot_bridge_figure_viewer.py`(持 DataFigure 链,C20/C14 豁免路径),FlowGraphView 557 行→`flow_graph_view.py`(纯 Qt 无 mpl,非 bridge 名)。import 改写指真源:`.task_console` 三名逐名拆(PanelConfig→zlc_data.console_records、TaskConsoleState→zlc_frontend.console_state、TaskConsole→plot_bridge_console),`.data_figure`→live_plot.plot_figure,`_paths`→zlc_storage.paths;领域三条(SignalHub/signal_tensor/logic+惰性 format_dims)=Z4/Z2A 具名越界,死亡条件=领域层搬迁(C20/C25)。壳=24 行显式别名壳(0 def,13 名)+PEP562 壳;Z3 28→30;plot_kind 钉随代码迁(C5)。**三壳均 0 def** | 壳同一性+门面转发 OK;起窗 rc=0;自 A/B 零结构差异;受影响 99 绿 |
+| 2026-07-21 | 一次性大清除(用户直令) | `DONE` | 全仓 legacy 一刀删尽(b68fc81,185 文件 -53,985 行):两旧树+五 seam+`zlc_frontend/live_plot` 渲染暂存(终裁:不留过渡渲染,面板直接接 worker-raster 新架构)+render_loop/plot_bridge_canvas/`zlc_workbench/legacy.py` 桥+全部 DIES_WITH 测试(C41)。三窗骨架 member 级手术(渲染桥→GUI 同步 compose);domain-ports 组合调用由 zlc_workbench 继承(_domain_wiring,C20);FlowGraphView 毕业 qt_widgets;runtime_compiler 边沿预算改读 streamer_geometry 单源(C32)。守卫全部重写为终态零断言(z0/charter/import-targets);timing 双表示裁决更新为永久双栖。**纠偏记录(C45):ops/SignalHub 误搬入 zlc_neutral_atom 被用户拦停并全撤——§10 已有 Measurement/StreamProcessor/Task/DefinitionCatalog 新架构对应物,接线以它为准** | 边界守卫 64 passed;compileall 全绿 |
