@@ -24,6 +24,10 @@ alive.  That confound is the reason this test looks the way it does.
 
 from __future__ import annotations
 
+#: C41 -- this oracle guards a legacy artifact and is deleted in the same commit that
+#: deletes it (swept by test_design_charter).
+DIES_WITH = ('Zou_lab_control/frontend/task_console.py', 'Zou_lab_control/frontend/pulse_gui.py')
+
 import ast
 import pathlib
 
@@ -52,7 +56,9 @@ SHELLS = ["Zou_lab_control/frontend/task_console.py",
 #: Qt/Matplotlib object behind a rule that says the package holds serialisable values (L303).
 #: So: the shell's movable surface is exhausted, and what is left is not small -- it is bound.
 RENDER_FREE_TOP_LEVEL_DEFS = 2
-TOTAL_TOP_LEVEL_DEFS = 26
+#: 25 after the test cull exposed _min_board_width: its ONLY referencer was a frozen test,
+#: so deleting the archive turned a delegation stub into a corpse this very guard then caught.
+TOTAL_TOP_LEVEL_DEFS = 25
 
 RENDER_PACKAGES = ("PyQt5", "matplotlib", "zlc_frontend.render_style", "zlc_frontend.qt_widgets",
                    "zlc_frontend.live_plot", "zlc_frontend.qt_canvas", "zlc_frontend.render")

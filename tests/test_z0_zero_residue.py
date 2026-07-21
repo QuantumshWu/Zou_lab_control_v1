@@ -28,6 +28,10 @@ window work that makes them meaningful.
 
 from __future__ import annotations
 
+#: C41 -- this oracle guards a legacy artifact and is deleted in the same commit that
+#: deletes it (swept by test_design_charter).
+DIES_WITH = ('Zou_lab_control/frontend', 'Zou_lab_control/neutral_atom')
+
 import ast
 import fnmatch
 from pathlib import Path
@@ -89,13 +93,17 @@ Z2B_ACTIVE_TEST_IMPORTERS = {
     Path("tests/test_u06_shell_domain_ports.py"),       # proves the legacy root wires the port
     Path("tests/test_zlc_frontend_form.py"),            # form parity across the move
 }
-Z2C_FROZEN_TEST_IMPORTERS = 168
+#: 0 since the great cull: every off-manifest (frozen) test was DELETED outright -- git keeps
+#: them.  L3806 already made them non-evidence; keeping 176 dead files made tests/ unnavigable.
+Z2C_FROZEN_TEST_IMPORTERS = 0
 #: 19 as of the render-loop move: ``frontend/render_loop.py`` became a shim when the module
 #: itself went to ``zlc_frontend/qt_widgets``.  The count is allowed to RISE only when a move
 #: creates the shim -- which is the one legitimate reason -- and it must fall back to zero at Z0.
 Z3_FORWARDING_SHIMS = 19
 Z7_REBUILT_WORKBENCH_FILES = 12
-Z8_TESTS_OFF_THE_MANIFEST = 176
+#: 0 forever: after the cull the manifest IS the suite.  A test file not on the manifest is no
+#: longer a frozen archive entry -- it is a mistake, and this guard says so immediately.
+Z8_TESTS_OFF_THE_MANIFEST = 0
 
 #: The S0.5 bridges that were actually BUILT.  The design document names four
 #: symbols; two of them (``LegacyPanelHost``, ``LegacyRuntimeFence``) have zero

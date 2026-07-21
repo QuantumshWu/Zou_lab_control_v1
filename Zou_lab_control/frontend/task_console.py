@@ -654,11 +654,6 @@ def _first_free_slot(cfg, placed, board_w: int) -> tuple[int, int]:
     return _layout.first_free_slot(cfg, placed, board_w, _board_metrics())
 
 
-def _min_board_width(configs: Sequence["PanelConfig"]) -> int:
-    """See :func:`zlc_frontend.board_layout.min_board_width`."""
-    return _layout.min_board_width(configs, _board_metrics())
-
-
 def _board_width(configs: Sequence["PanelConfig"]) -> int:
     """See :func:`zlc_frontend.board_layout.board_width`."""
     return _layout.board_width(configs, _board_metrics())
