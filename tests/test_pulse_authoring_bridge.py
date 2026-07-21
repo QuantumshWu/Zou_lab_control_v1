@@ -10,9 +10,15 @@ buttons drive it: binding a scan field, setting a bus value, freezing a table.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
+
 from zlc_neutral_atom.pulse_authoring import pulse_document_from_table
 from zlc_neutral_atom.timing.board_config import load_board_config
+from zlc_neutral_atom.timing.pulse_table import PulsePeriod as EditorPeriod
 from zlc_neutral_atom.timing.pulse_table import PulseTableState
+from zlc_pulse.authoring import new_pulse_document
 
 
 def _authored_state() -> PulseTableState:
@@ -30,6 +36,49 @@ def _authored_state() -> PulseTableState:
     state.set_scan_table([[1000.0], [2000.0], [3000.0]])
     state.scan_code = "import numpy as np\nscan = np.linspace(1e3, 3e3, 3)"
     return state
+
+
+def test_the_two_models_are_a_draft_and_a_validated_artefact_not_two_copies() -> None:
+    """Why a translation exists at all -- and why it is not a duplicated source.
+
+    A single source of truth forbids one fact being writable in two places that can
+    drift.  These two are not that: the document is DERIVED from the editor state and
+    never written back, and it cannot even represent what the editor must hold while a
+    human is mid-edit.  Pinning that here so nobody later "unifies" them by handing a
+    document to the editor, or a half-typed state to the hardware.
+    """
+
+    board = load_board_config()
+    document = new_pulse_document(board.pulse_target(), time_step_ns=20.0, name="draft")
+    period = document.periods[0]
+
+    # An operator typing "1234.5" into a 20 ns machine is a legal editing state and an
+    # illegal programme.  The document refuses it -- that refusal is its whole job.
+    with pytest.raises(ValueError):
+        replace(document, periods=(replace(period, duration=1234.5, unit="ns"),))
+    with pytest.raises(TypeError):
+        replace(document, periods=(replace(period, duration="s0", unit="ns"),))
+
+    # The editor must accept both: the first is being typed, the second is a scan
+    # binding that only becomes a number once a slot supplies one.
+    states = (0,) * len(board.pulse_target().raw_lanes)
+    assert EditorPeriod(duration=1234.5, states=states, unit="ns").duration == 1234.5
+    assert EditorPeriod(duration="s0", states=states, unit="str (ns)").duration == "s0"
+
+
+def test_an_unquantised_edit_is_refused_loudly_by_the_bridge() -> None:
+    """The bridge must not round a half-typed duration onto the grid behind the operator."""
+
+    board = load_board_config()
+    catalog = board.port_catalog()
+    state = PulseTableState(
+        port_catalog=catalog,
+        visible_ports=[port.key for port in catalog.ports if port.kind != "clock"][:2],
+    )
+    state.periods[0] = replace(state.periods[0], duration=1234.5, unit="ns")
+
+    with pytest.raises((ValueError, TypeError)):
+        pulse_document_from_table(state, board.pulse_target())
 
 
 def test_a_dac_value_moves_out_of_the_bit_vector_into_an_analog_step() -> None:
