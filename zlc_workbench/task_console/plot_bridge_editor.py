@@ -9,7 +9,7 @@ Every import names a TRUE owner -- nothing here touches the legacy tree.
 
 from __future__ import annotations
 
-import pathlib
+from pathlib import Path
 import time
 
 import numpy as np
@@ -22,9 +22,12 @@ from zlc_frontend.qt_widgets import (
     FluentComboBox,
     FluentLabel,
     FluentLineEdit,
+    FluentPathEdit,
+    FluentReadoutEdit,
     FluentScrollArea,
     FluentSectionLabel,
     FluentSettingRow,
+    FluentSwitch,
     GREEN,
     GREY,
     ORANGE,
@@ -34,14 +37,22 @@ from zlc_frontend.qt_widgets import (
     scaled_px,
     signals_blocked as _signals_blocked,
 )
-from zlc_frontend.console_state import TaskConsoleState as _TaskConsoleState
-from zlc_frontend.form import lenient_float as _safe_float
+from zlc_frontend.console_state import (
+    TaskConsoleState as _TaskConsoleState,
+    task_files_dir as _task_files_dir,
+)
+from zlc_frontend.form import (
+    lenient_float as _safe_float,
+    python_to_text as _py_to_text,
+    text_to_python as _text_to_py,
+)
 from zlc_frontend.panel_params import (
     PANEL_PARAMS,
     panel_display_decls as _panel_display_decls,
     resolved_cmap as _resolved_cmap,
     resolved_param as _resolved_param,
 )
+from .plot_bridge import _RELIM_PARAM
 from zlc_data.console_records import (
     BLANK_SOURCE as _BLANK_SOURCE,
     PANEL_KINDS,
@@ -57,6 +68,35 @@ PARAM_WIDGETS = _qt_widgets.param_widgets.PARAM_WIDGETS
 ParamWidgetContext = _qt_widgets.param_widgets.ParamWidgetContext
 fill_grouped_signal_combo = _qt_widgets.param_widgets.fill_grouped_signal_combo
 
+#: Containers the Save row offers.  A container is a DATA-layer choice (which file
+#: the same picture lands in), never an art knob: geometry, dpi and typography are
+#: identical whichever is picked.
+SAVE_IMAGE_FORMATS = ("png", "jpg")
+
+
+
+def _front_qimage(frame):
+    """The presented front as one Qt image, or None.
+
+    Reads the panel's own raster rather than re-rendering: what gets written is
+    the exact front the operator was looking at, palette and colour window
+    included.
+    """
+
+    panels = tuple(getattr(frame, "panels", ()) or ())
+    if not panels:
+        return None
+    raster = panels[0].raster
+    fmt = (QtGui.QImage.Format_Indexed8
+           if str(raster.pixel_format.value).lower().startswith("indexed")
+           else QtGui.QImage.Format_RGB32)
+    image = QtGui.QImage(bytes(raster.pixels), raster.width, raster.height,
+                         raster.stride_bytes, fmt)
+    payload = panels[0].display_payload
+    palette = tuple(getattr(payload, "base_palette", ()) or ())
+    if palette and fmt == QtGui.QImage.Format_Indexed8:
+        image.setColorTable(list(palette))
+    return image.copy()          # own the bytes: the raster is not ours to keep
 
 
 class PanelEditor(QtWidgets.QWidget):
@@ -80,17 +120,330 @@ class PanelEditor(QtWidgets.QWidget):
     fit/limits row off-screen (the old single-editor cutoff)."""
 
 
-    # ------------------------------------------------------------- snapshot
-    def teardown(self) -> None:
-        if self._canvas is not None:
-            self.canvas_holder.removeWidget(self._canvas)
-            self._canvas.deleteLater()
-        if self._plotter is not None and plt is not None and self._plotter.fig is not None:
-            plt.close(self._plotter.fig)
-        self._canvas = None
-        self._plotter = None
-        self._df = None
+    def __init__(self, card: "PanelCard", console: "TaskConsole", parent=None):
+        super().__init__(parent)
+        self.card = card
+        self.console = console
+        self.setStyleSheet("background: transparent;")
+        # Which kind's PANEL_PARAMS this page baked its rows from -- a grid's resolved
+        # per-cell kind can change later, and refresh_on_show then rebuilds the page so
+        # the rows never lie.
+        self._param_kind_built = card._param_kind() if card is not None else None
+        self._board = None
+        self._composer = None
+        # A plot panel's Edit never carries a measurement form or Start/Stop: a plot is a
+        # pure VIEW, and the node that produces its data lives on the Logic tab.
+        self.meas_panel = None
+        self._node = None                       # the node that produces this panel's data
+        self._node_widgets = {}                 # acquisition-param name -> editable field
+        self._node_now_labels = {}              # acquisition-param name -> "now: X" reference
+        self.fit_combo = None
+        self.xmin = self.xmax = self.ymin = self.ymax = None
+        self.clo = self.chi = None
 
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = FluentScrollArea()
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll)
+        page = QtWidgets.QWidget()
+        page.setStyleSheet("background: transparent;")
+        scroll.setWidget(page)
+        col = QtWidgets.QVBoxLayout(page)
+        margin = scaled_px(10, minimum=6)
+        col.setContentsMargins(margin, margin, margin, margin)
+        col.setSpacing(scaled_px(6, minimum=4))
+
+        def section(text):
+            col.addWidget(FluentSectionLabel(text))
+
+        def labeled(text):
+            label = FluentLabel(text)
+            label.setStyleSheet("color: %s; background: transparent; border: none;" % GREY)
+            return label
+
+        def inline(*widgets, trailing=None):
+            host = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(host)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(scaled_px(6, minimum=4))
+            for widget in widgets:
+                row.addWidget(widget, 0)
+            row.addStretch(1)
+            if trailing is not None:
+                row.addWidget(trailing, 0)
+            return host
+
+        label_w = scaled_px(96, minimum=72)
+
+        # ---- Panel: rename here as well as in the Setting popup; both go through the
+        # card's one title handler, so the two surfaces stay views of one string.
+        section("Panel")
+        self.title_edit = FluentLineEdit(card.config.title)
+        self.title_edit.setPlaceholderText("panel title...")
+        self.title_edit.setToolTip("Rename this panel (also the default save name).")
+        self.title_edit.textChanged.connect(self._edit_title)
+        col.addWidget(FluentSettingRow("title", self.title_edit, label_width=label_w))
+
+        # ---- Acquisition: the editable parameters of the SOURCE behind this panel,
+        # prefilled with the current value and trailed by a live "now:" reference.
+        # Apply pushes them to that source in place; it starts nothing.
+        self._node = console._producing_node(card)
+        for name, current in console._node_params(self._node):
+            if not self._node_widgets:
+                section("Acquisition")
+            edit = FluentLineEdit(_py_to_text(current))
+            edit.setMinimumWidth(scaled_px(150, minimum=120))
+            self._node_widgets[name] = edit
+            now = labeled("now: %s" % _py_to_text(current))
+            self._node_now_labels[name] = now
+            holder = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(holder)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(scaled_px(6, minimum=4))
+            row.addWidget(edit, 1)
+            row.addWidget(now, 0)
+            col.addWidget(FluentSettingRow(name, holder,
+                                           label_width=scaled_px(170, minimum=140)))
+        if self._node_widgets:
+            self.node_apply_button = FluentButton("Apply", color=ACCENT)
+            self.node_apply_button.setToolTip(
+                "Apply the edited acquisition parameters to the data source in place -- "
+                "the panel keeps streaming.")
+            self.node_apply_button.clicked.connect(self._restart_node)
+            col.addWidget(self.node_apply_button)
+
+        # ---- Source: the producing node's own declarative form, when it exposes no live
+        # acquisition parameters above.  Apply rebuilds + restarts that node; it is
+        # started and stopped from its OWN Logic-tab Edit, so no Start/Stop here.
+        self._source_row = None
+        self.source_form = None
+        if not self._node_widgets:
+            self._source_row = console._producing_row(card)
+            source_spec = (console._spec_for_logic(self._source_row.node)
+                           if self._source_row is not None else None)
+            if source_spec is not None:
+                section("Source: %s" % source_spec.name)
+                self.source_form = MeasurementPanel(
+                    [source_spec], single=True, controls=False,
+                    signals_provider=getattr(console, "_signal_names", None),
+                    sources_provider=getattr(console, "_signal_providers", None),
+                    formats_provider=getattr(console, "_signal_formats", None),
+                    short_names_provider=getattr(console, "_signal_short_names", None))
+                self.source_form.seed_values(self._source_row.node.values or {})
+                col.addWidget(self.source_form)
+                self.source_apply_button = FluentButton("Apply", color=ACCENT)
+                self.source_apply_button.setToolTip(
+                    "Apply these parameters to the source node (rebuild + restart it); "
+                    "the plot keeps reading its published signal.")
+                self.source_apply_button.clicked.connect(self._apply_source_form)
+                col.addWidget(self.source_apply_button)
+
+        # ---- Parameters: the plot's own functional params, auto-discovered from the
+        # kind's declarations, so a kind that gains a knob shows it with no wiring here.
+        functional = [spec for spec in _panel_display_decls(card.config.kind, card._param_kind())
+                      if not spec.display]
+        if functional:
+            section("Parameters")
+            for spec in functional:
+                widget = card._make_param_widget(spec, apply=self._edit_param)
+                col.addWidget(FluentSettingRow(spec.label, widget, label_width=label_w))
+
+        # ---- Display: the same view knobs the Setting popup renders, through the card's
+        # SHARED row emitter and writing the SAME config.params through the card's one
+        # writer -- the two surfaces are views of one state and cannot drift.
+        self.ed_cmap = self.ed_relim = self.ed_unit_button = self.ed_fixed_row = None
+        self.ed_fixed_lo = self.ed_fixed_hi = None
+        self.ed_params = {}
+        section("Display")
+        display_specs = ([spec for spec in _panel_display_decls(card.config.kind, card._param_kind())
+                          if spec.display] + [_RELIM_PARAM] + list(card._repeat_param_specs()))
+        self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, label_w)
+        self.ed_cmap = self.ed_params.get("colormap")
+        self.ed_relim = self.ed_params.get("relim")
+        # An image's VALUE axis is its colour limit, pinned by the "colour range" row in
+        # Limits; a second fixed lo/hi here would put two inputs on one source.
+        if card.config.kind not in ("2d", "sites"):
+            self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = card._make_fixed_lim_row(
+                self._edit_fixed_lim, label_w)
+            col.addWidget(self.ed_fixed_row)
+            # The row stays PERMANENTLY in the layout; only its inputs enable in fixed
+            # mode.  A visibility toggle above the snapshot reflowed everything below it
+            # by the row's height on every relim change -- the reported Edit-tab jump.
+            self._sync_fixed_lim_enabled(card._relim())
+        unit_row, self.ed_unit_button, _ = card._make_unit_cycle_row(
+            self._edit_unit_cycle, label_w, with_label=False)
+        col.addWidget(unit_row)
+
+        # ---- Processing: the frozen snapshot and its Refresh.
+        section("Processing")
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(labeled("frozen snapshot of current data"), 1)
+        self.refresh_button = FluentButton("Refresh", color=GREY)
+        self.refresh_button.setToolTip("Re-snapshot the panel's current data")
+        self.refresh_button.clicked.connect(self.rebuild)
+        head.addWidget(self.refresh_button)
+        col.addLayout(head)
+        self.canvas_holder = QtWidgets.QVBoxLayout()
+        self.canvas_holder.setContentsMargins(0, 0, 0, 0)
+        col.addLayout(self.canvas_holder)
+
+        # ---- Analysis: the same control set the Setting popup builds, through the ONE
+        # composite; every action routes through the card's one fit mutator.
+        self.ed_fix_seed = None
+        self._analysis_controls = None
+        if self.card is not None:
+            controls = AnalysisControls(self.card, surface="edit", label_w=label_w)
+            if controls.empty:
+                controls.deleteLater()
+            else:
+                section("Analysis")
+                col.addWidget(controls)
+                self._analysis_controls = controls
+                self.fit_combo = controls.model_combo
+                self.ed_fix_seed = controls.fix_seed
+
+        # ---- Limits: the view-window pins.  A box holds the STORED pin (empty =
+        # autoscale) and is re-seeded only on build / show / Clear, so the refresh tick
+        # can never clobber typing; the live window shows as the grey placeholder.
+        section("Limits")
+        self.xmin = FluentLineEdit("")
+        self.xmax = FluentLineEdit("")
+        if card.config.kind in ("2d", "sites"):
+            # An image's x AND y are pixel coordinates: pinning both is what makes a crop
+            # real.  A curve's y is owned by the relim family instead, so it gets no row.
+            self.ymin = FluentLineEdit("")
+            self.ymax = FluentLineEdit("")
+            self.clo = FluentLineEdit("")
+            self.chi = FluentLineEdit("")
+        boxes = (self.xmin, self.xmax) + ((self.ymin, self.ymax) if self.ymin is not None else ())
+        for widget in boxes:
+            widget.setFixedWidth(scaled_px(88, minimum=68))
+            widget.returnPressed.connect(self.apply_limits)
+        apply_button = FluentButton("Apply lim", color=ACCENT)
+        apply_button.clicked.connect(self.apply_limits)
+        clear_button = FluentButton("Clear", color=GREY)
+        clear_button.clicked.connect(self.clear_limits)
+        lim_row = inline(self.xmin, self.xmax, trailing=apply_button)
+        lim_row.layout().addWidget(clear_button, 0)
+        col.addWidget(FluentSettingRow("x range", lim_row, label_width=label_w))
+        if self.ymin is not None:
+            col.addWidget(FluentSettingRow("y range", inline(self.ymin, self.ymax),
+                                           label_width=label_w))
+        if self.clo is not None:
+            for widget in (self.clo, self.chi):
+                widget.setFixedWidth(scaled_px(88, minimum=68))
+                widget.returnPressed.connect(self.apply_clim)
+            clim_apply = FluentButton("Apply", color=ACCENT)
+            clim_apply.clicked.connect(self.apply_clim)
+            clim_auto = FluentButton("Auto", color=GREY)
+            clim_auto.clicked.connect(self.clear_clim)
+            clim_row = inline(self.clo, self.chi, trailing=clim_apply)
+            clim_row.layout().addWidget(clim_auto, 0)
+            col.addWidget(FluentSettingRow("colour range", clim_row, label_width=label_w))
+
+        # ---- Save: the figure this panel is showing.  Only the picture is written here:
+        # the DATA behind it is already owned by the run's repository, and a second copy
+        # written by the GUI would be a second answer to what was measured.
+        section("Save")
+        self.save_dir_edit = FluentPathEdit(
+            self.console._last_save_dir or str(_task_files_dir()),
+            mode="dir", caption="Choose where to save", base_dir=str(_task_files_dir()))
+        self.save_dir_edit.setToolTip(
+            "Where to save (folder, or a full path base).  Remembered across saves this "
+            "session.  With auto-name OFF this is the exact output path.")
+        col.addWidget(FluentSettingRow("path", self.save_dir_edit, label_width=label_w))
+        self.save_autoname = FluentSwitch("auto-name (type + time)   ")
+        self.save_autoname.setChecked(True)
+        self.save_autoname.setToolTip(
+            "ON: append _<plot-kind>_<timestamp> to the path (unique files).  "
+            "OFF: write the path verbatim (you set the exact name; overwrites).")
+        self.save_format_combo = FluentComboBox()
+        self.save_format_combo.addItems(list(SAVE_IMAGE_FORMATS))
+        self.save_format_combo.setCurrentText(SAVE_IMAGE_FORMATS[0])
+        self.save_format_combo.setFixedWidth(scaled_px(72, minimum=56))
+        self.save_format_combo.setToolTip("Image container for the saved figure.")
+        self.save_button = FluentButton("Save Fig", color=ACCENT)
+        self.save_button.setToolTip("Save exactly the picture this snapshot is showing.")
+        col.addWidget(FluentSettingRow(
+            "name", inline(self.save_autoname, self.save_format_combo, trailing=self.save_button),
+            label_width=label_w))
+        # A read-only-but-copyable field, not a wrapping label: a long absolute path has
+        # nothing to wrap on, so a label would drag the whole page wider.
+        self.save_preview = FluentReadoutEdit("")
+        self.save_preview.setToolTip("The exact file that will be written -- select to copy.")
+        self.save_preview.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+        col.addWidget(FluentSettingRow("file", self.save_preview, label_width=label_w))
+        self.save_dir_edit.changed.connect(lambda *_: self._update_save_preview())
+        self.save_autoname.toggled.connect(lambda *_: self._update_save_preview())
+        self.save_format_combo.currentTextChanged.connect(lambda *_: self._update_save_preview())
+        self.save_button.clicked.connect(self.save)
+        self._update_save_preview()
+
+        self.status = FluentLabel("")
+        self.status.setStyleSheet("color: %s; background: transparent; border: none;" % GREY)
+        # A status line must never drive the page WIDTH: a label's size hint tracks its
+        # text, so a long message would balloon the column into a horizontal scroll.
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        col.addWidget(self.status)
+        col.addStretch(1)
+
+        self.rebuild()
+
+    def rebuild(self) -> None:
+        """Snapshot the bound card's CURRENT data onto this tab's own surface.
+
+        Composed from the SAME frozen value and display state the card drew, through the
+        same composer -- so the Edit tab shows what the Monitor panel shows rather than a
+        second rendering that could disagree with it.  Its own composer, though: this
+        surface may be zoomed and sized differently, and sharing one would make the card
+        inherit the Edit tab's viewport.
+        """
+
+        from zlc_frontend.panel_render import PanelComposer, PanelProvenance, PanelRenderError
+        from zlc_frontend.qt_widgets.board import QtImageBoard
+
+        card = self.card
+        value = None if card is None else getattr(card, "_last_value", None)
+        if value is None or getattr(value, "snapshot", None) is None:
+            self.status.setText("open the panel with data first")
+            return
+        if self._board is None:
+            self._board = QtImageBoard("edit-%x" % id(self), empty_text="no snapshot yet",
+                                       zoomable=True)
+            self.canvas_holder.addWidget(self._board)
+        if self._composer is None:
+            self._composer = PanelComposer("edit-%x" % id(self),
+                                           intent=card.view_intent(),
+                                           label=str(value.name))
+        try:
+            frame = self._composer.compose(
+                value.snapshot,
+                display=card._display_state(),
+                provenance=PanelProvenance(value.run_id, value.epoch_id, value.join_digest))
+        except PanelRenderError as error:
+            self.status.setText(str(error)[:160])
+            return
+        except Exception as error:
+            self.status.setText(("%s: %s" % (type(error).__name__, error))[:160])
+            return
+        self._board.present(frame)
+        self.status.setText("")
+
+    def teardown(self) -> None:
+        """Release this tab's surface.  Its composer goes with it.
+
+        The composer carries the colour window this snapshot resolved; keeping it
+        past the surface would let a later snapshot of different data inherit the
+        contrast of data it never showed.
+        """
+
+        if self._board is not None:
+            self.canvas_holder.removeWidget(self._board)
+            self._board.setParent(None)
+            self._board.deleteLater()
+        self._board = None
+        self._composer = None
 
     def _edit_param(self, key: str, value) -> None:
         """A plot-param edit from the Edit tab (declarative display knob OR functional param): apply to
@@ -112,16 +465,8 @@ class PanelEditor(QtWidgets.QWidget):
             # re-seed THOSE boxes here so picking relim in the chooser fills/empties them to match the
             # pin -- runs even when ed_fixed_row is None, unlike the block above (#2 colour range).
             self._seed_clim_boxes()
-        # EVERY knob first tries the snapshot's own in-place apply (BaseLivePlot.apply_param handles
-        # the relim family for every kind; a GridPlot stores + forwards to its focused cell and NEVER
-        # asks for a rebuild) -- rebuild() is only the fallback for a knob the snapshot truly cannot
-        # apply, because it tears down + recreates the whole snapshot (which would throw away a
-        # focused grid cell = the "changing lim bounces the enlarged cell back to the grid" bug).
-        snap = getattr(self, "_plotter", None)
-        if snap is not None and snap.apply_param(key, value):
-            if getattr(self, "_canvas", None) is not None:
-                self._canvas.draw_idle()
-            return
+        # The knob is stored on the card; re-composing this snapshot from the same
+        # display state is how it shows up here.  There is no second push path.
         self.rebuild()
 
     def _sync_fixed_lim_enabled(self, relim: str) -> None:
@@ -151,11 +496,6 @@ class PanelEditor(QtWidgets.QWidget):
         lo = _safe_float(self.ed_fixed_lo.text(), 0.0)
         hi = _safe_float(self.ed_fixed_hi.text(), 1.0)
         self.card.apply_fixed_lims(lo, hi)
-        snap = getattr(self, "_plotter", None)
-        if snap is not None and snap.apply_param("fixed_lo", lo) and snap.apply_param("fixed_hi", hi):
-            if getattr(self, "_canvas", None) is not None:
-                self._canvas.draw_idle()
-            return
         self.rebuild()
 
     def _edit_unit_cycle(self) -> None:
@@ -177,66 +517,25 @@ class PanelEditor(QtWidgets.QWidget):
         self._update_save_preview()               # default save name follows the title
         self.rebuild()
 
-    def _run_command(self) -> None:
-        """A one-line REPL on this panel's DataFigure (confocal's ``data_figure.<fn>(...)``).
-        Names exposed: ``data_figure``/``df``, ``fig``, ``ax``, ``plotter``, ``np``.  An
-        expression shows its repr; a statement shows ``ok``; an error shows its message.
-        SECURITY: runs arbitrary local Python -- trusted-input tool, like the Scan tab."""
-        if self._plotter is None or not hasattr(self, "cmd_input"):
-            return
-        text = self.cmd_input.text().strip()
-        if not text:
-            return
-        try:
-            df = self._df_for()
-            ns = {"data_figure": df, "df": df, "fig": self._plotter.fig,
-                  "ax": getattr(self._plotter, "ax", None), "plotter": self._plotter, "np": np}
-            try:
-                value = eval(text, ns)            # noqa: S307 - local experiment tool, trusted input
-                msg = "ok" if value is None else repr(value)
-            except SyntaxError:
-                exec(text, ns)                    # noqa: S102 - a statement, not an expression
-                msg = "ok"
-            if self._canvas is not None:
-                self._canvas.draw_idle()
-            self.cmd_result.setText(str(msg)[:300])
-        except Exception as exc:
-            self.cmd_result.setText(f"error: {str(exc).splitlines()[0][:200]}")
-
-    def _apply_snapshot_unit(self) -> None:
-        """Cycle the Edit snapshot's x-axis unit ``unit_index`` times from its original,
-        mirroring the live card's :meth:`PanelCard._apply_unit` (shared :func:`_unit_df_for`).
-        Called on every rebuild so the persisted unit survives a Refresh / re-snapshot."""
-        if self._plotter is None or self.card is None:
-            return
-        index = int(self.card.config.params.get("unit_index", 0) or 0)
-        if index <= 0:
-            return
-        try:
-            df = _unit_df_for(self._plotter)
-            if not getattr(df, "conversion_map", None):
-                return
-            for _ in range(index % max(1, len(df.conversion_map))):
-                df.change_unit()
-            if self._canvas is not None:
-                self._canvas.draw_idle()
-        except Exception:
-            pass
-
     def _selected_rect(self):
-        """The area rectangle if one is drawn, ELSE the current view box (x AND y
-        view limits).  Returns (xlo, xhi, ylo, yhi) sorted, or all None -- so
-        scroll-zoom alone sets the region, with a drag-rectangle overriding it."""
-        plotter = self._plotter
-        if plotter is None or plotter.ax is None:
+        """The panel's stored selection as ``(xlo, xhi, ylo, yhi)``, else all None.
+
+        A selection is DATA, not a figure state: it is what the operator marked,
+        it survives a re-compose, and it is the same object the ROI and the fit
+        act on.  Reading it here rather than asking a figure for its view box
+        keeps one answer to "what was selected".
+        """
+
+        selection = None if self.card is None else self.card.current_selection()
+        ranges = tuple(getattr(selection, "ranges", ()) or ())
+        if len(ranges) < 2:
             return (None, None, None, None)
-        area = getattr(plotter, "area", None)
-        if area is not None and area.range[0] is not None:
-            x1, x2, y1, y2 = (float(v) for v in area.range)
-            return (min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2))
-        xlo, xhi = sorted(float(v) for v in plotter.ax.get_xlim())
-        ylo, yhi = sorted(float(v) for v in plotter.ax.get_ylim())
-        return (xlo, xhi, ylo, yhi)
+        try:
+            x1, x2 = (float(ranges[0].start), float(ranges[0].stop))
+            y1, y2 = (float(ranges[1].start), float(ranges[1].stop))
+        except (AttributeError, TypeError, ValueError):
+            return (None, None, None, None)
+        return (min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2))
 
     def _read_region(self) -> None:
         """Confocal ``_read_range`` for a 2D panel, GENERIC over the source.
@@ -249,7 +548,7 @@ class PanelEditor(QtWidgets.QWidget):
         Acquisition parameters (a camera node -> a ROI rectangle; a 2-D scan ->
         axis ranges).  Whatever fields it names are filled in the Edit form, then
         Apply pushes them.  The frontend encodes NO device-specific shape."""
-        if self._node is None or self._plotter is None:
+        if self._node is None:
             return
         convert = getattr(self._node, "region_to_acquisition_parameters", None)
         if convert is None:
@@ -368,17 +667,6 @@ class PanelEditor(QtWidgets.QWidget):
         from PyQt5 import QtCore
         QtCore.QTimer.singleShot(25, lambda: self._await_fresh_frame(node, epoch0, _tries=_tries + 1))
 
-    def _df_for(self):
-        # Route through the plotter's OWN to_data_figure() -- the SINGLE source that already knows a
-        # GridPlot is N per-cell DataFigures (returns a _GridData composite) while every other kind is a
-        # flat DataFigure.  Building DataFigure(self._plotter) directly would collapse a grid to cell-0's
-        # axes over placeholder arrays, so fit/limits would touch one subplot with garbage; going through
-        # the override makes fit_targets()/xlim()/ylim() fan out over every cell.  Cached so repeated
-        # Fit/Clear reuse the SAME per-cell handles (clear_fit clears this instance, not a fresh one).
-        if self._df is None:
-            self._df = self._plotter.to_data_figure()
-        return self._df
-
     def do_fit(self) -> None:
         """Apply a curve fit from the Edit tab through the ONE :class:`AnalysisControls` composite (which
         funnels into card.set_fit_request), so the live overlay, the hub node, and the Setting popup's
@@ -451,20 +739,41 @@ class PanelEditor(QtWidgets.QWidget):
                 except (TypeError, ValueError):
                     continue
 
-    def _limits_ax(self):
-        """The axes the x-range boxes are a live VIEW of (#3): the LIVE card's plotter when it exists (so a
-        zoom / pan on the panel reflects here), else the Edit-tab snapshot.  For a grid the x-window is
-        shared across cells, so cell-0's axes is representative."""
-        for plotter in (getattr(self.card, "plotter", None) if self.card is not None else None, self._plotter):
-            if plotter is None:
-                continue
-            ax = getattr(plotter, "ax", None)
-            if ax is None:
-                axes = getattr(plotter, "site_axes", None)     # a grid: cells share one x-window
-                ax = axes[0] if axes else None
-            if ax is not None:
-                return ax
-        return None
+    def _limit_axes(self):
+        """The view-window rows this editor built, as ``(param key, lo box, hi box)``.
+
+        One list drives seeding, applying and clearing, so a kind that has no y
+        row simply contributes no y triple instead of every reader repeating the
+        same "does this kind have y?" test.
+        """
+
+        rows = [("view_xlim", self.xmin, self.xmax)]
+        if self.ymin is not None:
+            rows.append(("view_ylim", self.ymin, self.ymax))
+        return tuple(rows)
+
+    def _front_view_bounds(self):
+        """The window the composed front is showing, as (xlo, xhi, ylo, yhi).
+
+        Read off the front's own viewport: it is the transform that maps this
+        picture's pixels back onto the declared axes, so the hint describes the
+        picture rather than a range derived beside it.
+        """
+
+        front = None if self._board is None else self._board.front_frame
+        panels = tuple(getattr(front, "panels", ()) or ())
+        if not panels:
+            return None
+        viewport = getattr(panels[0].display_payload, "viewport", None)
+        axes = tuple(getattr(viewport, "axes", ()) or ())
+        bounds = tuple(getattr(viewport, "visible_bounds", ()) or ())
+        if len(axes) != 2 or len(bounds) != 4:
+            return None
+        y_axis, x_axis = axes
+        x_size = float(getattr(x_axis, "size", 0) or 0)
+        y_size = float(getattr(y_axis, "size", 0) or 0)
+        left, top, right, bottom = (float(value) for value in bounds)
+        return (left * x_size, right * x_size, top * y_size, bottom * y_size)
 
     def _seed_limit_boxes(self) -> None:
         """Put the STORED x-window pin (``view_xlim`` in ``config.params``) into the boxes.  The boxes
@@ -501,18 +810,16 @@ class PanelEditor(QtWidgets.QWidget):
         # so a pinned/typed value is never overwritten.
         if getattr(self, "clo", None) is not None and self.card is not None \
                 and self.card.plotter is not None and hasattr(self.card.plotter, "current_lims"):
-            try:
-                clo, chi = self.card.plotter.current_lims()
-                self.clo.setPlaceholderText(f"{clo:.6g}"); self.chi.setPlaceholderText(f"{chi:.6g}")
-            except Exception:
-                pass
-        ax = self._limits_ax()
-        if ax is None:
+            shown = self.card._shown_limits() if self.card is not None else None
+            if shown is not None:
+                self.clo.setPlaceholderText(f"{shown[0]:.6g}")
+                self.chi.setPlaceholderText(f"{shown[1]:.6g}")
+        bounds = self._front_view_bounds()
+        if bounds is None:
             return
-        xlo, xhi = ax.get_xlim()
+        xlo, xhi, ylo, yhi = bounds
         self.xmin.setPlaceholderText(f"{xlo:.6g}"); self.xmax.setPlaceholderText(f"{xhi:.6g}")
         if self.ymin is not None:           # y hint only where y is a view axis (an image family)
-            ylo, yhi = ax.get_ylim()
             self.ymin.setPlaceholderText(f"{ylo:.6g}"); self.ymax.setPlaceholderText(f"{yhi:.6g}")
 
 
@@ -589,11 +896,7 @@ class PanelEditor(QtWidgets.QWidget):
         self._edit_param("relim", "fixed")          # make the fixed clim take effect (seeds from view) ...
         if self.card is not None:
             self.card.apply_fixed_lims(lo, hi)      # ... then overwrite with the typed lo/hi (final state)
-        snap = getattr(self, "_plotter", None)      # push onto THIS tab's snapshot too (as _edit_fixed_lim)
-        if snap is not None:
-            snap.apply_param("fixed_lo", lo); snap.apply_param("fixed_hi", hi)
-            if getattr(self, "_canvas", None) is not None:
-                self._canvas.draw_idle()
+        self.rebuild()                              # this snapshot re-composes from that one source
         self._sync_relim_combo("fixed")
         # _edit_param("relim","fixed") re-seeded the boxes from the FROZEN current view; re-seed now that
         # apply_fixed_lims has written the TYPED lo/hi so the boxes show what was actually pinned.
@@ -713,39 +1016,30 @@ class PanelEditor(QtWidgets.QWidget):
         return view
 
     def save(self) -> None:
-        if self._plotter is None:
+        """Write exactly the picture this snapshot is showing.
+
+        The front already IS the composed figure, so saving it is a transcription
+        rather than a second render -- there is no way for the file and the screen
+        to disagree.  The DATA is not written here: the run's repository already
+        owns it, and a GUI-written copy would be a second answer to what was
+        measured.
+        """
+
+        front = None if self._board is None else self._board.front_frame
+        if front is None:
+            self.status.setText("no snapshot to save")
             return
         try:
-            df = self._df_for()
-            # BIND the figure to its data SOURCE, then let ``DataFigure.save`` capture ``info['signals']``
-            # + ``info['provenance']`` through the ONE frontend-neutral core (the SAME path a notebook
-            # ``p.save()`` runs) -- the console only supplies its resolvers (a stopped node's lingering
-            # signal still resolves via ``_node_for_signal``, incl. the ``_last_node`` fallback).  The
-            # GUI-only display blocks (source/kind/size/view) stay ``extra_info`` (they are console state,
-            # not signal/provenance).
-            inputs = list(self.card.config.inputs or [])
-            value_node = self.console._node_for_signal(inputs[0]) if inputs else None
-            df.bind_source(self.console.hub, value_node, inputs=inputs,
-                           resolve_node=self.console._node_for_signal,
-                           session=self.console.experiment)
             stem = self._save_stem(time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime()))
             stem.parent.mkdir(parents=True, exist_ok=True)
-            # the operator-chosen container (png / pdf / jpg) drives BOTH the file suffix and
-            # ``DataFigure.save(image_ext=...)`` -- the ONE format reader keeps them in lockstep.
-            ext = self._save_image_ext()
-            # a path WITH a suffix makes DataFigure.save write it VERBATIM (no extra timestamp),
-            # so this resolver is the single source of the output name.
-            out = df.save(stem.with_suffix(f".{ext}"), image_ext=ext,
-                          extra_info={"source": self.card.config.source,
-                                      "kind": self.card.config.kind,
-                                      "size": self.card.config.size,
-                                      "view": self._save_view_state()})
-            self.console._last_save_dir = str(stem.parent)   # remember where (kernel session)
+            target = stem.with_suffix(".%s" % self._save_image_ext())
+            image = _front_qimage(front)
+            if image is None or not image.save(str(target)):
+                raise RuntimeError("Qt refused to write %s" % target.name)
+            self.console._last_save_dir = str(stem.parent)
             self._update_save_preview()
-            # Show the LEAF folder, not the full absolute path (the full path is one click away in the
-            # tooltip + the save-preview field) -- a short message that fits, with the width-safe status
-            # policy as the backstop so even a long folder name can never widen the page.
-            self.status.setText(f"saved {out['figure'].name} + {out['data'].name} → …/{stem.parent.name}")
+            self.status.setText("saved %s -> .../%s" % (target.name, stem.parent.name))
             self.status.setToolTip(str(stem.parent))
-        except Exception as exc:
-            self.status.setText(f"save failed: {str(exc).splitlines()[0][:120]}")
+        except Exception as error:
+            self.status.setText("save failed: %s" % str(error).splitlines()[0][:120])
+

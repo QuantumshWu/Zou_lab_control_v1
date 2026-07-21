@@ -632,9 +632,7 @@ class PanelCard(FluentGroupBox):
         key = (self.config.kind, str(value.name), str(value.source))
         if self._compose_key != key:
             self._composer_obj = PanelComposer(
-                self.panel_id,
-                intent=_panel_view_intents().get(self.config.kind, ViewIntent.IMAGE),
-                label=str(value.name),
+                self.panel_id, intent=self.view_intent(), label=str(value.name),
             )
             self._compose_key = key
         return self._composer_obj
@@ -671,6 +669,18 @@ class PanelCard(FluentGroupBox):
         self.set_status("ok", error=False)
         return True
 
+    def view_intent(self):
+        """Which view this panel's kind asks its data for.
+
+        Public because the Edit tab composes the same panel on its own surface:
+        both must ask for the same view, or the snapshot would be a different
+        picture of the same data.
+        """
+
+        from zlc_frontend.figure import ViewIntent
+
+        return _panel_view_intents().get(self.config.kind, ViewIntent.IMAGE)
+
     def _display_state(self):
         """The display knobs this panel's kind exposes, as the renderer's own state.
 
@@ -696,7 +706,7 @@ class PanelCard(FluentGroupBox):
         if mode is RelimMode.FIXED:
             fixed = (float(params.get("fixed_lo", 0.0)),
                      float(params.get("fixed_hi", 1.0)))
-        intent = _panel_view_intents().get(self.config.kind, ViewIntent.IMAGE)
+        intent = self.view_intent()
         if intent is ViewIntent.CURVE:
             return CurveDisplayState(
                 revision=self._display_revision, relim_mode=mode, fixed_y_limits=fixed,
