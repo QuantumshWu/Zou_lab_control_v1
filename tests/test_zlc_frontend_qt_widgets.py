@@ -1146,24 +1146,9 @@ def test_qt_public_facade_covers_every_production_consumer(monkeypatch) -> None:
 def test_current_user_and_maintainer_docs_name_only_the_new_ui_owners() -> None:
     paths = [
         ROOT / "README.md",
-        ROOT / "Zou_lab_control" / "frontend" / "README.md",
         ROOT / "docs" / "MAINTAINER_NOTES.md",
         ROOT / "docs" / "task_console_design" / "task_console_design_zh.texbody",
     ]
-    paths.extend(
-        (ROOT / "Zou_lab_control" / "frontend" / "content" / "manual_templates").glob(
-            "*.texbody"
-        )
-    )
-    paths.extend(
-        (
-            ROOT
-            / "Zou_lab_control"
-            / "neutral_atom"
-            / "content"
-            / "manual_templates"
-        ).glob("*.texbody")
-    )
     forbidden = (
         "qt_fluent",
         r"qt\_fluent",

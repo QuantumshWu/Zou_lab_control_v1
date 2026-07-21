@@ -1,150 +1,64 @@
-"""Zero residue as a NUMBER that may only fall, not a paragraph anyone can believe.
+"""Zero legacy residue -- the end state, asserted as arithmetic over the whole tree.
 
-The design document's Z0 section is a prose checklist of things that "must be 0",
-with no mechanical counterpart, and an audit found it unverifiable: it contained a
-ghost entry, a clause referring to a section that only forward-references itself,
-and no way to tell how far from zero anything actually was.  This file replaces
-belief with arithmetic.
+The one-shot purge (directive 2026-07-21) deleted the legacy backend trees, the
+legacy render pipeline and every migration bridge outright.  What remains is the
+original UI skeletons on the current zlc_* stack.  This file keeps that true: no
+budgets, no ledgers, no whitelists -- every count below is zero and stays zero.
 
-Every assertion is a property computed over ``git ls-files`` - never a hard-coded
-list of names, because a name list cannot catch the file nobody remembered.  Each
-one prints the offending paths so a failure is actionable without re-deriving it.
-
-Two shapes, chosen per assertion:
-
-* SHARP - the property already holds, so it is frozen as a ratchet.  Z4 is the
-  important one: not one of the six target packages imports the legacy tree
-  today, and this is what stops that from silently changing.
-* BUDGET - the property does not hold yet.  The count is recorded, may only
-  DECREASE, and reaching zero is what "migrated" means.  A budget is not a
-  tolerance: it is a debt with a number on it.
-
-Deliberately NOT here yet, so nothing pretends to be checked that is not:
-Z10 (every UX-ledger row closed or approved) needs a parser for the design
-document's table, and Z12 (every entry point resolves outside the rebuilt
-workbench) needs to import the product entries at test time.  Both land with the
-window work that makes them meaningful.
+Every assertion is a property computed over ``git ls-files`` (plus untracked,
+non-ignored files) -- never a hard-coded list of names, because a name list
+cannot catch the file nobody remembered.
 """
 
 from __future__ import annotations
 
-#: C41 -- this oracle guards a legacy artifact and is deleted in the same commit that
-#: deletes it (swept by test_design_charter).
-DIES_WITH = ('Zou_lab_control/frontend', 'Zou_lab_control/neutral_atom')
-
 import ast
 import fnmatch
 from pathlib import Path
-import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 
-#: The legacy subpackages Z0 deletes.  ``Zou_lab_control`` itself is NOT legacy -
-#: ``Zou_lab_control.notebook`` and ``.workbench`` are the user's entry points and
-#: survive - so the prefixes are named individually rather than by their root.
-LEGACY_PREFIXES = (
+#: Module prefixes that stopped existing at the purge.  An import of any of these,
+#: absolute or relative, eager or lazy, is residue.
+DEAD_PREFIXES = (
     "Zou_lab_control.frontend",
     "Zou_lab_control.neutral_atom",
+    "Zou_lab_control._clock",
     "Zou_lab_control._paths",
     "Zou_lab_control._readout_math",
-    "Zou_lab_control._viewer_registry",
-    "Zou_lab_control._clock",
     "Zou_lab_control._streamer_geometry",
+    "Zou_lab_control._viewer_registry",
+    "zlc_frontend.live_plot",
+    "zlc_frontend.qt_widgets.render_loop",
+    "zlc_workbench.task_console.plot_bridge_canvas",
+    "zlc_workbench.legacy",
 )
 
-LEGACY_TREES = ("Zou_lab_control/frontend/", "Zou_lab_control/neutral_atom/")
+#: Paths whose very existence is residue (trees and single files the purge removed).
+DEAD_PATHS = (
+    "Zou_lab_control/frontend",
+    "Zou_lab_control/neutral_atom",
+    "Zou_lab_control/_clock.py",
+    "Zou_lab_control/_paths.py",
+    "Zou_lab_control/_readout_math.py",
+    "Zou_lab_control/_streamer_geometry.py",
+    "Zou_lab_control/_viewer_registry.py",
+    "zlc_frontend/live_plot",
+    "zlc_frontend/qt_widgets/render_loop.py",
+    "zlc_workbench/task_console/plot_bridge_canvas.py",
+    "zlc_workbench/legacy.py",
+)
 
-#: The six target packages.  ``fpga`` is deliberately excluded: it is a separate
-#: published package with its own row in Z2, not one of the six.
-TARGET_PACKAGES = ("zlc_data/", "zlc_storage/", "zlc_pulse/", "zlc_neutral_atom/",
-                   "zlc_frontend/", "zlc_workbench/")
-
-# --------------------------------------------------------------------- budgets
-# Every number below was MEASURED, not estimated, and is mirrored in
-# the design doc's S4 progress ledger.  They may only be lowered.
-
-Z1_LEGACY_FILES = 122          # tracked files under the two legacy trees
-Z2A_PRODUCTION_IMPORTERS = {   # non-test code OUTSIDE legacy that still imports it
-    Path("docs/task_console_design/build.py"),
-    # The figure-viewer composition root: delegates to the legacy viewer stack while the
-    # 1033-line shell is dismantled.  Dies with the shell (C20/C25).  The root
-    # figure_viewer.py launcher left this table when it was re-pointed at this root.
-    Path("zlc_workbench/figure_viewer/app.py"),
-    # The viewer BODY + flow-graph view (whole-file moves); only the DOMAIN layer still
-    # crosses, and it goes when that layer reaches zlc_neutral_atom (C20/C25).
-    Path("zlc_workbench/figure_viewer/plot_bridge_figure_viewer.py"),
-    Path("zlc_workbench/figure_viewer/flow_graph_view.py"),
-    Path("fpga/pulse_streamer/sim/_gen_replay_t.py"),  # fpga -> legacy, and zlc_pulse -> fpga
-    # The task console's composition root, delegating the WHOLE window to the legacy shell
-    # while the shell is taken apart widget by widget.  Transitional by construction: every
-    # class that moves out shrinks this crossing, and it goes with the shell (C20/C25).
-    Path("zlc_workbench/task_console/app.py"),
-    # Same transitional delegation for the pulse editor composition root (C20/C25).
-    Path("zlc_workbench/pulse_editor/app.py"),
-    # The pulse editor BODY, moved whole out of the legacy shell.  Its remaining legacy
-    # imports are the DEVICE layer only (fpga_pulse_streamer geometry names + the runtime
-    # compiler for save-to-file); the crossing dies when the device layer reaches
-    # zlc_neutral_atom, and the file itself graduates out of plot_bridge at P5 (C20/C25).
-    Path("zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py"),
-}
-#: Whitelisted tests that reach into the legacy tree, NAMED rather than counted.
-#: A count would let one more slip in unnoticed; naming each makes every addition
-#: a decision.  Every entry is legitimate today and all die with what they guard:
-#: the migration ledgers must build the legacy windows in order to compare
-#: against them, which is the whole point of a parity oracle.
-Z2B_ACTIVE_TEST_IMPORTERS = {
-    Path("tests/test_calibration_sitemap_inputs.py"),   # legacy calibration inputs
-    Path("tests/test_public_hardware_boundary.py"),     # audits the legacy surface itself
-    Path("tests/test_u04_signal_picker_owner.py"),      # picker ownership across the move
-    Path("tests/test_u05_declaration_not_class.py"),    # pins predicates ON legacy console/domain nodes
-    Path("tests/test_u05_render_island.py"),            # proves the legacy console reaches the loop only via the island
-    Path("tests/test_u05_raster_front.py"),             # pins the legacy canvas' worker/GUI hand-off to the documented raster
-    Path("tests/test_u05_signal_expr_widget.py"),       # asserts the shell alias IS the moved class
-    Path("tests/test_u05_pulse_slots_widget.py"),       # same, for the last composite
-    Path("tests/test_u05_panel_config.py"),             # same, for the panel record the frontend re-exports
-    Path("tests/test_u05_console_state_format.py"),     # demonstrates the schema break on the real record
-    Path("tests/test_u05_project_root_single_source.py"),  # pins both shells onto the storage path seam
-    Path("tests/test_u05_console_state_module.py"),      # asserts the shell names ARE the moved objects
-    Path("tests/test_u05_panel_params_module.py"),       # same, for the panel-param catalog
-    Path("tests/test_u05_render_loop_module.py"),        # asserts the shim forwards to the moved worker
-    Path("tests/test_u06_shell_domain_ports.py"),       # proves the legacy root wires the port
-    Path("tests/test_zlc_frontend_form.py"),            # form parity across the move
-}
-#: 0 since the great cull: every off-manifest (frozen) test was DELETED outright -- git keeps
-#: them.  L3806 already made them non-evidence; keeping 176 dead files made tests/ unnavigable.
-Z2C_FROZEN_TEST_IMPORTERS = 0
-#: 19 as of the render-loop move: ``frontend/render_loop.py`` became a shim when the module
-#: itself went to ``zlc_frontend/qt_widgets``.  The count is allowed to RISE only when a move
-#: creates the shim -- which is the one legitimate reason -- and it must fall back to zero at Z0.
-Z3_FORWARDING_SHIMS = 30   # +7: the pulse domain (pulse_table/sequence/ports/_serialization/
-                           # _clock/_streamer_geometry -> zlc_neutral_atom.timing) and
-                           # _viewer_registry (-> zlc_data) left shims behind
-                           # +1: frontend/pulse_gui.py became the alias shell of
-                           # zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py
-                           # +2: frontend/figure_viewer.py + flow_graph_view.py became
-                           # shims of the zlc_workbench/figure_viewer package
-Z7_REBUILT_WORKBENCH_FILES = 12
-#: 0 forever: after the cull the manifest IS the suite.  A test file not on the manifest is no
-#: longer a frozen archive entry -- it is a mistake, and this guard says so immediately.
-Z8_TESTS_OFF_THE_MANIFEST = 0
-
-#: The S0.5 bridges that were actually BUILT.  The design document names four
-#: symbols; two of them (``LegacyPanelHost``, ``LegacyRuntimeFence``) have zero
-#: class definitions in the repository and never did - see the design doc
-#: section 3 F4.  Asserting on the two real ones keeps Z0 from hunting ghosts.
-Z6_BRIDGES = ("CatalogRouter", "SerializedLegacyAggBridge")
-Z6_BRIDGE_DEFINITIONS = 2
+#: Migration-bridge classes.  All died with the purge; a re-definition anywhere is
+#: a bridge being rebuilt, which the end state forbids.
+DEAD_BRIDGE_CLASSES = ("CatalogRouter", "SerializedLegacyAggBridge",
+                       "LegacyPanelHost", "LegacyRuntimeFence")
 
 
 def _tracked(pattern: str = "") -> tuple[str, ...]:
-    """Tracked files PLUS untracked-but-not-ignored ones.
-
-    ``git ls-files`` alone lists only the index, so a brand new file is invisible
-    until it is staged - and a guard that cannot see the file you just wrote
-    gives false comfort exactly when you are most likely to be adding residue.
-    Found by mutation: creating a new forwarding shim did not move the Z3 budget.
-    """
+    """Tracked files PLUS untracked-but-not-ignored ones, so a brand-new file is
+    visible to the guard before it is staged."""
 
     args = ["git", "ls-files", "--cached", "--others", "--exclude-standard"]
     if pattern:
@@ -153,200 +67,78 @@ def _tracked(pattern: str = "") -> tuple[str, ...]:
     return tuple(sorted({line for line in out.stdout.split() if line}))
 
 
-def _imported_roots(relative: str) -> set[str]:
-    """Every absolute module this file imports, including lazy in-function ones."""
+def _is_dead(dotted: str) -> bool:
+    return any(dotted == p or dotted.startswith(p + ".") for p in DEAD_PREFIXES)
+
+
+def _resolved_imports(relative: str):
+    """Every absolute dotted target this file imports, with relative imports
+    resolved against the file's package -- a ``from .render_loop import X`` inside
+    ``zlc_frontend/qt_widgets/`` must count as ``zlc_frontend.qt_widgets.render_loop``."""
 
     tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"), filename=relative)
-    names: set[str] = set()
+    parts = relative[:-3].split("/")
+    package = parts[:-1] if not relative.endswith("__init__.py") else parts[:-1]
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            names.add(node.module)
+        if isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                target = node.module or ""
+            else:
+                if node.level > len(package):
+                    continue
+                anchor = package[: len(package) - node.level + 1]
+                target = ".".join([*anchor, *([node.module] if node.module else [])])
+            if target:
+                yield target, node.lineno
         elif isinstance(node, ast.Import):
-            names.update(alias.name for alias in node.names)
-    return names
+            for alias in node.names:
+                yield alias.name, node.lineno
 
 
-def _legacy_importers() -> set[str]:
-    return {
-        path for path in _tracked("*.py")
-        if any(name.startswith(LEGACY_PREFIXES) for name in _imported_roots(path))
-    }
+def test_the_dead_paths_stay_dead():
+    present = [p for p in DEAD_PATHS if (ROOT / p).exists()]
+    assert not present, f"purged paths have reappeared: {present}"
+    ghosts = [p for p in _tracked() if p.startswith(tuple(t + "/" for t in DEAD_PATHS))]
+    assert not ghosts, f"files exist under purged trees: {ghosts[:20]}"
 
 
-def _fail(label: str, offenders, budget: int, remedy: str):
-    offenders = sorted(offenders)
-    assert len(offenders) <= budget, (
-        f"{label}: {len(offenders)} exceeds the recorded budget of {budget}.\n"
-        + "\n".join(f"  {item}" for item in offenders[:40])
-        + (f"\n  ... and {len(offenders) - 40} more" if len(offenders) > 40 else "")
-        + f"\n{remedy}"
-    )
-
-
-# ------------------------------------------------------------------ the ratchet
-
-
-#: The ONLY files in the six packages allowed to reach into the legacy tree, named one by one.
-#:
-#: This began as an absolute ban and it was green -- but only because the entry had been
-#: re-pointed away from the operator's console, leaving the legacy shell with no importer at
-#: all.  Greenness bought by abandoning the window the user opens is not an invariant worth
-#: keeping.  Restoring the entry means ONE file knows both worlds, so the rule becomes: the
-#: crossing lives in a composition root and nowhere else, by name, with a death condition.
-Z4_COMPOSITION_ROOTS = {
-    # Delegates the whole task console window to the legacy shell while that shell is taken
-    # apart widget by widget.  Shrinks every round; deleted with the shell (C20/C25).
-    Path("zlc_workbench/task_console/app.py"),
-    # The pulse editor's composition root: delegates to the legacy editor stack while the
-    # 4475-line shell is dismantled.  Dies with the shell (C20/C25).
-    Path("zlc_workbench/pulse_editor/app.py"),
-    # The pulse editor BODY (the whole 4475-line module, moved out of the legacy shell).
-    # Only the DEVICE layer still crosses: fpga_pulse_streamer geometry names and the
-    # lazy runtime compiler in save_to_file.  The crossing dies when the device layer
-    # moves to zlc_neutral_atom; the file graduates from plot_bridge at P5 (C20/C25).
-    Path("zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py"),
-    # The figure viewer's composition root: same transitional delegation (C20/C25).
-    Path("zlc_workbench/figure_viewer/app.py"),
-    # The viewer BODY and its flow-graph view, moved whole out of the legacy shell.
-    # Remaining legacy imports are the DOMAIN layer only (SignalHub/signal_tensor/
-    # operations.logic; format_dims lazily) - they die when that layer reaches
-    # zlc_neutral_atom, and the body graduates from plot_bridge at P5 (C20/C25).
-    Path("zlc_workbench/figure_viewer/plot_bridge_figure_viewer.py"),
-    Path("zlc_workbench/figure_viewer/flow_graph_view.py"),
-}
-
-
-def test_z4_only_named_composition_roots_import_the_legacy_tree():
-    """SHARP on identity, not on count.
-
-    A single lazy import from any of the six into the legacy tree would make the new
-    architecture undeletable, and it would not show up until that line ran.  Naming the
-    exceptions keeps that force: a crossing anywhere else is still a hard failure, and each
-    named one carries what has to become true for it to go away.
-    """
-
+def test_no_python_file_imports_a_dead_module():
     offenders = sorted(
-        f"{path} -> {name}"
+        f"{path}:{lineno} -> {target}"
         for path in _tracked("*.py")
-        if path.startswith(TARGET_PACKAGES) and Path(path) not in Z4_COMPOSITION_ROOTS
-        for name in _imported_roots(path)
-        if name == "Zou_lab_control" or name.startswith("Zou_lab_control.")
+        for target, lineno in _resolved_imports(path)
+        if _is_dead(target)
     )
     assert not offenders, (
-        "a target package reached into the legacy tree:\n"
-        + "\n".join(f"  {item}" for item in offenders)
-        + "\nThe six packages must be deletable-independent of Zou_lab_control. "
-          "If a live domain object is genuinely needed, add a port in "
-          "zlc_frontend/domain_ports.py and inject it from a composition root -- and only "
-          "a root named in Z4_COMPOSITION_ROOTS may hold the crossing itself."
-    )
-    stale = sorted(str(item) for item in Z4_COMPOSITION_ROOTS if not (ROOT / item).exists())
-    assert not stale, f"Z4_COMPOSITION_ROOTS names files that are gone: {stale}"
-
-
-def test_z1_the_legacy_trees_shrink():
-    files = [p for p in _tracked() if p.startswith(LEGACY_TREES)]
-    _fail("Z1 legacy tracked files", files, Z1_LEGACY_FILES,
-          "Files leave these trees by being salvaged into a target package "
-          "(design doc L4648, shell salvage), never by being copied.")
-
-
-def test_z2a_production_code_outside_legacy_has_a_named_ledger():
-    """Sharp on identity, not just count: every file has a known fate.
-
-    build.py is a documentation builder, _gen_replay_t.py is the fpga->legacy
-    edge that matters because eleven modules in zlc_pulse/zlc_neutral_atom import
-    fpga - so the new pulse stack depends transitively on the legacy tree.  The
-    rest are the window composition roots / moved window bodies, each transitional
-    by construction (C20/C25); the root launchers themselves now import only their
-    composition roots and left this table.
-    """
-
-    found = {
-        Path(path) for path in _legacy_importers()
-        if not path.startswith(LEGACY_TREES) and not path.startswith("tests/")
-    }
-    grew = found - Z2A_PRODUCTION_IMPORTERS
-    assert not grew, (
-        "new production code outside the legacy trees now imports them:\n"
-        + "\n".join(f"  {item}" for item in sorted(grew))
-    )
-    gone = Z2A_PRODUCTION_IMPORTERS - found
-    assert not gone, (
-        f"{sorted(str(p) for p in gone)} no longer import legacy; delete those "
-        "rows from Z2A_PRODUCTION_IMPORTERS in the same commit."
+        "these files import purged legacy modules:\n"
+        + "\n".join(f"  {item}" for item in offenders[:40])
     )
 
 
-def test_z2bc_test_dependence_on_legacy_shrinks():
-    manifest = {
-        line.strip().replace("\\", "/")
-        for line in (ROOT / "tests" / "migration_active_tests.txt")
-        .read_text(encoding="utf-8").split()
-        if line.strip()
-    }
-    importers = {p for p in _legacy_importers() if p.startswith("tests/")}
-    active = {p for p in importers if p in manifest}
-    frozen = importers - active
-
-    named = {Path(path) for path in active}
-    grew = named - Z2B_ACTIVE_TEST_IMPORTERS
-    assert not grew, (
-        "a whitelisted test started reaching into the legacy tree:\n"
-        + "\n".join(f"  {item}" for item in sorted(grew))
-        + "\nIf it genuinely must build a legacy window to compare against, add it "
-          "to Z2B_ACTIVE_TEST_IMPORTERS with the reason - a NAMED dependency is a "
-          "decision, a counted one is a leak."
-    )
-    gone = Z2B_ACTIVE_TEST_IMPORTERS - named
-    assert not gone, (
-        f"{sorted(str(p) for p in gone)} no longer reach legacy; delete those rows "
-        "from Z2B_ACTIVE_TEST_IMPORTERS in the same commit."
-    )
-    _fail("Z2c frozen tests importing legacy", frozen, Z2C_FROZEN_TEST_IMPORTERS,
-          "Frozen files are never edited; this budget falls only by DELETING them.")
-
-
-def test_z3_forwarding_shims_shrink():
-    shims = [
-        p for p in _tracked("*.py")
-        if not p.startswith("tests/") and "MOVED to" in (ROOT / p).read_text(encoding="utf-8")
-    ]
-    _fail("Z3 forwarding shims", shims, Z3_FORWARDING_SHIMS,
-          "A shim exists only while both paths must work. Z0 deletes every one.")
-
-
-def test_z6_only_the_bridges_that_exist_are_tracked():
+def test_no_migration_bridge_class_is_defined():
     definitions = sorted(
         f"{path}:{node.lineno} {node.name}"
         for path in _tracked("*.py")
         for node in ast.walk(ast.parse((ROOT / path).read_text(encoding="utf-8"), filename=path))
-        if isinstance(node, ast.ClassDef) and node.name in Z6_BRIDGES
+        if isinstance(node, ast.ClassDef) and node.name in DEAD_BRIDGE_CLASSES
     )
-    _fail("Z6 migration bridges still defined", definitions, Z6_BRIDGE_DEFINITIONS,
-          "The design document requires all migration bridges to be 0 at Z0.")
-
-    ghosts = sorted(
-        name for name in ("LegacyPanelHost", "LegacyRuntimeFence")
-        for path in _tracked("*.py")
-        for node in ast.walk(ast.parse((ROOT / path).read_text(encoding="utf-8"), filename=path))
-        if isinstance(node, ast.ClassDef) and node.name == name
-    )
-    assert not ghosts, (
-        f"{ghosts} now exist as classes. They never did - the design document "
-        "names them but nobody wrote them (design doc, S4 ledger). "
-        "If one is genuinely being built, move it into Z6_BRIDGES."
-    )
+    assert not definitions, f"migration bridges are being rebuilt: {definitions}"
 
 
-def test_z7_the_rebuilt_workbench_shrinks():
-    files = [p for p in _tracked("*.py") if p.startswith("Zou_lab_control/workbench/")]
-    _fail("Z7 rebuilt workbench modules", files, Z7_REBUILT_WORKBENCH_FILES,
-          "Each falls when its window's UX is restored onto the section 12.5 "
-          "board and the entry point is repointed - the two happen in ONE commit.")
+def test_no_forwarding_shim_remains():
+    shims = [
+        p for p in _tracked("*.py")
+        if not p.startswith("tests/")
+        and "MOVED to" in (ROOT / p).read_text(encoding="utf-8")
+    ]
+    assert not shims, f"forwarding shims remain: {shims}"
 
 
-def test_z8_the_evidence_surface_grows_to_cover_every_test():
+def test_the_manifest_is_the_suite():
+    """Anti-cheat: a test file off the manifest is a mistake, not an archive --
+    while files sit outside it, 'the suite is green' means 'the collected part
+    is green'."""
+
     manifest = {
         line.strip().replace("\\", "/")
         for line in (ROOT / "tests" / "migration_active_tests.txt")
@@ -354,10 +146,7 @@ def test_z8_the_evidence_surface_grows_to_cover_every_test():
         if line.strip()
     }
     all_tests = {p for p in _tracked() if fnmatch.fnmatch(p, "tests/test_*.py")}
-    _fail("Z8 tests off the manifest", all_tests - manifest, Z8_TESTS_OFF_THE_MANIFEST,
-          "This is the anti-cheat clause: while files sit outside the manifest, "
-          "'the suite is green' means 'the collected part is green'. The budget "
-          "falls by deleting a frozen file or by making it pass and listing it - "
-          "never by moving a red test OUT.")
-
-
+    off = sorted(all_tests - manifest)
+    assert not off, f"tests off the manifest: {off}"
+    missing = sorted(p for p in manifest if not (ROOT / p).exists())
+    assert not missing, f"manifest names tests that do not exist: {missing}"

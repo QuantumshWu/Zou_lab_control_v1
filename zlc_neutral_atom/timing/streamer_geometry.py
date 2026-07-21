@@ -50,12 +50,14 @@ try:  # pragma: no cover - exercised whenever the fpga package is importable (th
     DEFAULT_BUS_WIDTH = int(_CFG_PARAMS.bus_width)
     EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "evt_fifo_depth", 64))
     BUS_EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "bus_evt_fifo_depth", 32))
+    DEFAULT_MAX_EDGES = int(_CFG_PARAMS.max_edges)
 except Exception:  # pragma: no cover - fpga package not importable
     DEFAULT_FPGA_CHANNEL_COUNT = 62
     DEFAULT_BUS_COUNT = 4
     DEFAULT_BUS_WIDTH = 10
     EVT_FIFO_DEPTH = 64
     BUS_EVT_FIFO_DEPTH = 32
+    DEFAULT_MAX_EDGES = 4096
 
 
 def hardware_channel_names(count: int = DEFAULT_FPGA_CHANNEL_COUNT) -> list[str]:
@@ -82,6 +84,6 @@ def delay_eligible_channel_count(channel_count: int, bus_count: int = DEFAULT_BU
 
 __all__ += [
     "DEFAULT_FPGA_CHANNEL_COUNT", "DEFAULT_BUS_COUNT", "DEFAULT_BUS_WIDTH",
-    "EVT_FIFO_DEPTH", "BUS_EVT_FIFO_DEPTH",
+    "EVT_FIFO_DEPTH", "BUS_EVT_FIFO_DEPTH", "DEFAULT_MAX_EDGES",
     "hardware_channel_names", "delay_eligible_channel_count",
 ]

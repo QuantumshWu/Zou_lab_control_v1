@@ -18,9 +18,6 @@ from __future__ import annotations
 
 #: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
 #: file guards the NEW structure and is permanent (swept by test_design_charter).
-DIES_WITH_PARTIAL = {
-    "test_the_legacy_name_is_the_same_class": 'Zou_lab_control/frontend/task_console.py',
-}
 
 import ast
 import pathlib
@@ -127,7 +124,3 @@ def test_the_widget_module_pulls_in_no_renderer():
     assert not any(m.split(".")[0] == "matplotlib" for m in modules), modules
 
 
-def test_the_legacy_name_is_the_same_class():
-    from Zou_lab_control.frontend.task_console import _PulseSlotsWidget
-
-    assert _PulseSlotsWidget is PulseSlotsWidget

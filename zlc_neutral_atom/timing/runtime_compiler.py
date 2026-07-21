@@ -1839,7 +1839,7 @@ def _check_unrolled_edge_budget(
     hold).  ``validate_pulse_streamer_program`` is the authoritative gate; this just
     front-loads a friendlier message that names the inner repeat as the cause."""
 
-    from .fpga_pulse_streamer import DEFAULT_MAX_EDGES
+    from .streamer_geometry import DEFAULT_MAX_EDGES
 
     # 2 edges per ON run + a tick-0 anchor + a final off edge is a generous upper bound;
     # the real count is <= this, so we never reject a program the streamer could hold.

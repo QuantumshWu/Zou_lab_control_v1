@@ -32,10 +32,6 @@ from __future__ import annotations
 
 #: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
 #: file guards the NEW structure and is permanent (swept by test_design_charter).
-DIES_WITH_PARTIAL = {
-    "test_the_shell_takes_all_five_names_from_the_new_home": 'Zou_lab_control/frontend/task_console.py',
-    "test_the_legacy_names_are_the_same_objects": 'Zou_lab_control/frontend/task_console.py',
-}
 
 import ast
 import json
@@ -157,27 +153,5 @@ def test_the_module_reaches_for_no_renderer_and_no_toolkit():
                      "zlc_data", "zlc_storage"}, roots
 
 
-def test_the_shell_takes_all_five_names_from_the_new_home():
-    """Structural, so a shell that kept its own copy would pass every behaviour test."""
-
-    tree = ast.parse((REPO / "Zou_lab_control" / "frontend" / "task_console.py")
-                     .read_text(encoding="utf-8"))
-    sources: dict[str, set[str]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module:
-            for alias in node.names:
-                sources.setdefault(alias.name, set()).add(node.module)
-    for name in ("TaskConsoleState", "default_console_state", "resolve_task_state",
-                 "task_files_dir", "TASK_FILES_ENV"):
-        assert sources.get(name) == {"zlc_frontend.console_state"}, (name, sources.get(name))
 
 
-def test_the_legacy_names_are_the_same_objects():
-    """The frontend package re-exports these, and figure_viewer / devtools build them."""
-
-    from Zou_lab_control.frontend import task_console as shell
-
-    assert shell.TaskConsoleState is TaskConsoleState
-    assert shell.default_console_state is default_console_state
-    assert shell.resolve_task_state is resolve_task_state
-    assert shell.TASK_FILES_ENV == TASK_FILES_ENV

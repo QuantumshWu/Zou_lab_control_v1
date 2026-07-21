@@ -92,85 +92,16 @@ def test_the_lookup_is_the_same_objects_as_the_table():
     assert all(PLOT_KIND_SPEC_BY_KEY[spec.key] is spec for spec in PLOT_KIND_SPECS)
 
 
-def test_no_kind_can_be_silently_dropped():
-    """The two-step assembly, made mechanical.
-
-    ``GridPlot`` is defined after the table, so ``grid`` is bound in a second step.  That
-    is a fact about class-definition ORDER in one file, and the vocabulary must not know
-    about it: the literal carries all seven kinds.  What the render layer must guarantee
-    is that its two steps between them cover every spec -- a spec in neither the eager map
-    nor the late list would produce a table missing a kind, and nothing else would fail.
-    """
-
-    from zlc_frontend.live_plot import live
-
-    eager = set(live._CLS_BY_KEY)
-    late = set(live._LATE_BOUND_KEYS)
-    vocabulary = {spec.key for spec in PLOT_KIND_SPECS}
-    assert eager.isdisjoint(late), eager & late
-    assert eager | late == vocabulary, vocabulary - (eager | late)
-    assert [pk.key for pk in live.PLOT_KINDS] == [spec.key for spec in PLOT_KIND_SPECS]
 
 
-def test_each_row_pairs_the_shared_spec_object_with_its_renderer():
-    """Delegation, not duplication: the row holds the SAME spec, so it cannot disagree."""
-
-    from zlc_frontend.live_plot import live
-
-    for pk in live.PLOT_KINDS:
-        assert pk.spec is PLOT_KIND_SPEC_BY_KEY[pk.key]
-        assert pk.cls.__name__ == GOLDEN_CLS[pk.key]
-        # Read through the row exactly as every existing caller does.
-        assert (pk.label, pk.render_family, pk.panel, pk.input_format,
-                pk.input_slots, pk.single_slot, pk.repeat_modes) == GOLDEN[pk.key]
-        # ... and the mutable-looking ones are the spec's own objects, not copies.
-        assert pk.input_slots is pk.spec.input_slots
-        assert pk.repeat_modes is pk.spec.repeat_modes
 
 
-def test_the_row_stores_only_the_spec_and_the_class():
-    """A vocabulary field copied back into the row would pass every test above."""
-
-    from zlc_frontend.live_plot.live import PlotKind
-
-    assert set(PlotKind.__dataclass_fields__) == {"spec", "cls"}
 
 
-def test_binding_the_late_kinds_again_changes_nothing():
-    """It runs at import; a second call (re-import, a test) must not duplicate a row."""
-
-    from zlc_frontend.live_plot import live
-
-    before = live.PLOT_KINDS
-    live._bind_late_plot_kinds()
-    assert live.PLOT_KINDS is before
-    assert [pk.key for pk in live.PLOT_KINDS].count("grid") == 1
 
 
-def test_a_plotter_still_resolves_back_to_its_kind():
-    """The class half of the pairing, exercised rather than merely stored."""
-
-    from zlc_frontend.live_plot import live
-
-    for pk in live.PLOT_KINDS:
-        assert live.kind_for_plotter(pk.cls.__new__(pk.cls)) == pk.key
-    assert live.kind_for_plotter(object()) is None
 
 
-def test_every_offered_repeat_verb_is_one_the_reducer_implements():
-    """The kinds' menus and the reducer's verb set are TWO facts, deliberately not merged.
-
-    ``live.REPEAT_MODES`` is what the reduction code can actually do; each kind's
-    ``repeat_modes`` is what its menu offers.  They coincide today for the rolling trace,
-    which is exactly why merging them would be wrong -- one is a capability, the other a
-    per-kind choice.  The relation that must hold is containment: a menu may never offer a
-    verb the reducer would ignore.
-    """
-
-    from zlc_frontend.live_plot import live
-
-    offered = {mode for spec in PLOT_KIND_SPECS for mode in spec.repeat_modes}
-    assert offered <= live._REDUCE_REPEAT_MODES, offered - live._REDUCE_REPEAT_MODES
 
 
 def test_the_vocabulary_module_reaches_for_no_renderer_and_no_toolkit():
@@ -188,7 +119,6 @@ def test_the_vocabulary_module_reaches_for_no_renderer_and_no_toolkit():
     # zlc_data.console_records with PanelConfig, so the derivation -- and with it this
     # import -- now sits one layer down; the console reads the PANEL vocabulary instead.
     ("zlc_data/console_records.py", {"PLOT_KIND_SPECS", "PLOT_KIND_SPEC_BY_KEY"}),
-    ("zlc_frontend/live_plot/plot_figure.py", {"PLOT_KIND_SPECS", "PLOT_KIND_SPEC_BY_KEY"}),
     # The viewer body moved whole into the workbench app package; the pin follows the code.
     ("zlc_workbench/figure_viewer/plot_bridge_figure_viewer.py", {"PLOT_KIND_SPEC_BY_KEY"}),
 ])
@@ -208,15 +138,3 @@ def test_each_vocabulary_reader_names_the_new_home(relative, expected):
         assert imported.get(name) == {"zlc_data.plot_kind"}, (name, imported.get(name))
 
 
-def test_the_console_no_longer_pulls_the_render_table_in_to_read_words():
-    """The payoff: building the Add-Panel menu stopped being a rendering question.
-
-    The console still reaches for ``PLOT_KIND_BY_KEY`` inside two functions that genuinely
-    need a CLASS; what must not come back is the module-level import that made merely
-    importing the console drag the table along."""
-
-    tree = _module_tree(REPO / "Zou_lab_control" / "frontend" / "task_console.py")
-    top_level = {alias.name for node in tree.body
-                 if isinstance(node, ast.ImportFrom) for alias in node.names}
-    assert "PLOT_KINDS" not in top_level
-    assert "PLOT_KIND_BY_KEY" not in top_level

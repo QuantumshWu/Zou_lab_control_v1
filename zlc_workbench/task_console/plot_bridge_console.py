@@ -55,7 +55,6 @@ from zlc_frontend.console_state import (
     resolve_task_state,
     task_files_dir as _task_files_dir,
 )
-from zlc_frontend.live_plot.live import recommended_grid_size, region_binding
 from zlc_data.console_records import (
     ADDABLE_PANEL_KINDS,
     DEFAULT_UPDATE_MS,
@@ -245,9 +244,8 @@ class TaskConsole(QtWidgets.QWidget):
         self._task_output_node = None          # running Task whose typed TaskOutput feeds the panel
         self._task_card_tensor = None          # immutable latest SignalTensor, including validity
         self._task_locked = False              # True while a task runs -> all other actions blocked
-        # During whole-console shutdown a task panel cannot be destroyed while the render worker may
-        # still own its Figure.  Node termination therefore detaches the task state and parks the card
-        # here; only a confirmed RenderLoop join permits the UI-teardown phase to remove it.
+        # During whole-console shutdown node termination detaches the task state and parks the
+        # card here; the UI-teardown phase removes it once the nodes have stopped.
         self._defer_task_card_teardown = False
         self._deferred_task_card: "PanelCard | None" = None
 
@@ -260,20 +258,10 @@ class TaskConsole(QtWidgets.QWidget):
         # related view signals publishes them atomically, so companion values remain
         # shot-coherent without console-side joins.
 
-        # The ONE background render thread: every steady-tick compose (numpy prep + matplotlib
-        # artist updates + Agg rasterisation) runs there; the GUI thread only schedules, presents
-        # the finished front buffers, and serves interaction -- so a slow render lowers the plot
-        # frame rate, never the UI's responsiveness (see frontend/render_loop.py for the ownership
-        # protocol).  Structural builds (Qt widgets) come back to the GUI via _on_render_batch.
-        # Created BEFORE the UI build: load_state constructs panel cards, which take the barrier.
-        # L596: an un-migrated shared-Figure RenderLoop is only allowed to live INSIDE the
-        # SerializedLegacyAggBridge island, so the shell never holds the raw loop.  The bridge is
-        # fail-closed: a handoff that does not settle raises instead of letting this thread touch a
-        # Figure the worker may still own.  Every access below goes through _render_barrier().
-        from zlc_workbench.legacy import SerializedLegacyAggBridge
-
-        RenderLoop = _qt_widgets.render_loop.RenderLoop
-        self._render = SerializedLegacyAggBridge(RenderLoop(self._on_render_batch, parent=self))
+        # Rendering is SYNCHRONOUS on the GUI thread: _tick composes due panels directly (the
+        # same two-phase compose/present path refresh_once always used).  The legacy render
+        # worker and its hand-off bridge died with the legacy tree (purge 2026-07-21); a
+        # threaded pipeline, if wanted, is rebuilt on the current zlc_frontend render stack.
 
         self._build_ui()
         self.load_state(self.state)
@@ -1983,64 +1971,6 @@ class TaskConsole(QtWidgets.QWidget):
                          "ok" if valid else "invalid", quality, n_points,
                          node.fit_request.coordinate_frame)
 
-    def _update_fit_overlays(self) -> None:
-        """GUI thread (after each coherent present): push every fit panel's per-panel FitProcessor
-        PUBLISHED result to its plotter's DISPLAY-only overlay AND to the fit result line on BOTH surfaces
-        (the Setting popup + the open Edit tab).  This is how a fit reaches the plot now -- the overlay
-        reconstructs the curve/dot from published parameters, never solving on the Qt thread (#6).  Gated
-        on the node's published version so an unchanged fit costs nothing (and the result labels are
-        change-gated on top, so no per-tick setText thrash)."""
-        from zlc_frontend.live_plot.live import GridPlot
-        for card in self.cards:
-            plotter = card.plotter
-            is_grid = isinstance(plotter, GridPlot)
-            if plotter is None or not (is_grid or hasattr(plotter, "apply_published_fit")):
-                continue
-            row = self._panel_analysis_row(card)
-            node = self._logic_nodes.get(id(row)) if row is not None else None
-            # A node publishes fit parameters when it SAYS it does.  An Analysis node inherits BOTH
-            # strategies and its ``provides`` dispatches on the CURRENT action (analysis.py keeps
-            # declared == published per action), so the declaration already answers "is this fitting
-            # right now" -- and it names the very signal the version gate below reads, so the test and
-            # the gate cannot drift apart.
-            if node is None:                       # no analysis node bound to this panel yet
-                continue
-            fit_valid = f"{node.prefix}fit_valid"   # every LogicNode carries prefix/published_signals
-            if fit_valid not in node.published_signals():
-                continue
-            version = self.hub.signal_versions().get(fit_valid, -1)
-            if is_grid:
-                # #6b: a facet grid fit is the SAME worker node, publishing per-cell params.  Push them
-                # to the grid, which reconstructs each cell's curve (solve=False) -- so a grid fit NEVER
-                # solves on the Qt thread either.  Gate on the version, but ALSO push once when the grid
-                # is not yet in console (display-only) mode, so it stops solving in place from the start.
-                if self._fit_overlay_pushed.get(id(card)) == version \
-                        and getattr(plotter, "_published_cell_popt", None) is not None:
-                    continue
-                self._fit_overlay_pushed[id(card)] = version
-                model, cell_popts = self._published_cell_fits(node)
-                plotter.apply_published_cell_fits(cell_popts, model=model)
-                card._set_fit_result_text(self._published_fit_result(node))
-                continue
-            # Skip only when the version is unchanged AND this very plotter already carries the pushed
-            # overlay: a legitimate structural rebuild swaps in a FRESH plotter (which never had
-            # apply_published_fit called -- no _fit_overlay_result attribute), and without this second
-            # gate an unchanged fit version would leave the new plotter overlay-less until the next fit
-            # publish (the #3 risks' one-line hygiene fix, keyed on the plotter instead of a card hook).
-            if self._fit_overlay_pushed.get(id(card)) == version \
-                    and hasattr(plotter, "_fit_overlay_result"):
-                continue
-            self._fit_overlay_pushed[id(card)] = version
-            result = self._published_fit_result(node)
-            plotter.apply_published_fit(result)
-            # #6 stale-result fix: the node's SOLVED result now reaches the fit result line on BOTH
-            # surfaces (previously only overlays updated, so the Setting result row said 'not fitted'
-            # forever).  Both writers change-gate, so this is free when the text is unchanged.
-            card._set_fit_result_text(result)
-            editor = self._panel_editors.get(id(card))
-            edit_controls = getattr(editor, "_analysis_controls", None) if editor is not None else None
-            if edit_controls is not None:
-                edit_controls.set_result(card._fit_result_text(result))
 
     def _published_cell_fits(self, node) -> tuple[str, dict]:
         """Read a facet FitProcessor node's PUBLISHED per-cell params off the hub as ``(model_key,
@@ -2065,62 +1995,6 @@ class TaskConsole(QtWidgets.QWidget):
                 cell_popts[k] = vec
         return model.key, cell_popts
 
-    def _apply_panel_analysis(self, card: "PanelCard", *, action: str, selection, extra_values=None,
-                              node_params=None) -> None:
-        """The ONE create/retarget seam for BOTH analysis actions: publish the panel's region signal,
-        then land ``action`` (+ per-action values) on the panel's Analysis row.
-
-        * row exists -> RETARGET IT (running or stopped): update ``row.node.values`` (the persisted
-          truth) and, when the node is LIVE, queue ``set_acquisition_parameters`` so the worker
-          switches action / model between shots.  A STOPPED row is never deleted and never
-          auto-started -- stop means frozen; the status hints at the Logic tab (its lingering
-          outputs stay viewable, and Start replays the freshly republished region).
-        * no row -> CREATE one Analysis row (the single catalog spec) and Start it.
-
-        The old delete-and-recreate branches (which silently destroyed a user-stopped row, purged
-        its lingering signals, and re-started against their intent) are gone: fit<->roi is a
-        parameter switch on the SAME node/row/region."""
-        from zlc_data.vocabulary import ANALYSIS_SPEC_NAME
-        from zlc_data.signal_expr import DEFAULT_SOURCE
-        signal = str(card.config.inputs[0]) if card.config.inputs else ""
-        if not signal:
-            card.set_status("pick a signal in Setting before an analysis", error=True)
-            return
-        if self._task_locked:
-            card.set_status("console is locked by a running task", error=True)
-            return
-        bound = region_binding(
-            card.config.kind, selection,
-            structure=card._bound_structure(),
-            coordinates=card._selection_coordinates_for_binding(),
-            origin=selection.metadata.get("origin", (0.0, 0.0)))
-        region_name = self._publish_region(card, bound)
-        values = {"action": str(action), "region": region_name, **dict(extra_values or {})}
-        verb = "fit" if action == "fit" else "ROI"
-        row = self._panel_analysis_row(card)
-        if row is not None:
-            row.node.values = {**dict(row.node.values or {}), **values}
-            editor = self._logic_editors.get(id(row))
-            if editor is not None and hasattr(getattr(editor, "form", None), "seed_values"):
-                editor.form.seed_values(values)
-            node = self._logic_nodes.get(id(row))
-            if node is not None:
-                node.apply_acquisition_parameters(**dict(node_params or {}), action=str(action))
-                card.set_status(f"{verb} -> {row.node.title}", error=False)
-            else:
-                card.set_status(f"{row.node.title} is stopped — Start it from the Logic tab",
-                                error=False)
-            self._mark_dirty()
-            return
-        cfg = LogicNodeConfig(
-            kind="processor", name=ANALYSIS_SPEC_NAME,
-            title=self._analysis_node_title(card),
-            values={"source": {"inputs": [signal], "source": DEFAULT_SOURCE}, **values})
-        new_row = self._add_logic_node(cfg, focus=False)   # stay on the Monitor board -- no tab jump
-        self._start_logic_node(new_row)
-        started = self._logic_nodes.get(id(new_row)) is not None
-        card.set_status(f"{verb} -> {cfg.title}" + ("" if started else " (start failed — see Logic tab)"),
-                        error=not started)
 
     def _sync_fit_node(self, card: "PanelCard", request) -> None:
         """The console's ONE fit sink (wired to :attr:`PanelCard.fit_node_sink`): land the panel's fit
@@ -2382,32 +2256,6 @@ class TaskConsole(QtWidgets.QWidget):
         if getattr(node, "layer", "") == "task":
             self._set_task_running(row, node)
 
-    def _task_mid_run_config(self, spec, node, *, title: str) -> "PanelConfig":
-        """The task's mid-run panel, DECLARED as a plain ``PanelConfig`` -- so it is built by the SAME
-        ``_new_panel_card`` path a manually Added / a saved-and-reloaded panel uses, never a bespoke
-        widget.  The task declares only DATA: its spec's ``default_kind`` + ``mid_run_key`` and, for a
-        SCANNING task, its ``grid_shape`` (a plain tuple).  The console maps that to a panel whose size
-        comes from the ONE :func:`recommended_grid_size` rule (a few cells -> ``2x2``, never a magic
-        size) and whose cmap the ONE ``_resolved_cmap`` resolver fills at draw (render == Setting).
-
-        A scanning task (``default_kind='grid'`` + a >=2-D grid_shape) shows a live facet grid over its
-        LAST scan axis -- one 2-D map per outer-axis plane, filling in point-by-point (the SAME facet
-        machinery a pulse-scan grid panel uses; the panel's ``sub_plot_kind`` auto-derives from the
-        remaining axes, so it is not hand-set here).  Anything else is a plain frame panel.  Every task
-        panel reads the reserved ``__task_frame__`` the console injects each tick from the task's OWN
-        typed TaskOutput (off the hub, #6).  Its SignalSchema reaches the generic panel through
-        ``_signal_structure`` exactly like a Hub tensor; no shape is copied into panel params."""
-        kind = str(getattr(spec, "default_kind", "2d") or "2d")
-        source = f"value = {TASK_FRAME_KEY}"    # the reserved off-hub key (one spelling, TASK_FRAME_KEY)
-        gshape = tuple(int(n) for n in (getattr(node, "grid_shape", ()) or ()))
-        if kind == "grid" and len(gshape) >= 2:
-            facet_axis = len(gshape) - 1                 # facet the LAST scan axis -> one plane per cell
-            return PanelConfig(kind="grid", title=title, source=source,
-                               size=recommended_grid_size(gshape[facet_axis]),
-                               params={"facet": f"points:{facet_axis}"})
-        if kind == "grid":
-            kind = "1d"                                  # a 0/1-D "scan" is a plain task curve, not a grid
-        return PanelConfig(kind=kind, title=title, source=source)
 
     def _set_task_running(self, row: "LogicNodeRow", node) -> None:
         """Engage task-run mode: open the task's dedicated mid-run panel (declared by
@@ -2499,13 +2347,9 @@ class TaskConsole(QtWidgets.QWidget):
         except KeyError:
             pass
         self._update_task_status_text(node)
-        # The mid-run panel refresh touches its figure on the GUI thread, so it may only run while
-        # the render worker is idle (the worker never composes _task_card -- it is not in
-        # self.cards -- but the full-hub snapshot + single-card render must not overlap a batch).
-        # While busy, simply skip: the task's output buffer keeps the latest frame and the very
-        # next idle tick catches up.
-        if not self._render.busy:
-            self._task_card.refresh(self._expression_namespace())
+        # The mid-run panel refresh touches its figure on the GUI thread, which owns every
+        # figure now that rendering is synchronous.
+        self._task_card.refresh(self._expression_namespace())
         # NB: leaving task-run mode on finish is handled in ONE place -- _poll_logic_nodes
         # (the canonical node-lifecycle tick, which runs every tick regardless of whether
         # a mid-run panel exists), so a self-finishing task always releases the lock.
@@ -2606,23 +2450,9 @@ class TaskConsole(QtWidgets.QWidget):
         raise RuntimeError(f"unknown logic kind {kind!r}")
 
     def _render_barrier(self, timeout: float = 5.0) -> bool:
-        """Own every Figure, or say NO -- the one door to the render island.
+        """Rendering is synchronous on the GUI thread, so the GUI always owns every
+        Figure; the bool-returning contract stays because nine call sites hold it."""
 
-        The bridge raises when the handoff does not settle; the panels were handed a
-        bool-returning callable long before the bridge existed, so the exception is
-        turned back into False HERE rather than at nine call sites.  What changes is
-        what the console does with a False: it now aborts the operation instead of
-        proceeding to touch a Figure the render worker may still own.
-        """
-
-        from zlc_workbench.legacy import LegacyHandoffTimeout
-
-        try:
-            self._render.settle(timeout)
-        except LegacyHandoffTimeout:
-            return False
-        except BaseException:                      # bridge poisoned/closed, owner-thread misuse
-            return False
         return True
 
     def _render_handoff_failed(self, what: str) -> None:
@@ -2731,10 +2561,8 @@ class TaskConsole(QtWidgets.QWidget):
             self._legacy_handle_fences.pop(id(node), None)
             self._pending_fenced_starts.pop(id(node), None)
             self._starting_nodes.pop(id(row), None)
-        # A task's transient Figure is part of the same ownership handoff.  Ordinary Stop/finish
-        # waits for a render barrier; whole-console shutdown explicitly defers it until the central
-        # RenderLoop join.  A failed barrier keeps the task row/card references so the next tick or
-        # close retry can finish the handoff instead of destroying a Figure still in use.
+        # A failed clear keeps the task row/card references so the next tick or close retry
+        # can finish the teardown instead of destroying a Figure still in use.
         if row is self._running_task_row and not self._clear_task_running(
             timeout=max(0.0, deadline - time.monotonic())
         ):
@@ -3178,14 +3006,10 @@ class TaskConsole(QtWidgets.QWidget):
             self._update_summary()
             return
         self._tick_count += 1
-        # A render batch in flight (composing, or finished but its GUI pass still queued) blocks this
-        # tick's submission -- this refusal IS the frame-skip back-pressure (no budget, no rotor: the
-        # GUI thread no longer executes any compose, so there is nothing to ration on it).  But a beat
-        # that falls on a busy tick is OWED (``card._beat_owed``): the next idle tick serves it
-        # regardless of the modulo.  Without that, submissions phase-lock -- a heavy fast-beat panel
-        # occupies exactly the ticks a slow-beat panel's beats land on, starving it FOREVER under
-        # sustained overload (the fairness the deleted rotor used to provide).
-        busy = self._render.busy
+        # Rendering is synchronous on the GUI thread, so nothing is ever mid-flight when a tick
+        # runs; the beat-owed bookkeeping stays because a mid-drag panel is still skipped and
+        # served on the next tick.
+        busy = False
         disp = self._display_shot()            # the ONE coherent display shot for the whole board this tick
         sigvers = self.hub.signal_versions()   # ONE per-signal-counter snapshot for the whole tick
         elapsed = self._tick_count * self._base_interval_ms
@@ -3210,11 +3034,8 @@ class TaskConsole(QtWidgets.QWidget):
             card._beat_owed = False
             batch.append((card, key))
         if batch:
-            # The worker builds the shared namespace ITSELF (the full-hub snapshot copy is real
-            # work -- off the GUI thread with everything else) and composes each panel in place;
-            # panels needing a STRUCTURAL build come back untouched for the GUI pass.
-            self._render.submit(
-                lambda b=batch, d=disp: self._compose_batch(b, d))
+            # Compose and present in place -- the same two-phase path refresh_once uses.
+            self._on_render_batch(self._compose_batch(batch, disp))
         # keep the visible Edit tab's 'now:' acquisition references live, so a queued
         # parameter edit shows as applied once the loop picks it up.
         editor = self.tabs.currentWidget()
@@ -3524,27 +3345,8 @@ class TaskConsole(QtWidgets.QWidget):
             if not self.stop_all_nodes(timeout=max(0.0, deadline - time.monotonic())):
                 self._shutdown_state = "BLOCKED_NODE_OWNERSHIP"
                 return False
-        # Figure-owning editors/cards remain intact until the render worker's real thread
-        # termination is confirmed.  A timed-out join is OWNERSHIP_UNRESOLVED, not permission
-        # to clear pending state and destroy the Figure underneath the worker.
-        self._shutdown_state = "WAITING_RENDER"
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            self._shutdown_state = "BLOCKED_RENDER_OWNERSHIP"
-            return False
-        try:
-            self._render.close(max(0.0, float(remaining)))
-            render_stopped = bool(self._render.closed)
-        except BaseException as exc:
-            render_stopped = False
-            self._shutdown_error = exc
-        if not render_stopped:
-            self._shutdown_state = "BLOCKED_RENDER_OWNERSHIP"
-            self.status_strip.show_message(
-                "Close delayed: render worker still owns a Figure; retry after it stops",
-                severity="error",
-            )
-            return False
+        # Rendering is synchronous on the GUI thread: no worker thread to join, so figure
+        # ownership is already resolved the moment the nodes have stopped.
         if not getattr(self, "_on_close_done", False):
             self._shutdown_state = "CLOSING_RESOURCES"
             on_close = getattr(self, "_on_close", None)

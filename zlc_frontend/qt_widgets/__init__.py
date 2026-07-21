@@ -25,6 +25,7 @@ from .fit_authoring import FitAuthoringPane
 from .signal_expr_widget import SignalExprWidget
 from .pulse_slots_widget import PulseSlotsWidget
 from .logic_node_row import LogicNodeRow
+from .flow_graph_view import FlowGraphView
 from .signal_picker import (
     coerce_short_labels,
     fill_grouped_signal_combo,
@@ -159,6 +160,7 @@ from .style import (
 
 
 __all__ = [
+    "FlowGraphView",
     "LogicNodeRow",
     "LogicNodeEditor",
     "MeasurementPanel",
@@ -320,7 +322,6 @@ from . import param_widgets  # noqa: E402,F401
 # placement axiom puts it; bound here like ``param_widgets`` so consumers reach it as an
 # ATTRIBUTE of the package rather than importing the submodule path, which the package's own
 # guard forbids from outside.
-from . import render_loop  # noqa: E402,F401
 
 # The per-panel Analysis controls (fit + ROI), salvaged out of the console shell.  Pure Qt, so
 # qt_widgets is where the placement axiom puts them; bound as an attribute for the same reason

@@ -47,13 +47,6 @@ from zlc_frontend.qt_widgets import (
 )
 from zlc_frontend import board_layout as _layout
 from zlc_frontend.form import lenient_float as _safe_float
-from zlc_frontend.live_plot.live import (
-    coerce_panel_value,
-    normalize_facet,
-    panel_display_size,
-    panel_plot,
-    site_ring_radius,
-)
 from zlc_frontend.panel_params import (
     PANEL_PARAMS,
     panel_display_decls as _panel_display_decls,
@@ -80,7 +73,6 @@ from zlc_data.signal_expr import SIGNAL_EXPR_HELP
 # qt_widgets submodules are reached as ATTRIBUTES of the one facade binding: their names are
 # deliberately absent from the facade __all__, and the package forbids outside deep imports.
 AnalysisControls = _qt_widgets.analysis_controls.AnalysisControls
-_general_fit_models_for_kind = _qt_widgets.analysis_controls._general_fit_models_for_kind
 PARAM_WIDGETS = _qt_widgets.param_widgets.PARAM_WIDGETS
 ParamWidgetContext = _qt_widgets.param_widgets.ParamWidgetContext
 coerce_short_labels = _qt_widgets.param_widgets.coerce_short_labels
@@ -88,11 +80,6 @@ fill_grouped_signal_combo = _qt_widgets.param_widgets.fill_grouped_signal_combo
 
 # Mirrors the legacy shell's guard: a matplotlib install without the Qt backend still lets the
 # headless documents import; only actually BUILDING a panel canvas needs the backend.
-try:
-    import matplotlib.pyplot as plt
-    from .plot_bridge_canvas import panel_canvas
-except Exception:  # pragma: no cover - depends on the local matplotlib install
-    panel_canvas = None
 
 
 #: Per-signal publish counters ({name: version}) so a rolling monitor tells a new sample of
@@ -112,24 +99,6 @@ COORD_FRAMES_KEY = "__coord_frames__"
 # state; ``refresh`` treats it (and a source that produces None) as "pick a signal"
 # rather than an error, so a blank panel sits quietly until wired.
 
-def _card_y_is_view_axis(card) -> bool:
-    """Does THIS panel's y axis take a view-window pin -- an image, where x AND y are spatial
-    (pixel) coordinates and the value lives on the colour limit?  Reads the LIVE object's own
-    ``y_is_view_axis`` flag -- the plot class's for a flat panel, the CELL family's for a grid
-    (so a grid of image cells offers the pin and a hist/1d grid does not) -- falling back to the
-    kind's plot class in ``PLOT_KIND_BY_KEY`` before a plotter exists.  The ONE resolver every
-    Edit surface keys the "y range" row off, mirroring how the plot side gates ``view_ylim`` in
-    ``apply_param`` / ``consume_param`` on the same flag: UI and apply can never disagree."""
-    from zlc_frontend.live_plot.live import PLOT_KIND_BY_KEY
-
-    plotter = getattr(card, "plotter", None)
-    cell = getattr(plotter, "cell_renderer", None)
-    if cell is not None:
-        return bool(getattr(cell, "y_is_view_axis", False))
-    if plotter is not None:
-        return bool(getattr(plotter, "y_is_view_axis", False))
-    pk = PLOT_KIND_BY_KEY.get(str(getattr(card.config, "kind", "")))
-    return bool(getattr(pk.cls, "y_is_view_axis", False)) if pk is not None else False
 
 # Board layout (raw px).  The board is a pure PIXEL plane of card AABBs -- there is NO column
 # grid.  WIDTH still scales with the size (``cols // 2`` base-widths so 1x4 is wider than 1x2);
@@ -161,28 +130,7 @@ def _board_metrics() -> "_layout.BoardMetrics":
 
     return _layout.BoardMetrics(gap=GAP, card_size=_card_size)
 
-def _cell_size() -> tuple[int, int]:
-    """The base CARD WIDTH unit = a 1x2 panel's card: the figure (1 row x 2 cols) plus the card
-    chrome (L/R border + grey title strip + bottom border).  Every card width is a whole number of
-    these base widths joined by ``GAP``, so widths stay on one rhythm (height hugs the plot)."""
 
-    width = panel_display_size("1x2")[0] + 2 * CARD_PAD
-    height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + panel_display_size("1x2")[1] + CARD_PAD
-    return (width, height)
-
-def _card_size(size: str) -> tuple[int, int]:
-    """Outer card size: WIDTH = ``cols // 2`` base widths joined by ``GAP`` (1x4 is wider than 1x2),
-    HEIGHT HUGS the plot (title strip + the size's own figure height + bottom pad, NO blank padding
-    -- every size hugs like 1x2).  So width still scales with the size's columns, but height is
-    just tall enough for the figure -- the card's bottom edge sits right under the plot."""
-
-    rows, cols = panel_size_cells(size)
-    w_units = max(1, cols // 2)
-    cw, _ch = _cell_size()
-    width = w_units * cw + (w_units - 1) * GAP
-    # Height = the SAME chrome the cell uses, around THIS size's figure (not a cell multiple) -> hug.
-    height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + panel_display_size(size)[1] + CARD_PAD
-    return (width, height)
 
 def _opaque_white_composite(pm):
     """Composite a (possibly transparent, possibly HiDPI) grabbed pixmap onto an opaque WHITE canvas of
@@ -249,17 +197,6 @@ _RELIM_PARAM = ParamDecl(
 #: instant; long enough that a wheel spin coalesces.
 REBUILD_DEBOUNCE_MS = 90
 
-def _unit_df_for(plotter):
-    """A :class:`DataFigure` bound to ``plotter``'s figure/axes whose unit is inferred from
-    the LIVE x-axis label (NOT ``live_plot=``, which would mask a unit-bearing label like
-    'Detuning (GHz)').  ``change_unit`` operates on ``ax.lines``, so cycling rewrites that
-    figure's curve in place.  Shared by the Setting popup (the live card) and the Edit-tab
-    snapshot so the x-axis unit cycle is ONE implementation."""
-    from zlc_frontend.live_plot.plot_figure import DataFigure
-    ax = getattr(plotter, "ax", None)
-    unit = DataFigure._infer_unit(ax.get_xlabel()) if ax is not None else None
-    return DataFigure(fig=plotter.fig, ax=ax, data_x=plotter.data_x, data_y=plotter.data_y,
-                      labels=getattr(plotter, "labels", None), unit=unit)
 
 # ====================================================================== panels
 _MONITOR_UNSET = object()   # sentinel: a monitor panel that has never rolled yet
@@ -488,317 +425,6 @@ class PanelCard(FluentGroupBox):
             self.setting_button.raise_()
 
     # ------------------------------------------------------------- settings UI
-    def _build_settings(self) -> None:
-        """Confocal-style VERTICAL settings popup.
-
-        Layout idiom borrowed from ``Confocal_GUIv2/gui/gui_individual.py``'s
-        ``BaseLivePlotGUI`` settings page: one section header per group (bold,
-        own line), then one control per row underneath the header as a
-        ``[fixed-width label | control]`` cell.  Five sections stacked top-to-
-        bottom:
-
-        * **Source** -- pick a signal or write an expression + ``Apply``.
-        * **Display** -- size + (for image kinds) colormap (the COLORSET
-          chooser; there is no separate cbar show/hide toggle), plus each
-          kind's declarative ``PANEL_PARAMS`` widget.
-        * **Unit** -- ``Unit`` cycle button + current unit label.
-        * **Limits** -- ``auto``/``manual`` mode combo + a 3-column mini-grid
-          of ``[axis | lo | hi]`` rows (axis labels left, lo/hi headers top).
-        * **Panel** -- title edit, then a single row of
-          ``Remove | Edit… | <stretch> | Save Fig``.
-
-        Every edit is LIVE-applied -- there is no global ``Apply`` button for
-        the popup itself (Source has its own Apply because the expression is
-        validated separately).  Lifted helpers ``FluentSectionLabel`` and
-        ``FluentSettingRow`` (in ``zlc_frontend.qt_widgets``) own the visual rhythm so
-        future settings popups stay identical."""
-
-        # The rounded card is painted by FluentPopup (translucent, frameless),
-        # NOT a stylesheet border-radius on an opaque popup -- that left a
-        # square white nub past the arc at the corners + a native popup shadow.
-        # Painting the card also means no border stylesheet rule can cascade
-        # onto child labels/controls.
-        popup = FluentPopup(self)
-        # The sections (Source / Display / Unit / Limits / Panel) can stack taller than the
-        # screen when a panel has many signals -> wrap them in a FluentScrollArea so the popup
-        # never exceeds the visible area (it scrolls instead of running off / overflowing the
-        # panel).  The scroll viewport is transparent so FluentPopup's painted rounded card
-        # still shows through; the height is capped in _open_settings.
-        popup_outer = QtWidgets.QVBoxLayout(popup)
-        popup_outer.setContentsMargins(0, 0, 0, 0)
-        self._settings_scroll = FluentScrollArea()
-        self._settings_scroll.setWidgetResizable(True)
-        self._settings_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self._settings_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        # NEVER a horizontal scrollbar -- the popup widens to fit its content instead (the rows
-        # are narrow; only the HEIGHT is capped, below).  Vertical scroll only when the sections
-        # are taller than the panel they belong to.
-        self._settings_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self._settings_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        popup_content = QtWidgets.QWidget()
-        popup_content.setStyleSheet("background: transparent;")
-        self._settings_scroll.setWidget(popup_content)
-        popup_outer.addWidget(self._settings_scroll)
-        root = QtWidgets.QVBoxLayout(popup_content)
-        pad = scaled_px(10)
-        # RESERVE the vertical scrollbar's width on the RIGHT so the scrollbar never sits ON TOP
-        # of a control (it would otherwise occlude the combo / value boxes when content scrolls).
-        # The popup anchors its RIGHT edge at the gear, so this extra width grows the popup
-        # LEFTWARD into the empty space there -- exactly "extend the settings frame to the left".
-        scrollbar_w = fluent_scrollbar_thickness()   # ONE source for the bar width (not a hand-typed 12)
-        root.setContentsMargins(pad, pad, pad + scrollbar_w + scaled_px(4), pad)
-        root.setSpacing(scaled_px(10, minimum=6))
-
-        # fixed left-label column, SIZED TO CONTENT so nothing truncates: the longest
-        # label is normally "colormap", but a multi-input plot adds slot rows like
-        # "signal[0] occupancy" -- measure every label this popup will show and widen the
-        # column to the widest (floored at 80 px), so all rows still align and read fully.
-        base_slots = panel_input_slots(self.config.kind)
-        # EVERY plot kind uses the SAME source MECHANISM: a signal picker + a ``value = ...``
-        # expression (the reusable SignalExpr).  Whether a kind can GROW extra slots
-        # (+signal / −signal) is data-driven from the per-kind declaration
-        # (``panel_allows_multi_slot`` / PANEL_SINGLE_SLOT_KINDS), NOT an inline ``kind == 'sites'``
-        # check: a site map takes EXACTLY ONE occupancy signal (its ring centres + frame underlay
-        # resolve from signal[0]'s producing node, so a 2nd slot is meaningless) -> single picker,
-        # no +/-, but it STILL has the expression box.  The per-kind value SHAPE is enforced in
-        # _coerce (PANEL_INPUT_FORMAT): sites = a per-site (N,) vector, 2D = an (H×W) frame, etc.
-        self._multi_slot = panel_allows_multi_slot(self.config.kind)
-        n_slots = max(1, len(base_slots), len(self.config.inputs)) if self._multi_slot else max(1, len(base_slots))
-        slot_labels = [(f"signal[{i}]" if n_slots > 1 else "signal") for i in range(n_slots)]
-        slot_tips = [base_slots[i][2] if i < len(base_slots)
-                     else f"an added signal slot — read as signal[{i}] in the expression"
-                     for i in range(n_slots)]
-        fm = self.fontMetrics()
-        widest = max((fluent_text_width(fm, t) for t in [*slot_labels, "colormap", "threshold"]), default=0)
-        label_w = max(scaled_px(80, minimum=56), widest + scaled_px(10))
-
-        def section_box(title: str) -> QtWidgets.QVBoxLayout:
-            """Header label + inner VBox; rows added to the inner VBox stack
-            tightly under the header (own-line, vertical, confocal style)."""
-            root.addWidget(FluentSectionLabel(title))
-            inner = QtWidgets.QVBoxLayout()
-            inner.setContentsMargins(0, 0, 0, 0)
-            inner.setSpacing(scaled_px(6, minimum=4))
-            root.addLayout(inner)
-            return inner
-
-        # ---- Source --------------------------------------------------------
-        sec = section_box("Source")
-        # Tell the experimenter what SHAPE of signal this plot kind expects, so the
-        # signal picker / expression below is unambiguous (single source PANEL_INPUT_FORMAT).
-        accepts = PANEL_INPUT_FORMAT.get(self.config.kind)
-        if accepts:
-            accepts_label = FluentLabel(f"accepts {accepts}")
-            accepts_label.setWordWrap(True)
-            accepts_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            sec.addWidget(accepts_label)
-        # ONE signal picker: a combobox of the live hub signals.  Picking one sets the
-        # source to ``value = signal`` (the canonical form -- the picked signal IS ``signal``
-        # in the expression).  A site map needs only its occupancy signal; its ring centres
-        # + frame underlay are resolved from the SAME producing node, never extra slots.
-        self.slot_combos: list = []
-        for i in range(n_slots):
-            combo = FluentTreeComboBox()             # collapsible-tree signal picker (G2)
-            combo.setToolTip(slot_tips[i] + (
-                "\nSets the source to `value = signal`." if n_slots == 1
-                else f"\nRead as signal[{i}] in the expression (e.g. value = signal[0] - signal[1])."))
-            combo.activated.connect(lambda _ix, idx=i: self._on_slot_pick(idx))
-            self.slot_combos.append(combo)
-            sec.addWidget(FluentSettingRow(slot_labels[i], combo, label_width=label_w))
-        self.signal_combo = self.slot_combos[0]    # the (first) signal picker
-        # Add / remove signal slots (every kind except the site map): so a panel can combine
-        # several signals -- e.g. plot the DIFFERENCE of two occupancies with signal[0]-signal[1].
-        if self._multi_slot:
-            self.add_slot_button = FluentButton("+ signal", color=GREY)
-            self.add_slot_button.setToolTip("Add another signal slot (read as signal[i] in the expression).")
-            self.add_slot_button.clicked.connect(self._add_signal_slot)
-            self.remove_slot_button = FluentButton("− signal", color=GREY)
-            self.remove_slot_button.setToolTip("Remove the last signal slot.")
-            self.remove_slot_button.clicked.connect(self._remove_signal_slot)
-            self.remove_slot_button.setEnabled(n_slots > 1)
-            slot_btn_row = QtWidgets.QHBoxLayout()
-            slot_btn_row.setContentsMargins(0, 0, 0, 0)
-            slot_btn_row.setSpacing(scaled_px(6, minimum=4))
-            slot_btn_row.addWidget(self.add_slot_button, 0)
-            slot_btn_row.addWidget(self.remove_slot_button, 0)
-            slot_btn_row.addStretch(1)
-            sec.addLayout(slot_btn_row)
-
-        self.source_edit = FluentLineEdit(self.config.source)
-        self.source_edit.setMinimumWidth(scaled_px(280, minimum=220))
-        self.source_edit.setStyleSheet(
-            self.source_edit.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
-        self.source_edit.setToolTip(SIGNAL_EXPR_HELP)
-        # An inline one-liner is cramped for a real expression; "Edit…" pops a LARGE floating
-        # multi-line editor (a modal card, so it does NOT reflow the panel layout) prefilled
-        # with the source -- comfortable for typing math across signals -- and writes it back.
-        # The "Edit…" wording matches the panel's other Fluent "Edit…" buttons (one house style).
-        self.expand_button = FluentButton("Edit…", color=GREY)
-        self.expand_button.setFixedWidth(scaled_px(56, minimum=44))
-        self.expand_button.setToolTip("Open a large floating editor for this expression")
-        self.expand_button.clicked.connect(self._open_expr_editor)
-        self.apply_button = FluentButton("Apply", color=GREEN)
-        self.apply_button.setFixedWidth(scaled_px(64, minimum=52))
-        self.apply_button.clicked.connect(self._apply_source)
-        self.source_edit.textChanged.connect(lambda: self.apply_button.set_dirty(True))
-        self.source_edit.returnPressed.connect(self._apply_source)
-        expr_row = QtWidgets.QHBoxLayout()
-        expr_row.setContentsMargins(0, 0, 0, 0)
-        expr_row.setSpacing(scaled_px(6, minimum=4))
-        expr_row.addWidget(self.source_edit, 1)
-        expr_row.addWidget(self.expand_button, 0)
-        expr_row.addWidget(self.apply_button, 0)
-        sec.addLayout(expr_row)
-
-        self.status = FluentLabel("")
-        self.status.setWordWrap(True)
-        self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-        sec.addWidget(self.status)
-
-        # ---- Display -------------------------------------------------------
-        sec = section_box("Display")
-        self.size_combo = FluentComboBox()
-        self.size_combo.addItems(list(PANEL_SIZES))
-        self.size_combo.setCurrentText(self.config.size)
-        self.size_combo.setToolTip("Panel size preset (height x width half-units; 2x2 = the stock plot region)")
-        self.size_combo.currentTextChanged.connect(self._on_size)
-        sec.addWidget(FluentSettingRow("size", self.size_combo, label_width=label_w))
-
-        # The plot's DISPLAY knobs are DECLARATIVE ParamDecls rendered through the SAME _make_param_widget
-        # / PARAM_WIDGETS path everywhere (#H3v-4b): the per-kind colormap / toggles (display=True) for
-        # every panel, plus the relim chooser.  Adding a plot display
-        # ParamDecl here makes it appear in the Edit tab too with NO hand-wiring (both call
-        # _emit_param_rows).  Size, colormap, relim, repeat, unit, and update are all view controls;
-        # data production remains on the separate Logic tab.
-        self.param_widgets: dict[str, QtWidgets.QWidget] = {}
-        # {key: kind} for every declarative Setting control, so refresh_on_show can re-seed each widget
-        # from config.params through its kind's PARAM_WIDGETS.write (one source -- no per-key handwiring).
-        self._param_kinds: dict[str, str] = {}
-        # remember which kind's params this popup baked -- when a grid panel's RESOLVED per-cell
-        # kind changes later (facet / sub-plot pick, a signal bind), _sync_settings_param_rows
-        # rebuilds the popup so the rows below are never a stale bake of the old kind.
-        self._settings_param_kind = self._param_kind()
-        display_specs = (
-            [s for s in PANEL_PARAMS.get(self._settings_param_kind, ()) if s.display]
-            + [_RELIM_PARAM]
-        )
-        self.param_widgets.update(
-            self._emit_param_rows(display_specs, sec.addWidget, self._set_param, label_w))
-        self.lim_combo = self.param_widgets.get("relim")     # named back-ref (relim is now declarative)
-
-        # ``repeat_mode`` (the DISPLAY collapse) is the ONLY repeat knob the plot owns: how to
-        # collapse a measurement's repeat axis for display (average / add / replace / roll / create).
-        # How MANY repeats lives on the MEASUREMENT (``repeat``, 0 = ∞, auto-injected by
-        # _acquisition_param_decls -- #H3l), NOT here.  Rendered through the SAME _make_param_widget
-        # path as every other param (no hand-placed widget); edits route through _set_param.
-        for spec in self._repeat_param_specs():
-            widget = self._make_param_widget(spec)
-            self.param_widgets[spec.key] = widget
-            self._param_kinds[spec.key] = spec.kind    # remember for refresh_on_show re-seed
-            sec.addWidget(FluentSettingRow(spec.label, widget, label_width=label_w))
-
-        # fixed lo/hi inputs (#8): ONE bespoke [lo | hi] row (the single special-cased control,
-        # shown only when relim == "fixed") -- built by the shared helper the Edit tab also uses.
-        self.fixed_lim_row, self.fixed_lo_edit, self.fixed_hi_edit = \
-            self._make_fixed_lim_row(self._on_fixed_lim_edited, label_w)
-        sec.addWidget(self.fixed_lim_row)
-
-        # FACET chooser (grid panels only): which axis of the bound (R,P,*data_shape)
-        # block expands into the cells -- the grid-as-axis-expander declaration.  Options derive
-        # from the producing node's declared structure and refresh on every Setting open (the
-        # signal-combo rule); "(recipe)" keeps the loaded-figure snapshot behaviour.  Beside it
-        # the SUB PLOT chooser picks what each cell draws (auto = derive from what the slice
-        # leaves; else an explicit hist / 2d / 1d) -- the params section below always shows the
-        # RESOLVED kind's knobs (see _sync_settings_param_rows).
-        self.facet_combo = None
-        self.sub_kind_combo = None
-        if self.config.kind == "grid":
-            self.facet_combo = FluentComboBox()
-            self.facet_combo.setToolTip(
-                "Expand ONE axis of the bound block into the grid cells: each repeat / scan-axis "
-                "entry / data-axis entry becomes its own cell ((recipe) = a loaded figure's snapshot)")
-            self.facet_combo.activated.connect(self._on_facet_changed)
-            sec.addWidget(FluentSettingRow("facet", self.facet_combo, label_width=label_w))
-            self._refresh_facet_combo()
-            from zlc_frontend.live_plot.live import GRID_CELL_BY_KIND
-            self.sub_kind_combo = FluentComboBox()
-            self.sub_kind_combo.addItem("auto", "")
-            for cell_kind in GRID_CELL_BY_KIND:     # the cell families, ONE source
-                self.sub_kind_combo.addItem(cell_kind, cell_kind)
-            self.sub_kind_combo.setToolTip(
-                "What each cell draws: auto derives it from what the facet slice leaves "
-                "(a 2-D frame -> 2d, an ordered axis -> 1d, bare samples -> hist); "
-                "an explicit pick overrides")
-            self.sub_kind_combo.activated.connect(self._on_sub_kind_changed)
-            sec.addWidget(FluentSettingRow("sub plot", self.sub_kind_combo, label_width=label_w))
-            self._refresh_sub_kind_combo()
-
-        # unit cycle: a single row [Unit button | <stretch> | current unit text] under the "unit"
-        # label (one-control-per-row rhythm) -- the IDENTICAL row the Edit tab builds via the helper.
-        unit_row, self.unit_button, self.unit_label = \
-            self._make_unit_cycle_row(self._on_unit_cycle, label_w, with_label=True)
-        sec.addWidget(unit_row)
-
-        # per-panel display refresh rate (this panel only).  A fixed, harmonic set so
-        # panels that share a beat stay frame-coherent (see UPDATE_INTERVALS); a fast rate
-        # suits a live-1D alignment monitor.  Changing it re-bases the console timer.
-        self.update_combo = FluentComboBox()
-        for ms in UPDATE_INTERVALS:
-            self.update_combo.addItem(f"{ms} ms", ms)
-        idx = self.update_combo.findData(self.config.update_ms)
-        self.update_combo.setCurrentIndex(idx if idx >= 0 else self.update_combo.findData(DEFAULT_UPDATE_MS))
-        self.update_combo.setToolTip(
-            "How often THIS panel redraws.  Every rate shares one base tick, so panels that\n"
-            "share a beat refresh on the SAME tick from the same data -- a 2-D frame and its\n"
-            "site-map stay shot-coherent.  A fast 100 ms suits a live-1D alignment monitor.")
-        self.update_combo.currentIndexChanged.connect(self._on_update_interval)
-        sec.addWidget(FluentSettingRow("update", self.update_combo, label_width=label_w))
-
-        # ---- Analysis --------------------------------------------------
-        # ONE picker for what a drag-selection DOES, spanning BOTH analyses this section owns: a
-        # general CURVE FIT (its whole state = config.params['fit_request'] presence) and an ROI
-        # crop (selection_action == 'roi').  The combo is a pure VIEW -- it DERIVES its selected
-        # item from that state on every open (_refresh_analysis_controls), so the Setting picker
-        # and the Edit picker can never disagree (#8); picking "curve fit" toggles fit_request
-        # (never writes selection_action='fit'), "ROI" arms the crop, "none" clears both.  The
-        # section is named "Analysis" because it is no longer fit-only nor roi-only (#3 naming).
-        self._build_analysis_section(section_box, label_w)
-
-        # ---- Panel ---------------------------------------------------------
-        sec = section_box("Panel")
-        self.title_edit = FluentLineEdit(self.config.title)
-        self.title_edit.setPlaceholderText("panel title…")
-        self.title_edit.textChanged.connect(self._on_title)
-        sec.addWidget(FluentSettingRow("title", self.title_edit, label_width=label_w))
-
-        # Action row: Remove on the left (destructive, ORANGE) + Edit… to open the
-        # panel's Edit tab.  Saving lives ONLY in the Edit tab now (it owns the folder
-        # picker + the full DataFigure controls) -- the lightweight Setting popup no
-        # longer carries a Save button, so there is one place to save from.
-        remove = FluentButton("Remove", color=ORANGE)
-        remove.setFixedWidth(scaled_px(72, minimum=58))
-        remove.clicked.connect(lambda: self.remove_requested.emit(self))
-        edit_button = FluentButton("Edit…", color=ACCENT)
-        edit_button.setFixedWidth(scaled_px(64, minimum=52))
-        edit_button.setToolTip("Open this panel's Edit tab: colormap / unit / relim, curve fit, limits, save")
-        edit_button.clicked.connect(lambda: (self.settings_popup.hide(), self.edit_requested.emit(self)))
-        action_row = QtWidgets.QHBoxLayout()
-        action_row.setContentsMargins(0, 0, 0, 0)
-        action_row.setSpacing(scaled_px(6, minimum=4))
-        action_row.addWidget(remove, 0)
-        action_row.addWidget(edit_button, 0)
-        action_row.addStretch(1)
-        sec.addLayout(action_row)
-
-        self.settings_popup = popup
-        # Setting-frame height high-water mark (#H3i-2): the popup GROWS to fit its content and
-        # GROWS when the panel size grows, but NEVER shrinks back within a session.  Reset here so a
-        # REBUILT popup (its content changed, e.g. a +/- signal slot) fits fresh, then grows again.
-        self._settings_h_hwm = 0
-        # A Qt.Popup auto-closes on the press that lands on the Setting button; record
-        # WHEN so the button's release does not immediately re-open it (real toggle).
-        self._settings_dismissed_at = 0.0
-        popup._on_hidden = self._note_settings_dismissed
 
     def _note_settings_dismissed(self) -> None:
         self._settings_dismissed_at = time.monotonic()
@@ -1273,15 +899,6 @@ class PanelCard(FluentGroupBox):
         return out
 
     # --------------------------------------------------------------- facet (the grid as an axis-expander)
-    def _facet(self) -> str | None:
-        """The panel's facet declaration (``config.params["facet"]``): which axis of the bound
-        canonical ``(R,P,*data_shape)`` block expands into the grid cells.  A missing value means a
-        non-faceted recipe grid; every present value is one canonical facet token."""
-        value = self.config.params.get("facet")
-        if value is None:
-            return None
-        normalize_facet(value)
-        return str(value)
 
     def _facet_value_shapes(self) -> tuple[tuple, tuple]:
         """(points multi-D shape, data shape) from the producing node's declared structure (#H3o) --
@@ -1293,151 +910,9 @@ class PanelCard(FluentGroupBox):
         ds = tuple(int(n) for n in (st.get("data_shape") or ()))
         return (gs or ps), ds
 
-    def _resolved_sub_kind(self) -> str:
-        """The facet grid's per-cell kind: the operator's explicit ``sub_plot_kind`` param when set,
-        else the ONE auto rule (``default_sub_plot_kind``: what each cell has left after the slice)."""
-        from zlc_frontend.live_plot.live import GRID_CELL_BY_KIND, default_sub_plot_kind
-        sub = str(self.config.params.get("sub_plot_kind") or "")
-        if sub in GRID_CELL_BY_KIND:
-            return sub
-        points_shape, data_shape = self._facet_value_shapes()
-        return default_sub_plot_kind(
-            self._facet() or "repeat", points_shape=points_shape, data_shape=data_shape)
 
-    def _facet_cells(self, value):
-        """Slice the bound block into the per-cell inputs through the ONE rule (live.facet_cells)."""
-        from zlc_frontend.live_plot.live import facet_cells, normalize_facet
-        block = np.asarray(value)                 # NATIVE dtype (uint8 camera block stays uint8);
-        if block.dtype.kind not in "iubf":        # only non-numeric results normalize to float
-            block = np.asarray(block, dtype=float)
-        if block.ndim < 2:
-            raise ValueError(
-                "a facet grid slices the bound signal's canonical (R,P,*data_shape) block; got shape "
-                f"{block.shape} -- bind a measurement's block signal (not a scalar).")
-        pts, _ = self._facet_value_shapes()
-        if int(np.prod(pts, dtype=np.int64) if pts else 0) != int(block.shape[1]):
-            pts = ()                              # declared shape does not match this block -> flat points
-        cells = facet_cells(block, self._facet(), sub_plot_kind=self._resolved_sub_kind(),
-                            points_shape=pts, repeat_mode=self._repeat_mode_value())
-        # A LIVE finite block carries only the repeats that HOLD data (it grows 1..ring as shots
-        # land), so a facet=repeat grid would see its cell count change every shot -- a full
-        # build-then-swap per shot for the WHOLE fill window, and a >MAX_GRID_CELLS repeat would
-        # only error at shot ring+1.  Pad to the producer's declared ring with ZERO-memory NaN
-        # placeholders (broadcast views -- never a materialised full-size frame), so the grid holds
-        # a constant ring cells from the first shot: not-yet-taken cells render blank (NaN), filled
-        # cells stream through the in-place update_cells fast path, and the cell-count cap fires
-        # immediately.  Only the repeat facet pads: a points/data facet's cell count is a declared
-        # shape, not the fill state.
-        spec = normalize_facet(self._facet())
-        if spec is not None and spec[0] == "repeat" and cells:
-            st = self._bound_structure()
-            ring = int((st or {}).get("ring", 0) or 0)
-            if ring > len(cells):
-                blank = np.broadcast_to(np.float32(np.nan), np.shape(cells[0]))
-                cells = list(cells) + [blank] * (ring - len(cells))
-        return cells
 
-    def _build_facet_plotter(self, value, *, interactions: bool):
-        """Build this panel's FACET grid through the ONE factory + replay its persisted per-kind
-        display knobs (bins / fit / ylog / cmap) AND the relim family (BaseLivePlot.apply_param owns
-        them all).  The ONE builder the live card (display-only) and the Edit-tab snapshot
-        (interactive) share -- so the two can never drift."""
-        from zlc_frontend.live_plot.live import facet_axis_labels, facet_cell_labels, grid as build_facet_grid
-        sub = self._resolved_sub_kind()
-        cells = self._facet_cells(value)
-        # Per-cell TITLE identifiers (#5): the console pre-slices (facet=None to the factory), so it hands
-        # the labels EXPLICITLY, derived from the bound facet + its points shape through the ONE
-        # ``facet_cell_labels`` source -- so a repeat / scan / site grid's cells read 'rep k' / a scan
-        # coordinate / 's k' instead of a hardcoded site tag, from the same source the notebook path uses.
-        points_shape, data_shape = self._facet_value_shapes()
-        # The swept axis NAMES + per-cell COORDINATES are metadata of the producing SCAN NODE and the
-        # facet spec -- NOT of the value expression -- so they are fetched UNGATED: even a transforming
-        # value (``np.log(f)``, ``a-b``) still faceted on scan axis i, so cell k is still scan point k
-        # of axis i and its coordinate is known.  (``_bound_structure`` is identity-gated because it
-        # drives the value's SHAPE reshape, a DIFFERENT concern; the scan names/coordinates never
-        # change under a value transform -- gating them there was the root cause of the ``pt k``
-        # fallback.)  ``param_names`` are needed for EVERY facet group -- a repeat / data facet's cells
-        # keep the scan axes as their remaining x/y (#6) -- while the per-cell COORDS label only a
-        # POINTS facet's cells (``Bz=1.2`` instead of a bare ``pt k``).
-        from zlc_frontend.live_plot.live import normalize_facet
-        coords = names = None
-        spec = normalize_facet(self._facet())
-        if self.config.inputs and callable(self.structure_provider):
-            try:
-                raw = self.structure_provider(self.config.inputs[0])
-            except Exception:
-                raw = None
-            if raw:
-                names = raw.get("param_names")
-                if spec and spec[0] == "points":
-                    all_coords = raw.get("points_coords") or []
-                    axis = int(spec[1])
-                    if axis < len(all_coords) and len(all_coords[axis]) == len(cells):
-                        coords = all_coords[axis]
-        cell_labels = facet_cell_labels(self._facet(), len(cells), points_shape=points_shape,
-                                        coords=coords, param_names=names)
-        plotter = build_facet_grid(
-            cells, sub_plot_kind=sub, size=self.config.size, cell_labels=cell_labels,
-            # figure-level x/y axis names FOLLOW the facet (#6): the ONE facet_axis_labels rule maps
-            # the REMAINING axes to a cell's x/y (scan param names / the value's declared axis
-            # label), degrading to the kind's stock defaults when the metadata is unknown.  The
-            # console pre-slices (facet=None to the factory), so it hands the labels explicitly --
-            # the same derivation the notebook ``grid(value, facet=...)`` path runs inside.
-            labels=facet_axis_labels(
-                self._facet(), sub, points_shape=points_shape, data_shape=data_shape,
-                param_names=names, value_label=self._source_axis_label()),
-            display=False, interactions=interactions, title=self.config.title or "")
-        # Fold the persisted display knobs in with the draws SUSPENDED.  Each ``apply_param`` otherwise
-        # forces a synchronous N-cell repaint, so ~10 keys = up to 10 full grid ``draw()``s per build --
-        # the draw-per-mutation anti-pattern, byte-identical to the loop in ``build_grid_figure`` above
-        # (which already suspends).  The ONE first render happens via the caller's ``canvas.draw`` (the
-        # plotter is built ``display=False``), exactly as the non-facet grid path.
-        # A console-driven grid with an active fit is DISPLAY-ONLY: mark it before replaying fit_request
-        # so the build's apply_param never solves in place on the build thread (#6b -- the worker node
-        # fits per-cell; the next _update_fit_overlays pushes the params and this reconstructs them).
-        if callable(self.fit_node_sink) and self.config.params.get("fit_request") \
-                and getattr(plotter, "_published_cell_popt", None) is None:
-            plotter._published_cell_popt = {}
-        with plotter.suspend_draws():
-            for key in ([d.key for d in _panel_display_decls("grid", sub)]
-                        + ["relim", "fixed_lo", "fixed_hi", "view_xlim", "view_ylim", "fit_request"]):
-                if key == "cmap":
-                    # Inject the RESOLVED cmap (operator's pick ELSE the sub-kind's declared PANEL_PARAMS
-                    # default) through the ONE ``_resolved_cmap`` resolver -- the SAME source the Setting
-                    # popup shows.  Without this a grid whose params carry no explicit cmap fell through to
-                    # ImageCell's own default (grey), so the live grid drew grey while the Setting said the
-                    # default: render == Setting now, one source, no silent divergence.
-                    plotter.apply_param("cmap", _resolved_cmap(sub, self.config.params))
-                elif key in self.config.params:
-                    plotter.apply_param(key, self.config.params[key])
-        return plotter
 
-    def _facet_choices(self) -> list[tuple[str | None, str, bool]]:
-        """The facet dropdown's ``[(stored value, display text, enabled)]`` -- derived from the
-        producing node's declared axis structure, with the axis LENGTH shown so the operator picks
-        by meaning ('scan axis 0 (5)').  An axis longer than :data:`MAX_GRID_CELLS` is listed but
-        DISABLED (the grid factory refuses it -- the UI would freeze); the "(saved figure)" row
-        exists only when the bound node actually carries a saved grid recipe to replay."""
-        from zlc_frontend.live_plot.live import MAX_GRID_CELLS
-        out = []
-        if self._grid_recipe_or_none() is not None:
-            out.append((None, "(saved figure)", True))
-        out.append(("repeat", "repeat", True))
-
-        def _axis(value, text, n):
-            ok = int(n) <= MAX_GRID_CELLS
-            out.append((value, text if ok else f"{text} – too many", ok))
-
-        points_shape, data_shape = self._facet_value_shapes()
-        if len(points_shape) > 1:
-            for i, n in enumerate(points_shape):
-                _axis(f"points:{i}", f"scan axis {i} ({n})", n)
-        elif points_shape and points_shape[0] > 1:
-            _axis("points:0", f"scan axis 0 ({points_shape[0]})", points_shape[0])
-        for i, n in enumerate(data_shape):
-            if n > 1:
-                _axis(f"data:{i}", f"data axis {i} ({n})", n)
-        return out
 
     def _refresh_facet_combo(self) -> None:
         """Refill the facet dropdown from the CURRENT node structure (a Setting open re-derives it,
@@ -1459,26 +934,6 @@ class PanelCard(FluentGroupBox):
                     index = j
             combo.setCurrentIndex(index)
 
-    def _on_facet_changed(self, index: int) -> None:
-        """The operator picked a facet axis: persist + rebuild.  A facet change is a STRUCTURE change
-        (the cell count and even the per-cell kind may differ), so it goes through the ordinary reset
-        path -- the generic refocus rule returns to the enlarged cell when it survives the rebuild."""
-        raw_value = self.facet_combo.itemData(int(index))
-        value = None if raw_value is None else str(raw_value)
-        if value is not None:
-            normalize_facet(value)
-        if value == self._facet():
-            return
-        self._wait_render_idle()   # the teardown+rebuild below must own the figure (ownership protocol)
-        if value is None:
-            self.config.params.pop("facet", None)
-        else:
-            self.config.params["facet"] = value
-        self._reset_plot()
-        self._render_version = -1
-        self._rerender_last()
-        self._sync_settings_param_rows()   # the resolved per-cell kind may have changed with the axis
-        self.changed.emit()
 
     def _refresh_sub_kind_combo(self) -> None:
         """Re-select the stored ``sub_plot_kind`` pick ("" = auto) on the Setting's sub-plot chooser."""
@@ -1766,14 +1221,6 @@ class PanelCard(FluentGroupBox):
         self.fit_fix_seed = controls.fix_seed
         self.fit_result_label = controls.result_label
 
-    def _default_fit_model(self) -> str:
-        """The model a fresh curve fit uses: the stored request's model FIRST (single source once fit
-        is on), else this panel family's first offered model."""
-        saved = self.config.params.get("fit_request")
-        if isinstance(saved, Mapping) and saved.get("model"):
-            return str(saved["model"])
-        models = _general_fit_models_for_kind(self._param_kind())
-        return models[0].key if models else "gaussian"
 
     def _build_fit_request_from_widgets(self, model_combo, fix_seed, selection):
         """Build a fresh fit request from a surface's OWN model combo + fix/seed editor + the selection
@@ -2092,38 +1539,6 @@ class PanelCard(FluentGroupBox):
         from zlc_data.signal_expr import SignalExpr
         return SignalExpr(self.config.inputs, self._compiled_source)
 
-    def _signal_then_repeat(self, namespace: Mapping[str, object]):
-        """Evaluate and reduce canonical signal tensors without rank inference."""
-        from zlc_frontend.live_plot.live import reduce_repeat, repeats_with_data
-        # A pulse panel's ``value`` is a STRUCTURED object (a sequence / PulseTableState), not an array --
-        # it has no repeat axis and must NOT be float-coerced.  Read the bound signal (or the ``value =
-        # ...`` expression result) as-is and hand it straight to _render / _build_plot, exactly as the
-        # array pipeline hands a reduced block to the other kinds -- the kind (not the shape) decides how
-        # its own data is consumed (a 2d reshapes to an image, sites uses centres, pulse uses the sequence).
-        if self.config.kind == "pulse":
-            self._repeat_cur = 1
-            return self._signal_expr().evaluate(namespace)
-        mode = self._repeat_mode_value()
-        structure = self._bound_structure()
-        if structure is not None:
-            block = self._signal_expr().evaluate(namespace)
-            b = self._validate_canonical_block(block, structure, self.config.inputs[0])
-            valid = (namespace.get(SIG_VALID_KEY, {}) or {}).get(self.config.inputs[0])
-            self._repeat_cur = repeats_with_data(b, valid=valid)
-            if self.config.kind == "grid":
-                return b
-            return reduce_repeat(
-                b, mode, valid=valid, hist=(self.config.kind == "hist"))
-
-        block, had_repeat, valid = self._eval_signal_per_slice(namespace)
-        b = np.asarray(block)
-        if b.dtype.kind not in "iubf":
-            b = np.asarray(b, dtype=float)
-        if not had_repeat:
-            self._repeat_cur = 1
-            return b
-        self._repeat_cur = repeats_with_data(b, valid=valid)
-        return reduce_repeat(b, mode, valid=valid, hist=(self.config.kind == "hist"))
 
     @staticmethod
     def _validate_canonical_block(value, structure, name="signal") -> np.ndarray:
@@ -2207,58 +1622,7 @@ class PanelCard(FluentGroupBox):
         except Exception:
             return None
 
-    def _coerce(self, value):
-        # The per-kind reshape (image / lines / samples / one-value-per-site) lives WITH the plots
-        # now -- ``live.coerce_panel_value`` owns every plot kind's INPUT contract.  The console only
-        # GATHERS the inputs (value + the bound node's structure + params + repeat mode) and dispatches,
-        # so the wiring layer holds ZERO per-kind reshape logic (a plot kind's input shape can change
-        # without touching task_console).
-        return coerce_panel_value(
-            self.config.kind, value,
-            structure=self._bound_structure(),
-            params=self.config.params,
-            repeat_mode=self._repeat_mode_value())
 
-    def _sites_aux(self, namespace: Mapping[str, object]):
-        """Resolve a site map's centres and underlay from its value producer.
-
-        The producer declares the companion signal names and publishes all three
-        atomically, so the user binds one value signal without class-specific wiring.
-        """
-        occ = self.config.inputs[0] if self.config.inputs else ""
-        centers_name, image_name = (None, None)
-        if callable(self.sites_inputs_provider) and occ:
-            try:
-                centers_name, image_name = self.sites_inputs_provider(occ)
-            except Exception:
-                centers_name, image_name = (None, None)
-        centers = namespace.get(centers_name) if centers_name else None
-        if centers is None:
-            raise ValueError(
-                f"site map needs centres declared by `{occ}`'s producing node; "
-                "bind a producer that supplies value, centres and frame companions.")
-        centers = np.asarray(centers, dtype=float)
-        if centers.ndim != 4 or centers.shape[:2] != (1, 1) or centers.shape[-1] != 2:
-            raise ValueError(
-                "centres signal must be canonical (1,1,N,2) with data_shape=(N,2); "
-                f"got {centers.shape}")
-        centers = centers[0, 0]
-        image = namespace.get(image_name) if image_name else None
-        if image is not None:
-            image = np.asarray(image, dtype=float)
-            if image.ndim != 4 or image.shape[1] != 1:
-                raise ValueError(
-                    "site underlay must be canonical (R,1,H,W) with data_shape=(H,W); "
-                    f"got {image.shape}")
-            from zlc_frontend.live_plot.live import reduce_repeat
-            # Reduce only the declared repeat axis.  P remains explicit until we
-            # select its sole point; no squeeze/rank guess is involved.
-            mode = self._repeat_mode_value()
-            valid = (namespace.get(SIG_VALID_KEY, {}) or {}).get(image_name)
-            image = reduce_repeat(
-                image[:, 0], "replace" if mode == "create" else mode, valid=valid)
-            image = np.asarray(image).reshape(image.shape[-2:])
-        return centers[:, :2], image
 
     def _co_names(self) -> frozenset:
         """The hub-signal names this panel reads (cached) -- for the monitor roll-gate
@@ -2600,240 +1964,6 @@ class PanelCard(FluentGroupBox):
         every other kind pins its value axis (1D y-axis / 2D·sites clim)."""
         return {"relim_mode": self._relim(), **self._fixed_lim_kwargs()}
 
-    def _build_plot(self, value, namespace: Mapping[str, object] | None = None) -> None:
-        if panel_canvas is None:
-            raise RuntimeError("matplotlib Qt canvas is not available")
-        kind = self.config.kind
-        size = self.config.size
-        label = self.config.title or PANEL_KINDS[kind]
-        if kind == "pulse":
-            # A pulse panel renders its full timeline through the ONE pulse renderer in the PLOT LAYER
-            # (``live.build_pulse_preview_plot`` -- the SAME one the editor + the reopened-recipe path use;
-            # NEVER imported from the pulse_gui app -- see test_pulse_render_single_source), so a seeded
-            # pulse figure is faithful (every digital channel / analog bus trace / repeat bracket), not a
-            # flattened line.  The reproduction STATE (a PulseTableState) is an OBJECT the float-only hub
-            # cannot carry, so it is resolved off the SAME producing node via ``pulse_state_provider`` --
-            # the SAME "aux data from the producing node" wiring the site map uses for its centres/frame
-            # (the hub ``value`` here is only a numeric placeholder).  The figure keeps its own spec-owned
-            # geometry (frontend-owned); its own repeat brackets carry ×N, so there is no repeat_mode.
-            from zlc_frontend.live_plot.live import build_pulse_preview_plot
-
-            resolved = self.pulse_state_provider(self.config.inputs[0]) \
-                if (callable(self.pulse_state_provider) and self.config.inputs) else None
-            if resolved is None:
-                raise ValueError(
-                    "pulse panel needs a pulse figure's producing node -- point it at a loaded pulse "
-                    "figure's fig_value signal (it carries the PulseTableState to reproduce).")
-            state, node_include_off = resolved
-            # The "show off rows" toggle is the panel's own display param (seeded from the saved value);
-            # fall back to the node's recorded value when the param is unset -- so toggling re-renders.
-            include_off = bool(self.config.params.get("include_always_off", node_include_off))
-            # size drives the geometry like every other kind (config.size); interactions=True builds the
-            # selector layer, then _apply_selectors_state (end of this build) PARKS it to the header's
-            # "Selectors" switch -- OFF (default) keeps the Monitor card display-only exactly as before,
-            # ON arms zoom / area / cross in place (the same rule the sites / 2d / hist / 1d branches
-            # apply below).  The Edit tab stays the always-interactive surface.
-            plotter, _channels, _repeat = build_pulse_preview_plot(
-                state, include_always_off=include_off, size=size, interactions=True)
-        elif kind == "grid":
-            # A grid panel renders its per-site distribution / kernel grid through the ONE grid builder in
-            # the PLOT LAYER (``live.build_grid_figure`` -- the SAME one ``na.load_figure(npz).plot()`` and
-            # the report use).  Its reproduction RECIPE (a dict) is an OBJECT the float-only hub cannot
-            # carry, so it is resolved off the producing node via ``grid_recipe_provider`` -- the SAME "aux
-            # data from the producing node" wiring the pulse panel + site map use (the hub ``value`` here is
-            # only a numeric placeholder).  Its geometry (cell count-driven size) is frontend-owned.
-            # Build every cell's selector bundle; the card disables GridPlot's
-            # notebook focus callback below so its own focus host remains the sole
-            # double-click owner.
-            facet = self._facet()
-            if facet:
-                # A FACET grid: the bound block IS the data -- slice it along the declared axis
-                # (facet_cells, the ONE rule) and build through the ONE shared builder (the Edit-tab
-                # snapshot uses the same one); every tick after this first build moves the cells in
-                # place (update_cells in _render).
-                plotter = self._build_facet_plotter(value, interactions=True)
-            else:
-                from zlc_frontend.live_plot.live import build_grid_figure
-
-                recipe = self.grid_recipe_provider(self.config.inputs[0]) \
-                    if (callable(self.grid_recipe_provider) and self.config.inputs) else None
-                if recipe is None:
-                    raise ValueError(
-                        "grid panel needs a grid figure's producing node (a loaded grid figure's "
-                        "fig_value signal) -- or pick a facet in Setting to expand a measurement "
-                        "block's axis into cells.")
-                recipe = self._grid_recipe_with_params(recipe)   # fold the panel's live display knobs in
-                plotter = build_grid_figure(recipe, interactions=True, size=size, display=False)
-            click_cid = getattr(plotter, "_click_cid", None)
-            if click_cid is not None:
-                plotter.fig.canvas.mpl_disconnect(click_cid)
-                plotter._click_cid = None
-        elif kind == "sites":
-            centers, image = self._sites_aux(namespace or {})
-            vec = np.asarray(value, dtype=float).reshape(-1)
-            if len(vec) != len(centers):
-                raise ValueError(
-                    f"site-map value has {len(vec)} entries but the centers signal has {len(centers)} sites")
-            plotter = panel_plot(
-                centers, vec, kind="sites", size=size, interactions=True,
-                image=image, roi_radius=site_ring_radius(centers),
-                cmap=_resolved_cmap("sites", self.config.params),   # operator pick, else the kind default (ONE resolver)
-                **self._view_kwargs("sites"),
-                labels=self._panel_labels("Camera x (px)", "Camera y (px)", label),
-                title=self.config.title or None)
-        elif kind == "2d":
-            arr = np.asarray(value, dtype=float)
-            ny, nx = arr.shape
-            # Coordinate axes ARE the source's pixel space: when the producing node
-            # declares a spatial region, its endpoints [x_min, x_max, y_min, y_max]
-            # give the axis ORIGIN (index 0 = x_min, index 2 = y_min); the image x/y
-            # are the REAL pixels (x_min..x_min+nx), not 0..N -- so the axes match
-            # the camera window and a selection maps straight back to a new region.
-            roi = self._source_coord_frame(namespace)
-            self._roi_built = list(roi) if roi else None
-            if roi and len(roi) >= 4:
-                x0, y0 = float(roi[0]), float(roi[2])
-                xlabel, ylabel = "Camera x (px)", "Camera y (px)"
-            else:
-                x0, y0 = 0.0, 0.0
-                xlabel, ylabel = "X (px)", "Y (px)"
-            from zlc_data.raster import RegularRaster
-            data_x = RegularRaster((ny, nx), origin=(x0, y0))
-            plotter = panel_plot(
-                data_x, arr.ravel(), kind="2d", size=size, interactions=True,
-                cmap=_resolved_cmap("2d", self.config.params),   # operator pick, else the kind default (ONE resolver)
-                **self._view_kwargs("2d"),
-                # x / y / colour-bar all via the ONE _panel_labels source: a LIVE 2D panel labels its
-                # colour bar with the bound signal's own axis label (a camera frame's "Counts"); a
-                # REPRODUCED 2D figure overrides x / y / colour bar with the SAVED labels seeded into the
-                # panel params (_seed_state), so the reopened image draws the axes it was saved with.
-                labels=self._panel_labels(xlabel, ylabel, self._source_axis_label() or ""),
-                title=self.config.title or None)
-        elif kind == "monitor":
-            # Declared PANEL_PARAMS defaults via the ONE _resolved_param resolver (never a
-            # re-typed consume-site literal); the >=20 floor mirrors the decl's lo bound.
-            length = max(20, int(_resolved_param(kind, self.config.params, "length")))
-            history = np.full(length, np.nan)
-            plotter = panel_plot(
-                np.arange(length, dtype=float), history, kind="monitor", size=size, interactions=True,
-                show_dist=bool(_resolved_param(kind, self.config.params, "show_dist")),
-                labels=self._panel_labels("Shots ago", self._source_axis_label() or label),
-                **self._view_kwargs("monitor"),
-                title=self.config.title or None)
-            plotter.roll(float(value), draw=False)
-        elif kind == "hist":
-            plotter = panel_plot(
-                np.asarray(value, dtype=float), kind="hist", size=size, interactions=True,
-                bins=int(_resolved_param(kind, self.config.params, "bins")),
-                ylog=bool(_resolved_param(kind, self.config.params, "ylog")),
-                fit=str(_resolved_param(kind, self.config.params, "fit")),
-                **self._view_kwargs("hist"),                # relim/fixed pins the VALUE (x) axis (#3)
-                labels=self._panel_labels("Value", "Shots"), title=self.config.title or None)
-        else:  # 1d
-            arr = np.asarray(value, dtype=float)
-            if self.config.params.get("xy") and arr.ndim == 2 and arr.shape[1] == 2:
-                # an x-y curve (col0 = x, col1 = y): plot y vs the supplied x
-                # (a scanned measurement's result panel uses this -- value =
-                # column_stack([x_key, y_key]) grows the curve over the scan).
-                data_x, vec = arr[:, 0], arr[:, 1]
-                xlabel = str(self.config.params.get("xlabel", "X"))
-                ylabel = str(self.config.params.get("ylabel", "")) or label
-            else:
-                # A reduced scan curve is ``(points, ncols)`` -- KEEP it 2-D so each column draws as
-                # its own line (the one-dimensional data_shape, or one line per repeat in ``create`` mode); a
-                # plain vector stays 1-D (one line).  npts = the point count either way.
-                vec = arr if arr.ndim == 2 else arr.reshape(-1)
-                npts = arr.shape[0] if arr.ndim == 2 else vec.size
-                ylabel = self._source_axis_label() or label
-                # A scan's y curve: draw it vs the companion x signal from the SAME
-                # producing node (its axis label/unit come with it) -- so a 1d plot wired
-                # to ``temperature_survival`` reads "Trap-off time (s)" on x (#3).  Falls
-                # back to a per-site index when there is no companion x.
-                x_name = None
-                if self.config.inputs and callable(self.curve_x_provider):
-                    try:
-                        x_name = self.curve_x_provider(self.config.inputs[0])
-                    except Exception:
-                        x_name = None
-                x_vals = (namespace or {}).get(x_name) if x_name else None
-                x_arr = None if x_vals is None else np.asarray(x_vals, dtype=float).reshape(-1)
-                if x_arr is not None and x_arr.size == npts:
-                    data_x, xlabel = x_arr, (self._axis_label_for(x_name) or "X")
-                else:
-                    data_x, xlabel = np.arange(npts, dtype=float), "Site"
-            plotter = panel_plot(
-                data_x, vec, kind="1d", size=size, interactions=True,
-                labels=self._panel_labels(xlabel, ylabel),
-                **self._view_kwargs("1d"),
-                title=self.config.title or None)
-            # Colours cycle by column index inside Live1D (confocal-exact: grey, skyblue, ...; a lone
-            # line is grey, every line alpha=1 / linewidth=1) -- no per-line styling needed here.
-            # The plot shows the repeat count as a "xN" ylabel suffix (the panel computed it while
-            # reducing the measurement's repeat axis).  Apply it NOW (an in-place update with the same
-            # data) so the "xN" shows on the first build too -- not only after the next live tick.
-            rc = int(getattr(self, "_repeat_cur", 1))
-            plotter.repeat_cur = rc
-            if rc != 1:
-                plotter.update(plotter.data_y, repeat_cur=rc, draw=False)
-        # ATOMIC build-then-swap: the new plotter is now fully built.  Capture the OLD canvas/figure,
-        # INSERT the new canvas FIRST, then remove the old -- so the holder is NEVER empty during the
-        # swap (no one-frame blank).  A build error above (e.g. the sites length check) returns before
-        # here, leaving the previous figure untouched (#4 "图有时消失").  The card is setFixedSize, so the
-        # swap cannot reflow its geometry -- the plot never visibly resizes/jumps either (#5 "图变大").
-        old_canvas, old_plotter = self.canvas, self.plotter
-        self.plotter = plotter
-        # Re-apply the persisted Setting toggles (unit + x/y limits + x-window) to the FRESH plotter NOW
-        # -- BEFORE wrapping it in the canvas -- so the canvas's construction render draws the FINAL
-        # content ONCE.  Applying them AFTER the canvas (as it used to) rendered pre-knob content, then
-        # re-rendered: 2+ full re-renders of a heavy 36-cell grid.  Each apply_param itself redraws the
-        # whole figure, so suspend the plotter's per-knob draws; the canvas's own render is the single one.
-        with self.plotter.suspend_draws():
-            self._apply_display_params()
-        # Monitor cards default to display-only: the selector layer is built but PARKED
-        # inactive (see _apply_selectors_state below, gated by the header's "Selectors"
-        # switch) and the wheel scrolls the board (isolate_wheel=False) instead of being
-        # swallowed.  Switch ON arms the selectors in place -- Edit-tab behaviour on the
-        # live board; _apply_selectors_state also flips the wheel policy to match.
-        self.canvas = panel_canvas(self.plotter.fig, isolate_wheel=False)
-        # The canvas OWNS its size: EmbeddedFigureCanvas setFixedSize's itself to its DPR-invariant
-        # design size at construction (and renders its buffer synchronously), so the host no longer pins
-        # setMinimumSize(sizeHint()) on top -- that two-pin + DPR-derived-sizeHint race is what ballooned
-        # the figure.  The card is setFixedSize to hold the canvas + the proportional bottom padding the
-        # trailing stretch absorbs.
-        add_stretch = self.canvas_holder.count() == 0       # first build (no canvas, no stretch yet)
-        # canvas pins to the TOP of the content (right below the grey title strip); the trailing
-        # stretch is the proportional bottom padding (collapses to ~0 for a 1-row card).
-        self.canvas_holder.insertWidget(0, self.canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
-        if add_stretch:
-            self.canvas_holder.addStretch(1)
-        # NOW retire the old canvas/figure -- the new one is already in the holder, so there is no blank
-        # window between remove and insert (the swap is atomic from the user's view).
-        if old_canvas is not None:
-            self.canvas_holder.removeWidget(old_canvas)
-            old_canvas.setParent(None)
-            old_canvas.deleteLater()
-        if old_plotter is not None and plt is not None and old_plotter.fig is not None:
-            plt.close(old_plotter.fig)
-        # park (or arm) the fresh plotter's selector layer to the header's "Selectors" switch --
-        # a rebuild must inherit the current state, never come up with live selectors while OFF.
-        self._apply_selectors_state()
-        # The canvas already rendered the FINAL content at construction (the display knobs were applied to
-        # the plotter ABOVE, before it was wrapped).  Re-render only if the selector-state pass dirtied the
-        # figure -- otherwise a no-op, not a second full render of the heavy grid.
-        self.canvas._zlc_draw_if_needed()
-        self._place_setting_button()
-        # A GRID panel is display-only, so its own focus-zoom is dormant -- THIS card catches the double-click
-        # on the grid canvas and swaps to the clicked cell's standalone plot-kind figure (build_focus_plotter).
-        if kind == "grid" and self._grid_focus is None:
-            self._connect_grid_focus_click(self.plotter)
-            # A rebuild that interrupted an ENLARGED cell (recorded by _teardown_plot) re-focuses the SAME
-            # cell on the fresh grid -- a size/structure edit while zoomed stays zoomed (#no-focus-bounce).
-            k = self._pending_refocus_k
-            self._pending_refocus_k = None
-            if k is not None and 0 <= k < int(getattr(self.plotter, "n_cells", 0)):
-                self._focus_grid_cell(self.plotter, k)
-        else:
-            self._pending_refocus_k = None      # a non-grid rebuild has no cell to restore
 
     def _connect_grid_focus_click(self, grid) -> None:
         """Wire a double-click on the GRID canvas to enlarge the clicked cell into its standalone plot-kind

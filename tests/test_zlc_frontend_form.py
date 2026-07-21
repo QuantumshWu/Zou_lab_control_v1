@@ -300,18 +300,3 @@ def test_required_empty_field_is_reported_by_key() -> None:
         form.widget_for("missing")
 
 
-def test_legacy_scalar_is_a_deletion_boundary_over_the_current_owner() -> None:
-    """Ratchet: the old consumers may adapt, but may not regain scalar widgets."""
-
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from Zou_lab_control.frontend import param_widgets as legacy
-    from zlc_frontend.qt_widgets import FORM_WIDGET_HANDLERS
-
-    for kind in ("text", "int", "float", "bool"):
-        adapter = legacy.PARAM_WIDGETS[kind]
-        assert adapter._handler is FORM_WIDGET_HANDLERS[kind]
-    assert (
-        legacy.PARAM_WIDGETS["choice"]._ordinary._handler
-        is FORM_WIDGET_HANDLERS["choice"]
-    )
-    assert legacy.PARAM_WIDGETS["device"]._handler is FORM_WIDGET_HANDLERS["choice"]

@@ -22,9 +22,6 @@ from __future__ import annotations
 
 #: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
 #: file guards the NEW structure and is permanent (swept by test_design_charter).
-DIES_WITH_PARTIAL = {
-    "test_the_shell_reads_all_three_names_back_from_their_new_homes": 'Zou_lab_control/frontend/task_console.py',
-}
 
 import ast
 import pathlib
@@ -130,17 +127,3 @@ def test_the_record_module_reaches_for_no_toolkit_and_no_renderer():
     assert not any(m.split(".")[0] in {"matplotlib", "PyQt5"} for m in modules), modules
 
 
-def test_the_shell_reads_all_three_names_back_from_their_new_homes():
-    """Structural, so a shell that quietly kept a copy shows up in the import graph."""
-
-    root = pathlib.Path(__file__).resolve().parents[1]
-    text = (root / "Zou_lab_control" / "frontend" / "task_console.py").read_text(encoding="utf-8")
-    tree = ast.parse(text)
-    sources = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module:
-            for alias in node.names:
-                sources.setdefault(alias.name, set()).add(node.module)
-    assert sources.get("LogicNodeConfig") == {"zlc_data.console_records"}
-    assert sources.get("layout_record") == {"zlc_data.console_records"}
-    assert sources.get("LogicNodeRow") == {"zlc_frontend.qt_widgets"}

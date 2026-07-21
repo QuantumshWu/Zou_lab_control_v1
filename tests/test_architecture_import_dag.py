@@ -118,6 +118,17 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         # saved figure recorded: a panel size ("2x3"), a fit-model key, an axis
         # name, a saved axis label.
         (Path("zlc_data/panel_size.py"), "panel_size_cells"),
+        # The domain-ports wiring inherited from the legacy frontend root: the
+        # template reader normalises the scan PROGRAM text a human typed into the
+        # Scan-tab editor (or a template file carries) -- exactly the external
+        # input boundary this guard reserves .strip() for.
+        (Path("zlc_workbench/_domain_wiring.py"), "_read_pulse_template"),
+        # The runtime compiler (moved whole from the legacy device layer) parses
+        # slot REFERENCES ("s0") that a human's plan entries and saved documents
+        # carry as text, plus the wire-codec payload fields that mirror them.
+        (Path("zlc_neutral_atom/timing/runtime_compiler.py"), "RuntimeBusSegment.from_dict"),
+        (Path("zlc_neutral_atom/timing/runtime_compiler.py"), "_slot_ref_index"),
+        (Path("zlc_neutral_atom/timing/runtime_compiler.py"), "_pulse_table_bus_segments._emit"),
     # The signal-expression composite moved into qt_widgets (S5-shell(o)); its two
     # normalisation points came with it, so the named entries follow the code.
     (Path("zlc_frontend/qt_widgets/signal_expr_widget.py"), "SignalExprWidget._open_editor"),
@@ -150,9 +161,6 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
     # typed into two line edits, which is exactly the boundary this guard reserves .strip() for,
     # so the named entry follows the code rather than the guard being widened.
     (Path("zlc_frontend/qt_widgets/analysis_controls.py"), "_FitFixSeedEditor.values"),
-        (Path("zlc_frontend/live_plot/live.py"), "general_fit_models"),
-        (Path("zlc_frontend/live_plot/live.py"), "facet_cell_labels"),
-        (Path("zlc_frontend/live_plot/plot_figure.py"), "SavedFigure.axis_labels"),
         (Path("zlc_frontend/qt_widgets/fluent.py"), "align_to_resolution"),
         (Path("zlc_frontend/qt_widgets/fluent.py"), "FluentPathEdit._dialog_start"),
         (Path("zlc_frontend/qt_widgets/fluent.py"), "FluentTreeComboBox.current_signal"),
@@ -1056,26 +1064,17 @@ def test_pulse_software_formats_have_no_upgrade_or_edit_counter():
 def test_legacy_frontend_persisted_formats_have_no_edit_counter_or_single_role():
     """Owners are resolved by DEFINITION SITE, never by path -- see ``_sole_definition``.
 
-    The saved-figure format follows whichever module defines the ``SavedFigure``
-    record (today ``zlc_frontend/live_plot/plot_figure.py``, formerly the legacy
-    ``frontend/data_figure.py``), and the two console records follow their class
-    definitions.  So the guard survives the salvage instead of being silently
-    orphaned by it.
-
-    The anchor is the RECORD, not the ``load_figure`` reader: that name is
-    legitimately reused by the notebook sugar at
-    ``Zou_lab_control/neutral_atom/_gui.py`` which merely delegates.  Anchoring a
-    single-owner check on a name that a facade may reasonably re-export would make
-    the guard fail on a design that is fine.
+    The two console records follow their class definitions, so the guard survives
+    a salvage instead of being silently orphaned by it.  The legacy ``SavedFigure``
+    npz record died with the legacy render stack (terminal ruling 2026-07-21); the
+    current persisted-figure format is the ``zlc_frontend.figure`` document tree
+    with its own codec guards, so no anchor for it remains here.
     """
 
-    figure_module, _ = _sole_definition("SavedFigure")
     console_state_path, console_state_node = _sole_definition("TaskConsoleState")
     panel_config_path, panel_config_node = _sole_definition("PanelConfig")
 
     owners = (
-        (figure_module, ast.parse(figure_module.read_text(encoding="utf-8")),
-         {"_SAVED_FIGURE_VERSION", "version"}),
         (console_state_path, console_state_node, {"version"}),
         (panel_config_path, panel_config_node, {"role"}),
     )

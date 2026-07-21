@@ -1,4 +1,4 @@
-"""Current headless coherent-board host and bounded legacy-island contracts."""
+"""Current headless coherent-board host contracts."""
 
 from __future__ import annotations
 
@@ -42,13 +42,6 @@ from zlc_frontend.render import (
     RasterBuffer,
     RenderSurface,
     SourceIdentity,
-)
-from zlc_workbench.legacy import (
-    CatalogEntry,
-    CatalogRoute,
-    CatalogRouter,
-    LegacyHandoffTimeout,
-    SerializedLegacyAggBridge,
 )
 from zlc_workbench.workspace import (
     BoardController,
@@ -688,95 +681,6 @@ def test_workspace_updates_are_revisioned_values() -> None:
     assert workspace.revision == 0 and changed.revision == 1
     assert workspace.boards[0].layout_generation == 0
     assert changed.boards[0].layout_generation == 1
-
-
-def test_catalog_router_requires_one_explicit_route_per_use_case() -> None:
-    with pytest.raises(ValueError, match="exactly one"):
-        CatalogRouter(
-            ("camera",),
-            (
-                CatalogEntry("camera", CatalogRoute.LEGACY),
-                CatalogEntry("camera", CatalogRoute.TARGET),
-            ),
-        )
-    with pytest.raises(ValueError, match="missing=pulse"):
-        CatalogRouter(
-            ("camera", "pulse"),
-            (CatalogEntry("camera", CatalogRoute.TARGET),),
-        )
-    router = CatalogRouter(
-        ("camera",),
-        (CatalogEntry("camera", CatalogRoute.TARGET),),
-    )
-    assert router.resolve("camera").route is CatalogRoute.TARGET
-    with pytest.raises(KeyError, match="no explicit catalog route"):
-        router.resolve("pulse")
-
-
-class _LegacyLoop:
-    def __init__(self, barrier_result=True, stop_result=True) -> None:
-        self.barrier_result = barrier_result
-        self.stop_result = stop_result
-        self.stopped = False
-
-    def submit(self, _job):
-        return True
-
-    def barrier(self, _timeout):
-        return self.barrier_result
-
-    def stop(self, _timeout):
-        self.stopped = True
-        return self.stop_result
-
-
-class _RaisingLegacyLoop(_LegacyLoop):
-    def __init__(self, *, raise_barrier=False, raise_stop=False):
-        super().__init__()
-        self.raise_barrier = raise_barrier
-        self.raise_stop = raise_stop
-
-    def barrier(self, _timeout):
-        if self.raise_barrier:
-            raise RuntimeError("barrier exploded")
-        return True
-
-    def stop(self, _timeout):
-        if self.raise_stop:
-            raise RuntimeError("stop exploded")
-        return True
-
-
-def test_serialized_legacy_agg_handoff_timeout_poison_is_fail_closed() -> None:
-    bridge = SerializedLegacyAggBridge(_LegacyLoop(False))
-    with pytest.raises(LegacyHandoffTimeout):
-        bridge.settle(0.1)
-    assert bridge.poisoned
-    with pytest.raises(RuntimeError, match="poisoned"):
-        bridge.submit(lambda: None)
-
-
-def test_serialized_legacy_agg_close_requires_confirmed_worker_join() -> None:
-    loop = _LegacyLoop(stop_result=False)
-    bridge = SerializedLegacyAggBridge(loop)
-    with pytest.raises(LegacyHandoffTimeout, match="did not terminate"):
-        bridge.close(0.1)
-    assert loop.stopped and bridge.poisoned and not bridge.closed
-    loop.stop_result = True
-    bridge.close(0.1)
-    assert bridge.closed
-
-
-def test_serialized_legacy_agg_exceptions_poison_and_block_future_access() -> None:
-    bridge = SerializedLegacyAggBridge(_RaisingLegacyLoop(raise_barrier=True))
-    with pytest.raises(LegacyHandoffTimeout, match="handoff failed"):
-        bridge.settle(0.1)
-    assert bridge.poisoned
-
-    bridge = SerializedLegacyAggBridge(_RaisingLegacyLoop(raise_stop=True))
-    with pytest.raises(LegacyHandoffTimeout, match="stop failed"):
-        bridge.close(0.1)
-    assert bridge.poisoned and not bridge.closed
 
 
 def test_target_frontend_and_workbench_import_without_qt_side_effects() -> None:

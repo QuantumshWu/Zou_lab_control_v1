@@ -48,19 +48,6 @@ __all__ = [
 ]
 
 
-def _general_fit_models_for_kind(kind: str) -> list:
-    """The general curve-fit models offered for a panel of ``kind``: resolve kind -> render_family ->
-    the ONE :func:`live.general_fit_models` capability table (keyed off ``render_family``, the single
-    source).  A kind's OWN built-in fit no longer suppresses the general one -- a histogram
-    (render_family ``1d``) is offered the 1-D family here ALONGSIDE its bimodal ``fit`` knob, while a
-    site map (render_family ``auto``) is offered nothing (its occupancy rings are not a fittable
-    curve).  Both Setting and Edit read this ONE adapter; the fit engine stays the sole owner of model
-    keys, families, and parameter names."""
-    # Named at its real owner, not at the legacy forwarding module the shell used to reach it
-    # through: naming a shim as the source is how a second apparent source is born.
-    from ..live_plot.live import PLOT_KIND_BY_KEY, general_fit_models
-    pk = PLOT_KIND_BY_KEY.get(str(kind))
-    return general_fit_models(pk.render_family) if pk is not None else []
 
 
 class _FitFixSeedEditor(QtWidgets.QWidget):
@@ -204,79 +191,6 @@ class AnalysisControls(QtWidgets.QWidget):
     (``analysis_combo`` / ``fit_model_combo`` / ``fit_fix_seed`` / ``fit_result_label`` on the card,
     ``fit_combo`` / ``ed_fix_seed`` on the editor)."""
 
-    def __init__(self, card, *, surface: str, label_w: int, parent=None):
-        super().__init__(parent)
-        # Lazy for the same reason as the fit-model adapter above: the ROI capability table sits with
-        # the plot kinds, and this file must not pull the render layer in at import time.
-        from ..live_plot.live import kind_supports_roi
-        self.setStyleSheet("background: transparent;")
-        self.card = card
-        self.surface = str(surface)
-        self.action_combo = self.model_combo = self.fix_seed = None
-        self.result_label = self.fit_button = self.clear_button = None
-        models = _general_fit_models_for_kind(card._param_kind())
-        offers_roi = kind_supports_roi(card._param_kind())
-        col = QtWidgets.QVBoxLayout(self)
-        col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(scaled_px(6, minimum=4))
-        self.empty = not (models or offers_roi)
-        if self.empty:
-            return
-        # action combo (both surfaces) -- the action VOCABULARY is the AnalysisProcessor's own
-        # ANALYSIS_ACTIONS (single source), each entry gated by this panel kind's capability.
-        from zlc_data.vocabulary import ANALYSIS_ACTIONS
-        self.action_combo = FluentComboBox()
-        self.action_combo.addItem("none", "none")
-        labels = {"fit": "curve fit", "roi": "ROI"}
-        offered = {"fit": bool(models), "roi": offers_roi}
-        for action in ANALYSIS_ACTIONS:
-            if offered.get(action):
-                self.action_combo.addItem(labels.get(action, action), action)
-        self.action_combo.setToolTip(
-            "What a drag-selection on this panel does:\n"
-            "  none      = just report the selected points"
-            + ("\n  curve fit = fit the chosen model to the selection (the result overlays the plot;\n"
-               "              a 2-D image centre fit ALSO publishes fit_x0/fit_y0/... as hub signals)"
-               if models else "")
-            + ("\n  ROI       = reduce the selected region to one scalar (publishes roi_value; also\n"
-               "              roi_frame -- an image crop, or a 1-D / distribution / site sub-view)"
-               if offers_roi else ""))
-        self.action_combo.currentIndexChanged.connect(self._on_action)
-        col.addWidget(FluentSettingRow("action", self.action_combo, label_width=label_w))
-        if models:
-            self.model_combo = FluentComboBox()
-            for model in models:
-                self.model_combo.addItem(model.formula, model.key)
-            self.model_combo.setToolTip(
-                "Curve-fit model for this panel's plot family (a 2d image offers the 2D-Gaussian\n"
-                "'2D center'; a 1d / monitor / distribution offers the peak/decay models).")
-            self.model_combo.currentIndexChanged.connect(self._on_model)
-            if self.surface == "edit":
-                # Edit adds explicit Fit / Clear buttons beside the picker (its historical entry); the
-                # action combo above is the SAME entry the Setting popup uses.
-                self.fit_button = FluentButton("Fit", color=ACCENT)
-                self.fit_button.clicked.connect(self.do_fit)
-                self.clear_button = FluentButton("Clear", color=GREY)
-                self.clear_button.clicked.connect(self.clear_fit)
-                host = QtWidgets.QWidget()
-                hl = QtWidgets.QHBoxLayout(host)
-                hl.setContentsMargins(0, 0, 0, 0)
-                hl.setSpacing(scaled_px(6, minimum=4))
-                hl.addWidget(self.model_combo, 0)
-                hl.addStretch(1)
-                hl.addWidget(self.fit_button, 0)
-                hl.addWidget(self.clear_button, 0)
-                col.addWidget(FluentSettingRow("model", host, label_width=label_w))
-            else:
-                col.addWidget(FluentSettingRow("model", self.model_combo, label_width=label_w))
-            self.fix_seed = _FitFixSeedEditor()
-            self.fix_seed.changed.connect(self._on_fix_seed)
-            col.addWidget(FluentSettingRow("fix / seed", self.fix_seed, label_width=label_w))
-            self.result_label = FluentLabel("not fitted")
-            self.result_label.setWordWrap(True)
-            self.result_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            col.addWidget(FluentSettingRow("result", self.result_label, label_width=label_w))
-        self.derive()
 
     def derive(self) -> None:
         """Re-seed every control from the card's state (fit_request presence + selection_action) -- the

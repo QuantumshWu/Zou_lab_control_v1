@@ -47,24 +47,6 @@ def test_the_helpers_are_owned_by_the_widget_package():
         ), name
 
 
-def test_the_old_module_re_exports_rather_than_copying():
-    """One owner: the old leaf must hand back the very same objects."""
-
-    from Zou_lab_control.frontend import param_widgets
-
-    for name in PUBLIC:
-        assert getattr(param_widgets, name) is getattr(signal_picker, name), name
-
-    source = (
-        ROOT / "Zou_lab_control" / "frontend" / "param_widgets.py"
-    ).read_text(encoding="utf-8")
-    # Since the shell salvage the whole legacy module is a forwarding shim onto
-    # zlc_frontend.qt_widgets.param_widgets - a STRONGER form of the original
-    # "re-export, never copy" requirement this test was written to pin.
-    assert "zlc_frontend.qt_widgets.param_widgets" in source
-    assert "MOVED to" in source
-    for name in PUBLIC:
-        assert f"def {name}(" not in source, f"{name} still has a second definition"
 
 
 def test_the_moved_module_stayed_dependency_closed():

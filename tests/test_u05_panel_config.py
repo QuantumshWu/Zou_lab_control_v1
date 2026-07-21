@@ -28,10 +28,6 @@ from __future__ import annotations
 
 #: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
 #: file guards the NEW structure and is permanent (swept by test_design_charter).
-DIES_WITH_PARTIAL = {
-    "test_the_shell_reads_both_records_and_the_panel_vocabulary_from_the_new_home": 'Zou_lab_control/frontend/task_console.py',
-    "test_the_legacy_name_is_the_same_class": 'Zou_lab_control/frontend/task_console.py',
-}
 
 import ast
 import pathlib
@@ -199,30 +195,5 @@ def test_the_record_module_reaches_for_no_toolkit_and_no_renderer():
     assert roots <= {"zlc_data", "zlc_storage"}, roots
 
 
-def test_the_shell_reads_both_records_and_the_panel_vocabulary_from_the_new_home():
-    """Structural, so this file keeps no legacy-tree dependency of its own.
-
-    A shell that quietly kept its own copy of any of these would pass every behaviour test
-    above -- only the import graph can see it."""
-
-    tree = ast.parse((REPO / "Zou_lab_control" / "frontend" / "task_console.py")
-                     .read_text(encoding="utf-8"))
-    sources: dict[str, set[str]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module:
-            for alias in node.names:
-                sources.setdefault(alias.name, set()).add(node.module)
-    for name in ("PanelConfig", "LogicNodeConfig", "PANEL_KINDS", "ADDABLE_PANEL_KINDS",
-                 "PANEL_INPUT_FORMAT", "PANEL_INPUT_SLOTS", "PANEL_SINGLE_SLOT_KINDS",
-                 "UPDATE_INTERVALS", "DEFAULT_UPDATE_MS", "layout_record",
-                 "panel_input_slots", "panel_allows_multi_slot"):
-        assert sources.get(name) == {"zlc_data.console_records"}, (name, sources.get(name))
 
 
-def test_the_legacy_name_is_the_same_class():
-    """The shell alias must BE the moved class, not a lookalike left behind -- the frontend
-    package re-exports ``PanelConfig``, and devtools / figure_viewer construct it."""
-
-    from Zou_lab_control.frontend.task_console import PanelConfig as shell_name
-
-    assert shell_name is PanelConfig

@@ -20,9 +20,6 @@ from __future__ import annotations
 
 #: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
 #: file guards the NEW structure and is permanent (swept by test_design_charter).
-DIES_WITH_PARTIAL = {
-    "test_both_shells_read_the_vocabulary_from_its_new_home": ('Zou_lab_control/frontend/task_console.py', 'Zou_lab_control/frontend/pulse_gui.py'),
-}
 
 import ast
 import importlib
@@ -33,12 +30,6 @@ import pytest
 import zlc_data.panel_size as canonical
 
 
-def test_the_render_layer_reads_back_the_one_definition():
-    """Not a copy: the same object, so the two can never disagree."""
-
-    live = importlib.import_module("zlc_frontend.live_plot.live")
-    assert live.PANEL_SIZES is canonical.PANEL_SIZES
-    assert live.panel_size_cells is canonical.panel_size_cells
 
 
 def test_every_preset_parses_and_anything_else_is_refused():
@@ -71,25 +62,3 @@ def test_the_vocabulary_module_imports_nothing():
     assert not imports, f"panel_size.py grew imports: {[ast.dump(n) for n in imports]}"
 
 
-def test_both_shells_read_the_vocabulary_from_its_new_home():
-    """Structural, so this file needs no legacy import of its own.
-
-    A shell that kept importing it from the figure module would still work today - the
-    re-export is the same object - which is precisely why only the import graph, not a
-    value comparison, can catch the drift.
-    """
-
-    root = pathlib.Path(__file__).resolve().parents[1]
-    for relative in ("Zou_lab_control/frontend/task_console.py",
-                     "Zou_lab_control/frontend/pulse_gui.py"):
-        text = (root / relative).read_text(encoding="utf-8")
-        tree = ast.parse(text)
-        sources = {
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom)
-            and any(alias.name in {"PANEL_SIZES", "panel_size_cells"} for alias in node.names)
-        }
-        assert sources, f"{relative} no longer imports the panel-size vocabulary"
-        assert sources == {"zlc_data.panel_size"}, (
-            f"{relative} reads the vocabulary from {sources}, not its canonical home")

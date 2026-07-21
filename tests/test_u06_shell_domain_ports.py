@@ -32,8 +32,9 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 
-from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
-from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+from zlc_neutral_atom.timing.ports import PortCatalog
+from zlc_neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+from zlc_neutral_atom.timing.streamer_geometry import hardware_channel_names
 
 BUS = "da_x"
 TICK_NS = 20.0
@@ -46,7 +47,9 @@ def _state(plan, durations_us=(1.0, 2.0, 1.0)) -> PulseTableState:
     end; the plan is padded in front with holds to line up with them.
     """
 
-    catalog = VirtualSequencer().port_catalog
+    lanes = tuple(f"dx{i}" for i in range(6))
+    catalog = PortCatalog.from_channels(
+        list(lanes) + hardware_channel_names(4), analog_buses={BUS: lanes})
     state = PulseTableState(port_catalog=catalog, time_step_ns=TICK_NS)
     off = tuple([0] * len(catalog.raw_lanes))
     seeded = len(state.periods)
@@ -61,6 +64,7 @@ def _state(plan, durations_us=(1.0, 2.0, 1.0)) -> PulseTableState:
 def _appended_starts(state: PulseTableState) -> list[int]:
     slots = state._reference_slots()
     return state.period_start_steps(slots=slots, time_step_ns=state.time_step_ns)
+
 
 
 def test_an_all_edge_plan_samples_exactly_at_the_period_boundaries():
@@ -142,33 +146,6 @@ def test_a_scanned_slot_value_previews_at_its_reference_instead_of_failing():
     )
 
 
-def test_the_render_surface_has_no_private_copy_of_the_sampler():
-    """The single-source ratchet: what ``live.py`` draws IS what the state reports.
-
-    ``analog_bus_traces`` used to import the compiler helpers and re-derive the
-    period prefix sum itself.  Both are now the state's job; this pins that the
-    render output stays identical to the state's own answer, so a future edit
-    cannot quietly reintroduce a second sampler that drifts.
-    """
-
-    from Zou_lab_control.frontend.live import analog_bus_traces
-
-    state = _state(
-        [
-            {"mode": "edge", "value": 20},
-            {"mode": "ramp", "value": -30},
-            {"mode": "hold", "value": None},
-        ]
-    )
-    traces, _folded = analog_bus_traces(state)
-    drawn = {trace["name"]: trace for trace in traces}
-    assert BUS in drawn, "the DAC bus must fold into one analog trace row"
-
-    ticks, values = state.analog_bus_samples(BUS, looping=True)
-    assert drawn[BUS]["values"] == values
-    assert drawn[BUS]["starts"] == [tick * state.time_step_ns * 1e-9 for tick in ticks], (
-        "the render converts the state's ticks to seconds and nothing else"
-    )
 
 
 # ------------------------------------------------- the pulse-replay object port
@@ -248,12 +225,13 @@ def test_the_product_surface_reaches_no_legacy_module():
     )
 
 
-def test_importing_the_legacy_frontend_wires_the_pulse_replay_port():
-    """Today's composition root.  Importing ANY frontend submodule runs the
-    package __init__, so a saved pulse figure always replays - the behaviour the
-    lazy `from ...pulse_table import PulseTableState` used to give for free."""
+def test_importing_the_workbench_wires_the_pulse_replay_port():
+    """Today's composition root: ``zlc_workbench`` (the call inherited from the
+    deleted legacy frontend root).  Importing the package registers the factory,
+    so any window composed from it can replay a saved pulse figure."""
 
-    import Zou_lab_control.frontend  # noqa: F401
+    import zlc_workbench  # noqa: F401  - the import IS the wiring under test
+
     from zlc_frontend.domain_ports import (
         pulse_state_factory_is_registered,
         pulse_state_from_dict,
@@ -277,6 +255,7 @@ def test_a_second_conflicting_factory_is_refused():
 
     import pytest
 
+    import zlc_workbench  # noqa: F401  - ensures the factory is wired
     from zlc_frontend import domain_ports
 
     current = domain_ports._PULSE_STATE_FACTORY
@@ -320,7 +299,7 @@ def test_the_template_reader_returns_rows_the_gui_can_draw_without_pulse_types()
     console stop reaching into a live PulseTableState.
     """
 
-    import Zou_lab_control.frontend  # noqa: F401  - today's composition root
+    import zlc_workbench  # noqa: F401  - ensures the reader is wired
     from zlc_frontend.domain_ports import (
         PulseTemplateRows,
         pulse_template_reader_is_registered,
@@ -356,48 +335,3 @@ def test_the_template_reader_returns_rows_the_gui_can_draw_without_pulse_types()
         assert all(isinstance(x, str) for x in (coordinate, kind, target, unit))
 
 
-def test_the_template_port_hands_over_columns_the_gui_could_not_have_built():
-    """The DAC-vs-duration sweep default is derived DOMAIN-side, and stays right.
-
-    ``scan_column_spec`` reads the bus signed range, the unit table and the clock
-    tick, so the render layer cannot run it - ``zlc_frontend`` may not import the
-    pulse package at all.  The port therefore carries finished columns.  What must
-    survive that move is the per-KIND default: a DAC column sweeps its signed code
-    range (0 = 0 V), a duration column sweeps time.  Seeding a +-512 DAC column
-    with a duration's ns range is the operator-visible bug this distinction exists
-    to prevent, so it is pinned here rather than trusted.
-
-    The fixture deliberately BINDS one slot of each kind: the older row assertions
-    above run over a template with no slots at all, and an empty tuple would make
-    any claim about columns vacuously true.
-    """
-
-    import json
-    import tempfile
-
-    import Zou_lab_control.frontend  # noqa: F401  - registers the reader
-    from zlc_data.scan_template import ScanColumnSpec
-    from zlc_frontend.domain_ports import pulse_template_rows
-    from Zou_lab_control.neutral_atom.timing.pulse_table import ApiSlot, ScanSlot
-
-    state = _state([{"mode": "edge", "value": 20},
-                    {"mode": "hold", "value": None},
-                    {"mode": "hold", "value": None}])
-    last = len(state.periods) - 1
-    state.scan_slots.append(ScanSlot(kind="dac", target=f"{BUS}@{last}", label="bus", unit="code"))
-    state.scan_slots.append(ScanSlot(kind="duration", target=str(last), label="dur", unit="us"))
-    state.api_slots.append(ApiSlot(name="a1", kind="duration", target=str(last), unit="us"))
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "template.json"
-        path.write_text(json.dumps(state.to_dict(), default=str), encoding="utf-8")
-        rows = pulse_template_rows(str(path))
-
-    assert len(rows.scan_columns) == len(rows.scan_rows) == 2, "fixture must bind both kinds"
-    assert len(rows.api_columns) == len(rows.api_rows) == 1
-    assert all(isinstance(c, ScanColumnSpec) for c in rows.scan_columns + rows.api_columns)
-
-    dac, duration = rows.scan_columns
-    assert dac.is_dac and (dac.lo, dac.hi) == (-512.0, 511.0)
-    assert not duration.is_dac and duration.lo < duration.hi
-    # The distinction itself: a DAC column never inherits the time column's range.
-    assert (dac.lo, dac.hi) != (duration.lo, duration.hi)

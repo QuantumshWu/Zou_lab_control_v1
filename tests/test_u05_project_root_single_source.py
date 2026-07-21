@@ -30,9 +30,6 @@ from __future__ import annotations
 
 #: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
 #: file guards the NEW structure and is permanent (swept by test_design_charter).
-DIES_WITH_PARTIAL = {
-    "test_resolve_task_state_reports_the_folder_it_searched": 'Zou_lab_control/frontend/task_console.py',
-}
 
 import ast
 import os
@@ -139,14 +136,6 @@ def test_the_seam_is_the_only_definition_of_the_project_root():
         "asking zlc_storage.paths:\n" + "\n".join(offenders))
 
 
-def test_resolve_task_state_reports_the_folder_it_searched():
-    """The operator-visible consequence: an unknown layout name names the real folder."""
-
-    from Zou_lab_control.frontend.task_console import _task_files_dir, resolve_task_state
-
-    with pytest.raises(ValueError) as caught:
-        resolve_task_state("definitely_not_a_saved_layout")
-    assert str(_task_files_dir()) in str(caught.value)
 
 
 def test_the_storage_seam_still_needs_nothing_but_pathlib():

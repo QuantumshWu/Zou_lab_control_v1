@@ -1,66 +1,14 @@
-"""Mechanical public-object boundary for installation-owned hardware."""
+"""Mechanical public-object boundary for installation-owned hardware.
+
+The legacy device classes this file used to enumerate died with the legacy backend
+(directive 2026-07-21); what remains is the live claim: a public session hands out
+catalog VALUES, never raw device objects.
+"""
 
 from __future__ import annotations
 
-import pytest
-
-import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.notebook import connect
-from Zou_lab_control.neutral_atom import adapter_sdk, testing
 
-
-RAW_PUBLIC_NAMES = (
-    "BaseDevice",
-    "CameraDevice",
-    "CommandSequencerBackend",
-    "DeviceSet",
-    "ManualSequencer",
-    "PulseController",
-    "QCMOSCamera",
-    "QCMOSConfig",
-    "RemoteSequencer",
-    "SequencerDevice",
-    "SequencerService",
-    "TrapArrayDevice",
-    "VirtualCamera",
-    "VirtualSequencer",
-    "VirtualTrapArray",
-    "bind_pulse",
-    "discover_devices",
-    "load_devices",
-    "register_device_class",
-    "run_sequencer_server",
-    "serve_runtime_sequencer",
-    "triggered_frames",
-)
-
-
-@pytest.mark.parametrize("name", RAW_PUBLIC_NAMES)
-def test_ordinary_neutral_atom_umbrella_has_no_raw_hardware(name):
-    assert name not in na.__all__
-    assert not hasattr(na, name)
-
-
-def test_adapter_sdk_has_contracts_but_no_concrete_or_registry_escape():
-    assert adapter_sdk.CameraDevice is not None
-    assert adapter_sdk.CameraBufferOverrun is not None
-    assert adapter_sdk.CameraCaptureTerminalRecord is not None
-    assert adapter_sdk.CameraFrameRecord is not None
-    assert adapter_sdk.SequencerDevice is not None
-    for forbidden in (
-        "QCMOSCamera",
-        "RemoteSequencer",
-        "VirtualSequencer",
-        "load_devices",
-        "register_device_class",
-    ):
-        assert not hasattr(adapter_sdk, forbidden)
-
-
-def test_simulation_fakes_require_the_explicit_testing_namespace():
-    assert testing.VirtualSequencer is not None
-    assert testing.bind_test_pulse is not None
-    assert not hasattr(na, "VirtualSequencer")
 
 
 def test_public_session_exposes_catalog_values_not_raw_devices(tmp_path):

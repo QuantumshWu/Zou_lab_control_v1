@@ -132,9 +132,9 @@ def test_every_scaffolding_test_dies_with_an_artifact_that_still_exists():
                             stale.append(f"{path.name}::{test} dies with {rel}, which is gone "
                                          f"-- delete the test and its map entry")
     assert not stale, "\n".join(stale)
-    assert declared >= 10, (
-        f"only {declared} tests declare DIES_WITH/DIES_WITH_PARTIAL -- the scaffolding oracles "
-        f"are supposed to carry their expiry (see the ledger's 测试大清洗 row)")
+    # No minimum count: the one-shot purge (2026-07-21) deleted the legacy artifacts and
+    # their DIES_WITH oracles together, so a low count is the healthy end state -- what
+    # matters is only that any REMAINING declaration still points at a live artifact.
 
 
 def test_the_manifest_is_the_suite():
@@ -149,38 +149,18 @@ def test_the_manifest_is_the_suite():
         f"manifest-only: {sorted(manifest - files)}; file-only: {sorted(files - manifest)}")
 
 
-#: C24 -- the migration's progress metric.  Files in the deletion ledger's 承 table whose target
-#: package is still ``?``.  EQUALITY (C6): every round that decides one lowers this by hand, and
-#: a round that quietly adds an undecided file cannot hide behind a ceiling.
-UNDECIDED_LEGACY_FILES = 17
-
-
 def test_the_deletion_ledger_covers_every_legacy_file():
-    """C24/C25.  The ledger is a census, so its value is entirely in being EXHAUSTIVE: a legacy
-    file missing from it is a file nobody ever has to decide about, which is how residue
-    survives a migration that believes itself finished."""
+    """C24/C25, completed.  The census the ledger existed for is finished: the one-shot
+    purge (2026-07-21) deleted both legacy trees outright, so the exhaustiveness claim
+    collapses to its end state -- ZERO tracked legacy files, forever."""
 
     import subprocess
 
     tracked = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
                              text=True, check=True).stdout.split()
-    legacy = {p for p in tracked
-              if p.startswith(("Zou_lab_control/frontend/", "Zou_lab_control/neutral_atom/"))
-              and p.endswith(".py")}
-
-    text = LEDGER.read_text(encoding="utf-8")
-    section = text[text.index("## 删除台账"):text.index("## 新台账")]
-    # Rows are ``| `path` | ... |``; the backticks are what separate a listed file from prose
-    # that merely mentions one.
-    listed = set(re.findall(r"^\| `([^`]+\.py)` \|", section, flags=re.MULTILINE))
-    assert listed == legacy, (
-        f"ledger-only: {sorted(listed - legacy)}; unlisted legacy files: {sorted(legacy - listed)}")
-
-    undecided = len(re.findall(r"\| \?\s*\|", section))
-    assert undecided == UNDECIDED_LEGACY_FILES, (
-        f"{undecided} legacy files still have no target package, recorded "
-        f"{UNDECIDED_LEGACY_FILES} -- "
-        f"{'lower the constant in this commit' if undecided < UNDECIDED_LEGACY_FILES else 'ROSE'}")
+    legacy = sorted(p for p in tracked
+                    if p.startswith(("Zou_lab_control/frontend/", "Zou_lab_control/neutral_atom/")))
+    assert not legacy, f"legacy trees have tracked files again: {legacy[:10]}"
 
 
 def test_no_file_marries_qt_to_matplotlib_outside_the_sanctioned_zones():
@@ -201,7 +181,7 @@ def test_no_file_marries_qt_to_matplotlib_outside_the_sanctioned_zones():
         if ("__pycache__" in rel or rel.startswith(("tests/", "tools/", "fpga/", "docs/",
                                                     "_output/", "results/", "mot_field/"))):
             continue
-        if rel.startswith("Zou_lab_control/frontend/") or "/plot_bridge" in rel:
+        if "/plot_bridge" in rel:
             continue
         try:
             tree = _ast.parse(path.read_text(encoding="utf-8"))

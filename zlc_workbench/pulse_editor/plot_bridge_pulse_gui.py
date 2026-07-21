@@ -39,18 +39,6 @@ from zlc_storage.paths import project_path   # the ONE owner of where the projec
 # not own the render.  ``bus_signed_bounds`` / ``bus_display_label`` are shared render+editor helpers that
 # also live there now (single source; the editor's ``_bus_signed_bounds`` / ``_bus_display_label`` names
 # alias them below so the many editor call sites are unchanged).
-from zlc_frontend.live_plot.live import (
-    plot as frontend_plot,
-    pulse_plot_channels,
-    pulse_repeat_markers,
-    pulse_repeat_notation,
-    build_pulse_preview_plot,
-    default_pulse_size,
-    analog_bus_traces as _analog_bus_traces,
-    annotate_pulse_variable_regions,
-    bus_signed_bounds as _bus_signed_bounds,
-    bus_display_label as _bus_display_label,
-)
 from zlc_frontend.qt_widgets import (
     ACCENT,
     BG,
@@ -99,19 +87,6 @@ from zlc_frontend.qt_widgets import (
     signals_blocked as _signals_blocked,
 )
 
-try:  # Matplotlib is already a frontend dependency, but keep import errors tidy.
-    import matplotlib.pyplot as plt
-    # The preview embeds its figure through the SAME port as task_console / figure_viewer:
-    # qt_canvas.panel_canvas (wheel isolation + the ONE panel display scale, style.PANEL_DISPLAY_SCALE) --
-    # the pulse preview is NOT special-cased at 1:1 any more.  FigureCanvas is only the availability
-    # sentinel (None when matplotlib-qt is missing); construction goes through panel_canvas.
-    from zlc_workbench.task_console.plot_bridge_canvas import EmbeddedFigureCanvas as FigureCanvas, panel_canvas
-    if FigureCanvas is None:
-        raise ImportError("matplotlib qt canvas unavailable")
-except Exception:  # pragma: no cover - depends on the local desktop environment.
-    FigureCanvas = None
-    panel_canvas = None
-    plt = None
 
 
 TIME_UNITS = ["ns", "us", "ms", "s", "str (ns)"]
@@ -373,14 +348,6 @@ def _set_duration_unit_combo(combo, *, scanned: bool, unit: str) -> None:
     combo.setCurrentText("str (ns)" if scanned else (unit if unit in DURATION_UNITS else "ns"))
 
 
-def _normalize_bus_value_text(text: str, *, max_value: int) -> str:
-    lo, hi = _bus_signed_bounds(max_value)
-    try:
-        value = int(round(float(str(text or "0").strip())))
-    except Exception as exc:
-        raise ValueError(f"analog bus value must be an integer {lo}..{hi} (signed; 0 = 0 V).") from exc
-    value = max(lo, min(hi, value))
-    return str(value)
 
 
 def _unit_resolution(step_ns: float, unit: str) -> float:
@@ -641,199 +608,6 @@ class PeriodCard(FluentGroupBox):
     busScanRequested = QtCore.pyqtSignal(str)
     busChanged = QtCore.pyqtSignal()  # a DAC mode/value committed -> refresh hold displays
 
-    def __init__(
-        self,
-        index: int,
-        period: PulsePeriod,
-        *,
-        total_periods: int = 1,
-        channels: Sequence[str],
-        labels: dict[str, str],
-        hidden_states: dict[str, int] | None = None,
-        rows: Sequence[Mapping[str, object]] | None = None,
-        state: PulseTableState | None = None,
-        compact: bool = False,
-        time_step_ns: float = 1.0,
-        parent=None,
-    ):
-        super().__init__("", parent)
-        self.channels = list(channels)
-        self.rows = list(rows or [{"kind": "channel", "key": channel, "name": channel, "channels": [channel], "label": labels.get(channel) or channel} for channel in channels])
-        self.state_ref = state
-        self.checks: dict[str, FluentCheckBox] = {}
-        self.bus_mode_combos: dict[str, FluentComboBox] = {}
-        self.bus_value_edits: dict[str, FluentLineEdit] = {}
-        self.bus_dots: dict[str, FluentScanDot] = {}
-        self.bus_max_values: dict[str, int] = {}
-        self.bus_members: dict[str, list[str]] = {}
-        self.hidden_states = {str(k): int(v) for k, v in dict(hidden_states or {}).items()}
-        self.compact = bool(compact)
-        self.time_step_ns = float(time_step_ns)
-        self.set_period_position(index, total_periods)
-
-        width = _period_card_width()
-        control_width = _period_control_width(width)
-        self.check_full_labels: dict[str, str] = {}
-        self._checkbox_text_width = control_width - _px(24)
-        self.setMinimumWidth(width)
-        self.setMaximumWidth(width)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(_px(7), _px(7), _px(7), _px(7))
-        layout.setSpacing(_row_spacing())
-
-        top = QtWidgets.QWidget()
-        top.setStyleSheet("background: transparent;")
-        top.setFixedHeight(_panel_top_height())
-        top_layout = QtWidgets.QVBoxLayout(top)
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.setSpacing(_px(6, minimum=4))
-
-        duration_label = FluentLabel("Duration")
-        duration_label.setAlignment(QtCore.Qt.AlignCenter)
-        duration_label.setToolTip("Duration")
-        top_layout.addWidget(_set_fixed_height(duration_label))
-
-        scanned = _is_slot_expr(period.duration)
-        self.duration_edit = FluentScanLineEdit(_period_duration_text(period), tooltip="Duration value; click the dot to cycle scan (sN) -> API (aN) -> off")
-        self.duration_edit.setFixedWidth(control_width)
-        # Input restriction is applied in _handle_unit: a numeric unit (ns/us/...) only
-        # accepts digits/./e; the "str (ns)" unit allows an affine slot expression.
-        self.duration_dot = self.duration_edit.dot
-        top_layout.addWidget(_set_fixed_height(self.duration_edit))
-
-        self.unit_combo = FluentComboBox()
-        _set_duration_unit_combo(self.unit_combo, scanned=scanned, unit=period.unit)
-        self.unit_combo.setToolTip("Duration unit")
-        self.unit_combo.setFixedWidth(control_width)
-        top_layout.addWidget(_set_fixed_height(self.unit_combo))
-        # Editable period NAME (e.g. "load", "image") -- the index stays in the card
-        # title ("Period 3/5"); the name is free text saved with the pulse so the
-        # experiment log can reference periods by meaning, not number.  Placed BELOW
-        # the unit combo so Duration/unit keep their cross-panel alignment.
-        self.name_edit = FluentLineEdit(period.name or "")
-        self.name_edit.setToolTip("Period name (optional; saved with the pulse)")
-        self.name_edit.setPlaceholderText("name…")
-        self.name_edit.setFixedWidth(control_width)
-        top_layout.addWidget(_set_fixed_height(self.name_edit))
-        top_layout.addStretch()
-        layout.addWidget(top)
-        layout.addSpacing(_px(1, minimum=0))
-
-        if scanned:
-            self.duration_edit.set_scan_bound(True, _slot_index_of_expr(period.duration) + 1)
-            self.unit_combo.setEnabled(False)
-        elif self.state_ref is not None and self.state_ref.api_slot_for("duration", str(index)):
-            self.duration_edit.set_api_bound(True, _api_number(self.state_ref.api_slot_for("duration", str(index))))
-
-        row_height = _channel_row_height(len(self.rows))
-        full_state = self.state_ref
-        for offset, row in enumerate(self.rows):
-            if row.get("kind") == "bus" and full_state is not None:
-                bus_name = str(row["name"])
-                members = [str(channel) for channel in row.get("channels", [])]
-                plan = full_state.analog_bus_plan(bus_name)
-                entry = dict(plan[index]) if index < len(plan) else {"mode": "hold", "value": None}
-                mode = str(entry.get("mode", "hold")).lower()
-                raw_value = entry.get("value")
-                bound = _is_slot_expr(raw_value)
-                max_value = (1 << max(1, len(members))) - 1
-                lo_signed, hi_signed = _bus_signed_bounds(max_value)
-                if bound:
-                    value_display = str(raw_value)
-                elif raw_value is None:
-                    # hold row: show the SIGNED value carried into this period (0 = 0 V)
-                    value_display = str(int(full_state.analog_bus_value_at_period_start(index, bus_name)))
-                else:
-                    value_display = str(max(lo_signed, min(hi_signed, int(raw_value))))
-                # The DAC row uses the SAME height as every other channel row so
-                # the period card stays aligned, row-for-row, with the Names and
-                # Delay panels (which render the bus row at row_height too).  The
-                # combo / value field are given setFixedHeight(row_height) below,
-                # which overrides their 30 px minimumHeight; their content only
-                # needs ~24 px, so nothing clips even at the compressed 26 px.
-                bus_row_height = row_height
-                row_widget = QtWidgets.QWidget()
-                row_widget.setStyleSheet("background: transparent;")
-                row_widget.setFixedHeight(bus_row_height)
-                row_layout = QtWidgets.QHBoxLayout(row_widget)
-                row_layout.setContentsMargins(0, 0, 0, 0)
-                # A clear gap between the mode combo and the value field (they used to
-                # sit almost flush, which read as one merged control).
-                row_gap = _px(7, minimum=5)
-                row_layout.setSpacing(row_gap)
-                combo = FluentComboBox()
-                combo.addItems(["Edge", "Ramp", "Hold"])
-                combo.setCurrentText(_bus_mode_title(mode))
-                # Just wide enough for "Edge"/"Ramp"/"Hold" + the dropdown arrow (the
-                # value field keeps the rest, so the widest value -512 always shows).
-                combo_w = _bus_mode_combo_width()
-                combo.setFixedSize(combo_w, bus_row_height)
-                combo.setToolTip(f"{bus_name}: output mode")
-                value_edit = FluentScanLineEdit(
-                    value_display,
-                    tooltip=f"{bus_name}: signed integer {lo_signed}..{hi_signed} (0 = 0 V); click the dot to cycle scan (sN) -> API (aN) -> off",
-                )
-                value_edit.setFixedHeight(bus_row_height)
-                # Size the value field to EXACTLY the card's remaining width (combo + gap
-                # + value = card content), so it can never spill past the card's right
-                # border and clip the embedded scan dot -- independent of the font's
-                # width.  On the real (narrow) font the leftover comfortably fits "-512".
-                value_w = max(_px(44), (width - 2 * _px(7)) - combo_w - row_gap)
-                value_edit.setFixedWidth(value_w)
-                # DAC value is a SIGNED integer (0 = true 0 V); reject any other keystroke.
-                value_edit.set_numeric_validator("int", bottom=lo_signed, top=hi_signed)
-                # NB: use set_editable (read-only + muted) NOT setEnabled --
-                # disabling the field would also disable the embedded scan dot,
-                # so you could never click it again to unbind the slot.
-                value_edit.set_editable(mode != "hold")
-                value_edit.editingFinished.connect(lambda edit=value_edit, limit=max_value: self._normalize_bus_value_edit(edit, limit))
-                value_edit.editingFinished.connect(self.busChanged)
-                value_edit.textChanged.connect(self.changed)
-                value_edit.scanClicked.connect(lambda b=bus_name: self.busScanRequested.emit(b))
-                combo.currentTextChanged.connect(lambda text, edit=value_edit: edit.set_editable(_bus_mode_value(text) != "hold"))
-                combo.currentTextChanged.connect(self.changed)
-                combo.currentTextChanged.connect(self.busChanged)
-                self.bus_mode_combos[bus_name] = combo
-                self.bus_value_edits[bus_name] = value_edit
-                self.bus_max_values[bus_name] = max_value
-                self.bus_members[bus_name] = members
-                self.bus_dots[bus_name] = value_edit.dot
-                row_layout.addWidget(combo)
-                row_layout.addWidget(value_edit, 1)
-                layout.addWidget(row_widget)
-                if bound:
-                    slot_index = full_state.slot_index_for("dac", f"{bus_name}@{index}")
-                    value_edit.set_scan_bound(True, None if slot_index is None else slot_index + 1)
-                    combo.setEnabled(False)
-                elif full_state.api_slot_for("dac", f"{bus_name}@{index}"):
-                    value_edit.set_api_bound(True, _api_number(full_state.api_slot_for("dac", f"{bus_name}@{index}")))
-                continue
-            channel = str(row["key"])
-            source_index = self.channels.index(channel) if channel in self.channels else offset
-            full_label = str(labels.get(channel) or channel)
-            checkbox = FluentCheckBox(_elide_text(full_label, self._checkbox_text_width))
-            checkbox.setChecked(bool(period.states[source_index]))
-            checkbox.setToolTip(f"{channel} / {full_label}" if full_label != channel else channel)
-            checkbox.setFixedHeight(row_height)
-            checkbox.toggled.connect(self.changed)
-            # A clk-driven channel's pin is the FPGA clock, so the engine never drives it:
-            # lock + grey its per-period checkbox (like the delay field in the Delay panel).
-            if full_state is not None and full_state.is_clk_channel(channel):
-                checkbox.setEnabled(False)
-                checkbox.setToolTip(f"{channel}: wired to the FPGA clk (not engine-driven)")
-            self.checks[channel] = checkbox
-            self.check_full_labels[channel] = full_label
-            layout.addWidget(checkbox)
-        layout.addStretch()
-
-        self.name_edit.textChanged.connect(self.changed)
-        self.duration_edit.textChanged.connect(self._handle_duration_text)
-        self.duration_edit.textChanged.connect(self.changed)
-        self.unit_combo.currentTextChanged.connect(self._handle_unit)
-        self.unit_combo.currentTextChanged.connect(self.changed)
-        self._handle_duration_text(self.duration_edit.text())
 
     def set_period_position(self, index: int, total: int) -> None:
         self.setTitle(f"Period {int(index) + 1}/{max(1, int(total))}")
@@ -896,15 +670,6 @@ class PeriodCard(FluentGroupBox):
         period.duration_ns(slots=slots, time_step_ns=time_step_ns)
         return period
 
-    def set_channel_display_labels(self, labels: Mapping[str, str]) -> None:
-        for channel, checkbox in self.checks.items():
-            full = str(labels.get(channel) or channel)
-            self.check_full_labels[channel] = full
-            checkbox.setText(_elide_text(full, self._checkbox_text_width))
-            checkbox.setToolTip(f"{channel} / {full}" if full != channel else channel)
-        for bus_name, edit in self.bus_value_edits.items():
-            lo_t, hi_t = _bus_signed_bounds(self.bus_max_values.get(bus_name, 1))
-            edit.setToolTip(f"{labels.get(_bus_key(bus_name), bus_name)}: signed integer {lo_t}..{hi_t} (0 = 0 V)")
 
     def bus_modes(self) -> dict[str, dict[str, object]]:
         out: dict[str, dict[str, object]] = {}
@@ -2571,113 +2336,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             # (stale DAC target after a reorder, missing bus, invalid slot) is visible.
             self._message(f"could not restore {kind} field {target!r} after unbind: {exc}")
 
-    def _apply_scan_state_in_place(self, state: PulseTableState) -> bool:
-        """Refresh scan-binding visuals on the EXISTING widgets, no rebuild.
-
-        A scan-dot toggle never changes the period/channel structure -- only
-        which fields are bound and their slot numbers.  Re-deriving each field's
-        display in place (instead of destroying + recreating hundreds of
-        widgets) turns a ~400 ms "Show All" toggle into a few milliseconds.
-        Returns ``False`` without touching anything if the live widget tree no
-        longer matches the state, so the caller can fall back to ``load_state``.
-        """
-
-        try:
-            cards = self.drag_container.pulse_cards()
-            if len(cards) != len(state.periods) or not hasattr(self, "channel_panel"):
-                return False
-            buses = state.bus_channels()
-            for pidx, card in enumerate(cards):
-                period = state.periods[pidx]
-                # --- duration ---
-                scanned = _is_slot_expr(period.duration)
-                api_name = state.api_slot_for("duration", str(pidx))
-                edit, combo = card.duration_edit, card.unit_combo
-                with _signals_blocked(edit, combo):
-                    edit.set_scan_bound(False)
-                    edit.set_api_bound(False)
-                    edit.setText(_period_duration_text(period))
-                    _set_duration_unit_combo(combo, scanned=scanned, unit=period.unit)
-                    combo.setEnabled(not scanned)
-                    if scanned:
-                        idx = _slot_index_of_expr(period.duration)
-                        edit.set_scan_bound(True, None if idx is None else idx + 1)
-                    elif api_name:   # api slot keeps the number + unit editable, violet marker
-                        edit.set_api_bound(True, _api_number(api_name))
-                # --- bus value fields ---
-                for bus, value_edit in getattr(card, "bus_value_edits", {}).items():
-                    plan = state.analog_bus_plan(bus)
-                    entry = dict(plan[pidx]) if pidx < len(plan) else {"mode": "hold", "value": None}
-                    mode = str(entry.get("mode", "hold")).lower()
-                    raw = entry.get("value")
-                    bound = _is_slot_expr(raw)
-                    members = buses.get(bus, [])
-                    lo_signed, hi_signed = _bus_signed_bounds((1 << max(1, len(members))) - 1)
-                    if bound:
-                        disp = str(raw)
-                    elif raw is None:
-                        # hold row: SIGNED value carried into this period (0 = 0 V)
-                        disp = str(int(state.analog_bus_value_at_period_start(pidx, bus)))
-                    else:
-                        disp = str(max(lo_signed, min(hi_signed, int(raw))))
-                    mode_combo = card.bus_mode_combos[bus]
-                    api_name = state.api_slot_for("dac", f"{bus}@{pidx}")
-                    with _signals_blocked(value_edit, mode_combo):
-                        value_edit.set_scan_bound(False)
-                        value_edit.set_api_bound(False)
-                        value_edit.setText(disp)
-                        value_edit.set_editable(mode != "hold")
-                        mode_combo.setCurrentText(_bus_mode_title(mode))
-                        mode_combo.setEnabled(not bound)
-                        if bound:
-                            si = state.slot_index_for("dac", f"{bus}@{pidx}")
-                            value_edit.set_scan_bound(True, None if si is None else si + 1)
-                        elif api_name:   # api slot keeps the value editable, violet marker
-                            value_edit.set_api_bound(True, _api_number(api_name))
-            # --- channel panel: delay fields (fixed per-channel/bus value, not scannable) ---
-            panel = self.channel_panel
-            for key, edit in panel.delay_edits.items():
-                is_bus = str(key).startswith("bus:")
-                # The API delay target is the channel itself, or the BARE bus name (the data
-                # layer fans a bus slot out to its members) -- the same token the build path
-                # and the scan-slot editor use, so the dot reflects symmetrically.
-                api_target = str(key).split(":", 1)[1] if is_bus else key
-                api_name = state.api_slot_for("delay", api_target)
-                if is_bus:
-                    members = buses.get(api_target, [])
-                    vals = [state.delays.get(c, 0) for c in members]
-                    units = [state.delay_units.get(c, "ns") for c in members]
-                    uniform = vals and all(v == vals[0] for v in vals) and all(u == units[0] for u in units)
-                    if vals and not uniform:
-                        # per-member delays differ (API-set): show "(mixed)" and protect
-                        # them from being flattened by the next read_values -- but STILL
-                        # reflect the bus's API dot (the slot is independent of uniformity).
-                        with _signals_blocked(edit):
-                            edit.setText("")
-                            edit.setPlaceholderText("(mixed)")
-                            edit._zlc_mixed = True
-                            if hasattr(edit, "set_api_bound"):
-                                edit.set_api_bound(bool(api_name), _api_number(api_name) if api_name else None)
-                        continue
-                    edit._zlc_mixed = False
-                    dval = vals[0] if vals else 0
-                    dunit = units[0] if units else "ns"
-                else:
-                    dval = state.delays.get(key, 0)
-                    dunit = state.delay_units.get(key, "ns")
-                ucombo = panel.delay_units.get(key)
-                with _signals_blocked(edit, ucombo):
-                    edit.setText(str(dval))
-                    if ucombo is not None:
-                        ucombo.setCurrentText(dunit)
-                    # reflect the delay's API-slot marker (EVERY delay field carries the dot)
-                    if hasattr(edit, "set_api_bound"):
-                        edit.set_api_bound(bool(api_name), _api_number(api_name) if api_name else None)
-            panel.state = state
-            panel.set_scan_summary()
-            return True
-        except Exception:
-            return False
 
     def _cycle_field_slot(self, state: PulseTableState, kind: str, target: str, *, unit: str = "ns", label: str = "") -> None:
         """Cycle a field's slot on each dot click: none -> SCAN (sN) -> API (aN) -> none.
@@ -4065,35 +3723,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         directory = Path(self.address_str).parent if self.address_str else _pulse_files_dir()
         return directory / f"{_safe_file_stem(state.name)}.png"
 
-    def _preview_size_for(self, state: PulseTableState, *, include_always_off: bool) -> str:
-        """The size preset to render this preview at.  If the operator has PINNED a size (picked one from
-        the dropdown) that value wins; otherwise it is :func:`optimal_pulse_size` for this state's drawn
-        row / period counts (the ONE default source, shared with the loaded panel) and the dropdown is kept
-        in sync so it always shows the size the plot uses."""
-        if self._preview_size_pinned:
-            return self.preview_size_combo.currentText()
-        # The default is the ONE shared default source (default_pulse_size in the plot layer, which counts
-        # EXACTLY the rows the render draws), so the preview default matches the loaded panel default and
-        # never re-derives the row count here (which could drift from the render).
-        size = default_pulse_size(state, include_always_off=include_always_off)
-        if self.preview_size_combo.currentText() != size:
-            with _signals_blocked(self.preview_size_combo):   # sync display without re-triggering a refresh
-                self.preview_size_combo.setCurrentText(size)
-        return size
 
     def _on_preview_size_picked(self, *_args) -> None:
         """The operator picked a size: PIN it (stop auto-tracking the content) and re-render."""
         self._preview_size_pinned = True
         self._request_preview_refresh()
 
-    def _create_preview_plot(self, state: PulseTableState, *, include_always_off: bool, size: str | None = None):
-        # The pulse render is a PURE function of the state that lives in the PLOT LAYER (live.py, next to
-        # every other kind's render) -- this editor merely CONSUMES it, as do the reopened-recipe replay
-        # (``SavedFigure.plot()``) and a seeded console pulse panel, so all three draw byte-for-byte the
-        # same figure.  (Enforced by test_pulse_render_single_source: the render is not defined here.)
-        if size is None:
-            size = self._preview_size_for(state, include_always_off=include_always_off)
-        return build_pulse_preview_plot(state, include_always_off=include_always_off, size=size)
 
     def save_figure(self) -> None:
         try:
@@ -4126,120 +3761,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         except Exception as exc:
             self._message(str(exc))
 
-    def _preview_data_figure(self, state: PulseTableState, *, include_always_off: bool):
-        """Wrap the pulse preview as a generic :class:`DataFigure` so its Save writes the
-        standard figure+npz pair (``data_x`` / ``data_y`` / ``info``) that the figure
-        viewer can reopen.
-
-        The pulse figure is rendered from a STRUCTURED source (the period table + analog buses),
-        so it cannot be faithfully expressed as ``data_x`` / ``data_y`` alone -- a flattened
-        time-vs-level trace loses the multi-channel 0/1 rows, the analog bus traces and the pulse
-        rendering.  So, like a site map stores its underlay frame, the save carries a REPLAY RECIPE
-        under ``info['figure_recipe']``: ``{"kind": "pulse", "pulse_state": state.to_dict(),
-        "include_always_off": ...}``.  That recipe is the SINGLE truth source for reproduction --
-        :meth:`~.data_figure.SavedFigure.plot` rebuilds the ``PulseTableState`` from it and calls
-        :func:`build_pulse_preview_plot` (the SAME renderer this preview uses), so ``na.load_figure(npz)
-        .plot()`` and the figure viewer reproduce the ORIGINAL pulse figure (channels + analog traces +
-        brackets), not a 1-D line.
-
-        The recipe is extensible: ``figure_recipe['kind']`` names the structured-figure family, so a
-        future structured plot adds its own recipe kind without touching this seam.
-
-        ``data_x`` / ``data_y`` still carry a plain time-vs-level reconstruction (the shared edge-time
-        grid + one step-held level column per drawn row) as a NO-RECIPE FALLBACK -- an older reader that
-        does not understand ``figure_recipe`` still gets a valid 1-D payload.  No hub binding is stamped,
-        so ``DataFigure.save`` degrades to the basic payload (no signals / provenance), which is all a
-        static preview has to offer.
-        """
-        import numpy as np
-
-        from zlc_frontend.live_plot.plot_figure import DataFigure
-
-        # Render (and save) at the SAME size the preview shows, and record it so a reopen restores it.
-        size = self._preview_size_for(state, include_always_off=include_always_off)
-        plotter, channels, _repeat = self._create_preview_plot(
-            state, include_always_off=include_always_off, size=size)
-        # Collect one "level at time t" column per drawn row: digital channels (0/1 held
-        # between start and stop) followed by analog buses (signed value, step-held).
-        columns: list[tuple[str, list[tuple[float, float]]]] = []
-        pulses_by_channel: dict[str, list[dict]] = {}
-        for row in getattr(plotter, "pulses", []):
-            pulses_by_channel.setdefault(str(row["channel"]), []).append(row)
-        for channel in channels:
-            steps: list[tuple[float, float]] = [(0.0, 0.0)]
-            for row in sorted(pulses_by_channel.get(str(channel), []), key=lambda r: float(r["start"])):
-                level = 1.0 if row.get("value") else 0.0
-                steps.append((float(row["start"]), level))
-                steps.append((float(row["stop"]), 0.0))
-            columns.append((state.label_for(channel), steps))
-        for trace in getattr(plotter, "analog_traces", []):
-            starts = [float(s) for s in trace.get("starts", [])]
-            values = [float(v) for v in trace.get("values", [])]
-            steps = [(0.0, 0.0)]
-            for edge, value in zip(starts, values):
-                steps.append((edge, value))
-            columns.append((str(trace.get("label") or trace.get("name") or "analog"), steps))
-
-        # Shared, sorted, de-duplicated edge-time grid across every column; each column is
-        # sampled by "last edge at or before t" (a step hold) onto that grid.
-        edge_set = {0.0}
-        for _label, steps in columns:
-            for t, _v in steps:
-                if np.isfinite(t):
-                    edge_set.add(float(t))
-        seq_end = float(getattr(plotter, "duration", 0.0) or 0.0)
-        if seq_end > 0.0:
-            edge_set.add(seq_end)
-        times = np.array(sorted(edge_set), dtype=float)
-        if times.size < 1:
-            times = np.array([0.0], dtype=float)
-
-        def _sample(steps: list[tuple[float, float]]) -> np.ndarray:
-            steps = sorted(steps, key=lambda s: s[0])
-            edges = np.array([s[0] for s in steps], dtype=float)
-            levels = np.array([s[1] for s in steps], dtype=float)
-            idx = np.searchsorted(edges, times, side="right") - 1
-            idx = np.clip(idx, 0, len(levels) - 1)
-            return levels[idx]
-
-        if columns:
-            data_y = np.column_stack([_sample(steps) for _label, steps in columns])
-        else:
-            data_y = np.zeros((times.size, 1), dtype=float)
-        data_x = times.reshape(-1, 1)
-        row_labels = [label for label, _steps in columns]
-
-        info = {
-            "kind": "pulse",
-            "source": "pulse preview",
-            "name": state.name or "pulse",
-            # The REPLAY RECIPE: the single truth source for a faithful reproduction.  ``pulse_state`` is
-            # the FULL JSON-able ``PulseTableState.to_dict()`` -- the SAME serialization format the
-            # sequencer records as ``last_payload_json`` in its ``.snapshot()`` (so a FIRED pulse's
-            # provenance carries the identical bytes; ``SavedFigure._pulse_state_dict`` PREFERS the
-            # provenance sequencer payload when present and only falls back to THIS for a pure preview
-            # that was never fired to a device).  Rebuilding from it reconstructs the exact editor state
-            # and re-renders the identical pulse figure.
-            "figure_recipe": {
-                "kind": "pulse",
-                "pulse_state": state.to_dict(),
-                "include_always_off": bool(include_always_off),
-                # The size preset the figure was drawn at -- a reopen restores it (the operator can still
-                # change it), so the reproduced panel opens at the size it was saved, not a forced default.
-                "panel_size": str(size),
-            },
-            # Human-readable per-row legend, so a reader can tell which line is which
-            # channel/bus even in the no-recipe fallback (a generic 1-D step-line view).
-            "channels": row_labels,
-        }
-        return DataFigure(
-            fig=plotter.fig,
-            data_x=data_x,
-            data_y=data_y,
-            labels=("Time (s)", "Level", "State"),
-            name=state.name or "pulse",
-            info=info,
-        )
 
     def _save_preview_image(self, state: PulseTableState, image_path: Path) -> Path:
         image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4274,97 +3795,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         if hasattr(self, "tabs") and self.tabs.currentWidget() is getattr(self, "preview_tab", None):
             self._preview_timer.start()
 
-    def refresh_preview(self) -> None:
-        if FigureCanvas is None:
-            self.preview_status.setText("Matplotlib Qt canvas is not available.")
-            return
-        try:
-            state = self.read_state()
-            include_always_off = self.preview_include_off.isChecked()
-            # The size preset (pinned pick, else optimal for the content) is part of what is rendered, so
-            # it keys the skip-rebuild cache AND is passed to the render -- picking a new size re-renders.
-            size = self._preview_size_for(state, include_always_off=include_always_off)
-            # Rebuilding the figure + canvas costs ~130 ms; every visit to the
-            # Preview tab used to pay it even with NOTHING changed.  Skip the
-            # rebuild when the rendered (state, toggle, size) triple is identical -- the
-            # existing canvas already shows exactly this plot.  Restoring the
-            # home view keeps the OLD observable behaviour (a rebuild always
-            # came back at the default zoom).
-            render_key = (self._state_key(state), bool(include_always_off), size)
-            if (self._preview_canvas is not None
-                    and render_key == getattr(self, "_preview_render_key", None)):
-                tools = getattr(self._preview_plot, "tools", None)
-                zoom = getattr(tools, "zoom", None)
-                needs_redraw = False
-                if zoom is not None:
-                    ax = zoom.ax
-                    if (tuple(ax.get_xlim()) != tuple(zoom._home_xlim)
-                            or tuple(ax.get_ylim()) != tuple(zoom._home_ylim)):
-                        ax.set_xlim(zoom._home_xlim)
-                        ax.set_ylim(zoom._home_ylim)
-                        needs_redraw = True
-                area = getattr(tools, "area", None)
-                if area is not None and (area.text is not None or area.range != [None] * 4):
-                    area.clear()
-                    needs_redraw = True
-                cross = getattr(tools, "cross", None)
-                if cross is not None and cross.point is not None:
-                    cross.remove_point()
-                    needs_redraw = True
-                if needs_redraw:
-                    self._preview_canvas.draw_idle()
-                # Restore the "N/M plotted" status a rebuild would have shown -- an
-                # auxiliary message left by Save-figure / scan-load / sync since the
-                # last build must not linger when re-entering an unchanged preview.
-                if getattr(self, "_preview_status_text", None) is not None:
-                    self.preview_status.setText(self._preview_status_text)
-                self._preview_dirty = False
-                return
-            plotter, channels, repeat = self._create_preview_plot(
-                state, include_always_off=include_always_off, size=size)
-            self._replace_preview_canvas(plotter)
-            repeat_part = f" | {repeat}" if repeat else ""
-            mode = "all channels" if include_always_off else "active channels"
-            total = len(tuple(
-                port for port in state.port_catalog.ports if port.kind != PORT_CLOCK
-            ))
-            self._preview_status_text = f"{len(channels)}/{total} plotted ({mode}){repeat_part}"
-            self.preview_status.setText(self._preview_status_text)
-            self._preview_dirty = False
-            self._preview_render_key = render_key
-            self._update_file_state(state)
-        except Exception as exc:
-            self._preview_render_key = None
-            self.preview_status.setText(str(exc))
 
-    def _replace_preview_canvas(self, plotter) -> None:
-        # Null the references FIRST: if canvas construction below raises, the
-        # wheel eventFilter must not keep dereferencing a deleteLater()'d widget
-        # (a dead sip wrapper inside a Qt callback aborts the process).
-        old_plot, self._preview_plot, self._preview_canvas = self._preview_plot, None, None
-        while self.preview_body_layout.count():
-            item = self.preview_body_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-        if old_plot is not None and plt is not None:
-            try:
-                plt.close(old_plot.fig)
-            except Exception:
-                pass
-        # The ONE embed port: panel_canvas draws + fixes its own design size (inches x DESIGN_DPI x
-        # PANEL_DISPLAY_SCALE), exactly like task_console -- no bespoke setFixedSize(sizeHint()) dance.
-        canvas = panel_canvas(plotter.fig)
-        self.preview_body_layout.addWidget(canvas)
-        size = canvas.size()
-        margins = self.preview_body_layout.contentsMargins()
-        self.preview_body.setFixedSize(
-            size.width() + margins.left() + margins.right(),
-            size.height() + margins.top() + margins.bottom(),
-        )
-        self._preview_plot = plotter
-        self._preview_canvas = canvas
 
     def eventFilter(self, obj, event):  # noqa: N802 (Qt naming)
         # Preview viewport wheel isolation: a wheel whose position is on the pulse-plot

@@ -28,9 +28,6 @@ from __future__ import annotations
 
 #: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
 #: file guards the NEW structure and is permanent (swept by test_design_charter).
-DIES_WITH_PARTIAL = {
-    "test_the_shell_takes_every_catalog_name_from_the_new_home": 'Zou_lab_control/frontend/task_console.py',
-}
 
 import ast
 import pathlib
@@ -51,27 +48,6 @@ from zlc_frontend.panel_params import (
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 
-def test_the_shell_takes_every_catalog_name_from_the_new_home():
-    """Structural: a shell that kept its own copy would pass every behaviour test below."""
-
-    tree = ast.parse((REPO / "Zou_lab_control" / "frontend" / "task_console.py")
-                     .read_text(encoding="utf-8"))
-    sources: dict[str, set[str]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module:
-            for alias in node.names:
-                sources.setdefault(alias.name, set()).add(node.module)
-    for name in ("CMAPS", "GRID_TITLE_PARAMS", "PANEL_PARAMS", "panel_display_decls",
-                 "panel_param_default", "resolved_cmap", "resolved_param"):
-        assert sources.get(name) == {"zlc_frontend.panel_params"}, (name, sources.get(name))
-
-    from Zou_lab_control.frontend import task_console as shell
-
-    assert shell.PANEL_PARAMS is PANEL_PARAMS
-    assert shell._resolved_param is resolved_param
-    assert shell._resolved_cmap is resolved_cmap
-    assert shell._panel_param_default is panel_param_default
-    assert shell._panel_display_decls is panel_display_decls
 
 
 def test_the_catalog_module_pulls_in_no_toolkit():
@@ -115,15 +91,6 @@ def test_the_solver_rejects_a_verb_that_is_not_in_the_catalog_and_accepts_every_
         HistogramFitResult.invalid("triple", "nope")
 
 
-def test_the_histogram_figure_opens_on_the_declared_default():
-    """The consequence an operator sees: the Setting UI's default IS what the figure draws."""
-
-    import inspect
-
-    from zlc_frontend.live_plot.live import HistogramFigure
-
-    assert (inspect.signature(HistogramFigure.__init__).parameters["fit"].default
-            == DEFAULT_HISTOGRAM_FIT)
 
 
 def test_no_module_restates_the_fit_verbs_as_a_literal():

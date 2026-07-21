@@ -33,18 +33,8 @@ from typing import Mapping, Sequence
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from zlc_frontend.qt_widgets import (
-    ACCENT,
-    DIVIDER,
-    FONT,
-    GREEN,
-    GREY,
-    ORANGE,
-    TEXT,
-    YELLOW,
-    fluent_font_size,
-    scaled_px,
-)
+from .fluent import fluent_font_size, scaled_px
+from .style import ACCENT, DIVIDER, FONT, GREEN, GREY, ORANGE, TEXT, YELLOW
 
 
 #: Role -> (fill, border) colours, all from the shared Fluent token set (never a fresh per-call colour):
@@ -476,17 +466,6 @@ class FlowGraphView(QtWidgets.QWidget):
             painter.drawText(plate, int(QtCore.Qt.AlignCenter), label)
 
     @staticmethod
-    def _edge_label(e: Mapping) -> str:
-        sig = str(e.get("signal") or "")
-        shape = e.get("shape")
-        if sig and shape is not None:
-            try:
-                from Zou_lab_control.neutral_atom.operations import format_dims   # ONE shape->string spelling
-                dims = format_dims(shape)
-            except Exception:
-                dims = ""
-            return f"{sig} ({dims})" if dims else sig
-        return sig
 
     def _draw_arrow_head(self, painter: QtGui.QPainter, p1: QtCore.QPointF, p2: QtCore.QPointF) -> None:
         import math

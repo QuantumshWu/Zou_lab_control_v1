@@ -19,9 +19,6 @@ from __future__ import annotations
 
 #: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
 #: file guards the NEW structure and is permanent (swept by test_design_charter).
-DIES_WITH_PARTIAL = {
-    "test_the_shell_forwards_to_the_moved_packer": 'Zou_lab_control/frontend/task_console.py',
-}
 
 import ast
 import pathlib
@@ -156,25 +153,3 @@ def test_the_module_reaches_for_no_renderer_and_no_toolkit():
     assert modules <= {"__future__", "dataclasses", "typing"}, modules
 
 
-def test_the_shell_forwards_to_the_moved_packer():
-    """Structural, so this file keeps its zero legacy-tree dependency.
-
-    A shell that quietly kept its own copy would still pass every test above, because
-    the behaviour is identical - only the call graph shows the duplication.
-    """
-
-    root = pathlib.Path(__file__).resolve().parents[1]
-    # The forwarding wrappers moved with the PanelCard cluster into the plot_bridge zone;
-    # the shell keeps assignment aliases, so the CALL-GRAPH proof lives at the new home.
-    text = (root / "zlc_workbench" / "task_console" / "plot_bridge.py").read_text(encoding="utf-8")
-    tree = ast.parse(text)
-    forwarded = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef) or node.name not in {"pack", "drop_index"}:
-            continue
-        for call in ast.walk(node):
-            if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
-                    and isinstance(call.func.value, ast.Name)
-                    and call.func.value.id == "_layout"):
-                forwarded.add(node.name)
-    assert forwarded == {"pack", "drop_index"}, forwarded
