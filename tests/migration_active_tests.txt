@@ -1,4 +1,5 @@
 tests/test_architecture_import_dag.py
+tests/test_board_topology_single_source.py
 tests/test_camera_capture_endpoint.py
 tests/test_camera_sample_contract.py
 tests/test_capture_artifact_repository.py
@@ -20,11 +21,11 @@ tests/test_m2d_camera_monitor_roi_selector.py
 tests/test_m2e_camera_monitor_first_roi.py
 tests/test_migration_manifest_gate.py
 tests/test_notebook_experiment_facade.py
-tests/test_tutorial_notebook_spine.py
 tests/test_operator_flows_on_virtual.py
 tests/test_public_hardware_boundary.py
 tests/test_pulse_command_port.py
 tests/test_pulse_target_binding.py
+tests/test_qt_app_single_entry.py
 tests/test_remote_sequencer_execution_endpoint.py
 tests/test_runtime_capture.py
 tests/test_runtime_commit_journal.py
@@ -42,6 +43,7 @@ tests/test_storage_repository_lease.py
 tests/test_stream_processor_worker.py
 tests/test_timing_pulse_boundary.py
 tests/test_triggered_capture_pipeline.py
+tests/test_tutorial_notebook_spine.py
 tests/test_u02c_qt_curve_interaction.py
 tests/test_u02d_occupancy_workbench.py
 tests/test_u02d_qt_site_map_interaction.py
@@ -142,4 +144,3 @@ tests/test_zlc_readout_physical_context.py
 tests/test_zlc_readout_validity.py
 tests/test_zlc_site_map_geometry.py
 tests/test_zlc_storage_canonical.py
-tests/test_qt_app_single_entry.py
