@@ -21,6 +21,7 @@ from Zou_lab_control.workbench import (
     open_offline_pulse_workbench,
     open_pulse_workbench,
 )
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import FluentFormGrid, GREEN, ORANGE
 from zlc_neutral_atom.runtime.run import RunState
 from zlc_pulse import (
@@ -44,7 +45,7 @@ ROOT = Path(__file__).parents[1]
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 @pytest.fixture(scope="module")

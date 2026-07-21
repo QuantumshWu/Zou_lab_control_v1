@@ -23,6 +23,7 @@ from zlc_frontend.figure import DatasetId, EvaluatedAxis, EvaluatedImage, Evalua
 from zlc_frontend.image_display import image_display_form_values
 from zlc_frontend.image_view import ImageViewportTransform
 from zlc_frontend.occupancy_render import OccupancyCellNavigation, OccupancyCellView
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import (
     FluentRevisionedFormEditor, FluentSwitch, QtRasterBoard,
 )
@@ -40,7 +41,7 @@ _APPLICATION = None
 @pytest.fixture(scope="module")
 def application():
     global _APPLICATION
-    _APPLICATION = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    _APPLICATION = ensure_qt_app()
     return _APPLICATION
 
 

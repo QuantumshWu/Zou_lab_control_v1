@@ -69,6 +69,7 @@ from zlc_frontend.image_display import (
     ImageDisplayState,
     image_viewport_for_display_state,
 )
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import QtRasterBoard
 from zlc_frontend.render import HistogramPanelPayload
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
@@ -77,7 +78,7 @@ from zlc_workbench.live import LiveFrontStatus
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 @pytest.fixture(scope="module")

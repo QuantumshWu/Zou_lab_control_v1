@@ -14,6 +14,8 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtCore, QtWidgets
+
+from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
 import Zou_lab_control.notebook as zlc
@@ -30,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 @pytest.fixture(scope="module")

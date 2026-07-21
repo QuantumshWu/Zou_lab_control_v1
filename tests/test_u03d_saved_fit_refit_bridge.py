@@ -9,6 +9,8 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtCore, QtTest, QtWidgets
+
+from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
 import Zou_lab_control.notebook as zlc
@@ -35,7 +37,7 @@ PANEL_ID = "generic-typed"
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 def _until(application, predicate, *, timeout: float = 45.0) -> None:

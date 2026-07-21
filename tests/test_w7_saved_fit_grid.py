@@ -70,6 +70,7 @@ from zlc_frontend.figure import (
     SuggestionStatus,
     suggest_fit_view,
 )
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import AxisLayoutNavigator, QtImageBoard, QtRasterBoard
 from zlc_neutral_atom.artifacts import AdmittedCapture, FitResultRepository
 from zlc_neutral_atom.fit_reference import FitResultArtifactRef
@@ -93,7 +94,7 @@ ONE_DIMENSIONAL_MODELS = tuple(
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 def _until(application, predicate, *, timeout: float = 45.0) -> None:

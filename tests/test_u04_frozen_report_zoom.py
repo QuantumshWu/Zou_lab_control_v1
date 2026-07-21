@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import QtImageBoard
 
 
@@ -28,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(scope="module")
 def app():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 def _png_bytes(width: int = 40, height: int = 20) -> bytes:

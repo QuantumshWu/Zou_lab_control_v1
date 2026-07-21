@@ -45,7 +45,7 @@ def _add_panel(window, QtCore, QtTest, QtWidgets) -> None:
 def experiment(tmp_path_factory):
     from PyQt5 import QtWidgets
 
-    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ensure_qt_app()
     # One installation runtime per process, so every console here shares it.
     return zlc.connect(
         "virtual",
@@ -135,7 +135,8 @@ def test_remove_refuses_a_running_card_instead_of_killing_it(console):
 
     assert console.cards == (card,)
     assert panel.shutdown_calls == 0
-    from zlc_frontend.qt_widgets import FluentStatusStrip
+    from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
+from zlc_frontend.qt_widgets import FluentStatusStrip
 
     status = console.findChild(FluentStatusStrip, "taskConsoleStatusStrip")
     assert "must be stopped and idle before Remove" in status.text()

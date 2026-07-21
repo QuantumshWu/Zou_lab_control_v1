@@ -27,6 +27,7 @@ from zlc_frontend.figure import (
     ResolvedDatasetMap,
 )
 from zlc_frontend.display_range import RelimMode
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import QtRasterBoard
 from zlc_frontend.render import CurvePanelPayload
 from zlc_neutral_atom.acquisition.camera import CameraFrameMetadataContract
@@ -38,7 +39,7 @@ from zlc_neutral_atom.runtime.dataset import (
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 @pytest.fixture(scope="module")

@@ -11,6 +11,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PyQt5 import QtCore, QtWidgets
+
+from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
 import Zou_lab_control.notebook as zlc
@@ -179,7 +181,7 @@ def test_fit_single_panel_presentation_rejects_empty_sparse_selection() -> None:
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 @pytest.fixture(scope="module")

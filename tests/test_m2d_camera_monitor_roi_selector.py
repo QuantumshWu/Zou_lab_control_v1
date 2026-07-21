@@ -32,6 +32,7 @@ from zlc_data import (
     ValueSchema,
 )
 from zlc_frontend.figure import DatasetId
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import ImageViewportTransform, QtRasterBoard
 from zlc_neutral_atom.acquisition.camera import (
     CameraFrameMetadata,
@@ -60,7 +61,7 @@ from zlc_workbench.live import LiveBoardController, LiveDatasetSlot
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 @pytest.fixture(scope="module")

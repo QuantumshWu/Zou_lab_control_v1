@@ -392,9 +392,10 @@ def _run_task_console_product_e2e(tmp_path: Path):
     from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
     from Zou_lab_control.workbench._figure import DataFigureWindow
     from Zou_lab_control.workbench._task_console import ScanIntentForm
-    from zlc_frontend.qt_widgets import GREEN, ORANGE
+    from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
+from zlc_frontend.qt_widgets import GREEN, ORANGE
 
-    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    application = ensure_qt_app()
 
     def until(predicate, timeout=30.0):
         deadline = time.monotonic() + timeout

@@ -51,6 +51,7 @@ from zlc_frontend.figure import (
     ViewIntent,
     suggest_view,
 )
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import QtRasterBoard
 from zlc_neutral_atom.artifacts import (
     FitExecution,
@@ -66,7 +67,7 @@ PANEL_ID = "generic-typed"
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 @pytest.fixture(scope="module")

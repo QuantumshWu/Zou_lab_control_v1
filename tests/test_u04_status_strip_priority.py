@@ -18,6 +18,7 @@ import pytest
 
 import Zou_lab_control.notebook as zlc
 
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import FluentStatusStrip, arbitrate_status_line
 
 
@@ -48,7 +49,7 @@ def test_the_ladder_refuses_a_non_string_input():
 def console(tmp_path_factory):
     from PyQt5 import QtWidgets
 
-    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ensure_qt_app()
     experiment = zlc.connect(
         "virtual",
         repository=tmp_path_factory.mktemp("repository") / "workspace",

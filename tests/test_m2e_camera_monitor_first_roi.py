@@ -14,6 +14,7 @@ import pytest
 
 import Zou_lab_control.notebook as zlc
 from zlc_data import ReductionMethod, Selection
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import QtRasterBoard
 from zlc_neutral_atom.processing.roi_monitor import RoiScalarStreamProjection
 from zlc_neutral_atom.runtime.control import ControlAckStatus
@@ -32,7 +33,7 @@ _SCALAR_PANELS = (
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 @pytest.fixture(scope="module")

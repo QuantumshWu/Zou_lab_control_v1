@@ -13,6 +13,8 @@ import numpy as np
 import pytest
 from PyQt5 import QtCore, QtWidgets
 
+from zlc_frontend.qt_widgets import ensure_qt_app
+
 import Zou_lab_control.notebook as zlc
 from zlc_data import (
     REPEAT,
@@ -69,7 +71,7 @@ PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 def _until(application, predicate, *, timeout: float = 45.0) -> None:

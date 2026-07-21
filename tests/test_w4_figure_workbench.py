@@ -56,6 +56,7 @@ from zlc_frontend.figure import (
     ViewPreferences,
     suggest_view,
 )
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import QtImageBoard, QtRasterBoard
 from zlc_frontend.matplotlib_render import release_agg_figure
 from zlc_neutral_atom.readout.calibration import (
@@ -71,7 +72,7 @@ PULSE = ROOT / "pulses" / "probe_template.json"
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 @pytest.fixture(scope="module")

@@ -30,6 +30,7 @@ from zlc_frontend.figure import (
 from zlc_frontend.display_range import RelimMode
 from zlc_frontend.image_display import ImageColormap
 from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import GREEN, ORANGE, QtRasterBoard
 from zlc_neutral_atom.monitor_application import (
     CameraMonitorLiveDataset,
@@ -51,7 +52,7 @@ MULTI_EVENT_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.jso
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 @pytest.fixture(scope="module")

@@ -50,13 +50,14 @@ from zlc_frontend.figure import (
     suggest_view,
 )
 from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import QtRasterBoard
 from Zou_lab_control.workbench import _figure as figure_workbench
 
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 def _axis(name: str, role, size: int, *, coordinates=None) -> AxisSpec:

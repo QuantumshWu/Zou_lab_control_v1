@@ -18,6 +18,7 @@ import Zou_lab_control.notebook as zlc
 from zlc_data import MONITOR_HISTORY, SPATIAL_X, SPATIAL_Y
 from zlc_frontend.display_range import RelimMode
 from zlc_frontend.image_display import ImageColormap
+from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import QtRasterBoard
 from zlc_frontend.render import PixelFormat
 from zlc_frontend.selector import ImageViewportCommit
@@ -36,7 +37,7 @@ from zlc_pulse import (
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 @pytest.fixture(scope="module")

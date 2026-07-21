@@ -13,6 +13,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 from PIL import Image
 from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
+
+from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
 import Zou_lab_control.notebook as zlc
@@ -60,7 +62,7 @@ from Zou_lab_control.workbench import _figure as figure_workbench
 
 @pytest.fixture(scope="module")
 def application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ensure_qt_app()
 
 
 def _axis(name: str, role, size: int, coordinates) -> AxisSpec:
