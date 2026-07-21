@@ -137,3 +137,4 @@ tests/test_zlc_readout_physical_context.py
 tests/test_zlc_readout_validity.py
 tests/test_zlc_site_map_geometry.py
 tests/test_zlc_storage_canonical.py
+tests/test_console_catalog_bridge.py
