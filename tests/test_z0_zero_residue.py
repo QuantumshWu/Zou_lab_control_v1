@@ -75,6 +75,11 @@ Z2A_PRODUCTION_IMPORTERS = {   # non-test code OUTSIDE legacy that still imports
     Path("zlc_workbench/task_console/app.py"),
     # Same transitional delegation for the pulse editor composition root (C20/C25).
     Path("zlc_workbench/pulse_editor/app.py"),
+    # The pulse editor BODY, moved whole out of the legacy shell.  Its remaining legacy
+    # imports are the DEVICE layer only (fpga_pulse_streamer geometry names + the runtime
+    # compiler for save-to-file); the crossing dies when the device layer reaches
+    # zlc_neutral_atom, and the file itself graduates out of plot_bridge at P5 (C20/C25).
+    Path("zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py"),
 }
 #: Whitelisted tests that reach into the legacy tree, NAMED rather than counted.
 #: A count would let one more slip in unnoticed; naming each makes every addition
@@ -105,9 +110,11 @@ Z2C_FROZEN_TEST_IMPORTERS = 0
 #: 19 as of the render-loop move: ``frontend/render_loop.py`` became a shim when the module
 #: itself went to ``zlc_frontend/qt_widgets``.  The count is allowed to RISE only when a move
 #: creates the shim -- which is the one legitimate reason -- and it must fall back to zero at Z0.
-Z3_FORWARDING_SHIMS = 27   # +7: the pulse domain (pulse_table/sequence/ports/_serialization/
+Z3_FORWARDING_SHIMS = 28   # +7: the pulse domain (pulse_table/sequence/ports/_serialization/
                            # _clock/_streamer_geometry -> zlc_neutral_atom.timing) and
                            # _viewer_registry (-> zlc_data) left shims behind
+                           # +1: frontend/pulse_gui.py became the alias shell of
+                           # zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py
 Z7_REBUILT_WORKBENCH_FILES = 12
 #: 0 forever: after the cull the manifest IS the suite.  A test file not on the manifest is no
 #: longer a frozen archive entry -- it is a mistake, and this guard says so immediately.
@@ -184,6 +191,11 @@ Z4_COMPOSITION_ROOTS = {
     # The pulse editor's composition root: delegates to the legacy editor stack while the
     # 4475-line shell is dismantled.  Dies with the shell (C20/C25).
     Path("zlc_workbench/pulse_editor/app.py"),
+    # The pulse editor BODY (the whole 4475-line module, moved out of the legacy shell).
+    # Only the DEVICE layer still crosses: fpga_pulse_streamer geometry names and the
+    # lazy runtime compiler in save_to_file.  The crossing dies when the device layer
+    # moves to zlc_neutral_atom; the file graduates from plot_bridge at P5 (C20/C25).
+    Path("zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py"),
 }
 
 
