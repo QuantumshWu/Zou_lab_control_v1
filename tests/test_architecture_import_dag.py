@@ -136,6 +136,10 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
     # variable a human typed, and a task NAME a human typed on the CLI or in the GUI.
     (Path("zlc_frontend/console_state.py"), "task_files_dir"),
     (Path("zlc_frontend/console_state.py"), "resolve_task_state"),
+    # The panel-param catalog moved into zlc_frontend (S5-shell(y)).  Its one normalisation
+    # point reads the colormap NAME a human picked in the Setting combo, so the named entry
+    # follows the code rather than the guard being widened.
+    (Path("zlc_frontend/panel_params.py"), "resolved_cmap"),
         (Path("zlc_frontend/live_plot/live.py"), "general_fit_models"),
         (Path("zlc_frontend/live_plot/live.py"), "facet_cell_labels"),
         (Path("zlc_frontend/live_plot/plot_figure.py"), "SavedFigure.axis_labels"),

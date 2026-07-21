@@ -49,7 +49,6 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .live import (
-    DEFAULT_HIST_FIT,
     coerce_panel_value,
     kind_supports_roi,
     normalize_facet,
@@ -59,7 +58,6 @@ from .live import (
     region_binding,
     site_ring_radius,
 )
-from zlc_frontend.render_style import PALETTE  # the ONE render colour owner
 from zlc_frontend import board_layout as _layout
 from zlc_data.console_records import (
     ADDABLE_PANEL_KINDS,
@@ -282,7 +280,18 @@ _SignalExprWidget = SignalExprWidget
 # "task" a one-shot orchestration.  A node is added STOPPED and Start/Stop'd from
 # its own Edit -- it only ever publishes to the hub (display suppressed).
 
-CMAPS = ("inferno", "viridis", "magma", "plasma", "gray", "coolwarm")
+# The panel-param CATALOG and its four resolvers now live in ``zlc_frontend.panel_params``
+# (S5-shell(y)); the names below are the shell's plain aliases for them.
+from zlc_frontend.panel_params import (  # noqa: E402
+    CMAPS,
+    GRID_TITLE_PARAMS,
+    PANEL_PARAMS,
+    panel_display_decls as _panel_display_decls,
+    panel_param_default as _panel_param_default,
+    resolved_cmap as _resolved_cmap,
+    resolved_param as _resolved_param,
+)
+
 
 # A fresh plot panel is BLANK: a pure view is fully decoupled from acquisition, so
 # it shows nothing until the user picks a hub signal in its Setting (signal_combo)
@@ -291,130 +300,6 @@ CMAPS = ("inferno", "viridis", "magma", "plasma", "gray", "coolwarm")
 # rather than an error, so a blank panel sits quietly until wired.
 _BLANK_SOURCE = ""
 
-
-# A plot panel's per-kind params are REAL ``ParamDecl``s -- the SAME declarative record the
-# measurement form uses -- so they render through the SAME PARAM_WIDGETS registry and are
-# validated by the SAME kind whitelist (a typo'd kind raises at construction, instead of a
-# parallel ParamSpec silently degrading to a text box).  ``display`` (a ParamDecl DATA flag,
-# not an art knob) places the param: True = a basic display knob in the Setting popup (the
-# colormap chooser); False = a functional plot-API param in the panel's Edit tab -- so the two
-# surfaces never duplicate.  Adding a panel param is ONE ParamDecl here; adding a KIND is one
-# handler in param_widgets + one whitelist entry on ParamDecl.
-PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
-    "2d": (
-        ParamDecl(key="cmap", label="colormap", kind="choice", default=PALETTE["cmap_scan"], choices=CMAPS,
-                  tooltip="Image colormap", display=True),
-    ),
-    "sites": (
-        # A site map is a binary occupancy OVERLAY (faint ring = empty, bold ring =
-        # occupied) on the camera FRAME.  The colormap applies to that frame underlay
-        # (its counts colorbar); the rings carry no scale.  It takes ONE signal input --
-        # the per-site occupancy (PANEL_INPUT_SLOTS["sites"], picked in the Setting's Source
-        # section); its ring CENTRES and the frame UNDERLAY auto-resolve from that signal's
-        # producing node, so they are NOT extra slots or params here.
-        ParamDecl(key="cmap", label="colormap", kind="choice", default=PALETTE["cmap_camera"], choices=CMAPS,
-                  tooltip="Colormap for the camera-frame underlay", display=True),
-    ),
-    # Pure DISPLAY knobs (history / bins / fit / log axis / colormap) live in the lightweight
-    # Setting popup (display=True): they only change how the SAME data is drawn, so they belong with
-    # size / relim where an operator reaches for them.  Only acquisition / measurement-API params
-    # (none on these display-only kinds) would be display=False and live in the Edit tab.
-    "1d": (),
-    "monitor": (
-        ParamDecl(key="length", label="history", kind="int", default=300, lo=20, hi=10_000,
-                  display=True, tooltip="Rolling history length (shots kept on screen)"),
-        # The side distribution is ONE plot kind's toggle (not a separate "no-dist" kind):
-        # ON shows the histogram band beside the trace, OFF gives the bare rolling line.
-        ParamDecl(key="show_dist", label="side distribution", kind="bool", default=True, display=True,
-                  tooltip="Show the side distribution histogram beside the rolling trace"),
-    ),
-    "hist": (
-        ParamDecl(key="bins", label="bins", kind="int", default=60, lo=5, hi=500, display=True,
-                  tooltip="Histogram bins"),
-        # The fit is a confocal-style capsule tri-toggle (none / single / double), NOT a forced default:
-        # the operator picks which fit to draw on whatever data the source provides.  "double" is the
-        # dark/bright readout convention.  ``segmented=True`` renders it as the TriStateToggleSwitch
-        # capsule (sliding thumb) instead of a combo box.
-        ParamDecl(key="fit", label="fit", kind="choice", choices=("none", "single", "double"),
-                  default=DEFAULT_HIST_FIT, segmented=True, display=True,
-                  tooltip="Distribution fit (drives the display directly -- no auto-decision):\n"
-                          "  none   = no fit curve\n"
-                          "  single = one Gaussian\n"
-                          "  double = the dark/bright two-Gaussian readout (fidelity stat shown only "
-                          "when the two peaks cleanly separate, else 'fit F=N/A')"),
-        # A log count axis makes a SPARSE bright tail (rare high occupancy) visible -- on a linear
-        # axis a handful of bright shots vanish under the dark peak.  Default OFF (linear).
-        ParamDecl(key="ylog", label="log count axis", kind="bool", default=False, display=True,
-                  tooltip="Log-scale the count (y) axis -- reveals a sparse bright tail"),
-    ),
-    # A pulse panel (seeded from a saved pulse figure) has ONE display knob: whether to draw the
-    # always-off channel rows.  The seed restores the saved value; toggling it re-renders the timeline.
-    "pulse": (
-        ParamDecl(key="include_always_off", label="show off rows", kind="bool", default=True, display=True,
-                  tooltip="Draw channel rows that stay OFF the whole sequence (and idle DAC buses)"),
-    ),
-    # NOTE: there is DELIBERATELY no ``"grid"`` entry.  A grid panel's params are its per-site
-    # ``sub_plot_kind``'s params (a hist grid -> the ``"hist"`` bins/fit/ylog, a 2d grid -> the ``"2d"``
-    # colormap), resolved dynamically by ``PanelCard._param_kind`` -- so the Setting/Edit UI ALWAYS matches
-    # what each cell actually is, instead of a hard-coded hist set that lied for a kernel grid (#4).
-}
-
-
-# Grid-ONLY per-cell title knob (#5): a grid panel ADDS this to its sub_plot_kind's ``PANEL_PARAMS`` so the
-# operator can edit the per-cell title TEMPLATE from the Edit tab.  ``display=False`` => the Edit tab (a
-# functional knob), not the lightweight Setting popup.  It flows through the SAME ``store_display_param`` ->
-# ``GridCell.consume_param`` path every grid display knob uses, and round-trips through the saved view -- so
-# ``{id}`` (the facet-aware identifier), ``{popt[i]}`` (a fit param), ``{fid}`` (readout fidelity) are all
-# reachable.  (There is no font-SIZE knob: the cell title auto-tracks the xy tick-label size -- _cell_title_pt.)
-GRID_TITLE_PARAMS: tuple[ParamDecl, ...] = (
-    ParamDecl(key="title_template", label="cell title", kind="text", default="{id}", display=False,
-              tooltip="Per-cell title template.  {id}=facet identifier (site / repeat / scan value); "
-                      "{k}=cell index; {popt[i]}=a fit parameter; {fid}=readout fidelity.  "
-                      "e.g. '{id}  F={popt[2]:.2f}'"),
-)
-
-
-def _panel_display_decls(kind: str, param_kind: str) -> tuple[ParamDecl, ...]:
-    """The FULL ParamDecl list a panel's Setting / Edit UI + save / recipe enumerate: the kind's own
-    ``PANEL_PARAMS`` plus, for a GRID, the grid-generic per-cell title knobs (#5).  The ONE place the two
-    are combined, so every enumeration site shows the SAME set and a grid's title template / size are
-    edited, applied, saved and reopened through the very same path as bins / cmap."""
-    decls = PANEL_PARAMS.get(param_kind, ())
-    return decls + GRID_TITLE_PARAMS if kind == "grid" else decls
-
-
-def _panel_param_default(kind: str, key: str) -> object:
-    """The declared default of a panel kind's param, from the ONE ``PANEL_PARAMS`` catalog -- so a
-    kind's colormap default (``2d`` -> ``inferno``, ``sites`` -> ``gray``) has a SINGLE source and is
-    never hand-typed at a consume site.  Returns ``None`` for a kind/key with no declared param."""
-    for decl in PANEL_PARAMS.get(str(kind), ()):  # noqa: SIM110 - explicit loop is clearer than any()
-        if decl.key == key:
-            return decl.default
-    return None
-
-
-def _resolved_param(kind: str, params: Mapping[str, object], key: str) -> object:
-    """The value a panel of ``kind`` actually renders for ``key``: the operator's stored
-    ``params[key]`` when PRESENT, else the kind's declared default from ``PANEL_PARAMS``
-    (:func:`_panel_param_default`) -- so a consume site (plot build / Edit snapshot) never
-    hand-types a declared default, and changing a declaration changes the render AND the
-    Setting/Edit UI together (they read the same decl).  Presence is ``key in params``,
-    never a truthiness test: ``False`` / ``0`` are legal stored values for a bool/int knob."""
-    store = params or {}
-    return store[key] if key in store else _panel_param_default(kind, key)
-
-
-def _resolved_cmap(kind: str, params: Mapping[str, object]) -> str:
-    """The colormap a panel of ``kind`` actually draws with: the operator's picked ``params['cmap']``
-    if set, else the kind's declared default from ``PANEL_PARAMS`` (``_panel_param_default``).  Returns
-    an empty string for a kind that declares no cmap param (1-D / hist / monitor draw no image), so a
-    caller can store ``''`` for "no colormap" and a colormap-drawing kind always resolves a real name.
-    This is the SINGLE resolver for both the plot-build sites and the save's recorded view state."""
-    picked = str((params or {}).get("cmap") or "").strip()
-    if picked:
-        return picked
-    default = _panel_param_default(kind, "cmap")
-    return str(default) if default else ""
 
 def _card_y_is_view_axis(card) -> bool:
     """Does THIS panel's y axis take a view-window pin -- an image, where x AND y are spatial

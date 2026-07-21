@@ -60,6 +60,17 @@ ModelFunction = Callable[..., np.ndarray]
 Initializer = Callable[[object, np.ndarray], tuple[list[list[float]], tuple[np.ndarray, np.ndarray]]]
 
 
+#: The histogram-fit VERBS, in menu order, and which one a chooser opens on.
+#:
+#: These are vocabulary, not rendering: the solver below validates against them, the console's
+#: panel-param catalog offers them as a choice, and the histogram figure opens on the default.
+#: They used to be a set literal written twice here while the DEFAULT lived across the layer
+#: boundary in the render module -- so a verb could be added to one and not the others.
+#: ``"double"`` is the dark/bright readout convention, which is why it is what a chooser starts on.
+HISTOGRAM_FIT_MODES: tuple[str, ...] = ("none", "single", "double")
+DEFAULT_HISTOGRAM_FIT = "double"
+
+
 @dataclass(frozen=True)
 class FitRequest:
     model: str
@@ -206,7 +217,7 @@ class HistogramFitResult:
 
     def __post_init__(self) -> None:
         mode = str(self.requested_mode).strip().lower()
-        if mode not in {"none", "single", "double"}:
+        if mode not in HISTOGRAM_FIT_MODES:
             raise ValueError(f"unknown histogram fit mode {self.requested_mode!r}")
         count = int(self.component_count)
         expected = {0: 0, 1: 3, 2: 6}
@@ -613,8 +624,9 @@ def fit_histogram(edges, counts, mode: str) -> HistogramFitResult:
     """
 
     requested = str(mode).strip().lower()
-    if requested not in {"none", "single", "double"}:
-        raise ValueError("histogram fit mode must be 'none', 'single', or 'double'")
+    if requested not in HISTOGRAM_FIT_MODES:
+        raise ValueError("histogram fit mode must be one of "
+                         + ", ".join(repr(mode) for mode in HISTOGRAM_FIT_MODES))
     edges = np.asarray(edges, dtype=float)
     counts = np.asarray(counts, dtype=float)
     if requested == "none":
@@ -870,6 +882,7 @@ def fit_image(
 
 
 __all__ = [
+    "DEFAULT_HISTOGRAM_FIT", "HISTOGRAM_FIT_MODES",
     "FitModel", "FitRequest", "FitResult", "HistogramFitResult", "fit_data", "fit_histogram",
     "fit_image", "fit_model", "fit_models", "fit_selected",
 ]

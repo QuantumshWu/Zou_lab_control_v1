@@ -43,7 +43,7 @@ from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, Intera
 from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
 from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY, PLOT_KIND_SPECS, PlotKindSpec
 from zlc_data.readout_math import confidence_weighted_fidelity, finite_mean
-from zlc_data.curve_fitting import fit_histogram
+from zlc_data.curve_fitting import DEFAULT_HISTOGRAM_FIT, fit_histogram
 from zlc_data.signal_tensor import canonical_physical_shape
 from .ticks import apply_smart_ticks
 # The pulse RENDER lives here (the plot layer owns every plot kind's rendering): building the timeline
@@ -3306,13 +3306,6 @@ class PulseSequenceFigure(BaseLivePlot):
         self.fig._zlc_state = PlotState(plot_type="pulse", x_array=None, y_array=None)
 
 
-#: The histogram-fit chooser's default -- "double" is the dark/bright readout convention.  ONE
-#: source for the standalone dis, the grid's hist cells AND the console's PANEL_PARAMS spec, so the
-#: Setting UI's default can never disagree with what the figure actually draws (the "fit says double
-#: but the grid shows no fit until toggled" bug).
-DEFAULT_HIST_FIT = "double"
-
-
 def histogram_binned(vals, bins):
     """``np.histogram`` with an exact fast path for small-domain integer samples (a uint8/uint16
     camera frame): per-value ``bincount`` (O(N), ~5x faster than histogram's sort-based path on
@@ -3354,7 +3347,7 @@ class HistogramFigure(BaseLivePlot):
         thresholds: Sequence[float] | None = None,
         labels: Sequence[str] = ("Counts", "Shots", "Population"),
         ylog: bool = False,
-        fit: str = DEFAULT_HIST_FIT,    # fit chooser: "none" | "single" | "double" (ONE default source)
+        fit: str = DEFAULT_HISTOGRAM_FIT,    # fit chooser: "none" | "single" | "double" (ONE default source)
         value_xlim: "tuple[float, float] | None" = None,
         **kwargs,
     ):
@@ -4340,9 +4333,9 @@ class HistogramCell(GridCell):
         self.edges = None
         # The hist kind's OWN display knobs, rendered on the thumbnails through the SAME primitives
         # the standalone HistogramFigure uses (core fit_histogram / set_yscale) -- and the SAME
-        # defaults (DEFAULT_HIST_FIT): what the Setting UI shows as the default IS what the grid
+        # defaults (DEFAULT_HISTOGRAM_FIT): what the Setting UI shows as the default IS what the grid
         # draws, never a per-surface divergence.
-        self.fit = DEFAULT_HIST_FIT
+        self.fit = DEFAULT_HISTOGRAM_FIT
         self.ylog = False
         self.threshold_lines: list = [None] * self.n_cells
         self.tag_texts: list = [None] * self.n_cells
