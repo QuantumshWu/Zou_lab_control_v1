@@ -82,7 +82,10 @@ def test_its_neighbour_really_is_married_which_is_why_it_stayed():
     'the render pair is done'.  ``qt_canvas`` needs BOTH toolkits and L4650 places it nowhere
     in zlc_frontend; it leaves only via the §12.5 worker-raster rework."""
 
-    canvas = REPO / "Zou_lab_control" / "frontend" / "qt_canvas.py"
+    # The canvas moved INTO the sanctioned Qt x matplotlib zone -- the exact destiny this
+    # judgement predicted for it; its legacy path is a PEP 562 shim.  The proof that the
+    # marriage is REAL (both toolkits, a QTAgg base) follows the code.
+    canvas = REPO / "zlc_workbench" / "task_console" / "plot_bridge_canvas.py"
     roots = _import_roots(canvas)
     assert "matplotlib" in roots, roots
     tree = ast.parse(canvas.read_text(encoding="utf-8"))
@@ -266,7 +269,9 @@ def test_the_two_real_consumers_import_the_owner_not_the_shim():
     directly, exactly as ``param_widgets`` is reached.  So the assertion is "names the new
     package", and separately that nothing still names the shim."""
 
-    for relative in ("Zou_lab_control/frontend/qt_canvas.py",
+    # qt_canvas moved wholesale into the plot_bridge zone (its legacy path is a PEP 562
+    # shim); the consumer proof follows the code.
+    for relative in ("zlc_workbench/task_console/plot_bridge_canvas.py",
                      "Zou_lab_control/frontend/task_console.py"):
         source = (REPO / relative).read_text(encoding="utf-8")
         tree = ast.parse(source)

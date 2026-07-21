@@ -9,9 +9,9 @@
 
 | 项 | 现值 |
 | --- | --- |
-| 两巨石行数 | `frontend/task_console.py` **8607**(顶层 def 25→21) + `frontend/pulse_gui.py` 4475(未开始) |
+| 两巨石行数 | `frontend/task_console.py` **5646**(顶层 def **6**:MeasurementPanel/PanelEditor/LogicNodeEditor/_StopAttempt/TaskConsole/show_task_console) + `frontend/pulse_gui.py` 4475(未开始) |
 | 删除台账剩余 | 承 20(目标包待定 20)/ 内 68 / 死 19,共 107 |
-| 当前窗口 | task_console(入口已切 `zlc_workbench/task_console/app.py`,与 main 指纹全等;**解体第 1 批 = Analysis 控件簇 → `qt_widgets/analysis_controls.py` 317 行**) |
+| 当前窗口 | task_console(入口已切,指纹与 main 全等;第 1 批 Analysis 簇→qt_widgets;**第 2 批 = PanelCard 簇+几何桥+qt_canvas 整体 → `zlc_workbench/task_console/plot_bridge*.py`**(3080+396 行);余 6 def 待拆) |
 
 ## 22. 最终验收
 
@@ -926,7 +926,7 @@ Pulse/FPGA：
 | `Zou_lab_control/neutral_atom/operations/logic.py` | 2273 | `tests/test_u05_declaration_not_class.py` | ? |
 | `Zou_lab_control/neutral_atom/core/signals.py` | 909 | `tests/test_u05_declaration_not_class.py`, `tests/test_u05_render_island.py` | ? |
 | `Zou_lab_control/frontend/devtools.py` | 522 | `docs/task_console_design/build.py` | ? |
-| `Zou_lab_control/frontend/qt_canvas.py` | 395 | `tests/test_u05_raster_front.py` | ? |
+| `Zou_lab_control/frontend/qt_canvas.py` | 22 | 已搬空:本体在 `zlc_workbench/task_console/plot_bridge_canvas.py`,此路径=PEP 562 转发壳(Z0 死)| 已定:plot_bridge(done) |
 | `Zou_lab_control/neutral_atom/operations/processors/fit.py` | 354 | `tests/test_u05_declaration_not_class.py` | ? |
 | `Zou_lab_control/frontend/__init__.py` | 341 | `docs/task_console_design/build.py`, `figure_viewer.py`, `tests/test_u04_signal_picker_owner.py` 等 8 处 | ? |
 | `Zou_lab_control/frontend/notes.py` | 323 | `docs/task_console_design/build.py` | ? |
@@ -1052,3 +1052,4 @@ Pulse/FPGA：
 | 2026-07-20 | 基础设施+入口真相 | `DONE` | 指纹探针 `tools/window_fingerprint.py` 建成:从每棵树自己的启动器源码推导入口(不硬编码,改指后自动跟随),子进程 offscreen 起窗出 JSON。**当轮新测量**:main 启动器走 `show_task_console(hub=)` 得 `TaskConsole` 49 widget(含 FluentTabWidget/_PanelBoard),本分支启动器走 `experiment.task_console()` 只得 `TaskConsoleWindow` 19 widget、无 tab——旧 8869 行 console 已无任何 consumer(`_gui`/`show_task_console` 全仓零引用),是死码而非在用壳,故 C22 的复原对象是它。删除台账建成:旧树 107 个 .py,承 20/内 68/死 19(C24 指标=承表 `?` 数,现 20 只准降)。相对 import 必须解析到绝对名,否则 `session.py`/`devices/base.py` 被误判死件(C5) | 探针两树 A/B 输出;`test_the_deletion_ledger_covers_every_legacy_file`;47 passed |
 | 2026-07-20 | task_console 入口先行 | `DONE` | `zlc_workbench/task_console/` 建包(`intent.py` 原文件 + `app.py` = 唯一 Qt composition root),根启动器与 `Experiment.task_console()` 同 commit 改指 `app.open_task_console`(C20)。**当轮新测量**:自 A/B 指纹与 main 全等——49 widget / `TaskConsole` / by_class 零差异,用户双击 .bat 即得 main 的 console。`ReadoutFacade` 尚无 `measurement_specs/processor_specs/task_specs`,故 catalog 走鸭子型 seam(后端长出即自动填,现为 `--no-connect` 形态)。Z4 由绝对禁令改为**具名 composition root**——它此前为真只因 console 被废弃,用放弃操作员窗口换的绿不算不变量(C5/C25)。窄窗口留作组件,三个测试改指它。承表 console 目标包已定,C24 未决 20→19 | 探针两树 diff;启动器 rc=0;u04×2/w3/z0/charter 全绿 |
 | 2026-07-20 | 壳解体 1:Analysis 控件簇 | `DONE` | `AnalysisControls`/`_FitFixSeedEditor`/`_apply_analysis_state_to_widgets`/`_general_fit_models_for_kind` 四件整批搬入 `zlc_frontend/qt_widgets/analysis_controls.py`(317 行,C21 600 上限内),壳留别名走包门面(C20)。**当轮新测量**:自 A/B 指纹(工作树 vs `git archive HEAD`)root 树逐字节相等、49 widget、by_class 零差异;运行时验证别名 `is` 移动后对象本体。板 packer 早已搬走(6 个 3 行委托),故本批不是几何簇。两处渲染层能力查询(`kind_supports_roi`/`general_fit_models`)保持函数体内惰性 import 并改指真 owner `zlc_frontend.live_plot.live`,模块级 import 图不含渲染层(C13);面板 kind 能力声明缺无工具包之家 = P5 待办。`.strip()` 豁免随文本迁移(与 §22 同款,C5);census 棘轮 25→21(C6) | 启动器 rc=0;指纹 diff 空;63 守卫 passed |
+| 2026-07-20 | 壳解体 2:PanelCard 簇+qt_canvas 整体进 plot_bridge | `DONE` | 硬骨头一次端走:PanelCard(2779 行)+_GridFocus+_PanelBoard+几何桥(_cell_size/_card_size/_board_metrics+六转发)+10 常量 = 2921 行 → `plot_bridge.py`(C20);qt_canvas.py 整文件→ `plot_bridge_canvas.py`,旧路径留 PEP 562 壳(Z3 20,C25)。**当轮新测量**:批次对 6 个留守 def 零依赖(AST 全闭包,含 try 块内 import——上轮扫描漏 try 是真坑);12 处体内相对 import 改指真 owner(`.live`→live_plot.live,`.data_figure`→plot_figure);_BLANK_SOURCE 壳内影子字面量死于搬迁,单源回 console_records。壳 8607→5646 行、def 21→6(census 等值推进);23 个悬空 import 机械清除。自 A/B root 树逐字节相等 49 widget;别名 is 本体;四守卫跟随(married-neighbour/raster_front 钉点随代码、DAG headless 豁免具名 /plot_bridge、C6) | 启动器 rc=0;80 守卫 passed;指纹 diff 空 |

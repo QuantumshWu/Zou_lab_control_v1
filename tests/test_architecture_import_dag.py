@@ -671,6 +671,14 @@ def test_only_the_frontend_package_may_import_a_gui_toolkit(package):
         pytest.skip(f"{package} has not entered its migration slice")
     violations = []
     for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(ROOT).as_posix()
+        # The ONE sanctioned exception (C14/C20): the workbench plot_bridge zone holds the
+        # widgets that marry Qt to matplotlib while the legacy shells are dismantled.  It is
+        # reached only by explicit import (never from a package __init__), so every package
+        # root here still imports headless; the zone itself empties in the render-purification
+        # pass, at which point this exemption is deleted with it.
+        if "/plot_bridge" in f"/{rel}":
+            continue
         for imported in _imports(path):
             if imported.split(".")[0] in GUI_TOOLKITS:
                 violations.append(f"{path.relative_to(ROOT)} imports {imported}")

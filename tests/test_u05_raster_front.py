@@ -147,8 +147,10 @@ def _snapshot_front_source() -> str:
     would make this guard silently skip wherever that import fails.
     """
 
+    # The canvas moved into the plot_bridge zone; its legacy path is a PEP 562 shim with
+    # no method bodies, so the source read follows the code.
     path = (pathlib.Path(__file__).resolve().parents[1]
-            / "Zou_lab_control" / "frontend" / "qt_canvas.py")
+            / "zlc_workbench" / "task_console" / "plot_bridge_canvas.py")
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "_zlc_snapshot_front":

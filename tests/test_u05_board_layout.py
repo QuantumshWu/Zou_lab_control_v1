@@ -164,7 +164,9 @@ def test_the_shell_forwards_to_the_moved_packer():
     """
 
     root = pathlib.Path(__file__).resolve().parents[1]
-    text = (root / "Zou_lab_control" / "frontend" / "task_console.py").read_text(encoding="utf-8")
+    # The forwarding wrappers moved with the PanelCard cluster into the plot_bridge zone;
+    # the shell keeps assignment aliases, so the CALL-GRAPH proof lives at the new home.
+    text = (root / "zlc_workbench" / "task_console" / "plot_bridge.py").read_text(encoding="utf-8")
     tree = ast.parse(text)
     forwarded = set()
     for node in ast.walk(tree):

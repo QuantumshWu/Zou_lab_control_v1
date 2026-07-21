@@ -152,7 +152,7 @@ def test_the_manifest_is_the_suite():
 #: C24 -- the migration's progress metric.  Files in the deletion ledger's 承 table whose target
 #: package is still ``?``.  EQUALITY (C6): every round that decides one lowers this by hand, and
 #: a round that quietly adds an undecided file cannot hide behind a ceiling.
-UNDECIDED_LEGACY_FILES = 19
+UNDECIDED_LEGACY_FILES = 18
 
 
 def test_the_deletion_ledger_covers_every_legacy_file():
