@@ -339,7 +339,9 @@ class PanelCard(FluentGroupBox):
         # non-grid image case.  Its teardown counterpart is ``selection_clear_sink(card, "fit")``.  The
         # ONE mutator :meth:`set_fit_request` calls this, so the overlay + the hub node stay in lockstep.
         self.fit_node_sink = fit_node_sink
-        self.plotter = None
+        # The card's display surface: an immutable-bytes raster board (contract 4).
+        self.board = None
+        self.plotter = None      # no Matplotlib object lives on a card any more
         self.canvas = None
         # The console header's "Selectors" switch state for THIS card (set via
         # ``set_selectors_enabled``; default OFF = the historical display-only Monitor board).
@@ -654,6 +656,53 @@ class PanelCard(FluentGroupBox):
                     PARAM_WIDGETS[kind].write(widget, self.config.params[key])
                 except (TypeError, ValueError):
                     continue
+
+    def _build_plot(self) -> None:
+        """Give this card its raster surface.
+
+        A panel shows PIXELS the worker produced -- an encoded raster handed to
+        :class:`~zlc_frontend.qt_widgets.board.QtImageBoard`, which paints from
+        immutable bytes and owns no figure.  The card therefore holds no
+        Matplotlib object at all: rendering happens off the GUI thread and
+        arrives here already rasterised, which is what keeps a 2.3 MP frame from
+        being drawn on the thread that also has to stay responsive.
+        """
+
+        from zlc_frontend.qt_widgets.board import QtImageBoard
+
+        if self.board is not None:
+            return
+        self.board = QtImageBoard(
+            f"panel-{id(self):x}",
+            empty_text="waiting for data",
+        )
+        self.canvas_holder.addWidget(self.board)
+
+    def _build_settings(self) -> None:
+        """The Setting popup's shell: the card that holds the sections.
+
+        The sections themselves are rebuilt from the panel's declared params as
+        the display state lands (contract 4); this builds the popup, its scroll
+        viewport and the geometry bookkeeping the open path reads, so a card is
+        constructible and its gear opens.
+        """
+
+        popup = FluentPopup(self)
+        outer = QtWidgets.QVBoxLayout(popup)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._settings_scroll = FluentScrollArea()
+        self._settings_scroll.setWidgetResizable(True)
+        self._settings_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._settings_scroll.viewport().setAutoFillBackground(False)
+        content = QtWidgets.QWidget()
+        content.setAutoFillBackground(False)
+        self._settings_col = QtWidgets.QVBoxLayout(content)
+        self._settings_col.setContentsMargins(popup_gap(), popup_gap(), popup_gap(), popup_gap())
+        self._settings_col.setSpacing(popup_gap())
+        self._settings_scroll.setWidget(content)
+        outer.addWidget(self._settings_scroll)
+        self.settings_popup = popup
+        self._settings_h_hwm = 0
 
     def _open_settings(self) -> None:
         # Click-to-open / click-again-to-close TOGGLE.  A Qt.Popup already auto-closes

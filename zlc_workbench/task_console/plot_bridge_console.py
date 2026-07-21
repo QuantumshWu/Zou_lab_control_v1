@@ -2606,7 +2606,6 @@ class TaskConsole(QtWidgets.QWidget):
         for card, key in structural + composed:
             card._render_version = key
             card.present()
-        self._update_fit_overlays()   # push each fit panel's node params to its DISPLAY-only overlay (#6)
 
     def refresh_once(self) -> None:
         """Synchronous FULL refresh (tests / notebooks / Resume catch-up): COMPOSE every card from the
@@ -2629,7 +2628,6 @@ class TaskConsole(QtWidgets.QWidget):
             card._render_version = self._panel_frame_key(card, versions)
         for card in self.cards:
             card.present()
-        self._update_fit_overlays()   # push each fit panel's node params to its DISPLAY-only overlay (#6)
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
             editor.refresh_node_now_labels()
