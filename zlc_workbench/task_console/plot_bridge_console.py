@@ -235,12 +235,12 @@ class TaskConsole(QtWidgets.QWidget):
     def _build_ui(self) -> None:
         self.setWindowTitle("TaskConsole@Zou lab")
         self.setStyleSheet(fluent_widget_stylesheet())
-        # Standalone: a fixed window (the shared GUI sizing rule).  EMBEDDED: the parent (the figure
-        # viewer's right pane) owns the size, so we set only a MINIMUM and expand into whatever the
-        # layout gives -- that lets the gravity board read the live viewport width and reflow into
-        # multiple columns instead of being pinned to a frozen width that stacks every card in one column.
+        # Standalone: a fixed window (the shared GUI sizing rule).  EMBEDDED: the parent owns
+        # the size and this is only one pane of it, so the console expands into whatever the
+        # layout gives and demands no minimum of its own.  It used to ask for the WHOLE-window
+        # size as its minimum, which made any host that put anything beside it wider than every
+        # other GUI -- the shared rule sets the window, and the window is divided up inside it.
         if self.embedded:
-            self.setMinimumSize(self._target_console_size())
             self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         else:
             self.setFixedSize(self._target_console_size())

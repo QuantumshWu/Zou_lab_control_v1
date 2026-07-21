@@ -7,7 +7,7 @@ Run the smallest check that proves the changed boundary still works.  Full `pyte
 - **Contract tests, Python side only.** There is no iverilog/cocotb in the repo: RTL behaviour is checked by a faithful Python mirror plus `xsim` (the real IP netlist — the strongest hardware evidence), and verilog port widths are locked by a Python contract test (`test_..._vio_widths_match_python_generator`).
 - **Visual changes must be verified as the user sees them.**  Use
   `Zou_lab_control.frontend.devtools.capture_user_view(target, out_dir, scales=(1.0, 1.25, 1.5))`
-  — three `QT_SCALE_FACTOR` whole-window screenshots, inspected as 1:1 pixel crops; the `parity` target compares the two GUIs' control sizes on one screen.  A DPR=1 offscreen pass is **not** acceptance.  Popups / sub-widgets: `widget.grab()`.  Settle ≥ 800 ms before grabbing.
+  — a whole-window screenshot at THIS MACHINE's own display scale, inspected as a 1:1 pixel crop; the `parity` target compares the two GUIs' control sizes on one screen.  Do not force a scale factor: a window checked at invented scales proves nothing the real one does not.  Popups / sub-widgets: `widget.grab()`.  Settle ≥ 800 ms before grabbing.
 - **Performance optimizations must be logic/appearance-neutral.**  Only make the same output faster (analytic Jacobian, skip-if-unchanged guards, cached invariants); never change cadence/appearance.  Prove equivalence (e.g. fit `popt` agrees numerically).
 - **After delete/refactor:** `git grep` of the dead identifier == 0; `python -m compileall` clean; no stray TODO/FIXME.
 

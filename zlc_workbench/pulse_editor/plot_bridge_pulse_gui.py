@@ -655,6 +655,16 @@ class PeriodCard(FluentGroupBox):
         self.bus_value_edits: dict[str, FluentLineEdit] = {}
         self.bus_max_values: dict[str, int] = {}
 
+        # A period is one COLUMN in a row of periods, so the card is exactly as wide as
+        # its content needs and never stretches: a card that filled the editor would push
+        # every other period off the screen.  Both widths come from the shared helpers, so
+        # all cards agree with each other and with the fields inside them.
+        card_width = _period_card_width()
+        self.setMinimumWidth(card_width)
+        self.setMaximumWidth(card_width)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+        control_width = _period_control_width(card_width)
+
         column = QtWidgets.QVBoxLayout(self)
         pad = _px(4, minimum=2) if compact else _px(6, minimum=3)
         column.setContentsMargins(pad, pad, pad, pad)
@@ -664,6 +674,7 @@ class PeriodCard(FluentGroupBox):
         # --- name: free text, and the only thing telling two identical periods apart
         self.name_edit = FluentLineEdit(str(period.name or ""))
         self.name_edit.setPlaceholderText("name")
+        self.name_edit.setFixedWidth(control_width)
         self.name_edit.setToolTip("This period's name (shown in the preview and the summary)")
         self.name_edit.textChanged.connect(lambda *_: self.changed.emit())
         column.addWidget(self.name_edit)

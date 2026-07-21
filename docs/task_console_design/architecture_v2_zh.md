@@ -142,8 +142,8 @@ panel 空白处的"读/发信号"图例:加**左右 padding**,过长**按需分�
 - **P3 Processor**:cursor-driven typed transform + explicit output schema；验:`frame_0→occupied` 走同一 detect，processor 读 calibration 文件。
 - **P4 Task**:`calibrate_readout` 文件夹流程 + 中途输出通道 + 产物指纹。验:task 产 npz、中途 panel 收到进度。
 - **P5 自动 UI**:`ParamDecl + PARAM_WIDGETS/ParamWidgetHandler` + 三种 Edit；验:N declarations→N controls、typed 往返、Edit 分工正确。
-- **P6 console 重建**:Add Panel 四类(plot/measurement/processor/task)、接信号、流向图与 task 中途 panel。验:三档 DPR + 四个例子工作流。
-- **P7 全验**:契约测试全绿、虚拟==实机端到端、三档 DPR、四例、文档与 tutorial 同步。
+- **P6 console 重建**:Add Panel 四类(plot/measurement/processor/task)、接信号、流向图与 task 中途 panel。验:真实入口窗口截图 + 四个例子工作流。
+- **P7 全验**:契约测试全绿、虚拟==实机端到端、真实入口窗口截图、四例、文档与 tutorial 同步。
 
 ## 13. 决策(§13 答案,已定)
 

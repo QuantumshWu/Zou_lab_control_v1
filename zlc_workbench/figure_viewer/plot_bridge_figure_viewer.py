@@ -108,6 +108,13 @@ class FigureViewer(QtWidgets.QWidget):
         self._label_w = setting_label_width(
             ("calibration", "data_shape", "points_shape", "captured_at"))
 
+        # The window IS the shared screen-fit size -- the same statement the task console
+        # makes standalone -- and everything inside is divided out of it.  Leaving it to a
+        # size hint is not the same thing: the hint gets clamped to the desktop and this
+        # window came out smaller than the other two, which is exactly the drift the shared
+        # rule exists to prevent.
+        self.setFixedSize(screen_fit_window_size(self.window_ratio))
+
         root = QtWidgets.QHBoxLayout(self)
         root.setContentsMargins(0, window_pad(1), 0, window_pad(1))
         root.setSpacing(0)
