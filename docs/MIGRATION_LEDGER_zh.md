@@ -5,6 +5,14 @@
 > **新增行铁律(宪法 C 条)**:每行 ≤5 行文本;必须引用宪法条号 + 当轮新测量;
 > **禁止引用其他台账行作为架构依据**——台账行只记录事实,不产生法。
 
+## 进度表(每轮更新;数字由守卫机械对账)
+
+| 项 | 现值 |
+| --- | --- |
+| 两巨石行数 | `frontend/task_console.py` 8869 + `frontend/pulse_gui.py` 4475 |
+| 删除台账剩余 | 承 20(目标包待定 20)/ 内 68 / 死 19,共 107 |
+| 当前窗口 | task_console(入口尚指 19-widget 窄窗口,main 为 49-widget `TaskConsole`) |
+
 ## 22. 最终验收
 
 ### 22.1 追溯整改范围与当前 gate
@@ -898,6 +906,142 @@ Pulse/FPGA：
 
 ---
 
+## 删除台账(旧树逐文件处置,C24/C25)
+
+> 由 `git ls-files` 全量派生,守卫 `test_the_deletion_ledger_covers_every_legacy_file` 强制**表 == 文件集**且 `?` 行数只降。
+
+> 分类判据(机械):**承**=旧树之外仍有 importer(点名 consumer,必须先搬走或改指);**内**=只被旧树内部引用(根一断整体倒,随 Z0 批量删);**死**=全仓无 importer(可即刻删)。
+
+> 相对 import 已解析到绝对模块名——只数绝对 import 会把 `session.py`/`devices/base.py` 误判成死件(C5)。
+
+
+### 承(=不能删,20 个;C24 指标 = 本表 `?` 行数单调降)
+
+| 旧树文件 | 行 | 旧树之外的 consumer | 目标包 |
+| --- | ---: | --- | --- |
+| `Zou_lab_control/frontend/task_console.py` | 8869 | `tests/test_u05_console_state_format.py`, `tests/test_u05_console_state_module.py`, `tests/test_u05_declaration_not_class.py` 等 9 处 | ? |
+| `Zou_lab_control/neutral_atom/timing/pulse_table.py` | 3029 | `tests/test_u06_shell_domain_ports.py` | ? |
+| `Zou_lab_control/neutral_atom/devices/sequencer.py` | 2873 | `fpga/pulse_streamer/sim/_gen_replay_t.py` | ? |
+| `Zou_lab_control/neutral_atom/devices/virtual.py` | 2723 | `tests/test_u06_shell_domain_ports.py` | ? |
+| `Zou_lab_control/neutral_atom/operations/logic.py` | 2273 | `tests/test_u05_declaration_not_class.py` | ? |
+| `Zou_lab_control/neutral_atom/core/signals.py` | 909 | `tests/test_u05_declaration_not_class.py`, `tests/test_u05_render_island.py` | ? |
+| `Zou_lab_control/frontend/devtools.py` | 522 | `docs/task_console_design/build.py` | ? |
+| `Zou_lab_control/frontend/qt_canvas.py` | 395 | `tests/test_u05_raster_front.py` | ? |
+| `Zou_lab_control/neutral_atom/operations/processors/fit.py` | 354 | `tests/test_u05_declaration_not_class.py` | ? |
+| `Zou_lab_control/frontend/__init__.py` | 341 | `docs/task_console_design/build.py`, `figure_viewer.py`, `tests/test_u04_signal_picker_owner.py` 等 8 处 | ? |
+| `Zou_lab_control/frontend/notes.py` | 323 | `docs/task_console_design/build.py` | ? |
+| `Zou_lab_control/neutral_atom/operations/processors/analysis.py` | 229 | `tests/test_u05_declaration_not_class.py` | ? |
+| `Zou_lab_control/neutral_atom/operations/calibration.py` | 206 | `tests/test_calibration_sitemap_inputs.py` | ? |
+| `Zou_lab_control/neutral_atom/operations/__init__.py` | 135 | `tests/test_calibration_sitemap_inputs.py` | ? |
+| `Zou_lab_control/neutral_atom/adapter_sdk.py` | 40 | `tests/test_public_hardware_boundary.py` | ? |
+| `Zou_lab_control/frontend/live.py` | 30 | `tests/test_u06_shell_domain_ports.py` | ? |
+| `Zou_lab_control/frontend/render_loop.py` | 30 | `tests/test_u05_render_loop_module.py` | ? |
+| `Zou_lab_control/neutral_atom/testing.py` | 29 | `tests/test_public_hardware_boundary.py` | ? |
+| `Zou_lab_control/frontend/param_widgets.py` | 26 | `tests/test_u04_signal_picker_owner.py`, `tests/test_zlc_frontend_form.py` | ? |
+| `Zou_lab_control/neutral_atom/__init__.py` | 8 | `fpga/pulse_streamer/sim/_gen_replay_t.py`, `tests/test_public_hardware_boundary.py` | ? |
+
+### 死(=全仓无 importer,19 个,可即刻删)
+
+| 旧树文件 | 行 |
+| --- | ---: |
+| `Zou_lab_control/neutral_atom/devices/drivers/dcam/dcamcon.py` | 849 |
+| `Zou_lab_control/neutral_atom/devices/pylon.py` | 454 |
+| `Zou_lab_control/neutral_atom/operations/tasks/mot_field.py` | 333 |
+| `Zou_lab_control/neutral_atom/operations/processors/readout_fidelity.py` | 147 |
+| `Zou_lab_control/neutral_atom/operations/measurements/readout_duration.py` | 121 |
+| `Zou_lab_control/neutral_atom/operations/measurements/grey_molasses_detuning.py` | 114 |
+| `Zou_lab_control/neutral_atom/notes.py` | 111 |
+| `Zou_lab_control/neutral_atom/core/__init__.py` | 108 |
+| `Zou_lab_control/neutral_atom/operations/signal_expr.py` | 30 |
+| `Zou_lab_control/frontend/_watcher.py` | 28 |
+| `Zou_lab_control/neutral_atom/views/__init__.py` | 12 |
+| `Zou_lab_control/neutral_atom/operations/measurements/__init__.py` | 11 |
+| `Zou_lab_control/neutral_atom/operations/processors/__init__.py` | 8 |
+| `Zou_lab_control/neutral_atom/operations/tasks/__init__.py` | 8 |
+| `Zou_lab_control/neutral_atom/devices/drivers/dcam/__init__.py` | 7 |
+| `Zou_lab_control/neutral_atom/simulation.py` | 7 |
+| `Zou_lab_control/neutral_atom/content/__init__.py` | 3 |
+| `Zou_lab_control/neutral_atom/devices/drivers/__init__.py` | 2 |
+| `Zou_lab_control/frontend/content/__init__.py` | 1 |
+
+### 内(=只被旧树内部引用,68 个,随 Z0 整体删)
+
+<details><summary>展开 68 个文件</summary>
+
+| 旧树文件 | 行 | 旧树内 importer 数 |
+| --- | ---: | ---: |
+| `Zou_lab_control/frontend/pulse_gui.py` | 4475 | 2 |
+| `Zou_lab_control/neutral_atom/devices/base.py` | 1626 | 11 |
+| `Zou_lab_control/neutral_atom/devices/drivers/dcam/dcamapi4.py` | 1369 | 2 |
+| `Zou_lab_control/frontend/device_manager.py` | 1234 | 2 |
+| `Zou_lab_control/neutral_atom/devices/qcmos.py` | 1176 | 1 |
+| `Zou_lab_control/neutral_atom/devices/fpga_pulse_streamer.py` | 1073 | 3 |
+| `Zou_lab_control/frontend/figure_viewer.py` | 1033 | 1 |
+| `Zou_lab_control/neutral_atom/subsystems/readout.py` | 891 | 1 |
+| `Zou_lab_control/neutral_atom/operations/measurement.py` | 869 | 10 |
+| `Zou_lab_control/neutral_atom/devices/drivers/dcam/dcam.py` | 747 | 1 |
+| `Zou_lab_control/neutral_atom/timing/sequence.py` | 683 | 6 |
+| `Zou_lab_control/neutral_atom/session.py` | 634 | 4 |
+| `Zou_lab_control/neutral_atom/core/calibration.py` | 604 | 10 |
+| `Zou_lab_control/frontend/flow_graph_view.py` | 557 | 1 |
+| `Zou_lab_control/neutral_atom/content/manuals.py` | 536 | 1 |
+| `Zou_lab_control/neutral_atom/core/analysis.py` | 480 | 20 |
+| `Zou_lab_control/neutral_atom/devices/registry.py` | 447 | 9 |
+| `Zou_lab_control/neutral_atom/ports.py` | 445 | 7 |
+| `Zou_lab_control/neutral_atom/operations/temperature.py` | 421 | 4 |
+| `Zou_lab_control/neutral_atom/operations/fidelity.py` | 401 | 3 |
+| `Zou_lab_control/neutral_atom/operations/imageio.py` | 375 | 4 |
+| `Zou_lab_control/neutral_atom/operations/measurements/pulse_scan.py` | 370 | 1 |
+| `Zou_lab_control/neutral_atom/installation.py` | 359 | 1 |
+| `Zou_lab_control/frontend/content/manuals.py` | 355 | 1 |
+| `Zou_lab_control/neutral_atom/core/results.py` | 330 | 7 |
+| `Zou_lab_control/neutral_atom/device_catalog.py` | 326 | 2 |
+| `Zou_lab_control/frontend/session.py` | 317 | 1 |
+| `Zou_lab_control/neutral_atom/_gui.py` | 287 | 2 |
+| `Zou_lab_control/neutral_atom/operations/processors/roi.py` | 262 | 1 |
+| `Zou_lab_control/neutral_atom/core/psf.py` | 240 | 3 |
+| `Zou_lab_control/neutral_atom/timing/verilog.py` | 219 | 4 |
+| `Zou_lab_control/neutral_atom/core/bimodal.py` | 203 | 4 |
+| `Zou_lab_control/neutral_atom/devices/discovery.py` | 186 | 5 |
+| `Zou_lab_control/frontend/jupyter.py` | 185 | 1 |
+| `Zou_lab_control/neutral_atom/devices/camera_trigger.py` | 185 | 6 |
+| `Zou_lab_control/neutral_atom/operations/processor.py` | 177 | 4 |
+| `Zou_lab_control/neutral_atom/operations/_spec.py` | 171 | 3 |
+| `Zou_lab_control/neutral_atom/operations/_open_registry.py` | 165 | 3 |
+| `Zou_lab_control/neutral_atom/views/plots.py` | 148 | 5 |
+| `Zou_lab_control/neutral_atom/operations/processors/_region.py` | 137 | 3 |
+| `Zou_lab_control/neutral_atom/operations/measurements/temperature.py` | 133 | 1 |
+| `Zou_lab_control/neutral_atom/devices/__init__.py` | 130 | 6 |
+| `Zou_lab_control/neutral_atom/subsystems/timing.py` | 121 | 1 |
+| `Zou_lab_control/neutral_atom/timing/__init__.py` | 109 | 17 |
+| `Zou_lab_control/neutral_atom/operations/measurements/_coupled_template.py` | 103 | 2 |
+| `Zou_lab_control/neutral_atom/_serialization.py` | 91 | 6 |
+| `Zou_lab_control/frontend/content/tutorials.py` | 78 | 1 |
+| `Zou_lab_control/neutral_atom/operations/task.py` | 75 | 2 |
+| `Zou_lab_control/neutral_atom/core/utils.py` | 52 | 6 |
+| `Zou_lab_control/neutral_atom/operations/measurement_registry.py` | 48 | 6 |
+| `Zou_lab_control/neutral_atom/operations/processor_registry.py` | 45 | 4 |
+| `Zou_lab_control/neutral_atom/operations/task_registry.py` | 44 | 3 |
+| `Zou_lab_control/neutral_atom/timing/persistence.py` | 37 | 1 |
+| `Zou_lab_control/neutral_atom/core/selection.py` | 33 | 3 |
+| `Zou_lab_control/neutral_atom/operations/detection.py` | 32 | 1 |
+| `Zou_lab_control/frontend/_validate.py` | 30 | 1 |
+| `Zou_lab_control/neutral_atom/operations/figure_capture.py` | 30 | 1 |
+| `Zou_lab_control/frontend/data_figure.py` | 29 | 4 |
+| `Zou_lab_control/neutral_atom/subsystems/base.py` | 28 | 3 |
+| `Zou_lab_control/neutral_atom/core/facet.py` | 27 | 1 |
+| `Zou_lab_control/neutral_atom/core/fitting.py` | 27 | 3 |
+| `Zou_lab_control/neutral_atom/core/params.py` | 27 | 15 |
+| `Zou_lab_control/neutral_atom/core/raster.py` | 27 | 1 |
+| `Zou_lab_control/neutral_atom/core/signal_tensor.py` | 27 | 5 |
+| `Zou_lab_control/frontend/canvas.py` | 24 | 1 |
+| `Zou_lab_control/frontend/selectors.py` | 24 | 1 |
+| `Zou_lab_control/frontend/ticks.py` | 24 | 1 |
+| `Zou_lab_control/neutral_atom/subsystems/__init__.py` | 7 | 1 |
+
+</details>
+
+
 ## 新台账(2026-07-20 起;每行受宪法 C2 约束:≤700 字符、必须引用 C 条号 + 当轮新测量、禁止引用旧台账行)
 
 | 日期 | 条目 | 状态 | 内容(引宪法条号) | 证据 |
@@ -905,3 +1049,4 @@ Pulse/FPGA：
 | 2026-07-20 | 路线定案 | `DONE` | 按用户批准改道:壳按控件解体(C20/C21),后端清剿以删除台账为指标(C24),§12.5 摘出关键路径(C23),行为权威=ZLC_main 活体 A/B(C22)。实测:task_console 8874 行/pulse_gui 4475 行待解体;qt_widgets 存量超限件 board 4624/fluent 3736/param_widgets 774 | 本文件+宪法本身;测试 143=清单 |
 | 2026-07-20 | 环境分离 | `DONE` | main 独立 clone 至 `../../ZLC_main`(origin=GitHub,migration-repo=本仓库);本仓库=迁移分支;editable 修复指向 ZLC_main 并双向验证(C44)。原 editable 指向已删除的 `Dropbox/Experiment/...`,全局 import 一直是坏的 | pip -e 实测两侧 `__file__` |
 | 2026-07-20 | 测试大清洗 | `DONE` | 176 条冻结测试全删(C41;删除安全实测:零 active import/零 conftest 引用);Z8/Z2C 预算归零改等值(C6) | 143 文件=清单;两门 17 passed |
+| 2026-07-20 | 基础设施+入口真相 | `DONE` | 指纹探针 `tools/window_fingerprint.py` 建成:从每棵树自己的启动器源码推导入口(不硬编码,改指后自动跟随),子进程 offscreen 起窗出 JSON。**当轮新测量**:main 启动器走 `show_task_console(hub=)` 得 `TaskConsole` 49 widget(含 FluentTabWidget/_PanelBoard),本分支启动器走 `experiment.task_console()` 只得 `TaskConsoleWindow` 19 widget、无 tab——旧 8869 行 console 已无任何 consumer(`_gui`/`show_task_console` 全仓零引用),是死码而非在用壳,故 C22 的复原对象是它。删除台账建成:旧树 107 个 .py,承 20/内 68/死 19(C24 指标=承表 `?` 数,现 20 只准降)。相对 import 必须解析到绝对名,否则 `session.py`/`devices/base.py` 被误判死件(C5) | 探针两树 A/B 输出;`test_the_deletion_ledger_covers_every_legacy_file`;47 passed |

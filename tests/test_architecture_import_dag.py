@@ -899,6 +899,15 @@ def test_current_format_names_do_not_encode_edit_counters():
             "zlc_pulse.PulseTargetABI/v1",
             "ZLC-CANONICAL-1",
         ),
+        # The progress ledger moved OUT of the design doc (section 22 -> its own file), and the
+        # two APPROVED hardware-protocol identities travelled with the historical rows that
+        # discuss them.  The allowlist follows the text to its new home; the pattern is not
+        # weakened.  Found the commit after the move, because this sweep reads ``git ls-files``
+        # and an untracked new document is invisible to it until it is committed.
+        Path("docs/MIGRATION_LEDGER_zh.md"): (
+            "zlc_pulse.PulseTargetABI/v1",
+            "ZLC-CANONICAL-1",
+        ),
     }
     ratchet_path = Path(__file__).resolve().relative_to(ROOT)
     roots = (

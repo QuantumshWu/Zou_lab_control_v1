@@ -149,6 +149,40 @@ def test_the_manifest_is_the_suite():
         f"manifest-only: {sorted(manifest - files)}; file-only: {sorted(files - manifest)}")
 
 
+#: C24 -- the migration's progress metric.  Files in the deletion ledger's 承 table whose target
+#: package is still ``?``.  EQUALITY (C6): every round that decides one lowers this by hand, and
+#: a round that quietly adds an undecided file cannot hide behind a ceiling.
+UNDECIDED_LEGACY_FILES = 20
+
+
+def test_the_deletion_ledger_covers_every_legacy_file():
+    """C24/C25.  The ledger is a census, so its value is entirely in being EXHAUSTIVE: a legacy
+    file missing from it is a file nobody ever has to decide about, which is how residue
+    survives a migration that believes itself finished."""
+
+    import subprocess
+
+    tracked = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
+                             text=True, check=True).stdout.split()
+    legacy = {p for p in tracked
+              if p.startswith(("Zou_lab_control/frontend/", "Zou_lab_control/neutral_atom/"))
+              and p.endswith(".py")}
+
+    text = LEDGER.read_text(encoding="utf-8")
+    section = text[text.index("## 删除台账"):text.index("## 新台账")]
+    # Rows are ``| `path` | ... |``; the backticks are what separate a listed file from prose
+    # that merely mentions one.
+    listed = set(re.findall(r"^\| `([^`]+\.py)` \|", section, flags=re.MULTILINE))
+    assert listed == legacy, (
+        f"ledger-only: {sorted(listed - legacy)}; unlisted legacy files: {sorted(legacy - listed)}")
+
+    undecided = len(re.findall(r"\| \?\s*\|", section))
+    assert undecided == UNDECIDED_LEGACY_FILES, (
+        f"{undecided} legacy files still have no target package, recorded "
+        f"{UNDECIDED_LEGACY_FILES} -- "
+        f"{'lower the constant in this commit' if undecided < UNDECIDED_LEGACY_FILES else 'ROSE'}")
+
+
 def test_no_file_marries_qt_to_matplotlib_outside_the_sanctioned_zones():
     """C14 -- the render end state, enforced from today.  Qt sees pixels; matplotlib lives in
     the headless render leaf; the ONLY places allowed to touch both are the legacy frontend
