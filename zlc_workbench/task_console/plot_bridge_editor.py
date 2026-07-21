@@ -726,7 +726,8 @@ class PanelEditor(QtWidgets.QWidget):
             inputs = list(self.card.config.inputs or [])
             value_node = self.console._node_for_signal(inputs[0]) if inputs else None
             df.bind_source(self.console.hub, value_node, inputs=inputs,
-                           resolve_node=self.console._node_for_signal, session=self.console.session)
+                           resolve_node=self.console._node_for_signal,
+                           session=self.console.experiment)
             stem = self._save_stem(time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime()))
             stem.parent.mkdir(parents=True, exist_ok=True)
             # the operator-chosen container (png / pdf / jpg) drives BOTH the file suffix and

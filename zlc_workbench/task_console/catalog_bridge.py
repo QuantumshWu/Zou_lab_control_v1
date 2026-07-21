@@ -51,6 +51,7 @@ class ConsoleNodeSpec:
     key: DefinitionKey
     kind: str                     # "camera" | "measurement" | "processor" | "task"
     title: str
+    description: str
     form_spec: FormSpec
     declared_outputs: tuple[ConsoleSignalDecl, ...]
     build_request: Callable[[Mapping[str, object]], object]
@@ -63,6 +64,21 @@ class ConsoleNodeSpec:
 
 
 _GROUP_TO_KIND = {"Task": "task", "Measurement": "measurement", "Processor": "processor"}
+
+
+def _short_title(key: DefinitionKey) -> str:
+    """A menu-length label derived from the definition's STABLE id.
+
+    A ``Definition.title`` is free prose -- some read as labels ("Pulse scan"),
+    one is a full sentence describing what the processor does -- and a menu row
+    cannot hold a sentence.  Deriving from ``stable_definition_id`` gives every
+    entry the same shape, and ties the label the operator sees to the same
+    string the saved board persists, so a title reword cannot orphan a layout.
+    The prose title survives as the entry's ``description`` (its tooltip).
+    """
+
+    words = str(key.stable_definition_id).replace("_", "-").split("-")
+    return " ".join(words).capitalize()
 
 
 def _camera_monitor_form(camera_roles: tuple[str, ...]) -> FormSpec:
@@ -163,7 +179,8 @@ class ConsoleCatalogView:
                                    "scalar_history_capacity", "io_timeout_seconds"))
 
             return ConsoleNodeSpec(
-                key=item.key, kind="camera", title=item.title,
+                key=item.key, kind="camera", title=_short_title(item.key),
+                description=item.title,
                 form_spec=_camera_monitor_form(roles),
                 declared_outputs=(
                     ConsoleSignalDecl("frame", "frame", "camera frame", "counts"),
@@ -187,7 +204,8 @@ class ConsoleCatalogView:
                                    "memory_limit_bytes", "timeout_seconds"))
 
             return ConsoleNodeSpec(
-                key=item.key, kind=kind, title=item.title,
+                key=item.key, kind=kind, title=_short_title(item.key),
+                description=item.title,
                 form_spec=_pulse_scan_form(self.camera_roles(), self.sequencer_roles()),
                 declared_outputs=(
                     ConsoleSignalDecl("scan", "scan", "scan result", ""),
@@ -202,7 +220,8 @@ class ConsoleCatalogView:
                 "RUN seam (contract 2)")
 
         return ConsoleNodeSpec(
-            key=item.key, kind=kind, title=item.title,
+            key=item.key, kind=kind, title=_short_title(item.key),
+            description=item.title,
             form_spec=_occupancy_form(),
             declared_outputs=(
                 ConsoleSignalDecl("occupied", "occupied", "site occupancy", ""),
@@ -212,6 +231,17 @@ class ConsoleCatalogView:
         )
 
     # -------------------------------------------------------------- queries
+    @property
+    def experiment(self):
+        """The one session this view projects.
+
+        The skeleton reaches the domain ONLY through this view, so the window
+        never imports ``Zou_lab_control.notebook`` itself; the RUN seam derives
+        its prepare/start closures from the same object.
+        """
+
+        return self._experiment
+
     def specs(self, kind: str | None = None) -> tuple[ConsoleNodeSpec, ...]:
         if kind is None:
             return self._specs

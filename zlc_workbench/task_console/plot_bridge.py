@@ -47,6 +47,7 @@ from zlc_frontend.qt_widgets import (
 )
 from zlc_frontend import board_layout as _layout
 from zlc_frontend.form import lenient_float as _safe_float
+from zlc_frontend.render_style import panel_display_size
 from zlc_frontend.panel_params import (
     PANEL_PARAMS,
     panel_display_decls as _panel_display_decls,
@@ -118,6 +119,37 @@ GRID_UNIT = 8
 # public art/geom knob); change this one number to retune all board
 # spacing.
 GAP = GRID_UNIT
+
+
+def _cell_size() -> tuple[int, int]:
+    """The board's base CELL in pixels: the footprint of the narrowest card ("1x2").
+
+    The packer works in cells; this is the one place a cell is converted to pixels.
+    Width and height both come from the panel's displayed raster box
+    (:func:`~zlc_frontend.render_style.panel_display_size`) plus the card chrome the
+    FluentGroupBox component owns, so a card is exactly as tall as its content.
+    """
+
+    width = panel_display_size("1x2")[0] + 2 * CARD_PAD
+    height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + panel_display_size("1x2")[1] + CARD_PAD
+    return (width, height)
+
+
+def _card_size(size: str) -> tuple[int, int]:
+    """Pixel footprint of a card at a panel-size preset.
+
+    Width snaps to a whole number of base cells (so cards align to the board grid and
+    the inter-column joins are the same GAP as between cards); height hugs the panel's
+    own displayed height, so no size leaves blank padding under the plot.
+    """
+
+    rows, cols = panel_size_cells(size)
+    w_units = max(1, cols // 2)
+    cw, _ch = _cell_size()
+    width = w_units * cw + (w_units - 1) * GAP
+    height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + panel_display_size(size)[1] + CARD_PAD
+    return (width, height)
+
 
 def _board_metrics() -> "_layout.BoardMetrics":
     """The two facts the moved packer cannot derive, read LIVE on every call.

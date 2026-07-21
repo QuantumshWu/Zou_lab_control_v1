@@ -129,10 +129,7 @@ class TaskConsole(QtWidgets.QWidget):
         hub,
         state: TaskConsoleState | None = None,
         running_nodes: Sequence[object] = (),
-        measurements: Sequence[object] = (),
-        processors: Sequence[object] = (),
-        tasks: Sequence[object] = (),
-        session: object | None = None,
+        catalog_view: object | None = None,
         runtime_fence: object | None = None,
         runtime_fence_provider=None,
         scale: float | None = None,
@@ -181,20 +178,12 @@ class TaskConsole(QtWidgets.QWidget):
         self._starting_nodes: dict[int, object] = {}
         self._pending_fenced_starts: dict[int, set[str]] = {}
         self._panel_teardown_phases: dict[int, set[str]] = {}
-        # The declarative measurement catalog: each becomes an addable LOGIC NODE
-        # (a swept measurement) on the Logic tab; with none, only the camera /
-        # processors / tasks are offered (and only plot kinds without a session).
-        self.measurements = list(measurements)
-        # The declarative DATA-PROCESSING catalog (reactive transform nodes) and the
-        # TASK catalog (one-shot orchestrations): each is an addable LOGIC NODE.
-        self.processors = list(processors)
-        self.tasks = list(tasks)
-        # The connected experiment session (optional): with it, the camera live
-        # Measurement is offered too (readout.camera_measurement).
-        self.session = session
-        # The camera row's display name, read ONCE from readout.camera_spec().name when the
-        # Add-Panel dropdown is populated (the spec owns it; "" until/without a session camera).
-        self._camera_title = ""
+        # CATALOG SEAM (contract 1): the ONE capability vocabulary this window offers.
+        # ``ConsoleCatalogView`` projects the domain DefinitionCatalog into addable
+        # entries -- camera / measurement / processor / task -- each carrying its own
+        # parameter form, declared outputs and typed-request builder.  Without a view
+        # the window is plot-kinds only (a layout you can open with no session).
+        self._catalog = catalog_view
         self.state = state or default_console_state()
         self.window_ratio = float(window_ratio)
         self._window_px = window_px
@@ -345,30 +334,25 @@ class TaskConsole(QtWidgets.QWidget):
         #   * "Task: Z"        -- a one-shot orchestration logic node (e.g. calibrate).
         # A logic node (measurement/processor/task) is added STOPPED to the Logic tab;
         # you Start/Stop it from its own Edit.  A plot is added to the Monitor board.
-        readout = getattr(self.session, "readout", None)
         # The dropdown offers only the ADDABLE plot kinds (``panel=True``) -- the ones you add a
         # BLANK panel of and wire live.  ``pulse`` is a real panel kind too, but it is not added
         # blank live (it comes from a saved recipe / a fired sequence via the seed path), so it is
         # not listed here.
         for key, label in ADDABLE_PANEL_KINDS.items():
             self.kind_combo.addItem(f"Plot: {label}", key)
-        # MEASUREMENT layer: the continuous camera (a live frame stream) first, then
-        # the swept measurements from the catalog.
-        if readout is not None and hasattr(readout, "camera_measurement") and hasattr(readout, "camera_spec"):
-            # The camera row's DISPLAY name is the authoritative spec's own name
-            # (readout.camera_spec().name) -- never a re-typed literal, so a spec rename
-            # reaches the dropdown AND the row title (_add_panel) automatically.  Resolved
-            # ONCE here (camera_spec() re-enumerates devices; keep it out of hot paths).
-            self._camera_title = str(readout.camera_spec().name)
-            self.kind_combo.addItem(f"Measurement: {self._camera_title}", ("camera", "live"))
-        for spec in self.measurements:
-            self.kind_combo.addItem(f"Measurement: {spec.name}", ("measurement", spec.name))
-        # PROCESSOR layer (the "func" nodes).
-        for spec in self.processors:
-            self.kind_combo.addItem(f"Processor: {spec.name}", ("processor", spec.name))
-        # TASK layer: one-shot orchestrations from the auto-discovered task catalog.
-        for spec in self.tasks:
-            self.kind_combo.addItem(f"Task: {spec.name}", ("task", spec.name))
+        # The node LAYERS, straight off the catalog view: every entry carries its own
+        # display title, so a renamed domain Definition reaches the dropdown AND the row
+        # title without a second literal.  The camera is NOT special-cased any more -- it
+        # is one catalog entry among the others (the old ``("camera", "live")`` singleton
+        # placeholder encoded an assumption the DefinitionCatalog does not make).
+        for kind, layer in (("camera", "Measurement"), ("measurement", "Measurement"),
+                            ("processor", "Processor"), ("task", "Task")):
+            for spec in self._catalog_specs(kind):
+                self.kind_combo.addItem(f"{layer}: {spec.name}", (kind, spec.name))
+                # The definition's prose title is the row's tooltip: the menu stays
+                # scannable while the full sentence stays one hover away.
+                self.kind_combo.setItemData(self.kind_combo.count() - 1,
+                                            spec.description, QtCore.Qt.ToolTipRole)
         self.kind_combo.setFixedWidth(scaled_px(170, minimum=130))
         add_button = FluentButton("Add Panel", color=ACCENT)
         add_button.clicked.connect(self._add_panel)
@@ -1631,10 +1615,9 @@ class TaskConsole(QtWidgets.QWidget):
         # measurement / processor / task).  It publishes nothing until Started.
         if isinstance(data, tuple) and len(data) == 2 and data[0] in LOGIC_KINDS:
             kind, name = data
-            # The camera's row title = the spec's display name resolved at populate time
-            # (readout.camera_spec().name -- ONE source); every other kind's name IS its
-            # catalog spec's name already.
-            title = self._camera_title if kind == "camera" else str(name)
+            # Every layer's dropdown name IS its catalog entry's title -- ONE source for the
+            # dropdown label, the Logic row title and the spec lookup.
+            title = str(name)
             self._add_logic_node(LogicNodeConfig(kind=kind, name=name, title=title), focus=True)
             return
         # Otherwise a PLOT kind -> a BLANK pure-view panel on the Monitor board
@@ -1707,22 +1690,36 @@ class TaskConsole(QtWidgets.QWidget):
         self._panel_teardown_phases.pop(id(card), None)
         return True
 
+    @property
+    def experiment(self):
+        """The session behind the catalog view, or None for a catalog-less window.
+
+        The skeleton reaches the domain ONLY through the catalog seam, so this is
+        the single accessor every panel/editor asks -- no second session field.
+        """
+
+        return self._catalog.experiment if self._catalog is not None else None
+
     # ====================================================================== logic nodes
+    def _catalog_specs(self, kind: str) -> tuple:
+        """The catalog entries of ONE layer, or empty without a catalog view."""
+
+        if self._catalog is None:
+            return ()
+        return tuple(self._catalog.specs(kind))
+
     def _spec_for_logic(self, node: LogicNodeConfig):
-        """The declarative spec a logic node builds from -- it carries the node's
-        editable ParamDecls (so the Edit auto-form renders them) and a ``build``.
-        The camera's spec comes from ``readout.camera_spec()`` (its params are the
-        camera's exposure / frames-per-cycle), the others from the catalogs."""
-        if node.kind == "camera":
-            readout = getattr(self.session, "readout", None)
-            return readout.camera_spec() if readout is not None and hasattr(readout, "camera_spec") else None
-        if node.kind == "measurement":
-            return next((s for s in self.measurements if getattr(s, "name", None) == node.name), None)
-        if node.kind == "processor":
-            return next((s for s in self.processors if getattr(s, "name", None) == node.name), None)
-        if node.kind == "task":
-            return next((s for s in self.tasks if getattr(s, "name", None) == node.name), None)
-        return None
+        """The catalog entry a logic node builds from.
+
+        It carries the node's parameter form (the Edit auto-form renders it), its
+        declared outputs and the typed-request builder the RUN seam starts from.
+        One lookup for every layer: the entry's own title is its identity.
+        """
+
+        if self._catalog is None:
+            return None
+        spec = self._catalog.spec_named(node.name)
+        return spec if spec is not None and spec.kind == node.kind else None
 
     def _unique_logic_title(self, title: str) -> str:
         """Make a logic-node title ``"<base> #N"`` and UNIQUE among the existing Logic rows
@@ -2439,7 +2436,8 @@ class TaskConsole(QtWidgets.QWidget):
                 return None
 
             roles = {str(r) for r in (getattr(spec, "devices", ()) or ())}
-            readout = getattr(self.session, "readout", None)
+            experiment = self._catalog.experiment if self._catalog is not None else None
+            readout = getattr(experiment, "readout", None)
             # Symmetric with the reactive branch above: the SPEC builds its own node.
             return spec.make_run(self.hub, readout=readout,
                                  camera=_borrow("camera") if "camera" in roles else None,
@@ -3422,10 +3420,7 @@ def show_task_console(
     state: TaskConsoleState | None = None,
     task: str | None = None,
     running_nodes: Sequence[object] = (),
-    measurements: Sequence[object] = (),
-    processors: Sequence[object] = (),
-    tasks: Sequence[object] = (),
-    session: object | None = None,
+    catalog_view: object | None = None,
     runtime_fence: object | None = None,
     runtime_fence_provider=None,
     scale: float | None = None,
@@ -3440,12 +3435,11 @@ def show_task_console(
     ``task`` loads a layout YOU saved (``tasks/<name>.json``) or a JSON path;
     without one the console opens empty.
 
-    ``measurements`` is the declarative measurement catalog
-    (``exp.readout.measurement_specs()`` -- an AUTO-DISCOVERED list, built-ins +
-    any ``@measurement`` / ``register_measurement``): pass it and every spec is
-    listed in the header's Add Panel dropdown; picking one + Add Panel creates a
-    result panel and opens its Edit tab (auto-generated parameter form + one-click
-    Start).  Omit it and the dropdown carries only plot kinds.
+    ``catalog_view`` is the CATALOG seam (contract 1): a
+    :class:`~zlc_workbench.task_console.catalog_bridge.ConsoleCatalogView`
+    projecting the domain DefinitionCatalog into the Add-Panel dropdown -- every
+    entry brings its own parameter form, declared outputs and typed-request
+    builder.  Omit it and the dropdown carries only plot kinds.
 
     Teardown: closing the window stops the refresh timer and every running node's owner
     thread (the cooperative-cancel path), so no acquire thread is left holding the
@@ -3458,8 +3452,8 @@ def show_task_console(
     ensure_qt_app()          # the console is a QWidget: the app must exist BEFORE its ctor
     if state is None and task is not None:
         state = resolve_task_state(task)
-    console = TaskConsole(hub=hub, state=state, running_nodes=running_nodes, measurements=measurements,
-                          processors=processors, tasks=tasks, session=session,
+    console = TaskConsole(hub=hub, state=state, running_nodes=running_nodes,
+                          catalog_view=catalog_view,
                           runtime_fence=runtime_fence,
                           runtime_fence_provider=runtime_fence_provider, scale=scale,
                           window_ratio=window_ratio)

@@ -56,6 +56,36 @@ PANEL_DISPLAY_SCALE = 0.7
 STOCK_DATA_PX = (480, 360)                # the stock single-axes data region (confocal)
 STOCK_MARGINS_PX = (110, 110, 100, 40)    # confocal stock margins (L, R, B, T)
 
+# --- panel geometry: the ONE size table every dashboard card is laid out from ---
+# A panel size ("2x2", "4x8", ...) is rows x cols in HALF-UNITS; one half-unit is
+# PANEL_UNIT_PX.  The displayed pixel size of a panel is therefore a pure function of
+# its size preset -- data region + margins, scaled by PANEL_DISPLAY_SCALE -- and NOT of
+# what is drawn inside it.  That is what makes every kind's card at a given size line up
+# to the pixel, and what lets the board packer compute card boxes without asking the
+# renderer.  These are OWNED constants of the visual system, not per-call knobs.
+TITLE_SLOT_PX = 70                        # vertical px a centred panel title needs
+PANEL_UNIT_PX = (180, 240)                # (height, width) of one half-unit
+# L = STOCK_MARGINS_PX[0] (110): the MINIMUM that holds a 4-5 digit y-tick label (a qCMOS
+# ROI pixel value) PLUS the rotated y-title -- narrower clipped the title off the figure.
+PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 96, 80, TITLE_SLOT_PX)   # (L, R, B, T)
+
+
+def panel_display_size(size: str = "2x2") -> tuple[int, int]:
+    """On-screen (logical px) size of a panel of ``size`` -- the card's canvas box.
+
+    Pure geometry over the owned tokens: no figure, no renderer, no Qt.  A host
+    reserves exactly this much room for the panel's raster surface, so a card's
+    footprint is known before anything is drawn into it.
+    """
+
+    from zlc_data.panel_size import panel_size_cells
+
+    rows, cols = panel_size_cells(size)
+    left, right, bottom, top = PANEL_MARGINS_PX
+    width = cols * PANEL_UNIT_PX[1] + left + right
+    height = rows * PANEL_UNIT_PX[0] + bottom + top
+    return (round(width * PANEL_DISPLAY_SCALE), round(height * PANEL_DISPLAY_SCALE))
+
 # Stock figure size in inches = (data + L + R, data + B + T) / dpi.  Derived, so
 # it can never disagree with FigureSpec's defaults (which read the same tokens).
 _STOCK_FIGSIZE = (
@@ -379,6 +409,10 @@ __all__ = [
     "PALETTE",
     "indexed_colormap",
     "PANEL_DISPLAY_SCALE",
+    "PANEL_MARGINS_PX",
+    "PANEL_UNIT_PX",
+    "TITLE_SLOT_PX",
+    "panel_display_size",
     "PULSE_SCAN_ANNOTATION_COLOR",
     "PULSE_SCAN_ANNOTATION_FONT_SIZE",
     "PULSE_SCAN_REGION_COLOR",
