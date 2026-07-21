@@ -636,7 +636,7 @@ class PanelCard(FluentGroupBox):
         being drawn on the thread that also has to stay responsive.
         """
 
-        from zlc_frontend.qt_widgets.board import QtImageBoard
+        from zlc_frontend.qt_widgets import QtImageBoard
 
         if self.board is not None:
             return

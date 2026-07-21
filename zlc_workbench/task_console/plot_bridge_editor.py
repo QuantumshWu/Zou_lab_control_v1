@@ -401,7 +401,7 @@ class PanelEditor(QtWidgets.QWidget):
         """
 
         from zlc_frontend.panel_render import PanelComposer, PanelProvenance, PanelRenderError
-        from zlc_frontend.qt_widgets.board import QtImageBoard
+        from zlc_frontend.qt_widgets import QtImageBoard
 
         card = self.card
         value = None if card is None else getattr(card, "_last_value", None)
