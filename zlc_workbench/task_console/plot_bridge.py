@@ -1384,7 +1384,7 @@ class PanelCard(FluentGroupBox):
         new admissible model does not need a second list updating to offer it.
         """
 
-        from zlc_data.fit_model import fit_model_catalog
+        from zlc_data import fit_model_catalog
 
         catalog = fit_model_catalog()
         if not catalog:

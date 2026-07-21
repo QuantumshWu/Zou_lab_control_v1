@@ -103,7 +103,7 @@ def _general_fit_models_for_kind(kind: str):
     import graph must stay free of anything but Qt.
     """
 
-    from zlc_data.fit_model import fit_model_catalog
+    from zlc_data import fit_model_catalog
     from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY
 
     spec = PLOT_KIND_SPEC_BY_KEY.get(str(kind or ""))
