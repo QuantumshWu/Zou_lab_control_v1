@@ -10,21 +10,45 @@ It is deliberately the WHOLE arc rather than one call per test: what the
 tutorial promises is that these steps compose, and a capture reference that
 no calibration will accept would pass every isolated check.
 
-Scope note: the spine ends at the calibration report.  Detection, per-site
-thresholds, scans and the temperature fit are taught later in the notebook and
-belong to the same guard, but the notebook's own text for them has not been
-rewritten onto this facade yet; adding assertions for calls the tutorial does
-not yet make would pin a contract nobody is reading.  They join when that
-section does.
+Scope note: the spine ends at per-shot detection, which is where the rewritten
+notebook ends.  Per-site thresholds, scans and the temperature fit are real
+capabilities that belong in this guard, but the notebook's text for them has
+not been rewritten onto this facade yet; asserting calls the tutorial does not
+make would pin a contract nobody is reading.  They join when that section does.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 
 import Zou_lab_control.notebook as zlc
 from zlc_neutral_atom.artifacts import CaptureArtifactRef
+from zlc_neutral_atom.readout.sitemap import load_packaged_sitemap_pulse
+
+
+def _single_readout_event(document):
+    """The imaging document with only its SECOND trigger window left armed.
+
+    The tutorial reaches detection this way and the reason is physical: the
+    imaging template brackets a shot with three frames, while an occupancy
+    decision is about one readout event.  Keeping the middle window is what
+    makes the capture carry the single event detection requires.
+    """
+
+    trigger_index = document.target.raw_lanes.index("ch11")
+    periods, runs, previous = [], 0, False
+    for period in document.periods:
+        states = list(period.states)
+        high = bool(states[trigger_index])
+        if high and not previous:
+            runs += 1
+        states[trigger_index] = int(high and runs == 2)
+        periods.append(replace(period, states=tuple(states)))
+        previous = high
+    assert runs == 3, "the bracket is what makes this worth narrowing"
+    return replace(document, name="spine-readout", periods=tuple(periods), repeat=None)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,5 +90,18 @@ def test_the_tutorial_spine_runs_on_the_virtual_installation() -> None:
             # per-site quantity downstream is expressed against.
             calibration = exp.readout.sitemap(frames=6)
             report = exp.readout.load_calibration_report(calibration)
-            assert report.labels is not None
-            assert report.model is not None
+            assert report.labels.n_sites > 0
+            assert len(report.psf_fits) == report.labels.n_sites
+
+            # Third act: is this site loaded, on this shot?  A pulse document is
+            # ordinary data the tutorial edits in place -- no editor involved.
+            shot = exp.readout.capture(
+                _single_readout_event(load_packaged_sitemap_pulse()),
+                trigger_channel="ch11",
+                readout_events_per_repeat=1,
+            )
+            occupancy = exp.readout.detect(
+                exp.readout.detection_request(shot, calibration)
+            )
+            assert isinstance(occupancy, zlc.OccupancyArtifactRef)
+            assert exp.readout.load_occupancy(occupancy) is not None
