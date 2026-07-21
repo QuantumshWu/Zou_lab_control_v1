@@ -13,6 +13,7 @@ tests/test_console_data_plane.py
 tests/test_console_run_bridge.py
 tests/test_definition_catalog.py
 tests/test_design_charter.py
+tests/test_dropdown_anchor.py
 tests/test_m1_camera_monitor.py
 tests/test_m2_camera_monitor_roi_curve.py
 tests/test_m2b_camera_monitor_scalar_history.py

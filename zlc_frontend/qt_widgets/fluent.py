@@ -1630,19 +1630,23 @@ class _RoundedPopupCard(QtCore.QObject):
             painter.end()
             return True
         if et == QtCore.QEvent.Move and self._combo is not None and isinstance(obj, QtWidgets.QWidget):
-            # ALWAYS BELOW: the dropdown must open downward off the box, never flip above it.
-            # Qt drops the popup flush against the combo (and near the screen bottom would flip it
-            # UPWARD) in a deferred step a showPopup-time move() can't beat; re-apply the downward
-            # offset every time it is repositioned so the dropdown sits a few px BELOW the box -- the
-            # same gap the Setting FluentPopup uses below its button.  Self-converging: once at target
-            # the guard no-ops, so the corrective move does not loop.  (Overrun past the screen bottom
-            # is handled by clamping the popup HEIGHT to the below-the-box space so it scrolls -- see
-            # FluentComboBox.showPopup / _anchor_available_height -- not by flipping it up.)
-            below = self._combo.mapToGlobal(QtCore.QPoint(0, self._combo.height())).y()
+            # DIRECTLY UNDER THE BOX -- both axes, unconditionally.  "Under" is two facts: the
+            # dropdown's TOP sits just below the box's bottom, and its LEFT edge lines up with the
+            # box's left edge.  Qt violates each one for its own reason and in a deferred step a
+            # showPopup-time move() cannot beat, so both are re-applied on every reposition:
+            #   * vertically it flips the list ABOVE the box when the space below runs out;
+            #   * horizontally it SLIDES a popup that is wider than its box leftwards to keep it
+            #     inside the screen -- so the list detaches from the box exactly at the right-hand
+            #     edge of a window, which reads as the list jumping somewhere else.
+            # Neither is wanted: a list that moves no longer points at the box that was clicked.
+            # Overrun is absorbed instead -- vertically by clamping the popup HEIGHT so it scrolls
+            # (FluentComboBox.showPopup / _anchor_available_height), horizontally by letting the
+            # wider card extend past the box.  Self-converging: at target the guard no-ops.
+            anchor = self._combo.mapToGlobal(QtCore.QPoint(0, self._combo.height()))
             geo = obj.geometry()
-            target = below + self._gap
-            if abs(geo.top() - target) > 1:
-                obj.move(geo.left(), target)
+            target_top = anchor.y() + self._gap
+            if abs(geo.top() - target_top) > 1 or geo.left() != anchor.x():
+                obj.move(anchor.x(), target_top)
             return False
         return False
 
