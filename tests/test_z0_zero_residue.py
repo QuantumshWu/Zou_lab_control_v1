@@ -73,6 +73,8 @@ Z2A_PRODUCTION_IMPORTERS = {   # non-test code OUTSIDE legacy that still imports
     # while the shell is taken apart widget by widget.  Transitional by construction: every
     # class that moves out shrinks this crossing, and it goes with the shell (C20/C25).
     Path("zlc_workbench/task_console/app.py"),
+    # Same transitional delegation for the pulse editor composition root (C20/C25).
+    Path("zlc_workbench/pulse_editor/app.py"),
 }
 #: Whitelisted tests that reach into the legacy tree, NAMED rather than counted.
 #: A count would let one more slip in unnoticed; naming each makes every addition
@@ -177,6 +179,9 @@ Z4_COMPOSITION_ROOTS = {
     # Delegates the whole task console window to the legacy shell while that shell is taken
     # apart widget by widget.  Shrinks every round; deleted with the shell (C20/C25).
     Path("zlc_workbench/task_console/app.py"),
+    # The pulse editor's composition root: delegates to the legacy editor stack while the
+    # 4475-line shell is dismantled.  Dies with the shell (C20/C25).
+    Path("zlc_workbench/pulse_editor/app.py"),
 }
 
 

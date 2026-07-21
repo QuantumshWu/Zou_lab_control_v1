@@ -99,11 +99,14 @@ def test_current_workbench_entry_points_never_accept_a_raw_sequencer() -> None:
 
 
 def test_standalone_launcher_composes_the_current_product_surface() -> None:
+    # The launcher opens the OFFLINE legacy editor through the ONE composition root
+    # (behaviour authority = main, C22); it constructs no device and no experiment.
+    # The workbench windows remain components behind Zou_lab_control.workbench.
     source = (ROOT / "pulse_gui.py").read_text(encoding="utf-8")
 
-    assert 'connect(\n            "virtual"' in source
-    assert "open_pulse_workbench" in source
-    assert "open_offline_pulse_workbench" in source
+    assert "from zlc_workbench.pulse_editor.app import open_pulse_editor" in source
+    assert "open_pulse_editor(state=args.state" in source
+    assert "connect(" not in source
     assert "managed_pulse_command_port" not in source
     assert "RemoteSequencer" not in source
     assert "VirtualSequencer" not in source

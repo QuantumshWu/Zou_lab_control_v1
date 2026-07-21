@@ -1,4 +1,9 @@
-"""Standalone launcher for the current PulseWorkbench product surface."""
+"""Standalone launcher for the pulse-sequence editor (double-click ``pulse_gui.bat``).
+
+Opens the OFFLINE editor -- no device is created or discovered.  Executable use on virtual
+or real hardware enters through a session (``exp.pulse_gui()`` in a notebook), exactly as
+before the migration.
+"""
 
 from __future__ import annotations
 
@@ -9,40 +14,21 @@ import sys
 from typing import Sequence
 
 
-def _positive_float(text: str) -> float:
-    value = float(text)
-    if value <= 0:
-        raise argparse.ArgumentTypeError("value must be positive")
-    return value
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Open the current Zou_lab_control PulseWorkbench.",
+        description="Open the Zou_lab_control pulse-sequence editor (offline).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--state",
         type=Path,
-        help="Open one current zlc_pulse.PulseDocument JSON file.",
+        help="Load a saved pulse program (a PulseTableState JSON).",
     )
     parser.add_argument(
-        "--repository",
-        type=Path,
-        default=Path.home() / ".zlc" / "pulse_gui",
-        help="Virtual Experiment workspace. Ignored in offline mode.",
-    )
-    parser.add_argument("--name", default="pulse_gui", help="Virtual Experiment name.")
-    parser.add_argument(
-        "--offline",
-        action="store_true",
-        help="Author and preview only; no fake execution backend is constructed.",
-    )
-    parser.add_argument(
-        "--clock-hz",
-        type=_positive_float,
-        default=50_000_000.0,
-        help="Clock for a new offline document. Loaded documents retain their own grid.",
+        "--scale",
+        type=float,
+        default=None,
+        help="Display scale override (default: screen-derived).",
     )
     return parser
 
@@ -53,47 +39,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from PyQt5 import QtCore
 
-    from Zou_lab_control.workbench import (
-        open_offline_pulse_workbench,
-        open_pulse_workbench,
-    )
     from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.pulse_editor.app import open_pulse_editor
 
     application = ensure_qt_app()
-    experiment = None
-    if args.offline:
-        from zlc_pulse import load_deployed_pulse_target
-
-        window = open_offline_pulse_workbench(
-            load_deployed_pulse_target(),
-            time_step_ns=1e9 / args.clock_hz,
-            path=args.state,
-        )
-    else:
-        from Zou_lab_control.notebook import connect
-        from zlc_storage import durable_makedirs
-
-        # Own the workspace levels above the repository the composition
-        # root creates, so a first run with no ~/.zlc still starts.
-        durable_makedirs(args.repository.expanduser().parent)
-        experiment = connect(
-            "virtual",
-            repository=args.repository,
-            name=args.name,
-        )
-        window = open_pulse_workbench(experiment, path=args.state)
-
+    editor = open_pulse_editor(state=args.state, scale=args.scale)
     auto_close_ms = os.environ.get("ZLC_PULSE_GUI_AUTO_CLOSE_MS")
     if auto_close_ms:
-        QtCore.QTimer.singleShot(
-            max(0, int(auto_close_ms)),
-            lambda: window.request_close(discard_unsaved=True),
-        )
-    try:
-        return int(application.exec_())
-    finally:
-        if experiment is not None:
-            experiment.close()
+        # The editor is the window BODY; its Fluent frame is the top-level window, and
+        # closing the body alone leaves the frame open and the launcher hung in exec_()
+        # (the exact task_console lesson).
+        QtCore.QTimer.singleShot(max(0, int(auto_close_ms)), editor.window().close)
+    return int(application.exec_())
 
 
 if __name__ == "__main__":

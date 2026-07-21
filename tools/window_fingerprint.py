@@ -49,7 +49,8 @@ ENTRY_MARKERS = {
                      ("experiment.task_console(", "facade"),
                      ("open_task_console(", "workbench_app")),
     "pulse_gui": (("show_pulse_gui(", "legacy"),
-                  ("open_pulse_workbench(", "workbench")),
+                  ("open_pulse_workbench(", "workbench"),
+                  ("open_pulse_editor(", "editor_app")),
     "figure_viewer": (("show_figure_viewer(", "legacy"),),
 }
 
@@ -140,6 +141,10 @@ def build(name, kind, connect_devices):
     if kind == "workbench_app":
         from zlc_workbench.task_console.app import open_task_console
         window = open_task_console(experiment)
+    elif kind == "editor_app":
+        # The launcher opens the OFFLINE editor (no session), so the probe does too.
+        from zlc_workbench.pulse_editor.app import open_pulse_editor
+        window = open_pulse_editor()
     elif name == "task_console":
         window = experiment.task_console()
     elif kind == "workbench":

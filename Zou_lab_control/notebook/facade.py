@@ -2457,17 +2457,16 @@ class Experiment:
         self.readout = ReadoutFacade(authority_token)
         self.pulse = PulseFacade(authority_token)
 
-    def pulse_gui(
-        self,
-        document: PulseDocument | None = None,
-        *,
-        path: str | Path | None = None,
-    ):
-        """Lazily open the current PulseWorkbench on this Experiment authority."""
+    def pulse_gui(self, *, state=None, **kwargs):
+        """Lazily open the pulse-sequence editor through the ONE composition root.
 
-        from Zou_lab_control.workbench import open_pulse_workbench
+        The narrow PulseWorkbench this used to return is still reachable as a component:
+        ``Zou_lab_control.workbench.open_pulse_workbench(experiment, document)``.
+        """
 
-        return open_pulse_workbench(self, document, path=path)
+        from zlc_workbench.pulse_editor.app import open_pulse_editor
+
+        return open_pulse_editor(self, state=state, **kwargs)
 
     def scan_gui(self, request: ScanRequest | OccupancyScanRequest):
         """Open the current typed SCAN_SLOT panel for a frozen request."""

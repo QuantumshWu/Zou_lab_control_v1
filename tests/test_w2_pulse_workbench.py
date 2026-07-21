@@ -405,7 +405,10 @@ def test_offline_and_public_import_have_no_hardware_or_qt_backdoor(
         assert forbidden not in source
 
 
-def test_standalone_virtual_launcher_owns_and_closes_its_experiment(tmp_path):
+def test_standalone_launcher_opens_and_closes_the_offline_editor(tmp_path):
+    # The launcher is the OFFLINE legacy editor now (main behaviour, C22): no
+    # experiment, no repository.  The bounded auto-close proves the window opens and
+    # the frame (not just the editor body) actually shuts the event loop down.
     environment = os.environ.copy()
     environment["QT_QPA_PLATFORM"] = "offscreen"
     environment["ZLC_PULSE_GUI_AUTO_CLOSE_MS"] = "20"
@@ -413,8 +416,6 @@ def test_standalone_virtual_launcher_owns_and_closes_its_experiment(tmp_path):
         [
             sys.executable,
             str(ROOT / "pulse_gui.py"),
-            "--repository",
-            str(tmp_path / "standalone"),
         ],
         cwd=ROOT,
         env=environment,

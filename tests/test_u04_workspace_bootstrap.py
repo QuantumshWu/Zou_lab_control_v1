@@ -58,7 +58,9 @@ def test_both_launchers_prepare_the_workspace_before_connecting():
     """Neither launcher may hand the composition root a missing ancestor."""
 
     root = Path(__file__).resolve().parents[1]
-    for name in ("task_console.py", "pulse_gui.py"):
+    # pulse_gui.py now opens the OFFLINE editor and never connects (main behaviour,
+    # C22), so the workspace-bootstrap obligation applies to the console launcher only.
+    for name in ("task_console.py",):
         source = (root / name).read_text(encoding="utf-8")
         assert "durable_makedirs(" in source, name
         prepare = source.index("durable_makedirs(")
