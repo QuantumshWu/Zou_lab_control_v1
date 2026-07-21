@@ -62,6 +62,34 @@ class ConsoleNodeSpec:
 
         return self.title
 
+    @property
+    def params(self) -> tuple:
+        """The form as the skeleton's own param vocabulary (ParamDecl).
+
+        The definition declares its parameters once, as a FormSpec; the console's
+        editor renders ParamDecls.  Projecting here keeps that ONE declaration
+        authoritative -- an editor-side copy of the field list would be a second
+        place for a parameter to exist, and the two would drift the first time a
+        definition gained a knob.
+        """
+
+        from zlc_data.param_decl import ParamDecl
+
+        decls = []
+        for field in self.form_spec.fields:
+            kind = str(getattr(field.kind, "value", field.kind))
+            decls.append(ParamDecl(
+                key=field.key,
+                label=field.label,
+                kind="choice" if field.choices else kind,
+                default=field.default,
+                unit=field.unit or "",
+                required=bool(field.required),
+                choices=tuple(str(c.value) for c in field.choices),
+                tooltip=field.description or "",
+            ))
+        return tuple(decls)
+
 
 _GROUP_TO_KIND = {"Task": "task", "Measurement": "measurement", "Processor": "processor"}
 

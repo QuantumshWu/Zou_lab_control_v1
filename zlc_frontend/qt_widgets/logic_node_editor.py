@@ -9,7 +9,13 @@ from PyQt5 import QtWidgets
 
 from zlc_data.param_decl import ParamDecl
 
-from .fluent import FluentLabel, GREY, scaled_px
+from .fluent import (
+    FluentLabel,
+    FluentScrollArea,
+    FluentSectionLabel,
+    GREY,
+    scaled_px,
+)
 from .measurement_panel import MeasurementPanel
 
 __all__ = ["LogicNodeEditor"]
@@ -51,15 +57,12 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # which already carries start_requested(self) / stop_requested + the typed,
         # no-eval form).  A spec drives a real ParamDecl form; the camera (spec is
         # None) shows nothing here but Start/Stop still build/run the camera node.
-        # ``repeat`` (0 = ∞) is the ONE MEASUREMENT-layer acquisition knob -- the plot can NEVER tell a
-        # measurement how many times to run (#H3l).  It is a DECLARED ParamDecl auto-injected into the
-        # SAME auto-form as every other param (never a hand-placed widget; 0 is the ∞ sentinel, the same
-        # semantics as the scan-repeat count -- no separate Free-run toggle).  An acquisition node
-        # (measurement / camera) gets it; a processor / task does not.  How the repeats are DISPLAYED is
-        # the PLOT's "repeat mode" Setting.  A camera defaults to ∞ (repeat=0, a live monitor); a scan
-        # defaults to a single finite sweep (repeat=1).
-        acquisition = (_acquisition_param_decls(repeat_default=(0 if row.node.kind == "camera" else 1))
-                       if row.node.kind in ("measurement", "camera") else ())
+        # Acquisition knobs are NOT injected here any more: a definition declares
+        # its own parameters (the catalog spec's form), so a camera's history depth
+        # and IO deadline arrive with the definition rather than being added on the
+        # side by the editor.  One declaration, one form -- an editor that also
+        # invented fields could offer a knob the request has no place for.
+        acquisition = ()
         names_provider = getattr(console, "_signal_names", None)
         if row.node.kind == "processor" and callable(names_provider):
             # A reactive processor's source picker must not offer the node's OWN outputs -- picking

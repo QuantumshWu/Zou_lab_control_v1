@@ -37,14 +37,89 @@ __all__ = ["open_task_console"]
 def open_task_console(experiment, *, state=None, task=None, **kwargs):
     """Open the console UI for ``experiment`` and return the console body.
 
-    ``experiment`` is the current ``Zou_lab_control.notebook`` Experiment; the
-    four seams above are derived from it HERE and nowhere else -- the skeleton
-    never imports the domain."""
+    ``experiment`` is the current ``Zou_lab_control.notebook`` Experiment.  The
+    seams are derived from it HERE and nowhere else: the skeleton is handed a
+    catalog view, a run factory and a data plane, and never imports the domain.
+    """
 
-    raise NotImplementedError(
-        "task_console rewiring in progress (purge b68fc81 landed; reconnect phase): "
-        "the catalog/run/monitor/render seams -- see this module's docstring, "
-        "contracts 1-4 -- are being assembled onto the current zlc_neutral_atom "
-        "application layer.  The ORIGINAL UI skeleton is intact in "
-        "plot_bridge_console and reopens the moment seams 1+3 land."
+    from Zou_lab_control.notebook.facade import _prepare_camera_monitor_for_workbench
+    from zlc_frontend.figure import DatasetId, FigureEvaluationPolicy
+    from zlc_workbench.live import LiveDatasetSlot
+
+    from .catalog_bridge import ConsoleCatalogView
+    from .data_plane import ConsoleDataPlane
+    from .plot_bridge_console import show_task_console
+    from .run_bridge import ConsoleRunNode
+
+    catalog_view = ConsoleCatalogView(experiment)
+    data_plane = ConsoleDataPlane()
+    console: list = []            # filled below; the wake closure needs the body
+
+    def request_owner_wake() -> None:
+        """A worker finished something -- let the next tick pick it up.
+
+        The console already polls every tick, so waking is a no-op here; the
+        callback exists because the mailbox promises never to block a worker on
+        the GUI thread, and a surface that DID need an immediate repaint would
+        hook it here rather than inside the run bridge.
+        """
+
+    def run_factory(spec, values):
+        node = ConsoleRunNode(
+            spec, values,
+            prepare=lambda request: _prepare_camera_monitor_for_workbench(experiment, request),
+            request_owner_wake=request_owner_wake,
+        )
+        _bind_monitor_view(node, data_plane)
+        return node
+
+    body = show_task_console(
+        state=state, task=task,
+        catalog_view=catalog_view,
+        run_factory=run_factory,
+        data_plane=data_plane,
+        **kwargs,
     )
+    console.append(body)
+    return body
+
+
+def _bind_monitor_view(node, data_plane) -> None:
+    """Teach one run node how to start WITH a live view, and register that view.
+
+    A camera monitor starts only through ``start_with_view``: the factory it
+    receives runs on the worker, builds this node's LiveDatasetSlot, and hands it
+    to the data plane, which is what makes the node's frames reach the board.
+    """
+
+    from zlc_frontend.figure import DatasetId, FigureEvaluationPolicy
+    from zlc_workbench.live import LiveDatasetSlot
+
+    dataset_id = DatasetId(f"console-{node.spec.key.stable_definition_id}-{id(node):x}")
+
+    def start(command):
+        if not hasattr(command, "start_with_view"):
+            return command.start()
+
+        def factory(view_spec):
+            slot = LiveDatasetSlot(
+                view_spec,
+                dataset_id=dataset_id,
+                evaluation_policy=FigureEvaluationPolicy(),
+                retain_on_terminal=False,
+            )
+            data_plane.attach(node, slot)
+            return slot
+
+        return command.start_with_view(
+            downstream_peak_bytes=_MONITOR_DOWNSTREAM_PEAK_BYTES,
+            factory=factory,
+        )
+
+    node.bind_starter(start)
+
+
+#: Headroom the console reserves for its own view of a monitor stream.  It bounds
+#: what the presentation side may hold, separately from the acquisition budget the
+#: request itself carries.
+_MONITOR_DOWNSTREAM_PEAK_BYTES = 1 << 20

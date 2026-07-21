@@ -79,6 +79,7 @@ from .plot_bridge import (
     drop_index,
     pack,
 )
+from .data_plane import ConsoleDataPlane
 from .plot_bridge_editor import PanelEditor
 
 
@@ -98,11 +99,11 @@ class TaskConsole(QtWidgets.QWidget):
     def __init__(
         self,
         *,
-        hub,
         state: TaskConsoleState | None = None,
         running_nodes: Sequence[object] = (),
         catalog_view: object | None = None,
         run_factory=None,
+        data_plane=None,
         scale: float | None = None,
         window_ratio: float = WINDOW_SCREEN_FRACTION,
         window_px: tuple[int, int] | None = None,
@@ -111,7 +112,12 @@ class TaskConsole(QtWidgets.QWidget):
         ensure_qt_app()
         set_fluent_scale(scale)
         super().__init__()
-        self.hub = hub
+        # MONITOR SEAM (contract 3): the board reads ONE frozen snapshot per tick.
+        # The plane owns the live slots the RUN seam's start closures register;
+        # ``self._tick_data`` is the snapshot the current tick is drawing from, so
+        # every widget in one tick describes the same instant.
+        self._data = data_plane if data_plane is not None else ConsoleDataPlane()
+        self._tick_data = self._data.freeze()
         # EMBEDDED mode (the figure viewer hosts a whole TaskConsole in one pane): a stripped,
         # RESIZABLE console -- no Logic tab, no whole-board Pause/Save image/Save/Load buttons (a
         # loaded static figure has nothing to acquire, freeze, or persist as a layout) -- and, crucially,
@@ -525,16 +531,13 @@ class TaskConsole(QtWidgets.QWidget):
             # Replay every panel's persisted REGION as its control signal, so a loaded Analysis row
             # (still STOPPED) sees the saved selection the moment the user Starts it -- never a silent
             # whole-frame fallback -- and the derived panel<->row association is live immediately.
-            from zlc_data.plot_region import Selection, region_bins, region_tensor
+            from zlc_data.plot_region import Selection
             for card in self.cards:
                 name = str(card.config.params.get("region_signal") or "")
                 payload = card.config.params.get("region")
                 if not name or not isinstance(payload, Mapping):
                     continue
-                selection = Selection.from_dict(payload)
-                tensor = region_tensor(selection, bins=region_bins(selection))
-                self.hub.register_signal(name, tensor.schema)   # idempotent: byte-stable schema
-                self.hub.publish({name: tensor})
+                Selection.from_dict(payload)      # validates the persisted payload
             self._fit_overlay_pushed.clear()   # loaded panels re-pull their overlays from scratch
             self._arrange()
         finally:
@@ -773,7 +776,7 @@ class TaskConsole(QtWidgets.QWidget):
         choke point the picker pool filter AND the orphan-GC exemption both read."""
         from zlc_data.plot_region import CONTROL_ROLE
         try:
-            schema = self.hub.schema(str(name))
+            schema = self._signal_schema(str(name))
         except KeyError:
             return False
         return dict(getattr(schema, "metadata", None) or {}).get("role") == CONTROL_ROLE
@@ -784,7 +787,7 @@ class TaskConsole(QtWidgets.QWidget):
         every signal picker, so a not-yet-started node's output is selectable (#6).  CONTROL-plane
         signals (a panel's region) are NOT bindable data and are filtered here -- one choke point,
         so the flat combo, the tree combo, the expression popup and the pulse-scan y all agree (#7)."""
-        names = {str(n) for n in self.hub.names()}
+        names = {str(n) for n in self._signal_names()}
         names.update(self._signal_providers().keys())
         return sorted(n for n in names if not self._is_control_signal(n))
 
@@ -796,10 +799,10 @@ class TaskConsole(QtWidgets.QWidget):
         name (e.g. ``occupied  [(35,)]``)."""
         from zlc_data.shape_text import describe_shape
         out: dict[str, str] = {}
-        for name in self.hub.names():
+        for name in self._signal_names():
             try:
                 st = self._signal_structure(name) or {}
-                out[str(name)] = describe_shape(self.hub.latest(name), points_shape=st.get("points_shape"),
+                out[str(name)] = describe_shape(self._signal_values(name), points_shape=st.get("points_shape"),
                                                 data_shape=st.get("data_shape"), grid_shape=st.get("grid_shape"))
             except Exception:
                 continue
@@ -985,7 +988,7 @@ class TaskConsole(QtWidgets.QWidget):
                 # ZERO-COPY: read the tensor's ``.data`` (a reference -- only ``.shape`` is used) rather
                 # than ``hub.latest`` (which .copy()s the whole 2.3 MB frame every tick just to format a
                 # shape string, #4-E).
-                shape = self._describe_from_schema(self.hub.latest_tensor(full).data, self.hub.schema(full))
+                shape = self._describe_from_schema(self._signal_values(full), self._signal_schema(full))
             except Exception:
                 shape = "—"
             rows.append((short, shape, desc(full)))
@@ -1157,7 +1160,7 @@ class TaskConsole(QtWidgets.QWidget):
         if name == TASK_FRAME_KEY:
             return self._task_mid_run_structure()
         try:
-            schema = self.hub.schema(name)
+            schema = self._signal_schema(name)
         except KeyError:
             return None
         result = self._schema_structure(schema)
@@ -1166,8 +1169,8 @@ class TaskConsole(QtWidgets.QWidget):
         if coordinate_names:
             arrays = []
             for coordinate_name in coordinate_names:
-                coordinate = np.asarray(self.hub.latest(str(coordinate_name)), dtype=float)
-                coordinate_schema = self.hub.schema(str(coordinate_name))
+                coordinate = np.asarray(self._signal_values(str(coordinate_name)), dtype=float)
+                coordinate_schema = self._signal_schema(str(coordinate_name))
                 expected = (coordinate.shape[0], coordinate_schema.point_count, 1)
                 if coordinate_schema.data_shape != (1,) or tuple(coordinate.shape) != expected:
                     raise ValueError(
@@ -1206,15 +1209,6 @@ class TaskConsole(QtWidgets.QWidget):
         # dropping frame_1/frame_2 from ``providers`` -> they are caught here (the eager purges in
         # _start/_remove_logic_node cover the rebuild / remove paths synchronously; THIS catches every
         # remaining path, switches included).
-        # CONTROL-plane signals (a panel's ``<slug>_region``) are published by the CONSOLE, not by a
-        # LogicNode, so they have no ``providers`` entry -- exempt them BY THEIR DECLARED ROLE
-        # (``schema.metadata['role'] == 'control'``, stamped by the ONE region encoder), never by a
-        # parallel name list.  Their lifecycle is explicit: _remove_panel_analysis removes them with
-        # the analysis (and _remove_panel with the panel), so nothing lingers.
-        orphans = [n for n in self.hub.names()
-                   if n not in providers and not self._is_control_signal(n)]
-        if orphans:
-            self.hub.remove_signals(orphans)
         for card in self.cards:
             reads = sorted(self._card_reads(card))
             parts: list[str] = []
@@ -1262,30 +1256,17 @@ class TaskConsole(QtWidgets.QWidget):
     def _begin_run(self, node) -> None:
         """Start one ConsoleRunNode and register it as running.
 
-        Submission returns at once (the RUN seam owns the worker), so the board
-        stays interactive while a camera opens; the tick's ``poll`` is what turns
-        the pending start into a live handle or a reported failure.
+        The node already knows HOW it starts -- the composition root bound that
+        when it built the node, because knowing a camera monitor needs a live
+        view is the root's business, not the board's.  Submission returns at
+        once (the RUN seam owns the worker), so the board stays interactive
+        while a camera opens; the tick's ``poll`` turns the pending start into a
+        live handle or a reported failure.
         """
 
-        node.start(self._start_run_command)
+        node.start()
         if node not in self.running_nodes:
             self.running_nodes.append(node)
-
-    def _start_run_command(self, command):
-        """Start a prepared domain command -- the one place that knows the shapes.
-
-        A camera monitor only starts WITH a live view (the MONITOR seam supplies
-        the factory and its byte budget); every other prepared command just
-        starts.  Until that seam lands, a view-requiring command is refused
-        plainly rather than started blind.
-        """
-
-        if not hasattr(command, "start"):
-            raise RuntimeError(
-                f"{type(command).__name__} starts only with a live view; the MONITOR "
-                "seam (contract 3) owns that factory and has not landed yet"
-            )
-        return command.start()
 
     def _stop_run(self, node, *, timeout: float = 2.0) -> bool:
         """Ask a ConsoleRunNode to stop and report whether it reached terminal.
@@ -1636,7 +1617,7 @@ class TaskConsole(QtWidgets.QWidget):
         # node's lingering signals -- not just running_nodes (#2): otherwise a new same-kind node added
         # after an earlier one STOPPED (its signals deliberately linger) would see no running collision,
         # take the empty prefix, and CLOBBER the stopped node's lingering data on the hub.
-        running: set[str] = set(self.hub.signal_versions())
+        running: set[str] = set(self._tick_data.versions())
         for n in self.running_nodes:
             try:
                 running.update(str(s) for s in n.published_signals())  # just-started, maybe not in hub yet
@@ -1744,10 +1725,8 @@ class TaskConsole(QtWidgets.QWidget):
                 raise RuntimeError(
                     "cannot remove analysis while its owner thread is still active"
                 )
-        region = card.config.params.pop("region_signal", None)
+        card.config.params.pop("region_signal", None)
         card.config.params.pop("region", None)
-        if region:
-            self.hub.remove_signals([str(region)])
         self._fit_overlay_pushed.pop(id(card), None)   # a fresh fit re-pushes from version -1
         if card.plotter is not None and hasattr(card.plotter, "apply_published_fit"):
             card.plotter.apply_published_fit(None)     # drop any live fit overlay too
@@ -1757,7 +1736,7 @@ class TaskConsole(QtWidgets.QWidget):
         consumed region (running or stopped, loaded or fresh), and every panel's persisted name.  The
         dedup scope that makes cross-linking structurally impossible (two panels can never share a
         region name, even across save/load/rename)."""
-        names = {str(n) for n in self.hub.registered_names()}
+        names = {str(n) for n in self._signal_names()}
         for row in self.logic_nodes:
             region = str((row.node.values or {}).get("region") or "")
             if region:
@@ -1776,7 +1755,7 @@ class TaskConsole(QtWidgets.QWidget):
         (both persist with the panel, so save/load replays the region and re-associates the row).  A
         re-drag republishes the SAME name with a byte-stable schema (:func:`region_tensor` -- fixed
         shape, ``role='control'``), so a retarget can never fork the schema or gap a running consumer."""
-        from zlc_data.plot_region import region_doc, region_tensor
+        from zlc_data.plot_region import region_doc
         from zlc_data.shape_text import measurement_slug
         name = str(card.config.params.get("region_signal") or "")
         if not name:
@@ -1790,9 +1769,6 @@ class TaskConsole(QtWidgets.QWidget):
             card.config.params["region_signal"] = name
         bins = int(card.config.params.get("bins", 50)) if card.config.kind == "hist" else None
         card.config.params["region"] = region_doc(selection, bins=bins)
-        tensor = region_tensor(selection, bins=bins)
-        self.hub.register_signal(name, tensor.schema)     # idempotent: the schema is byte-stable
-        self.hub.publish({name: tensor})
         return name
 
     def _published_fit_result(self, node):
@@ -1804,11 +1780,11 @@ class TaskConsole(QtWidgets.QWidget):
         prefix = node.prefix
 
         def _scalar(key):
-            return float(np.asarray(self.hub.latest(prefix + key)).reshape(-1)[0])
+            return float(np.asarray(self._signal_values(prefix + key)).reshape(-1)[0])
 
         try:
             params = np.array([_scalar(f"fit_{name}") for name in model.names], dtype=float)
-            valid = bool(np.asarray(self.hub.latest(prefix + "fit_valid")).reshape(-1)[0])
+            valid = bool(np.asarray(self._signal_values(prefix + "fit_valid")).reshape(-1)[0])
         except Exception:
             return None
         if not np.isfinite(params).all():
@@ -1837,8 +1813,8 @@ class TaskConsole(QtWidgets.QWidget):
         model = fit_model(node.fit_request.model)
         prefix = node.prefix
         try:
-            valid = np.asarray(self.hub.latest(prefix + "fit_valid")).reshape(-1)
-            params = [np.asarray(self.hub.latest(prefix + f"fit_{name}")).reshape(-1)
+            valid = np.asarray(self._signal_values(prefix + "fit_valid")).reshape(-1)
+            params = [np.asarray(self._signal_values(prefix + f"fit_{name}")).reshape(-1)
                       for name in model.names]
         except Exception:
             return model.key, {}
@@ -1897,7 +1873,7 @@ class TaskConsole(QtWidgets.QWidget):
         signal = str(card.config.inputs[0]) if card.config.inputs else ""
         if signal:
             try:
-                self.hub.schema(signal)
+                self._signal_schema(signal)
             except KeyError:
                 card.set_status("ROI source has no registered signal schema", error=True)
                 return
@@ -1958,16 +1934,6 @@ class TaskConsole(QtWidgets.QWidget):
         # `frame` under TWO sources = the "two cameras" bug).  One label per node => one entry in
         # the signal picker (#H3n).
         node.instance_label = str(getattr(row.node, "title", "") or getattr(node, "instance_label", ""))
-        # Capture THIS row's PREVIOUS published signals so a source/param change that drops some of
-        # them (fewer emCCD events -> fewer frame_i, a different processor source, ...) UNLINKS the now
-        # orphan signals from the hub instead of leaving them as stale "(unbound)" picker entries (#5).
-        _prev = self._logic_nodes.get(id(row)) or self._last_node.get(id(row))
-        old_sigs = set()
-        if _prev is not None and hasattr(_prev, "published_signals"):
-            try:
-                old_sigs = {str(s) for s in _prev.published_signals()}
-            except Exception:
-                old_sigs = set()
         # The build is good -- NOW stand the previous run of THIS node down (never pile up), and
         # apply the device-OCCUPANCY mutual exclusion over ALL running nodes (#A3): each node
         # declares the hardware INSTANCES it drives (``occupied_devices``, from its own
@@ -2009,7 +1975,6 @@ class TaskConsole(QtWidgets.QWidget):
         # other running node owns -> a switched/rebuilt node leaves NO orphan "(unbound)" signal behind.
         self._logic_nodes[id(row)] = node
         self._last_node[id(row)] = node           # survives Stop, for signal-source labelling
-        self._remove_replaced_orphans(node, old_sigs)
         row.set_state("running", status="running")
         self._update_row_publishes(row)            # now show the LIVE node's published shapes
         if editor is not None:
@@ -2033,16 +1998,6 @@ class TaskConsole(QtWidgets.QWidget):
 
         spec = getattr(node, "spec", None)
         return str(getattr(spec, "kind", "") or "")
-
-    def _remove_replaced_orphans(self, node, old_sigs: set[str]) -> None:
-        keep = set(self._declared_signal_names(node))
-        for other in self.running_nodes:
-            if other is node:
-                continue
-            keep.update(self._declared_signal_names(other))
-        orphan = set(old_sigs) - keep
-        if orphan:
-            self.hub.remove_signals(orphan)
 
     @staticmethod
     def _declared_signal_names(node) -> tuple[str, ...]:
@@ -2268,12 +2223,6 @@ class TaskConsole(QtWidgets.QWidget):
            
             or self._last_node.get(id(row))
         )
-        gone_sigs: set[str] = set()
-        if gone is not None and hasattr(gone, "published_signals"):
-            try:
-                gone_sigs = {str(s) for s in gone.published_signals()}
-            except Exception:
-                gone_sigs = set()
         if not self._stop_logic_node(row, _silent=True):
             return False
         editor = self._logic_editors.pop(id(row), None)
@@ -2296,19 +2245,6 @@ class TaskConsole(QtWidgets.QWidget):
         row.deleteLater()
         if not self.logic_nodes:
             self.logic_hint.show()
-        # PURGE the removed node's signals that NO OTHER live node still owns (a shared/prefixed name
-        # another running node also publishes is kept), so the hub sheds the stale names instead of
-        # accumulating them across runs.
-        if gone_sigs:
-            keep: set[str] = set()
-            for other in self.running_nodes:
-                try:
-                    keep.update(str(s) for s in other.published_signals())
-                except Exception:
-                    pass
-            purge = gone_sigs - keep
-            if purge:
-                self.hub.remove_signals(purge)
         if _rebuild:
             self._mark_dirty()
         return True
@@ -2383,101 +2319,68 @@ class TaskConsole(QtWidgets.QWidget):
         self._update_summary()
 
     # ------------------------------------------------------------------ refresh
-    def _display_shot(self) -> int | None:
-        """The ONE coherent display shot for the WHOLE board this tick (the global shot clock): the newest
-        source-shot that EVERY displayed, still-running-producer signal has reached -- the ``min`` of their
-        latest provenance ids.  :meth:`_expression_namespace` reads :meth:`SignalHub.snapshot_at` at this
-        shot, so every panel draws ONE physical shot and they can never stagger: two 2-D images on ``frame_0``
-        / ``frame_2`` and a sitemap fed by ``frame_1``->occupancy all show the same clock cycle; a fast camera
-        frame is held back to match the slower reactive occupancy (the user's hard requirement -- coherence
-        over freshness, "同一个clock周期，不要错位").
+    # ------------------------------------------------- reading the frozen tick
+    def _signal_values(self, name):
+        """This signal's array as of the current tick, or None if it has none yet."""
 
-        Crucially this holds back ONLY relative to OTHER co-displayed producers: a LONE camera-repeat panel's
-        bound set is just ``frame_0``, so its ``min`` is its OWN latest -> it stays fully live (repeat /
-        repeat_mode never stutter).  The hold appears exactly when a slower producer is shown ALONGSIDE it.
+        value = self._tick_data.value(str(name))
+        return None if value is None else value.values
 
-        Scope = signals that are BOTH bound by a live panel AND published by a node STILL RUNNING: a lingering
-        signal of a STOPPED node is excluded (it would freeze the clock at its last shot), and a free-running
-        :data:`NO_LINEAGE` scalar (a loading rate) never constrains.  ``None`` (-> latest of each, i.e.
-        :meth:`snapshot_latest`) when nothing displayed carries a lineage yet."""
-        from zlc_data.vocabulary import NO_LINEAGE             # single source of the sentinel
-        live: set[str] = set()
-        for node in self.running_nodes:
-            # Exclude a FAULTED node's straggling signals from the min, the SAME principle as the
-            # STOPPED-node exclusion above: a running-but-erroring analysis node (its provenance frozen
-            # at its last good shot) would otherwise pin the whole board's clock and freeze every panel
-            # (#4-C).  A slow-but-HEALTHY node (consecutive_errors == 0) is kept, so coherence still
-            # holds it back -- only a dead one is dropped.
-            if int(getattr(node, "consecutive_errors", 0) or 0) > 0:
-                continue
-            try:
-                live |= {str(s) for s in node.published_signals()}
-            except Exception:
-                continue
-        if not live:
-            return None
-        shots: list[int] = []
-        for card in self.cards:
-            for name in self._card_reads(card):
-                if name in live:
-                    p = self.hub.latest_provenance(name)
-                    if p != NO_LINEAGE:
-                        shots.append(int(p))
-        return min(shots) if shots else None
+    def _signal_schema(self, name):
+        """This signal's schema as of the current tick, or None if unpublished."""
 
-    def _expression_namespace(self, disp="__current__") -> dict[str, object]:
-        """The board's shared shot-coherent GUI namespace.  ``disp`` pins the display shot (the
-        render thread passes the one its batch was scheduled against); by default it is computed
-        fresh (the single-card refresh / test paths)."""
-        if disp == "__current__":
-            disp = self._display_shot()
-        return self._expression_namespace_at(disp)
+        value = self._tick_data.value(str(name))
+        return None if value is None else value.schema
 
-    def _expression_namespace_at(self, disp) -> dict[str, object]:
-        # Shot-COHERENT read at the board's global display shot (#shot-clock): every signal resolves to its
-        # value AT that shot, so a frame_0 2-D, a frame_2 2-D and a frame_1->occupancy sitemap can never show
-        # different shots -- the faster camera is held back to the slower co-displayed producer.  A signal
-        # with no sample at that shot (a free-running scalar, or a producer not yet there) falls back to its
-        # latest, never blanking a panel.  display_shot None -> latest of each (snapshot_latest).  A LONE
-        # fast panel is NOT held back: its own signal is the min (see _display_shot).  The off-hub task
-        # tensor is appended below with the same canonical data + validity interface.
-        # The helpers (np/numpy/math/history/latest/names/shot) come from the ONE signal_expr builder
-        # layered on this view's snapshot -- a panel expression and a node-side expression (pulse-scan
-        # y, processor source) can never diverge in capability (GUI == node).
-        from zlc_data.signal_expr import hub_namespace
-        from zlc_data.signal_tensor import SignalHistoryGap
-        try:
-            tensors = self.hub.snapshot_at(disp, tensors=True)
-        except SignalHistoryGap:
-            # A lagging DERIVED signal (a slow per-panel worker fit/roi) can drag ``disp`` below a fast
-            # frame's bounded history, so no coherent state exists at ``disp`` for that one signal.  Fall
-            # back to its LATEST for THAT signal only -- the documented "a producer not yet there falls
-            # back to its latest, never blanking a panel" behavior -- keeping every other signal
-            # shot-coherent.  Per-signal so one straggler can't blank the whole board.  Only reached when
-            # a gap actually occurs (a slow worker node behind the display shot), never on the happy path.
-            tensors = {}
-            for name in self.hub.names():
-                try:
-                    tensors.update(self.hub.snapshot_at(disp, tensors=True, names=[name]))
-                except SignalHistoryGap:
-                    tensors.update(self.hub.snapshot_at(None, tensors=True, names=[name]))
-        namespace = hub_namespace(self.hub, {name: tensor.data for name, tensor in tensors.items()})
-        valid = {name: tensor.valid for name, tensor in tensors.items()}
+    def _signal_names(self) -> tuple:
+        """Every signal the current tick carries."""
+
+        return self._tick_data.names()
+
+    def _expression_namespace(self, snapshot=None) -> dict[str, object]:
+        """The board's shared expression namespace, built from ONE frozen tick.
+
+        Coherence comes from the freeze itself, not from a clock: every signal in
+        a snapshot was materialised in the same pass, so a frame 2-D panel and an
+        occupancy sitemap fed from it cannot show different instants.  The old
+        console instead computed a global display shot (the min over co-displayed
+        producers' provenance) and re-read a mutable hub at it; a snapshot needs
+        no such arbitration, and there is no hub left to re-read.
+
+        Panel expressions keep the same vocabulary they always had -- ``latest``,
+        ``schema``, ``names``, ``np`` -- now answered by the snapshot, so what an
+        expression can see is exactly what the board is drawing.
+        """
+
+        import math
+
+        data = snapshot if snapshot is not None else self._tick_data
+        namespace: dict[str, object] = {
+            name: value.values for name, value in data.signals.items()
+        }
+        namespace.update({
+            "latest": lambda name: (
+                data.value(str(name)).values if data.value(str(name)) is not None else None
+            ),
+            "schema": lambda name: (
+                data.value(str(name)).schema if data.value(str(name)) is not None else None
+            ),
+            "names": lambda: data.names(),
+            "np": np,
+            "numpy": np,
+            "math": math,
+        })
+        valid = {}
         task_tensor = self._task_card_tensor
         namespace[TASK_FRAME_KEY] = task_tensor.data if task_tensor is not None else None
         if task_tensor is not None:
             valid[TASK_FRAME_KEY] = task_tensor.valid
         namespace[SIG_VALID_KEY] = valid
-        # Per-signal publish counters (reserved key) so a rolling monitor can tell
-        # a new sample of its own source from an unrelated node's version bump.
-        versions = self.hub.signal_versions()
-        if self._task_output_node is not None:
-            versions[TASK_FRAME_KEY] = int(self._task_output_node.output.version)
-        namespace[SIG_VERSIONS_KEY] = versions
-        # Coordinate frames (reserved key): {signal_name: [x, w, y, h]} from any
-        # node whose acquisition source declares a ROI.  A 2D panel reads its
-        # source signal's frame so the image axes are the REAL camera pixel
-        # coordinates (ROI), not 0..N -- and an area-select maps back to the ROI.
+        # Per-signal versions (reserved key) so a rolling monitor can tell a new
+        # sample of its own source from an unrelated producer's advance.
+        namespace[SIG_VERSIONS_KEY] = data.versions()
+        # Coordinate frames (reserved key): {signal: [x, w, y, h]} for a source that
+        # declares a ROI, so a 2D panel's axes are REAL camera pixels, not 0..N.
         namespace[COORD_FRAMES_KEY] = self._coord_frames()
         return namespace
 
@@ -2595,25 +2498,19 @@ class TaskConsole(QtWidgets.QWidget):
         self._last_save_dir = str(Path(path).parent)
         self._update_summary()
 
-    def _panel_frame_key(self, card, disp, sigvers: Mapping[str, int]):
-        """The identity of the COHERENT FRAME this panel would draw right now.  It is the board display
-        shot ``disp`` -- which pins EVERY lineage / shot-clock signal (that signal's value AT that shot is
-        fixed) -- plus the publish counters of the panel's FREE-RUNNING (no-lineage) inputs (a loading
-        rate, which ``disp`` does not constrain).  The panel's buffer is stale exactly when this changes:
-        when the coherent clock ADVANCES -- so ALL panels go stale together and recompose from the ONE
-        shared snapshot, and the three emCCD frames of a pulse can NEVER freeze on different shots -- or
-        when one of the panel's own free-running scalars ticks.  ``sigvers`` is one shared
-        ``hub.signal_versions()`` snapshot.
+    def _panel_frame_key(self, card, versions: Mapping[str, int]):
+        """The identity of the frame this panel would draw from the current tick.
 
-        (Successor of the per-signal gate, whose flaw was ignoring ``disp``: a panel whose OWN signal had
-        already published stayed frozen a shot behind while a slower co-displayed producer advanced the
-        clock -> the reported "the three frames are not one shot" desync.  Blit makes recomposing every
-        panel on a clock tick cheap, so coherence costs nothing.)"""
-        from zlc_data.vocabulary import NO_LINEAGE             # single source of the sentinel
-        inputs = card.config.inputs or ()
-        free = tuple((str(n), sigvers.get(str(n), 0)) for n in inputs
-                     if self.hub.latest_provenance(str(n)) == NO_LINEAGE)
-        return (disp, free)
+        A panel is stale exactly when a signal it READS has advanced.  Coherence
+        across panels is a property of the freeze -- every panel in one tick reads
+        one snapshot, so the three frames of a pulse can never split -- which is
+        what the old global display shot was arbitrating by hand.
+        """
+
+        return tuple(
+            (str(name), int(versions.get(str(name), 0)))
+            for name in sorted(self._card_reads(card))
+        )
 
     def _tick(self) -> None:
         # poll the logic nodes EVERY base tick (even when no new signal arrived) so a
@@ -2635,8 +2532,9 @@ class TaskConsole(QtWidgets.QWidget):
         # runs; the beat-owed bookkeeping stays because a mid-drag panel is still skipped and
         # served on the next tick.
         busy = False
-        disp = self._display_shot()            # the ONE coherent display shot for the whole board this tick
-        sigvers = self.hub.signal_versions()   # ONE per-signal-counter snapshot for the whole tick
+        # ONE freeze for the whole tick: what every panel, legend and picker reads.
+        self._tick_data = self._data.freeze()
+        versions = self._tick_data.versions()
         elapsed = self._tick_count * self._base_interval_ms
         # COLLECT every panel whose coherent frame changed and whose beat is due (or owed).  The panel's
         # OWN beat (update_ms) gates WHEN it recomposes; the coherent clock decides WHAT it shows (the
@@ -2647,7 +2545,7 @@ class TaskConsole(QtWidgets.QWidget):
         # the widget blit backgrounds); its beat is owed too, so it catches up right on release.
         batch = []
         for card in self.cards:
-            key = self._panel_frame_key(card, disp, sigvers)
+            key = self._panel_frame_key(card, versions)
             if key == card._render_version:
                 continue                       # nothing this panel shows changed
             if elapsed % card.config.update_ms != 0 and not card._beat_owed:
@@ -2660,7 +2558,7 @@ class TaskConsole(QtWidgets.QWidget):
             batch.append((card, key))
         if batch:
             # Compose and present in place -- the same two-phase path refresh_once uses.
-            self._on_render_batch(self._compose_batch(batch, disp))
+            self._on_render_batch(self._compose_batch(batch))
         # keep the visible Edit tab's 'now:' acquisition references live, so a queued
         # parameter edit shows as applied once the loop picks it up.
         editor = self.tabs.currentWidget()
@@ -2669,10 +2567,13 @@ class TaskConsole(QtWidgets.QWidget):
             editor.refresh_limit_hints()  # #3a: tick updates only the grey placeholder hint, never the text
         self._update_summary()
 
-    def _compose_batch(self, batch, disp):
-        """RENDER THREAD: build the ONE shared shot-coherent namespace and compose every batched
-        panel into its offscreen Agg buffer.  Returns the per-panel outcome for the GUI pass."""
-        namespace = self._expression_namespace(disp)
+    def _compose_batch(self, batch):
+        """Compose every batched panel from the tick's ONE namespace.
+
+        Returns the per-panel outcome for the present pass.  All panels in a
+        batch share the frozen tick, so a batch is coherent by construction.
+        """
+        namespace = self._expression_namespace()
         composed, structural = [], []
         for card, key in batch:
             try:
@@ -2718,14 +2619,14 @@ class TaskConsole(QtWidgets.QWidget):
         self._poll_logic_nodes()
         self._refresh_signal_info()
         self._refresh_task_panel()
-        disp = self._display_shot()
-        sigvers = self.hub.signal_versions()
-        # compose EVERY card at the one coherent snapshot, THEN present them together (tests / notebooks /
-        # Resume catch-up) so a frozen board is a single consistent shot, never a torn mix.
+        self._tick_data = self._data.freeze()
+        versions = self._tick_data.versions()
+        # compose EVERY card from the one frozen tick, THEN present them together (tests /
+        # notebooks / Resume catch-up) so a refreshed board is one consistent instant.
         namespace = self._expression_namespace()
         for card in self.cards:
             card.compose(namespace)
-            card._render_version = self._panel_frame_key(card, disp, sigvers)
+            card._render_version = self._panel_frame_key(card, versions)
         for card in self.cards:
             card.present()
         self._update_fit_overlays()   # push each fit panel's node params to its DISPLAY-only overlay (#6)
@@ -2736,29 +2637,19 @@ class TaskConsole(QtWidgets.QWidget):
         self._update_summary()
 
     def _note_display_drops(self) -> int:
-        """Shots the hub's bounded ring dropped since the last banner refresh because acquisition -- which
-        is deliberately never rate-capped -- outran the display.  Returns the count dropped THIS refresh
-        (0 = the display is keeping up).  Acquisition is never throttled or affected; this only reports lost
-        DISPLAY frames, for the amber heads-up.
+        """Events the monitor taps dropped because the display fell behind.
 
-        Measured CONSUMER-side, which is the only sound place: the hub silently rotates its ring on every
-        long run, so a hub-side drop counter would fire constantly and mean nothing.  What matters is how
-        many shots were published SINCE THIS display last read, versus the ring depth -- if that exceeds the
-        ring, the oldest of them rolled off before any rolling-history panel could read them."""
-        shot = self.hub.shot
-        last = getattr(self, "_last_seen_shot", None)
-        self._last_seen_shot = shot
-        if last is None:                       # first call: establish the baseline, report nothing
-            return 0
-        overrun = (shot - last) - self.hub.history_len
-        return overrun if overrun > 0 else 0
+        A tap overwrites rather than back-pressuring acquisition -- which is
+        deliberately never rate-capped -- and reports the loss per signal.  The
+        advisory sums those: there is no global shot clock to subtract against,
+        and one would compare runs that advance independently.
+        """
+
+        return sum(value.behind for value in self._tick_data.signals.values())
 
     def _update_summary(self) -> None:
-        try:
-            n_signals = len(self.hub.names())
-        except Exception:
-            n_signals = 0
-        telemetry = f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}"
+        n_signals = len(self._tick_data.names())
+        telemetry = f"{len(self.cards)} panels | {n_signals} signals"
         if telemetry != getattr(self, "_summary_text", None):
             self._summary_text = telemetry
             self.summary.setText(telemetry)
@@ -2779,8 +2670,8 @@ class TaskConsole(QtWidgets.QWidget):
             self.status_strip.show_message(self._task_status_text, severity="task")
         elif dropped:
             self.status_strip.show_message(
-                f"⚠ display behind: dropped {dropped} shot(s) faster than the "
-                f"{self.hub.history_len}-deep buffer -- acquisition unaffected", severity="warning")
+                f"⚠ display behind: the monitor taps dropped {dropped} event(s) -- "
+                "acquisition unaffected", severity="warning")
         else:
             # Idle telemetry already lives in the header.  Keep the status surface empty (but at its
             # fixed height, so layout never jumps) until an event worth the operator's attention exists.
@@ -3043,12 +2934,12 @@ class TaskConsole(QtWidgets.QWidget):
 
 def show_task_console(
     *,
-    hub,
     state: TaskConsoleState | None = None,
     task: str | None = None,
     running_nodes: Sequence[object] = (),
     catalog_view: object | None = None,
     run_factory=None,
+    data_plane=None,
     scale: float | None = None,
     window_ratio: float = WINDOW_SCREEN_FRACTION,
     title: str = "TaskConsole@Zou lab",
@@ -3078,9 +2969,10 @@ def show_task_console(
     ensure_qt_app()          # the console is a QWidget: the app must exist BEFORE its ctor
     if state is None and task is not None:
         state = resolve_task_state(task)
-    console = TaskConsole(hub=hub, state=state, running_nodes=running_nodes,
+    console = TaskConsole(state=state, running_nodes=running_nodes,
                           catalog_view=catalog_view, run_factory=run_factory,
-                          scale=scale, window_ratio=window_ratio)
+                          data_plane=data_plane, scale=scale,
+                          window_ratio=window_ratio)
     console._on_close = on_close
     # Closing the window must stop the node owner threads (else they keep running, blocked in
     # camera.acquire holding the camera / RPyC link, wedging the kernel).  The console is a CHILD

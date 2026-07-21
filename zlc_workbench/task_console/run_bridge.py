@@ -56,6 +56,7 @@ class ConsoleRunNode:
         self._snapshot = None
         self._error: str | None = None
         self._stop_requested = False
+        self._starter = None
 
     # ----------------------------------------------------------------- facts
     @property
@@ -88,7 +89,20 @@ class ConsoleRunNode:
         return snapshot is None or not snapshot.state.terminal
 
     # ------------------------------------------------------------ lifecycle
-    def start(self, start: Callable[[object], object]) -> None:
+    def bind_starter(self, start: Callable[[object], object]) -> None:
+        """Fix how THIS node starts, so a caller with no such knowledge can start it.
+
+        The composition root knows a camera monitor needs a live view and what
+        that view is; the board's Start button knows only "start this row".
+        Binding once at construction lets the board call :meth:`start` with no
+        argument and still get the right shape.
+        """
+
+        if not callable(start):
+            raise TypeError("starter must be callable")
+        self._starter = start
+
+    def start(self, start: Callable[[object], object] | None = None) -> None:
         """Prepare and start on the worker.  Returns immediately.
 
         ``start`` receives the prepared command and returns its RunHandle.  How a
@@ -102,8 +116,11 @@ class ConsoleRunNode:
         from.
         """
 
+        start = self._starter if start is None else start
         if not callable(start):
-            raise TypeError("start must be callable")
+            raise TypeError(
+                "this node has no starter: bind one (bind_starter) or pass it here"
+            )
         if self.running:
             return
         self._error = None
