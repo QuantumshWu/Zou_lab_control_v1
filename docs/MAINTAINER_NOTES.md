@@ -322,12 +322,18 @@ editor.grab_screenshot(path, settle_ms=1000)   # preferred helper
 # or: app.processEvents(); QtTest.QTest.qWait(1000); app.processEvents(); editor.grab().save(path)
 ```
 
-Prefer native Windows Qt screenshots; offscreen captures can miss text, so also
-run object-level checks (button text fits, geometry, state, `show_all_ports`
-keeps the full logical-port list, `On Pulse` prepares-then-fires, `Stop Pulse` calls safe
-state). Capture the default visible ports, all programmable ports at scroll top, and
-all programmable ports mid-scroll. Verify both the inner editor and the `FluentWindow`
-wrapper.
+For the fast path, set `QT_QPA_PLATFORM=offscreen` before the sole
+`ensure_qt_app()` call, then open the formal product composition and grab its
+outer `FluentWindow`; never construct a separate QApplication or force DPI,
+size, or style.  On Windows the owner registers the declared Segoe UI system
+faces when the offscreen plugin exposes an empty font database; the fast-path
+contract rasterizes a label and rejects evidence with no glyph pixels.  The
+slow/final path launches the real root entry and uses
+desktop mouse/keyboard plus a screen capture.  In both paths also run
+object-level checks (button text fits, geometry, state, `show_all_ports` keeps
+the full logical-port list, `On Pulse` prepares-then-fires, `Stop Pulse` calls
+safe state). Capture the default visible ports, all programmable ports at scroll
+top, and all programmable ports mid-scroll.
 
 ## 6. FPGA: Hardware, Capacity, RTL
 

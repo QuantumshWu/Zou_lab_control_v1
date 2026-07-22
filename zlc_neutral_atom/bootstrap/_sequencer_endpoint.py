@@ -31,6 +31,7 @@ from zlc_neutral_atom.timing.pulse import (
 )
 from zlc_pulse import (
     PulseExecutionForm,
+    PulseTargetManifest,
     PreparedPulseRef,
     RemotePulseExecutionClient,
     build_pulse_playback,
@@ -561,19 +562,25 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
     def __init__(
         self,
         sequencer: VirtualSequencer,
+        manifest: PulseTargetManifest,
         *,
         max_blocking_call_seconds: float = 10.0,
         params: StreamerParams | None = None,
     ) -> None:
         if type(sequencer) is not VirtualSequencer:
             raise TypeError("this endpoint is specific to VirtualSequencer")
+        if not isinstance(manifest, PulseTargetManifest):
+            raise TypeError("manifest must be PulseTargetManifest")
+        if manifest.target != sequencer.target:
+            raise ValueError("virtual manifest target differs from sequencer target")
         self._sequencer = sequencer
         self._timeout = _positive_real(
             max_blocking_call_seconds,
             "max_blocking_call_seconds",
         )
         self._params = params or StreamerParams()
-        self._target = sequencer.target
+        self._manifest = manifest
+        self._target = manifest.target
         self._geometry = build_fingerprint(self._params) & 0xFFFFFFFF
         self._owner = _SequencerSessionOwner(
             self,
@@ -587,6 +594,7 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
             {
                 "contract": "zlc.virtual-sequencer-execution",
                 "target_abi_fingerprint": self._target.abi_fingerprint,
+                "manifest_fingerprint": self._manifest.fingerprint,
                 "clock_hz": float(self._sequencer.clock_hz),
                 "geometry_fingerprint": self._geometry,
                 "resident_scan_point_capacity": resident_scan_point_capacity(
@@ -598,7 +606,7 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
         )
         return SequencerCapabilitySnapshot(
             binding_stamp=binding.binding_stamp,
-            target=self._target,
+            manifest=self._manifest,
             clock_hz=float(self._sequencer.clock_hz),
             geometry_fingerprint=self._geometry,
             resident_scan_point_capacity=resident_scan_point_capacity(
@@ -778,7 +786,8 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
         self._client = client
         self._endpoint_label = _text(endpoint_label, "endpoint_label")
         self._timeout = limit
-        self._target = snapshot.target
+        self._manifest = snapshot.manifest
+        self._target = self._manifest.target
         self._clock_hz = snapshot.clock_hz
         self._geometry = snapshot.geometry_fingerprint
         self._resident_scan_point_capacity = snapshot.resident_scan_point_capacity
@@ -806,6 +815,7 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
                     self._server_connection_generation
                 ),
                 "target_abi_fingerprint": self._target.abi_fingerprint,
+                "manifest_fingerprint": self._manifest.fingerprint,
                 "clock_hz": self._clock_hz,
                 "geometry_fingerprint": self._geometry,
                 "resident_scan_point_capacity": self._resident_scan_point_capacity,
@@ -817,7 +827,7 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
         )
         return SequencerCapabilitySnapshot(
             binding_stamp=binding.binding_stamp,
-            target=self._target,
+            manifest=self._manifest,
             clock_hz=self._clock_hz,
             geometry_fingerprint=self._geometry,
             resident_scan_point_capacity=self._resident_scan_point_capacity,

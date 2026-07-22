@@ -32,6 +32,7 @@ from zlc_pulse.scan_execution import (
     resolve_scan_point,
 )
 from zlc_pulse.server import PulseExecutionService
+from zlc_pulse.manifest import pulse_target_manifest_from_lanes
 
 
 ROOT = Path(__file__).parents[1]
@@ -196,7 +197,7 @@ def test_continuous_scan_rejects_terminal_evidence_and_service_completion():
 
     backend = _RecordingBackend()
     service = PulseExecutionService(
-        document.target,
+        pulse_target_manifest_from_lanes(document.target),
         clock_hz=50e6,
         backend=backend,
         connection_generation="focused-generation",

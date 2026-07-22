@@ -14,6 +14,8 @@ from pathlib import Path
 from zlc_pulse import (
     PulseDocument,
     load_deployed_pulse_target,
+    pulse_target_manifest_from_lanes,
+    restrict_pulse_document_to_manifest,
     validate_pulse_document_clock_grid,
 )
 from zlc_workbench.pulse import PulseEditorSession
@@ -127,11 +129,18 @@ def open_pulse_editor(
             time_step_ns=descriptor.time_step_ns,
         )
         session.bind_target(descriptor.target)
+        session.replace_document(
+            restrict_pulse_document_to_manifest(
+                session.document,
+                descriptor.manifest,
+            )
+        )
         validate_pulse_document_clock_grid(session.document, descriptor.clock_hz)
         controller = PulseEditorController(
             session,
             pulse=pulse,
             descriptor=descriptor,
+            authoring_manifest=descriptor.manifest,
             initial_connection_mode=_managed_connection_mode(experiment, descriptor),
         )
         return launch_pulse_editor_window(controller, hide_on_close=True)
@@ -145,9 +154,13 @@ def open_pulse_editor(
         target=target,
         time_step_ns=default_time_step_ns(),
     )
+    authoring_manifest = pulse_target_manifest_from_lanes(
+        session.document.target
+    )
     workspace = _standalone_workspace(repository)
     controller = PulseEditorController(
         session,
+        authoring_manifest=authoring_manifest,
         connection_factory=_standalone_connection_factory(workspace),
         initial_connection_mode="offline",
     )

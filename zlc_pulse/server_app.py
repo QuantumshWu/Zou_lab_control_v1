@@ -19,6 +19,7 @@ from fpga.pulse_streamer.host.image import (
 from .artifact import CompiledPulseArtifact
 from .deployment import APPROVED_DEPLOYED_TARGET_ABI, validate_deployed_target
 from .evidence import PulseBackendCompletion
+from .manifest import PulseTargetManifest, pulse_target_manifest_from_xdc
 from .server import PulseExecutionService, serve_pulse_execution_service
 from .target import PulseTarget, load_pulse_target
 from .transport import (
@@ -122,12 +123,15 @@ class PulseServerRuntime:
 
 
 def build_service_for_session(
-    target: PulseTarget,
+    manifest: PulseTargetManifest,
     session: DeployedStreamerSession,
     *,
     params: StreamerParams | None = None,
     clock_hz: float | None = None,
 ) -> PulseExecutionService:
+    if not isinstance(manifest, PulseTargetManifest):
+        raise TypeError("manifest must be PulseTargetManifest")
+    target = manifest.target
     geometry = params or default_params()
     clock = float(default_clock_hz() if clock_hz is None else clock_hz)
     validate_deployed_target(target, geometry)
@@ -136,7 +140,7 @@ def build_service_for_session(
     if float(getattr(session, "clock_hz", 0.0)) != clock:
         raise ValueError("hardware session clock differs from server deployment clock")
     return PulseExecutionService(
-        target,
+        manifest,
         clock_hz=clock,
         backend=session,
         params=geometry,
@@ -198,7 +202,7 @@ def open_deployed_session(
 
 
 def build_server_runtime(
-    target: PulseTarget,
+    manifest: PulseTargetManifest,
     *,
     backend: str,
     state_dir: str | Path,
@@ -210,6 +214,9 @@ def build_server_runtime(
     clock_hz: float | None = None,
     start: bool = False,
 ) -> PulseServerRuntime:
+    if not isinstance(manifest, PulseTargetManifest):
+        raise TypeError("manifest must be PulseTargetManifest")
+    target = manifest.target
     geometry = params or default_params()
     clock = float(default_clock_hz() if clock_hz is None else clock_hz)
     session = open_deployed_session(
@@ -223,7 +230,7 @@ def build_server_runtime(
     )
     try:
         service = build_service_for_session(
-            target,
+            manifest,
             session,
             params=geometry,
             clock_hz=clock,
@@ -257,6 +264,11 @@ def build_server_runtime(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the current-only pulse execution server")
     parser.add_argument("--target", required=True, help="canonical zlc_pulse.PulseTarget file")
+    parser.add_argument(
+        "--xdc",
+        required=True,
+        help="server-side constraints file owning deployed signal/package-pin bindings",
+    )
     parser.add_argument("--backend", required=True, choices=("jtag-axi", "uart"))
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--host", default="0.0.0.0")
@@ -279,8 +291,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     arguments = build_arg_parser().parse_args(argv)
     target = load_pulse_target(arguments.target)
+    manifest = pulse_target_manifest_from_xdc(target, arguments.xdc)
     build_server_runtime(
-        target,
+        manifest,
         backend=arguments.backend,
         state_dir=arguments.state_dir,
         host=arguments.host,

@@ -20,7 +20,8 @@
       不是 bug；current owner 在 `zlc_pulse/transport/session.py` 通过
       `image.build_fingerprint`/geometry handshake 校验)。冻结 RTL/bitstream 不因软件架构偏好重烧；
       只有证实现有 RTL bug 或偏离既定设计才进入独立硬件变更流程。
-- [ ] 启动 `fpga\run_server.bat`(`jtag-axi` 后端);确认监听端口(默认 18861)。
+- [ ] 启动 `fpga\run_server.bat`(`jtag-axi` 后端);确认启动摘要同时列出当前
+      `ZLC_PS_TARGET`与**server-side** `ZLC_PS_XDC`，并通过target/XDC逐lane校验后监听端口(默认18861)。
 
 ### 主机端(跑 notebook / GUI 的那台)
 - [ ] 安装 hardware/workbench extra（其中包含 current pulse RPC 所需的 `rpyc`）。
@@ -28,8 +29,8 @@
 - [ ] 网络能 ping 通 FPGA 端 IP;防火墙放行 server 端口(18861)。
 
 ### 当前可上线边界
-- [ ] Pulse-only real composition 不读取旧 `remote_template.json`，显式使用 server 的 `host:port`；
-      target、clock、geometry 与 connection generation 全从 current server snapshot 取得并在每次Run重验。
+- [ ] Pulse-only real composition 不读取旧 `remote_template.json`或客户端XDC，显式使用server的`host:port`；
+      target manifest（含package-pin endpoints）、clock、geometry与connection generation全从current server snapshot取得并在每次Run重验。
 - [ ] 完整 qCMOS + sequencer real installation 尚未闭合，不能把 pulse server 连通冒充相机也已可用。
       相机 bring-up 继续先做独立contract qualification；不得恢复旧 `RemoteSequencer/QCMOSCamera` raw session 绕过runtime。
 
@@ -74,8 +75,8 @@ pulse-only 路径。
 
 ## 3. 首次上电逐步验证
 
-1. FPGA 端起 `run_server.bat`；主机打开Pulse GUI，选Remote并连接。状态必须显示
-   `Pulse: READY · remote server`，否则不运行。
+1. FPGA端起`run_server.bat`；主机打开Pulse GUI，选Remote并连接。状态必须显示READY，
+   Target tab必须只读，Edit左列必须显示server XDC发布的package pin（如`F15`）而非`ch00`；否则不运行。
 2. 先用 **Run Once** 跑一个全safe短pulse，再跑一个单通道短pulse；示波器确认波形与编译Preview一致。
 3. 用 **On Pulse (HOLD)** 验证持续输出，再点 **Stop**；只有窗口显示STOPPED/SAFE且server snapshot为SAFE才继续。
 4. 冻结一张小scan table，用 **Run Scan** 验证整表由FPGA自主无缝运行；不得改成host逐点fire-and-wait。

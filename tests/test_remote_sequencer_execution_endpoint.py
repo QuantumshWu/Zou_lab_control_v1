@@ -42,6 +42,7 @@ from zlc_pulse import (
     freeze_scan_table,
     load_pulse_document,
     pulse_server_snapshot_from_tree,
+    pulse_target_manifest_from_lanes,
 )
 from zlc_pulse.server import (
     decode_artifact_message,
@@ -225,7 +226,11 @@ def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe() -> None:
         trigger_channels=("ch11",),
     )
     backend = Backend()
-    service = PulseExecutionService(document.target, clock_hz=50e6, backend=backend)
+    service = PulseExecutionService(
+        pulse_target_manifest_from_lanes(document.target),
+        clock_hz=50e6,
+        backend=backend,
+    )
     control = Connection(service)
     interrupt = Connection(service)
     client = InProcessRemotePulseExecutionClient(
@@ -316,7 +321,11 @@ def test_remote_continuous_scan_progress_requires_a_real_cursor_sample() -> None
             }
 
     backend = ProgressBackend()
-    service = PulseExecutionService(document.target, clock_hz=50e6, backend=backend)
+    service = PulseExecutionService(
+        pulse_target_manifest_from_lanes(document.target),
+        clock_hz=50e6,
+        backend=backend,
+    )
     control = Connection(service)
     interrupt = Connection(service)
     client = InProcessRemotePulseExecutionClient(
@@ -408,7 +417,11 @@ def test_interrupt_fences_a_provisional_remote_prepare_before_it_can_fire() -> N
             return super().current_prepare(payload)
 
     backend = Backend()
-    service = PulseExecutionService(document.target, clock_hz=50e6, backend=backend)
+    service = PulseExecutionService(
+        pulse_target_manifest_from_lanes(document.target),
+        clock_hz=50e6,
+        backend=backend,
+    )
     control = Connection(service)
     blocking_root = BlockingBeforeServiceRoot(service)
     control.root = blocking_root

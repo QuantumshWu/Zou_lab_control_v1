@@ -39,7 +39,7 @@ from .evidence import (
     validate_backend_completion_for_artifact,
     validate_backend_completion_intrinsic,
 )
-from .target import PulseTarget, pulse_target_to_tree
+from .manifest import PulseTargetManifest, pulse_target_manifest_to_tree
 from .validation import validate_target_ir_for_target
 
 
@@ -132,15 +132,15 @@ class PulseExecutionService:
 
     def __init__(
         self,
-        target: PulseTarget,
+        manifest: PulseTargetManifest,
         *,
         clock_hz: float,
         backend: PulseExecutionBackend,
         params: StreamerParams | None = None,
         connection_generation: str | None = None,
     ) -> None:
-        if not isinstance(target, PulseTarget):
-            raise TypeError("target must be PulseTarget")
+        if not isinstance(manifest, PulseTargetManifest):
+            raise TypeError("manifest must be PulseTargetManifest")
         if not isinstance(clock_hz, (int, float)) or not math.isfinite(float(clock_hz)) or clock_hz <= 0:
             raise ValueError("clock_hz must be finite and positive")
         for method in (
@@ -153,7 +153,8 @@ class PulseExecutionService:
         ):
             if not callable(getattr(backend, method, None)):
                 raise TypeError(f"pulse backend is missing {method}()")
-        self._target = target
+        self._manifest = manifest
+        self._target = manifest.target
         self._clock_hz = float(clock_hz)
         self._backend = backend
         self._params = params or StreamerParams()
@@ -196,7 +197,7 @@ class PulseExecutionService:
         return {
             "schema": "zlc_pulse.PulseExecutionSnapshot",
             "connection_generation": self._generation,
-            "target": pulse_target_to_tree(self._target),
+            "manifest": pulse_target_manifest_to_tree(self._manifest),
             "clock_hz": self._clock_hz,
             "geometry_fingerprint": self._geometry_fingerprint,
             "resident_scan_point_capacity": resident_scan_point_capacity(

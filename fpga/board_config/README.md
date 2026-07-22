@@ -5,8 +5,8 @@ intentionally separate from the RTL and the host code so you can reconfigure for
 different FPGA board or cabling without touching anything else.
 
 This is the sole in-repository default. `ZLC_PS_XDC` may explicitly select an
-external board file for the FPGA build; it is not a client-side Remote-GUI
-override.
+external board file for the FPGA build **and the pulse server**; it is never a
+client-side Remote-GUI override.
 
 ## What goes in here
 
@@ -26,9 +26,10 @@ Contract the build enforces (`fpga/build_and_program.bat`, `create_project.tcl`)
 
 - it **must** define the `trig` output (`[get_ports trig]`),
 - it must **not** contain unfilled `<PIN_CHxx>` placeholders,
-- the host infers the **channel count + labels + pins** from it
-  (`infer_xdc_channel_count` / `_labels` / `_pins`), so the GUI shows the right
-  channels even with no hardware attached.
+- the build infers the **channel count + labels + pins** from it, while
+  `run_server.bat` validates the deployed `PulseTarget` against the same XDC and
+  publishes one `PulseTargetManifest`; the Remote GUI displays those server-owned
+  package pins without reading a client XDC.
 
 > **Analog (DAC) buses are auto-detected from the XDC, not hard-coded.** Any group of
 > outputs whose names follow `base[0]`, `base[1]`, … `base[N]` (contiguous bits, ≥2 wide)
@@ -77,10 +78,11 @@ Two options:
    - cmd: `set ZLC_PS_XDC=C:\path\to\your_board.xdc`
 
 After changing boards, produce a canonical `PulseTarget` from that exact XDC and
-start the server with `ZLC_PS_TARGET` pointing at it.  The Remote GUI deliberately
-does not read its local XDC: it accepts the target published by the server, because
-the client and the physical board may be on different machines.  Package pins stay
-deployment/bitstream facts; pulse execution addresses the target's ordered raw lanes.
+start the server with `ZLC_PS_TARGET` and `ZLC_PS_XDC` pointing at the paired files.
+The server rejects any lane/signal/DAC-bit mismatch before listening. The Remote GUI
+deliberately does not read its local XDC: it accepts the manifest published by the
+server because client and board may be on different machines. Package pins remain
+deployment/bitstream evidence; pulse execution still addresses ordered raw lanes.
 
 ## Environment overrides (so a moved board / Vivado / part never hard-breaks)
 
@@ -88,7 +90,7 @@ All optional — set only what differs from the defaults:
 
 | variable | overrides | used by |
 |---|---|---|
-| `ZLC_PS_XDC` | the board pin map path | FPGA build and build-time inference |
+| `ZLC_PS_XDC` | the board pin map path | FPGA build/inference and `fpga/run_server.bat` manifest publication |
 | `ZLC_PS_TARGET` | canonical target paired with the deployed bitstream/XDC | `fpga/run_server.bat`; published to Remote clients in the server snapshot |
 | `ZLC_PS_CONFIG` | the `streamer_config.json` path | host validation/estimate, `estimate_resources.bat` |
 | `ZLC_PS_FPGA_PART` | the synthesis part (else read from `streamer_config.json`) | `create_project.tcl`, capacity estimate |
@@ -107,11 +109,14 @@ different Artix-7 retargets the build without editing the `.tcl`.
 - `fpga/build_and_program.bat` (build + program)
 - `zlc_neutral_atom.timing.board_config.load_board_config` (explicit projection and
   checked-in topology contract; its default is this in-repository file)
+- `fpga/run_server.bat` / `zlc_pulse.server_app` (server-side target validation and
+  package-pin manifest publication)
 
-`fpga/run_server.bat` instead loads `ZLC_PS_TARGET` (default:
-`zlc_pulse/assets/deployed_target.json`) and publishes that exact target to Remote
-clients.  The checked-in architecture test requires the default target to equal the
-default XDC's lane/name/bus projection as a whole.
+`fpga/run_server.bat` loads `ZLC_PS_TARGET` (default:
+`zlc_pulse/assets/deployed_target.json`) together with `ZLC_PS_XDC`, validates them as
+one deployment, and publishes the resulting manifest to Remote clients. The
+checked-in architecture test requires the default target to equal the default XDC's
+lane/name/bus projection as a whole.
 
 `streamer_config.json` (search order: `ZLC_PS_CONFIG` env → cwd → this file):
 

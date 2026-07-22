@@ -18,6 +18,7 @@ from PyQt5 import QtCore, QtTest, QtWidgets
 from conftest import pulse_backend_completion_for
 from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_neutral_atom.runtime.run import RunState
+from zlc_neutral_atom.timing.board_config import DEFAULT_BOARD_CONFIG
 from zlc_pulse import (
     FIELD_DURATION,
     FrozenScanTable,
@@ -26,10 +27,16 @@ from zlc_pulse import (
     ScanParameter,
     load_deployed_pulse_target,
     new_pulse_document,
+    pulse_target_manifest_from_xdc,
     save_pulse_document,
 )
 from zlc_pulse.server import serve_pulse_execution_service
 from zlc_workbench.pulse_editor.app import open_pulse_editor
+from gui_user_flow import click_tab as _click_tab, until as _until
+from pulse_gui_user_flow import (
+    choose_mode as _choose_mode,
+    exercise_offline_dac_round_trip as _exercise_offline_dac_round_trip,
+)
 
 
 class _Backend:
@@ -72,48 +79,8 @@ class _Backend:
         return {"safe": self.safe}
 
 
-def _until(application, predicate, *, timeout: float = 10.0) -> None:
-    deadline = time.monotonic() + timeout
-    while not predicate() and time.monotonic() < deadline:
-        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-        time.sleep(0.005)
-    assert predicate()
-
-
-def _click_tab(body, page) -> None:
-    index = body.tabs.indexOf(page)
-    bar = body.tabs.tabBar()
-    QtTest.QTest.mouseClick(
-        bar,
-        QtCore.Qt.LeftButton,
-        pos=bar.tabRect(index).center(),
-    )
-
-
 def _choose_remote(body) -> None:
-    combo = body.schedule_view.conn_target_combo
-    QtTest.QTest.mouseClick(combo, QtCore.Qt.LeftButton)
-    view = combo.view()
-    remote_index = combo.model().index(combo.findData("remote"), 0)
-    application = QtWidgets.QApplication.instance()
-    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-    remote_position = view.visualRect(remote_index).center()
-    QtTest.QTest.mouseMove(view.viewport(), remote_position)
-    QtTest.QTest.mousePress(
-        view.viewport(), QtCore.Qt.LeftButton, pos=remote_position
-    )
-    QtTest.QTest.mouseRelease(
-        view.viewport(), QtCore.Qt.LeftButton, pos=remote_position
-    )
-    assert combo.currentData() == "remote"
-    # The owner snapshot timer ticks every 40 ms.  Keep the draft selection
-    # untouched for multiple ticks before the operator enters an address or
-    # presses Connect; otherwise this regression can pass by racing the timer.
-    deadline = time.monotonic() + 0.15
-    while time.monotonic() < deadline:
-        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-        time.sleep(0.005)
-    assert combo.currentData() == "remote"
+    _choose_mode(body, "remote")
 
 
 def _enter_address(body, endpoint: str) -> None:
@@ -150,10 +117,70 @@ def _scan_document():
     )
 
 
+def _server_manifest():
+    return pulse_target_manifest_from_xdc(
+        load_deployed_pulse_target(),
+        DEFAULT_BOARD_CONFIG,
+    )
+
+
+def _run_offline_dac_target_gui(workspace: Path, application) -> None:
+    body = open_pulse_editor(repository=workspace / "offline-target")
+    wrapper = body.window()
+    try:
+        _exercise_offline_signal_rename(body, application)
+        _exercise_offline_dac_round_trip(body, application)
+    finally:
+        body.request_close(discard_unsaved=True)
+        _until(application, lambda: body._controller.snapshot().close_complete)
+        _until(application, lambda: not wrapper.isVisible())
+
+
+def _exercise_offline_signal_rename(body, application) -> None:
+    """Rename one visible channel through the Target tab's real controls."""
+
+    _click_tab(body, body.target_view)
+    row = body.target_view._rows[0]
+    key = row.key
+    endpoint = row.endpoints.text()
+    previous_label = body.current_document.target.by_key[key].label
+    previous_abi = body.current_document.target.abi_fingerprint
+    renamed = f"{previous_label}_renamed"
+
+    QtTest.QTest.mouseClick(row.signal, QtCore.Qt.LeftButton)
+    QtTest.QTest.keyClick(row.signal, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
+    QtTest.QTest.keyClicks(row.signal, renamed)
+    assert body.current_document.target.by_key[key].label == previous_label
+    QtTest.QTest.mouseClick(body.target_view.apply_button, QtCore.Qt.LeftButton)
+    _until(
+        application,
+        lambda: body.current_document.target.by_key[key].label == renamed,
+    )
+
+    rebuilt = next(item for item in body.target_view._rows if item.key == key)
+    assert rebuilt.signal.text() == renamed
+    assert rebuilt.endpoints.text() == endpoint
+    assert body.current_document.target.abi_fingerprint == previous_abi
+
+    _click_tab(body, body.schedule_view)
+    _until(
+        application,
+        lambda: body.schedule_view.names_panel.port_labels[key].text() == renamed,
+    )
+    assert body.schedule_view.names_panel.hardware_labels[key].text() == endpoint
+    combo = body.schedule_view.add_channel_combo
+    for index in range(combo.count()):
+        hidden_key = str(combo.itemData(index))
+        hidden_label = body.current_document.target.by_key[hidden_key].label
+        assert combo.itemText(index).startswith(hidden_label)
+        if hidden_label != hidden_key:
+            assert not combo.itemText(index).startswith(f"{hidden_key}  (")
+
+
 def _run_remote_gui(workspace: Path) -> None:
     backend = _Backend()
     service = PulseExecutionService(
-        load_deployed_pulse_target(),
+        _server_manifest(),
         clock_hz=50e6,
         backend=backend,
     )
@@ -169,6 +196,7 @@ def _run_remote_gui(workspace: Path) -> None:
         unavailable_port = reservation.getsockname()[1]
 
     application = ensure_qt_app()
+    _run_offline_dac_target_gui(workspace, application)
     body = open_pulse_editor(repository=workspace, document=_scan_document())
     wrapper = body.window()
     try:
@@ -198,9 +226,10 @@ def _run_remote_gui(workspace: Path) -> None:
             lambda: body._controller.snapshot().connection_state == "ready"
             and body.schedule_view.conn_status.text() == endpoint,
         )
-        assert body.summary.text() == (
-            f"Connected to sequencer server at {endpoint}."
-        )
+        assert body.schedule_view.names_panel.hardware_labels["ch00"].text() == "F15"
+        _click_tab(body, body.target_view)
+        assert not body.target_view.apply_button.isEnabled()
+        assert body.target_view._rows[0].signal.isReadOnly()
 
         _set_scan_repeats(body, 1)
         _until(
@@ -264,7 +293,7 @@ def _run_remote_gui(workspace: Path) -> None:
 def _run_load_before_remote(workspace: Path) -> None:
     backend = _Backend()
     deployed = load_deployed_pulse_target()
-    service = PulseExecutionService(deployed, clock_hz=50e6, backend=backend)
+    service = PulseExecutionService(_server_manifest(), clock_hz=50e6, backend=backend)
     server = serve_pulse_execution_service(
         service,
         host="127.0.0.1",
@@ -341,9 +370,136 @@ def test_document_is_loaded_before_automatic_remote_preflight(tmp_path) -> None:
     )
 
 
+def _run_virtual_manifest_gui(workspace: Path) -> None:
+    application = ensure_qt_app()
+    body = open_pulse_editor(repository=workspace)
+    wrapper = body.window()
+    offline_visible = body.current_document.visible_ports
+    offline_available = body._controller.snapshot().target_manifest.available_port_keys
+    expected = (
+        "ch00",
+        "ch01",
+        "ch03",
+        "ch09",
+        "ch11",
+        "da_bias_y",
+        "da_bias_x",
+        "da_bias_z",
+    )
+    try:
+        _choose_mode(body, "virtual")
+        QtTest.QTest.mouseClick(
+            body.schedule_view.conn_connect_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(
+            application,
+            lambda: body._controller.snapshot().connection_state == "ready",
+        )
+        assert body._controller.snapshot().target_manifest.available_port_keys == expected
+        assert body.current_document.visible_ports == offline_visible
+        assert body.schedule_view._visible_ports == expected
+
+        QtTest.QTest.mouseClick(
+            body.schedule_view.hide_off_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(application, lambda: len(body.schedule_view._visible_ports) == 4)
+        geometry_before = (
+            body.schedule_view.dataset_scroll.geometry().getRect(),
+            body.schedule_view.button_frame.geometry().getRect(),
+            body.schedule_view.dataset_body.width(),
+        )
+        QtTest.QTest.mouseClick(
+            body.schedule_view.show_all_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(application, lambda: body.schedule_view._visible_ports == expected)
+        geometry_after = (
+            body.schedule_view.dataset_scroll.geometry().getRect(),
+            body.schedule_view.button_frame.geometry().getRect(),
+            body.schedule_view.dataset_body.width(),
+        )
+        assert geometry_after == geometry_before
+        assert body.current_document.visible_ports == offline_visible
+        assert body.schedule_view._programmable_ports == expected
+        _click_tab(body, body.target_view)
+        assert len(body.target_view._rows) == len(expected)
+        assert not body.target_view.add_dac_button.isEnabled()
+
+        _click_tab(body, body.schedule_view)
+        _choose_mode(body, "offline")
+        QtTest.QTest.mouseClick(
+            body.schedule_view.conn_connect_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(
+            application,
+            lambda: (
+                body._controller.snapshot().connection_state == "offline"
+                and body._controller.snapshot().connection_mode == "offline"
+            ),
+        )
+        assert body.current_document.visible_ports == offline_visible
+        assert body.schedule_view._visible_ports == offline_visible
+        assert body.schedule_view._programmable_ports == offline_available
+
+        # The formal deployed target crosses the old 16-channel density
+        # threshold.  Drive Hide Off -> Show All through the real controls and
+        # keep both the viewport and every surviving channel row stationary.
+        first_key = body.schedule_view._visible_ports[0]
+        QtTest.QTest.mouseClick(
+            body.schedule_view.hide_off_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(application, lambda: len(body.schedule_view._visible_ports) == 4)
+        offline_geometry_before = (
+            body.schedule_view.dataset_scroll.geometry().getRect(),
+            body.schedule_view.button_frame.geometry().getRect(),
+            body.schedule_view.names_panel.port_labels[first_key].height(),
+        )
+        QtTest.QTest.mouseClick(
+            body.schedule_view.show_all_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(
+            application,
+            lambda: body.schedule_view._visible_ports == offline_visible,
+        )
+        offline_geometry_after = (
+            body.schedule_view.dataset_scroll.geometry().getRect(),
+            body.schedule_view.button_frame.geometry().getRect(),
+            body.schedule_view.names_panel.port_labels[first_key].height(),
+        )
+        assert offline_geometry_after == offline_geometry_before
+
+        _click_tab(body, body.target_view)
+        assert body.target_view.add_dac_button.isEnabled()
+    finally:
+        body.request_close(discard_unsaved=True)
+        _until(application, lambda: body._controller.snapshot().close_complete)
+        _until(application, lambda: not wrapper.isVisible())
+
+
+def test_virtual_gui_exposes_only_simulator_wired_digital_and_dac_ports(
+    tmp_path,
+) -> None:
+    environment = os.environ.copy()
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), str(tmp_path), "virtual"],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        timeout=30,
+        check=True,
+    )
+
+
 if __name__ == "__main__":
     root = Path(sys.argv[1]).resolve()
     if len(sys.argv) > 2 and sys.argv[2] == "load-before-remote":
         _run_load_before_remote(root)
+    elif len(sys.argv) > 2 and sys.argv[2] == "virtual":
+        _run_virtual_manifest_gui(root)
     else:
         _run_remote_gui(root)

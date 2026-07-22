@@ -46,10 +46,10 @@ from zlc_pulse import (
     PORT_DIGITAL,
     TIME_UNIT_TO_NS,
     PulseDocument,
-    PulseExecutionForm,
     PulseFieldRef,
-    compile_pulse_document,
-    iter_physical_digital_high_intervals,
+    PulseTargetManifest,
+    count_authored_digital_pulses,
+    pulse_target_manifest_from_lanes,
 )
 
 from ._layout import (
@@ -115,26 +115,9 @@ def _number(text: object) -> int | float:
 
 
 def _expanded_pulse_count(document: PulseDocument) -> int:
-    """Count the exact expanded digital high intervals compiled from ``document``.
+    """Project the pulse-owned logical count without deployment preflight."""
 
-    The formal summary has always counted pulses, not authored period cards.  The
-    pulse compiler is the one owner of finite-repeat expansion, output delays and
-    scan-reference lowering, so the view consumes that projection instead of
-    guessing from period cardinality.
-    """
-
-    execution_form = (
-        PulseExecutionForm.STATIC_REFERENCE_POINT
-        if document.scan_parameters
-        else PulseExecutionForm.STATIC_ONCE
-    )
-    target_ir = compile_pulse_document(
-        document,
-        clock_hz=1e9 / float(document.time_step_ns),
-        execution_form=execution_form,
-        live_target=document.target,
-    )
-    return sum(1 for _item in iter_physical_digital_high_intervals(target_ir))
+    return count_authored_digital_pulses(document)
 
 
 def _repeat_summary_text(document: PulseDocument) -> str:
@@ -191,6 +174,7 @@ class _PortRow:
     label: str
     width: int
     signed_range: tuple[int, int] | None
+    endpoints: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -217,10 +201,19 @@ class _InteractionSnapshot:
     focus: _FocusSnapshot | None
 
 
-def _port_rows(document: PulseDocument, *, visible_only: bool) -> tuple[_PortRow, ...]:
-    visible = set(document.visible_ports)
+def _port_rows(
+    document: PulseDocument,
+    manifest: PulseTargetManifest,
+    *,
+    visible_only: bool,
+    visible_ports: tuple[str, ...],
+) -> tuple[_PortRow, ...]:
+    if document.target.abi_fingerprint != manifest.target.abi_fingerprint:
+        raise ValueError("schedule manifest target differs from PulseDocument")
+    visible = set(visible_ports)
     rows = []
-    for port in document.target.ports:
+    for exposed in manifest.ports:
+        port = document.target.by_key[exposed.port_key]
         if port.kind == PORT_CLOCK or (visible_only and port.key not in visible):
             continue
         rows.append(
@@ -230,6 +223,7 @@ def _port_rows(document: PulseDocument, *, visible_only: bool) -> tuple[_PortRow
                 label=port.label,
                 width=port.width,
                 signed_range=port.signed_range,
+                endpoints=exposed.endpoints,
             )
         )
     return tuple(rows)
@@ -402,7 +396,7 @@ class PeriodCard(FluentGroupBox):
         self.duration_edit.editingFinished.connect(self._commit_duration)
         self.unit_combo.currentTextChanged.connect(lambda _text: self._commit_duration())
 
-        row_height = _channel_row_height(len(rows))
+        row_height = _channel_row_height()
         for row in rows:
             if row.kind == PORT_DAC:
                 column.addWidget(
@@ -523,7 +517,7 @@ class PeriodCard(FluentGroupBox):
 
 
 class ChannelNamesPanel(FluentGroupBox):
-    """Formal Port Catalog column, projected from current logical ports."""
+    """Operator channel catalog projected from the active target manifest."""
 
     documentNameEdited = QtCore.pyqtSignal(str)
     portLabelEdited = QtCore.pyqtSignal(str, str)
@@ -586,16 +580,24 @@ class ChannelNamesPanel(FluentGroupBox):
         top_layout.addStretch()
         layout.addWidget(top)
 
-        row_height = _channel_row_height(len(rows))
+        row_height = _channel_row_height()
         for row_info in rows:
             row = QtWidgets.QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(_px(5, minimum=3))
-            hardware = FluentLabel(row_info.key)
+            endpoint_text = (
+                row_info.endpoints[0]
+                if len(row_info.endpoints) == 1
+                else f"{row_info.endpoints[0]}…{row_info.endpoints[-1]}"
+            )
+            hardware = FluentLabel(endpoint_text)
             hardware.setToolTip(
-                f"port {row_info.key}"
+                f"endpoint {row_info.endpoints[0]}"
                 if row_info.kind == PORT_DIGITAL
-                else f"{row_info.width}-bit DAC port {row_info.key}"
+                else (
+                    f"{row_info.width}-bit DAC endpoints: "
+                    f"{', '.join(row_info.endpoints)}"
+                )
             )
             hardware.setAlignment(QtCore.Qt.AlignCenter)
             hardware.setFixedSize(label_w, row_height)
@@ -715,7 +717,7 @@ class ChannelPanel(FluentGroupBox):
         top_layout.addStretch()
         layout.addWidget(top)
 
-        row_height = _channel_row_height(len(rows))
+        row_height = _channel_row_height()
         for row_info in rows:
             row = QtWidgets.QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
@@ -1220,17 +1222,24 @@ class PulseScheduleView(QtWidgets.QWidget):
     def __init__(
         self,
         document: PulseDocument,
+        manifest: PulseTargetManifest | None = None,
         parent=None,
         *,
+        display_visible_ports: tuple[str, ...] | None = None,
         document_generation: int = 0,
         revision: int = 0,
     ) -> None:
         if not isinstance(document, PulseDocument):
             raise TypeError("document must be PulseDocument")
+        if manifest is None:
+            manifest = pulse_target_manifest_from_lanes(document.target)
+        elif not isinstance(manifest, PulseTargetManifest):
+            raise TypeError("manifest must be PulseTargetManifest or None")
         super().__init__(parent)
         self._document_generation = -1
         self._revision = -1
         self._document_fingerprint = ""
+        self._manifest_fingerprint = ""
         self._period_ids: tuple[str, ...] = ()
         self._visible_ports: tuple[str, ...] = ()
         self._programmable_ports: tuple[str, ...] = ()
@@ -1244,6 +1253,8 @@ class PulseScheduleView(QtWidgets.QWidget):
         self._build_ui()
         self.set_document(
             document,
+            manifest,
+            display_visible_ports=display_visible_ports,
             document_generation=document_generation,
             revision=revision,
         )
@@ -1269,7 +1280,10 @@ class PulseScheduleView(QtWidgets.QWidget):
 
         self.dataset_scroll = FluentScrollArea()
         self.dataset_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.dataset_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        # The channel form changes height when ports are shown/hidden.  Reserve
+        # the Fluent scrollbar gutter permanently so the first overflow never
+        # steals width and shifts every aligned column in the Edit surface.
+        self.dataset_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
         self.dataset_body = QtWidgets.QWidget()
         dataset = QtWidgets.QHBoxLayout(self.dataset_body)
         gutter = _card_gutter()
@@ -1639,7 +1653,9 @@ class PulseScheduleView(QtWidgets.QWidget):
     def set_document(
         self,
         document: PulseDocument,
+        manifest: PulseTargetManifest | None = None,
         *,
+        display_visible_ports: tuple[str, ...] | None = None,
         document_generation: int,
         revision: int,
     ) -> bool:
@@ -1651,6 +1667,22 @@ class PulseScheduleView(QtWidgets.QWidget):
 
         if not isinstance(document, PulseDocument):
             raise TypeError("document must be PulseDocument")
+        if manifest is None:
+            manifest = pulse_target_manifest_from_lanes(document.target)
+        elif not isinstance(manifest, PulseTargetManifest):
+            raise TypeError("manifest must be PulseTargetManifest or None")
+        if display_visible_ports is None:
+            display_visible_ports = document.visible_ports
+        else:
+            display_visible_ports = tuple(str(key) for key in display_visible_ports)
+        unknown_display = set(display_visible_ports) - set(
+            manifest.available_port_keys
+        )
+        if unknown_display:
+            raise ValueError(
+                "display_visible_ports names ports outside the target manifest: "
+                f"{sorted(unknown_display)}"
+            )
         if (
             isinstance(document_generation, bool)
             or not isinstance(document_generation, int)
@@ -1660,6 +1692,7 @@ class PulseScheduleView(QtWidgets.QWidget):
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
             raise ValueError("revision must be a non-negative integer")
         fingerprint = document.fingerprint
+        manifest_fingerprint = manifest.fingerprint
         incoming_version = (document_generation, revision)
         current_version = (self._document_generation, self._revision)
         if incoming_version < current_version:
@@ -1667,12 +1700,26 @@ class PulseScheduleView(QtWidgets.QWidget):
         if incoming_version == current_version:
             if fingerprint != self._document_fingerprint:
                 raise ValueError("one editor revision cannot identify two PulseDocuments")
-            return False
+            if (
+                manifest_fingerprint == self._manifest_fingerprint
+                and display_visible_ports == self._visible_ports
+            ):
+                return False
 
         interaction = self._capture_interaction()
 
-        rows = _port_rows(document, visible_only=True)
-        all_rows = _port_rows(document, visible_only=False)
+        rows = _port_rows(
+            document,
+            manifest,
+            visible_only=True,
+            visible_ports=display_visible_ports,
+        )
+        all_rows = _port_rows(
+            document,
+            manifest,
+            visible_only=False,
+            visible_ports=display_visible_ports,
+        )
         bindings = _field_bindings(document)
         digital_values = _digital_values(document)
         analog_values, analog_active = _analog_values(document)
@@ -1864,6 +1911,7 @@ class PulseScheduleView(QtWidgets.QWidget):
             self._document_generation = document_generation
             self._revision = revision
             self._document_fingerprint = fingerprint
+            self._manifest_fingerprint = manifest_fingerprint
             self._sync_dataset_geometry()
             self._restore_interaction(interaction, version=incoming_version)
             QtCore.QTimer.singleShot(
@@ -2059,11 +2107,7 @@ class PulseScheduleView(QtWidgets.QWidget):
             display = (
                 f"{row.label}  ({row.width} pins)"
                 if row.kind == PORT_DAC
-                else (
-                    f"{row.key}  ({row.label})"
-                    if row.label != row.key
-                    else row.key
-                )
+                else row.label
             )
             self.add_channel_combo.addItem(display, row.key)
         has_hidden = self.add_channel_combo.count() > 0

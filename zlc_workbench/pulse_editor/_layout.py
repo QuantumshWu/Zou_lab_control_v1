@@ -132,8 +132,15 @@ def add_labeled_widget(
     return label
 
 
-def channel_row_height(channel_count: int) -> int:
-    return px(26 if channel_count > 16 else ROW_HEIGHT, minimum=22)
+def channel_row_height() -> int:
+    """Return the one formal channel-row height used by every pulse column.
+
+    The number of visible channels controls only the scroll extent.  It must
+    never select a denser layout: doing so moves every existing control when
+    Show All crosses an arbitrary channel-count threshold.
+    """
+
+    return px(ROW_HEIGHT, minimum=22)
 
 
 def elide_text(text: object, width: int) -> str:

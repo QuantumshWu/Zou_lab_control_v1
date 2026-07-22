@@ -1094,6 +1094,54 @@ def test_fluent_double_spinbox_can_preserve_authoritative_float_values() -> None
     assert field.value() == value
 
 
+def test_integer_and_double_spinboxes_share_visible_split_arrow_buttons() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtCore
+
+    import zlc_frontend.qt_widgets.fluent as fluent_module
+    from zlc_frontend.qt_widgets import (
+        FluentDoubleSpinBox,
+        FluentSpinBox,
+        ensure_qt_app,
+    )
+    from zlc_frontend.qt_widgets.style import COMBO_WIDTH
+
+    application = ensure_qt_app()
+    for field_type in (FluentSpinBox, FluentDoubleSpinBox):
+        field = field_type()
+        field.resize(100, 30)
+        field.show()
+        application.processEvents()
+        image = _render_qt_widget(field)
+        button_left = field.width() - fluent_module.scaled_px(COMBO_WIDTH)
+        split_y = field.height() // 2
+        split = [
+            image.pixelColor(x, split_y)
+            for x in range(button_left, field.width() - 1)
+        ]
+        below_split = [
+            image.pixelColor(x, split_y + 1)
+            for x in range(button_left, field.width() - 1)
+        ]
+        upper = [
+            image.pixelColor(x, y)
+            for y in range(3, split_y - 2)
+            for x in range(button_left + 3, field.width() - 3)
+        ]
+        lower = [
+            image.pixelColor(x, y)
+            for y in range(split_y + 2, field.height() - 3)
+            for x in range(button_left + 3, field.width() - 3)
+        ]
+        is_white = lambda color: min(color.red(), color.green(), color.blue()) > 235
+        brightness = lambda color: color.red() + color.green() + color.blue()
+        assert sum(map(brightness, split)) > sum(map(brightness, below_split)) + 500
+        assert any(map(is_white, upper))
+        assert any(map(is_white, lower))
+        field.close()
+    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+
+
 def test_qt_public_facade_covers_every_production_consumer(monkeypatch) -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     import zlc_frontend.qt_widgets as qt

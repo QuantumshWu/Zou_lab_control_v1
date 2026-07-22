@@ -25,6 +25,7 @@ from zlc_pulse import (
     pack_target_ir,
     compile_pulse_artifact,
     load_pulse_document,
+    pulse_target_manifest_from_lanes,
 )
 from zlc_pulse.transport import (
     DeployedStreamerSession,
@@ -183,7 +184,7 @@ def test_current_artifact_bytes_drive_the_existing_axi_transport_exactly(tmp_pat
     hardware = CurrentStreamerHardware(params)
     session = _axi_session(tmp_path, document.target, params, hardware)
     service = PulseExecutionService(
-        document.target,
+        pulse_target_manifest_from_lanes(document.target),
         clock_hz=50e6,
         backend=session,
         params=params,
@@ -244,7 +245,7 @@ def test_current_artifact_uses_the_same_contract_over_uart(tmp_path):
     transport = ModelUartLink(build_fingerprint(params))
     session = _uart_session(tmp_path, document.target, params, transport)
     service = PulseExecutionService(
-        document.target,
+        pulse_target_manifest_from_lanes(document.target),
         clock_hz=50e6,
         backend=session,
         params=params,

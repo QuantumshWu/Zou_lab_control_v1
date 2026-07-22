@@ -13,6 +13,7 @@ from zlc_pulse import (
     RemotePulseExecutionClient,
     compile_pulse_artifact,
     load_pulse_document,
+    pulse_target_manifest_from_lanes,
 )
 from zlc_pulse.server import (
     decode_artifact_message,
@@ -140,7 +141,11 @@ def _fixture():
         trigger_channels=("ch11",),
     )
     backend = Backend()
-    service = PulseExecutionService(document.target, clock_hz=50e6, backend=backend)
+    service = PulseExecutionService(
+        pulse_target_manifest_from_lanes(document.target),
+        clock_hz=50e6,
+        backend=backend,
+    )
     connection = Connection(service)
     return artifact, service, connection
 

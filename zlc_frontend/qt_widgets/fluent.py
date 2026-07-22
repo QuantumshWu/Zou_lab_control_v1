@@ -93,6 +93,14 @@ def window_pad(mult: float = 1.0) -> int:
 _QT_APP = None
 _QT_LOOP_ENABLED = False
 _FLUENT_SCALE = 1.0
+_WINDOWS_FLUENT_FONT_FILES = (
+    "segoeui.ttf",
+    "segoeuib.ttf",
+    "segoeuii.ttf",
+    "segoeuiz.ttf",
+    "segoeuil.ttf",
+    "segoeuisl.ttf",
+)
 # Matches one float token; used by align_to_resolution to snap numbers inside a value.
 _FLOAT_TOKEN_RE = re.compile(r"(?<![A-Za-z_])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 
@@ -333,6 +341,33 @@ def _enable_ipython_qt_loop() -> None:
         pass
 
 
+def _ensure_offscreen_fluent_fonts(app: QtWidgets.QApplication) -> bool:
+    """Make the declared Fluent font rasterizable by Windows offscreen Qt.
+
+    The Windows ``offscreen`` platform can expose an empty ``QFontDatabase``.
+    Qt then computes widget geometry but paints no glyphs, producing a plausible
+    yet textless screenshot.  The desktop platform already discovers system
+    fonts and is deliberately untouched.  In offscreen mode we register the
+    same Segoe UI files the desktop uses, from the operating-system font
+    directory; no bundled or substitute font is introduced.
+    """
+
+    if app.platformName().strip().lower() != "offscreen":
+        return False
+    if FONT in set(QtGui.QFontDatabase().families()):
+        return False
+    windows_root = os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+    if not windows_root:
+        return False
+    font_directory = os.path.join(windows_root, "Fonts")
+    added = False
+    for filename in _WINDOWS_FLUENT_FONT_FILES:
+        path = os.path.join(font_directory, filename)
+        if os.path.isfile(path):
+            added = QtGui.QFontDatabase.addApplicationFont(path) >= 0 or added
+    return added
+
+
 def ensure_qt_app() -> QtWidgets.QApplication:
     """Return the owner-thread QApplication, creating it only on Python's main thread.
 
@@ -346,6 +381,8 @@ def ensure_qt_app() -> QtWidgets.QApplication:
     if app is not None:
         if QtCore.QThread.currentThread() != app.thread():
             raise RuntimeError("Qt UI operations must run on the QApplication owner thread")
+        if _ensure_offscreen_fluent_fonts(app):
+            app.setFont(QtGui.QFont(FONT, fluent_font_size()))
         _QT_APP = app
         _enable_ipython_qt_loop()
         return app
@@ -358,6 +395,7 @@ def ensure_qt_app() -> QtWidgets.QApplication:
     # Silence the harmless Windows "Unable to open default EUDC font" Qt warning.
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
     _QT_APP = QtWidgets.QApplication(sys.argv)
+    _ensure_offscreen_fluent_fonts(_QT_APP)
     _QT_APP.setFont(QtGui.QFont(FONT, fluent_font_size()))
     _enable_ipython_qt_loop()
     return _QT_APP
@@ -2740,6 +2778,54 @@ def fluent_spinbox_stylesheet(selector: str) -> str:
     """
 
 
+def _paint_fluent_spin_buttons(widget: QtWidgets.QAbstractSpinBox) -> None:
+    """Paint the one shared separator and arrow glyphs for numeric controls."""
+
+    if widget.buttonSymbols() == QtWidgets.QAbstractSpinBox.NoButtons:
+        return
+    painter = QtGui.QPainter(widget)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing)
+    size = scaled_px(COMBO_TRI_SIZE)
+    button_width = scaled_px(COMBO_WIDTH)
+    center_x = widget.width() - button_width / 2
+    height = widget.height()
+
+    # QSS owns the blue button surfaces, while this owner supplies the glyphs
+    # and the explicit split between the two hit regions.  Without the split,
+    # both buttons read as one solid blue bar; without these glyphs, Windows
+    # offscreen Qt paints no native spin indicator at all.
+    painter.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 1))
+    painter.drawLine(
+        widget.width() - button_width,
+        int(height / 2),
+        widget.width() - 1,
+        int(height / 2),
+    )
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.setBrush(QtGui.QBrush(QtGui.QColor("#FFFFFF")))
+    up_y = height * 0.25
+    painter.drawPolygon(
+        QtGui.QPolygon(
+            [
+                QtCore.QPoint(int(center_x - size / 2), int(up_y + size / 4)),
+                QtCore.QPoint(int(center_x + size / 2), int(up_y + size / 4)),
+                QtCore.QPoint(int(center_x), int(up_y - size / 4)),
+            ]
+        )
+    )
+    down_y = height * 0.75
+    painter.drawPolygon(
+        QtGui.QPolygon(
+            [
+                QtCore.QPoint(int(center_x - size / 2), int(down_y - size / 4)),
+                QtCore.QPoint(int(center_x + size / 2), int(down_y - size / 4)),
+                QtCore.QPoint(int(center_x), int(down_y + size / 4)),
+            ]
+        )
+    )
+    painter.end()
+
+
 class _WheelFocusGuardMixin:
     """Scroll-over protection for numeric spin controls: the wheel only changes the value
     AFTER the widget has been clicked into (has keyboard focus).  Without focus the wheel
@@ -2772,6 +2858,10 @@ class FluentSpinBox(_WheelFocusGuardMixin, QtWidgets.QSpinBox):
         self.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.lineEdit().setTextMargins(0, 0, 0, 0)
         self.setStyleSheet(fluent_spinbox_stylesheet("QSpinBox"))
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        _paint_fluent_spin_buttons(self)
 
 
 class FluentInputDialog(QtWidgets.QDialog):
@@ -2999,31 +3089,7 @@ class FluentDoubleSpinBox(_WheelFocusGuardMixin, QtWidgets.QDoubleSpinBox):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        size = scaled_px(COMBO_TRI_SIZE)
-        btn_w = scaled_px(COMBO_WIDTH)
-        cx = self.width() - btn_w / 2
-        height = self.height()
-        painter.setPen(QtCore.Qt.NoPen)
-        painter.setBrush(QtGui.QBrush(QtGui.QColor("#FFFFFF")))
-
-        y_up = height * 0.25
-        up_points = [
-            QtCore.QPoint(int(cx - size / 2), int(y_up + size / 4)),
-            QtCore.QPoint(int(cx + size / 2), int(y_up + size / 4)),
-            QtCore.QPoint(int(cx), int(y_up - size / 4)),
-        ]
-        painter.drawPolygon(QtGui.QPolygon(up_points))
-
-        y_down = height * 0.75
-        down_points = [
-            QtCore.QPoint(int(cx - size / 2), int(y_down - size / 4)),
-            QtCore.QPoint(int(cx + size / 2), int(y_down - size / 4)),
-            QtCore.QPoint(int(cx), int(y_down + size / 4)),
-        ]
-        painter.drawPolygon(QtGui.QPolygon(down_points))
-        painter.end()
+        _paint_fluent_spin_buttons(self)
 
 
 class FluentCheckBox(QtWidgets.QCheckBox):

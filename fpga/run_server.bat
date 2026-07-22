@@ -36,6 +36,7 @@ if not defined ZLC_PS_HOST set "ZLC_PS_HOST=0.0.0.0"
 if not defined ZLC_PS_PORT set "ZLC_PS_PORT=18861"
 if not defined ZLC_PS_SERVER_BACKEND set "ZLC_PS_SERVER_BACKEND=jtag-axi"
 if not defined ZLC_PS_TARGET set "ZLC_PS_TARGET=%REPO_ROOT%\zlc_pulse\assets\deployed_target.json"
+if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%FPGA_DIR%board_config\board.xdc"
 if not defined ZLC_PS_STATE_DIR set "ZLC_PS_STATE_DIR=%FPGA_DIR%build\state"
 if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%FPGA_DIR%build\ps"
 
@@ -46,6 +47,11 @@ if /I not "%ZLC_PS_SERVER_BACKEND%"=="jtag-axi" if /I not "%ZLC_PS_SERVER_BACKEN
 if not exist "%ZLC_PS_TARGET%" (
   echo ERROR: canonical PulseTarget file does not exist:
   echo   %ZLC_PS_TARGET%
+  exit /b 2
+)
+if not exist "%ZLC_PS_XDC%" (
+  echo ERROR: server-side pulse constraints file does not exist:
+  echo   %ZLC_PS_XDC%
   exit /b 2
 )
 if /I "%ZLC_PS_SERVER_BACKEND%"=="uart" if not defined ZLC_PS_UART_PORT (
@@ -65,11 +71,12 @@ echo ZLC current-only pulse execution server
 echo Host:    %ZLC_PS_HOST%:%ZLC_PS_PORT%
 echo Backend: %ZLC_PS_SERVER_BACKEND%
 echo Target:  %ZLC_PS_TARGET%
+echo XDC:     %ZLC_PS_XDC%
 echo Geometry/clock: fpga\board_config\streamer_config.json
 echo Bitstream policy: frozen; this launcher never synthesizes or programs hardware
 
 if "%ZLC_CHECK_ONLY%"=="1" (
-  %ZLC_PY_CMD% -c "from fpga.pulse_streamer.host.image import default_clock_hz,default_params,build_fingerprint; from zlc_pulse import load_pulse_target; from zlc_pulse.server_app import validate_deployed_target; t=load_pulse_target(r'%ZLC_PS_TARGET%'); p=default_params(); validate_deployed_target(t,p); print('Target ABI:',t.abi_fingerprint); print('Raw lanes:',len(t.raw_lanes)); print('Clock Hz:',default_clock_hz()); print('Geometry fingerprint: 0x%%08X'%%build_fingerprint(p))"
+  %ZLC_PY_CMD% -c "from fpga.pulse_streamer.host.image import default_clock_hz,default_params,build_fingerprint; from zlc_pulse import load_pulse_target,pulse_target_manifest_from_xdc; from zlc_pulse.server_app import validate_deployed_target; t=load_pulse_target(r'%ZLC_PS_TARGET%'); m=pulse_target_manifest_from_xdc(t,r'%ZLC_PS_XDC%'); p=default_params(); validate_deployed_target(t,p); print('Target ABI:',t.abi_fingerprint); print('Published ports:',len(m.ports)); print('Raw lanes:',len(t.raw_lanes)); print('Clock Hz:',default_clock_hz()); print('Geometry fingerprint: 0x%%08X'%%build_fingerprint(p))"
   set "ZLC_STATUS=!ERRORLEVEL!"
   popd
   endlocal & exit /b !ZLC_STATUS!
@@ -83,6 +90,7 @@ if /I "%ZLC_PS_SERVER_BACKEND%"=="uart" (
 
 %ZLC_PY_CMD% -m zlc_pulse.server_app ^
   --target "%ZLC_PS_TARGET%" ^
+  --xdc "%ZLC_PS_XDC%" ^
   --backend %ZLC_PS_SERVER_BACKEND% ^
   --state-dir "%ZLC_PS_STATE_DIR%" ^
   --host %ZLC_PS_HOST% ^
@@ -102,6 +110,7 @@ echo.
 echo Deployment environment:
 echo   ZLC_PS_SERVER_BACKEND=jtag-axi ^| uart   ^(default jtag-axi; never auto-guessed^)
 echo   ZLC_PS_TARGET=path\to\pulse_target.json
+echo   ZLC_PS_XDC=path\to\board.xdc            ^(server-side authority^)
 echo   ZLC_PS_UART_PORT=COM3                    ^(required for uart^)
 echo   ZLC_PS_HOST=0.0.0.0
 echo   ZLC_PS_PORT=18861

@@ -36,6 +36,8 @@ from zlc_pulse import (
     PulseDocument,
     PulseFieldRef,
     PulseExecutionForm,
+    PulseTargetEditResult,
+    PulseTargetManifest,
     PulseTimelineDocument,
     RepeatRegion,
     ScanParameter,
@@ -49,9 +51,12 @@ from zlc_pulse import (
     resolve_scan_point,
     replace_field_binding,
     replace_pulse_field,
+    replace_pulse_document_target,
+    restrict_pulse_document_to_manifest,
     set_analog_action,
     set_digital_output,
     set_output_delay,
+    pulse_target_manifest_from_lanes,
     validate_pulse_document_clock_grid,
 )
 from zlc_workbench.pulse import PulseEditorSession, project_pulse_preview
@@ -244,6 +249,8 @@ class PulseEditorControllerSnapshot:
     connection_mode: str
     connection_endpoint: str
     target_descriptor: PulseTargetDescriptor | None
+    target_manifest: PulseTargetManifest
+    display_visible_ports: tuple[str, ...]
     run_snapshot: RunSnapshot | None
     run_generation: int | None
     run_revision: int | None
@@ -277,6 +284,7 @@ class PulseEditorController:
         *,
         pulse: PulseRunFacade | None = None,
         descriptor: PulseTargetDescriptor | None = None,
+        authoring_manifest: PulseTargetManifest | None = None,
         connection_factory: Callable[
             [str, str | None, int | None, PulseDocument], OwnedPulseConnection
         ]
@@ -291,6 +299,19 @@ class PulseEditorController:
             raise ValueError("pulse facade and descriptor must appear together")
         if pulse is not None and connection_factory is not None:
             raise ValueError("an installation-managed editor cannot replace its authority")
+        if authoring_manifest is None:
+            authoring_manifest = (
+                descriptor.manifest
+                if descriptor is not None
+                else pulse_target_manifest_from_lanes(editor.document.target)
+            )
+        if not isinstance(authoring_manifest, PulseTargetManifest):
+            raise TypeError("authoring_manifest must be PulseTargetManifest")
+        if (
+            authoring_manifest.target.abi_fingerprint
+            != editor.document.target.abi_fingerprint
+        ):
+            raise ValueError("authoring manifest target differs from editor document")
         if pulse is None:
             mode = "offline" if initial_connection_mode is None else str(initial_connection_mode)
             if mode != "offline":
@@ -302,6 +323,7 @@ class PulseEditorController:
         self._editor = editor
         self._pulse = pulse
         self._descriptor = descriptor
+        self._authoring_manifest = authoring_manifest
         self._connection_factory = connection_factory
         self._owned_connection: OwnedPulseConnection | None = None
         self._notify = notify or (lambda: None)
@@ -373,6 +395,20 @@ class PulseEditorController:
         self._connection_state = "ready" if pulse is not None else "offline"
         self._connection_mode = mode
         self._connection_endpoint = str(initial_connection_endpoint)
+        self._active_manifest_mode = mode if descriptor is not None else "offline"
+        self._display_ports_by_mode: dict[str, tuple[str, ...]] = {
+            self._active_manifest_mode: (
+                editor.document.visible_ports
+                if self._active_manifest_mode == "offline"
+                else descriptor.manifest.available_port_keys
+            )
+        }
+        self._pending_connection_request: tuple[
+            str,
+            str | None,
+            int | None,
+            str,
+        ] | None = None
         self._reset_scan_workspace(editor.document)
         self.request_preview()
 
@@ -388,6 +424,17 @@ class PulseEditorController:
 
     def snapshot(self) -> PulseEditorControllerSnapshot:
         revision, document = self._editor.snapshot()
+        source_manifest = (
+            self._descriptor.manifest
+            if self._descriptor is not None
+            else self._authoring_manifest
+        )
+        target_manifest = source_manifest.with_target(document.target)
+        display_visible_ports = self._display_ports_for(
+            self._active_manifest_mode,
+            target_manifest,
+            document=document,
+        )
         return PulseEditorControllerSnapshot(
             document=document,
             document_generation=self._editor_generation,
@@ -399,6 +446,8 @@ class PulseEditorController:
             connection_mode=self._connection_mode,
             connection_endpoint=self._connection_endpoint,
             target_descriptor=self._descriptor,
+            target_manifest=target_manifest,
+            display_visible_ports=display_visible_ports,
             run_snapshot=self._run_snapshot,
             run_generation=self._run_generation,
             run_revision=self._run_revision,
@@ -423,17 +472,75 @@ class PulseEditorController:
             close_complete=self._close_complete,
         )
 
+    def _display_ports_for(
+        self,
+        mode: str,
+        manifest: PulseTargetManifest,
+        *,
+        document: PulseDocument | None = None,
+    ) -> tuple[str, ...]:
+        source = self._editor.document if document is None else document
+        saved = self._display_ports_by_mode.get(mode)
+        if saved is None:
+            saved = (
+                source.visible_ports
+                if mode == "offline"
+                else manifest.available_port_keys
+            )
+        selected = set(saved)
+        return tuple(
+            key for key in manifest.available_port_keys if key in selected
+        )
+
     def replace_document(self, document: PulseDocument) -> int:
         self._require_authoring_available()
         previous = self._editor.document
         if self._descriptor is not None:
             document = bind_pulse_document_target(document, self._descriptor.target)
+            document = restrict_pulse_document_to_manifest(
+                document,
+                self._descriptor.manifest,
+            )
             validate_pulse_document_clock_grid(document, self._descriptor.clock_hz)
+        elif (
+            document.target.abi_fingerprint
+            != self._authoring_manifest.target.abi_fingerprint
+        ):
+            self._authoring_manifest = pulse_target_manifest_from_lanes(
+                document.target
+            )
         document = self._invalidate_changed_scan_schema(previous, document)
         revision = self._editor.replace_document(document)
+        if self._active_manifest_mode == "offline":
+            self._display_ports_by_mode["offline"] = document.visible_ports
         self._observe_document_schema_change(previous, document)
         self.request_preview()
         return revision
+
+    def apply_target_manifest(
+        self,
+        manifest: PulseTargetManifest,
+        *,
+        cascade: bool = False,
+    ) -> PulseTargetEditResult:
+        """Commit one Offline Target draft and document remap as one owner turn."""
+
+        self._require_authoring_available()
+        if self._descriptor is not None or self._connection_mode != "offline":
+            raise RuntimeError("Target topology is editable only in Offline mode")
+        previous = self._editor.document
+        result = replace_pulse_document_target(
+            previous,
+            manifest,
+            cascade=cascade,
+        )
+        document = self._invalidate_changed_scan_schema(previous, result.document)
+        self._editor.replace_document(document)
+        self._authoring_manifest = result.manifest.with_target(document.target)
+        self._display_ports_by_mode["offline"] = document.visible_ports
+        self._observe_document_schema_change(previous, document)
+        self.request_preview()
+        return PulseTargetEditResult(document, self._authoring_manifest, result.impact)
 
     def rename_document(self, name: str) -> int:
         """Commit the visible pulse name without making the view an authority."""
@@ -528,22 +635,26 @@ class PulseEditorController:
     def set_visible_ports(self, ports: tuple[str, ...] | list[str]) -> int:
         document = self._editor.document
         requested = tuple(str(port) for port in ports)
-        supported = {
-            port.key
-            for port in document.target.ports
-            if port.kind in (PORT_DIGITAL, PORT_DAC)
-        }
+        manifest = (
+            self._descriptor.manifest.with_target(document.target)
+            if self._descriptor is not None
+            else self._authoring_manifest.with_target(document.target)
+        )
+        supported = set(manifest.available_port_keys)
         unknown = set(requested) - supported
         if unknown:
             raise KeyError(f"unknown visible pulse ports: {sorted(unknown)}")
         if len(set(requested)) != len(requested):
             raise ValueError("visible pulse ports must be unique")
+        selected = set(requested)
         ordered = tuple(
-            port.key
-            for port in document.target.ports
-            if port.key in set(requested)
+            key for key in manifest.available_port_keys if key in selected
         )
-        return self.replace_document(replace(document, visible_ports=ordered))
+        self._display_ports_by_mode[self._active_manifest_mode] = ordered
+        if self._active_manifest_mode == "offline":
+            return self.replace_document(replace(document, visible_ports=ordered))
+        self._notify()
+        return self._editor.revision
 
     def clear_port(self, port: str) -> int:
         """Apply the formal row-clear action through the domain owner."""
@@ -1024,33 +1135,71 @@ class PulseEditorController:
         )
 
     def connect(self, mode: str, endpoint: str = "") -> None:
-        if self._pulse is not None or self._connection_factory is None:
-            raise RuntimeError("this Pulse editor cannot establish an installation")
+        if self._connection_factory is None:
+            raise RuntimeError("this Pulse editor cannot change its installation")
         if self._connect_inflight or self._close_requested:
             return
+        if self._owned_close_failed:
+            raise RuntimeError("the current Pulse installation did not close safely")
         if self._load_inflight or self._save_inflight or self._run_busy():
             raise RuntimeError("connection requires an idle Pulse editor")
         normalized_mode = str(mode).strip().lower()
         if normalized_mode == "remote":
             host, port = parse_remote_endpoint(endpoint)
+            endpoint_label = f"{host}:{port}"
         elif normalized_mode == "virtual":
             host, port = None, None
+            endpoint_label = "local virtual"
         elif normalized_mode == "offline":
-            self._connection_state = "offline"
-            self._connection_mode = "offline"
-            self._connection_endpoint = ""
-            self._diagnostic = ""
-            return
+            host, port, endpoint_label = None, None, ""
         else:
             raise ValueError("Pulse connection mode must be virtual, remote, or offline")
+
+        current_ports = self._display_ports_for(
+            self._active_manifest_mode,
+            (
+                self._descriptor.manifest.with_target(self._editor.document.target)
+                if self._descriptor is not None
+                else self._authoring_manifest.with_target(self._editor.document.target)
+            ),
+        )
+        self._display_ports_by_mode[self._active_manifest_mode] = current_ports
+        request = (normalized_mode, host, port, endpoint_label)
+
+        if self._owned_connection is not None:
+            if (
+                normalized_mode == self._active_manifest_mode
+                and endpoint_label == self._connection_endpoint
+            ):
+                return
+            self._pending_connection_request = request
+            self._connect_inflight = True
+            self._owned_close_inflight = True
+            self._connection_state = "switching"
+            self._connection_mode = normalized_mode
+            self._connection_endpoint = endpoint_label
+            connection = self._owned_connection
+            self._submit("switch-close", connection, connection.close)
+            return
+
+        if normalized_mode == "offline":
+            self._activate_offline()
+            return
+        self._begin_connection(request)
+
+    def _begin_connection(
+        self,
+        request: tuple[str, str | None, int | None, str],
+    ) -> None:
+        normalized_mode, host, port, endpoint_label = request
         connector = self._connection_factory
+        if connector is None:
+            raise RuntimeError("this Pulse editor cannot establish an installation")
         required_document = self._editor.document
         self._connect_inflight = True
         self._connection_state = "connecting"
         self._connection_mode = normalized_mode
-        self._connection_endpoint = (
-            "local virtual" if host is None else f"{host}:{port}"
-        )
+        self._connection_endpoint = endpoint_label
 
         def connect_owned():
             connection = connector(
@@ -1075,6 +1224,21 @@ class PulseEditorController:
             connect_owned,
         )
 
+    def _activate_offline(self) -> None:
+        self._owned_connection = None
+        self._pulse = None
+        self._descriptor = None
+        self._active_manifest_mode = "offline"
+        self._connection_state = "offline"
+        self._connection_mode = "offline"
+        self._connection_endpoint = ""
+        self._diagnostic = ""
+        self._run_snapshot = None
+        self._applied_snapshot = None
+        self._run_generation = None
+        self._run_revision = None
+        self._scan_progress = None
+
     def start(
         self,
         form: PulseExecutionForm,
@@ -1094,6 +1258,10 @@ class PulseEditorController:
         document = self._editor.document
         if self._descriptor is not None:
             rebound = bind_pulse_document_target(document, self._descriptor.target)
+            rebound = restrict_pulse_document_to_manifest(
+                rebound,
+                self._descriptor.manifest,
+            )
             validate_pulse_document_clock_grid(rebound, self._descriptor.clock_hz)
             if rebound != document:
                 self.replace_document(rebound)
@@ -1611,6 +1779,12 @@ class PulseEditorController:
                     loaded = future.result()
                     if self._descriptor is not None:
                         loaded.bind_target(self._descriptor.target)
+                        loaded.replace_document(
+                            restrict_pulse_document_to_manifest(
+                                loaded.document,
+                                self._descriptor.manifest,
+                            )
+                        )
                         validate_pulse_document_clock_grid(
                             loaded.document,
                             self._descriptor.clock_hz,
@@ -1620,6 +1794,25 @@ class PulseEditorController:
                 else:
                     if not self._close_requested and not self._run_busy():
                         self._editor = loaded
+                        if self._descriptor is None:
+                            if (
+                                loaded.document.target.abi_fingerprint
+                                == self._authoring_manifest.target.abi_fingerprint
+                            ):
+                                self._authoring_manifest = (
+                                    self._authoring_manifest.with_target(
+                                        loaded.document.target
+                                    )
+                                )
+                            else:
+                                self._authoring_manifest = (
+                                    pulse_target_manifest_from_lanes(
+                                        loaded.document.target
+                                    )
+                                )
+                        self._display_ports_by_mode["offline"] = (
+                            loaded.document.visible_ports
+                        )
                         self._editor_generation += 1
                         self._reset_scan_workspace(loaded.document)
                         self._diagnostic = f"Opened {loaded.path}"
@@ -1651,7 +1844,6 @@ class PulseEditorController:
                 try:
                     connection = future.result()
                 except InstallationRestartRequiredError as error:
-                    self._connection_factory = None
                     self._connection_state = "restart_required"
                     self._diagnostic = str(error)
                     continue
@@ -1674,6 +1866,10 @@ class PulseEditorController:
                         self._editor.document,
                         descriptor.target,
                     )
+                    rebound = restrict_pulse_document_to_manifest(
+                        rebound,
+                        descriptor.manifest,
+                    )
                     validate_pulse_document_clock_grid(
                         rebound,
                         descriptor.clock_hz,
@@ -1691,10 +1887,35 @@ class PulseEditorController:
                 self._owned_connection = connection
                 self._pulse = connection.pulse
                 self._descriptor = descriptor
-                self._connection_factory = None
+                self._active_manifest_mode = str(token[0])
+                if self._active_manifest_mode not in self._display_ports_by_mode:
+                    self._display_ports_by_mode[self._active_manifest_mode] = (
+                        descriptor.manifest.available_port_keys
+                    )
                 self._connection_state = "ready"
                 self._diagnostic = ""
                 self.request_preview()
+                continue
+            if kind == "switch-close":
+                self._owned_close_inflight = False
+                request = self._pending_connection_request
+                self._pending_connection_request = None
+                try:
+                    future.result()
+                except BaseException as error:
+                    self._connect_inflight = False
+                    self._owned_close_failed = True
+                    self._connection_state = "close_blocked"
+                    self._diagnostic = f"Pulse installation SAFE close failed: {error}"
+                    continue
+                self._activate_offline()
+                self._connect_inflight = False
+                if (
+                    request is not None
+                    and request[0] != "offline"
+                    and not self._close_requested
+                ):
+                    self._begin_connection(request)
                 continue
             if kind == "discard-connection":
                 try:
@@ -1705,7 +1926,6 @@ class PulseEditorController:
                         OwnedPulseConnection,
                     ):
                         self._owned_connection = token
-                    self._connection_factory = None
                     self._owned_close_failed = True
                     self._connection_state = "close_blocked"
                     self._diagnostic = f"Remote SAFE close failed: {error}"
@@ -1909,7 +2129,6 @@ class PulseEditorController:
         diagnostic: str,
     ) -> None:
         self._owned_connection = connection
-        self._connection_factory = None
         self._connection_state = "restart_required"
         self._diagnostic = diagnostic
         self._owned_close_inflight = True
@@ -2040,7 +2259,12 @@ class PulseEditorController:
                 self._submit("close-owned", connection, connection.close)
             return
         if not self._pool_closed:
-            self._pool.shutdown(wait=False)
+            # There are no tracked futures/results at this boundary, so the
+            # executor is idle and joining it cannot wait on product work.
+            # Publishing close_complete after shutdown(wait=False) left worker
+            # threads unwinding while Python destroyed Qt/font resources at
+            # process exit, producing intermittent 0xC0000409 crashes.
+            self._pool.shutdown(wait=True)
             self._pool_closed = True
         self._connection_state = "closed"
         self._close_complete = True

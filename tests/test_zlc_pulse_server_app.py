@@ -14,6 +14,7 @@ from zlc_pulse import (
     PulseTarget,
     load_deployed_pulse_target,
     load_pulse_target,
+    pulse_target_manifest_from_xdc,
 )
 from zlc_pulse.server_app import (
     bring_up_frozen_session,
@@ -77,6 +78,13 @@ class AppSession:
 
 def _target():
     return load_deployed_pulse_target()
+
+
+def _manifest():
+    return pulse_target_manifest_from_xdc(
+        _target(),
+        ROOT / "fpga" / "board_config" / "board.xdc",
+    )
 
 
 def test_target_file_loader_accepts_only_the_current_canonical_schema(tmp_path):
@@ -157,7 +165,7 @@ def test_server_rejects_target_or_session_geometry_drift():
 
     session = AppSession(replace(params, bank_size=1024))
     with pytest.raises(ValueError, match="session geometry"):
-        build_service_for_session(target, session, params=params, clock_hz=50e6)
+        build_service_for_session(_manifest(), session, params=params, clock_hz=50e6)
 
 
 def test_server_runtime_composes_only_the_current_service(monkeypatch, tmp_path):
@@ -191,7 +199,7 @@ def test_server_runtime_composes_only_the_current_service(monkeypatch, tmp_path)
 
     monkeypatch.setattr("zlc_pulse.server_app.serve_pulse_execution_service", fake_serve)
     runtime = build_server_runtime(
-        _target(),
+        _manifest(),
         backend="jtag-axi",
         state_dir=tmp_path,
         params=params,
@@ -229,7 +237,7 @@ def test_rpc_server_construction_failure_closes_the_hardware_owner(monkeypatch, 
     )
     with pytest.raises(RuntimeError, match="cannot bind"):
         build_server_runtime(
-            _target(),
+            _manifest(),
             backend="jtag-axi",
             state_dir=tmp_path,
             params=params,

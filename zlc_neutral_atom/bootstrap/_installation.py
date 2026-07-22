@@ -45,12 +45,15 @@ from zlc_neutral_atom.runtime.run import RunController, RunHandle, RunPlan
 from zlc_neutral_atom.runtime.safety_journal import PersistentSafetyJournal
 from zlc_neutral_atom.timing.pulse import BoundPulsePort
 from zlc_pulse import (
+    PORT_DAC,
     PORT_DIGITAL,
     PulseDocument,
     PulseTarget,
+    PulseTargetManifest,
     RemotePulseExecutionClient,
     bind_pulse_document_target,
     load_deployed_pulse_target,
+    pulse_target_manifest,
     validate_pulse_document_clock_grid,
 )
 from zlc_storage import canonical_digest, durable_mkdir, normalized_text
@@ -75,6 +78,11 @@ _COOLING_CHANNELS = ("ch00", "ch01")
 _PROBE_CHANNELS = ("ch03",)
 _TRAP_CHANNELS = ("ch09",)
 _CAMERA_TRIGGER_CHANNELS = ("ch11",)
+_VIRTUAL_MOT_COIL_PORTS = {
+    "da_x": "da_bias_x",
+    "da_y": "da_bias_y",
+    "da_z": "da_bias_z",
+}
 
 
 def _virtual_readout_geometry() -> ReadoutGridGeometry:
@@ -212,19 +220,49 @@ def _deployed_target() -> PulseTarget:
         *_PROBE_CHANNELS,
         *_TRAP_CHANNELS,
         *_CAMERA_TRIGGER_CHANNELS,
+        *_VIRTUAL_MOT_COIL_PORTS.values(),
     }
     missing = tuple(sorted(required.difference(target.by_key)))
     if missing:
         raise RuntimeError(
             f"deployed PulseTarget is missing virtual installation ports {missing}"
         )
-    for key in sorted(required):
+    for key in sorted(required.difference(_VIRTUAL_MOT_COIL_PORTS.values())):
         port = target.by_key[key]
         if port.kind != PORT_DIGITAL or port.lanes != (key,):
             raise RuntimeError(
                 f"virtual installation wiring {key!r} is not a one-lane digital port"
             )
+    for key in _VIRTUAL_MOT_COIL_PORTS.values():
+        port = target.by_key[key]
+        if port.kind != PORT_DAC or port.latch_clock is None:
+            raise RuntimeError(
+                f"virtual MOT wiring {key!r} is not a latched DAC port"
+            )
     return target
+
+
+def _virtual_target_manifest(target: PulseTarget) -> PulseTargetManifest:
+    """Publish exactly the simulator wires with a physical-model consumer."""
+
+    endpoints: dict[str, tuple[str, ...]] = {
+        "ch00": ("SIM:C0",),
+        "ch01": ("SIM:C1",),
+        "ch03": ("SIM:PROBE",),
+        "ch09": ("SIM:TRAP",),
+        "ch11": ("SIM:CAM",),
+    }
+    for model_axis, port_key in _VIRTUAL_MOT_COIL_PORTS.items():
+        port = target.by_key[port_key]
+        endpoints[port_key] = tuple(
+            f"SIM:{model_axis.removeprefix('da_').upper()}{bit}"
+            for bit in range(port.width)
+        )
+        assert port.latch_clock is not None
+        endpoints[port.latch_clock] = (
+            f"SIM:{model_axis.removeprefix('da_').upper()}CLK",
+        )
+    return pulse_target_manifest(target, endpoints)
 
 
 def _identity_for(
@@ -339,8 +377,9 @@ def _bind_sequencer(
     asset: InstallationAsset,
     asset_map_revision: str,
     sequencer: VirtualSequencer,
+    manifest: PulseTargetManifest,
 ) -> BoundPulsePort:
-    endpoint = VirtualSequencerExecutionEndpoint(sequencer)
+    endpoint = VirtualSequencerExecutionEndpoint(sequencer, manifest)
     binding: BoundDevice | None = None
 
     def current_binding() -> BoundDevice:
@@ -745,6 +784,7 @@ def create_virtual_installation(
     broker: DeviceBroker | None = None
     try:
         target = _deployed_target()
+        target_manifest = _virtual_target_manifest(target)
         readout_geometry = _virtual_readout_geometry()
         trap = VirtualAtomArray(
             geometry=readout_geometry,
@@ -768,7 +808,10 @@ def create_virtual_installation(
             capture_trigger_channels=_CAMERA_TRIGGER_CHANNELS,
         )
         devices["camera"] = camera
-        monitor_camera = VirtualMonitorCamera(sequencer)
+        monitor_camera = VirtualMonitorCamera(
+            sequencer,
+            coil_ports=_VIRTUAL_MOT_COIL_PORTS,
+        )
         devices["monitor_camera"] = monitor_camera
         # The trap is a private simulator model behind the camera, not an unbound
         # public physical-device role.  It remains in the exact reverse-close graph.
@@ -803,6 +846,7 @@ def create_virtual_installation(
             assets.require("sequencer", sequencer),
             assets.revision,
             sequencer,
+            target_manifest,
         )
         sitemap_profile = SitemapAcquisitionProfile(
             readout_binding=ReadoutBindingKey("camera"),

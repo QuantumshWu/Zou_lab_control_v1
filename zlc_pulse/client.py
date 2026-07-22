@@ -19,13 +19,14 @@ from .server import (
     encode_prepared_ref_message,
     prepared_pulse_ref_from_tree,
 )
-from .target import PulseTarget, pulse_target_from_tree
+from .manifest import PulseTargetManifest, pulse_target_manifest_from_tree
+from .target import PulseTarget
 
 
 @dataclass(frozen=True)
 class PulseServerSnapshot:
     connection_generation: str
-    target: PulseTarget
+    manifest: PulseTargetManifest
     clock_hz: float
     geometry_fingerprint: int
     resident_scan_point_capacity: int
@@ -33,12 +34,16 @@ class PulseServerSnapshot:
     prepared_ref: PreparedPulseRef | None
     backend: dict[str, object]
 
+    @property
+    def target(self) -> PulseTarget:
+        return self.manifest.target
+
 
 def pulse_server_snapshot_from_tree(tree: object) -> PulseServerSnapshot:
     fields = {
         "schema",
         "connection_generation",
-        "target",
+        "manifest",
         "clock_hz",
         "geometry_fingerprint",
         "resident_scan_point_capacity",
@@ -80,7 +85,7 @@ def pulse_server_snapshot_from_tree(tree: object) -> PulseServerSnapshot:
     raw_ref = tree["prepared_ref"]
     return PulseServerSnapshot(
         generation,
-        pulse_target_from_tree(tree["target"]),
+        pulse_target_manifest_from_tree(tree["manifest"]),
         float(clock),
         geometry,
         resident_capacity,

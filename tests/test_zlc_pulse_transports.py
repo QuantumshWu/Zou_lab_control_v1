@@ -33,6 +33,7 @@ from zlc_pulse import (
     compile_pulse_artifact,
     freeze_scan_table,
     load_pulse_document,
+    pulse_target_manifest_from_lanes,
 )
 from zlc_pulse.transport import (
     DeployedStreamerSession,
@@ -159,7 +160,7 @@ def test_public_service_rejects_nonresident_scan_before_backend_io():
     transport = TraceRegisterTransport(params)
     session = _session(document, params, transport)
     service = PulseExecutionService(
-        document.target,
+        pulse_target_manifest_from_lanes(document.target),
         clock_hz=50e6,
         backend=session,
         params=params,

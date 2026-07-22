@@ -117,6 +117,56 @@ def test_summary_keeps_expanded_pulse_and_repeat_warnings() -> None:
         _process_events(application)
 
 
+def test_offline_summary_does_not_preflight_frozen_streamer_geometry() -> None:
+    """A valid authoring target may exceed the currently deployed FPGA ABI.
+
+    The Edit summary must remain usable; Preview/Run preflight is the boundary
+    that may reject deployment.  This reproduces the former Qt-slot crash after
+    adding an Offline DAC port.
+    """
+
+    application = ensure_qt_app()
+    lanes = tuple(f"authoring_{index}" for index in range(70))
+    target = PulseTarget(
+        lanes,
+        tuple(
+            PulsePortSpec(
+                lane,
+                PORT_DIGITAL,
+                (lane,),
+                f"Offline {index}",
+                None,
+                1,
+                "binary",
+                0,
+                None,
+            )
+            for index, lane in enumerate(lanes)
+        ),
+    )
+    document = PulseDocument(
+        "offline authoring geometry",
+        target,
+        10.0,
+        (
+            PulsePeriod(
+                "p1",
+                100,
+                "ns",
+                "one logical pulse",
+                (1,) + (0,) * (len(lanes) - 1),
+            ),
+        ),
+        visible_ports=(lanes[0],),
+    )
+    view = PulseScheduleView(document)
+    try:
+        assert " | 1 pulses | " in view.summary_text()
+    finally:
+        view.close()
+        _process_events(application)
+
+
 def test_summary_repeat_wording_uses_the_same_three_state_policy() -> None:
     application = ensure_qt_app()
     base = _interaction_document(period_count=3)

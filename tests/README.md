@@ -5,9 +5,15 @@ Run the smallest check that proves the changed boundary still works.  Full `pyte
 ## Principles (see the repo-root `AGENTS.md` for the full rules)
 
 - **Contract tests, Python side only.** There is no iverilog/cocotb in the repo: RTL behaviour is checked by a faithful Python mirror plus `xsim` (the real IP netlist — the strongest hardware evidence), and verilog port widths are locked by a Python contract test (`test_..._vio_widths_match_python_generator`).
-- **Visual changes must be verified as the user sees them.**  Use
-  `Zou_lab_control.frontend.devtools.capture_user_view(target, out_dir, scales=(1.0, 1.25, 1.5))`
-  — a whole-window screenshot at THIS MACHINE's own display scale, inspected as a 1:1 pixel crop; the `parity` target compares the two GUIs' control sizes on one screen.  Do not force a scale factor: a window checked at invented scales proves nothing the real one does not.  Popups / sub-widgets: `widget.grab()`.  Settle ≥ 800 ms before grabbing.
+- **Every GUI uses the same two visual-debug paths.**  The fast path is
+  `ensure_qt_app()` → the formal composition/open function → real Qt input →
+  outer `FluentWindow.grab()` at this machine's actual display scale.  It must
+  not force DPI, size, style, tabs, or controller state.  The slow final/dispute
+  path starts the formal `.py/.bat` launcher and uses desktop mouse input plus a
+  screen capture.  Both paths share the same application owner, composition,
+  sizing/style, and operator sequence.  `offscreen`/`minimal` is behavior-only
+  evidence and can never be reported as visual acceptance.  This rule applies
+  to PulseGUI, TaskConsole, DeviceManager, FigureViewer, and every future GUI.
 - **Performance optimizations must be logic/appearance-neutral.**  Only make the same output faster (analytic Jacobian, skip-if-unchanged guards, cached invariants); never change cadence/appearance.  Prove equivalence (e.g. fit `popt` agrees numerically).
 - **After delete/refactor:** `git grep` of the dead identifier == 0; `python -m compileall` clean; no stray TODO/FIXME.
 
@@ -75,18 +81,24 @@ generated `impl_1\zlc_pulse_streamer_top.{bit,ltx}`.
 
 ## GUI Screenshot Checks
 
-When Pulse GUI internals are split, verify the formal `PulseEditorWindowBody` and the
-outer `FluentWindow`.  Let Qt render before grabbing screenshots:
+Application-specific fast flows reuse `tests/gui_user_flow.py`; they define only
+their visible input sequence.  The shared owner selects `QT_QPA_PLATFORM=offscreen`
+before the sole `ensure_qt_app()` call, then captures the untouched formal outer
+window.  On Windows that same owner registers the product's declared system font
+when the offscreen plugin provides no fonts; `test_qt_app_single_entry.py`
+requires actual glyph pixels, so an empty-text screenshot cannot pass.  For
+PulseGUI, run from the repo root:
 
-```python
-app.processEvents()
-QtTest.QTest.qWait(1000)
-app.processEvents()
-body.window().grab().save(str(path))
+```powershell
+python tests\pulse_gui_user_flow.py --out .gui-evidence\pulse
 ```
 
-Object-level checks for button text, visible channels, labels, and geometry are
-still useful because offscreen screenshots can miss native Windows text.
+This fast path must remain offscreen and therefore must not open a desktop
+window.  Final or disputed appearance uses the slow path: launch the corresponding
+root `.py/.bat` entry, drive the visible GUI with desktop mouse/keyboard, and take
+a screen screenshot.  Both paths use the same application owner, composition,
+sizing/style, and product input sequence.  Object-level checks for button text,
+visible channels, labels, and geometry remain complementary behavior oracles.
 
 ## Cleanup
 

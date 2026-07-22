@@ -24,6 +24,7 @@ from zlc_pulse import (
     PulseDocument,
     PulseExecutionForm,
     PulseTarget,
+    PulseTargetManifest,
     build_pulse_playback,
     pulse_completion_from_tree,
     pulse_completion_to_tree,
@@ -223,7 +224,7 @@ class PulseTerminalEvidenceKind(str, Enum):
 @dataclass(frozen=True)
 class SequencerCapabilitySnapshot:
     binding_stamp: DeviceBindingStamp
-    target: PulseTarget
+    manifest: PulseTargetManifest
     clock_hz: float
     geometry_fingerprint: int
     resident_scan_point_capacity: int
@@ -235,8 +236,8 @@ class SequencerCapabilitySnapshot:
     def __post_init__(self) -> None:
         if not isinstance(self.binding_stamp, DeviceBindingStamp):
             raise TypeError("binding_stamp must be DeviceBindingStamp")
-        if not isinstance(self.target, PulseTarget):
-            raise TypeError("target must be PulseTarget")
+        if not isinstance(self.manifest, PulseTargetManifest):
+            raise TypeError("manifest must be PulseTargetManifest")
         object.__setattr__(self, "clock_hz", _positive_float(self.clock_hz, "clock_hz"))
         if (
             isinstance(self.geometry_fingerprint, bool)
@@ -265,6 +266,10 @@ class SequencerCapabilitySnapshot:
                 "server_connection_generation",
             )
         _sha256(self.capability_fingerprint, "capability_fingerprint")
+
+    @property
+    def target(self) -> PulseTarget:
+        return self.manifest.target
 
     @property
     def target_abi_fingerprint(self) -> str:

@@ -630,7 +630,7 @@ class PulseFacade:
             capability = port.capability
             return PulseTargetDescriptor(
                 reference,
-                capability.target,
+                capability.manifest,
                 capability.clock_hz,
                 capability.geometry_fingerprint,
                 capability.resident_scan_point_capacity,

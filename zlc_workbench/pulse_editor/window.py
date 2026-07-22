@@ -43,7 +43,7 @@ from zlc_frontend.qt_widgets import (
     window_pad,
 )
 from zlc_neutral_atom.runtime.run import RunState
-from zlc_pulse import PulseExecutionForm
+from zlc_pulse import DestructivePulseTargetEditError, PulseExecutionForm
 from zlc_storage.paths import project_path
 
 from ._layout import px
@@ -55,6 +55,7 @@ from .scan_view import (
     format_scan_progress,
 )
 from .schedule_view import PulseScheduleView
+from .target_view import PulseTargetView
 
 
 _PULSE_FILES_ENV = "ZLC_PULSE_DIR"
@@ -164,14 +165,26 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self.tabs = FluentTabWidget()
         self.schedule_view = PulseScheduleView(
             snapshot.document,
+            snapshot.target_manifest,
+            display_visible_ports=snapshot.display_visible_ports,
             document_generation=snapshot.document_generation,
             revision=snapshot.editor_revision,
         )
         self.preview_view = PulsePreviewView()
         self.scan_view = PulseScanView()
+        self.target_view = PulseTargetView(
+            snapshot.target_manifest,
+            editable=(
+                snapshot.target_descriptor is None
+                and snapshot.connection_state == "offline"
+                and snapshot.connection_mode == "offline"
+            ),
+            mode=snapshot.connection_mode,
+        )
         self.tabs.addTab(self.schedule_view, "Edit")
         self.tabs.addTab(self.preview_view, "Preview")
         self.tabs.addTab(self.scan_view, "Scan")
+        self.tabs.addTab(self.target_view, "Target")
         root.addWidget(self.tabs, 1)
 
         self.preview_host = SinglePanelHost(
@@ -293,6 +306,8 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
                 "loaded" if use_loaded else "generated",
             )
         )
+        self.target_view.feedbackRequested.connect(self._message)
+        self.target_view.applyRequested.connect(self._apply_target_manifest)
 
         self.preview_view.includeOffToggled.connect(
             lambda checked: self._invoke(
@@ -372,6 +387,33 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             self.preview_view.reset_preview_size_pin()
             self._invoke(self._controller.reset_preview_size)
             self._invoke(self._controller.request_preview)
+
+    def _apply_target_manifest(self, manifest) -> None:
+        try:
+            self._controller.apply_target_manifest(manifest)
+        except DestructivePulseTargetEditError as error:
+            references = "\n".join(
+                f"• {value}" for value in error.impact.cleared_references
+            )
+            if not fluent_confirm(
+                self,
+                "Pulse Target",
+                "The new target removes or changes ports used by this pulse. "
+                "Apply and clear these references?\n\n" + references,
+                confirm_text="Apply and clear",
+                cancel_text="Keep draft",
+            ):
+                return
+            self._invoke(
+                self._controller.apply_target_manifest,
+                manifest,
+                cascade=True,
+            )
+            return
+        except BaseException as error:
+            self._message(str(error))
+            return
+        self._wake.request_owner_wake()
 
     def _current_preview_pixel_ratio(self) -> float:
         """Read the physical/logical ratio of the screen painting this window."""
@@ -611,19 +653,39 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         document_key = (
             snapshot.document_generation,
             snapshot.editor_revision,
+            snapshot.target_manifest.fingerprint,
+            snapshot.display_visible_ports,
         )
         old_document_key = (
             None
             if previous is None
-            else (previous.document_generation, previous.editor_revision)
+            else (
+                previous.document_generation,
+                previous.editor_revision,
+                previous.target_manifest.fingerprint,
+                previous.display_visible_ports,
+            )
         )
         if document_key != old_document_key:
             self.schedule_view.set_document(
                 snapshot.document,
+                snapshot.target_manifest,
+                display_visible_ports=snapshot.display_visible_ports,
                 document_generation=snapshot.document_generation,
                 revision=snapshot.editor_revision,
             )
             self.scan_view.set_repeats(snapshot.document.scan_sweep_count)
+        self.target_view.set_manifest(
+            snapshot.target_manifest,
+            editable=(
+                snapshot.target_descriptor is None
+                and snapshot.connection_state == "offline"
+                and snapshot.connection_mode == "offline"
+                and not snapshot.file_busy
+                and not snapshot.run_busy
+            ),
+            mode=snapshot.connection_mode,
+        )
         self.summary.setText(self.schedule_view.summary_text())
         previous_diagnostic = "" if previous is None else previous.diagnostic
         if snapshot.diagnostic and snapshot.diagnostic != previous_diagnostic:
@@ -780,6 +842,8 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             mode = "offline" if snapshot.target_descriptor is None else "virtual"
         if snapshot.connection_state == "connecting":
             status = "Connecting…"
+        elif snapshot.connection_state == "switching":
+            status = "Switching safely…"
         elif snapshot.connection_state == "ready":
             status = (
                 snapshot.connection_endpoint

@@ -30,6 +30,7 @@ from zlc_pulse import (
     PulseDocument,
     PulseExecutionForm,
     PulseTarget,
+    PulseTargetManifest,
     bind_pulse_document_target,
     compile_pulse_artifact,
 )
@@ -113,7 +114,7 @@ class PulseTargetDescriptor:
     """Read-only target facts; it contains no hardware drive capability."""
 
     sequencer_ref: DeviceRef
-    target: PulseTarget
+    manifest: PulseTargetManifest
     clock_hz: float
     geometry_fingerprint: int
     resident_scan_point_capacity: int
@@ -121,8 +122,8 @@ class PulseTargetDescriptor:
     def __post_init__(self) -> None:
         if not isinstance(self.sequencer_ref, DeviceRef):
             raise TypeError("sequencer_ref must be DeviceRef")
-        if not isinstance(self.target, PulseTarget):
-            raise TypeError("target must be PulseTarget")
+        if not isinstance(self.manifest, PulseTargetManifest):
+            raise TypeError("manifest must be PulseTargetManifest")
         clock_hz = positive_real(self.clock_hz, "clock_hz")
         object.__setattr__(self, "clock_hz", clock_hz)
         if (
@@ -137,6 +138,10 @@ class PulseTargetDescriptor:
             or self.resident_scan_point_capacity < 1
         ):
             raise ValueError("resident_scan_point_capacity must be positive")
+
+    @property
+    def target(self) -> PulseTarget:
+        return self.manifest.target
 
     @property
     def time_step_ns(self) -> float:

@@ -610,6 +610,68 @@ class PulseDocument:
         return load_pulse_document(path)
 
 
+def count_authored_digital_pulses(document: PulseDocument) -> int:
+    """Count logical digital high intervals in one authored timeline pass.
+
+    This is a property of :class:`PulseDocument`, not of a deployed FPGA
+    geometry.  A constant output delay moves an entire logical output in time
+    without changing its interval count, and duration/DAC scan fields do not
+    change digital states.  The finite ``RepeatRegion`` is therefore evaluated
+    directly from the immutable period states.  Keeping this query here lets
+    authoring and summary views remain valid for an Offline target that is not
+    deployable on the currently frozen streamer; deployment validation remains
+    the compiler/preflight owner's responsibility.
+
+    The implementation summarizes the repeated body instead of materializing
+    ``count`` copies, while preserving transitions across the end/start boundary
+    of consecutive iterations.
+    """
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+
+    period_ids = tuple(period.period_id for period in document.periods)
+    if document.repeat is None:
+        segments = ((tuple(range(len(document.periods))), 1),)
+    else:
+        start = period_ids.index(document.repeat.start_period_id)
+        end = period_ids.index(document.repeat.end_period_id)
+        segments = (
+            (tuple(range(0, start)), 1),
+            (tuple(range(start, end + 1)), document.repeat.count),
+            (tuple(range(end + 1, len(document.periods))), 1),
+        )
+
+    lane_index = {
+        lane: index for index, lane in enumerate(document.target.raw_lanes)
+    }
+    total = 0
+    for port in document.target.ports:
+        if port.kind != PORT_DIGITAL:
+            continue
+        index = lane_index[port.lanes[0]]
+        previous = False
+        for period_indices, repetitions in segments:
+            if not period_indices:
+                continue
+            states = tuple(
+                bool(document.periods[period_index].states[index])
+                for period_index in period_indices
+            )
+            internal_rises = sum(
+                1
+                for left, right in zip(states, states[1:])
+                if not left and right
+            )
+            total += int(not previous and states[0]) + internal_rises
+            if repetitions > 1:
+                total += (repetitions - 1) * (
+                    int(not states[-1] and states[0]) + internal_rises
+                )
+            previous = states[-1]
+    return total
+
+
 def frozen_scan_table_to_tree(table: FrozenScanTable) -> dict[str, object]:
     if not isinstance(table, FrozenScanTable):
         raise TypeError("table must be FrozenScanTable")
@@ -907,6 +969,7 @@ __all__ = [
     "ScanRecipeProvenance",
     "TIME_UNITS",
     "TIME_UNIT_TO_NS",
+    "count_authored_digital_pulses",
     "frozen_scan_table_from_tree",
     "frozen_scan_table_to_tree",
     "load_pulse_document",
