@@ -839,19 +839,24 @@ class PeriodCard(FluentGroupBox):
 
         # The bus row is pinned to the SAME row height as every channel row (the combo and
         # value edit override their taller natural minimums), so the DAC rows keep the
-        # Name/Delay panels' pitch and the columns stay aligned past them.
+        # Name/Delay panels' pitch and the columns stay aligned past them.  The row shows
+        # NO name label -- like the reference, its identity is read ACROSS from the Port
+        # Catalog column; the card only holds the mode combo and the value field, so the
+        # widest value (-512) always fits.
         row = QtWidgets.QWidget()
+        row.setStyleSheet("background: transparent;")
         row.setFixedHeight(row_height)
         layout = QtWidgets.QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(_px(3, minimum=2))
-        layout.addWidget(FluentLabel(label if compact else f"{label}:"), 0)
+        # A clear gap between the mode combo and the value field (they used to sit
+        # almost flush, which read as one merged control).
+        layout.setSpacing(_px(7, minimum=5))
 
         combo = FluentComboBox()
         combo.addItems([_bus_mode_title(name) for name in ("edge", "ramp", "hold")])
         combo.setCurrentText(_bus_mode_title(mode))
-        combo.setToolTip("Edge / Ramp apply this period's value; Hold carries the previous one")
-        combo.setFixedHeight(row_height)
+        combo.setToolTip(f"{bus_name}: output mode")
+        combo.setFixedSize(_bus_mode_combo_width(), row_height)
         self.bus_mode_combos[bus_name] = combo
         layout.addWidget(combo, 0)
 
