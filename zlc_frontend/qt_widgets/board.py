@@ -63,7 +63,27 @@ from .style import (
     BG,
     GREEN,
     ORANGE,
+    SELECTOR_ALPHA,
+    SELECTOR_COLOR,
+    SELECTOR_DOT_PX,
+    SELECTOR_FONT_PX,
+    SELECTOR_HANDLE_PX,
+    SELECTOR_LINE_PX,
 )
+
+
+def _selector_pen_color() -> QtGui.QColor:
+    color = QtGui.QColor(SELECTOR_COLOR)
+    color.setAlpha(SELECTOR_ALPHA)
+    return color
+
+
+def _selector_precision(span: float) -> int:
+    """Decimal places for a selector coordinate label, the reference's rule
+    exactly: enough digits to resolve 1/1000 of the visible span."""
+
+    gap = abs(span) / 1000 if span else 0.01
+    return max(0, -int(math.ceil(math.log10(gap))))
 
 
 def _prepared_qimage(panel_or_raster) -> tuple[bytes, QtGui.QImage]:
@@ -481,6 +501,10 @@ class _NumericPanelBinding:
     applied_span: tuple[float, float] | None = None
     span_anchor: float | None = None
     span_candidate: tuple[float, float] | None = None
+    # The DRAWN selection rectangle in normalized plot coordinates
+    # (x0, y0, x1, y1): live during the drag, kept after release (the
+    # reference's RectangleSelector leaves its box + label standing).
+    span_rect: tuple[float, float, float, float] | None = None
     pan_anchor: float | None = None
     pan_origin: _NumericViewport | None = None
     pan_candidate: tuple[float, float] | None = None
@@ -2092,6 +2116,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 )
                 binding.span_anchor = point[0]
                 binding.span_candidate = None
+                binding.span_rect = (point[0], point[1], point[0], point[1])
                 self._set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
@@ -2203,6 +2228,10 @@ class QtRasterBoard(QtWidgets.QWidget):
                         )
                     except ValueError:
                         numeric_binding.span_candidate = None
+                rect = numeric_binding.span_rect
+                if rect is not None:
+                    numeric_binding.span_rect = (
+                        rect[0], rect[1], point[0], point[1])
                 self.update()
             event.accept()
             return
@@ -2224,6 +2253,16 @@ class QtRasterBoard(QtWidgets.QWidget):
                     )
                 except ValueError:
                     numeric_binding.pan_candidate = None
+                # The reference pans LIVE: every motion lands the new limits
+                # immediately (mpl's on_motion -> set_xlim -> draw), so the
+                # view follows the pointer instead of jumping at release.
+                if numeric_binding.pan_candidate is not None:
+                    self._commit_numeric_viewport(
+                        numeric_binding,
+                        numeric_binding.pan_candidate,
+                        hold=self._selector_hold,
+                    )
+                self.update()
             event.accept()
             return
         image_binding = self._active_image_binding()
@@ -2365,6 +2404,10 @@ class QtRasterBoard(QtWidgets.QWidget):
             candidate = numeric_binding.span_candidate
             hold = self._selector_hold
             numeric_binding.span_anchor = None
+            if candidate is None:
+                # A degenerate click clears the standing box + label, exactly
+                # like the reference's empty-extents onselect.
+                numeric_binding.span_rect = None
             try:
                 if hold is not None:
                     origin = self._numeric_interaction_origin(
@@ -3400,6 +3443,13 @@ class QtRasterBoard(QtWidgets.QWidget):
         if payload is None or x_limits == payload.viewport.x_limits:
             return False
         assert isinstance(payload, _NUMERIC_PAYLOAD_TYPES[binding.kind])
+        # A LIVE pan commits once per motion while the hold keeps the press
+        # frame's payload, so the revision must advance past any still-pending
+        # candidate rather than re-issuing the press revision + 1 every time.
+        base_revision = payload.viewport.display_revision
+        if binding.pending_viewport is not None:
+            base_revision = max(
+                base_revision, binding.pending_viewport.display_revision)
         if binding.pending_viewport is not None:
             return False
         front = self._front
@@ -3414,7 +3464,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         origin = self._numeric_interaction_origin(binding, hold=hold)
         candidate = replace(
             payload.viewport,
-            display_revision=payload.viewport.display_revision + 1,
+            display_revision=base_revision + 1,
             x_limits=x_limits,
             **(
                 {"x_limits_are_auto": False}
@@ -4244,32 +4294,72 @@ class QtRasterBoard(QtWidgets.QWidget):
         painter.save()
         try:
             painter.setClipRect(plot)
-            span = binding.span_candidate or binding.applied_span
-            if span is not None:
-                y_low = (
-                    viewport.y_limits[0]
-                    if isinstance(viewport, CurveViewportTransform)
-                    else viewport.count_limits[0]
-                )
-                left = widget_point(span[0], y_low).x()
-                right = widget_point(span[1], y_low).x()
+            # The reference's AreaSelector, verbatim: a grey SOLID rectangle at
+            # alpha 0.8, NO fill, white square handles, and (after release) an
+            # unboxed two-line coordinate label in the top-left corner.
+            rect_norm = binding.span_rect
+            if rect_norm is not None:
+                selector_color = _selector_pen_color()
+                x0 = plot.left() + rect_norm[0] * plot.width()
+                y0 = plot.top() + rect_norm[1] * plot.height()
+                x1 = plot.left() + rect_norm[2] * plot.width()
+                y1 = plot.top() + rect_norm[3] * plot.height()
                 rectangle = QtCore.QRectF(
-                    min(left, right),
-                    plot.top(),
-                    abs(right - left),
-                    plot.height(),
-                ).intersected(plot)
-                painter.fillRect(rectangle, QtGui.QColor(245, 166, 35, 38))
-                pen = QtGui.QPen(QtGui.QColor(ORANGE), 1.5)
-                pen.setStyle(QtCore.Qt.DashLine)
-                painter.setPen(pen)
+                    QtCore.QPointF(min(x0, x1), min(y0, y1)),
+                    QtCore.QPointF(max(x0, x1), max(y0, y1)),
+                )
+                painter.setPen(QtGui.QPen(selector_color, SELECTOR_LINE_PX))
+                painter.setBrush(QtCore.Qt.NoBrush)
                 painter.drawRect(rectangle)
+                handle_pen = QtGui.QPen(
+                    selector_color, SELECTOR_LINE_PX / 2.0)
+                painter.setPen(handle_pen)
+                painter.setBrush(QtGui.QBrush(QtGui.QColor("white")))
+                half = SELECTOR_HANDLE_PX / 2.0
+                centre = rectangle.center()
+                for hx, hy in (
+                    (rectangle.left(), rectangle.top()),
+                    (centre.x(), rectangle.top()),
+                    (rectangle.right(), rectangle.top()),
+                    (rectangle.left(), centre.y()),
+                    (rectangle.right(), centre.y()),
+                    (rectangle.left(), rectangle.bottom()),
+                    (centre.x(), rectangle.bottom()),
+                    (rectangle.right(), rectangle.bottom()),
+                ):
+                    painter.drawRect(QtCore.QRectF(
+                        hx - half, hy - half,
+                        SELECTOR_HANDLE_PX, SELECTOR_HANDLE_PX))
+                if binding.span_anchor is None:
+                    # Selection complete: the reference prints the SORTED extents
+                    # "(xmin, ymin)\n(xmax, ymax)" top-left (its selector's
+                    # ``extents`` order, whatever the drag direction), precision
+                    # 1/1000 of the visible span, no box.
+                    ax0, ay0 = viewport.widget_normalized_to_data(
+                        rect_norm[0], rect_norm[1])
+                    ax1, ay1 = viewport.widget_normalized_to_data(
+                        rect_norm[2], rect_norm[3])
+                    lo_x, hi_x = sorted((ax0, ax1))
+                    lo_y, hi_y = sorted((ay0, ay1))
+                    dx = _selector_precision(
+                        viewport.x_limits[1] - viewport.x_limits[0])
+                    y_span = (
+                        viewport.y_limits
+                        if isinstance(viewport, CurveViewportTransform)
+                        else viewport.count_limits
+                    )
+                    dy = _selector_precision(y_span[1] - y_span[0])
+                    label = (f"({lo_x:.{dx}f}, {lo_y:.{dy}f})\n"
+                             f"({hi_x:.{dx}f}, {hi_y:.{dy}f})")
+                    self._paint_selector_text(
+                        painter, label, plot, selector_color, corner="top_left")
 
             cross = binding.cross
             if cross is not None:
+                selector_color = _selector_pen_color()
                 point = widget_point(cross.x, cross.y)
                 if plot.contains(point):
-                    painter.setPen(QtGui.QPen(QtGui.QColor(GREEN), 1.5))
+                    painter.setPen(QtGui.QPen(selector_color, SELECTOR_LINE_PX))
                     painter.drawLine(
                         QtCore.QPointF(point.x(), plot.top()),
                         QtCore.QPointF(point.x(), plot.bottom()),
@@ -4278,16 +4368,24 @@ class QtRasterBoard(QtWidgets.QWidget):
                         QtCore.QPointF(plot.left(), point.y()),
                         QtCore.QPointF(plot.right(), point.y()),
                     )
-                self._paint_curve_label(
+                    painter.setBrush(QtGui.QBrush(selector_color))
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.drawEllipse(
+                        point, SELECTOR_DOT_PX / 2.0, SELECTOR_DOT_PX / 2.0)
+                dx = _selector_precision(
+                    viewport.x_limits[1] - viewport.x_limits[0])
+                y_span = (
+                    viewport.y_limits
+                    if isinstance(viewport, CurveViewportTransform)
+                    else viewport.count_limits
+                )
+                dy = _selector_precision(y_span[1] - y_span[0])
+                self._paint_selector_text(
                     painter,
-                    (
-                        f"x={cross.x:.6g}{x_unit}  count={cross.y:.6g}"
-                        if isinstance(payload, HistogramPanelPayload)
-                        else f"x={cross.x:.6g}{x_unit}  y={cross.y:.6g}{y_unit}"
-                    ),
+                    f"({cross.x:.{dx}f}, {cross.y:.{dy}f})",
                     plot,
-                    QtGui.QColor(GREEN),
-                    top_right=True,
+                    selector_color,
+                    corner="top_right",
                 )
 
             sample = binding.hover
@@ -4322,6 +4420,40 @@ class QtRasterBoard(QtWidgets.QWidget):
                     QtGui.QColor(ORANGE),
                     anchor=position,
                 )
+        finally:
+            painter.restore()
+
+    @staticmethod
+    def _paint_selector_text(
+        painter: QtGui.QPainter,
+        label: str,
+        plot: QtCore.QRectF,
+        color: QtGui.QColor,
+        *,
+        corner: str,
+    ) -> None:
+        """The reference's selector coordinate text, verbatim: UNBOXED, in the
+        selector's own colour at legend-fontsize, inset 2.5% from the plot
+        corner (``ax.text(0.025/0.975, 0.975, ...)``)."""
+
+        painter.save()
+        try:
+            font = painter.font()
+            font.setPixelSize(SELECTOR_FONT_PX)
+            painter.setFont(font)
+            painter.setPen(color)
+            inset_x = 0.025 * plot.width()
+            inset_y = 0.025 * plot.height()
+            area = QtCore.QRectF(
+                plot.left() + inset_x,
+                plot.top() + inset_y,
+                plot.width() - 2 * inset_x,
+                plot.height() - 2 * inset_y,
+            )
+            flags = QtCore.Qt.AlignTop | (
+                QtCore.Qt.AlignRight if corner == "top_right"
+                else QtCore.Qt.AlignLeft)
+            painter.drawText(area, flags, label)
         finally:
             painter.restore()
 
@@ -4645,6 +4777,11 @@ class QtRasterBoard(QtWidgets.QWidget):
         *,
         clear_span: bool,
     ) -> None:
+        # A gesture cancelled MID-DRAG (the anchor is still armed) loses its
+        # half-drawn rectangle; a completed selection keeps its box + label
+        # (the reference's RectangleSelector leaves them standing).
+        if clear_span and binding.span_anchor is not None:
+            binding.span_rect = None
         binding.span_anchor = None
         binding.pan_anchor = None
         binding.pan_origin = None

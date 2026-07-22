@@ -26,6 +26,22 @@ YELLOW = "#E5C85B"
 GREY = "#A2A2A2"
 
 MUTED_LABEL_STYLE = f"color: {GREY}; background: transparent; border: none;"
+
+# ---- Selector overlay art: the REFERENCE's matplotlib selectors, verbatim ---- #
+# The reference (frontend/selectors.py) draws its area/cross selectors as GREY
+# SOLID lines at alpha 0.8 with white square handles (legend.fontsize/2 pt), a
+# lines.markersize pt crosshair dot, and UNBOXED coordinate labels at
+# legend.fontsize pt.  The pixel values below are those point sizes at the
+# panel's effective dpi (DESIGN_DPI 300 x PANEL_DISPLAY_SCALE 0.7 = 210 dpi;
+# px = pt x 210 / 72).  qt_widgets stays matplotlib-free (charter C12), so a
+# contract test pins these literals to the render-style rcParams instead of an
+# import -- the two layers cannot drift without a red test.
+SELECTOR_COLOR = "#808080"       # matplotlib 'grey'
+SELECTOR_ALPHA = 204             # alpha 0.8
+SELECTOR_LINE_PX = 2.9           # lines.linewidth   1.0 pt @ 210 dpi
+SELECTOR_FONT_PX = 19            # legend.fontsize   6.5 pt @ 210 dpi
+SELECTOR_HANDLE_PX = 9           # legend.fontsize/2 3.25 pt @ 210 dpi (square side)
+SELECTOR_DOT_PX = 6              # lines.markersize  2.0 pt @ 210 dpi (dot diameter)
 RADIUS = 4
 CARD_TITLE_PX = 32
 CARD_PAD = 10

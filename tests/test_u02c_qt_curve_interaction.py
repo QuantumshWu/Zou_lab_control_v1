@@ -380,15 +380,24 @@ def test_curve_cross_and_hover_overlay_show_both_axis_units(monkeypatch) -> None
         binding = board._numeric_bindings["curve"]
         assert binding.hover is not None
 
-        labels = []
+        hover_labels = []
+        cross_labels = []
 
-        def capture_label(_painter, label, _plot, _color, **_kwargs):
-            labels.append(label)
+        def capture_hover(_painter, label, _plot, _color, **_kwargs):
+            hover_labels.append(label)
+
+        def capture_cross(_painter, label, _plot, _color, **_kwargs):
+            cross_labels.append(label)
 
         monkeypatch.setattr(
             type(board),
             "_paint_curve_label",
-            staticmethod(capture_label),
+            staticmethod(capture_hover),
+        )
+        monkeypatch.setattr(
+            type(board),
+            "_paint_selector_text",
+            staticmethod(capture_cross),
         )
         image = QtGui.QImage(
             board.size(),
@@ -406,9 +415,15 @@ def test_curve_cross_and_hover_overlay_show_both_axis_units(monkeypatch) -> None
             board._paint_numeric_binding_overlay(painter, binding)
         finally:
             painter.end()
-        assert len(labels) == 2
-        assert all("x=" in label and " ms" in label for label in labels)
-        assert all("y=" in label and " count" in label for label in labels)
+        # The hover overlay (the design's ADDED capability) names both units;
+        # the pinned cross prints the reference's exact "(x, y)" wording.  The
+        # right click that pins the cross clears the hover, so each paints once.
+        assert len(hover_labels) == 1
+        assert all("x=" in label and " ms" in label for label in hover_labels)
+        assert all("y=" in label and " count" in label for label in hover_labels)
+        assert len(cross_labels) == 1
+        assert cross_labels[0].startswith("(") and cross_labels[0].endswith(")")
+        assert ", " in cross_labels[0]
     finally:
         board.close()
         application.processEvents()
@@ -659,3 +674,40 @@ def test_curve_lifecycle_and_callback_fault_are_local() -> None:
     finally:
         board.close()
         application.processEvents()
+
+
+def test_selector_art_tokens_match_render_style_rcparams():
+    """The reference draws selectors with matplotlib rcParams (grey, alpha 0.8,
+    legend.fontsize text, lines.linewidth strokes, legend.fontsize/2 handles,
+    lines.markersize dot).  qt_widgets may not import matplotlib (charter C12),
+    so its SELECTOR_* tokens are literals -- this contract pins each literal to
+    the rcParams value at the panel's effective dpi so the two layers cannot
+    drift apart silently."""
+
+    import matplotlib.colors
+
+    from zlc_frontend.qt_widgets.style import (
+        SELECTOR_ALPHA,
+        SELECTOR_COLOR,
+        SELECTOR_DOT_PX,
+        SELECTOR_FONT_PX,
+        SELECTOR_HANDLE_PX,
+        SELECTOR_LINE_PX,
+    )
+    from zlc_frontend.render_style import (
+        DEFAULT_STYLE,
+        DESIGN_DPI,
+        PANEL_DISPLAY_SCALE,
+    )
+
+    px_per_pt = DESIGN_DPI * PANEL_DISPLAY_SCALE / 72.0
+    assert SELECTOR_COLOR == matplotlib.colors.to_hex("grey")
+    assert SELECTOR_ALPHA == round(0.8 * 255)
+    assert SELECTOR_LINE_PX == pytest.approx(
+        DEFAULT_STYLE["lines.linewidth"] * px_per_pt, abs=0.05)
+    assert SELECTOR_FONT_PX == round(
+        DEFAULT_STYLE["legend.fontsize"] * px_per_pt)
+    assert SELECTOR_HANDLE_PX == round(
+        DEFAULT_STYLE["legend.fontsize"] / 2.0 * px_per_pt)
+    assert SELECTOR_DOT_PX == round(
+        DEFAULT_STYLE["lines.markersize"] * px_per_pt)
