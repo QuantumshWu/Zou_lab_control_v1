@@ -1045,6 +1045,9 @@ def render_pulse_timeline_png(
     repeat_markers=(),
     repeat_notation: str = "",
     size: str = "2x2",
+    analog_traces=(),
+    scan_regions=(),
+    scan_dac_segments=(),
 ) -> bytes:
     """The pulse-timeline figure as PNG bytes -- the reference's faithful preview.
 
@@ -1052,6 +1055,18 @@ def render_pulse_timeline_png(
     drawn as FILLED blocks (``Rectangle`` patches), the board name on the y axis
     (tinted to its row), a ``Time (unit)`` x axis, the pulse name inside long
     blocks, and the repeat span shown as grey brackets (or a top-right ``×∞`` note).
+
+    ``analog_traces`` fold each DAC bus into ONE extra row below the digital
+    channels: a dashed 0 V reference where the SIGNED zero maps inside the row
+    (mid-row for a bipolar bus) plus a solid step/staircase line of the actual
+    values -- dicts of ``{name, label, min, max, starts, values}`` with ``starts``
+    in seconds (one more than ``values``) and signed values.
+
+    ``scan_regions`` shade the time span a scanned DURATION slot affects in
+    transparent orange across every channel; ``scan_dac_segments`` draw a thick
+    orange level segment on the affected bus row -- dicts of
+    ``{start, stop, number}`` and ``{trace_name, start, stop, value, number}``,
+    each carrying its 1-based slot number drawn once as a circled badge.
 
     ``size`` is one of the panel-size presets (``PANEL_SIZES``); the figure geometry is derived from
     it through the frontend's ONE size source (:func:`panel_figure_size_inches`), so the preview
@@ -1072,8 +1087,9 @@ def render_pulse_timeline_png(
     from matplotlib.ticker import FuncFormatter, MaxNLocator
 
     from .render_style import (
-        DESIGN_DPI, PALETTE, PANEL_DISPLAY_SCALE, apply_title, panel_figure_size_inches,
-        render_style_context, smaller_fontsize,
+        DESIGN_DPI, PALETTE, PANEL_DISPLAY_SCALE, PULSE_SCAN_ANNOTATION_COLOR,
+        PULSE_SCAN_ANNOTATION_FONT_SIZE, PULSE_SCAN_REGION_COLOR, apply_title,
+        panel_figure_size_inches, render_style_context, smaller_fontsize,
     )
 
     # The size PRESET is the one geometry knob: inches come from the frontend's single size source and
@@ -1088,10 +1104,18 @@ def render_pulse_timeline_png(
     colors = list(PALETTE["pulse_cycle"])
     bracket_colors = list(PALETTE["bracket_cycle"])
 
+    # DAC buses draw BELOW the digital channels, one row each; every row key -- a
+    # channel name or an analog trace key -- shares one index/colour space so the
+    # colour cycle simply continues past the channels (the reference's layout).
+    analog_traces = [dict(trace) for trace in analog_traces]
+    analog_keys = [f"analog:{i}:{trace.get('name', 'analog')}"
+                   for i, trace in enumerate(analog_traces)]
+    row_keys = channels + analog_keys
     n_channels = len(channels)
-    index_map = {channel: n_channels - 1 - i for i, channel in enumerate(channels)}
-    color_map = {channel: colors[i % len(colors)] for i, channel in enumerate(channels)}
-    row_height = 0.64 if n_channels <= 10 else max(0.42, 6.4 / max(1, n_channels))
+    n_rows = len(row_keys)
+    index_map = {key: n_rows - 1 - i for i, key in enumerate(row_keys)}
+    color_map = {key: colors[i % len(colors)] for i, key in enumerate(row_keys)}
+    row_height = 0.64 if n_rows <= 10 else max(0.42, 6.4 / max(1, n_rows))
 
     # The axis spans the whole FRAME (total_duration), not just to the last pulse edge --
     # a trailing all-off stretch is real programme time and must stay visible.
@@ -1143,21 +1167,94 @@ def render_pulse_timeline_png(
                               ha="center", va="center", color=PALETTE["pulse_name"],
                               fontsize=smaller_fontsize(1.2, 4.8), clip_on=True, zorder=pulse_zorder + 1)
 
+            # DAC bus rows: a dashed 0 V reference where SIGNED zero maps inside the row
+            # (mid-row for a bipolar bus), plus a solid staircase of the actual values --
+            # same weight and opacity as the digital off-lines, per the reference.
+            analog_zero_y: dict[str, float] = {}
+            analog_geom: dict[str, tuple[float, int, int]] = {}
+            for key, trace in zip(analog_keys, analog_traces):
+                y_base = index_map[key] - baseline_offset
+                baseline_y[key] = y_base
+                v_max = int(trace.get("max", 1))
+                v_min = int(trace.get("min", 0))
+                v_span = max(1, v_max - v_min)
+                zero_frac = min(1.0, max(0.0, (0.0 - v_min) / v_span))
+                zero_y = y_base + row_height * zero_frac
+                name = str(trace.get("name", key))
+                analog_zero_y[name] = zero_y
+                analog_geom[name] = (y_base, v_min, v_span)
+                color = color_map[key]
+                axis.plot([left_limit, right_limit], [zero_y, zero_y],
+                          color=color, linewidth=0.65, alpha=0.5, linestyle=(0, (4, 3)),
+                          zorder=pulse_zorder + 1)
+                starts = np.asarray(trace.get("starts", []), dtype=float)
+                values = np.asarray(trace.get("values", []), dtype=float)
+                if starts.size >= 2 and values.size >= 1:
+                    x = starts[: values.size + 1]
+                    y_values = y_base + row_height * np.clip(
+                        (values[: x.size - 1] - v_min) / v_span, 0.0, 1.0)
+                    axis.plot(np.repeat(x, 2)[1:-1], np.repeat(y_values, 2),
+                              color=color, linewidth=0.65, alpha=1.0, zorder=pulse_zorder + 2)
+                else:
+                    axis.plot([left_limit, right_limit], [zero_y, zero_y],
+                              color=color, linewidth=0.65, alpha=1.0, zorder=pulse_zorder + 2)
+
+            # Scanned regions, exactly the reference's annotation: a transparent orange
+            # band across every row for a scanned DURATION, a thick orange level segment
+            # on the bus row for a scanned DAC value, each numbered once with a circled
+            # badge so several slots stay tellable apart.
+            badge_kwargs = dict(
+                ha="center", va="center", color=PULSE_SCAN_ANNOTATION_COLOR,
+                fontsize=max(2.6, float(PULSE_SCAN_ANNOTATION_FONT_SIZE)), zorder=12,
+                bbox=dict(boxstyle="circle,pad=0.3", facecolor=PULSE_SCAN_REGION_COLOR,
+                          edgecolor="none"))
+            area_bottom = min(baseline_y.values()) if baseline_y else -baseline_offset
+            area_top = (max(baseline_y.values()) + row_height) if baseline_y else row_height
+            for region in scan_regions:
+                r_start, r_stop = float(region["start"]), float(region["stop"])
+                if r_stop <= r_start:
+                    continue
+                axis.add_patch(Rectangle(
+                    (r_start, area_bottom), r_stop - r_start, area_top - area_bottom,
+                    facecolor=PULSE_SCAN_REGION_COLOR, edgecolor="none", alpha=0.18,
+                    zorder=6))
+                number = region.get("number")
+                if number is not None:
+                    axis.text((r_start + r_stop) / 2.0, area_top - row_height / 2.0,
+                              str(number), **badge_kwargs)
+            for segment in scan_dac_segments:
+                name = str(segment.get("trace_name", ""))
+                geom = analog_geom.get(name)
+                if geom is None:
+                    continue
+                y_base, v_min, v_span = geom
+                s_start, s_stop = float(segment["start"]), float(segment["stop"])
+                level = y_base + row_height * min(1.0, max(0.0, (float(segment["value"]) - v_min) / v_span))
+                axis.plot([s_start, s_stop], [level, level],
+                          color=PULSE_SCAN_REGION_COLOR, linewidth=3.0, alpha=0.9, zorder=8)
+                number = segment.get("number")
+                if number is not None:
+                    axis.text((s_start + s_stop) / 2.0, y_base + row_height / 2.0,
+                              str(number), **badge_kwargs)
+
             axis.set_xlim(left_limit, right_limit)
-            ylim_top = n_channels - 0.38
+            ylim_top = n_rows - 0.38
             if bracket_bounds:
-                ylim_top = n_channels + 0.78 + 0.26 * max(0, len(bracket_bounds) - 1)
+                ylim_top = n_rows + 0.78 + 0.26 * max(0, len(bracket_bounds) - 1)
             axis.set_ylim(-0.62, ylim_top)
-            axis.set_yticks([index_map[channel] for channel in channels])
-            axis.set_yticklabels([labels.get(channel, channel) for channel in channels])
+            axis.set_yticks([index_map[key] for key in row_keys])
+            axis.set_yticklabels(
+                [labels.get(channel, channel) for channel in channels]
+                + [str(trace.get("label") or trace.get("name") or "analog")
+                   for trace in analog_traces])
             # Channel names sit ONE row apart, so the reference shrinks the y-tick label a notch below
             # the stock tick size (ytick.labelsize - 1.2, floored at 4.8) to keep long board names from
             # crowding their neighbours -- match it exactly.
             axis.tick_params(
                 axis="y",
                 labelsize=max(4.8, matplotlib.rcParams["ytick.labelsize"] - 1.2))
-            for tick, channel in zip(axis.get_yticklabels(), channels):
-                tick.set_color(color_map[channel])
+            for tick, key in zip(axis.get_yticklabels(), row_keys):
+                tick.set_color(color_map[key])
             axis.set_xlabel(f"Time ({unit})")
             axis.xaxis.set_major_locator(MaxNLocator(nbins=5, prune="lower"))
             # Blank the cosmetic negative-time headroom ticks (the left margin lets a t=0 edge breathe
@@ -1173,7 +1270,7 @@ def render_pulse_timeline_png(
                 axis.text(0.995, 1.012, str(repeat_notation), transform=axis.transAxes,
                           ha="right", va="bottom", color=PALETTE["pulse_repeat_note"],
                           fontsize=smaller_fontsize(1.0, 5.5))
-            _draw_pulse_repeat_brackets(axis, repeat_markers, n_channels, bracket_colors)
+            _draw_pulse_repeat_brackets(axis, repeat_markers, n_rows, bracket_colors)
             if title:
                 # The ONE title mechanism (apply_title = title_fontsize, the stock label size); NOT
                 # axis.set_title(), whose default 'large' titlesize dwarfs the compact preview and

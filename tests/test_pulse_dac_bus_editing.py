@@ -129,6 +129,48 @@ def test_untouched_buses_hold_and_repeated_round_trips_stay_clean(editor, applic
     assert editor.preview_png_bytes(state, include_always_off=True)
 
 
+def test_preview_draws_the_dac_row_and_scan_highlights(editor, application):
+    """The preview folds a driven DAC bus into its own analog row, and binding a
+    scan slot adds the orange highlight -- each step must CHANGE the picture.
+
+    The regressions this pins: the renderer had no analog support at all (a DAC
+    bus never appeared in the preview), and scan/API bindings left no visible
+    trace on the plot even though the reference shades every scanned span.
+    """
+
+    card = _first_card(editor)
+    card.bus_mode_combos["da_dipole"].setCurrentText("Edge")
+    _settle(application)
+    _type_value(application, card.bus_value_edits["da_dipole"], "300")
+    state = editor.read_state()
+
+    # A driven bus is an analog row even with "Show off rows" OFF.
+    traces = editor._preview_analog_traces(state, include_always_off=False)
+    assert [t["name"] for t in traces] == ["da_dipole"]
+    lo, hi = traces[0]["min"], traces[0]["max"]
+    assert (lo, hi) == (-512, 511), "analog row must carry the SIGNED bounds"
+    with_dac = editor.preview_png_bytes(state, include_always_off=False)
+
+    # Bind the DAC value to a scan slot: the orange level segment must appear.
+    card = _first_card(editor)
+    card.busScanRequested.emit("da_dipole")
+    _settle(application, 8)
+    scanned = editor.read_state()
+    regions, segments = editor._preview_scan_annotations(scanned)
+    assert segments and segments[0]["trace_name"] == "da_dipole"
+    with_scan = editor.preview_png_bytes(scanned, include_always_off=False)
+    assert with_scan != with_dac, "binding a DAC scan slot left the preview unchanged"
+
+    # Bind the first period's duration too: the cross-channel band must appear.
+    editor._toggle_duration_scan(_first_card(editor))
+    _settle(application, 8)
+    both = editor.read_state()
+    regions, _segments = editor._preview_scan_annotations(both)
+    assert regions and regions[0]["stop"] > regions[0]["start"]
+    with_band = editor.preview_png_bytes(both, include_always_off=False)
+    assert with_band != with_scan, "binding a duration scan slot left the preview unchanged"
+
+
 def test_dac_mode_cycling_never_raises_in_a_slot(editor, application):
     """Cycling Edge/Ramp/Hold repeatedly is exception-free (the bus_dots crash)."""
 

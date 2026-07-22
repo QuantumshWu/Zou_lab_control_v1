@@ -4232,6 +4232,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             markers = [(0.0, total, "×∞")]
         elif int(getattr(state, "repeat_count", 1) or 1) > 1:
             markers = [(0.0, total, f"×{int(state.repeat_count)}")]
+        traces = self._preview_analog_traces(state, include_always_off=include_always_off)
+        regions, segments = self._preview_scan_annotations(state)
         return render_pulse_timeline_png(
             pulses=pulses,
             channels=channels,
@@ -4241,7 +4243,90 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             repeat_markers=markers,
             repeat_notation=_repeat_summary_text(state),
             size=self._preview_size_for(state, include_always_off=include_always_off),
+            analog_traces=traces,
+            scan_regions=regions,
+            scan_dac_segments=segments,
         )
+
+    def _preview_analog_traces(self, state: PulseTableState, *,
+                               include_always_off: bool) -> list[dict]:
+        """Each DAC bus folded into ONE plain-data preview row (the reference's flow).
+
+        The plan is resolved through the compiler's own helpers -- scan slots to their
+        reference values, ramps to the Bresenham staircase, ``looping=True`` for the
+        steady state the endlessly repeating preview converges to -- so the trace shows
+        exactly what the hardware would drive.  With "Show off rows" OFF a bus with no
+        signal (all HOLD, no scanned value) hides like an always-off TTL channel.
+        """
+
+        slots = state._reference_slots()
+        step_ns = float(state.time_step_ns)
+        starts_steps = state.period_start_steps(slots=slots, time_step_ns=step_ns)
+        scanned_buses = {
+            str(slot.target).split("@", 1)[0]
+            for slot in (state.scan_slots or ()) if slot.kind == "dac"}
+        port_labels = {port.key: port.label for port in state.port_catalog.ports}
+        traces: list[dict] = []
+        for bus_name, members in state.bus_channels().items():
+            plan = state._resolved_bus_plan(bus_name, slots)
+            has_signal = bus_name in scanned_buses or any(
+                str((entry or {}).get("mode", "hold")) != "hold"
+                for entry in ((state.analog_bus_modes or {}).get(bus_name) or ()))
+            if not include_always_off and not has_signal:
+                continue
+            lo, hi = bus_signed_range(len(members))
+            ticks = _analog_bus_ticks(plan, starts_steps)
+            traces.append({
+                "name": bus_name,
+                "label": port_labels.get(bus_name, bus_name),
+                "min": lo,
+                "max": hi,
+                "starts": [tick * step_ns * 1e-9 for tick in ticks],
+                "values": [
+                    _analog_bus_value_at_tick(plan, starts_steps, tick, looping=True)
+                    for tick in ticks[:-1]
+                ],
+            })
+        return traces
+
+    def _preview_scan_annotations(self, state: PulseTableState) -> tuple[list[dict], list[dict]]:
+        """The time spans each scan slot affects, as plain render data.
+
+        A scanned DURATION spans its whole period (every channel feels the boundary
+        move); a scanned DAC value spans its period on its own bus row at the slot's
+        reference level.  Each slot carries its 1-based number exactly once.
+        """
+
+        slots = state._reference_slots()
+        step_ns = float(state.time_step_ns)
+        starts_steps = state.period_start_steps(slots=slots, time_step_ns=step_ns)
+        starts_s = [tick * step_ns * 1e-9 for tick in starts_steps]
+        regions: list[dict] = []
+        segments: list[dict] = []
+        for number, slot in enumerate(state.scan_slots or (), start=1):
+            if slot.kind == "duration":
+                try:
+                    period = int(str(slot.target))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= period < len(starts_s) - 1:
+                    regions.append({"start": starts_s[period],
+                                    "stop": starts_s[period + 1],
+                                    "number": number})
+            elif slot.kind == "dac":
+                target = str(slot.target)
+                bus_name, _, period_text = target.partition("@")
+                try:
+                    period = int(period_text)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= period < len(starts_s) - 1:
+                    segments.append({"trace_name": bus_name,
+                                     "start": starts_s[period],
+                                     "stop": starts_s[period + 1],
+                                     "value": float(slot.nominal),
+                                     "number": number})
+        return regions, segments
 
     def _preview_size_for(self, state: PulseTableState, *, include_always_off: bool) -> str:
         """The size preset the preview renders at -- the operator's PINNED pick (the Size dropdown once
