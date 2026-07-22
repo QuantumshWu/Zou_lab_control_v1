@@ -1048,7 +1048,7 @@ def test_one_active_gesture_blocks_chords_and_pending_only_gates_image_hit() -> 
         application.processEvents()
 
 
-def test_middle_pan_uses_press_pixels_holds_only_exact_payload_and_commits_on_release() -> None:
+def test_middle_pan_uses_press_pixels_holds_only_exact_payload_and_commits_live() -> None:
     from PyQt5 import QtCore, QtTest
 
     initial_viewport = _viewport(revision=3, bounds=(0.2, 0.2, 0.8, 0.8))
@@ -1081,15 +1081,17 @@ def test_middle_pan_uses_press_pixels_holds_only_exact_payload_and_commits_on_re
         assert board._selector_hold is hold
         assert board.visible_image_origin() == held_origin
         _drag_move(board, end, QtCore.Qt.MiddleButton)
-        assert committed == []
-        QtTest.QTest.mouseRelease(board, QtCore.Qt.MiddleButton, pos=end)
-
+        # The reference pans LIVE: the commit lands on the motion itself.
         assert len(committed) == 1
         expected = initial_viewport.panned_by_pixels(
             (24.0, 9.0),
             (target.width(), target.height()),
         )
         assert committed[0].viewport == expected
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.MiddleButton, pos=end)
+
+        # Release only ends the gesture; the last candidate is not re-issued.
+        assert len(committed) == 1
         assert board._selector_hold is None
         assert board.visible_image_origin().sequence == 2
     finally:
@@ -1151,13 +1153,17 @@ def test_clim_handle_holds_exact_front_and_commits_without_a_temporary_lut() -> 
         assert board.visible_image_payload() is payload
         assert board._selector_hold.display_payload is payload
         _drag_move(board, end, QtCore.Qt.LeftButton)
-        assert committed == []
+        # The reference's DragHLine recolors on EVERY motion: the commit goes
+        # out live, while the painted LUT still waits for the owner's answer
+        # (never a temporary LUT).
+        assert len(committed) == 1
         assert tuple(board._front[1][0][1].colorTable()) == original_lut
         candidate_label = board._clim_candidate_label(_binding(board), payload)
         assert candidate_label.startswith("H low=")
         assert "high=3500" in candidate_label
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
 
+        # Release only ends the gesture; the last candidate is not re-issued.
         assert len(committed) == 1
         command = committed[0]
         assert isinstance(command, ImageColorLimitsCommit)

@@ -1119,12 +1119,14 @@ class QtRasterBoard(QtWidgets.QWidget):
         for panel_id, binding in self._image_bindings.items():
             target_viewport = target_image_viewports.get(panel_id)
             pending = binding.pending_viewport
+            answered = False
             if pending is not None and target_viewport is not None:
                 if (
                     target_viewport == pending
                     or target_viewport.viewport_revision > pending.viewport_revision
                 ):
                     binding.pending_viewport = None
+                    answered = True
             pending_origin = binding.pending_origin
             if (
                 binding.pending_color_limits is not None
@@ -1134,8 +1136,27 @@ class QtRasterBoard(QtWidgets.QWidget):
                 > pending_origin.presentation.panel_revision
             ):
                 binding.pending_color_limits = None
+                answered = True
             if not self._image_interaction_is_pending(binding):
                 binding.pending_origin = None
+            hold = self._selector_hold
+            if answered and hold is not None and hold.panel_id == panel_id:
+                # This present answers the running gesture's OWN intent (a
+                # live pan/zoom/clim step): the frozen front absorbs it so the
+                # picture follows the pointer, while EXTERNAL data frames keep
+                # landing underneath unseen -- same as the numeric absorption
+                # below and the reference's per-motion redraw during a drag.
+                index = target_panel_ids.index(panel_id)
+                panel = frame.panels[index]
+                self._selector_hold = replace(
+                    hold,
+                    sequence=frame.sequence,
+                    source_identity=panel.source_identity,
+                    presentation=_panel_presentation(panel),
+                    raster_geometry=_raster_geometry(panel),
+                    prepared=prepared[index],
+                    display_payload=panel.display_payload,
+                )
         for panel_id, binding in self._numeric_bindings.items():
             pending = binding.pending_viewport
             candidate = target_numeric_viewports.get(panel_id)
@@ -2370,6 +2391,13 @@ class QtRasterBoard(QtWidgets.QWidget):
                 else:
                     high = max(value, math.nextafter(low, math.inf))
                 image_binding.clim_candidate = (low, high)
+                # The reference's DragHLine recolors on EVERY motion.
+                if self._selector_hold is not None:
+                    self._commit_color_limits(
+                        image_binding,
+                        image_binding.clim_candidate,
+                        hold=self._selector_hold,
+                    )
                 self.update()
             event.accept()
             return
@@ -2402,6 +2430,18 @@ class QtRasterBoard(QtWidgets.QWidget):
                 float(event.localPos().y() - pan_anchor.y()),
             )
             image_binding.pan_candidate = pan_origin.panned_by_pixels(delta, pan_size)
+            # The reference pans LIVE: every motion lands the new window (the
+            # commit rebases the candidate's revision monotonically).
+            if (
+                image_binding.pan_candidate is not None
+                and self._selector_hold is not None
+            ):
+                self._commit_viewport(
+                    image_binding,
+                    image_binding.pan_candidate,
+                    hold=self._selector_hold,
+                )
+            self.update()
             event.accept()
             return
 
@@ -2465,21 +2505,13 @@ class QtRasterBoard(QtWidgets.QWidget):
             and numeric_binding.pan_anchor is not None
             and event.button() == QtCore.Qt.MiddleButton
         ):
-            candidate = numeric_binding.pan_candidate
-            hold = self._selector_hold
-            try:
-                if candidate is not None and hold is not None:
-                    self._commit_numeric_viewport(
-                        numeric_binding,
-                        candidate,
-                        hold=hold,
-                    )
-            finally:
-                self._cancel_active_gesture(
-                    clear_image_draft=False,
-                    clear_numeric_spans=False,
-                )
-                self.update()
+            # Every motion already committed its candidate (the reference's
+            # live pan); release only ends the gesture.
+            self._cancel_active_gesture(
+                clear_image_draft=False,
+                clear_numeric_spans=False,
+            )
+            self.update()
             event.accept()
             return
         if (
@@ -2530,14 +2562,10 @@ class QtRasterBoard(QtWidgets.QWidget):
             and image_binding.clim_drag is not None
             and event.button() == QtCore.Qt.LeftButton
         ):
-            candidate = image_binding.clim_candidate
-            hold = self._selector_hold
-            try:
-                if candidate is not None and hold is not None:
-                    self._commit_color_limits(image_binding, candidate, hold=hold)
-            finally:
-                self._cancel_image_gesture(image_binding, clear_draft=False)
-                self.update()
+            # Every motion already committed its candidate (the reference's
+            # DragHLine recolors live); release only ends the gesture.
+            self._cancel_image_gesture(image_binding, clear_draft=False)
+            self.update()
             event.accept()
             return
         if (
@@ -2545,14 +2573,9 @@ class QtRasterBoard(QtWidgets.QWidget):
             and image_binding.pan_anchor is not None
             and event.button() == QtCore.Qt.MiddleButton
         ):
-            candidate = image_binding.pan_candidate
-            hold = self._selector_hold
-            try:
-                if candidate is not None and hold is not None:
-                    self._commit_viewport(image_binding, candidate, hold=hold)
-            finally:
-                self._cancel_image_gesture(image_binding, clear_draft=False)
-                self.update()
+            # Live pan committed per motion; release only ends the gesture.
+            self._cancel_image_gesture(image_binding, clear_draft=False)
+            self.update()
             event.accept()
             return
         anchor = None if image_binding is None else image_binding.drag_anchor
@@ -2753,6 +2776,26 @@ class QtRasterBoard(QtWidgets.QWidget):
             return
         hits_image = target is not None and target[0].contains(event.pos())
         hits_rail = rail_target is not None and rail_target[0].contains(event.pos())
+        if (
+            event.button() == QtCore.Qt.MiddleButton
+            and binding.interaction_callback is not None
+            and hits_image
+        ):
+            # Qt delivers a press BEFORE the double-click and that press
+            # already began a middle pan -- release the incomplete gesture so
+            # the double-middle always lands (zoom-to-area or home).
+            if binding.pan_anchor is not None:
+                self._cancel_image_gesture(binding, clear_draft=False)
+            viewport = self._viewport_for_target(binding, target)
+            area = binding.draft_bounds or binding.applied_bounds
+            candidate = viewport.with_visible_bounds(
+                (0.0, 0.0, 1.0, 1.0) if area is None else area
+            )
+            self._commit_viewport(binding, candidate)
+            self._set_hover_sample(binding, None)
+            self.update()
+            event.accept()
+            return
         if self._image_interaction_is_pending(binding) or self._selector_hold is not None:
             if hits_image or hits_rail:
                 event.accept()
@@ -2764,20 +2807,6 @@ class QtRasterBoard(QtWidgets.QWidget):
             return
         if event.button() == QtCore.Qt.RightButton:
             self._set_cross_sample(binding, None)
-            self._set_hover_sample(binding, None)
-            self.update()
-            event.accept()
-            return
-        if (
-            event.button() == QtCore.Qt.MiddleButton
-            and binding.interaction_callback is not None
-        ):
-            viewport = self._viewport_for_target(binding, target)
-            area = binding.draft_bounds or binding.applied_bounds
-            candidate = viewport.with_visible_bounds(
-                (0.0, 0.0, 1.0, 1.0) if area is None else area
-            )
-            self._commit_viewport(binding, candidate)
             self._set_hover_sample(binding, None)
             self.update()
             event.accept()
@@ -3538,10 +3567,25 @@ class QtRasterBoard(QtWidgets.QWidget):
             return False
         if candidate.axes != current.axes:
             raise ValueError("viewport commit cannot change image axes")
+        # A live pan/zoom commits once per motion while the hold keeps the
+        # press frame's viewport: the revision base is the LATEST of the
+        # current (possibly frozen) viewport, the last presented one and any
+        # still-pending candidate, and a newer candidate REPLACES an
+        # in-flight one instead of being refused (the reference redraws on
+        # every single motion).
+        base_revision = current.viewport_revision
+        if binding.viewport is not None:
+            base_revision = max(base_revision, binding.viewport.viewport_revision)
+        if binding.pending_viewport is not None:
+            base_revision = max(
+                base_revision, binding.pending_viewport.viewport_revision)
+        if candidate.viewport_revision <= base_revision:
+            candidate = candidate.with_visible_bounds(
+                candidate.visible_bounds,
+                viewport_revision=base_revision + 1,
+            )
         if candidate.viewport_revision <= current.viewport_revision:
             raise ValueError("viewport commit revision must increase")
-        if self._image_interaction_is_pending(binding):
-            return False
         front = self._front
         if front is None:
             return False
@@ -3668,8 +3712,9 @@ class QtRasterBoard(QtWidgets.QWidget):
         payload = _image_payload(hold)
         if payload is None or limits == payload.color_limits:
             return False
-        if self._image_interaction_is_pending(binding):
-            return False
+        # A live clim drag commits once per motion (the reference's DragHLine
+        # calls back on every mouse move); a newer candidate REPLACES an
+        # in-flight one instead of being refused.
         front = self._front
         if front is None or not self._hold_matches_frame(
             hold,
