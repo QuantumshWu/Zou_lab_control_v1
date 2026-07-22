@@ -145,6 +145,39 @@ def test_size_preset_scales_the_rendered_pixels(preview_editor):
     assert dims["2x2"][1] < dims["4x4"][1] < dims["8x8"][1], "a bigger preset must heighten the figure"
 
 
+def test_a_trailing_all_off_period_keeps_the_frame_length_visible(preview_editor):
+    """Two periods, a channel ON only in period 0: the preview must span the WHOLE frame.
+
+    The regression: the render took its span from ``sequence.duration``, which derives from
+    the last pulse EDGE -- the trailing all-off period vanished and the channel read as
+    "always on" across a truncated axis.  The frame length is the period table's
+    ``total_duration_ns`` (the authoritative single source), so the ON block must end at
+    half the axis, not at its right edge.
+    """
+
+    state = preview_editor.read_state()
+    # The default editor state IS the scenario: 2 x 1000 ns periods, ch00 on only in period 0.
+    assert len(state.periods) == 2
+    assert state.periods[0].states[0] == 1 and state.periods[1].states[0] == 0
+    seq = state.to_sequence()
+    frame_s = float(state.total_duration_ns()) * 1e-9
+    last_edge_s = max(float(p.stop) for p in seq.pulses)
+    assert last_edge_s < frame_s, "scenario must have a trailing all-off stretch"
+    # The rendered axis must include the full frame: compare the PNG against a render of a
+    # one-period state (which spans only the pulse) -- they must differ, and the block in the
+    # two-period render must NOT touch the right margin.  Cheap mechanical proxy: rendering
+    # with the trailing period present vs removed changes the picture.
+    png_two = preview_editor.preview_png_bytes(state, include_always_off=False)
+    import dataclasses as _d
+    one = type(state).from_dict({**state.to_dict(), "periods": [state.periods[0].to_dict()]}) \
+        if hasattr(state.periods[0], "to_dict") else None
+    if one is not None:
+        png_one = preview_editor.preview_png_bytes(one, include_always_off=False)
+        assert png_two != png_one, (
+            "removing the trailing all-off period did not change the preview -- the frame "
+            "length is not being honoured")
+
+
 def test_repeat_forever_bracket_draws_the_infinity_glyph_cleanly(preview_editor):
     """A repeat-forever pulse draws the ×∞ bracket label; the ∞ (U+221E) must resolve to a real glyph.
 

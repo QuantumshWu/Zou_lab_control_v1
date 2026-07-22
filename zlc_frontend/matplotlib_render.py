@@ -1093,8 +1093,10 @@ def render_pulse_timeline_png(
     color_map = {channel: colors[i % len(colors)] for i, channel in enumerate(channels)}
     row_height = 0.64 if n_channels <= 10 else max(0.42, 6.4 / max(1, n_channels))
 
+    # The axis spans the whole FRAME (total_duration), not just to the last pulse edge --
+    # a trailing all-off stretch is real programme time and must stay visible.
     start_min = min([0.0] + [float(row["start"]) for row in pulses])
-    stop_max = max([1e-12] + [float(row["stop"]) for row in pulses])
+    stop_max = max([1e-12, float(total_duration)] + [float(row["stop"]) for row in pulses])
     bracket_bounds = []
     for marker in repeat_markers:
         try:

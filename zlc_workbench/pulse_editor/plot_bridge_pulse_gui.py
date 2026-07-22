@@ -4149,7 +4149,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
              "value": bool(pulse.value), "name": str(getattr(pulse, "name", "") or "")}
             for pulse in raw_pulses
         ]
-        total = float(getattr(sequence, "duration", 0.0) or 0.0)
+        # The frame length comes from the PERIOD TABLE (total_duration_ns, the authoritative
+        # single source), NEVER from sequence.duration: the sequence derives its duration from
+        # the last pulse edge, so a trailing all-off period vanishes and a channel that is on
+        # only in period 0 reads as "always on" across a truncated axis.
+        total = float(state.total_duration_ns()) * 1e-9
         labels = {channel: state.label_for(channel) for channel in channels}
         # The repeat span reads as a bracket (its ×N / ×∞ label), matching the run.
         markers = []
