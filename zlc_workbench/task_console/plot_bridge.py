@@ -628,19 +628,23 @@ class PanelCard(FluentGroupBox):
     def _build_plot(self) -> None:
         """Give this card its raster surface.
 
-        A panel shows PIXELS the worker produced -- an encoded raster handed to
-        :class:`~zlc_frontend.qt_widgets.board.QtImageBoard`, which paints from
-        immutable bytes and owns no figure.  The card therefore holds no
-        Matplotlib object at all: rendering happens off the GUI thread and
-        arrives here already rasterised, which is what keeps a 2.3 MP frame from
-        being drawn on the thread that also has to stay responsive.
+        A panel shows PIXELS the worker produced -- an already-coherent
+        BoardFrame handed to :class:`~zlc_frontend.qt_widgets.SinglePanelHost`,
+        which paints from immutable bytes and owns no figure.  The card
+        therefore holds no Matplotlib object at all: rendering happens off the
+        GUI thread and arrives here already rasterised.  The host is the ONE
+        selector owner (design rule: an interactive window uses the
+        QtRasterBoard chain; QtImageBoard stays a frozen-report presenter), so
+        the console card's selector switch and future gesture wiring go
+        through the same binding as every other one-panel window.
         """
 
-        from zlc_frontend.qt_widgets import QtImageBoard
+        from zlc_frontend.qt_widgets import SinglePanelHost
 
         if self.board is not None:
             return
-        self.board = QtImageBoard(self.panel_id, empty_text="waiting for data")
+        self.board = SinglePanelHost(
+            self.panel_id, empty_text="waiting for data")
         self.canvas_holder.addWidget(self.board)
 
     def _composer(self, value):
@@ -763,7 +767,7 @@ class PanelCard(FluentGroupBox):
             return
         self._pending_frame = None
         self._build_plot()
-        self.board.present(frame)
+        self.board.present_frame(frame)
 
     def _build_settings(self) -> None:
         """The Setting popup: the sections the operator tunes this panel through.

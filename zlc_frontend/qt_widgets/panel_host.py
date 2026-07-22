@@ -60,11 +60,13 @@ class SinglePanelHost(QtWidgets.QWidget):
 
     def __init__(self, panel_id: str = "panel", *,
                  group: str | None = None,
+                 empty_text: str = "",
                  parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self._panel_id = str(panel_id)
         self._group = str(group or panel_id)
-        self._board = QtRasterBoard((self._panel_id,), columns=1)
+        self._board = QtRasterBoard(
+            (self._panel_id,), columns=1, empty_text=empty_text)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -83,6 +85,12 @@ class SinglePanelHost(QtWidgets.QWidget):
         """The underlying unified interaction owner (read-mostly access)."""
 
         return self._board
+
+    @property
+    def front_frame(self):
+        """The board's painted front (or None) -- same fact as the board's."""
+
+        return self._board.front_frame
 
     def set_selectors_enabled(self, on: bool) -> None:
         """The Selectors switch, same semantics as every console card: remember
