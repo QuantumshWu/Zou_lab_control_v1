@@ -64,6 +64,12 @@ class SinglePanelHost(QtWidgets.QWidget):
         layout.addWidget(self._board)
         self._bound_kind: str | None = None
         self._sequence = -1
+        # The design's "Selectors default OFF" rule: the host remembers the
+        # operator's switch itself (exactly like a console card) so a switch
+        # flipped BEFORE the first present is replayed once the binding exists
+        # -- the board refuses to arm with no healthy binding, and a refusal
+        # inside a Qt slot would kill the process.
+        self._selectors_on = False
 
     @property
     def board(self) -> QtRasterBoard:
@@ -72,9 +78,13 @@ class SinglePanelHost(QtWidgets.QWidget):
         return self._board
 
     def set_selectors_enabled(self, on: bool) -> None:
-        """The board-wide Selectors switch, same semantics as every console card."""
+        """The Selectors switch, same semantics as every console card: remember
+        the desired state and gate the CURRENT binding now; a binding created
+        later (first present) inherits it."""
 
-        self._board.set_selectors_enabled(bool(on))
+        self._selectors_on = bool(on)
+        if self._bound_kind is not None:
+            self._board.set_selectors_enabled(self._selectors_on)
 
     def present_panel(self, raster: RasterBuffer, payload, *,
                       pixel_ratio: float = 1.0) -> tuple[int, int]:
@@ -128,7 +138,13 @@ class SinglePanelHost(QtWidgets.QWidget):
     # ------------------------------------------------------------------ #
 
     def _ensure_binding(self, payload) -> None:
-        """Bind the gesture family matching the FIRST payload's kind, once."""
+        """Bind the gesture family matching the FIRST payload's kind, once.
+
+        The binding is created READY (the panel was just presented, so its
+        provenance is current) and the board-wide arm state is then set from
+        the host's remembered switch -- so the surface comes up matching the
+        switch (default OFF) instead of coming up live behind the operator.
+        """
 
         if self._bound_kind is not None:
             return
@@ -142,6 +158,8 @@ class SinglePanelHost(QtWidgets.QWidget):
             self._board.bind_histogram_interaction(
                 self._panel_id, self._on_intent)
             self._bound_kind = "histogram"
+        if self._bound_kind is not None:
+            self._board.set_selectors_enabled(self._selectors_on)
 
     def _echo_range_candidate(self, x_span) -> None:
         if self._bound_kind == "pulse":

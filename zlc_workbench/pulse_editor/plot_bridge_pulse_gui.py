@@ -2100,6 +2100,19 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.preview_include_off.setFixedSize(_px(198, minimum=178), preview_control_h)
         self.preview_include_off.setToolTip("Show channels that are always off in the preview.")
         self.preview_include_off.toggled.connect(self._on_include_off_toggled)
+        # "Selectors" switch, the SAME control (and default) as the console header:
+        # the preview is display-only BY DEFAULT (the wheel scrolls; no misclick
+        # zoom) -- flip ON to arm the unified selector layer (wheel zoom / pan,
+        # area, cross) on the preview panel in place.
+        self.preview_selectors_switch = FluentSwitch("Selectors")
+        self.preview_selectors_switch.setFixedSize(
+            _px(168, minimum=150), preview_control_h)
+        self.preview_selectors_switch.setChecked(False)
+        self.preview_selectors_switch.setToolTip(
+            "OFF: the preview is display-only (wheel scrolls).\n"
+            "ON: zoom / pan / area / cross work on the preview plot.")
+        self.preview_selectors_switch.toggled.connect(
+            self._on_preview_selectors_toggled)
         # Preview SIZE: one of PANEL_SIZES (the same size presets the console panels use), so the pulse
         # figure's data region scales like every other kind.  The default is optimal_pulse_size for the
         # current channel / period counts (the ONE default source, shared with the loaded panel); once the
@@ -2121,6 +2134,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.preview_status.setEnabled(False)
         self.preview_status.setFixedHeight(preview_control_h)
         preview_row.addWidget(self.preview_include_off)
+        preview_row.addWidget(self.preview_selectors_switch)
         preview_row.addWidget(self.preview_size_label)
         preview_row.addWidget(self.preview_size_combo)
         preview_row.addWidget(self.preview_status, 1)
@@ -4494,7 +4508,21 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self.preview_body_layout.addWidget(
                 host, 0, QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
             host.viewCommitted.connect(self._on_preview_view_committed)
+            # A host built after the operator flipped the switch inherits it,
+            # exactly like a console panel added while Selectors is ON.
+            host.set_selectors_enabled(
+                bool(getattr(self, "preview_selectors_switch", None)
+                     and self.preview_selectors_switch.isChecked()))
         return host
+
+    def _on_preview_selectors_toggled(self, on: bool) -> None:
+        """Preview "Selectors" switch: arm (ON) or park (OFF) the preview
+        panel's selector layer in place -- a pure display gate, same semantics
+        as the console header's switch."""
+
+        host = getattr(self, "preview_host", None)
+        if host is not None:
+            host.set_selectors_enabled(bool(on))
 
     def _present_preview(self, state: PulseTableState, *,
                          include_always_off: bool,

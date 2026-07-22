@@ -250,18 +250,31 @@ def test_wheel_zoom_on_the_preview_rerenders_the_time_view(preview_editor, appli
     target = board._numeric_target(binding)
     centre = QtCore.QPoint(
         int(round(target.plot.center().x())), int(round(target.plot.center().y())))
-    event = QtGui.QWheelEvent(
-        QtCore.QPointF(centre),
-        QtCore.QPointF(board.mapToGlobal(centre)),
-        QtCore.QPoint(),
-        QtCore.QPoint(0, -120),
-        QtCore.Qt.NoButton,
-        QtCore.Qt.NoModifier,
-        QtCore.Qt.ScrollUpdate,
-        False,
-    )
-    board.wheelEvent(event)
+
+    def wheel() -> None:
+        board.wheelEvent(QtGui.QWheelEvent(
+            QtCore.QPointF(centre),
+            QtCore.QPointF(board.mapToGlobal(centre)),
+            QtCore.QPoint(),
+            QtCore.QPoint(0, -120),
+            QtCore.Qt.NoButton,
+            QtCore.Qt.NoModifier,
+            QtCore.Qt.ScrollUpdate,
+            False,
+        ))
+        application.processEvents()
+
+    # Selectors default OFF (the design's anti-misclick rule): the wheel must
+    # NOT zoom while the switch is parked.
+    assert not preview_editor.preview_selectors_switch.isChecked()
+    wheel()
+    parked = board.visible_pulse_payload()
+    assert parked.viewport.x_limits == home, (
+        "the wheel zoomed while the Selectors switch was OFF")
+
+    preview_editor.preview_selectors_switch.setChecked(True)
     application.processEvents()
+    wheel()
 
     after = board.visible_pulse_payload()
     assert after is not None
