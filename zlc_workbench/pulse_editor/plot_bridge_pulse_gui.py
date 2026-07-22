@@ -714,6 +714,19 @@ class PeriodCard(FluentGroupBox):
         # Seed resolution + validator from the value just loaded, so a freshly built
         # card enforces exactly what an edited one does.
         self._handle_duration_text(self.duration_edit.text())
+        # Reflect a scan/API binding the state already carries, so a rebuilt or reopened
+        # card shows the SAME orange sN / violet aN marker the operator set.  Without this
+        # the dot cycle mutates the model but leaves the field looking untouched -- the
+        # whole 3-state effect is invisible (the bug behind "the click does nothing").
+        if _is_slot_expr(period.duration):
+            slot_index = _slot_index_of_expr(period.duration)
+            self.duration_edit.set_scan_bound(
+                True, None if slot_index is None else slot_index + 1)
+            self.unit_combo.setEnabled(False)
+        else:
+            api_name = state.api_slot_for("duration", str(index))
+            if api_name:
+                self.duration_edit.set_api_bound(True, _api_number(api_name))
         self.duration_edit.textChanged.connect(self._handle_duration_text)
         self.duration_edit.textChanged.connect(lambda *_: self.changed.emit())
         self.unit_combo.currentTextChanged.connect(self._handle_unit)
@@ -799,6 +812,17 @@ class PeriodCard(FluentGroupBox):
         combo.currentTextChanged.connect(
             lambda title, w=edit_field: w.setVisible(_bus_mode_value(title) != "hold"))
         edit_field.setVisible(_bus_mode_value(combo.currentText()) != "hold")
+        # Same scan/API marker the duration field shows: a DAC value bound to a scan slot
+        # goes orange + read-only with its sN number; an API-bound value keeps its number
+        # with a violet border.  Without this the DAC dot cycle leaves no visible trace.
+        if _is_slot_expr(stored):
+            slot_index = state.slot_index_for("dac", f"{bus_name}@{index}")
+            edit_field.set_scan_bound(True, None if slot_index is None else slot_index + 1)
+            combo.setEnabled(False)
+        else:
+            api_name = state.api_slot_for("dac", f"{bus_name}@{index}")
+            if api_name:
+                edit_field.set_api_bound(True, _api_number(api_name))
         return row
 
     def set_period_position(self, index: int, total: int) -> None:
