@@ -2494,14 +2494,42 @@ class Experiment:
             | FitExecution
             | FitResultArtifactRef
             | AdmittedFitResult
-        ),
+            | str
+            | Path
+            | None
+        ) = None,
         *,
         intent: "ViewIntent | None" = None,
         selection: Selection | None = None,
         preferences: "ViewPreferences | None" = None,
         occupancy_output: str | None = None,
     ):
-        """Resolve and show one frozen figure without blocking the notebook GUI."""
+        """Open the saved-figure browser or show one typed frozen source.
+
+        ``None`` opens the session-independent FigureViewer.  A filesystem path
+        opens that viewer and commits the selected current archive; typed
+        artifact/result inputs retain their existing interactive dispatch.
+        """
+
+        if source is None or isinstance(source, (str, Path)):
+            supplied_overrides = tuple(
+                name
+                for name, value in (
+                    ("intent", intent),
+                    ("selection", selection),
+                    ("preferences", preferences),
+                    ("occupancy_output", occupancy_output),
+                )
+                if value is not None
+            )
+            if supplied_overrides:
+                raise ValueError(
+                    "saved FigureViewer does not accept typed-source view overrides: "
+                    + ", ".join(supplied_overrides)
+                )
+            from zlc_workbench.figure_viewer.app import open_figure_viewer
+
+            return open_figure_viewer(path=source)
 
         if (
             isinstance(source, FitResultArtifactRef)

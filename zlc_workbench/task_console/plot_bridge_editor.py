@@ -131,6 +131,8 @@ class PanelEditor(QtWidgets.QWidget):
         self._param_kind_built = card._param_kind() if card is not None else None
         self._board = None
         self._composer = None
+        self._displayed_figure = None
+        self._displayed_display = None
         # A plot panel's Edit never carries a measurement form or Start/Stop: a plot is a
         # pure VIEW, and the node that produces its data lives on the Logic tab.
         self.meas_panel = None
@@ -416,11 +418,16 @@ class PanelEditor(QtWidgets.QWidget):
             self._composer = PanelComposer("edit-%x" % id(self),
                                            intent=card.view_intent(),
                                            label=str(value.name))
+        display = card._display_state()
         try:
             frame = self._composer.compose(
                 value.snapshot,
-                display=card._display_state(),
+                display=display,
                 provenance=PanelProvenance(value.run_id, value.epoch_id, value.join_digest))
+            figure = card.frozen_data_figure(
+                value=value,
+                composer=self._composer,
+            )
         except PanelRenderError as error:
             self.status.setText(str(error))
             return
@@ -428,6 +435,8 @@ class PanelEditor(QtWidgets.QWidget):
             self.status.setText("%s: %s" % (type(error).__name__, error))
             return
         self._board.present(frame)
+        self._displayed_figure = figure
+        self._displayed_display = display
         self.status.setText("")
 
     def teardown(self) -> None:
@@ -969,60 +978,8 @@ class PanelEditor(QtWidgets.QWidget):
         self.save_preview.setText(
             f"{display_path(str(self._save_stem(None)))}.{self._save_image_ext()} + .npz")
 
-    def _save_view_state(self) -> dict[str, object]:
-        """The panel's DISPLAY knobs, DERIVED from the ONE source (``config.params`` keyed by the ONE
-        ``PANEL_PARAMS`` catalog), folded into saved ``info['view']`` so ``load_figure(...).plot()`` and
-        the figure viewer reopen the figure AS SEEN.  Captures BOTH:
-
-        * the cross-kind view knobs that live OUTSIDE ``PANEL_PARAMS`` (relim mode + fixed lo/hi from
-          ``card._relim`` / the fixed bounds, unit index, repeat mode);
-        * EVERY kind-specific knob the panel actually renders from -- looped from
-          ``PANEL_PARAMS[_param_kind()]`` (a hist(-grid)'s bins/fit/ylog, a 2d/sites(-grid)'s colormap,
-          a monitor's length/show_dist), the SAME declarative catalog the render path (``_build_plot`` /
-          ``_build_facet_plotter``) and the Setting/Edit UI read.  Each stores the panel's EFFECTIVE
-          value (operator's pick else the declared default), so the npz is self-describing and reopens
-          exactly as drawn.
-
-        This kills the old divergence where the save HARD-LISTED only 6 keys and silently dropped every
-        other rendered knob (bins/fit/ylog/length/show_dist) -- a knob added to ``PANEL_PARAMS`` is now
-        saved automatically, so *display == reopened figure* by construction.  ``_param_kind()`` yields a
-        grid's per-cell ``sub_plot_kind``, so a grid captures its cells' knobs through the very same loop
-        (the same thing ``_grid_recipe_with_params`` already does).  ``cmap`` is one of these declared
-        keys: ``params.get('cmap', decl.default)`` is exactly the operator-pick-else-kind-default the
-        ``_resolved_cmap`` resolver gives, so an image/site-map save still records the real colormap name
-        it drew with; a kind with no colormap param simply omits the key (never a stray ``''``)."""
-        params = self.card.config.params
-        view: dict[str, object] = {
-            "relim": self.card._relim(),
-            "fixed_lo": _safe_float(str(params.get("fixed_lo", 0.0)), 0.0),
-            "fixed_hi": _safe_float(str(params.get("fixed_hi", 1.0)), 1.0),
-            "unit_index": int(params.get("unit_index", 0) or 0),
-            "repeat_mode": self.card._repeat_mode_value(),
-        }
-        # the view-window pins (#3) are cross-kind view knobs too: persist them so a reopened figure keeps
-        # the operator's window (only when actually set -- a never-pinned panel omits them, staying
-        # autoscale; view_ylim only ever exists on the image family, whose store gate wrote it).
-        for key in ("view_xlim", "view_ylim"):
-            pin = params.get(key)
-            if pin:
-                view[key] = [float(pin[0]), float(pin[1])]
-        # The serialized request is the one cross-surface fit state.  It contains
-        # model + Selection + typed options and is safe to round-trip as data.
-        if params.get("fit_request"):
-            view["fit_request"] = dict(params["fit_request"])
-        for decl in _panel_display_decls(self.card.config.kind, self.card._param_kind()):
-            view[decl.key] = params.get(decl.key, decl.default)
-        return view
-
     def save(self) -> None:
-        """Write exactly the picture this snapshot is showing.
-
-        The front already IS the composed figure, so saving it is a transcription
-        rather than a second render -- there is no way for the file and the screen
-        to disagree.  The DATA is not written here: the run's repository already
-        owns it, and a GUI-written copy would be a second answer to what was
-        measured.
-        """
+        """Write the exact visible pixels and their exact typed data revision."""
 
         front = None if self._board is None else self._board.front_frame
         if front is None:
@@ -1035,9 +992,21 @@ class PanelEditor(QtWidgets.QWidget):
             image = _front_qimage(front)
             if image is None or not image.save(str(target)):
                 raise RuntimeError("Qt refused to write %s" % target.name)
+            figure = self._displayed_figure
+            display = self._displayed_display
+            if figure is None or display is None:
+                raise RuntimeError("the editor has no exact typed figure to save")
+            figure.save_archive(
+                stem.with_suffix(".npz"),
+                display=display,
+                metadata={
+                    "panel_kind": str(self.card.config.kind),
+                    "title": str(self.card.config.title or ""),
+                },
+            )
             self.console._last_save_dir = str(stem.parent)
             self._update_save_preview()
-            self.status.setText("saved %s -> %s" % (target.name, stem.parent))
+            self.status.setText("saved %s + %s" % (target.name, stem.with_suffix(".npz").name))
             self.status.setToolTip(str(stem.parent))
         except Exception as error:
             self.status.setText("save failed: %s" % error)

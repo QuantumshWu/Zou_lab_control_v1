@@ -785,6 +785,34 @@ class PanelCard(FluentGroupBox):
             y_view=pin_y,
         )
 
+    def frozen_data_figure(self, *, value=None, composer=None):
+        """Return the exact typed figure behind the currently displayed panel.
+
+        This is a projection of the already-owned immutable monitor revision,
+        not another acquisition and not a GUI snapshot.  The same
+        :class:`PanelComposer` supplies the document used to draw the card, so
+        saving cannot re-guess axes or plot kind from an array shape.
+        """
+
+        from zlc_frontend import DataFigure
+        from zlc_frontend.figure import ResolvedDataset, ResolvedDatasetMap
+
+        if value is None:
+            value = self._last_value
+        snapshot = None if value is None else getattr(value, "snapshot", None)
+        block = None if snapshot is None else getattr(snapshot, "block", None)
+        if block is None:
+            raise RuntimeError("the panel has no immutable data revision to save")
+        owner = self._composer(value) if composer is None else composer
+        document = owner.document_for(block.schema)
+        if len(document.datasets) != 1:
+            raise RuntimeError("a saved panel must bind exactly one typed dataset")
+        dataset_id = document.datasets[0].dataset_id
+        return DataFigure(
+            document,
+            ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
+        )
+
     def present(self) -> None:
         """Flush this card's composed front to the screen.  GUI thread only.
 
@@ -1991,13 +2019,12 @@ class PanelCard(FluentGroupBox):
         return entry[0] if entry else None
 
     def _panel_labels(self, xlabel: str, ylabel: str, zlabel: str = "") -> tuple[str, str, str]:
-        """The (x, y, z) axis labels this panel draws.  A REPRODUCED figure seeds the SAVED labels as
-        ``xlabel`` / ``ylabel`` / ``zlabel`` panel params (figure_viewer._seed_state, from the ONE
-        ``SavedFigure.axis_labels`` source) so a reopened panel draws the SAME axes it was saved with --
-        the params are then the single source; a LIVE panel carries no such params and keeps the kind's
-        reconstructed defaults passed in here.  A NON-EMPTY override wins (``axis_labels`` only ever seeds
-        non-empty labels); an absent OR empty param falls back to the default, so this never blanks a live
-        axis (matching the xy-curve branch's own ``params.get('ylabel', '') or label``)."""
+        """Resolve optional authored labels over the live schema-derived defaults.
+
+        Current saved figures retain their typed FigureDocument and DatasetSchema,
+        so this TaskConsole-only helper is not a persistence or replay contract.
+        Empty authored fields never erase a declared live label.
+        """
         p = self.config.params
         return (str(p.get("xlabel") or xlabel), str(p.get("ylabel") or ylabel), str(p.get("zlabel") or zlabel))
 

@@ -45,6 +45,7 @@ from .curve_display import numeric_curve_coordinates
 if TYPE_CHECKING:
     from .fit_curve_projection import CurveFitOverlayPlan
     from .fit_image_projection import RadialGaussianImageFitPanel
+    from .figure_archive import FigureDisplayState
     from .render import RadialGaussianImageFitOverlay
 
 
@@ -233,10 +234,13 @@ class DataFigure:
 
     ``DataFigure`` never resolves repositories, sessions, devices, or live
     streams.  Construction evaluates the supplied frozen snapshots once and
-    releases them; later renders consume only immutable presentation DTOs.
+    retains those same immutable references for exact archive export; it never
+    copies them or turns them into a live source.  Later renders consume only
+    immutable presentation DTOs.
     """
 
     __slots__ = (
+        "_datasets",
         "_document",
         "_evaluated",
         "_fit_results",
@@ -284,6 +288,7 @@ class DataFigure:
             selection_views_validated=True,
         )
 
+        self._datasets = datasets
         self._document = document
         self._evaluated = evaluated
         self._fit_results = validated_fit_results
@@ -296,6 +301,20 @@ class DataFigure:
     @property
     def evaluated(self):
         return self._evaluated
+
+    @property
+    def datasets(self) -> ResolvedDatasetMap:
+        """Return the exact immutable source revisions used by this figure."""
+
+        return self._datasets
+
+    @property
+    def fit_results(self) -> Mapping[str, FitResultBatch]:
+        """Return a read-only mapping of the exact fit overlays."""
+
+        from types import MappingProxyType
+
+        return MappingProxyType(dict(self._fit_results))
 
     @property
     def has_fit_overlays(self) -> bool:
@@ -331,6 +350,7 @@ class DataFigure:
             selection_views_validated=True,
         )
         clone = object.__new__(type(self))
+        clone._datasets = self._datasets
         clone._document = self._document
         clone._evaluated = self._evaluated
         clone._fit_results = validated
@@ -519,6 +539,7 @@ class DataFigure:
             ),
         )
         clone = object.__new__(type(self))
+        clone._datasets = self._datasets
         clone._document = focused_document
         clone._evaluated = focused_evaluated
         clone._fit_results = ()
@@ -710,6 +731,29 @@ class DataFigure:
 
     def _repr_png_(self) -> bytes:
         return self.to_png_bytes()
+
+    def save_archive(
+        self,
+        path: str | Path,
+        *,
+        display: FigureDisplayState | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> Path:
+        """Atomically persist this typed figure without changing its authority.
+
+        The optional display value is authored presentation state only.  Source
+        datasets and fit results remain their complete owner-defined values;
+        no evaluated x/y projection is promoted into the archive.
+        """
+
+        from .figure_archive import save_figure_archive
+
+        return save_figure_archive(
+            self,
+            path,
+            display=display,
+            metadata=metadata,
+        )
 
     def export(
         self,

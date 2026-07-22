@@ -189,11 +189,9 @@ def test_the_product_surface_reaches_no_legacy_module():
     reach the legacy ``pulse_table``; wiring it at package import ALSO loaded the
     renderer and broke the headless guarantee
     (``test_headless_notebook_import_does_not_load_frontend_renderer``).  The
-    port is not reachable from the product anyway: nothing in the product surface
-    or ``zlc_workbench`` loads a saved npz figure, so ``SavedFigure.pulse_state``
-    has no product caller until the saved-figure viewer is salvaged.  The
-    registration moves then - lazily, on the render-touching path, never at
-    import - and this set is where a premature attempt shows up.
+    Current FigureViewer now loads only typed dataset Figure archives and has no
+    pulse-state compatibility path.  Any attempt to reintroduce the old replay
+    registration would therefore still be premature and appears in this set.
     """
 
     import ast

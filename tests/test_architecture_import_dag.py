@@ -1070,10 +1070,9 @@ def test_legacy_frontend_persisted_formats_have_no_edit_counter_or_single_role()
     """Owners are resolved by DEFINITION SITE, never by path -- see ``_sole_definition``.
 
     The two console records follow their class definitions, so the guard survives
-    a salvage instead of being silently orphaned by it.  The legacy ``SavedFigure``
-    npz record died with the legacy render stack (terminal ruling 2026-07-21); the
-    current persisted-figure format is the ``zlc_frontend.figure`` document tree
-    with its own codec guards, so no anchor for it remains here.
+    a salvage instead of being silently orphaned by it.  Persisted figures now use
+    the exact current ``zlc_frontend.figure_archive`` envelope and owner codecs;
+    the deleted frontend record therefore has no compatibility anchor here.
     """
 
     console_state_path, console_state_node = _sole_definition("TaskConsoleState")
@@ -1103,7 +1102,7 @@ def test_legacy_frontend_persisted_formats_have_no_edit_counter_or_single_role()
                 )
 
     assert not violations, (
-        "legacy frontend persisted records are current-only: SavedFigure and "
+        "frontend persisted records are current-only: FigureArchive and "
         "TaskConsole keep a plain schema, while single-value panel roles and "
         "numeric edit counters stay deleted:\n" + "\n".join(violations)
     )

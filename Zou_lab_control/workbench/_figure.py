@@ -1442,6 +1442,8 @@ class DataFigureWindow(FrozenRasterWindow):
         *,
         fit_bindings: _FitWorkbenchBindings | None = None,
         typed_front_committed=None,
+        initial_display: _TypedDisplayState | None = None,
+        embedded: bool = False,
     ) -> None:
         if not callable(initial_loader) or not callable(typed_renderer):
             raise TypeError("figure worker callables must be callable")
@@ -1456,10 +1458,16 @@ class DataFigureWindow(FrozenRasterWindow):
             raise TypeError("fit_overlay_renderer must be callable or None")
         if typed_front_committed is not None and not callable(typed_front_committed):
             raise TypeError("typed_front_committed must be callable or None")
+        if initial_display is not None:
+            _state_intent(initial_display)
+        if not isinstance(embedded, bool):
+            raise TypeError("embedded must be bool")
         self._typed_renderer = typed_renderer
         self._fit_overlay_renderer = fit_overlay_renderer
         self._fit_bindings = fit_bindings
         self._typed_front_committed = typed_front_committed
+        self._initial_display = initial_display
+        self._embedded = embedded
         self._view_family: str | None = None
         self._display: _TypedDisplayState | None = None
         self._typed_contract: (
@@ -1526,6 +1534,13 @@ class DataFigureWindow(FrozenRasterWindow):
             object_prefix="figureViewer",
             subject="figure",
         )
+        if embedded:
+            self.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Expanding,
+            )
+            self._layout.setContentsMargins(0, 0, 0, 0)
+            self._close_button.hide()
 
         self._typed_page = QtWidgets.QWidget(self._tabs)
         self._typed_page.hide()
@@ -3199,9 +3214,12 @@ class DataFigureWindow(FrozenRasterWindow):
                 self._mode.setText("FROZEN DATA FIGURE · DISPLAY ONLY")
                 self._present_bundle(result)
             elif isinstance(result, _TypedFigureFront):
+                initial_display = self._initial_display
+                if initial_display is None:
+                    initial_display = _default_typed_state(result.intent)
                 self._present_typed_front(
                     result,
-                    expected_state=_default_typed_state(result.intent),
+                    expected_state=initial_display,
                     request_revision=self._request_revision,
                 )
                 if (
@@ -3628,7 +3646,13 @@ def _figure_window_factory(
     *,
     fit_bindings: _FitWorkbenchBindings | None = None,
     initial_fit_result_identity: str | None = None,
+    initial_display: _TypedDisplayState | None = None,
+    embedded: bool = False,
 ):
+    if initial_display is not None:
+        _state_intent(initial_display)
+    if not isinstance(embedded, bool):
+        raise TypeError("embedded must be bool")
     worker_thread_id: int | None = None
     cached_typed: DataFigure | None = None
     cached_base: DataFigure | None = None
@@ -3665,9 +3689,18 @@ def _figure_window_factory(
                 )
             if not figure.has_fit_overlays and initial_fit_result_identity is not None:
                 raise ValueError("Fit result identity was supplied for a source-only Figure")
+            display = (
+                _default_typed_state(intent)
+                if initial_display is None
+                else initial_display
+            )
+            if _state_intent(display) is not intent:
+                raise ValueError(
+                    "saved display state does not match the figure view intent"
+                )
             front = _render_typed_front(
                 figure,
-                _default_typed_state(intent),
+                display,
                 current_value_limits=None,
                 previous_relim_mode=None,
                 previous_count_scale=None,
@@ -3684,6 +3717,10 @@ def _figure_window_factory(
             return front
         grid_intent, grid_panel_count, grid_reason = _classify_typed_grid(figure)
         if grid_intent is not None and grid_panel_count is not None:
+            if initial_display is not None:
+                raise ValueError(
+                    "a multi-panel figure does not accept one single-panel display state"
+                )
             if initial_fit_result_identity is not None:
                 raise ValueError("Fit result identity was supplied for a typed grid")
             overview = _render_typed_grid_overview(figure, cancelled)
@@ -3787,12 +3824,41 @@ def _figure_window_factory(
         rerender if fit_bindings is not None else None,
         fit_bindings=fit_bindings,
         typed_front_committed=commit_front,
+        initial_display=initial_display,
+        embedded=embedded,
     )
 
 
 
+def create_data_figure_pane(
+    figure: DataFigure,
+    *,
+    initial_display: _TypedDisplayState | None = None,
+    initial_fit_result_identity: str | None = None,
+    embedded: bool = True,
+) -> DataFigureWindow:
+    """Build the one DataFigure interaction owner for embedding or launch.
+
+    This is construction only: callers that need a top-level window still go
+    through :func:`open_data_figure_workbench`.  FigureViewer uses the same
+    body as a child, so saved figures cannot grow a second selector, Setting,
+    Fit, or export implementation.
+    """
+
+    if not isinstance(figure, DataFigure):
+        raise TypeError("figure must be DataFigure")
+    return _figure_window_factory(
+        lambda: figure,
+        initial_display=initial_display,
+        initial_fit_result_identity=initial_fit_result_identity,
+        embedded=embedded,
+    )()
+
+
 def open_data_figure_workbench(
     figure: DataFigure,
+    *,
+    initial_display: _TypedDisplayState | None = None,
 ) -> DataFigureWindow:
     """Open an already-resolved DataFigure on the shared raster lane."""
 
@@ -3801,6 +3867,7 @@ def open_data_figure_workbench(
     return open_workbench_window(
         _figure_window_factory(
             lambda: figure,
+            initial_display=initial_display,
         )
     )
 

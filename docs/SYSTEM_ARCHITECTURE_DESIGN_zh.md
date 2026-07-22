@@ -661,7 +661,7 @@ Experiment                         # notebook/application facade，不含领域�
   .load_fit(FitResultArtifactRef) -> AdmittedFitResult
   .figure_document(result_or_ref, occupancy_output=None) # headless projector
   .figure(result_or_ref, occupancy_output=None)          # 需要 zlc_frontend[render]
-  .figure_gui(result_or_ref, occupancy_output=None)      # typed交互查看；Capture/Scan可Analyze->Fit，saved-fit进入可显式Refit的exact GridPlot
+  .figure_gui(source=None, occupancy_output=None)        # 无source打开Saved Figure；path直开current .npz；typed source保持交互查看语义
   .readout.load_calibration_computation(calibration_ref) # 同次decode返回artifact+report
   .readout.calibration_report_gui(calibration_ref)       # 懒加载冻结标定报告，只读显示
   .readout.calibration_gui(calibration_request)           # 编辑显式request，成功即原子FINAL commit
@@ -685,6 +685,8 @@ Notebook 的 Pulse 窗口是 Experiment-owned singleton：第一次 `exp.pulse_g
 
 
 **当前Fit/figure事实覆盖上一段的历史W4/W5/W7/W8枚举：** ScanArtifact已经是FitResultRepository、headless `.fit()`、DataFigure、`figure_gui/fit_gui`与exact saved-grid的正式source；generic单panelCURVE/IMAGE及fit-bearing replay均为typed interactive，不再是`FROZEN / DISPLAY ONLY`；独立W5 `_fit.py`与Capture-only ref/repository均已物理删除。U0.3e又让TaskConsole的`Add Analysis -> Fit`只在当前card拥有精确FINAL ScanArtifact时委托同一host；它不是尚未实现的formal AnalysisStep，也不保存自动重跑preset。不能把上一段的历史措辞用于新实现。
+
+`Experiment.figure_gui()`的无参数形态是session-independent的正式FigureViewer入口；传入`.npz`路径则直接打开该文件，传入`.png/.jpg/.jpeg`只解析同stem的`.npz`，绝不从像素或数组rank反猜数据语义。传入typed source/ref仍走既有DataFigure/fit/grid分派，不能因为增加文件入口而改写其行为。FigureViewer沿用`main`正式窗口的File/Info外壳，但右侧嵌入唯一`DataFigureWindow`交互owner；不得恢复旧`LoadedFigureNode`、伪Hub/RunId、TaskConsole重放或另一套plot/selector实现。路径输入仅在Browse结果或`editingFinished`提交时做一次I/O；普通文字输入、viewport、selector、Setting/Edit不产生全局snapshot或重建窗口。候选文件必须在worker中完整解码和验证，成功后才原子替换当前pane；失败保留上一幅有效Figure及Info并给出完整错误。
 
 W4b在这个边界上交付`.readout.load_calibration_computation(ref)`与`.readout.calibration_report_gui(ref)`：repository一次解码并成对返回已经互相校验的`CalibrationArtifact + CalibrationReport`，worker只投影和绘制已经保存的site、threshold、fidelity、validity与empirical PSF事实，Qt只接收多页owned immutable PNG。报告不重新拟合、不重新阈值化、不把canonical site向量reshape成二维数据，也不为了复用DataFigure而伪造`DatasetSchema`。它与W4a共用一个capacity-one frozen-raster executor、同一Qt window lifecycle和同一encoded-page DTO；关闭窗口只撤销未开始/阶段间工作，已进入repository或Agg的调用诚实排空且不发布stale结果。该窗口只是static frozen calibration report；大阵列的交互focus/zoom/export、live site-map/gridplot仍属于后续明确consumer，不能用本纵切的缩放PNG冒充已交付。W6已在同一paired loader/renderer上补交显式request edit/recalibrate，仍不把静态PNG冒充live grid或几何selector。
 
@@ -1940,12 +1942,17 @@ FigureSession     transient frontend interaction state
 FigureEvaluator   (document, ResolvedDatasetMap) -> EvaluatedFigureData
 FigureRenderer    (document, EvaluatedFigureData) -> surface/frame
 FigureCodec       current schema only
+FigureArchive     exact current typed NPZ（FigureDocument + source revisions + fit + display）
 DataFigure        frontend.render 的 notebook/public render facade
 ```
 
 FigureDocument 只持有 frontend-owned DatasetId/immutable dataset descriptor、zlc_data Selection 和已解析的 dataset ViewSpec；dataset-fed ViewIntent 只在创建/编辑时作为 suggest_view 输入，不成为另一份持久状态。document-fed PULSE 不能出现在 ViewSpec/FigureDocument/codec 中。权威派生 dataset 另带 zlc_data CommittedTransform/analysis record 与 frontend FigureArtifact digest。FigureDocument 不持有 neutral runtime ref/lineage 类型；Workbench 在 materialize 时把外部 causation 转成 FigureArtifact manifest 的普通 canonical descriptors。Workbench LiveFigureBinding 维护 LiveDataBlockRef -> DatasetId 的临时映射，解析成 zlc_data DataBlock snapshot/ResolvedDatasetMap。
 
-Interactive live path 在 per-panel latest-only view-evaluation executor 运行 FigureEvaluator：直接解析 ViewSpec 的 axis bindings/navigation policy，再执行 display transform/reduction/layer data 计算，产生带 document/input revision 与 resolution records 的 immutable EvaluatedFigureData；具体 surface ownership 见 §12.5。Workbench 的 live/headless export job 在 worker 中永久独占自己的 Figure。冻结的 notebook DataFigure 是不同的同步 one-shot surface：构造时一次 evaluate 并释放 source snapshot，每次 `render/export/_repr_png_` 在调用线程用 OO Agg 新建一个 caller-owned Figure；它没有 live mutation、共享 artist 或第二个scheduler，因此不为DataFigure本身预建render lane。W4a窗口只是把既有`.figure()`和一次`to_png_bytes()`作为同一个module-owned capacity-one worker job托管，使这个“调用线程”不是Qt owner；job结束即释放DataFigure/Agg，只留下immutable PNG front，不把one-shot viewer提升为live renderer。所有路径都只执行 document 已决定的 ViewSpec，不重新猜 axis；live/persisted binding 的保存规则见 §16.3。
+Interactive live path 在 per-panel latest-only view-evaluation executor 运行 FigureEvaluator：直接解析 ViewSpec 的 axis bindings/navigation policy，再执行 display transform/reduction/layer data 计算，产生带 document/input revision 与 resolution records 的 immutable EvaluatedFigureData；具体 surface ownership 见 §12.5。Workbench 的 live/headless export job 在 worker 中永久独占自己的 Figure。冻结的 notebook DataFigure 是不同的同步 one-shot surface：构造时一次evaluate，同时保留它已经接收的immutable `ResolvedDatasetMap`引用以支持精确archive；不复制array、不回查repository、也不取得live/session authority。每次 `render/export/_repr_png_` 在调用线程用 OO Agg 新建一个caller-owned Figure；它没有live mutation、共享artist或第二个scheduler，因此不为DataFigure本身预建render lane。窗口只把既有DataFigure交给共享worker/interactive owner，不把one-shot Figure提升成周期snapshot源。所有路径都只执行document已决定的ViewSpec，不重新猜axis；live/persisted binding的保存规则见§16.3。
+
+`FigureArchive`是`zlc_frontend`唯一的保存/读取owner，并采用`allow_pickle=False`的严格current-only NPZ。外层只有固定schema标识与canonical payload；payload由各领域值对象自己的canonical codec组成，必须精确保留`FigureDocument`、每个`DatasetId + DatasetRevisionRef + DatasetSchema + DataBlock`（包括完整`(R,P,*data_shape)`、coordinates/layout、`ComponentValidity`）、每层`FitResultBatch`和string-keyed metadata。当前display state单独作为`DISPLAY_ONLY`保存，用于重开时还原屏幕选择；它不得修改document、CommittedTransform、FitSpec或scan authority。writer以临时文件+同目录原子替换提交；reader先完整校验canonical envelope、schema绑定、source revision与fit绑定，再构造`DataFigure`并计算payload digest作为只读身份。格式不带无消费者的数字version，不提供旧8/9-key reader、converter、shape/rank inference或兼容fallback；不符合current envelope的文件明确拒绝。
+
+FigureViewer只负责文件选择、异步decode、Info投影和pane生命周期；显示、selector、Setting/Edit、fit与export全部委托同一个`DataFigureWindow`。一次成功Open/Load是允许的完整generation替换，旧pane只在新pane构造成功后销毁；失败不能清空旧front。加载之后的普通交互只更新稳定widget和display state，不重新解码archive、不构造全应用snapshot、不重建pane。TaskConsole保存panel时，图像文件必须逐像素转录当前front，而同stem `.npz`由这一archive owner写出exact source+document+display；两者任何一个失败都不能报告“image + data均已保存”。
 
 Calibration report不是普通dataset view：它同时展示runtime artifact、statistical report、component validity、threshold provenance与empirical PSF diagnostics，强塞进DataFigure会要求伪造point/data axes并丢失领域关系。W4b因此只复用相同的frozen-raster hosting，不复用DataFigure语义：neutral owner成对校验artifact/report并给出阈值来源与GridOrder物理位置；Workbench composition投影成frontend-owned immutable report view；frontend renderer只画stored facts。`EncodedRasterDocument/Page`是DataFigure与Calibration两个真实consumer共用的唯一worker→Qt DTO，shared shell至多保留一个尚未开始的latest请求，并统一负责取消/reap与atomic multi-page present；它不是第二renderer或通用workflow engine。
 

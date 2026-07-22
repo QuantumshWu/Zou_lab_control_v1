@@ -4,8 +4,8 @@ data produced" tree the :mod:`~.figure_viewer` shows on its **Flow** tab.
 A figure's provenance is NOT a single chain: a site map consumes occupancy + centres + an underlay frame,
 each of which flows up its OWN chain to a device.  So the graph BRANCHES UPWARD (several parents) and can
 CONVERGE (one source feeding two processors that both feed the plot).  This widget takes the neutral
-``{"nodes": [...], "edges": [...]}`` graph captured by
-:func:`~...neutral_atom.operations.figure_capture.capture_flow_graph` and draws it as a node-link diagram:
+``{"nodes": [...], "edges": [...]}`` graph supplied as optional typed archive
+metadata and draws it as a node-link diagram:
 
 * nodes are laid out in TOPOLOGICAL LAYERS -- the terminal ``plot`` at the bottom, each producing node one
   layer up from the node it feeds (longest-path layering, so an edge always points DOWN across >=1 layer),

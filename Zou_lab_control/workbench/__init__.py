@@ -60,6 +60,25 @@ def open_data_figure_workbench(figure):
     return _open(figure)
 
 
+def create_data_figure_pane(
+    figure,
+    *,
+    initial_display=None,
+    initial_fit_result_identity=None,
+    embedded=True,
+):
+    """Build the shared DataFigure body for an owning Workbench shell."""
+
+    from ._figure import create_data_figure_pane as _create
+
+    return _create(
+        figure,
+        initial_display=initial_display,
+        initial_fit_result_identity=initial_fit_result_identity,
+        embedded=embedded,
+    )
+
+
 def open_occupancy_cell_workbench(
     navigation_loader,
     cell_loader,
@@ -159,6 +178,7 @@ __all__ = [
     "open_calibration_report_workbench",
     "open_camera_monitor_workbench",
     "open_capture_workbench",
+    "create_data_figure_pane",
     "open_data_figure_workbench",
     "open_figure_workbench",
     "open_occupancy_cell_workbench",

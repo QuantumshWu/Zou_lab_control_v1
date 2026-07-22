@@ -5,6 +5,13 @@ from .data_figure import (
     DataFigure,
     FigurePanelRegion,
 )
+from .figure_archive import (
+    FIGURE_ARCHIVE_SCHEMA,
+    FigureDisplayState,
+    LoadedFigureArchive,
+    load_figure_archive,
+    save_figure_archive,
+)
 from .curve_display import (
     CurveDisplayState,
     CurveViewportTransform,
@@ -173,6 +180,7 @@ __all__ = [
     "DatasetDescriptor",
     "DatasetId",
     "DataFigure",
+    "FIGURE_ARCHIVE_SCHEMA",
     "DisplayReduction",
     "DisplayReductionMethod",
     "DisplayRange",
@@ -191,6 +199,7 @@ __all__ = [
     "FigureEvaluator",
     "FigureLayer",
     "FigurePanelRegion",
+    "FigureDisplayState",
     "FitAuthoringOption",
     "FigureSelection",
     "FixedIndex",
@@ -222,6 +231,7 @@ __all__ = [
     "HistogramViewportCommit",
     "HistogramViewportTransform",
     "LatestNonempty",
+    "LoadedFigureArchive",
     "MIN_HISTOGRAM_BINS",
     "NormalizedPoint",
     "NormalizedRectangle",
@@ -267,6 +277,7 @@ __all__ = [
     "image_display_form_values",
     "image_display_from_form",
     "image_viewport_for_display_state",
+    "load_figure_archive",
     "validated_display_range",
     "fit_axis_summary",
     "fit_authority_summary",
@@ -278,4 +289,5 @@ __all__ = [
     "validate_view_spec",
     "parse_number_text",
     "selection_fit_view_projection",
+    "save_figure_archive",
 ]
