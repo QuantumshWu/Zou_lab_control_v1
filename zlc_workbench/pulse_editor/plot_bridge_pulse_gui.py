@@ -4131,14 +4131,49 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         second rendering that could differ.
         """
 
+        from zlc_frontend.matplotlib_render import render_pulse_timeline_png
+
         if state is None:
             state = self.read_state()
         if include_always_off is None:
             include_always_off = bool(
                 getattr(self, "preview_include_off", None)
                 and self.preview_include_off.isChecked())
-        figure = self._preview_data_figure(state, include_always_off=include_always_off)
-        return figure.to_png_bytes()
+        # The plot layer owns the faithful pulse-timeline render (filled step blocks +
+        # coloured baselines + repeat brackets); this window is a PURE data source, so
+        # the preview, Save Figure and Save Image all draw the identical figure and the
+        # frontend never imports the pulse/neutral packages.
+        sequence = state.to_sequence()
+        clock_lanes = {lane for port in state.port_catalog.clock_ports for lane in port.lanes}
+        raw_pulses = list(getattr(sequence, "pulses", ()) or ())
+        active = {str(pulse.channel) for pulse in raw_pulses}
+        channels = [str(name) for name in sequence.channels
+                    if name not in clock_lanes and (include_always_off or name in active)]
+        if not channels:
+            channels = [str(name) for name in sequence.channels if name not in clock_lanes]
+        pulses = [
+            {"channel": str(pulse.channel), "start": float(pulse.start),
+             "stop": float(pulse.stop), "duration": float(pulse.duration),
+             "value": bool(pulse.value), "name": str(getattr(pulse, "name", "") or "")}
+            for pulse in raw_pulses
+        ]
+        total = float(getattr(sequence, "duration", 0.0) or 0.0)
+        labels = {channel: state.label_for(channel) for channel in channels}
+        # The repeat span reads as a bracket (its ×N / ×∞ label), matching the run.
+        markers = []
+        if getattr(state, "repeat_forever", False):
+            markers = [(0.0, total, "×∞")]
+        elif int(getattr(state, "repeat_count", 1) or 1) > 1:
+            markers = [(0.0, total, f"×{int(state.repeat_count)}")]
+        return render_pulse_timeline_png(
+            pulses=pulses,
+            channels=channels,
+            channel_labels=labels,
+            total_duration=total,
+            title=str(getattr(state, "name", "") or ""),
+            repeat_markers=markers,
+            repeat_notation=_repeat_summary_text(state),
+        )
 
     def refresh_preview(self) -> None:
         """Redraw the Preview tab from the CURRENT table.

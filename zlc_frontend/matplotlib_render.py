@@ -975,6 +975,189 @@ def save_image_panel_png(
         gc.collect()
 
 
+def _pulse_time_unit(span_s: float) -> tuple[float, str]:
+    """Seconds -> (scale, unit) so a pulse timeline reads in ns / us / ms / s.
+
+    The same thresholds the reference uses, so the x axis label and tick values
+    match: sub-us spans stay in ns, sub-ms in us, sub-s in ms, else seconds."""
+    span = abs(float(span_s))
+    if span < 1e-6:
+        return 1e-9, "ns"
+    if span < 1e-3:
+        return 1e-6, "us"
+    if span < 1.0:
+        return 1e-3, "ms"
+    return 1.0, "s"
+
+
+def _draw_pulse_repeat_brackets(axis, repeat_markers, n_channels, colors) -> None:
+    """The grey square brackets that enclose a repeated span, with its ``×N`` /
+    ``×∞`` label, exactly as the reference draws them: two vertical stems with
+    short inward feet at each end, nested outward for multiple brackets."""
+
+    import numpy as _np
+
+    from .render_style import smaller_fontsize
+
+    markers = [m for m in repeat_markers if m is not None]
+    if not markers:
+        return
+    xlim = axis.get_xlim()
+    span = max(float(xlim[1] - xlim[0]), 1e-12)
+    tick_base = span * 0.024
+    bracket_count = max(1, len(markers))
+    for index, marker in enumerate(markers):
+        try:
+            start, stop, label = float(marker[0]), float(marker[1]), str(marker[2])
+        except Exception:
+            continue
+        if not _np.isfinite(start) or not _np.isfinite(stop) or stop <= start:
+            continue
+        color = colors[index % len(colors)]
+        alpha = 0.58
+        outer_depth = max(0, bracket_count - 1 - index)
+        y_low = -0.42 - 0.13 * outer_depth
+        y_high = float(n_channels) - 0.10 + 0.34 * outer_depth
+        tick = min(tick_base, max(stop - start, 0.0) * 0.2)
+        tick = max(tick, span * 0.006)
+        axis.plot([start + tick, start, start, start + tick], [y_high, y_high, y_low, y_low],
+                  color=color, alpha=alpha, linewidth=1.05, solid_capstyle="round",
+                  clip_on=True, zorder=8 + index)
+        axis.plot([stop - tick, stop, stop, stop - tick], [y_high, y_high, y_low, y_low],
+                  color=color, alpha=alpha, linewidth=1.05, solid_capstyle="round",
+                  clip_on=True, zorder=8 + index)
+        if label:
+            axis.text((start + stop) / 2.0, y_high + 0.06 * (1 + outer_depth), label,
+                      ha="center", va="bottom", color=color, alpha=alpha,
+                      fontsize=smaller_fontsize(1.0, 5.5), clip_on=False, zorder=8 + index)
+
+
+def render_pulse_timeline_png(
+    *,
+    pulses,
+    channels,
+    channel_labels,
+    total_duration: float,
+    title: str = "",
+    repeat_markers=(),
+    repeat_notation: str = "",
+    size_inches: tuple[float, float] = (5.0, 4.0),
+    dpi: float = 100.0,
+) -> bytes:
+    """The pulse-timeline figure as PNG bytes -- the reference's faithful preview.
+
+    Each digital channel is one row: a coloured OFF baseline with the ON spans
+    drawn as FILLED blocks (``Rectangle`` patches), the board name on the y axis
+    (tinted to its row), a ``Time (unit)`` x axis, the pulse name inside long
+    blocks, and the repeat span shown as grey brackets (or a top-right ``×∞`` note).
+
+    Plain data only (no ``PulseTableState``/pulse imports) so the plot layer stays
+    free of the domain packages; the editor extracts these lists from its sequence.
+    """
+
+    import io
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Rectangle
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
+
+    from .render_style import PALETTE, render_style_context, smaller_fontsize
+
+    dpi = _render_dpi(dpi)
+    pulses = [dict(row) for row in pulses]
+    channels = [str(channel) for channel in channels]
+    labels = dict(channel_labels or {})
+    colors = list(PALETTE["pulse_cycle"])
+    bracket_colors = list(PALETTE["bracket_cycle"])
+
+    n_channels = len(channels)
+    index_map = {channel: n_channels - 1 - i for i, channel in enumerate(channels)}
+    color_map = {channel: colors[i % len(colors)] for i, channel in enumerate(channels)}
+    row_height = 0.64 if n_channels <= 10 else max(0.42, 6.4 / max(1, n_channels))
+
+    start_min = min([0.0] + [float(row["start"]) for row in pulses])
+    stop_max = max([1e-12] + [float(row["stop"]) for row in pulses])
+    bracket_bounds = []
+    for marker in repeat_markers:
+        try:
+            b_start, b_stop = float(marker[0]), float(marker[1])
+        except Exception:
+            continue
+        if b_stop > b_start:
+            bracket_bounds.append((b_start, b_stop))
+            start_min = min(start_min, b_start)
+            stop_max = max(stop_max, b_stop)
+    span = max(stop_max - start_min, 1e-12)
+    scale, unit = _pulse_time_unit(span)
+    margin_x = max(span * 0.04, 1e-12)
+    left_limit = start_min - margin_x
+    right_limit = stop_max + margin_x
+    if bracket_bounds:
+        right_limit += span * 0.05
+
+    figure = None
+    try:
+        with render_style_context():
+            figure = Figure(figsize=size_inches, dpi=dpi, constrained_layout=True)
+            FigureCanvasAgg(figure)
+            axis = figure.subplots()
+            axis.set_ylabel("")
+            baseline_offset = row_height / 2
+            pulse_zorder = 3
+            baseline_y = {}
+            for channel in channels:
+                y = index_map[channel]
+                baseline_y[channel] = y - baseline_offset
+                axis.hlines(baseline_y[channel], left_limit, right_limit,
+                            color=color_map[channel], linewidth=0.65, alpha=1.0, zorder=pulse_zorder)
+            for row in pulses:
+                if not row.get("value") or row["channel"] not in index_map or row["duration"] <= 0:
+                    continue
+                channel = row["channel"]
+                axis.add_patch(Rectangle(
+                    (row["start"], baseline_y[channel]), row["duration"], row_height,
+                    facecolor=color_map[channel], edgecolor="none", linewidth=0.0,
+                    alpha=1.0, zorder=pulse_zorder))
+                if row.get("name") and row["duration"] >= 0.09 * max(total_duration, 1e-12):
+                    axis.text(row["start"] + row["duration"] / 2.0, index_map[channel], str(row["name"]),
+                              ha="center", va="center", color=PALETTE["pulse_name"],
+                              fontsize=smaller_fontsize(1.2, 4.8), clip_on=True, zorder=pulse_zorder + 1)
+
+            axis.set_xlim(left_limit, right_limit)
+            ylim_top = n_channels - 0.38
+            if bracket_bounds:
+                ylim_top = n_channels + 0.78 + 0.26 * max(0, len(bracket_bounds) - 1)
+            axis.set_ylim(-0.62, ylim_top)
+            axis.set_yticks([index_map[channel] for channel in channels])
+            axis.set_yticklabels([labels.get(channel, channel) for channel in channels])
+            for tick, channel in zip(axis.get_yticklabels(), channels):
+                tick.set_color(color_map[channel])
+            axis.set_xlabel(f"Time ({unit})")
+            axis.xaxis.set_major_locator(MaxNLocator(nbins=5, prune="lower"))
+            axis.xaxis.set_major_formatter(
+                FuncFormatter(lambda value, _pos, s=scale: f"{value / s:.4g}"))
+            axis.tick_params(axis="x", which="both", bottom=True, top=False,
+                             labelbottom=True, labeltop=False, pad=2)
+            axis.set_axisbelow(True)
+            axis.grid(axis="x", color=PALETTE["pulse_grid"], linewidth=0.35, zorder=0)
+            axis.spines[["top", "right"]].set_visible(False)
+            if repeat_notation and not bracket_bounds:
+                axis.text(0.995, 1.012, str(repeat_notation), transform=axis.transAxes,
+                          ha="right", va="bottom", color=PALETTE["pulse_repeat_note"],
+                          fontsize=smaller_fontsize(1.0, 5.5))
+            _draw_pulse_repeat_brackets(axis, repeat_markers, n_channels, bracket_colors)
+            if title:
+                axis.set_title(str(title))
+            buffer = io.BytesIO()
+            figure.savefig(buffer, format="png", dpi=dpi)
+            return buffer.getvalue()
+    finally:
+        if figure is not None:
+            release_agg_figure(figure)
+        gc.collect()
+
+
 def estimate_projected_radial_fit_render_peak_nbytes(
     panels: tuple[RadialGaussianImageFitPanel, ...],
     *,
