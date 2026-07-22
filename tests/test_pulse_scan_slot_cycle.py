@@ -91,6 +91,36 @@ def test_duration_dot_cycles_none_scan_api_off(editor, application):
         "third click must return the field to unbound")
 
 
+def test_delay_dot_cycles_none_api_none(editor, application):
+    """A channel delay is not scannable, so its dot cycles none -> API -> none.
+
+    This exercises the exact regression that hid on the channel side: a delay API
+    binding lives in ``api_slots`` (not ``delays``), so the panel-rebuild cache key
+    must include it -- otherwise cycling the dot binds the model but never rebuilds
+    the panel, and the violet marker never shows.
+    """
+
+    def delay_dot():
+        panel = editor.channel_panel
+        key = list(panel.delay_edits.keys())[0]
+        return panel.delay_edits[key]
+
+    field = delay_dot()
+    assert not getattr(field.dot, "_api", False), "a fresh delay field starts unbound"
+
+    delay_dot().dot.click()                                          # none -> API
+    _settle(application)
+    field = delay_dot()
+    assert getattr(field.dot, "_api", False) and field.dot.number() == 1, (
+        "clicking the delay dot must bind an API slot and show its violet marker")
+    assert not field.isReadOnly(), "an API delay stays editable (the API sets it by name)"
+
+    delay_dot().dot.click()                                          # API -> none
+    _settle(application)
+    field = delay_dot()
+    assert not getattr(field.dot, "_api", False), "a second click must clear the API binding"
+
+
 def test_duration_dot_binding_survives_a_rebuild(editor, application):
     """Binding is state, not a widget flag: a full reload must re-show the marker.
 

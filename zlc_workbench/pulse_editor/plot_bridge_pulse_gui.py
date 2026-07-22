@@ -2103,6 +2103,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 # pulse.  This key only detects change, so string identity is sufficient and correct.
                 tuple(sorted((str(k), str(v)) for k, v in (state.delays or {}).items())),
                 tuple(sorted((str(k), str(v)) for k, v in (state.delay_units or {}).items())),
+                # A delay API binding lives in api_slots (kind="delay"), NOT in delays, so it must be
+                # in this key too: without it, cycling a delay dot to/from API leaves chan_key unchanged,
+                # the channel panel is not rebuilt, and the violet aN marker never appears (or clear).
+                tuple(sorted((str(s.target), str(s.name))
+                             for s in (state.api_slots or ()) if getattr(s, "kind", None) == "delay")),
                 len(state.scan_slots), float(state.time_step_ns),
             )
             if chan_key != getattr(self, "_chan_panel_key", None) or not hasattr(self, "channel_panel"):
