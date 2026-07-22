@@ -13,7 +13,7 @@ import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5 import QtCore, QtTest
+from PyQt5 import QtCore, QtTest, QtWidgets
 
 from conftest import pulse_backend_completion_for
 from zlc_frontend.qt_widgets import ensure_qt_app
@@ -93,9 +93,26 @@ def _click_tab(body, page) -> None:
 def _choose_remote(body) -> None:
     combo = body.schedule_view.conn_target_combo
     QtTest.QTest.mouseClick(combo, QtCore.Qt.LeftButton)
-    QtTest.QTest.keyClick(combo, QtCore.Qt.Key_Home)
-    QtTest.QTest.keyClick(combo, QtCore.Qt.Key_Down)
-    QtTest.QTest.keyClick(combo, QtCore.Qt.Key_Return)
+    view = combo.view()
+    remote_index = combo.model().index(combo.findData("remote"), 0)
+    application = QtWidgets.QApplication.instance()
+    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+    remote_position = view.visualRect(remote_index).center()
+    QtTest.QTest.mouseMove(view.viewport(), remote_position)
+    QtTest.QTest.mousePress(
+        view.viewport(), QtCore.Qt.LeftButton, pos=remote_position
+    )
+    QtTest.QTest.mouseRelease(
+        view.viewport(), QtCore.Qt.LeftButton, pos=remote_position
+    )
+    assert combo.currentData() == "remote"
+    # The owner snapshot timer ticks every 40 ms.  Keep the draft selection
+    # untouched for multiple ticks before the operator enters an address or
+    # presses Connect; otherwise this regression can pass by racing the timer.
+    deadline = time.monotonic() + 0.15
+    while time.monotonic() < deadline:
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        time.sleep(0.005)
     assert combo.currentData() == "remote"
 
 

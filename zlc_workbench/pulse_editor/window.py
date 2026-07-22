@@ -631,7 +631,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             if "failed" in lowered or "error" in lowered:
                 self._message(snapshot.diagnostic)
         self._apply_file_and_run_state(snapshot)
-        self._apply_connection_state(snapshot)
+        self._apply_connection_state(snapshot, previous)
         self._apply_preview(snapshot)
         self._apply_scan_workspace(snapshot, previous)
         self._last_snapshot = snapshot
@@ -749,7 +749,29 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     def _apply_connection_state(
         self,
         snapshot: PulseEditorControllerSnapshot,
+        previous: PulseEditorControllerSnapshot | None,
     ) -> None:
+        connection_key = (
+            snapshot.connection_state,
+            snapshot.connection_mode,
+            snapshot.connection_endpoint,
+        )
+        previous_key = (
+            None
+            if previous is None
+            else (
+                previous.connection_state,
+                previous.connection_mode,
+                previous.connection_endpoint,
+            )
+        )
+        if connection_key == previous_key:
+            # The target/address controls are an operator edit buffer.  A periodic
+            # presentation refresh must not overwrite an unsubmitted choice with
+            # the controller's last committed connection.  Reconcile them only
+            # when connection authority itself advances (initial, connecting,
+            # ready, failure, or close).
+            return
         mode = snapshot.connection_mode
         if mode not in ("virtual", "remote", "offline"):
             # Existing-installation composition supplies the actual mode before

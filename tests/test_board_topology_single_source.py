@@ -19,13 +19,21 @@ import json
 
 from zlc_neutral_atom.timing.board_config import load_board_config
 from zlc_neutral_atom.timing.ports import PORT_DAC
-from zlc_pulse.target import pulse_target_to_tree
+from zlc_pulse.target import load_deployed_pulse_target, pulse_target_to_tree
 
 ROOT = Path(__file__).resolve().parents[1]
 #: Documents shipped WITH the board config; a user's own saved pulse may legitimately
 #: come from another board -- that mismatch is the geometry fingerprint's job to reject
 #: at connect time, not this test's.
 SHIPPED_DOCUMENTS = sorted((ROOT / "zlc_neutral_atom" / "assets").glob("*.json"))
+
+
+def test_the_deployed_target_is_the_board_projection() -> None:
+    """The server's default target must not drift from the XDC lane topology."""
+
+    assert pulse_target_to_tree(load_deployed_pulse_target()) == pulse_target_to_tree(
+        load_board_config().pulse_target()
+    )
 
 
 def test_the_board_builds_the_target_shipped_documents_carry() -> None:
