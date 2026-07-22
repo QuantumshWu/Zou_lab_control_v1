@@ -20,6 +20,7 @@ from ..selector import (
 )
 from .axis_navigator import AxisLayoutNavigator
 from .board import QtImageBoard, QtOwnerWake, QtRasterBoard
+from .panel_host import SinglePanelHost
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
 from .fit_authoring import FitAuthoringPane
 from .signal_expr_widget import SignalExprWidget
@@ -246,6 +247,7 @@ __all__ = [
     "QtImageBoard",
     "QtOwnerWake",
     "QtRasterBoard",
+    "SinglePanelHost",
     "RADIUS",
     "RectangleGesture",
     "RED",

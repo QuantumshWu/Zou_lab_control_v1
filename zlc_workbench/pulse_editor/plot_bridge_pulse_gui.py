@@ -4478,36 +4478,34 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             f"{len(drawn)}/{total} plotted ({mode})"
             + (f" | {notation}" if notation else ""))
 
-    def _ensure_preview_board(self):
-        """The ONE interactive preview surface: a QtRasterBoard hosting the
-        single PULSE panel, bound once to the unified gesture owner."""
+    def _ensure_preview_host(self):
+        """The ONE interactive preview surface: the frontend's reusable
+        :class:`SinglePanelHost` (board + gesture binding + identity), built
+        once and wired to this editor's two answers -- nothing pulse-specific
+        lives below this seam."""
 
-        board = getattr(self, "preview_board", None)
-        if board is None:
-            from zlc_frontend.qt_widgets import QtRasterBoard
+        host = getattr(self, "preview_host", None)
+        if host is None:
+            from zlc_frontend.qt_widgets import SinglePanelHost
 
-            board = QtRasterBoard(("pulse",), columns=1)
-            self.preview_board = board
+            host = SinglePanelHost("pulse", group="pulse-preview")
+            self.preview_host = host
+            self.preview_board = host.board
             self.preview_body_layout.addWidget(
-                board, 0, QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
-            board.bind_pulse_interaction("pulse", self._on_preview_intent)
-        return board
+                host, 0, QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+            host.viewCommitted.connect(self._on_preview_view_committed)
+        return host
 
     def _present_preview(self, state: PulseTableState, *,
                          include_always_off: bool,
                          display_revision: int | None = None) -> tuple[int, int]:
-        """Render the CURRENT table and present it as one coherent BoardFrame.
+        """Render the CURRENT table and hand it to the reusable panel host.
 
-        The pulse preview is a first-class panel: the same drawing as the PNG
-        exit, read back as a raster + draw-frozen viewport, presented on the
-        unified QtRasterBoard so area/cross/zoom/pan run through the one
-        selector owner.  Returns the board's LOGICAL pixel size.
-
-        Identity: the provenance revision advances when the CONTENT changes
-        (state fingerprint), the display revision on every present (a zoom
-        commit passes its own candidate revision back so the pending intent
-        matches its accepted front).  The zoomed view survives an edit -- x is
-        pinned; only the picture underneath updates.
+        The editor owns only its OWN facts: what to draw
+        (:meth:`_preview_render_kwargs`), when the content changed (the state
+        fingerprint drives the provenance revision), and the pinned time view.
+        The host owns everything generic -- frame identity, present, gesture
+        binding, logical-size pinning.  Returns the host's LOGICAL pixel size.
         """
 
         import hashlib
@@ -4516,9 +4514,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             BlockId, DatasetRevision, DatasetRevisionRef, StreamGenerationId)
         from zlc_frontend.figure import DatasetId, EvaluatedInput
         from zlc_frontend.matplotlib_render import render_pulse_timeline_panel
-        from zlc_frontend.render import (
-            BoardFrame, CoherenceStamp, PanelFrame, PanelPresentationIdentity,
-            SourceIdentity)
 
         kwargs = self._preview_render_kwargs(
             state, include_always_off=include_always_off)
@@ -4548,64 +4543,25 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             display_revision=self._preview_display_rev,
             x_limits=getattr(self, "_preview_view_x_limits", None),
         )
-        presentation = PanelPresentationIdentity(
-            "pulse", "pulse-preview", self._preview_content_rev, 0,
-            self._preview_display_rev)
-        stamp = CoherenceStamp(
-            "pulse-editor",
-            f"pulse-epoch-{self._preview_display_rev}",
-            f"pulse-frame-{self._preview_display_rev}",
-            fingerprint,
-            fingerprint,
-            (provenance,),
-            (presentation,),
+        host = self._ensure_preview_host()
+        return host.present_panel(raster, payload, pixel_ratio=ratio)
+
+    def _on_preview_view_committed(self, candidate) -> None:
+        """Answer a wheel-zoom/pan commit: re-render the SAME table at the
+        candidate's x limits and present the accepted front under the
+        candidate's display revision.  Landing back on the home span clears
+        the pin so later refreshes track the full frame again."""
+
+        limits = tuple(float(value) for value in candidate.x_limits)
+        home = tuple(float(value) for value in candidate.home_x_limits)
+        self._preview_view_x_limits = None if limits == home else limits
+        include_off = bool(getattr(self, "preview_include_off", None)
+                           and self.preview_include_off.isChecked())
+        self._present_preview(
+            self.read_state(),
+            include_always_off=include_off,
+            display_revision=int(candidate.display_revision),
         )
-        source = SourceIdentity(
-            provenance.dataset_id,
-            provenance.ref.block_id,
-            provenance.ref.stream_generation,
-            fingerprint,
-        )
-        panel = PanelFrame("pulse", "pulse-preview", source, stamp, raster, payload)
-        board = self._ensure_preview_board()
-        self._preview_board_seq = int(getattr(self, "_preview_board_seq", -1)) + 1
-        board.present(BoardFrame(
-            "pulse-preview-board", 0, self._preview_board_seq, (panel,)))
-        # The board cell stretch-blits the raster over its whole rect, so fixing
-        # the widget at the LOGICAL size makes the device-pixel raster land 1:1
-        # on a HiDPI screen -- same crispness rule as the pixmap path it replaces.
-        logical = (int(round(raster.width / ratio)),
-                   int(round(raster.height / ratio)))
-        board.setFixedSize(logical[0], logical[1])
-        return logical
-
-    def _on_preview_intent(self, intent) -> None:
-        """Answer the unified owner's typed pulse intents.
-
-        Area (CurveRangeGesture) projects the display-only candidate back onto
-        the board; a wheel-zoom/pan commit (CurveViewportCommit) re-renders the
-        SAME table at the candidate's x limits and presents the accepted front
-        under the candidate's display revision.  Landing back on the home span
-        clears the pin so later refreshes track the full frame again.
-        """
-
-        from zlc_frontend.selector import CurveRangeGesture, CurveViewportCommit
-
-        if isinstance(intent, CurveRangeGesture):
-            self.preview_board.set_pulse_range_candidate(intent.x_span)
-            return
-        if isinstance(intent, CurveViewportCommit):
-            candidate = intent.viewport
-            limits = tuple(float(value) for value in candidate.x_limits)
-            home = tuple(float(value) for value in candidate.home_x_limits)
-            self._preview_view_x_limits = None if limits == home else limits
-            include_off = bool(getattr(self, "preview_include_off", None)
-                               and self.preview_include_off.isChecked())
-            self._present_preview(
-                self.read_state(),
-                include_always_off=include_off,
-                display_revision=int(candidate.display_revision),
-            )
 
     def _apply_scan_state_in_place(self, state: PulseTableState) -> bool:
         """Whether a scan toggle can be absorbed without rebuilding the cards.
