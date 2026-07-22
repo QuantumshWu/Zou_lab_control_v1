@@ -130,6 +130,7 @@ def test_console_cards_answer_zoom_home_and_clim_from_human_controls(experiment)
             -120,
         ).isAccepted()
         assert forwarded_views
+        assert forwarded_views[-1].origin == curve_board.visible_curve_origin()
         zoomed = curve_card._display_state()
         assert zoomed.x_view is not None
         assert zoomed.revision == 1

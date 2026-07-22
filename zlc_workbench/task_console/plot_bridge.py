@@ -642,7 +642,7 @@ class PanelCard(FluentGroupBox):
         therefore holds no Matplotlib object at all: rendering happens off the
         GUI thread and arrives here already rasterised.  The host is the ONE
         selector owner (design rule: an interactive window uses the
-        QtRasterBoard chain; QtImageBoard stays a frozen-report presenter), so
+        QtRasterBoard chain; FrozenRasterView stays a frozen-report presenter), so
         the console card's selector switch and future gesture wiring go
         through the same binding as every other one-panel window.
         """
@@ -1104,13 +1104,36 @@ class PanelCard(FluentGroupBox):
 
         self.unit_label.setText(self._current_unit_text()) if hasattr(self, "unit_label") else None
 
-    def _on_view_committed(self, candidate) -> None:
-        """Answer a board zoom/pan commit: re-compose this card at the
-        candidate's view under the candidate's revision (the pulse preview's
-        answer-by-re-render, with the card's worker-composer as the renderer).
-        Landing back on home clears the pin so later ticks track the frame.
+    def _on_view_committed(self, commit) -> None:
+        """CAS and answer one exact-front zoom/pan commit.
+
+        ``SinglePanelHost`` deliberately forwards the whole typed commit.  A
+        delayed gesture from an older front therefore cannot rewrite this
+        card's current view, and a failed compose releases only that pending
+        origin instead of leaving the selector permanently wedged.
         """
 
+        from zlc_frontend.selector import (
+            CurveViewportCommit,
+            HistogramViewportCommit,
+            ImageViewportCommit,
+        )
+
+        if not isinstance(
+            commit,
+            (CurveViewportCommit, HistogramViewportCommit, ImageViewportCommit),
+        ):
+            raise TypeError("view commit must retain its typed exact origin")
+        host = self.board
+        if host is None:
+            return
+        if commit.origin != host.visible_interaction_origin():
+            host.discard_pending_interaction(commit.origin)
+            return
+        if self._display_revision != commit.origin.presentation.panel_revision:
+            host.discard_pending_interaction(commit.origin)
+            return
+        candidate = commit.viewport
         viewport_revision = getattr(candidate, "viewport_revision", None)
         if viewport_revision is not None:      # image-family transform
             views = candidate.optional_coordinate_views_for_normalized_bounds()
@@ -1121,19 +1144,86 @@ class PanelCard(FluentGroupBox):
             home = tuple(float(value) for value in candidate.home_x_limits)
             pin = None if span == home else (span, None)
             revision = int(candidate.display_revision)
+        old_pin = self._view_pin
+        old_revision = self._display_revision
         self._view_pin = pin
         self._display_revision = revision
-        if self._last_value is not None and self.compose_signal_value(
-                self._last_value):
+        if self._last_value is None:
+            # An arriving source tick will answer the already-authored state.
+            # Production panels retain their last value; this branch also
+            # makes a pre-source gesture safe rather than inventing a frame.
+            return
+        if not self.compose_signal_value(self._last_value):
+            self._view_pin = old_pin
+            self._display_revision = old_revision
+            host.discard_pending_interaction(commit.origin)
+            return
+        try:
             self.present()
+        except Exception as error:
+            self._view_pin = old_pin
+            self._display_revision = old_revision
+            host.discard_pending_interaction(commit.origin)
+            self.set_status(f"{type(error).__name__}: {error}"[:160], error=True)
 
-    def _on_color_limits_committed(self, limits) -> None:
-        """Answer a clim-rail commit: the dragged window IS a fixed colour
-        window, so it lands in the SAME persisted fact the Setting's fixed
-        inputs write (relim=fixed + lo/hi through the one writer)."""
+    def _on_color_limits_committed(self, commit) -> None:
+        """CAS one clim-rail commit into the shared fixed-limits fact."""
+
+        from zlc_frontend.selector import ImageColorLimitsCommit
+
+        if not isinstance(commit, ImageColorLimitsCommit):
+            raise TypeError("color-limit commit must retain its typed exact origin")
+        host = self.board
+        if host is None:
+            return
+        if commit.origin != host.visible_interaction_origin():
+            host.discard_pending_interaction(commit.origin)
+            return
+        if self._display_revision != commit.origin.presentation.panel_revision:
+            host.discard_pending_interaction(commit.origin)
+            return
+
+        params = self.config.params
+        missing = object()
+        old = {
+            key: params.get(key, missing)
+            for key in ("relim", "fixed_lo", "fixed_hi")
+        }
+        old_revision = self._display_revision
+
+        def restore() -> None:
+            for key, value in old.items():
+                if value is missing:
+                    params.pop(key, None)
+                else:
+                    params[key] = value
+            self._display_revision = old_revision
+
+        lo, hi = (float(value) for value in commit.color_limits)
+        self._store_fixed_lims(lo, hi)
+        self._display_revision = old_revision + 1
+        if self._last_value is None:
+            self.changed.emit()
+            return
+        if not self.compose_signal_value(self._last_value):
+            restore()
+            host.discard_pending_interaction(commit.origin)
+            return
+        try:
+            self.present()
+        except Exception as error:
+            restore()
+            host.discard_pending_interaction(commit.origin)
+            self.set_status(f"{type(error).__name__}: {error}"[:160], error=True)
+            return
+        self.changed.emit()
+
+    def _store_fixed_lims(self, lo: float, hi: float) -> None:
+        """The sole low-level writer for persisted fixed colour/count limits."""
 
         self.config.params["relim"] = "fixed"
-        self.apply_fixed_lims(float(limits[0]), float(limits[1]))
+        self.config.params["fixed_lo"] = float(lo)
+        self.config.params["fixed_hi"] = float(hi)
 
     def apply_fixed_lims(self, lo: float, hi: float) -> None:
         """Persist the fixed lo/hi and re-compose with them NOW.
@@ -1143,7 +1233,7 @@ class PanelCard(FluentGroupBox):
         display state on the next compose.
         """
 
-        self.config.params["fixed_lo"], self.config.params["fixed_hi"] = float(lo), float(hi)
+        self._store_fixed_lims(lo, hi)
         self._rerender_now()
         self.changed.emit()
 
