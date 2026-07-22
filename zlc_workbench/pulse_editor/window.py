@@ -783,7 +783,8 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         elif snapshot.connection_state == "ready":
             status = (
                 snapshot.connection_endpoint
-                or ("Remote server" if mode == "remote" else "Virtual (sim)")
+                if mode == "remote"
+                else "Virtual (sim)"
             )
         elif snapshot.connection_state == "restart_required":
             status = "Restart required"
@@ -796,6 +797,26 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             endpoint=snapshot.connection_endpoint,
             status=status,
         )
+        if previous is None:
+            return
+        if (
+            snapshot.connection_state == "ready"
+            and previous.connection_state != "ready"
+        ):
+            if mode == "remote":
+                self._message(
+                    "Connected to sequencer server at "
+                    f"{snapshot.connection_endpoint}."
+                )
+            else:
+                self._message("Connected to a virtual (in-memory) sequencer.")
+        elif (
+            snapshot.connection_state == "offline"
+            and mode == "offline"
+            and previous.connection_mode != "offline"
+            and not snapshot.diagnostic
+        ):
+            self._message("Offline: editing only, no backend calls.")
 
     def _settle_pending_preview_through(
         self,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -265,6 +267,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # This executable owns its process, so expose the RPyC lifecycle in the
+    # launcher window.  Its ``server started`` record is emitted only after the
+    # socket enters LISTEN; accepted/welcome/goodbye also make GUI connections
+    # observable instead of leaving a silent console.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="ZLC pulse server: %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
     arguments = build_arg_parser().parse_args(argv)
     target = load_pulse_target(arguments.target)
     build_server_runtime(

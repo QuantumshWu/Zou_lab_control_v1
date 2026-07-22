@@ -198,6 +198,9 @@ def _run_remote_gui(workspace: Path) -> None:
             lambda: body._controller.snapshot().connection_state == "ready"
             and body.schedule_view.conn_status.text() == endpoint,
         )
+        assert body.summary.text() == (
+            f"Connected to sequencer server at {endpoint}."
+        )
 
         _set_scan_repeats(body, 1)
         _until(

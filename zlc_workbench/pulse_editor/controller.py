@@ -1049,7 +1049,7 @@ class PulseEditorController:
         self._connection_state = "connecting"
         self._connection_mode = normalized_mode
         self._connection_endpoint = (
-            "local virtual" if host is None else str(endpoint).strip()
+            "local virtual" if host is None else f"{host}:{port}"
         )
 
         def connect_owned():
