@@ -1,165 +1,83 @@
 # Zou_lab_control
 
-Notebook-first neutral-atom experiment control: a standalone frontend layer
-(plotting + PyQt/Fluent pulse GUI) and a standalone FPGA pulse-streamer hardware
-side, joined over RPyC. The same experiment logic runs with virtual devices,
-real qCMOS hardware, and a remote FPGA sequencer.
+Notebook-first neutral-atom experiment control with typed data, pulse, device,
+analysis, storage, and Qt workbench boundaries.
 
-## Start Here
+The current public products are:
+
+- a complete virtual readout path for capture, calibration, occupancy, fit, and GUI work;
+- an offline/virtual/remote Pulse GUI using the current `PulseDocument` model;
+- a pulse-only remote FPGA installation;
+- content-addressed experiment artifacts that can be reopened without exposing raw devices.
+
+Complete real qCMOS + remote-sequencer readout composition is not yet published.
+Pulse-server connectivity must not be interpreted as camera/readout readiness.
+
+## Start
 
 ```powershell
-install_requirements.bat            # install the editable package + record .zlc_python_path
-start_tutorials_jupyter_lab.bat     # open the checked-in tutorials
-pulse_gui.bat                        # open the pulse editor (offline if no server)
-task_console.bat                     # open the live experiment dashboard (virtual camera)
+install_requirements.bat
+start_tutorials_jupyter_lab.bat
+pulse_gui.bat
+task_console.bat
 ```
 
-The installer records the selected interpreter in the ignored local file
-`.zlc_python_path`. The root launchers use that interpreter before falling back
-to PATH, so the GUI, notebooks, and the FPGA server share the same editable
-checkout. If VS Code/Jupyter already has the right kernel but PowerShell cannot
-find that Python, run `%run ../install_current_kernel.py` from a notebook in
-`tutorials/`.
+The installer records the selected interpreter in the ignored
+`.zlc_python_path`; the root launchers use that interpreter before falling back
+to `PATH`.
 
-### First day (new lab member)
+There is exactly one user tutorial:
+[`tutorials/neutral_atom_tutorial.ipynb`](tutorials/neutral_atom_tutorial.ipynb).
+It executes the current virtual installation from request inspection through
+capture, provenance, site-map/PSF calibration, occupancy, and the formal GUI
+entry points.
 
-Follow this order; everything before step 4 runs on a **virtual** backend (no
-hardware needed), so you can practice the whole readout flow at your desk.
+For the currently supported real pulse-only path, follow
+[`docs/REAL_HARDWARE_BRINGUP_zh.md`](docs/REAL_HARDWARE_BRINGUP_zh.md) and start
+the server with `fpga\run_server.bat`.
 
-1. `install_requirements.bat`, then `start_tutorials_jupyter_lab.bat`.
-2. **Learn the model + scripted readout:** `tutorials/neutral_atom_tutorial.ipynb`
-   (connect virtual, calibrate, detect, scan) — start here. The plotting/pulse
-   primitives are in `tutorials/frontend_tutorial.ipynb`.
-3. **Inspect the live GUI:** `task_console.bat` currently supports the catalog entries it
-   actually lists (including camera/plot workflows). The retired calibration/occupancy
-   wrappers are deliberately absent until their current controller slice lands.
-4. **Go to real hardware:** read `docs/REAL_HARDWARE_BRINGUP_zh.md` (the
-   first-power-on checklist), start the FPGA side with
-   `tutorials/neutral_atom_fpga_server.ipynb`, then bring up the control PC with
-   `tutorials/neutral_atom_hardware_quickstart.ipynb`.
-
-A per-notebook one-liner + the recommended order also lives in
-[tutorials/README.md](tutorials/README.md).
-
-## Repository Layout
+## Package ownership
 
 ```text
-Zou_lab_control/
-  frontend/       standalone plotting, PyQt/Fluent GUI, PDF, notebook helpers
-  neutral_atom/   device contracts, qCMOS/readout/session/timing logic
-fpga/             standalone JTAG-to-AXI pulse-streamer build/server side
-pulses/           checked-in PulseTableState presets
-tutorials/        generated Jupyter notebooks
-docs/             reference manuals, maintainer notes, bring-up checklist, generated PDFs
-tests/            targeted verification matrix and tests
+zlc_data/          multidimensional data, selections, reductions, and fit
+zlc_storage/       canonical encoding and content-addressed persistence
+zlc_pulse/         PulseDocument, compiler, target contract, and wire protocol
+zlc_neutral_atom/  experiment domains, repositories, runtime, and device ports
+zlc_frontend/      headless figure/selector semantics and rendering
+zlc_workbench/     Qt composition and product windows
+Zou_lab_control/   notebook composition facade and public launch glue
+fpga/              frozen pulse-streamer server/transport/deployment assets
+tutorials/         the single executable user tutorial
 ```
 
-## Documentation
+The public notebook entry is:
 
-Four reference PDF manuals (built from `.texbody` sources), a real-hardware
-first-day checklist, and one maintainer note:
+```python
+from pathlib import Path
+import Zou_lab_control.notebook as zlc
 
-- **First-power-on checklist:** [docs/REAL_HARDWARE_BRINGUP_zh.md](docs/REAL_HARDWARE_BRINGUP_zh.md)
-  — environment prerequisites, the DCAM/`dcamapi.dll` setup, the firewall/port-18861
-  notes, the ordered first-power-on verification, and a symptom → root-cause → fix
-  table for the errors a first-timer hits at the machine. Read this before step 4 above.
+exp = zlc.connect("virtual", repository=Path("results") / "experiment")
+```
 
-| Manual | Source dir | Covers |
-| --- | --- | --- |
-| Main | `docs/main_manual/` | System architecture, neutral-atom session/devices/timing, `PulseSequence` vs `PulseTableState`, the sequencer lifecycle (prepare/fire/wait_done/safe_state), the real-hardware runbook, and the N-slot scan model end to end |
-| Frontend | `docs/frontend_manual/` | The `zlc_frontend.qt_widgets` widget library and layout primitives, the pulse GUI (Edit/Preview/Scan tabs), the per-field scan-dot workflow, the plotting API, and PDF rendering |
-| FPGA | `docs/fpga_manual/` | The Artix-7 35T edge-table pulse-streamer RTL, the 1-tick FIFO prefetch pipeline, the 2-bank streaming scan window, the affine N-slot scan engine, the analog-bus DAC engine, the event-scheduler output delays, the JTAG-to-AXI host upload flow, and the resource budget |
-| Device | `docs/device_manual/` | Device configuration/contracts, `load_devices`, camera acquisition, the readout pipeline (sitemap/thresholds/detect), trap calibration, and the virtual backends |
+Ordinary notebook and GUI code receives typed facades and immutable artifacts,
+not raw camera, sequencer, registry, or SDK objects.
 
-- Maintainer/agent notes (architecture invariants, anti-patterns, QA): see
-  [docs/MAINTAINER_NOTES.md](docs/MAINTAINER_NOTES.md).
-- Subsystem pointers: [fpga/README.md](fpga/README.md),
-  [fpga/pulse_streamer/README.md](fpga/pulse_streamer/README.md),
-  [pulses/README.md](pulses/README.md),
-  [Zou_lab_control/frontend/README.md](Zou_lab_control/frontend/README.md).
-- Test strategy: [tests/README.md](tests/README.md).
+## Design and operations
 
-### Building the manuals
+- [System architecture](docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md)
+- [Design charter](docs/DESIGN_CHARTER_zh.md)
+- [Migration ledger](docs/MIGRATION_LEDGER_zh.md)
+- [Real-hardware bring-up](docs/REAL_HARDWARE_BRINGUP_zh.md)
+- [FPGA server notes](fpga/README.md)
+- [Verification guide](tests/README.md)
 
-Each manual is generated from a `.texbody` template into a `.tex` wrapper and
-compiled with XeLaTeX (2-pass, in a temporary build dir). XeLaTeX must be on
-PATH.
+## Targeted verification
+
+Prefer the smallest current product test that exercises the changed boundary.
+Do not repair historical tests by restoring removed architecture.
 
 ```powershell
-python -c "from Zou_lab_control.neutral_atom.notes import build_main_manual, build_fpga_manual, build_device_manual; build_main_manual(); build_fpga_manual(); build_device_manual()"
-python -c "from Zou_lab_control.frontend.notes import build_frontend_manual; build_frontend_manual()"
-```
-
-## Real Hardware Path
-
-```text
-control/qCMOS computer
-  -> RemoteSequencer (RPyC)
-  -> FPGA/Vivado computer running fpga\run_server.bat
-  -> persistent Vivado hw_axi session (JTAG-to-AXI)
-  -> zlc_pulse_streamer_top bitstream (edge-table engine)
-```
-
-The host packs the compiled program into a BRAM image and uploads it over
-JTAG-to-AXI (`VivadoAxiStreamerSession` in
-`Zou_lab_control/neutral_atom/devices/axi_session.py`); a CTRL register-file
-mailbox carries COMMAND/STATUS and the streaming-scan handshake. The FPGA side
-infers the full hardware contract from the board XDC. The
-GUI may show only a subset such as `ch09/ch00/ch03/ch11`, but upload compiles
-against the full hardware order; hidden or unconfigured channels are off. The
-clock is 50 MHz (20 ns tick). Hardware-side commands on the FPGA/Vivado
-computer:
-
-```powershell
-fpga\build_and_program.bat --check
-fpga\build_and_program.bat
-fpga\run_server.bat --check-config
-fpga\run_server.bat
-```
-
-Generated Vivado projects and server state live under `fpga\build\ps`
-by default (short name `ps` keeps Vivado's deep run/.Xil temp path under the
-Windows MAX_PATH limit while staying in-repo); the printed `ZLC project dir` is
-the source of truth for the
-generated `impl_1\zlc_pulse_streamer_top.{bit,ltx}`. The full runbook is in the
-**main manual**.
-
-## Frontend
-
-The pulse GUI edits a `PulseTableState` and drives a supplied sequencer; it is a
-frontend only, not a separate hardware-control layer. Scanning uses semantic
-`ScanSlot.name` values such as `probe_duration` or `da_x`; `s0, s1, ...` are
-compiler-only column tokens. Bind any duration/DAC field (a scan dot in the GUI,
-or `state.bind_field(kind, target, name=...)`), then provide an `N_points x N_slots`
-`scan_table`. A channel delay is a fixed per-channel output delay set through
-the API; it is never scanned. The **frontend manual** covers the widget library, the
-Edit/Preview/Scan tabs, the scan-dot workflow, and the plotting/PDF API. Open
-the editor remotely or offline:
-
-```powershell
-pulse_gui.bat --remote-host 192.168.0.20 --state .\pulses\camera_imaging_address_switch.json   # 192.168.0.20 = a PLACEHOLDER; use your FPGA PC's IP
-pulse_gui.bat --no-sequencer --state .\pulses\camera_imaging_address_switch.json
-```
-
-The **task console** (`task_console.bat`) is the experiment-side dashboard: a
-configurable grid of live panels (2D image with side distribution and draggable
-clim, rolling trace, bimodal-fit histogram, 1D vector), each wired to named
-experiment signals through a small Python expression. It opens empty: from
-**Add Panel** you can currently assemble camera Measurements publishing
-`frame_0`, `frame_1`, ... per trigger event and plot panels reading those raw
-signals. Formal calibration/occupancy panels stay absent until their current
-artifact-backed controller slice lands; there is no fallback detector hidden in
-the demo or GUI. Layouts save/load as one JSON in `tasks/`.
-
-## Targeted Verification
-
-Prefer scoped checks from [tests/README.md](tests/README.md) over the full suite
-for small changes. Typical handoff checks:
-
-```powershell
-pytest -q tests\test_neutral_atom_lightweight.py -k "repo_vivado_entrypoint_contract"
-python -m json.tool tutorials\neutral_atom_hardware_quickstart.ipynb > $null
+python -m pytest -q tests\test_tutorial_notebook_spine.py
+python -m json.tool tutorials\neutral_atom_tutorial.ipynb > $null
 git diff --check
 ```
-
-Use full `pytest -q` for broad or cross-subsystem changes.

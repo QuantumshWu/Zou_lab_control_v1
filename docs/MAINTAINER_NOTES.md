@@ -7,46 +7,14 @@ architecture and migration authority. Sections about `BaseLivePlot`,
 Confocal-derived geometry, selectors, or the shared Figure model apply only
 while that island remains behind `SerializedLegacyAggBridge`.
 
-User-facing tutorials live in the four PDF manuals
-(`docs/main_manual`, `docs/frontend_manual`, `docs/fpga_manual`,
-`docs/device_manual`) and must stay
-tutorial-like: explain behaviour and state ownership, not blame.
-
 ## 1. Documentation Layout And Rules
 
-There are two audiences. Keep them separate.
-
-- **User manuals** (the four PDFs) teach concepts, workflow, API calls,
-  expected output, and troubleshooting in a neutral instructional voice.
-- **Maintainer notes** (this file, plus review findings) may name
-  anti-patterns, failure modes, and invariants directly.
-
-Style rules for manuals:
-
-- Prefer "this component does X" over "do not do Y" unless it is safety-critical.
-- Prefer "recommended path" / "fallback path" over "right/wrong".
-- Always state who owns the state: camera, sequencer, session, readout
-  calibration, frontend plot.
-- Do not put sentences like "this is a serious architecture error" into a
-  manual. Rephrase as neutral behaviour. That invariant belongs here.
-- Describe only the active implementation and its current contracts; do not carry retired
-  implementations into user-facing documentation.
-
-Source of truth for generated docs (edit the template, then rebuild the PDF):
-
-- main manual body: `Zou_lab_control/neutral_atom/content/manual_templates/main_manual_zh.texbody`
-- frontend manual body: `Zou_lab_control/frontend/content/manual_templates/frontend_manual_zh.texbody`
-- FPGA manual body: `Zou_lab_control/neutral_atom/content/manual_templates/fpga_manual_zh.texbody`
-- device & experiment manual body: `Zou_lab_control/neutral_atom/content/manual_templates/device_manual_zh.texbody`
-- shared preamble: `Zou_lab_control/frontend/templates/zlc_frontend_notes.sty`
-
-The build entry points are in `Zou_lab_control/neutral_atom/content/manuals.py`
-and `Zou_lab_control/frontend/content/manuals.py`; both call
-`Zou_lab_control.frontend.notes.render_tex_pdf` / `render_notes_pdf`. See
-section 10 for the build commands.
-
-Notebook markdown should be short and operational: say what the next cell does,
-show the concrete call, and link to a manual for background.
+The only user tutorial is `tutorials/neutral_atom_tutorial.ipynb`. Current
+architecture, migration, and hardware-operation truth lives respectively in
+`SYSTEM_ARCHITECTURE_DESIGN_zh.md`, `MIGRATION_LEDGER_zh.md`,
+`DESIGN_CHARTER_zh.md`, and `REAL_HARDWARE_BRINGUP_zh.md`. This legacy note may
+explain source behaviour that still has a consumer, but it must not publish API
+calls, package paths, or build instructions for removed architecture.
 
 ## 2. Core Architecture
 
@@ -714,24 +682,6 @@ summary pass compares the state key against the applied key and restores the run
 if the edit was reverted.  Save shows "Save*" + yellow while dirty, "Save" + accent when
 clean; Add Bracket is accent (yellow is reserved for Save-dirty).
 
-## 10. Building The Manuals
-
-```powershell
-python -c "from Zou_lab_control.neutral_atom.notes import build_main_manual, build_fpga_manual, build_device_manual; build_main_manual(); build_fpga_manual(); build_device_manual()"
-python -c "from Zou_lab_control.frontend.notes import build_frontend_manual; build_frontend_manual()"
-```
-
-Each builder generates example figures into `assets/`, fills the `.texbody`
-template, assembles the `.tex` wrapper **in memory**, and runs `render_tex_pdf`
-(XeLaTeX, 2-pass, in a temp dir) with `assets=<dir>` so figures resolve. XeLaTeX
-must be on PATH (or pass `xelatex=`). **Only the `.pdf` lands in `docs/<manual>/`**
-(plus the committed `assets/`); no `.tex`/`.sty`/`.aux`/`.log`/`.toc`/`.out` is
-ever written there (`docs/**/*.tex` and `*.sty` are gitignored). A failed build
-leaves only a `.build.log` next to the target PDF. `render_tex_pdf(tex, out_pdf)`
-accepts a tex **string** or a `.tex` **path**. `write_notes_tex` is the explicit
-source-inspection path; PDF compilation always goes through the temporary-directory
-renderer. See §18.
-
 ## 11. Verification
 
 Tests are owned by another agent; see `tests/README.md` for the scoped matrix.
@@ -739,9 +689,9 @@ Prefer the smallest scoped check that covers the edited boundary; use full
 `pytest -q` only for broad handoff. Typical doc-adjacent checks:
 
 ```powershell
-pytest -q tests\test_frontend_smoke.py -k "render_tex_pdf or pulse_gui"
+pytest -q tests\test_frontend_smoke.py -k "pulse_gui"
 pytest -q tests\test_neutral_atom_lightweight.py -k "repo_vivado_entrypoint_contract or scan"
-python -m json.tool tutorials\neutral_atom_hardware_quickstart.ipynb > $null
+python -m json.tool tutorials\neutral_atom_tutorial.ipynb > $null
 git diff --check
 ```
 

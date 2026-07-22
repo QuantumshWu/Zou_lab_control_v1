@@ -53,12 +53,20 @@ python pulse_gui.py            # 默认 Offline，可编辑/Preview但执行按�
 - notebook使用同一入口：
 
   ```python
-  exp = connect("remote", repository=repo,
-                sequencer_host="<FPGA_IP>", sequencer_port=18861)
+  from pathlib import Path
+  import Zou_lab_control.notebook as zlc
+
+  installation = zlc.InstallationConfigDocument.remote_pulse(
+      host="<FPGA_IP>",
+      port=18861,
+  )
+  repository = Path("results") / "pulse-only"
+  repository.parent.mkdir(exist_ok=True)
+  exp = zlc.connect(installation, repository=repository)
   exp.pulse_gui()
   ```
 
-  这里窗口复用该Experiment，关闭窗口不关闭notebook中的Experiment；standalone窗口则拥有并在关闭时安全关闭自己的Experiment。
+  该Experiment只有sequencer能力，没有camera/readout能力。窗口复用该Experiment，关闭窗口不关闭notebook中的Experiment；standalone窗口则拥有并在关闭时安全关闭自己的Experiment。
 
 ---
 

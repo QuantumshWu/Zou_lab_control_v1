@@ -59,7 +59,7 @@ if %ERRORLEVEL%==0 (
         exit /b !ERRORLEVEL!
     )
     cd /d "%ZLC_TUTORIALS_DIR%"
-    jupyter lab .
+    jupyter lab neutral_atom_tutorial.ipynb
     set "EXIT_CODE=!ERRORLEVEL!"
     if not "!EXIT_CODE!"=="0" if "%ZLC_NO_PAUSE%"=="" pause
     exit /b !EXIT_CODE!
@@ -71,7 +71,7 @@ if "%ZLC_NO_PAUSE%"=="" pause
 exit /b 1
 
 :zlc_help
-echo Open the Zou_lab_control tutorial notebooks in Jupyter Lab.
+echo Open the Zou_lab_control neutral-atom tutorial in Jupyter Lab.
 echo.
 echo Usage:
 echo   start_tutorials_jupyter_lab.bat
@@ -92,7 +92,7 @@ if "%ZLC_TUTORIALS_MODE%"=="check" (
     exit /b !ERRORLEVEL!
 )
 cd /d "%ZLC_TUTORIALS_DIR%"
-"%ZLC_PYTHON_EXE%" -m jupyter lab .
+"%ZLC_PYTHON_EXE%" -m jupyter lab neutral_atom_tutorial.ipynb
 set "EXIT_CODE=!ERRORLEVEL!"
 if not "!EXIT_CODE!"=="0" if "%ZLC_NO_PAUSE%"=="" pause
 exit /b !EXIT_CODE!
@@ -107,7 +107,7 @@ if "%ZLC_TUTORIALS_MODE%"=="check" (
     exit /b !ERRORLEVEL!
 )
 cd /d "%ZLC_TUTORIALS_DIR%"
-%ZLC_PYTHON_CMD% -m jupyter lab .
+%ZLC_PYTHON_CMD% -m jupyter lab neutral_atom_tutorial.ipynb
 set "EXIT_CODE=!ERRORLEVEL!"
 if not "!EXIT_CODE!"=="0" if "%ZLC_NO_PAUSE%"=="" pause
 exit /b !EXIT_CODE!

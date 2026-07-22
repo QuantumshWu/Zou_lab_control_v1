@@ -667,7 +667,7 @@ def test_public_calibration_report_gui_loads_and_renders_off_qt_owner(
             _close(application, window)
 
 
-def test_occupancy_document_uses_metadata_only_exact_output_schemas(
+def test_occupancy_document_uses_admitted_exact_output_schemas(
     occupancy_product,
     capture_product,
     monkeypatch,
@@ -677,10 +677,6 @@ def test_occupancy_document_uses_metadata_only_exact_output_schemas(
     experiment, reference, resolved = occupancy_product
     artifact = resolved.artifact
 
-    def forbidden_admit(*_args, **_kwargs):
-        raise AssertionError("figure_document must not materialize occupancy arrays")
-
-    monkeypatch.setattr(OccupancyRepository, "admit", forbidden_admit)
     occupied = experiment.figure_document(reference)
     assert len(occupied.datasets) == len(occupied.layers) == 1
     assert occupied.datasets[0].schema_fingerprint == (
@@ -703,10 +699,10 @@ def test_occupancy_document_uses_metadata_only_exact_output_schemas(
     assert counts.layers[0].view.intent is ViewIntent.HISTOGRAM
     assert "occupancy counts" in counts.datasets[0].label
 
-    def forbidden_inspect(*_args, **_kwargs):
-        raise AssertionError("invalid output must fail before repository inspection")
+    def forbidden_admit(*_args, **_kwargs):
+        raise AssertionError("invalid output must fail before repository admission")
 
-    monkeypatch.setattr(OccupancyRepository, "inspect_final", forbidden_inspect)
+    monkeypatch.setattr(OccupancyRepository, "admit", forbidden_admit)
     with pytest.raises(ValueError, match="occupancy_output"):
         experiment.figure_document(reference, occupancy_output="flattened")
     with pytest.raises(ValueError, match="only for OccupancyArtifactRef"):

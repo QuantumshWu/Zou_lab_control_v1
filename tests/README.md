@@ -41,8 +41,6 @@ pytest -q tests\test_frontend_smoke.py -k "pulse_gui"
 For notebook edits, validate only the notebooks that changed:
 
 ```powershell
-python -m json.tool tutorials\neutral_atom_fpga_server.ipynb > $null
-python -m json.tool tutorials\neutral_atom_hardware_quickstart.ipynb > $null
 python -m json.tool tutorials\neutral_atom_tutorial.ipynb > $null
 ```
 
@@ -103,7 +101,4 @@ visible channels, labels, and geometry remain complementary behavior oracles.
 ## Cleanup
 
 Test runs may create `.pytest_cache` or `__pycache__`; remove them before
-handoff if they were created only by the current verification pass.  PDF
-generation should use `Zou_lab_control.frontend.render_tex_pdf(...)`, which
-compiles in a temporary directory and leaves only the final PDF or a
-`.build.log` on failure.
+handoff if they were created only by the current verification pass.

@@ -10,11 +10,9 @@ It is deliberately the WHOLE arc rather than one call per test: what the
 tutorial promises is that these steps compose, and a capture reference that
 no calibration will accept would pass every isolated check.
 
-Scope note: the spine ends at per-shot detection, which is where the rewritten
-notebook ends.  Per-site thresholds, scans and the temperature fit are real
-capabilities that belong in this guard, but the notebook's text for them has
-not been rewritten onto this facade yet; asserting calls the tutorial does not
-make would pin a contract nobody is reading.  They join when that section does.
+The tutorial intentionally teaches the smallest complete current readout path.
+More advanced products join only with their own executable user workflow; this
+guard never promises calls that the checked-in tutorial does not make.
 """
 
 from __future__ import annotations
@@ -53,6 +51,11 @@ def _single_readout_event(document):
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+
+
+def test_there_is_one_current_user_tutorial() -> None:
+    notebooks = sorted(path.name for path in (ROOT / "tutorials").glob("*.ipynb"))
+    assert notebooks == ["neutral_atom_tutorial.ipynb"]
 
 
 def test_the_tutorial_spine_runs_on_the_virtual_installation() -> None:

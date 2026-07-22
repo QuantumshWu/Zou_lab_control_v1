@@ -517,17 +517,17 @@ def _occupancy_repository(
 
 def _occupancy_cell_navigation(
     reference,
-    inspected,
+    artifact,
 ):
-    """Project neutral FINAL metadata into the frontend-owned navigation value."""
+    """Project one admitted occupancy artifact into frontend navigation."""
 
     from zlc_frontend.occupancy_render import OccupancyCellNavigation
 
-    schema = inspected.occupied_schema
+    schema = artifact.occupied.schema
     return OccupancyCellNavigation(
         artifact_identity=reference.target_ref,
         schema_fingerprint=schema.fingerprint,
-        generation=inspected.generation,
+        generation=artifact.generation,
         repeat_axis=schema.repeat_axis,
         point_axes=schema.point_axes,
         point_layout=schema.point_layout,
@@ -1144,8 +1144,8 @@ class ReadoutFacade:
             raise TypeError("analysis must be CalibrationAnalysisRequest")
         timeout = _positive_real(timeout_seconds, "timeout_seconds")
         with _service_guard(self._token) as services:
-            inspected = services.capture_repository.inspect_final(source)
-            binding = inspected.readout_binding
+            source_artifact = services.capture_repository.admit(source).artifact
+            binding = source_artifact.camera_provenance.binding
             self._require_binding(binding)
             return CalibrationArtifactRequest(
                 source,
@@ -1257,9 +1257,9 @@ class ReadoutFacade:
 
         with _service_guard(self._token) as services:
             repository = _calibration_repository(services)
-            summary = repository.inspect_final(reference)
-            self._require_binding(summary.readout_binding)
-            return repository.load_computation(reference)
+            computation = repository.load_computation(reference)
+            self._require_binding(computation.artifact.frame_contract.binding)
+            return computation
 
     def load_calibration_report(
         self,
@@ -1300,17 +1300,17 @@ class ReadoutFacade:
             raise TypeError("model_kind must be ReadoutModelKind or None")
         timeout = _positive_real(timeout_seconds, "timeout_seconds")
         with _service_guard(self._token) as services:
-            inspected_source = services.capture_repository.inspect_final(source)
-            inspected_calibration = _calibration_repository(services).inspect_final(
-                calibration
-            )
-            binding = inspected_source.readout_binding
-            if inspected_calibration.readout_binding != binding:
-                raise ValueError("capture and calibration name different readout bindings")
+            source_artifact = services.capture_repository.admit(source).artifact
+            calibration_artifact = _calibration_repository(services).load(calibration)
+            binding = source_artifact.camera_provenance.binding
+            if calibration_artifact.frame_contract.binding != binding:
+                raise ValueError(
+                    "capture and calibration name different readout bindings"
+                )
             self._require_binding(binding)
             event_axes = tuple(
                 axis
-                for axis in inspected_source.dataset_schema.point_axes
+                for axis in source_artifact.frame_source.schema.point_axes
                 if axis.role == READOUT_EVENT
             )
             if len(event_axes) != 1 or event_axes[0].size != 1:
@@ -1318,11 +1318,13 @@ class ReadoutFacade:
                     "detection requires exactly one singleton READOUT_EVENT axis"
                 )
             selected_model = (
-                inspected_calibration.default_model_kind
+                calibration_artifact.default_model_kind
                 if model_kind is None
                 else model_kind
             )
-            if selected_model not in inspected_calibration.model_kinds:
+            if selected_model not in tuple(
+                model.kind for model in calibration_artifact.models
+            ):
                 raise KeyError(selected_model)
             return DetectionRequest(
                 source,
@@ -1364,33 +1366,37 @@ class ReadoutFacade:
         self,
         reference: OccupancyArtifactRef,
     ):
-        """Read only the committed outer-axis metadata needed by the navigator."""
+        """Resolve the committed outer axes needed by the navigator."""
 
         if not isinstance(reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
         with _service_guard(self._token) as services:
             occupancy_repository = _occupancy_repository(services)
             calibration_repository = _calibration_repository(services)
-            inspected = occupancy_repository.inspect_final(reference)
-            source_info = services.capture_repository.inspect_final(
-                inspected.source_capture_ref
+            resolved = occupancy_repository.admit(
+                reference,
+                services.capture_repository,
+                calibration_repository,
             )
-            calibration_info = calibration_repository.inspect_final(
-                inspected.calibration_reference
+            artifact = resolved.artifact
+            source_artifact = services.capture_repository.admit(
+                artifact.source_capture_ref
+            ).artifact
+            calibration_artifact = calibration_repository.load(
+                artifact.calibration_reference
             )
-            self._require_binding(source_info.readout_binding)
-            if calibration_info.readout_binding != source_info.readout_binding:
+            self._require_binding(resolved.readout_binding)
+            if calibration_artifact.frame_contract.binding != resolved.readout_binding:
                 raise ValueError("occupancy source and calibration bindings differ")
+            source_schema = source_artifact.frame_source.schema
+            occupied_schema = artifact.occupied.schema
             if (
-                source_info.dataset_schema.repeat_axis
-                != inspected.occupied_schema.repeat_axis
-                or source_info.dataset_schema.point_axes
-                != inspected.occupied_schema.point_axes
-                or source_info.dataset_schema.point_layout
-                != inspected.occupied_schema.point_layout
+                source_schema.repeat_axis != occupied_schema.repeat_axis
+                or source_schema.point_axes != occupied_schema.point_axes
+                or source_schema.point_layout != occupied_schema.point_layout
             ):
                 raise ValueError("occupancy outer axes differ from the source capture")
-            frame_schema = source_info.dataset_schema.cell_schema
+            frame_schema = source_schema.cell_schema
             if len(frame_schema.data_shape) != 2:
                 raise ValueError(
                     "physical occupancy map requires a two-dimensional camera frame"
@@ -1403,10 +1409,10 @@ class ReadoutFacade:
                     "physical occupancy map requires exactly one declared "
                     "SPATIAL_X and SPATIAL_Y frame axis"
                 )
-            site_count = inspected.occupied_schema.cell_schema.data_axes[0].size
-            if calibration_info.site_count != site_count:
+            site_count = occupied_schema.cell_schema.data_axes[0].size
+            if calibration_artifact.site_map.site_axis.size != site_count:
                 raise ValueError("occupancy SITE cardinality differs from calibration")
-            return _occupancy_cell_navigation(reference, inspected)
+            return _occupancy_cell_navigation(reference, artifact)
 
     def _load_occupancy_cell_source(
         self,
@@ -1443,17 +1449,23 @@ class ReadoutFacade:
         with _service_guard(self._token) as services:
             occupancy_repository = _occupancy_repository(services)
             calibration_repository = _calibration_repository(services)
-            inspected = occupancy_repository.inspect_final(reference)
-            source_info = services.capture_repository.inspect_final(
-                inspected.source_capture_ref
+            resolved = occupancy_repository.admit(
+                reference,
+                services.capture_repository,
+                calibration_repository,
             )
-            calibration_info = calibration_repository.inspect_final(
-                inspected.calibration_reference
-            )
-            self._require_binding(source_info.readout_binding)
-            if calibration_info.readout_binding != source_info.readout_binding:
+            artifact = resolved.artifact
+            self._require_binding(resolved.readout_binding)
+            source_ref = artifact.source_capture_ref
+            calibration_ref = artifact.calibration_reference
+            source = services.capture_repository.admit(source_ref)
+            source_artifact = source.artifact
+            frame_source = source_artifact.frame_source
+            source_schema = frame_source.schema
+            calibration = calibration_repository.load(calibration_ref)
+            if calibration.frame_contract.binding != resolved.readout_binding:
                 raise ValueError("occupancy source and calibration bindings differ")
-            frame_schema = source_info.dataset_schema.cell_schema
+            frame_schema = source_schema.cell_schema
             if len(frame_schema.data_shape) != 2:
                 raise ValueError("physical occupancy map requires a two-dimensional camera frame")
             frame_axes = frame_schema.data_axes
@@ -1472,8 +1484,9 @@ class ReadoutFacade:
             if x_position == y_position:
                 raise ValueError("physical occupancy frame axes are not distinct")
             x_axis, y_axis = frame_axes[x_position], frame_axes[y_position]
-            site_axis = inspected.occupied_schema.cell_schema.data_axes[0]
-            current_navigation = _occupancy_cell_navigation(reference, inspected)
+            occupied_schema = artifact.occupied.schema
+            site_axis = occupied_schema.cell_schema.data_axes[0]
+            current_navigation = _occupancy_cell_navigation(reference, artifact)
             if (
                 expected_navigation is not None
                 and current_navigation.identity != expected_navigation.identity
@@ -1492,22 +1505,6 @@ class ReadoutFacade:
                 point_storage_index,
             )
 
-            resolved = occupancy_repository.admit(
-                reference,
-                services.capture_repository,
-                calibration_repository,
-            )
-            artifact = resolved.artifact
-            if (
-                artifact.source_capture_ref != inspected.source_capture_ref
-                or artifact.calibration_reference != inspected.calibration_reference
-                or artifact.readout_event_axis_id != inspected.readout_event_axis_id
-                or artifact.model_kind is not inspected.model_kind
-                or artifact.generation != inspected.generation
-                or artifact.counts.schema != inspected.counts_schema
-                or artifact.occupied.schema != inspected.occupied_schema
-            ):
-                raise ValueError("materialized occupancy differs from FINAL inspection")
             r = address.repeat_index
             p = address.point_storage_index
             occupied = np.array(
@@ -1526,11 +1523,8 @@ class ReadoutFacade:
                 artifact.occupied.ref(generation),
             )
             model_kind = artifact.model_kind
-            source_ref = artifact.source_capture_ref
-            calibration_ref = artifact.calibration_reference
             del artifact, resolved, validity
 
-            calibration = calibration_repository.load(calibration_ref)
             calibration_site_axis = calibration.site_map.site_axis
             if calibration_site_axis != site_axis:
                 raise ValueError("occupancy SITE axis differs from its calibration")
@@ -1552,17 +1546,11 @@ class ReadoutFacade:
                 )
             del calibration, calibration_site_axis
 
-            if source_info.dataset_schema.repeat_axis != inspected.occupied_schema.repeat_axis or (
-                source_info.dataset_schema.point_axes != inspected.occupied_schema.point_axes
-                or source_info.dataset_schema.point_layout
-                != inspected.occupied_schema.point_layout
+            if source_schema.repeat_axis != occupied_schema.repeat_axis or (
+                source_schema.point_axes != occupied_schema.point_axes
+                or source_schema.point_layout != occupied_schema.point_layout
             ):
                 raise ValueError("occupancy outer axes differ from the source capture")
-            source = services.capture_repository.admit(source_ref)
-            source_artifact = source.artifact
-            frame_source = source_artifact.frame_source
-            if frame_source.schema != source_info.dataset_schema:
-                raise ValueError("admitted capture differs from its FINAL inspection")
             if frame_source.revision != revision:
                 raise ValueError("occupancy revision differs from its source frame revision")
             source_generation = source_artifact.provenance.generation
@@ -1748,7 +1736,7 @@ def _project_notebook_figure(
 
     fit_result = draft_fit_result
     snapshot = preloaded_snapshot
-    source_inspection = None
+    source_final = None
     selected_occupancy_output = None
     source_label = "capture"
     if draft_fit_result is not None:
@@ -1765,29 +1753,26 @@ def _project_notebook_figure(
             "occupied" if occupancy_output is None else occupancy_output
         )
         repository = _occupancy_repository(services)
-        if not materialize:
-            inspected = repository.inspect_final(source)
-            schema = (
-                inspected.occupied_schema
-                if selected_occupancy_output == "occupied"
-                else inspected.counts_schema
-            )
-            model_kind = inspected.model_kind
-        else:
-            resolved = repository.admit(
-                source,
-                services.capture_repository,
-                _calibration_repository(services),
-            )
-            artifact = resolved.artifact
+        resolved = repository.admit(
+            source,
+            services.capture_repository,
+            _calibration_repository(services),
+        )
+        artifact = resolved.artifact
+        selected_block = (
+            artifact.occupied
+            if selected_occupancy_output == "occupied"
+            else artifact.counts
+        )
+        schema = selected_block.schema
+        model_kind = artifact.model_kind
+        if materialize:
             snapshot = (
                 artifact.occupied_snapshot
                 if selected_occupancy_output == "occupied"
                 else artifact.counts_snapshot
             )
-            schema = snapshot.block.schema
-            model_kind = artifact.model_kind
-            del artifact, resolved
+        del selected_block, artifact, resolved
         source_label = (
             f"occupancy {selected_occupancy_output} | {model_kind.value}"
         )
@@ -1819,11 +1804,12 @@ def _project_notebook_figure(
         if isinstance(source_ref, CaptureArtifactRef):
             if snapshot is None:
                 if preinspected_schema is None:
-                    source_inspection = services.capture_repository.inspect_final(
-                        source_ref
+                    source_final = services.capture_repository.admit(source_ref)
+                    capture = source_final.artifact
+                    schema = capture.frame_source.schema
+                    source_dataset_ref = capture.frame_source.ref(
+                        capture.provenance.generation
                     )
-                    schema = source_inspection.dataset_schema
-                    source_dataset_ref = source_inspection.dataset_revision_ref
                 else:
                     schema = preinspected_schema
                     source_dataset_ref = preinspected_dataset_ref
@@ -1833,11 +1819,10 @@ def _project_notebook_figure(
         elif isinstance(source_ref, ScanArtifactRef):
             if snapshot is None:
                 if preinspected_schema is None:
-                    source_inspection = services.scan_repository.inspect_final(
-                        source_ref
-                    )
-                    schema = source_inspection.output_schema
-                    source_dataset_ref = source_inspection.output_dataset_ref
+                    source_final = services.scan_repository.admit(source_ref)
+                    scan = source_final
+                    schema = scan.output_schema
+                    source_dataset_ref = scan.output_dataset_ref
                 else:
                     schema = preinspected_schema
                     source_dataset_ref = preinspected_dataset_ref
@@ -1917,11 +1902,11 @@ def _project_notebook_figure(
     if not materialize:
         return document, None, fit_result
     if snapshot is None and source_ref is not None:
-        if source_inspection is None:
-            raise RuntimeError("figure source inspection is unavailable")
-        del source_inspection, schema, suggestion
+        if source_final is None:
+            raise RuntimeError("figure FINAL source is unavailable")
+        del schema, suggestion
         if isinstance(source_ref, CaptureArtifactRef):
-            snapshot = services.capture_repository.materialize_final(source_ref)
+            snapshot = source_final.materialize_snapshot()
         elif isinstance(source_ref, ScanArtifactRef):
             snapshot = services.scan_repository.materialize(source_ref).snapshot
         else:  # pragma: no cover - source kind is closed above
@@ -2118,11 +2103,11 @@ class Experiment:
             if spec is None:
                 assert model is not None
                 if isinstance(source, CaptureArtifactRef):
-                    inspection = services.capture_repository.inspect_final(source)
-                    schema = inspection.dataset_schema
+                    capture = services.capture_repository.admit(source).artifact
+                    schema = capture.frame_source.schema
                 else:
-                    inspection = services.scan_repository.inspect_final(source)
-                    schema = inspection.output_schema
+                    scan = services.scan_repository.admit(source)
+                    schema = scan.output_schema
                 spec = fit_spec_for(
                     schema,
                     model,
@@ -2135,7 +2120,7 @@ class Experiment:
                         else numeric_policy
                     ),
                 )
-                del schema, inspection
+                del schema
             elif any(
                 value is not None
                 for value in (
@@ -2208,16 +2193,16 @@ class Experiment:
             elif chosen_model != initial_fit_spec.model_id:
                 raise ValueError("selected model differs from the initial FitSpec")
 
-        def inspect_source(services):
+        def load_final_source(services):
             if isinstance(fit_source, CaptureArtifactRef):
-                return services.capture_repository.inspect_final(fit_source)
-            return services.scan_repository.inspect_final(fit_source)
+                return services.capture_repository.admit(fit_source).artifact
+            return services.scan_repository.admit(fit_source)
 
         def source_schema(services):
-            inspected = inspect_source(services)
+            artifact = load_final_source(services)
             if isinstance(fit_source, CaptureArtifactRef):
-                return inspected.dataset_schema
-            return inspected.output_schema
+                return artifact.frame_source.schema
+            return artifact.output_schema
 
         def prepare_fit(
             fit_axis_ids: tuple[AxisId, ...],
@@ -2362,14 +2347,16 @@ class Experiment:
                 if source != fit_source:
                     raise ValueError("direct Fit Figure loader received another source")
                 with _service_guard(self._authority_token) as services:
-                    inspected = inspect_source(services)
+                    artifact = load_final_source(services)
                     if isinstance(fit_source, CaptureArtifactRef):
-                        schema = inspected.dataset_schema
-                        dataset_ref = inspected.dataset_revision_ref
+                        schema = artifact.frame_source.schema
+                        dataset_ref = artifact.frame_source.ref(
+                            artifact.provenance.generation
+                        )
                     else:
-                        schema = inspected.output_schema
-                        dataset_ref = inspected.output_dataset_ref
-                    del inspected
+                        schema = artifact.output_schema
+                        dataset_ref = artifact.output_dataset_ref
+                    del artifact
                     seed_document, _datasets, _fit_result = (
                         _project_notebook_figure(
                             services,
