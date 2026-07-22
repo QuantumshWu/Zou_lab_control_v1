@@ -75,6 +75,11 @@ class HistogramDisplayState:
     bin_count: int = DEFAULT_HISTOGRAM_BINS
     x_view: DisplayRange | None = None
     fixed_count_limits: DisplayRange | None = None
+    # ZERO OR MORE vertical threshold cut lines (the design's frozen histogram
+    # selector row): authored values in the histogram's VALUE coordinate, drawn
+    # by the renderer and dragged live on the board.  The reference keeps them
+    # as plain display state on the figure -- never an analysis authority.
+    thresholds: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -108,6 +113,14 @@ class HistogramDisplayState:
         if self.relim_mode is RelimMode.FIXED:
             if fixed is None:
                 raise ValueError("fixed relim_mode requires fixed_count_limits")
+        object.__setattr__(
+            self,
+            "thresholds",
+            tuple(
+                finite_real(value, "histogram threshold")
+                for value in self.thresholds
+            ),
+        )
 
 
 _HISTOGRAM_DISPLAY_FORM = FormSpec(
@@ -236,6 +249,9 @@ def histogram_display_from_form(
         bin_count=bin_count,
         x_view=x_view,
         fixed_count_limits=fixed_count_limits,
+        # The display form does not edit thresholds; the authored cut lines
+        # ride along unchanged (they are dragged on the board, not typed).
+        thresholds=base.thresholds,
     )
     if candidate == base:
         return base
@@ -254,6 +270,26 @@ def histogram_display_with_x_view(
     if x_view == base.x_view:
         return base
     return replace(base, revision=base.revision + 1, x_view=x_view)
+
+
+def histogram_display_with_thresholds(
+    base: HistogramDisplayState,
+    thresholds: tuple[float, ...],
+) -> HistogramDisplayState:
+    """Commit one authored threshold set (a board drag step or an explicit
+    ``set_thresholds``-style write, the reference's single mutation point)."""
+
+    if not isinstance(base, HistogramDisplayState):
+        raise TypeError("base must be HistogramDisplayState")
+    candidate = replace(
+        base,
+        thresholds=tuple(
+            finite_real(value, "histogram threshold") for value in thresholds
+        ),
+    )
+    if candidate == base:
+        return base
+    return replace(candidate, revision=base.revision + 1)
 
 
 def _normalized_plot_bounds(value: object) -> tuple[float, float, float, float]:

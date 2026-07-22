@@ -48,12 +48,17 @@ from zlc_frontend.histogram_display import (
     histogram_count_limits,
     histogram_display_form_values,
     histogram_display_from_form,
+    histogram_display_with_thresholds,
     histogram_display_with_x_view,
     histogram_home_x_limits,
     histogram_projection_home_x_limits,
 )
-from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
+from zlc_frontend.matplotlib_render import (
+    SinglePanelAggRenderer,
+    _histogram_left_fraction,
+)
 from zlc_frontend.render import HistogramPanelPayload
+from zlc_frontend.render_style import PALETTE as RENDER_PALETTE
 
 
 def test_histogram_form_freezes_exact_front_and_validates_log_and_bins() -> None:
@@ -282,7 +287,9 @@ def test_shared_histogram_binning_is_common_lossless_and_immutable() -> None:
         )
 
 
-def test_histogram_evaluator_preserves_unit_coordinates_and_component_validity() -> None:
+def _histogram_document_and_evaluated():
+    """One minimal evaluated HISTOGRAM panel shared by the display tests."""
+
     repeat = AxisSpec(AxisId("repeat"), "Repeat", REPEAT, 2)
     point = AxisSpec(AxisId("point"), "Point", SCAN_POINT, 1)
     site = AxisSpec(
@@ -358,6 +365,11 @@ def test_histogram_evaluator_preserves_unit_coordinates_and_component_validity()
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
     )
+    return document, evaluated
+
+
+def test_histogram_evaluator_preserves_unit_coordinates_and_component_validity() -> None:
+    document, evaluated = _histogram_document_and_evaluated()
     histogram = evaluated.layers[0].cells[0].series[0].data
     assert isinstance(histogram, EvaluatedHistogram)
     assert histogram.value_unit == "photoelectron"
@@ -368,9 +380,9 @@ def test_histogram_evaluator_preserves_unit_coordinates_and_component_validity()
     coordinates = {
         item.axis_id: item.coordinates for item in histogram.sample_coordinates
     }
-    assert coordinates[repeat.axis_id] == (0, 0, 0, 1, 1, 1, 1)
-    assert coordinates[site.axis_id] == ("A", "A", "B", "A", "A", "B", "B")
-    assert coordinates[channel.axis_id] == ("x", "y", "x", "x", "y", "x", "y")
+    assert coordinates[AxisId("repeat")] == (0, 0, 0, 1, 1, 1, 1)
+    assert coordinates[AxisId("site")] == ("A", "A", "B", "A", "A", "B", "B")
+    assert coordinates[AxisId("channel")] == ("x", "y", "x", "x", "y", "x", "y")
     assert histogram.dropped_count == 1
 
     renderer = SinglePanelAggRenderer(document, width=420, height=280)
@@ -432,3 +444,77 @@ def test_histogram_evaluator_preserves_unit_coordinates_and_component_validity()
         assert renderer._axis.get_yscale() == "log"
     finally:
         renderer.close()
+
+
+def test_histogram_threshold_lines_render_and_echo_into_the_payload() -> None:
+    """The design's frozen histogram selector row: ZERO OR MORE vertical
+    threshold cut lines drawn in the reference's art (orange axvline) with the
+    th=/L/R= stats readout, echoed on the payload for the board to grab."""
+
+    document, evaluated = _histogram_document_and_evaluated()
+    renderer = SinglePanelAggRenderer(document, width=420, height=280)
+    try:
+        bare_raster, bare_payload = renderer.render_interactive_histogram(
+            evaluated,
+            HistogramDisplayState(),
+            current_count_limits=None,
+            previous_relim_mode=None,
+            previous_count_scale=None,
+        )
+        assert bare_payload.thresholds == ()
+        cut = 4.5
+        raster, payload = renderer.render_interactive_histogram(
+            evaluated,
+            HistogramDisplayState(revision=1, thresholds=(cut,)),
+            current_count_limits=None,
+            previous_relim_mode=None,
+            previous_count_scale=None,
+        )
+        assert payload.thresholds == (cut,)
+        assert raster.pixels != bare_raster.pixels
+        # The cut line is the reference's exact orange; scan the raster for it.
+        import matplotlib.colors
+
+        expected = tuple(
+            int(round(255 * v))
+            for v in matplotlib.colors.to_rgb(RENDER_PALETTE["threshold"])
+        )
+        pixels = np.frombuffer(raster.pixels, dtype=np.uint8).reshape(
+            raster.height, raster.width, 4)
+        orange = (
+            (np.abs(pixels[..., 0].astype(int) - expected[0]) < 30)
+            & (np.abs(pixels[..., 1].astype(int) - expected[1]) < 30)
+            & (np.abs(pixels[..., 2].astype(int) - expected[2]) < 30)
+        )
+        assert int(orange.sum()) > 0, "threshold line pixels are absent"
+        # The line is VERTICAL at the cut: orange pixels concentrate in a
+        # narrow column band around the threshold's raster x.
+        viewport = payload.viewport
+        left, _top, right, _bottom = viewport.plot_bounds
+        x_low, x_high = viewport.x_limits
+        fraction = (cut - x_low) / (x_high - x_low)
+        expected_x = (left + fraction * (right - left)) * raster.width
+        columns = np.where(orange.any(axis=0))[0]
+        assert columns.size > 0
+        assert abs(float(np.median(columns)) - expected_x) < 6.0
+        # The stats readout follows the reference's binned left fraction.
+        left_fraction = _histogram_left_fraction(cut, payload.bin_projection)
+        samples = np.concatenate(
+            [np.asarray(s) for s in payload.bin_projection.series_samples])
+        exact = float(np.mean(samples <= cut))
+        assert abs(left_fraction - exact) <= 1.0 / max(len(samples), 1) + 0.2
+    finally:
+        renderer.close()
+
+
+def test_histogram_display_thresholds_state_semantics() -> None:
+    """thresholds ride the display state: the drag helper advances the
+    revision only on real change and the display form carries them along."""
+
+    base = HistogramDisplayState()
+    dragged = histogram_display_with_thresholds(base, (1.5,))
+    assert dragged.thresholds == (1.5,)
+    assert dragged.revision == base.revision + 1
+    assert histogram_display_with_thresholds(dragged, (1.5,)) is dragged
+    with pytest.raises(ValueError):
+        HistogramDisplayState(thresholds=(float("nan"),))

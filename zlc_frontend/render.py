@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from numbers import Integral
 import threading
 from typing import Protocol, runtime_checkable
@@ -702,8 +703,18 @@ class HistogramPanelPayload:
     series: tuple[EvaluatedSeries, ...]
     series_labels: tuple[str, ...]
     bin_projection: HistogramBinProjection
+    # The drawn threshold cut lines (display state echoed by the renderer so
+    # the board can grab them in the value coordinate).
+    thresholds: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "thresholds",
+            tuple(float(value) for value in self.thresholds),
+        )
+        if any(not math.isfinite(value) for value in self.thresholds):
+            raise ValueError("histogram payload thresholds must be finite")
         if not isinstance(self.evaluated_input, EvaluatedInput):
             raise TypeError("histogram payload requires one EvaluatedInput")
         if not isinstance(self.viewport, HistogramViewportTransform):

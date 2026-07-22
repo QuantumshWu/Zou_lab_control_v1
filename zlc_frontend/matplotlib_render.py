@@ -1600,6 +1600,28 @@ def save_radial_gaussian_image_fit_panels(
         gc.collect()
 
 
+def _histogram_left_fraction(threshold: float, projection) -> float:
+    """Fraction of samples <= threshold from the ALREADY-BINNED pooled counts
+    (linear interpolation inside the cut bin) -- the reference's
+    ``_left_fraction`` verbatim: O(bins), never a per-sample comparison, with
+    sub-bin error below one bin's mass."""
+
+    edges = np.asarray(projection.bin_edges, dtype=float)
+    n = np.zeros(max(len(edges) - 1, 0), dtype=float)
+    for counts in projection.bin_counts:
+        n = n + np.asarray(counts, dtype=float)
+    total = float(np.sum(n))
+    if n.size == 0 or total <= 0:
+        return 0.0
+    i = int(np.clip(np.searchsorted(edges, threshold, side="right") - 1, -1, len(n)))
+    if i < 0:
+        return 0.0
+    if i >= len(n):
+        return 1.0
+    frac_in_bin = (threshold - edges[i]) / max(float(edges[i + 1] - edges[i]), 1e-300)
+    return float((np.sum(n[:i]) + n[i] * np.clip(frac_in_bin, 0.0, 1.0)) / total)
+
+
 def _histogram_projection(series_group, bins: int):
     return HistogramBinProjection(
         tuple(series.data.samples for series in series_group), bins=bins
@@ -2317,6 +2339,31 @@ class SinglePanelAggRenderer:
         axis.set_yscale(state.count_scale.value)
         axis.set_xlim(*x_limits)
         axis.set_ylim(*count_limits)
+        # ZERO OR MORE vertical threshold cut lines plus the reference's
+        # stats readout (th= / fit F= / L/R=), drawn only when a cut is
+        # authored.  The fit fidelity line reads N/A here exactly like the
+        # reference with an invalid fit -- the histogram fit overlay is a
+        # separate consumer and fills it in on its own path.
+        if state.thresholds:
+            from .render_style import (
+                PALETTE, small_fontsize, threshold_line_kwargs)
+            for threshold in state.thresholds:
+                axis.axvline(float(threshold), **threshold_line_kwargs())
+            left = _histogram_left_fraction(state.thresholds[0], bin_projection)
+            axis.text(
+                0.975,
+                0.975,
+                (
+                    f"th={state.thresholds[0]:.4g}\n"
+                    "fit F=N/A\n"
+                    f"L/R={100 * left:.1f}%/{100 * (1 - left):.1f}%"
+                ),
+                transform=axis.transAxes,
+                ha="right",
+                va="top",
+                color=PALETTE["annotation"],
+                fontsize=small_fontsize(),
+            )
         raster = self._draw_raster(figure)
         actual_x_limits = validated_display_range(
             tuple(float(value) for value in axis.get_xlim()),
@@ -2363,6 +2410,7 @@ class SinglePanelAggRenderer:
             tuple(series_group),
             labels,
             bin_projection,
+            thresholds=state.thresholds,
         )
 
     def _prepare_panel(
