@@ -143,3 +143,27 @@ def test_size_preset_scales_the_rendered_pixels(preview_editor):
             f"size {preset} rendered {dims[preset]} px, not panel_display_size {panel_display_size(preset)}")
     assert dims["2x2"][0] < dims["4x4"][0] < dims["8x8"][0], "a bigger preset must widen the figure"
     assert dims["2x2"][1] < dims["4x4"][1] < dims["8x8"][1], "a bigger preset must heighten the figure"
+
+
+def test_repeat_forever_bracket_draws_the_infinity_glyph_cleanly(preview_editor):
+    """A repeat-forever pulse draws the ×∞ bracket label; the ∞ (U+221E) must resolve to a real glyph.
+
+    The design font (Helvetica Light) lacks ∞, so drawing the label in it emits a "Glyph 8734 missing"
+    UserWarning and paints a tofu box -- the reference dodges this by drawing the bracket label in
+    DejaVu Sans.  Fail if that warning ever comes back.
+    """
+
+    import warnings
+
+    state = preview_editor.read_state()
+    try:
+        state.repeat_forever = True
+    except Exception:                                        # pragma: no cover - defensive
+        pytest.skip("cannot force repeat_forever on this state")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        preview_editor.preview_png_bytes(state, include_always_off=True)
+    glyph_warnings = [w for w in caught if "missing from font" in str(w.message)]
+    assert not glyph_warnings, (
+        "the ×∞ bracket label hit a missing-glyph fallback (tofu box): "
+        + "; ".join(str(w.message) for w in glyph_warnings))

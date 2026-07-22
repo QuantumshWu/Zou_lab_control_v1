@@ -1027,12 +1027,12 @@ def _draw_pulse_repeat_brackets(axis, repeat_markers, n_channels, colors) -> Non
                   color=color, alpha=alpha, linewidth=1.05, solid_capstyle="round",
                   clip_on=True, zorder=8 + index)
         if label:
-            # The ×∞ label needs the U+221E glyph, which the design's Helvetica Light lacks (it renders
-            # a tofu box).  Draw the bracket label in DejaVu Sans -- which HAS ∞ -- exactly as the
-            # reference does, so ×∞ reads as infinity and not a missing-glyph square.
-            axis.text((start + stop) / 2.0, y_high + 0.06 * (1 + outer_depth), label,
-                      ha="center", va="bottom", color=color, alpha=alpha, fontfamily="DejaVu Sans",
-                      fontsize=smaller_fontsize(1.0, 5.5), clip_on=False, zorder=8 + index)
+            # Label placement matches the reference EXACTLY: just to the RIGHT of the right stem
+            # (``stop + tick*0.12``, left-aligned), not centred above the span.  DejaVu Sans supplies
+            # the U+221E glyph the design's Helvetica Light lacks, so ×∞ reads as infinity, not tofu.
+            axis.text(stop + tick * 0.12, y_high + 0.055, label,
+                      ha="left", va="bottom", color=color, alpha=alpha, fontfamily="DejaVu Sans",
+                      fontsize=smaller_fontsize(0.8, 5.5), clip_on=False, zorder=9 + index)
 
 
 def render_pulse_timeline_png(
@@ -1064,13 +1064,15 @@ def render_pulse_timeline_png(
 
     import io
 
+    import matplotlib
+
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
     from matplotlib.patches import Rectangle
     from matplotlib.ticker import FuncFormatter, MaxNLocator
 
     from .render_style import (
-        DESIGN_DPI, PALETTE, PANEL_DISPLAY_SCALE, panel_figure_size_inches,
+        DESIGN_DPI, PALETTE, PANEL_DISPLAY_SCALE, apply_title, panel_figure_size_inches,
         render_style_context, smaller_fontsize,
     )
 
@@ -1146,12 +1148,20 @@ def render_pulse_timeline_png(
             axis.set_ylim(-0.62, ylim_top)
             axis.set_yticks([index_map[channel] for channel in channels])
             axis.set_yticklabels([labels.get(channel, channel) for channel in channels])
+            # Channel names sit ONE row apart, so the reference shrinks the y-tick label a notch below
+            # the stock tick size (ytick.labelsize - 1.2, floored at 4.8) to keep long board names from
+            # crowding their neighbours -- match it exactly.
+            axis.tick_params(
+                axis="y",
+                labelsize=max(4.8, matplotlib.rcParams["ytick.labelsize"] - 1.2))
             for tick, channel in zip(axis.get_yticklabels(), channels):
                 tick.set_color(color_map[channel])
             axis.set_xlabel(f"Time ({unit})")
             axis.xaxis.set_major_locator(MaxNLocator(nbins=5, prune="lower"))
+            # Blank the cosmetic negative-time headroom ticks (the left margin lets a t=0 edge breathe
+            # off the spine); the reference never prints a negative tick, so nor does the preview.
             axis.xaxis.set_major_formatter(
-                FuncFormatter(lambda value, _pos, s=scale: f"{value / s:.4g}"))
+                FuncFormatter(lambda value, _pos, s=scale: "" if value < 0 else f"{value / s:.4g}"))
             axis.tick_params(axis="x", which="both", bottom=True, top=False,
                              labelbottom=True, labeltop=False, pad=2)
             axis.set_axisbelow(True)
@@ -1163,7 +1173,10 @@ def render_pulse_timeline_png(
                           fontsize=smaller_fontsize(1.0, 5.5))
             _draw_pulse_repeat_brackets(axis, repeat_markers, n_channels, bracket_colors)
             if title:
-                axis.set_title(str(title))
+                # The ONE title mechanism (apply_title = title_fontsize, the stock label size); NOT
+                # axis.set_title(), whose default 'large' titlesize dwarfs the compact preview and
+                # crowds the repeat bracket right below it.
+                apply_title(axis, str(title))
             buffer = io.BytesIO()
             figure.savefig(buffer, format="png", dpi=dpi)
             return buffer.getvalue()
