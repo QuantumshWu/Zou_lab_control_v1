@@ -64,14 +64,18 @@ def test_the_preview_plot_is_not_collapsed_to_a_sliver(preview_editor):
 def test_the_preview_status_reads_like_the_reference(preview_editor):
     """The status line names how many channels were drawn, out of how many exist,
     the mode, and the repeat -- the same wording main shows (``N/M plotted
-    (active channels) | repeat …``), NOT a bare ``us, periods`` blurb.
+    (active channels) | repeat …``), where the repeat is the reference's exact
+    three-state notation: ``repeat ∞``, ``repeat P1-P2 x3`` (bracket covers the
+    whole table) or ``repeat ∞ + P2-P3 x2`` (partial inner bracket); a one-shot
+    program without a bracket says nothing.
     """
 
     import re
 
     text = preview_editor.preview_status.text()
     assert re.fullmatch(
-        r"\d+/\d+ plotted \((active|all) channels\) \| repeat (∞|\d+)", text), (
+        r"\d+/\d+ plotted \((active|all) channels\)"
+        r"( \| repeat (∞|P\d+-P\d+ x\d+|∞ \+ P\d+-P\d+ x\d+))?", text), (
         f"the preview status {text!r} does not match the reference wording "
         "'N/M plotted (active channels) | repeat …'")
 
@@ -176,6 +180,52 @@ def test_a_trailing_all_off_period_keeps_the_frame_length_visible(preview_editor
         assert png_two != png_one, (
             "removing the trailing all-off period did not change the preview -- the frame "
             "length is not being honoured")
+
+
+def test_the_inner_repeat_bracket_draws_nested_not_unrolled(preview_editor):
+    """A finite inner bracket ``[P1..P1] × 3`` must read as its OWN nested square
+    bracket over period 1's span -- the reference's semantics exactly:
+
+    * partial bracket in a forever loop  -> outer ``×∞`` plus inner ``×3``;
+    * bracket covering the whole table   -> only the inner ``×N`` bracket;
+    * partial bracket, forever off       -> the inner bracket alone;
+    * the axis spans the AUTHORED table, never the unrolled copies.
+
+    The regression this pins: the preview collapsed everything to one
+    whole-frame marker (×∞ swallowing ×N entirely) and drew the bracket
+    UNROLLED across an axis stretched to the expanded length.
+    """
+
+    from zlc_workbench.pulse_editor.plot_bridge_pulse_gui import _preview_repeat_markers
+
+    state = preview_editor.read_state()
+    assert len(state.periods) == 2
+    baseline = preview_editor.preview_png_bytes(state, include_always_off=False)
+
+    state.repeat_start, state.repeat_end, state.repeat_count = 0, 0, 3
+    markers, total = _preview_repeat_markers(state)
+    assert [label for (_start, _stop, label) in markers] == ["×∞", "×3"], (
+        "a partial inner bracket inside a forever loop must draw BOTH brackets")
+    outer, inner = markers
+    assert outer[0] == 0.0 and outer[1] == pytest.approx(total)
+    assert inner[0] == 0.0 and 0.0 < inner[1] < total, (
+        "the inner bracket must span exactly its own periods, not the whole frame")
+    # The frame is the AUTHORED table: expanding [P0]x3 + P1 would be longer.
+    expanded = float(state.total_duration_ns()) * 1e-9
+    assert total < expanded, "the preview axis must not stretch over the unrolled copies"
+    with_bracket = preview_editor.preview_png_bytes(state, include_always_off=False)
+    assert with_bracket != baseline, "adding the inner bracket left the preview unchanged"
+
+    # Bracket over the WHOLE table: only the inner ×N bracket is drawn.
+    state.repeat_start, state.repeat_end = 0, 1
+    markers, _total = _preview_repeat_markers(state)
+    assert [label for (_start, _stop, label) in markers] == ["×3"]
+
+    # Forever off with a partial bracket: the inner bracket alone.
+    state.repeat_start, state.repeat_end = 0, 0
+    state.repeat_forever = False
+    markers, _total = _preview_repeat_markers(state)
+    assert [label for (_start, _stop, label) in markers] == ["×3"]
 
 
 def test_repeat_forever_bracket_draws_the_infinity_glyph_cleanly(preview_editor):

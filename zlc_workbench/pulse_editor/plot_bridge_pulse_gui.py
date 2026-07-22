@@ -465,11 +465,62 @@ def _display_row_label(row: Mapping[str, object], labels: Mapping[str, str] | No
 def _repeat_summary_text(state: "PulseTableState") -> str:
     """How the program's repeat is phrased everywhere it is shown.
 
-    ``repeat ∞`` for a forever program, ``repeat N`` for a finite one -- the header
-    summary and the Preview status must not word this differently, so both read it here.
+    The reference's exact three-state wording (``pulse_repeat_notation``):
+    ``repeat ∞`` for a forever program without an inner bracket, ``repeat
+    P2-P3 x2`` when the bracket covers the whole table, and ``repeat ∞ +
+    P2-P3 x2`` when a partial inner bracket rides inside the forever loop.
+    A one-shot program without a bracket has nothing to say.  The header
+    summary and the Preview status both read it here.
     """
 
-    return "repeat ∞" if state.repeat_forever else f"repeat {int(state.repeat_count)}"
+    repeat_start, repeat_end = state.repeat_start, state.repeat_end
+    if repeat_start is None or repeat_end is None:
+        return "repeat ∞" if state.repeat_forever else ""
+    inner = f"P{int(repeat_start) + 1}-P{int(repeat_end) + 1} x{int(state.repeat_count)}"
+    if state.periods and (int(repeat_start) != 0
+                          or int(repeat_end) != len(state.periods) - 1):
+        return f"repeat ∞ + {inner}"
+    return f"repeat {inner}"
+
+
+def _preview_repeat_markers(state: "PulseTableState") -> tuple[list[tuple[float, float, str]], float]:
+    """All repeat brackets a pulse preview draws, plus the UN-EXPANDED frame length.
+
+    The reference's exact semantics (``pulse_repeat_markers``): the preview
+    shows the period table AS AUTHORED -- the inner finite bracket
+    ``[repeat_start .. repeat_end] × repeat_count`` reads as a NESTED square
+    bracket over its own time span, never as the unrolled copies -- so the
+    spans come from the ORIGINAL periods' prefix sum (``period_start_steps``),
+    the same single source the scan/DAC annotations already use:
+
+    * no bracket:            ``[×∞ over the whole frame]`` when forever, else none;
+    * bracket == whole table: only the inner ``×N`` bracket;
+    * partial bracket:        outer ``×∞`` plus the inner ``×N`` when forever,
+                              else the inner bracket alone.
+
+    Returns ``(markers, total_seconds)`` -- the total is ``starts[-1]`` of the
+    original table, which IS the preview's frame length (the expanded
+    ``total_duration_ns`` would stretch the axis over the unrolled copies the
+    preview deliberately does not draw).
+    """
+
+    slots = state._reference_slots()
+    step_ns = float(state.time_step_ns)
+    starts_steps = state.period_start_steps(slots=slots, time_step_ns=step_ns)
+    starts_s = [steps * step_ns * 1e-9 for steps in starts_steps]
+    total = starts_s[-1]
+    repeat_start, repeat_end = state.repeat_start, state.repeat_end
+    forever = bool(state.repeat_forever)
+    if repeat_start is None or repeat_end is None:
+        return ([(0.0, total, "×∞")] if forever else []), total
+    repeat_start, repeat_end = int(repeat_start), int(repeat_end)
+    if repeat_start < 0 or repeat_end < repeat_start or repeat_end + 1 >= len(starts_s):
+        return [], total
+    inner = (starts_s[repeat_start], starts_s[repeat_end + 1],
+             f"×{int(state.repeat_count)}")
+    if repeat_start == 0 and repeat_end == len(state.periods) - 1:
+        return [inner], total
+    return ([(0.0, total, "×∞"), inner] if forever else [inner]), total
 
 
 def _summary_time_text(value_ns: float) -> str:
@@ -4089,7 +4140,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         if include_always_off:
             return universe
         if sequence is None:
-            sequence = state.to_sequence()
+            sequence = state.to_sequence(expand_repeat=False)
         active = {
             str(pulse.channel)
             for pulse in (getattr(sequence, "pulses", ()) or ())
@@ -4119,7 +4170,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         )
         from zlc_data.value import OwnedSnapshot
 
-        sequence = state.to_sequence()
+        sequence = state.to_sequence(expand_repeat=False)
         pulses = list(getattr(sequence, "pulses", ()) or ())
         channels = self._preview_channels(
             state, include_always_off=include_always_off, sequence=sequence)
@@ -4215,8 +4266,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # The plot layer owns the faithful pulse-timeline render (filled step blocks +
         # coloured baselines + repeat brackets); this window is a PURE data source, so
         # the preview, Save Figure and Save Image all draw the identical figure and the
-        # frontend never imports the pulse/neutral packages.
-        sequence = state.to_sequence()
+        # frontend never imports the pulse/neutral packages.  The table is drawn AS
+        # AUTHORED (expand_repeat=False, the reference's preview call): an inner
+        # bracket reads as a nested square bracket over its own span, never as the
+        # unrolled copies the hardware plays.
+        sequence = state.to_sequence(expand_repeat=False)
         raw_pulses = list(getattr(sequence, "pulses", ()) or ())
         # Rows come from the ONE channel source (the digital-port universe, filtered by "Show off
         # rows"), NOT sequence.channels -- an always-off channel is absent from the compiled sequence,
@@ -4229,18 +4283,21 @@ class PulseSequenceEditor(QtWidgets.QWidget):
              "value": bool(pulse.value), "name": str(getattr(pulse, "name", "") or "")}
             for pulse in raw_pulses
         ]
-        # The frame length comes from the PERIOD TABLE (total_duration_ns, the authoritative
-        # single source), NEVER from sequence.duration: the sequence derives its duration from
-        # the last pulse edge, so a trailing all-off period vanishes and a channel that is on
-        # only in period 0 reads as "always on" across a truncated axis.
-        total = float(state.total_duration_ns()) * 1e-9
+        # The frame length and every bracket span come from ONE prefix sum over the
+        # AUTHORED period table (period_start_steps inside _preview_repeat_markers),
+        # NEVER from sequence.duration (a trailing all-off period would vanish) and
+        # never from the expanded total (the unrolled copies are not drawn).
+        markers, total = _preview_repeat_markers(state)
         labels = {channel: state.label_for(channel) for channel in channels}
-        # The repeat span reads as a bracket (its ×N / ×∞ label), matching the run.
-        markers = []
-        if getattr(state, "repeat_forever", False):
-            markers = [(0.0, total, "×∞")]
-        elif int(getattr(state, "repeat_count", 1) or 1) > 1:
-            markers = [(0.0, total, f"×{int(state.repeat_count)}")]
+        # A delayed channel can push its last edge past the frame; the reference
+        # stretches the ∞ bracket over that tail so the loop reads as enclosing it.
+        seq_end = max([0.0] + [float(pulse.stop) for pulse in raw_pulses])
+        if seq_end > 0.0:
+            markers = [
+                (start, max(stop, seq_end), label) if "∞" in str(label)
+                else (start, stop, label)
+                for (start, stop, label) in markers
+            ]
         traces = self._preview_analog_traces(state, include_always_off=include_always_off)
         regions, segments = self._preview_scan_annotations(state)
         return render_pulse_timeline_png(
@@ -4406,8 +4463,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         _snapshot, drawn = self._preview_snapshot(state, include_always_off=include_off)
         total = len(state.port_catalog.digital_ports)
         mode = "all channels" if include_off else "active channels"
+        notation = _repeat_summary_text(state)
         self.preview_status.setText(
-            f"{len(drawn)}/{total} plotted ({mode}) | {_repeat_summary_text(state)}")
+            f"{len(drawn)}/{total} plotted ({mode})"
+            + (f" | {notation}" if notation else ""))
 
     def _apply_scan_state_in_place(self, state: PulseTableState) -> bool:
         """Whether a scan toggle can be absorbed without rebuilding the cards.
