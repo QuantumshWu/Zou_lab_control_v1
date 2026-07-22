@@ -323,8 +323,12 @@ def test_curve_uses_draw_frozen_bbox_and_horizontal_span() -> None:
             (0.5, 2.5)
         )
         assert board._selector_hold is None
-        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
-        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=start)
+        # A degenerate click clears ONLY when it lands OUTSIDE the standing
+        # box (the reference's press on a handle/centre is a resize/move, not
+        # a fresh pull) -- so click clear of the old box and its handles.
+        outside = _point(plot, 0.05, 0.10)
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=outside)
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=outside)
         clear = commands[-1]
         assert isinstance(clear, CurveRangeGesture) and clear.x_span is None
         board.set_curve_range_candidate(clear.x_span)
@@ -640,6 +644,11 @@ def test_curve_lifecycle_and_callback_fault_are_local() -> None:
             pos=_point(plot, 0.2, 0.5),
         )
         board.present(_frame(2, curve_revision=1))
+        # The hold survives a same-identity revision advance (fresh data or
+        # its own live pan/zoom answer): the gesture keeps running on the
+        # frozen press frame, exactly like the reference's frozen panel.
+        assert board._selector_hold is not None
+        QtTest.QTest.keyClick(board, QtCore.Qt.Key_Escape)
         assert board._selector_hold is None
 
         board.bind_curve_interaction("curve", lambda _command: None)

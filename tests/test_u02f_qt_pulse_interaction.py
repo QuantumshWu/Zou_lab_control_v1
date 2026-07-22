@@ -174,8 +174,11 @@ def test_pulse_area_select_is_a_time_span_and_resolves_a_selection() -> None:
         assert board._numeric_bindings["pulse"].applied_span == pytest.approx(
             gesture.x_span)
 
-        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
-        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=start)
+        # Click OUTSIDE the standing box (a press on its edge/centre is the
+        # reference's resize/move grab, not a clearing click).
+        outside = _point(plot, 0.05, 0.10)
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=outside)
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=outside)
         clear = commands[-1]
         assert isinstance(clear, CurveRangeGesture) and clear.x_span is None
         board.set_pulse_range_candidate(clear.x_span)

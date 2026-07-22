@@ -510,9 +510,11 @@ def test_histogram_x_only_zoom_pan_area_home_and_exact_pending_discard() -> None
         assert isinstance(selected, HistogramRangeGesture)
         assert selected.origin == board.visible_histogram_origin()
         board.set_histogram_range_candidate(selected.x_span)
-        center = _point(target.plot, 0.5, 0.5)
-        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=center)
-        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=center)
+        # Click OUTSIDE the standing box: a press on its centre would MOVE it
+        # (the reference's centre-handle grab), never clear it.
+        outside = _point(target.plot, 0.05, 0.10)
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=outside)
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=outside)
         clear = commands[-1]
         assert isinstance(clear, HistogramRangeGesture) and clear.x_span is None
         board.set_histogram_range_candidate(clear.x_span)

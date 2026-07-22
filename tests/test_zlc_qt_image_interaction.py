@@ -1198,78 +1198,6 @@ def test_clim_handle_holds_exact_front_and_commits_without_a_temporary_lut() -> 
         application.processEvents()
 
 
-def test_hold_badge_does_not_cover_a_locked_cross_value() -> None:
-    from PyQt5 import QtCore, QtTest
-
-    class RecordingPainter:
-        def __init__(self, metrics):
-            self._metrics = metrics
-            self.filled = []
-
-        def save(self):
-            pass
-
-        def restore(self):
-            pass
-
-        def setClipRect(self, _rect):
-            pass
-
-        def setPen(self, _pen):
-            pass
-
-        def setBrush(self, _brush):
-            pass
-
-        def drawLine(self, *_args):
-            pass
-
-        def drawEllipse(self, *_args):
-            pass
-
-        def drawText(self, *_args):
-            pass
-
-        def fontMetrics(self):
-            return self._metrics
-
-        def fillRect(self, rect, _color):
-            self.filled.append(QtCore.QRect(rect))
-
-    application, board = _bound_board(_frame(1))
-    try:
-        target = _target(board)
-        center = _point(target, 0.5, 0.5)
-        QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=center)
-        assert _binding(board).cross is not None
-        QtTest.QTest.mousePress(
-            board,
-            QtCore.Qt.LeftButton,
-            pos=_point(target, 0.1, 0.1),
-        )
-        assert board._selector_hold is not None
-
-        hold_painter = RecordingPainter(board.fontMetrics())
-        board._paint_hold_badge(
-            hold_painter,
-            board._selector_hold,
-            target,
-            live_sequence=board.front_frame.sequence + 1,
-        )
-        cross_painter = RecordingPainter(board.fontMetrics())
-        board._paint_cross_sample(
-            cross_painter,
-            _binding(board),
-            _binding(board).cross,
-            target,
-        )
-        assert len(hold_painter.filled) == len(cross_painter.filled) == 1
-        assert not hold_painter.filled[0].intersects(cross_painter.filled[0])
-    finally:
-        board.close()
-        application.processEvents()
-
-
 def test_locked_cross_value_remains_visible_when_zoom_moves_point_off_view() -> None:
     from unittest.mock import Mock
 
@@ -1411,8 +1339,10 @@ def test_panel_revision_preserves_applied_and_cross_but_rejects_stale_front() ->
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=center)
         cross = _binding(board).cross
 
-        # An active draft is tied to revision 0 and must be cancelled when the
-        # display-only panel revision changes.
+        # A display-only revision advance does NOT kill a live gesture: the
+        # hold keeps the press frame frozen while the new front lands
+        # underneath (the design's hold semantics).  Escape then releases the
+        # gesture without touching the applied state.
         QtTest.QTest.mousePress(
             board,
             QtCore.Qt.LeftButton,
@@ -1421,6 +1351,8 @@ def test_panel_revision_preserves_applied_and_cross_but_rejects_stale_front() ->
         replacement_viewport = _viewport(revision=1)
         replacement = _frame(2, viewport=replacement_viewport)
         board.present(replacement)
+        assert board._selector_hold is not None
+        QtTest.QTest.keyClick(board, QtCore.Qt.Key_Escape)
         assert board._selector_hold is None
         assert _binding(board).draft_bounds is None
         assert _binding(board).applied_bounds is not None

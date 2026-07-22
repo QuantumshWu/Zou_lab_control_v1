@@ -505,6 +505,13 @@ class _NumericPanelBinding:
     # (x0, y0, x1, y1): live during the drag, kept after release (the
     # reference's RectangleSelector leaves its box + label standing).
     span_rect: tuple[float, float, float, float] | None = None
+    # Interactive-handle modes on a STANDING box, the reference's
+    # RectangleSelector semantics: an edge grab resizes one dimension only
+    # ('x' keeps the y ends frozen, 'y' keeps the x span frozen) and a center
+    # grab ('span_move_grab' = pointer offset from the box origin) moves the
+    # whole box.  Both are None during a plain corner drag / fresh pull.
+    span_resize_lock: str | None = None
+    span_move_grab: tuple[float, float] | None = None
     pan_anchor: float | None = None
     pan_origin: _NumericViewport | None = None
     pan_candidate: tuple[float, float] | None = None
@@ -1138,6 +1145,24 @@ class QtRasterBoard(QtWidgets.QWidget):
                 and candidate.display_revision >= pending.display_revision
             ):
                 binding.pending_viewport = None
+                hold = self._selector_hold
+                if hold is not None and hold.panel_id == panel_id:
+                    # This present answers the running gesture's OWN view
+                    # intent (a live pan/zoom step): the frozen front absorbs
+                    # it so the view follows the pointer, exactly like the
+                    # reference's set_xlim redraw during a drag -- while
+                    # EXTERNAL data frames keep landing underneath unseen.
+                    index = target_panel_ids.index(panel_id)
+                    panel = frame.panels[index]
+                    self._selector_hold = replace(
+                        hold,
+                        sequence=frame.sequence,
+                        source_identity=panel.source_identity,
+                        presentation=_panel_presentation(panel),
+                        raster_geometry=_raster_geometry(panel),
+                        prepared=prepared[index],
+                        display_payload=panel.display_payload,
+                    )
             if binding.pending_viewport is None:
                 binding.pending_origin = None
         image_hover_positions = {
@@ -1997,7 +2022,6 @@ class QtRasterBoard(QtWidgets.QWidget):
             panel_ids=self._panel_ids,
         ):
             hold = None
-        held_target = None
         for index, (_pixels, latest_image) in enumerate(images):
             panel_id = self._panel_ids[index]
             panel = front[0].panels[index]
@@ -2060,15 +2084,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                     rail,
                     self._image_bindings.get(panel_id),
                 )
-            if hold is not None and hold.panel_id == panel_id:
-                held_target = target
-        if hold is not None and held_target is not None:
-            self._paint_hold_badge(
-                painter,
-                hold,
-                held_target,
-                live_sequence=front[0].sequence,
-            )
         self._paint_selector_overlays(painter)
         self._paint_numeric_overlays(painter)
 
@@ -2111,12 +2126,56 @@ class QtRasterBoard(QtWidgets.QWidget):
                 event.accept()
                 return
             if event.button() == QtCore.Qt.LeftButton:
+                # The reference's RectangleSelector on a STANDING box: grab the
+                # centre to move it, a corner/edge handle to resize it, and a
+                # press anywhere else discards it and pulls a fresh box.
+                standing = (
+                    binding.span_rect if binding.span_anchor is None else None
+                )
+                handle = (
+                    self._span_handle_hit(
+                        numeric_target.bounds, standing, event.localPos())
+                    if standing is not None
+                    else None
+                )
                 self._selector_hold = self._held_panel_from_numeric_target(
                     numeric_target
                 )
-                binding.span_anchor = point[0]
-                binding.span_candidate = None
-                binding.span_rect = (point[0], point[1], point[0], point[1])
+                if handle is not None:
+                    xs = sorted((standing[0], standing[2]))
+                    ys = sorted((standing[1], standing[3]))
+                    if handle == "C":
+                        binding.span_rect = (xs[0], ys[0], xs[1], ys[1])
+                        binding.span_move_grab = (
+                            point[0] - xs[0], point[1] - ys[0])
+                    elif handle in ("N", "S"):
+                        # A y-edge resize never changes the x span.
+                        fixed_y = ys[1] if handle == "N" else ys[0]
+                        binding.span_rect = (xs[0], fixed_y, xs[1], point[1])
+                        binding.span_anchor = xs[0]
+                        binding.span_resize_lock = "y"
+                    else:
+                        anchor_x = xs[1] if "W" in handle else xs[0]
+                        if handle in ("W", "E"):
+                            binding.span_rect = (
+                                anchor_x, ys[0], point[0], ys[1])
+                            binding.span_resize_lock = "x"
+                        else:
+                            anchor_y = (
+                                ys[1] if handle in ("NW", "NE") else ys[0])
+                            binding.span_rect = (
+                                anchor_x, anchor_y, point[0], point[1])
+                        binding.span_anchor = anchor_x
+                    try:
+                        binding.span_candidate = viewport.selection_x_span(
+                            binding.span_rect[0], binding.span_rect[2])
+                    except ValueError:
+                        binding.span_candidate = None
+                else:
+                    binding.span_anchor = point[0]
+                    binding.span_candidate = None
+                    binding.span_rect = (
+                        point[0], point[1], point[0], point[1])
                 self._set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
@@ -2209,7 +2268,10 @@ class QtRasterBoard(QtWidgets.QWidget):
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         numeric_binding = self._active_numeric_binding()
-        if numeric_binding is not None and numeric_binding.span_anchor is not None:
+        if numeric_binding is not None and (
+            numeric_binding.span_anchor is not None
+            or numeric_binding.span_move_grab is not None
+        ):
             target = self._numeric_target(numeric_binding)
             if target is not None:
                 viewport = target.payload.viewport
@@ -2218,20 +2280,44 @@ class QtRasterBoard(QtWidgets.QWidget):
                     event.localPos(),
                     clamp_to_plot=True,
                 )
-                if point[0] == numeric_binding.span_anchor:
-                    numeric_binding.span_candidate = None
-                else:
+                rect = numeric_binding.span_rect
+                grab = numeric_binding.span_move_grab
+                if grab is not None and rect is not None:
+                    # Centre-handle grab: the whole box follows the pointer.
+                    width = rect[2] - rect[0]
+                    height = rect[3] - rect[1]
+                    x0 = point[0] - grab[0]
+                    y0 = point[1] - grab[1]
+                    numeric_binding.span_rect = (
+                        x0, y0, x0 + width, y0 + height)
                     try:
-                        numeric_binding.span_candidate = viewport.selection_x_span(
-                            numeric_binding.span_anchor,
-                            point[0],
-                        )
+                        numeric_binding.span_candidate = (
+                            viewport.selection_x_span(x0, x0 + width))
                     except ValueError:
                         numeric_binding.span_candidate = None
-                rect = numeric_binding.span_rect
-                if rect is not None:
-                    numeric_binding.span_rect = (
-                        rect[0], rect[1], point[0], point[1])
+                elif numeric_binding.span_resize_lock == "y":
+                    # A y-edge resize reshapes the box only -- the x span (and
+                    # so the candidate fixed at press) never changes.
+                    if rect is not None:
+                        numeric_binding.span_rect = (
+                            rect[0], rect[1], rect[2], point[1])
+                else:
+                    if point[0] == numeric_binding.span_anchor:
+                        numeric_binding.span_candidate = None
+                    else:
+                        try:
+                            numeric_binding.span_candidate = viewport.selection_x_span(
+                                numeric_binding.span_anchor,
+                                point[0],
+                            )
+                        except ValueError:
+                            numeric_binding.span_candidate = None
+                    if rect is not None:
+                        numeric_binding.span_rect = (
+                            (rect[0], rect[1], point[0], rect[3])
+                            if numeric_binding.span_resize_lock == "x"
+                            else (rect[0], rect[1], point[0], point[1])
+                        )
                 self.update()
             event.accept()
             return
@@ -2398,12 +2484,17 @@ class QtRasterBoard(QtWidgets.QWidget):
             return
         if (
             numeric_binding is not None
-            and numeric_binding.span_anchor is not None
+            and (
+                numeric_binding.span_anchor is not None
+                or numeric_binding.span_move_grab is not None
+            )
             and event.button() == QtCore.Qt.LeftButton
         ):
             candidate = numeric_binding.span_candidate
             hold = self._selector_hold
             numeric_binding.span_anchor = None
+            numeric_binding.span_move_grab = None
+            numeric_binding.span_resize_lock = None
             if candidate is None:
                 # A degenerate click clears the standing box + label, exactly
                 # like the reference's empty-extents onselect.
@@ -2619,6 +2710,25 @@ class QtRasterBoard(QtWidgets.QWidget):
             and self._numeric_interaction_armed(numeric_target.binding)
         ):
             binding = numeric_target.binding
+            if event.button() == QtCore.Qt.MiddleButton:
+                # Qt delivers a press BEFORE the double-click, and that press
+                # already began a middle pan (hold + possibly a live pan
+                # commit).  The reference's double-middle always lands -- so
+                # release that incomplete gesture and act, instead of letting
+                # the hold/pending gate swallow the double-click.
+                if binding.pan_anchor is not None:
+                    self._cancel_numeric_gesture(binding, clear_span=False)
+                viewport = numeric_target.payload.viewport
+                self._commit_numeric_viewport(
+                    binding,
+                    viewport.home_x_limits
+                    if binding.applied_span is None
+                    else binding.applied_span,
+                )
+                self._set_numeric_hover(binding, None)
+                self.update()
+                event.accept()
+                return
             if (
                 binding.pending_viewport is not None
                 or self._selector_hold is not None
@@ -2627,20 +2737,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 return
             if event.button() == QtCore.Qt.RightButton:
                 binding.cross = None
-                self._set_numeric_hover(binding, None)
-                self.update()
-                event.accept()
-                return
-            if (
-                event.button() == QtCore.Qt.MiddleButton
-            ):
-                viewport = numeric_target.payload.viewport
-                self._commit_numeric_viewport(
-                    binding,
-                    viewport.home_x_limits
-                    if binding.applied_span is None
-                    else binding.applied_span,
-                )
                 self._set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
@@ -2705,6 +2801,19 @@ class QtRasterBoard(QtWidgets.QWidget):
             self.update()
             event.accept()
             return
+        if event.key() == QtCore.Qt.Key_Escape and self._selector_enabled:
+            # The reference's escape also clears a STANDING selection box
+            # (RectangleSelector's 'clear' key hides the artists silently --
+            # no onselect fires and the applied range is left as-is).
+            cleared = False
+            for binding in self._numeric_bindings.values():
+                if binding.span_rect is not None:
+                    binding.span_rect = None
+                    cleared = True
+            if cleared:
+                self.update()
+                event.accept()
+                return
         super().keyPressEvent(event)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
@@ -3153,6 +3262,42 @@ class QtRasterBoard(QtWidgets.QWidget):
         return None
 
     @staticmethod
+    def _span_handle_hit(
+        bounds: QtCore.QRect,
+        rect_norm: tuple[float, float, float, float],
+        pos: QtCore.QPointF,
+    ) -> str | None:
+        """Which handle of a STANDING selection box a press grabs.
+
+        The reference's RectangleSelector rules verbatim: the box centre
+        within twice the grab range moves the whole box (``"C"``, priority);
+        otherwise the nearest of the eight corner/edge handles within the
+        grab range resizes; anything else returns None (press elsewhere
+        discards the box and pulls a fresh one)."""
+
+        grab = 10.0
+        xs = sorted((bounds.x() + rect_norm[0] * bounds.width(),
+                     bounds.x() + rect_norm[2] * bounds.width()))
+        ys = sorted((bounds.y() + rect_norm[1] * bounds.height(),
+                     bounds.y() + rect_norm[3] * bounds.height()))
+        centre_x = (xs[0] + xs[1]) / 2.0
+        centre_y = (ys[0] + ys[1]) / 2.0
+        px, py = float(pos.x()), float(pos.y())
+        if math.hypot(px - centre_x, py - centre_y) < 2.0 * grab:
+            return "C"
+        handles = (
+            ("NW", xs[0], ys[0]), ("N", centre_x, ys[0]), ("NE", xs[1], ys[0]),
+            ("W", xs[0], centre_y), ("E", xs[1], centre_y),
+            ("SW", xs[0], ys[1]), ("S", centre_x, ys[1]), ("SE", xs[1], ys[1]),
+        )
+        name, best = None, None
+        for key, hx, hy in handles:
+            distance = math.hypot(px - hx, py - hy)
+            if best is None or distance < best:
+                name, best = key, distance
+        return name if best is not None and best <= grab else None
+
+    @staticmethod
     def _numeric_normalized_point(
         target: _NumericTarget,
         point: QtCore.QPointF,
@@ -3446,12 +3591,20 @@ class QtRasterBoard(QtWidgets.QWidget):
         # A LIVE pan commits once per motion while the hold keeps the press
         # frame's payload, so the revision must advance past any still-pending
         # candidate rather than re-issuing the press revision + 1 every time.
+        # The revision base is the LATEST of the (possibly held/frozen)
+        # payload, the last PRESENTED viewport and any still-pending
+        # candidate: a live pan commits once per motion while the hold keeps
+        # the press frame's payload, so a fresh candidate must REPLACE an
+        # in-flight one with a strictly newer revision -- never re-issue an
+        # already-presented revision with different bounds, and never refuse
+        # (refusing would move the view one step per round-trip).
         base_revision = payload.viewport.display_revision
+        if binding.viewport is not None:
+            base_revision = max(
+                base_revision, binding.viewport.display_revision)
         if binding.pending_viewport is not None:
             base_revision = max(
                 base_revision, binding.pending_viewport.display_revision)
-        if binding.pending_viewport is not None:
-            return False
         front = self._front
         if front is None:
             return False
@@ -3774,35 +3927,27 @@ class QtRasterBoard(QtWidgets.QWidget):
             )
         else:
             payload_matches = current_payload is None
+        # The hold survives ANY same-identity present -- its own live pan/zoom
+        # answers and fresh data frames alike advance the revisions while the
+        # gesture keeps running on the frozen press frame (the design's hold
+        # semantics; the reference never kills a drag on a redraw).  Only an
+        # identity change (panel, document, selection) is a real mismatch.
+        current = _panel_presentation(panel)
+        presentation_matches = (
+            current.panel_id == hold.presentation.panel_id
+            and current.document_id == hold.presentation.document_id
+            and current.selection_revision == hold.presentation.selection_revision
+            and current.document_revision >= hold.presentation.document_revision
+            and current.panel_revision >= hold.presentation.panel_revision
+        )
         return (
             panel.panel_id == hold.panel_id
             and panel.coherence_group == hold.coherence_group
             and panel.source_identity == hold.source_identity
-            and _panel_presentation(panel) == hold.presentation
+            and presentation_matches
             and _raster_geometry(panel) == hold.raster_geometry
             and payload_matches
         )
-
-    @staticmethod
-    def _paint_hold_badge(
-        painter: QtGui.QPainter,
-        hold: _HeldPanelFront,
-        target: QtCore.QRect,
-        *,
-        live_sequence: int,
-    ) -> None:
-        painter.save()
-        try:
-            painter.setClipRect(target)
-            label = f"H {hold.sequence}→{live_sequence}"
-            metrics = painter.fontMetrics()
-            label_bounds = metrics.boundingRect(label).adjusted(-6, -3, 6, 3)
-            label_bounds.moveBottomRight(target.bottomRight() + QtCore.QPoint(-6, -6))
-            painter.fillRect(label_bounds, QtGui.QColor(0, 0, 0, 190))
-            painter.setPen(QtGui.QColor(ORANGE))
-            painter.drawText(label_bounds, QtCore.Qt.AlignCenter, label)
-        finally:
-            painter.restore()
 
     @staticmethod
     def _paint_site_map_rings(
@@ -4299,11 +4444,15 @@ class QtRasterBoard(QtWidgets.QWidget):
             # unboxed two-line coordinate label in the top-left corner.
             rect_norm = binding.span_rect
             if rect_norm is not None:
+                # rect_norm is BOUNDS-normalized (the same vocabulary the press/
+                # move handlers store via _numeric_normalized_point), so it maps
+                # through the panel bounds -- mapping it through the plot rect
+                # would draw the rubber band offset from the pointer.
                 selector_color = _selector_pen_color()
-                x0 = plot.left() + rect_norm[0] * plot.width()
-                y0 = plot.top() + rect_norm[1] * plot.height()
-                x1 = plot.left() + rect_norm[2] * plot.width()
-                y1 = plot.top() + rect_norm[3] * plot.height()
+                x0 = bounds.x() + rect_norm[0] * bounds.width()
+                y0 = bounds.y() + rect_norm[1] * bounds.height()
+                x1 = bounds.x() + rect_norm[2] * bounds.width()
+                y1 = bounds.y() + rect_norm[3] * bounds.height()
                 rectangle = QtCore.QRectF(
                     QtCore.QPointF(min(x0, x1), min(y0, y1)),
                     QtCore.QPointF(max(x0, x1), max(y0, y1)),
@@ -4780,9 +4929,14 @@ class QtRasterBoard(QtWidgets.QWidget):
         # A gesture cancelled MID-DRAG (the anchor is still armed) loses its
         # half-drawn rectangle; a completed selection keeps its box + label
         # (the reference's RectangleSelector leaves them standing).
-        if clear_span and binding.span_anchor is not None:
+        if clear_span and (
+            binding.span_anchor is not None
+            or binding.span_move_grab is not None
+        ):
             binding.span_rect = None
         binding.span_anchor = None
+        binding.span_move_grab = None
+        binding.span_resize_lock = None
         binding.pan_anchor = None
         binding.pan_origin = None
         binding.pan_candidate = None

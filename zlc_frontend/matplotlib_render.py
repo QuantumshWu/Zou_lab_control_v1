@@ -992,10 +992,18 @@ def _pulse_time_unit(span_s: float) -> tuple[float, str]:
     return 1.0, "s"
 
 
-def _draw_pulse_repeat_brackets(axis, repeat_markers, n_channels, colors) -> None:
+def _draw_pulse_repeat_brackets(
+    axis, repeat_markers, n_channels, colors, home_x_limits
+) -> None:
     """The grey square brackets that enclose a repeated span, with its ``×N`` /
     ``×∞`` label, exactly as the reference draws them: two vertical stems with
-    short inward feet at each end, nested outward for multiple brackets."""
+    short inward feet at each end, nested outward for multiple brackets.
+
+    ``home_x_limits`` is the full-frame HOME span: the reference bakes its
+    bracket artists ONCE at the home xlim and a zoom only re-windows them, so
+    the feet/label geometry must always derive from the home span -- never the
+    currently zoomed ``axis.get_xlim()`` -- or zooming would grow the feet and
+    shift the label instead of just magnifying the picture."""
 
     import numpy as _np
 
@@ -1004,8 +1012,7 @@ def _draw_pulse_repeat_brackets(axis, repeat_markers, n_channels, colors) -> Non
     markers = [m for m in repeat_markers if m is not None]
     if not markers:
         return
-    xlim = axis.get_xlim()
-    span = max(float(xlim[1] - xlim[0]), 1e-12)
+    span = max(float(home_x_limits[1] - home_x_limits[0]), 1e-12)
     tick_base = span * 0.024
     bracket_count = max(1, len(markers))
     for index, marker in enumerate(markers):
@@ -1032,9 +1039,17 @@ def _draw_pulse_repeat_brackets(axis, repeat_markers, n_channels, colors) -> Non
             # Label placement matches the reference EXACTLY: just to the RIGHT of the right stem
             # (``stop + tick*0.12``, left-aligned), not centred above the span.  DejaVu Sans supplies
             # the U+221E glyph the design's Helvetica Light lacks, so ×∞ reads as infinity, not tofu.
-            axis.text(stop + tick * 0.12, y_high + 0.055, label,
-                      ha="left", va="bottom", color=color, alpha=alpha, fontfamily="DejaVu Sans",
-                      fontsize=smaller_fontsize(0.8, 5.5), clip_on=False, zorder=9 + index)
+            text = axis.text(stop + tick * 0.12, y_high + 0.055, label,
+                             ha="left", va="bottom", color=color, alpha=alpha,
+                             fontfamily="DejaVu Sans",
+                             fontsize=smaller_fontsize(0.8, 5.5),
+                             clip_on=False, zorder=9 + index)
+            # clip_on=False is the reference's look (a zoomed-out label floats
+            # in the margin), but this preview re-renders per zoom with
+            # constrained layout while the reference lays out ONCE -- the
+            # escaped label must not feed the layout solver or the axes width
+            # breathes with every zoom step.
+            text.set_in_layout(False)
 
 
 def _draw_pulse_timeline(
@@ -1284,7 +1299,9 @@ def _draw_pulse_timeline(
         axis.text(0.995, 1.012, str(repeat_notation), transform=axis.transAxes,
                   ha="right", va="bottom", color=PALETTE["pulse_repeat_note"],
                   fontsize=smaller_fontsize(1.0, 5.5))
-    _draw_pulse_repeat_brackets(axis, repeat_markers, n_rows, bracket_colors)
+    _draw_pulse_repeat_brackets(
+        axis, repeat_markers, n_rows, bracket_colors,
+        (left_limit, right_limit))
     if title:
         # The ONE title mechanism (apply_title = title_fontsize, the stock label size); NOT
         # axis.set_title(), whose default 'large' titlesize dwarfs the compact preview and
