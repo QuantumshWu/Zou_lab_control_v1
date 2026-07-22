@@ -128,6 +128,12 @@ class PanelComposer:
         label: str = "",
         evaluation_policy: FigureEvaluationPolicy | None = None,
     ) -> None:
+        from .figure import dataset_contract_for
+
+        try:
+            dataset_contract_for(intent)
+        except ValueError as error:
+            raise PanelRenderError(str(error)) from error
         self._panel_id = str(panel_id)
         self._intent = intent
         self._size = (int(size[0]), int(size[1]))

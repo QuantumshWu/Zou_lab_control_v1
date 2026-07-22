@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from numbers import Integral, Real
 from typing import Sequence
 
@@ -32,8 +32,10 @@ from zlc_data import (
     resolve_selection_indices,
     resolve_transformed_schema,
 )
+from zlc_storage import canonical_text
 
 from .model import (
+    DATASET_VIEW_INTENTS,
     AxisRolePolicy,
     AxisViewRole,
     DisplayReductionMethod,
@@ -243,18 +245,61 @@ METER_CONTRACT = ViewContract(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentViewContract:
+    """A view fed by an authored document rather than a DatasetSchema.
+
+    The separate type is the firewall: document views have no repeat policy,
+    axis-role suggestion, batch capacity, or facet capacity to fill with inert
+    values. ``source_schema`` is an opaque owner-qualified identity; frontend
+    neither imports that owner nor decodes its document.
+    """
+
+    intent: ViewIntent
+    source_schema: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, ViewIntent):
+            raise TypeError("intent must be ViewIntent")
+        if self.intent in DATASET_VIEW_INTENTS:
+            raise ValueError("dataset-fed intents require ViewContract")
+        source_schema = canonical_text(self.source_schema, "document source_schema")
+        if "." not in source_schema:
+            raise ValueError("document source_schema must be an owner-qualified name")
+        object.__setattr__(self, "source_schema", source_schema)
+
+
+PULSE_CONTRACT = DocumentViewContract(
+    ViewIntent.PULSE,
+    "zlc_pulse.PulseTimelineDocument",
+)
+
+
 VIEW_CONTRACTS = {
     ViewIntent.IMAGE: IMAGE_CONTRACT,
     ViewIntent.CURVE: CURVE_CONTRACT,
     ViewIntent.HISTOGRAM: HISTOGRAM_CONTRACT,
     ViewIntent.METER: METER_CONTRACT,
+    ViewIntent.PULSE: PULSE_CONTRACT,
 }
 
 
-def contract_for(intent: ViewIntent) -> ViewContract:
+def contract_for(intent: ViewIntent) -> ViewContract | DocumentViewContract:
     if not isinstance(intent, ViewIntent):
         raise TypeError("intent must be ViewIntent")
     return VIEW_CONTRACTS[intent]
+
+
+def dataset_contract_for(intent: ViewIntent) -> ViewContract:
+    """Return a DatasetSchema contract or reject a document-fed intent."""
+
+    contract = contract_for(intent)
+    if not isinstance(contract, ViewContract):
+        raise ValueError(
+            f"{intent.value} is document-fed from {contract.source_schema}; "
+            "it has no DataBlock ViewSpec/evaluator path"
+        )
+    return contract
 
 
 def dataset_axes(schema: DatasetSchema):
@@ -475,7 +520,7 @@ def fit_single_panel_presentation(
     preferences = ViewPreferences() if preferences is None else preferences
     if not isinstance(preferences, ViewPreferences):
         raise TypeError("preferences must be ViewPreferences or None")
-    validate_view_spec(schema, view, contract_for(view.intent))
+    validate_view_spec(schema, view, dataset_contract_for(view.intent))
 
     axes = dataset_axes(schema)
     axis_by_id = {axis.axis_id: axis for axis in axes}
@@ -657,7 +702,7 @@ def validate_view_spec(
         raise TypeError("schema must be DatasetSchema")
     if not isinstance(spec, ViewSpec):
         raise TypeError("spec must be ViewSpec")
-    contract = contract_for(spec.intent) if contract is None else contract
+    contract = dataset_contract_for(spec.intent) if contract is None else contract
     if not isinstance(contract, ViewContract) or contract.intent is not spec.intent:
         raise ValueError("view contract does not match ViewSpec intent")
     if spec.schema_fingerprint != schema.fingerprint:
@@ -861,16 +906,19 @@ def _validate_selection_fit_view(
         for binding in view.axis_bindings
     ):
         raise ValueError("selection-only transformed fit display cannot reduce axes")
-    validate_view_spec(schema, view, contract_for(view.intent))
+    validate_view_spec(schema, view, dataset_contract_for(view.intent))
 
 
 __all__ = [
     "CURVE_CONTRACT",
+    "DocumentViewContract",
     "HISTOGRAM_CONTRACT",
     "IMAGE_CONTRACT",
     "METER_CONTRACT",
+    "PULSE_CONTRACT",
     "VIEW_CONTRACTS",
     "contract_for",
+    "dataset_contract_for",
     "dataset_axes",
     "display_axis_indices",
     "fit_single_panel_presentation",

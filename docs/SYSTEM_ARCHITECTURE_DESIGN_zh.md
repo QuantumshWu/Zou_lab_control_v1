@@ -627,10 +627,12 @@ zlc_workbench.project_pulse_preview(PulseDocument)
   -> zlc_pulse.compile_pulse_artifact(STATIC_ONCE | STATIC_REFERENCE_POINT)
   -> zlc_pulse.build_pulse_timeline(PulseDocument, CompiledPulseArtifact)
   -> immutable PulseTimelineDocument
-  -> Workbench 的窄 timeline renderer / Qt canvas
+  -> Workbench 提取 frontend-owned plain pulse render input
+  -> frontend 唯一 pulse renderer -> RasterBuffer + PulsePanelPayload
+  -> SinglePanelHost / QtRasterBoard
 ```
 
-`PulseTimelineDocument` 只是一组 renderer-neutral、进程内 immutable row/segment/annotation 值，不是新的持久格式、版本化 schema 或可编辑真相；保存/加载仍只有 current `PulseDocument`。离线 editor 因此只需文档自带的 target/time grid，不构造假 `DeviceRef`或 `PulseTargetDescriptor`；在线 composition 只在执行边界另外注入 live descriptor/facade，并通过显式 `bind_target()` 将文档重绑到当前 target。projector 只接收携带 `source_document_digest` 的完整 `CompiledPulseArtifact` 并核对源文档，禁止把 A 的 TargetIR 与 B 的标签、visible rows 或 digest 拼接。scan-authored document 的默认预览明确编译 nominal literal reference，绝不把第一行或任意孤立 scan row 冒充具有前序 DAC carry 的精确物理点。API/scan nominal reference 在画面中可见标注；但 nominal API 只允许预览，hardware `PulseRunRequest` 必须先通过 `resolve_api_parameters` 显式提供值并清除已解析声明，仍有任何未解析 API parameter 即拒绝 Run。frontend codec 不认识 PulseDocument；未来 export 只把同一 timeline 渲染为不可变 raster/vector，不反向恢复 authoring document。
+`PulseTimelineDocument` 只是一组 renderer-neutral、进程内 immutable row/segment/annotation 值，不是新的持久格式、版本化 schema 或可编辑真相；保存/加载仍只有 current `PulseDocument`。离线 editor 因此只需文档自带的 target/time grid，不构造假 `DeviceRef`或 `PulseTargetDescriptor`；在线 composition 只在执行边界另外注入 live descriptor/facade，并通过显式 `bind_target()` 将文档重绑到当前 target。projector 只接收携带 `source_document_digest` 的完整 `CompiledPulseArtifact` 并核对源文档，禁止把 A 的 TargetIR 与 B 的标签、visible rows 或 digest 拼接。scan-authored document 的默认预览明确编译 nominal literal reference，绝不把第一行或任意孤立 scan row 冒充具有前序 DAC carry 的精确物理点。API/scan nominal reference 在画面中可见标注；但 nominal API 只允许预览，hardware `PulseRunRequest` 必须先通过 `resolve_api_parameters` 显式提供值并清除已解析声明，仍有任何未解析 API parameter 即拒绝 Run。Workbench 是同时看见 pulse 与 frontend 的 composition seam，只做一次不含语义猜测的 plain render projection；frontend 不导入 pulse。`PULSE_CONTRACT` 的类型边界、pulse renderer 与 `PulsePanelPayload` 共同保证它不进入 DataBlock/ViewSpec/FigureEvaluator/通用 Figure codec，也不把 display-only time span 提升成 zlc_data Selection authority。Qt 只呈现不可变 raster/viewport，不另建第二个 pulse renderer。export 只把同一 timeline drawing 输出为不可变 raster/vector，不反向恢复 authoring document。
 
 ### 4.5 Notebook-first Experiment 门面
 
@@ -1645,9 +1647,10 @@ CommittedTransform:
 frontend figure 拥有只服务于呈现的：
 
 ```text
-ViewIntent                         # suggest_view 的小型 enum 输入，不持久化成另一状态机
-ViewContract                       # 每种 figure kind 的静态能力/安全规则
-ViewSpec                           # 唯一可保存的 presentation spec
+ViewIntent                         # frontend 展示意图的封闭词汇，不持久化成另一状态机
+ViewContract                       # dataset-fed intent 的静态 axis/reduction 规则
+DocumentViewContract               # document-fed intent 的来源类型防火墙
+ViewSpec                           # dataset presentation 唯一可保存的 spec
 suggest_view(schema, view_intent, selection, preferences)
 
 ViewSpec:
@@ -1699,9 +1702,10 @@ IMAGE
 CURVE
 HISTOGRAM
 METER
+PULSE       # authored pulse document-fed；不是 DataBlock projection
 ```
 
-每个 ViewIntent 对应一个 declarative ViewContract，而不是 render 主干中的 plot-kind 分支：
+每个 ViewIntent 都有 declarative contract，但数据集视图与文档视图必须是不同类型，不能为了共用字段而伪造语义：
 
 ```text
 ViewContract:
@@ -1710,9 +1714,15 @@ ViewContract:
   maximum visible facets/layers
   permitted presentation-only reductions
   unresolved-axis policy
+
+DocumentViewContract:
+  owner-qualified source schema
+  # 无 repeat/axis-role/batch/facet 字段
 ```
 
-ViewContract 是 frontend figure 的静态值。新 plot kind 必须先声明合同，再复用同一个 suggestion/validation pipeline。用户 preference 只能在合同列出的等价安全选项中选默认项，例如 image repeat 显示 latest 或 mean；preference 必须随 workspace 保存，不能自行开放新的 reduction capability。
+其中 IMAGE/CURVE/HISTOGRAM/METER 是 dataset-evaluated intent，使用 `ViewContract` 并走 `suggest_view -> ViewSpec -> FigureEvaluator`。PULSE 使用 `DocumentViewContract(source_schema="zlc_pulse.PulseTimelineDocument")`；它必须由 authored pulse document 提取 plain render data，再经唯一 pulse renderer 生成 `PulsePanelPayload`，禁止伪造 DataBlock/ViewSpec/DatasetRevisionRef，禁止进入 FigureEvaluator 或通用 Figure codec。它可以复用同一个 `SinglePanelHost` 与 x-only gesture vocabulary，但不能因此把 pulse 当成 CURVE/IMAGE 数据投影，也不能把 display-only time span 升级成 zlc_data Selection。
+
+两类 contract 都是 frontend figure 的静态值。新 plot kind 必须先声明真实来源合同；只有 dataset-fed kind 才复用 suggestion/validation pipeline。用户 preference 只能在 dataset 合同列出的等价安全选项中选默认项，例如 image repeat 显示 latest 或 mean；preference 必须随 workspace 保存，不能自行开放新的 reduction capability。
 
 自动建议的输入只有 schema/axis metadata、视图意图、已有 Selection 和明确的用户 preference；禁止读取数组值后“猜哪条轴像信号”，禁止根据 rank、singleton、长度或 axis 顺序猜语义。
 
@@ -1759,6 +1769,8 @@ role 只说明 axis 是什么；ViewIntent 说明用户现在想怎么看。两�
 | spatial-x/y | 显示轴 | 需要 ROI/Selection，不自动平均 | batch/facet，除非明确 pool sites | 需要 ROI 或物理积分 |
 | spectral | curve x/facet/fixed slider；不能把最大波长索引叫 latest | 优先作为 x | batch/facet | 带标签 fixed；band/integral 必须显式 |
 | site/component | facet/batch/select | facet/batch/select | 默认逐 site；pool 必须显式 | select |
+
+上表只覆盖四种 dataset-evaluated intent；PULSE 的 channel/time/repeat bracket 来自 authored pulse document，不参与 axis-role 自动建议。
 
 `mean`、`sum`、`integrate` 是不同物理 reduction，不能编码成一个含义模糊的 reducer。通用 `mean/sum/min/max` 使用 zlc_data 中封闭的 current reducer 合同，并由用户/analysis spec 显式选择；ROI photon count、相机畸变校正等带设备/物理含义的操作由 neutral 领域 StreamProcessor/Analysis 定义，不能因输入恰好是 image 就由 frontend 自动提出。普通 image 默认只能显示、选择或保留 spatial axes。
 
@@ -1953,7 +1965,7 @@ FigureCodec       current schema only
 DataFigure        frontend.render 的 notebook/public render facade
 ```
 
-FigureDocument 只持有 frontend-owned DatasetId/immutable dataset descriptor、zlc_data Selection 和已解析的 ViewSpec；ViewIntent 只是创建/编辑时调用 suggest_view 的输入，不成为另一份持久状态。权威派生 dataset 另带 zlc_data CommittedTransform/analysis record 与 frontend FigureArtifact digest。FigureDocument 不持有 neutral runtime ref/lineage 类型；Workbench 在 materialize 时把外部 causation 转成 FigureArtifact manifest 的普通 canonical descriptors。Workbench LiveFigureBinding 维护 LiveDataBlockRef -> DatasetId 的临时映射，解析成 zlc_data DataBlock snapshot/ResolvedDatasetMap。
+FigureDocument 只持有 frontend-owned DatasetId/immutable dataset descriptor、zlc_data Selection 和已解析的 dataset ViewSpec；dataset-fed ViewIntent 只在创建/编辑时作为 suggest_view 输入，不成为另一份持久状态。document-fed PULSE 不能出现在 ViewSpec/FigureDocument/codec 中。权威派生 dataset 另带 zlc_data CommittedTransform/analysis record 与 frontend FigureArtifact digest。FigureDocument 不持有 neutral runtime ref/lineage 类型；Workbench 在 materialize 时把外部 causation 转成 FigureArtifact manifest 的普通 canonical descriptors。Workbench LiveFigureBinding 维护 LiveDataBlockRef -> DatasetId 的临时映射，解析成 zlc_data DataBlock snapshot/ResolvedDatasetMap。
 
 Interactive live path 在 per-panel latest-only view-evaluation executor 运行 FigureEvaluator：直接解析 ViewSpec 的 axis bindings/navigation policy，再执行 display transform/reduction/layer data 计算，产生带 document/input revision 与 resolution records 的 immutable EvaluatedFigureData；具体 surface ownership 见 §12.5。Workbench 的 live/headless export job 在 worker 中永久独占自己的 Figure。冻结的 notebook DataFigure 是不同的同步 one-shot surface：构造时一次 evaluate 并释放 source snapshot，每次 `render/export/_repr_png_` 在调用线程用 OO Agg 新建一个 caller-owned Figure；它没有 live mutation、共享 artist 或第二个scheduler，因此不为DataFigure本身预建render lane。W4a窗口只是把既有`.figure()`和一次`to_png_bytes()`作为同一个module-owned capacity-one worker job托管，使这个“调用线程”不是Qt owner；job结束即释放DataFigure/Agg，只留下immutable PNG front，不把one-shot viewer提升为live renderer。所有路径都只执行 document 已决定的 ViewSpec，不重新猜 axis；live/persisted binding 的保存规则见 §16.3。
 

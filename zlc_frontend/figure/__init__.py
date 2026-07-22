@@ -12,11 +12,14 @@ from .codec import (
 )
 from .contract import (
     CURVE_CONTRACT,
+    DocumentViewContract,
     HISTOGRAM_CONTRACT,
     IMAGE_CONTRACT,
     METER_CONTRACT,
+    PULSE_CONTRACT,
     VIEW_CONTRACTS,
     contract_for,
+    dataset_contract_for,
     dataset_axes,
     display_axis_indices,
     fit_single_panel_presentation,
@@ -35,6 +38,7 @@ from .evaluate import (
     estimate_view_evaluation_peak_nbytes,
 )
 from .model import (
+    DATASET_VIEW_INTENTS,
     AxisAddress,
     AxisResolution,
     AxisRolePolicy,
@@ -77,7 +81,8 @@ from .suggest import suggest_fit_view, suggest_view
 
 __all__ = [
     "AxisAddress", "AxisResolution", "AxisRolePolicy",
-    "AxisViewBinding", "AxisViewRole", "CURVE_CONTRACT", "DatasetDescriptor",
+    "AxisViewBinding", "AxisViewRole", "CURVE_CONTRACT", "DATASET_VIEW_INTENTS",
+    "DatasetDescriptor", "DocumentViewContract",
     "DatasetId", "DecisionReason", "DisplayReduction", "DisplayReductionMethod",
     "DisplaySlot", "EvaluatedAxis", "EvaluatedCell", "EvaluatedCurve",
     "EvaluatedFigureData", "EvaluatedHistogram", "EvaluatedImage", "EvaluatedInput",
@@ -86,10 +91,10 @@ __all__ = [
     "FigureEvaluationError", "FigureEvaluationLimitExceeded", "FigureEvaluationPolicy",
     "FigureEvaluator", "FigureLayer", "FigureSelection",
     "FixedIndex", "HISTOGRAM_CONTRACT", "IMAGE_CONTRACT", "LatestNonempty",
-    "METER_CONTRACT", "ReductionResolution", "RepeatViewMode", "ResolvedDataset",
+    "METER_CONTRACT", "PULSE_CONTRACT", "ReductionResolution", "RepeatViewMode", "ResolvedDataset",
     "ResolvedDatasetMap", "SampleCoordinates", "SuggestionStatus", "VIEW_CONTRACTS",
     "ViewAlternative", "ViewContract", "ViewIntent", "ViewPreferences", "ViewSpec",
-    "ViewSuggestion", "contract_for", "dataset_axes", "display_axis_indices", "fit_single_panel_presentation", "decode_figure_document",
+    "ViewSuggestion", "contract_for", "dataset_contract_for", "dataset_axes", "display_axis_indices", "fit_single_panel_presentation", "decode_figure_document",
     "decode_view_spec", "encode_figure_document", "encode_view_spec",
     "figure_document_from_tree", "figure_document_to_tree", "suggest_fit_view", "suggest_view",
     "estimate_view_evaluation_peak_nbytes",

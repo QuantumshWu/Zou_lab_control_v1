@@ -1,7 +1,7 @@
 """METER's display state belongs to zlc_frontend, beside the other three.
 
-`ViewIntent` has four members.  IMAGE, CURVE and HISTOGRAM each owned a display
-module under `zlc_frontend/`; METER's state was a private class inside one Qt
+The four dataset-evaluated intents need display state.  IMAGE, CURVE and
+HISTOGRAM each owned a module under `zlc_frontend/`; METER's state was a private class inside one Qt
 window (`Zou_lab_control/workbench/_figure.py`).  A board could therefore render
 a METER panel but had nowhere to keep its display state, and any second consumer
 would have had to import a GUI module to get one - the exact reverse of the
@@ -21,6 +21,14 @@ import pytest
 
 import zlc_frontend
 from zlc_frontend import MeterDisplayState
+from zlc_frontend.figure import (
+    DATASET_VIEW_INTENTS,
+    DocumentViewContract,
+    PULSE_CONTRACT,
+    VIEW_CONTRACTS,
+    ViewContract,
+    contract_for,
+)
 from zlc_frontend.figure.model import ViewIntent
 
 
@@ -32,8 +40,11 @@ def test_the_state_is_owned_by_the_frontend_package():
     assert "MeterDisplayState" in zlc_frontend.__all__
 
 
-def test_every_view_intent_now_has_a_display_state_in_one_package():
-    """No intent may be the odd one out that lives in a GUI module."""
+def test_every_dataset_evaluated_intent_has_display_state_in_one_package():
+    """No dataset-evaluated intent may live in a GUI module.
+
+    PULSE is document-fed, so this dataset-state table must not absorb it.
+    """
 
     owners = {
         ViewIntent.IMAGE: "zlc_frontend.image_display",
@@ -41,7 +52,7 @@ def test_every_view_intent_now_has_a_display_state_in_one_package():
         ViewIntent.HISTOGRAM: "zlc_frontend.histogram_display",
         ViewIntent.METER: "zlc_frontend.meter_display",
     }
-    assert set(owners) == set(ViewIntent)
+    assert set(owners) == DATASET_VIEW_INTENTS
     import importlib
 
     for intent, module_name in owners.items():
@@ -49,6 +60,28 @@ def test_every_view_intent_now_has_a_display_state_in_one_package():
         assert any(
             name.endswith("DisplayState") for name in vars(module)
         ), f"{intent} owner {module_name} has no display state"
+
+
+def test_view_contract_catalog_separates_dataset_and_document_sources():
+    assert set(VIEW_CONTRACTS) == set(ViewIntent)
+    assert {
+        intent
+        for intent, contract in VIEW_CONTRACTS.items()
+        if isinstance(contract, ViewContract)
+    } == DATASET_VIEW_INTENTS
+    assert {
+        intent
+        for intent, contract in VIEW_CONTRACTS.items()
+        if isinstance(contract, DocumentViewContract)
+    } == {ViewIntent.PULSE}
+    assert contract_for(ViewIntent.PULSE) is PULSE_CONTRACT
+    assert isinstance(PULSE_CONTRACT, DocumentViewContract)
+    assert PULSE_CONTRACT.source_schema == "zlc_pulse.PulseTimelineDocument"
+
+    from zlc_frontend.panel_render import PanelComposer, PanelRenderError
+
+    with pytest.raises(PanelRenderError, match="document-fed"):
+        PanelComposer("pulse", intent=ViewIntent.PULSE)
 
 
 def test_the_state_validates_its_panel_and_selection():

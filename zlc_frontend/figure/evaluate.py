@@ -572,8 +572,12 @@ def _layer_budget(view, allowed) -> tuple[int, int, int, int]:
             for binding in view.axis_bindings
             if binding.role is AxisViewRole.SAMPLE
         )
-    else:
+    elif view.intent is ViewIntent.METER:
         per_series = 1
+    else:
+        raise FigureEvaluationError(
+            f"{view.intent.value} has no DatasetSchema evaluation path"
+        )
     output_elements = series * per_series
     histogram_samples = output_elements if view.intent is ViewIntent.HISTOGRAM else 0
     return facet_cells, series, output_elements, histogram_samples
@@ -1453,10 +1457,14 @@ class FigureEvaluator:
                         guard,
                         value_unit=block.schema.cell_schema.value_unit,
                     )
-                else:
+                elif view.intent is ViewIntent.METER:
                     data = _meter(
                         working,
                         value_unit=block.schema.cell_schema.value_unit,
+                    )
+                else:
+                    raise FigureEvaluationError(
+                        f"{view.intent.value} has no DatasetSchema evaluation path"
                     )
                 series.append(
                     EvaluatedSeries(

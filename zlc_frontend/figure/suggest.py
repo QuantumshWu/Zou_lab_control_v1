@@ -22,7 +22,7 @@ from .contract import (
     IMAGE_CONTRACT,
     _first_visible_point_tuple,
     _selection_fit_projection,
-    contract_for,
+    dataset_contract_for,
     dataset_axes,
     display_axis_indices,
     validate_view_spec,
@@ -512,6 +512,7 @@ def suggest_view(
 ) -> ViewSuggestion:
     """Suggest one safe presentation using the ordinary public contract."""
 
+    contract = dataset_contract_for(intent)
     return _suggest_view(
         schema,
         intent,
@@ -520,7 +521,7 @@ def suggest_view(
         contract=(
             _AUTO_CURVE_CONTRACT
             if intent is ViewIntent.CURVE
-            else contract_for(intent)
+            else contract
         ),
     )
 
@@ -686,7 +687,7 @@ def suggest_fit_view(
             effective.spec.axis_bindings,
             (display_selection,),
         )
-        validate_view_spec(schema, lifted, contract_for(lifted.intent))
+        validate_view_spec(schema, lifted, dataset_contract_for(lifted.intent))
     except (TypeError, ValueError, IndexError) as exc:
         return _needs(
             "TRANSFORMED_FIT_VIEW_REJECTED",

@@ -56,6 +56,17 @@ class ViewIntent(str, Enum):
     CURVE = "CURVE"
     HISTOGRAM = "HISTOGRAM"
     METER = "METER"
+    PULSE = "PULSE"
+
+
+DATASET_VIEW_INTENTS = frozenset(
+    {
+        ViewIntent.IMAGE,
+        ViewIntent.CURVE,
+        ViewIntent.HISTOGRAM,
+        ViewIntent.METER,
+    }
+)
 
 
 class AxisViewRole(str, Enum):
@@ -152,6 +163,10 @@ class ViewSpec:
         )
         if not isinstance(self.intent, ViewIntent):
             raise TypeError("intent must be ViewIntent")
+        if self.intent not in DATASET_VIEW_INTENTS:
+            raise ValueError(
+                f"{self.intent.value} is document-fed and cannot be stored in ViewSpec"
+            )
         bindings = tuple(self.axis_bindings)
         if any(not isinstance(binding, AxisViewBinding) for binding in bindings):
             raise TypeError("axis_bindings must contain AxisViewBinding values")
@@ -278,6 +293,8 @@ class ViewContract:
     def __post_init__(self) -> None:
         if not isinstance(self.intent, ViewIntent):
             raise TypeError("intent must be ViewIntent")
+        if self.intent not in DATASET_VIEW_INTENTS:
+            raise ValueError("document-fed intents cannot use dataset ViewContract")
         slots = tuple(self.display_slots)
         policies = tuple(self.role_policies)
         repeat_modes = tuple(self.repeat_modes)
@@ -781,6 +798,7 @@ class EvaluatedFigureData:
 
 
 __all__ = [
+    "DATASET_VIEW_INTENTS",
     "AxisAddress",
     "AxisResolution",
     "AxisRolePolicy",

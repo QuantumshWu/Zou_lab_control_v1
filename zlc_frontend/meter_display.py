@@ -1,7 +1,8 @@
 """Pure authored state for a single-value METER panel.
 
-`ViewIntent` has four members and three of them already owned a display module
-here (`image_display`, `curve_display`, `histogram_display`).  METER's state was
+The four dataset-evaluated `ViewIntent` values need frontend display state;
+three already owned a module here (`image_display`, `curve_display`,
+`histogram_display`).  METER's state was
 stranded as a private class inside one workbench window, which meant a board
 could render a METER panel but could not hold a display state for it - the live
 board's panel-to-revision mapping had no slot for it at all, and every other
@@ -12,6 +13,9 @@ number for one exact selection, and it has no authored display parameter to
 edit.  Inventing an empty form so the file "matches its siblings" would put an
 empty tab in every Setting popup.  When a real METER knob appears (a unit or a
 format, say), it belongs here beside the state, and the form arrives with it.
+PULSE is deliberately outside that dataset-state set: it is fed by an authored
+pulse document and its x-only view state belongs to the document renderer seam,
+not to a DataBlock evaluator or this METER owner.
 """
 
 from __future__ import annotations

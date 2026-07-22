@@ -157,6 +157,39 @@ def only_series(evaluated):
     return evaluated.layers[0].cells[0].series[0]
 
 
+def test_pulse_is_document_fed_and_cannot_enter_the_dataset_figure_path():
+    repeat = axis("repeat", REPEAT, 1)
+    point = axis("time", SCAN_POINT, 2)
+    block = make_block(
+        np.zeros((1, 2)),
+        repeat_axis=repeat,
+        point_axes=(point,),
+        point_layout=PointLayout.rect_c((2,)),
+    )
+
+    with pytest.raises(ValueError, match="document-fed"):
+        ViewSpec(block.schema.fingerprint, ViewIntent.PULSE, ())
+    with pytest.raises(ValueError, match="document-fed"):
+        suggest_view(block.schema, ViewIntent.PULSE)
+
+    ordinary = suggest_view(block.schema, ViewIntent.CURVE).spec
+    assert ordinary is not None
+    illegal_tree = view_spec_to_tree(ordinary)
+    illegal_tree["intent"] = ViewIntent.PULSE.value
+    with pytest.raises(ValueError, match="document-fed"):
+        decode_view_spec(encode(illegal_tree))
+
+    # Even a corrupted/in-memory object that bypasses the dataclass constructor
+    # cannot fall through FigureEvaluator's closed dispatch and become METER.
+    forged = object.__new__(ViewSpec)
+    object.__setattr__(forged, "schema_fingerprint", ordinary.schema_fingerprint)
+    object.__setattr__(forged, "intent", ViewIntent.PULSE)
+    object.__setattr__(forged, "axis_bindings", ordinary.axis_bindings)
+    object.__setattr__(forged, "display_selections", ordinary.display_selections)
+    with pytest.raises(ValueError, match="document-fed"):
+        evaluated_data(block, forged)
+
+
 def test_suggest_curve_is_axis_total_role_driven_and_deterministic():
     repeat = axis("repeat", REPEAT, 3)
     detuning = axis("detuning", SCAN_POINT, 5)

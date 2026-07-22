@@ -120,6 +120,9 @@ def _panel_view_intents():
         "monitor": ViewIntent.CURVE,
         "hist": ViewIntent.HISTOGRAM,
         "grid": ViewIntent.IMAGE,
+        # PULSE has a document contract.  The dataset-only PanelComposer rejects
+        # it explicitly instead of silently drawing the signal as IMAGE.
+        "pulse": ViewIntent.PULSE,
     }
 
 #: Sentinel for "this panel has never stored a repeat mode".  A stored ``None``
@@ -723,9 +726,12 @@ class PanelCard(FluentGroupBox):
         picture of the same data.
         """
 
-        from zlc_frontend.figure import ViewIntent
-
-        return _panel_view_intents().get(self.config.kind, ViewIntent.IMAGE)
+        try:
+            return _panel_view_intents()[self.config.kind]
+        except KeyError as error:
+            raise ValueError(
+                f"panel kind {self.config.kind!r} has no declared view intent"
+            ) from error
 
     def _display_state(self):
         """The display knobs this panel's kind exposes, as the renderer's own state.
@@ -743,6 +749,11 @@ class PanelCard(FluentGroupBox):
         from zlc_frontend.figure import ViewIntent
 
         params = self.config.params
+        intent = self.view_intent()
+        if intent is ViewIntent.PULSE:
+            raise ValueError(
+                "PULSE display state belongs to its document renderer, not the dataset composer"
+            )
         # The panel's relim vocabulary IS the renderer's: tight / normal / fixed.
         # Converting rather than re-deciding keeps one set of names, so a mode
         # the renderer grows is a mode the Setting can offer with no mapping to
@@ -753,7 +764,6 @@ class PanelCard(FluentGroupBox):
             fixed = (float(params.get("fixed_lo", 0.0)),
                      float(params.get("fixed_hi", 1.0)))
         pin_x, pin_y = self._view_pin or (None, None)
-        intent = self.view_intent()
         if intent is ViewIntent.CURVE:
             return CurveDisplayState(
                 revision=self._display_revision, relim_mode=mode, fixed_y_limits=fixed,
