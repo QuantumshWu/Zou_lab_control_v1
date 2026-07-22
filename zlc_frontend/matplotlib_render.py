@@ -1027,8 +1027,11 @@ def _draw_pulse_repeat_brackets(axis, repeat_markers, n_channels, colors) -> Non
                   color=color, alpha=alpha, linewidth=1.05, solid_capstyle="round",
                   clip_on=True, zorder=8 + index)
         if label:
+            # The ×∞ label needs the U+221E glyph, which the design's Helvetica Light lacks (it renders
+            # a tofu box).  Draw the bracket label in DejaVu Sans -- which HAS ∞ -- exactly as the
+            # reference does, so ×∞ reads as infinity and not a missing-glyph square.
             axis.text((start + stop) / 2.0, y_high + 0.06 * (1 + outer_depth), label,
-                      ha="center", va="bottom", color=color, alpha=alpha,
+                      ha="center", va="bottom", color=color, alpha=alpha, fontfamily="DejaVu Sans",
                       fontsize=smaller_fontsize(1.0, 5.5), clip_on=False, zorder=8 + index)
 
 
@@ -1041,8 +1044,7 @@ def render_pulse_timeline_png(
     title: str = "",
     repeat_markers=(),
     repeat_notation: str = "",
-    size_inches: tuple[float, float] = (5.0, 4.0),
-    dpi: float = 100.0,
+    size: str = "2x2",
 ) -> bytes:
     """The pulse-timeline figure as PNG bytes -- the reference's faithful preview.
 
@@ -1050,6 +1052,11 @@ def render_pulse_timeline_png(
     drawn as FILLED blocks (``Rectangle`` patches), the board name on the y axis
     (tinted to its row), a ``Time (unit)`` x axis, the pulse name inside long
     blocks, and the repeat span shown as grey brackets (or a top-right ``×∞`` note).
+
+    ``size`` is one of the panel-size presets (``PANEL_SIZES``); the figure geometry is derived from
+    it through the frontend's ONE size source (:func:`panel_figure_size_inches`), so the preview
+    rescales with the preset exactly like every other panel kind -- the raster is emitted at the same
+    on-screen resolution a panel of that size reserves, never a bespoke inch/dpi pair.
 
     Plain data only (no ``PulseTableState``/pulse imports) so the plot layer stays
     free of the domain packages; the editor extracts these lists from its sequence.
@@ -1062,9 +1069,17 @@ def render_pulse_timeline_png(
     from matplotlib.patches import Rectangle
     from matplotlib.ticker import FuncFormatter, MaxNLocator
 
-    from .render_style import PALETTE, render_style_context, smaller_fontsize
+    from .render_style import (
+        DESIGN_DPI, PALETTE, PANEL_DISPLAY_SCALE, panel_figure_size_inches,
+        render_style_context, smaller_fontsize,
+    )
 
-    dpi = _render_dpi(dpi)
+    # The size PRESET is the one geometry knob: inches come from the frontend's single size source and
+    # the raster dpi matches a panel's on-screen scale, so the emitted PNG is exactly the pixel box a
+    # card of this size reserves (panel_display_size(size)) -- preview, Save Figure and a seeded panel
+    # all agree, and a bigger preset yields a bigger picture.
+    size_inches = panel_figure_size_inches(size)
+    dpi = _render_dpi(DESIGN_DPI * PANEL_DISPLAY_SCALE)
     pulses = [dict(row) for row in pulses]
     channels = [str(channel) for channel in channels]
     labels = dict(channel_labels or {})

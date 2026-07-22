@@ -90,3 +90,56 @@ def test_the_preview_y_axis_uses_board_names_not_raw_lane_keys(preview_editor):
         assert name not in labels, (
             f"the preview axis shows the raw lane key {name!r} instead of its board name "
             f"{labels[name]!r}")
+
+
+def _png_size(data: bytes) -> tuple[int, int]:
+    from PyQt5 import QtGui
+
+    pixmap = QtGui.QPixmap()
+    pixmap.loadFromData(data)
+    return (pixmap.width(), pixmap.height())
+
+
+def test_show_off_rows_reveals_the_always_off_channels(preview_editor):
+    """Flipping the "Show off rows" switch ON must draw MORE rows than OFF (the always-off
+    channels) and produce a genuinely different picture -- the regression was that the render
+    took its rows from the compiled sequence (active lanes only), so the toggle did nothing.
+    """
+
+    state = preview_editor.read_state()
+    off_rows = preview_editor._preview_channels(state, include_always_off=False)
+    all_rows = preview_editor._preview_channels(state, include_always_off=True)
+    assert len(all_rows) > len(off_rows), (
+        "'Show off rows' ON did not add any channels -- the toggle is a no-op "
+        f"(off={off_rows}, on={all_rows})")
+    # The whole universe is exactly the catalog's digital ports, never the compiled sequence.
+    universe = [port.lanes[0] for port in state.port_catalog.digital_ports]
+    assert all_rows == universe
+
+    off_png = preview_editor.preview_png_bytes(state, include_always_off=False)
+    on_png = preview_editor.preview_png_bytes(state, include_always_off=True)
+    assert off_png != on_png, "the off-rows toggle produced an identical PNG"
+    assert _png_size(on_png)[1] > _png_size(off_png)[1], (
+        "more rows must make a taller figure")
+
+
+def test_size_preset_scales_the_rendered_pixels(preview_editor):
+    """Picking a size in the dropdown must rescale the figure to that panel size's pixel box --
+    the regression was that the render ignored the preset entirely, so every size looked the same.
+    """
+
+    from zlc_frontend.render_style import panel_display_size
+
+    state = preview_editor.read_state()
+    combo = preview_editor.preview_size_combo
+    preview_editor._preview_size_pinned = True                # as if the operator picked a size
+
+    dims = {}
+    for preset in ("2x2", "4x4", "8x8"):
+        combo.setCurrentText(preset)
+        dims[preset] = _png_size(preview_editor.preview_png_bytes(state))
+        # The emitted raster is exactly the on-screen card box for that preset (one geometry source).
+        assert dims[preset] == panel_display_size(preset), (
+            f"size {preset} rendered {dims[preset]} px, not panel_display_size {panel_display_size(preset)}")
+    assert dims["2x2"][0] < dims["4x4"][0] < dims["8x8"][0], "a bigger preset must widen the figure"
+    assert dims["2x2"][1] < dims["4x4"][1] < dims["8x8"][1], "a bigger preset must heighten the figure"

@@ -70,12 +70,12 @@ PANEL_UNIT_PX = (180, 240)                # (height, width) of one half-unit
 PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 96, 80, TITLE_SLOT_PX)   # (L, R, B, T)
 
 
-def panel_display_size(size: str = "2x2") -> tuple[int, int]:
-    """On-screen (logical px) size of a panel of ``size`` -- the card's canvas box.
+def panel_figure_size_inches(size: str = "2x2") -> tuple[float, float]:
+    """Figure size in INCHES for a panel of ``size`` -- the ONE source a renderer builds its
+    ``Figure(figsize=...)`` from (data region + margins over :data:`DESIGN_DPI`).
 
-    Pure geometry over the owned tokens: no figure, no renderer, no Qt.  A host
-    reserves exactly this much room for the panel's raster surface, so a card's
-    footprint is known before anything is drawn into it.
+    :func:`panel_display_size` is exactly this scaled to on-screen logical px, so a panel's rastered
+    figure and the card box a host reserves for it describe the SAME geometry and can never drift.
     """
 
     from zlc_data.panel_size import panel_size_cells
@@ -84,7 +84,50 @@ def panel_display_size(size: str = "2x2") -> tuple[int, int]:
     left, right, bottom, top = PANEL_MARGINS_PX
     width = cols * PANEL_UNIT_PX[1] + left + right
     height = rows * PANEL_UNIT_PX[0] + bottom + top
-    return (round(width * PANEL_DISPLAY_SCALE), round(height * PANEL_DISPLAY_SCALE))
+    return (width / DESIGN_DPI, height / DESIGN_DPI)
+
+
+def panel_display_size(size: str = "2x2") -> tuple[int, int]:
+    """On-screen (logical px) size of a panel of ``size`` -- the card's canvas box.
+
+    Pure geometry over the owned tokens: no figure, no renderer, no Qt.  A host
+    reserves exactly this much room for the panel's raster surface, so a card's
+    footprint is known before anything is drawn into it.  Derived from
+    :func:`panel_figure_size_inches` so the reserved box and the rastered figure share one source.
+    """
+
+    width_in, height_in = panel_figure_size_inches(size)
+    return (round(width_in * DESIGN_DPI * PANEL_DISPLAY_SCALE),
+            round(height_in * DESIGN_DPI * PANEL_DISPLAY_SCALE))
+
+
+# The readability floor a pulse timeline needs in the size-preset DATA region: enough px PER ROW that a
+# channel name is not squashed, and enough px PER PERIOD that periods do not blur into one band.  A busy
+# pulse (many channels / periods) therefore defaults to a BIGGER size preset (:func:`optimal_pulse_size`)
+# and the data region rescales with that preset like every other panel kind.  Owned ART tokens.
+_PULSE_ROW_MIN_PX = 26       # min data-region height per pulse row for a legible channel name
+_PULSE_PERIOD_MIN_PX = 46    # min data-region width per period so periods stay distinct
+
+
+def optimal_pulse_size(channel_count: int, period_count: int) -> str:
+    """The SMALLEST panel-size preset whose data region holds ``channel_count`` rows (>=
+    :data:`_PULSE_ROW_MIN_PX` each) and ``period_count`` periods (>= :data:`_PULSE_PERIOD_MIN_PX`
+    each), else the LARGEST preset.  The ONE default-size source for a pulse preview / a loaded pulse
+    panel: the size preset CARRIES the content density, and the data region rescales with the preset.
+    An extreme pulse beyond the largest preset still returns it and scrolls in its card."""
+
+    from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
+
+    rows_needed = max(1, int(channel_count))
+    periods_needed = max(1, int(period_count))
+    by_area = sorted(PANEL_SIZES, key=lambda name: (lambda rc: rc[0] * rc[1])(panel_size_cells(name)))
+    for name in by_area:
+        cells_r, cells_c = panel_size_cells(name)
+        data_w = cells_c * PANEL_UNIT_PX[1]
+        data_h = cells_r * PANEL_UNIT_PX[0]
+        if data_h >= rows_needed * _PULSE_ROW_MIN_PX and data_w >= periods_needed * _PULSE_PERIOD_MIN_PX:
+            return name
+    return by_area[-1]
 
 # Stock figure size in inches = (data + L + R, data + B + T) / dpi.  Derived, so
 # it can never disagree with FigureSpec's defaults (which read the same tokens).

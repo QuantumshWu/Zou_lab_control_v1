@@ -3994,6 +3994,30 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
 
     # ------------------------------------------------------------------ preview
+    def _preview_channels(self, state: PulseTableState, *, include_always_off: bool,
+                          sequence=None) -> list[str]:
+        """The digital channels the preview DRAWS -- the ONE source both the snapshot (status line)
+        and the timeline render count, so "how many rows" can never drift between the two.
+
+        The universe is the catalog's DIGITAL ports (one lane each), never ``sequence.channels`` --
+        the compiled sequence lists only lanes that carry a pulse, so an always-off channel is absent
+        there and "Show off rows" could never reveal it.  Clock and DAC lanes are excluded (a clk lane
+        is not engine-driven; a DAC owns its own analog row).  ``include_always_off`` shows the whole
+        universe; otherwise only channels with a real ON pulse (falling back to the first lane so the
+        plot is never empty)."""
+        universe = [port.lanes[0] for port in state.port_catalog.digital_ports]
+        if include_always_off:
+            return universe
+        if sequence is None:
+            sequence = state.to_sequence()
+        active = {
+            str(pulse.channel)
+            for pulse in (getattr(sequence, "pulses", ()) or ())
+            if getattr(pulse, "value", 0) and float(getattr(pulse, "duration", 0.0) or 0.0) > 0.0
+        }
+        visible = [channel for channel in universe if channel in active]
+        return visible or (universe[:1] if universe else [])
+
     def _preview_snapshot(self, state: PulseTableState, *, include_always_off: bool):
         """The compiled sequence as one dataset: time across, one component per channel.
 
@@ -4017,11 +4041,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
         sequence = state.to_sequence()
         pulses = list(getattr(sequence, "pulses", ()) or ())
-        active = {str(pulse.channel) for pulse in pulses}
-        channels = [str(name) for name in sequence.channels
-                    if include_always_off or name in active]
-        if not channels:
-            channels = [str(name) for name in sequence.channels]
+        channels = self._preview_channels(
+            state, include_always_off=include_always_off, sequence=sequence)
         if not channels:
             return None, []
 
@@ -4094,34 +4115,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # claim one; saying so plainly is what keeps the provenance honest.
         return OwnedSnapshot(block.ref(StreamGenerationId("pulse-editor-preview")), block), channels
 
-    def _preview_data_figure(self, state: PulseTableState, *, include_always_off: bool = False):
-        """The preview as a :class:`DataFigure` -- document + dataset, no canvas."""
-
-        from zlc_frontend.data_figure import DataFigure
-        from zlc_frontend.figure import (
-            DatasetDescriptor, DatasetId, FigureDocument, FigureLayer,
-            ResolvedDataset, ResolvedDatasetMap, ViewIntent,
-        )
-        from zlc_frontend.panel_render import view_for_schema
-
-        snapshot, _channels = self._preview_snapshot(
-            state, include_always_off=include_always_off)
-        if snapshot is None:
-            raise ValueError("this pulse program has no channels to preview")
-        schema = snapshot.block.schema
-        dataset_id = DatasetId("pulse-preview")
-        document = FigureDocument(
-            "pulse-preview",
-            1,
-            (DatasetDescriptor(dataset_id, "Pulse preview", schema.fingerprint),),
-            (FigureLayer("pulse-preview-layer", dataset_id,
-                         view_for_schema(schema, ViewIntent.CURVE, None)),),
-        )
-        return DataFigure(
-            document,
-            ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
-        )
-
     def preview_png_bytes(self, state: PulseTableState | None = None, *,
                           include_always_off: bool | None = None) -> bytes:
         """The preview as PNG bytes -- the ONE place pixels are produced.
@@ -4144,13 +4137,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # the preview, Save Figure and Save Image all draw the identical figure and the
         # frontend never imports the pulse/neutral packages.
         sequence = state.to_sequence()
-        clock_lanes = {lane for port in state.port_catalog.clock_ports for lane in port.lanes}
         raw_pulses = list(getattr(sequence, "pulses", ()) or ())
-        active = {str(pulse.channel) for pulse in raw_pulses}
-        channels = [str(name) for name in sequence.channels
-                    if name not in clock_lanes and (include_always_off or name in active)]
-        if not channels:
-            channels = [str(name) for name in sequence.channels if name not in clock_lanes]
+        # Rows come from the ONE channel source (the digital-port universe, filtered by "Show off
+        # rows"), NOT sequence.channels -- an always-off channel is absent from the compiled sequence,
+        # so counting rows off it would make "Show off rows" a no-op.
+        channels = self._preview_channels(
+            state, include_always_off=include_always_off, sequence=sequence)
         pulses = [
             {"channel": str(pulse.channel), "start": float(pulse.start),
              "stop": float(pulse.stop), "duration": float(pulse.duration),
@@ -4173,7 +4165,20 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             title=str(getattr(state, "name", "") or ""),
             repeat_markers=markers,
             repeat_notation=_repeat_summary_text(state),
+            size=self._preview_size_for(state, include_always_off=include_always_off),
         )
+
+    def _preview_size_for(self, state: PulseTableState, *, include_always_off: bool) -> str:
+        """The size preset the preview renders at -- the operator's PINNED pick (the Size dropdown once
+        they choose one) else the content-derived default (:func:`optimal_pulse_size` over the drawn row
+        + period counts).  The ONE size source shared by the on-screen preview, Save Figure and Save
+        Image, so all three draw the same picture at the same size."""
+        from zlc_frontend.render_style import optimal_pulse_size
+
+        if getattr(self, "_preview_size_pinned", False) and getattr(self, "preview_size_combo", None):
+            return self.preview_size_combo.currentText()
+        channels = self._preview_channels(state, include_always_off=include_always_off)
+        return optimal_pulse_size(len(channels), len(getattr(state, "periods", ()) or ()))
 
     def refresh_preview(self) -> None:
         """Redraw the Preview tab from the CURRENT table.
@@ -4189,6 +4194,15 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self._preview_revision = int(getattr(self, "_preview_revision", 0)) + 1
         try:
             state = self.read_state()
+            # When the operator has NOT pinned a size, the dropdown TRACKS the content-derived default
+            # so it always shows the size the picture is actually drawn at (setCurrentText fires
+            # currentTextChanged, not `activated`, so it does not spuriously pin the size).
+            include_off_now = bool(getattr(self, "preview_include_off", None)
+                                   and self.preview_include_off.isChecked())
+            if not getattr(self, "_preview_size_pinned", False) and getattr(self, "preview_size_combo", None):
+                effective = self._preview_size_for(state, include_always_off=include_off_now)
+                if self.preview_size_combo.currentText() != effective:
+                    self.preview_size_combo.setCurrentText(effective)
             png = self.preview_png_bytes(state)
         except Exception as exc:
             self.preview_status.setText(
@@ -4215,12 +4229,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             pixmap.height() + margins.top() + margins.bottom())
         self._preview_dirty = False
         # Match the reference wording exactly (C22): "N/M plotted (active channels) | repeat …".
-        # N = channels the render drew, M = programmable (non-clock) ports, and the mode names
-        # whether off rows were included -- so the operator reads the same status main shows.
+        # N = channels the render drew, M = the DIGITAL-port universe those rows are drawn from (the
+        # SAME set _preview_channels counts, so "all channels" reads M/M), and the mode names whether
+        # off rows were included -- so the operator reads the same status main shows.
         include_off = bool(getattr(self, "preview_include_off", None)
                            and self.preview_include_off.isChecked())
         _snapshot, drawn = self._preview_snapshot(state, include_always_off=include_off)
-        total = sum(1 for port in state.port_catalog.ports if port.kind != PORT_CLOCK)
+        total = len(state.port_catalog.digital_ports)
         mode = "all channels" if include_off else "active channels"
         self.preview_status.setText(
             f"{len(drawn)}/{total} plotted ({mode}) | {_repeat_summary_text(state)}")
