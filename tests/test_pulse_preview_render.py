@@ -182,6 +182,48 @@ def test_a_trailing_all_off_period_keeps_the_frame_length_visible(preview_editor
             "length is not being honoured")
 
 
+def test_display_carries_the_screen_ratio_and_export_saves_at_600_dpi(preview_editor):
+    """The two dpi principles, both the reference's, must hold mechanically:
+
+    * the ON-SCREEN raster is the panel's logical pixel box times the screen's
+      device-pixel ratio (blitted 1:1 crisp -- a HiDPI screen must not stretch a
+      soft logical-pixel image), and the shown pixmap is tagged with that ratio;
+    * an EXPORT ignores the screen and saves the same drawing at the style's
+      ``savefig.dpi`` (600), so a saved figure is publication resolution.
+    """
+
+    from zlc_frontend.render_style import (
+        DEFAULT_STYLE, panel_display_size, panel_figure_size_inches)
+
+    state = preview_editor.read_state()
+    size = preview_editor._preview_size_for(state, include_always_off=False)
+    logical = panel_display_size(size)
+
+    doubled = _png_size(preview_editor.preview_png_bytes(
+        state, include_always_off=False, pixel_ratio=2.0))
+    assert doubled == (logical[0] * 2, logical[1] * 2), (
+        f"pixel_ratio=2 must emit exactly twice the logical box {logical}, got {doubled}")
+
+    exported = _png_size(preview_editor.preview_png_bytes(
+        state, include_always_off=False, export=True))
+    inches = panel_figure_size_inches(size)
+    save_dpi = float(DEFAULT_STYLE["savefig.dpi"])
+    expected = (round(inches[0] * save_dpi), round(inches[1] * save_dpi))
+    assert exported == expected, (
+        f"export must save at savefig.dpi={save_dpi:g} ({expected} px), got {exported}")
+
+    with pytest.raises(ValueError):
+        preview_editor.preview_png_bytes(state, pixel_ratio=2.0, export=True)
+
+    # The GUI display chain tags the pixmap with the widget's ratio so Qt shows
+    # it at the logical size instead of stretching device pixels.
+    preview_editor.refresh_preview()
+    pixmap = preview_editor.preview_image.pixmap()
+    assert pixmap is not None and not pixmap.isNull()
+    assert pixmap.devicePixelRatio() == pytest.approx(
+        float(preview_editor.devicePixelRatioF() or 1.0))
+
+
 def test_the_inner_repeat_bracket_draws_nested_not_unrolled(preview_editor):
     """A finite inner bracket ``[P1..P1] × 3`` must read as its OWN nested square
     bracket over period 1's span -- the reference's semantics exactly:

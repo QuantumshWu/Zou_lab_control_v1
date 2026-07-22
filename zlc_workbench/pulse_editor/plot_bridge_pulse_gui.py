@@ -4117,8 +4117,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             # Save Figure writes the picture, and only the picture.  The old
             # twin .npz came from a DataFigure.save that no longer exists: data
             # persistence belongs to the run repository, and a preview is not a
-            # run -- it is a drawing of the table currently being edited.
-            image_path.write_bytes(self.preview_png_bytes(state))
+            # run -- it is a drawing of the table currently being edited.  The
+            # export is the SAME drawing saved at the style's savefig.dpi (600).
+            image_path.write_bytes(self.preview_png_bytes(state, export=True))
             self.preview_status.setText(f"Saved figure: {image_path.name}")
         except Exception as exc:
             self._message(str(exc))
@@ -4247,12 +4248,17 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         return OwnedSnapshot(block.ref(StreamGenerationId("pulse-editor-preview")), block), channels
 
     def preview_png_bytes(self, state: PulseTableState | None = None, *,
-                          include_always_off: bool | None = None) -> bytes:
+                          include_always_off: bool | None = None,
+                          pixel_ratio: float = 1.0,
+                          export: bool = False) -> bytes:
         """The preview as PNG bytes -- the ONE place pixels are produced.
 
         Display, Save Figure and Save Image all go through here, so what is
-        written to disk is the same picture that was on screen rather than a
-        second rendering that could differ.
+        written to disk is the same PICTURE that was on screen.  The dpi split
+        is the reference's: the on-screen raster carries the caller's screen
+        ``pixel_ratio`` (device pixels, blitted 1:1 -- never a soft
+        logical-pixel image stretched by Qt), while ``export`` saves the same
+        drawing at the style's ``savefig.dpi`` (600), independent of any screen.
         """
 
         from zlc_frontend.matplotlib_render import render_pulse_timeline_png
@@ -4312,6 +4318,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             analog_traces=traces,
             scan_regions=regions,
             scan_dac_segments=segments,
+            pixel_ratio=pixel_ratio,
+            export=export,
         )
 
     def _preview_analog_traces(self, state: PulseTableState, *,
@@ -4429,7 +4437,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 effective = self._preview_size_for(state, include_always_off=include_off_now)
                 if self.preview_size_combo.currentText() != effective:
                     self.preview_size_combo.setCurrentText(effective)
-            png = self.preview_png_bytes(state)
+            # The screen's device-pixel ratio rides into the render so the Agg
+            # buffer holds exactly the widget's DEVICE pixels; tagging the pixmap
+            # with the same ratio keeps its logical size unchanged while Qt blits
+            # 1:1 -- the reference's "never rendered small and stretched up" rule.
+            ratio = float(self.devicePixelRatioF() or 1.0)
+            png = self.preview_png_bytes(state, pixel_ratio=ratio)
         except Exception as exc:
             self.preview_status.setText(
                 f"Preview unavailable: {str(exc).splitlines()[0][:120]}")
@@ -4437,6 +4450,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self._preview_png = png
         pixmap = QtGui.QPixmap()
         pixmap.loadFromData(png)
+        pixmap.setDevicePixelRatio(ratio)
         if getattr(self, "preview_image", None) is None:
             self.preview_image = QtWidgets.QLabel()
             self.preview_image.setAlignment(QtCore.Qt.AlignCenter)
@@ -4446,13 +4460,14 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.preview_image.show()
         # The scroll area holds the body at its OWN size hint (setWidgetResizable(False)),
         # so a layout stretch cannot grow it: without this the QLabel keeps its ~13 px
-        # minimum and the 500x400 plot shows as a sliver.  Size the body to the pixmap
-        # (plus the layout margins) so the whole plot is visible and the scroll bars only
-        # appear when it genuinely overflows the viewport.
+        # minimum and the 500x400 plot shows as a sliver.  Size the body to the pixmap's
+        # LOGICAL size (device pixels over the ratio, plus the layout margins) so the
+        # whole plot is visible and the scroll bars only appear when it genuinely
+        # overflows the viewport.
         margins = self.preview_body_layout.contentsMargins()
         self.preview_body.resize(
-            pixmap.width() + margins.left() + margins.right(),
-            pixmap.height() + margins.top() + margins.bottom())
+            int(round(pixmap.width() / ratio)) + margins.left() + margins.right(),
+            int(round(pixmap.height() / ratio)) + margins.top() + margins.bottom())
         self._preview_dirty = False
         # Match the reference wording exactly (C22): "N/M plotted (active channels) | repeat …".
         # N = channels the render drew, M = the DIGITAL-port universe those rows are drawn from (the
@@ -4482,7 +4497,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
     def _save_preview_image(self, state: PulseTableState, image_path: Path) -> Path:
         image_path.parent.mkdir(parents=True, exist_ok=True)
-        image_path.write_bytes(self.preview_png_bytes(state))
+        image_path.write_bytes(self.preview_png_bytes(state, export=True))
         return image_path
 
     def _on_tab_changed(self, _index: int) -> None:

@@ -1050,6 +1050,7 @@ def _draw_pulse_timeline(
     analog_traces=(),
     scan_regions=(),
     scan_dac_segments=(),
+    pixel_ratio: float = 1.0,
 ):
     """Draw the pulse-timeline figure once -- the reference's faithful preview.
 
@@ -1102,7 +1103,11 @@ def _draw_pulse_timeline(
     # card of this size reserves (panel_display_size(size)) -- preview, Save Figure and a seeded panel
     # all agree, and a bigger preset yields a bigger picture.
     size_inches = panel_figure_size_inches(size)
-    dpi = _render_dpi(DESIGN_DPI * PANEL_DISPLAY_SCALE)
+    # ``pixel_ratio`` is the caller's SCREEN device-pixel ratio: the reference
+    # renders every on-screen Agg buffer at exactly the widget's device pixels
+    # (design dpi x display scale x real screen ratio) so the blit is 1:1
+    # crisp, never rendered at logical pixels and stretched up by Qt.
+    dpi = _render_dpi(DESIGN_DPI * PANEL_DISPLAY_SCALE * _render_dpi(pixel_ratio))
     pulses = [dict(row) for row in pulses]
     channels = [str(channel) for channel in channels]
     labels = dict(channel_labels or {})
@@ -1295,9 +1300,21 @@ def render_pulse_timeline_png(
     analog_traces=(),
     scan_regions=(),
     scan_dac_segments=(),
+    pixel_ratio: float = 1.0,
+    export: bool = False,
 ) -> bytes:
-    """The pulse-timeline figure as PNG bytes (one exit of the shared drawing)."""
+    """The pulse-timeline figure as PNG bytes (one exit of the shared drawing).
 
+    Two dpi principles, both the reference's: an ON-SCREEN raster is emitted at
+    the panel's logical pixel box times the caller's screen ``pixel_ratio`` (so
+    a HiDPI display blits device pixels 1:1 instead of stretching a soft
+    logical-pixel image), while an ``export`` write ignores the screen entirely
+    and saves at the style's ``savefig.dpi`` (600) -- the same split as the
+    reference's live canvas vs its bare ``savefig`` call.
+    """
+
+    if export and float(pixel_ratio) != 1.0:
+        raise ValueError("an exported figure is screen-independent; leave pixel_ratio at 1")
     figure = None
     try:
         with render_style_context():
@@ -1313,9 +1330,14 @@ def render_pulse_timeline_png(
                 analog_traces=analog_traces,
                 scan_regions=scan_regions,
                 scan_dac_segments=scan_dac_segments,
+                pixel_ratio=pixel_ratio,
             )
             buffer = BytesIO()
-            figure.savefig(buffer, format="png", dpi=figure.get_dpi())
+            if export:
+                # No explicit dpi: the style context's savefig.dpi (600) applies.
+                figure.savefig(buffer, format="png")
+            else:
+                figure.savefig(buffer, format="png", dpi=figure.get_dpi())
             return buffer.getvalue()
     finally:
         if figure is not None:
@@ -1338,6 +1360,7 @@ def render_pulse_timeline_panel(
     scan_dac_segments=(),
     evaluated_input,
     display_revision: int = 0,
+    pixel_ratio: float = 1.0,
 ) -> "tuple[RasterBuffer, PulsePanelPayload]":
     """The SAME pulse-timeline picture as an interactive raster front.
 
@@ -1368,6 +1391,7 @@ def render_pulse_timeline_panel(
                 analog_traces=analog_traces,
                 scan_regions=scan_regions,
                 scan_dac_segments=scan_dac_segments,
+                pixel_ratio=pixel_ratio,
             )
             figure.canvas.draw()
             width, height = figure.canvas.get_width_height()
