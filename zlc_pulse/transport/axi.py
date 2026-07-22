@@ -423,9 +423,7 @@ class VivadoAxiRegisterTransport:
                 ),
                 "Vivado Tcl action returned an error",
             )
-            raise RuntimeError(
-                f"persistent Vivado {action} failed: {detail[:1000]}"
-            )
+            raise RuntimeError(f"persistent Vivado {action} failed: {detail}")
         return output
 
     def _kill_process(self) -> None:

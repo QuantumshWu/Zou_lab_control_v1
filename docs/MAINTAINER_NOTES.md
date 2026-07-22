@@ -536,8 +536,8 @@ at flush:
 Streaming bound. A scan with more than `2*bank_size` points does **not** make the upload
 grow without bound. The engine plays a 2-bank ping-pong window; the host streams — it
 refills the bank behind the consumed `CURSOR` with the next chunk and re-arms
-`BANK_READY` (see section 3 and 6). Total scan points are limited only by host memory, and
-a late refill STALLs (`STATUS_UNDERFLOW`, hold), never a wrong point.
+`BANK_READY` (see section 3 and 6). There is no host-side artificial scan-point limit; a
+late refill STALLs (`STATUS_UNDERFLOW`, hold), never a wrong point.
 
 ## 7b. UART Fast-Control Side-Channel (root fix for the ~1 s apply latency)
 
@@ -1452,12 +1452,12 @@ discipline as the loading model.
 
 ### task_console live-refresh: BLIT (the full-draw floor was NOT intrinsic)
 
-Source: memory note `task-console-live-perf-floor`; blit landed 2026-07 (`BaseLivePlot._compose_blit`,
+Source: performance investigation `task-console-live-perf-floor`; blit landed 2026-07 (`BaseLivePlot._compose_blit`,
 split into a two-phase `compose()`/`present()` so the board composes every panel's buffer then presents
 them together in one coherent frame).
 The old cost: `BaseLivePlot.draw()` re-rasterised the WHOLE 300-dpi figure every tick
 (`canvas.draw_idle()+flush_events()`, cProfile top = `draw_text` glyph rasterisation across all
-axes), ~12 ms per 2x2 panel — 5-6 panels at 100 ms saturated the budget. Confocal-GUIv2 (the
+axes), ~12 ms per 2x2 panel — 5-6 panels at 100 ms saturated each refresh interval. Confocal-GUIv2 (the
 reference) always blitted; this reimplementation had never ported it.
 
 **Now the live tick BLITS** (single-sourced in `BaseLivePlot`): restore a cached chrome-only
@@ -1942,7 +1942,7 @@ saturation-broadening / laser-has-no-detuning + RF-owns-it / trap-floor-follows-
 the detuning-scan recapture-rate peaks at δ=0 end-to-end). Adding two devices bumps the virtual roster,
 so `test_device_config_io.py`'s expected name list includes `laser` / `rf`.
 
-## 24. Live-path performance root fixes: native dtype, binned dis, tick budget, drag protocol (2026-07-09)
+## 24. Live-path performance root fixes: native dtype, binned dis, worker render, drag protocol (2026-07-09)
 
 Root cause of the real-pylon "camera measurement + 2d is very laggy / unable to allocate 18.xxM":
 a 1920x1200 float64 frame is exactly 17.58 MiB, and the live path allocated several per tick while
@@ -1967,11 +1967,11 @@ thread. Five orthogonal fixes, each at its own layer:
    inside the binned counts. Measured: 2.3 MP uint8 dis update with a NEW shot per tick ≈ 29 ms
    (was 170+ ms).
 
-3. **Console tick: per-panel beat honoured + compose time budget.** The "coherence beats the
-   throttle" override is gone (a live camera advanced `disp` every shot, so update_ms was dead for
-   camera panels); the beat gates WHEN, the coherent clock decides WHAT. The compose phase carries
-   `_TICK_BUDGET_FRACTION` of the base interval; overrun panels stay stale and retry next tick from
-   a rotating start index (fair degradation) — the Qt event loop always breathes.
+3. **Console tick: per-panel beat honoured; compose leaves the GUI thread.** The "coherence beats
+   the throttle" override is gone (a live camera advanced `disp` every shot, so update_ms was dead
+   for camera panels); the beat gates WHEN, the coherent clock decides WHAT. Worker-side whole-board
+   compose publishes one immutable front, while the Qt owner only presents the completed front and
+   replaces not-yet-started stale revisions.
 
 4. **Selector-on-live protocol** (`selectors.begin/end_figure_interaction`): every drag freezes its
    own panel's recompose (catch-up on release via the frame key); a blitted panel
@@ -2006,7 +2006,7 @@ service (`WAIT_FOREVER_MESSAGE` single source).
 
 ## 25. The render thread + typed selection actions (2026-07-09, W round)
 
-The V3 tick budget/rotor only *rescheduled* the GUI-thread render burst; the W round removed it.
+The earlier GUI-thread rotor only *rescheduled* the render burst; the W round removed it.
 `frontend/render_loop.py` is the console's ONE background worker: every steady-tick compose (the
 numpy display prep, matplotlib artist updates and the Agg rasterisation) runs there, strictly one
 batch at a time.  The GUI thread keeps scheduling (frame-key/beat gates), presents the finished

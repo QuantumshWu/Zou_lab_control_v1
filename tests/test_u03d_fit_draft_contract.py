@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +39,6 @@ from zlc_data import (
     ReductionMethod,
     ReductionSpec,
     bind_fit,
-    bound_fit_execution_peak_upper_bound_nbytes,
     commit_transform,
     fit_spec_for,
     suggest_fit_draft,
@@ -429,31 +427,3 @@ def test_data_fit_owner_has_no_frontend_or_display_reducer_dependency():
     assert "zlc_frontend" not in source
     assert "ViewSpec" not in source
     assert "DisplayReduction" not in source
-
-
-def test_execution_peak_bound_is_data_free_conservative_and_policy_monotone():
-    _snapshot_value, small_bound, _result = _curve_product(3)
-    _snapshot_value, larger_batch_bound, _result = _curve_product(33)
-    scan_id = small_bound.spec.fit_axis_ids[0]
-    wider_policy = replace(
-        small_bound.spec.numeric_policy,
-        max_evaluations=8_000,
-        sample_budget_per_batch=24_000,
-        max_packed_observations=4_000_000,
-    )
-    wider_bound = suggest_fit_draft(
-        small_bound.expected_schema,
-        small_bound.spec.model_id,
-        fit_axis_ids=(scan_id,),
-        numeric_policy=wider_policy,
-    )
-
-    small = bound_fit_execution_peak_upper_bound_nbytes(small_bound)
-    larger_batch = bound_fit_execution_peak_upper_bound_nbytes(larger_batch_bound)
-    wider = bound_fit_execution_peak_upper_bound_nbytes(wider_bound)
-
-    assert small > 8 * 1024 * 1024
-    assert larger_batch > small
-    assert wider > small
-    with pytest.raises(TypeError, match="bound must be BoundFit"):
-        bound_fit_execution_peak_upper_bound_nbytes(object())

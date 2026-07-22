@@ -9,7 +9,6 @@ from fpga.pulse_streamer.host.image import StreamerParams
 from .artifact import CompiledPulseArtifact
 from .document import FrozenScanTable, PulseDocument
 from .fpga import pack_target_ir
-from .ir import MAX_MATERIALIZED_SCAN_POINTS
 from .target import (
     DAC_OFFSET_BINARY,
     PORT_CLOCK,
@@ -128,12 +127,7 @@ def expand_autonomous_scan_repeats(document: PulseDocument) -> PulseDocument:
     order.  Deployment capacity is checked separately against the bound port.
     """
 
-    table, repeat_count, total_points = _autonomous_scan_repeat_domain(document)
-    if total_points > MAX_MATERIALIZED_SCAN_POINTS:
-        raise ValueError(
-            "repeat-major scan expansion exceeds the pulse owner's materialization "
-            f"limit: {total_points} points > {MAX_MATERIALIZED_SCAN_POINTS}"
-        )
+    table, repeat_count, _ = _autonomous_scan_repeat_domain(document)
     repeat = document.repeat
     if repeat is None:
         return document

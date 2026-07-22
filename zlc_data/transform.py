@@ -434,17 +434,8 @@ def apply_transform(
     )
 
 
-def _schema_value_nbytes(schema: TransformedSchema) -> int:
-    return int(math.prod(schema.physical_shape) * schema.dtype.itemsize)
-
-
-def _schema_row_validity_nbytes(schema: TransformedSchema) -> int:
-    sizes = tuple(schema.axis(axis_id).size for axis_id in schema.validity_axis_ids)
-    return int(schema.cell_layout.storage_size * math.prod(sizes or (1,)))
-
-
-def _require_bounded_snapshot_step(schema: TransformedSchema, step) -> None:
-    """Keep this bounded DatasetSchema bridge within its earned cell semantics."""
+def _require_materialized_snapshot_step(schema: TransformedSchema, step) -> None:
+    """Keep the DatasetSchema bridge within its declared cell semantics."""
 
     cell_axes = {axis.axis_id: axis for axis in schema.cell_axes}
     if isinstance(step, ReductionSpec):
@@ -467,47 +458,24 @@ def _require_bounded_snapshot_step(schema: TransformedSchema, step) -> None:
     )
     if not (singleton_drop or full_noop):
         raise ValueError(
-            "bounded dataset snapshots only select a singleton cell axis or "
+            "materialized dataset snapshots only select a singleton cell axis or "
             "retain its full index range"
         )
 
 
-def _transformed_snapshot_data_peak_nbytes(
+def _validate_materialized_snapshot_transform(
     source_schema: DatasetSchema,
     transform: CommittedTransform,
-    *,
-    source_validity_nbytes: int,
-) -> int:
-    """Conservative data-plane peak for a cell-preserving dataset snapshot.
-
-    The bound includes the retained source snapshot, every possibly retained
-    selection view base, reduction scratch, compact validity and the immutable
-    output copy.  The reduction allowance also includes exact integer SUM
-    object-array pointers and Python-integer heap, rather than ndarrays alone.
-    Generic repeat/point selection and reduction remain available through
-    :func:`apply_transform`; this bounded bridge admits only the scan consumer's
-    singleton cell drop plus trailing-data selection/reduction contract.
-    Immutable schema/layout/coordinate metadata is admitted by its caller's
-    separate metadata policy, matching raw Capture materialization semantics.
-    """
+) -> None:
+    """Validate the cell-preserving transform used by snapshot materialization."""
 
     if not isinstance(source_schema, DatasetSchema):
         raise TypeError("source_schema must be DatasetSchema")
     if not isinstance(transform, CommittedTransform):
         raise TypeError("transform must be CommittedTransform")
-    if (
-        isinstance(source_validity_nbytes, bool)
-        or not isinstance(source_validity_nbytes, Integral)
-        or source_validity_nbytes < 0
-    ):
-        raise ValueError("source_validity_nbytes must be a nonnegative integer")
     if transform.input_schema_fingerprint != source_schema.fingerprint:
         raise ValueError("CommittedTransform input schema fingerprint is stale")
     state = _State(_source_transformed_schema(source_schema), None, None)
-    retained = _schema_value_nbytes(state.schema) + 2 * int(
-        source_validity_nbytes
-    )
-    peak = retained
     for operation in transform.spec.operations:
         steps = (
             tuple(Selection((term,)) for term in operation.terms)
@@ -515,75 +483,14 @@ def _transformed_snapshot_data_peak_nbytes(
             else (operation,)
         )
         for step in steps:
-            previous_state = state
-            before = state.schema
-            _require_bounded_snapshot_step(before, step)
+            _require_materialized_snapshot_step(state.schema, step)
             state = (
                 _apply_selection(state, step)
                 if isinstance(step, Selection)
                 else _apply_reduction(state, step)
             )
-            if state is previous_state:
-                continue
-            after = state.schema
-            after_value = _schema_value_nbytes(after)
-            after_validity = _schema_row_validity_nbytes(after)
-            if isinstance(step, Selection):
-                term = step.terms[0]
-                coordinate_index_heap = (
-                    64 * after.axis(term.axis_id).size
-                    if isinstance(term, CoordinateRangeSelection)
-                    else 0
-                )
-                scratch = (
-                    after_value
-                    + 2 * after_validity
-                    + 9 * before.cell_layout.storage_size
-                    + coordinate_index_heap
-                )
-            else:
-                before_elements = math.prod(before.physical_shape)
-                after_elements = math.prod(after.physical_shape)
-                scratch = (
-                    2 * _schema_value_nbytes(before)
-                    + 2 * before_elements
-                    + 6 * after_value
-                    + (5 + len(after.data_axes)) * after_elements
-                    + 8 * after_elements
-                    + 16 * before.cell_layout.storage_size
-                )
-                contributors = math.prod(
-                    before.axis(axis_id).size for axis_id in step.axis_ids
-                )
-                if (
-                    step.method is ReductionMethod.SUM
-                    and before.dtype.kind in "biu"
-                    and _integer_sum_requires_object(before.dtype, contributors)
-                ):
-                    scratch = max(scratch, 192 * before_elements)
-            peak = max(peak, retained + scratch)
-            retained += after_value + after_validity
-    output = state.schema
-    if output.fingerprint != transform.output_schema_fingerprint:
-        raise RuntimeError("transform memory plan disagrees with committed output schema")
-    final_freeze = _schema_value_nbytes(output) + _schema_row_validity_nbytes(output)
-    return int(max(peak, retained + final_freeze))
-
-
-def transformed_snapshot_peak_nbytes(
-    source_schema: DatasetSchema,
-    transform: CommittedTransform,
-) -> int:
-    """Worst-case owned data-plane peak available before acquisition starts."""
-
-    if not isinstance(source_schema, DatasetSchema):
-        raise TypeError("source_schema must be DatasetSchema")
-    source = _source_transformed_schema(source_schema)
-    return _transformed_snapshot_data_peak_nbytes(
-        source_schema,
-        transform,
-        source_validity_nbytes=_schema_row_validity_nbytes(source),
-    )
+    if state.schema.fingerprint != transform.output_schema_fingerprint:
+        raise RuntimeError("transform validation disagrees with committed output schema")
 
 
 def materialize_transformed_snapshot(
@@ -592,9 +499,8 @@ def materialize_transformed_snapshot(
     *,
     output_ref: DatasetRevisionRef,
     output_schema: DatasetSchema,
-    memory_limit_bytes: int,
 ) -> OwnedSnapshot:
-    """Execute one data-plane-bounded transform into its final DataBlock."""
+    """Execute one cell-preserving transform into its final DataBlock."""
 
     if not isinstance(output_ref, DatasetRevisionRef):
         raise TypeError("output_ref must be DatasetRevisionRef")
@@ -606,26 +512,7 @@ def materialize_transformed_snapshot(
         raise ValueError("output_ref schema fingerprint differs from output_schema")
     if _source_transformed_schema(output_schema).fingerprint != transform.output_schema_fingerprint:
         raise ValueError("output_schema differs from the committed transform")
-    if (
-        isinstance(memory_limit_bytes, bool)
-        or not isinstance(memory_limit_bytes, Integral)
-        or memory_limit_bytes <= 0
-    ):
-        raise ValueError("memory_limit_bytes must be a positive integer")
-    validity_nbytes = (
-        snapshot.block.validity.mask.nbytes
-        if isinstance(snapshot.block.validity, (CellValidity, ComponentValidity))
-        else 0
-    )
-    required = _transformed_snapshot_data_peak_nbytes(
-        snapshot.block.schema,
-        transform,
-        source_validity_nbytes=validity_nbytes,
-    )
-    if required > memory_limit_bytes:
-        raise MemoryError(
-            f"transformed snapshot peak {required} exceeds limit {memory_limit_bytes}"
-        )
+    _validate_materialized_snapshot_transform(snapshot.block.schema, transform)
     state = _execute_transform(snapshot.block, transform.spec)
     if state.schema.fingerprint != transform.output_schema_fingerprint:
         raise RuntimeError("transform execution disagrees with its committed output schema")
@@ -1294,5 +1181,4 @@ __all__ = [
     "commit_transform",
     "materialize_transformed_snapshot",
     "resolve_transformed_schema",
-    "transformed_snapshot_peak_nbytes",
 ]

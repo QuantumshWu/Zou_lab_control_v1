@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from math import prod
 
 from zlc_data import (
     DatasetSchema,
@@ -116,10 +115,9 @@ def _plan_automatic_bindings(
     axes,
     contract,
     allowed,
-    existing_bindings,
     point_defaults,
 ):
-    """Find the best contract-ordered visible layout without using dataset order."""
+    """Choose the first declared visible role without inventing work caps."""
 
     policy_order = {
         policy.axis_role: position
@@ -134,76 +132,27 @@ def _plan_automatic_bindings(
             ),
         )
     )
-    batch_product = prod(
-        len(allowed[binding.axis_id])
-        for binding in existing_bindings.values()
-        if binding.role is AxisViewRole.BATCH
-    )
-    facet_product = prod(
-        len(allowed[binding.axis_id])
-        for binding in existing_bindings.values()
-        if binding.role is AxisViewRole.FACET
-    )
-    if (
-        batch_product > contract.maximum_batch_series
-        or facet_product > contract.maximum_facet_cells
-    ):
-        return None
-
-    # A state is bounded by the two contract products.  Its value keeps the
-    # lexicographically best contract-rank plan reaching that state; future
-    # feasibility depends only on the state.
-    states = {
-        (batch_product, facet_product): ((), ()),
-    }
+    planned = {}
     for axis in ordered_axes:
         policy = contract.policy_for(axis.role)
         if policy is None or not policy.automatic_roles:
             return None
-        candidates = []
-        cardinality = len(allowed[axis.axis_id])
-        for rank, role in enumerate(policy.automatic_roles):
-            if role is AxisViewRole.SLIDER:
-                fixed = AxisViewBinding(
-                    axis.axis_id,
-                    role,
-                    selector=FixedIndex(
-                        point_defaults.get(
-                            axis.axis_id,
-                            allowed[axis.axis_id][0],
-                        )
-                    ),
-                )
-                candidates.append((rank, fixed))
-            else:
-                candidates.append((rank, AxisViewBinding(axis.axis_id, role)))
-
-        next_states = {}
-        for (batch, facet), (score, plan) in states.items():
-            for rank, binding in candidates:
-                next_batch, next_facet = batch, facet
-                if binding.role is AxisViewRole.BATCH:
-                    next_batch *= cardinality
-                    if next_batch > contract.maximum_batch_series:
-                        continue
-                elif binding.role is AxisViewRole.FACET:
-                    next_facet *= cardinality
-                    if next_facet > contract.maximum_facet_cells:
-                        continue
-                state = (next_batch, next_facet)
-                candidate = (score + (rank,), plan + (binding,))
-                incumbent = next_states.get(state)
-                if incumbent is None or candidate[0] < incumbent[0]:
-                    next_states[state] = candidate
-        if not next_states:
-            return None
-        states = next_states
-
-    _, (_, planned) = min(
-        states.items(),
-        key=lambda item: (item[1][0], item[0]),
-    )
-    return {binding.axis_id: binding for binding in planned}
+        role = policy.automatic_roles[0]
+        if role is AxisViewRole.SLIDER:
+            binding = AxisViewBinding(
+                axis.axis_id,
+                role,
+                selector=FixedIndex(
+                    point_defaults.get(
+                        axis.axis_id,
+                        allowed[axis.axis_id][0],
+                    )
+                ),
+            )
+        else:
+            binding = AxisViewBinding(axis.axis_id, role)
+        planned[axis.axis_id] = binding
+    return planned
 
 
 def _suggest_view(
@@ -406,24 +355,6 @@ def _suggest_view(
         (preferences.batch_axis_ids, AxisViewRole.BATCH),
         (preferences.facet_axis_ids, AxisViewRole.FACET),
     )
-    batch_size = prod(
-        len(allowed[binding.axis_id])
-        for binding in bindings.values()
-        if binding.role is AxisViewRole.BATCH
-    )
-    facet_size = prod(
-        len(allowed[binding.axis_id])
-        for binding in bindings.values()
-        if binding.role is AxisViewRole.FACET
-    )
-    if batch_size > contract.maximum_batch_series:
-        return _needs(
-            "BATCH_LIMIT",
-            "repeat batch exceeds contract limit",
-            axis_id=repeat_axis.axis_id,
-        )
-    if facet_size > contract.maximum_facet_cells:
-        return _needs("FACET_LIMIT", "visible facets exceed contract limit")
     for axis_ids, view_role in explicit_roles:
         for axis_id in axis_ids:
             axis = axis_by_id.get(axis_id)
@@ -437,14 +368,6 @@ def _suggest_view(
                 )
             if view_role is AxisViewRole.SAMPLE and intent is not ViewIntent.HISTOGRAM:
                 return _needs("SAMPLE_REQUIRES_HISTOGRAM", "SAMPLE is histogram-only", axis_id=axis_id)
-            if view_role is AxisViewRole.BATCH:
-                batch_size *= len(allowed[axis.axis_id])
-                if batch_size > contract.maximum_batch_series:
-                    return _needs("BATCH_LIMIT", "explicit batch exceeds contract limit", axis_id=axis_id)
-            if view_role is AxisViewRole.FACET:
-                facet_size *= len(allowed[axis.axis_id])
-                if facet_size > contract.maximum_facet_cells:
-                    return _needs("FACET_LIMIT", "explicit facet exceeds contract limit", axis_id=axis_id)
             bindings[axis_id] = AxisViewBinding(axis_id, view_role)
             unbound.remove(axis_id)
             if view_role is AxisViewRole.SAMPLE and axis.role not in (REPEAT,):
@@ -466,13 +389,12 @@ def _suggest_view(
         automatic_axes,
         contract,
         allowed,
-        bindings,
         point_defaults,
     )
     if planned is None:
         return _needs(
-            "VIEW_CAPACITY_EXHAUSTED",
-            "no contract-valid visible assignment fits the batch/facet limits",
+            "UNRESOLVED_INFORMATION_AXIS",
+            "no declared automatic role can display every remaining axis",
         )
     for axis in automatic_axes:
         binding = planned[axis.axis_id]
@@ -550,8 +472,8 @@ def _suggest_fit_view_for_effective_schema(
         # Fit replay must expose every authoritative repeat batch by default.
         # Selecting index zero / LATEST here used to hide valid fit cells and
         # made replay depend on a presentation-time accident.  Curves can carry
-        # repeat as series; images carry it as visible facets.  Contract limits
-        # below fail with NEEDS_INPUT instead of silently sampling one cell.
+        # repeat as series; images carry it as visible facets.  Rendering all
+        # authoritative cells is preferable to silently sampling one cell.
         preferences = replace(
             preferences,
             repeat_mode=(

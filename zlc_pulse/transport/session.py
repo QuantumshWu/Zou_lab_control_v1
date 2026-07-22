@@ -568,7 +568,7 @@ class DeployedStreamerSession:
         """Abort immediately, invalidate the capability, and join the only I/O worker."""
 
         deadline = time.monotonic() + self.action_timeout
-        if not self._safe_lock.acquire(timeout=self._remaining_budget(deadline)):
+        if not self._safe_lock.acquire(timeout=self._remaining_seconds(deadline)):
             raise TimeoutError("pulse SAFE timed out waiting for the safety owner")
         try:
             self._require_started()
@@ -593,7 +593,7 @@ class DeployedStreamerSession:
             except BaseException as error:
                 failure = error
             try:
-                self._stop_worker(timeout=self._remaining_budget(deadline))
+                self._stop_worker(timeout=self._remaining_seconds(deadline))
             except BaseException as error:
                 if failure is None:
                     failure = error
@@ -679,7 +679,7 @@ class DeployedStreamerSession:
             return True
         return self._wait_status(
             wait_mask=wait_mask,
-            timeout=self._remaining_budget(deadline),
+            timeout=self._remaining_seconds(deadline),
             stop=stop,
         )
 
@@ -730,7 +730,7 @@ class DeployedStreamerSession:
         )
         retry_at = time.monotonic() + min(
             0.05,
-            max(0.001, self._remaining_budget(absolute_deadline) / 2),
+            max(0.001, self._remaining_seconds(absolute_deadline) / 2),
         )
         retried = False
         stable_zero = 0
@@ -983,10 +983,10 @@ class DeployedStreamerSession:
                 raise RuntimeError("pulse session has not acquired its device lease")
 
     @staticmethod
-    def _remaining_budget(deadline: float) -> float:
+    def _remaining_seconds(deadline: float) -> float:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("pulse safe-state wall-clock budget expired")
+            raise TimeoutError("pulse safe-state deadline expired")
         return remaining
 
 

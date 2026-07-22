@@ -241,32 +241,9 @@ class CameraSample:
 
 @dataclass(frozen=True)
 class CameraFrameMetadataContract:
-    correlation_id_max_bytes: int = 160
-
-    def __post_init__(self) -> None:
-        limit = _integer(
-            self.correlation_id_max_bytes,
-            "correlation_id_max_bytes",
-            nonnegative=True,
-        )
-        assert limit is not None
-        if limit == 0:
-            raise ValueError("correlation_id_max_bytes must be positive")
-        object.__setattr__(self, "correlation_id_max_bytes", limit)
-
     @property
     def fingerprint(self) -> str:
-        return canonical_digest(
-            {
-                "contract": "zlc.camera-frame-metadata",
-                "correlation_id_max_bytes": self.correlation_id_max_bytes,
-            }
-        )
-
-    @property
-    def max_retained_nbytes(self) -> int:
-        # Conservative scalar/object accounting plus bounded UTF-8 correlation id.
-        return 256 + self.correlation_id_max_bytes
+        return canonical_digest({"contract": "zlc.camera-frame-metadata"})
 
     def snapshot(self, payload: CameraSample) -> CameraFrameMetadata:
         if not isinstance(payload, CameraSample):
@@ -277,16 +254,8 @@ class CameraFrameMetadataContract:
     def validate(self, metadata: object) -> None:
         if not isinstance(metadata, CameraFrameMetadata):
             raise TypeError("metadata must be CameraFrameMetadata")
-        encoded_id = metadata.correlation_id.encode("utf-8")
-        if len(encoded_id) > self.correlation_id_max_bytes:
-            raise ValueError("correlation_id exceeds the declared retained-byte bound")
         if not math.isfinite(metadata.captured_at):
             raise ValueError("captured_at must be finite")
-
-    def retained_nbytes(self, metadata: object) -> int:
-        self.validate(metadata)
-        assert isinstance(metadata, CameraFrameMetadata)
-        return 256 + len(metadata.correlation_id.encode("utf-8"))
 
     def digest(self, metadata: object) -> str:
         self.validate(metadata)
@@ -315,13 +284,6 @@ class CameraSampleContract:
             }
         )
 
-    @property
-    def max_retained_nbytes(self) -> int:
-        return (
-            ValuePayloadContract(self.value_schema).max_retained_nbytes
-            + self.metadata_contract.max_retained_nbytes
-        )
-
     def snapshot(self, payload: CameraSample) -> CameraSample:
         self.validate(payload)
         return payload
@@ -331,13 +293,6 @@ class CameraSampleContract:
             raise TypeError("payload must be CameraSample")
         ValuePayloadContract(self.value_schema).validate(payload.image)
         self.metadata_contract.validate(payload.metadata)
-
-    def retained_nbytes(self, payload: CameraSample) -> int:
-        self.validate(payload)
-        return (
-            ValuePayloadContract(self.value_schema).retained_nbytes(payload.image)
-            + self.metadata_contract.retained_nbytes(payload.metadata)
-        )
 
     def digest(self, payload: CameraSample) -> str:
         """Bind one physical frame's pixels and acquisition metadata together."""

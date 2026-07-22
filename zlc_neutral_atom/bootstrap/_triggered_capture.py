@@ -41,7 +41,6 @@ from zlc_neutral_atom.timing.pulse import (
 )
 from zlc_neutral_atom.timing.segmented import (
     ApiSlotPointDescriptor,
-    admit_api_slot_segmented_control_memory,
 )
 from zlc_pulse import (
     CompiledPulseArtifact,
@@ -49,7 +48,6 @@ from zlc_pulse import (
     PulseExecutionForm,
     bind_pulse_document_target,
     compile_pulse_artifact,
-    compiled_pulse_retained_upper_bound_bytes,
 )
 from zlc_storage import canonical_text, positive_integer as _positive_int
 
@@ -256,8 +254,6 @@ def bind_api_slot_segmented_camera_acquisition(
     trigger_channel: str | None,
     repeat_axis_id: AxisId,
     readout_event_axis_id: AxisId,
-    transport_memory_limit_bytes: int,
-    memory_limit_bytes: int,
 ) -> ApiSlotSegmentedCameraBinding:
     """Precompile P static rows and bind one R-major/P-fast camera arm."""
 
@@ -271,12 +267,6 @@ def bind_api_slot_segmented_camera_acquisition(
         raise TypeError("repeat_axis_id must be AxisId")
     if not isinstance(readout_event_axis_id, AxisId):
         raise TypeError("readout_event_axis_id must be AxisId")
-    transport_memory_limit_bytes = _positive_int(
-        transport_memory_limit_bytes,
-        "transport_memory_limit_bytes",
-    )
-    memory_limit_bytes = _positive_int(memory_limit_bytes, "memory_limit_bytes")
-
     bound_program = ApiSlotSegmentedProgram(
         bind_pulse_document_target(
             program.document,
@@ -287,12 +277,6 @@ def bind_api_slot_segmented_camera_acquisition(
     )
     point_count = bound_program.point_count
     repeat_count = bound_program.repeat_count
-    control_retained = admit_api_slot_segmented_control_memory(
-        point_count,
-        repeat_count,
-        memory_limit_bytes,
-    )
-
     camera_capability = camera_port.capability
     camera_evidence = camera_capability.camera_capability_evidence
     camera_facts = camera_evidence.physical_facts
@@ -309,10 +293,6 @@ def bind_api_slot_segmented_camera_acquisition(
         selected_trigger = canonical_text(trigger_channel, "trigger_channel")
     camera_facts.require_single_capture_trigger_channel(selected_trigger)
 
-    # Point axes/layout and resolved documents are intentionally derived only
-    # after the R*P control count is admitted.  The input table itself is
-    # already the caller's frozen P data; the camera contract remains the sole
-    # owner of its exact transport-memory formula below.
     point_table = bound_program.point_table
     if repeat_axis_id == readout_event_axis_id or repeat_axis_id in {
         axis.axis_id for axis in point_table.point_axes
@@ -326,7 +306,6 @@ def bind_api_slot_segmented_camera_acquisition(
         raise RuntimeError("resolved API point documents do not cover P")
 
     artifacts_list: list[CompiledPulseArtifact] = []
-    compiled_retained = control_retained
     for document in point_documents:
         artifact = compile_pulse_artifact(
             document,
@@ -335,12 +314,6 @@ def bind_api_slot_segmented_camera_acquisition(
             trigger_channels=(selected_trigger,),
             live_target=pulse_port.capability.target,
         )
-        compiled_retained += compiled_pulse_retained_upper_bound_bytes(artifact)
-        if compiled_retained > memory_limit_bytes:
-            raise MemoryError(
-                "API segmented compiled point artifacts require more than "
-                f"{memory_limit_bytes} bytes"
-            )
         artifacts_list.append(artifact)
     artifacts = tuple(artifacts_list)
     for artifact in artifacts:
@@ -395,7 +368,6 @@ def bind_api_slot_segmented_camera_acquisition(
             cell_schedule,
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             0,
-            transport_memory_limit_bytes,
             (camera_facts.event_setting(0),),
         ),
     )
@@ -448,7 +420,6 @@ def bind_triggered_camera_acquisition(
     execution_form: PulseExecutionForm,
     trigger_channel: str | None,
     layout: TriggeredCameraLayout,
-    transport_memory_limit_bytes: int,
 ) -> TriggeredCameraBinding:
     """Bind one exact finite pulse/camera acquisition without starting hardware."""
 
@@ -467,11 +438,6 @@ def bind_triggered_camera_acquisition(
         raise ValueError("triggered camera acquisition requires a finite pulse form")
     if not isinstance(layout, TriggeredCameraLayout):
         raise TypeError("layout must be TriggeredCameraLayout")
-    transport_memory_limit_bytes = _positive_int(
-        transport_memory_limit_bytes,
-        "transport_memory_limit_bytes",
-    )
-
     document = bind_pulse_document_target(
         pulse_document,
         pulse_port.capability.target,
@@ -601,7 +567,6 @@ def bind_triggered_camera_acquisition(
             cell_plan.cell_schedule,
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             0,
-            transport_memory_limit_bytes,
             tuple(
                 camera_facts.event_setting(index)
                 for index in range(events_per_repeat)

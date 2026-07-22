@@ -21,7 +21,6 @@ from .file_lock import (
 
 _MAGIC = b"ZLCJNL1\n"
 _HEADER = struct.Struct(">8sQ32s")
-_DEFAULT_MAX_RECORD_BYTES = 64 * 1024 * 1024
 
 
 class JournalCorruptionError(RuntimeError):
@@ -51,38 +50,28 @@ class FramedJournal:
     def __init__(
         self,
         path: str | os.PathLike[str],
-        *,
-        max_record_bytes: int = _DEFAULT_MAX_RECORD_BYTES,
     ) -> None:
-        self._initialize(path, max_record_bytes=max_record_bytes, scan=True)
+        self._initialize(path, scan=True)
 
     @classmethod
     def open_exclusive(
         cls,
         path: str | os.PathLike[str],
-        *,
-        max_record_bytes: int = _DEFAULT_MAX_RECORD_BYTES,
     ) -> "FramedJournalSession":
         """Create a lifetime-exclusive session with one startup scan."""
 
         journal = cls.__new__(cls)
-        journal._initialize(path, max_record_bytes=max_record_bytes, scan=False)
+        journal._initialize(path, scan=False)
         return FramedJournalSession(journal)
 
     def _initialize(
         self,
         path: str | os.PathLike[str],
         *,
-        max_record_bytes: int,
         scan: bool,
     ) -> None:
-        if isinstance(max_record_bytes, bool) or not isinstance(max_record_bytes, int):
-            raise TypeError("max_record_bytes must be an integer")
-        if max_record_bytes <= 0:
-            raise ValueError("max_record_bytes must be positive")
         self.path = Path(path).resolve()
         self.lock_path = self.path.with_name(self.path.name + ".lock")
-        self.max_record_bytes = max_record_bytes
         self._thread_lock = threading.Lock()
         durability.durable_mkdir(self.path.parent)
         open_durable_lock_file(self.lock_path).close()
@@ -113,8 +102,6 @@ class FramedJournal:
         if not callable(validate):
             raise TypeError("validate must be callable")
         payload = encode({"record_id": record_id, "value": value})
-        if len(payload) > self.max_record_bytes:
-            raise ValueError("journal record exceeds max_record_bytes")
         frame = _HEADER.pack(_MAGIC, len(payload), hashlib.sha256(payload).digest()) + payload
         with self._thread_lock, _interprocess_lock(self.lock_path):
             with self.path.open("r+b") as stream:
@@ -174,10 +161,6 @@ class FramedJournal:
             if magic != _MAGIC:
                 raise JournalCorruptionError(
                     f"invalid journal frame magic at byte {frame_start}"
-                )
-            if size > self.max_record_bytes:
-                raise JournalCorruptionError(
-                    f"journal frame at byte {frame_start} exceeds configured limit"
                 )
             payload = stream.read(size)
             if len(payload) < size:
@@ -254,8 +237,6 @@ class FramedJournalSession:
         self._ensure_open()
         record_id = _record_id(record_id)
         payload = encode({"record_id": record_id, "value": value})
-        if len(payload) > self._journal.max_record_bytes:
-            raise ValueError("journal record exceeds max_record_bytes")
         previous = self._records.get(record_id)
         if previous is not None:
             if previous[0] != payload:

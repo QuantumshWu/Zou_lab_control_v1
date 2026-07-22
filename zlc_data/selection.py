@@ -8,7 +8,7 @@ from typing import Any
 
 from zlc_storage.canonical import exact_mapping as _exact_map
 
-from ._diagnostic import bounded_integer_diagnostic
+from ._diagnostic import exact_integer_text
 from .axis import (
     AxisId,
     AxisSpec,
@@ -174,7 +174,7 @@ def resolve_selection_indices(
         if term.index >= axis.size:
             raise IndexError(
                 "selection index "
-                f"{bounded_integer_diagnostic(term.index)} is outside axis "
+                f"{exact_integer_text(term.index)} is outside axis "
                 f"{axis.axis_id}"
             )
         return range(term.index, term.index + 1), True
@@ -182,7 +182,7 @@ def resolve_selection_indices(
         if term.stop > axis.size:
             raise IndexError(
                 "selection range stop "
-                f"{bounded_integer_diagnostic(term.stop)} is outside axis "
+                f"{exact_integer_text(term.stop)} is outside axis "
                 f"{axis.axis_id}"
             )
         return range(term.start, term.stop), False

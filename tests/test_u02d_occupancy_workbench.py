@@ -66,7 +66,7 @@ def _fixture(point_count=3):
     navigation = OccupancyCellNavigation(
         reference.target_ref, "a" * 64, StreamGenerationId("occupancy-final"),
         repeat, (point,), PointLayout.rect_c((point_count,)),
-        AxisLayout.rect_c((1, point_count)), 1 << 20, 48 << 20,
+        AxisLayout.rect_c((1, point_count)),
     )
 
     def view(point_index):
@@ -119,13 +119,11 @@ def _open(application, *, gate=None):
         if gate is not None and len(calls) == 1:
             gate[0].set()
             gate[1].wait(5.0)
-        view = view_for(point)
-        return view, max(view.array_nbytes, 2 << 20)
+        return view_for(point)
 
     window = open_occupancy_cell_workbench(
         lambda *_args, **_options: navigation, cell_loader, reference,
         selection=navigation.selection_for_indices(0, (0,)),
-        memory_limit_bytes=64 << 20,
     )
     return window, navigation, calls
 
@@ -143,7 +141,7 @@ def test_public_exact_front_freezes_both_inputs_and_display_only_rectangle(
     application, monkeypatch,
 ):
     owner = threading.get_ident()
-    window, _navigation, calls = _open(application)
+    window, navigation, calls = _open(application)
     try:
         _until(application, lambda: window.raster_ready)
         assert isinstance(window, QtWidgets.QWidget)
@@ -159,7 +157,7 @@ def test_public_exact_front_freezes_both_inputs_and_display_only_rectangle(
         payload = frame.panels[0].display_payload
         assert isinstance(payload, SiteMapPanelPayload)
         assert calls[0][1] != owner
-        assert calls[0][2]["memory_limit_bytes"] == 48 << 20
+        assert calls[0][2]["expected_navigation"] == navigation
         assert frame.panels[0].source_identity.dataset_id == payload.occupancy_input.dataset_id
         assert frame.panels[0].coherence_stamp.inputs == tuple(sorted(
             (payload.background.evaluated_input, payload.occupancy_input),
@@ -200,40 +198,25 @@ def test_exact_cell_view_rejects_coerced_occupancy_and_validity_facts():
         replace(view, site_validity=np.asarray((1.0, 1.0, np.nan)))
 
 
-@pytest.mark.parametrize("fault", ("wrong-cell", "oversized-bound"))
-def test_cell_loader_fails_closed_on_selection_or_retained_bound_drift(
-    application,
-    fault,
-):
+def test_cell_loader_fails_closed_on_selection_drift(application):
     reference, navigation, view_for = _fixture()
 
     def cell_loader(_reference, selection, **options):
         requested = navigation.resolve_selection(selection)[2][0]
-        view = view_for(1 if fault == "wrong-cell" else requested)
-        retained = (
-            options["memory_limit_bytes"] + 1
-            if fault == "oversized-bound"
-            else max(view.array_nbytes, 2 << 20)
-        )
-        return view, retained
+        assert options["expected_navigation"] == navigation
+        return view_for(1 if requested == 0 else 0)
 
     window = open_occupancy_cell_workbench(
         lambda *_args, **_options: navigation,
         cell_loader,
         reference,
         selection=navigation.selection_for_indices(0, (0,)),
-        memory_limit_bytes=64 << 20,
     )
     try:
         _until(application, lambda: "FAILED" in window._status.text())
         assert not window.raster_ready
         assert not window._board.has_front
-        expected = (
-            "different exact selection"
-            if fault == "wrong-cell"
-            else "exceeds the interactive cell peak bound"
-        )
-        assert expected in window._diagnostic.text()
+        assert "different exact selection" in window._diagnostic.text()
     finally:
         _close(application, window)
 

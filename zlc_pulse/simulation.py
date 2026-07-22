@@ -13,9 +13,6 @@ from .physical import (
 )
 
 
-MAX_MATERIALIZED_PLAYBACK_PULSES = 1_000_000
-
-
 @dataclass(frozen=True)
 class PlaybackPulse:
     channel: str
@@ -299,11 +296,6 @@ def build_pulse_playback(
     terminal_tick = physical_digital_playback_terminal_tick(ir)
     pulses: list[PlaybackPulse] = []
     for interval in iter_physical_digital_high_intervals(ir):
-        if len(pulses) >= MAX_MATERIALIZED_PLAYBACK_PULSES:
-            raise ValueError(
-                "pulse playback exceeds the materialization limit of "
-                f"{MAX_MATERIALIZED_PLAYBACK_PULSES} high intervals"
-            )
         pulses.append(
             PlaybackPulse(
                 interval.lane,
@@ -356,7 +348,6 @@ def build_pulse_playback(
 
 
 __all__ = [
-    "MAX_MATERIALIZED_PLAYBACK_PULSES",
     "PlaybackPulse",
     "PlaybackTriggerGroup",
     "PulsePlayback",

@@ -708,10 +708,10 @@ class PanelCard(FluentGroupBox):
                 ),
             )
         except PanelRenderError as error:
-            self.set_status(str(error)[:160], error=True)
+            self.set_status(str(error), error=True)
             return False
         except Exception as error:                 # one bad panel never kills the batch
-            self.set_status(f"{type(error).__name__}: {error}"[:160], error=True)
+            self.set_status(f"{type(error).__name__}: {error}", error=True)
             return False
         self._pending_frame = frame
         self._last_value = value
@@ -1164,7 +1164,7 @@ class PanelCard(FluentGroupBox):
             self._view_pin = old_pin
             self._display_revision = old_revision
             host.discard_pending_interaction(commit.origin)
-            self.set_status(f"{type(error).__name__}: {error}"[:160], error=True)
+            self.set_status(f"{type(error).__name__}: {error}", error=True)
 
     def _on_color_limits_committed(self, commit) -> None:
         """CAS one clim-rail commit into the shared fixed-limits fact."""
@@ -1214,7 +1214,7 @@ class PanelCard(FluentGroupBox):
         except Exception as error:
             restore()
             host.discard_pending_interaction(commit.origin)
-            self.set_status(f"{type(error).__name__}: {error}"[:160], error=True)
+            self.set_status(f"{type(error).__name__}: {error}", error=True)
             return
         self.changed.emit()
 
@@ -1383,7 +1383,7 @@ class PanelCard(FluentGroupBox):
             return
         self._status_text = str(text)
         if hasattr(self, "status"):
-            self.status.setText(str(text)[:200])
+            self.status.setText(str(text))
         self.setting_button.setToolTip(f"Panel settings — {text}" if text else "Panel settings")
         if error is not getattr(self, "_status_error", None):
             self._status_error = bool(error)

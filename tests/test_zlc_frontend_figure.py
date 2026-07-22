@@ -8,7 +8,6 @@ import importlib
 from itertools import permutations, product
 from pathlib import Path
 import time
-import tracemalloc
 
 import numpy as np
 import pytest
@@ -56,8 +55,6 @@ from zlc_frontend.figure import (
     FigureDocument,
     FigureEvaluationCancelled,
     FigureEvaluationDeadlineExceeded,
-    FigureEvaluationLimitExceeded,
-    FigureEvaluationPolicy,
     FigureEvaluator,
     FigureLayer,
     FigureSelection,
@@ -1077,7 +1074,7 @@ def test_display_sum_overflow_is_fail_closed():
         evaluated_data(block, view)
 
 
-def test_evaluation_policy_cancels_and_rejects_before_materialization(monkeypatch):
+def test_evaluation_cancels_and_honours_deadline():
     repeat = axis("repeat", REPEAT, 1)
     point = axis("point", SCAN_POINT, 3)
     block = make_block(
@@ -1094,43 +1091,6 @@ def test_evaluation_policy_cancels_and_rejects_before_materialization(monkeypatc
         FigureEvaluator().evaluate(
             doc, datasets, monotonic_deadline=time.monotonic() - 1.0
         )
-
-    evaluator_module = importlib.import_module("zlc_frontend.figure.evaluate")
-
-    def forbidden_extract(*args, **kwargs):
-        raise AssertionError("policy must reject before materialization")
-
-    monkeypatch.setattr(evaluator_module, "_extract", forbidden_extract)
-    policy = FigureEvaluationPolicy(max_output_elements=2)
-    with pytest.raises(FigureEvaluationLimitExceeded, match="output_elements"):
-        FigureEvaluator(policy).evaluate(doc, datasets)
-
-    large_repeat = axis("large-repeat", REPEAT, 1000)
-    large_point = axis("large-point", SCAN_POINT, 1000)
-    large_block = make_block(
-        np.zeros((1000, 1000), dtype=np.float64),
-        repeat_axis=large_repeat,
-        point_axes=(large_point,),
-        point_layout=PointLayout.rect_c((1000,)),
-    )
-    large_view = suggest_view(large_block.schema, ViewIntent.CURVE).spec
-    large_doc, large_datasets = document(large_block, large_view)
-    with pytest.raises(FigureEvaluationLimitExceeded, match="physical_rows"):
-        FigureEvaluator().evaluate(large_doc, large_datasets)
-    live_memory_policy = FigureEvaluationPolicy(
-        max_physical_rows=2_000_000,
-        max_reduction_contributions=2_000_000,
-        max_live_nbytes=6_000_000,
-    )
-    with pytest.raises(FigureEvaluationLimitExceeded, match="live_nbytes"):
-        FigureEvaluator(live_memory_policy).evaluate(large_doc, large_datasets)
-    contribution_policy = FigureEvaluationPolicy(
-        max_physical_rows=2_000_000,
-        max_reduction_contributions=500_000,
-        max_live_nbytes=512 * 1024 * 1024,
-    )
-    with pytest.raises(FigureEvaluationLimitExceeded, match="reduction_contributions"):
-        FigureEvaluator(contribution_policy).evaluate(large_doc, large_datasets)
 
 
 def test_real_36_by_32_grid_has_bounded_end_to_end_latency():
@@ -1170,7 +1130,7 @@ def test_real_36_by_32_grid_has_bounded_end_to_end_latency():
     assert elapsed < 1.25
 
 
-def test_public_evaluator_preserves_one_full_qcmos_frame_with_bounded_peak():
+def test_public_evaluator_preserves_one_full_qcmos_frame():
     repeat = AxisSpec(AxisId("camera-repeat"), "camera repeat", REPEAT, 1)
     point = AxisSpec(AxisId("camera-point"), "camera point", SCAN_POINT, 1)
     y = AxisSpec(AxisId("camera-y"), "camera y", SPATIAL_Y, 2304)
@@ -1188,21 +1148,9 @@ def test_public_evaluator_preserves_one_full_qcmos_frame_with_bounded_peak():
     view = suggest_view(block.schema, ViewIntent.IMAGE).spec
     doc, datasets = document(block, view)
 
-    tracemalloc.start()
-    with pytest.raises(FigureEvaluationLimitExceeded, match="live_nbytes"):
-        FigureEvaluator(
-            FigureEvaluationPolicy(max_live_nbytes=16 * 1024 * 1024)
-        ).evaluate(doc, datasets)
-    _, rejected_peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    assert rejected_peak < 2 * 1024 * 1024
-
-    tracemalloc.start()
     started = time.perf_counter()
     evaluated = FigureEvaluator().evaluate(doc, datasets)
     elapsed = time.perf_counter() - started
-    _, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
 
     series = only_series(evaluated)
     image = series.data
@@ -1221,8 +1169,6 @@ def test_public_evaluator_preserves_one_full_qcmos_frame_with_bounded_peak():
         image.values.setflags(write=True)
     with pytest.raises(ValueError):
         image.validity.setflags(write=True)
-    retained = image.values.nbytes + image.validity.nbytes
-    assert peak < 2.75 * retained
     assert elapsed < 1.0
     assert block.values.shape == (1, 1, 2304, 2304)
     assert block.values.dtype == np.dtype("<u2")
@@ -1282,20 +1228,14 @@ def test_sparse_coordinate_image_selects_narrowest_axis_before_large_gather():
     )
     view = suggest_view(block.schema, ViewIntent.IMAGE, selection).spec
     doc, datasets = document(block, view)
-    tracemalloc.start()
     image = only_series(
-        FigureEvaluator(
-            FigureEvaluationPolicy(max_live_nbytes=512 * 1024)
-        ).evaluate(doc, datasets)
+        FigureEvaluator().evaluate(doc, datasets)
     ).data
-    _, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
     np.testing.assert_array_equal(
         image.values,
         block.values[0, 0, ::2][:, (0, -1)],
     )
     assert image.values.shape == (512, 2)
-    assert peak < 512 * 1024
 
 
 def test_single_repeat_image_keeps_component_axes_and_invalid_components():
@@ -1360,7 +1300,7 @@ def test_multi_repeat_integer_mean_remains_canonical_and_fractional():
     assert series.reductions[0].maximum_contributors == 2
 
 
-def test_explicit_current_point_admission_counts_visible_frame_not_rolling_history():
+def test_explicit_current_point_evaluates_visible_frame_not_rolling_history():
     repeat = axis("rolling-repeat", REPEAT, 1)
     point = axis("rolling-point", SCAN_POINT, 8)
     y = axis("rolling-y", SPATIAL_Y, 64)
@@ -1381,9 +1321,7 @@ def test_explicit_current_point_admission_counts_visible_frame_not_rolling_histo
         Selection.index(point.axis_id, 7),
     ).spec
     doc, datasets = document(block, view)
-    evaluated = FigureEvaluator(
-        FigureEvaluationPolicy(max_reduction_contributions=4_100)
-    ).evaluate(doc, datasets)
+    evaluated = FigureEvaluator().evaluate(doc, datasets)
     layer = evaluated.layers[0]
     assert layer.resolutions[0].axis_id == point.axis_id
     assert layer.resolutions[0].selector == "FIXED_INDEX"
@@ -1438,29 +1376,6 @@ def test_evaluated_validity_is_exact_bool_and_complex_views_fail_closed():
     )
     with pytest.raises(ValueError, match="complex-value projection"):
         validate_view_spec(complex_block.schema, manual_complex_view)
-
-
-def test_500k_histogram_default_budget_rejects_before_materialization(monkeypatch):
-    repeat = AxisSpec(AxisId("hist-repeat"), "hist repeat", REPEAT, 500_000)
-    point = AxisSpec(AxisId("hist-point"), "hist point", SCAN_POINT, 1)
-    block = make_block(
-        np.zeros((500_000, 1), dtype=np.float64),
-        repeat_axis=repeat,
-        point_axes=(point,),
-        point_layout=PointLayout.rect_c((1,)),
-    )
-    view = suggest_view(block.schema, ViewIntent.HISTOGRAM).spec
-    doc, datasets = document(block, view)
-    evaluator_module = importlib.import_module("zlc_frontend.figure.evaluate")
-
-    def forbidden_extract(*args, **kwargs):
-        raise AssertionError("histogram budget must reject before materialization")
-
-    monkeypatch.setattr(evaluator_module, "_extract", forbidden_extract)
-    started = time.perf_counter()
-    with pytest.raises(FigureEvaluationLimitExceeded, match="histogram_samples"):
-        FigureEvaluator().evaluate(doc, datasets)
-    assert time.perf_counter() - started < 0.2
 
 
 def test_ragged_explicit_reduction_never_pads_to_groups_times_max(monkeypatch):
@@ -1550,9 +1465,7 @@ def test_grouping_checks_deadline_every_4096_rows(monkeypatch):
         return 0.0 if calls < 3 else 2.0
 
     monkeypatch.setattr(evaluator_module.time, "monotonic", fake_monotonic)
-    guard = evaluator_module._EvaluationGuard(
-        FigureEvaluationPolicy(), None, 1.0
-    )
+    guard = evaluator_module._EvaluationGuard(None, 1.0)
     with pytest.raises(FigureEvaluationDeadlineExceeded):
         evaluator_module._reduce(working, (reduction,), guard)
     assert calls == 3

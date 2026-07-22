@@ -64,7 +64,6 @@ def _case_capture_and_fit(root: Path) -> None:
         assert descriptor.expected_frames == 3
         assert descriptor.output_shape == (1, 3, 96, 128)
         assert descriptor.resource_claims == ("device/sequencer", "device/camera")
-        assert descriptor.estimated_peak_bytes < request.pipeline_memory_limit_bytes
 
         reference = exp.run(request)
         assert isinstance(reference, CaptureArtifactRef)
@@ -92,8 +91,6 @@ def _case_capture_and_fit(root: Path) -> None:
             model="radial_gaussian_center",
             numeric_policy=FitNumericPolicy(
                 max_evaluations=500,
-                sample_budget_per_batch=512,
-                max_packed_observations=4_096,
             ),
         )
         assert tuple(axis.role for axis in execution.result.fit_axis_specs) == (
@@ -105,8 +102,6 @@ def _case_capture_and_fit(root: Path) -> None:
         )
         assert len(execution.result.batch_axis_specs) == 2
 
-        # Notebook-first short path uses the repository's bounded installation
-        # default; interactive hosts still pass their exact residual budget.
         fit_ref = execution.save()
         assert isinstance(fit_ref, FitResultArtifactRef)
         admitted = exp.load_fit(fit_ref)
@@ -137,24 +132,16 @@ def _case_scan_and_fit(root: Path) -> None:
             exp.readout.scan_request(document, timeout_seconds=15.0)
         )
         source = exp.readout.materialize_scan(scan_ref)
-        with pytest.raises(MemoryError):
-            exp.fit(
-                scan_ref,
-                model="radial_gaussian_center",
-                memory_limit_bytes=1,
-            )
         execution = exp.fit(
             scan_ref,
             model="radial_gaussian_center",
             numeric_policy=FitNumericPolicy(
                 max_evaluations=500,
-                sample_budget_per_batch=512,
-                max_packed_observations=4_096,
             ),
         )
         assert execution.source_artifact_ref == scan_ref
         assert execution.result.source_ref == source.snapshot.ref
-        fit_ref = execution.save(operation_memory_limit_bytes=512 << 20)
+        fit_ref = execution.save()
         admitted = exp.load_fit(fit_ref)
         assert admitted.source_artifact_ref == scan_ref
         assert encode_fit_result_batch(admitted.result) == encode_fit_result_batch(

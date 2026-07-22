@@ -387,5 +387,5 @@ class MeasurementPanel(QtWidgets.QWidget):
             widget.setEnabled(not running)
 
     def set_status(self, text: str, *, error: bool) -> None:
-        self.status.setText(str(text)[:200])
+        self.status.setText(str(text))
         self.status.setStyleSheet(f"color: {RED if error else GREY}; background: transparent; border: none;")

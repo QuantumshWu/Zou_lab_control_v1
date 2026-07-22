@@ -12,8 +12,8 @@ from typing import Mapping
 import numpy as np
 
 from ._diagnostic import (
-    bounded_index_tuple_diagnostic,
-    bounded_integer_diagnostic,
+    exact_index_tuple_text,
+    exact_integer_text,
 )
 
 
@@ -262,7 +262,7 @@ class AxisLayout:
             except KeyError as exc:
                 raise KeyError(
                     "logical point "
-                    f"{bounded_index_tuple_diagnostic(multi)} is not present in "
+                    f"{exact_index_tuple_text(multi)} is not present in "
                     "sparse layout"
                 ) from exc
         if self.mode is AxisLayoutMode.PRODUCT:
@@ -363,8 +363,8 @@ class AxisLayout:
         if isinstance(index, bool) or not isinstance(index, Integral) or not 0 <= index < self.storage_size:
             raise IndexError(
                 "storage index "
-                f"{bounded_integer_diagnostic(index)} is outside [0, "
-                f"{bounded_integer_diagnostic(self.storage_size)})"
+                f"{exact_integer_text(index)} is outside [0, "
+                f"{exact_integer_text(self.storage_size)})"
             )
 
     def _validate_multi_index(self, multi: tuple[int, ...]) -> None:
@@ -376,8 +376,8 @@ class AxisLayout:
             if isinstance(index, bool) or not isinstance(index, Integral) or not 0 <= index < size:
                 raise ValueError(
                     "multi-index "
-                    f"{bounded_index_tuple_diagnostic(multi)} is outside logical "
-                    f"shape {bounded_index_tuple_diagnostic(self.logical_shape)}"
+                    f"{exact_index_tuple_text(multi)} is outside logical "
+                    f"shape {exact_index_tuple_text(self.logical_shape)}"
                 )
 
 

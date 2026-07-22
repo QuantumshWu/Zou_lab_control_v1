@@ -30,12 +30,9 @@ from .evaluate import (
     FigureEvaluationCancelled,
     FigureEvaluationDeadlineExceeded,
     FigureEvaluationError,
-    FigureEvaluationLimitExceeded,
-    FigureEvaluationPolicy,
     FigureEvaluator,
     ResolvedDataset,
     ResolvedDatasetMap,
-    estimate_view_evaluation_peak_nbytes,
 )
 from .model import (
     DATASET_VIEW_INTENTS,
@@ -88,7 +85,7 @@ __all__ = [
     "EvaluatedFigureData", "EvaluatedHistogram", "EvaluatedImage", "EvaluatedInput",
     "EvaluatedLayer", "EvaluatedMeter", "EvaluatedSeries", "FigureDocument",
     "FigureEvaluationCancelled", "FigureEvaluationDeadlineExceeded",
-    "FigureEvaluationError", "FigureEvaluationLimitExceeded", "FigureEvaluationPolicy",
+    "FigureEvaluationError",
     "FigureEvaluator", "FigureLayer", "FigureSelection",
     "FixedIndex", "HISTOGRAM_CONTRACT", "IMAGE_CONTRACT", "LatestNonempty",
     "METER_CONTRACT", "PULSE_CONTRACT", "ReductionResolution", "RepeatViewMode", "ResolvedDataset",
@@ -97,6 +94,5 @@ __all__ = [
     "ViewSuggestion", "contract_for", "dataset_contract_for", "dataset_axes", "display_axis_indices", "fit_single_panel_presentation", "decode_figure_document",
     "decode_view_spec", "encode_figure_document", "encode_view_spec",
     "figure_document_from_tree", "figure_document_to_tree", "suggest_fit_view", "suggest_view",
-    "estimate_view_evaluation_peak_nbytes",
     "selection_fit_view_projection", "validate_view_spec", "view_spec_from_tree", "view_spec_to_tree",
 ]

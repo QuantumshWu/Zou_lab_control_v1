@@ -43,7 +43,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     """
 
     from Zou_lab_control.notebook.facade import _prepare_camera_monitor_for_workbench
-    from zlc_frontend.figure import DatasetId, FigureEvaluationPolicy
+    from zlc_frontend.figure import DatasetId
     from zlc_workbench.live import LiveDatasetSlot
 
     from .catalog_bridge import ConsoleCatalogView
@@ -92,7 +92,7 @@ def _bind_monitor_view(node, data_plane) -> None:
     to the data plane, which is what makes the node's frames reach the board.
     """
 
-    from zlc_frontend.figure import DatasetId, FigureEvaluationPolicy
+    from zlc_frontend.figure import DatasetId
     from zlc_workbench.live import LiveDatasetSlot
 
     dataset_id = DatasetId(f"console-{node.spec.key.stable_definition_id}-{id(node):x}")
@@ -105,21 +105,17 @@ def _bind_monitor_view(node, data_plane) -> None:
             slot = LiveDatasetSlot(
                 view_spec,
                 dataset_id=dataset_id,
-                evaluation_policy=FigureEvaluationPolicy(),
                 retain_on_terminal=False,
             )
             data_plane.attach(node, slot)
+
+            def source_changed() -> None:
+                data_plane.mark_changed(node)
+                request_owner_wake()
+
+            slot.set_change_listener(source_changed)
             return slot
 
-        return command.start_with_view(
-            downstream_peak_bytes=_MONITOR_DOWNSTREAM_PEAK_BYTES,
-            factory=factory,
-        )
+        return command.start_with_view(factory=factory)
 
     node.bind_starter(start)
-
-
-#: Headroom the console reserves for its own view of a monitor stream.  It bounds
-#: what the presentation side may hold, separately from the acquisition budget the
-#: request itself carries.
-_MONITOR_DOWNSTREAM_PEAK_BYTES = 1 << 20

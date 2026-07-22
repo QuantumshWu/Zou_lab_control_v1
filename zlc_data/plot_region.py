@@ -289,7 +289,7 @@ def region_to_payload(selection: "Selection", *, bins: int | None = None) -> np.
     """Encode a :class:`Selection` as the region signal's fixed-size uint8 JSON payload.
 
     Named ``*_payload`` rather than ``encode_``/``decode_`` on purpose: those
-    prefixes are reserved in ``zlc_data`` for CANONICAL byte admission, which
+    prefixes are reserved in ``zlc_data`` for canonical artifact serialization, which
     ``zlc_data.codec`` owns and which every persisted-artifact decoder must
     delegate to.  This pair never crosses a storage boundary - it moves a
     region across the in-process signal hub, written and read by the same

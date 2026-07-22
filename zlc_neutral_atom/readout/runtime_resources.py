@@ -1,21 +1,7 @@
 """Shared runtime claims for concrete neutral-atom readout workloads."""
 
-from zlc_neutral_atom.runtime.resources import (
-    ClaimMode,
-    ResourceClaim,
-    ResourceKey,
-)
 from zlc_neutral_atom.runtime._failure import record_secondary_failure
 from zlc_storage import RepositoryRootLease, RepositoryRootLeaseBorrow
-
-
-# Calibration and committed-capture occupancy both retain large immutable
-# arrays.  Per-run estimators cannot make their aggregate peak safe, so the two
-# real consumers share one flat claim instead of inventing an analysis queue.
-READOUT_ANALYSIS_CLAIM = ResourceClaim(
-    ResourceKey(("analysis", "neutral-atom-readout")),
-    ClaimMode.EXCLUSIVE,
-)
 
 
 def acquire_repository_borrows(
@@ -72,7 +58,6 @@ def release_repository_borrows(
 
 
 __all__ = [
-    "READOUT_ANALYSIS_CLAIM",
     "acquire_repository_borrows",
     "release_repository_borrows",
 ]

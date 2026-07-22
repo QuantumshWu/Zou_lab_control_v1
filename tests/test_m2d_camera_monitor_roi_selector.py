@@ -43,7 +43,6 @@ from zlc_neutral_atom.acquisition.camera import (
 from zlc_neutral_atom.processing.roi_monitor import (
     RoiScalarBinding,
     RoiScalarMetadata,
-    RoiScalarMetadataContract,
     RoiScalarStreamProjection,
     reduce_camera_roi,
 )
@@ -54,7 +53,6 @@ from zlc_neutral_atom.monitor_application import (
 from zlc_neutral_atom.runtime.control import ControlAckStatus, create_control_topic
 import zlc_neutral_atom.runtime.dataset as dataset_runtime
 from zlc_neutral_atom.runtime.run import RunState
-from zlc_storage import canonical_digest
 import zlc_workbench.live as live_module
 from zlc_workbench.live import LiveBoardController, LiveDatasetSlot
 
@@ -289,17 +287,6 @@ def test_max_is_typed_validity_aware_and_all_roi_reducers_reject_valid_nonfinite
         ReductionMethod.SUM,
         ValidityPolicy.OMIT_INVALID,
     ).fingerprint
-    metadata_contract = RoiScalarMetadataContract(CameraFrameMetadataContract())
-    old_layout_fingerprint = canonical_digest(
-        {
-            "contract": "zlc_neutral_atom.RoiScalarMetadata",
-            "source_metadata": metadata_contract.source_metadata_contract.fingerprint,
-            "source_reference_max_bytes": metadata_contract.source_reference_max_bytes,
-        }
-    )
-    assert metadata_contract.fingerprint != old_layout_fingerprint
-
-
 def test_sticky_presentation_freeze_ends_a_candidate_waiting_for_gui_admission():
     controller = object.__new__(LiveBoardController)
     controller._owner_thread = threading.get_ident()
@@ -485,7 +472,6 @@ def test_roi_control_never_calls_source_cancel_and_manual_stop_remains_source_ow
         roi=initial_roi,
         roi_reduction=ReductionMethod.MEAN,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
     window = experiment.readout.camera_monitor_gui(request)
     try:
@@ -602,7 +588,6 @@ def test_rectangle_release_hot_applies_same_schema_and_rejection_keeps_old_branc
         roi=initial_roi,
         roi_reduction=ReductionMethod.MEAN,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
     window = experiment.readout.camera_monitor_gui(request)
     try:
@@ -1110,7 +1095,6 @@ def test_applied_receipt_drain_keeps_concurrent_branch_failure_reason(
     request = experiment.readout.camera_monitor_request(
         history_capacity=3,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
     window = experiment.readout.camera_monitor_gui(request)
     try:
@@ -1201,7 +1185,6 @@ def test_stop_after_same_schema_commit_keeps_the_revision_applied(
         history_capacity=3,
         roi=initial_roi,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
     window = experiment.readout.camera_monitor_gui(request)
     commit_returned = threading.Event()
@@ -1304,7 +1287,6 @@ def test_spontaneous_roi_branch_failure_falls_back_to_raw_without_source_gap(
         history_capacity=3,
         roi=initial_roi,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
     window = experiment.readout.camera_monitor_gui(request)
     try:
@@ -1437,7 +1419,6 @@ def test_broken_view_notification_faults_only_presentation_while_raw_ingest_cont
 ):
     request = experiment.readout.camera_monitor_request(
         history_capacity=4,
-        memory_limit_bytes=1 << 30,
     )
     window = experiment.readout.camera_monitor_gui(request)
     try:

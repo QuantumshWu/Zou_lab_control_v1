@@ -6,10 +6,7 @@ from dataclasses import dataclass
 
 from zlc_storage import canonical_text
 
-from .image_raster import (
-    estimate_encoded_png_front_peak_nbytes,
-    png_raster_size,
-)
+from .image_raster import png_raster_size
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,13 +36,5 @@ class EncodedRasterDocument:
         if len({page.key for page in pages}) != len(pages):
             raise ValueError("raster page keys must be unique")
         object.__setattr__(self, "pages", pages)
-
-    @property
-    def source_front_peak_nbytes(self) -> int:
-        return sum(
-            estimate_encoded_png_front_peak_nbytes(page.png_bytes)
-            for page in self.pages
-        )
-
 
 __all__ = ["EncodedRasterDocument", "EncodedRasterPage"]

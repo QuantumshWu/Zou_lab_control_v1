@@ -501,51 +501,6 @@ class CalibrationCaptureLayout:
             tuple(selected_rows),
         )
 
-    def _memory_upper_bounds(
-        self,
-        schema: DatasetSchema,
-    ) -> tuple[int, int, int]:
-        """Return group-count, join-build, and retained-join upper bounds."""
-
-        event_position, _event_axis = self._axis_position(schema)
-        context_rank = len(schema.point_axes) - 1
-        selected_events = self.reference_event_indices + (self.readout_event_index,)
-        event_count = len(selected_events)
-        logical_contexts = math.prod(
-            axis.size
-            for position, axis in enumerate(schema.point_axes)
-            if position != event_position
-        )
-        layout = schema.point_layout
-        if layout.storage_size == math.prod(layout.logical_shape):
-            event_row_counts = [logical_contexts] * event_count
-        else:
-            event_slots = {
-                event_index: slot for slot, event_index in enumerate(selected_events)
-            }
-            event_row_counts = [0] * event_count
-            for storage_row in range(layout.storage_size):
-                slot = event_slots.get(layout.multi_index(storage_row)[event_position])
-                if slot is not None:
-                    event_row_counts[slot] += 1
-        complete_contexts = max(event_row_counts)
-        build_contexts = min(logical_contexts, sum(event_row_counts))
-        # Conservative CPython object-graph allowances.  The build bound also
-        # covers an invalid sparse source in which every selected row opens a
-        # different incomplete context before the join rejects it.
-        retained = complete_contexts * (
-            512 + 64 * (context_rank + event_count)
-        )
-        build_peak = (
-            build_contexts * (1024 + 128 * (context_rank + event_count))
-            + retained
-        )
-        return (
-            schema.repeat_axis.size * complete_contexts,
-            build_peak,
-            retained,
-        )
-
 @dataclass(frozen=True)
 class FrameContract:
     """Single-frame facts determining calibration-model applicability."""

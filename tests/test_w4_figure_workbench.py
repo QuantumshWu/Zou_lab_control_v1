@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 from contextlib import contextmanager
 from dataclasses import replace
 import os
@@ -201,7 +200,6 @@ def _faceted_curve_figure() -> DataFigure:
     return DataFigure(
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
-        render_memory_limit_bytes=64 << 20,
     )
 
 
@@ -240,14 +238,12 @@ def test_public_figure_gui_resolves_and_renders_off_the_qt_owner(
     monkeypatch.setattr(type(experiment), "figure", gated_resolution)
     monkeypatch.setattr(figure_workbench, "_render_typed_front", gated_render)
     preferences = ViewPreferences()
-    render_limit = 96 << 20
     window = None
     try:
         window = experiment.figure_gui(
             capture_ref,
             intent=ViewIntent.IMAGE,
             preferences=preferences,
-            memory_limit_bytes=render_limit,
         )
         assert resolution_started.wait(2.0)
         assert not release_resolution.is_set()
@@ -259,7 +255,6 @@ def test_public_figure_gui_resolves_and_renders_off_the_qt_owner(
             "intent": ViewIntent.IMAGE,
             "selection": None,
             "preferences": preferences,
-            "memory_limit_bytes": render_limit,
         }
         release_resolution.set()
         assert render_started.wait(2.0)
@@ -315,78 +310,6 @@ def test_shared_viewer_presents_one_coherent_multi_panel_front(
         assert isinstance(calls[0][0], bytes)
         assert calls[0][0].startswith(b"\x89PNG\r\n\x1a\n")
         assert calls[0][1] == "PNG"
-        _close(application, window)
-    finally:
-        if window.isVisible():
-            _close(application, window)
-
-
-def test_memory_rejection_never_reaches_qt_decode(application, monkeypatch):
-    figure = _faceted_curve_figure()
-    payload = figure.to_png_bytes(memory_limit_bytes=64 << 20)
-    assert payload[:8] == b"\x89PNG\r\n\x1a\n"
-    assert payload[12:16] == b"IHDR"
-    width = int.from_bytes(payload[16:20], "big")
-    height = int.from_bytes(payload[20:24], "big")
-    decode_peak = len(payload) + 2 * width * height * 4
-    assert width > 0 and height > 0 and decode_peak > 1
-    calls = []
-
-    def forbidden_decode(self, payload, *, image_format="PNG"):
-        calls.append((self, payload, image_format))
-
-    monkeypatch.setattr(FrozenRasterView, "present_encoded", forbidden_decode)
-    monkeypatch.setattr(DataFigure, "to_png_bytes", lambda self, **kwargs: payload)
-    window = open_data_figure_workbench(
-        figure,
-        memory_limit_bytes=decode_peak - 1,
-    )
-    try:
-        _until(application, lambda: window.worker_idle)
-        status = window.findChild(QtWidgets.QLabel, "figureViewerStatus")
-        diagnostic = window.findChild(QtWidgets.QLabel, "figureViewerDiagnostic")
-        assert status.text() == "FIGURE FAILED"
-        assert "MemoryError" in diagnostic.text()
-        assert calls == []
-        assert not window.raster_ready
-        _close(application, window)
-    finally:
-        if window.isVisible():
-            _close(application, window)
-
-
-def test_physical_board_budget_is_checked_before_qt_decode(
-    application,
-    monkeypatch,
-):
-    one_pixel_png = base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
-        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
-    )
-    assert one_pixel_png[:8] == b"\x89PNG\r\n\x1a\n"
-    calls = []
-    monkeypatch.setattr(
-        DataFigure,
-        "to_png_bytes",
-        lambda self, **kwargs: one_pixel_png,
-    )
-    monkeypatch.setattr(
-        FrozenRasterView,
-        "present_encoded",
-        lambda self, payload, *, image_format="PNG": calls.append(payload),
-    )
-    window = open_data_figure_workbench(
-        _faceted_curve_figure(),
-        memory_limit_bytes=1024,
-    )
-    try:
-        _until(application, lambda: window.worker_idle)
-        status = window.findChild(QtWidgets.QLabel, "figureViewerStatus")
-        diagnostic = window.findChild(QtWidgets.QLabel, "figureViewerDiagnostic")
-        assert status.text() == "DISPLAY FAILED"
-        assert "Qt figure presentation requires" in diagnostic.text()
-        assert calls == []
-        assert not window.raster_ready
         _close(application, window)
     finally:
         if window.isVisible():
@@ -546,35 +469,6 @@ def test_calibration_histogram_rejects_finite_invalid_filler(
     assert sentinel not in captured
 
 
-def test_calibration_render_uses_one_source_plus_render_budget_before_agg(
-    calibration_product,
-    monkeypatch,
-):
-    import zlc_frontend.calibration_render as calibration_render
-    from Zou_lab_control.workbench._calibration import _project_calibration
-
-    view = _project_calibration(calibration_product[2])
-    allocations = []
-    monkeypatch.setattr(
-        calibration_render,
-        "_new_figure",
-        lambda *_args, **_kwargs: allocations.append(True),
-    )
-    source_retained = 3 << 20
-    render_without_source = (
-        calibration_render._RENDER_FIXED_BYTES
-        + calibration_render._RASTER_PEAK_MULTIPLIER * 1800 * 1100 * 4
-        + calibration_render._ARRAY_PEAK_MULTIPLIER * view.array_nbytes
-    )
-    with pytest.raises(MemoryError, match="composition requires"):
-        calibration_render.render_calibration_report(
-            view,
-            memory_limit_bytes=render_without_source + source_retained - 1,
-            source_retained_upper_bound_bytes=source_retained,
-        )
-    assert allocations == []
-
-
 def test_calibration_figure_release_remains_inside_matplotlib_lane(
     calibration_product,
     monkeypatch,
@@ -599,12 +493,8 @@ def test_calibration_figure_release_remains_inside_matplotlib_lane(
     monkeypatch.setattr(calibration_render, "render_style_context", traced_lane)
     monkeypatch.setattr(calibration_render, "release_agg_figure", traced_release)
     calibration_render._render_page(
-        _project_calibration(calibration_product[2]),
         width=80,
         height=60,
-        retained_png_bytes=0,
-        source_retained_upper_bound_bytes=1,
-        memory_limit_bytes=64 << 20,
         builder=lambda _figure: None,
         checkpoint=lambda: None,
     )
@@ -719,9 +609,9 @@ def test_public_calibration_report_gui_loads_and_renders_off_qt_owner(
     present_calls = []
     original_present = FrozenRasterView.present_encoded
 
-    def traced_load(self, candidate, *, memory_limit_bytes):
-        loader_calls.append((threading.get_ident(), candidate, memory_limit_bytes))
-        return computation, 8 << 20
+    def traced_load(self, candidate):
+        loader_calls.append((threading.get_ident(), candidate))
+        return computation
 
     def traced_present(self, payload, *, image_format="PNG"):
         present_calls.append((threading.get_ident(), self.objectName(), payload))
@@ -739,7 +629,6 @@ def test_public_calibration_report_gui_loads_and_renders_off_qt_owner(
         assert len(loader_calls) == 1
         assert loader_calls[0][0] != owner_thread
         assert loader_calls[0][1] == reference
-        assert loader_calls[0][2] == 512 << 20
         assert window.findChild(
             QtWidgets.QLabel,
             "calibrationReportMode",
@@ -772,10 +661,7 @@ def test_public_calibration_report_gui_loads_and_renders_off_qt_owner(
             if board.objectName().startswith("calibrationReportBoard_")
         )
         _close(application, window)
-        assert experiment.readout.load_calibration_computation(
-            reference,
-            memory_limit_bytes=512 << 20,
-        ) is computation
+        assert experiment.readout.load_calibration_computation(reference) is computation
     finally:
         if window.isVisible():
             _close(application, window)
@@ -880,38 +766,6 @@ def test_occupancy_figure_preserves_selected_block_lineage_validity_and_axes(
     )
 
 
-def test_occupancy_preflight_rejects_known_peak_before_full_dependency_admit(
-    occupancy_product,
-    monkeypatch,
-):
-    import zlc_neutral_atom.readout.occupancy_repository as occupancy_repository
-    from zlc_neutral_atom.artifacts.capture import CaptureRepository
-    from zlc_neutral_atom.runtime.run import RunFailed
-
-    experiment, _reference, resolved = occupancy_product
-    artifact = resolved.artifact
-    request = experiment.readout.detection_request(
-        artifact.source_capture_ref,
-        artifact.calibration_reference,
-        model_kind=artifact.model_kind,
-    )
-    monkeypatch.setattr(
-        occupancy_repository,
-        "_estimate_committed_occupancy_peak_from_footprints",
-        lambda **_kwargs: request.memory_limit_bytes + 1,
-    )
-    admits = []
-
-    def forbidden_admit(*args, **kwargs):
-        admits.append((args, kwargs))
-        raise AssertionError("known-over-budget preflight must not admit dependencies")
-
-    monkeypatch.setattr(CaptureRepository, "admit", forbidden_admit)
-    with pytest.raises(RunFailed, match="occupancy analysis peak"):
-        experiment.readout.detect(request)
-    assert admits == []
-
-
 def test_boolean_histogram_keeps_false_and_true_as_two_categories(
     occupancy_product,
     monkeypatch,
@@ -984,7 +838,6 @@ def test_public_occupancy_figure_gui_forwards_selected_output_off_qt_owner(
         assert options["intent"] is ViewIntent.HISTOGRAM
         assert options["selection"] == selection
         assert options["preferences"] is None
-        assert options["memory_limit_bytes"] == 512 << 20
         assert "histogram" in window.findChild(
             QtWidgets.QLabel,
             "figureViewerSummary",
@@ -1027,8 +880,6 @@ def test_exact_occupancy_cell_selection_uses_named_axes_and_sparse_layout():
         schema.point_axes,
         schema.point_layout,
         schema.cell_layout,
-        1 << 20,
-        32 << 20,
     )
     repeat_index, point_storage_index, logical, label = navigation.resolve_selection(
         selection
@@ -1089,10 +940,9 @@ def test_exact_occupancy_cell_loader_reads_one_same_address_without_full_capture
     monkeypatch.setattr(CaptureFrameSource, "read", traced_read)
     monkeypatch.setattr(CaptureFrameSource, "materialize", forbidden_materialize)
     monkeypatch.setattr(AdmittedCapture, "materialize_snapshot", forbidden_materialize)
-    view, retained = experiment.readout._load_occupancy_cell_source(
+    view = experiment.readout._load_occupancy_cell_source(
         reference,
         None,
-        memory_limit_bytes=512 << 20,
     )
     assert len(calls) == 1
     address, sample = calls[0]
@@ -1114,7 +964,6 @@ def test_exact_occupancy_cell_loader_reads_one_same_address_without_full_capture
         view.site_validity,
         resolved.artifact.occupied.validity.mask[0, 0, :],
     )
-    assert retained >= view.array_nbytes
     assert view.background_input.ref.revision == view.occupancy_input.ref.revision
     assert view.background_input.dataset_id != view.occupancy_input.dataset_id
     assert view.home_viewport.y_axis.role == SPATIAL_Y
@@ -1124,108 +973,6 @@ def test_exact_occupancy_cell_loader_reads_one_same_address_without_full_capture
     assert "address=(0, 0)" in view.summary
     assert resolved.artifact.source_capture_ref.target_ref in view.summary
     assert resolved.artifact.calibration_reference.target_ref in view.summary
-
-
-def test_occupancy_cell_budget_includes_all_retained_inspections(
-    occupancy_product,
-    monkeypatch,
-):
-    from zlc_frontend.occupancy_render import (
-        estimate_occupancy_cell_view_retained_nbytes,
-    )
-    from zlc_neutral_atom.readout.occupancy_repository import OccupancyRepository
-
-    experiment, reference, _resolved = occupancy_product
-    from Zou_lab_control.notebook.facade import _service_guard, _occupancy_repository
-
-    with _service_guard(experiment.readout._token) as app_services:
-        inspected = _occupancy_repository(app_services).inspect_final(reference)
-        source = app_services.capture_repository.inspect_final(
-            inspected.source_capture_ref,
-        )
-        calibration = app_services.calibration_repository.inspect_final(
-            inspected.calibration_reference,
-        )
-        admission_peak = _occupancy_repository(
-            app_services
-        ).admission_peak_upper_bound_bytes(
-            reference,
-            app_services.capture_repository,
-            app_services.calibration_repository,
-        )
-    frame = source.dataset_schema.cell_schema
-    sites = inspected.occupied_schema.cell_schema.data_axes[0].size
-    view_bound = estimate_occupancy_cell_view_retained_nbytes(
-        frame.data_shape,
-        frame.dtype,
-        sites,
-    )
-    inspection_headroom = (
-        inspected.inspection_retained_upper_bound_bytes
-        + source.inspection_retained_upper_bound_bytes
-        + calibration.inspection_retained_upper_bound_bytes
-    )
-    limit = (
-        admission_peak
-        + view_bound
-        + inspection_headroom
-        - 1
-    )
-    assert admission_peak + view_bound <= limit
-    calls = []
-
-    def forbidden_admit(*args, **kwargs):
-        calls.append((args, kwargs))
-        raise AssertionError("aggregate-over-budget display must reject before admission")
-
-    monkeypatch.setattr(OccupancyRepository, "admit", forbidden_admit)
-    with pytest.raises(MemoryError, match="dependency admission"):
-        experiment.readout._load_occupancy_cell_source(
-            reference,
-            None,
-            memory_limit_bytes=limit,
-        )
-    assert calls == []
-
-def test_interactive_occupancy_required_minus_one_rejects_before_large_admission(
-    occupancy_product,
-    monkeypatch,
-):
-    from zlc_neutral_atom.artifacts.capture import CaptureRepository
-    from zlc_neutral_atom.artifacts.capture_frames import CaptureFrameSource
-    from zlc_neutral_atom.readout.calibration_repository import CalibrationRepository
-    from zlc_neutral_atom.readout.occupancy_repository import OccupancyRepository
-
-    experiment, reference, _resolved = occupancy_product
-    navigation = experiment.readout._inspect_occupancy_cell_navigation(
-        reference,
-        memory_limit_bytes=512 << 20,
-    )
-    required = (
-        navigation.retained_upper_bound_bytes
-        + navigation.cell_peak_upper_bound_bytes
-    )
-    calls = []
-
-    def forbidden(*_args, **_kwargs):
-        calls.append(True)
-        raise AssertionError("insufficient SiteMap budget reached large-array admission")
-
-    monkeypatch.setattr(OccupancyRepository, "admit", forbidden)
-    monkeypatch.setattr(CalibrationRepository, "load", forbidden)
-    monkeypatch.setattr(CaptureRepository, "admit", forbidden)
-    monkeypatch.setattr(CaptureFrameSource, "read", forbidden)
-    with pytest.raises(MemoryError, match="interactive occupancy cell requires"):
-        experiment.readout._inspect_occupancy_cell_navigation(
-            reference,
-            memory_limit_bytes=required - 1,
-        )
-    assert calls == []
-    exact = experiment.readout._inspect_occupancy_cell_navigation(
-        reference,
-        memory_limit_bytes=required,
-    )
-    assert exact.cell_peak_upper_bound_bytes == navigation.cell_peak_upper_bound_bytes
 
 
 def test_public_exact_occupancy_cell_gui_stays_off_qt_owner(
@@ -1243,18 +990,7 @@ def test_public_exact_occupancy_cell_gui_stays_off_qt_owner(
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(type(experiment.readout), "_load_occupancy_cell_source", traced)
-    navigation = experiment.readout._inspect_occupancy_cell_navigation(
-        reference,
-        memory_limit_bytes=512 << 20,
-    )
-    exact_limit = (
-        navigation.retained_upper_bound_bytes
-        + navigation.cell_peak_upper_bound_bytes
-    )
-    window = experiment.readout.occupancy_cell_gui(
-        reference,
-        memory_limit_bytes=exact_limit,
-    )
+    window = experiment.readout.occupancy_cell_gui(reference)
     try:
         _until(application, lambda: window.raster_ready, timeout=45.0)
         assert calls and calls == [calls[0]] and calls[0] != owner_thread
@@ -1287,21 +1023,16 @@ def test_occupancy_navigation_inspection_reads_metadata_without_admission(
         raise AssertionError("navigation metadata must not materialize occupancy arrays")
 
     monkeypatch.setattr(OccupancyRepository, "admit", forbidden_admit)
-    navigation = experiment.readout._inspect_occupancy_cell_navigation(
-        reference,
-        memory_limit_bytes=512 << 20,
-    )
+    navigation = experiment.readout._inspect_occupancy_cell_navigation(reference)
     assert calls == []
     assert navigation.artifact_identity == reference.target_ref
     assert navigation.repeat_axis == resolved.artifact.occupied.schema.repeat_axis
     assert navigation.point_axes == resolved.artifact.occupied.schema.point_axes
     assert navigation.point_layout == resolved.artifact.occupied.schema.point_layout
-    assert navigation.retained_upper_bound_bytes > 0
     with pytest.raises(ValueError, match="changed after navigation inspection"):
         experiment.readout._load_occupancy_cell_source(
             reference,
             None,
-            memory_limit_bytes=512 << 20,
             expected_navigation=replace(
                 navigation,
                 generation=StreamGenerationId("stale-navigation"),

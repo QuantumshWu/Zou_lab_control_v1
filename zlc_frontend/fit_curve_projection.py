@@ -57,8 +57,6 @@ class CurveFitOverlayPlan:
         if not isinstance(self.source_ref, DatasetRevisionRef):
             raise TypeError("curve fit plan source_ref must be DatasetRevisionRef")
         identity = canonical_text(self.result_identity, "curve fit result identity")
-        if len(identity) > 4096:
-            raise ValueError("curve fit result identity exceeds its display bound")
         object.__setattr__(self, "result_identity", identity)
         if not isinstance(self._result, FitResultBatch):
             raise TypeError("curve fit plan result must be FitResultBatch")
@@ -348,56 +346,8 @@ def _curve_source_span(
     return (start, stop)
 
 
-def curve_fit_overlays_retained_nbytes(
-    overlays: tuple[CurveFitOverlay, ...],
-) -> tuple[int, int]:
-    """Return conservative retained DTO bytes and exact prediction-array bytes.
-
-    The first value includes Python/container/text/address overhead and the
-    immutable prediction buffers.  The second is separated so Agg admission
-    can additionally charge the artist/model-to-line scratch term without
-    double-counting the retained DTO ownership.
-    """
-
-    overlays = tuple(overlays)
-    if any(not isinstance(item, CurveFitOverlay) for item in overlays):
-        raise TypeError("overlays must contain CurveFitOverlay values")
-    prediction_bytes = sum(int(item.predicted_y.nbytes) for item in overlays)
-    retained = prediction_bytes
-    for item in overlays:
-        retained += 1024
-        retained += len(item.result_identity.encode("utf-8"))
-        retained += len(item.diagnostic.encode("utf-8"))
-        retained += 256 * len(item.series_batch_address)
-    return int(retained), int(prediction_bytes)
-
-
-def estimate_curve_fit_overlay_plan_nbytes(
-    plan: CurveFitOverlayPlan,
-) -> tuple[int, int]:
-    """Return retained plan/DTO bytes and prediction bytes before evaluation."""
-
-    if not isinstance(plan, CurveFitOverlayPlan):
-        raise TypeError("plan must be CurveFitOverlayPlan")
-    prediction_bytes = sum(
-        (entry.source_sample_span[1] - entry.source_sample_span[0])
-        * np.dtype("<f8").itemsize
-        for entry in plan._entries
-        if entry.status is FitBatchStatus.CONVERGED
-    )
-    retained = prediction_bytes + 4096 + 512 * len(plan._entries)
-    identity_bytes = len(plan.result_identity.encode("utf-8"))
-    for entry in plan._entries:
-        retained += 1024 + identity_bytes
-        retained += len(entry.diagnostic.encode("utf-8"))
-        retained += 256 * len(entry.series.batch_address)
-    return int(retained), int(prediction_bytes)
-
-
 __all__ = [
     "CurveFitOverlayPlan",
-    "curve_fit_overlays_retained_nbytes",
-    "estimate_curve_fit_overlay_plan_nbytes",
     "materialize_curve_fit_overlay_plan",
     "single_panel_curve_fit_overlay_plan",
     "transient_single_panel_curve_fit_overlay_plan",

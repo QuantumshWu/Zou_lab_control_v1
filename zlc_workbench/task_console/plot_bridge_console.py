@@ -1756,7 +1756,7 @@ class TaskConsole(QtWidgets.QWidget):
                 count = len(selection.ranges)
                 card.set_status(f"selected {count} range(s)", error=False)
             except Exception as exc:
-                card.set_status(f"selection invalid: {str(exc).splitlines()[0][:100]}", error=True)
+                card.set_status(f"selection invalid: {exc}", error=True)
 
     def _analysis_node_title(self, card: "PanelCard") -> str:
         """A per-PANEL analysis-node title derived from the panel's OWN title (``"2D image #1
@@ -1991,9 +1991,9 @@ class TaskConsole(QtWidgets.QWidget):
         try:
             node = self._build_logic_node(row.node, values)
         except Exception as exc:
-            row.set_state("error", status=f"build failed: {str(exc).splitlines()[0][:80]}")
+            row.set_state("error", status=f"build failed: {exc}")
             if editor is not None:
-                editor.set_status(f"build failed: {str(exc).splitlines()[0][:140]}", error=True)
+                editor.set_status(f"build failed: {exc}", error=True)
             return
         row.node.values = dict(values)            # remember for the next Edit reopen + save
         # Label the built node with its ROW TITLE so its provider label MATCHES the declared row's
@@ -2031,10 +2031,10 @@ class TaskConsole(QtWidgets.QWidget):
             # compatibility and never reaches into the hub's schema internals.
             self._begin_run(node)
         except Exception as exc:
-            row.set_state("error", status=f"start failed: {str(exc).splitlines()[0][:80]}")
+            row.set_state("error", status=f"start failed: {exc}")
             if editor is not None:
                 editor.set_running(False)
-                editor.set_status(f"start failed: {str(exc).splitlines()[0][:140]}", error=True)
+                editor.set_status(f"start failed: {exc}", error=True)
             return
         # COMMIT: the node is genuinely running -- only now does it enter the registries, and only
         # now are the previous build's orphan signals unlinked (a failed start leaves the old
@@ -2339,7 +2339,7 @@ class TaskConsole(QtWidgets.QWidget):
             snapshot = node.poll()
             error = node.last_error
             if error:
-                row.set_state("error", status=f"error: {error[:60]}")
+                row.set_state("error", status=f"error: {error}")
                 if editor is not None:
                     editor.set_running(False)
                     editor.set_status(f"error: {error}", error=True)
@@ -2362,7 +2362,7 @@ class TaskConsole(QtWidgets.QWidget):
             if snapshot.state.terminal:
                 if state == "FAILED":
                     message = snapshot.primary_error or "run failed"
-                    row.set_state("error", status=f"error: {message[:60]}")
+                    row.set_state("error", status=f"error: {message}")
                     if editor is not None:
                         editor.set_running(False)
                         editor.set_status(f"error: {message}", error=True)
@@ -2740,7 +2740,7 @@ class TaskConsole(QtWidgets.QWidget):
             who = (getattr(node, "prefix", "") or self._node_label(node) or "node").rstrip("_:")
             n = int(getattr(node, "consecutive_errors", 1))
             self.status_strip.show_message(
-                f"⚠ NODE ERROR ({who}, ×{n}): {node.last_error}"[:300], severity="error")
+                f"⚠ NODE ERROR ({who}, ×{n}): {node.last_error}", severity="error")
         elif getattr(self, "_task_status_text", None):
             self.status_strip.show_message(self._task_status_text, severity="task")
         elif dropped:

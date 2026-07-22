@@ -287,8 +287,6 @@ class ViewContract:
     repeat_modes: tuple[RepeatViewMode, ...]
     default_repeat_mode: RepeatViewMode
     reducible_axis_roles: tuple[AxisRoleId, ...]
-    maximum_batch_series: int
-    maximum_facet_cells: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, ViewIntent):
@@ -311,12 +309,6 @@ class ViewContract:
             raise ValueError("default repeat mode must be allowed by the contract")
         if any(not isinstance(role, AxisRoleId) for role in reducible):
             raise TypeError("reducible_axis_roles must contain AxisRoleId values")
-        object.__setattr__(
-            self, "maximum_batch_series", _nonnegative(self.maximum_batch_series, "batch limit")
-        )
-        object.__setattr__(
-            self, "maximum_facet_cells", _nonnegative(self.maximum_facet_cells, "facet limit")
-        )
         object.__setattr__(self, "display_slots", slots)
         object.__setattr__(self, "role_policies", policies)
         object.__setattr__(self, "repeat_modes", repeat_modes)

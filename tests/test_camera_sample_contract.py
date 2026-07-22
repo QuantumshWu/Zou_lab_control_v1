@@ -148,7 +148,7 @@ def test_camera_capture_spec_has_one_current_canonical_encoding():
         )
 
 
-def test_camera_sample_contract_preserves_all_data_axes_and_owned_bytes():
+def test_camera_sample_contract_preserves_all_data_axes_and_owned_pixels():
     value_schema, _dataset_schema = _schemas()
     source = np.arange(12, dtype=np.uint16).reshape(3, 4)
     value = Value(source, VALID, value_schema)
@@ -167,7 +167,6 @@ def test_camera_sample_contract_preserves_all_data_axes_and_owned_bytes():
     assert contract.source_ordinal(frozen) == 0
     assert contract.captured_at(frozen) == pytest.approx(301.000401)
     assert contract.correlation_id(frozen) == "camera-session:0"
-    assert contract.retained_nbytes(frozen) <= contract.max_retained_nbytes
 
 
 def test_metadata_digest_covers_every_physical_observation():
@@ -211,17 +210,13 @@ def test_camera_sample_digest_binds_pixels_and_physical_metadata_atomically():
     assert contract.digest(metadata_variant) != baseline_digest
 
 
-def test_camera_metadata_rejects_partial_timestamp_and_unbounded_correlation():
+def test_camera_metadata_rejects_partial_timestamp():
     with pytest.raises(ValueError, match="must appear together"):
         _metadata(timestamp_microseconds=None)
     with pytest.raises(ValueError, match="less than"):
         _metadata(timestamp_microseconds=1_000_000)
     with pytest.raises(TypeError, match="source_ordinal"):
         _metadata(source_ordinal=0.5)
-
-    contract = CameraFrameMetadataContract(correlation_id_max_bytes=4)
-    with pytest.raises(ValueError, match="retained-byte bound"):
-        contract.validate(_metadata(correlation_id="too-long"))
 
 
 def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
@@ -261,10 +256,7 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         capture_spec_owner_fingerprint=CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
         flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
         max_source_burst_events=2,
-        driver_ring_bytes=1 << 20,
-        adapter_record_retention_bytes=1 << 20,
         max_blocking_call_seconds=1.0,
-        max_capture_spec_bytes=4096,
         physical_facts=physical_facts,
     )
     binding_stamp = DeviceBindingStamp(
@@ -314,7 +306,6 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         ),
         capability=capability,
         required_consumer_lag_events=0,
-        transport_memory_limit_bytes=3 << 20,
         camera_provenance=CameraCaptureProvenance(
             descriptor,
             ReadoutBindingKey("camera"),
@@ -329,9 +320,5 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
     assert projected is sample.image
     assert projected.values.shape == (3, 4)
     assert np.array_equal(projected.values, sample.image.values)
-    assert contract.payload_contract.max_retained_nbytes == (
-        ValuePayloadContract(value_schema).max_retained_nbytes
-        + contract.event_adapter.metadata_contract.max_retained_nbytes
-    )
     assert contract.total_events == 4
     assert contract.max_inflight_events == 2

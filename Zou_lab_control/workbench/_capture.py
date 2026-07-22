@@ -19,11 +19,9 @@ from zlc_frontend.figure import (
     DatasetDescriptor,
     DatasetId,
     FigureDocument,
-    FigureEvaluationPolicy,
     FigureLayer,
     SuggestionStatus,
     ViewIntent,
-    estimate_view_evaluation_peak_nbytes,
     suggest_view,
 )
 from zlc_frontend.display_range import RelimMode
@@ -35,7 +33,6 @@ from zlc_frontend.image_display import (
     image_display_from_form,
     image_viewport_for_display_state,
 )
-from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
 from zlc_frontend.image_view import ImageViewportTransform
 from zlc_frontend.qt_widgets import (
     FluentButton,
@@ -215,7 +212,6 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(40)
         self._timer.timeout.connect(self._poll_run_snapshot)
-        self._timer.start()
         self._start_button.clicked.connect(self._start_capture)
         self._stop_button.clicked.connect(self._cancel_capture)
         self._selector_switch.toggled.connect(self._set_selector_enabled)
@@ -600,26 +596,6 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             ):
                 raise ValueError("IMAGE view needs an explicit axis choice")
             view = suggestion.spec
-            evaluation_peak = estimate_view_evaluation_peak_nbytes(schema, view)
-            # A finite preview publishes one immutable source event.  A display
-            # commit updates the target revision and _update_interaction_controls
-            # synchronously marks the painted revision unready, releasing the
-            # pointer hold before the commit returns.  Even if worker evaluation
-            # has already started, the hold and current front are aliases of one
-            # distinct retained raster/sample.  The finite topology therefore
-            # retains one old front, unlike an advancing camera monitor where a
-            # newer current source may coexist with an older held one.
-            downstream_peak = (
-                evaluation_peak
-                + estimate_indexed8_raster_peak_nbytes(
-                    y_axes[0].size,
-                    x_axes[0].size,
-                    value_itemsize=schema.cell_schema.dtype.itemsize,
-                    retained_fronts=1,
-                    retained_sample_fronts=1,
-                )
-            )
-            policy = FigureEvaluationPolicy(max_live_nbytes=evaluation_peak)
             dataset_id = DatasetId(f"capture-preview-{next_generation}")
             document = FigureDocument(
                 f"capture-preview-{next_generation}",
@@ -691,7 +667,6 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             slot = LiveDatasetSlot(
                 spec,
                 dataset_id=dataset_id,
-                evaluation_policy=policy,
             )
             attached = threading.Event()
             response: dict[str, object] = {}
@@ -719,7 +694,6 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             "start",
             lambda: command.start_with_preview(
                 block_id=block_id,
-                downstream_peak_bytes=downstream_peak,
                 factory=factory,
             ),
             generation=generation,
@@ -797,6 +771,32 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             # raster in the same owner cycle.  Recompute after both actions so
             # a repeated finite Run cannot overlap that retained exact work.
             self._update_start_button()
+            self._sync_poll_timer()
+
+    def _sync_poll_timer(self) -> None:
+        """Poll only a live RunHandle or an explicitly retried preview close."""
+
+        handle = self._handle
+        snapshot = self._last_snapshot
+        active_run = (
+            handle is not None
+            and not self._run_owner.owner_reaped
+            and (snapshot is None or not snapshot.state.terminal)
+        )
+        retry_preview_close = (
+            self._live is not None
+            and snapshot is not None
+            and snapshot.state.terminal
+            and not (
+                snapshot.state is RunState.SUCCEEDED
+                and snapshot.final_committed
+            )
+        )
+        if active_run or retry_preview_close:
+            if not self._timer.isActive():
+                self._timer.start()
+        else:
+            self._timer.stop()
 
     def _drain_worker_results(self) -> None:
         for completion in self._run_owner.drain_completions():

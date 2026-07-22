@@ -35,22 +35,8 @@ from zlc_storage.canonical import (
 from .ir import TargetIR, evaluate_affine_tick
 
 
-MAX_INDEXED_PHYSICAL_ASSIGNMENTS = 1_000_000
-MAX_DIGITAL_PLAYBACK_ASSIGNMENTS = 1_000_000
-MAX_DIGITAL_PLAYBACK_WORK_ITEMS = 64_000_000
 _U64_MAX = (1 << 64) - 1
 _U64 = np.dtype("<u8")
-
-# Conservative CPython-independent admission charges.  Packed bytes are counted
-# exactly below; these constants cover the bounded index/projection object graph,
-# names, list/tuple handoff, and one point's affine-tick scratch.  They are bounds,
-# not an assertion about one interpreter's current ``sys.getsizeof`` values.
-_INDEX_FIXED_BYTES = 128 * 1024
-_INDEX_OBJECT_BYTES = 1_024
-_AFFINE_TICK_SCRATCH_BYTES = 64
-_PROJECTION_FIXED_BYTES = 64 * 1024
-_PROJECTION_TRACE_BYTES = 1_024
-_PROJECTION_TRANSITION_BYTES = 192
 
 
 class PhysicalReadoutContextUnsupportedError(ValueError):
@@ -235,7 +221,6 @@ class _BusTimeline:
 class _IndexPlan:
     digital_rows: int
     bus_rows: int
-    build_peak_bytes: int
 
 
 class _Checkpoint:
@@ -269,8 +254,6 @@ class PhysicalWaveformIndex:
         "_digital_ticks",
         "_digital_masks",
         "_bus_timelines",
-        "_packed_nbytes",
-        "_build_peak_bytes_bound",
     )
 
     def __init__(
@@ -281,7 +264,6 @@ class PhysicalWaveformIndex:
         digital_ticks: np.ndarray,
         digital_masks: np.ndarray,
         bus_timelines: tuple[_BusTimeline, ...],
-        build_peak_bytes_bound: int,
     ) -> None:
         if not isinstance(ir, TargetIR):
             raise TypeError("ir must be TargetIR")
@@ -320,9 +302,6 @@ class PhysicalWaveformIndex:
             )
             for output_key, lane in ir.logical_digital_outputs
         )
-        packed = int(digital_ticks.nbytes + digital_masks.nbytes) + sum(
-            int(item.ticks.nbytes + item.values.nbytes) for item in timelines
-        )
         object.__setattr__(self, "_ir_fingerprint", ir.fingerprint)
         object.__setattr__(self, "_clock_hz", ir.clock_hz)
         object.__setattr__(self, "_target_abi_fingerprint", ir.target_abi_fingerprint)
@@ -331,28 +310,10 @@ class PhysicalWaveformIndex:
         object.__setattr__(self, "_digital_ticks", digital_ticks)
         object.__setattr__(self, "_digital_masks", digital_masks)
         object.__setattr__(self, "_bus_timelines", timelines)
-        object.__setattr__(self, "_packed_nbytes", packed)
-        object.__setattr__(
-            self,
-            "_build_peak_bytes_bound",
-            _positive_integer(build_peak_bytes_bound, "build_peak_bytes_bound"),
-        )
 
     @property
     def source_ir_fingerprint(self) -> str:
         return self._ir_fingerprint
-
-    @property
-    def packed_nbytes(self) -> int:
-        """Exact retained bytes of the fixed-width waveform columns."""
-
-        return self._packed_nbytes
-
-    @property
-    def build_peak_bytes_bound(self) -> int:
-        """The conservative peak admitted before this index was allocated."""
-
-        return self._build_peak_bytes_bound
 
     @property
     def terminal_tick(self) -> int:
@@ -398,7 +359,6 @@ class PhysicalWaveformIndex:
         integration_start_offset_seconds: float,
         integration_seconds: float,
         exclude_output_key: str,
-        max_projection_bytes: int,
         checkpoint: Callable[[], None],
     ) -> PhysicalWindowProjection:
         """Project one strict ``[start, stop)`` integration window.
@@ -425,28 +385,6 @@ class PhysicalWaveformIndex:
         window_stop = window_start + duration * self._clock_hz
         if not math.isfinite(window_start) or not math.isfinite(window_stop):
             raise ValueError("physical integration window exceeds the finite time domain")
-        projection_limit = _positive_integer(
-            max_projection_bytes,
-            "max_projection_bytes",
-        )
-        projection_used = _PROJECTION_FIXED_BYTES + _PROJECTION_TRACE_BYTES * (
-            len(self._digital_bindings) - 1 + len(self._bus_timelines)
-        )
-
-        def charge_transition() -> None:
-            nonlocal projection_used
-            projection_used += _PROJECTION_TRANSITION_BYTES
-            if projection_used > projection_limit:
-                raise MemoryError(
-                    "physical window projection requires more than "
-                    f"{projection_limit} admitted bytes"
-                )
-
-        if projection_used > projection_limit:
-            raise MemoryError(
-                "physical window projection requires more than "
-                f"{projection_limit} admitted bytes"
-            )
         callback()
 
         digital: list[PhysicalDigitalWindow] = []
@@ -478,7 +416,6 @@ class PhysicalWaveformIndex:
                     + binding.delay_ticks
                     - anchor
                 )
-                charge_transition()
                 changes.append((relative_tick, next_state))
                 state = next_state
             digital.append(
@@ -509,7 +446,6 @@ class PhysicalWaveformIndex:
                 next_value = int(timeline.values[index])
                 if next_value == current:
                     continue
-                charge_transition()
                 changes.append((int(timeline.ticks[index]) - anchor, next_value))
                 current = next_value
             buses.append(
@@ -571,8 +507,6 @@ def iter_physical_digital_high_intervals(
     ir: TargetIR,
     *,
     checkpoint: Callable[[], None] | None = None,
-    max_assignments: int = MAX_DIGITAL_PLAYBACK_ASSIGNMENTS,
-    max_work_items: int = MAX_DIGITAL_PLAYBACK_WORK_ITEMS,
 ) -> Iterator[PhysicalDigitalHighInterval]:
     """Stream exact delayed digital high intervals without an assignment graph.
 
@@ -588,8 +522,6 @@ def iter_physical_digital_high_intervals(
 
     if not isinstance(ir, TargetIR):
         raise TypeError("ir must be TargetIR")
-    assignment_limit = _positive_integer(max_assignments, "max_assignments")
-    work_limit = _positive_integer(max_work_items, "max_work_items")
     counter = _Checkpoint(checkpoint)
     counter.boundary()
     lane_bits = {lane: index for index, lane in enumerate(ir.channels)}
@@ -605,17 +537,6 @@ def iter_physical_digital_high_intervals(
     if not bindings:
         counter.boundary()
         return
-    assignment_count = _digital_assignment_count(
-        ir,
-        checkpoint=counter.boundary,
-    )
-    work_items = assignment_count * len(bindings)
-    if assignment_count > assignment_limit or work_items > work_limit:
-        raise ValueError(
-            "physical digital playback requires "
-            f"{assignment_count} assignments/{work_items} binding work items; "
-            f"limits are {assignment_limit}/{work_limit}"
-        )
     active: list[int | None] = [None] * len(bindings)
     states = [False] * len(bindings)
     for tick, mask in _iter_digital_mask_assignments(ir, counter):
@@ -645,55 +566,18 @@ def iter_physical_digital_high_intervals(
     counter.boundary()
 
 
-def estimate_physical_waveform_index_peak_bytes(
-    ir: TargetIR,
-    *,
-    checkpoint: Callable[[], None] | None = None,
-) -> int:
-    """Return a conservative build peak after a constant-memory counting pass."""
-
-    return _index_plan(ir, checkpoint=checkpoint).build_peak_bytes
-
-
-def estimate_physical_window_projection_peak_bytes(
-    ir: TargetIR,
-    *,
-    checkpoint: Callable[[], None] | None = None,
-) -> int:
-    """Bound one window result without constructing the waveform index."""
-
-    plan = _index_plan(ir, checkpoint=checkpoint)
-    trace_count = max(0, len(ir.logical_digital_outputs) - 1) + len(ir.bus_names)
-    transition_count = (
-        plan.digital_rows * max(0, len(ir.logical_digital_outputs) - 1)
-        + plan.bus_rows
-    )
-    return (
-        _PROJECTION_FIXED_BYTES
-        + _PROJECTION_TRACE_BYTES * trace_count
-        + _PROJECTION_TRANSITION_BYTES * transition_count
-    )
-
-
 def build_physical_waveform_index(
     ir: TargetIR,
     *,
-    max_peak_bytes: int,
     checkpoint: Callable[[], None],
 ) -> PhysicalWaveformIndex:
-    """Build an immutable packed index after memory admission and with cancellation."""
+    """Build an immutable packed index with cancellation checkpoints."""
 
     if not isinstance(ir, TargetIR):
         raise TypeError("ir must be TargetIR")
-    limit = _positive_integer(max_peak_bytes, "max_peak_bytes")
     callback = _callback(checkpoint, "checkpoint")
     callback()
     plan = _index_plan(ir, checkpoint=callback)
-    if plan.build_peak_bytes > limit:
-        raise MemoryError(
-            f"physical waveform index requires at most {plan.build_peak_bytes} bytes; "
-            f"limit {limit}"
-        )
 
     digital_ticks_mutable = np.empty(plan.digital_rows, dtype=_U64)
     digital_masks_mutable = np.empty(plan.digital_rows, dtype=_U64)
@@ -785,7 +669,6 @@ def build_physical_waveform_index(
         digital_ticks=digital_ticks,
         digital_masks=digital_masks,
         bus_timelines=tuple(sorted(timelines, key=lambda item: item.bus_name)),
-        build_peak_bytes_bound=plan.build_peak_bytes,
     )
 
 
@@ -801,39 +684,11 @@ def _index_plan(
         ir,
         checkpoint=counter.boundary,
     )
-    if digital_rows > MAX_INDEXED_PHYSICAL_ASSIGNMENTS:
-        raise PhysicalReadoutContextUnsupportedError(
-            "physical waveform exceeds the packed materialization limit of "
-            f"{MAX_INDEXED_PHYSICAL_ASSIGNMENTS} assignments"
-        )
     points = len(ir.scan_points) if ir.scan_points else 1
     driven_buses = len({item.bus_index for item in ir.bus_segments})
     bus_rows = points * len(ir.bus_segments) + driven_buses
-    packed_bytes = 16 * (digital_rows + bus_rows)
-    names_bytes = sum(
-        len(value.encode("utf-8"))
-        for value in (
-            *ir.channels,
-            *ir.bus_names,
-            *(key for key, _lane in ir.logical_digital_outputs),
-        )
-    )
-    object_count = (
-        len(ir.channels)
-        + len(ir.logical_digital_outputs)
-        + len(ir.bus_names)
-        + len(ir.bus_segments)
-    )
-    scratch = _AFFINE_TICK_SCRATCH_BYTES * len(ir.ticks)
-    peak = (
-        _INDEX_FIXED_BYTES
-        + _INDEX_OBJECT_BYTES * object_count
-        + names_bytes
-        + scratch
-        + 2 * packed_bytes
-    )
     counter.boundary()
-    return _IndexPlan(digital_rows, bus_rows, peak)
+    return _IndexPlan(digital_rows, bus_rows)
 
 
 def _validate_supported_domain(ir: TargetIR) -> None:
@@ -991,9 +846,6 @@ def _search_left(values: np.ndarray, boundary: float | int) -> int:
 
 
 __all__ = [
-    "MAX_DIGITAL_PLAYBACK_ASSIGNMENTS",
-    "MAX_DIGITAL_PLAYBACK_WORK_ITEMS",
-    "MAX_INDEXED_PHYSICAL_ASSIGNMENTS",
     "PhysicalBusWindow",
     "PhysicalDigitalHighInterval",
     "PhysicalDigitalWindow",
@@ -1001,8 +853,6 @@ __all__ = [
     "PhysicalWaveformIndex",
     "PhysicalWindowProjection",
     "build_physical_waveform_index",
-    "estimate_physical_waveform_index_peak_bytes",
-    "estimate_physical_window_projection_peak_bytes",
     "iter_physical_digital_high_intervals",
     "physical_digital_playback_terminal_tick",
 ]

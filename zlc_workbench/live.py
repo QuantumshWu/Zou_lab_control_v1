@@ -22,7 +22,6 @@ from zlc_frontend.figure import (
     EvaluatedInput,
     EvaluatedMeter,
     FigureDocument,
-    FigureEvaluationPolicy,
     FigureEvaluator,
     ResolvedDataset,
     ResolvedDatasetMap,
@@ -170,7 +169,6 @@ class LiveDatasetSlot:
         *,
         dataset_id: DatasetId,
         scalar_dataset_id: DatasetId | None = None,
-        evaluation_policy: FigureEvaluationPolicy,
         retain_on_terminal: bool = True,
     ) -> None:
         if not isinstance(spec, (CapturePreviewSpec, CameraMonitorViewSpec)):
@@ -188,14 +186,11 @@ class LiveDatasetSlot:
         )
         if expects_scalar != (scalar_dataset_id is not None):
             raise ValueError("scalar DatasetId must match the admitted camera view spec")
-        if not isinstance(evaluation_policy, FigureEvaluationPolicy):
-            raise TypeError("evaluation_policy must be FigureEvaluationPolicy")
         if not isinstance(retain_on_terminal, bool):
             raise TypeError("retain_on_terminal must be bool")
         self.spec = spec
         self.dataset_id = dataset_id
         self.scalar_dataset_id = scalar_dataset_id
-        self.evaluation_policy = evaluation_policy
         self._retain_on_terminal = retain_on_terminal
         self._lock = threading.Lock()
         self._dataset: MonitorDataset | CameraMonitorLiveDataset | None = None
@@ -646,7 +641,7 @@ class LiveBoardController:
         self._board = board
         self._configuration = configuration
         self._configuration_epoch = 0
-        self._evaluator = FigureEvaluator(slot.evaluation_policy)
+        self._evaluator = FigureEvaluator()
         self._scalar_size = scalar_raster_size
         self._worker_thread_affine = worker_thread_affine
         self._submit_worker = submit_worker

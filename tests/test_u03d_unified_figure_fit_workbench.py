@@ -220,7 +220,6 @@ def _curve_figure() -> tuple[DataFigure, DatasetSchema, AxisSpec, AxisSpec]:
     figure = DataFigure(
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
-        render_memory_limit_bytes=128 << 20,
     )
     return figure, schema, scan, site
 
@@ -358,8 +357,7 @@ def test_curve_range_promotes_only_x_while_display_cell_stays_presentation(
 ) -> None:
     figure, schema, x_axis, batch_axis = _curve_figure()
 
-    def prepare(fit_axis_ids, authority_selection, operation_memory_limit_bytes):
-        assert operation_memory_limit_bytes > 0
+    def prepare(fit_axis_ids, authority_selection):
         return tuple(
             fit_authoring_option(
                 suggest_fit_draft(
@@ -379,7 +377,6 @@ def test_curve_range_promotes_only_x_while_display_cell_stays_presentation(
     window = open_figure_workbench(
         lambda _source, **_options: figure,
         "frozen-curve",
-        memory_limit_bytes=128 << 20,
         fit_preparer=prepare,
         fit_executor=forbidden,
         fit_saver=forbidden,
@@ -574,8 +571,8 @@ def test_failed_save_cannot_restore_draft_after_selector_revision_changes(
     entered = threading.Event()
     release = threading.Event()
 
-    def failed_save(self, *, operation_memory_limit_bytes):
-        del self, operation_memory_limit_bytes
+    def failed_save(self):
+        del self
         entered.set()
         if not release.wait(10.0):
             raise TimeoutError("test did not release failed Fit save")
@@ -623,11 +620,8 @@ def test_close_during_atomic_save_accepts_reference_then_releases_heavy_state(
     release = threading.Event()
     original_save = FitExecution.save
 
-    def blocked_save(self, *, operation_memory_limit_bytes):
-        saved = original_save(
-            self,
-            operation_memory_limit_bytes=operation_memory_limit_bytes,
-        )
+    def blocked_save(self):
+        saved = original_save(self)
         published.set()
         if not release.wait(10.0):
             raise TimeoutError("test did not release saved reference")

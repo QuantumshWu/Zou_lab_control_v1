@@ -176,7 +176,6 @@ def compile_triggered_occupancy_pipeline(
     *,
     preview: ExactDatasetPreviewPort | None = None,
     _admitted_preview_spec: ExactDatasetPreviewSpec | None = None,
-    _retained_overhead_bytes: int = 0,
 ) -> RunPlan:
     """Compile ready-all -> arm camera -> one FIRE -> drain -> attest."""
 
@@ -208,7 +207,7 @@ def compile_triggered_occupancy_pipeline(
             preview_spec = _occupancy_preview_spec(spec.occupancy, preview)
             if preview_spec != _admitted_preview_spec:
                 raise ValueError(
-                    "occupancy preview budget changed after scan admission"
+                    "occupancy preview spec changed after scan admission"
                 )
         except BaseException as error:
             _notify_preview_failure(preview, error)
@@ -226,7 +225,6 @@ def compile_triggered_occupancy_pipeline(
                 context,
                 preview=preview,
                 preview_spec=preview_spec,
-                retained_overhead_bytes=_retained_overhead_bytes,
             )
         except BaseException as primary:
             try:

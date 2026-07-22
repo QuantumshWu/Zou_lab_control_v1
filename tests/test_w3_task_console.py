@@ -50,10 +50,8 @@ from zlc_pulse import (
 from zlc_frontend import describe_authoritative_transform
 from zlc_workbench.task_console import (
     SCAN_INTENT_DEFAULT_CAMERA_ROLE,
-    SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES,
     SCAN_INTENT_DEFAULT_SEQUENCER_ROLE,
     SCAN_INTENT_DEFAULT_TIMEOUT_SECONDS,
-    SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES,
     ScanDisplayIntent,
     ScanEditConflict,
     ScanEditDraft,
@@ -66,7 +64,7 @@ from zlc_workbench.task_console import (
     save_task_console_scan_intent,
     task_console_catalog_items,
     task_console_scan_binding_form_spec,
-    task_console_scan_budget_form_spec,
+    task_console_scan_runtime_form_spec,
 )
 from zlc_workbench.progressive_scan import build_occupancy_progressive_spec
 
@@ -227,7 +225,7 @@ def test_scan_scalar_form_specs_project_owner_defaults_and_strict_bounds_once():
         ("camera", "camera-secondary"),
         ("sequencer",),
     )
-    budgets = task_console_scan_budget_form_spec()
+    runtime = task_console_scan_runtime_form_spec()
 
     assert binding.keys == ("camera_role", "sequencer_role", "trigger_channel")
     assert binding.default_values() == {
@@ -239,16 +237,10 @@ def test_scan_scalar_form_specs_project_owner_defaults_and_strict_bounds_once():
         "camera",
         "camera-secondary",
     )
-    assert budgets.default_values() == {
-        "transport_memory_limit_bytes": (
-            SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES
-        ),
-        "memory_limit_bytes": SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES,
+    assert runtime.default_values() == {
         "timeout_seconds": SCAN_INTENT_DEFAULT_TIMEOUT_SECONDS,
     }
-    assert budgets.fields[0].minimum == 1
-    assert budgets.fields[1].minimum == 1
-    assert budgets.fields[2].minimum > 0.0
+    assert runtime.fields[0].minimum > 0.0
 
 
 def test_scan_intent_round_trip_preserves_named_axes_and_display_authority(tmp_path):

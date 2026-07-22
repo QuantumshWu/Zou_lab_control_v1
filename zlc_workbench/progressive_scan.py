@@ -19,11 +19,9 @@ from zlc_data import (
     SITE,
     dataset_revision_ref_to_tree,
     materialize_transformed_snapshot,
-    transformed_snapshot_peak_nbytes,
 )
 from zlc_frontend.matplotlib_render import (
     SinglePanelAggRenderer,
-    estimate_live_panel_raster_peak_nbytes,
 )
 from zlc_frontend.curve_display import (
     CurveDisplayState,
@@ -35,7 +33,6 @@ from zlc_frontend.figure import (
     DatasetDescriptor,
     DatasetId,
     FigureDocument,
-    FigureEvaluationPolicy,
     FigureEvaluator,
     FigureLayer,
     AxisViewRole,
@@ -47,7 +44,6 @@ from zlc_frontend.figure import (
     SuggestionStatus,
     ViewIntent,
     ViewPreferences,
-    estimate_view_evaluation_peak_nbytes,
     suggest_view,
 )
 from zlc_frontend.render import (
@@ -62,11 +58,7 @@ from zlc_frontend.render import (
     SourceIdentity,
     detached_render_fault,
 )
-from zlc_neutral_atom.runtime.dataset import (
-    DatasetPreviewSnapshot,
-    ExactDatasetPreviewReader,
-    dataset_storage_nbytes,
-)
+from zlc_neutral_atom.runtime.dataset import DatasetPreviewSnapshot, ExactDatasetPreviewReader
 from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewSpec
 from zlc_neutral_atom.scan import ScanOutputContract
 from zlc_storage import canonical_digest, canonical_text
@@ -115,8 +107,6 @@ class ProgressiveScanSpec:
     output_block_id: BlockId
     document: FigureDocument
     projection_summary: str
-    transform_peak_bytes: int
-    evaluation_peak_bytes: int
     preview_spec: ExactDatasetPreviewSpec
     display_selection: Selection | None
     display_preferences: ViewPreferences
@@ -181,13 +171,6 @@ class ProgressiveScanSpec:
             "projection_summary",
             canonical_text(self.projection_summary, "projection_summary"),
         )
-        for name in (
-            "transform_peak_bytes",
-            "evaluation_peak_bytes",
-        ):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
 
     @property
     def dataset_id(self) -> DatasetId:
@@ -244,20 +227,16 @@ def build_occupancy_progressive_spec(
     if len(site_axes) != 1:
         raise ValueError("occupancy output must declare exactly one SITE axis")
     site_axis = site_axes[0]
-    batch_limit = CURVE_CONTRACT.maximum_batch_series
     if display_intent.site_mode == "batch":
-        if not 1 < site_axis.size <= batch_limit:
-            raise ValueError(
-                "site batch display requires between 2 and "
-                f"{batch_limit} sites"
-            )
+        if site_axis.size <= 1:
+            raise ValueError("site batch display requires at least 2 sites")
         batch_axis = site_axis
     elif display_intent.site_mode == "select":
         if display_intent.site_index >= site_axis.size:
             raise ValueError("selected site index exceeds the declared SITE axis")
         batch_axis = None
     else:
-        batch_axis = site_axis if 1 < site_axis.size <= batch_limit else None
+        batch_axis = site_axis if site_axis.size > 1 else None
     terms.extend(
         IndexSelection(
             axis.axis_id,
@@ -325,37 +304,12 @@ def build_occupancy_progressive_spec(
             " · static curve (interactive selector unavailable: "
             f"{interaction_unavailable_reason})"
         )
-    transform_peak = transformed_snapshot_peak_nbytes(
-        source_schema,
-        output_contract.committed_transform,
-    )
-    evaluation_peak = estimate_view_evaluation_peak_nbytes(output_schema, view)
-    raster_peak = estimate_live_panel_raster_peak_nbytes(
-        _RASTER_WIDTH,
-        _RASTER_HEIGHT,
-        evaluated_data_upper_bound_bytes=evaluation_peak,
-        extra_retained_fronts=(1 if interactive_curve else 0),
-        extra_retained_evaluated_data_bytes=(
-            evaluation_peak if interactive_curve else 0
-        ),
-    )
-    # source_terminal may freeze while the render worker still owns its source
-    # snapshot.  One additional immutable source copy is cheaper and safer than
-    # introducing another cross-thread handoff state machine.
-    downstream_peak = (
-        transform_peak
-        + evaluation_peak
-        + raster_peak
-        + dataset_storage_nbytes(source_schema)
-    )
     return ProgressiveScanSpec(
         output_contract,
         BlockId(f"scan-preview-output-{identity}"),
         document,
         summary,
-        transform_peak,
-        evaluation_peak,
-        ExactDatasetPreviewSpec(source_schema.fingerprint, downstream_peak),
+        ExactDatasetPreviewSpec(source_schema.fingerprint),
         selection,
         preferences,
         interactive_curve,
@@ -606,7 +560,7 @@ class ProgressiveScanPreview:
         if not callable(submit_worker) or not callable(request_owner_wake):
             raise TypeError("worker submission and owner wake must be callable")
         if slot.spec != spec.preview_spec:
-            raise ValueError("slot and progressive display budgets differ")
+            raise ValueError("slot and progressive display contracts differ")
         self._owner_thread = threading.get_ident()
         self._slot = slot
         self._spec = spec
@@ -823,11 +777,7 @@ class ProgressiveScanPreview:
             failure = self._slot.failure
             if failure is not None:
                 raise RuntimeError(failure)
-            evaluator = FigureEvaluator(
-                FigureEvaluationPolicy(
-                    max_live_nbytes=self._spec.evaluation_peak_bytes,
-                )
-            )
+            evaluator = FigureEvaluator()
             renderer = SinglePanelAggRenderer(
                 self._spec.document,
                 width=_RASTER_WIDTH,
@@ -861,7 +811,6 @@ class ProgressiveScanPreview:
                             output_schema=(
                                 self._spec.output_contract.output_dataset_schema
                             ),
-                            memory_limit_bytes=self._spec.transform_peak_bytes,
                         )
                         last_revision = source.ref.revision
                         next_evaluated = evaluator.evaluate(

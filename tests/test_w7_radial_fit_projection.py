@@ -123,8 +123,6 @@ def _sparse_radial_figure():
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
         fit_results={"data": result},
-        evaluation_memory_limit_bytes=200 << 20,
-        render_memory_limit_bytes=200 << 20,
     )
     return figure, model, result
 
@@ -225,7 +223,7 @@ def test_canonical_agg_uses_same_center_ring_projection_without_model_evaluation
         raise AssertionError("radial saved-fit rendering must not evaluate a predicted image")
 
     monkeypatch.setattr(FitResultBatch, "evaluate_batch", forbidden_evaluate)
-    rendered = figure.render(memory_limit_bytes=200 << 20)
+    rendered = figure.render()
     try:
         data_axes = rendered.axes[:6]
         expected_converged = sum(
@@ -268,7 +266,6 @@ def test_projected_radial_export_honors_current_view_cmap_clim_and_formats(
     monkeypatch,
 ):
     from zlc_frontend.matplotlib_render import (
-        estimate_projected_radial_fit_render_peak_nbytes,
         release_agg_figure,
         render_radial_gaussian_image_fit_panels,
         save_radial_gaussian_image_fit_panels,
@@ -291,25 +288,13 @@ def test_projected_radial_export_honors_current_view_cmap_clim_and_formats(
         raise AssertionError("typed radial export must not evaluate a fit model")
 
     monkeypatch.setattr(FitResultBatch, "evaluate_batch", forbidden_evaluate)
-    required = estimate_projected_radial_fit_render_peak_nbytes(
-        panels,
-        dpi=72.0,
-        columns=3,
-    )
     with pytest.raises(ValueError, match="columns cannot exceed"):
-        estimate_projected_radial_fit_render_peak_nbytes(
-            panels,
-            dpi=72.0,
-            columns=len(panels) + 1,
-        )
-    with pytest.raises(MemoryError, match="projected radial render peak"):
         render_radial_gaussian_image_fit_panels(
             panels,
             display,
             limits,
-            columns=3,
             dpi=72.0,
-            memory_limit_bytes=required - 1,
+            columns=len(panels) + 1,
         )
     rendered = render_radial_gaussian_image_fit_panels(
         panels,
@@ -317,7 +302,6 @@ def test_projected_radial_export_honors_current_view_cmap_clim_and_formats(
         limits,
         columns=3,
         dpi=72.0,
-        memory_limit_bytes=required,
     )
     try:
         from matplotlib.patches import Rectangle
@@ -358,6 +342,5 @@ def test_projected_radial_export_honors_current_view_cmap_clim_and_formats(
             image_format=image_format,
             columns=1,
             dpi=72.0,
-            memory_limit_bytes=required,
         )
         assert output.getvalue().startswith(signature)

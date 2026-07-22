@@ -30,11 +30,6 @@ from zlc_frontend.display_range import RelimMode
 from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import QtRasterBoard
 from zlc_frontend.render import CurvePanelPayload
-from zlc_neutral_atom.acquisition.camera import CameraFrameMetadataContract
-from zlc_neutral_atom.runtime.dataset import (
-    dataset_storage_nbytes,
-    mutable_dataset_storage_nbytes,
-)
 
 
 @pytest.fixture(scope="module")
@@ -213,7 +208,7 @@ def test_typed_roi_curve_preserves_raw_axes_and_presents_one_coherent_board(
         assert bindings[scalar_schema.repeat_axis.axis_id].role is AxisViewRole.SELECTED
         assert curve_document.layers[0].view.display_selections == ()
 
-        evaluated = FigureEvaluator(window._slot.evaluation_policy).evaluate(
+        evaluated = FigureEvaluator().evaluate(
             curve_document,
             ResolvedDatasetMap(
                 (
@@ -235,34 +230,6 @@ def test_typed_roi_curve_preserves_raw_axes_and_presents_one_coherent_board(
     finally:
         if window.isVisible():
             _close_window(application, window)
-
-
-def test_history_admission_counts_reorder_scratch_and_every_metadata_record(
-    experiment,
-):
-    one = experiment.readout.inspect_camera_monitor(
-        experiment.readout.camera_monitor_request(history_capacity=1)
-    )
-    four = experiment.readout.inspect_camera_monitor(
-        experiment.readout.camera_monitor_request(history_capacity=4)
-    )
-    metadata = CameraFrameMetadataContract().max_retained_nbytes
-    expected_delta = (
-        2 * mutable_dataset_storage_nbytes(four.output_schema)
-        + dataset_storage_nbytes(four.output_schema)
-        + 4 * metadata
-        - mutable_dataset_storage_nbytes(one.output_schema)
-        - dataset_storage_nbytes(one.output_schema)
-        - metadata
-    )
-    assert four.base_peak_bytes - one.base_peak_bytes == expected_delta
-
-    oversized = experiment.readout.camera_monitor_request(
-        history_capacity=10**9,
-        memory_limit_bytes=1,
-    )
-    with pytest.raises(MemoryError, match="base peak"):
-        experiment.readout.inspect_camera_monitor(oversized)
 
 
 def test_curve_selector_and_form_change_only_the_monitor_presentation(

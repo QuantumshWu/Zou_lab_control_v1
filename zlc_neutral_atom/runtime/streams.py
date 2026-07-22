@@ -36,13 +36,6 @@ _MONITOR_TOKEN = object()
 _STREAM_TOKEN = object()
 _PRODUCER_TOKEN = object()
 _READINESS_TOKEN = object()
-_MAX_ARTIFACT_REFERENCE_BYTES = 64 * 1024
-_MAX_DIRECT_ARTIFACT_INPUTS = 32
-_MAX_DIRECT_ARTIFACT_INPUT_BYTES = 1024 * 1024
-_MAX_EXACT_PROCESSOR_STAGES = 64
-_MAX_CHAIN_ARTIFACT_INPUT_OCCURRENCES = 256
-_MAX_CHAIN_ARTIFACT_INPUT_BYTES = 4 * 1024 * 1024
-_MAX_TRACE_CAUSATION_REFS = 1 + _MAX_DIRECT_ARTIFACT_INPUTS
 _EVENT_SPAN_REF_SCHEMA = "zlc_neutral_atom.EventSpanRef"
 _ARTIFACT_INPUT_REF_SCHEMA = "zlc_neutral_atom.ArtifactInputRef"
 _PROCESSOR_STAGE_PROVENANCE_SCHEMA = (
@@ -52,11 +45,8 @@ _PROCESSOR_STAGE_PROVENANCE_SCHEMA = (
 
 class PayloadContract(Protocol[PayloadT]):
     fingerprint: str
-    max_retained_nbytes: int
 
     def snapshot(self, payload: PayloadT) -> PayloadT: ...
-
-    def retained_nbytes(self, payload: PayloadT) -> int: ...
 
     def digest(self, payload: PayloadT) -> str: ...
 
@@ -276,8 +266,8 @@ class ArtifactInputRef:
         if not isinstance(self.canonical_reference, bytes):
             raise TypeError("canonical_reference must be immutable bytes")
         raw = self.canonical_reference
-        if not raw or len(raw) > _MAX_ARTIFACT_REFERENCE_BYTES:
-            raise ValueError("canonical_reference must contain at most 64 KiB")
+        if not raw:
+            raise ValueError("canonical_reference must not be empty")
         try:
             tree = decode(raw)
         except Exception as error:
@@ -321,7 +311,7 @@ def _owned_artifact_input_ref(reference: ArtifactInputRef) -> ArtifactInputRef:
 
 @dataclass(frozen=True)
 class ProcessorStageProvenance:
-    """Bounded, inspectable identity of one direct processor dependency set."""
+    """Inspectable identity of one direct processor dependency set."""
 
     processor_binding_digest: str
     direct_artifact_inputs: tuple[ArtifactInputRef, ...] = ()
@@ -335,13 +325,6 @@ class ProcessorStageProvenance:
             raise TypeError(
                 "direct_artifact_inputs must contain ArtifactInputRef values"
             )
-        if len(inputs) > _MAX_DIRECT_ARTIFACT_INPUTS:
-            raise ValueError("processor stage has too many direct artifact inputs")
-        if (
-            sum(len(item.canonical_reference) for item in inputs)
-            > _MAX_DIRECT_ARTIFACT_INPUT_BYTES
-        ):
-            raise ValueError("processor stage artifact inputs exceed the byte budget")
         identities = tuple(item.fingerprint for item in inputs)
         if len(set(identities)) != len(identities):
             raise ValueError("processor stage repeats an artifact input")
@@ -358,25 +341,11 @@ class ProcessorStageProvenance:
 def _validated_processor_stage_chain(
     processor_stages: tuple[ProcessorStageProvenance, ...],
 ) -> tuple[ProcessorStageProvenance, ...]:
-    """Apply the one resource boundary shared by live and durable lineage."""
+    """Validate the processor chain shared by live and durable lineage."""
 
     stages = tuple(processor_stages)
     if any(not isinstance(stage, ProcessorStageProvenance) for stage in stages):
         raise TypeError("processor_stages contains an unsupported value")
-    if len(stages) > _MAX_EXACT_PROCESSOR_STAGES:
-        raise ValueError("exact processor chain exceeds the stage budget")
-    chain_inputs = tuple(
-        reference
-        for stage in stages
-        for reference in stage.direct_artifact_inputs
-    )
-    if len(chain_inputs) > _MAX_CHAIN_ARTIFACT_INPUT_OCCURRENCES:
-        raise ValueError("exact processor chain has too many artifact input edges")
-    if (
-        sum(len(reference.canonical_reference) for reference in chain_inputs)
-        > _MAX_CHAIN_ARTIFACT_INPUT_BYTES
-    ):
-        raise ValueError("exact processor chain artifact inputs exceed the byte budget")
     return stages
 
 
@@ -524,8 +493,6 @@ class TraceContext:
         refs = tuple(self.causation_refs)
         if any(not isinstance(ref, (EventRef, EventSpanRef, ArtifactInputRef)) for ref in refs):
             raise TypeError("causation_refs contains an unsupported reference")
-        if len(refs) > _MAX_TRACE_CAUSATION_REFS:
-            raise ValueError("causation_refs exceeds the direct lineage budget")
         object.__setattr__(self, "causation_refs", refs)
         for field in ("config_revision", "control_revision"):
             value = getattr(self, field)
@@ -759,7 +726,6 @@ class ProducerFlowControl(str, Enum):
 @dataclass(frozen=True)
 class _Stored(Generic[PayloadT]):
     envelope: Envelope[PayloadT]
-    payload_bytes: int
 
 
 class Delivery(Generic[PayloadT]):
@@ -815,7 +781,6 @@ class ExactReservation(Generic[PayloadT]):
         start_sequence: int,
         end_sequence: int,
         max_inflight_events: int,
-        max_inflight_bytes: int,
         trace_binding: TraceBinding,
     ) -> None:
         if authority is not _RESERVATION_TOKEN:
@@ -825,10 +790,8 @@ class ExactReservation(Generic[PayloadT]):
         self.start_sequence = start_sequence
         self.end_sequence = end_sequence
         self.max_inflight_events = max_inflight_events
-        self.max_inflight_bytes = max_inflight_bytes
         self.trace_binding = trace_binding
         self._ack_sequence = start_sequence
-        self._unacked_bytes = 0
         self._state = ReservationState.RESERVED
         self._cursor: AcquisitionCursor[PayloadT] | None = None
         self._consumer_owner: object | None = None
@@ -1415,42 +1378,27 @@ class MonitorTap(Generic[PayloadT]):
         *,
         stream: "AcquisitionStream[PayloadT]",
         max_events: int,
-        max_bytes: int,
     ) -> None:
         if authority is not _MONITOR_TOKEN:
             raise PermissionError("MonitorTap can only be minted by AcquisitionStream")
         self._stream = stream
         self.max_events = _positive_int(max_events, "monitor max_events")
-        self.max_bytes = _positive_int(max_bytes, "monitor max_bytes")
-        if self.max_bytes < stream.max_payload_bytes:
-            raise ValueError("monitor max_bytes must retain one maximum payload")
         self._condition = threading.Condition(threading.Lock())
         self._queue: deque[_Stored[PayloadT]] = deque()
-        self._retained_bytes = 0
         self._missed = 0
         self._closed = False
         self._source_finished = False
         self._terminal_error: StreamError | None = None
         self._consumer_owner: object | None = None
 
-    @property
-    def retained_bytes(self) -> int:
-        with self._condition:
-            return self._retained_bytes
-
     def _offer(self, stored: _Stored[PayloadT]) -> None:
         with self._condition:
             if self._closed or self._source_finished:
                 return
-            while self._queue and (
-                len(self._queue) >= self.max_events
-                or self._retained_bytes + stored.payload_bytes > self.max_bytes
-            ):
-                removed = self._queue.popleft()
-                self._retained_bytes -= removed.payload_bytes
+            while self._queue and len(self._queue) >= self.max_events:
+                self._queue.popleft()
                 self._missed += 1
             self._queue.append(stored)
-            self._retained_bytes += stored.payload_bytes
             self._condition.notify_all()
 
     def _claim_consumer(self, owner: object) -> None:
@@ -1508,11 +1456,9 @@ class MonitorTap(Generic[PayloadT]):
                 raise PermissionError("monitor tap belongs to another consumer")
             if latest:
                 while len(self._queue) > 1:
-                    removed = self._queue.popleft()
-                    self._retained_bytes -= removed.payload_bytes
+                    self._queue.popleft()
                     self._missed += 1
             stored = self._queue.popleft()
-            self._retained_bytes -= stored.payload_bytes
             missed, self._missed = self._missed, 0
             return MonitorUpdate(stored.envelope, missed)
 
@@ -1543,7 +1489,6 @@ class MonitorTap(Generic[PayloadT]):
             self._terminal_error = error
             if error is not None:
                 self._queue.clear()
-                self._retained_bytes = 0
             self._condition.notify_all()
 
     def close(self) -> None:
@@ -1552,7 +1497,6 @@ class MonitorTap(Generic[PayloadT]):
             self._closed = True
             self._consumer_owner = None
             self._queue.clear()
-            self._retained_bytes = 0
             self._condition.notify_all()
 
 
@@ -1603,7 +1547,6 @@ class AcquisitionStream(Generic[PayloadT]):
         payload_contract: PayloadContract[PayloadT],
         flow_control: ProducerFlowControl,
         retention_events: int,
-        retention_bytes: int,
         join_key_contract: JoinKeyContract | None = None,
     ) -> None:
         if authority is not _STREAM_TOKEN:
@@ -1616,7 +1559,6 @@ class AcquisitionStream(Generic[PayloadT]):
             raise TypeError("flow_control must be ProducerFlowControl")
         try:
             payload_contract_fingerprint = payload_contract.fingerprint
-            max_payload_bytes = payload_contract.max_retained_nbytes
         except AttributeError as exc:
             raise TypeError("payload_contract does not implement PayloadContract") from exc
         _digest(payload_contract_fingerprint, "payload contract fingerprint")
@@ -1625,11 +1567,7 @@ class AcquisitionStream(Generic[PayloadT]):
         self.payload_contract_fingerprint = payload_contract_fingerprint
         self.flow_control = flow_control
         self.retention_events = _positive_int(retention_events, "retention_events")
-        self.retention_bytes = _positive_int(retention_bytes, "retention_bytes")
-        self.max_payload_bytes = _positive_int(max_payload_bytes, "max_payload_bytes")
-        if self.max_payload_bytes > self.retention_bytes:
-            raise ValueError("max_payload_bytes cannot exceed retention_bytes")
-        for method in ("snapshot", "validate", "retained_nbytes", "digest"):
+        for method in ("snapshot", "validate", "digest"):
             if not callable(getattr(payload_contract, method, None)):
                 raise TypeError(f"payload_contract.{method} must be callable")
         if join_key_contract is not None:
@@ -1641,7 +1579,6 @@ class AcquisitionStream(Generic[PayloadT]):
         self._condition = threading.Condition(threading.RLock())
         self._records: dict[int, _Stored[PayloadT]] = {}
         self._order: deque[int] = deque()
-        self._retained_bytes = 0
         self._next_sequence = 0
         self._reservations: dict[object, ExactReservation[PayloadT]] = {}
         self._formal_consumer_claimed = False
@@ -1667,7 +1604,6 @@ class AcquisitionStream(Generic[PayloadT]):
         *,
         flow_control: ProducerFlowControl,
         retention_events: int,
-        retention_bytes: int,
         join_key_contract: JoinKeyContract | None = None,
     ) -> tuple["AcquisitionStream[PayloadT]", AcquisitionProducer[PayloadT]]:
         stream = cls(
@@ -1677,7 +1613,6 @@ class AcquisitionStream(Generic[PayloadT]):
             payload_contract=payload_contract,
             flow_control=flow_control,
             retention_events=retention_events,
-            retention_bytes=retention_bytes,
             join_key_contract=join_key_contract,
         )
         producer = stream._producer_owner
@@ -1702,11 +1637,6 @@ class AcquisitionStream(Generic[PayloadT]):
             return self._next_sequence
 
     @property
-    def retained_bytes(self) -> int:
-        with self._condition:
-            return self._retained_bytes
-
-    @property
     def retained_events(self) -> int:
         with self._condition:
             return len(self._order)
@@ -1716,23 +1646,14 @@ class AcquisitionStream(Generic[PayloadT]):
         *,
         total_events: int,
         max_inflight_events: int,
-        max_inflight_bytes: int,
         trace_binding: TraceBinding,
     ) -> ExactReservation[PayloadT]:
         total = _positive_int(total_events, "total_events")
         inflight_events = _positive_int(max_inflight_events, "max_inflight_events")
-        inflight_bytes = _positive_int(max_inflight_bytes, "max_inflight_bytes")
         if not isinstance(trace_binding, TraceBinding):
             raise TypeError("trace_binding must be TraceBinding")
         if inflight_events > total:
             raise ValueError("max_inflight_events cannot exceed total_events")
-        required_worst_case_bytes = inflight_events * self.max_payload_bytes
-        if inflight_bytes < required_worst_case_bytes:
-            raise ValueError(
-                "max_inflight_bytes must cover max_inflight_events * max_payload_bytes"
-            )
-        if inflight_bytes > self.retention_bytes:
-            raise ReservationCapacityExceeded("reservation byte budget exceeds stream capacity")
         with self._condition:
             if self._closed:
                 raise StreamEndedEarly("cannot reserve a closed stream")
@@ -1752,7 +1673,6 @@ class AcquisitionStream(Generic[PayloadT]):
                 start_sequence=self._next_sequence,
                 end_sequence=self._next_sequence + total,
                 max_inflight_events=inflight_events,
-                max_inflight_bytes=inflight_bytes,
                 trace_binding=trace_binding,
             )
             self._reservations[token] = reservation
@@ -1771,12 +1691,11 @@ class AcquisitionStream(Generic[PayloadT]):
                 reservation_token=None,
             )
 
-    def monitor(self, *, max_events: int, max_bytes: int) -> MonitorTap[PayloadT]:
+    def monitor(self, *, max_events: int) -> MonitorTap[PayloadT]:
         tap = MonitorTap(
             _MONITOR_TOKEN,
             stream=self,
             max_events=max_events,
-            max_bytes=max_bytes,
         )
         with self._condition:
             if self._closed:
@@ -1801,12 +1720,6 @@ class AcquisitionStream(Generic[PayloadT]):
             self._payload_contract.digest(payload),
             "payload digest",
         )
-        size = _positive_int(
-            self._payload_contract.retained_nbytes(payload),
-            "measured payload bytes",
-        )
-        if size > self.max_payload_bytes:
-            raise ValueError("payload exceeds the stream contract max_payload_bytes")
         if self._join_key_contract is None:
             if join_key is not None:
                 raise ValueError("this stream generation does not declare a join key")
@@ -1894,21 +1807,14 @@ class AcquisitionStream(Generic[PayloadT]):
                     unacked_events = sequence - reservation._ack_sequence + 1
                     if unacked_events > reservation.max_inflight_events:
                         raise StreamBackpressure(
-                            "exact consumer exceeded its event backlog budget"
+                            "exact consumer exceeded its event backlog capacity"
                         )
-                    if reservation._unacked_bytes + size > reservation.max_inflight_bytes:
-                        raise StreamBackpressure(
-                            "exact consumer exceeded its byte backlog budget"
-                        )
-                trim_removals = self._plan_trim_locked(
-                    extra_events=1,
-                    extra_bytes=size,
-                )
+                trim_removals = self._plan_trim_locked(extra_events=1)
             except StreamBackpressure as error:
                 if self.flow_control is ProducerFlowControl.BACKPRESSURE_CAPABLE:
                     raise
                 overrun = RetentionOverrun(
-                    "non-backpressure source exceeded frozen retention budget; "
+                    "non-backpressure source exceeded frozen record capacity; "
                     "the generation is permanently invalid"
                 )
                 self._terminal_error = overrun
@@ -1921,7 +1827,7 @@ class AcquisitionStream(Generic[PayloadT]):
                         reservation._state = ReservationState.FAILED
                 self._close_generation_locked(overrun)
                 raise overrun from error
-            stored = _Stored(envelope, size)
+            stored = _Stored(envelope)
             committed_next_sequence = sequence + 1
             # This counter is the first authoritative mutation of publication.
             # Callers with the exclusive producer can therefore use its delta
@@ -1934,7 +1840,6 @@ class AcquisitionStream(Generic[PayloadT]):
                 self._apply_trim_locked(trim_removals)
                 self._records[sequence] = stored
                 self._order.append(sequence)
-                self._retained_bytes += size
                 for reservation in self._reservations.values():
                     if (
                         reservation._state
@@ -1947,7 +1852,6 @@ class AcquisitionStream(Generic[PayloadT]):
                         <= sequence
                         < reservation.end_sequence
                     ):
-                        reservation._unacked_bytes += size
                         if (
                             self._next_sequence >= reservation.end_sequence
                             and reservation._state is ReservationState.ACTIVE
@@ -2375,7 +2279,6 @@ class AcquisitionStream(Generic[PayloadT]):
         if stored is None:
             raise StreamGap(sequence, self._earliest_retained_locked(), self._next_sequence)
         reservation._ack_sequence += 1
-        reservation._unacked_bytes -= stored.payload_bytes
         self._trim_locked()
         self._condition.notify_all()
 
@@ -2438,42 +2341,30 @@ class AcquisitionStream(Generic[PayloadT]):
         self,
         *,
         extra_events: int = 0,
-        extra_bytes: int = 0,
     ) -> int:
         protected = self._protected_sequence_locked()
         prospective_count = len(self._order)
-        prospective_bytes = self._retained_bytes
         removal_count = 0
         for oldest in self._order:
             below_protected_watermark = protected is not None and oldest < protected
-            over_capacity = (
-                prospective_count + extra_events > self.retention_events
-                or prospective_bytes + extra_bytes > self.retention_bytes
-            )
+            over_capacity = prospective_count + extra_events > self.retention_events
             if not below_protected_watermark and not over_capacity:
                 break
             if not below_protected_watermark and protected is not None:
                 raise StreamBackpressure("stream retention is pinned by an unacknowledged exact cursor")
             prospective_count -= 1
-            prospective_bytes -= self._records[oldest].payload_bytes
             removal_count += 1
         if prospective_count + extra_events > self.retention_events:
             raise StreamBackpressure("stream event retention capacity is exhausted")
-        if prospective_bytes + extra_bytes > self.retention_bytes:
-            raise StreamBackpressure("stream byte retention capacity is exhausted")
         return removal_count
 
     def _apply_trim_locked(self, removal_count: int) -> None:
         for _ in range(removal_count):
             oldest = self._order.popleft()
-            removed = self._records.pop(oldest)
-            self._retained_bytes -= removed.payload_bytes
+            self._records.pop(oldest)
 
-    def _trim_locked(self, *, extra_events: int = 0, extra_bytes: int = 0) -> None:
-        removal_count = self._plan_trim_locked(
-            extra_events=extra_events,
-            extra_bytes=extra_bytes,
-        )
+    def _trim_locked(self, *, extra_events: int = 0) -> None:
+        removal_count = self._plan_trim_locked(extra_events=extra_events)
         self._apply_trim_locked(removal_count)
 
 

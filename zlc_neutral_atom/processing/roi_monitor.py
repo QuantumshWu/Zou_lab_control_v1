@@ -10,7 +10,6 @@ camera input and one optional scalar output branch.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import math
 from numbers import Integral
 
 import numpy as np
@@ -37,7 +36,7 @@ from zlc_data.numeric import (
     canonical_sum_dtype,
     checked_numeric_sum,
 )
-from zlc_storage import canonical_digest, encode, sha256_text
+from zlc_storage import canonical_digest, sha256_text
 
 from zlc_neutral_atom.acquisition.camera import (
     CameraFrameMetadata,
@@ -56,10 +55,6 @@ from zlc_neutral_atom.runtime.streams import (
 )
 
 
-_REFERENCE_MAX_BYTES = 2048
-_RECORD_BYTES = 128
-
-
 @dataclass(frozen=True, init=False)
 class RoiScalarBinding:
     """One admitted ROI/reducer and its fixed output contract."""
@@ -70,7 +65,6 @@ class RoiScalarBinding:
     validity_policy: ValidityPolicy
     output_schema: ValueSchema = field(init=False, repr=False)
     fingerprint: str = field(init=False)
-    reduction_scratch_nbytes: int = field(init=False)
     _y_range: tuple[int, int] = field(init=False, repr=False, compare=False)
     _x_range: tuple[int, int] = field(init=False, repr=False, compare=False)
 
@@ -151,18 +145,6 @@ class RoiScalarBinding:
                 raise OverflowError(
                     "ROI SUM contributor bound exceeds its canonical output dtype"
                 )
-        # Partial component validity needs one selected safe array.  MEAN may
-        # additionally widen that array to the canonical accumulator dtype.
-        object.__setattr__(
-            self,
-            "reduction_scratch_nbytes",
-            _roi_scalar_scratch_nbytes(
-                schema,
-                output_schema,
-                self.reduction,
-                contributors,
-            ),
-        )
         object.__setattr__(
             self,
             "fingerprint",
@@ -205,50 +187,6 @@ def roi_scalar_output_schema(
         ValidityContract.value(),
         output_dtype,
         schema.value_unit,
-    )
-
-
-def max_roi_scalar_reduction_scratch_nbytes(
-    input_contract: CameraSampleContract,
-    reduction: ReductionMethod,
-) -> int:
-    """Worst scratch for the full admitted camera cell under ``reduction``."""
-
-    output_schema = roi_scalar_output_schema(input_contract, reduction)
-    schema = input_contract.value_schema
-    contributors = math.prod(schema.data_shape)
-    return _roi_scalar_scratch_nbytes(
-        schema,
-        output_schema,
-        reduction,
-        contributors,
-    )
-
-
-def _roi_scalar_scratch_nbytes(
-    input_schema: ValueSchema,
-    output_schema: ValueSchema,
-    reduction: ReductionMethod,
-    contributors: int,
-) -> int:
-    selected_input_bytes = contributors * input_schema.dtype.itemsize
-    selected_accumulator_bytes = contributors * output_schema.dtype.itemsize
-    finite_mask_bytes = (
-        contributors * np.dtype(bool).itemsize
-        if reduction is ReductionMethod.MEAN or input_schema.dtype.kind in "fc"
-        else 0
-    )
-    return int(
-        selected_input_bytes
-        + (
-            selected_accumulator_bytes
-            if reduction is ReductionMethod.MEAN
-            and output_schema.dtype != input_schema.dtype
-            else 0
-        )
-        # checked_numeric_sum verifies finite floating/complex inputs and
-        # therefore owns one ROI-sized boolean temporary at peak.
-        + finite_mask_bytes
     )
 
 
@@ -369,15 +307,10 @@ class RoiScalarSample:
 @dataclass(frozen=True)
 class RoiScalarMetadataContract:
     source_metadata_contract: CameraFrameMetadataContract
-    source_reference_max_bytes: int = _REFERENCE_MAX_BYTES
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_metadata_contract, CameraFrameMetadataContract):
             raise TypeError("source_metadata_contract must be CameraFrameMetadataContract")
-        limit = self.source_reference_max_bytes
-        if isinstance(limit, bool) or not isinstance(limit, Integral) or limit <= 0:
-            raise ValueError("source_reference_max_bytes must be a positive integer")
-        object.__setattr__(self, "source_reference_max_bytes", int(limit))
 
     @property
     def fingerprint(self) -> str:
@@ -385,16 +318,7 @@ class RoiScalarMetadataContract:
             {
                 "contract": "zlc_neutral_atom.RoiScalarRevisionMetadata",
                 "source_metadata": self.source_metadata_contract.fingerprint,
-                "source_reference_max_bytes": self.source_reference_max_bytes,
             }
-        )
-
-    @property
-    def max_retained_nbytes(self) -> int:
-        return (
-            _RECORD_BYTES
-            + self.source_reference_max_bytes
-            + self.source_metadata_contract.max_retained_nbytes
         )
 
     def snapshot(self, payload: RoiScalarSample) -> RoiScalarMetadata:
@@ -411,17 +335,6 @@ class RoiScalarMetadataContract:
         sha256_text(metadata.binding_fingerprint, "binding_fingerprint")
         if metadata.control_revision <= 0:
             raise ValueError("control_revision must be a positive integer")
-        if len(encode(event_ref_to_tree(metadata.source_event_ref))) > self.source_reference_max_bytes:
-            raise ValueError("source EventRef exceeds the admitted metadata byte bound")
-
-    def retained_nbytes(self, metadata: object | None) -> int:
-        self.validate(metadata)
-        assert isinstance(metadata, RoiScalarMetadata)
-        return (
-            _RECORD_BYTES
-            + len(encode(event_ref_to_tree(metadata.source_event_ref)))
-            + self.source_metadata_contract.retained_nbytes(metadata.source_metadata)
-        )
 
     def digest(self, metadata: object | None) -> str:
         self.validate(metadata)
@@ -465,14 +378,6 @@ class RoiScalarSampleContract:
             }
         )
 
-    @property
-    def max_retained_nbytes(self) -> int:
-        return (
-            _RECORD_BYTES
-            + self.value_contract.max_retained_nbytes
-            + self.metadata_contract.max_retained_nbytes
-        )
-
     def snapshot(self, payload: RoiScalarSample) -> RoiScalarSample:
         self.validate(payload)
         return payload
@@ -482,14 +387,6 @@ class RoiScalarSampleContract:
             raise TypeError("payload must be RoiScalarSample")
         self.value_contract.validate(payload.value)
         self.metadata_contract.validate(payload.metadata)
-
-    def retained_nbytes(self, payload: RoiScalarSample) -> int:
-        self.validate(payload)
-        return (
-            _RECORD_BYTES
-            + self.value_contract.retained_nbytes(payload.value)
-            + self.metadata_contract.retained_nbytes(payload.metadata)
-        )
 
     def digest(self, payload: RoiScalarSample) -> str:
         self.validate(payload)
@@ -619,7 +516,6 @@ __all__ = [
     "RoiScalarSample",
     "RoiScalarSampleContract",
     "RoiScalarStreamProjection",
-    "max_roi_scalar_reduction_scratch_nbytes",
     "reduce_camera_roi",
     "roi_scalar_output_schema",
 ]

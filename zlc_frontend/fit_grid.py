@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from itertools import product
 import math
+from numbers import Integral
 
 from zlc_data import (
     REPEAT,
@@ -15,129 +16,37 @@ from zlc_data import (
     IndexRangeSelection,
     IndexSelection,
     Selection,
-    axis_layout_retained_upper_bound_nbytes,
-    axis_spec_retained_upper_bound_nbytes,
+    exact_integer_text,
     resolve_selection_indices,
 )
-from zlc_storage import canonical_text, positive_integer
+from zlc_storage import canonical_text
 
 from .figure import RepeatViewMode, ViewPreferences
 
 
 _GRID_PAGE_CELL_LIMIT = 36
-FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS = 2048
-_FIT_GRID_NAVIGATOR_AXIS_MEMORY_BYTES = 128 << 10
 
 
-def bounded_coordinate_label(value: object) -> str:
-    """Return a bounded display label; index authority retains the exact value."""
+def coordinate_label(value: object) -> str:
+    """Return the exact human-readable coordinate value."""
 
-    if isinstance(value, str):
-        if len(value) <= 192:
-            return value
-        return f"{value[:128]}…{value[-32:]} [length={len(value)}]"
-    if isinstance(value, int) and value.bit_length() > 4096:
-        sign = "negative " if value < 0 else ""
-        return f"<{sign}integer; {value.bit_length()} bits>"
+    if not isinstance(value, bool) and isinstance(value, Integral):
+        return exact_integer_text(value)
     return str(value)
 
 
-def _bounded_index_tuple_label(values: tuple[int, ...]) -> str:
-    labels = tuple(bounded_coordinate_label(value) for value in values)
+def _index_tuple_label(values: tuple[int, ...]) -> str:
+    labels = tuple(coordinate_label(value) for value in values)
     if len(labels) == 1:
         return f"({labels[0]},)"
     return f"({', '.join(labels)})"
 
 
-def _bounded_coordinate_label_upper_bound_characters(value: object) -> int:
-    """Bound :func:`bounded_coordinate_label` without decimalizing a bigint."""
-
-    if isinstance(value, str):
-        if len(value) <= 192:
-            return len(value)
-        # ``prefix…suffix [length=N]``; the decimalized value is only len(value).
-        return 176 + len(str(len(value)))
-    if isinstance(value, int):
-        bits = value.bit_length()
-        if bits > 4096:
-            return 32 + len(str(bits))
-        # ceil(bits * log10(2)) plus sign and conservative punctuation slack.
-        return 4 + max(1, (bits * 30103 + 99999) // 100000)
-    if isinstance(value, float):
-        return 32
-    if value is None:
-        return 4
-    # AxisSpec permits only int/float/str/null coordinates.  Keep this helper
-    # fail-closed if an invalid hand-written evaluated DTO reaches the UI.
-    raise TypeError("coordinate labels require int/float/str/null values")
-
-
 def _axis_address(axis: AxisSpec, index: int) -> str:
-    coordinate = bounded_coordinate_label(axis.coordinate_at(index))
-    index_label = bounded_coordinate_label(index)
+    coordinate = coordinate_label(axis.coordinate_at(index))
+    index_label = coordinate_label(index)
     unit = "" if axis.unit is None else f" {axis.unit}"
     return f"{axis.name}={coordinate}{unit} [index {index_label}]"
-
-
-def _fit_cell_address_upper_bound_characters(
-    axes: tuple[AxisSpec, ...],
-    multi_index: tuple[int, ...],
-) -> int:
-    """Bound one logical cell address before allocating any formatted text."""
-
-    if len(axes) != len(multi_index):
-        raise ValueError("fit cell address rank differs from its batch axes")
-    if not axes:
-        return len("scalar batch cell")
-    total = 3 * (len(axes) - 1)
-    for axis, index in zip(axes, multi_index, strict=True):
-        total += (
-            len(axis.name)
-            + 1
-            + _bounded_coordinate_label_upper_bound_characters(
-                axis.coordinate_at(index)
-            )
-            + (0 if axis.unit is None else 1 + len(axis.unit))
-            + len(" [index ]")
-            + _bounded_coordinate_label_upper_bound_characters(index)
-        )
-    return total
-
-
-def _fit_cell_summary_upper_bound_characters(
-    result: FitResultBatch,
-    storage_index: int | None,
-    address_characters: int,
-) -> int:
-    """Bound one panel summary before its address/lines are materialized."""
-
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("result must be FitResultBatch")
-    if isinstance(address_characters, bool) or not isinstance(
-        address_characters, int
-    ) or address_characters < 0:
-        raise ValueError("address_characters must be a non-negative integer")
-    if storage_index is None:
-        return address_characters + 512
-    if (
-        isinstance(storage_index, bool)
-        or not isinstance(storage_index, int)
-        or not 0 <= storage_index < result.batch_layout.storage_size
-    ):
-        raise IndexError("fit summary storage_index is outside the saved batch")
-    status = result.statuses[storage_index]
-    if status is not FitBatchStatus.CONVERGED:
-        error = result.errors[storage_index]
-        return address_characters + 768 + (0 if error is None else len(error))
-    parameter_characters = sum(
-        len(definition.name) + 2 * len(unit) + 96
-        for definition, unit in zip(
-            result.parameter_definitions,
-            result.parameter_units,
-            strict=True,
-        )
-    )
-    return address_characters + parameter_characters + 1024
 
 
 def _fit_cell_address(
@@ -232,102 +141,6 @@ def _page_spans(axes: tuple[AxisSpec, ...]) -> tuple[int, ...]:
     return tuple(spans)
 
 
-def _compact_retained_upper_bound(
-    artifact_identity: str,
-    model_id: str,
-    fit_axes: tuple[AxisSpec, ...],
-    axes: tuple[AxisSpec, ...],
-    layout: AxisLayout,
-) -> int:
-    axis_bytes = sum(
-        axis_spec_retained_upper_bound_nbytes(axis)
-        for axis in (*fit_axes, *axes)
-    )
-    ui_text_characters = sum(
-        len(axis.axis_id.value)
-        + len(axis.name)
-        + len(axis.role.value)
-        + (0 if axis.unit is None else len(axis.unit))
-        for axis in (*fit_axes, *axes)
-    )
-    # The compact model retains the authoritative AxisLayout but no fit
-    # arrays, covariance, per-cell error tuple, or formatted row table.
-    layout_bytes = axis_layout_retained_upper_bound_nbytes(layout)
-    return positive_integer(
-        64 * 1024
-        + 4 * (len(artifact_identity) + len(model_id))
-        + axis_bytes
-        + layout_bytes
-        # Model summaries, page/cell labels, the Qt navigator and transient
-        # handoff strings can coexist.  Coordinate values themselves are
-        # bounded by _coordinate_label and remain authoritative by index.
-        + 16 * ui_text_characters
-        + 2048 * len(FitBatchStatus),
-        "fit grid compact retained upper bound",
-    )
-
-
-def fit_grid_model_retained_upper_bound_nbytes(
-    artifact_identity: str,
-    result: FitResultBatch,
-) -> int:
-    """Preflight one compact grid model without constructing it or textifying coordinates."""
-
-    canonical_text(artifact_identity, "fit artifact identity")
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("result must be FitResultBatch")
-    return _compact_retained_upper_bound(
-        artifact_identity,
-        result.spec.model_id,
-        result.fit_axis_specs,
-        result.batch_axis_specs,
-        result.batch_layout,
-    )
-
-
-def fit_grid_navigation_retained_upper_bound_nbytes(
-    result: FitResultBatch,
-) -> int:
-    """Reserve one current page/cell summary alongside the compact model."""
-
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("result must be FitResultBatch")
-    axes = (*result.fit_axis_specs, *result.batch_axis_specs)
-    axis_text = sum(
-        len(axis.axis_id.value)
-        + len(axis.name)
-        + len(axis.role.value)
-        + (0 if axis.unit is None else len(axis.unit))
-        for axis in axes
-    )
-    parameter_text = sum(
-        len(definition.name) + len(unit)
-        for definition, unit in zip(
-            result.parameter_definitions,
-            result.parameter_units,
-            strict=True,
-        )
-    )
-    error_text = max(
-        (0 if value is None else len(value) for value in result.errors),
-        default=0,
-    )
-    # Page and focused-cell values are mutually exclusive, but the returned
-    # string, Qt copy, and worker handoff can coexist.  Coordinate labels are
-    # deliberately bounded by _coordinate_label; authority remains the exact
-    # IndexSelection rather than the presentation string.
-    return positive_integer(
-        64 * 1024
-        + 24 * (axis_text + parameter_text + error_text)
-        # One navigator editor can transiently retain Qt UTF-16, Python text,
-        # parse input, and a Python bigint.  This dominates the shared bounded
-        # direct-entry contract while physical Previous/Next remains exact for
-        # still larger sparse logical indices.
-        + _FIT_GRID_NAVIGATOR_AXIS_MEMORY_BYTES * len(axes),
-        "fit grid navigation retained upper bound",
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class FitGridPage:
     """One bounded logical tile containing at least one stored fit cell."""
@@ -390,7 +203,6 @@ class FitGridModel:
     layout: AxisLayout
     status_counts: tuple[tuple[FitBatchStatus, int], ...]
     page_spans: tuple[int, ...] = field(init=False)
-    retained_upper_bound_bytes: int = field(init=False)
 
     def __post_init__(self) -> None:
         canonical_text(self.artifact_identity, "fit artifact identity")
@@ -423,17 +235,6 @@ class FitGridModel:
         object.__setattr__(self, "axes", axes)
         object.__setattr__(self, "status_counts", counts)
         object.__setattr__(self, "page_spans", _page_spans(axes))
-        object.__setattr__(
-            self,
-            "retained_upper_bound_bytes",
-            _compact_retained_upper_bound(
-                self.artifact_identity,
-                self.model_id,
-                fit_axes,
-                axes,
-                self.layout,
-            ),
-        )
 
     @classmethod
     def from_result(
@@ -477,11 +278,11 @@ class FitGridModel:
         )
         batch_axes = ", ".join(
             f"{axis.name} ({axis.role.value}, "
-            f"{bounded_coordinate_label(axis.size)})"
+            f"{coordinate_label(axis.size)})"
             for axis in self.axes
         ) or "one scalar batch"
         statuses = ", ".join(
-            f"{status.value.lower()}={bounded_coordinate_label(count)}"
+            f"{status.value.lower()}={coordinate_label(count)}"
             for status, count in self.status_counts
         ) or "no stored cells"
         return (
@@ -545,7 +346,7 @@ class FitGridModel:
         except KeyError as error:
             raise ValueError(
                 "selected logical fit cell "
-                f"{_bounded_index_tuple_label(multi)} is absent from the saved "
+                f"{_index_tuple_label(multi)} is absent from the saved "
                 "batch layout"
             ) from error
         return storage, multi, _fit_cell_address(self.axes, multi)
@@ -609,8 +410,8 @@ class FitGridModel:
                 raise ValueError("fit grid page address is outside a batch axis")
             terms.append(IndexRangeSelection(axis.axis_id, start, stop))
             bounds.append(
-                f"{axis.name}[{bounded_coordinate_label(start)}:"
-                f"{bounded_coordinate_label(stop)}]"
+                f"{axis.name}[{coordinate_label(start)}:"
+                f"{coordinate_label(stop)}]"
             )
             if axis.role != REPEAT and stop - start > 1:
                 facet_axis_ids.append(axis.axis_id)
@@ -708,11 +509,8 @@ class FitGridModel:
 
 
 __all__ = [
-    "FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS",
-    "bounded_coordinate_label",
+    "coordinate_label",
     "FitGridCellSummary",
     "FitGridModel",
     "FitGridPage",
-    "fit_grid_model_retained_upper_bound_nbytes",
-    "fit_grid_navigation_retained_upper_bound_nbytes",
 ]

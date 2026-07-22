@@ -15,7 +15,6 @@ import pytest
 
 import Zou_lab_control.notebook as zlc
 from Zou_lab_control.workbench._camera_monitor import CameraMonitorWorkbenchWindow
-from Zou_lab_control.workbench._camera_monitor import _scalar_presentation_peak
 from zlc_data import (
     MONITOR_HISTORY,
     REPEAT,
@@ -43,7 +42,6 @@ from zlc_frontend.figure import (
     EvaluatedHistogram,
     EvaluatedMeter,
     FigureDocument,
-    FigureEvaluationPolicy,
     FigureEvaluator,
     FigureLayer,
     FixedIndex,
@@ -54,16 +52,11 @@ from zlc_frontend.figure import (
 )
 from zlc_frontend.curve_display import CurveDisplayState
 from zlc_frontend.histogram_display import (
-    MAX_HISTOGRAM_BINS,
     HistogramBinProjection,
     HistogramCountScale,
     HistogramDisplayState,
 )
-from zlc_frontend.matplotlib_render import (
-    SinglePanelAggRenderer,
-    estimate_live_panel_raster_peak_nbytes,
-)
-from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
+from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
 from zlc_frontend.image_display import (
     ImageColormap,
     ImageDisplayState,
@@ -478,128 +471,6 @@ def test_histogram_binning_is_deterministic_and_never_fakes_empty_data():
     assert int(counts.sum()) == 5
     with pytest.raises(ValueError, match="finite"):
         HistogramBinProjection((np.array([1.0, np.nan]),))
-
-
-def test_scalar_display_budget_rejects_before_monitor_arm(experiment, application):
-    roi = _typed_roi(experiment)
-    roomy = experiment.readout.camera_monitor_request(
-        history_capacity=2,
-        roi=roi,
-        scalar_history_capacity=8,
-        memory_limit_bytes=1 << 30,
-    )
-    window = experiment.readout.camera_monitor_gui(roomy)
-    try:
-        start = window.findChild(QtWidgets.QPushButton, "startButton")
-        _until(application, start.isEnabled)
-        prepared = window._prepared
-        assert prepared is not None
-        required_peak = (
-            prepared.command.descriptor.base_peak_bytes
-            + prepared.downstream_peak_bytes
-        )
-        y_axis, x_axis = prepared.command.view_schema.cell_schema.data_axes
-        pixels = y_axis.size * x_axis.size
-        value_itemsize = prepared.command.view_schema.cell_schema.dtype.itemsize
-        held_bytes = pixels * (
-            2  # immutable INDEXED8 bytes + detached QImage pixel plane
-            + value_itemsize  # exact value plane for Z/H/hover
-            + np.dtype(bool).itemsize  # exact component validity
-        ) + 128 * (y_axis.size + x_axis.size)  # retained axis DTO entries
-        assert (
-            estimate_indexed8_raster_peak_nbytes(
-                y_axis.size,
-                x_axis.size,
-                value_itemsize=value_itemsize,
-                retained_fronts=2,
-                retained_sample_fronts=2,
-            )
-            - estimate_indexed8_raster_peak_nbytes(
-                y_axis.size,
-                x_axis.size,
-                value_itemsize=value_itemsize,
-                retained_fronts=1,
-                retained_sample_fronts=1,
-            )
-            == held_bytes
-        )
-        scalar_total, scalar_evaluation_peaks, scalar_hold_extra = (
-            _scalar_presentation_peak(
-                prepared.command.roi_control_schemas[0]
-            )
-        )
-        histogram_evaluation_peak = scalar_evaluation_peaks[1]
-        histogram_base = estimate_live_panel_raster_peak_nbytes(
-            800,
-            520,
-            evaluated_data_upper_bound_bytes=histogram_evaluation_peak,
-            histogram_bins=MAX_HISTOGRAM_BINS,
-        )
-        histogram_held = estimate_live_panel_raster_peak_nbytes(
-            800,
-            520,
-            evaluated_data_upper_bound_bytes=histogram_evaluation_peak,
-            histogram_bins=MAX_HISTOGRAM_BINS,
-            extra_retained_fronts=1,
-            extra_retained_evaluated_data_bytes=histogram_evaluation_peak,
-        )
-        assert scalar_total > 0
-        assert scalar_hold_extra >= histogram_held - histogram_base
-    finally:
-        if window.isVisible():
-            _close_window(application, window)
-
-    request = experiment.readout.camera_monitor_request(
-        history_capacity=2,
-        roi=roi,
-        scalar_history_capacity=8,
-        memory_limit_bytes=required_peak - 1,
-    )
-    window = experiment.readout.camera_monitor_gui(request)
-    try:
-        start = window.findChild(QtWidgets.QPushButton, "startButton")
-        _until(application, lambda: "peak budget" in window._local_diagnostic)
-        assert not start.isEnabled()
-        assert window._handle is None
-        assert window._slot is None
-    finally:
-        if window.isVisible():
-            _close_window(application, window)
-
-    exact = experiment.readout.camera_monitor_request(
-        history_capacity=2,
-        roi=roi,
-        scalar_history_capacity=8,
-        memory_limit_bytes=required_peak,
-    )
-    window = experiment.readout.camera_monitor_gui(exact)
-    try:
-        start = window.findChild(QtWidgets.QPushButton, "startButton")
-        _until(application, start.isEnabled)
-        assert window._handle is None and window._slot is None
-    finally:
-        if window.isVisible():
-            _close_window(application, window)
-
-    oversized = experiment.readout.camera_monitor_request(
-        history_capacity=2,
-        roi=roi,
-        scalar_history_capacity=FigureEvaluationPolicy().max_histogram_samples + 1,
-        memory_limit_bytes=1 << 30,
-    )
-    window = experiment.readout.camera_monitor_gui(oversized)
-    try:
-        start = window.findChild(QtWidgets.QPushButton, "startButton")
-        _until(
-            application,
-            lambda: "histogram sample limit" in window._local_diagnostic,
-        )
-        assert not start.isEnabled()
-        assert window._handle is None
-        assert window._slot is None
-    finally:
-        if window.isVisible():
-            _close_window(application, window)
 
 
 def test_image_reconfigure_shares_first_scalar_renderer_holder_across_worker_race(

@@ -29,10 +29,7 @@ from zlc_frontend.image_display import (
 )
 from zlc_frontend.image_raster import rasterize_image_indexed8
 from zlc_frontend.image_view import ImageViewportTransform
-from zlc_frontend.matplotlib_render import (
-    estimate_image_png_export_peak_nbytes,
-    save_image_panel_png,
-)
+from zlc_frontend.matplotlib_render import save_image_panel_png
 from zlc_frontend.render import ImagePanelPayload, RadialGaussianImageFitOverlay
 from zlc_frontend.render_style import indexed_colormap
 
@@ -153,8 +150,6 @@ def test_image_panel_png_export_preserves_exact_current_front(monkeypatch):
     from matplotlib.figure import Figure
 
     payload, display = _current_image_payload()
-    required = estimate_image_png_export_peak_nbytes(payload.image, dpi=72.0)
-    assert required > payload.image.values.nbytes + payload.image.validity.nbytes
 
     draw_calls = []
     original_draw = owner._draw_projected_image
@@ -180,23 +175,12 @@ def test_image_panel_png_export_preserves_exact_current_front(monkeypatch):
     monkeypatch.setattr(owner, "_draw_projected_image", recording_draw)
     monkeypatch.setattr(Figure, "savefig", recording_savefig)
 
-    with pytest.raises(MemoryError, match="image panel PNG export peak"):
-        save_image_panel_png(
-            payload,
-            display,
-            BytesIO(),
-            dpi=72.0,
-            memory_limit_bytes=required - 1,
-        )
-    assert draw_calls == []
-
     output = BytesIO()
     save_image_panel_png(
         payload,
         display,
         output,
         dpi=72.0,
-        memory_limit_bytes=required,
     )
     assert output.getvalue().startswith(b"\x89PNG\r\n\x1a\n")
     assert len(draw_calls) == 1
@@ -344,7 +328,6 @@ def test_generic_image_export_draws_fit_overlay_and_preserves_dynamic_clim(
 
     raw_payload, fixed_display = _current_image_payload()
     fit_payload, _ = _current_image_payload(fit_overlay=True)
-    required = estimate_image_png_export_peak_nbytes(raw_payload.image, dpi=72.0)
 
     viewport_type = type(fit_payload.viewport)
     point_calls = []
@@ -387,7 +370,6 @@ def test_generic_image_export_draws_fit_overlay_and_preserves_dynamic_clim(
         fixed_display,
         output,
         dpi=72.0,
-        memory_limit_bytes=required,
     )
     assert output.getvalue().startswith(b"\x89PNG\r\n\x1a\n")
     overlay = fit_payload.fit_overlay
@@ -440,7 +422,6 @@ def test_generic_image_export_draws_fit_overlay_and_preserves_dynamic_clim(
         dynamic_display,
         output,
         dpi=72.0,
-        memory_limit_bytes=required,
     )
     assert output.getvalue().startswith(b"\x89PNG\r\n\x1a\n")
     assert observed_draws[0]["color_limits"] == dynamic_limits
@@ -475,7 +456,6 @@ def test_image_fit_export_failure_or_sparse_cell_has_no_success_geometry(
         one_over_e_radius=None,
     )
     payload = replace(payload, fit_overlay=overlay)
-    required = estimate_image_png_export_peak_nbytes(payload.image, dpi=72.0)
 
     def forbidden_geometry(*_args, **_kwargs):
         raise AssertionError("failed/sparse fit export retained success geometry")
@@ -496,7 +476,6 @@ def test_image_fit_export_failure_or_sparse_cell_has_no_success_geometry(
         display,
         output,
         dpi=72.0,
-        memory_limit_bytes=required,
     )
     assert output.getvalue().startswith(b"\x89PNG\r\n\x1a\n")
     assert len(observed) == 1
@@ -505,58 +484,8 @@ def test_image_fit_export_failure_or_sparse_cell_has_no_success_geometry(
     assert observed[0]["diagnostic"] == diagnostic
 
 
-def _profile_witness_image(size: int, dtype) -> EvaluatedImage:
-    frame = CoordinateFrameId(f"profile-{size}")
-    coordinates = tuple(range(size))
-    return EvaluatedImage(
-        EvaluatedAxis(
-            AxisId(f"profile-{size}.x"),
-            "x",
-            SPATIAL_X,
-            "pixel",
-            coordinates,
-            coordinates,
-            frame,
-        ),
-        EvaluatedAxis(
-            AxisId(f"profile-{size}.y"),
-            "y",
-            SPATIAL_Y,
-            "pixel",
-            coordinates,
-            coordinates,
-            frame,
-        ),
-        np.zeros((size, size), dtype=dtype),
-        np.ones((size, size), dtype=np.bool_),
-    )
-
-
-@pytest.mark.parametrize(
-    ("size", "dtype", "measured_incremental_peak"),
-    (
-        (512, np.uint8, 35_367_651),
-        (1024, np.uint8, 75_846_083),
-        (1024, np.uint16, 76_947_732),
-        (1024, np.float32, 78_752_306),
-        (1024, np.float64, 82_942_638),
-        (2304, np.uint16, 373_728_906),
-    ),
-)
-def test_image_export_estimate_exceeds_frozen_profile_witness(
-    size: int,
-    dtype,
-    measured_incremental_peak: int,
-) -> None:
-    """Keep the static imshow formula above the July-2026 Windows Agg profiles."""
-
-    image = _profile_witness_image(size, dtype)
-    assert estimate_image_png_export_peak_nbytes(image) >= measured_incremental_peak
-
-
 def test_image_panel_png_export_rejects_state_that_does_not_own_payload_front():
     payload, display = _current_image_payload()
-    required = estimate_image_png_export_peak_nbytes(payload.image, dpi=72.0)
 
     with pytest.raises(ValueError, match="exact payload viewport"):
         save_image_panel_png(
@@ -564,7 +493,6 @@ def test_image_panel_png_export_rejects_state_that_does_not_own_payload_front():
             replace(display, x_view=None),
             BytesIO(),
             dpi=72.0,
-            memory_limit_bytes=required,
         )
     forged_x_axis = replace(payload.viewport.x_axis, name="forged camera x")
     forged_payload = replace(
@@ -581,7 +509,6 @@ def test_image_panel_png_export_rejects_state_that_does_not_own_payload_front():
             display,
             BytesIO(),
             dpi=72.0,
-            memory_limit_bytes=required,
         )
     with pytest.raises(ValueError, match="colormap differs"):
         save_image_panel_png(
@@ -589,7 +516,6 @@ def test_image_panel_png_export_rejects_state_that_does_not_own_payload_front():
             replace(display, colormap=ImageColormap.VIRIDIS),
             BytesIO(),
             dpi=72.0,
-            memory_limit_bytes=required,
         )
     with pytest.raises(ValueError, match="fixed image display limits differ"):
         save_image_panel_png(
@@ -597,5 +523,4 @@ def test_image_panel_png_export_rejects_state_that_does_not_own_payload_front():
             replace(display, fixed_color_limits=(3.0, 9.0)),
             BytesIO(),
             dpi=72.0,
-            memory_limit_bytes=required,
         )

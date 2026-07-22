@@ -336,7 +336,7 @@ class FigureViewer(QtWidgets.QWidget):
     def sizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt API name
         # The window opens at the SAME screen fraction as the other two top-level GUIs -- the task
         # console (``TaskConsole.sizeHint``) and the pulse editor both return ``screen_fit_window_size``
-        # VERBATIM from their ``sizeHint``.  The size is the screen BUDGET, never the content: the inner
+        # VERBATIM from their ``sizeHint``.  The size is the screen envelope, never the content: the inner
         # layout (fixed Info column + a console board sized to fill the rest) fits inside it, so the
         # window can't collapse to a bare Info strip whether or not a figure is loaded.  A Python
         # exception from this Qt-virtual would crash the C++ adjustSize, so self-swallow.

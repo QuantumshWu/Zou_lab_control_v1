@@ -10,7 +10,6 @@ import pytest
 
 from zlc_storage.canonical import (
     CanonicalArrayEvent,
-    CanonicalDecodeLimits,
     CanonicalEncodingError,
     CanonicalListEvent,
     canonical_text,
@@ -266,9 +265,9 @@ def test_structure_admission_rejects_before_any_ndarray_materialization(monkeypa
             if isinstance(event, CanonicalListEvent) and event.path == ("sites",)
         )
         if sites.length > 1:
-            raise RuntimeError("site budget exceeded")
+            raise RuntimeError("site cardinality rejected")
 
-    with pytest.raises(RuntimeError, match="site budget"):
+    with pytest.raises(RuntimeError, match="site cardinality"):
         decode(payload, admit_structure=reject)
     assert materializations == 0
 
@@ -289,25 +288,6 @@ def test_structure_paths_do_not_confuse_dotted_keys_with_nested_maps():
         admit_structure=admit,
     )
     assert observed == [("a", "b"), ("a.b",)]
-
-
-def test_generic_array_count_limit_rejects_before_materialization(monkeypatch):
-    payload = encode([np.empty(0, dtype="<u1"), np.empty(0, dtype="<u1")])
-    materializations = 0
-
-    import zlc_storage.canonical as canonical
-
-    original = canonical._decode_array
-
-    def counted(payload, *, path):
-        nonlocal materializations
-        materializations += 1
-        return original(payload, path=path)
-
-    monkeypatch.setattr(canonical, "_decode_array", counted)
-    with pytest.raises(CanonicalEncodingError, match="ndarray count"):
-        decode(payload, limits=CanonicalDecodeLimits(max_arrays=1))
-    assert materializations == 0
 
 
 def test_noncanonical_dtype_spelling_rejects_before_materialization(monkeypatch):

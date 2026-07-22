@@ -381,7 +381,6 @@ def _resolve_calibration_source(
     layout: CalibrationCaptureLayout,
     *,
     checkpoint: Callable[[], None] | None = None,
-    physical_memory_limit_bytes: int | None = None,
 ) -> _ResolvedCalibrationSource:
     """Resolve source lineage, physical contract, and sparse event join once."""
 
@@ -421,7 +420,6 @@ def _resolve_calibration_source(
             layout,
             contract,
             checkpoint=checkpoint,
-            physical_memory_limit_bytes=physical_memory_limit_bytes,
         ),
         join,
     )
@@ -432,7 +430,6 @@ def _validate_calibration_artifact_source_compatibility(
     capture: object,
     *,
     checkpoint: Callable[[], None] | None = None,
-    physical_memory_limit_bytes: int | None = None,
 ) -> _ResolvedCalibrationSource:
     """Compare one admitted source while honoring cancellation/resource bounds."""
 
@@ -442,7 +439,6 @@ def _validate_calibration_artifact_source_compatibility(
         capture,
         artifact.source_binding.layout,
         checkpoint=checkpoint,
-        physical_memory_limit_bytes=physical_memory_limit_bytes,
     )
     if resolved.source_binding != artifact.source_binding:
         raise ValueError("calibration source differs from the resolved capture")
@@ -461,7 +457,6 @@ def derive_calibration_readout_physical_context(
     frame_contract: FrameContract,
     *,
     checkpoint: Callable[[], None] | None = None,
-    physical_memory_limit_bytes: int | None = None,
 ) -> ReadoutPhysicalContext:
     """Derive calibration applicability only from admitted pulse/camera lineage."""
 
@@ -493,7 +488,6 @@ def derive_calibration_readout_physical_context(
         integration_start_offset_seconds=integration_offset,
         integration_seconds=frame_contract.exposure_seconds,
         checkpoint=checkpoint,
-        physical_memory_limit_bytes=physical_memory_limit_bytes,
     )
 
 
@@ -1094,95 +1088,6 @@ def apply_calibration(
     return _apply_readout_model(artifact.select_model(model_kind), frame)
 
 
-def calibration_retained_array_nbytes(artifact: CalibrationArtifact) -> int:
-    """Return a codec-stable upper bound for retained logical array payloads.
-
-    In-memory analysis may share one immutable validity array between several
-    fields, while a canonical decode is free to reconstruct equal fields as
-    distinct arrays.  Resource admission therefore counts every persisted
-    logical field instead of depending on process-local ndarray identity.
-    """
-
-    if not isinstance(artifact, CalibrationArtifact):
-        raise TypeError("artifact must be CalibrationArtifact")
-    arrays: list[np.ndarray] = [
-        artifact.site_map.coordinates_xy,
-        artifact.site_map.validity.mask,
-    ]
-    for model in artifact.models:
-        arrays.extend(
-            [
-                model.thresholds,
-                model.usable_sites.mask,
-                model.feature.boxes_xywh,
-                model.feature.valid_sites.mask,
-            ]
-        )
-        if isinstance(model.feature, PerSitePsfFeature):
-            arrays.append(model.feature.kernels)
-        elif isinstance(model.feature, UniformPsfFeature):
-            arrays.append(model.feature.kernel)
-    return sum(int(array.nbytes) for array in arrays)
-
-
-def readout_runtime_scratch_nbytes(
-    artifact: CalibrationArtifact,
-    model_kind: ReadoutModelKind | None = None,
-) -> int:
-    """Conservative transient-memory bound for one bound frame evaluation.
-
-    This estimate is owned beside the numeric implementation because it must
-    change with its allocation behavior.  In particular, it accounts for the
-    observed qCMOS failure mode where a full frame was converted to float64,
-    while the normal path now converts only one site window at a time.  A PSF
-    annulus with no usable local pixels retains main's whole-frame median
-    fallback, so that rare path remains part of the bound.
-    """
-
-    if not isinstance(artifact, CalibrationArtifact):
-        raise TypeError("artifact must be CalibrationArtifact")
-    model = artifact.select_model(model_kind)
-    feature = model.feature
-    dtype = artifact.frame_contract.dtype
-    dtype_bytes = int(dtype.itemsize)
-    float_temporary = 8
-    bool_temporary = 1
-    site_scratch = feature.site_axis.size * float_temporary
-    box_areas = feature.boxes_xywh[:, 2] * feature.boxes_xywh[:, 3]
-    largest_box = int(np.max(box_areas))
-
-    if isinstance(feature, BoxFeature):
-        # Boolean finite mask + boolean-indexed source values + float64 reducer
-        # input.  The latter two can overlap during dtype conversion.
-        return site_scratch + largest_box * (
-            bool_temporary + dtype_bytes + float_temporary
-        )
-
-    padding = feature.background_padding
-    largest_region = int(
-        np.max(
-            (feature.boxes_xywh[:, 2] + 2 * padding)
-            * (feature.boxes_xywh[:, 3] + 2 * padding)
-        )
-    )
-    local_background = largest_region * (
-        bool_temporary + 2 * dtype_bytes
-    )
-    frame_pixels = int(np.prod(artifact.frame_contract.frame_schema.data_shape))
-    finite_masks = 2 * bool_temporary if np.issubdtype(dtype, np.inexact) else 0
-    global_background_fallback = frame_pixels * (
-        2 * dtype_bytes + finite_masks
-    )
-    weighted_product = largest_box * float_temporary
-    # The float64 cutout remains live while background or weighted-product
-    # scratch is allocated.
-    return site_scratch + largest_box * float_temporary + max(
-        local_background,
-        global_background_fallback,
-        weighted_product,
-    )
-
-
 __all__ = [
     "BackgroundMode",
     "BoxFeature",
@@ -1200,10 +1105,8 @@ __all__ = [
     "SiteMap",
     "UniformPsfFeature",
     "apply_calibration",
-    "calibration_retained_array_nbytes",
     "classify_occupancy",
     "derive_calibration_readout_physical_context",
     "extract_readout_features",
-    "readout_runtime_scratch_nbytes",
     "site_grid_positions_yx",
 ]

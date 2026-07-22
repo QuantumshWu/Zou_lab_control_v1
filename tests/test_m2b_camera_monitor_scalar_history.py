@@ -45,10 +45,6 @@ from zlc_neutral_atom.processing.roi_monitor import (
     RoiScalarStreamProjection,
     reduce_camera_roi,
 )
-from zlc_neutral_atom.runtime.dataset import (
-    dataset_storage_nbytes,
-    mutable_dataset_storage_nbytes,
-)
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
     ProducerFlowControl,
@@ -221,12 +217,6 @@ def test_roi_scalar_projection_omits_invalid_components_and_carries_lineage():
         ReductionMethod.MEAN,
         ValidityPolicy.OMIT_INVALID,
     )
-    contributors = y_axis.size * x_axis.size
-    assert binding.reduction_scratch_nbytes == contributors * (
-        schema.dtype.itemsize
-        + binding.output_schema.dtype.itemsize
-        + np.dtype(bool).itemsize
-    )
     output_contract = RoiScalarSampleContract(
         binding.output_schema,
         RoiScalarMetadataContract(CameraFrameMetadataContract()),
@@ -236,18 +226,15 @@ def test_roi_scalar_projection_omits_invalid_components_and_carries_lineage():
         contract,
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=1,
-        retention_bytes=contract.max_retained_nbytes,
     )
     source_tap = source.monitor(
         max_events=1,
-        max_bytes=contract.max_retained_nbytes,
     )
     output, output_producer = AcquisitionStream.create(
         StreamId("m2b-test-roi"),
         output_contract,
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=1,
-        retention_bytes=output_contract.max_retained_nbytes,
     )
     projection = RoiScalarStreamProjection(source_tap)
     metadata = CameraFrameMetadata(
@@ -297,48 +284,3 @@ def test_roi_scalar_projection_omits_invalid_components_and_carries_lineage():
     output_producer.finish()
     projection.close()
     assert output.next_sequence == 1
-
-
-def test_scalar_history_memory_is_admitted_without_growing_raw_history(experiment):
-    roi, _y_axis, _x_axis = _typed_roi(experiment)
-    one = experiment.readout.inspect_camera_monitor(
-        experiment.readout.camera_monitor_request(
-            history_capacity=4,
-            roi=roi,
-            scalar_history_capacity=1,
-        )
-    )
-    many = experiment.readout.inspect_camera_monitor(
-        experiment.readout.camera_monitor_request(
-            history_capacity=4,
-            roi=roi,
-            scalar_history_capacity=20,
-        )
-    )
-    assert one.output_schema.physical_shape == many.output_schema.physical_shape
-    assert one.scalar_output_schema is not None and many.scalar_output_schema is not None
-    metadata_bytes = RoiScalarMetadataContract(
-        CameraFrameMetadataContract()
-    ).max_retained_nbytes
-    expected_delta = 2 * (
-        2 * mutable_dataset_storage_nbytes(many.scalar_output_schema)
-        + dataset_storage_nbytes(many.scalar_output_schema)
-        + 20 * metadata_bytes
-        - mutable_dataset_storage_nbytes(one.scalar_output_schema)
-        - dataset_storage_nbytes(one.scalar_output_schema)
-        - metadata_bytes
-    )
-    assert many.base_peak_bytes - one.base_peak_bytes == expected_delta
-
-    raw_only = experiment.readout.inspect_camera_monitor(
-        experiment.readout.camera_monitor_request(history_capacity=4)
-    )
-    with pytest.raises(MemoryError, match="base peak"):
-        experiment.readout.inspect_camera_monitor(
-            experiment.readout.camera_monitor_request(
-                history_capacity=4,
-                roi=roi,
-                scalar_history_capacity=10**7,
-                memory_limit_bytes=raw_only.base_peak_bytes + 1,
-            )
-        )

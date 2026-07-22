@@ -149,7 +149,6 @@ def compile_triggered_pipeline(
     spec: TriggeredCaptureSpec,
     *,
     preview: CapturePreviewPort | None = None,
-    _retained_overhead_bytes: int = 0,
 ) -> RunPlan:
     """Compile prepare→camera arm→one FPGA FIRE→drain→terminal into one Run."""
 
@@ -157,11 +156,7 @@ def compile_triggered_pipeline(
         raise TypeError("spec must be TriggeredCaptureSpec")
     camera_port = spec.capture.measurement.capture_port
     pulse_port = spec.pulse_port
-    preview_spec = _admit_capture_preview(
-        spec.capture,
-        preview,
-        retained_overhead_bytes=_retained_overhead_bytes,
-    )
+    preview_spec = _admit_capture_preview(spec.capture, preview)
     if camera_port.device.key == pulse_port.device.key:
         error = ValueError("camera and sequencer must be distinct physical resources")
         _notify_preview_failure(preview, error)

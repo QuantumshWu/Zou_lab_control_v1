@@ -152,8 +152,6 @@ IMAGE_CONTRACT = ViewContract(
     ),
     RepeatViewMode.MEAN,
     (REPEAT,),
-    maximum_batch_series=1,
-    maximum_facet_cells=36,
 )
 
 
@@ -192,8 +190,6 @@ CURVE_CONTRACT = ViewContract(
     ),
     RepeatViewMode.MEAN,
     (REPEAT, SPATIAL_X, SPATIAL_Y),
-    maximum_batch_series=32,
-    maximum_facet_cells=36,
 )
 
 
@@ -219,8 +215,6 @@ HISTOGRAM_CONTRACT = ViewContract(
     ),
     RepeatViewMode.SAMPLE,
     (REPEAT,),
-    maximum_batch_series=32,
-    maximum_facet_cells=36,
 )
 
 
@@ -240,8 +234,6 @@ METER_CONTRACT = ViewContract(
     (RepeatViewMode.LATEST, RepeatViewMode.MEAN, RepeatViewMode.SUM),
     RepeatViewMode.LATEST,
     (REPEAT, SPATIAL_X, SPATIAL_Y),
-    maximum_batch_series=1,
-    maximum_facet_cells=36,
 )
 
 
@@ -749,9 +741,6 @@ def validate_view_spec(
         raise ValueError(
             "point selections and fixed selectors do not identify a physical point"
         )
-    effective_cardinality = {
-        axis_id: len(indices) for axis_id, indices in allowed_indices.items()
-    }
     roles = tuple(binding.role for binding in spec.axis_bindings)
     expected_display = tuple(slot.binding_role for slot in contract.display_slots)
     actual_display = tuple(role for role in roles if role in {
@@ -771,8 +760,6 @@ def validate_view_spec(
     if spec.intent is not ViewIntent.HISTOGRAM and AxisViewRole.SAMPLE in roles:
         raise ValueError("SAMPLE axes are valid only for HISTOGRAM")
 
-    batch_size = 1
-    facet_size = 1
     for binding in spec.axis_bindings:
         axis = axis_by_id[binding.axis_id]
         policy = contract.policy_for(axis.role)
@@ -819,10 +806,6 @@ def validate_view_spec(
                     raise ValueError(
                         f"{binding.role.value} is not allowed for axis role {axis.role}"
                     )
-        if binding.role is AxisViewRole.BATCH:
-            batch_size *= effective_cardinality[axis.axis_id]
-        if binding.role is AxisViewRole.FACET:
-            facet_size *= effective_cardinality[axis.axis_id]
     reduction_methods = {
         binding.reduction.method
         for binding in spec.axis_bindings
@@ -830,14 +813,6 @@ def validate_view_spec(
     }
     if len(reduction_methods) > 1:
         raise ValueError("joint display reductions must use one common method")
-    if batch_size > contract.maximum_batch_series:
-        raise ValueError(
-            f"batch product {batch_size} exceeds contract limit {contract.maximum_batch_series}"
-        )
-    if facet_size > contract.maximum_facet_cells:
-        raise ValueError(
-            f"facet product {facet_size} exceeds contract limit {contract.maximum_facet_cells}"
-        )
     if spec.intent is ViewIntent.METER:
         unresolved = tuple(
             binding.axis_id

@@ -131,7 +131,6 @@ def _histogram_grid(*, layers: int = 1, revision: int = 5) -> DataFigure:
     return DataFigure(
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
-        render_memory_limit_bytes=128 << 20,
     )
 
 
@@ -213,40 +212,6 @@ def test_histogram_grid_overview_shares_bins_and_count_scale() -> None:
         release_agg_figure(rendered)
 
 
-def test_histogram_overview_budget_rejects_before_domain_or_agg(monkeypatch) -> None:
-    from zlc_frontend.matplotlib_render import (
-        estimate_render_peak_nbytes,
-        evaluated_figure_array_nbytes,
-    )
-
-    figure = _histogram_grid()
-    panel_count = len(figure.evaluated.layers[0].cells)
-    retained = figure.retained_upper_bound_nbytes
-    evaluated_bytes = evaluated_figure_array_nbytes(figure.evaluated)
-    region_bytes = 64 * 1024 + panel_count * 4096
-    required = (
-        estimate_render_peak_nbytes(figure.evaluated, dpi=100.0)
-        + max(0, retained - evaluated_bytes)
-        + region_bytes
-    )
-
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("rejected overview derived a domain or reached Agg")
-
-    monkeypatch.setattr(
-        figure_workbench,
-        "histogram_projection_home_x_limits",
-        forbidden,
-    )
-    monkeypatch.setattr(DataFigure, "to_png_bytes_with_panel_regions", forbidden)
-    with pytest.raises(MemoryError, match="overview render requires"):
-        figure_workbench._render_typed_grid_overview(
-            figure,
-            required - 1,
-            threading.Event(),
-        )
-
-
 def test_histogram_focus_reuses_exact_series_and_revision_identity() -> None:
     figure = _histogram_grid()
     _png, regions = figure.to_png_bytes_with_panel_regions()
@@ -255,13 +220,6 @@ def test_histogram_focus_reuses_exact_series_and_revision_identity() -> None:
         1,
         expected_selection=regions[1].selection,
         expected_intent=ViewIntent.HISTOGRAM,
-    )
-    assert (
-        focused.retained_upper_bound_nbytes
-        <= figure.focused_typed_panel_retained_upper_bound_nbytes(
-            1,
-            expected_intent=ViewIntent.HISTOGRAM,
-        )
     )
     assert focused.evaluated.layers[0].cells[0].series[0] is expected
     assert focused.evaluated.inputs == figure.evaluated.inputs
@@ -450,113 +408,6 @@ def test_histogram_grid_overview_focus_interaction_back_and_exports(
         application.processEvents()
         assert window._view_family == "histogram-overview"
         assert window._bundle.pages[0].png_bytes is original_png
-    finally:
-        _close(application, window)
-
-
-def test_histogram_focus_budget_rejects_before_panel_derivation(
-    application,
-    monkeypatch,
-) -> None:
-    figure = _histogram_grid()
-    window = figure_workbench.open_data_figure_workbench(figure)
-    try:
-        _until(application, lambda: window.raster_ready and window.worker_idle)
-        overview = window._grid_overview
-        assert overview is not None
-        external = (
-            overview.external_retained_upper_bound_bytes
-            + window._grid_overview_presentation_bytes
-        )
-        display = HistogramDisplayState()
-        _focused, _render, aggregate = figure_workbench._typed_focus_preflight_nbytes(
-            figure,
-            0,
-            expected_intent=ViewIntent.HISTOGRAM,
-            display=display,
-            external_session_retained_bytes=external,
-        )
-        calls = 0
-
-        def forbidden(*_args, **_kwargs):
-            nonlocal calls
-            calls += 1
-            raise AssertionError("focused histogram was derived before admission")
-
-        monkeypatch.setattr(DataFigure, "focused_typed_panel", forbidden)
-        window._memory_limit_bytes = aggregate - 1
-        window._focus_grid_region(*_center(overview.regions[0]))
-        _until(application, lambda: window.worker_idle)
-        assert calls == 0
-        assert window._view_family == "histogram-overview"
-        assert window._status.text() == "HISTOGRAM FOCUS FAILED"
-        assert "aggregate peak" in window._diagnostic.text()
-    finally:
-        _close(application, window)
-
-
-def test_histogram_focus_rerender_keeps_grid_session_in_budget(
-    application,
-    monkeypatch,
-) -> None:
-    figure = _histogram_grid()
-    window = figure_workbench.open_data_figure_workbench(figure)
-    try:
-        _until(application, lambda: window.raster_ready and window.worker_idle)
-        overview = window._grid_overview
-        assert overview is not None
-        window._focus_grid_region(*_center(overview.regions[1]))
-        _until(
-            application,
-            lambda: window.worker_idle and window._view_family == "histogram",
-        )
-        display = window._display
-        assert isinstance(display, HistogramDisplayState)
-        candidate = replace(display, revision=display.revision + 1, bin_count=19)
-        external = window._grid_session_retained_bytes()
-        assert external > 0
-        focused = figure.focused_typed_panel(
-            1,
-            expected_selection=overview.regions[1].selection,
-            expected_intent=ViewIntent.HISTOGRAM,
-        )
-        probe = figure_workbench._render_typed_front(
-            focused,
-            candidate,
-            current_value_limits=window._visible_value_limits(),
-            previous_relim_mode=display.relim_mode,
-            previous_count_scale=display.count_scale,
-            sequence=window._request_revision + 1,
-            memory_limit_bytes=1 << 30,
-            cancelled=threading.Event(),
-            external_session_retained_bytes=external,
-            post_commit_external_session_retained_bytes=external,
-            histogram_projection_value_range=(
-                overview.histogram_home_x_limits
-            ),
-        )
-        required = probe.session_peak_bytes
-        probe = None
-
-        import zlc_frontend.matplotlib_render as matplotlib_render
-
-        class ForbiddenRenderer:
-            def __init__(self, *_args, **_kwargs):
-                raise AssertionError("grid rerender reached Agg before admission")
-
-        monkeypatch.setattr(
-            matplotlib_render,
-            "SinglePanelAggRenderer",
-            ForbiddenRenderer,
-        )
-        window._memory_limit_bytes = required - 1
-        values = histogram_display_form_values(display)
-        values["bin_count"] = 19
-        window._apply_display_form(window._edit_display, display.revision, values)
-        _until(application, lambda: window.worker_idle)
-        assert window._display is display
-        assert window._view_family == "histogram"
-        assert "aggregate peak" in window._diagnostic.text()
     finally:
         _close(application, window)
 

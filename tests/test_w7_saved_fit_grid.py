@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import hashlib
 import os
 from pathlib import Path
@@ -43,7 +42,6 @@ from zlc_data import (
     ValueSchema,
     bind_fit,
     fit_model_catalog,
-    fit_result_retained_upper_bound_nbytes,
     fit_spec_for,
     resolve_selection_indices,
 )
@@ -54,9 +52,7 @@ from zlc_frontend import (
     ImageDisplayState,
     ImagePanelPayload,
     PixelFormat,
-    radial_gaussian_image_fit_panel_retained_upper_bound_nbytes,
 )
-from zlc_frontend.fit_grid import FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS
 from zlc_frontend.image_display import ImageColormap
 from zlc_frontend.figure import (
     AxisViewRole,
@@ -77,8 +73,6 @@ from zlc_neutral_atom.fit_reference import FitResultArtifactRef
 
 from Zou_lab_control.workbench._fit_grid import (
     _build_image_grid_frame,
-    _fit_grid_memory_bounds,
-    _load_grid_view,
     _reframe_existing_image_panels,
     _rerasterize_grid_view,
 )
@@ -226,8 +220,6 @@ def sparse_fit_grid():
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
         fit_results={"data": result},
-        evaluation_memory_limit_bytes=200 << 20,
-        render_memory_limit_bytes=200 << 20,
     )
     return result, model, page, suggestion.spec, figure
 
@@ -239,17 +231,16 @@ def sparse_typed_page(sparse_fit_grid):
         "data",
         artifact_identity=model.artifact_identity,
     )
-    frame, color_limits, retained = _build_image_grid_frame(
+    frame, color_limits = _build_image_grid_frame(
         projected,
         ImageDisplayState(),
         current_color_limits=None,
         previous_relim_mode=None,
         layout_generation=0,
         sequence=1,
-        memory_limit_bytes=200 << 20,
         cancelled=threading.Event(),
     )
-    return result, model, page, view, projected, frame, color_limits, retained
+    return result, model, page, view, projected, frame, color_limits
 
 
 @pytest.fixture(scope="module")
@@ -260,7 +251,7 @@ def saved_fit_products(tmp_path_factory):
         radial_reference = experiment.fit(
             capture,
             model="radial_gaussian_center",
-        ).save(operation_memory_limit_bytes=512 << 20)
+        ).save()
         curve_capture = experiment.readout.capture(CURVE_PULSE)
         schema = experiment.readout.load_capture(curve_capture).frame_source.schema
         x_axis = next(
@@ -273,11 +264,8 @@ def saved_fit_products(tmp_path_factory):
                 fit_axis_ids=(x_axis.axis_id,),
                 numeric_policy=FitNumericPolicy(
                     max_evaluations=80,
-                    max_batch_cells=256,
-                    sample_budget_per_batch=x_axis.size,
-                    max_packed_observations=x_axis.size * 128,
                 ),
-            ).save(operation_memory_limit_bytes=512 << 20)
+            ).save()
             for model_id in ONE_DIMENSIONAL_MODELS
         }
         yield experiment, radial_reference, curve_references, workspace
@@ -350,7 +338,6 @@ def test_typed_image_page_preserves_repeat_sparse_holes_overlay_and_shared_clim(
         projected,
         frame,
         color_limits,
-        retained,
     ) = sparse_typed_page
     repeat_axis = next(axis for axis in model.axes if axis.role == REPEAT)
     assert page.preferences.repeat_mode is RepeatViewMode.FACET
@@ -361,17 +348,7 @@ def test_typed_image_page_preserves_repeat_sparse_holes_overlay_and_shared_clim(
     )
     assert not hasattr(model, "result")
     assert model.layout.storage_size == result.batch_layout.storage_size == 4
-    assert fit_result_retained_upper_bound_nbytes(result) > sum(
-        array.nbytes
-        for array in (
-            result.parameter_values,
-            result.covariance,
-            result.residual_sum_squares,
-        )
-    )
-
     assert 0 < len(frame.panels) == len(projected) == 6 <= 36
-    assert retained > 0
     assert all(panel.raster.pixel_format is PixelFormat.INDEXED8 for panel in frame.panels)
     payloads = tuple(panel.display_payload for panel in frame.panels)
     assert all(isinstance(payload, ImagePanelPayload) for payload in payloads)
@@ -416,7 +393,7 @@ def test_typed_image_page_preserves_repeat_sparse_holes_overlay_and_shared_clim(
 def test_focus_and_overview_reframe_cached_typed_panels_without_copying_samples(
     sparse_typed_page,
 ):
-    _result, _model, _page, _view, projected, frame, _limits, _retained = (
+    _result, _model, _page, _view, projected, frame, _limits = (
         sparse_typed_page
     )
     present_index = next(
@@ -463,7 +440,7 @@ def test_focus_and_overview_reframe_cached_typed_panels_without_copying_samples(
 def test_display_reraster_advances_only_the_presentation_and_keeps_shared_clim(
     sparse_typed_page,
 ):
-    _result, _model, _page, _view, projected, initial, initial_limits, retained = (
+    _result, _model, _page, _view, projected, initial, initial_limits = (
         sparse_typed_page
     )
     initial_display = ImageDisplayState()
@@ -474,7 +451,6 @@ def test_display_reraster_advances_only_the_presentation_and_keeps_shared_clim(
         returned_display,
         rerasterized,
         rerasterized_limits,
-        rerasterized_retained,
     ) = _rerasterize_grid_view(
         projected,
         changed,
@@ -482,7 +458,6 @@ def test_display_reraster_advances_only_the_presentation_and_keeps_shared_clim(
         initial_display.relim_mode,
         0,
         2,
-        200 << 20,
         threading.Event(),
     )
 
@@ -492,7 +467,6 @@ def test_display_reraster_advances_only_the_presentation_and_keeps_shared_clim(
     assert rerasterized.layout_generation == initial.layout_generation
     assert rerasterized.sequence > initial.sequence
     assert rerasterized_limits == initial_limits
-    assert rerasterized_retained == retained
     for old, new, source in zip(
         initial.panels,
         rerasterized.panels,
@@ -514,131 +488,6 @@ def test_display_reraster_advances_only_the_presentation_and_keeps_shared_clim(
             if item.panel_id == new.panel_id
         )
         assert presentation.panel_revision == changed.revision
-
-
-def test_display_reraster_budgets_preexisting_exact_samples_only_once(
-    sparse_typed_page,
-):
-    _result, _model, _page, _view, projected, _frame, limits, _retained = (
-        sparse_typed_page
-    )
-    _full_retained, initial_peak = _fit_grid_memory_bounds(projected)
-    _same_retained, reraster_peak = _fit_grid_memory_bounds(
-        projected,
-        samples_prebudgeted=True,
-    )
-    assert 0 < reraster_peak < initial_peak
-    limit = (reraster_peak + initial_peak) // 2
-
-    with pytest.raises(MemoryError, match="worker budget"):
-        _build_image_grid_frame(
-            projected,
-            ImageDisplayState(),
-            current_color_limits=None,
-            previous_relim_mode=None,
-            layout_generation=0,
-            sequence=1,
-            memory_limit_bytes=limit,
-            cancelled=threading.Event(),
-        )
-
-    result = _rerasterize_grid_view(
-        projected,
-        ImageDisplayState(revision=1, colormap=ImageColormap.MAGMA),
-        limits,
-        ImageDisplayState().relim_mode,
-        0,
-        2,
-        limit,
-        threading.Event(),
-    )
-    assert result[3].sequence == 2
-
-
-def test_typed_panel_metadata_increases_peak_without_erasing_raster_scratch(
-    sparse_typed_page,
-) -> None:
-    panel = sparse_typed_page[4][0]
-    baseline_retained, baseline_peak = _fit_grid_memory_bounds((panel,))
-    expanded_overlay = replace(panel.fit_overlay, caption="c" * 6000)
-    expanded = replace(
-        panel,
-        summary="s" * 6000,
-        fit_overlay=expanded_overlay,
-    )
-    expanded_retained, expanded_peak = _fit_grid_memory_bounds((expanded,))
-    metadata_delta = (
-        radial_gaussian_image_fit_panel_retained_upper_bound_nbytes(expanded)
-        - radial_gaussian_image_fit_panel_retained_upper_bound_nbytes(panel)
-    )
-    assert metadata_delta > 0
-    assert baseline_peak > baseline_retained
-    assert expanded_retained - baseline_retained == metadata_delta
-    assert expanded_peak - baseline_peak == metadata_delta
-    assert (
-        expanded_peak - expanded_retained
-        == baseline_peak - baseline_retained
-        > 0
-    )
-
-
-def test_saved_grid_rejects_before_typed_panel_dto_allocation(
-    sparse_fit_grid,
-    monkeypatch,
-) -> None:
-    _result, model, page, _view, figure = sparse_fit_grid
-    reference = FitResultArtifactRef("w7-preflight", "f" * 64)
-    session_retained = 1
-    projection_peak = figure.radial_gaussian_image_fit_panels_preflight_nbytes(
-        "data",
-        artifact_identity=reference.target_ref,
-    )
-    required = (
-        figure.retained_upper_bound_nbytes
-        + projection_peak
-        + session_retained
-        + model.retained_upper_bound_bytes
-    )
-    projection_calls = []
-
-    def view_loader(
-        candidate,
-        *,
-        page_address,
-        cell_selection,
-        memory_limit_bytes,
-    ):
-        assert candidate == reference
-        assert page_address == page.address
-        assert cell_selection is None
-        assert memory_limit_bytes == required - 1
-        return figure, model, page, None, session_retained
-
-    def forbidden_projection(self, *args, **kwargs):
-        projection_calls.append((self, args, kwargs))
-        raise AssertionError("panel DTO allocation ran before aggregate admission")
-
-    monkeypatch.setattr(
-        DataFigure,
-        "radial_gaussian_image_fit_panels",
-        forbidden_projection,
-    )
-    with pytest.raises(MemoryError, match="panel projection"):
-        _load_grid_view(
-            view_loader,
-            reference,
-            page.address,
-            None,
-            required - 1,
-            1,
-            True,
-            ImageDisplayState(),
-            None,
-            None,
-            0,
-            threading.Event(),
-        )
-    assert projection_calls == []
 
 
 def test_grid_pages_are_bounded_and_axis_navigator_skips_sparse_holes(
@@ -700,7 +549,6 @@ def test_axis_navigator_preserves_bigint_sparse_indices_and_physical_order(
         control = navigator._controls[0][1]
         assert isinstance(control, QtWidgets.QLineEdit)
         assert not isinstance(control, QtWidgets.QSpinBox)
-        assert control.maxLength() == FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS
         control.setFocus()
         QtTest.QTest.keyClicks(control, str(second))
         application.processEvents()
@@ -723,7 +571,7 @@ def test_axis_navigator_preserves_bigint_sparse_indices_and_physical_order(
         )
 
 
-def test_axis_navigator_and_invalid_selection_bound_hostile_labels(
+def test_axis_navigator_preserves_full_labels_and_exact_invalid_indices(
     application,
 ) -> None:
     long_coordinate = "x" * 100_000
@@ -756,15 +604,15 @@ def test_axis_navigator_and_invalid_selection_bound_hostile_labels(
     )
     try:
         text_label = text_navigator._controls[0][2].text()
-        assert len(text_label) <= 512
-        assert "[length=100000]" in text_label
+        assert text_label == f"{long_coordinate} · index 0"
 
         huge_navigator.set_storage_index(0)
         huge_label = huge_navigator._controls[0][2].text()
         assert huge_navigator.indices == (huge_index,)
-        assert len(huge_label) <= 512
-        assert "20001 bits" in huge_label
-        assert len(huge_navigator._controls[0][1].text()) <= 512
+        assert huge_label == f"{hex(huge_index)} · index {hex(huge_index)}"
+        exact_edit = huge_navigator._controls[0][1]
+        assert exact_edit.maxLength() == (1 << 31) - 1
+        assert exact_edit.text() == hex(huge_index)
 
         hostile = 1 << 25_000
         with pytest.raises(IndexError) as failure:
@@ -772,8 +620,7 @@ def test_axis_navigator_and_invalid_selection_bound_hostile_labels(
                 huge_axis,
                 IndexSelection(huge_axis.axis_id, hostile),
             )
-        assert len(str(failure.value)) <= 256
-        assert "25001 bits" in str(failure.value)
+        assert hex(hostile) in str(failure.value)
     finally:
         text_navigator.deleteLater()
         huge_navigator.deleteLater()
@@ -1092,41 +939,12 @@ def test_every_saved_1d_catalog_model_reopens_focuses_and_exports_without_refit(
         _close(application, window)
 
 
-def test_saved_fit_grid_budget_and_close_are_fail_closed(
+def test_saved_fit_grid_close_during_load_is_nonblocking_and_releases_state(
     application,
     saved_fit_product,
     monkeypatch,
 ):
     experiment, reference, _workspace = saved_fit_product
-
-    import zlc_neutral_atom.artifacts.fit_result as fit_result_module
-
-    with monkeypatch.context() as budget_patch:
-        load_calls = []
-
-        def forbidden_load(self, *args, **kwargs):
-            load_calls.append((args, kwargs))
-            raise AssertionError("tiny fixed-state budget reached fit-result load")
-
-        def forbidden_decode(*_args, **_kwargs):
-            raise AssertionError("tiny-budget load reached fit-result decode")
-
-        budget_patch.setattr(FitResultRepository, "load", forbidden_load)
-        budget_patch.setattr(
-            fit_result_module,
-            "decode_fit_result_batch",
-            forbidden_decode,
-        )
-        tiny = experiment.figure_gui(reference, memory_limit_bytes=1)
-        try:
-            _until(application, lambda: tiny.worker_idle)
-            assert not tiny.raster_ready
-            assert tiny._model is None
-            assert tiny._status.text() == "SAVED FIT GRID FAILED"
-            assert "MemoryError" in tiny._diagnostic.text()
-            assert load_calls == []
-        finally:
-            _close(application, tiny)
 
     entered = threading.Event()
     release = threading.Event()

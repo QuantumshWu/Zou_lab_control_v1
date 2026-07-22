@@ -2,8 +2,8 @@
 
 The one-shot purge (directive 2026-07-21) deleted the legacy backend trees, the
 legacy render pipeline and every migration bridge outright.  What remains is the
-original UI skeletons on the current zlc_* stack.  This file keeps that true: no
-budgets, no ledgers, no whitelists -- every count below is zero and stays zero.
+original UI skeletons on the current zlc_* stack.  This file keeps that true:
+no migration bridges or allowlists -- every count below is zero and stays zero.
 
 Every assertion is a property computed over ``git ls-files`` (plus untracked,
 non-ignored files) -- never a hard-coded list of names, because a name list

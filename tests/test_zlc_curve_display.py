@@ -47,7 +47,6 @@ from zlc_frontend.figure import (
 )
 from zlc_frontend.matplotlib_render import (
     SinglePanelAggRenderer,
-    estimate_live_panel_raster_peak_nbytes,
 )
 from zlc_frontend.render import CurvePanelPayload, PixelFormat
 
@@ -264,7 +263,6 @@ def test_interactive_renderer_returns_exact_bbox_payload_and_shared_axis() -> No
     finally:
         renderer.close()
 
-
 def test_curve_payload_and_renderer_reject_different_series_axes() -> None:
     first = EvaluatedCurve(
         _axis((0.0, 1.0)),
@@ -298,8 +296,6 @@ def test_curve_payload_and_renderer_reject_different_series_axes() -> None:
         assert len(payload.series) == 2
     finally:
         renderer.close()
-
-
 def test_interactive_renderer_keeps_all_same_axis_series_in_payload() -> None:
     axis = _axis((0.0, 1.0, 4.0))
     curves = (
@@ -330,19 +326,3 @@ def test_interactive_renderer_keeps_all_same_axis_series_in_payload() -> None:
         assert payload.viewport.y_limits == pytest.approx((-1.9, 32.9))
     finally:
         renderer.close()
-
-
-def test_live_raster_estimator_counts_explicit_pointer_hold_retention() -> None:
-    base = estimate_live_panel_raster_peak_nbytes(
-        100,
-        80,
-        evaluated_data_upper_bound_bytes=4096,
-    )
-    held = estimate_live_panel_raster_peak_nbytes(
-        100,
-        80,
-        evaluated_data_upper_bound_bytes=4096,
-        extra_retained_fronts=1,
-        extra_retained_evaluated_data_bytes=1234,
-    )
-    assert held - base == 100 * 80 * 4 + 1234

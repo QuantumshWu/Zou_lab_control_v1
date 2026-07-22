@@ -543,31 +543,6 @@ def test_changed_display_commit_recovers_stopped_not_ready_preparation(
         _close_window(application, window)
 
 
-def test_total_memory_rejection_happens_before_start_and_next_window_remains_usable(
-    experiment,
-    application,
-):
-    bad = experiment.readout.camera_monitor_gui(memory_limit_bytes=1)
-    good = None
-    try:
-        start, _stop, status, _view, diagnostics, board = _widgets(bad)
-        _until(application, lambda: "base peak" in diagnostics.text())
-        assert status.text() == "Monitor: NOT READY"
-        assert not start.isEnabled() and not board.has_front
-        _close_window(application, bad)
-
-        good = experiment.readout.camera_monitor_gui()
-        start, _stop, _status, view, _diagnostics, board = _widgets(good)
-        _until(application, start.isEnabled)
-        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
-        _until(application, lambda: board.has_front and view.text().startswith("View: LIVE"))
-    finally:
-        if bad.isVisible():
-            _close_window(application, bad)
-        if good is not None and good.isVisible():
-            _close_window(application, good)
-
-
 def test_monitor_public_boundary_stays_typed_and_workbench_has_no_raw_authority():
     root = Path(__file__).parents[1]
     source = (root / "Zou_lab_control" / "workbench" / "_camera_monitor.py").read_text(

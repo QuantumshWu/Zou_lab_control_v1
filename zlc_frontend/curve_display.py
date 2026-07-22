@@ -226,7 +226,7 @@ def numeric_curve_coordinates(axis: EvaluatedAxis) -> tuple[Real, ...]:
         raise ValueError("interactive curve axis must not be empty")
     # EvaluatedAxis already owns an immutable tuple.  Return that exact owner
     # after validation rather than allocating list/tuple/np.diff scratch before
-    # the caller's memory-admission boundary.
+    # the caller's rendering path.
     return axis.coordinates
 
 

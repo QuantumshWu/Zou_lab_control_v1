@@ -37,7 +37,6 @@ from zlc_neutral_atom.processing.roi_monitor import (
     RoiScalarSample,
     RoiScalarSampleContract,
     RoiScalarStreamProjection,
-    max_roi_scalar_reduction_scratch_nbytes,
     roi_scalar_output_schema,
 )
 from zlc_neutral_atom.runtime._failure import safe_error_summary
@@ -52,8 +51,6 @@ from zlc_neutral_atom.runtime.dataset import (
     FrozenDatasetEdge,
     MonitorDataset,
     MonitorDatasetSnapshot,
-    dataset_storage_nbytes,
-    mutable_dataset_storage_nbytes,
 )
 from zlc_neutral_atom.runtime.monitor import (
     BoundCameraMonitorPort,
@@ -96,7 +93,6 @@ class CameraMonitorRequest:
     """Declarative request for one hardware-paced, display-only camera monitor."""
 
     camera_ref: DeviceRef
-    memory_limit_bytes: int = 256 << 20
     io_timeout_seconds: float = 2.0
     history_capacity: int = 8
     roi: Selection | None = None
@@ -107,11 +103,6 @@ class CameraMonitorRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.camera_ref, DeviceRef):
             raise TypeError("camera_ref must be DeviceRef")
-        object.__setattr__(
-            self,
-            "memory_limit_bytes",
-            positive_integer(self.memory_limit_bytes, "memory_limit_bytes"),
-        )
         object.__setattr__(
             self,
             "io_timeout_seconds",
@@ -159,7 +150,6 @@ class CameraMonitorDescriptor:
     output_schema: DatasetSchema
     scalar_output_schema: DatasetSchema | None
     resource_claim: str
-    base_peak_bytes: int
 
     def __post_init__(self) -> None:
         canonical_text(self.name, "camera monitor name")
@@ -172,11 +162,6 @@ class CameraMonitorDescriptor:
         ):
             raise TypeError("scalar_output_schema must be DatasetSchema or None")
         canonical_text(self.resource_claim, "resource_claim")
-        object.__setattr__(
-            self,
-            "base_peak_bytes",
-            positive_integer(self.base_peak_bytes, "base_peak_bytes"),
-        )
 
     @property
     def output_shape(self) -> tuple[int, ...]:
@@ -196,7 +181,6 @@ class CameraMonitorViewSpec:
     scalar_block_id: BlockId | None
     scalar_dataset_edge: FrozenDatasetEdge[RoiScalarSample] | None
     roi_binding: RoiScalarBinding | None
-    downstream_peak_bytes: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.block_id, BlockId):
@@ -237,14 +221,6 @@ class CameraMonitorViewSpec:
                 or scalar_schema.cell_schema.data_axes
             ):
                 raise ValueError("ROI scalar view requires one dense scalar history")
-        object.__setattr__(
-            self,
-            "downstream_peak_bytes",
-            nonnegative_integer(
-                self.downstream_peak_bytes,
-                "downstream_peak_bytes",
-            ),
-        )
 
 
 @dataclass(frozen=True)
@@ -397,7 +373,6 @@ class CameraMonitorLiveDataset:
         input_contract: CameraSampleContract,
         scalar_edges: tuple[FrozenDatasetEdge[RoiScalarSample], ...],
         scalar_stream_id: StreamId,
-        max_reduction_scratch_nbytes: int,
         initial_scalar_block_id: BlockId | None = None,
         initial_scalar_edge: FrozenDatasetEdge[RoiScalarSample] | None = None,
         initial_binding: RoiScalarBinding | None = None,
@@ -421,10 +396,6 @@ class CameraMonitorLiveDataset:
             edge_by_schema[fingerprint] = edge
         if not isinstance(scalar_stream_id, StreamId):
             raise TypeError("scalar_stream_id must be StreamId")
-        scratch = nonnegative_integer(
-            max_reduction_scratch_nbytes,
-            "max_reduction_scratch_nbytes",
-        )
         initial_values = (
             initial_scalar_block_id,
             initial_scalar_edge,
@@ -447,7 +418,6 @@ class CameraMonitorLiveDataset:
         self._input_contract = input_contract
         self._edge_by_schema = edge_by_schema
         self._scalar_stream_id = scalar_stream_id
-        self._max_reduction_scratch_nbytes = scratch
         self._initial_scalar_block_id = initial_scalar_block_id
         self._initial_scalar_edge = initial_scalar_edge
         self._initial_revision = 1 if initial_binding is not None else None
@@ -501,8 +471,6 @@ class CameraMonitorLiveDataset:
             validity_policy,
             edge.schema.cell_schema,
         )
-        if binding.reduction_scratch_nbytes > self._max_reduction_scratch_nbytes:
-            raise MemoryError("ROI candidate exceeds the admitted reduction scratch bound")
         return binding
 
     def submit_roi_control(
@@ -874,13 +842,9 @@ class CameraMonitorLiveDataset:
                 edge.payload_contract,
                 flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
                 retention_events=_STREAM_RETENTION_EVENTS,
-                retention_bytes=(
-                    _STREAM_RETENTION_EVENTS * edge.payload_max_retained_nbytes
-                ),
             )
             tap = stream.monitor(
                 max_events=_TAP_BACKLOG_EVENTS,
-                max_bytes=_TAP_BACKLOG_EVENTS * edge.payload_max_retained_nbytes,
             )
             dataset = MonitorDataset.append_window(block_id, tap, edge)
             return _RoiScalarBranch(
@@ -1143,12 +1107,10 @@ class PreparedCameraMonitor:
         "_descriptor",
         "_edge",
         "_lock",
-        "_memory_limit_bytes",
         "_port",
         "_request",
         "_roi_binding",
         "_roi_control_edges",
-        "_max_roi_reduction_scratch_nbytes",
         "_scalar_edge",
         "_start_run",
         "_started",
@@ -1202,7 +1164,6 @@ class PreparedCameraMonitor:
         )
         control_edges: list[FrozenDatasetEdge[RoiScalarSample]] = []
         seen_output_schemas: set[str] = set()
-        scratch_bounds: list[int] = []
         for reduction in (
             ReductionMethod.MEAN,
             ReductionMethod.SUM,
@@ -1212,12 +1173,6 @@ class PreparedCameraMonitor:
                 output_schema = roi_scalar_output_schema(
                     capability.payload_contract,
                     reduction,
-                )
-                scratch_bounds.append(
-                    max_roi_scalar_reduction_scratch_nbytes(
-                        capability.payload_contract,
-                        reduction,
-                    )
                 )
             except TypeError:
                 # MAX has no meaningful order for complex camera values.  The
@@ -1255,10 +1210,9 @@ class PreparedCameraMonitor:
                     RoiScalarDatasetEventAdapter(scalar_contract),
                 )
             )
-        if not control_edges or not scratch_bounds:
+        if not control_edges:
             raise ValueError("camera contract admits no ROI scalar reduction schema")
         self._roi_control_edges = tuple(control_edges)
-        self._max_roi_reduction_scratch_nbytes = max(scratch_bounds)
         self._roi_binding = (
             None
             if request.roi is None
@@ -1283,29 +1237,16 @@ class PreparedCameraMonitor:
                 self._roi_control_edges,
                 self._roi_binding.output_schema,
             )
-        base_peak = _base_monitor_peak_bytes(
-            port,
-            self._edge,
-            self._roi_control_edges,
-            self._max_roi_reduction_scratch_nbytes,
-        )
-        if base_peak > request.memory_limit_bytes:
-            raise MemoryError(
-                f"camera monitor base peak {base_peak} exceeds limit "
-                f"{request.memory_limit_bytes}"
-            )
         self._descriptor = CameraMonitorDescriptor(
             "Camera monitor",
             request.camera_ref.role,
             schema,
             None if self._scalar_edge is None else self._scalar_edge.schema,
             str(port.resource_claim.key),
-            base_peak,
         )
         self._request = request
         self._port = port
         self._start_run = start_run
-        self._memory_limit_bytes = request.memory_limit_bytes
         self._lock = threading.Lock()
         self._started = False
 
@@ -1336,21 +1277,10 @@ class PreparedCameraMonitor:
     def start_with_view(
         self,
         *,
-        downstream_peak_bytes: int,
         factory: Callable[[CameraMonitorViewSpec], CameraMonitorViewPort],
     ) -> RunHandle:
         if not callable(factory):
             raise TypeError("factory must be callable")
-        downstream = nonnegative_integer(
-            downstream_peak_bytes,
-            "downstream_peak_bytes",
-        )
-        required = self._descriptor.base_peak_bytes + downstream
-        if required > self._memory_limit_bytes:
-            raise MemoryError(
-                f"camera monitor peak budget {required} exceeds limit "
-                f"{self._memory_limit_bytes}"
-            )
         self._claim_start()
         spec = CameraMonitorViewSpec(
             BlockId(f"camera-monitor-{uuid.uuid4().hex}"),
@@ -1362,7 +1292,6 @@ class PreparedCameraMonitor:
             ),
             self._scalar_edge,
             self._roi_binding,
-            downstream,
         )
         view = factory(spec)
         if getattr(view, "spec", None) is not spec:
@@ -1376,9 +1305,6 @@ class PreparedCameraMonitor:
             self._port,
             view,
             roi_control_edges=self._roi_control_edges,
-            max_roi_reduction_scratch_nbytes=(
-                self._max_roi_reduction_scratch_nbytes
-            ),
         )
         try:
             return self._start_run(plan)
@@ -1394,83 +1320,6 @@ class PreparedCameraMonitor:
             if self._started:
                 raise RuntimeError("PreparedCameraMonitor is one-shot")
             self._started = True
-
-
-def _base_monitor_peak_bytes(
-    port: BoundCameraMonitorPort,
-    edge: FrozenDatasetEdge[CameraSample],
-    scalar_edges: tuple[FrozenDatasetEdge[RoiScalarSample], ...],
-    max_roi_reduction_scratch_nbytes: int,
-) -> int:
-    capability = port.capability
-    payload = capability.payload_contract.max_retained_nbytes
-    schema = edge.schema
-    history_cells = schema.repeat_axis.size * schema.point_layout.storage_size
-    immutable_snapshot = dataset_storage_nbytes(schema)
-    mutable_materializer = mutable_dataset_storage_nbytes(schema)
-    # A non-trivial append window is presented newest-first.  Once its ring has
-    # advanced, NumPy gathers values, validity, and the written mask before the
-    # immutable DataBlock makes its own owner copy.  Admission must cover that
-    # worst case rather than only the canonical first frame.
-    reorder_scratch = mutable_materializer if history_cells > 1 else 0
-    raw_peak = (
-        capability.driver_ring_bytes
-        + capability.adapter_record_retention_bytes
-        + (_STREAM_RETENTION_EVENTS * payload)
-        # Raw display and the stable ROI processor ingress each own a monitor
-        # tap from the unchanged source generation.
-        + (_TAP_BACKLOG_EVENTS * payload)
-        + (_TAP_BACKLOG_EVENTS * payload)
-        + mutable_materializer
-        + immutable_snapshot
-        + reorder_scratch
-        + (history_cells * edge.metadata_max_retained_nbytes)
-    )
-    edges = tuple(scalar_edges)
-    if not edges:
-        raise ValueError("scalar_edges cannot be empty")
-    branch_peaks = sorted(
-        (_scalar_branch_peak_bytes(scalar_edge) for scalar_edge in edges),
-        reverse=True,
-    )
-    # A schema migration commits its replacement before superseding the old
-    # branch.  Same-schema retarget likewise owns old plus shadow append
-    # storage until its first replacement event commits.  Two full branch
-    # peaks conservatively close both overlap shapes with one admitted bound.
-    scalar_overlap = (
-        sum(branch_peaks[:2])
-        if len(branch_peaks) > 1
-        else 2 * branch_peaks[0]
-    )
-    return (
-        raw_peak
-        + scalar_overlap
-        + nonnegative_integer(
-            max_roi_reduction_scratch_nbytes,
-            "max_roi_reduction_scratch_nbytes",
-        )
-    )
-
-
-def _scalar_branch_peak_bytes(
-    edge: FrozenDatasetEdge[RoiScalarSample],
-) -> int:
-    scalar_schema = edge.schema
-    scalar_cells = (
-        scalar_schema.repeat_axis.size * scalar_schema.point_layout.storage_size
-    )
-    scalar_mutable = mutable_dataset_storage_nbytes(scalar_schema)
-    scalar_snapshot = dataset_storage_nbytes(scalar_schema)
-    scalar_reorder = scalar_mutable if scalar_cells > 1 else 0
-    scalar_payload = edge.payload_max_retained_nbytes
-    return (
-        (_STREAM_RETENTION_EVENTS * scalar_payload)
-        + (_TAP_BACKLOG_EVENTS * scalar_payload)
-        + scalar_mutable
-        + scalar_snapshot
-        + scalar_reorder
-        + (scalar_cells * edge.metadata_max_retained_nbytes)
-    )
 
 
 def _edge_for_output_schema(
@@ -1491,7 +1340,6 @@ def _compile_camera_monitor_plan(
     view: CameraMonitorViewPort,
     *,
     roi_control_edges: tuple[FrozenDatasetEdge[RoiScalarSample], ...],
-    max_roi_reduction_scratch_nbytes: int,
 ) -> RunPlan[_CameraMonitorTransaction, None, None]:
     spec = getattr(view, "spec", None)
     if not isinstance(spec, CameraMonitorViewSpec):
@@ -1511,17 +1359,9 @@ def _compile_camera_monitor_plan(
                 port.capability.payload_contract,
                 flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
                 retention_events=_STREAM_RETENTION_EVENTS,
-                retention_bytes=(
-                    _STREAM_RETENTION_EVENTS
-                    * port.capability.payload_contract.max_retained_nbytes
-                ),
             )
             raw_tap = stream.monitor(
                 max_events=_TAP_BACKLOG_EVENTS,
-                max_bytes=(
-                    _TAP_BACKLOG_EVENTS
-                    * port.capability.payload_contract.max_retained_nbytes
-                ),
             )
             raw_dataset = MonitorDataset.append_window(
                 spec.block_id,
@@ -1530,10 +1370,6 @@ def _compile_camera_monitor_plan(
             )
             processor_tap = stream.monitor(
                 max_events=_TAP_BACKLOG_EVENTS,
-                max_bytes=(
-                    _TAP_BACKLOG_EVENTS
-                    * port.capability.payload_contract.max_retained_nbytes
-                ),
             )
             projection = RoiScalarStreamProjection(processor_tap)
             dataset = CameraMonitorLiveDataset(
@@ -1543,9 +1379,6 @@ def _compile_camera_monitor_plan(
                 scalar_edges=roi_control_edges,
                 scalar_stream_id=StreamId(
                     f"camera-monitor-roi-scalar:{request.camera_ref.role}"
-                ),
-                max_reduction_scratch_nbytes=(
-                    max_roi_reduction_scratch_nbytes
                 ),
                 initial_scalar_block_id=spec.scalar_block_id,
                 initial_scalar_edge=spec.scalar_dataset_edge,

@@ -7,12 +7,14 @@ document, so the UI target and the physical field cannot diverge.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 import math
 import re
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
+from types import MappingProxyType
 
 from zlc_storage import (
     canonical_digest,
@@ -239,6 +241,24 @@ class FrozenScanTable:
         compare=False,
         default=None,
     )
+    _validated_contract: tuple[object, ...] | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    _definition_contract: tuple[object, ...] | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    _definition_digest: str | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
 
     def __post_init__(self) -> None:
         columns = tuple(_identifier(item, "scan table column") for item in self.columns)
@@ -262,6 +282,28 @@ class FrozenScanTable:
             cached = canonical_digest(frozen_scan_table_to_tree(self))
             object.__setattr__(self, "_fingerprint", cached)
         return cached
+
+    def _is_validated_for(self, contract: tuple[object, ...]) -> bool:
+        return self._validated_contract == contract
+
+    def _record_validated_contract(self, contract: tuple[object, ...]) -> None:
+        object.__setattr__(self, "_validated_contract", contract)
+
+    def _definition_digest_for(
+        self,
+        contract: tuple[object, ...],
+    ) -> str | None:
+        if self._definition_contract != contract:
+            return None
+        return self._definition_digest
+
+    def _record_definition_digest(
+        self,
+        contract: tuple[object, ...],
+        digest: str,
+    ) -> None:
+        object.__setattr__(self, "_definition_contract", contract)
+        object.__setattr__(self, "_definition_digest", digest)
 
 
 @dataclass(frozen=True)
@@ -342,6 +384,26 @@ class PulseDocument:
         compare=False,
         default=None,
     )
+    _period_by_id: Mapping[str, PulsePeriod] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _scan_parameter_by_id: Mapping[str, ScanParameter] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _api_parameter_by_id: Mapping[str, ApiParameter] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _delay_by_port: Mapping[str, OutputDelay] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _text(self.name, "pulse document name"))
@@ -393,6 +455,11 @@ class PulseDocument:
             )
         periods = tuple(normalized_periods)
         object.__setattr__(self, "periods", periods)
+        object.__setattr__(
+            self,
+            "_period_by_id",
+            MappingProxyType({period.period_id: period for period in periods}),
+        )
 
         visible = tuple(_text(key, "visible port") for key in self.visible_ports)
         if len(set(visible)) != len(visible) or any(
@@ -423,6 +490,11 @@ class PulseDocument:
             )
         delays = tuple(sorted(delays, key=lambda item: port_order[item.port]))
         object.__setattr__(self, "delays", delays)
+        object.__setattr__(
+            self,
+            "_delay_by_port",
+            MappingProxyType({delay.port: delay for delay in delays}),
+        )
 
         repeat = self.repeat
         if repeat is not None:
@@ -475,6 +547,20 @@ class PulseDocument:
             self._validate_field_ref(parameter.field)
         object.__setattr__(self, "scan_parameters", scan_parameters)
         object.__setattr__(self, "api_parameters", api_parameters)
+        object.__setattr__(
+            self,
+            "_scan_parameter_by_id",
+            MappingProxyType(
+                {parameter.parameter_id: parameter for parameter in scan_parameters}
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_api_parameter_by_id",
+            MappingProxyType(
+                {parameter.parameter_id: parameter for parameter in api_parameters}
+            ),
+        )
 
         table = self.scan_table
         if table is not None:
@@ -482,14 +568,17 @@ class PulseDocument:
                 raise TypeError("scan_table must be FrozenScanTable or None")
             if set(table.columns) != set(scan_ids) or len(table.columns) != len(scan_ids):
                 raise ValueError("scan table columns must identify every scan parameter exactly once")
-            by_id = {item.parameter_id: item for item in scan_parameters}
-            for row_index, row in enumerate(table.rows):
-                for parameter_id, value in zip(table.columns, row):
-                    self._validate_frozen_scan_value(
-                        by_id[parameter_id],
-                        value,
-                        field=f"scan row {row_index} column {parameter_id!r}",
-                    )
+            contract = self._scan_definition_contract()
+            if not table._is_validated_for(contract):
+                by_id = self.scan_parameter_by_id
+                for row_index, row in enumerate(table.rows):
+                    for parameter_id, value in zip(table.columns, row):
+                        self._validate_frozen_scan_value(
+                            by_id[parameter_id],
+                            value,
+                            field=f"scan row {row_index} column {parameter_id!r}",
+                        )
+                table._record_validated_contract(contract)
         elif self.scan_recipe is not None:
             raise ValueError("scan recipe provenance requires a frozen scan table")
 
@@ -506,7 +595,7 @@ class PulseDocument:
                 )
 
     def _validate_field_ref(self, reference: PulseFieldRef) -> None:
-        periods = {period.period_id: period for period in self.periods}
+        periods = self.period_by_id
         if reference.kind == FIELD_DURATION:
             if reference.period_id not in periods:
                 raise ValueError(f"duration field references missing period {reference.period_id!r}")
@@ -515,7 +604,7 @@ class PulseDocument:
             port = self.target.by_key.get(reference.port)
             if port is None or port.kind not in (PORT_DIGITAL, PORT_DAC):
                 raise ValueError(f"delay field references unsupported port {reference.port!r}")
-            if reference.port not in {delay.port for delay in self.delays}:
+            if reference.port not in self._delay_by_port:
                 raise ValueError("a delay parameter requires an explicit nominal OutputDelay")
             return
         period = periods.get(reference.period_id)
@@ -552,25 +641,60 @@ class PulseDocument:
         return cached
 
     @property
-    def period_by_id(self) -> dict[str, PulsePeriod]:
-        return {period.period_id: period for period in self.periods}
+    def period_by_id(self) -> Mapping[str, PulsePeriod]:
+        return self._period_by_id
 
     @property
-    def scan_parameter_by_id(self) -> dict[str, ScanParameter]:
-        return {parameter.parameter_id: parameter for parameter in self.scan_parameters}
+    def scan_parameter_by_id(self) -> Mapping[str, ScanParameter]:
+        return self._scan_parameter_by_id
 
     @property
-    def api_parameter_by_id(self) -> dict[str, ApiParameter]:
-        return {parameter.parameter_id: parameter for parameter in self.api_parameters}
+    def api_parameter_by_id(self) -> Mapping[str, ApiParameter]:
+        return self._api_parameter_by_id
 
-    @property
-    def scan_definition_digest(self) -> str:
-        if self.scan_table is None:
-            raise ValueError("a scan definition digest requires a frozen scan table")
-        by_id = self.scan_parameter_by_id
-        parameters = []
+    def _scan_definition_contract(self) -> tuple[object, ...]:
+        table = self.scan_table
+        if table is None:
+            raise ValueError("a scan definition contract requires a frozen scan table")
+        parameters: list[tuple[object, ...]] = []
+        for parameter_id in table.columns:
+            parameter = self.scan_parameter_by_id[parameter_id]
+            reference = parameter.field
+            if reference.port is None:
+                physical_port: tuple[object, ...] | None = None
+            else:
+                port = self.target.by_key[reference.port]
+                latch_lanes = (
+                    None
+                    if port.latch_clock is None
+                    else self.target.by_key[port.latch_clock].lanes
+                )
+                physical_port = (
+                    port.kind,
+                    port.lanes,
+                    port.bus_index,
+                    port.width,
+                    port.encoding,
+                    port.safe_value,
+                    latch_lanes,
+                )
+            parameters.append(
+                (
+                    parameter.parameter_id,
+                    reference.kind,
+                    reference.period_id,
+                    reference.port,
+                    physical_port,
+                    parameter.unit,
+                )
+            )
+        return (self.time_step_ns, tuple(parameters))
+
+    def _scan_definition_parameters(self) -> list[dict[str, object]]:
+        assert self.scan_table is not None
+        parameters: list[dict[str, object]] = []
         for parameter_id in self.scan_table.columns:
-            parameter = by_id[parameter_id]
+            parameter = self.scan_parameter_by_id[parameter_id]
             reference = parameter.field
             if reference.port is None:
                 physical_port = None
@@ -599,14 +723,26 @@ class PulseDocument:
                     "unit": parameter.unit,
                 }
             )
-        return canonical_digest(
+        return parameters
+
+    @property
+    def scan_definition_digest(self) -> str:
+        if self.scan_table is None:
+            raise ValueError("a scan definition digest requires a frozen scan table")
+        contract = self._scan_definition_contract()
+        cached = self.scan_table._definition_digest_for(contract)
+        if cached is not None:
+            return cached
+        digest = canonical_digest(
             {
                 "schema": "zlc_pulse.FrozenScanDefinition",
                 "time_step_ns": self.time_step_ns,
-                "parameters": parameters,
+                "parameters": self._scan_definition_parameters(),
                 "table": frozen_scan_table_to_tree(self.scan_table),
             }
         )
+        self.scan_table._record_definition_digest(contract, digest)
+        return digest
 
     def field_value(self, reference: PulseFieldRef) -> tuple[int | float, str]:
         if not isinstance(reference, PulseFieldRef):
@@ -616,7 +752,7 @@ class PulseDocument:
             period = self.period_by_id[reference.period_id]
             return period.duration, period.unit
         if reference.kind == FIELD_DELAY:
-            delay = next(item for item in self.delays if item.port == reference.port)
+            delay = self._delay_by_port[reference.port]
             return delay.value, delay.unit
         period = self.period_by_id[reference.period_id]
         analog = next(item for item in period.analog_steps if item.port == reference.port)

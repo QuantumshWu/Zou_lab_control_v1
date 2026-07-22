@@ -10,7 +10,6 @@ from dataclasses import replace
 
 from .authoring import replace_pulse_field
 from .document import FrozenScanTable, PulseDocument
-from .ir import MAX_MATERIALIZED_SCAN_POINTS
 
 
 def materialize_scan_sweeps(
@@ -33,12 +32,6 @@ def materialize_scan_sweeps(
     table = document.scan_table
     if table is None:
         raise ValueError("scan sweep materialization requires a frozen scan table")
-    total_points = sweep_count * len(table.rows)
-    if total_points > MAX_MATERIALIZED_SCAN_POINTS:
-        raise ValueError(
-            "scan sweep materialization exceeds the pulse owner's point limit: "
-            f"{total_points} points > {MAX_MATERIALIZED_SCAN_POINTS}"
-        )
     if sweep_count == 1:
         return document
     return replace(

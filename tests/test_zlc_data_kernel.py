@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 import subprocess
-import tracemalloc
 from fractions import Fraction
 
 import numpy as np
@@ -354,37 +353,6 @@ def test_value_payload_digest_binds_valid_content_and_normalizes_invalid_fillers
     )
 
 
-def test_component_canonicalization_does_not_allocate_an_inverse_frame_mask():
-    y = axis("large.camera.y", SPATIAL_Y, 512)
-    x = axis("large.camera.x", SPATIAL_X, 512)
-    schema = ValueSchema(
-        (y, x),
-        ValidityContract.components(y.axis_id, x.axis_id),
-        np.dtype(np.uint16),
-        "count",
-    )
-    values = np.arange(512 * 512, dtype=np.uint16).reshape(512, 512)
-    mask = np.ones(schema.data_shape, dtype=bool)
-    mask[0, 0] = False
-    validity = ComponentValidity((y.axis_id, x.axis_id), mask)
-
-    was_tracing = tracemalloc.is_tracing()
-    if not was_tracing:
-        tracemalloc.start()
-    tracemalloc.clear_traces()
-    canonical = canonical_value_array(values, validity, schema)
-    _current, peak = tracemalloc.get_traced_memory()
-    if not was_tracing:
-        tracemalloc.stop()
-
-    assert canonical is not None
-    assert canonical[0, 0] == 0
-    np.testing.assert_array_equal(canonical[1:], values[1:])
-    # One canonical value frame is necessary.  A dense ``~validity`` mask
-    # would add 256 KiB and make this independent peak check fail.
-    assert peak <= values.nbytes + (128 << 10)
-
-
 def test_schema_fingerprint_normalizes_dtype_endianness():
     little = ValueSchema((), ValidityContract.value(), np.dtype("<i2"))
     big = ValueSchema((), ValidityContract.value(), np.dtype(">i2"))
@@ -539,18 +507,6 @@ def test_big_endian_complex_nan_payloads_have_one_content_identity():
     assert first_canonical.tobytes() == second_canonical.tobytes()
     contract = ValuePayloadContract(schema)
     assert contract.digest_content(first, VALID) == contract.digest_content(second, VALID)
-
-
-def test_retained_byte_bound_uses_unbounded_integer_arithmetic():
-    height = AxisSpec(AxisId("huge.y"), "y", SPATIAL_Y, 2**32)
-    width = AxisSpec(AxisId("huge.x"), "x", SPATIAL_X, 2**32 + 1)
-    schema = ValueSchema(
-        (height, width),
-        ValidityContract.components(height.axis_id, width.axis_id),
-        np.dtype(np.uint16),
-    )
-    expected_elements = (2**32) * (2**32 + 1)
-    assert ValuePayloadContract(schema).max_retained_nbytes == expected_elements * 3
 
 
 def test_import_is_headless_and_does_not_pull_legacy_domain():

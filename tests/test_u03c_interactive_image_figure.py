@@ -115,7 +115,6 @@ def _image_figure(
     y_coordinates: tuple[float, ...] = (20.0, 22.0, 24.0, 26.0),
     coordinate_frame: CoordinateFrameId | None = CoordinateFrameId("u03c-camera"),
     with_fit: bool = False,
-    render_memory_limit_bytes: int = 64 << 20,
     figure_class=DataFigure,
 ) -> DataFigure:
     repeat = AxisSpec(AxisId("u03c.repeat"), "Repeat", REPEAT, 2, (0, 1))
@@ -193,7 +192,6 @@ def _image_figure(
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
         fit_results=None if result is None else {"image": result},
-        render_memory_limit_bytes=render_memory_limit_bytes,
     )
 
 
@@ -204,22 +202,6 @@ def _typed_front(window):
     payload = frame.panels[0].display_payload
     assert isinstance(payload, ImagePanelPayload)
     return board, frame, payload
-
-
-def _initial_session_peak(figure: DataFigure, state: ImageDisplayState) -> int:
-    import Zou_lab_control.workbench._figure as figure_module
-
-    front = figure_module._render_typed_front(
-        figure,
-        state,
-        current_value_limits=None,
-        previous_relim_mode=None,
-        previous_count_scale=None,
-        sequence=0,
-        memory_limit_bytes=1 << 30,
-        cancelled=threading.Event(),
-    )
-    return front.session_peak_bytes
 
 
 def _image_target(board: QtRasterBoard):
@@ -423,34 +405,6 @@ def test_image_authority_or_geometry_gaps_fail_to_whole_figure_encoded(
     _close(application, window)
 
 
-def test_image_frozen_budget_admits_exact_required_and_rejects_required_minus_one(
-    application,
-    open_window,
-) -> None:
-    from Zou_lab_control.workbench import _figure as figure_module
-
-    probe = _image_figure()
-    render_required = figure_module._typed_front_required_peak_bytes(
-        probe,
-        ImageDisplayState(),
-    )
-    required = _initial_session_peak(probe, ImageDisplayState())
-    assert required > render_required
-    admitted = open_window(probe, memory_limit_bytes=required)
-    _until(application, lambda: admitted.raster_ready)
-    assert admitted._view_family == "image"
-    _close(application, admitted)
-
-    rejected = open_window(
-        _image_figure(),
-        memory_limit_bytes=required - 1,
-    )
-    _until(application, lambda: rejected.raster_ready)
-    assert rejected._view_family == "encoded"
-    assert "frozen memory budget" in rejected._summary.text()
-    _close(application, rejected)
-
-
 @pytest.mark.parametrize("forgery", ("values", "axis-frame"))
 def test_image_rerender_cas_rejects_a_new_exact_data_object(
     application,
@@ -534,7 +488,6 @@ def test_initial_image_front_cannot_self_attest_a_conflicting_viewport() -> None
         previous_relim_mode=None,
         previous_count_scale=None,
         sequence=0,
-        memory_limit_bytes=64 << 20,
         cancelled=threading.Event(),
     )
     panel = front.frame.panels[0]
@@ -573,7 +526,6 @@ def test_image_front_rejects_forged_raster_contract(forgery: str) -> None:
         previous_relim_mode=None,
         previous_count_scale=None,
         sequence=0,
-        memory_limit_bytes=64 << 20,
         cancelled=threading.Event(),
     )
     panel = front.frame.panels[0]

@@ -211,7 +211,6 @@ def _curve_grid(
             ),
         ),
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
-        render_memory_limit_bytes=128 << 20,
     )
 
 
@@ -319,13 +318,6 @@ def test_curve_grid_shares_overview_y_but_focus_keeps_local_relim() -> None:
     binding = focused.document.layers[0].view.binding(AxisId("u03h.site"))
     assert binding.role is AxisViewRole.SELECTED
     assert binding.selector.index == 1
-    assert (
-        focused.retained_upper_bound_nbytes
-        <= figure.focused_typed_panel_retained_upper_bound_nbytes(
-            1,
-            expected_intent=ViewIntent.CURVE,
-        )
-    )
     renderer = SinglePanelAggRenderer(focused.document, width=800, height=520)
     try:
         _raster, payload = renderer.render_interactive_curve(
@@ -411,7 +403,6 @@ def test_curve_grid_focus_interaction_back_and_atomic_exports(
         )
         _until(application, lambda: window.worker_idle and window._display.revision == 2)
         assert window._display.fixed_y_limits is not None
-        assert window._grid_focus_cache_charge_bytes > 0
 
         focused_frame = window._board_widget.front_frame
         focused_path = tmp_path / "curve-focus.png"
@@ -429,11 +420,6 @@ def test_curve_grid_focus_interaction_back_and_atomic_exports(
         application.processEvents()
         assert window._view_family == "curve-overview"
         assert window._bundle.pages[0].png_bytes is original_png
-        assert (
-            window._current_front_peak_bytes
-            == window._grid_focus_cache_charge_bytes
-            > 0
-        )
         overview_path = tmp_path / "curve-overview.png"
         window._start_export(overview_path)
         _until(application, lambda: window.worker_idle and overview_path.exists())
@@ -449,47 +435,7 @@ def test_curve_grid_focus_interaction_back_and_atomic_exports(
         _close(application, window)
 
 
-def test_curve_focus_budget_rejects_before_panel_derivation(
-    application,
-    monkeypatch,
-) -> None:
-    figure = _curve_grid()
-    window = figure_workbench.open_data_figure_workbench(figure)
-    try:
-        _until(application, lambda: window.raster_ready and window.worker_idle)
-        overview = window._grid_overview
-        assert overview is not None
-        external = (
-            overview.external_retained_upper_bound_bytes
-            + window._grid_overview_presentation_bytes
-        )
-        _focused, _render, aggregate = figure_workbench._typed_focus_preflight_nbytes(
-            figure,
-            0,
-            expected_intent=ViewIntent.CURVE,
-            display=CurveDisplayState(),
-            external_session_retained_bytes=external,
-        )
-        calls = 0
-
-        def forbidden(*_args, **_kwargs):
-            nonlocal calls
-            calls += 1
-            raise AssertionError("focused curve was derived before admission")
-
-        monkeypatch.setattr(DataFigure, "focused_typed_panel", forbidden)
-        window._memory_limit_bytes = aggregate - 1
-        window._focus_grid_region(*_center(overview.regions[0]))
-        _until(application, lambda: window.worker_idle)
-        assert calls == 0
-        assert window._view_family == "curve-overview"
-        assert window._status.text() == "CURVE FOCUS FAILED"
-        assert "aggregate peak" in window._diagnostic.text()
-    finally:
-        _close(application, window)
-
-
-def test_failed_curve_focus_does_not_publish_unadmitted_worker_cache(
+def test_failed_curve_focus_does_not_publish_worker_cache(
     application,
     monkeypatch,
 ) -> None:
@@ -512,8 +458,6 @@ def test_failed_curve_focus_does_not_publish_unadmitted_worker_cache(
         _until(application, lambda: window.worker_idle)
         assert window._status.text() == "CURVE FOCUS FAILED"
         assert window._view_family == "curve-overview"
-        assert window._grid_focus_cache_charge_bytes == 0
-        assert window._current_front_peak_bytes == 0
         retained = inspect.getclosurevars(window._typed_renderer).nonlocals
         assert retained["cached_typed"] is None
         assert retained["cached_base"] is None
@@ -521,7 +465,7 @@ def test_failed_curve_focus_does_not_publish_unadmitted_worker_cache(
         _close(application, window)
 
 
-def test_rejected_curve_present_keeps_worker_cache_charged(
+def test_rejected_curve_present_keeps_worker_cache_for_retry(
     application,
     monkeypatch,
 ) -> None:
@@ -542,11 +486,6 @@ def test_rejected_curve_present_keeps_worker_cache_charged(
         retained = inspect.getclosurevars(window._typed_renderer).nonlocals
         assert isinstance(retained["cached_typed"], DataFigure)
         assert retained["cached_base"] is retained["cached_typed"]
-        assert (
-            window._current_front_peak_bytes
-            == window._grid_focus_cache_charge_bytes
-            > 0
-        )
     finally:
         _close(application, window)
 

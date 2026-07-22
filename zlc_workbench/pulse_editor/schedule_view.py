@@ -8,7 +8,7 @@ It never reconstructs a document from widget contents.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from typing import Mapping, Sequence
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -138,8 +138,8 @@ def _repeat_summary_text(document: PulseDocument) -> str:
     return summary
 
 
-def _restart_high_labels(document: PulseDocument) -> tuple[str, ...]:
-    """Labels of digital outputs high when a partial inner loop restarts."""
+def _restart_high_ports(document: PulseDocument) -> tuple[str, ...]:
+    """Stable ids of digital outputs high when a partial inner loop restarts."""
 
     repeat = document.repeat
     if repeat is None:
@@ -155,7 +155,7 @@ def _restart_high_labels(document: PulseDocument) -> tuple[str, ...]:
         if port.kind == PORT_DIGITAL
     }
     return tuple(
-        digital_by_lane[lane].label
+        digital_by_lane[lane].key
         for lane, high in zip(
             document.target.raw_lanes,
             document.periods[0].states,
@@ -163,6 +163,70 @@ def _restart_high_labels(document: PulseDocument) -> tuple[str, ...]:
         )
         if high and lane in digital_by_lane
     )
+
+
+def _schedule_facts(
+    document: PulseDocument,
+    rows: Sequence[_PortRow],
+    visible: Sequence[str],
+    digital_values: Mapping[tuple[str, str], bool],
+    analog_active: Mapping[str, bool],
+) -> tuple[object, ...]:
+    """Derive the one summary used by full and local presentation paths."""
+
+    period_ids = tuple(period.period_id for period in document.periods)
+    active = {
+        port
+        for (period_id, port), high in digital_values.items()
+        if high and period_id in period_ids
+    }
+    active.update(port for port, value in analog_active.items() if value)
+    base_ns = {
+        period.period_id: float(period.duration) * TIME_UNIT_TO_NS[period.unit]
+        for period in document.periods
+    }
+    total_ns = sum(base_ns.values())
+    repeat = None
+    if document.repeat is not None:
+        repeat = (
+            document.repeat.start_period_id,
+            document.repeat.end_period_id,
+            document.repeat.count,
+        )
+        start = period_ids.index(repeat[0])
+        end = period_ids.index(repeat[1])
+        total_ns += (repeat[2] - 1) * sum(
+            base_ns[period_id] for period_id in period_ids[start : end + 1]
+        )
+    point_count = 0 if document.scan_table is None else len(document.scan_table.rows)
+    parts = [
+        f"{len(visible)}/{len(rows)} ports visible",
+        f"{len(period_ids)} periods",
+        f"step {document.time_step_ns:g} ns",
+        f"{total_ns:.3g} ns",
+        f"{_expanded_pulse_count(document)} pulses",
+        _repeat_summary_text(document),
+    ]
+    rows_by_key = {row.key: row for row in rows}
+    hidden = tuple(
+        row.label for row in rows if row.key in active and row.key not in visible
+    )
+    if document.scan_parameters:
+        parts.append(f"scan {len(document.scan_parameters)} slots × {point_count} pts")
+    if hidden:
+        parts.append(f"hidden active: {', '.join(hidden)}")
+    boundary_ports = _restart_high_ports(document)
+    boundary = tuple(
+        rows_by_key[port].label for port in boundary_ports if port in rows_by_key
+    )
+    if boundary:
+        shown = boundary[:4]
+        suffix = "" if len(boundary) <= 4 else f", +{len(boundary) - 4}"
+        parts.append(
+            "table restart high every "
+            f"{_summary_time_text(total_ns)}: {', '.join(shown)}{suffix}"
+        )
+    return frozenset(active), total_ns, repeat, point_count, " | ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -632,10 +696,114 @@ class PeriodCard(FluentGroupBox):
         self.setTitle(f"Period {int(index) + 1}/{max(1, int(total))}")
 
     def set_port_label(self, port: str, label: str) -> None:
+        self._rows = tuple(
+            dataclass_replace(row, label=str(label)) if row.key == port else row
+            for row in self._rows
+        )
         check = self.checks.get(port)
         if check is not None:
             check.setText(label)
             check.setToolTip(f"{label}: high for this whole period")
+            return
+        edit = self.bus_value_edits.get(port)
+        row = next((item for item in self._rows if item.key == port), None)
+        if edit is not None and row is not None:
+            lo, hi = row.signed_range or (0, 0)
+            suffix = ""
+            if "\nParameter:" in edit.toolTip():
+                suffix = "\nParameter:" + edit.toolTip().split("\nParameter:", 1)[1]
+            edit.setToolTip(
+                f"{label}: signed integer {lo}..{hi} (0 = 0 V); "
+                "click the dot to cycle scan (sN) -> API (aN) -> off"
+                + suffix
+            )
+
+    def apply_period_name(self, name: str) -> None:
+        with signals_blocked(self.name_edit):
+            _set_widget_text(self.name_edit, name)
+        self._committed_name = str(name)
+        self._projection_state = None
+
+    def apply_duration(
+        self,
+        value: int | float,
+        unit: str,
+        binding: _Binding | None,
+    ) -> None:
+        text = (
+            f"s{binding.position}"
+            if binding is not None and binding.kind == "scan"
+            else str(value)
+        )
+        with signals_blocked(self.duration_edit, self.unit_combo):
+            self.duration_edit.set_scan_bound(False, None)
+            self.duration_edit.set_api_bound(False, None)
+            self.duration_edit.set_numeric_validator("float", bottom=0.0)
+            _set_widget_text(self.duration_edit, text)
+            tooltip = "How long this period lasts, in the unit below"
+            if binding is not None:
+                if binding.kind == "scan":
+                    self.duration_edit.set_scan_bound(True, binding.position + 1)
+                    self.duration_edit.setValidator(None)
+                else:
+                    self.duration_edit.set_api_bound(True, binding.position + 1)
+                tooltip += f"\nParameter: {binding.parameter_id}"
+            self.duration_edit.setToolTip(tooltip)
+            _set_duration_units(self.unit_combo, binding, str(unit))
+        self._committed_duration = value
+        self._committed_unit = str(unit)
+        self._projection_state = None
+
+    def apply_digital(self, port: str, high: bool) -> None:
+        check = self.checks.get(port)
+        if check is None:
+            raise KeyError(f"period {self.period_id!r} has no digital port {port!r}")
+        with signals_blocked(check):
+            check.setChecked(bool(high))
+        self._projection_state = None
+
+    def apply_analog(
+        self,
+        port: str,
+        mode: str,
+        value: int | float,
+        binding: _Binding | None,
+    ) -> None:
+        combo = self.bus_mode_combos.get(port)
+        edit = self.bus_value_edits.get(port)
+        row = next((item for item in self._rows if item.key == port), None)
+        if combo is None or edit is None or row is None:
+            raise KeyError(f"period {self.period_id!r} has no DAC port {port!r}")
+        lo, hi = row.signed_range or (0, 0)
+        text = (
+            f"s{binding.position}"
+            if binding is not None and binding.kind == "scan"
+            else str(value)
+        )
+        with signals_blocked(combo, edit):
+            combo.setEnabled(True)
+            title = _bus_mode_title(mode)
+            if combo.currentText() != title:
+                combo.setCurrentText(title)
+            edit.set_scan_bound(False, None)
+            edit.set_api_bound(False, None)
+            edit.set_numeric_validator("int", bottom=lo, top=hi)
+            _set_widget_text(edit, text)
+            edit.set_editable(mode != "hold")
+            tooltip = (
+                f"{row.label}: signed integer {lo}..{hi} (0 = 0 V); "
+                "click the dot to cycle scan (sN) -> API (aN) -> off"
+            )
+            if binding is not None:
+                if binding.kind == "scan":
+                    edit.set_scan_bound(True, binding.position + 1)
+                    edit.setValidator(None)
+                    combo.setEnabled(False)
+                else:
+                    edit.set_api_bound(True, binding.position + 1)
+                tooltip += f"\nParameter: {binding.parameter_id}"
+            edit.setToolTip(tooltip)
+        self._projection_state = None
 
     def reconcile(
         self,
@@ -679,36 +847,8 @@ class PeriodCard(FluentGroupBox):
 
         duration_ref = PulseFieldRef(FIELD_DURATION, self.period_id)
         duration_binding = bindings.get(duration_ref)
-        duration_text = (
-            f"s{duration_binding.position}"
-            if duration_binding is not None and duration_binding.kind == "scan"
-            else str(period.duration)
-        )
-        with signals_blocked(self.duration_edit, self.unit_combo, self.name_edit):
-            self.duration_edit.set_scan_bound(False, None)
-            self.duration_edit.set_api_bound(False, None)
-            self.duration_edit.set_numeric_validator("float", bottom=0.0)
-            _set_widget_text(self.duration_edit, duration_text)
-            base_tooltip = "How long this period lasts, in the unit below"
-            self.duration_edit.setToolTip(base_tooltip)
-            if duration_binding is not None:
-                if duration_binding.kind == "scan":
-                    self.duration_edit.set_scan_bound(
-                        True, duration_binding.position + 1
-                    )
-                    self.duration_edit.setValidator(None)
-                else:
-                    self.duration_edit.set_api_bound(
-                        True, duration_binding.position + 1
-                    )
-                self.duration_edit.setToolTip(
-                    f"{base_tooltip}\nParameter: {duration_binding.parameter_id}"
-                )
-            _set_duration_units(self.unit_combo, duration_binding, period.unit)
-            _set_widget_text(self.name_edit, period.name or "")
-        self._committed_duration = period.duration
-        self._committed_unit = period.unit
-        self._committed_name = str(period.name or "")
+        self.apply_duration(period.duration, period.unit, duration_binding)
+        self.apply_period_name(period.name or "")
 
         rows_by_key = {row.key: row for row in rows}
         for key, check in self.checks.items():
@@ -718,39 +858,9 @@ class PeriodCard(FluentGroupBox):
                 check.setToolTip(f"{row.label}: high for this whole period")
                 check.setChecked(bool(digital_values.get(key, False)))
         for key, combo in self.bus_mode_combos.items():
-            row = rows_by_key[key]
             mode, number = analog_values.get(key, ("hold", 0))
             binding = bindings.get(PulseFieldRef(FIELD_DAC, self.period_id, key))
-            edit = self.bus_value_edits[key]
-            lo, hi = row.signed_range or (0, 0)
-            text = (
-                f"s{binding.position}"
-                if binding is not None and binding.kind == "scan"
-                else str(0 if number is None else number)
-            )
-            with signals_blocked(combo, edit):
-                combo.setEnabled(True)
-                mode_title = _bus_mode_title(mode)
-                if combo.currentText() != mode_title:
-                    combo.setCurrentText(mode_title)
-                edit.set_scan_bound(False, None)
-                edit.set_api_bound(False, None)
-                edit.set_numeric_validator("int", bottom=lo, top=hi)
-                _set_widget_text(edit, text)
-                edit.set_editable(mode != "hold")
-                tooltip = (
-                    f"{row.label}: signed integer {lo}..{hi} (0 = 0 V); "
-                    "click the dot to cycle scan (sN) -> API (aN) -> off"
-                )
-                if binding is not None:
-                    if binding.kind == "scan":
-                        edit.set_scan_bound(True, binding.position + 1)
-                        edit.setValidator(None)
-                        combo.setEnabled(False)
-                    else:
-                        edit.set_api_bound(True, binding.position + 1)
-                    tooltip = f"{tooltip}\nParameter: {binding.parameter_id}"
-                edit.setToolTip(tooltip)
+            self.apply_analog(key, mode, 0 if number is None else number, binding)
         self._projection_state = projection_state
 
     def set_visible_ports(self, ports: frozenset[str]) -> None:
@@ -925,6 +1035,21 @@ class ChannelNamesPanel(FluentGroupBox):
             _set_widget_text(self.total_label, total_text)
             _set_widget_text(self.periods_label, period_count)
             _set_widget_text(self.visible_label, visible_text)
+
+    def apply_document_name(self, name: str) -> None:
+        with signals_blocked(self.name_edit):
+            _set_widget_text(self.name_edit, name)
+
+    def apply_port_label(self, port: str, label: str) -> None:
+        editor = self.port_labels.get(port)
+        if editor is None:
+            raise KeyError(f"unknown port label row {port!r}")
+        with signals_blocked(editor):
+            _set_widget_text(editor, label)
+        self.rows = tuple(
+            dataclass_replace(row, label=str(label)) if row.key == port else row
+            for row in self.rows
+        )
 
     def set_visible_ports(self, ports: frozenset[str]) -> None:
         for key, widget in self.row_widgets.items():
@@ -1152,31 +1277,9 @@ class ChannelPanel(FluentGroupBox):
             label = self.channel_labels[key]
             _set_widget_text(label, row.label)
             label.setToolTip(key)
-            value, unit_text = delays.get(key, (0, "ns"))
-            edit = self.delay_edits[key]
-            unit = self.delay_units[key]
             binding = bindings.get(PulseFieldRef(FIELD_DELAY, None, key))
-            with signals_blocked(edit, unit):
-                edit.set_scan_bound(False, None)
-                edit.set_api_bound(False, None)
-                edit.set_numeric_validator("float")
-                _set_widget_text(edit, value)
-                if binding is not None:
-                    edit.set_api_bound(True, binding.position + 1)
-                    edit.setToolTip(f"API parameter: {binding.parameter_id}")
-                elif row.kind == PORT_DAC:
-                    edit.setToolTip(
-                        "Physical DAC-bus output delay (may be negative): the whole "
-                        "bus value shifts by d, out[t] = in[t-d]."
-                    )
-                else:
-                    edit.setToolTip(
-                        "Physical per-channel output delay (may be negative): the "
-                        "whole channel waveform shifts by d, out[t] = in[t-d]."
-                    )
-                selected_unit = unit_text if unit_text in DELAY_UNITS else "ns"
-                if unit.currentText() != selected_unit:
-                    unit.setCurrentText(selected_unit)
+            value, unit_text = delays.get(key, (0, "ns"))
+            self.apply_delay(key, value, unit_text, binding)
         self._projection_state = projection_state
 
     def _commit_delay(self, port: str) -> None:
@@ -1207,6 +1310,45 @@ class ChannelPanel(FluentGroupBox):
         widget = self.channel_labels.get(port)
         if widget is not None:
             widget.setText(label)
+        self.rows = tuple(
+            dataclass_replace(row, label=str(label)) if row.key == port else row
+            for row in self.rows
+        )
+
+    def apply_delay(
+        self,
+        port: str,
+        value: int | float,
+        unit_text: str,
+        binding: _Binding | None,
+    ) -> None:
+        edit = self.delay_edits.get(port)
+        unit = self.delay_units.get(port)
+        row = next((item for item in self.rows if item.key == port), None)
+        if edit is None or unit is None or row is None:
+            raise KeyError(f"unknown delay row {port!r}")
+        with signals_blocked(edit, unit):
+            edit.set_scan_bound(False, None)
+            edit.set_api_bound(False, None)
+            edit.set_numeric_validator("float")
+            _set_widget_text(edit, value)
+            if binding is not None:
+                edit.set_api_bound(True, binding.position + 1)
+                edit.setToolTip(f"API parameter: {binding.parameter_id}")
+            elif row.kind == PORT_DAC:
+                edit.setToolTip(
+                    "Physical DAC-bus output delay (may be negative): the whole "
+                    "bus value shifts by d, out[t] = in[t-d]."
+                )
+            else:
+                edit.setToolTip(
+                    "Physical per-channel output delay (may be negative): the "
+                    "whole channel waveform shifts by d, out[t] = in[t-d]."
+                )
+            selected_unit = unit_text if unit_text in DELAY_UNITS else "ns"
+            if unit.currentText() != selected_unit:
+                unit.setCurrentText(selected_unit)
+        self._projection_state = None
 
     def set_visible_ports(self, ports: frozenset[str]) -> None:
         for key, widget in self.row_widgets.items():
@@ -1668,7 +1810,7 @@ class PulseScheduleView(QtWidgets.QWidget):
         super().__init__(parent)
         self._document_generation = -1
         self._revision = -1
-        self._document_identity = 0
+        self._document_identity: int | None = 0
         self._manifest_fingerprint = ""
         self._period_ids: tuple[str, ...] = ()
         self._visible_ports: tuple[str, ...] = ()
@@ -2092,6 +2234,7 @@ class PulseScheduleView(QtWidgets.QWidget):
         digital_values: Mapping[tuple[str, str], bool],
         analog_values: Mapping[tuple[str, str], tuple[str, int | None]],
         bindings: Mapping[PulseFieldRef, _Binding],
+        reconcile_existing: bool = True,
     ) -> None:
         """Incrementally add/remove/move cards and repeat markers by stable id."""
 
@@ -2125,7 +2268,7 @@ class PulseScheduleView(QtWidgets.QWidget):
                     bindings=bindings,
                 )
                 self._connect_period_card(card)
-            else:
+            elif reconcile_existing:
                 card.reconcile(
                     index,
                     period,
@@ -2147,6 +2290,8 @@ class PulseScheduleView(QtWidgets.QWidget):
                     },
                     bindings=bindings,
                 )
+            else:
+                card.set_period_position(index, total)
             cards.append(card)
 
         existing_start = next(
@@ -2248,9 +2393,14 @@ class PulseScheduleView(QtWidgets.QWidget):
         if incoming_version < current_version:
             return False
         if incoming_version == current_version:
-            if document_identity != self._document_identity:
+            if (
+                self._document_identity is not None
+                and document_identity != self._document_identity
+            ):
                 raise ValueError("one editor revision cannot identify two PulseDocuments")
             if (
+                self._document_identity is not None
+                and
                 manifest_fingerprint == self._manifest_fingerprint
                 and display_visible_ports == self._visible_ports
             ):
@@ -2275,33 +2425,13 @@ class PulseScheduleView(QtWidgets.QWidget):
         period_ids = tuple(period.period_id for period in document.periods)
         programmable = tuple(row.key for row in all_rows)
         visible = tuple(row.key for row in rows)
-
-        active = {
-            port
-            for (period_id, port), high in digital_values.items()
-            if high and period_id in period_ids
-        }
-        active.update(port for port, is_active in analog_active.items() if is_active)
-
-        base_ns_by_id = {
-            period.period_id: float(period.duration) * TIME_UNIT_TO_NS[period.unit]
-            for period in document.periods
-        }
-        total_ns = sum(base_ns_by_id.values())
-        pulse_count = _expanded_pulse_count(document)
-        repeat = None
-        if document.repeat is not None:
-            repeat = (
-                document.repeat.start_period_id,
-                document.repeat.end_period_id,
-                document.repeat.count,
-            )
-            start = period_ids.index(document.repeat.start_period_id)
-            end = period_ids.index(document.repeat.end_period_id)
-            inner_ids = period_ids[start : end + 1]
-            total_ns += (document.repeat.count - 1) * sum(
-                base_ns_by_id[item] for item in inner_ids
-            )
+        active, total_ns, repeat, point_count, summary_text = _schedule_facts(
+            document,
+            all_rows,
+            visible,
+            digital_values,
+            analog_active,
+        )
         row_structure = tuple((row.key, row.kind) for row in all_rows)
         previous_row_structure = tuple(
             (row.key, row.kind) for row in self._all_rows
@@ -2318,41 +2448,6 @@ class PulseScheduleView(QtWidgets.QWidget):
         visible_changed = visible != self._visible_ports
         layout_changed = structure_changed or visible_changed
         interaction = self._capture_interaction() if layout_changed else None
-        repeat_text = _repeat_summary_text(document)
-        visible_set = set(visible)
-        hidden_active = tuple(
-            row.label
-            for row in all_rows
-            if row.key in active and row.key not in visible_set
-        )
-        boundary_active = _restart_high_labels(document)
-
-        point_count = 0 if document.scan_table is None else len(document.scan_table.rows)
-        summary_parts = [
-            f"{len(visible)}/{len(programmable)} ports visible",
-            f"{len(period_ids)} periods",
-            f"step {document.time_step_ns:g} ns",
-            f"{total_ns:.3g} ns",
-            f"{pulse_count} pulses",
-            repeat_text,
-        ]
-        if document.scan_parameters:
-            summary_parts.append(
-                f"scan {len(document.scan_parameters)} slots × {point_count} pts"
-            )
-        if hidden_active:
-            summary_parts.append(f"hidden active: {', '.join(hidden_active)}")
-        if boundary_active:
-            labels = boundary_active[:4]
-            suffix = (
-                ""
-                if len(boundary_active) <= 4
-                else f", +{len(boundary_active) - 4}"
-            )
-            summary_parts.append(
-                "table restart high every "
-                f"{_summary_time_text(total_ns)}: {', '.join(labels)}{suffix}"
-            )
 
         if layout_changed:
             self.setUpdatesEnabled(False)
@@ -2423,7 +2518,7 @@ class PulseScheduleView(QtWidgets.QWidget):
             self._programmable_ports = programmable
             self._all_rows = tuple(all_rows)
             self._visible_ports = visible
-            self._active_ports = frozenset(active)
+            self._active_ports = active
             self._repeat = repeat
             selected_period_id = (
                 self._selected_period_id
@@ -2456,7 +2551,7 @@ class PulseScheduleView(QtWidgets.QWidget):
                 f"Visible {len(visible)}/{len(programmable)} ports | "
                 f"Hidden {len(programmable) - len(visible)}"
             )
-            self._summary_text = " | ".join(summary_parts)
+            self._summary_text = summary_text
             self._document_generation = document_generation
             self._revision = revision
             self._document_identity = document_identity
@@ -2477,6 +2572,194 @@ class PulseScheduleView(QtWidgets.QWidget):
                 self.setUpdatesEnabled(True)
                 self.update()
         return True
+
+    def apply_local_delta(self, delta) -> bool:
+        """Read changed stable ids from one committed same-thread document."""
+
+        if delta.document_generation != self._document_generation:
+            return False
+        document_changed = delta.editor_revision != delta.base_revision
+        if document_changed:
+            if delta.base_revision != self._revision:
+                return False
+            if delta.editor_revision <= self._revision:
+                return False
+            self._revision = delta.editor_revision
+            # A later explicit snapshot boundary is allowed to perform one full
+            # verification at this same revision.  Ordinary edits never do it.
+            self._document_identity = None
+        elif delta.editor_revision != self._revision:
+            return False
+
+        document = delta.document
+        if delta.document_name is not None:
+            self.names_panel.apply_document_name(delta.document_name)
+
+        if delta.period_structure:
+            existing = {card.period_id for card in self.period_cards()}
+            has_new_card = any(
+                period.period_id not in existing for period in document.periods
+            )
+            digital_values = _digital_values(document) if has_new_card else {}
+            analog_values, _active = (
+                _analog_values(document) if has_new_card else ({}, {})
+            )
+            bindings = _field_bindings(document) if has_new_card else {}
+            self._reconcile_period_items(
+                document,
+                self._all_rows,
+                digital_values=digital_values,
+                analog_values=analog_values,
+                bindings=bindings,
+                reconcile_existing=False,
+            )
+            self._period_ids = tuple(period.period_id for period in document.periods)
+            self._repeat = (
+                None
+                if document.repeat is None
+                else (
+                    document.repeat.start_period_id,
+                    document.repeat.end_period_id,
+                    document.repeat.count,
+                )
+            )
+            if self._selected_period_id not in self._period_ids:
+                self._selected_period_id = None
+            if (
+                self._selected_gap is not None
+                and self._selected_gap > len(self._period_ids)
+            ):
+                self._selected_gap = None
+            self.drag_container.show_selection(
+                period_id=self._selected_period_id,
+                gap=self._selected_gap,
+            )
+            self.remove_button.setEnabled(len(self._period_ids) > 1)
+
+        cards = {card.period_id: card for card in self.period_cards()}
+        for period_id in delta.period_ids:
+            card = cards.get(period_id)
+            if card is None:
+                return False
+            card.apply_period_name(document.period_by_id[period_id].name)
+
+        row_keys = {row.key for row in self._all_rows}
+        for port in delta.port_ids:
+            if port not in row_keys or port not in document.target.by_key:
+                return False
+            label = document.target.by_key[port].label
+            self._all_rows = tuple(
+                dataclass_replace(row, label=label) if row.key == port else row
+                for row in self._all_rows
+            )
+            self.names_panel.apply_port_label(port, label)
+            self.channel_panel.set_port_label(port, label)
+            for card in cards.values():
+                card.set_port_label(port, label)
+
+        digital_values = _digital_values(document) if delta.digital_cells else {}
+        for period_id, port in delta.digital_cells:
+            card = cards.get(period_id)
+            if card is None or port not in card.checks:
+                return False
+            card.apply_digital(port, digital_values[(period_id, port)])
+
+        bindings = (
+            _field_bindings(document)
+            if delta.fields or delta.analog_cells or delta.refresh_bindings
+            else {}
+        )
+        fields = set(delta.fields)
+        if delta.refresh_bindings:
+            fields.update(
+                parameter.field
+                for parameter in (*document.scan_parameters, *document.api_parameters)
+            )
+
+        analog_cells = set(delta.analog_cells)
+        for field in fields:
+            binding = bindings.get(field)
+            if field.kind == FIELD_DURATION:
+                card = cards.get(field.period_id)
+                if card is None:
+                    return False
+                value, unit = document.field_value(field)
+                card.apply_duration(value, unit, binding)
+            elif field.kind == FIELD_DAC:
+                analog_cells.add((field.period_id, field.port))
+            else:
+                value, unit = document.field_value(field)
+                self.channel_panel.apply_delay(
+                    field.port,
+                    value,
+                    unit,
+                    binding,
+                )
+
+        if analog_cells:
+            analog_values, _active = _analog_values(document)
+            for period_id, port in analog_cells:
+                card = cards.get(period_id)
+                if card is None or port not in card.bus_mode_combos:
+                    return False
+                mode, value = analog_values[(period_id, port)]
+                card.apply_analog(
+                    port,
+                    mode,
+                    value,
+                    bindings.get(PulseFieldRef(FIELD_DAC, period_id, port)),
+                )
+
+        visible = delta.display_visible_ports
+        if visible is not None:
+            if set(visible) - set(self._programmable_ports):
+                return False
+            self._visible_ports = tuple(visible)
+            self._apply_visible_port_projection(frozenset(visible))
+            self._refresh_hidden_combo(self._all_rows)
+
+        if (
+            delta.period_structure
+            or delta.port_ids
+            or delta.digital_cells
+            or delta.analog_cells
+            or delta.display_visible_ports is not None
+            or delta.refresh_bindings
+            or any(field.kind == FIELD_DURATION for field in delta.fields)
+            or (delta.scan_workspace is not None and document_changed)
+        ):
+            self._refresh_summary_from_document(document)
+        return True
+
+    def _refresh_summary_from_document(self, document: PulseDocument) -> None:
+        """Recompute cheap textual facts without touching the widget structure."""
+
+        digital_values = _digital_values(document)
+        _analog_values_by_cell, analog_active = _analog_values(document)
+        active, total_ns, repeat, point_count, summary = _schedule_facts(
+            document,
+            self._all_rows,
+            self._visible_ports,
+            digital_values,
+            analog_active,
+        )
+        self._active_ports = active
+        self._repeat = repeat
+        self.channel_panel.set_scan_summary(len(document.scan_parameters), point_count)
+        self.names_panel.reconcile_header(
+            document_name=document.name,
+            total_text=_summary_time_text(total_ns),
+            period_count=len(self._period_ids),
+            visible_text=f"{len(self._visible_ports)}/{len(self._programmable_ports)}",
+        )
+        self.names_panel.total_label.setToolTip(
+            f"{total_ns:.9g} ns total (one frame)"
+        )
+        self.visible_label.setText(
+            f"Visible {len(self._visible_ports)}/{len(self._programmable_ports)} ports | "
+            f"Hidden {len(self._programmable_ports) - len(self._visible_ports)}"
+        )
+        self._summary_text = summary
 
     def _apply_visible_port_projection(self, visible: frozenset[str]) -> None:
         """Reveal existing aligned rows without rebuilding any editor widget."""

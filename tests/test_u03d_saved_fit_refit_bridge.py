@@ -106,7 +106,7 @@ def test_saved_fit_requires_explicit_cell_then_replays_exact_ref_for_refit(
             numeric_policy=numeric_policy,
         )
         original_spec = execution.result.spec
-        saved_ref = execution.save(operation_memory_limit_bytes=512 << 20)
+        saved_ref = execution.save()
 
         execute_sources = []
         opened_sources = []

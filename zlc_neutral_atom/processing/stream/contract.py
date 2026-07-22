@@ -462,7 +462,7 @@ class BoundStreamProcessor:
             ("output_payload_contract", self.output_payload_contract),
         ):
             _digest(getattr(contract, "fingerprint", None), f"{name}.fingerprint")
-            for member in ("snapshot", "retained_nbytes", "digest"):
+            for member in ("snapshot", "digest"):
                 if not callable(getattr(contract, member, None)):
                     raise TypeError(f"{name}.{member} must be callable")
         _digest(

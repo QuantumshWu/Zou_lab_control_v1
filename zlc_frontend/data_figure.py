@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from dataclasses import fields, is_dataclass
-from enum import Enum
 from io import BytesIO
 import math
 from numbers import Integral
@@ -19,8 +17,6 @@ from zlc_data import (
     FitResultBatch,
     Selection,
     dataset_revision_ref_to_tree,
-    dataset_schema_retained_upper_bound_nbytes,
-    fit_result_source_validation_additional_peak_upper_bound_nbytes,
     validate_fit_result_source_binding,
 )
 from zlc_storage import canonical_digest, canonical_text
@@ -38,7 +34,6 @@ from .figure import (
     EvaluatedMeter,
     FigureDocument,
     FigureEvaluator,
-    FigureEvaluationPolicy,
     FigureLayer,
     FixedIndex,
     ResolvedDatasetMap,
@@ -202,10 +197,8 @@ def _validate_fit_result_sources_before_evaluation(
     source_refs,
     source_schemas: tuple[tuple[DatasetId, DatasetSchema], ...],
     fit_results: Mapping[str, FitResultBatch] | None,
-    *,
-    validation_memory_limit_bytes: int | None,
 ) -> None:
-    """Gate and validate sparse source lineage before Figure evaluation."""
+    """Validate sparse source lineage before Figure evaluation."""
 
     supplied = {} if fit_results is None else dict(fit_results)
     if not supplied:
@@ -224,18 +217,6 @@ def _validate_fit_result_sources_before_evaluation(
             source_schema = schemas[layer.dataset_id]
         except KeyError as exc:
             raise ValueError("fit layer source metadata is absent") from exc
-        peak = fit_result_source_validation_additional_peak_upper_bound_nbytes(
-            result,
-            source_schema,
-        )
-        if (
-            validation_memory_limit_bytes is not None
-            and peak > validation_memory_limit_bytes
-        ):
-            raise MemoryError(
-                f"fit source validation requires {peak} bytes; limit is "
-                f"{validation_memory_limit_bytes}"
-            )
         validate_fit_result_source_binding(result, source_ref, source_schema)
         if result.spec.committed_transform is not None:
             try:
@@ -245,47 +226,6 @@ def _validate_fit_result_sources_before_evaluation(
                     "transformed fit overlay is not faithfully displayable: "
                     f"{exc}"
                 ) from exc
-
-
-def _metadata_retained_upper_bound_nbytes(value: object) -> int:
-    """Conservatively charge immutable Python metadata, excluding ndarrays."""
-
-    if isinstance(value, np.ndarray):
-        return 0
-    if is_dataclass(value) and not isinstance(value, type):
-        return 512 + sum(
-            _metadata_retained_upper_bound_nbytes(getattr(value, item.name))
-            for item in fields(value)
-        )
-    if isinstance(value, Mapping):
-        return 256 + sum(
-            _metadata_retained_upper_bound_nbytes(key)
-            + _metadata_retained_upper_bound_nbytes(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, (tuple, list)):
-        return 128 + sum(_metadata_retained_upper_bound_nbytes(item) for item in value)
-    if isinstance(value, str):
-        return 128 + 4 * len(value)
-    if isinstance(value, (bytes, bytearray)):
-        return 128 + len(value)
-    if isinstance(value, Enum):
-        return 128
-    if value is None or isinstance(value, (bool, int, float, complex)):
-        return 64
-    # Axis ids and other tiny canonical wrappers intentionally receive a
-    # generous fixed allowance without depending on their implementation.
-    return 256
-
-
-def figure_document_retained_upper_bound_nbytes(
-    document: FigureDocument,
-) -> int:
-    """Bound the immutable document graph before evaluator/source allocation."""
-
-    if not isinstance(document, FigureDocument):
-        raise TypeError("document must be FigureDocument")
-    return int(64 * 1024 + _metadata_retained_upper_bound_nbytes(document))
 
 
 class DataFigure:
@@ -300,7 +240,6 @@ class DataFigure:
         "_document",
         "_evaluated",
         "_fit_results",
-        "_render_memory_limit_bytes",
         "_source_schemas",
     )
 
@@ -310,17 +249,11 @@ class DataFigure:
         datasets: ResolvedDatasetMap,
         *,
         fit_results: Mapping[str, FitResultBatch] | None = None,
-        evaluation_memory_limit_bytes: int | None = None,
-        render_memory_limit_bytes: int | None = None,
     ) -> None:
         if not isinstance(document, FigureDocument):
             raise TypeError("document must be FigureDocument")
         if not isinstance(datasets, ResolvedDatasetMap):
             raise TypeError("datasets must be ResolvedDatasetMap")
-        render_limit = self._validated_memory_limit(
-            render_memory_limit_bytes,
-            "render_memory_limit_bytes",
-        )
         source_schemas = tuple(
             (
                 descriptor.dataset_id,
@@ -329,21 +262,6 @@ class DataFigure:
             for descriptor in document.datasets
         )
 
-        if evaluation_memory_limit_bytes is None:
-            policy = FigureEvaluationPolicy()
-        else:
-            if (
-                isinstance(evaluation_memory_limit_bytes, bool)
-                or not isinstance(evaluation_memory_limit_bytes, Integral)
-                or evaluation_memory_limit_bytes <= 0
-            ):
-                raise ValueError(
-                    "evaluation_memory_limit_bytes must be a positive integer or None"
-                )
-            policy = replace(
-                FigureEvaluationPolicy(),
-                max_live_nbytes=int(evaluation_memory_limit_bytes),
-            )
         _validate_fit_result_sources_before_evaluation(
             document,
             tuple(
@@ -355,9 +273,8 @@ class DataFigure:
             ),
             source_schemas,
             fit_results,
-            validation_memory_limit_bytes=policy.max_live_nbytes,
         )
-        evaluated = FigureEvaluator(policy).evaluate(document, datasets)
+        evaluated = FigureEvaluator().evaluate(document, datasets)
         validated_fit_results = _validated_fit_result_mapping(
             document,
             evaluated,
@@ -370,7 +287,6 @@ class DataFigure:
         self._document = document
         self._evaluated = evaluated
         self._fit_results = validated_fit_results
-        self._render_memory_limit_bytes = render_limit
         self._source_schemas = source_schemas
 
     @property
@@ -382,51 +298,9 @@ class DataFigure:
         return self._evaluated
 
     @property
-    def render_memory_limit_bytes(self) -> int | None:
-        """Frozen default admission limit for every later render/export."""
-        return self._render_memory_limit_bytes
-
-    @property
     def has_fit_overlays(self) -> bool:
         """Whether this immutable figure carries an exact saved or draft fit."""
         return bool(self._fit_results)
-
-    @property
-    def fit_results_retained_upper_bound_nbytes(self) -> int:
-        """Bytes retained only by the immutable Fit-result mapping."""
-
-        from zlc_data import fit_result_retained_upper_bound_nbytes
-
-        return int(
-            sum(
-                fit_result_retained_upper_bound_nbytes(result)
-                for _layer_id, result in self._fit_results
-            )
-        )
-
-    @property
-    def retained_upper_bound_nbytes(self) -> int:
-        """Conservative bytes strongly retained by this frozen figure.
-
-        Composition roots subtract this value from the *one* operation budget
-        before admitting a solver or another render front.  It is not a second
-        independent allowance.
-        """
-
-        from .matplotlib_render import evaluated_figure_array_nbytes
-
-        metadata = _metadata_retained_upper_bound_nbytes(
-            (self._document, self._evaluated)
-        ) + sum(
-            dataset_schema_retained_upper_bound_nbytes(schema)
-            for _dataset_id, schema in self._source_schemas
-        )
-        fit_results = self.fit_results_retained_upper_bound_nbytes
-        return int(
-            evaluated_figure_array_nbytes(self._evaluated)
-            + metadata
-            + fit_results
-        )
 
     def with_fit_results(
         self,
@@ -447,7 +321,6 @@ class DataFigure:
             tuple((item.dataset_id, item.ref) for item in self._evaluated.inputs),
             self._source_schemas,
             fit_results,
-            validation_memory_limit_bytes=self._render_memory_limit_bytes,
         )
         validated = _validated_fit_result_mapping(
             self._document,
@@ -461,7 +334,6 @@ class DataFigure:
         clone._document = self._document
         clone._evaluated = self._evaluated
         clone._fit_results = validated
-        clone._render_memory_limit_bytes = self._render_memory_limit_bytes
         clone._source_schemas = self._source_schemas
         return clone
 
@@ -526,60 +398,6 @@ class DataFigure:
             raise RuntimeError("focused typed source schema is absent or ambiguous")
         return panel_index, source_layer, layer, cell, source_schemas
 
-    def _typed_focus_retained_bound(
-        self,
-        source_layer,
-        layer,
-        cell,
-        source_schemas,
-    ) -> int:
-        array_bytes = sum(
-            int(series.data.samples.nbytes)
-            for series in cell.series
-            if isinstance(series.data, EvaluatedHistogram)
-        )
-        array_bytes += sum(
-            int(series.data.values.nbytes + series.data.validity.nbytes)
-            for series in cell.series
-            if isinstance(series.data, EvaluatedCurve)
-        )
-        metadata_seed = (
-            self._document.descriptor(layer.dataset_id),
-            source_layer,
-            self._evaluated.inputs,
-            layer.layer_id,
-            layer.dataset_id,
-            cell,
-            layer.resolutions,
-        )
-        return int(
-            64 * 1024
-            + array_bytes
-            + _metadata_retained_upper_bound_nbytes(metadata_seed)
-            + sum(
-                dataset_schema_retained_upper_bound_nbytes(schema)
-                for _dataset_id, schema in source_schemas
-            )
-        )
-
-    def focused_typed_panel_retained_upper_bound_nbytes(
-        self,
-        panel_index: int,
-        *,
-        expected_intent: ViewIntent,
-    ) -> int:
-        """Bound one focus derivation without allocating its Figure DTO graph."""
-
-        _index, source_layer, layer, cell, source_schemas = (
-            self._typed_focus_parts(panel_index, expected_intent)
-        )
-        return self._typed_focus_retained_bound(
-            source_layer,
-            layer,
-            cell,
-            source_schemas,
-        )
-
     def focused_typed_panel(
         self,
         panel_index: int,
@@ -602,13 +420,6 @@ class DataFigure:
         panel_index, source_layer, layer, cell, source_schemas = (
             self._typed_focus_parts(panel_index, expected_intent)
         )
-        retained_bound = self._typed_focus_retained_bound(
-            source_layer,
-            layer,
-            cell,
-            source_schemas,
-        )
-
         # Imported lazily because fit_image_projection also imports the public
         # FigurePanelRegion DTO from this module.
         from .fit_image_projection import fit_panel_selection
@@ -711,17 +522,13 @@ class DataFigure:
         clone._document = focused_document
         clone._evaluated = focused_evaluated
         clone._fit_results = ()
-        clone._render_memory_limit_bytes = self._render_memory_limit_bytes
         clone._source_schemas = source_schemas
-        if clone.retained_upper_bound_nbytes > retained_bound:
-            raise RuntimeError("focused typed DTO exceeded its preflight bound")
         return clone
 
     def render(
         self,
         *,
         dpi: float = 100.0,
-        memory_limit_bytes: int | None = None,
     ):
         """Create a caller-owned Figure with canonical artist styles frozen in.
 
@@ -732,8 +539,6 @@ class DataFigure:
         from .matplotlib_render import (
             render_evaluated_figure,
         )
-
-        self._check_render_budget(dpi, memory_limit_bytes)
 
         return render_evaluated_figure(
             self._document,
@@ -746,11 +551,9 @@ class DataFigure:
         self,
         *,
         dpi: float = 100.0,
-        memory_limit_bytes: int | None = None,
     ) -> bytes:
         from .matplotlib_render import save_evaluated_figure
 
-        effective_limit = self._check_render_budget(dpi, memory_limit_bytes)
         output = BytesIO()
         save_evaluated_figure(
             self._document,
@@ -760,30 +563,23 @@ class DataFigure:
             image_format="png",
             dpi=dpi,
         )
-        payload = output.getvalue()
-        if effective_limit is not None and len(payload) > effective_limit:
-            raise MemoryError("PNG payload exceeds figure render memory limit")
-        return payload
+        return output.getvalue()
 
     def to_png_bytes_with_panel_regions(
         self,
         *,
         dpi: float = 100.0,
-        memory_limit_bytes: int | None = None,
     ) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
         """Encode the same frozen figure plus exact display-panel hit regions."""
 
         from .matplotlib_render import encode_evaluated_figure_with_panel_regions
 
-        effective_limit = self._check_render_budget(dpi, memory_limit_bytes)
         payload, regions = encode_evaluated_figure_with_panel_regions(
             self._document,
             self._evaluated,
             dict(self._fit_results),
             dpi=dpi,
         )
-        if effective_limit is not None and len(payload) > effective_limit:
-            raise MemoryError("PNG payload exceeds figure render memory limit")
         return payload, regions
 
     def radial_gaussian_image_fit_panels(
@@ -805,27 +601,6 @@ class DataFigure:
         result = self._fit_result_for_layer(layer_id)
 
         return radial_gaussian_image_fit_panels(
-            self._document,
-            self._evaluated,
-            result,
-            layer_id,
-            artifact_identity=artifact_identity,
-        )
-
-    def radial_gaussian_image_fit_panels_preflight_nbytes(
-        self,
-        layer_id: str,
-        *,
-        artifact_identity: str,
-    ) -> int:
-        """Bound typed IMAGE projection before allocating panel DTOs or labels."""
-
-        from .fit_image_projection import (
-            radial_gaussian_image_fit_panels_additional_peak_upper_bound_nbytes,
-        )
-
-        result = self._fit_result_for_layer(layer_id)
-        return radial_gaussian_image_fit_panels_additional_peak_upper_bound_nbytes(
             self._document,
             self._evaluated,
             result,
@@ -856,113 +631,6 @@ class DataFigure:
             self._single_panel_source_schema(),
             result_identity=result_identity,
         )
-
-    def single_panel_fit_overlay_preflight_nbytes(
-        self,
-        result: FitResultBatch | None = None,
-        *,
-        result_identity: str,
-    ) -> tuple[int, int, int, int]:
-        """Return validation, retained, prediction, and projection-peak bounds.
-
-        This method performs only bounded metadata reads and integer arithmetic.
-        The Workbench calls it before any sparse source validation, overlay plan,
-        selection-index expansion, model evaluation, or raster allocation.
-        """
-
-        identity = canonical_text(result_identity, "fit result identity")
-        if len(identity) > 4096:
-            raise ValueError("fit result identity exceeds its display bound")
-        if result is None:
-            if len(self._fit_results) != 1:
-                raise ValueError("canonical fit preflight requires one layer result")
-            result = self._fit_results[0][1]
-        elif not isinstance(result, FitResultBatch):
-            raise TypeError("result must be FitResultBatch or None")
-        source_schema = self._single_panel_source_schema()
-        validation = (
-            fit_result_source_validation_additional_peak_upper_bound_nbytes(
-                result,
-                source_schema,
-            )
-        )
-        if len(self._document.layers) != 1 or len(self._evaluated.layers) != 1:
-            raise ValueError("typed fit preflight requires one layer")
-        layer = self._evaluated.layers[0]
-        if len(layer.cells) != 1:
-            raise ValueError("typed fit preflight requires one displayed cell")
-        cell = layer.cells[0]
-        intent = self._document.layers[0].view.intent
-        identity_bytes = 4 * len(identity)
-        if intent is ViewIntent.CURVE:
-            from .figure import EvaluatedCurve
-
-            prediction_bytes = 0
-            retained = 4096
-            for series in cell.series:
-                if not isinstance(series.data, EvaluatedCurve):
-                    raise ValueError("CURVE fit preflight found another series type")
-                prediction_bytes += int(series.data.values.size) * 8
-                retained += (
-                    2048
-                    + identity_bytes
-                    + 4 * (512 + 32)
-                    + 256 * len(series.batch_address)
-                )
-            if not cell.series:
-                raise ValueError("CURVE fit preflight found no series")
-            retained += prediction_bytes
-            return (
-                validation,
-                retained,
-                prediction_bytes,
-                retained + 2 * 1024 * 1024,
-            )
-        if intent is ViewIntent.IMAGE:
-            from .figure import EvaluatedImage
-
-            if len(cell.series) != 1 or not isinstance(
-                cell.series[0].data,
-                EvaluatedImage,
-            ):
-                raise ValueError("IMAGE fit preflight requires one image series")
-            descriptor = self._document.descriptor(
-                self._document.layers[0].dataset_id
-            )
-            text_characters = len(descriptor.label)
-            addresses = (
-                *cell.facet_address,
-                *cell.series[0].batch_address,
-                *layer.resolutions,
-            )
-            for address in addresses:
-                text_characters += len(address.axis_id.value) + 4
-                coordinate = address.coordinate
-                text_characters += len(coordinate) if isinstance(coordinate, str) else 64
-            for reduction in cell.series[0].reductions:
-                text_characters += len(reduction.method.value) + 32
-                text_characters += sum(
-                    len(axis_id.value) + 2 for axis_id in reduction.axis_ids
-                )
-                # Contributor counters are policy-bounded integers; 128 chars
-                # covers both decimal renderings plus punctuation.
-                text_characters += 128
-            metadata_bytes = 4 * text_characters + 512 * (
-                1 + len(cell.series[0].reductions)
-            )
-            retained = (
-                64 * 1024
-                + identity_bytes
-                + metadata_bytes
-                + 4 * (512 + 32)
-            )
-            # ``figure_panel_title`` first owns address/reduction fragments,
-            # then their joins, then successive immutable title copies.  Four
-            # simultaneous Unicode-sized copies conservatively cover that
-            # construction before the bounded overlay becomes the retained one.
-            projection_peak = retained + 16 * text_characters + 256 * 1024
-            return validation, retained, 0, projection_peak
-        raise ValueError("typed Fit overlay requires CURVE or IMAGE")
 
     def transient_single_panel_curve_fit_overlay_plan(
         self,
@@ -1049,7 +717,6 @@ class DataFigure:
         *,
         image_format: str | None = None,
         dpi: float = 100.0,
-        memory_limit_bytes: int | None = None,
     ) -> Path:
         target = Path(path)
         if image_format is None:
@@ -1058,7 +725,6 @@ class DataFigure:
             target = target.with_suffix(f".{image_format}")
         from .matplotlib_render import save_evaluated_figure
 
-        self._check_render_budget(dpi, memory_limit_bytes)
         save_evaluated_figure(
             self._document,
             self._evaluated,
@@ -1069,43 +735,8 @@ class DataFigure:
         )
         return target
 
-    def _check_render_budget(
-        self,
-        dpi: float,
-        memory_limit_bytes: int | None,
-    ) -> int | None:
-        requested = self._validated_memory_limit(
-            memory_limit_bytes,
-            "memory_limit_bytes",
-        )
-        frozen = self._render_memory_limit_bytes
-        if frozen is not None and requested is not None and requested > frozen:
-            raise ValueError(
-                "memory_limit_bytes cannot weaken the DataFigure render limit"
-            )
-        effective = frozen if requested is None else requested
-        if effective is None:
-            return None
-        from .matplotlib_render import estimate_render_peak_nbytes
-
-        required = estimate_render_peak_nbytes(self._evaluated, dpi=dpi)
-        if required > effective:
-            raise MemoryError(
-                f"figure render peak {required} exceeds limit {effective}"
-            )
-        return effective
-
-    @staticmethod
-    def _validated_memory_limit(value: int | None, name: str) -> int | None:
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
-            raise ValueError(f"{name} must be a positive integer or None")
-        return int(value)
-
 
 __all__ = [
     "DataFigure",
     "FigurePanelRegion",
-    "figure_document_retained_upper_bound_nbytes",
 ]

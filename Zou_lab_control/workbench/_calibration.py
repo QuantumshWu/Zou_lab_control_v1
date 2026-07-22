@@ -20,7 +20,7 @@ from zlc_frontend.qt_widgets import (
 )
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
 from zlc_neutral_atom.runtime.run import RunCancelled, RunHandle
-from zlc_storage import positive_integer, positive_real
+from zlc_storage import positive_real
 from zlc_workbench.calibration import (
     CalibrationEditorSeed,
     calibration_analysis_form,
@@ -37,7 +37,6 @@ from ._frozen_raster import (
 from ._window_runtime import error_summary, open_workbench_window
 
 
-_DEFAULT_CALIBRATION_GUI_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_CALIBRATION_GUI_TIMEOUT_SECONDS = 300.0
 
 
@@ -161,8 +160,6 @@ def _project_calibration(computation):
 def _render_calibration_computation(
     computation,
     reference: CalibrationArtifactRef,
-    source_retained_upper_bound_bytes: int,
-    memory_limit_bytes: int,
     cancelled: threading.Event,
 ) -> EncodedRasterDocument:
     if cancelled.is_set():
@@ -176,8 +173,6 @@ def _render_calibration_computation(
 
     rendered = render_calibration_report(
         view,
-        memory_limit_bytes=memory_limit_bytes,
-        source_retained_upper_bound_bytes=source_retained_upper_bound_bytes,
         checkpoint=lambda: _require_not_cancelled(cancelled),
     )
     if cancelled.is_set():
@@ -202,43 +197,27 @@ def _render_calibration_computation(
 def _load_calibration_computation(
     loader,
     reference: CalibrationArtifactRef,
-    memory_limit_bytes: int,
 ):
     try:
-        return loader(
-            reference,
-            memory_limit_bytes=memory_limit_bytes,
-        )
+        return loader(reference)
     except FileNotFoundError as error:
         raise FileNotFoundError(
             "calibration diagnostics are unavailable; this does not by itself "
             "invalidate the committed runtime calibration"
-        ) from error
-    except MemoryError as error:
-        raise MemoryError(
-            "calibration diagnostics exceed the display budget; this does not by "
-            "itself invalidate the committed runtime calibration"
         ) from error
 
 
 def _render_calibration(
     loader,
     reference: CalibrationArtifactRef,
-    memory_limit_bytes: int,
     cancelled: threading.Event,
 ) -> EncodedRasterDocument:
     if cancelled.is_set():
         raise CancelledError()
-    computation, source_retained_upper_bound_bytes = _load_calibration_computation(
-        loader,
-        reference,
-        memory_limit_bytes,
-    )
+    computation = _load_calibration_computation(loader, reference)
     return _render_calibration_computation(
         computation,
         reference,
-        source_retained_upper_bound_bytes,
-        memory_limit_bytes,
         cancelled,
     )
 
@@ -246,7 +225,6 @@ def _render_calibration(
 def _prepare_calibration_editor(
     computation_loader,
     reference: CalibrationArtifactRef,
-    memory_limit_bytes: int,
     timeout_seconds: float,
     cancelled: threading.Event,
 ):
@@ -256,23 +234,16 @@ def _prepare_calibration_editor(
         raise TypeError("reference must be CalibrationArtifactRef")
     if cancelled.is_set():
         raise CancelledError()
-    computation, retained = _load_calibration_computation(
-        computation_loader,
-        reference,
-        memory_limit_bytes,
-    )
+    computation = _load_calibration_computation(computation_loader, reference)
     prepared = calibration_seed_from_computation(
         computation,
         reference,
-        memory_limit_bytes=memory_limit_bytes,
         timeout_seconds=timeout_seconds,
     )
     try:
         bundle = _render_calibration_computation(
             computation,
             reference,
-            retained,
-            memory_limit_bytes,
             cancelled,
         )
     except BaseException as error:
@@ -292,7 +263,6 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
         *,
         seed: CalibrationEditorSeed | None,
         reference: CalibrationArtifactRef | None,
-        memory_limit_bytes: int,
         timeout_seconds: float,
     ) -> None:
         if not callable(computation_loader) or not callable(run_starter):
@@ -330,7 +300,6 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             loading_summary="Resolving immutable calibration authority…",
             object_prefix="calibrationEditor",
             subject="calibration",
-            memory_limit_bytes=memory_limit_bytes,
         )
         self._run_owner = QtRunOwnerMailbox(
             self._wake.request_owner_wake,
@@ -386,7 +355,6 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
                 _prepare_calibration_editor,
                 self._computation_loader,
                 reference,
-                self._memory_limit_bytes,
                 self._timeout_seconds,
                 self._cancelled,
             ):
@@ -490,7 +458,6 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
                     seed.source_capture_ref,
                     seed.readout_binding,
                     analysis,
-                    seed.memory_limit_bytes,
                     seed.timeout_seconds,
                 ),
                 generation=generation,
@@ -685,7 +652,6 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             _render_calibration,
             self._computation_loader,
             reference,
-            self._memory_limit_bytes,
             self._cancelled,
         ):
             self._raster_job_kind = None
@@ -826,8 +792,6 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
 def open_calibration_report_workbench(
     computation_loader,
     reference: CalibrationArtifactRef,
-    *,
-    memory_limit_bytes: int = _DEFAULT_CALIBRATION_GUI_MEMORY_LIMIT_BYTES,
 ) -> FrozenRasterWindow:
     """Load and display one FINAL calibration report on the shared raster lane."""
 
@@ -835,12 +799,10 @@ def open_calibration_report_workbench(
         raise TypeError("computation_loader must be callable")
     if not isinstance(reference, CalibrationArtifactRef):
         raise TypeError("reference must be CalibrationArtifactRef")
-    limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
     return open_frozen_raster_window(
         lambda cancelled: _render_calibration(
             computation_loader,
             reference,
-            limit,
             cancelled,
         ),
         window_title="Calibration Report",
@@ -848,7 +810,6 @@ def open_calibration_report_workbench(
         loading_summary=f"Resolving {reference.target_ref}…",
         object_prefix="calibrationReport",
         subject="report",
-        memory_limit_bytes=limit,
     )
 
 
@@ -858,7 +819,6 @@ def open_calibration_workbench(
     *,
     seed: CalibrationEditorSeed | None = None,
     reference: CalibrationArtifactRef | None = None,
-    memory_limit_bytes: int = _DEFAULT_CALIBRATION_GUI_MEMORY_LIMIT_BYTES,
     timeout_seconds: float = _DEFAULT_CALIBRATION_GUI_TIMEOUT_SECONDS,
 ) -> CalibrationWorkbenchWindow:
     """Open formal creation/editing from one request seed or exact artifact ref."""
@@ -866,10 +826,8 @@ def open_calibration_workbench(
     if (seed is None) == (reference is None):
         raise ValueError("provide exactly one calibration seed or reference")
     if seed is not None:
-        limit = seed.memory_limit_bytes
         timeout = seed.timeout_seconds
     else:
-        limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
         timeout = positive_real(timeout_seconds, "timeout_seconds")
     return open_workbench_window(
         lambda: CalibrationWorkbenchWindow(
@@ -877,7 +835,6 @@ def open_calibration_workbench(
             run_starter,
             seed=seed,
             reference=reference,
-            memory_limit_bytes=limit,
             timeout_seconds=timeout,
         )
     )

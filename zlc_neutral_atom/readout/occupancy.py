@@ -89,8 +89,6 @@ OCCUPANCY_STREAM_PROCESSOR_DEFINITION = StreamProcessorDefinition(
 OCCUPANCY_STREAM_PROCESSOR_DEFINITIONS = (
     OCCUPANCY_STREAM_PROCESSOR_DEFINITION,
 )
-_RECORD_BYTES = 128
-_COMMITTED_OCCUPANCY_FIXED_BYTES = 4 << 20
 OCCUPANCY_COUNTS_BLOCK_ID = BlockId("occupancy-counts")
 OCCUPANCY_OCCUPIED_BLOCK_ID = BlockId("occupancy-occupied")
 
@@ -341,9 +339,8 @@ def _require_committed_occupancy_context(
     binding: _CommittedOccupancyBinding,
     *,
     checkpoint: Callable[[], None] | None = None,
-    physical_memory_limit_bytes: int | None = None,
 ) -> _ResolvedCommittedOccupancy:
-    """Stream-compare every selected pulse window after memory admission."""
+    """Stream-compare every selected pulse window."""
 
     from zlc_neutral_atom.artifacts.capture import AdmittedCapture
 
@@ -377,7 +374,6 @@ def _require_committed_occupancy_context(
             calibration.artifact.frame_contract.exposure_seconds
         ),
         checkpoint=checkpoint,
-        physical_memory_limit_bytes=physical_memory_limit_bytes,
     )
     if current_context != calibration.artifact.readout_physical_context:
         raise ValueError("capture pulse context differs from the calibration")
@@ -713,37 +709,6 @@ def _analyze_committed_occupancy_resolved(
     )
 
 
-def _estimate_committed_occupancy_peak_from_footprints(
-    *,
-    event_count: int,
-    site_count: int,
-    source_read_scratch_bytes: int,
-    dependency_retained_bytes: int,
-    runtime_scratch_bytes: int,
-) -> int:
-    """Bound streaming analysis from owner-supplied cardinality/resource facts."""
-
-    for field, value in (
-        ("event_count", event_count),
-        ("site_count", site_count),
-        ("source_read_scratch_bytes", source_read_scratch_bytes),
-        ("dependency_retained_bytes", dependency_retained_bytes),
-        ("runtime_scratch_bytes", runtime_scratch_bytes),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"{field} must be a non-negative integer")
-    if event_count == 0 or site_count == 0:
-        raise ValueError("occupancy event_count and site_count must be positive")
-    output_bytes = event_count * site_count * (8 + 1 + 1)
-    return (
-        _COMMITTED_OCCUPANCY_FIXED_BYTES
-        + source_read_scratch_bytes
-        + dependency_retained_bytes
-        + runtime_scratch_bytes
-        + 2 * output_bytes
-    )
-
-
 @dataclass(frozen=True, eq=False)
 class OccupancySample:
     """Counts and occupancy atomically derived from one physical camera frame."""
@@ -814,19 +779,6 @@ class OccupancySampleContract:
             }
         )
 
-    @property
-    def max_retained_nbytes(self) -> int:
-        return (
-            _RECORD_BYTES
-            + self._counts.max_retained_nbytes
-            + self._occupied.max_retained_nbytes
-            + self.metadata_contract.max_retained_nbytes
-        )
-
-    @property
-    def finalization_scratch_nbytes(self) -> int:
-        return 32 * self.counts_schema.data_axes[0].size
-
     def snapshot(self, payload: OccupancySample) -> OccupancySample:
         self.validate(payload)
         return payload
@@ -837,15 +789,6 @@ class OccupancySampleContract:
         self._counts.validate(payload.counts)
         self._occupied.validate(payload.occupied)
         self.metadata_contract.validate(payload.metadata)
-
-    def retained_nbytes(self, payload: OccupancySample) -> int:
-        self.validate(payload)
-        return (
-            _RECORD_BYTES
-            + self._counts.retained_nbytes(payload.counts)
-            + self._occupied.retained_nbytes(payload.occupied)
-            + self.metadata_contract.retained_nbytes(payload.metadata)
-        )
 
     def digest(self, payload: OccupancySample) -> str:
         self.validate(payload)
@@ -914,14 +857,6 @@ class _OccupancyDatasetMetadataContract:
             }
         )
 
-    @property
-    def max_retained_nbytes(self) -> int:
-        return (
-            _RECORD_BYTES
-            + self._occupied.max_retained_nbytes
-            + self.payload_contract.metadata_contract.max_retained_nbytes
-        )
-
     def snapshot(self, payload: OccupancySample) -> OccupancyDatasetMetadata:
         self.payload_contract.validate(payload)
         return OccupancyDatasetMetadata(payload.occupied, payload.metadata)
@@ -931,17 +866,6 @@ class _OccupancyDatasetMetadataContract:
             raise TypeError("metadata must be OccupancyDatasetMetadata")
         self._occupied.validate(metadata.occupied)
         self.payload_contract.metadata_contract.validate(metadata.source_metadata)
-
-    def retained_nbytes(self, metadata: object | None) -> int:
-        self.validate(metadata)
-        assert isinstance(metadata, OccupancyDatasetMetadata)
-        return (
-            _RECORD_BYTES
-            + self._occupied.retained_nbytes(metadata.occupied)
-            + self.payload_contract.metadata_contract.retained_nbytes(
-                metadata.source_metadata
-            )
-        )
 
     def digest(self, metadata: object | None) -> str:
         self.validate(metadata)

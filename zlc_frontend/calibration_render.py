@@ -14,7 +14,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Circle, Rectangle
 
-from zlc_storage import canonical_text, positive_integer
+from zlc_storage import canonical_text
 
 from .encoded_raster import EncodedRasterDocument, EncodedRasterPage
 from .image_raster import png_raster_size
@@ -33,11 +33,6 @@ from .render_style import (
 
 
 _SCREEN_DPI = 150
-_RENDER_FIXED_BYTES = 8 << 20
-_RASTER_PEAK_MULTIPLIER = 8
-_ARRAY_PEAK_MULTIPLIER = 8
-
-
 def _array(value, dtype, shape, field_name, *, finite: bool = False):
     result = np.asarray(value, dtype=dtype)
     if result.shape != shape:
@@ -135,26 +130,6 @@ class CalibrationModelView:
             "global_fidelity",
             _metric(self.global_fidelity, "global_fidelity"),
         )
-
-    @property
-    def array_nbytes(self) -> int:
-        return sum(
-            int(getattr(self, name).nbytes)
-            for name in (
-                "signals",
-                "signal_validity",
-                "bin_edges",
-                "quick_thresholds",
-                "formal_thresholds",
-                "runtime_thresholds",
-                "feature_validity",
-                "runtime_usable",
-                "bright_above",
-                "model_fidelity",
-                "heldout_fidelity",
-            )
-        )
-
 
 @dataclass(frozen=True, eq=False)
 class CalibrationReportView:
@@ -280,26 +255,6 @@ class CalibrationReportView:
         object.__setattr__(self, "psf_fit_ok", fit_ok)
         object.__setattr__(self, "psf_sigma_xy", sigma)
 
-    @property
-    def array_nbytes(self) -> int:
-        arrays = (
-            self.reference_average,
-            self.reference_average_validity,
-            self.actual_centers_xy,
-            self.site_validity,
-            self.default_boxes_xywh,
-            self.occupied_labels,
-            self.dark_labels,
-            self.label_validity,
-        )
-        total = sum(int(value.nbytes) for value in arrays)
-        if self.expected_centers_xy is not None:
-            total += int(self.expected_centers_xy.nbytes)
-        if self.psf_kernels is not None:
-            total += int(self.psf_kernels.nbytes + self.psf_fit_ok.nbytes + self.psf_sigma_xy.nbytes)
-        return total + sum(model.array_nbytes for model in self.models)
-
-
 def _mean_metric(values: np.ndarray) -> float:
     finite = np.asarray(values, dtype=float)
     finite = finite[np.isfinite(finite)]
@@ -321,28 +276,12 @@ def _new_figure(width: int, height: int) -> Figure:
 
 
 def _render_page(
-    view: CalibrationReportView,
     *,
     width: int,
     height: int,
-    retained_png_bytes: int,
-    source_retained_upper_bound_bytes: int,
-    memory_limit_bytes: int,
     builder,
     checkpoint: Callable[[], None],
 ) -> bytes:
-    required = (
-        _RENDER_FIXED_BYTES
-        + source_retained_upper_bound_bytes
-        + _RASTER_PEAK_MULTIPLIER * width * height * 4
-        + _ARRAY_PEAK_MULTIPLIER * view.array_nbytes
-        + 2 * retained_png_bytes
-    )
-    if required > memory_limit_bytes:
-        raise MemoryError(
-            f"calibration raster composition requires {required} bytes; "
-            f"limit is {memory_limit_bytes}"
-        )
     figure = None
     with render_style_context():
         try:
@@ -529,62 +468,39 @@ def _build_psf_grid(view: CalibrationReportView, figure: Figure) -> None:
 def render_calibration_report(
     view: CalibrationReportView,
     *,
-    memory_limit_bytes: int,
-    source_retained_upper_bound_bytes: int,
     checkpoint: Callable[[], None] | None = None,
 ) -> EncodedRasterDocument:
     """Render stored diagnostics without fitting, rethresholding, or reshaping sites."""
 
     if not isinstance(view, CalibrationReportView):
         raise TypeError("view must be CalibrationReportView")
-    limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-    source_retained = positive_integer(
-        source_retained_upper_bound_bytes,
-        "source_retained_upper_bound_bytes",
-    )
     check = (lambda: None) if checkpoint is None else checkpoint
     if not callable(check):
         raise TypeError("checkpoint must be callable or None")
     pages = []
-    retained = 0
-
     payload = _render_page(
-        view,
         width=1800,
         height=1100,
-        retained_png_bytes=retained,
-        source_retained_upper_bound_bytes=source_retained,
-        memory_limit_bytes=limit,
         builder=lambda figure: _build_overview(view, figure),
         checkpoint=check,
     )
     pages.append(EncodedRasterPage("overview", "Overview", payload))
-    retained += len(payload)
 
     rows, columns = view.grid_shape_yx
     grid_width = max(1200, 260 * columns)
     grid_height = max(800, 220 * rows)
     for model in view.models:
         payload = _render_page(
-            view,
             width=grid_width,
             height=grid_height,
-            retained_png_bytes=retained,
-            source_retained_upper_bound_bytes=source_retained,
-            memory_limit_bytes=limit,
             builder=lambda figure, selected=model: _build_histogram_grid(view, selected, figure),
             checkpoint=check,
         )
         pages.append(EncodedRasterPage(f"hist-{model.label}", model.label, payload))
-        retained += len(payload)
     if view.psf_kernels is not None:
         payload = _render_page(
-            view,
             width=grid_width,
             height=grid_height,
-            retained_png_bytes=retained,
-            source_retained_upper_bound_bytes=source_retained,
-            memory_limit_bytes=limit,
             builder=lambda figure: _build_psf_grid(view, figure),
             checkpoint=check,
         )

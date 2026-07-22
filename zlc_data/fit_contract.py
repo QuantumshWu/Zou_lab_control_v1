@@ -15,12 +15,7 @@ from zlc_storage.canonical import canonical_text, sha256_text
 from ._arrays import immutable_array, immutable_bool_array
 from .axis import AxisId, AxisSpec
 from .layout import AxisLayout
-from .schema import (
-    DatasetSchema,
-    axis_layout_retained_upper_bound_nbytes,
-    axis_spec_retained_upper_bound_nbytes,
-)
-from .selection import Selection
+from .schema import DatasetSchema
 from .transform import (
     CommittedTransform,
     TransformedSchema,
@@ -101,22 +96,13 @@ class FitParameterConstraint:
 @dataclass(frozen=True)
 class FitNumericPolicy:
     max_evaluations: int = 4_000
-    max_batch_cells: int = 100_000
-    sample_budget_per_batch: int = 12_000
-    max_packed_observations: int = 2_000_000
     covariance_rcond: float = 1e-12
 
     def __post_init__(self) -> None:
-        for field in (
-            "max_evaluations",
-            "max_batch_cells",
-            "sample_budget_per_batch",
-            "max_packed_observations",
-        ):
-            value = getattr(self, field)
-            if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
-                raise ValueError(f"{field} must be a positive integer")
-            object.__setattr__(self, field, int(value))
+        value = self.max_evaluations
+        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+            raise ValueError("max_evaluations must be a positive integer")
+        object.__setattr__(self, "max_evaluations", int(value))
         value = self.covariance_rcond
         if isinstance(value, bool) or not isinstance(value, Real):
             raise TypeError("covariance_rcond must be a positive finite real number")
@@ -235,14 +221,6 @@ class BoundFit:
         requested_ids = self.spec.fit_axis_ids + self.spec.batch_axis_ids
         if len(requested_ids) != len(effective_ids) or set(requested_ids) != set(effective_ids):
             raise ValueError("BoundFit axes do not cover the effective schema exactly")
-        if self.spec.numeric_policy.sample_budget_per_batch < self.minimum_observation_count:
-            raise ValueError(
-                "sample_budget_per_batch is below this fit request's minimum observation count"
-            )
-        if self.spec.numeric_policy.max_packed_observations < self.minimum_observation_count:
-            raise ValueError(
-                "max_packed_observations is below this fit request's minimum observation count"
-            )
         if len(self.spec.fit_axis_ids) != model.independent_arity:
             raise ValueError(
                 f"model {model.model_id!r} requires "
@@ -352,14 +330,10 @@ class FitProblem:
         if self.value_unit is not None:
             canonical_text(self.value_unit, "value_unit")
         batch_size = self.batch_layout.storage_size
-        if batch_size > self.spec.numeric_policy.max_batch_cells:
-            raise ValueError("fit problem exceeds its declared batch-cell budget")
         offsets = _immutable_numeric(self.batch_offsets, "<i8", (batch_size + 1,))
         if offsets[0] != 0 or np.any(np.diff(offsets) < 0):
             raise ValueError("fit problem batch offsets must be monotonic and start at zero")
         packed_size = int(offsets[-1])
-        if packed_size > self.spec.numeric_policy.max_packed_observations:
-            raise ValueError("fit problem exceeds its declared packed-observation budget")
         observations = _immutable_numeric(self.observations, "<f8", (packed_size,))
         independent = tuple(
             _immutable_numeric(values, "<f8", (packed_size,))
@@ -381,11 +355,6 @@ class FitProblem:
             raise ValueError("valid observation count exceeds present count")
         if np.any(counts["used_observation_counts"] > counts["valid_observation_counts"]):
             raise ValueError("used observation count exceeds valid count")
-        if np.any(
-            counts["used_observation_counts"]
-            > self.spec.numeric_policy.sample_budget_per_batch
-        ):
-            raise ValueError("used observation count exceeds the declared sampling budget")
         if not np.array_equal(np.diff(offsets), counts["used_observation_counts"]):
             raise ValueError("packed offsets disagree with used observation counts")
         object.__setattr__(self, "fit_axis_specs", fit_axes)
@@ -454,8 +423,6 @@ class FitResultBatch:
             canonical_text(self.value_unit, "value_unit")
         minimum_observations = _minimum_observation_count(self.spec, model)
         batch_size = self.batch_layout.storage_size
-        if batch_size > self.spec.numeric_policy.max_batch_cells:
-            raise ValueError("fit result exceeds its declared batch-cell budget")
         parameter_count = len(parameters)
         object.__setattr__(
             self,
@@ -493,13 +460,11 @@ class FitResultBatch:
         if len(statuses) != batch_size or any(not isinstance(item, FitBatchStatus) for item in statuses):
             raise ValueError("statuses must match batch layout")
         if len(errors) != batch_size:
-            raise ValueError("errors must contain bounded text or None per batch")
+            raise ValueError("errors must contain text or None per batch")
         for value in errors:
             if value is None:
                 continue
             canonical_text(value, "errors item")
-            if len(value) > 512:
-                raise ValueError("errors must contain bounded text or None per batch")
         fixed_indices = tuple(
             index
             for index, parameter in enumerate(parameters)
@@ -614,23 +579,9 @@ class FitResultBatch:
             raise ValueError("valid observation count exceeds present count")
         if np.any(self.used_observation_counts > self.valid_observation_counts):
             raise ValueError("used observation count exceeds valid count")
-        if np.any(
-            self.used_observation_counts
-            > self.spec.numeric_policy.sample_budget_per_batch
-        ):
-            raise ValueError("used observation count exceeds the declared sampling budget")
-        if (
-            sum(int(value) for value in self.used_observation_counts)
-            > self.spec.numeric_policy.max_packed_observations
-        ):
-            raise ValueError(
-                "fit result exceeds its declared packed-observation budget"
-            )
         if np.any(self.evaluation_counts > self.spec.numeric_policy.max_evaluations):
-            raise ValueError("evaluation count exceeds the declared numeric budget")
+            raise ValueError("evaluation count exceeds max_evaluations")
         canonical_text(self.scipy_version, "scipy_version")
-        if len(self.scipy_version) > 128:
-            raise ValueError("scipy_version must be canonical non-empty text")
         object.__setattr__(self, "fit_axis_specs", fit_axes)
         object.__setattr__(self, "batch_axis_specs", batch_axes)
         object.__setattr__(self, "statuses", statuses)
@@ -701,233 +652,6 @@ class FitResultBatch:
 
         model = fit_model_definition(self.spec.model_id)
         return evaluate_fit_model(model, coordinates, self.parameter_values[index])
-
-
-def fit_result_retained_upper_bound_nbytes(result: FitResultBatch) -> int:
-    """Conservatively bound one decoded result while it remains strongly held.
-
-    The fit artifact codec has a bounded blob size, but a decoded result also
-    owns NumPy buffers plus Python tuples/strings for statuses, errors, axes,
-    and sparse layout addresses.  Composition roots use this bound to admit a
-    source snapshot, view evaluation, and render without pretending that the
-    overlay result is free.
-    """
-
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("result must be FitResultBatch")
-    arrays = (
-        result.parameter_values,
-        result.covariance,
-        result.covariance_valid,
-        result.present_observation_counts,
-        result.valid_observation_counts,
-        result.used_observation_counts,
-        result.evaluation_counts,
-        result.residual_sum_squares,
-        result.r_squared,
-        result.r_squared_valid,
-    )
-    array_bytes = sum(int(value.nbytes) for value in arrays)
-    # Four bytes per Unicode code point is a UTF-8 upper bound and, unlike
-    # ``encode()``, performs no allocation while this function is itself used
-    # as an admission preflight.
-    text_bytes = sum(
-        0 if value is None else 4 * len(value)
-        for value in result.errors
-    )
-    axis_bytes = sum(
-        axis_spec_retained_upper_bound_nbytes(axis)
-        for axis in (*result.fit_axis_specs, *result.batch_axis_specs)
-    )
-    layout_bytes = axis_layout_retained_upper_bound_nbytes(result.batch_layout)
-    text_bytes += 4 * (
-        len(result.source_ref.block_id.value)
-        + len(result.source_ref.stream_generation.value)
-        + len(result.source_ref.schema_fingerprint)
-        + len(result.spec.input_schema_fingerprint)
-        + len(result.spec.model_id)
-        + len(result.scipy_version)
-        + (0 if result.value_unit is None else len(result.value_unit))
-        + sum(len(axis_id.value) for axis_id in result.spec.fit_axis_ids)
-        + sum(len(axis_id.value) for axis_id in result.spec.batch_axis_ids)
-        + sum(
-            len(constraint.parameter_name)
-            for constraint in result.spec.constraints
-        )
-    )
-    transform = result.spec.committed_transform
-    if transform is not None:
-        text_bytes += 4 * (
-            len(transform.input_schema_fingerprint)
-            + len(transform.output_schema_fingerprint)
-        )
-        for operation in transform.spec.operations:
-            if isinstance(operation, Selection):
-                for term in operation.terms:
-                    text_bytes += 4 * len(term.axis_id.value) + 512
-                    frame = getattr(term, "coordinate_frame", None)
-                    if frame is not None:
-                        text_bytes += 4 * len(frame.value)
-            else:
-                text_bytes += sum(
-                    4 * len(axis_id.value) + 512
-                    for axis_id in operation.axis_ids
-                )
-    batch_size = result.batch_layout.storage_size
-    axis_count = len(result.batch_axis_specs)
-    # Per-row allowance covers tuple/PyLong layout addresses, status/error
-    # references, and allocator overhead.  Rectangular layouts intentionally
-    # receive the same conservative allowance so admission never depends on a
-    # CPython implementation detail.
-    row_bytes = batch_size * (1024 + 128 * axis_count)
-    return int(
-        64 * 1024
-        + array_bytes
-        + text_bytes
-        + axis_bytes
-        + layout_bytes
-        + row_bytes
-    )
-
-
-def bound_fit_execution_peak_upper_bound_nbytes(bound: BoundFit) -> int:
-    """Return a data-free conservative peak for one :meth:`BoundFit.run`.
-
-    The bound covers the schema-derived packing tables, simultaneous packed
-    observation/coordinate parts and their final arrays, the largest one-cell
-    nonlinear least-squares workspace, result arrays, bounded status/error
-    objects, and an authority-transform allowance.  It intentionally uses the
-    logical batch product when a sparse layout has not yet been inspected; the
-    runtime may consume less, never more than the declared policy caps.
-
-    ``max_evaluations`` is a time cap rather than an evaluation-history size --
-    SciPy retains only the current residual/Jacobian -- but a small per-call
-    bookkeeping allowance keeps that policy field represented without the
-    false ``O(samples * evaluations)`` multiplication.
-    """
-
-    if type(bound) is not BoundFit:
-        raise TypeError("bound must be BoundFit")
-    schema = bound.effective_schema
-    policy = bound.spec.numeric_policy
-    arity = len(bound.spec.fit_axis_ids)
-    parameter_count = len(bound.model.parameters)
-    batch_axes = tuple(
-        schema.axis(axis_id) for axis_id in bound.spec.batch_axis_ids
-    )
-    logical_batch_cells = math.prod(axis.size for axis in batch_axes)
-    batch_cells = (
-        0
-        if schema.cell_layout.storage_size == 0
-        else min(policy.max_batch_cells, logical_batch_cells)
-    )
-    physical_observations = (
-        schema.cell_layout.storage_size
-        * math.prod(axis.size for axis in schema.data_axes)
-    )
-    packed_observations = min(
-        policy.max_packed_observations,
-        batch_cells * policy.sample_budget_per_batch,
-        physical_observations,
-    )
-    one_cell_samples = min(
-        policy.sample_budget_per_batch,
-        physical_observations,
-    )
-
-    # During concatenation every float64 part can coexist with its final
-    # contiguous array.  The (arity + 1) channels are y plus named x axes.
-    packed_float_bytes = 16 * packed_observations * (arity + 1)
-    problem_index_bytes = 8 * (
-        packed_observations * (arity + 4)
-        + 4 * batch_cells
-        + batch_cells
-        + 1
-    )
-    part_object_bytes = 256 * batch_cells * (arity + 1)
-
-    cell_axis_count = len(schema.cell_axes)
-    batch_axis_count = len(batch_axes)
-    row_count = schema.cell_layout.storage_size
-    # axis_indices, row-order/lexsort temporaries, row-group PyLong/list
-    # storage, sparse batch addresses, and data-combination tuples.
-    schema_plan_bytes = (
-        8 * row_count * (12 + 4 * arity + cell_axis_count)
-        + row_count * (256 + 32 * cell_axis_count)
-        + batch_cells * (2048 + 256 * batch_axis_count)
-    )
-
-    # The sampler scans at most 65,536 values at once.  The larger term covers
-    # selected ranks, unravelled indices, finite masks and feature candidates
-    # for the maximum one-cell sample budget.
-    sampling_bytes = (
-        8 * 65_536 * (16 + 4 * arity)
-        + 8 * one_cell_samples * (24 + 8 * arity)
-        + 2 * 1024 * 1024
-    )
-
-    # scipy.optimize.least_squares(method='trf', tr_solver='exact') retains a
-    # residual and dense m-by-n Jacobian plus factorization/model temporaries,
-    # not all evaluations.  Sixty-four float64 copies of the dominant shapes
-    # is deliberately above the arrays owned by the current SciPy path.
-    solver_bytes = 8 * (
-        64 * one_cell_samples * (parameter_count + arity + 4)
-        + 256 * parameter_count * parameter_count
-        + 256 * parameter_count
-    )
-    evaluation_bookkeeping_bytes = 64 * policy.max_evaluations
-
-    # Arrays allocated by fit_solver and retained by FitResultBatch.  Boolean
-    # flags are charged as eight-byte slots so allocator/alignment details
-    # cannot make the estimate optimistic.
-    result_array_bytes = 8 * batch_cells * (
-        parameter_count
-        + parameter_count * parameter_count
-        + 10
-    )
-    result_object_bytes = batch_cells * (
-        4096 + 128 * batch_axis_count
-    )
-
-    transform_bytes = 0
-    transform = bound.spec.committed_transform
-    if transform is not None:
-        source = bound.expected_schema
-        source_elements = math.prod(source.physical_shape)
-        source_payload = source_elements * (source.cell_schema.dtype.itemsize + 1)
-        operation_count = len(transform.spec.operations)
-        if all(isinstance(operation, Selection) for operation in transform.spec.operations):
-            # A selection never grows the source.  At an allocation boundary,
-            # the old and new value/validity buffers plus selector scratch can
-            # coexist; contiguous slicing usually consumes far less.
-            transform_bytes = (
-                3 * source_payload
-                + 32 * source.cell_layout.storage_size
-                + 64 * 1024
-            )
-        else:
-            # Generic reductions include integer-object SUM and validity
-            # scratch.  256 bytes per source element per operation exceeds the
-            # transform engine's current 192-byte object-SUM allowance.
-            transform_bytes = (
-                3 * source_payload
-                + 256 * source_elements * operation_count
-                + 64 * 1024
-            )
-
-    return int(
-        8 * 1024 * 1024
-        + packed_float_bytes
-        + problem_index_bytes
-        + part_object_bytes
-        + schema_plan_bytes
-        + sampling_bytes
-        + solver_bytes
-        + evaluation_bookkeeping_bytes
-        + result_array_bytes
-        + result_object_bytes
-        + transform_bytes
-    )
 
 
 def resolve_parameter_units(
@@ -1035,5 +759,4 @@ __all__ = [
     "FitParameterConstraint",
     "FitResultBatch",
     "FitSpec",
-    "bound_fit_execution_peak_upper_bound_nbytes",
 ]

@@ -29,7 +29,6 @@ from zlc_data import (
     IndexRangeSelection,
     Selection,
     dataset_revision_ref_to_tree,
-    fit_result_retained_upper_bound_nbytes,
 )
 from zlc_frontend import (
     BoardFrame,
@@ -51,7 +50,6 @@ from zlc_frontend import (
 )
 from zlc_frontend.fit_curve_projection import (
     CurveFitOverlayPlan,
-    estimate_curve_fit_overlay_plan_nbytes,
     materialize_curve_fit_overlay_plan,
 )
 from zlc_frontend.encoded_raster import EncodedRasterDocument, EncodedRasterPage
@@ -91,10 +89,7 @@ from zlc_frontend.image_display import (
     image_display_from_form,
     image_viewport_for_display_state,
 )
-from zlc_frontend.image_raster import (
-    estimate_indexed8_raster_peak_nbytes,
-    rasterize_image_indexed8,
-)
+from zlc_frontend.image_raster import rasterize_image_indexed8
 from zlc_frontend.image_view import image_viewport_for_evaluated_image
 from zlc_frontend.render_style import indexed_colormap
 from zlc_frontend.qt_widgets import (
@@ -126,7 +121,7 @@ from zlc_frontend.selector import (
     PanelInteractionOrigin,
     RectangleGesture,
 )
-from zlc_storage import canonical_digest, nonnegative_integer, positive_integer
+from zlc_storage import canonical_digest, nonnegative_integer
 
 from ._frozen_raster import FrozenRasterWindow
 from ._window_runtime import (
@@ -138,7 +133,6 @@ from ._window_runtime import (
 from zlc_workbench.fit import FitDraftAuthority, FitDraftResult
 
 
-_DEFAULT_FIGURE_GUI_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 _DEFAULT_FIT_TIMEOUT_SECONDS = 30.0
 _FIT_WORK_EXECUTOR = ThreadPoolExecutor(
     max_workers=1,
@@ -168,12 +162,6 @@ def _figure_summary(figure: DataFigure) -> str:
         f"{'/'.join(value.lower() for value in intents)} · {panel_count} panel(s) · "
         f"document revision {document.revision}"
     )
-
-
-def _figure_render_limit(figure: DataFigure, memory_limit_bytes: int) -> int:
-    limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-    frozen_limit = figure.render_memory_limit_bytes
-    return limit if frozen_limit is None else min(limit, frozen_limit)
 
 
 def _classify_single_typed(
@@ -299,35 +287,26 @@ def _classify_typed_grid(
 
 def _encoded_figure(
     figure: DataFigure,
-    memory_limit_bytes: int,
     cancelled: threading.Event | None,
     *,
     unavailable_reason: str | None = None,
 ) -> EncodedRasterDocument:
     _require_not_cancelled(cancelled)
-    render_limit = _figure_render_limit(figure, memory_limit_bytes)
-    payload = figure.to_png_bytes(memory_limit_bytes=render_limit)
+    payload = figure.to_png_bytes()
     _require_not_cancelled(cancelled)
     summary = _figure_summary(figure)
     if unavailable_reason is not None:
         if not isinstance(unavailable_reason, str) or not unavailable_reason.strip():
             raise ValueError("unavailable_reason must be non-empty text or None")
         summary = f"{summary} · interaction unavailable: {unavailable_reason.strip()}"
-    document = EncodedRasterDocument(
+    return EncodedRasterDocument(
         summary,
         (EncodedRasterPage("figure", "Figure", payload),),
     )
-    if document.source_front_peak_nbytes > memory_limit_bytes:
-        raise MemoryError(
-            "encoded raster fronts require "
-            f"{document.source_front_peak_nbytes} bytes; limit is {memory_limit_bytes}"
-        )
-    return document
 
 
 def _render_figure(
     loader,
-    memory_limit_bytes: int,
     cancelled: threading.Event | None = None,
 ) -> EncodedRasterDocument:
     """Retain the exact encoded fallback used by current fit and figure views."""
@@ -336,7 +315,7 @@ def _render_figure(
     figure = loader()
     if not isinstance(figure, DataFigure):
         raise TypeError("figure loader must return DataFigure")
-    return _encoded_figure(figure, memory_limit_bytes, cancelled)
+    return _encoded_figure(figure, cancelled)
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,7 +324,6 @@ class _TypedGridOverview:
     bundle: EncodedRasterDocument
     regions: tuple[FigurePanelRegion, ...]
     histogram_home_x_limits: tuple[float, float] | None
-    external_retained_upper_bound_bytes: int
 
     def __post_init__(self) -> None:
         if self.intent not in (
@@ -384,19 +362,8 @@ class _TypedGridOverview:
             )
         elif home is not None:
             raise ValueError("METER grid cannot carry a histogram home x range")
-        object.__setattr__(
-            self,
-            "external_retained_upper_bound_bytes",
-            positive_integer(
-                self.external_retained_upper_bound_bytes,
-                "typed grid overview external retained bytes",
-            ),
-        )
-
-
 def _render_typed_grid_overview(
     figure: DataFigure,
-    memory_limit_bytes: int,
     cancelled: threading.Event,
 ) -> _TypedGridOverview:
     intent, panel_count, reason = _classify_typed_grid(figure)
@@ -406,24 +373,6 @@ def _render_typed_grid_overview(
             + ("" if reason is None else f": {reason}")
         )
     _require_not_cancelled(cancelled)
-    from zlc_frontend.matplotlib_render import (
-        estimate_render_peak_nbytes,
-        evaluated_figure_array_nbytes,
-    )
-
-    retained = figure.retained_upper_bound_nbytes
-    evaluated_bytes = evaluated_figure_array_nbytes(figure.evaluated)
-    region_bytes = 64 * 1024 + panel_count * 4096
-    render_peak = estimate_render_peak_nbytes(figure.evaluated, dpi=100.0)
-    render_session_peak = (
-        render_peak + max(0, retained - evaluated_bytes) + region_bytes
-    )
-    aggregate = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-    if render_session_peak > aggregate:
-        raise MemoryError(
-            f"{intent.value} overview render requires {render_session_peak} bytes; "
-            f"limit is {aggregate}"
-        )
     histogram_home = None
     if intent is ViewIntent.HISTOGRAM:
         histogram_home = histogram_projection_home_x_limits(
@@ -434,10 +383,7 @@ def _render_typed_grid_overview(
             )
         )
     _require_not_cancelled(cancelled)
-    render_limit = _figure_render_limit(figure, aggregate)
-    payload, regions = figure.to_png_bytes_with_panel_regions(
-        memory_limit_bytes=render_limit,
-    )
+    payload, regions = figure.to_png_bytes_with_panel_regions()
     _require_not_cancelled(cancelled)
     if len(regions) != panel_count:
         raise RuntimeError("typed grid regions do not cover every canonical panel")
@@ -451,19 +397,11 @@ def _render_typed_grid_overview(
             ),
         ),
     )
-    steady_peak = retained + region_bytes + bundle.source_front_peak_nbytes
-    required = max(render_session_peak, steady_peak)
-    if required > aggregate:
-        raise MemoryError(
-            f"{intent.value} overview retention requires {required} bytes; "
-            f"limit is {aggregate}"
-        )
     return _TypedGridOverview(
         intent,
         bundle,
         regions,
         histogram_home,
-        retained + region_bytes,
     )
 
 
@@ -573,7 +511,6 @@ class _FitOverlayRequest:
     analysis_revision: int
     result: FitResultBatch | None
     result_identity: str | None
-    result_retained_bytes: int = 0
 
     def __post_init__(self) -> None:
         revision = nonnegative_integer(
@@ -590,15 +527,6 @@ class _FitOverlayRequest:
             or not self.result_identity.strip()
         ):
             raise ValueError("fit overlay identity must be non-empty text or None")
-        retained = nonnegative_integer(
-            self.result_retained_bytes,
-            "fit overlay result_retained_bytes",
-        )
-        if self.result is None and retained:
-            raise ValueError("an overlay without a transient result retains no result bytes")
-        if self.result is not None and retained <= 0:
-            raise ValueError("a transient Fit overlay requires a retained-byte bound")
-        object.__setattr__(self, "result_retained_bytes", retained)
 
 
 def _same_fit_overlay_request(
@@ -611,7 +539,6 @@ def _same_fit_overlay_request(
         left.analysis_revision == right.analysis_revision
         and left.result_identity == right.result_identity
         and left.result is right.result
-        and left.result_retained_bytes == right.result_retained_bytes
     )
 
 
@@ -659,16 +586,11 @@ def _prepare_fit_options(
     fit_axis_ids: tuple[AxisId, ...],
     axis_roles: tuple[tuple[AxisId, AxisViewRole], ...],
     selection: Selection | None,
-    operation_memory_limit_bytes: int,
 ) -> tuple[FitAuthoringOption, ...]:
     options = tuple(
         prepare(
             fit_axis_ids,
             selection,
-            positive_integer(
-                operation_memory_limit_bytes,
-                "operation_memory_limit_bytes",
-            ),
         )
     )
     if not options or any(
@@ -695,7 +617,7 @@ def _execute_fit_draft(
     deadline_monotonic: float,
     window_cancelled: threading.Event,
     analysis_cancelled: threading.Event,
-) -> tuple[FitDraftResult, str, int]:
+) -> tuple[FitDraftResult, str]:
     def cancelled() -> bool:
         return window_cancelled.is_set() or analysis_cancelled.is_set()
 
@@ -708,7 +630,6 @@ def _execute_fit_draft(
         return (
             draft,
             _fit_summary(draft, cancelled=cancelled),
-            fit_result_retained_upper_bound_nbytes(draft.result),
         )
     except BaseException:
         # ``authority.execute`` has already installed the one live draft.  Any
@@ -718,15 +639,14 @@ def _execute_fit_draft(
         raise
 
 
-def _reload_fit_result_with_retained(
+def _reload_fit_result(
     reload_result,
     reference: FitResultArtifactRef,
-    memory_limit_bytes: int,
-) -> tuple[FitResultBatch, int]:
-    result = reload_result(reference, memory_limit_bytes)
+) -> FitResultBatch:
+    result = reload_result(reference)
     if not isinstance(result, FitResultBatch):
         raise TypeError("saved Fit reload returned another result type")
-    return result, fit_result_retained_upper_bound_nbytes(result)
+    return result
 
 
 def _state_intent(state: _TypedDisplayState) -> ViewIntent:
@@ -924,15 +844,7 @@ class _TypedFigureFront:
     axis_roles: tuple[tuple[AxisId, AxisViewRole], ...]
     fit_result_identity: str | None
     transient_fit_result_owner: FitResultBatch | None
-    transient_fit_result_retained_bytes: int
     release_initial_canonical_on_commit: bool
-    retained_figure_upper_bound_bytes: int
-    fit_overlay_retained_bytes: int
-    session_peak_bytes: int
-    concurrent_reservation_bytes: int
-    required_peak_bytes: int
-    effective_limit_bytes: int
-    aggregate_limit_bytes: int
 
     def __post_init__(self) -> None:
         if self.intent not in (
@@ -980,44 +892,10 @@ class _TypedFigureFront:
             FitResultBatch,
         ):
             raise TypeError("transient_fit_result_owner must be FitResultBatch or None")
-        transient_retained = nonnegative_integer(
-            self.transient_fit_result_retained_bytes,
-            "transient_fit_result_retained_bytes",
-        )
-        if (self.transient_fit_result_owner is None) != (transient_retained == 0):
-            raise ValueError(
-                "transient Fit result owner and retained bound must be present together"
-            )
-        object.__setattr__(
-            self,
-            "transient_fit_result_retained_bytes",
-            transient_retained,
-        )
         if not isinstance(self.release_initial_canonical_on_commit, bool):
             raise TypeError("release_initial_canonical_on_commit must be bool")
-        retained = positive_integer(
-            self.retained_figure_upper_bound_bytes,
-            "retained_figure_upper_bound_bytes",
-        )
         object.__setattr__(self, "fit_axis_ids", fit_axis_ids)
         object.__setattr__(self, "axis_roles", roles)
-        object.__setattr__(self, "retained_figure_upper_bound_bytes", retained)
-        overlay_retained = nonnegative_integer(
-            self.fit_overlay_retained_bytes,
-            "fit_overlay_retained_bytes",
-        )
-        object.__setattr__(self, "fit_overlay_retained_bytes", overlay_retained)
-        session_peak = positive_integer(self.session_peak_bytes, "session_peak_bytes")
-        if session_peak < retained:
-            raise ValueError("typed session peak is smaller than retained DataFigure")
-        object.__setattr__(self, "session_peak_bytes", session_peak)
-        concurrent = positive_integer(
-            self.concurrent_reservation_bytes,
-            "concurrent_reservation_bytes",
-        )
-        if concurrent < retained:
-            raise ValueError("typed concurrent reservation is smaller than retained DataFigure")
-        object.__setattr__(self, "concurrent_reservation_bytes", concurrent)
         panel = self.frame.panels[0]
         payload = panel.display_payload
         if (
@@ -1052,27 +930,6 @@ class _TypedFigureFront:
                 or raster.stride_bytes != raster.width * 4
             ):
                 raise ValueError("numeric front requires packed RGBA")
-        required = positive_integer(
-            self.required_peak_bytes,
-            "required_peak_bytes",
-        )
-        effective = positive_integer(
-            self.effective_limit_bytes,
-            "effective_limit_bytes",
-        )
-        if required > effective:
-            raise MemoryError("typed figure front exceeds its frozen budget")
-        aggregate = positive_integer(
-            self.aggregate_limit_bytes,
-            "aggregate_limit_bytes",
-        )
-        if session_peak > aggregate:
-            raise MemoryError("typed Figure session exceeds its frozen budget")
-        if concurrent > aggregate:
-            raise MemoryError("typed Figure rerender reservation exceeds its frozen budget")
-        object.__setattr__(self, "required_peak_bytes", required)
-        object.__setattr__(self, "effective_limit_bytes", effective)
-        object.__setattr__(self, "aggregate_limit_bytes", aggregate)
 
 
 def _typed_join_digest(
@@ -1101,10 +958,9 @@ def _typed_join_digest(
 
 def _build_typed_front_contract(
     intent: ViewIntent,
-    effective_limit_bytes: int,
     frame: BoardFrame,
 ) -> tuple[tuple[object, ...], tuple[object, ...]]:
-    """Build a bounded source token plus exact immutable data owners."""
+    """Build a compact source token plus exact immutable data owners."""
 
     panel = frame.panels[0]
     payload = panel.display_payload
@@ -1152,7 +1008,6 @@ def _build_typed_front_contract(
         exact_data = payload.series
     stable_identity = (
         intent,
-        effective_limit_bytes,
         frame.board_id,
         frame.layout_generation,
         panel.panel_id,
@@ -1181,13 +1036,12 @@ def _build_typed_front_contract(
 def _typed_front_contract(
     front: _TypedFigureFront,
 ) -> tuple[tuple[object, ...], tuple[object, ...]]:
-    """Rebuild the bounded token from the payload actually being presented."""
+    """Rebuild the compact token from the payload actually being presented."""
 
     if not isinstance(front, _TypedFigureFront):
         raise TypeError("front must be _TypedFigureFront")
     return _build_typed_front_contract(
         front.intent,
-        front.effective_limit_bytes,
         front.frame,
     )
 
@@ -1279,158 +1133,6 @@ def _validate_rendered_authored_payload(
     ):
         raise ValueError("histogram worker returned conflicting authored state")
 
-
-def _typed_front_required_peak_bytes(
-    figure: DataFigure,
-    state: _TypedDisplayState,
-    *,
-    curve_fit_overlay_nbytes: tuple[int, int] | None = None,
-    image_fit_overlay_retained_bytes: int = 0,
-    fit_result_retained_bytes: int = 0,
-    previous_fit_overlay_retained_bytes: int = 0,
-    external_session_retained_bytes: int = 0,
-) -> int:
-    intent, unavailable_reason = _classify_single_typed(figure)
-    if intent is None or intent is not _state_intent(state):
-        raise ValueError(
-            "typed budget requires one matching logical panel"
-            + ("" if unavailable_reason is None else f": {unavailable_reason}")
-        )
-    from zlc_frontend.matplotlib_render import (
-        estimate_live_panel_raster_peak_nbytes,
-        evaluated_figure_array_nbytes,
-    )
-
-    evaluated_bytes = evaluated_figure_array_nbytes(figure.evaluated)
-    if isinstance(state, ImageDisplayState):
-        from zlc_frontend.matplotlib_render import (
-            estimate_image_png_export_peak_nbytes,
-        )
-
-        series = figure.evaluated.layers[0].cells[0].series
-        image = series[0].data
-        assert isinstance(image, EvaluatedImage)
-        height, width = image.values.shape
-        # The frozen session retains exact evaluated arrays and one current
-        # INDEXED8/Qt-detached front.  A rerasterization candidate and a PNG
-        # export are mutually exclusive on the one worker lane, so admission
-        # adds the larger incremental peak instead of summing both operations.
-        retained_baseline = (
-            evaluated_bytes
-            + external_session_retained_bytes
-            + fit_result_retained_bytes
-            + previous_fit_overlay_retained_bytes
-            + image_fit_overlay_retained_bytes
-            + 2 * height * width
-        )
-        raster_incremental = estimate_indexed8_raster_peak_nbytes(
-            height,
-            width,
-            value_itemsize=image.values.dtype.itemsize,
-            retained_fronts=0,
-        )
-        export_incremental = estimate_image_png_export_peak_nbytes(image)
-        return retained_baseline + max(raster_incremental, export_incremental)
-
-    width, height = _NUMERIC_RASTER_SIZE
-    series_count = len(figure.evaluated.layers[0].cells[0].series)
-    options = {
-        "evaluated_data_upper_bound_bytes": evaluated_bytes,
-        # Admission covers the currently painted Qt/held front while the next
-        # immutable worker front is composed and admitted.
-        "extra_retained_fronts": 1,
-        # FitResult parameters/covariance are held once; they are not copied
-        # into Matplotlib artists.  The visible old overlay remains reachable
-        # through Qt until the new board front is atomically presented.
-        "extra_retained_evaluated_data_bytes": (
-            fit_result_retained_bytes
-            + previous_fit_overlay_retained_bytes
-            + external_session_retained_bytes
-        ),
-    }
-    if curve_fit_overlay_nbytes is not None:
-        overlay_retained, prediction_bytes = curve_fit_overlay_nbytes
-        options.update(
-            fit_overlay_retained_upper_bound_bytes=overlay_retained,
-            fit_prediction_upper_bound_bytes=prediction_bytes,
-        )
-    if isinstance(state, HistogramDisplayState):
-        options.update(
-            histogram_bins=state.bin_count,
-            histogram_series_count=series_count,
-        )
-    return estimate_live_panel_raster_peak_nbytes(width, height, **options)
-
-
-def _typed_focus_preflight_nbytes(
-    figure: DataFigure,
-    panel_index: int,
-    *,
-    expected_intent: ViewIntent,
-    display: _TypedDisplayState,
-    external_session_retained_bytes: int,
-) -> tuple[int, int, int]:
-    """Bound one typed focus DTO and candidate before deriving either."""
-
-    if not isinstance(figure, DataFigure):
-        raise TypeError("figure must be DataFigure")
-    if _state_intent(display) is not expected_intent:
-        raise ValueError("focused display state belongs to another grid intent")
-    external = nonnegative_integer(
-        external_session_retained_bytes,
-        "external_session_retained_bytes",
-    )
-    focused_retained = (
-        figure.focused_typed_panel_retained_upper_bound_nbytes(
-            panel_index,
-            expected_intent=expected_intent,
-        )
-    )
-    from zlc_frontend.matplotlib_render import estimate_live_panel_raster_peak_nbytes
-
-    width, height = _NUMERIC_RASTER_SIZE
-    current_front_bytes = width * height * 4
-    cell = figure.evaluated.layers[0].cells[panel_index]
-    evaluated_bytes = sum(
-        int(series.data.samples.nbytes)
-        for series in cell.series
-        if isinstance(series.data, EvaluatedHistogram)
-    )
-    evaluated_bytes += sum(
-        int(series.data.values.nbytes + series.data.validity.nbytes)
-        for series in cell.series
-        if isinstance(series.data, EvaluatedCurve)
-    )
-    metadata_bytes = max(0, focused_retained - evaluated_bytes)
-    options = {
-        "evaluated_data_upper_bound_bytes": evaluated_bytes,
-        "extra_retained_fronts": 1,
-    }
-    if isinstance(display, HistogramDisplayState):
-        options.update(
-            histogram_bins=display.bin_count,
-            histogram_series_count=len(cell.series),
-        )
-    render_required = estimate_live_panel_raster_peak_nbytes(
-        width,
-        height,
-        extra_retained_evaluated_data_bytes=external,
-        **options,
-    )
-    next_render_required = estimate_live_panel_raster_peak_nbytes(
-        width,
-        height,
-        **options,
-    )
-    aggregate_peak = max(
-        render_required + metadata_bytes,
-        focused_retained + external + current_front_bytes,
-        next_render_required + metadata_bytes,
-        focused_retained + current_front_bytes,
-    )
-    return focused_retained, render_required, aggregate_peak
-
-
 def _render_typed_front(
     figure: DataFigure,
     state: _TypedDisplayState,
@@ -1439,13 +1141,9 @@ def _render_typed_front(
     previous_relim_mode,
     previous_count_scale: HistogramCountScale | None,
     sequence: int,
-    memory_limit_bytes: int,
     cancelled: threading.Event,
     fit_result: FitResultBatch | None = None,
     fit_result_identity: str | None = None,
-    previous_fit_overlay_retained_bytes: int = 0,
-    external_session_retained_bytes: int = 0,
-    post_commit_external_session_retained_bytes: int = 0,
     histogram_projection_value_range: tuple[float, float] | None = None,
     release_initial_canonical_on_commit: bool = False,
 ) -> _TypedFigureFront:
@@ -1456,18 +1154,6 @@ def _render_typed_front(
             + ("" if unavailable_reason is None else f": {unavailable_reason}")
         )
     _require_not_cancelled(cancelled)
-    external_session_retained_bytes = nonnegative_integer(
-        external_session_retained_bytes,
-        "external_session_retained_bytes",
-    )
-    post_commit_external_session_retained_bytes = nonnegative_integer(
-        post_commit_external_session_retained_bytes,
-        "post_commit_external_session_retained_bytes",
-    )
-    if post_commit_external_session_retained_bytes > external_session_retained_bytes:
-        raise ValueError(
-            "post-commit external retention cannot exceed current external retention"
-        )
     if histogram_projection_value_range is not None:
         if intent is not ViewIntent.HISTOGRAM:
             raise ValueError("only HISTOGRAM render can fix its projection value range")
@@ -1491,112 +1177,6 @@ def _render_typed_front(
         or fit_result_identity is not None
     ):
         raise ValueError("METER display cannot carry a Fit overlay")
-    fit_result_retained_bytes = (
-        0
-        if fit_result is None
-        else fit_result_retained_upper_bound_nbytes(fit_result)
-    )
-    validation_peak = 0
-    overlay_retained_preflight = 0
-    prediction_bytes_preflight = 0
-    projection_peak_preflight = 0
-    if figure.has_fit_overlays or fit_result is not None:
-        assert fit_result_identity is not None
-        (
-            validation_peak,
-            overlay_retained_preflight,
-            prediction_bytes_preflight,
-            projection_peak_preflight,
-        ) = figure.single_panel_fit_overlay_preflight_nbytes(
-            fit_result,
-            result_identity=fit_result_identity,
-        )
-    curve_overlay_nbytes = (
-        (overlay_retained_preflight, prediction_bytes_preflight)
-        if intent is ViewIntent.CURVE and overlay_retained_preflight
-        else None
-    )
-    image_overlay_retained = (
-        overlay_retained_preflight
-        if intent is ViewIntent.IMAGE
-        else 0
-    )
-    required = _typed_front_required_peak_bytes(
-        figure,
-        state,
-        curve_fit_overlay_nbytes=curve_overlay_nbytes,
-        image_fit_overlay_retained_bytes=image_overlay_retained,
-        fit_result_retained_bytes=fit_result_retained_bytes,
-        previous_fit_overlay_retained_bytes=(
-            previous_fit_overlay_retained_bytes
-        ),
-        external_session_retained_bytes=external_session_retained_bytes,
-    )
-    effective_limit = _figure_render_limit(figure, memory_limit_bytes)
-    from zlc_frontend.matplotlib_render import evaluated_figure_array_nbytes
-
-    figure_retained = figure.retained_upper_bound_nbytes
-    evaluated_bytes = evaluated_figure_array_nbytes(figure.evaluated)
-    render_session_peak = required + max(0, figure_retained - evaluated_bytes)
-    if isinstance(state, ImageDisplayState):
-        image = figure.evaluated.layers[0].cells[0].series[0].data
-        assert isinstance(image, EvaluatedImage)
-        current_front_bytes = 2 * int(image.values.size)
-    else:
-        width, height = _NUMERIC_RASTER_SIZE
-        current_front_bytes = width * height * 4
-    planning_session_peak = (
-        figure_retained
-        + external_session_retained_bytes
-        + fit_result_retained_bytes
-        + previous_fit_overlay_retained_bytes
-        + current_front_bytes
-        + max(validation_peak, projection_peak_preflight)
-    )
-    # Pre-admit the next steady-state rerender as well.  Its "old" overlay is
-    # the candidate being built now; deferring this calculation until after
-    # prediction materialization would turn required-1 into a fail-late path.
-    post_commit_external = post_commit_external_session_retained_bytes
-    next_required = _typed_front_required_peak_bytes(
-        figure,
-        state,
-        curve_fit_overlay_nbytes=curve_overlay_nbytes,
-        image_fit_overlay_retained_bytes=image_overlay_retained,
-        fit_result_retained_bytes=fit_result_retained_bytes,
-        previous_fit_overlay_retained_bytes=overlay_retained_preflight,
-        external_session_retained_bytes=post_commit_external,
-    )
-    next_render_session_peak = next_required + max(
-        0,
-        figure_retained - evaluated_bytes,
-    )
-    next_planning_session_peak = (
-        figure_retained
-        + post_commit_external
-        + fit_result_retained_bytes
-        + overlay_retained_preflight
-        + current_front_bytes
-        + max(validation_peak, projection_peak_preflight)
-    )
-    concurrent_reservation = max(
-        next_render_session_peak,
-        next_planning_session_peak,
-    )
-    session_peak = max(
-        render_session_peak,
-        planning_session_peak,
-        concurrent_reservation,
-    )
-    if required > effective_limit:
-        raise MemoryError(
-            f"interactive {intent.value.lower()} requires {required} bytes; "
-            f"limit is {effective_limit}"
-        )
-    if session_peak > memory_limit_bytes:
-        raise MemoryError(
-            f"interactive {intent.value.lower()} aggregate peak {session_peak} "
-            f"exceeds limit {memory_limit_bytes}"
-        )
     _require_not_cancelled(cancelled)
     curve_fit_overlay_plan: CurveFitOverlayPlan | None = None
     image_fit_overlay: RadialGaussianImageFitOverlay | None = None
@@ -1623,15 +1203,6 @@ def _render_typed_front(
                 result_identity=fit_result_identity,
                 check_cancelled=lambda: _require_not_cancelled(cancelled),
             )
-    if curve_fit_overlay_plan is not None:
-        exact_overlay_nbytes = estimate_curve_fit_overlay_plan_nbytes(
-            curve_fit_overlay_plan
-        )
-        if (
-            exact_overlay_nbytes[0] > overlay_retained_preflight
-            or exact_overlay_nbytes[1] > prediction_bytes_preflight
-        ):
-            raise RuntimeError("curve Fit overlay exceeded its preflight bound")
     curve_fit_overlays: tuple[CurveFitOverlay, ...] = (
         ()
         if curve_fit_overlay_plan is None
@@ -1641,16 +1212,6 @@ def _render_typed_front(
         )
     )
     _require_not_cancelled(cancelled)
-
-    # External bytes belong to the window, not the immutable front.  They are
-    # required while this candidate is built (old result/canonical cache and
-    # compact authoring options), then the window either releases the old owner
-    # or continues accounting the still-live options independently.
-    if concurrent_reservation > memory_limit_bytes:
-        raise MemoryError(
-            f"interactive {intent.value.lower()} rerender reservation "
-            f"{concurrent_reservation} exceeds limit {memory_limit_bytes}"
-        )
 
     if isinstance(state, ImageDisplayState):
         evaluated_input = figure.evaluated.inputs[0]
@@ -1761,7 +1322,6 @@ def _render_typed_front(
     fit_axis_ids, axis_roles = _fit_projection_metadata(figure, intent)
     data_contract = _build_typed_front_contract(
         intent,
-        effective_limit,
         frame,
     )
     return _TypedFigureFront(
@@ -1774,17 +1334,9 @@ def _render_typed_front(
         axis_roles=axis_roles,
         fit_result_identity=fit_result_identity,
         transient_fit_result_owner=fit_result,
-        transient_fit_result_retained_bytes=fit_result_retained_bytes,
         release_initial_canonical_on_commit=(
             release_initial_canonical_on_commit
         ),
-        retained_figure_upper_bound_bytes=figure_retained,
-        fit_overlay_retained_bytes=overlay_retained_preflight,
-        session_peak_bytes=session_peak,
-        concurrent_reservation_bytes=concurrent_reservation,
-        required_peak_bytes=required,
-        effective_limit_bytes=effective_limit,
-        aggregate_limit_bytes=memory_limit_bytes,
     )
 
 
@@ -1792,7 +1344,6 @@ def _export_typed_png(
     frame: BoardFrame,
     state: _TypedDisplayState,
     destination: Path,
-    memory_limit_bytes: int,
     revision: int,
     cancelled: threading.Event,
     commit_lock: threading.Lock,
@@ -1812,10 +1363,6 @@ def _export_typed_png(
                 payload,
                 state,
                 path,
-                memory_limit_bytes=positive_integer(
-                    memory_limit_bytes,
-                    "image export memory limit",
-                ),
             )
             _require_not_cancelled(cancelled)
 
@@ -1893,7 +1440,6 @@ class DataFigureWindow(FrozenRasterWindow):
         typed_renderer,
         fit_overlay_renderer=None,
         *,
-        memory_limit_bytes: int,
         fit_bindings: _FitWorkbenchBindings | None = None,
         typed_front_committed=None,
     ) -> None:
@@ -1932,17 +1478,11 @@ class DataFigureWindow(FrozenRasterWindow):
         self._edit_display: FluentRevisionedFormEditor | None = None
         self._setting_display: FluentRevisionedFormEditor | None = None
         self._export_commit_lock = threading.Lock()
-        self._current_front_peak_bytes = 0
-        self._visible_fit_overlay_retained_bytes = 0
         self._visible_transient_fit_result_owner: FitResultBatch | None = None
-        self._visible_transient_fit_result_retained_bytes = 0
         self._fit_axis_ids: tuple[AxisId, ...] = ()
         self._fit_axis_roles: tuple[tuple[AxisId, AxisViewRole], ...] = ()
         self._visible_fit_result_identity: str | None = None
         self._grid_overview: _TypedGridOverview | None = None
-        self._grid_overview_presentation_bytes = 0
-        self._grid_overview_admission_retained_bytes = 0
-        self._grid_focus_cache_charge_bytes = 0
         self._grid_focus_pending: _GridFocusRequest | None = None
         self._discard_grid_focus_sequence: int | None = None
 
@@ -1958,11 +1498,8 @@ class DataFigureWindow(FrozenRasterWindow):
         self._fit_initial_selection_consumed = False
         self._fit_auto_open_consumed = False
         self._fit_options: dict[str, FitAuthoringOption] = {}
-        self._fit_options_retained_bytes = 0
         self._fit_options_release_pending = False
         self._fit_cancelled: threading.Event | None = None
-        self._fit_execution_limit_bytes = 0
-        self._fit_save_limit_bytes = 0
         self._fit_draft: FitDraftResult | None = None
         self._fit_draft_summary: str | None = None
         self._fit_save_inflight: FitDraftResult | None = None
@@ -1977,12 +1514,8 @@ class DataFigureWindow(FrozenRasterWindow):
                     spec,
                     cancel_check,
                     deadline,
-                    self._fit_execution_limit_bytes,
                 ),
-                lambda execution: fit_bindings.save(
-                    execution,
-                    self._fit_save_limit_bytes,
-                ),
+                lambda execution: fit_bindings.save(execution),
             )
 
         super().__init__(
@@ -1992,7 +1525,6 @@ class DataFigureWindow(FrozenRasterWindow):
             loading_summary="Resolving immutable input…",
             object_prefix="figureViewer",
             subject="figure",
-            memory_limit_bytes=memory_limit_bytes,
         )
 
         self._typed_page = QtWidgets.QWidget(self._tabs)
@@ -2062,39 +1594,20 @@ class DataFigureWindow(FrozenRasterWindow):
         self._set_typed_controls_enabled(False)
         self._submit_future(
             initial_loader,
-            self._memory_limit_bytes,
             self._request_revision,
             self._cancelled,
         )
 
-    def _presentation_memory_limit(self) -> int:
-        retained = self._grid_overview_admission_retained_bytes
-        if retained <= 0:
-            return super()._presentation_memory_limit()
-        remaining = self._memory_limit_bytes - retained
-        if remaining <= 0:
-            raise MemoryError("frozen typed grid leaves no Qt overview budget")
-        return remaining
-
     def _present_grid_overview(self, overview: _TypedGridOverview) -> None:
         if not isinstance(overview, _TypedGridOverview):
             raise TypeError("overview must be _TypedGridOverview")
-        retained = overview.external_retained_upper_bound_bytes
-        self._grid_overview_admission_retained_bytes = retained
-        try:
-            if not self._present_bundle(overview.bundle):
-                raise RuntimeError("Qt rejected the immutable typed grid overview")
-        finally:
-            self._grid_overview_admission_retained_bytes = 0
+        if not self._present_bundle(overview.bundle):
+            raise RuntimeError("Qt rejected the immutable typed grid overview")
         if len(self._boards) != 1 or not isinstance(self._boards[0], FrozenRasterView):
             raise RuntimeError("typed grid overview did not admit one encoded board")
-        presentation_bytes = self._presentation_peak(overview.bundle, self._boards)
-        if retained + presentation_bytes > self._memory_limit_bytes:
-            raise MemoryError("typed grid overview exceeds the presentation budget")
         board = self._boards[0]
         board.normalizedDoubleClicked.connect(self._focus_grid_region)
         self._grid_overview = overview
-        self._grid_overview_presentation_bytes = presentation_bytes
         self._view_family = f"{overview.intent.value.lower()}-overview"
         self._display = None
         self._typed_contract = None
@@ -2167,10 +1680,7 @@ class DataFigureWindow(FrozenRasterWindow):
             None,
             None,
             self._request_revision,
-            self._memory_limit_bytes,
             self._cancelled,
-            0,
-            self._grid_session_retained_bytes(),
         ):
             self._grid_focus_pending = None
             self._active_kind = None
@@ -2192,11 +1702,8 @@ class DataFigureWindow(FrozenRasterWindow):
         self._board_widget.clear()
         self._display = None
         self._typed_contract = None
-        self._current_front_peak_bytes = self._grid_focus_cache_charge_bytes
-        self._visible_fit_overlay_retained_bytes = 0
         self._visible_fit_result_identity = None
         self._visible_transient_fit_result_owner = None
-        self._visible_transient_fit_result_retained_bytes = 0
         self._fit_axis_ids = ()
         self._fit_axis_roles = ()
         self._fit_overlay_desired = None
@@ -2688,14 +2195,6 @@ class DataFigureWindow(FrozenRasterWindow):
             self._fit_prepare_pending = True
             return
         self._fit_prepare_pending = False
-        residual = self._fit_operation_residual_bytes()
-        if residual <= 0:
-            pane.set_busy(None, draft_ready=self._fit_draft is not None)
-            self._status.setText("FIT PREPARATION REJECTED")
-            self._diagnostic.setText(
-                "visible Figure front leaves no Fit preparation budget"
-            )
-            return
         pane.set_busy("prepare", draft_ready=self._fit_draft is not None)
         self._status.setText("PREPARING FIT")
         self._diagnostic.setText("")
@@ -2707,7 +2206,6 @@ class DataFigureWindow(FrozenRasterWindow):
             self._fit_axis_ids,
             self._fit_axis_roles,
             self._current_fit_selection(),
-            residual,
         ):
             self._fit_job_revision = None
             pane.set_busy(None, draft_ready=self._fit_draft is not None)
@@ -2735,16 +2233,8 @@ class DataFigureWindow(FrozenRasterWindow):
             if pane is not None:
                 released_later = pane.clear_options()
                 release_pending = release_pending or released_later
-            # Remove the old selected-axis QString while its conservative
-            # option charge is still held.
             self._summary.setText("")
-            # Qt destroys the detached form through DeferredDelete.  Keep its
-            # conservative option charge until a fresh queued owner turn; a
-            # same-callback prepare could otherwise overlap the old widgets
-            # with a full new option set outside the aggregate budget.
             self._fit_options_release_pending = release_pending
-            if not release_pending:
-                self._fit_options_retained_bytes = 0
             self._fit_prepare_pending = True
             self._wake.request_owner_wake()
 
@@ -2755,7 +2245,6 @@ class DataFigureWindow(FrozenRasterWindow):
         if not self._fit_options_release_pending:
             return
         self._fit_options_release_pending = False
-        self._fit_options_retained_bytes = 0
         if self._fit_prepare_pending and not self._closing:
             self._wake.request_owner_wake()
 
@@ -2772,63 +2261,6 @@ class DataFigureWindow(FrozenRasterWindow):
     def _reject_fit_request(self, diagnostic: str) -> None:
         self._status.setText("FIT REQUEST INVALID")
         self._diagnostic.setText(str(diagnostic))
-
-    def _fit_operation_limit(self) -> int:
-        residual = self._fit_operation_residual_bytes()
-        if residual <= 0:
-            raise MemoryError("visible Figure front leaves no Fit operation budget")
-        return residual
-
-    def _unpresented_fit_retained_bytes(self) -> int:
-        retained = 0
-        seen: list[FitResultBatch] = []
-        for request in (
-            self._fit_overlay_desired,
-            self._fit_overlay_pending,
-            self._fit_overlay_inflight,
-        ):
-            if request is None or request.result is None:
-                continue
-            if request.result is self._visible_transient_fit_result_owner:
-                continue
-            if any(request.result is item for item in seen):
-                continue
-            seen.append(request.result)
-            retained += request.result_retained_bytes
-        return retained
-
-    def _fit_operation_residual_bytes(self) -> int:
-        return int(
-            self._memory_limit_bytes
-            - self._current_front_peak_bytes
-            - self._unpresented_fit_retained_bytes()
-            - self._fit_options_retained_bytes
-        )
-
-    def _render_external_retained_bytes(
-        self,
-        incoming_result: FitResultBatch | None,
-    ) -> int:
-        old_result_bytes = (
-            self._visible_transient_fit_result_retained_bytes
-            if self._visible_transient_fit_result_owner is not None
-            and self._visible_transient_fit_result_owner is not incoming_result
-            else 0
-        )
-        return int(
-            self._fit_options_retained_bytes
-            + old_result_bytes
-            + self._grid_session_retained_bytes()
-        )
-
-    def _grid_session_retained_bytes(self) -> int:
-        overview = self._grid_overview
-        if overview is None:
-            return 0
-        return int(
-            overview.external_retained_upper_bound_bytes
-            + self._grid_overview_presentation_bytes
-        )
 
     def _start_fit(self, _pane_revision: int, spec: FitSpec) -> None:
         pane = self._fit_pane
@@ -2857,14 +2289,12 @@ class DataFigureWindow(FrozenRasterWindow):
                 or spec.numeric_policy != current.spec.numeric_policy
             ):
                 raise ValueError("Fit request differs from the prepared authority draft")
-            operation_limit = self._fit_operation_limit()
         except BaseException as error:
             self._status.setText("FIT REQUEST INVALID")
             self._diagnostic.setText(error_summary(error))
             return
 
         self._discard_fit_draft()
-        self._fit_execution_limit_bytes = operation_limit
         self._fit_cancelled = threading.Event()
         self._fit_job_revision = self._fit_analysis_revision
         deadline = time.monotonic() + bindings.timeout_seconds
@@ -2872,7 +2302,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._status.setText("FITTING")
         self._summary.setText(pane.axis_summary.text())
         self._diagnostic.setText("")
-        self._queue_fit_overlay(None, None, result_retained_bytes=0)
+        self._queue_fit_overlay(None, None)
         if not self._submit_fit_future(
             "fit",
             _execute_fit_draft,
@@ -2909,13 +2339,7 @@ class DataFigureWindow(FrozenRasterWindow):
             or self._closing
         ):
             return
-        residual = self._fit_operation_residual_bytes()
-        if residual <= 0:
-            self._status.setText("FIT SAVE REJECTED")
-            self._diagnostic.setText("visible Figure front leaves no reload budget")
-            return
         self._fit_save_inflight = draft
-        self._fit_save_limit_bytes = residual
         self._fit_job_revision = self._fit_analysis_revision
         pane.set_busy("save", draft_ready=True)
         self._status.setText("SAVING FIT")
@@ -2927,7 +2351,6 @@ class DataFigureWindow(FrozenRasterWindow):
             draft,
         ):
             self._fit_save_inflight = None
-            self._fit_save_limit_bytes = 0
             self._fit_job_revision = None
             pane.set_busy(None, draft_ready=True)
 
@@ -2941,15 +2364,13 @@ class DataFigureWindow(FrozenRasterWindow):
         if pane is not None:
             pane.set_busy(None, draft_ready=False)
         self._status.setText("FIT CLEARED")
-        self._summary.setText("Source view retained; selection remains a draft candidate")
+        self._summary.setText("Source view preserved; selection remains a draft candidate")
         self._diagnostic.setText("")
 
     def _queue_fit_overlay(
         self,
         result: FitResultBatch | None,
         result_identity: str | None,
-        *,
-        result_retained_bytes: int = 0,
     ) -> None:
         if self._fit_overlay_renderer is None or self._display is None:
             return
@@ -2957,7 +2378,6 @@ class DataFigureWindow(FrozenRasterWindow):
             self._fit_analysis_revision,
             result,
             result_identity,
-            result_retained_bytes,
         )
         self._fit_overlay_desired = request
         if (
@@ -3004,10 +2424,7 @@ class DataFigureWindow(FrozenRasterWindow):
             display.relim_mode,
             previous_scale,
             self._request_revision,
-            self._memory_limit_bytes,
             self._cancelled,
-            self._visible_fit_overlay_retained_bytes,
-            self._render_external_retained_bytes(request.result),
         ):
             self._fit_overlay_inflight = None
             self._pending_state = None
@@ -3351,10 +2768,7 @@ class DataFigureWindow(FrozenRasterWindow):
             display.relim_mode,
             previous_scale,
             self._request_revision,
-            self._memory_limit_bytes,
             self._cancelled,
-            self._visible_fit_overlay_retained_bytes,
-            self._render_external_retained_bytes(overlay_result),
         )
         if not submitted:
             self._fit_overlay_inflight = None
@@ -3402,7 +2816,7 @@ class DataFigureWindow(FrozenRasterWindow):
         front: _TypedFigureFront,
         expected_state: _TypedDisplayState,
     ) -> tuple[tuple[object, ...], tuple[object, ...]]:
-        # The worker performs the data-sized proof.  Qt repeats only bounded
+        # The worker validates the semantic payload.  Qt repeats only compact
         # display fields and immutable object identities; it never rescans a
         # coordinate vector or trusts a token detached from the current frame.
         if (
@@ -3441,8 +2855,6 @@ class DataFigureWindow(FrozenRasterWindow):
         expected_state: _TypedDisplayState,
         request_revision: int,
     ) -> None:
-        if front.required_peak_bytes > self._memory_limit_bytes:
-            raise MemoryError("typed front exceeds the window budget")
         request_revision = nonnegative_integer(
             request_revision,
             "typed request revision",
@@ -3470,21 +2882,12 @@ class DataFigureWindow(FrozenRasterWindow):
             self._typed_contract = contract
         self._display = expected_state
         self._view_family = front.intent.value.lower()
-        self._current_front_peak_bytes = front.concurrent_reservation_bytes
-        self._visible_fit_overlay_retained_bytes = front.fit_overlay_retained_bytes
         self._fit_axis_ids = front.fit_axis_ids
         self._fit_axis_roles = front.axis_roles
         self._visible_fit_result_identity = front.fit_result_identity
         self._visible_transient_fit_result_owner = (
             front.transient_fit_result_owner
         )
-        self._visible_transient_fit_result_retained_bytes = (
-            front.transient_fit_result_retained_bytes
-        )
-        if self._grid_overview is not None:
-            self._grid_focus_cache_charge_bytes = (
-                front.retained_figure_upper_bound_bytes
-            )
         if front.intent is not ViewIntent.METER and self._fit_overlay_desired is None:
             self._fit_overlay_desired = _FitOverlayRequest(
                 self._fit_analysis_revision,
@@ -3625,11 +3028,9 @@ class DataFigureWindow(FrozenRasterWindow):
         )
         if kind == "save":
             self._close_deferred_during_fit_save = False
-            self._fit_save_limit_bytes = 0
         pane = self._fit_pane
         completed_draft: FitDraftResult | None = None
         completed_summary: str | None = None
-        completed_result_retained_bytes = 0
         try:
             result = future.result()
             if kind == "prepare":
@@ -3639,18 +3040,14 @@ class DataFigureWindow(FrozenRasterWindow):
             elif kind == "fit":
                 if (
                     not isinstance(result, tuple)
-                    or len(result) != 3
+                    or len(result) != 2
                     or not isinstance(result[0], FitDraftResult)
                     or not isinstance(result[1], str)
-                    or isinstance(result[2], bool)
-                    or not isinstance(result[2], int)
-                    or result[2] <= 0
                 ):
                     raise TypeError("Fit worker returned another draft type")
                 (
                     completed_draft,
                     completed_summary,
-                    completed_result_retained_bytes,
                 ) = result
                 if fit_cancelled is not None and fit_cancelled.is_set():
                     raise CancelledError()
@@ -3659,16 +3056,9 @@ class DataFigureWindow(FrozenRasterWindow):
                     raise TypeError("Fit save returned another reference type")
                 reference = result
             elif kind == "reload_saved":
-                if (
-                    not isinstance(result, tuple)
-                    or len(result) != 2
-                    or not isinstance(result[0], FitResultBatch)
-                    or isinstance(result[1], bool)
-                    or not isinstance(result[1], int)
-                    or result[1] <= 0
-                ):
+                if not isinstance(result, FitResultBatch):
                     raise TypeError("saved Fit reload returned another result type")
-                reloaded_result, reloaded_result_retained_bytes = result
+                reloaded_result = result
             else:
                 raise RuntimeError(f"unknown Fit worker completion {kind!r}")
         except (CancelledError, FitCancelled):
@@ -3723,9 +3113,6 @@ class DataFigureWindow(FrozenRasterWindow):
                     self._fit_options = {
                         option.spec.model_id: option for option in options
                     }
-                    self._fit_options_retained_bytes = sum(
-                        option.retained_upper_bound_bytes for option in options
-                    )
                     self._status.setText("FIT READY")
                     self._summary.setText(pane.axis_summary.text())
                     self._diagnostic.setText(
@@ -3747,7 +3134,6 @@ class DataFigureWindow(FrozenRasterWindow):
                     self._queue_fit_overlay(
                         completed_draft.result,
                         identity,
-                        result_retained_bytes=completed_result_retained_bytes,
                     )
                     self._status.setText("DRAFT FIT READY")
                     self._summary.setText(completed_summary)
@@ -3766,7 +3152,6 @@ class DataFigureWindow(FrozenRasterWindow):
                     f"{reference.repository_id}:{reference.manifest_digest}"
                 )
                 bindings = self._fit_bindings
-                residual = self._fit_operation_residual_bytes()
                 if close_after_save:
                     self._diagnostic.setText(
                         "Artifact reference accepted; completing the deferred close."
@@ -3775,9 +3160,9 @@ class DataFigureWindow(FrozenRasterWindow):
                     self._diagnostic.setText(
                         "Artifact is saved; stale editor authority was not reloaded."
                     )
-                elif bindings is None or residual <= 0:
+                elif bindings is None:
                     self._diagnostic.setText(
-                        "Artifact is saved; the visible Figure leaves no reopen budget."
+                        "Artifact is saved; no reload capability is available."
                     )
                 else:
                     self._deferred_fit_reload = (reference, job_revision)
@@ -3792,14 +3177,13 @@ class DataFigureWindow(FrozenRasterWindow):
                     self._queue_fit_overlay(
                         reloaded_result,
                         identity,
-                        result_retained_bytes=reloaded_result_retained_bytes,
                     )
                     self._status.setText("FIT SAVED")
                     self._diagnostic.setText("")
                 else:
                     self._status.setText("FIT SAVED · EDITOR CHANGED")
                     self._diagnostic.setText(
-                        "Saved artifact retained; its overlay was not applied to a newer draft."
+                        "Saved artifact preserved; its overlay was not applied to a newer draft."
                     )
         if close_after_save and not self._closing:
             self.shutdown()
@@ -3834,16 +3218,6 @@ class DataFigureWindow(FrozenRasterWindow):
         if kind == "grid_focus":
             if not isinstance(result, _TypedFigureFront):
                 raise TypeError("typed grid focus worker returned another result")
-            # The worker cache exists before Qt attempts its CAS/present.  Charge
-            # that capacity-one owner even if GUI validation or presentation
-            # rejects the completed front; a later focus replaces it atomically.
-            self._grid_focus_cache_charge_bytes = (
-                result.retained_figure_upper_bound_bytes
-            )
-            self._current_front_peak_bytes = max(
-                self._current_front_peak_bytes,
-                self._grid_focus_cache_charge_bytes,
-            )
             pending = self._grid_focus_pending
             if pending is None:
                 raise RuntimeError("typed grid focus completed without a pending panel")
@@ -3956,7 +3330,7 @@ class DataFigureWindow(FrozenRasterWindow):
             elif self._fit_draft is not None:
                 self._status.setText("DRAFT FIT READY")
                 if self._fit_draft_summary is None:
-                    raise RuntimeError("Fit draft summary was not retained from its worker")
+                    raise RuntimeError("Fit draft summary was not returned by its worker")
                 self._summary.setText(self._fit_draft_summary)
             elif self._saved_fit_reference is not None and request.result is not None:
                 self._status.setText("FIT SAVED")
@@ -4115,21 +3489,11 @@ class DataFigureWindow(FrozenRasterWindow):
             self._active_kind = None
             self._set_typed_controls_enabled(True)
             return
-        export_limit = self._memory_limit_bytes - self._fit_options_retained_bytes
-        if export_limit <= 0:
-            self._active_kind = None
-            self._set_typed_controls_enabled(True)
-            self._status.setText("TYPED EXPORT REJECTED")
-            self._diagnostic.setText(
-                "Fit authoring options leave no aggregate export budget."
-            )
-            return
         if not self._submit_future(
             _export_typed_png,
             frame,
             display,
             Path(destination),
-            export_limit,
             self._request_revision,
             self._cancelled,
             self._export_commit_lock,
@@ -4143,9 +3507,6 @@ class DataFigureWindow(FrozenRasterWindow):
         super()._clear_bundle()
         self._board_widget.clear()
         self._grid_overview = None
-        self._grid_overview_presentation_bytes = 0
-        self._grid_overview_admission_retained_bytes = 0
-        self._grid_focus_cache_charge_bytes = 0
         self._grid_focus_pending = None
         self._discard_grid_focus_sequence = None
 
@@ -4191,19 +3552,16 @@ class DataFigureWindow(FrozenRasterWindow):
                 reference, revision = deferred_reload
                 self._deferred_fit_reload = None
                 bindings = self._fit_bindings
-                residual = self._fit_operation_residual_bytes()
                 if (
                     revision == self._fit_analysis_revision
                     and bindings is not None
-                    and residual > 0
                 ):
                     self._fit_job_revision = revision
                     if not self._submit_fit_future(
                         "reload_saved",
-                        _reload_fit_result_with_retained,
+                        _reload_fit_result,
                         bindings.reload,
                         reference,
-                        residual,
                     ):
                         self._fit_job_revision = None
             if self._fit_prepare_pending and self._fit_future is None:
@@ -4220,7 +3578,6 @@ class DataFigureWindow(FrozenRasterWindow):
             self._fit_save_inflight = None
             self._fit_candidate = None
             self._fit_options.clear()
-            self._fit_options_retained_bytes = 0
             self._fit_options_release_pending = False
             pane = self._fit_pane
             if pane is not None:
@@ -4237,7 +3594,6 @@ class DataFigureWindow(FrozenRasterWindow):
             self._deferred_fit_reload = None
             self._deferred_typed_retry = None
             self._visible_transient_fit_result_owner = None
-            self._visible_transient_fit_result_retained_bytes = 0
         super()._finish_close_if_ready()
 
     def shutdown(self) -> None:
@@ -4267,21 +3623,17 @@ class DataFigureWindow(FrozenRasterWindow):
         if fit_future is not None:
             fit_future.cancel()
 
-
 def _figure_window_factory(
     loader,
     *,
-    memory_limit_bytes: int,
     fit_bindings: _FitWorkbenchBindings | None = None,
     initial_fit_result_identity: str | None = None,
 ):
-    limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
     worker_thread_id: int | None = None
     cached_typed: DataFigure | None = None
     cached_base: DataFigure | None = None
     cached_typed_grid: tuple[ViewIntent, DataFigure] | None = None
     cached_grid_histogram_home_x_limits: tuple[float, float] | None = None
-    cached_canonical_result_retained_bytes = 0
 
     def require_worker_owner() -> None:
         nonlocal worker_thread_id
@@ -4292,12 +3644,10 @@ def _figure_window_factory(
             raise RuntimeError("figure view session changed worker thread")
 
     def initial(
-        memory_limit: int,
         sequence: int,
         cancelled: threading.Event,
     ):
         nonlocal cached_typed, cached_base, cached_typed_grid
-        nonlocal cached_canonical_result_retained_bytes
         require_worker_owner()
         _require_not_cancelled(cancelled)
         figure = loader()
@@ -4308,7 +3658,6 @@ def _figure_window_factory(
             if figure.has_fit_overlays and initial_fit_result_identity is None:
                 return _encoded_figure(
                     figure,
-                    memory_limit,
                     cancelled,
                     unavailable_reason=(
                         "typed Fit replay requires an exact caller-supplied result identity"
@@ -4316,32 +3665,17 @@ def _figure_window_factory(
                 )
             if not figure.has_fit_overlays and initial_fit_result_identity is not None:
                 raise ValueError("Fit result identity was supplied for a source-only Figure")
-            state = _default_typed_state(intent)
-            try:
-                front = _render_typed_front(
-                    figure,
-                    state,
-                    current_value_limits=None,
-                    previous_relim_mode=None,
-                    previous_count_scale=None,
-                    sequence=sequence,
-                    memory_limit_bytes=memory_limit,
-                    cancelled=cancelled,
-                    fit_result_identity=initial_fit_result_identity,
-                )
-            except MemoryError:
-                return _encoded_figure(
-                    figure,
-                    memory_limit,
-                    cancelled,
-                    unavailable_reason=(
-                        f"interactive {intent.value} front exceeds the frozen memory budget"
-                    ),
-                )
-            cached_typed = figure
-            cached_canonical_result_retained_bytes = (
-                figure.fit_results_retained_upper_bound_nbytes
+            front = _render_typed_front(
+                figure,
+                _default_typed_state(intent),
+                current_value_limits=None,
+                previous_relim_mode=None,
+                previous_count_scale=None,
+                sequence=sequence,
+                cancelled=cancelled,
+                fit_result_identity=initial_fit_result_identity,
             )
+            cached_typed = figure
             cached_base = (
                 figure.with_fit_results(None)
                 if figure.has_fit_overlays
@@ -4352,27 +3686,11 @@ def _figure_window_factory(
         if grid_intent is not None and grid_panel_count is not None:
             if initial_fit_result_identity is not None:
                 raise ValueError("Fit result identity was supplied for a typed grid")
-            try:
-                overview = _render_typed_grid_overview(
-                    figure,
-                    memory_limit,
-                    cancelled,
-                )
-            except MemoryError:
-                return _encoded_figure(
-                    figure,
-                    memory_limit,
-                    cancelled,
-                    unavailable_reason=(
-                        f"interactive {grid_intent.value} focus exceeds the "
-                        "frozen memory budget"
-                    ),
-                )
+            overview = _render_typed_grid_overview(figure, cancelled)
             cached_typed_grid = (grid_intent, figure)
             return overview
         return _encoded_figure(
             figure,
-            memory_limit,
             cancelled,
             unavailable_reason=unavailable_reason or grid_reason,
         )
@@ -4385,10 +3703,7 @@ def _figure_window_factory(
         previous_relim_mode,
         previous_count_scale,
         sequence: int,
-        memory_limit: int,
         cancelled: threading.Event,
-        previous_fit_overlay_retained_bytes: int,
-        window_external_retained_bytes: int,
     ) -> _TypedFigureFront:
         nonlocal cached_typed, cached_base, cached_grid_histogram_home_x_limits
         require_worker_owner()
@@ -4401,47 +3716,13 @@ def _figure_window_factory(
                 raise ValueError("typed grid focus intent changed after overview")
             if fit_result is not None or fit_result_identity is not None:
                 raise ValueError("typed grid focus cannot carry a Fit result")
-            # A returned-to-overview panel has no remaining use.  Drop its
-            # compact DTO before admitting the next focus so repeated cell
-            # navigation cannot accumulate one metadata graph per visit.
             cached_typed = None
             cached_base = None
-            external_retained = nonnegative_integer(
-                window_external_retained_bytes,
-                "window_external_retained_bytes",
-            )
-            focused_bound, render_required, aggregate_peak = (
-                _typed_focus_preflight_nbytes(
-                    grid,
-                    state.panel_index,
-                    expected_intent=grid_intent,
-                    display=display,
-                    external_session_retained_bytes=external_retained,
-                )
-            )
-            effective_limit = _figure_render_limit(grid, memory_limit)
-            if render_required > effective_limit:
-                raise MemoryError(
-                    f"interactive {grid_intent.value.lower()} requires "
-                    f"{render_required} bytes; "
-                    f"limit is {effective_limit}"
-                )
-            if aggregate_peak > memory_limit:
-                raise MemoryError(
-                    f"interactive {grid_intent.value.lower()} aggregate peak "
-                    f"{aggregate_peak} "
-                    f"exceeds limit {memory_limit}"
-                )
             focused = grid.focused_typed_panel(
                 state.panel_index,
                 expected_selection=state.expected_selection,
                 expected_intent=grid_intent,
             )
-            if focused.retained_upper_bound_nbytes > focused_bound:
-                raise RuntimeError("focused typed panel exceeded its preflight bound")
-            # Keep focus derivation transactional: a failed/cancelled Agg must
-            # release the local DTO instead of publishing it into the worker
-            # closure without a matching Qt-side cache charge.
             front = _render_typed_front(
                 focused,
                 display,
@@ -4449,14 +3730,8 @@ def _figure_window_factory(
                 previous_relim_mode=None,
                 previous_count_scale=None,
                 sequence=sequence,
-                memory_limit_bytes=memory_limit,
                 cancelled=cancelled,
-                previous_fit_overlay_retained_bytes=0,
-                external_session_retained_bytes=external_retained,
-                post_commit_external_session_retained_bytes=external_retained,
-                histogram_projection_value_range=(
-                    state.histogram_home_x_limits
-                ),
+                histogram_projection_value_range=state.histogram_home_x_limits,
             )
             cached_typed = focused
             cached_base = focused
@@ -4480,7 +3755,8 @@ def _figure_window_factory(
             raise ValueError("typed renderer has no exact result for this identity")
         releases_canonical = bool(
             render_figure is base
-            and cached_canonical_result_retained_bytes
+            and cached_typed is not None
+            and cached_typed is not base
         )
         return _render_typed_front(
             render_figure,
@@ -4489,30 +3765,9 @@ def _figure_window_factory(
             previous_relim_mode=previous_relim_mode,
             previous_count_scale=previous_count_scale,
             sequence=sequence,
-            memory_limit_bytes=memory_limit,
             cancelled=cancelled,
             fit_result=fit_result,
             fit_result_identity=fit_result_identity,
-            previous_fit_overlay_retained_bytes=(
-                previous_fit_overlay_retained_bytes
-            ),
-            external_session_retained_bytes=(
-                cached_canonical_result_retained_bytes
-                if releases_canonical
-                else 0
-            )
-            + nonnegative_integer(
-                window_external_retained_bytes,
-                "window_external_retained_bytes",
-            ),
-            post_commit_external_session_retained_bytes=(
-                nonnegative_integer(
-                    window_external_retained_bytes,
-                    "window_external_retained_bytes",
-                )
-                if cached_typed_grid is not None
-                else 0
-            ),
             histogram_projection_value_range=(
                 cached_grid_histogram_home_x_limits
                 if cached_typed_grid is not None
@@ -4522,25 +3777,22 @@ def _figure_window_factory(
         )
 
     def commit_front(release_initial_canonical: bool) -> None:
-        nonlocal cached_typed, cached_canonical_result_retained_bytes
+        nonlocal cached_typed
         if release_initial_canonical:
             cached_typed = None
-            cached_canonical_result_retained_bytes = 0
 
     return lambda: DataFigureWindow(
         initial,
         rerender,
         rerender if fit_bindings is not None else None,
-        memory_limit_bytes=limit,
         fit_bindings=fit_bindings,
         typed_front_committed=commit_front,
     )
 
 
+
 def open_data_figure_workbench(
     figure: DataFigure,
-    *,
-    memory_limit_bytes: int = _DEFAULT_FIGURE_GUI_MEMORY_LIMIT_BYTES,
 ) -> DataFigureWindow:
     """Open an already-resolved DataFigure on the shared raster lane."""
 
@@ -4549,7 +3801,6 @@ def open_data_figure_workbench(
     return open_workbench_window(
         _figure_window_factory(
             lambda: figure,
-            memory_limit_bytes=memory_limit_bytes,
         )
     )
 
@@ -4562,7 +3813,6 @@ def open_figure_workbench(
     selection=None,
     preferences=None,
     occupancy_output=None,
-    memory_limit_bytes: int = _DEFAULT_FIGURE_GUI_MEMORY_LIMIT_BYTES,
     fit_preparer=None,
     fit_executor=None,
     fit_saver=None,
@@ -4573,11 +3823,10 @@ def open_figure_workbench(
     fit_timeout_seconds: float = _DEFAULT_FIT_TIMEOUT_SECONDS,
     initial_fit_result_identity: str | None = None,
 ) -> DataFigureWindow:
-    """Resolve and display a current artifact entirely on the bounded worker."""
+    """Resolve and display a current artifact entirely on the worker lane."""
 
     if not callable(figure_factory):
         raise TypeError("figure_factory must be callable")
-    limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
     fit_calls = (fit_preparer, fit_executor, fit_saver, fit_reloader)
     if any(item is not None for item in fit_calls) and not all(
         callable(item) for item in fit_calls
@@ -4601,14 +3850,12 @@ def open_figure_workbench(
         "intent": intent,
         "selection": selection,
         "preferences": preferences,
-        "memory_limit_bytes": limit,
     }
     if occupancy_output is not None:
         options["occupancy_output"] = occupancy_output
     return open_workbench_window(
         _figure_window_factory(
             lambda: figure_factory(source, **options),
-            memory_limit_bytes=limit,
             fit_bindings=fit_bindings,
             initial_fit_result_identity=initial_fit_result_identity,
         )

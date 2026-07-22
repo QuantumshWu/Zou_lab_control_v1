@@ -28,7 +28,7 @@ from .intent import (
     compose_task_console_catalog,
     task_console_catalog_items,
     task_console_scan_binding_form_spec,
-    task_console_scan_budget_form_spec,
+    task_console_scan_runtime_form_spec,
 )
 
 __all__ = ["ConsoleCatalogView", "ConsoleNodeSpec", "ConsoleSignalDecl"]
@@ -141,12 +141,12 @@ def _camera_monitor_form(camera_roles: tuple[str, ...]) -> FormSpec:
 def _pulse_scan_form(camera_roles: tuple[str, ...],
                      sequencer_roles: tuple[str, ...]) -> FormSpec:
     binding = task_console_scan_binding_form_spec(camera_roles, sequencer_roles)
-    budget = task_console_scan_budget_form_spec()
+    runtime = task_console_scan_runtime_form_spec()
     pulse = FormFieldProps(
         "pulse", "text", "Pulse document", default=None, required=True,
         description="PulseDocument path (pulses/<name>.json) driving the scan",
     )
-    return FormSpec((pulse, *binding.fields, *budget.fields))
+    return FormSpec((pulse, *binding.fields, *runtime.fields))
 
 
 def _occupancy_form() -> FormSpec:
@@ -230,8 +230,7 @@ class ConsoleCatalogView:
                 return experiment.readout.scan_request(
                     pulse,
                     **_form_values(values, "camera_role", "sequencer_role",
-                                   "trigger_channel", "transport_memory_limit_bytes",
-                                   "memory_limit_bytes", "timeout_seconds"))
+                                   "trigger_channel", "timeout_seconds"))
 
             return ConsoleNodeSpec(
                 key=item.key, kind=kind, title=_short_title(item.key),

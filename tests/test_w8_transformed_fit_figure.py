@@ -221,8 +221,6 @@ def _data_figure(snapshot, result, suggestion):
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
         fit_results={"data": result},
-        evaluation_memory_limit_bytes=128 << 20,
-        render_memory_limit_bytes=128 << 20,
     )
 
 
@@ -418,7 +416,7 @@ def test_public_execution_and_saved_ref_reopen_the_same_selection_transform(
                 application,
                 lambda: draft_window.closed and not draft_window.isVisible(),
             )
-        saved_ref = execution.save(operation_memory_limit_bytes=512 << 20)
+        saved_ref = execution.save()
         saved = experiment.load_fit(saved_ref)
         saved_figure = experiment.figure(saved_ref)
 

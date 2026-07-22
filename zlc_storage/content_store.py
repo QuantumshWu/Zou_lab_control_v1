@@ -102,10 +102,6 @@ class ContentCorruptionError(RuntimeError):
     """Stored bytes do not match the immutable reference naming them."""
 
 
-class ContentSizeLimitError(RuntimeError):
-    """Stored content exceeds a caller's pre-read byte admission limit."""
-
-
 _CONTENT_STORE_AUTHORITY_TOKEN = object()
 
 
@@ -172,32 +168,20 @@ class ContentStoreAuthority:
         self._require_integrity()
         return ContentAddressedStore._identify_blob(payload)
 
-    def read_blob(
-        self,
-        reference: ContentRef,
-        *,
-        max_bytes: int | None = None,
-    ) -> bytes:
+    def read_blob(self, reference: ContentRef) -> bytes:
         self._require_integrity()
         return ContentAddressedStore._read_blob(
             self._store,
             reference,
-            max_bytes=max_bytes,
         )
 
-    def verify_blob(
-        self,
-        reference: ContentRef,
-        *,
-        max_bytes: int | None = None,
-    ) -> None:
+    def verify_blob(self, reference: ContentRef) -> None:
         """Verify an existing blob without materializing its payload."""
 
         self._require_integrity()
         ContentAddressedStore._verify_blob(
             self._store,
             reference,
-            max_bytes=max_bytes,
         )
 
     def publish_manifest(
@@ -219,23 +203,18 @@ class ContentStoreAuthority:
         self,
         namespace: str,
         digest: str,
-        *,
-        max_bytes: int | None = None,
     ) -> bytes:
         self._require_integrity()
         return ContentAddressedStore._read_manifest(
             self._store,
             namespace,
             digest,
-            max_bytes=max_bytes,
         )
 
     def confirm_manifest_durable(
         self,
         namespace: str,
         digest: str,
-        *,
-        max_bytes: int | None = None,
     ) -> bytes:
         """Verify/fsync an existing manifest and its parent; never create it."""
 
@@ -244,22 +223,18 @@ class ContentStoreAuthority:
             self._store,
             namespace,
             digest,
-            max_bytes=max_bytes,
         )
 
     def has_manifest(
         self,
         namespace: str,
         digest: str,
-        *,
-        max_bytes: int | None = None,
     ) -> bool:
         self._require_integrity()
         return ContentAddressedStore._has_manifest(
             self._store,
             namespace,
             digest,
-            max_bytes=max_bytes,
         )
 
     def _require_integrity(self) -> None:
@@ -351,50 +326,28 @@ class ContentAddressedStore:
         )
         return reference
 
-    def read_blob(
-        self,
-        reference: ContentRef,
-        *,
-        max_bytes: int | None = None,
-    ) -> bytes:
-        return self.authority().read_blob(reference, max_bytes=max_bytes)
+    def read_blob(self, reference: ContentRef) -> bytes:
+        return self.authority().read_blob(reference)
 
-    def _read_blob(
-        self,
-        reference: ContentRef,
-        *,
-        max_bytes: int | None = None,
-    ) -> bytes:
+    def _read_blob(self, reference: ContentRef) -> bytes:
         if not isinstance(reference, ContentRef):
             raise TypeError("read_blob requires ContentRef")
         return ContentAddressedStore._read_verified(
             self._blob_path_for_digest(reference.digest),
             reference,
-            max_bytes=max_bytes,
         )
 
-    def verify_blob(
-        self,
-        reference: ContentRef,
-        *,
-        max_bytes: int | None = None,
-    ) -> None:
+    def verify_blob(self, reference: ContentRef) -> None:
         """Verify an existing blob without materializing its payload."""
 
-        self.authority().verify_blob(reference, max_bytes=max_bytes)
+        self.authority().verify_blob(reference)
 
-    def _verify_blob(
-        self,
-        reference: ContentRef,
-        *,
-        max_bytes: int | None = None,
-    ) -> None:
+    def _verify_blob(self, reference: ContentRef) -> None:
         if not isinstance(reference, ContentRef):
             raise TypeError("verify_blob requires ContentRef")
         ContentAddressedStore._verify_open_handle(
             self._blob_path_for_digest(reference.digest),
             reference,
-            max_bytes=max_bytes,
         )
 
     def publish_manifest(
@@ -437,34 +390,26 @@ class ContentAddressedStore:
         self,
         namespace: str,
         digest: str,
-        *,
-        max_bytes: int | None = None,
     ) -> bytes:
         return self.authority().read_manifest(
             namespace,
             digest,
-            max_bytes=max_bytes,
         )
 
     def confirm_manifest_durable(
         self,
         namespace: str,
         digest: str,
-        *,
-        max_bytes: int | None = None,
     ) -> bytes:
         return self.authority().confirm_manifest_durable(
             namespace,
             digest,
-            max_bytes=max_bytes,
         )
 
     def _read_manifest(
         self,
         namespace: str,
         digest: str,
-        *,
-        max_bytes: int | None = None,
     ) -> bytes:
         namespace = _canonical_namespace(namespace)
         digest = _sha256(digest, "manifest digest")
@@ -472,15 +417,12 @@ class ContentAddressedStore:
         return ContentAddressedStore._read_verified_digest(
             path,
             digest,
-            max_bytes=max_bytes,
         )
 
     def _confirm_manifest_durable(
         self,
         namespace: str,
         digest: str,
-        *,
-        max_bytes: int | None = None,
     ) -> bytes:
         namespace = _canonical_namespace(namespace)
         digest = _sha256(digest, "manifest digest")
@@ -490,28 +432,22 @@ class ContentAddressedStore:
             path,
             expected_digest=digest,
             expected_size=None,
-            max_bytes=max_bytes,
         )
 
     def has_manifest(
         self,
         namespace: str,
         digest: str,
-        *,
-        max_bytes: int | None = None,
     ) -> bool:
         return self.authority().has_manifest(
             namespace,
             digest,
-            max_bytes=max_bytes,
         )
 
     def _has_manifest(
         self,
         namespace: str,
         digest: str,
-        *,
-        max_bytes: int | None = None,
     ) -> bool:
         namespace = _canonical_namespace(namespace)
         digest = _sha256(digest, "manifest digest")
@@ -523,7 +459,6 @@ class ContentAddressedStore:
         ContentAddressedStore._read_verified_digest(
             path,
             digest,
-            max_bytes=max_bytes,
         )
         return True
 
@@ -578,7 +513,6 @@ class ContentAddressedStore:
                     ContentAddressedStore._verify_stream(
                         stream,
                         reference,
-                        max_bytes=None,
                     )
                 # The destination name is derived from the payload digest.  A
                 # concurrent writer can only publish the same verified bytes.
@@ -588,7 +522,6 @@ class ContentAddressedStore:
                     ContentAddressedStore._verify_open_handle(
                         target,
                         reference,
-                        max_bytes=None,
                     )
                 except BaseException as verification_error:
                     # This call created the target while holding the store
@@ -622,7 +555,6 @@ class ContentAddressedStore:
                 ContentAddressedStore._verify_stream(
                     stream,
                     reference,
-                    max_bytes=None,
                 )
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -634,7 +566,6 @@ class ContentAddressedStore:
         *,
         expected_digest: str,
         expected_size: int | None,
-        max_bytes: int | None,
     ) -> bytes:
         """Durability barrier for an existing immutable target; never publish."""
 
@@ -644,7 +575,6 @@ class ContentAddressedStore:
                     stream,
                     expected_digest=expected_digest,
                     expected_size=expected_size,
-                    max_bytes=max_bytes,
                 )
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -652,33 +582,19 @@ class ContentAddressedStore:
             return data
 
     @classmethod
-    def _read_verified(
-        cls,
-        path: Path,
-        reference: ContentRef,
-        *,
-        max_bytes: int | None = None,
-    ) -> bytes:
+    def _read_verified(cls, path: Path, reference: ContentRef) -> bytes:
         return cls._read_open_handle(
             path,
             expected_digest=reference.digest,
             expected_size=reference.size,
-            max_bytes=max_bytes,
         )
 
     @classmethod
-    def _read_verified_digest(
-        cls,
-        path: Path,
-        digest: str,
-        *,
-        max_bytes: int | None = None,
-    ) -> bytes:
+    def _read_verified_digest(cls, path: Path, digest: str) -> bytes:
         return cls._read_open_handle(
             path,
             expected_digest=digest,
             expected_size=None,
-            max_bytes=max_bytes,
         )
 
     @staticmethod
@@ -687,14 +603,12 @@ class ContentAddressedStore:
         *,
         expected_digest: str,
         expected_size: int | None,
-        max_bytes: int | None,
     ) -> bytes:
         with path.open("rb") as stream:
             return ContentAddressedStore._read_verified_stream(
                 stream,
                 expected_digest=expected_digest,
                 expected_size=expected_size,
-                max_bytes=max_bytes,
             )
 
     @staticmethod
@@ -703,16 +617,9 @@ class ContentAddressedStore:
         *,
         expected_digest: str,
         expected_size: int | None,
-        max_bytes: int | None,
     ) -> bytes:
-        if max_bytes is not None:
-            max_bytes = nonnegative_integer(max_bytes, "max_bytes")
         stream.seek(0)
         actual_size = os.fstat(stream.fileno()).st_size
-        if max_bytes is not None and actual_size > max_bytes:
-            raise ContentSizeLimitError(
-                f"stored content size {actual_size} exceeds limit {max_bytes}"
-            )
         if expected_size is not None and actual_size != expected_size:
             raise ContentCorruptionError(
                 f"stored content does not match immutable reference {expected_digest}"
@@ -728,30 +635,16 @@ class ContentAddressedStore:
         return data
 
     @staticmethod
-    def _verify_open_handle(
-        path: Path,
-        reference: ContentRef,
-        *,
-        max_bytes: int | None,
-    ) -> None:
-        if max_bytes is not None:
-            max_bytes = nonnegative_integer(max_bytes, "max_bytes")
+    def _verify_open_handle(path: Path, reference: ContentRef) -> None:
         with path.open("rb") as stream:
             ContentAddressedStore._verify_stream(
                 stream,
                 reference,
-                max_bytes=max_bytes,
             )
 
     @staticmethod
-    def _verify_stream(stream, reference: ContentRef, *, max_bytes: int | None) -> None:
-        if max_bytes is not None:
-            max_bytes = nonnegative_integer(max_bytes, "max_bytes")
+    def _verify_stream(stream, reference: ContentRef) -> None:
         actual_size = os.fstat(stream.fileno()).st_size
-        if max_bytes is not None and actual_size > max_bytes:
-            raise ContentSizeLimitError(
-                f"stored content size {actual_size} exceeds limit {max_bytes}"
-            )
         if actual_size != reference.size:
             raise ContentCorruptionError(
                 "stored content does not match immutable reference "
@@ -783,7 +676,6 @@ __all__ = [
     "ContentAddressedStore",
     "ContentStoreAuthority",
     "ContentCorruptionError",
-    "ContentSizeLimitError",
     "ContentRef",
     "StoredManifest",
     "content_ref_from_tree",

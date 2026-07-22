@@ -18,7 +18,6 @@ from zlc_storage import (
 
 from .artifact import (
     CompiledPulseArtifact,
-    admit_compiled_pulse_payload_size,
     decode_compiled_pulse_artifact,
     encode_compiled_pulse_artifact,
 )
@@ -739,7 +738,6 @@ def serve_pulse_execution_service(
 
         def exposed_current_prepare(self, artifact_bytes):
             self._require_owner()
-            admit_compiled_pulse_payload_size(len(artifact_bytes))
             return encode_prepared_ref_message(
                 service.prepare(decode_artifact_message(bytes(artifact_bytes)))
             )

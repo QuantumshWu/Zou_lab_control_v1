@@ -348,7 +348,7 @@ class RadialGaussianImageFitOverlay:
 
     The fit result remains owned by the analysis/artifact layer.  This small
     presentation value carries only the already-published centre/radius facts,
-    their exact source/artifact identity, and a bounded status diagnostic.  It
+    their exact source/artifact identity, and a status diagnostic.  It
     can therefore be painted by Agg or Qt without either renderer seeing a
     ``FitResultBatch`` or re-running a solver.
     """
@@ -371,8 +371,6 @@ class RadialGaussianImageFitOverlay:
             "artifact_identity",
             _text(self.artifact_identity, "fit overlay artifact_identity"),
         )
-        if len(self.artifact_identity) > 4096:
-            raise ValueError("fit overlay artifact_identity exceeds display bound")
         storage = self.batch_storage_index
         if storage is not None:
             storage = _nonnegative(storage, "fit overlay batch_storage_index")
@@ -388,12 +386,8 @@ class RadialGaussianImageFitOverlay:
         if not isinstance(self.coordinate_frame, CoordinateFrameId):
             raise TypeError("fit overlay coordinate_frame must be CoordinateFrameId")
         object.__setattr__(self, "caption", _text(self.caption, "fit overlay caption"))
-        if len(self.caption) > 8192:
-            raise ValueError("fit overlay caption exceeds display bound")
         if not isinstance(self.diagnostic, str):
             raise TypeError("fit overlay diagnostic must be str")
-        if len(self.diagnostic) > 1024:
-            raise ValueError("fit overlay diagnostic exceeds display bound")
         center = self.center_xy
         radius = self.one_over_e_radius
         if status is FitBatchStatus.CONVERGED:
@@ -452,8 +446,6 @@ class CurveFitOverlay:
         if not isinstance(self.source_ref, DatasetRevisionRef):
             raise TypeError("curve fit overlay source_ref must be DatasetRevisionRef")
         identity = _text(self.result_identity, "curve fit result_identity")
-        if len(identity) > 4096:
-            raise ValueError("curve fit result_identity exceeds its display bound")
         object.__setattr__(self, "result_identity", identity)
 
         address = tuple(self.series_batch_address)
@@ -485,8 +477,6 @@ class CurveFitOverlay:
 
         if not isinstance(self.diagnostic, str):
             raise TypeError("curve fit overlay diagnostic must be str")
-        if len(self.diagnostic) > 1024:
-            raise ValueError("curve fit overlay diagnostic exceeds its display bound")
 
         predicted = np.asarray(self.predicted_y)
         if predicted.dtype != np.dtype("<f8") or predicted.ndim != 1:

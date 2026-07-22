@@ -72,7 +72,6 @@ def test_the_tutorial_spine_runs_on_the_virtual_installation() -> None:
             descriptor = exp.inspect(request)
             assert descriptor.camera_role == "camera"
             assert descriptor.expected_frames > 0
-            assert descriptor.estimated_peak_bytes < request.pipeline_memory_limit_bytes
 
             reference = exp.run(request)
             assert isinstance(reference, CaptureArtifactRef)

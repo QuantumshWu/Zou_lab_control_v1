@@ -11,7 +11,6 @@ from zlc_storage import (
     ContentAddressedStore,
     ContentCorruptionError,
     ContentRef,
-    ContentSizeLimitError,
     ContentStoreAuthority,
     DirectoryDurabilityError,
     content_ref_from_tree,
@@ -363,20 +362,6 @@ def test_manifest_is_the_only_visibility_point(tmp_path):
     assert not store._manifest_path("capture", missing).exists()
 
 
-def test_manifest_size_admission_happens_before_file_bytes_are_read(tmp_path):
-    store = ContentAddressedStore(tmp_path / "repository")
-    published = store.publish_manifest("capture", b"large-enough-manifest")
-    with pytest.raises(ContentSizeLimitError, match="exceeds limit"):
-        store.read_manifest("capture", published.content.digest, max_bytes=1)
-
-
-def test_blob_size_admission_uses_physical_file_not_untrusted_reference_size(tmp_path):
-    store = ContentAddressedStore(tmp_path / "repository")
-    reference = store.put_blob(b"larger-than-budget")
-    with pytest.raises(ContentSizeLimitError, match="exceeds limit"):
-        store.read_blob(reference, max_bytes=1)
-
-
 def test_verify_blob_streams_without_materializing_payload(tmp_path, monkeypatch):
     import zlc_storage.content_store as content_store
 
@@ -418,46 +403,6 @@ def test_verify_blob_streams_without_materializing_payload(tmp_path, monkeypatch
     assert max(read_sizes) <= 4
 
 
-def test_verify_blob_applies_physical_size_limit_before_reading_bytes(
-    tmp_path,
-    monkeypatch,
-):
-    import zlc_storage.content_store as content_store
-
-    store = ContentAddressedStore(tmp_path / "repository")
-    reference = store.put_blob(b"larger-than-budget")
-    real_open = content_store.Path.open
-    read_called = False
-
-    class NoReadStream:
-        def __init__(self, stream):
-            self._stream = stream
-
-        def __enter__(self):
-            self._stream.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self._stream.__exit__(*args)
-
-        def fileno(self):
-            return self._stream.fileno()
-
-        def read(self, _size=-1):
-            nonlocal read_called
-            read_called = True
-            raise AssertionError("size admission must happen before reading bytes")
-
-    def no_read_open(path, *args, **kwargs):
-        return NoReadStream(real_open(path, *args, **kwargs))
-
-    monkeypatch.setattr(content_store.Path, "open", no_read_open)
-
-    with pytest.raises(ContentSizeLimitError, match="exceeds limit"):
-        store.verify_blob(reference, max_bytes=1)
-    assert read_called is False
-
-
 def test_verify_blob_rejects_size_or_digest_corruption(tmp_path):
     store = ContentAddressedStore(tmp_path / "repository")
     payload = b"original"
@@ -470,19 +415,6 @@ def test_verify_blob_rejects_size_or_digest_corruption(tmp_path):
     store._blob_path(reference.digest).write_bytes(b"tampered")
     with pytest.raises(ContentCorruptionError, match="immutable reference"):
         store.verify_blob(reference)
-
-
-@pytest.mark.parametrize("max_bytes", [True, -1])
-@pytest.mark.parametrize("operation", ["read_blob", "verify_blob"])
-def test_read_limit_uses_canonical_nonnegative_integer_contract(
-    tmp_path,
-    max_bytes,
-    operation,
-):
-    store = ContentAddressedStore(tmp_path / "repository")
-    reference = store.put_blob(b"bounded")
-    with pytest.raises((TypeError, ValueError)):
-        getattr(store, operation)(reference, max_bytes=max_bytes)
 
 
 @pytest.mark.parametrize("size_delta", [-1, 1])

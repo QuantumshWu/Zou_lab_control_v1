@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import os
 from pathlib import Path
 import subprocess
@@ -20,16 +19,9 @@ import Zou_lab_control.notebook as zlc
 from Zou_lab_control.notebook.facade import _prepare_capture_for_workbench
 from Zou_lab_control.workbench import open_capture_workbench
 from zlc_data import BlockId, SPATIAL_X, SPATIAL_Y
-from zlc_frontend.figure import (
-    DatasetId,
-    FigureEvaluationPolicy,
-    ViewIntent,
-    estimate_view_evaluation_peak_nbytes,
-    suggest_view,
-)
+from zlc_frontend.figure import DatasetId
 from zlc_frontend.display_range import RelimMode
 from zlc_frontend.image_display import ImageColormap
-from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
 from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import GREEN, ORANGE, QtRasterBoard
 from zlc_neutral_atom.monitor_application import (
@@ -37,10 +29,6 @@ from zlc_neutral_atom.monitor_application import (
     CameraMonitorRoiState,
 )
 from zlc_neutral_atom.runtime.control import ControlAckStatus, create_control_topic
-from zlc_neutral_atom.runtime.pipeline import (
-    CapturePreviewSpec,
-    estimate_pipeline_peak_bytes,
-)
 import zlc_workbench.live as live_module
 from zlc_workbench.live import LiveBoardController, LiveDatasetSlot
 
@@ -136,41 +124,6 @@ def _choose_image_display_value(editor, key: str, value: object) -> None:
     assert index >= 0
     widget.setCurrentIndex(index)
     editor._form.changed.emit(key)
-
-
-def _finite_required_peak(prepared) -> int:
-    schema = prepared.preview_schema
-    y_axes = tuple(
-        axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_Y
-    )
-    x_axes = tuple(
-        axis for axis in schema.cell_schema.data_axes if axis.role == SPATIAL_X
-    )
-    assert len(y_axes) == len(x_axes) == 1
-    suggestion = suggest_view(schema, ViewIntent.IMAGE)
-    assert suggestion.spec is not None
-    downstream = estimate_view_evaluation_peak_nbytes(
-        schema,
-        suggestion.spec,
-    ) + estimate_indexed8_raster_peak_nbytes(
-        y_axes[0].size,
-        x_axes[0].size,
-        value_itemsize=schema.cell_schema.dtype.itemsize,
-        retained_fronts=1,
-        retained_sample_fronts=1,
-    )
-    preview = CapturePreviewSpec(
-        BlockId("w1-exact-budget-preview"),
-        prepared._preview_edge,
-        downstream,
-    )
-    assert prepared.descriptor.estimated_peak_bytes == estimate_pipeline_peak_bytes(
-        prepared._triggered.capture
-    )
-    return estimate_pipeline_peak_bytes(
-        prepared._triggered.capture,
-        preview_spec=preview,
-    )
 
 
 def _close_window(application, window) -> None:
@@ -773,63 +726,6 @@ def test_render_failure_does_not_change_final_capture(
             _close_window(application, window)
 
 
-def test_preview_budget_failure_is_visible_and_next_legal_window_succeeds(
-    experiment,
-    application,
-    monkeypatch,
-):
-    bad_window = None
-    good_window = None
-    try:
-        request = experiment.readout.capture_request(SINGLE_EVENT_PULSE)
-        required = _finite_required_peak(
-            _prepare_capture_for_workbench(experiment, request)
-        )
-        # Independent frozen witness for the default 96x128 virtual topology.
-        # Any estimator/topology change must update this value deliberately,
-        # not make required-1/exact pass by changing both sides together.
-        assert required == 1_359_561
-        from zlc_neutral_atom.bootstrap import _virtual_hardware
-
-        arm_calls = []
-        original_arm = _virtual_hardware.VirtualCamera.arm
-
-        def traced_arm(camera, *args, **kwargs):
-            arm_calls.append((args, kwargs))
-            return original_arm(camera, *args, **kwargs)
-
-        monkeypatch.setattr(_virtual_hardware.VirtualCamera, "arm", traced_arm)
-        bad_window = open_capture_workbench(
-            experiment,
-            replace(request, pipeline_memory_limit_bytes=required - 1),
-        )
-        start, capture, preview, diagnostics, board = _widgets(bad_window)
-        _until(application, start.isEnabled)
-        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
-        _until(application, lambda: "pipeline peak budget" in diagnostics.text())
-        assert "FAILED" in capture.text() and "NOT FINAL" in capture.text()
-        assert preview.text().startswith("Preview: FAILED")
-        assert not board.has_front
-        assert arm_calls == []
-        _close_window(application, bad_window)
-
-        good_window = open_capture_workbench(
-            experiment,
-            replace(request, pipeline_memory_limit_bytes=required),
-        )
-        start, capture, _preview, _diagnostics, board = _widgets(good_window)
-        _until(application, start.isEnabled)
-        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
-        _until(application, lambda: good_window.final_reference is not None)
-        assert capture.text().startswith("Capture: FINAL") and board.has_front
-        assert len(arm_calls) == 1
-    finally:
-        if bad_window is not None and bad_window.isVisible():
-            _close_window(application, bad_window)
-        if good_window is not None:
-            _close_window(application, good_window)
-
-
 def test_close_during_start_is_nonblocking_and_does_not_close_experiment(
     experiment,
     application,
@@ -861,14 +757,12 @@ def test_slot_replays_update_or_failure_once_to_a_late_listener(experiment):
             slot = LiveDatasetSlot(
                 spec,
                 dataset_id=DatasetId("late-update"),
-                evaluation_policy=FigureEvaluationPolicy(),
             )
             slots.append(slot)
             return slot
 
         handle = prepared.start_with_preview(
             block_id=BlockId("late-update-block"),
-            downstream_peak_bytes=0,
             factory=factory,
         )
         handle.result(5.0)
@@ -879,27 +773,13 @@ def test_slot_replays_update_or_failure_once_to_a_late_listener(experiment):
             slots[0].set_change_listener(lambda: None)
         slots[0].close()
 
-        bad = _prepare_capture_for_workbench(
-            experiment,
-            replace(request, pipeline_memory_limit_bytes=1),
-        )
-        failed_slots = []
-
-        def failed_factory(spec):
-            slot = LiveDatasetSlot(
-                spec,
+        failed_slots = [
+            LiveDatasetSlot(
+                slots[0].spec,
                 dataset_id=DatasetId("late-failure"),
-                evaluation_policy=FigureEvaluationPolicy(),
             )
-            failed_slots.append(slot)
-            return slot
-
-        with pytest.raises(MemoryError, match="pipeline peak budget"):
-            bad.start_with_preview(
-                block_id=BlockId("late-failure-block"),
-                downstream_peak_bytes=0,
-                factory=failed_factory,
-            )
+        ]
+        failed_slots[0].fail("injected source failure")
         failures = []
         failed_slots[0].set_change_listener(lambda: failures.append("failure"))
         assert failures == ["failure"]

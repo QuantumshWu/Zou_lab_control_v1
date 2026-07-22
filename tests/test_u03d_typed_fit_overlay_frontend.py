@@ -32,7 +32,6 @@ from zlc_data import (
     ValueSchema,
     bind_fit,
     commit_transform,
-    fit_result_retained_upper_bound_nbytes,
     fit_spec_for,
     Selection,
 )
@@ -41,7 +40,6 @@ from zlc_frontend import (
     CurveFitOverlay,
     CurvePanelPayload,
     DataFigure,
-    curve_fit_overlays_retained_nbytes,
 )
 from zlc_frontend.figure import (
     AxisViewBinding,
@@ -57,13 +55,8 @@ from zlc_frontend.figure import (
     suggest_fit_view,
     suggest_view,
 )
-from zlc_frontend.matplotlib_render import (
-    SinglePanelAggRenderer,
-    estimate_live_panel_raster_peak_nbytes,
-    evaluated_figure_array_nbytes,
-)
+from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
 from zlc_frontend.fit_curve_projection import (
-    estimate_curve_fit_overlay_plan_nbytes,
     materialize_curve_fit_overlay_plan,
 )
 
@@ -160,7 +153,6 @@ def _curve_fixture(
     base = DataFigure(
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
-        render_memory_limit_bytes=128 << 20,
     )
     return base, result
 
@@ -493,223 +485,11 @@ def test_transient_selector_fit_stays_on_cached_full_view_and_only_draws_roi():
     assert image_base.evaluated.layers[0].cells[0].series[0].data is full_image
 
 
-def test_fit_overlay_and_frozen_figure_retention_are_charged_once():
-    base, result = _curve_fixture()
-    fitted = base.with_fit_results({"curve": result})
-    overlays = materialize_curve_fit_overlay_plan(
-        fitted.single_panel_curve_fit_overlay_plan(result_identity="budget:1")
-    )
-    retained, predictions = curve_fit_overlays_retained_nbytes(overlays)
-    plan = fitted.single_panel_curve_fit_overlay_plan(result_identity="budget:1")
-    planned_retained, planned_predictions = (
-        estimate_curve_fit_overlay_plan_nbytes(plan)
-    )
-    assert planned_predictions == predictions
-    assert planned_retained >= retained
-    baseline = estimate_live_panel_raster_peak_nbytes(
-        640,
-        420,
-        evaluated_data_upper_bound_bytes=evaluated_figure_array_nbytes(
-            fitted.evaluated
-        ),
-    )
-    with_fit = estimate_live_panel_raster_peak_nbytes(
-        640,
-        420,
-        evaluated_data_upper_bound_bytes=evaluated_figure_array_nbytes(
-            fitted.evaluated
-        ),
-        fit_overlay_retained_upper_bound_bytes=retained,
-        fit_prediction_upper_bound_bytes=predictions,
-    )
-    assert with_fit - baseline == retained + 8 * predictions
-    assert fitted.retained_upper_bound_nbytes >= (
-        evaluated_figure_array_nbytes(fitted.evaluated)
-        + fit_result_retained_upper_bound_nbytes(result)
-    )
-
-
-def test_curve_overlay_aggregate_preflight_runs_before_any_prediction(
-    monkeypatch,
-):
-    from Zou_lab_control.workbench import _figure as figure_module
-
-    base, result = _curve_fixture(committed_range=(6, 25))
-    state = CurveDisplayState()
-    previous_overlays = materialize_curve_fit_overlay_plan(
-        base.transient_single_panel_curve_fit_overlay_plan(
-            result,
-            result_identity="previous:0",
-        )
-    )
-    previous_retained, _previous_predictions = (
-        curve_fit_overlays_retained_nbytes(previous_overlays)
-    )
-    calls = []
-    original = type(result).evaluate_batch
-
-    def traced(self, storage_index, coordinates):
-        calls.append(storage_index)
-        return original(self, storage_index, coordinates)
-
-    monkeypatch.setattr(type(result), "evaluate_batch", traced)
-    plan = base.transient_single_panel_curve_fit_overlay_plan(
-        result,
-        result_identity="preflight:1",
-    )
-    retained, predictions = estimate_curve_fit_overlay_plan_nbytes(plan)
-    assert retained > predictions > 0
-    assert calls == []
-
-    fit_retained = fit_result_retained_upper_bound_nbytes(result)
-    validation, retained_bound, prediction_bound, projection_peak = (
-        base.single_panel_fit_overlay_preflight_nbytes(
-            result,
-            result_identity="preflight:1",
-        )
-    )
-    without_fit_result = figure_module._typed_front_required_peak_bytes(
-        base,
-        state,
-        curve_fit_overlay_nbytes=(retained_bound, prediction_bound),
-        previous_fit_overlay_retained_bytes=previous_retained,
-    )
-    without_previous = figure_module._typed_front_required_peak_bytes(
-        base,
-        state,
-        curve_fit_overlay_nbytes=(retained_bound, prediction_bound),
-        fit_result_retained_bytes=fit_retained,
-    )
-    required = figure_module._typed_front_required_peak_bytes(
-        base,
-        state,
-        curve_fit_overlay_nbytes=(retained_bound, prediction_bound),
-        fit_result_retained_bytes=fit_retained,
-        previous_fit_overlay_retained_bytes=previous_retained,
-    )
-    assert required - without_fit_result == fit_retained
-    assert required - without_previous == previous_retained
-    aggregate = required + max(
-        0,
-        base.retained_upper_bound_nbytes
-        - evaluated_figure_array_nbytes(base.evaluated),
-    )
-    width, height = figure_module._NUMERIC_RASTER_SIZE
-    aggregate = max(
-        aggregate,
-        base.retained_upper_bound_nbytes
-        + fit_retained
-        + previous_retained
-        + width * height * 4
-        + max(validation, projection_peak),
-    )
-    next_required = figure_module._typed_front_required_peak_bytes(
-        base,
-        state,
-        curve_fit_overlay_nbytes=(retained_bound, prediction_bound),
-        fit_result_retained_bytes=fit_retained,
-        previous_fit_overlay_retained_bytes=retained_bound,
-    )
-    aggregate = max(
-        aggregate,
-        next_required
-        + max(
-            0,
-            base.retained_upper_bound_nbytes
-            - evaluated_figure_array_nbytes(base.evaluated),
-        ),
-        base.retained_upper_bound_nbytes
-        + fit_retained
-        + retained_bound
-        + width * height * 4
-        + max(validation, projection_peak),
-    )
-    cancelled = threading.Event()
-    options = {
-        "current_value_limits": None,
-        "previous_relim_mode": None,
-        "previous_count_scale": None,
-        "sequence": 1,
-        "cancelled": cancelled,
-        "fit_result": result,
-        "fit_result_identity": "preflight:1",
-        "previous_fit_overlay_retained_bytes": previous_retained,
-    }
-    with pytest.raises(MemoryError, match="aggregate peak"):
-        figure_module._render_typed_front(
-            base,
-            state,
-            memory_limit_bytes=aggregate - 1,
-            **options,
-        )
-    assert calls == []
-
-    front = figure_module._render_typed_front(
-        base,
-        state,
-        memory_limit_bytes=aggregate,
-        **options,
-    )
-    assert calls == [0, 1]
-    assert front.session_peak_bytes == aggregate
-
-
 def test_curve_overlay_materialization_checks_cancel_between_batches(monkeypatch):
     from Zou_lab_control.workbench import _figure as figure_module
 
     base, result = _curve_fixture(committed_range=(6, 25))
     state = CurveDisplayState()
-    plan = base.transient_single_panel_curve_fit_overlay_plan(
-        result,
-        result_identity="cancel:1",
-    )
-    fit_retained = fit_result_retained_upper_bound_nbytes(result)
-    validation, retained_bound, prediction_bound, projection_peak = (
-        base.single_panel_fit_overlay_preflight_nbytes(
-            result,
-            result_identity="cancel:1",
-        )
-    )
-    required = figure_module._typed_front_required_peak_bytes(
-        base,
-        state,
-        curve_fit_overlay_nbytes=(retained_bound, prediction_bound),
-        fit_result_retained_bytes=fit_retained,
-    )
-    aggregate = required + max(
-        0,
-        base.retained_upper_bound_nbytes
-        - evaluated_figure_array_nbytes(base.evaluated),
-    )
-    width, height = figure_module._NUMERIC_RASTER_SIZE
-    aggregate = max(
-        aggregate,
-        base.retained_upper_bound_nbytes
-        + fit_retained
-        + width * height * 4
-        + max(validation, projection_peak),
-    )
-    next_required = figure_module._typed_front_required_peak_bytes(
-        base,
-        state,
-        curve_fit_overlay_nbytes=(retained_bound, prediction_bound),
-        fit_result_retained_bytes=fit_retained,
-        previous_fit_overlay_retained_bytes=retained_bound,
-    )
-    aggregate = max(
-        aggregate,
-        next_required
-        + max(
-            0,
-            base.retained_upper_bound_nbytes
-            - evaluated_figure_array_nbytes(base.evaluated),
-        ),
-        base.retained_upper_bound_nbytes
-        + fit_retained
-        + retained_bound
-        + width * height * 4
-        + max(validation, projection_peak),
-    )
     cancelled = threading.Event()
     calls = []
     original = type(result).evaluate_batch
@@ -729,70 +509,8 @@ def test_curve_overlay_materialization_checks_cancel_between_batches(monkeypatch
             previous_relim_mode=None,
             previous_count_scale=None,
             sequence=1,
-            memory_limit_bytes=aggregate,
             cancelled=cancelled,
             fit_result=result,
             fit_result_identity="cancel:1",
         )
     assert calls == [0]
-
-
-def test_clearing_curve_overlay_charges_old_visible_predictions(monkeypatch):
-    from Zou_lab_control.workbench import _figure as figure_module
-
-    base, result = _curve_fixture(committed_range=(6, 25))
-    old_overlays = materialize_curve_fit_overlay_plan(
-        base.transient_single_panel_curve_fit_overlay_plan(
-            result,
-            result_identity="old-visible:1",
-        )
-    )
-    old_retained, _old_predictions = curve_fit_overlays_retained_nbytes(
-        old_overlays
-    )
-    state = CurveDisplayState()
-    baseline = figure_module._typed_front_required_peak_bytes(base, state)
-    required = figure_module._typed_front_required_peak_bytes(
-        base,
-        state,
-        previous_fit_overlay_retained_bytes=old_retained,
-    )
-    assert required - baseline == old_retained
-    aggregate = required + max(
-        0,
-        base.retained_upper_bound_nbytes
-        - evaluated_figure_array_nbytes(base.evaluated),
-    )
-    calls = []
-    original = type(result).evaluate_batch
-
-    def traced(self, storage_index, coordinates):
-        calls.append(storage_index)
-        return original(self, storage_index, coordinates)
-
-    monkeypatch.setattr(type(result), "evaluate_batch", traced)
-    options = {
-        "current_value_limits": None,
-        "previous_relim_mode": None,
-        "previous_count_scale": None,
-        "sequence": 1,
-        "cancelled": threading.Event(),
-        "previous_fit_overlay_retained_bytes": old_retained,
-    }
-    with pytest.raises(MemoryError, match="aggregate peak"):
-        figure_module._render_typed_front(
-            base,
-            state,
-            memory_limit_bytes=aggregate - 1,
-            **options,
-        )
-    assert calls == []
-    front = figure_module._render_typed_front(
-        base,
-        state,
-        memory_limit_bytes=aggregate,
-        **options,
-    )
-    assert calls == []
-    assert front.session_peak_bytes == aggregate
-    assert front.frame.panels[0].display_payload.fit_overlays == ()

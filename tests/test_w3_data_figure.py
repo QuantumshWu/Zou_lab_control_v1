@@ -36,11 +36,9 @@ from zlc_data import (
     ValueSchema,
     commit_transform,
     bind_fit,
-    dataset_schema_retained_upper_bound_nbytes,
-    fit_result_retained_upper_bound_nbytes,
     fit_spec_for,
 )
-from zlc_frontend import DataFigure, figure_document_retained_upper_bound_nbytes
+from zlc_frontend import DataFigure
 from zlc_frontend.figure import (
     AxisViewRole,
     DatasetDescriptor,
@@ -116,7 +114,7 @@ def _curve_figure():
 
 def _resolved_capture(exp, capture_ref, document):
     artifact = exp.readout.load_capture(capture_ref)
-    block = artifact.frame_source.materialize(memory_limit_bytes=512 << 20)
+    block = artifact.frame_source.materialize()
     snapshot = OwnedSnapshot(block.ref(artifact.provenance.generation), block)
     dataset_id = document.datasets[0].dataset_id
     return block, ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),))
@@ -361,8 +359,6 @@ def test_notebook_fit_figure_maps_each_visible_batch_and_skips_failure(monkeypat
             model="radial_gaussian_center",
             numeric_policy=FitNumericPolicy(
                 max_evaluations=500,
-                sample_budget_per_batch=512,
-                max_packed_observations=4_096,
             ),
         )
         document = exp.figure_document(execution)
@@ -381,39 +377,9 @@ def test_notebook_fit_figure_maps_each_visible_batch_and_skips_failure(monkeypat
             is AxisViewRole.FACET
         )
 
-        render_limit = 512 << 20
-        data_figure = exp.figure(execution, memory_limit_bytes=render_limit)
-        source_schema = exp.readout.load_capture(
-            capture_ref
-        ).frame_source.schema
-        assert data_figure.render_memory_limit_bytes == (
-            render_limit
-            - fit_result_retained_upper_bound_nbytes(execution.result)
-            - dataset_schema_retained_upper_bound_nbytes(source_schema)
-            - figure_document_retained_upper_bound_nbytes(data_figure.document)
-        )
+        data_figure = exp.figure(execution)
         import zlc_frontend.matplotlib_render as render_module
-
-        with monkeypatch.context() as budget_patch:
-            budget_patch.setattr(
-                render_module,
-                "estimate_render_peak_nbytes",
-                lambda _evaluated, *, dpi: render_limit + 1,
-            )
-            with pytest.raises(MemoryError, match="render peak"):
-                data_figure._repr_png_()
-            blocked_export = tmp_path / "frozen-budget-blocked.png"
-            with pytest.raises(MemoryError, match="render peak"):
-                data_figure.export(blocked_export)
-            assert not blocked_export.exists()
-            with pytest.raises(ValueError, match="cannot weaken"):
-                data_figure.export(
-                    tmp_path / "must-not-export.png",
-                    memory_limit_bytes=render_limit + 1,
-                )
-        assert data_figure.to_png_bytes(
-            memory_limit_bytes=render_limit // 2
-        ).startswith(b"\x89PNG")
+        assert data_figure.to_png_bytes().startswith(b"\x89PNG")
         expected = _displayed_batch_indices(data_figure, execution.result)
         calls = []
         original = type(execution.result).evaluate_batch

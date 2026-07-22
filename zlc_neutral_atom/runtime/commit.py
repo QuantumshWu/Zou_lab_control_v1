@@ -77,7 +77,6 @@ def publish_manifest_with_visibility_reconciliation(
     payload: bytes,
     *,
     expected_digest: str,
-    max_bytes: int,
 ) -> StoredManifest:
     """Publish once and classify an ordinary failure from the visible target.
 
@@ -101,7 +100,6 @@ def publish_manifest_with_visibility_reconciliation(
             visible = authority.read_manifest(
                 namespace,
                 expected_digest,
-                max_bytes=max_bytes,
             )
         except FileNotFoundError:
             raise publish_error

@@ -145,7 +145,6 @@ def test_rejected_initial_roi_falls_back_to_raw_and_can_recover_in_place(
         history_capacity=3,
         roi=initial_roi,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
     reject_initial = True
     real_project = RoiScalarStreamProjection.project
@@ -234,7 +233,6 @@ def test_rejected_initial_roi_and_raw_presentation_failure_keep_both_causes(
         history_capacity=3,
         roi=initial_roi,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
 
     def reject_initial_branch(self, update, binding, control_revision):
@@ -303,7 +301,6 @@ def test_first_roi_clear_and_recreate_only_migrate_the_scalar_branch(
     request = experiment.readout.camera_monitor_request(
         history_capacity=3,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
     assert request.roi is None
     window = experiment.readout.camera_monitor_gui(request)
@@ -447,7 +444,6 @@ def test_first_roi_presentation_failure_rolls_back_staged_layout_once(
     request = experiment.readout.camera_monitor_request(
         history_capacity=3,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
     window = experiment.readout.camera_monitor_gui(request)
     try:
@@ -605,7 +601,6 @@ def test_stop_folds_applied_roi_before_owner_drain_into_next_prepare(
     request = experiment.readout.camera_monitor_request(
         history_capacity=3,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
     window = experiment.readout.camera_monitor_gui(request)
     try:
@@ -706,7 +701,6 @@ def test_visible_roi_stop_restart_reuses_widget_and_reearns_applied_overlay(
         history_capacity=3,
         roi=initial_roi,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
     window = experiment.readout.camera_monitor_gui(request)
     try:
@@ -779,7 +773,6 @@ def test_overlapping_unpresented_roi_changes_freeze_the_old_coherent_front(
     request = experiment.readout.camera_monitor_request(
         history_capacity=3,
         scalar_history_capacity=12,
-        memory_limit_bytes=1 << 30,
     )
     window = experiment.readout.camera_monitor_gui(request)
     try:
@@ -895,7 +888,6 @@ def test_close_terminalizes_a_pending_roi_revision_without_stale_layout_promotio
     request = experiment.readout.camera_monitor_request(
         history_capacity=2,
         scalar_history_capacity=8,
-        memory_limit_bytes=1 << 30,
     )
     window = experiment.readout.camera_monitor_gui(request)
     release_projection = threading.Event()

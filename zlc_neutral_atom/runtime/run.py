@@ -592,7 +592,7 @@ class PostSafetyContext:
                 detach_failure(error, note_prefix="detached commit abandonment traceback")
             else:
                 self._take_tracked(operation)
-        return _bounded_diagnostics(tuple(errors))
+        return _diagnostics(tuple(errors))
 
     def _revoke(self) -> None:
         object.__setattr__(self, "_active", False)
@@ -702,7 +702,7 @@ class RunHandle(Generic[FinalT]):
             finally:
                 with self._condition:
                     if summary is not None:
-                        self._interrupt_errors = _bounded_diagnostics(
+                        self._interrupt_errors = _diagnostics(
                             (*self._interrupt_errors, summary)
                         )
                     self._interrupt_inflight = False
@@ -719,7 +719,7 @@ class RunHandle(Generic[FinalT]):
             thread.start()
         except BaseException as error:
             with self._condition:
-                self._interrupt_errors = _bounded_diagnostics(
+                self._interrupt_errors = _diagnostics(
                     (*self._interrupt_errors, safe_error_summary(error))
                 )
                 self._interrupt_inflight = False
@@ -800,12 +800,12 @@ class RunHandle(Generic[FinalT]):
                     self._install_retry(
                         retry,
                         instruction,
-                        _bounded_diagnostics((*prior, safe_error_summary(error))),
+                        _diagnostics((*prior, safe_error_summary(error))),
                         phase=phase,
                     )
                 except BaseException as error:
                     self._block_non_retryable_recovery(
-                        _bounded_diagnostics((*prior, safe_error_summary(error)))
+                        _diagnostics((*prior, safe_error_summary(error)))
                     )
                     detach_failure(error, note_prefix="detached recovery traceback")
 
@@ -837,7 +837,7 @@ class RunHandle(Generic[FinalT]):
                     self._install_retry(
                         retry,
                         instruction,
-                        _bounded_diagnostics((*prior, safe_error_summary(error))),
+                        _diagnostics((*prior, safe_error_summary(error))),
                         phase=phase,
                     )
                 detach_failure(error, note_prefix="detached recovery start traceback")
@@ -930,7 +930,7 @@ class RunHandle(Generic[FinalT]):
             self._retry_disposition = retry
             self._retry_phase = phase
             self._recovery_instruction = instruction
-            self._cleanup_errors = _bounded_diagnostics(errors)
+            self._cleanup_errors = _diagnostics(errors)
             self._condition.notify_all()
 
     def _block_non_retryable_recovery(self, errors: tuple[str, ...]) -> None:
@@ -942,7 +942,7 @@ class RunHandle(Generic[FinalT]):
                 "runtime recovery failed with a non-retryable invariant error; "
                 "retain this RunHandle and inspect diagnostics"
             )
-            self._cleanup_errors = _bounded_diagnostics(errors)
+            self._cleanup_errors = _diagnostics(errors)
             self._condition.notify_all()
 
     def _commit_gate_rejection_locked(
@@ -1293,12 +1293,12 @@ class RunHandle(Generic[FinalT]):
             if self._commit_inflight or self._pending_commit is not None:
                 raise RuntimeError("cannot publish while commit reconciliation is pending")
             self._cancel_gate_closed = True
-            cleanup_errors = _bounded_diagnostics(
+            cleanup_errors = _diagnostics(
                 (*cleanup_errors, *self._interrupt_errors)
             )
             if self._final_committed:
                 if primary_error is not None:
-                    cleanup_errors = _bounded_diagnostics((*cleanup_errors, primary_error))
+                    cleanup_errors = _diagnostics((*cleanup_errors, primary_error))
                 state = RunState.SUCCEEDED
                 primary_error = None
                 result = self._result
@@ -1566,7 +1566,7 @@ class RunController:
             state=RunState.FAILED,
             result=_MISSING,
             primary_error=summary,
-            cleanup_errors=_bounded_diagnostics(tuple(cleanup_summaries)),
+            cleanup_errors=_diagnostics(tuple(cleanup_summaries)),
         )
         lease.release_terminal(publication, disposition=RunState.FAILED.value)
 
@@ -1614,7 +1614,7 @@ class RunController:
                 safe_error_summary(error)
                 for error in report.errors
             )
-            cleanup_errors = _bounded_diagnostics((*cleanup_errors, *interrupt_errors))
+            cleanup_errors = _diagnostics((*cleanup_errors, *interrupt_errors))
             if (
                 primary is None
                 and handle._token.is_cancelled
@@ -1679,14 +1679,14 @@ class RunController:
                 cancelled = isinstance(error, CancellationRequested)
                 detach_failure(error, note_prefix="detached finalize traceback")
             abandonment_errors = post._abandon_unconsumed_commits()
-            cleanup_errors = _bounded_diagnostics((*cleanup_errors, *abandonment_errors))
+            cleanup_errors = _diagnostics((*cleanup_errors, *abandonment_errors))
             # A broad user callback may catch the private control exception.
             # Durable ambiguity remains authoritative and cannot be swallowed.
             pending_control = pending_control or handle._pending_commit is not None
         try:
             finalization_input.dispose()
         except BaseException as error:
-            cleanup_errors = _bounded_diagnostics(
+            cleanup_errors = _diagnostics(
                 (*cleanup_errors, safe_error_summary(error))
             )
             detach_failure(error, note_prefix="detached finalization-input disposal traceback")
@@ -1723,7 +1723,7 @@ class RunController:
                 if committed:
                     errors = cleanup_errors
                     if primary_error is not None:
-                        errors = _bounded_diagnostics((*errors, primary_error))
+                        errors = _diagnostics((*errors, primary_error))
                     publish_terminal(RunState.SUCCEEDED, committed_result, None, errors)
                     return
                 error = primary_error or "ambiguous commit was durably resolved as aborted"
@@ -1732,7 +1732,7 @@ class RunController:
             handle._install_retry(
                 retry_commit,
                 "reconcile the pending commit; finalize will not be re-entered",
-                _bounded_diagnostics((*cleanup_errors, pending.last_error_summary)),
+                _diagnostics((*cleanup_errors, pending.last_error_summary)),
                 phase="commit-reconciliation-failed",
             )
             return
@@ -1768,10 +1768,7 @@ def _dispose_finalization_input(
         )
 
 
-def _bounded_diagnostics(values: tuple[str, ...]) -> tuple[str, ...]:
-    """Keep first cause and latest observation; retry count cannot grow memory."""
+def _diagnostics(values: tuple[str, ...]) -> tuple[str, ...]:
+    """Preserve every non-empty string diagnostic in observation order."""
 
-    cleaned = tuple(value[:1024] for value in values if isinstance(value, str) and value)
-    if len(cleaned) <= 2:
-        return cleaned
-    return cleaned[0], cleaned[-1]
+    return tuple(value for value in values if isinstance(value, str) and value)

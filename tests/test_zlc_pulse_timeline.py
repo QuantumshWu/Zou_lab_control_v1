@@ -233,7 +233,7 @@ def test_scan_overlays_are_typed_and_numbered_in_frozen_hardware_column_order():
     assert (overlays[1].start_tick, overlays[1].stop_tick) == (4, 9)
 
 
-def test_timeline_fingerprint_covers_the_complete_render_input_without_a_budget_mode():
+def test_timeline_fingerprint_covers_every_render_input():
     timeline = _timeline(_document())
     assert _timeline(_document()).fingerprint == timeline.fingerprint
     assert "max_timeline_items" not in signature(build_pulse_timeline).parameters

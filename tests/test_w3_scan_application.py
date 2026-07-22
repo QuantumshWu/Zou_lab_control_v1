@@ -49,10 +49,7 @@ from zlc_data import (
     commit_transform,
     materialize_transformed_snapshot,
 )
-from zlc_frontend.matplotlib_render import (
-    SinglePanelAggRenderer,
-    estimate_live_panel_raster_peak_nbytes,
-)
+from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
 from zlc_frontend.curve_display import (
     CurveDisplayState,
     curve_display_with_x_view,
@@ -60,8 +57,6 @@ from zlc_frontend.curve_display import (
 from zlc_frontend.render import AtomicBoardFront, CurvePanelPayload
 from zlc_frontend.figure import (
     AxisViewRole,
-    CURVE_CONTRACT,
-    FigureEvaluationPolicy,
     FigureEvaluator,
     ResolvedDataset,
     ResolvedDatasetMap,
@@ -70,7 +65,6 @@ from zlc_frontend.figure import (
 from zlc_neutral_atom.runtime.dataset import (
     DatasetCoverage,
     DatasetPreviewSnapshot,
-    dataset_storage_nbytes,
 )
 from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewSpec
 from zlc_neutral_atom.runtime.run import (
@@ -288,14 +282,13 @@ def _fixed_api_values(document):
     }
 
 
-def test_transform_owner_freezes_once_and_preserves_component_validity(monkeypatch):
+def test_transform_owner_freezes_once_and_preserves_component_validity():
     source, transform, schema, output_ref, values, valid = _component_snapshot_case()
     output = materialize_transformed_snapshot(
         source,
         transform,
         output_ref=output_ref,
         output_schema=schema,
-        memory_limit_bytes=64 << 20,
     )
     assert output.ref == output_ref
     assert output.block.values.shape == (2, 3, 3)
@@ -304,27 +297,6 @@ def test_transform_owner_freezes_once_and_preserves_component_validity(monkeypat
     assert output.block.validity.axis_ids == (AxisId("site"),)
     np.testing.assert_array_equal(output.block.validity.mask, valid)
     assert not output.block.values.flags.writeable
-
-    import zlc_data.transform as transform_module
-
-    executed = False
-
-    def forbidden_execute(*_args, **_kwargs):
-        nonlocal executed
-        executed = True
-        raise AssertionError("transform executed below its admitted peak")
-
-    monkeypatch.setattr(transform_module, "_execute_transform", forbidden_execute)
-    with pytest.raises(MemoryError, match="transformed snapshot peak"):
-        materialize_transformed_snapshot(
-            source,
-            transform,
-            output_ref=output_ref,
-            output_schema=schema,
-            memory_limit_bytes=1,
-        )
-    assert not executed
-
 
 def test_progressive_renderer_reuses_artists_and_updates_component_validity(monkeypatch):
     source, transform, schema, output_ref, _values, valid = (
@@ -335,7 +307,6 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity(monk
         transform,
         output_ref=output_ref,
         output_schema=schema,
-        memory_limit_bytes=64 << 20,
     )
     contract = ScanOutputContract(transform, schema)
     progressive = build_occupancy_progressive_spec(
@@ -360,9 +331,7 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity(monk
         revision(1, partial_valid),
         revision(2, valid),
     )
-    evaluator = FigureEvaluator(
-        FigureEvaluationPolicy(max_live_nbytes=progressive.evaluation_peak_bytes)
-    )
+    evaluator = FigureEvaluator()
 
     def evaluate(snapshot):
         return evaluator.evaluate(
@@ -749,9 +718,8 @@ def test_progressive_watcher_cannot_starve_single_worker_terminal_result():
 
             return PreparedScanPanelRun(progressive, start)
 
-        def project_final(self, source_ref, *, memory_limit_bytes):
+        def project_final(self, source_ref):
             assert source_ref == reference
-            assert memory_limit_bytes > 0
             png = (
                 b"\x89PNG\r\n\x1a\n"
                 b"\x00\x00\x00\rIHDR"
@@ -811,11 +779,8 @@ def test_nonmonotonic_scan_axis_uses_explicit_static_progressive_fallback():
         transform,
         output_ref=output_ref,
         output_schema=schema,
-        memory_limit_bytes=64 << 20,
     )
-    evaluated = FigureEvaluator(
-        FigureEvaluationPolicy(max_live_nbytes=progressive.evaluation_peak_bytes)
-    ).evaluate(
+    evaluated = FigureEvaluator().evaluate(
         progressive.document,
         ResolvedDatasetMap((ResolvedDataset(progressive.dataset_id, output),)),
     )
@@ -826,9 +791,7 @@ def test_nonmonotonic_scan_axis_uses_explicit_static_progressive_fallback():
         renderer.close()
 
 
-def test_progressive_site_batch_uses_the_curve_contract_exact_boundary():
-    limit = CURVE_CONTRACT.maximum_batch_series
-
+def test_progressive_site_batch_preserves_every_declared_series():
     def build(site_count: int, *, mode: str = "auto"):
         repeat = _axis(f"repeat.{site_count}", REPEAT, 1, (0,))
         scan = _axis(f"scan.{site_count}", SCAN_POINT, 2, (0.0, 1.0))
@@ -877,76 +840,16 @@ def test_progressive_site_batch_uses_the_curve_contract_exact_boundary():
             display_intent=ScanDisplayIntent(site_mode=mode),
         ), site
 
-    at_limit, at_limit_site = build(limit)
+    all_sites, site_axis = build(67)
     assert (
-        at_limit.document.layers[0].view.binding(at_limit_site.axis_id).role
+        all_sites.document.layers[0].view.binding(site_axis.axis_id).role
         is AxisViewRole.BATCH
     )
-    over_limit, over_limit_site = build(limit + 1)
-    over_binding = over_limit.document.layers[0].view.binding(
-        over_limit_site.axis_id
+    explicit, explicit_axis = build(67, mode="batch")
+    assert (
+        explicit.document.layers[0].view.binding(explicit_axis.axis_id).role
+        is AxisViewRole.BATCH
     )
-    assert over_binding.role is AxisViewRole.SELECTED
-    assert over_binding.selector.index == 0
-    with pytest.raises(ValueError, match=f"2 and {limit} sites"):
-        build(limit + 1, mode="batch")
-
-
-def test_progressive_pointer_hold_budget_has_an_exact_one_byte_admission_edge():
-    source, transform, schema, _output_ref, _values, _valid = (
-        _component_snapshot_case()
-    )
-    contract = ScanOutputContract(transform, schema)
-    progressive = build_occupancy_progressive_spec(
-        source.block.schema,
-        contract,
-        identity="pointer-hold-memory-edge",
-    )
-    base_raster = estimate_live_panel_raster_peak_nbytes(
-        800,
-        520,
-        evaluated_data_upper_bound_bytes=progressive.evaluation_peak_bytes,
-    )
-    held_raster = estimate_live_panel_raster_peak_nbytes(
-        800,
-        520,
-        evaluated_data_upper_bound_bytes=progressive.evaluation_peak_bytes,
-        extra_retained_fronts=1,
-        extra_retained_evaluated_data_bytes=(
-            progressive.evaluation_peak_bytes
-        ),
-    )
-    assert held_raster - base_raster == (
-        800 * 520 * 4 + progressive.evaluation_peak_bytes
-    )
-    assert progressive.preview_spec.downstream_peak_bytes == (
-        progressive.transform_peak_bytes
-        + progressive.evaluation_peak_bytes
-        + held_raster
-        + dataset_storage_nbytes(source.block.schema)
-    )
-
-    from zlc_neutral_atom.scan.application import _admit_final_data_limit
-
-    exact_limit = (
-        progressive.transform_peak_bytes
-        + progressive.preview_spec.downstream_peak_bytes
-    )
-    with pytest.raises(MemoryError, match="scan final data-plane peak"):
-        _admit_final_data_limit(
-            source.block.schema,
-            contract,
-            memory_limit_bytes=exact_limit - 1,
-            retained_overhead_bytes=(
-                progressive.preview_spec.downstream_peak_bytes
-            ),
-        )
-    assert _admit_final_data_limit(
-        source.block.schema,
-        contract,
-        memory_limit_bytes=exact_limit,
-        retained_overhead_bytes=progressive.preview_spec.downstream_peak_bytes,
-    ) == progressive.transform_peak_bytes
 
 
 def test_progressive_curve_preserves_multidimensional_data_and_component_validity():
@@ -1011,7 +914,6 @@ def test_progressive_curve_preserves_multidimensional_data_and_component_validit
         transform,
         output_ref=output_ref,
         output_schema=output_schema,
-        memory_limit_bytes=64 << 20,
     )
     assert output.block.values.shape == (2, 3, 3, 2)
     assert output.block.validity.mask.shape == (2, 3, 3, 2)
@@ -1029,9 +931,7 @@ def test_progressive_curve_preserves_multidimensional_data_and_component_validit
     assert component_binding.selector.index == 0
     assert "component.multi=signal" in progressive.projection_summary
 
-    evaluated = FigureEvaluator(
-        FigureEvaluationPolicy(max_live_nbytes=progressive.evaluation_peak_bytes)
-    ).evaluate(
+    evaluated = FigureEvaluator().evaluate(
         progressive.document,
         ResolvedDatasetMap((ResolvedDataset(progressive.dataset_id, output),)),
     )
@@ -1064,7 +964,7 @@ def test_progressive_curve_preserves_multidimensional_data_and_component_validit
         )
 
 
-def test_bounded_snapshot_rejects_cell_reduction():
+def test_transformed_snapshot_rejects_cell_reduction():
     repeat = _axis("repeat", REPEAT, 1, (0,))
     point = _axis("scan.point", SCAN_POINT, 2, (0, 1))
     source_schema = DatasetSchema(
@@ -1107,11 +1007,10 @@ def test_bounded_snapshot_rejects_cell_reduction():
             cell_reduction,
             output_ref=output_ref,
             output_schema=output_schema,
-            memory_limit_bytes=64 << 20,
         )
 
 
-def test_bounded_snapshot_reduces_only_the_named_trailing_axis():
+def test_transformed_snapshot_reduces_only_the_named_trailing_axis():
     source, _transform, _schema, _output_ref, _values, _valid = (
         _component_snapshot_case()
     )
@@ -1146,7 +1045,6 @@ def test_bounded_snapshot_reduces_only_the_named_trailing_axis():
         transform,
         output_ref=output_ref,
         output_schema=output_schema,
-        memory_limit_bytes=64 << 20,
     )
     assert output.block.values.shape == (2, 3)
     np.testing.assert_allclose(
@@ -1178,43 +1076,9 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
             )
             descriptor = exp.inspect_scan(request)
         assert descriptor.expected_frames == 6
-        with pytest.raises(MemoryError, match="scan final data-plane peak"):
-            exp.scan(
-                exp.readout.scan_request(
-                    document,
-                    memory_limit_bytes=1,
-                    timeout_seconds=15.0,
-                )
-            )
-        import zlc_neutral_atom.scan.application as scan_application
-
-        base_compiled = False
-
-        def forbidden_base_compile(*_args, **_kwargs):
-            nonlocal base_compiled
-            base_compiled = True
-            raise AssertionError("hardware plan compiled below static-lineage admission")
-
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                scan_application,
-                "compile_triggered_pipeline",
-                forbidden_base_compile,
-            )
-            with pytest.raises(MemoryError, match="scan static-lineage peak"):
-                exp.scan(
-                    exp.readout.scan_request(
-                        document,
-                        memory_limit_bytes=1 << 20,
-                        timeout_seconds=15.0,
-                    )
-                )
-        assert not base_compiled
         scan_ref = exp.scan(
             exp.readout.scan_request(document, timeout_seconds=15.0)
         )
-        with pytest.raises(MemoryError):
-            exp.readout.materialize_scan(scan_ref, memory_limit_bytes=1)
         data = exp.readout.materialize_scan(scan_ref)
         artifact = exp.readout.load_scan(scan_ref)
 
@@ -1301,8 +1165,6 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
 
         figure = exp.figure(scan_ref)
         assert figure.document.datasets == figure_document.datasets
-        with pytest.raises(MemoryError, match="figure render peak"):
-            figure.to_png_bytes(memory_limit_bytes=1)
         assert figure.to_png_bytes().startswith(b"\x89PNG\r\n\x1a\n")
         scan_fit = exp.fit(
             scan_ref,
@@ -1399,112 +1261,6 @@ def _assert_public_occupancy_scan(exp, monkeypatch):
         with pytest.raises(RuntimeError, match="Experiment is closed"):
             guarded.start()
 
-    malformed_prepared = _prepare_occupancy_scan_for_workbench(exp, request)
-    malformed = ExactDatasetLiveSlot(
-        ExactDatasetPreviewSpec(malformed_prepared.source_schema.fingerprint, 1)
-    )
-    with pytest.raises(MemoryError, match="frozen source snapshot"):
-        malformed_prepared.start(malformed)
-    assert malformed.terminal
-    assert "frozen source snapshot" in (malformed.failure or "")
-
-    # This port is individually valid and can retain its complete exact
-    # source.  Only its additional aggregate footprint exceeds the request's
-    # science budget, so the neutral compiler—not the facade—must reject the
-    # optional branch and admit the same Run FINAL-only.
-    rejected = _prepare_occupancy_scan_for_workbench(exp, request)
-    capacity_only = ExactDatasetLiveSlot(
-        ExactDatasetPreviewSpec(
-            rejected.source_schema.fingerprint,
-            request.memory_limit_bytes,
-        )
-    )
-    import zlc_neutral_atom.scan.application as scan_application
-
-    admitted_bases = []
-    original_admit_preview = scan_application._admit_optional_preview_data_limit
-
-    def record_preview_admission(*args, **kwargs):
-        admitted_bases.append(kwargs["retained_base_bytes"])
-        return original_admit_preview(*args, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            scan_application,
-            "_admit_optional_preview_data_limit",
-            record_preview_admission,
-        )
-        fallback_handle = rejected.start(capacity_only)
-    fallback_reference = fallback_handle.result(timeout=30.0)
-    assert isinstance(fallback_reference, zlc.ScanArtifactRef)
-    assert len(admitted_bases) == 1
-    assert admitted_bases[0] > 0
-    assert capacity_only.terminal
-    assert "scan final retained overhead" in (capacity_only.failure or "")
-    second_start = ExactDatasetLiveSlot(capacity_only.spec)
-    with pytest.raises(RuntimeError, match="one-shot"):
-        rejected.start(second_start)
-    assert second_start.terminal
-    assert "one-shot" in (second_start.failure or "")
-
-    # FINAL-transform admission is not the only phase that retains the
-    # optional preview.  The bound camera→processor preflight owns a larger
-    # independent peak formula and must drop only that branch when its science
-    # baseline still fits—before camera prepare/FIRE—rather than failing Run.
-    pipeline_rejected = _prepare_occupancy_scan_for_workbench(exp, request)
-    pipeline_progressive = build_occupancy_progressive_spec(
-        pipeline_rejected.source_schema,
-        pipeline_rejected.output_contract,
-        identity="w3-pipeline-preview-capacity",
-    )
-    pipeline_slot = _CountingExactDatasetLiveSlot(
-        pipeline_progressive.preview_spec
-    )
-    import zlc_neutral_atom.readout.occupancy_pipeline as occupancy_pipeline
-
-    original_pipeline_peak = occupancy_pipeline._estimate_peak_bytes
-    pipeline_peak_calls = []
-
-    def preview_exceeds_pipeline_only(
-        spec,
-        bound,
-        preview_spec=None,
-        *,
-        retained_overhead_bytes=0,
-    ):
-        actual = original_pipeline_peak(
-            spec,
-            bound,
-            preview_spec,
-            retained_overhead_bytes=retained_overhead_bytes,
-        )
-        pipeline_peak_calls.append(preview_spec is not None)
-        if preview_spec is not None:
-            actual_baseline = original_pipeline_peak(
-                spec,
-                bound,
-                None,
-                retained_overhead_bytes=retained_overhead_bytes,
-            )
-            assert actual - actual_baseline == preview_spec.downstream_peak_bytes
-            return spec.memory_limit_bytes + 1
-        assert actual <= spec.memory_limit_bytes
-        return actual
-
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            occupancy_pipeline,
-            "_estimate_peak_bytes",
-            preview_exceeds_pipeline_only,
-        )
-        pipeline_handle = pipeline_rejected.start(pipeline_slot)
-        pipeline_reference = pipeline_handle.result(timeout=30.0)
-    assert isinstance(pipeline_reference, zlc.ScanArtifactRef)
-    assert pipeline_peak_calls == [True, False]
-    assert pipeline_slot.bind_calls == 0
-    assert pipeline_slot.terminal
-    assert "optional preview" in (pipeline_slot.failure or "")
-
     import zlc_neutral_atom.timing.occupancy as timing_occupancy
 
     failed_prepared = _prepare_occupancy_scan_for_workbench(exp, request)
@@ -1543,10 +1299,8 @@ def _assert_public_occupancy_scan(exp, monkeypatch):
         if binding.axis_id == site_axis.axis_id
     )
     assert site_axis.size == 35
-    assert site_axis.size > CURVE_CONTRACT.maximum_batch_series
-    assert site_binding.role is AxisViewRole.SELECTED
-    assert site_binding.selector.index == 0
-    assert f"{site_axis.name}={site_axis.coordinate_at(0)}" in (
+    assert site_binding.role is AxisViewRole.BATCH
+    assert f"{site_axis.name}=batch/{site_axis.size}" in (
         progressive.projection_summary
     )
     slot = _CountingExactDatasetLiveSlot(progressive.preview_spec)

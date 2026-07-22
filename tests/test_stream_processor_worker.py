@@ -238,7 +238,6 @@ def cells(schema: DatasetSchema) -> tuple[DatasetCellAddress, ...]:
 @dataclass(frozen=True)
 class _NoDatasetMetadataContract:
     fingerprint: str = "7" * 64
-    max_retained_nbytes: int = 0
 
     @staticmethod
     def snapshot(_payload):
@@ -248,11 +247,6 @@ class _NoDatasetMetadataContract:
     def validate(metadata):
         if metadata is not None:
             raise TypeError("value event has no metadata")
-
-    @staticmethod
-    def retained_nbytes(metadata):
-        _NoDatasetMetadataContract.validate(metadata)
-        return 0
 
     @staticmethod
     def digest(metadata):
@@ -403,7 +397,6 @@ def two_stage_chain(
         key_contract = source._join_key_contract
         if not isinstance(key_contract, DatasetCellKeyContract):
             raise TypeError("source_pair must use DatasetCellKeyContract")
-    budget = points * payload.max_retained_nbytes
     deadline = time.monotonic() + 3.0
 
     if source_pair is None:
@@ -412,13 +405,11 @@ def two_stage_chain(
             payload,
             flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
             retention_events=points,
-            retention_bytes=budget,
             join_key_contract=key_contract,
         )
     source_reservation = source.reserve(
         total_events=points,
         max_inflight_events=points,
-        max_inflight_bytes=budget,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-source"),
     )
     source_cursor = source_reservation.activate()
@@ -429,13 +420,11 @@ def two_stage_chain(
         payload,
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=retained,
-        retention_bytes=retained * payload.max_retained_nbytes,
         join_key_contract=key_contract,
     )
     intermediate_reservation = intermediate.reserve(
         total_events=points,
         max_inflight_events=retained,
-        max_inflight_bytes=retained * payload.max_retained_nbytes,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-first"),
     )
     intermediate_cursor = intermediate_reservation.activate()
@@ -455,13 +444,11 @@ def two_stage_chain(
         payload,
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=points,
-        retention_bytes=budget,
         join_key_contract=key_contract,
     )
     output_reservation = output.reserve(
         total_events=points,
         max_inflight_events=points,
-        max_inflight_bytes=budget,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-second"),
     )
     output_cursor = output_reservation.activate()
@@ -512,11 +499,8 @@ def two_stage_chain(
         downstream_readiness=downstream_readiness,
         deadline_monotonic=deadline,
     )
-    monitor = output.monitor(max_events=points, max_bytes=budget)
-    intermediate_monitor = intermediate.monitor(
-        max_events=points,
-        max_bytes=budget,
-    )
+    monitor = output.monitor(max_events=points)
+    intermediate_monitor = intermediate.monitor(max_events=points)
     if start_first:
         first.start()
     return TwoStageChain(
@@ -596,13 +580,11 @@ def chain(
         payload,
         flow_control=flow_control,
         retention_events=retention,
-        retention_bytes=retention * payload.max_retained_nbytes,
         join_key_contract=key_contract,
     )
     reservation = source.reserve(
         total_events=points,
         max_inflight_events=retention,
-        max_inflight_bytes=retention * payload.max_retained_nbytes,
         trace_binding=TraceBinding("synthetic-run", "synthetic-source"),
     )
     cursor = reservation.activate()
@@ -611,7 +593,6 @@ def chain(
         output_payload,
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=points,
-        retention_bytes=points * output_payload.max_retained_nbytes,
         join_key_contract=(
             key_contract
             if share_join_owner
@@ -621,7 +602,6 @@ def chain(
     output_reservation = output.reserve(
         total_events=points,
         max_inflight_events=points,
-        max_inflight_bytes=points * output_payload.max_retained_nbytes,
         trace_binding=TraceBinding(output_trace_run_id, output_trace_source_id),
     )
     output_cursor = output_reservation.activate()
@@ -672,10 +652,7 @@ def chain(
         deadline_monotonic=time.monotonic() + absolute_deadline_seconds,
         cancellation=cancellation,
     )
-    monitor = output.monitor(
-        max_events=points,
-        max_bytes=points * output_payload.max_retained_nbytes,
-    )
+    monitor = output.monitor(max_events=points)
     return Chain(
         data_schema,
         result_schema,
@@ -737,12 +714,8 @@ def test_post_commit_monitor_offer_failure_terminalizes_the_stream_generation(
         payload_contract,
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=1,
-        retention_bytes=payload_contract.max_retained_nbytes,
     )
-    tap = stream.monitor(
-        max_events=1,
-        max_bytes=payload_contract.max_retained_nbytes,
-    )
+    tap = stream.monitor(max_events=1)
     tap_type = type(tap)
     real_offer = tap_type._offer
 
@@ -966,7 +939,6 @@ def test_gap_and_join_key_mismatch_are_fail_closed():
     with gap.source._condition:
         gap.source._records.clear()
         gap.source._order.clear()
-        gap.source._retained_bytes = 0
     gap.worker.start()
     gap.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
@@ -1240,24 +1212,6 @@ def test_artifact_input_ref_snapshots_only_canonical_owner_bytes():
     )
     with pytest.raises(ValueError, match="too many direct artifact inputs"):
         ProcessorStageProvenance("d" * 64, many)
-
-    large = tuple(
-        ArtifactInputRef(
-            schema_id,
-            encode(
-                {
-                    "schema": schema_id,
-                    "id": index,
-                    "blob": "x" * (60 * 1024),
-                }
-            ),
-            f"{index + 100:064x}",
-        )
-        for index in range(18)
-    )
-    with pytest.raises(ValueError, match="byte budget"):
-        ProcessorStageProvenance("d" * 64, large)
-
 
 @pytest.mark.parametrize(
     "dtype",
@@ -1782,7 +1736,6 @@ def test_downstream_gap_propagates_without_acknowledging_upstream_input():
     with item.intermediate._condition:
         item.intermediate._records.clear()
         item.intermediate._order.clear()
-        item.intermediate._retained_bytes = 0
     CHAIN_CURSOR_RELEASE.set()
     item.first.wait(2.0)
 
@@ -1833,20 +1786,17 @@ def test_stale_downstream_readiness_cannot_bind_an_upstream_worker():
     schedule = cells(data_schema)
     payload = ValuePayloadContract(data_schema.cell_schema)
     key_contract = DatasetCellKeyContract.from_schema(data_schema)
-    budget = payload.max_retained_nbytes
     deadline = time.monotonic() + 2.0
     intermediate, intermediate_producer = AcquisitionStream.create(
         StreamId("synthetic.stale.intermediate"),
         payload,
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=1,
-        retention_bytes=budget,
         join_key_contract=key_contract,
     )
     intermediate_reservation = intermediate.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=budget,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-first"),
     )
     intermediate_cursor = intermediate_reservation.activate()
@@ -1855,13 +1805,11 @@ def test_stale_downstream_readiness_cannot_bind_an_upstream_worker():
         payload,
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=1,
-        retention_bytes=budget,
         join_key_contract=key_contract,
     )
     output_reservation = output.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=budget,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-second"),
     )
     output_cursor = output_reservation.activate()
@@ -1898,13 +1846,11 @@ def test_stale_downstream_readiness_cannot_bind_an_upstream_worker():
         payload,
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=1,
-        retention_bytes=budget,
         join_key_contract=key_contract,
     )
     raw_reservation = raw.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=budget,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-source"),
     )
     raw_cursor = raw_reservation.activate()

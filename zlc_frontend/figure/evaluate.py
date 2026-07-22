@@ -6,7 +6,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import product
 import math
-from numbers import Integral, Real
+from numbers import Real
 import time
 from typing import Any, Callable, Sequence
 
@@ -69,52 +69,10 @@ class FigureEvaluationDeadlineExceeded(FigureEvaluationError):
     """Evaluation crossed its caller-provided monotonic deadline."""
 
 
-class FigureEvaluationLimitExceeded(FigureEvaluationError):
-    """A document exceeds the configured finite evaluation budget."""
-
-
-@dataclass(frozen=True)
-class FigureEvaluationPolicy:
-    """Finite headless evaluation budgets; this is not an execution engine."""
-
-    max_layers: int = 32
-    max_cells: int = 256
-    max_series: int = 2048
-    max_output_elements: int = 6_000_000
-    max_histogram_samples: int = 100_000
-    max_live_nbytes: int = 256 * 1024 * 1024
-    max_physical_rows: int = 500_000
-    max_reduction_contributions: int = 32_000_000
-
-    def __post_init__(self) -> None:
-        for field in (
-            "max_layers",
-            "max_cells",
-            "max_series",
-            "max_output_elements",
-            "max_histogram_samples",
-            "max_live_nbytes",
-            "max_physical_rows",
-            "max_reduction_contributions",
-        ):
-            value = getattr(self, field)
-            if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
-                raise ValueError(f"{field} must be a positive integer")
-            object.__setattr__(self, field, int(value))
-
-
 @dataclass
 class _EvaluationGuard:
-    policy: FigureEvaluationPolicy
     cancel_requested: Callable[[], bool] | None
     monotonic_deadline: float | None
-    cells: int = 0
-    series: int = 0
-    output_elements: int = 0
-    histogram_samples: int = 0
-    retained_nbytes: int = 0
-    physical_rows: int = 0
-    reduction_contributions: int = 0
 
     def check(self) -> None:
         if self.cancel_requested is not None and self.cancel_requested():
@@ -124,54 +82,6 @@ class _EvaluationGuard:
             and time.monotonic() >= self.monotonic_deadline
         ):
             raise FigureEvaluationDeadlineExceeded("figure evaluation deadline exceeded")
-
-    def reserve_layer(
-        self,
-        *,
-        cells: int,
-        series: int,
-        output_elements: int,
-        histogram_samples: int,
-        retained_nbytes: int,
-        peak_live_nbytes: int,
-        physical_rows: int,
-        reduction_contributions: int,
-    ) -> None:
-        additions = {
-            "physical_rows": physical_rows,
-            "reduction_contributions": reduction_contributions,
-            "cells": cells,
-            "series": series,
-            "output_elements": output_elements,
-            "histogram_samples": histogram_samples,
-        }
-        limits = {
-            "physical_rows": self.policy.max_physical_rows,
-            "reduction_contributions": self.policy.max_reduction_contributions,
-            "cells": self.policy.max_cells,
-            "series": self.policy.max_series,
-            "output_elements": self.policy.max_output_elements,
-            "histogram_samples": self.policy.max_histogram_samples,
-        }
-        totals = {
-            field: getattr(self, field) + amount
-            for field, amount in additions.items()
-        }
-        for field, total in totals.items():
-            if total > limits[field]:
-                raise FigureEvaluationLimitExceeded(
-                    f"figure {field} budget {total} exceeds limit {limits[field]}"
-                )
-        projected_live_nbytes = self.retained_nbytes + peak_live_nbytes
-        if projected_live_nbytes > self.policy.max_live_nbytes:
-            raise FigureEvaluationLimitExceeded(
-                "figure live_nbytes budget "
-                f"{projected_live_nbytes} exceeds limit {self.policy.max_live_nbytes}"
-            )
-        for field, total in totals.items():
-            setattr(self, field, total)
-        self.retained_nbytes += retained_nbytes
-
 
 @dataclass(frozen=True)
 class ResolvedDataset:
@@ -281,14 +191,6 @@ def _select_axis(
     return array[tuple(selection)]
 
 
-def _is_full_selection(indices: Sequence[int] | np.ndarray, size: int) -> bool:
-    if len(indices) != size:
-        return False
-    if isinstance(indices, range):
-        return indices.step == 1 and indices.start == 0 and indices.stop == size
-    return all(int(index) == expected for expected, index in enumerate(indices))
-
-
 def _ordered_selection_axes(
     axes: Sequence[AxisSpec],
     choices: dict[AxisId, Sequence[int] | int],
@@ -319,28 +221,6 @@ def _select_named_axes(
         if isinstance(choice, int):
             active.remove(axis)
     return array, tuple(active)
-
-
-def _selection_peak_elements(
-    row_count: int,
-    row_gather: bool,
-    axes: Sequence[AxisSpec],
-    choices: dict[AxisId, Sequence[int] | int],
-) -> int:
-    """Peak owned elements for the same ordered orthogonal selection."""
-
-    current = row_count * math.prod(axis.size for axis in axes)
-    allocated = current if row_gather else 0
-    peak = allocated
-    for axis in _ordered_selection_axes(axes, choices):
-        choice = choices[axis.axis_id]
-        selected = 1 if isinstance(choice, int) else len(choice)
-        result = current // axis.size * selected
-        if not isinstance(choice, (int, range)):
-            peak = max(peak, allocated + result)
-            allocated = result
-        current = result
-    return max(peak, allocated)
 
 
 def _component_validity(
@@ -541,48 +421,6 @@ def _slice_working(
     )
 
 
-def _layer_budget(view, allowed) -> tuple[int, int, int, int]:
-    cardinality = {axis_id: len(indices) for axis_id, indices in allowed.items()}
-    facet_cells = math.prod(
-        cardinality[binding.axis_id]
-        for binding in view.axis_bindings
-        if binding.role is AxisViewRole.FACET
-    )
-    batch_per_cell = math.prod(
-        cardinality[binding.axis_id]
-        for binding in view.axis_bindings
-        if binding.role is AxisViewRole.BATCH
-    )
-    series = facet_cells * batch_per_cell
-    if view.intent is ViewIntent.IMAGE:
-        per_series = math.prod(
-            cardinality[binding.axis_id]
-            for binding in view.axis_bindings
-            if binding.role in (AxisViewRole.IMAGE_X, AxisViewRole.IMAGE_Y)
-        )
-    elif view.intent is ViewIntent.CURVE:
-        per_series = next(
-            cardinality[binding.axis_id]
-            for binding in view.axis_bindings
-            if binding.role is AxisViewRole.X
-        )
-    elif view.intent is ViewIntent.HISTOGRAM:
-        per_series = math.prod(
-            cardinality[binding.axis_id]
-            for binding in view.axis_bindings
-            if binding.role is AxisViewRole.SAMPLE
-        )
-    elif view.intent is ViewIntent.METER:
-        per_series = 1
-    else:
-        raise FigureEvaluationError(
-            f"{view.intent.value} has no DatasetSchema evaluation path"
-        )
-    output_elements = series * per_series
-    histogram_samples = output_elements if view.intent is ViewIntent.HISTOGRAM else 0
-    return facet_cells, series, output_elements, histogram_samples
-
-
 def _reduction_output_dtype(
     input_dtype: np.dtype,
     method: DisplayReductionMethod,
@@ -611,246 +449,6 @@ def _single_contributor_reduction_dtype(
     if input_dtype.kind in "biu":
         return input_dtype
     return _reduction_output_dtype(input_dtype, binding.reduction.method)
-
-
-def _layer_resource_upper_bound(
-    schema: DatasetSchema,
-    allowed,
-    fixed_indices: dict[AxisId, int],
-    view: ViewSpec,
-) -> tuple[int, int, int, int]:
-    """Bound evaluator-owned live arrays/bytes before materialization.
-
-    The bound excludes the caller-owned immutable input snapshot and general
-    interpreter/allocator overhead.  It includes retained DTO backing bytes,
-    array scratch, and explicit grouping/coordinate-object allowances.
-    """
-
-    physical_rows = schema.repeat_axis.size * schema.point_layout.storage_size
-    value_dtype = schema.cell_schema.dtype
-    value_bytes = value_dtype.itemsize
-    bool_bytes = np.dtype(bool).itemsize
-    int64_bytes = np.dtype(np.int64).itemsize
-    intp_bytes = np.dtype(np.intp).itemsize
-    coordinate_entry_bytes = 128
-    cell_axis_count = 1 + len(schema.point_axes)
-
-    # Coordinate/filter arrays are always materialized.  Full/contiguous value
-    # selections remain views; a true gather may coexist with its source once.
-    cell_workspace = physical_rows * (
-        (2 * cell_axis_count * int64_bytes)
-        + ((1 + cell_axis_count) * bool_bytes)
-        + intp_bytes
-    )
-    cell_axes = (schema.repeat_axis, *schema.point_axes)
-    row_gather = any(
-        (axis.axis_id in fixed_indices and axis.size > 1)
-        or not _is_full_selection(allowed[axis.axis_id], axis.size)
-        for axis in cell_axes
-    )
-    data_choices = {
-        axis.axis_id: (
-            fixed_indices[axis.axis_id]
-            if axis.axis_id in fixed_indices
-            else allowed[axis.axis_id]
-        )
-        for axis in schema.cell_schema.data_axes
-    }
-    extraction_workspace = _selection_peak_elements(
-        physical_rows,
-        row_gather,
-        schema.cell_schema.data_axes,
-        data_choices,
-    ) * (value_bytes + bool_bytes)
-    selection_index_workspace = max(
-        (
-            len(choice) * intp_bytes
-            for choice in data_choices.values()
-            if not isinstance(choice, (int, range))
-        ),
-        default=0,
-    )
-
-    reductions = tuple(
-        binding for binding in view.axis_bindings if binding.role is AxisViewRole.REDUCED
-    )
-    _, series, output_elements, histogram_samples = _layer_budget(view, allowed)
-    cardinality = {axis_id: len(indices) for axis_id, indices in allowed.items()}
-    unresolved_roles = {
-        AxisViewRole.X,
-        AxisViewRole.IMAGE_X,
-        AxisViewRole.IMAGE_Y,
-        AxisViewRole.SAMPLE,
-        AxisViewRole.REDUCED,
-    }
-    cell_axis_ids = {axis.axis_id for axis in cell_axes}
-    series_cell_rows = min(
-        physical_rows,
-        math.prod(
-            cardinality[binding.axis_id]
-            for binding in view.axis_bindings
-            if binding.axis_id in cell_axis_ids and binding.role in unresolved_roles
-        ),
-    )
-    series_data_elements = math.prod(
-        cardinality[binding.axis_id]
-        for binding in view.axis_bindings
-        if binding.axis_id not in cell_axis_ids and binding.role in unresolved_roles
-    )
-    series_elements = series_cell_rows * series_data_elements
-    reduction_contributions = series * series_elements if reductions else 0
-    series_output_elements = output_elements // series
-    later_fixed_cell_axis = any(
-        binding.axis_id in cell_axis_ids
-        and binding.axis_id not in fixed_indices
-        and cardinality[binding.axis_id] > 1
-        and binding.role
-        in (
-            AxisViewRole.BATCH,
-            AxisViewRole.FACET,
-            AxisViewRole.SELECTED,
-            AxisViewRole.SLIDER,
-        )
-        for binding in view.axis_bindings
-    )
-    series_workspace = (
-        series_elements * (value_bytes + bool_bytes)
-        if later_fixed_cell_axis and series_cell_rows > 1
-        else 0
-    )
-    workspace_nbytes = (
-        cell_workspace
-        + extraction_workspace
-        + selection_index_workspace
-        + series_workspace
-    )
-    method = reductions[0].reduction.method if reductions else None
-    reduced_contributors_per_output = (
-        math.prod(len(allowed[binding.axis_id]) for binding in reductions)
-        if reductions
-        else 0
-    )
-    axis_by_id = {axis.axis_id: axis for axis in dataset_axes(schema)}
-    singleton_dtype = _single_contributor_reduction_dtype(
-        value_dtype,
-        reductions,
-        axis_by_id,
-        reduced_contributors_per_output,
-    )
-    output_dtype = (
-        value_dtype
-        if method is None
-        else (
-            singleton_dtype
-            if singleton_dtype is not None
-            else _reduction_output_dtype(value_dtype, method)
-        )
-    )
-    output_bytes = output_dtype.itemsize
-    retained_array_nbytes = output_elements * (output_bytes + bool_bytes)
-    display_coordinate_count = series * sum(
-        len(allowed[binding.axis_id])
-        for binding in view.axis_bindings
-        if binding.role
-        in (AxisViewRole.X, AxisViewRole.IMAGE_X, AxisViewRole.IMAGE_Y)
-    )
-    retained_nbytes = retained_array_nbytes + (
-        coordinate_entry_bytes * display_coordinate_count
-    )
-    if view.intent is ViewIntent.HISTOGRAM:
-        sample_axis_count = sum(
-            binding.role is AxisViewRole.SAMPLE for binding in view.axis_bindings
-        )
-        retained_nbytes = (
-            histogram_samples * output_bytes
-            + histogram_samples * sample_axis_count * coordinate_entry_bytes
-        )
-    elif view.intent is ViewIntent.METER:
-        retained_nbytes = series * 256
-
-    peak_live_nbytes = workspace_nbytes + retained_nbytes
-    if reductions:
-        assert method is not None
-        # OrderedDict keys/lists and row-index matrices are Python-heavy.  A
-        # 128 B/physical-row plus 40 B/cell-axis intentionally overstates
-        # compact rectangular cases while covering tuple/PyLong growth; a small
-        # output cannot hide grouping cost.  Array terms cover grouped
-        # values/validity, np.where safe input, canonical accumulator,
-        # worst-case output, counts, and output validity.
-        grouping_workspace = series_cell_rows * (
-            128 + intp_bytes + (40 * cell_axis_count)
-        )
-        if singleton_dtype is not None:
-            # One canonical builder coexists with its immutable DTO bytes.
-            peak_live_nbytes += grouping_workspace + (
-                series_output_elements * singleton_dtype.itemsize
-            )
-        else:
-            contribution_arrays = series_elements * (
-                (2 * value_bytes) + bool_bytes + output_bytes
-            )
-            reduced_output_arrays = series_output_elements * (
-                (3 * output_bytes) + int64_bytes + bool_bytes
-            )
-            peak_live_nbytes += (
-                grouping_workspace
-                + contribution_arrays
-                + reduced_output_arrays
-            )
-            if (
-                method is DisplayReductionMethod.SUM
-                and value_dtype.kind in "iu"
-                and reduced_contributors_per_output > 1
-            ):
-                # checked_numeric_sum may promote every contribution to a Python
-                # integer for exact overflow detection.  Pointer + PyLong + allocator
-                # overhead is conservatively budgeted as 64 B/contribution.
-                peak_live_nbytes += 64 * series_elements
-
-    data_axis_ids = {
-        axis.axis_id for axis in schema.cell_schema.data_axes
-    }
-    display_axis_ids = {
-        binding.axis_id
-        for binding in view.axis_bindings
-        if binding.role
-        in (AxisViewRole.X, AxisViewRole.IMAGE_X, AxisViewRole.IMAGE_Y)
-    }
-    direct_assembly = (
-        view.intent is ViewIntent.IMAGE and display_axis_ids <= data_axis_ids
-    ) or (
-        view.intent is ViewIntent.CURVE and display_axis_ids <= data_axis_ids
-    )
-    if not direct_assembly and view.intent in (ViewIntent.IMAGE, ViewIntent.CURVE):
-        peak_live_nbytes += series_output_elements * (output_bytes + bool_bytes)
-    elif view.intent is ViewIntent.HISTOGRAM:
-        peak_live_nbytes += series_output_elements * output_bytes
-    return (
-        physical_rows,
-        reduction_contributions,
-        retained_nbytes,
-        peak_live_nbytes,
-    )
-
-
-def estimate_view_evaluation_peak_nbytes(
-    schema: DatasetSchema,
-    view: ViewSpec,
-) -> int:
-    """Bound one view's evaluator-owned peak from frozen metadata only."""
-
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    if not isinstance(view, ViewSpec):
-        raise TypeError("view must be ViewSpec")
-    validate_view_spec(schema, view)
-    allowed = _selection_index_sets(schema, view)
-    fixed = {
-        binding.axis_id: binding.selector.index
-        for binding in view.axis_bindings
-        if isinstance(binding.selector, FixedIndex)
-    }
-    return _layer_resource_upper_bound(schema, allowed, fixed, view)[3]
 
 
 def _reduce(
@@ -1272,11 +870,6 @@ def _combinations(axes: tuple[AxisSpec, ...], allowed):
 class FigureEvaluator:
     """Evaluate a FigureDocument without importing any renderer or authority transform."""
 
-    def __init__(self, policy: FigureEvaluationPolicy | None = None) -> None:
-        self._policy = FigureEvaluationPolicy() if policy is None else policy
-        if not isinstance(self._policy, FigureEvaluationPolicy):
-            raise TypeError("policy must be FigureEvaluationPolicy or None")
-
     def evaluate(
         self,
         document: FigureDocument,
@@ -1299,11 +892,7 @@ class FigureEvaluator:
             ):
                 raise ValueError("monotonic_deadline must be finite numeric time or None")
             monotonic_deadline = float(monotonic_deadline)
-        if len(document.layers) > self._policy.max_layers:
-            raise FigureEvaluationLimitExceeded(
-                f"figure layer count {len(document.layers)} exceeds limit {self._policy.max_layers}"
-            )
-        guard = _EvaluationGuard(self._policy, cancel_requested, monotonic_deadline)
+        guard = _EvaluationGuard(cancel_requested, monotonic_deadline)
         guard.check()
         evaluated_layers = []
         inputs: dict[DatasetId, EvaluatedInput] = {}
@@ -1350,26 +939,6 @@ class FigureEvaluator:
             ),
             None,
         )
-        cells, series_count, output_elements, histogram_samples = _layer_budget(
-            view, allowed
-        )
-        (
-            physical_rows,
-            reduction_contributions,
-            retained_nbytes,
-            peak_live_nbytes,
-        ) = _layer_resource_upper_bound(block.schema, allowed, fixed, view)
-        guard.reserve_layer(
-            cells=cells,
-            series=series_count,
-            output_elements=output_elements,
-            histogram_samples=histogram_samples,
-            retained_nbytes=retained_nbytes,
-            peak_live_nbytes=peak_live_nbytes,
-            physical_rows=physical_rows,
-            reduction_contributions=reduction_contributions,
-        )
-        guard.check()
         working_base = _extract(block, fixed, allowed)
         guard.check()
         resolutions = [
@@ -1497,10 +1066,7 @@ __all__ = [
     "FigureEvaluationCancelled",
     "FigureEvaluationDeadlineExceeded",
     "FigureEvaluationError",
-    "FigureEvaluationLimitExceeded",
-    "FigureEvaluationPolicy",
     "FigureEvaluator",
     "ResolvedDataset",
     "ResolvedDatasetMap",
-    "estimate_view_evaluation_peak_nbytes",
 ]

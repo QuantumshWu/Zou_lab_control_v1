@@ -22,7 +22,7 @@ from zlc_neutral_atom.readout.calibration import (
 )
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
 from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
-from zlc_storage import positive_integer, positive_real
+from zlc_storage import positive_real
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -32,7 +32,6 @@ class CalibrationEditorSeed:
     source_capture_ref: CaptureArtifactRef
     readout_binding: ReadoutBindingKey
     analysis: CalibrationAnalysisRequest
-    memory_limit_bytes: int
     timeout_seconds: float
     previous_reference: CalibrationArtifactRef | None = None
 
@@ -43,11 +42,6 @@ class CalibrationEditorSeed:
             raise TypeError("readout_binding must be ReadoutBindingKey")
         if not isinstance(self.analysis, CalibrationAnalysisRequest):
             raise TypeError("analysis must be CalibrationAnalysisRequest")
-        object.__setattr__(
-            self,
-            "memory_limit_bytes",
-            positive_integer(self.memory_limit_bytes, "memory_limit_bytes"),
-        )
         object.__setattr__(
             self,
             "timeout_seconds",
@@ -66,7 +60,6 @@ def calibration_seed_from_computation(
     computation: object,
     reference: CalibrationArtifactRef,
     *,
-    memory_limit_bytes: int,
     timeout_seconds: float,
 ) -> CalibrationEditorSeed:
     """Project one paired, admitted computation into an immutable editor seed."""
@@ -82,7 +75,6 @@ def calibration_seed_from_computation(
         artifact.source_binding.source_capture_ref,
         artifact.frame_contract.binding,
         computation.report.request,
-        memory_limit_bytes,
         timeout_seconds,
         reference,
     )

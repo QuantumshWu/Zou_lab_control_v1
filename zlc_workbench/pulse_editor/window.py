@@ -50,6 +50,7 @@ from ._layout import px
 from .controller import (
     PulseEditorController,
     PulseEditorControllerSnapshot,
+    PulseEditorLocalDelta,
     PulseEditorProjection,
 )
 from .preview_view import PulsePreviewView
@@ -103,6 +104,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._window = None
         self._last_snapshot: PulseEditorControllerSnapshot | None = None
         self._last_editor_projection: PulseEditorProjection | None = None
+        self._last_scan_workspace = None
         self._editor_projection_pending = False
         self._owner_cycle_active = False
         self._owner_cycle_pending = False
@@ -391,14 +393,64 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         except BaseException as error:
             self._message(str(error))
             return None
-        self._queue_editor_projection()
-        return result
+        if result is None:
+            return None
+        if isinstance(result, PulseEditorLocalDelta):
+            if not self._apply_editor_delta(result):
+                self._message(
+                    "Internal Pulse editor error: a local edit did not match "
+                    "the displayed revision; reload the document."
+                )
+                return None
+            return result
+        self._message(
+            "Internal Pulse editor error: an authoring action returned no "
+            "closed local delta."
+        )
+        return None
 
-    def _queue_editor_projection(self) -> None:
+    def _queue_full_editor_reconcile(self) -> None:
         if self._editor_projection_pending:
             return
         self._editor_projection_pending = True
         QtCore.QTimer.singleShot(0, self._present_editor_projection)
+
+    def _apply_editor_delta(self, delta: PulseEditorLocalDelta) -> bool:
+        """Present one local edit without constructing a document projection."""
+
+        runtime = self._last_snapshot
+        previous_editor = self._last_editor_projection
+        if runtime is None or previous_editor is None:
+            return False
+        if not self.schedule_view.apply_local_delta(delta):
+            return False
+        self.summary.setText(self.schedule_view.summary_text())
+        if delta.scan_sweep_count is not None:
+            self.scan_view.set_repeats(delta.scan_sweep_count)
+        if delta.scan_slots_text is not None:
+            self.scan_view.set_slots_text(delta.scan_slots_text)
+        if delta.scan_workspace is not None:
+            self._apply_scan_workspace_value(
+                delta.scan_workspace,
+                runtime,
+                self._last_scan_workspace,
+            )
+            self._last_scan_workspace = delta.scan_workspace
+        self._apply_file_and_run_state_values(
+            name=delta.document.name,
+            path=previous_editor.path,
+            file_state=previous_editor.file_state,
+            dirty=self._controller.dirty,
+            document_generation=delta.document_generation,
+            editor_revision=delta.editor_revision,
+            runtime=runtime,
+        )
+        if (
+            delta.editor_revision != delta.base_revision
+            and self.tabs.currentWidget() is self.preview_view
+        ):
+            self._controller.request_preview()
+        return True
 
     def _present_editor_projection(self) -> None:
         self._editor_projection_pending = False
@@ -447,16 +499,17 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
                 cancel_text="Keep draft",
             ):
                 return
-            self._invoke_editor(
-                self._controller.apply_target_manifest,
-                manifest,
-                cascade=True,
-            )
+            try:
+                self._controller.apply_target_manifest(manifest, cascade=True)
+            except BaseException as error:
+                self._message(str(error))
+                return
+            self._queue_full_editor_reconcile()
             return
         except BaseException as error:
             self._message(str(error))
             return
-        self._queue_editor_projection()
+        self._queue_full_editor_reconcile()
 
     def _current_preview_pixel_ratio(self) -> float:
         """Read the physical/logical ratio of the screen painting this window."""
@@ -571,7 +624,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             self._message(str(error))
 
     def _load_scan_array(self) -> None:
-        if not self._controller.editor_projection().document.scan_parameters:
+        if not self._controller.current_document.scan_parameters:
             self._message(
                 "Bind at least one field to a scan slot (click a dot) before "
                 "loading an array."
@@ -850,6 +903,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
                 runtime,
                 previous_editor,
             )
+            self._last_scan_workspace = projection.scan_workspace
         self._last_editor_projection = projection
 
     @staticmethod
@@ -984,6 +1038,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             )
         self._last_snapshot = snapshot
         self._last_editor_projection = editor
+        self._last_scan_workspace = editor.scan_workspace
         self._sync_runtime_watchers()
 
     def _sync_runtime_watchers(self) -> None:
@@ -1005,7 +1060,18 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         runtime: PulseEditorControllerSnapshot,
         previous_editor: PulseEditorProjection | None,
     ) -> None:
-        workspace = editor.scan_workspace
+        self._apply_scan_workspace_value(
+            editor.scan_workspace,
+            runtime,
+            None if previous_editor is None else previous_editor.scan_workspace,
+        )
+
+    def _apply_scan_workspace_value(
+        self,
+        workspace,
+        runtime: PulseEditorControllerSnapshot,
+        previous_workspace,
+    ) -> None:
         loaded_path = "" if workspace.loaded_path is None else str(workspace.loaded_path)
         self.schedule_view.set_scan_source(
             use_loaded=workspace.selected_source == "loaded",
@@ -1067,8 +1133,8 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 
         previous_diagnostic = (
             ""
-            if previous_editor is None
-            else previous_editor.scan_workspace.diagnostic
+            if previous_workspace is None
+            else previous_workspace.diagnostic
         )
         if workspace.diagnostic and workspace.diagnostic != previous_diagnostic:
             lowered = workspace.diagnostic.lower()
@@ -1082,13 +1148,34 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         editor: PulseEditorProjection,
         runtime: PulseEditorControllerSnapshot,
     ) -> None:
-        local = editor.path.name if editor.path is not None else ""
-        name = editor.document.name.strip() or "pulse"
-        if editor.dirty:
+        self._apply_file_and_run_state_values(
+            name=editor.document.name,
+            path=editor.path,
+            file_state=editor.file_state,
+            dirty=editor.dirty,
+            document_generation=editor.document_generation,
+            editor_revision=editor.editor_revision,
+            runtime=runtime,
+        )
+
+    def _apply_file_and_run_state_values(
+        self,
+        *,
+        name: str,
+        path: Path | None,
+        file_state: str,
+        dirty: bool,
+        document_generation: int,
+        editor_revision: int,
+        runtime: PulseEditorControllerSnapshot,
+    ) -> None:
+        local = path.name if path is not None else ""
+        name = str(name).strip() or "pulse"
+        if dirty:
             status = "unsaved" if local else "new"
             star = "*"
         else:
-            status = editor.file_state if local else "new"
+            status = file_state if local else "new"
             star = "" if local else "*"
         if local:
             self.label_name.setText(
@@ -1105,8 +1192,8 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         synchronized = (
             run is not None
             and run.state is RunState.RUNNING
-            and runtime.run_generation == editor.document_generation
-            and runtime.run_revision == editor.editor_revision
+            and runtime.run_generation == document_generation
+            and runtime.run_revision == editor_revision
         )
         if runtime.run_busy and run is None:
             color = YELLOW
@@ -1116,7 +1203,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             color = RED
         elif run is not None and run.state is RunState.FAILED:
             color = RED
-        elif runtime.connection_state == "ready" and editor.dirty:
+        elif runtime.connection_state == "ready" and dirty:
             color = ORANGE
         else:
             color = GREY if run is None else RED
@@ -1124,7 +1211,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self.schedule_view.set_control_state(
             running=bool(run is not None and run.state is RunState.RUNNING),
             synchronized=synchronized,
-            file_dirty=editor.dirty,
+            file_dirty=dirty,
             file_busy=runtime.file_busy,
             run_busy=runtime.run_busy,
         )
@@ -1238,9 +1325,9 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
                     )
                     self._pending_preview_origin = None
                     self._pending_preview_revision = None
-                self.preview_view.set_status(
-                    f"Preview unavailable: {snapshot.preview_error.splitlines()[0][:120]}"
-                )
+                diagnostic = f"Preview unavailable:\n{snapshot.preview_error}"
+                self.preview_view.set_status(diagnostic)
+                self.preview_view.preview_status.setToolTip(diagnostic)
             return
         key = (
             rendered.document_generation,
@@ -1262,10 +1349,9 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
                 rendered.presentation_revision,
                 failed=True,
             )
-            self.preview_view.set_status(
-                notice
-                or f"Preview unavailable: {str(error).splitlines()[0][:120]}"
-            )
+            diagnostic = notice or f"Preview unavailable:\n{error}"
+            self.preview_view.set_status(diagnostic)
+            self.preview_view.preview_status.setToolTip(diagnostic)
             return
         self._settle_pending_preview_through(
             rendered.presentation_revision,
@@ -1291,7 +1377,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 
     @property
     def current_document(self):
-        return self._controller.editor_projection().document
+        return self._controller.current_document
 
     @property
     def active_snapshot(self):
@@ -1299,7 +1385,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 
     def request_close(self, *, discard_unsaved: bool = False) -> bool:
         if not self._close_decided:
-            dirty = self._controller.editor_projection().dirty
+            dirty = self._controller.dirty
             if dirty and not discard_unsaved:
                 if not fluent_confirm(
                     self,

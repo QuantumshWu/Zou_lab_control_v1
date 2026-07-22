@@ -222,7 +222,7 @@ class CameraRunEvidence:
 
         event_count = self.source_event_span.count
         if decoded_arm.expected_frames != event_count:
-            raise ValueError("camera arm frame budget differs from source event span")
+            raise ValueError("camera expected frame count differs from source event span")
         if (
             terminal.produced_count != event_count
             or terminal.drained_count != event_count

@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 from zlc_storage.canonical import canonical_text as _nonempty_text
 
-from ._diagnostic import bounded_integer_diagnostic
+from ._diagnostic import exact_integer_text
 
 
 def _canonical_numeric_coordinate(value: Any, field: str) -> int | float:
@@ -133,8 +133,8 @@ class AxisSpec:
         index = int(index)
         if not 0 <= index < self.size:
             raise IndexError(
-                f"axis index {bounded_integer_diagnostic(index)} is outside "
-                f"[0, {bounded_integer_diagnostic(self.size)})"
+                f"axis index {exact_integer_text(index)} is outside "
+                f"[0, {exact_integer_text(self.size)})"
             )
         if self.coordinates is None:
             return self.index_origin + index

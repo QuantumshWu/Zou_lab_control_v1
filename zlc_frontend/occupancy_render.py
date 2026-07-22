@@ -1,9 +1,8 @@
-"""Headless exact occupancy-cell values and interactive SiteMap budgets."""
+"""Headless exact occupancy-cell values for interactive SiteMap display."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 import numpy as np
 
@@ -20,40 +19,11 @@ from zlc_data import (
     StreamGenerationId,
     resolve_selection_indices,
 )
-from zlc_storage import canonical_text, positive_integer, sha256_text
+from zlc_storage import canonical_text, sha256_text
 
 from .figure import EvaluatedImage, EvaluatedInput
-from .image_raster import (
-    estimate_evaluated_image_retained_nbytes,
-    estimate_indexed8_raster_peak_nbytes,
-)
 from .image_view import ImageViewportTransform
 from .site_map import immutable_site_state
-
-
-_VIEW_FIXED_BYTES = 1 << 20
-_NAVIGATION_UI_FIXED_BYTES = 1 << 20
-_NAVIGATION_UI_AXIS_BYTES = 64 << 10
-_SITE_MAP_FRONT_OBJECT_BYTES = 1 << 20
-_SITE_RADIUS_EXACT_WORKSPACE_BYTES = (
-    3 * 128 * 128 * np.dtype(np.float64).itemsize
-    + 128 * 128 * np.dtype(bool).itemsize
-)
-
-
-def estimate_occupancy_navigation_retained_nbytes(
-    inspection_retained_upper_bound_bytes: int,
-    axis_count: int,
-) -> int:
-    """Bound the long-lived FINAL metadata and its bounded Qt axis controls."""
-
-    inspection = positive_integer(
-        inspection_retained_upper_bound_bytes,
-        "inspection_retained_upper_bound_bytes",
-    )
-    if isinstance(axis_count, bool) or not isinstance(axis_count, int) or axis_count <= 0:
-        raise ValueError("axis_count must be a positive integer")
-    return inspection + _NAVIGATION_UI_FIXED_BYTES + axis_count * _NAVIGATION_UI_AXIS_BYTES
 
 
 @dataclass(frozen=True)
@@ -67,8 +37,6 @@ class OccupancyCellNavigation:
     point_axes: tuple[AxisSpec, ...]
     point_layout: PointLayout
     cell_layout: AxisLayout
-    retained_upper_bound_bytes: int
-    cell_peak_upper_bound_bytes: int
 
     def __post_init__(self) -> None:
         canonical_text(self.artifact_identity, "artifact_identity")
@@ -97,14 +65,6 @@ class OccupancyCellNavigation:
             != self.repeat_axis.size * self.point_layout.storage_size
         ):
             raise ValueError("cell_layout differs from repeat and point layout")
-        positive_integer(
-            self.retained_upper_bound_bytes,
-            "retained_upper_bound_bytes",
-        )
-        positive_integer(
-            self.cell_peak_upper_bound_bytes,
-            "cell_peak_upper_bound_bytes",
-        )
         object.__setattr__(self, "point_axes", point_axes)
 
     @property
@@ -213,125 +173,6 @@ class OccupancyCellNavigation:
         return self.cell_layout.storage_index((repeat_index, *logical))
 
 
-def estimate_occupancy_cell_view_retained_nbytes(
-    frame_shape: tuple[int, int],
-    frame_dtype: np.dtype | str,
-    site_count: int,
-) -> int:
-    """Conservatively bound the self-contained exact-cell presentation value."""
-
-    shape = tuple(frame_shape)
-    if (
-        len(shape) != 2
-        or any(isinstance(size, bool) or not isinstance(size, int) or size <= 0 for size in shape)
-    ):
-        raise ValueError("frame_shape must contain two positive integers")
-    dtype = np.dtype(frame_dtype)
-    if dtype.hasobject or dtype.kind == "c":
-        raise TypeError("physical site-map frames must be real numeric arrays")
-    sites = positive_integer(site_count, "site_count")
-    pixels = math.prod(shape)
-    # Frame + expanded pixel validity.  Site vectors are retained once between
-    # sequential repository phases and copied once into the cross-thread view.
-    return (
-        _VIEW_FIXED_BYTES
-        + pixels * (dtype.itemsize + np.dtype(bool).itemsize)
-        + 2 * sites * (2 * np.dtype("<f8").itemsize + 2)
-    )
-
-
-def estimate_interactive_site_map_peak_nbytes(
-    frame_shape: tuple[int, int],
-    frame_dtype: np.dtype | str,
-    site_count: int,
-    *,
-    source_projection_peak_upper_bound_bytes: int,
-) -> int:
-    """Bound load, raster, present, revision overlap, and pointer hold.
-
-    ``source_projection_peak_upper_bound_bytes`` is the facade-owned aggregate
-    for repository inspections/admission plus construction of the current
-    exact :class:`OccupancyCellView`.  Two older GUI generations may coexist:
-    the current front and a pointer-held front.  The capacity-one candidate is
-    the third generation and remains charged until Qt accepts or discards it.
-    """
-
-    shape = tuple(frame_shape)
-    if (
-        len(shape) != 2
-        or any(
-            isinstance(size, bool) or not isinstance(size, int) or size <= 0
-            for size in shape
-        )
-    ):
-        raise ValueError("frame_shape must contain two positive integers")
-    dtype = np.dtype(frame_dtype)
-    if dtype.hasobject or dtype.kind not in "biuf":
-        raise TypeError("physical site-map frames must be real numeric arrays")
-    sites = positive_integer(site_count, "site_count")
-    source_peak = positive_integer(
-        source_projection_peak_upper_bound_bytes,
-        "source_projection_peak_upper_bound_bytes",
-    )
-    height, width = shape
-    pixels = height * width
-    sample = estimate_evaluated_image_retained_nbytes(
-        height,
-        width,
-        value_itemsize=dtype.itemsize,
-    )
-    # Each frozen SiteMap payload owns centers, occupancy, validity, and the
-    # precomputed full-raster normalized centers: 16S + S + S + 16S.
-    payload_sites = 34 * sites
-    source_sites = 18 * sites
-    front = (
-        _SITE_MAP_FRONT_OBJECT_BYTES
-        + sample
-        + payload_sites
-        # RasterBuffer bytes plus the private INDEXED8 plane detached by Qt's
-        # color table.  Palette/histogram objects live in the fixed allowance.
-        + 2 * pixels
-    )
-    site_workspace = max(
-        _SITE_RADIUS_EXACT_WORKSPACE_BYTES,
-        16 * sites,  # vectorized normalized-center construction
-        3 * sites,  # empty / occupied / invalid paint masks
-    )
-    indexed = estimate_indexed8_raster_peak_nbytes(
-        height,
-        width,
-        value_itemsize=dtype.itemsize,
-        retained_fronts=2,
-        retained_sample_fronts=2,
-    )
-    load_with_old_fronts = source_peak + 2 * front
-    payload_with_old_fronts = 2 * front + (
-        _SITE_MAP_FRONT_OBJECT_BYTES
-        + sample
-        + source_sites
-        + payload_sites
-        + site_workspace
-    )
-    indexed_candidate = (
-        indexed
-        + 3 * _SITE_MAP_FRONT_OBJECT_BYTES
-        + sample
-        # candidate source+payload, current payload, and pointer-held payload
-        + 120 * sites
-    )
-    # Qt may paint a three-generation swap while a pointer-held SiteMap is
-    # sampled.  Ring-state masks need 3S bytes; nearest-site hover temporarily
-    # holds two Nx2 float64 planes plus one float64 distance vector (40S).
-    qt_interaction_workspace = max(3 * sites, 40 * sites)
-    qt_swap = 3 * front + qt_interaction_workspace
-    return max(
-        load_with_old_fronts,
-        payload_with_old_fronts,
-        indexed_candidate,
-        qt_swap,
-    )
-
-
 @dataclass(frozen=True, eq=False)
 class OccupancyCellView:
     """Self-contained physical facts for one exact ``(repeat, point)`` cell."""
@@ -418,24 +259,7 @@ class OccupancyCellView:
         object.__setattr__(self, "occupied", occupied)
         object.__setattr__(self, "site_validity", site_validity)
 
-    @property
-    def array_nbytes(self) -> int:
-        return sum(
-            int(value.nbytes)
-            for value in (
-                self.background.values,
-                self.background.validity,
-                self.centers_xy,
-                self.occupied,
-                self.site_validity,
-            )
-        )
-
-
 __all__ = [
     "OccupancyCellNavigation",
     "OccupancyCellView",
-    "estimate_interactive_site_map_peak_nbytes",
-    "estimate_occupancy_cell_view_retained_nbytes",
-    "estimate_occupancy_navigation_retained_nbytes",
 ]

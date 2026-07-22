@@ -61,55 +61,6 @@ from .pulse import (
 )
 
 
-_API_SEGMENTED_CONTROL_FIXED_BYTES = 4 << 10
-_API_POINT_CONTROL_BYTES = 256 << 10
-_API_EXECUTED_SEGMENT_CONTROL_BYTES = 4 << 10
-
-
-def api_slot_segmented_control_retained_upper_bound_bytes(
-    point_count: int,
-    repeat_count: int,
-) -> int:
-    """Conservatively charge the concrete point and execution control objects.
-
-    This CPython-independent charge is deliberately simple: P resolved point
-    documents, requests, and bindings are retained once, while R*P terminal
-    lineages and their FINAL conversion overlap briefly.  Camera frames and
-    compiled pulse artifacts have their own exact admission owners and are not
-    double-counted here.
-    """
-
-    points = positive_integer(point_count, "point_count")
-    repeats = positive_integer(repeat_count, "repeat_count")
-    segments = points * repeats
-    return (
-        _API_SEGMENTED_CONTROL_FIXED_BYTES
-        + points * _API_POINT_CONTROL_BYTES
-        + segments * _API_EXECUTED_SEGMENT_CONTROL_BYTES
-    )
-
-
-def admit_api_slot_segmented_control_memory(
-    point_count: int,
-    repeat_count: int,
-    memory_limit_bytes: int,
-) -> int:
-    """Reject an excessive R*P control schedule before resolving or compiling P."""
-
-    limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-    retained = api_slot_segmented_control_retained_upper_bound_bytes(
-        point_count,
-        repeat_count,
-    )
-    if retained > limit:
-        raise MemoryError(
-            "API segmented control schedule requires "
-            f"{retained} admission bytes for {repeat_count}x{point_count} segments; "
-            f"limit is {limit}"
-        )
-    return retained
-
-
 @dataclass(frozen=True, slots=True)
 class ApiSlotPointDescriptor:
     """One unique API point and its fully-static finite pulse authority."""
@@ -221,7 +172,7 @@ def _validated_point_descriptors(
     if contract.dataset_schema.point_layout.storage_size != point_count:
         raise ValueError("API point count differs from the camera point layout")
     if contract.total_events != expected_segments:
-        raise ValueError("segment count differs from the camera event budget")
+        raise ValueError("segment count differs from the expected camera event count")
     for ordinal, address in enumerate(contract.cell_schedule):
         repeat_index, point_ordinal = divmod(ordinal, point_count)
         if address != DatasetCellAddress(repeat_index, point_ordinal):
@@ -534,7 +485,6 @@ def compile_api_slot_segmented_pipeline(
     spec: ApiSlotSegmentedSpec,
     *,
     preview: CapturePreviewPort | None = None,
-    _retained_overhead_bytes: int = 0,
 ) -> RunPlan:
     """Compile one direct exact camera arm with ordered finite API segments."""
 
@@ -550,11 +500,7 @@ def compile_api_slot_segmented_pipeline(
         error = ValueError("camera and sequencer must be distinct physical resources")
         _notify_preview_failure(preview, error)
         raise error
-    preview_spec = _admit_capture_preview(
-        capture_spec,
-        preview,
-        retained_overhead_bytes=_retained_overhead_bytes,
-    )
+    preview_spec = _admit_capture_preview(capture_spec, preview)
 
     def preflight(context: RunContext) -> _PreparedSegmentedCapture:
         capture = _open_exact_capture_transaction(
@@ -639,8 +585,6 @@ def compile_api_slot_segmented_pipeline(
 
 def compile_api_slot_segmented_occupancy_pipeline(
     spec: ApiSlotSegmentedSpec,
-    *,
-    _retained_overhead_bytes: int = 0,
 ) -> RunPlan:
     """Compile FINAL-only occupancy over one armed segmented capture."""
 
@@ -659,7 +603,6 @@ def compile_api_slot_segmented_occupancy_pipeline(
         occupancy = _open_exact_occupancy(
             occupancy_spec,
             context,
-            retained_overhead_bytes=_retained_overhead_bytes,
         )
         return _PreparedSegmentedCapture(occupancy)
 
@@ -738,8 +681,6 @@ __all__ = [
     "ApiSlotSegmentLineage",
     "ApiSlotSegmentedResult",
     "ApiSlotSegmentedSpec",
-    "admit_api_slot_segmented_control_memory",
-    "api_slot_segmented_control_retained_upper_bound_bytes",
     "compile_api_slot_segmented_occupancy_pipeline",
     "compile_api_slot_segmented_pipeline",
 ]

@@ -422,10 +422,10 @@ class PanelEditor(QtWidgets.QWidget):
                 display=card._display_state(),
                 provenance=PanelProvenance(value.run_id, value.epoch_id, value.join_digest))
         except PanelRenderError as error:
-            self.status.setText(str(error)[:160])
+            self.status.setText(str(error))
             return
         except Exception as error:
-            self.status.setText(("%s: %s" % (type(error).__name__, error))[:160])
+            self.status.setText("%s: %s" % (type(error).__name__, error))
             return
         self._board.present(frame)
         self.status.setText("")
@@ -619,7 +619,7 @@ class PanelEditor(QtWidgets.QWidget):
         try:
             self.console._restart_node(self._node, new_params)
         except Exception as exc:
-            self.status.setText(f"apply failed: {str(exc).splitlines()[0][:120]}")
+            self.status.setText(f"apply failed: {exc}")
             return
         self.refresh_node_now_labels()        # reuse the same refresh the tick uses
         if running:
@@ -640,7 +640,7 @@ class PanelEditor(QtWidgets.QWidget):
         try:
             values = self.source_form.collect_values()
         except Exception as exc:
-            self.status.setText(f"apply failed: {str(exc).splitlines()[0][:120]}")
+            self.status.setText(f"apply failed: {exc}")
             return
         if not self.console._apply_source_params(self._source_row, values):
             self.status.setText("locked: a task is running — Stop it first")
@@ -842,7 +842,7 @@ class PanelEditor(QtWidgets.QWidget):
             try:
                 lo, hi = float(lo_text), float(hi_text)
             except ValueError as exc:
-                self.status.setText(f"bad limits: {str(exc).splitlines()[0][:100]}")
+                self.status.setText(f"bad limits: {exc}")
                 return
             self._edit_param(key, (lo, hi))
             applied.append(key[5])
@@ -890,7 +890,7 @@ class PanelEditor(QtWidgets.QWidget):
         try:
             lo, hi = float(self.clo.text()), float(self.chi.text())
         except ValueError as exc:
-            self.status.setText(f"bad colour range: {str(exc).splitlines()[0][:80]}")
+            self.status.setText(f"bad colour range: {exc}")
             return
         self._edit_param("relim", "fixed")          # make the fixed clim take effect (seeds from view) ...
         if self.card is not None:
@@ -1037,8 +1037,8 @@ class PanelEditor(QtWidgets.QWidget):
                 raise RuntimeError("Qt refused to write %s" % target.name)
             self.console._last_save_dir = str(stem.parent)
             self._update_save_preview()
-            self.status.setText("saved %s -> .../%s" % (target.name, stem.parent.name))
+            self.status.setText("saved %s -> %s" % (target.name, stem.parent))
             self.status.setToolTip(str(stem.parent))
         except Exception as error:
-            self.status.setText("save failed: %s" % str(error).splitlines()[0][:120])
+            self.status.setText("save failed: %s" % error)
 

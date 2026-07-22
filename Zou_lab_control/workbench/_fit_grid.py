@@ -30,7 +30,6 @@ from zlc_frontend import (
     PanelPresentationIdentity,
     RadialGaussianImageFitPanel,
     SourceIdentity,
-    radial_gaussian_image_fit_panel_retained_upper_bound_nbytes,
 )
 from zlc_frontend.encoded_raster import EncodedRasterDocument, EncodedRasterPage
 from zlc_frontend.display_range import RelimMode, deadband_display_range
@@ -43,8 +42,6 @@ from zlc_frontend.image_display import (
 )
 from zlc_frontend.image_raster import (
     evaluated_image_data_range,
-    estimate_evaluated_image_retained_nbytes,
-    estimate_indexed8_raster_peak_nbytes,
     rasterize_image_indexed8,
 )
 from zlc_frontend.qt_widgets import (
@@ -85,7 +82,6 @@ from ._window_runtime import (
 )
 
 
-_DEFAULT_FIT_GRID_MEMORY_LIMIT_BYTES = 512 << 20
 _BOARD_ID = "saved-fit-grid"
 _FIT_GRID_JOIN_SCHEMA_DIGEST = canonical_digest(
     {
@@ -241,48 +237,6 @@ def _fit_grid_join_identity(
     return artifact_identity, inputs, digest
 
 
-def _fit_grid_memory_bounds(
-    panels: tuple[RadialGaussianImageFitPanel, ...],
-    *,
-    samples_prebudgeted: bool = False,
-) -> tuple[int, int]:
-    """Return retained GUI-front and sequential worker peak upper bounds."""
-
-    if not isinstance(samples_prebudgeted, bool):
-        raise TypeError("samples_prebudgeted must be bool")
-    retained = 0
-    incremental_retained = 0
-    largest_scratch = 0
-    for panel in panels:
-        height, width = panel.image.values.shape
-        pixels = height * width
-        sample = estimate_evaluated_image_retained_nbytes(
-            height,
-            width,
-            value_itemsize=panel.image.values.dtype.itemsize,
-        )
-        panel_metadata = (
-            radial_gaussian_image_fit_panel_retained_upper_bound_nbytes(panel)
-        )
-        raster_retained = sample + 2 * pixels + (64 << 10)
-        panel_retained = raster_retained + panel_metadata
-        panel_incremental = 2 * pixels + (64 << 10) + panel_metadata
-        panel_peak = estimate_indexed8_raster_peak_nbytes(
-            height,
-            width,
-            value_itemsize=panel.image.values.dtype.itemsize,
-            retained_fronts=1,
-            retained_sample_fronts=1,
-        )
-        retained += panel_retained
-        incremental_retained += panel_incremental
-        largest_scratch = max(largest_scratch, panel_peak - raster_retained)
-    admitted_retained = (
-        incremental_retained if samples_prebudgeted else retained
-    )
-    return retained, admitted_retained + largest_scratch
-
-
 def _build_image_grid_frame(
     panels: tuple[RadialGaussianImageFitPanel, ...],
     display: ImageDisplayState,
@@ -291,24 +245,13 @@ def _build_image_grid_frame(
     previous_relim_mode: RelimMode | None,
     layout_generation: int,
     sequence: int,
-    memory_limit_bytes: int,
     cancelled: threading.Event,
-    samples_prebudgeted: bool = False,
-) -> tuple[BoardFrame, tuple[float, float], int]:
+) -> tuple[BoardFrame, tuple[float, float]]:
     panels = tuple(panels)
     if not panels or len(panels) > 36:
         raise ValueError("saved-fit IMAGE view requires between 1 and 36 panels")
     if len({_fit_panel_id(panel) for panel in panels}) != len(panels):
         raise ValueError("saved-fit logical panels do not have unique identities")
-    retained_bound, worker_peak_bound = _fit_grid_memory_bounds(
-        panels,
-        samples_prebudgeted=samples_prebudgeted,
-    )
-    if worker_peak_bound > positive_integer(
-        memory_limit_bytes,
-        "saved-fit image worker memory limit",
-    ):
-        raise MemoryError("saved-fit typed IMAGE front exceeds worker budget")
     _require_not_cancelled(cancelled)
     color_limits = _shared_color_limits(
         panels,
@@ -395,7 +338,6 @@ def _build_image_grid_frame(
             tuple(frames),
         ),
         color_limits,
-        retained_bound,
     )
 
 
@@ -488,22 +430,19 @@ def _rerasterize_grid_view(
     previous_relim_mode: RelimMode | None,
     layout_generation: int,
     revision: int,
-    memory_limit_bytes: int,
     cancelled: threading.Event,
 ):
     _require_not_cancelled(cancelled)
-    frame, limits, retained = _build_image_grid_frame(
+    frame, limits = _build_image_grid_frame(
         panels,
         display,
         current_color_limits=current_color_limits,
         previous_relim_mode=previous_relim_mode,
         layout_generation=layout_generation,
         sequence=revision,
-        memory_limit_bytes=memory_limit_bytes,
         cancelled=cancelled,
-        samples_prebudgeted=True,
     )
-    return revision, panels, display, frame, limits, retained
+    return revision, panels, display, frame, limits
 
 
 def _load_grid_view(
@@ -511,7 +450,6 @@ def _load_grid_view(
     reference: FitResultArtifactRef,
     page_address: tuple[int, ...] | None,
     cell_selection: Selection | None,
-    memory_limit_bytes: int,
     revision: int,
     return_model: bool,
     display: ImageDisplayState,
@@ -525,23 +463,18 @@ def _load_grid_view(
         reference,
         page_address=page_address,
         cell_selection=cell_selection,
-        memory_limit_bytes=memory_limit_bytes,
     )
-    if not isinstance(loaded, tuple) or len(loaded) != 5:
+    if not isinstance(loaded, tuple) or len(loaded) != 4:
         raise TypeError(
-            "saved-fit loader must return figure/model/page/cell summary/session budget"
+            "saved-fit loader must return figure/model/page/cell summary"
         )
-    figure, model, page, cell_summary, session_retained_bytes = loaded
+    figure, model, page, cell_summary = loaded
     if not isinstance(figure, DataFigure):
         raise TypeError("saved-fit loader must return DataFigure")
     if not isinstance(model, FitGridModel):
         raise TypeError("saved-fit loader must return FitGridModel")
     if model.artifact_identity != reference.target_ref:
         raise ValueError("saved-fit loader names a different artifact")
-    session_retained_bytes = positive_integer(
-        session_retained_bytes,
-        "saved-fit session retained bytes",
-    )
     if cell_selection is None:
         if not isinstance(page, FitGridPage) or cell_summary is not None:
             raise TypeError("saved-fit page load returned invalid compact metadata")
@@ -567,21 +500,6 @@ def _load_grid_view(
         if len(layers) != 1:
             raise ValueError(
                 "saved-fit typed IMAGE explorer requires exactly one layer"
-            )
-        projection_peak = (
-            figure.radial_gaussian_image_fit_panels_preflight_nbytes(
-                layers[0].layer_id,
-                artifact_identity=reference.target_ref,
-            )
-        )
-        projection_required = figure.retained_upper_bound_nbytes + projection_peak
-        if return_model:
-            projection_required += (
-                session_retained_bytes + model.retained_upper_bound_bytes
-            )
-        if projection_required > memory_limit_bytes:
-            raise MemoryError(
-                "saved-fit typed panel projection exceeds worker budget"
             )
         panels = figure.radial_gaussian_image_fit_panels(
             layers[0].layer_id,
@@ -614,26 +532,15 @@ def _load_grid_view(
                     "focused typed panel summary diverged from grid metadata"
                 )
         # The typed panels retain their exact arrays and overlay facts.  Drop
-        # the broader DataFigure/document before allocating the raster front so
-        # unrelated metadata cannot overlap outside the worker budget.
+        # the broader DataFigure/document before allocating the raster front.
         del loaded, figure, layers
-        frame_limit = memory_limit_bytes
-        if return_model:
-            frame_limit -= (
-                session_retained_bytes + model.retained_upper_bound_bytes
-            )
-        if frame_limit <= 0:
-            raise MemoryError(
-                "saved-fit session leaves no typed IMAGE front budget"
-            )
-        frame, color_limits, frame_retained_bytes = _build_image_grid_frame(
+        frame, color_limits = _build_image_grid_frame(
             panels,
             display,
             current_color_limits=current_color_limits,
             previous_relim_mode=previous_relim_mode,
             layout_generation=layout_generation,
             sequence=revision,
-            memory_limit_bytes=frame_limit,
             cancelled=cancelled,
         )
         projection = (
@@ -641,15 +548,12 @@ def _load_grid_view(
             panels,
             frame,
             color_limits,
-            frame_retained_bytes,
         )
     else:
         # The five public 1D fit models remain real saved-fit consumers.  Keep
         # their exact generic GridPlot path until the CURVE cell family is
         # migrated to the typed board; never make the IMAGE slice a blackout.
-        payload, regions = figure.to_png_bytes_with_panel_regions(
-            memory_limit_bytes=figure.render_memory_limit_bytes,
-        )
+        payload, regions = figure.to_png_bytes_with_panel_regions()
         bundle = EncodedRasterDocument(
             summary,
             (EncodedRasterPage("figure", "Fit grid", payload),),
@@ -669,11 +573,6 @@ def _load_grid_view(
                 raise ValueError(
                     "focused panel and stored cell summary disagree"
                 )
-        required = bundle.source_front_peak_nbytes
-        if return_model:
-            required += session_retained_bytes + model.retained_upper_bound_bytes
-        if required > memory_limit_bytes:
-            raise MemoryError("saved-fit session and raster exceed worker budget")
         projection = ("encoded", bundle, prepared_regions)
         del loaded, figure
     _require_not_cancelled(cancelled)
@@ -685,7 +584,6 @@ def _load_grid_view(
         revision,
         returned_model,
         model_identity,
-        session_retained_bytes,
         page,
         cell_summary,
         resolved_selection,
@@ -701,7 +599,6 @@ def _export_grid_view(
     page_address: tuple[int, ...] | None,
     cell_selection: Selection | None,
     destination: Path,
-    memory_limit_bytes: int,
     revision: int,
     cancelled: threading.Event,
     commit_lock: threading.Lock,
@@ -711,11 +608,10 @@ def _export_grid_view(
         reference,
         page_address=page_address,
         cell_selection=cell_selection,
-        memory_limit_bytes=memory_limit_bytes,
     )
-    if not isinstance(loaded, tuple) or len(loaded) != 5:
+    if not isinstance(loaded, tuple) or len(loaded) != 4:
         raise TypeError("saved-fit export loader returned invalid values")
-    figure, model, page, cell_summary, _session_retained_bytes = loaded
+    figure, model, page, cell_summary = loaded
     if not isinstance(figure, DataFigure) or not isinstance(model, FitGridModel):
         raise TypeError("saved-fit export loader returned invalid values")
     if model.artifact_identity != reference.target_ref:
@@ -743,7 +639,6 @@ def _export_grid_view(
         exported = figure.export(
             temporary,
             image_format=image_format,
-            memory_limit_bytes=figure.render_memory_limit_bytes,
         )
         if Path(exported) != temporary:
             raise RuntimeError("saved-fit export changed its staged destination")
@@ -764,7 +659,6 @@ def _export_typed_grid_view(
     columns: int,
     expected_join_key_digest: str,
     destination: Path,
-    memory_limit_bytes: int,
     revision: int,
     cancelled: threading.Event,
     commit_lock: threading.Lock,
@@ -786,10 +680,6 @@ def _export_typed_grid_view(
         or not 1 <= columns <= len(prepared)
     ):
         raise ValueError("saved-fit typed export columns are invalid")
-    memory_limit_bytes = positive_integer(
-        memory_limit_bytes,
-        "saved-fit typed export memory limit",
-    )
     target = Path(destination)
     image_format = target.suffix.lstrip(".").lower() or "png"
     if not target.suffix:
@@ -808,7 +698,6 @@ def _export_typed_grid_view(
             temporary,
             image_format=image_format,
             columns=columns,
-            memory_limit_bytes=memory_limit_bytes,
         )
         _require_not_cancelled(cancelled)
 
@@ -829,8 +718,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
         view_loader,
         refit_opener,
         reference: FitResultArtifactRef,
-        *,
-        memory_limit_bytes: int,
     ) -> None:
         if not callable(view_loader):
             raise TypeError("saved-fit view_loader must be callable")
@@ -842,18 +729,15 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._refit_opener = refit_opener
         self._reference = reference
         self._model: FitGridModel | None = None
-        self._session_retained_bytes = 0
         self._navigator: AxisLayoutNavigator | None = None
         self._page: FitGridPage | None = None
         self._page_panels: tuple[RadialGaussianImageFitPanel, ...] = ()
         self._page_frame: BoardFrame | None = None
-        self._page_retained_bytes = 0
         self._page_color_limits: tuple[float, float] | None = None
         self._page_encoded_bundle: EncodedRasterDocument | None = None
         self._page_regions: tuple[FigurePanelRegion, ...] = ()
         self._current_panels: tuple[RadialGaussianImageFitPanel, ...] = ()
         self._current_frame: BoardFrame | None = None
-        self._current_retained_bytes = 0
         self._current_encoded_bundle: EncodedRasterDocument | None = None
         self._regions: tuple[FigurePanelRegion, ...] = ()
         self._view_family: str | None = None
@@ -887,7 +771,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             loading_summary=f"Resolving {reference.target_ref}…",
             object_prefix="savedFitGrid",
             subject="SAVED FIT GRID",
-            memory_limit_bytes=memory_limit_bytes,
         )
 
         self._retire_tab_pages()
@@ -1032,7 +915,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             "page",
             page_address=None,
             cell_selection=None,
-            memory_limit_bytes=self._memory_limit_bytes,
             layout_generation=0,
         )
 
@@ -1076,79 +958,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._navigator = navigator
         self._navigation_host.layout().insertWidget(1, navigator)
         self._candidate_changed()
-
-    def _retained_state_bytes(
-        self,
-        *,
-        keep_page: bool,
-        keep_current: bool,
-    ) -> int:
-        retained = (
-            self._session_retained_bytes
-            + (
-                0
-                if self._model is None
-                else self._model.retained_upper_bound_bytes
-            )
-        )
-        if self._view_family == "encoded":
-            page = self._page_encoded_bundle
-            if keep_page and page is not None:
-                retained += page.source_front_peak_nbytes
-            current = self._current_encoded_bundle
-            if keep_current and current is not None and current is not page:
-                retained += current.source_front_peak_nbytes
-        else:
-            if keep_page and self._page_frame is not None:
-                retained += self._page_retained_bytes
-            if (
-                keep_current
-                and self._current_frame is not None
-                and self._current_frame is not self._page_frame
-            ):
-                retained += self._current_retained_bytes
-        return retained
-
-    def _available_worker_limit(
-        self,
-        *,
-        keep_page: bool,
-        keep_current: bool,
-    ) -> int:
-        available = self._memory_limit_bytes - self._retained_state_bytes(
-            keep_page=keep_page,
-            keep_current=keep_current,
-        )
-        if available <= 0:
-            raise MemoryError("saved-fit retained fronts leave no worker budget")
-        return available
-
-    def _admit_cached_relayout(self, target: BoardFrame) -> None:
-        """Admit the short old-QImage/new-QImage overlap of a local relayout."""
-
-        current = self._current_frame
-        page = self._page_frame
-        if current is None or page is None:
-            raise RuntimeError("saved-fit relayout requires current and page fronts")
-
-        def qimage_bytes(frame: BoardFrame) -> int:
-            return sum(len(panel.raster.pixels) for panel in frame.panels)
-
-        reserved_page_front = qimage_bytes(page)
-        overlap = max(
-            0,
-            qimage_bytes(current) + qimage_bytes(target) - reserved_page_front,
-        )
-        if overlap:
-            overlap += 64 << 10
-        required = self._retained_state_bytes(
-            keep_page=True,
-            keep_current=True,
-        ) + overlap
-        if required > self._memory_limit_bytes:
-            raise MemoryError(
-                "saved-fit cached relayout QImage overlap exceeds total budget"
-            )
 
     def _frame_matches_display_revision(
         self,
@@ -1375,10 +1184,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 continue
             seen.add(identity)
             image_viewport_for_display_state(state, panel.home_viewport)
-        worker_limit = self._available_worker_limit(
-            keep_page=self._page_frame is not None,
-            keep_current=self._current_frame is not None,
-        )
         rollback = (
             current,
             self._current_color_limits,
@@ -1399,7 +1204,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             kind,
             self._current_panels,
             layout_generation=self._layout_generation,
-            memory_limit_bytes=worker_limit,
             previous_relim_mode=current.relim_mode,
             baseline_color_limits=self._current_color_limits,
         ):
@@ -1448,7 +1252,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
         frame: BoardFrame,
         panels: tuple[RadialGaussianImageFitPanel, ...],
         *,
-        retained_bytes: int,
         color_limits: tuple[float, float],
     ) -> None:
         if self._view_family not in (None, "typed-image"):
@@ -1475,7 +1278,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._board_widget.show()
         self._current_panels = tuple(panels)
         self._current_frame = frame
-        self._current_retained_bytes = int(retained_bytes)
         self._current_color_limits = color_limits
         self._layout_generation = frame.layout_generation
         self._sync_panel_bindings(frame)
@@ -1490,18 +1292,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             raise RuntimeError("saved-fit view family changed within one exact session")
         if not isinstance(bundle, EncodedRasterDocument) or len(bundle.pages) != 1:
             raise TypeError("generic saved-fit view requires one encoded page")
-        model_bytes = (
-            0
-            if self._model is None
-            else self._model.retained_upper_bound_bytes
-        )
-        other = self._session_retained_bytes + model_bytes
-        page = self._page_encoded_bundle
-        if page is not None and page is not bundle:
-            other += page.source_front_peak_nbytes
-        required = self._presentation_peak(bundle, (self._encoded_board,))
-        if other + required > self._memory_limit_bytes:
-            raise MemoryError("generic saved-fit Qt front exceeds total budget")
         self._encoded_board.present_encoded(
             bundle.pages[0].png_bytes,
             image_format="PNG",
@@ -1628,7 +1418,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
         *,
         page_address: tuple[int, ...] | None,
         cell_selection: Selection | None,
-        memory_limit_bytes: int,
         layout_generation: int,
     ) -> None:
         self._request_revision += 1
@@ -1641,7 +1430,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._reference,
             page_address,
             cell_selection,
-            memory_limit_bytes,
             self._active_revision,
             self._model is None,
             self._display,
@@ -1659,7 +1447,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
         panels: tuple[RadialGaussianImageFitPanel, ...],
         *,
         layout_generation: int,
-        memory_limit_bytes: int,
         previous_relim_mode: RelimMode | None,
         baseline_color_limits: tuple[float, float] | None,
     ) -> bool:
@@ -1674,7 +1461,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             previous_relim_mode,
             layout_generation,
             self._active_revision,
-            memory_limit_bytes,
             self._cancelled,
         )
         if not submitted:
@@ -1684,17 +1470,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
     def _start_page(self, address: tuple[int, ...]) -> None:
         if self._future is not None or self._closing:
             return
-        try:
-            worker_limit = self._available_worker_limit(
-                keep_page=self._page is not None,
-                keep_current=(
-                    self._current_frame is not None
-                    or self._current_encoded_bundle is not None
-                ),
-            )
-        except BaseException as error:
-            self._diagnostic.setText(error_summary(error))
-            return
         self._status.setText("BUILDING FIT GRID PAGE")
         self._diagnostic.setText("")
         self._set_controls_enabled(False)
@@ -1702,7 +1477,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             "page",
             page_address=tuple(address),
             cell_selection=None,
-            memory_limit_bytes=worker_limit,
             layout_generation=self._layout_generation + 1,
         )
 
@@ -1809,10 +1583,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             if cached is not None:
                 self._start_cached_focus(cached)
                 return
-            worker_limit = self._available_worker_limit(
-                keep_page=True,
-                keep_current=True,
-            )
         except BaseException as error:
             self._status.setText("FIT CELL INVALID")
             self._diagnostic.setText(error_summary(error))
@@ -1824,7 +1594,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             "focus",
             page_address=None,
             cell_selection=selection,
-            memory_limit_bytes=worker_limit,
             layout_generation=self._layout_generation + 1,
         )
 
@@ -1857,11 +1626,9 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 )
                 return
             try:
-                self._admit_cached_relayout(frame)
                 self._present_typed_frame(
                     frame,
                     (panel,),
-                    retained_bytes=0,
                     color_limits=page_color_limits,
                 )
             except BaseException as error:
@@ -1881,14 +1648,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
                     self._navigator.set_indices(multi)
             self._set_controls_enabled(True)
             return
-        try:
-            worker_limit = self._available_worker_limit(
-                keep_page=True,
-                keep_current=True,
-            )
-        except BaseException as error:
-            self._diagnostic.setText(error_summary(error))
-            return
         self._requested_selection = panel.selection
         self._status.setText("RENDERING CACHED FIT CELL")
         self._diagnostic.setText("")
@@ -1897,7 +1656,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             "cached-focus",
             (panel,),
             layout_generation=self._layout_generation + 1,
-            memory_limit_bytes=worker_limit,
             previous_relim_mode=self._previous_relim_mode,
             baseline_color_limits=self._page_color_limits,
         ):
@@ -1953,11 +1711,9 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 sequence=self._request_revision,
             )
             try:
-                self._admit_cached_relayout(restored)
                 self._present_typed_frame(
                     restored,
                     self._page_panels,
-                    retained_bytes=self._page_retained_bytes,
                     color_limits=self._page_color_limits or (0.0, 1.0),
                 )
             except BaseException as error:
@@ -1977,14 +1733,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._diagnostic.setText("")
             self._set_controls_enabled(True)
             return
-        try:
-            worker_limit = self._available_worker_limit(
-                keep_page=True,
-                keep_current=True,
-            )
-        except BaseException as error:
-            self._diagnostic.setText(error_summary(error))
-            return
         self._requested_selection = None
         self._status.setText("RENDERING FIT GRID PAGE")
         self._diagnostic.setText("")
@@ -1993,7 +1741,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             "return-page-display",
             self._page_panels,
             layout_generation=self._layout_generation + 1,
-            memory_limit_bytes=worker_limit,
             previous_relim_mode=self._previous_relim_mode,
             baseline_color_limits=self._page_color_limits,
         ):
@@ -2026,10 +1773,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
         try:
             if model is None:
                 raise RuntimeError("saved-fit export has no compact model")
-            export_limit = self._available_worker_limit(
-                keep_page=True,
-                keep_current=True,
-            )
             typed_export = self._view_family == "typed-image"
             if typed_export:
                 frame = self._current_frame
@@ -2083,7 +1826,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 _grid_columns(len(panels)),
                 expected_join,
                 Path(destination),
-                export_limit,
                 self._active_revision,
                 self._cancelled,
                 self._export_commit_lock,
@@ -2101,7 +1843,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 ),
                 self._current_selection,
                 Path(destination),
-                export_limit,
                 self._active_revision,
                 self._cancelled,
                 self._export_commit_lock,
@@ -2115,7 +1856,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             result_revision,
             model,
             model_identity,
-            session_retained_bytes,
             page,
             cell_summary,
             resolved_selection,
@@ -2130,16 +1870,11 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 raise TypeError("initial saved-fit page omitted compact metadata")
             if model.identity != model_identity:
                 raise ValueError("saved-fit worker metadata identity changed")
-            self._session_retained_bytes = positive_integer(
-                session_retained_bytes,
-                "saved-fit session retained bytes",
-            )
             self._install_model(model)
         else:
             if (
                 model is not None
                 or model_identity != self._model.identity
-                or session_retained_bytes != self._session_retained_bytes
             ):
                 raise ValueError("saved-fit metadata changed during one exact-ref session")
         current_model = self._model
@@ -2155,22 +1890,19 @@ class SavedFitGridWindow(FrozenRasterWindow):
             if not isinstance(page, FitGridPage) or cell_summary is not None:
                 raise TypeError("saved-fit page result is invalid")
             if family == "typed-image":
-                if len(projection) != 5:
+                if len(projection) != 4:
                     raise TypeError("typed saved-fit projection has invalid fields")
-                _tag, panels, frame, color_limits, frame_retained_bytes = projection
+                _tag, panels, frame, color_limits = projection
                 next_panels = tuple(panels)
                 self._present_typed_frame(
                     frame,
                     next_panels,
-                    retained_bytes=frame_retained_bytes,
                     color_limits=color_limits,
                 )
                 self._page_panels = next_panels
                 self._page_frame = frame
-                self._page_retained_bytes = frame_retained_bytes
                 self._page_color_limits = color_limits
                 self._current_frame = self._page_frame
-                self._current_retained_bytes = self._page_retained_bytes
             else:
                 if len(projection) != 3:
                     raise TypeError("encoded saved-fit projection has invalid fields")
@@ -2191,13 +1923,12 @@ class SavedFitGridWindow(FrozenRasterWindow):
             if page is not None or not isinstance(cell_summary, FitGridCellSummary):
                 raise TypeError("saved-fit focus result is invalid")
             if family == "typed-image":
-                if len(projection) != 5:
+                if len(projection) != 4:
                     raise TypeError("typed saved-fit projection has invalid fields")
-                _tag, panels, frame, color_limits, frame_retained_bytes = projection
+                _tag, panels, frame, color_limits = projection
                 self._present_typed_frame(
                     frame,
                     tuple(panels),
-                    retained_bytes=frame_retained_bytes,
                     color_limits=color_limits,
                 )
             else:
@@ -2238,7 +1969,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             display,
             frame,
             color_limits,
-            retained_bytes,
         ) = result
         if result_revision != revision or revision != self._request_revision:
             self._set_controls_enabled(True)
@@ -2256,15 +1986,12 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._present_typed_frame(
                 frame,
                 candidate_panels,
-                retained_bytes=retained_bytes,
                 color_limits=color_limits,
             )
             self._page_panels = candidate_panels
             self._page_frame = frame
-            self._page_retained_bytes = retained_bytes
             self._page_color_limits = color_limits
             self._current_frame = self._page_frame
-            self._current_retained_bytes = self._page_retained_bytes
             self._showing_page = True
             self._current_selection = None
             self._requested_selection = None
@@ -2287,7 +2014,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._present_typed_frame(
                 frame,
                 focused,
-                retained_bytes=retained_bytes,
                 color_limits=color_limits,
             )
             self._showing_page = False
@@ -2408,13 +2134,11 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._page = None
         self._page_panels = ()
         self._page_frame = None
-        self._page_retained_bytes = 0
         self._page_color_limits = None
         self._page_encoded_bundle = None
         self._page_regions = ()
         self._current_panels = ()
         self._current_frame = None
-        self._current_retained_bytes = 0
         self._current_encoded_bundle = None
         self._regions = ()
 
@@ -2446,7 +2170,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._view_loader = None
             self._refit_opener = None
             self._model = None
-            self._session_retained_bytes = 0
             self._navigator = None
             self._forget_presented_pages()
         super()._finish_close_if_ready()
@@ -2456,16 +2179,12 @@ def open_saved_fit_grid_workbench(
     view_loader,
     refit_opener,
     reference: FitResultArtifactRef,
-    *,
-    memory_limit_bytes: int = _DEFAULT_FIT_GRID_MEMORY_LIMIT_BYTES,
 ) -> SavedFitGridWindow:
-    limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
     return open_workbench_window(
         lambda: SavedFitGridWindow(
             view_loader,
             refit_opener,
             reference,
-            memory_limit_bytes=limit,
         )
     )
 

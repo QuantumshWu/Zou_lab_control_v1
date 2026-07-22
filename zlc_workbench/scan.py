@@ -25,10 +25,7 @@ from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewPort
 from zlc_frontend.render import BoardPresenter
 from zlc_frontend.curve_display import CurveDisplayState
-from zlc_frontend.image_raster import (
-    estimate_encoded_png_front_peak_nbytes,
-    png_raster_size,
-)
+from zlc_frontend.image_raster import png_raster_size
 
 from .progressive_scan import (
     ExactDatasetLiveSlot,
@@ -37,12 +34,7 @@ from .progressive_scan import (
 )
 
 
-_DEFAULT_PROJECTION_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024
 _PREVIEW_CLOSE_RETRY_SECONDS = 0.1
-def _positive_integer(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
 
 
 def _error_summary(error: BaseException) -> str:
@@ -74,11 +66,6 @@ class FinalScanPresentation:
     @property
     def raster_size(self) -> tuple[int, int]:
         return png_raster_size(self.png_bytes)
-
-    @property
-    def gui_decode_peak_nbytes(self) -> int:
-        return estimate_encoded_png_front_peak_nbytes(self.png_bytes)
-
 
 @dataclass(frozen=True, slots=True)
 class PreparedScanPanelRun:
@@ -112,8 +99,6 @@ class ScanPanelApplication(Protocol):
     def project_final(
         self,
         source_ref: ScanArtifactRef,
-        *,
-        memory_limit_bytes: int,
     ) -> FinalScanPresentation: ...
 
 
@@ -162,7 +147,6 @@ class ScanPanelController:
         application: ScanPanelApplication,
         request_owner_wake: object,
         *,
-        projection_memory_limit_bytes: int = _DEFAULT_PROJECTION_MEMORY_LIMIT_BYTES,
         executor: Executor | None = None,
         preview_presenter: BoardPresenter | None = None,
     ) -> None:
@@ -181,10 +165,6 @@ class ScanPanelController:
         self._owner_thread = threading.get_ident()
         self._application: ScanPanelApplication | None = application
         self._request_owner_wake = request_owner_wake
-        self._projection_memory_limit_bytes = _positive_integer(
-            projection_memory_limit_bytes,
-            "projection_memory_limit_bytes",
-        )
         self._executor = (
             ThreadPoolExecutor(max_workers=2, thread_name_prefix="zlc-scan-panel")
             if executor is None
@@ -241,6 +221,23 @@ class ScanPanelController:
     def worker_idle(self) -> bool:
         with self._lock:
             return not self._tracked and not self._mailbox
+
+    @property
+    def needs_periodic_poll(self) -> bool:
+        """Whether the owner must poll a live RunHandle for terminal state.
+
+        Worker completions and progressive-display changes already request an
+        owner wake.  Only an admitted RunHandle lacks a push notification, so
+        an idle panel must not keep a timer running merely to rebuild the same
+        view model.
+        """
+
+        self._require_owner()
+        return (
+            not self._closed
+            and self._handle is not None
+            and not self._owner_reaped
+        )
 
     @property
     def can_reconfigure(self) -> bool:
@@ -728,13 +725,6 @@ class ScanPanelController:
                 raise TypeError("project_final must return FinalScanPresentation")
             if presentation.source_ref != token.artifact_ref:
                 raise ValueError("final presentation belongs to another artifact")
-            if (
-                presentation.gui_decode_peak_nbytes
-                > self._projection_memory_limit_bytes
-            ):
-                raise MemoryError(
-                    "final PNG decode exceeds the projection memory limit"
-                )
         except BaseException as caught:
             error = caught
         if not self._matches_active(token, require_artifact=True):
@@ -819,10 +809,7 @@ class ScanPanelController:
         self._submit(
             "project-final",
             token,
-            lambda: application.project_final(
-                reference,
-                memory_limit_bytes=self._projection_memory_limit_bytes,
-            ),
+            lambda: application.project_final(reference),
         )
 
     def _submit_stale_reap(self, handle: RunHandle) -> None:

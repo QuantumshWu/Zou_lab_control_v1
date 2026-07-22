@@ -5,15 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
-from zlc_pulse.artifact import (
-    CompiledPulseArtifact,
-    CompiledPulseRuntimeSummary,
-)
+from zlc_pulse.artifact import CompiledPulseArtifact
 from zlc_pulse.physical import (
     PhysicalWindowProjection,
     build_physical_waveform_index,
-    estimate_physical_window_projection_peak_bytes,
-    estimate_physical_waveform_index_peak_bytes,
 )
 from zlc_data import DatasetSchema, READOUT_EVENT
 from zlc_storage import (
@@ -31,104 +26,8 @@ from zlc_neutral_atom.timing.lineage import (
 )
 
 
-_DEFAULT_PHYSICAL_WINDOW_PROJECTION_BYTES = 64 * 1024 * 1024
-_CONTEXT_FIXED_RETAINED_BYTES = 128 * 1024
-_CONTEXT_TRACE_RETAINED_BYTES = 2_048
-_CONTEXT_TRANSITION_RETAINED_BYTES = 384
-
-
 def _noop_checkpoint() -> None:
     return None
-
-
-def estimate_readout_physical_context_peak_bytes(
-    artifact: CompiledPulseArtifact,
-    *,
-    checkpoint: Callable[[], None] | None = None,
-) -> int:
-    """Bound index construction and the worst multi-cell comparison phase."""
-
-    if not isinstance(artifact, CompiledPulseArtifact):
-        raise TypeError("artifact must be CompiledPulseArtifact")
-    if checkpoint is not None and not callable(checkpoint):
-        raise TypeError("checkpoint must be callable or None")
-    ir = artifact.target_ir
-    index_peak = estimate_physical_waveform_index_peak_bytes(
-        ir,
-        checkpoint=checkpoint,
-    )
-    projection_peak = min(
-        estimate_physical_window_projection_peak_bytes(
-            ir,
-            checkpoint=checkpoint,
-        ),
-        _DEFAULT_PHYSICAL_WINDOW_PROJECTION_BYTES,
-    )
-    return _readout_context_derive_peak(index_peak, projection_peak)
-
-
-def estimate_readout_physical_context_peak_from_summary(
-    summary: CompiledPulseRuntimeSummary,
-) -> int:
-    """Apply the readout projection policy to pulse-owned resource facts."""
-
-    if not isinstance(summary, CompiledPulseRuntimeSummary):
-        raise TypeError("summary must be CompiledPulseRuntimeSummary")
-    return _readout_context_derive_peak(
-        summary.physical_index_peak_upper_bound_bytes,
-        min(
-            summary.physical_projection_peak_upper_bound_bytes,
-            _DEFAULT_PHYSICAL_WINDOW_PROJECTION_BYTES,
-        ),
-    )
-
-
-def estimate_readout_physical_context_retained_from_summary(
-    summary: CompiledPulseRuntimeSummary,
-) -> int:
-    """Bound the one normalized context retained after index/projection release."""
-
-    if not isinstance(summary, CompiledPulseRuntimeSummary):
-        raise TypeError("summary must be CompiledPulseRuntimeSummary")
-    # The neutral context reconstructs immutable trace tuples from the pulse
-    # projection.  Twice the pulse-owned projection bound covers both its
-    # scalar/container representation and the neutral owner copy without
-    # treating the larger build peak as permanently retained state.
-    return _context_retained_from_projection_peak(
-        min(
-            summary.physical_projection_peak_upper_bound_bytes,
-            _DEFAULT_PHYSICAL_WINDOW_PROJECTION_BYTES,
-        )
-    )
-
-
-def _context_retained_from_projection_peak(projection_peak_bytes: int) -> int:
-    projection_peak = nonnegative_integer(
-        projection_peak_bytes,
-        "projection_peak_bytes",
-    )
-    return 2 * projection_peak
-
-
-def _readout_context_derive_peak(
-    index_peak_bytes: int,
-    projection_peak_bytes: int,
-) -> int:
-    """Single phase model for projection-to-neutral context comparison.
-
-    After the first cell, its normalized neutral context remains resident while
-    the next pulse projection is built and converted to a second neutral
-    context.  The comparison peak is therefore index + first context + next
-    projection + next context, not merely index + two pulse projections.
-    """
-
-    index_peak = nonnegative_integer(index_peak_bytes, "index_peak_bytes")
-    projection_peak = nonnegative_integer(
-        projection_peak_bytes,
-        "projection_peak_bytes",
-    )
-    context_retained = _context_retained_from_projection_peak(projection_peak)
-    return index_peak + 2 * context_retained + projection_peak
 
 
 @dataclass(frozen=True)
@@ -252,24 +151,6 @@ class ReadoutPhysicalContext:
         object.__setattr__(self, "buses", buses)
 
 
-def readout_physical_context_retained_upper_bound_bytes(
-    context: ReadoutPhysicalContext,
-) -> int:
-    """Bound the retained neutral context from its exact trace cardinalities."""
-
-    if not isinstance(context, ReadoutPhysicalContext):
-        raise TypeError("context must be ReadoutPhysicalContext")
-    traces = len(context.digital) + len(context.buses)
-    transitions = sum(len(item.transitions) for item in context.digital) + sum(
-        len(item.changes) for item in context.buses
-    )
-    return (
-        _CONTEXT_FIXED_RETAINED_BYTES
-        + _CONTEXT_TRACE_RETAINED_BYTES * traces
-        + _CONTEXT_TRANSITION_RETAINED_BYTES * transitions
-    )
-
-
 def derive_readout_physical_context(
     pulse_binding: PulseCaptureBinding,
     *,
@@ -317,7 +198,6 @@ def _derive_readout_physical_context_from_evidence(
     integration_start_offset_seconds: float,
     integration_seconds: float,
     checkpoint: Callable[[], None] | None = None,
-    physical_memory_limit_bytes: int | None = None,
 ) -> ReadoutPhysicalContext:
     """Derive a persisted context by ordinal-joining pulse edges and cells."""
 
@@ -365,7 +245,6 @@ def _derive_readout_physical_context_from_evidence(
         integration_start_offset_seconds=integration_start_offset_seconds,
         integration_seconds=integration_seconds,
         checkpoint=checkpoint,
-        physical_memory_limit_bytes=physical_memory_limit_bytes,
     )
 
 
@@ -377,7 +256,6 @@ def _derive_readout_context(
     integration_start_offset_seconds: float,
     integration_seconds: float,
     checkpoint: Callable[[], None] | None = None,
-    physical_memory_limit_bytes: int | None = None,
 ) -> ReadoutPhysicalContext:
     integration_offset = nonnegative_real(
         integration_start_offset_seconds,
@@ -393,34 +271,8 @@ def _derive_readout_context(
     if checkpoint is not None and not callable(checkpoint):
         raise TypeError("checkpoint must be callable or None")
     callback = _noop_checkpoint if checkpoint is None else checkpoint
-    index_peak = estimate_physical_waveform_index_peak_bytes(
-        ir,
-        checkpoint=callback,
-    )
-    projection_bound = min(
-        estimate_physical_window_projection_peak_bytes(
-            ir,
-            checkpoint=callback,
-        ),
-        _DEFAULT_PHYSICAL_WINDOW_PROJECTION_BYTES,
-    )
-    if physical_memory_limit_bytes is None:
-        index_limit = index_peak
-        projection_limit = projection_bound
-    else:
-        index_limit = nonnegative_integer(
-            physical_memory_limit_bytes,
-            "physical_memory_limit_bytes",
-        )
-        if index_limit == 0:
-            raise ValueError("physical_memory_limit_bytes must be positive")
-        projection_limit = min(
-            index_limit,
-            projection_bound,
-        )
     index = build_physical_waveform_index(
         ir,
-        max_peak_bytes=index_limit,
         checkpoint=callback,
     )
     iterator = iter(anchor_ticks)
@@ -434,7 +286,6 @@ def _derive_readout_context(
             integration_start_offset_seconds=integration_offset,
             integration_seconds=exposure,
             exclude_output_key=trigger_outputs[0],
-            max_projection_bytes=projection_limit,
             checkpoint=callback,
         )
     )
@@ -445,7 +296,6 @@ def _derive_readout_context(
                 integration_start_offset_seconds=integration_offset,
                 integration_seconds=exposure,
                 exclude_output_key=trigger_outputs[0],
-                max_projection_bytes=projection_limit,
                 checkpoint=callback,
             )
         )
@@ -581,10 +431,6 @@ __all__ = [
     "DigitalReadoutTrace",
     "ReadoutPhysicalContext",
     "derive_readout_physical_context",
-    "estimate_readout_physical_context_peak_bytes",
-    "estimate_readout_physical_context_peak_from_summary",
-    "estimate_readout_physical_context_retained_from_summary",
-    "readout_physical_context_retained_upper_bound_bytes",
     "readout_physical_context_from_tree",
     "readout_physical_context_to_tree",
 ]

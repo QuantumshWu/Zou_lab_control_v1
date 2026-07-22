@@ -58,7 +58,6 @@ tests/test_tutorial_notebook_spine.py
 tests/test_u02c_qt_curve_interaction.py
 tests/test_u02d_occupancy_workbench.py
 tests/test_u02d_qt_site_map_interaction.py
-tests/test_u02d_site_map_budget.py
 tests/test_u02d_site_map_payload.py
 tests/test_u02d_site_map_viewport.py
 tests/test_u02e_qt_histogram_interaction.py

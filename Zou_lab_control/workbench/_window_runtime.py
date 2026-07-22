@@ -36,10 +36,9 @@ def error_summary(error: BaseException) -> str:
 
 def load_raster_bundle(
     loader: Callable[[threading.Event], EncodedRasterDocument],
-    memory_limit_bytes: int,
     cancelled: threading.Event,
 ) -> EncodedRasterDocument:
-    """Load one immutable raster bundle within its declared front budget."""
+    """Load one immutable raster bundle unless the window was cancelled."""
 
     if cancelled.is_set():
         raise CancelledError()
@@ -48,11 +47,6 @@ def load_raster_bundle(
         raise TypeError("raster loader must return EncodedRasterDocument")
     if cancelled.is_set():
         raise CancelledError()
-    if bundle.source_front_peak_nbytes > memory_limit_bytes:
-        raise MemoryError(
-            "encoded raster fronts require "
-            f"{bundle.source_front_peak_nbytes} bytes; limit is {memory_limit_bytes}"
-        )
     return bundle
 
 

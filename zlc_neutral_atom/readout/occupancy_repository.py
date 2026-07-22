@@ -10,7 +10,6 @@ import threading
 import numpy as np
 
 from zlc_data import (
-    READOUT_EVENT,
     AxisId,
     ComponentValidity,
     DataBlock,
@@ -41,10 +40,8 @@ from zlc_neutral_atom.runtime.commit import (
 )
 from zlc_neutral_atom.runtime.run import PostSafetyContext, RunContext, RunPlan
 from zlc_storage import (
-    CanonicalDecodeLimits,
     ContentAddressedStore,
     ContentRef,
-    ContentSizeLimitError,
     ContentStoreAuthority,
     RepositoryRootLease,
     RepositoryRootLeaseBorrow,
@@ -54,7 +51,6 @@ from zlc_storage import (
     decode,
     encode,
     exact_mapping,
-    positive_integer,
     positive_real,
     sha256_digest,
 )
@@ -80,7 +76,6 @@ from .occupancy import (
     _ResolvedCommittedOccupancy,
     _RESOLVED_OCCUPANCY_TOKEN,
     _analyze_committed_occupancy_resolved,
-    _estimate_committed_occupancy_peak_from_footprints,
     _occupancy_generation_for_run,
     _require_committed_occupancy_context,
     _require_occupancy_output_schemas,
@@ -90,11 +85,7 @@ from .occupancy_reference import (
     OCCUPANCY_ARTIFACT_NAMESPACE,
     OccupancyArtifactRef,
 )
-from .physical_context import (
-    estimate_readout_physical_context_peak_from_summary,
-)
 from .runtime_resources import (
-    READOUT_ANALYSIS_CLAIM,
     acquire_repository_borrows,
     release_repository_borrows,
 )
@@ -103,13 +94,6 @@ from .runtime_resources import (
 OCCUPANCY_ARTIFACT_FORMAT = "zlc_neutral_atom.occupancy-storage"
 OCCUPANCY_MANIFEST_FORMAT = "zlc_neutral_atom.occupancy-manifest"
 _OCCUPANCY_ARTIFACT_KIND = "occupancy"
-_MAX_MANIFEST_BYTES = 1 * 1024 * 1024
-_MAX_ARTIFACT_METADATA_BYTES = 1 * 1024 * 1024
-_DEFAULT_MEMORY_LIMIT_BYTES = 1 << 30
-_ARRAY_MATERIALIZATION_MULTIPLIER = 3
-_METADATA_MATERIALIZATION_MULTIPLIER = 8
-_REPOSITORY_FIXED_BYTES = 4 << 20
-_INSPECTION_MATERIALIZATION_MULTIPLIER = 8
 _ARTIFACT_FIELDS = frozenset(
     {
         "format",
@@ -127,13 +111,6 @@ _ARTIFACT_FIELDS = frozenset(
 )
 _MANIFEST_FIELDS = frozenset(
     {"format", "repository_id", "metadata_blob"}
-)
-_ARTIFACT_DECODE_LIMITS = CanonicalDecodeLimits(
-    max_depth=32,
-    max_nodes=32_768,
-    max_container_entries=32_768,
-    max_arrays=0,
-    max_total_array_bytes=0,
 )
 
 
@@ -175,54 +152,6 @@ class _StoredOccupancy:
             or self.validity_blob.size != elements
         ):
             raise ValueError("occupancy blob sizes differ from the stored schemas")
-
-
-@dataclass(frozen=True, slots=True)
-class OccupancyArtifactInspection:
-    """FINAL occupancy facts obtained without materializing result arrays."""
-
-    reference: OccupancyArtifactRef
-    source_capture_ref: CaptureArtifactRef
-    calibration_reference: CalibrationArtifactRef
-    readout_event_axis_id: AxisId
-    model_kind: ReadoutModelKind
-    generation: StreamGenerationId
-    counts_schema: DatasetSchema
-    occupied_schema: DatasetSchema
-    inspection_retained_upper_bound_bytes: int
-    materialization_peak_upper_bound_bytes: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.reference, OccupancyArtifactRef):
-            raise TypeError("reference must be OccupancyArtifactRef")
-        if not isinstance(self.source_capture_ref, CaptureArtifactRef):
-            raise TypeError("source_capture_ref must be CaptureArtifactRef")
-        if not isinstance(self.calibration_reference, CalibrationArtifactRef):
-            raise TypeError("calibration_reference must be CalibrationArtifactRef")
-        if not isinstance(self.readout_event_axis_id, AxisId):
-            raise TypeError("readout_event_axis_id must be AxisId")
-        if not isinstance(self.model_kind, ReadoutModelKind):
-            raise TypeError("model_kind must be ReadoutModelKind")
-        if not isinstance(self.generation, StreamGenerationId):
-            raise TypeError("generation must be StreamGenerationId")
-        _require_occupancy_output_schemas(
-            self.counts_schema,
-            self.occupied_schema,
-        )
-        for field in (
-            "inspection_retained_upper_bound_bytes",
-            "materialization_peak_upper_bound_bytes",
-        ):
-            value = getattr(self, field)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{field} must be a positive integer")
-        if (
-            self.materialization_peak_upper_bound_bytes
-            < self.inspection_retained_upper_bound_bytes
-        ):
-            raise ValueError(
-                "occupancy materialization bound is smaller than its inspection"
-            )
 
 
 def _artifact_to_tree(value: _StoredOccupancy) -> dict[str, object]:
@@ -280,9 +209,7 @@ def _decode_artifact(payload: bytes | bytearray | memoryview) -> _StoredOccupanc
     if not isinstance(payload, (bytes, bytearray, memoryview)):
         raise TypeError("occupancy artifact payload must be bytes-like")
     raw = bytes(payload)
-    value = _artifact_from_tree(
-        decode(raw, limits=_ARTIFACT_DECODE_LIMITS)
-    )
+    value = _artifact_from_tree(decode(raw))
     if _encode_artifact(value) != raw:
         raise ValueError("occupancy artifact is typed but non-canonical")
     return value
@@ -331,128 +258,6 @@ def _decode_array_payload(
         if not np.all(np.isfinite(array)):
             raise ValueError(f"{field} payload must be finite")
     return array.reshape(shape)
-
-
-def _storage_peak_bytes(raw_array_bytes: int, metadata_bytes: int) -> int:
-    raw = positive_integer(raw_array_bytes, "raw_array_bytes")
-    metadata = positive_integer(metadata_bytes, "metadata_bytes")
-    return (
-        _REPOSITORY_FIXED_BYTES
-        + _ARRAY_MATERIALIZATION_MULTIPLIER * raw
-        + _METADATA_MATERIALIZATION_MULTIPLIER * metadata
-    )
-
-
-def _inspect_dependency_envelope(
-    capture_repository: CaptureRepository,
-    calibration_repository: CalibrationRepository,
-    source_capture_ref: CaptureArtifactRef,
-    calibration_ref: CalibrationArtifactRef,
-    *,
-    readout_event_axis_id: AxisId,
-    model_kind: ReadoutModelKind,
-    expected_readout_binding: ReadoutBindingKey | None = None,
-    memory_limit_bytes: int,
-) -> tuple[
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-]:
-    """Return compact dependency footprints without retaining schema inspections."""
-
-    memory_limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-    calibration = calibration_repository.inspect_final(
-        calibration_ref,
-        memory_limit_bytes=memory_limit,
-    )
-    calibration_headroom = calibration.inspection_retained_upper_bound_bytes
-    if calibration_headroom >= memory_limit:
-        raise MemoryError(
-            "calibration inspection leaves no budget for capture dependencies"
-        )
-    if model_kind not in calibration.model_kinds:
-        raise KeyError(model_kind)
-    training_capture_ref = calibration.source_capture_ref
-    calibration_binding = calibration.readout_binding
-    site_count = calibration.site_count
-    runtime_scratch = dict(calibration.runtime_scratch_nbytes_by_model)[model_kind]
-    calibration_retained = calibration.artifact_retained_upper_bound_bytes
-    calibration_decode_peak = calibration.artifact_decode_peak_upper_bound_bytes
-    training = capture_repository.inspect_final(
-        training_capture_ref,
-        memory_limit_bytes=memory_limit - calibration_headroom,
-    )
-    if training.readout_binding != calibration_binding:
-        raise ValueError("calibration source differs from its frozen binding")
-    training_pulse_summary = training.pulse_runtime_summary
-    if training_pulse_summary is None:
-        raise ValueError(
-            "authoritative calibration source requires persisted pulse lineage"
-        )
-    training_physical_peak = estimate_readout_physical_context_peak_from_summary(
-        training_pulse_summary
-    )
-    training_decode_peak = training.admission_decode_peak_upper_bound_bytes
-    training_retained = training.admission_retained_upper_bound_bytes
-    training_read_scratch = training.max_read_scratch_bytes
-    calibration_admission_peak = max(
-        calibration_headroom + calibration_decode_peak,
-        calibration_retained + training_decode_peak,
-        calibration_retained
-        + training_retained
-        + training_read_scratch
-        + training_physical_peak,
-    )
-    del training, training_pulse_summary
-
-    source = capture_repository.inspect_final(
-        source_capture_ref,
-        memory_limit_bytes=memory_limit - calibration_headroom,
-    )
-    if source.readout_binding != calibration_binding or (
-        expected_readout_binding is not None
-        and source.readout_binding != expected_readout_binding
-    ):
-        raise ValueError("occupancy dependencies differ from the frozen binding")
-    event_axes = tuple(
-        axis for axis in source.dataset_schema.point_axes if axis.role == READOUT_EVENT
-    )
-    if (
-        len(event_axes) != 1
-        or event_axes[0].axis_id != readout_event_axis_id
-        or event_axes[0].size != 1
-    ):
-        raise ValueError(
-            "occupancy request differs from the singleton READOUT_EVENT axis"
-        )
-    pulse_summary = source.pulse_runtime_summary
-    if pulse_summary is None:
-        raise ValueError("authoritative occupancy requires persisted pulse lineage")
-    event_count = source.event_count
-    source_read_scratch = source.max_read_scratch_bytes
-    source_decode_peak = source.admission_decode_peak_upper_bound_bytes
-    source_retained = source.admission_retained_upper_bound_bytes
-    source_physical_peak = estimate_readout_physical_context_peak_from_summary(
-        pulse_summary
-    )
-    prepared_retained = source_retained + calibration_retained
-    dependency_peak = max(
-        calibration_admission_peak,
-        calibration_retained + source_decode_peak,
-        prepared_retained + source_read_scratch + source_physical_peak,
-    )
-    del source, pulse_summary, calibration, event_axes
-    return (
-        event_count,
-        site_count,
-        source_read_scratch,
-        runtime_scratch,
-        prepared_retained,
-        dependency_peak,
-    )
 
 
 def _manifest_payload(repository_id: str, metadata_blob: ContentRef) -> bytes:
@@ -601,79 +406,19 @@ class OccupancyRepository:
         reference: OccupancyArtifactRef,
         *,
         manifest_payload: bytes | None = None,
-        memory_limit_bytes: int = _DEFAULT_MEMORY_LIMIT_BYTES,
-    ) -> tuple[_StoredOccupancy, int]:
-        memory_limit = positive_integer(
-            memory_limit_bytes,
-            "memory_limit_bytes",
-        )
-        if memory_limit <= _REPOSITORY_FIXED_BYTES:
-            raise MemoryError(
-                "occupancy inspection fixed state exceeds memory limit"
-            )
+    ) -> _StoredOccupancy:
         authority = self._content_authority()
         if manifest_payload is None:
-            manifest_max = min(
-                _MAX_MANIFEST_BYTES,
-                (memory_limit - _REPOSITORY_FIXED_BYTES)
-                // _INSPECTION_MATERIALIZATION_MULTIPLIER,
+            payload = authority.read_manifest(
+                OCCUPANCY_ARTIFACT_NAMESPACE,
+                reference.manifest_digest,
             )
-            try:
-                payload = authority.read_manifest(
-                    OCCUPANCY_ARTIFACT_NAMESPACE,
-                    reference.manifest_digest,
-                    max_bytes=manifest_max,
-                )
-            except ContentSizeLimitError as exc:
-                raise MemoryError(
-                    "occupancy manifest inspection exceeds memory limit"
-                ) from exc
         else:
             payload = manifest_payload
-        manifest_peak = (
-            _REPOSITORY_FIXED_BYTES
-            + _INSPECTION_MATERIALIZATION_MULTIPLIER * len(payload)
-        )
-        if manifest_peak > memory_limit:
-            raise MemoryError(
-                "occupancy manifest inspection exceeds memory limit"
-            )
         repository_id, metadata_ref = _decode_manifest(payload)
         if repository_id != self.repository_id:
             raise ValueError("occupancy manifest belongs to another repository")
-        if metadata_ref.size > _MAX_ARTIFACT_METADATA_BYTES:
-            raise MemoryError("occupancy metadata exceeds repository policy")
-        metadata_peak = (
-            manifest_peak
-            + _INSPECTION_MATERIALIZATION_MULTIPLIER * metadata_ref.size
-        )
-        if metadata_peak > memory_limit:
-            raise MemoryError(
-                "occupancy metadata inspection exceeds memory limit"
-            )
-        metadata = authority.read_blob(metadata_ref, max_bytes=metadata_ref.size)
-        return _decode_artifact(metadata), len(metadata)
-
-    @staticmethod
-    def _require_storage_budget(
-        stored: _StoredOccupancy,
-        metadata_bytes: int,
-        *,
-        memory_limit_bytes: int = _DEFAULT_MEMORY_LIMIT_BYTES,
-    ) -> int:
-        limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-        raw_bytes = (
-            stored.counts_blob.size
-            + stored.occupied_blob.size
-            + stored.validity_blob.size
-        )
-        peak = _storage_peak_bytes(raw_bytes, metadata_bytes)
-        if peak > limit:
-            raise MemoryError(
-                f"occupancy materialization peak {peak} exceeds repository "
-                f"limit {limit}"
-            )
-        return peak
+        return _decode_artifact(authority.read_blob(metadata_ref))
 
     @staticmethod
     def _expected_blob_sizes(
@@ -720,10 +465,7 @@ class OccupancyRepository:
     ) -> OccupancyArtifact:
         authority = self._content_authority()
         shape = binding.counts_schema.physical_shape
-        validity_payload = authority.read_blob(
-            stored.validity_blob,
-            max_bytes=stored.validity_blob.size,
-        )
+        validity_payload = authority.read_blob(stored.validity_blob)
         validity = ComponentValidity(
             (binding.model.feature.site_axis.axis_id,),
             _decode_array_payload(
@@ -734,10 +476,7 @@ class OccupancyRepository:
             ),
         )
         del validity_payload
-        counts_payload = authority.read_blob(
-            stored.counts_blob,
-            max_bytes=stored.counts_blob.size,
-        )
+        counts_payload = authority.read_blob(stored.counts_blob)
         counts = DataBlock(
             OCCUPANCY_COUNTS_BLOCK_ID,
             source.artifact.frame_source.revision,
@@ -751,10 +490,7 @@ class OccupancyRepository:
             binding.counts_schema,
         )
         del counts_payload
-        occupied_payload = authority.read_blob(
-            stored.occupied_blob,
-            max_bytes=stored.occupied_blob.size,
-        )
+        occupied_payload = authority.read_blob(stored.occupied_blob)
         occupied = DataBlock(
             OCCUPANCY_OCCUPIED_BLOCK_ID,
             source.artifact.frame_source.revision,
@@ -777,141 +513,16 @@ class OccupancyRepository:
             occupied,
         )
 
-    def inspect_final(
-        self,
-        reference: OccupancyArtifactRef,
-        *,
-        memory_limit_bytes: int = _DEFAULT_MEMORY_LIMIT_BYTES,
-    ) -> OccupancyArtifactInspection:
-        """Read FINAL output schemas without materializing occupancy arrays."""
-
-        with self._root_lease.borrow() as read_borrow:
-            read_borrow.require_active()
-            intent = self._require_final_commit(reference)
-            stored, metadata_bytes = self._stored(
-                reference,
-                memory_limit_bytes=memory_limit_bytes,
-            )
-            self._require_run_generation(stored, intent)
-            raw_bytes = (
-                stored.counts_blob.size
-                + stored.occupied_blob.size
-                + stored.validity_blob.size
-            )
-            inspection_retained = (
-                _REPOSITORY_FIXED_BYTES
-                + _METADATA_MATERIALIZATION_MULTIPLIER * metadata_bytes
-            )
-            return OccupancyArtifactInspection(
-                reference,
-                stored.source_capture_ref,
-                stored.calibration_reference,
-                stored.readout_event_axis_id,
-                stored.model_kind,
-                stored.generation,
-                stored.counts_schema,
-                stored.occupied_schema,
-                inspection_retained,
-                _storage_peak_bytes(raw_bytes, metadata_bytes),
-            )
-
-    @staticmethod
-    def _admission_peak_for_stored(
-        stored: _StoredOccupancy,
-        metadata_bytes: int,
-        capture_repository: CaptureRepository,
-        calibration_repository: CalibrationRepository,
-        *,
-        memory_limit_bytes: int,
-    ) -> int:
-        raw_bytes = (
-            stored.counts_blob.size
-            + stored.occupied_blob.size
-            + stored.validity_blob.size
-        )
-        storage_peak = _storage_peak_bytes(raw_bytes, metadata_bytes)
-        (
-            _event_count,
-            _site_count,
-            _source_read_scratch,
-            _runtime_scratch,
-            prepared_retained,
-            dependency_peak,
-        ) = _inspect_dependency_envelope(
-            capture_repository,
-            calibration_repository,
-            stored.source_capture_ref,
-            stored.calibration_reference,
-            readout_event_axis_id=stored.readout_event_axis_id,
-            model_kind=stored.model_kind,
-            memory_limit_bytes=memory_limit_bytes,
-        )
-        occupancy_inspection_retained = (
-            _REPOSITORY_FIXED_BYTES
-            + _METADATA_MATERIALIZATION_MULTIPLIER * metadata_bytes
-        )
-        return max(
-            occupancy_inspection_retained + dependency_peak,
-            prepared_retained + storage_peak,
-        )
-
-    def admission_peak_upper_bound_bytes(
-        self,
-        reference: OccupancyArtifactRef,
-        capture_repository: CaptureRepository,
-        calibration_repository: CalibrationRepository,
-        *,
-        memory_limit_bytes: int = _DEFAULT_MEMORY_LIMIT_BYTES,
-    ) -> int:
-        """Return the same complete dependency-aware peak enforced by ``admit``.
-
-        The bound belongs here because occupancy admission resolves and retains
-        both capture and calibration dependencies before decoding its own
-        arrays.  A composition facade may reserve this number, but must not
-        reconstruct the repository's dependency envelope.
-        """
-
-        if type(capture_repository) is not CaptureRepository:
-            raise TypeError("capture_repository must be CaptureRepository")
-        if type(calibration_repository) is not CalibrationRepository:
-            raise TypeError("calibration_repository must be CalibrationRepository")
-        memory_limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-        with self._root_lease.borrow() as admission_borrow:
-            admission_borrow.require_active()
-            with capture_repository._root_lease.borrow() as source_borrow:
-                with calibration_repository._root_lease.borrow() as calibration_borrow:
-                    source_borrow.require_active()
-                    calibration_borrow.require_active()
-                    intent = self._require_final_commit(reference)
-                    stored, metadata_bytes = self._stored(
-                        reference,
-                        memory_limit_bytes=memory_limit,
-                    )
-                    self._require_run_generation(stored, intent)
-                    return self._admission_peak_for_stored(
-                        stored,
-                        metadata_bytes,
-                        capture_repository,
-                        calibration_repository,
-                        memory_limit_bytes=memory_limit,
-                    )
-
     def admit(
         self,
         reference: OccupancyArtifactRef,
         capture_repository: CaptureRepository,
         calibration_repository: CalibrationRepository,
-        *,
-        memory_limit_bytes: int = _DEFAULT_MEMORY_LIMIT_BYTES,
     ) -> ResolvedOccupancy:
         if type(capture_repository) is not CaptureRepository:
             raise TypeError("capture_repository must be CaptureRepository")
         if type(calibration_repository) is not CalibrationRepository:
             raise TypeError("calibration_repository must be CalibrationRepository")
-        memory_limit = positive_integer(
-            memory_limit_bytes,
-            "memory_limit_bytes",
-        )
         with self._root_lease.borrow() as admission_borrow:
             admission_borrow.require_active()
             with capture_repository._root_lease.borrow() as source_borrow:
@@ -919,27 +530,11 @@ class OccupancyRepository:
                     source_borrow.require_active()
                     calibration_borrow.require_active()
                     intent = self._require_final_commit(reference)
-                    stored, metadata_bytes = self._stored(
-                        reference,
-                        memory_limit_bytes=memory_limit,
-                    )
+                    stored = self._stored(reference)
                     self._require_run_generation(stored, intent)
-                    peak = self._admission_peak_for_stored(
-                        stored,
-                        metadata_bytes,
-                        capture_repository,
-                        calibration_repository,
-                        memory_limit_bytes=memory_limit,
-                    )
-                    if peak > memory_limit:
-                        raise MemoryError(
-                            f"occupancy admission peak {peak} exceeds limit "
-                            f"{memory_limit}"
-                        )
                     calibration = calibration_repository.admit(
                         stored.calibration_reference,
                         capture_repository,
-                        memory_limit_bytes=memory_limit,
                     )
                     source = capture_repository.admit(stored.source_capture_ref)
                     binding = _resolve_committed_occupancy_structure(
@@ -979,7 +574,6 @@ class OccupancyRepository:
             return self._content_authority().has_manifest(
                 OCCUPANCY_ARTIFACT_NAMESPACE,
                 reference.manifest_digest,
-                max_bytes=_MAX_MANIFEST_BYTES,
             )
 
     def _stage_result(
@@ -1023,14 +617,8 @@ class OccupancyRepository:
             authority.identify_blob(validity_payload),
         )
         metadata = _encode_artifact(stored)
-        if len(metadata) > _MAX_ARTIFACT_METADATA_BYTES:
-            raise MemoryError(
-                f"occupancy metadata requires {len(metadata)} bytes; "
-                f"limit {_MAX_ARTIFACT_METADATA_BYTES}"
-            )
         if _decode_artifact(metadata) != stored:
             raise ValueError("occupancy metadata failed its canonical round-trip")
-        self._require_storage_budget(stored, len(metadata))
         for payload, expected in (
             (counts_payload, stored.counts_blob),
             (occupied_payload, stored.occupied_blob),
@@ -1072,7 +660,6 @@ class OccupancyRepository:
                     OCCUPANCY_ARTIFACT_NAMESPACE,
                     payload,
                     expected_digest=reference.manifest_digest,
-                    max_bytes=_MAX_MANIFEST_BYTES,
                 )
                 return PublishedManifest(
                     reference.target_ref,
@@ -1120,26 +707,23 @@ class OccupancyRepository:
             payload = authority.read_manifest(
                 OCCUPANCY_ARTIFACT_NAMESPACE,
                 reference.manifest_digest,
-                max_bytes=_MAX_MANIFEST_BYTES,
             )
         except FileNotFoundError:
             return None
-        stored, metadata_bytes = self._stored(
+        stored = self._stored(
             reference,
             manifest_payload=payload,
         )
         self._require_run_generation(stored, intent)
-        self._require_storage_budget(stored, metadata_bytes)
         for blob in (
             stored.counts_blob,
             stored.occupied_blob,
             stored.validity_blob,
         ):
-            authority.verify_blob(blob, max_bytes=blob.size)
+            authority.verify_blob(blob)
         if authority.confirm_manifest_durable(
             OCCUPANCY_ARTIFACT_NAMESPACE,
             reference.manifest_digest,
-            max_bytes=_MAX_MANIFEST_BYTES,
         ) != payload:
             raise RuntimeError("recovery durability check changed occupancy manifest")
         return PublishedManifest(
@@ -1165,7 +749,6 @@ def compile_occupancy_artifact_plan(
     expected_readout_binding: ReadoutBindingKey,
     readout_event_axis_id: AxisId,
     model_kind: ReadoutModelKind,
-    memory_limit_bytes: int,
     timeout_seconds: float,
 ) -> RunPlan:
     """Compile committed raw frames to one FINAL occupancy artifact."""
@@ -1186,7 +769,6 @@ def compile_occupancy_artifact_plan(
         raise TypeError("readout_event_axis_id must be AxisId")
     if not isinstance(model_kind, ReadoutModelKind):
         raise TypeError("model_kind must be a concrete ReadoutModelKind")
-    memory_limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
     timeout = positive_real(timeout_seconds, "timeout_seconds")
 
     def admit_inputs(
@@ -1196,7 +778,6 @@ def compile_occupancy_artifact_plan(
             calibration_ref,
             capture_repository,
             checkpoint=context.checkpoint,
-            memory_limit_bytes=memory_limit,
         )
         source = capture_repository.admit(source_capture_ref)
         if source.artifact.camera_provenance.binding != expected_readout_binding or (
@@ -1222,82 +803,12 @@ def compile_occupancy_artifact_plan(
         borrows: tuple[RepositoryRootLeaseBorrow, ...],
     ) -> _PreparedOccupancyAnalysis:
         context.checkpoint()
-        (
-            event_count,
-            site_count,
-            source_read_scratch,
-            runtime_scratch,
-            prepared_retained,
-            dependency_peak,
-        ) = _inspect_dependency_envelope(
-            capture_repository,
-            calibration_repository,
-            source_capture_ref,
-            calibration_ref,
-            readout_event_axis_id=readout_event_axis_id,
-            model_kind=model_kind,
-            expected_readout_binding=expected_readout_binding,
-            memory_limit_bytes=memory_limit,
-        )
-        analysis_peak = _estimate_committed_occupancy_peak_from_footprints(
-            event_count=event_count,
-            site_count=site_count,
-            source_read_scratch_bytes=source_read_scratch,
-            dependency_retained_bytes=prepared_retained,
-            runtime_scratch_bytes=runtime_scratch,
-        )
-        early_peak = max(dependency_peak, analysis_peak)
-        if early_peak > memory_limit:
-            raise MemoryError(
-                f"occupancy analysis peak {early_peak} exceeds limit "
-                f"{memory_limit}"
-            )
         source, calibration, binding = admit_dependencies(context)
-        exact_sizes = OccupancyRepository._expected_blob_sizes(binding)
-        elements = event_count * site_count
-        if exact_sizes != (elements * 8, elements, elements):
-            raise ValueError(
-                "occupancy runtime summary differs from admitted output geometry"
-            )
-        placeholder_digest = "0" * 64
-        prospective = _StoredOccupancy(
-            source_capture_ref,
-            calibration_ref,
-            readout_event_axis_id,
-            model_kind,
-            _occupancy_generation_for_run(context.run_id.value),
-            binding.counts_schema,
-            binding.occupied_schema,
-            ContentRef(placeholder_digest, exact_sizes[0]),
-            ContentRef(placeholder_digest, exact_sizes[1]),
-            ContentRef(placeholder_digest, exact_sizes[2]),
-        )
-        metadata_bytes = len(_encode_artifact(prospective))
-        if metadata_bytes > _MAX_ARTIFACT_METADATA_BYTES:
-            raise MemoryError(
-                f"occupancy metadata requires {metadata_bytes} bytes; "
-                f"repository limit {_MAX_ARTIFACT_METADATA_BYTES}"
-            )
-        storage_peak = OccupancyRepository._require_storage_budget(
-            prospective,
-            metadata_bytes,
-            memory_limit_bytes=memory_limit,
-        )
-        peak = max(
-            dependency_peak,
-            analysis_peak,
-            prepared_retained + storage_peak,
-        )
-        if peak > memory_limit:
-            raise MemoryError(
-                f"occupancy analysis peak {peak} exceeds limit {memory_limit}"
-            )
         resolved = _require_committed_occupancy_context(
             source,
             calibration,
             binding,
             checkpoint=context.checkpoint,
-            physical_memory_limit_bytes=memory_limit,
         )
         context.checkpoint()
         return resolved, borrows
@@ -1378,7 +889,7 @@ def compile_occupancy_artifact_plan(
 
     return RunPlan(
         name="classify committed camera capture occupancy",
-        resource_claims=(READOUT_ANALYSIS_CLAIM,),
+        resource_claims=(),
         bound_devices=(),
         preflight=preflight,
         execute=execute,
@@ -1393,7 +904,6 @@ def compile_occupancy_artifact_plan(
 __all__ = [
     "OCCUPANCY_ARTIFACT_FORMAT",
     "OCCUPANCY_MANIFEST_FORMAT",
-    "OccupancyArtifactInspection",
     "OccupancyRepository",
     "compile_occupancy_artifact_plan",
 ]

@@ -1,4 +1,4 @@
-"""MONITOR seam contract: one freeze per tick, and the values are the real ones.
+"""MONITOR seam contract: changed sources freeze once, unchanged fronts are reused.
 
 Worth a test where it touches reality: a live virtual monitor is frozen through
 the data plane and must yield the camera's actual block (shape, dtype, unit off
@@ -12,8 +12,28 @@ import ast
 import pathlib
 import subprocess
 import sys
+from types import SimpleNamespace
+
+from zlc_workbench.task_console.data_plane import ConsoleDataPlane
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
+
+
+def test_unchanged_sources_reuse_their_immutable_front() -> None:
+    plane = ConsoleDataPlane()
+    node = SimpleNamespace(name="camera")
+    slot = object()
+    calls = []
+    plane._freeze_one = lambda *_args: calls.append(object()) or {}
+    plane.attach(node, slot)
+
+    plane.freeze()
+    plane.freeze()
+    assert len(calls) == 1
+
+    plane.mark_changed(node)
+    plane.freeze()
+    assert len(calls) == 2
 
 
 def test_a_live_monitor_freezes_into_real_values_with_advancing_versions():
@@ -22,7 +42,7 @@ def test_a_live_monitor_freezes_into_real_values_with_advancing_versions():
         "from Zou_lab_control.notebook import connect\n"
         "from Zou_lab_control.notebook.facade import "
         "_prepare_camera_monitor_for_workbench\n"
-        "from zlc_frontend.figure import DatasetId, FigureEvaluationPolicy\n"
+        "from zlc_frontend.figure import DatasetId\n"
         "from zlc_workbench.live import LiveDatasetSlot\n"
         "from zlc_workbench.task_console.catalog_bridge import ConsoleCatalogView\n"
         "from zlc_workbench.task_console.run_bridge import ConsoleRunNode\n"
@@ -38,11 +58,11 @@ def test_a_live_monitor_freezes_into_real_values_with_advancing_versions():
         "    def start(command):\n"
         "        def factory(vs):\n"
         "            slot = LiveDatasetSlot(vs, dataset_id=DatasetId('console-1'),\n"
-        "                                   evaluation_policy=FigureEvaluationPolicy(),\n"
         "                                   retain_on_terminal=False)\n"
         "            plane.attach(node, slot)\n"
+        "            slot.set_change_listener(lambda: plane.mark_changed(node))\n"
         "            return slot\n"
-        "        return command.start_with_view(downstream_peak_bytes=1 << 20, factory=factory)\n"
+        "        return command.start_with_view(factory=factory)\n"
         "    node.start(start)\n"
         "    t = time.monotonic() + 60\n"
         "    while node.handle is None and node.last_error is None and time.monotonic() < t:\n"

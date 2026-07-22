@@ -159,7 +159,6 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
                 AxisId("capture.ordinal"),
                 readout_events_per_repeat=3,
             ),
-            transport_memory_limit_bytes=16 << 20,
         )
         schedule = static.compiled_artifact.trigger_schedules[0]
         assert schedule.minimum_interval_ticks is not None
@@ -213,7 +212,6 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
                 AxisId("single.ordinal"),
                 readout_events_per_repeat=1,
             ),
-            transport_memory_limit_bytes=16 << 20,
         )
         single_schedule = single_edge.compiled_artifact.trigger_schedules[0]
         assert single_schedule.total == 1
@@ -266,7 +264,6 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
                 execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
                 trigger_channel="ch11",
                 layout=scan_layout,
-                transport_memory_limit_bytes=16 << 20,
             )
         scanned = bind_triggered_camera_acquisition(
             pulse_port,
@@ -275,7 +272,6 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
             execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
             trigger_channel="ch11",
             layout=scan_layout,
-            transport_memory_limit_bytes=16 << 20,
         )
         scan_schedule = scanned.compiled_artifact.trigger_schedules[0]
         edges = tuple(scan_schedule.iter_edges())

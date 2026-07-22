@@ -667,7 +667,7 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
         )
         _until(
             application,
-            lambda: body.schedule_view._visible_ports == offline_visible,
+            lambda: body.schedule_view._visible_ports == offline_available,
         )
         offline_geometry_after = (
             body.schedule_view.dataset_scroll.geometry().getRect(),
@@ -698,14 +698,30 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
             first_card.duration_edit,
         )
         snapshot_calls = 0
+        projection_calls = 0
+        set_document_calls = 0
         original_snapshot = body._controller.snapshot
+        original_projection = body._controller.editor_projection
+        original_set_document = body.schedule_view.set_document
 
         def counted_snapshot():
             nonlocal snapshot_calls
             snapshot_calls += 1
             return original_snapshot()
 
+        def counted_projection():
+            nonlocal projection_calls
+            projection_calls += 1
+            return original_projection()
+
+        def counted_set_document(*args, **kwargs):
+            nonlocal set_document_calls
+            set_document_calls += 1
+            return original_set_document(*args, **kwargs)
+
         body._controller.snapshot = counted_snapshot
+        body._controller.editor_projection = counted_projection
+        body.schedule_view.set_document = counted_set_document
         prior_unit = first_card.unit_combo.currentText()
         try:
             QtTest.QTest.mouseClick(first_card.unit_combo, QtCore.Qt.LeftButton)
@@ -715,10 +731,54 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
                 application,
                 lambda: body.current_document.periods[0].unit != prior_unit,
             )
+
+            # Structural authoring uses the same local owner turn: adding,
+            # bracketing, and removing a period may insert/move/delete the
+            # keyed cards, but must not fall back to a whole editor projection.
+            original_cards = body.schedule_view.period_cards()
+            QtTest.QTest.mouseClick(
+                body.schedule_view.add_button,
+                QtCore.Qt.LeftButton,
+            )
+            _until(
+                application,
+                lambda: len(body.schedule_view.period_cards())
+                == len(original_cards) + 1,
+            )
+            assert body.schedule_view.period_cards()[0] is original_cards[0]
+            QtTest.QTest.mouseClick(
+                body.schedule_view.bracket_button,
+                QtCore.Qt.LeftButton,
+            )
+            _until(application, lambda: body.current_document.repeat is not None)
+            QtTest.QTest.mouseClick(
+                body.schedule_view.remove_button,
+                QtCore.Qt.LeftButton,
+            )
+            _until(
+                application,
+                lambda: len(body.schedule_view.period_cards()) == len(original_cards),
+            )
+            assert body.schedule_view.period_cards() == original_cards
+
+            digital = next(iter(first_card.checks))
+            if not first_card.checks[digital].isChecked():
+                QtTest.QTest.mouseClick(
+                    first_card.checks[digital],
+                    QtCore.Qt.LeftButton,
+                )
+                _until(application, lambda: first_card.checks[digital].isChecked())
+            QtTest.QTest.mouseClick(
+                body.schedule_view.channel_panel.clear_buttons[digital],
+                QtCore.Qt.LeftButton,
+            )
+            _until(application, lambda: not first_card.checks[digital].isChecked())
             application.processEvents()
-            assert snapshot_calls == 0
+            assert (snapshot_calls, projection_calls, set_document_calls) == (0, 0, 0)
         finally:
             body._controller.snapshot = original_snapshot
+            body._controller.editor_projection = original_projection
+            body.schedule_view.set_document = original_set_document
         assert all(
             before is after
             for before, after in zip(

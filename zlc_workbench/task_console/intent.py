@@ -56,7 +56,6 @@ from zlc_storage import (
     decode,
     encode,
     exact_mapping,
-    positive_integer,
     positive_real,
 )
 
@@ -67,8 +66,6 @@ from ..progressive_scan import ScanDisplayIntent
 TASK_CONSOLE_SCAN_INTENT_FORMAT = "zlc_workbench.TaskConsoleScanIntent"
 SCAN_INTENT_DEFAULT_CAMERA_ROLE = "camera"
 SCAN_INTENT_DEFAULT_SEQUENCER_ROLE = "sequencer"
-SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES = 64 << 20
-SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES = 512 << 20
 SCAN_INTENT_DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
@@ -218,29 +215,11 @@ def task_console_scan_binding_form_spec(
     )
 
 
-def task_console_scan_budget_form_spec() -> FormSpec:
-    """Single UI projection of TaskConsoleScanIntent resource constraints."""
+def task_console_scan_runtime_form_spec() -> FormSpec:
+    """Single UI projection of the whole-run deadline."""
 
     return FormSpec(
         (
-            FormFieldProps(
-                "transport_memory_limit_bytes",
-                "int",
-                "Transport bytes",
-                default=SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES,
-                required=True,
-                minimum=1,
-                description="Maximum admitted camera transport memory",
-            ),
-            FormFieldProps(
-                "memory_limit_bytes",
-                "int",
-                "Pipeline bytes",
-                default=SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES,
-                required=True,
-                minimum=1,
-                description="Maximum admitted pipeline and artifact memory",
-            ),
             FormFieldProps(
                 "timeout_seconds",
                 "float",
@@ -275,8 +254,6 @@ class TaskConsoleScanIntent:
     model_kind: ReadoutModelKind | None = None
     output_transform_spec: DataTransformSpec | None = None
     display_intent: ScanDisplayIntent = ScanDisplayIntent()
-    transport_memory_limit_bytes: int = SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES
-    memory_limit_bytes: int = SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES
     timeout_seconds: float = SCAN_INTENT_DEFAULT_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
@@ -342,19 +319,6 @@ class TaskConsoleScanIntent:
             raise TypeError("display_intent must be ScanDisplayIntent")
         if self.processor_key is None and self.display_intent != ScanDisplayIntent():
             raise ValueError("direct-camera intent has no SITE display choice")
-        object.__setattr__(
-            self,
-            "transport_memory_limit_bytes",
-            positive_integer(
-                self.transport_memory_limit_bytes,
-                "transport_memory_limit_bytes",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "memory_limit_bytes",
-            positive_integer(self.memory_limit_bytes, "memory_limit_bytes"),
-        )
         object.__setattr__(
             self,
             "timeout_seconds",
@@ -475,8 +439,6 @@ def task_console_scan_intent_to_tree(
             "site_mode": intent.display_intent.site_mode,
             "site_index": intent.display_intent.site_index,
         },
-        "transport_memory_limit_bytes": intent.transport_memory_limit_bytes,
-        "memory_limit_bytes": intent.memory_limit_bytes,
         "timeout_seconds": intent.timeout_seconds,
     }
 
@@ -497,8 +459,6 @@ def task_console_scan_intent_from_tree(tree: object) -> TaskConsoleScanIntent:
             "model_kind",
             "output_transform_spec",
             "display_intent",
-            "transport_memory_limit_bytes",
-            "memory_limit_bytes",
             "timeout_seconds",
         },
         TASK_CONSOLE_SCAN_INTENT_FORMAT,
@@ -540,8 +500,6 @@ def task_console_scan_intent_from_tree(tree: object) -> TaskConsoleScanIntent:
             display["site_mode"],
             display["site_index"],
         ),
-        transport_memory_limit_bytes=data["transport_memory_limit_bytes"],
-        memory_limit_bytes=data["memory_limit_bytes"],
         timeout_seconds=data["timeout_seconds"],
     )
     if task_console_scan_intent_to_tree(value) != tree:
@@ -586,10 +544,8 @@ def load_task_console_scan_intent(path: str | Path) -> TaskConsoleScanIntent:
 
 __all__ = [
     "SCAN_INTENT_DEFAULT_CAMERA_ROLE",
-    "SCAN_INTENT_DEFAULT_PIPELINE_MEMORY_BYTES",
     "SCAN_INTENT_DEFAULT_SEQUENCER_ROLE",
     "SCAN_INTENT_DEFAULT_TIMEOUT_SECONDS",
-    "SCAN_INTENT_DEFAULT_TRANSPORT_MEMORY_BYTES",
     "ScanDisplayIntent",
     "ScanEditConflict",
     "ScanEditDraft",
@@ -604,7 +560,7 @@ __all__ = [
     "load_task_console_scan_intent",
     "save_task_console_scan_intent",
     "task_console_scan_binding_form_spec",
-    "task_console_scan_budget_form_spec",
+    "task_console_scan_runtime_form_spec",
     "task_console_catalog_items",
     "task_console_scan_intent_from_tree",
     "task_console_scan_intent_to_tree",

@@ -130,7 +130,7 @@ class _FrozenScanApplication:
         def start_occupancy(preview):
             if preview is not None and preview.spec != progressive.preview_spec:
                 raise ValueError(
-                    "prepared progressive preview budget changed before start"
+                    "prepared progressive preview changed before start"
                 )
             return command.start(preview)
         progressive_enabled = isinstance(
@@ -145,10 +145,8 @@ class _FrozenScanApplication:
     def project_final(
         self,
         source_ref: ScanArtifactRef,
-        *,
-        memory_limit_bytes: int,
     ) -> FinalScanPresentation:
-        figure_options = {"memory_limit_bytes": memory_limit_bytes}
+        figure_options = {}
         if isinstance(self._request, OccupancyScanRequest):
             if self._final_preferences is None:
                 raise RuntimeError("occupancy display was not prepared")
@@ -170,10 +168,6 @@ class _FrozenScanApplication:
             summary += f" · selections={len(layer.view.display_selections)}"
         return FinalScanPresentation(
             source_ref,
-            # ``Experiment.figure`` has already partitioned the one operation
-            # budget across source/schema/document/evaluation and frozen the
-            # remaining render share.  Repassing the larger aggregate limit
-            # would attempt to weaken that admission contract.
             figure.to_png_bytes(),
             summary,
         )
@@ -183,6 +177,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
     """Progressive occupancy/final scan panel; rendering never blocks Qt."""
 
     finalReferenceChanged = QtCore.pyqtSignal(object)
+    stateChanged = QtCore.pyqtSignal()
 
     def __init__(
         self,
@@ -346,7 +341,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(40)
         self._timer.timeout.connect(self._owner_cycle)
-        self._timer.start()
+        self._reported_runtime_state: tuple[bool, bool] | None = None
         self._start.clicked.connect(self._start_scan)
         self._stop.clicked.connect(self._stop_scan)
         self._selector_switch.toggled.connect(self._set_selector_enabled)
@@ -759,6 +754,11 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
     def _owner_cycle(self) -> None:
         model = self._controller.owner_cycle()
         self._apply_model(model)
+        if self._controller.needs_periodic_poll:
+            if not self._timer.isActive():
+                self._timer.start()
+        else:
+            self._timer.stop()
         if model.closed and not self._allow_close:
             self._timer.stop()
             self._wake.detach()
@@ -766,6 +766,10 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(0, self.close)
 
     def _apply_model(self, model: ScanPanelViewModel) -> None:
+        runtime_state = (model.closed, model.can_start and model.worker_idle)
+        if runtime_state != self._reported_runtime_state:
+            self._reported_runtime_state = runtime_state
+            self.stateChanged.emit()
         if model.artifact_ref != self._reported_final_reference:
             self._reported_final_reference = model.artifact_ref
             self.finalReferenceChanged.emit(model.artifact_ref)

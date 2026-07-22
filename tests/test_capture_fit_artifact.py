@@ -15,13 +15,8 @@ from zlc_data import (
     BlockId,
     REPEAT,
     encode_fit_result_batch,
-    fit_result_decode_additional_peak_upper_bound_nbytes,
-    fit_result_encode_additional_peak_upper_bound_nbytes,
-    fit_result_retained_upper_bound_nbytes,
-    fit_result_source_validation_additional_peak_upper_bound_nbytes,
     fit_spec_for,
 )
-import zlc_neutral_atom.artifacts.fit_result as fit_result_module
 from zlc_neutral_atom.adapter_sdk import (
     CameraCaptureTerminalRecord,
     CameraFrameRecord,
@@ -222,13 +217,11 @@ class _CaptureCase:
                 AxisId("scan-ordinal"),
                 readout_events_per_repeat=3,
             ),
-            transport_memory_limit_bytes=8 << 20,
         )
         pipeline = MinimalPipelineSpec(
             "capture fit source",
             binding.measurement,
             BlockId("capture-fit-source"),
-            16 << 20,
             timeout_seconds=2.0,
         )
         triggered = TriggeredCaptureSpec(
@@ -267,10 +260,9 @@ def capture_case(tmp_path):
 
 
 def _execution(repository, case):
+    artifact = case.capture_repository.load(case.capture_reference)
     spec = fit_spec_for(
-        case.capture_repository.inspect_final(
-            case.capture_reference,
-        ).dataset_schema,
+        artifact.frame_source.schema,
         "exponential_decay",
         fit_axis_ids=(AxisId("camera.x"),),
     )
@@ -289,8 +281,8 @@ def test_execution_save_load_is_idempotent_and_has_no_mirror_truths(
     repository = FitResultRepository(tmp_path / "fits")
     try:
         execution = _execution(repository, capture_case)
-        first = execution.save(operation_memory_limit_bytes=512 << 20)
-        second = execution.save(operation_memory_limit_bytes=512 << 20)
+        first = execution.save()
+        second = execution.save()
         assert first == second
         assert isinstance(first, FitResultArtifactRef)
         assert execution.source_artifact_ref == capture_case.capture_reference
@@ -349,137 +341,6 @@ def test_execution_save_load_is_idempotent_and_has_no_mirror_truths(
         repository.close()
 
 
-def test_save_additional_workspace_is_admitted_before_encode_or_cas(
-    tmp_path,
-    capture_case,
-    monkeypatch,
-) -> None:
-    repository = FitResultRepository(tmp_path / "fits")
-    try:
-        execution = _execution(repository, capture_case)
-        required = (
-            fit_result_encode_additional_peak_upper_bound_nbytes(
-                execution.result
-            )
-            + fit_result_module._FIT_SAVE_REPOSITORY_FIXED_BYTES
-        )
-        encode_calls = 0
-        put_calls = 0
-        owner_encode = fit_result_module.encode_fit_result_batch
-        owner_put = ContentStoreAuthority.put_blob
-
-        def traced_encode(result):
-            nonlocal encode_calls
-            encode_calls += 1
-            return owner_encode(result)
-
-        def traced_put(authority, payload):
-            nonlocal put_calls
-            put_calls += 1
-            return owner_put(authority, payload)
-
-        monkeypatch.setattr(
-            fit_result_module,
-            "encode_fit_result_batch",
-            traced_encode,
-        )
-        monkeypatch.setattr(ContentStoreAuthority, "put_blob", traced_put)
-
-        with pytest.raises(MemoryError, match="additional workspace"):
-            execution.save(operation_memory_limit_bytes=required - 1)
-        assert encode_calls == 0
-        assert put_calls == 0
-
-        reference = execution.save(operation_memory_limit_bytes=required)
-        assert isinstance(reference, FitResultArtifactRef)
-        assert encode_calls == 1
-        assert put_calls == 1
-        default_reference = execution.save()
-        assert default_reference == reference
-        assert encode_calls == 2
-        assert put_calls == 2
-    finally:
-        repository.close()
-
-
-def test_load_codec_and_source_phases_share_one_aggregate_limit(
-    tmp_path,
-    capture_case,
-    monkeypatch,
-) -> None:
-    repository = FitResultRepository(tmp_path / "fits")
-    try:
-        execution = _execution(repository, capture_case)
-        save_required = (
-            fit_result_encode_additional_peak_upper_bound_nbytes(
-                execution.result
-            )
-            + fit_result_module._FIT_SAVE_REPOSITORY_FIXED_BYTES
-        )
-        reference = execution.save(
-            operation_memory_limit_bytes=save_required
-        )
-        manifest_payload = repository._store_authority.read_manifest(
-            "fit-result",
-            reference.manifest_digest,
-        )
-        result_ref = content_ref_from_tree(
-            decode(manifest_payload)["result_blob"]
-        )
-        inspection = capture_case.capture_repository.inspect_final(
-            capture_case.capture_reference,
-            memory_limit_bytes=512 << 20,
-        )
-        fixed = fit_result_module._FIT_LOAD_REPOSITORY_FIXED_BYTES
-        inspection_peak = inspection.inspection_decode_peak_upper_bound_bytes
-        inspection_retained = inspection.inspection_retained_upper_bound_bytes
-        decode_peak = fit_result_decode_additional_peak_upper_bound_nbytes(
-            result_ref.size
-        )
-        result_retained = fit_result_retained_upper_bound_nbytes(
-            execution.result
-        )
-        validation_peak = (
-            fit_result_source_validation_additional_peak_upper_bound_nbytes(
-                execution.result,
-                inspection.dataset_schema,
-            )
-        )
-        required = fixed + max(
-            inspection_peak,
-            inspection_retained + decode_peak,
-            inspection_retained + result_retained + validation_peak,
-        )
-        read_calls = 0
-        owner_read = ContentStoreAuthority.read_blob
-
-        def traced_read(authority, candidate, *args, **kwargs):
-            nonlocal read_calls
-            if candidate == result_ref:
-                read_calls += 1
-            return owner_read(authority, candidate, *args, **kwargs)
-
-        monkeypatch.setattr(ContentStoreAuthority, "read_blob", traced_read)
-        with pytest.raises(MemoryError, match="aggregate predecode peak"):
-            repository.load(
-                reference,
-                capture_repository=capture_case.capture_repository,
-                memory_limit_bytes=required - 1,
-            )
-        if fixed + inspection_retained + decode_peak == required:
-            assert read_calls == 0
-
-        admitted = repository.load(
-            reference,
-            capture_repository=capture_case.capture_repository,
-            memory_limit_bytes=required,
-        )
-        assert admitted.reference == reference
-        assert admitted.source_artifact_ref == capture_case.capture_reference
-    finally:
-        repository.close()
-
-
 def test_raw_fit_result_cannot_be_promoted_without_execution_authority(
     tmp_path,
     capture_case,
@@ -489,10 +350,7 @@ def test_raw_fit_result_cannot_be_promoted_without_execution_authority(
         execution = _execution(repository, capture_case)
         assert not hasattr(repository, "save")
         with pytest.raises(PermissionError, match="authority"):
-            repository._save_execution(  # type: ignore[arg-type]
-                execution.result,
-                operation_memory_limit_bytes=512 << 20,
-            )
+            repository._save_execution(execution.result)  # type: ignore[arg-type]
         with pytest.raises(PermissionError, match="only be minted"):
             FitExecution(
                 object(),
@@ -500,7 +358,7 @@ def test_raw_fit_result_cannot_be_promoted_without_execution_authority(
                 source_artifact_ref=capture_case.capture_reference,
                 result=execution.result,
             )
-        reference = execution.save(operation_memory_limit_bytes=512 << 20)
+        reference = execution.save()
         with pytest.raises(PermissionError, match="only be minted"):
             AdmittedFitResult(
                 object(),
@@ -535,9 +393,7 @@ def test_load_fails_closed_on_content_corruption(
 ) -> None:
     repository = FitResultRepository(tmp_path / "fits")
     try:
-        reference = _execution(repository, capture_case).save(
-            operation_memory_limit_bytes=512 << 20
-        )
+        reference = _execution(repository, capture_case).save()
         if target == "manifest":
             path = repository._store._manifest_path(
                 "fit-result",
@@ -569,9 +425,7 @@ def test_foreign_fit_repository_rejects_reference(tmp_path, capture_case) -> Non
         repository_id="foreign-fit-repository",
     )
     try:
-        reference = _execution(first, capture_case).save(
-            operation_memory_limit_bytes=512 << 20
-        )
+        reference = _execution(first, capture_case).save()
         with pytest.raises(ValueError, match="another repository"):
             second.load(
                 reference,

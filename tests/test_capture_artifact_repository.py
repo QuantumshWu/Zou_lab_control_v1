@@ -17,7 +17,6 @@ from zlc_neutral_atom.adapter_sdk import (
 from zlc_neutral_atom.artifacts import (
     CaptureArtifactRef,
     CaptureRepository,
-    CaptureRepositoryResourcePolicy,
     compile_capture_artifact_pipeline,
 )
 from zlc_neutral_atom.bootstrap._camera_endpoint import CameraCaptureEndpoint
@@ -184,7 +183,6 @@ class _CaptureCase:
         tmp_path,
         *,
         camera: _Camera | None = None,
-        resource_policy: CaptureRepositoryResourcePolicy | None = None,
     ) -> None:
         self.camera = _Camera() if camera is None else camera
         self.broker = DeviceBroker()
@@ -237,13 +235,11 @@ class _CaptureCase:
                 AxisId("scan-ordinal"),
                 readout_events_per_repeat=3,
             ),
-            transport_memory_limit_bytes=8 << 20,
         )
         pipeline = MinimalPipelineSpec(
             "persist current exact capture",
             binding.measurement,
             BlockId("capture-artifact-test"),
-            16 << 20,
             timeout_seconds=2.0,
         )
         self.triggered = TriggeredCaptureSpec(
@@ -253,8 +249,7 @@ class _CaptureCase:
             binding.trigger_channel,
             binding.cell_plan,
         )
-        kwargs = {} if resource_policy is None else {"resource_policy": resource_policy}
-        self.repository = CaptureRepository(tmp_path / "captures", **kwargs)
+        self.repository = CaptureRepository(tmp_path / "captures")
         self.resources = ResourceArbiter()
         self.controller = RunController(self.resources)
         self.handle = None
@@ -284,7 +279,7 @@ def test_exact_pipeline_commits_and_reloads_multidimensional_capture(tmp_path) -
         assert isinstance(reference, CaptureArtifactRef)
         assert case.handle.snapshot().final_committed
         artifact = case.repository.load(reference)
-        block = artifact.frame_source.materialize(memory_limit_bytes=16 << 20)
+        block = artifact.frame_source.materialize()
         assert block.values.shape == (1, 3, 3, 4)
         assert tuple(
             axis.axis_id.value for axis in block.schema.cell_schema.data_axes
@@ -299,7 +294,6 @@ def test_exact_pipeline_commits_and_reloads_multidimensional_capture(tmp_path) -
         ) == (0, 1, 2)
         assert artifact.pulse_evidence is not None
         assert artifact.pulse_evidence.expected_trigger_count == 3
-        assert not hasattr(artifact, "aggregate_peak_bytes")
     finally:
         case.close()
 
@@ -318,7 +312,6 @@ def test_manifest_contains_current_owner_values_without_mirror_truths(tmp_path) 
             "repository_id",
             "frame_index_blob",
             "compiled_pulse_blob",
-            "compiled_pulse_runtime_summary",
             "provenance",
             "terminal",
             "camera_provenance",
@@ -326,7 +319,6 @@ def test_manifest_contains_current_owner_values_without_mirror_truths(tmp_path) 
             "camera_arm_spec",
             "pulse_evidence",
         }
-        assert "aggregate_peak_bytes" not in manifest
         assert "checkpoint" not in manifest
         admitted = case.repository.admit(reference)
         assert admitted.reference == reference
@@ -346,18 +338,6 @@ def test_failed_terminal_count_never_publishes_a_manifest(tmp_path) -> None:
         case.close()
 
 
-def test_repository_resource_policy_rejects_before_final_visibility(tmp_path) -> None:
-    policy = CaptureRepositoryResourcePolicy(max_total_frame_bytes=1)
-    case = _CaptureCase(tmp_path, resource_policy=policy)
-    try:
-        with pytest.raises(RunFailed, match="frame storage"):
-            case.run()
-        manifests = tmp_path / "captures" / "content" / "manifests" / "capture"
-        assert not manifests.exists() or not tuple(manifests.iterdir())
-    finally:
-        case.close()
-
-
 def test_lazy_frame_read_fails_closed_on_chunk_corruption(tmp_path) -> None:
     case = _CaptureCase(tmp_path)
     try:
@@ -366,9 +346,7 @@ def test_lazy_frame_read_fails_closed_on_chunk_corruption(tmp_path) -> None:
         chunk = artifact.frame_source._chunk_refs[0]
         case.repository._store._blob_path(chunk.digest).write_bytes(b"corrupt")
         with pytest.raises(ContentCorruptionError):
-            case.repository.load(reference).frame_source.materialize(
-                memory_limit_bytes=16 << 20
-            )
+            case.repository.load(reference).frame_source.materialize()
     finally:
         case.close()
 

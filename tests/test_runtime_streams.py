@@ -142,7 +142,6 @@ def scalar_value(value: float) -> Value:
 def stream(
     *,
     events: int = 8,
-    payload_bytes: int = 8,
     flow_control: ProducerFlowControl = ProducerFlowControl.BACKPRESSURE_CAPABLE,
 ):
     contract = ValuePayloadContract(SCALAR_SCHEMA)
@@ -151,7 +150,6 @@ def stream(
         contract,
         flow_control=flow_control,
         retention_events=events,
-        retention_bytes=events * payload_bytes,
         join_key_contract=TupleJoinContract(),
     )
 
@@ -192,7 +190,6 @@ def test_exact_reservation_retains_every_event_until_ordered_ack():
     reservation = source.reserve(
         total_events=4,
         max_inflight_events=4,
-        max_inflight_bytes=32,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -210,7 +207,6 @@ def test_exact_reservation_retains_every_event_until_ordered_ack():
     source._complete_consumer(reservation, eos, owner, lambda: None)
     assert reservation.state is ReservationState.COMPLETED
     reservation.release()
-    assert source.retained_bytes <= 32
 
 
 def test_exact_consumer_reuses_the_publication_event_ref_without_rehash(monkeypatch):
@@ -227,7 +223,6 @@ def test_exact_consumer_reuses_the_publication_event_ref_without_rehash(monkeypa
     reservation = source.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -261,12 +256,11 @@ def test_exact_backlog_fails_before_overwrite_and_monitor_still_overwrites():
     reservation = source.reserve(
         total_events=4,
         max_inflight_events=3,
-        max_inflight_bytes=24,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     owner = bind_terminal_consumer(source, reservation)
-    monitor = source.monitor(max_events=2, max_bytes=16)
+    monitor = source.monitor(max_events=2)
     for index in range(3):
         emit(producer, float(index))
     with pytest.raises(StreamBackpressure):
@@ -289,12 +283,11 @@ def test_monitor_loss_accounting_never_changes_exact_order_or_retention():
     reservation = source.reserve(
         total_events=total,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     owner = bind_terminal_consumer(source, reservation)
-    monitor = source.monitor(max_events=7, max_bytes=56)
+    monitor = source.monitor(max_events=7)
     exact_sequences = []
     updates = []
 
@@ -318,23 +311,16 @@ def test_monitor_loss_accounting_never_changes_exact_order_or_retention():
     monitor.close()
 
 
-def test_monitor_budget_must_retain_one_contract_payload():
-    source, _producer = stream(events=2)
-    with pytest.raises(ValueError, match="retain one maximum payload"):
-        source.monitor(max_events=2, max_bytes=source.max_payload_bytes - 1)
-    assert not source._monitors
-
-
 def test_monitor_topology_cannot_expand_after_publication_begins():
     source, producer = stream(events=2)
     emit(producer, 0.0)
     with pytest.raises(ReservationStateError, match="before the first publication"):
-        source.monitor(max_events=1, max_bytes=8)
+        source.monitor(max_events=1)
 
 
 def test_monitor_close_is_terminal_for_polling_and_wakes_blocked_reader(monkeypatch):
     source, _producer = stream(events=2)
-    monitor = source.monitor(max_events=1, max_bytes=8)
+    monitor = source.monitor(max_events=1)
     failures: list[BaseException] = []
     entered_wait = threading.Event()
     real_wait = monitor._condition.wait
@@ -365,31 +351,21 @@ def test_monitor_close_is_terminal_for_polling_and_wakes_blocked_reader(monkeypa
         monitor.latest()
 
 
-def test_reservation_admission_is_atomic_over_event_and_byte_capacity():
+def test_reservation_allows_only_one_formal_exact_consumer():
     source, _producer = stream(events=4)
     first = source.reserve(
         total_events=4,
         max_inflight_events=3,
-        max_inflight_bytes=24,
         trace_binding=TRACE_BINDING,
     )
     with pytest.raises(ReservationCapacityExceeded, match="one formal exact consumer"):
         source.reserve(
             total_events=2,
             max_inflight_events=2,
-            max_inflight_bytes=16,
             trace_binding=TRACE_BINDING,
         )
     first.abort()
     first.release()
-
-    with pytest.raises(ValueError, match="max_payload_bytes"):
-        source.reserve(
-            total_events=2,
-            max_inflight_events=2,
-            max_inflight_bytes=8,
-            trace_binding=TRACE_BINDING,
-        )
 
 
 def test_unbound_exact_emit_is_side_effect_free_and_zero_event_preflight_is_retryable():
@@ -397,7 +373,6 @@ def test_unbound_exact_emit_is_side_effect_free_and_zero_event_preflight_is_retr
     reservation = source.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     reservation.activate()
@@ -412,7 +387,6 @@ def test_unbound_exact_emit_is_side_effect_free_and_zero_event_preflight_is_retr
     replacement = source.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     replacement.abort()
@@ -424,7 +398,6 @@ def test_failed_preclaim_is_retryable_but_first_data_tombstones_generation():
     reservation = source.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     reservation.activate()
@@ -444,7 +417,6 @@ def test_failed_preclaim_is_retryable_but_first_data_tombstones_generation():
     claimed = source.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     claimed.activate()
@@ -459,7 +431,6 @@ def test_failed_preclaim_is_retryable_but_first_data_tombstones_generation():
         source.reserve(
             total_events=1,
             max_inflight_events=1,
-            max_inflight_bytes=8,
             trace_binding=TRACE_BINDING,
         )
 
@@ -469,7 +440,6 @@ def test_zero_event_rebind_gate_blocks_loose_emit_and_survives_failed_replacemen
     abandoned = source.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     abandoned.activate()
@@ -486,7 +456,6 @@ def test_zero_event_rebind_gate_blocks_loose_emit_and_survives_failed_replacemen
     failed = source.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     failed.activate()
@@ -509,7 +478,6 @@ def test_zero_event_rebind_gate_blocks_loose_emit_and_survives_failed_replacemen
     replacement = source.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     replacement.activate()
@@ -526,7 +494,6 @@ def test_zero_event_release_and_emit_are_serialized_without_an_authority_gap():
     reservation = source.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     reservation.activate()
@@ -572,7 +539,6 @@ def test_formal_interval_rejects_extra_or_post_failure_emit_and_short_finish():
     reservation = source.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     reservation.activate()
@@ -590,7 +556,6 @@ def test_formal_interval_rejects_extra_or_post_failure_emit_and_short_finish():
     short = short_source.reserve(
         total_events=2,
         max_inflight_events=2,
-        max_inflight_bytes=16,
         trace_binding=TRACE_BINDING,
     )
     short.activate()
@@ -614,7 +579,6 @@ def test_formal_emit_rejects_wrong_trace_without_publication(wrong_trace):
     reservation = source.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     reservation.activate()
@@ -636,7 +600,6 @@ def test_formal_emit_rejects_wrong_trace_without_publication(wrong_trace):
 def test_stream_rejects_materialized_dataset_payloads():
     class IllegalContract:
         fingerprint = PAYLOAD_FINGERPRINT
-        max_retained_nbytes = 1024
 
         @staticmethod
         def snapshot(payload):
@@ -647,10 +610,6 @@ def test_stream_rejects_materialized_dataset_payloads():
             return None
 
         @staticmethod
-        def retained_nbytes(_payload):
-            return 8
-
-        @staticmethod
         def digest(_payload):
             return "0" * 64
 
@@ -659,7 +618,6 @@ def test_stream_rejects_materialized_dataset_payloads():
         IllegalContract(),
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=1,
-        retention_bytes=1024,
     )
     repeat = AxisSpec(AxisId("repeat"), "repeat", REPEAT, 1)
     point = AxisSpec(AxisId("point"), "point", SPATIAL_X, 1)
@@ -708,7 +666,6 @@ def test_value_payload_runs_the_materialization_admission_once(monkeypatch):
 def test_stream_requires_payload_contract_owned_content_digest():
     class MissingDigestContract:
         fingerprint = PAYLOAD_FINGERPRINT
-        max_retained_nbytes = 8
 
         @staticmethod
         def snapshot(payload):
@@ -718,17 +675,12 @@ def test_stream_requires_payload_contract_owned_content_digest():
         def validate(_payload):
             return None
 
-        @staticmethod
-        def retained_nbytes(_payload):
-            return 8
-
     with pytest.raises(TypeError, match="payload_contract.digest"):
         AcquisitionStream.create(
             StreamId("missing.payload-digest"),
             MissingDigestContract(),
             flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
             retention_events=1,
-            retention_bytes=8,
         )
 
 
@@ -755,7 +707,7 @@ def test_generation_supersession_terminates_old_cursor_even_with_retained_data()
 
 def test_monitor_drains_retained_event_then_observes_source_eos():
     source, producer = stream()
-    monitor = source.monitor(max_events=2, max_bytes=16)
+    monitor = source.monitor(max_events=2)
     expected = emit(producer, 1.0)
     eos = producer.finish()
     assert eos.end_sequence == 1
@@ -796,7 +748,7 @@ def test_cursor_and_terminal_receipt_cannot_be_fabricated():
 
 def test_schema_change_discards_monitor_queue_immediately():
     source, producer = stream()
-    monitor = source.monitor(max_events=2, max_bytes=16)
+    monitor = source.monitor(max_events=2)
     emit(producer, 1.0)
     producer.supersede(StreamGenerationId("generation-two"))
     with pytest.raises(SchemaChanged):
@@ -814,23 +766,6 @@ def test_rejected_emit_has_no_retention_side_effects():
             trace=trace(),
             join_key=(0, 2),
         )
-    assert source.retained_events == 1
-    assert cursor.next().envelope is expected
-
-
-def test_prepublication_record_failure_keeps_existing_retention(monkeypatch):
-    source, producer = stream(events=1)
-    cursor = source.subscribe(start_sequence=0)
-    expected = emit(producer, 1.0)
-
-    def fail_stored_record(*_args, **_kwargs):
-        raise MemoryError("synthetic stored-record allocation failure")
-
-    monkeypatch.setattr(runtime_streams, "_Stored", fail_stored_record)
-    with pytest.raises(MemoryError, match="stored-record allocation"):
-        emit(producer, 2.0)
-
-    assert source.next_sequence == 1
     assert source.retained_events == 1
     assert cursor.next().envelope is expected
 
@@ -898,7 +833,6 @@ def test_non_backpressure_overrun_permanently_poisons_generation():
     reservation = source.reserve(
         total_events=2,
         max_inflight_events=1,
-        max_inflight_bytes=8,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -938,8 +872,8 @@ def test_first_terminal_fact_cannot_be_replaced():
 
 def test_one_broken_terminal_tap_cannot_strand_the_remaining_fanout(monkeypatch):
     source, producer = stream()
-    broken = source.monitor(max_events=1, max_bytes=8)
-    healthy = source.monitor(max_events=1, max_bytes=8)
+    broken = source.monitor(max_events=1)
+    healthy = source.monitor(max_events=1)
     real_source_ended = runtime_streams.MonitorTap._source_ended
 
     def fail_one_tap(self, error):

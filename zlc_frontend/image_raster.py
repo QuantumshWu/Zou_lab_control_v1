@@ -6,8 +6,6 @@ from collections.abc import Iterable
 
 import numpy as np
 
-from zlc_storage import nonnegative_integer, positive_integer
-
 from .display_range import (
     RelimMode,
     deadband_display_range,
@@ -19,7 +17,6 @@ from .render import PixelFormat, RasterBuffer
 
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-_DISPLAY_COORDINATE_ENTRY_BYTES = 128
 _INDEXED8_VALID_CODE_SPAN = 254
 
 
@@ -84,102 +81,6 @@ def png_raster_size(payload: bytes) -> tuple[int, int]:
     if width <= 0 or height <= 0:
         raise ValueError("PNG raster dimensions must be positive")
     return width, height
-
-
-def estimate_encoded_png_front_peak_nbytes(
-    payload: bytes,
-    *,
-    presentation_size: tuple[int, int] | None = None,
-) -> int:
-    """Bound encoded bytes plus source and physical presentation RGBA fronts."""
-
-    width, height = png_raster_size(payload)
-    if presentation_size is None:
-        presentation_width, presentation_height = width, height
-    else:
-        if not isinstance(presentation_size, tuple) or len(presentation_size) != 2:
-            raise TypeError("presentation_size must be a (width, height) tuple")
-        presentation_width = positive_integer(
-            presentation_size[0],
-            "presentation width",
-        )
-        presentation_height = positive_integer(
-            presentation_size[1],
-            "presentation height",
-        )
-    return (
-        len(payload)
-        + width * height * 4
-        + presentation_width * presentation_height * 4
-    )
-
-
-def estimate_indexed8_raster_peak_nbytes(
-    height: int,
-    width: int,
-    *,
-    value_itemsize: int,
-    retained_fronts: int = 1,
-    retained_sample_fronts: int = 0,
-) -> int:
-    """Bound indexed-raster scratch plus retained raster/sample fronts.
-
-    The candidate :class:`EvaluatedImage` remains part of the caller's view
-    evaluation budget.  This function adds the finite mask, stable float64
-    normalization workspace, uint8 workspace, returned immutable bytes,
-    compact code histogram, ``retained_fronts`` presenter/interaction rasters,
-    and ``retained_sample_fronts`` older exact value+validity planes.  Every
-    retained indexed GUI front counts both its immutable RasterBuffer bytes and
-    the private pixel plane Qt creates when ``QImage.setColorTable()`` detaches.
-    A live interaction normally retains the latest board front plus the older
-    target panel held under the pointer.
-    """
-
-    height = positive_integer(height, "height")
-    width = positive_integer(width, "width")
-    value_itemsize = positive_integer(value_itemsize, "value_itemsize")
-    retained_fronts = nonnegative_integer(retained_fronts, "retained_fronts")
-    retained_sample_fronts = nonnegative_integer(
-        retained_sample_fronts,
-        "retained_sample_fronts",
-    )
-    pixels = height * width
-    scratch_and_result = pixels * (
-        np.dtype(bool).itemsize
-        + np.dtype(np.float64).itemsize
-        + 2 * np.dtype(np.uint8).itemsize
-    )
-    retained_rasters = (
-        2 * retained_fronts * pixels * np.dtype(np.uint8).itemsize
-    )
-    retained_samples = retained_sample_fronts * estimate_evaluated_image_retained_nbytes(
-        height,
-        width,
-        value_itemsize=value_itemsize,
-    )
-    # bincount(0..255), the immutable tuple copy, and one 256-entry QRgb LUT
-    # are fixed-size next to a multi-megapixel frame.  Keep an explicit 64 KiB
-    # allowance for the overlapping NumPy counts, Python tuples/ints and LUT
-    # objects rather than hiding them in a per-pixel multiplier.
-    indexed_metadata = 64 * 1024
-    return scratch_and_result + retained_rasters + retained_samples + indexed_metadata
-
-
-def estimate_evaluated_image_retained_nbytes(
-    height: int,
-    width: int,
-    *,
-    value_itemsize: int,
-) -> int:
-    """Bound one immutable image sample plus its explicit axis coordinates."""
-
-    height = positive_integer(height, "height")
-    width = positive_integer(width, "width")
-    value_itemsize = positive_integer(value_itemsize, "value_itemsize")
-    return (
-        height * width * (value_itemsize + np.dtype(bool).itemsize)
-        + _DISPLAY_COORDINATE_ENTRY_BYTES * (height + width)
-    )
 
 
 def rasterize_image_indexed8(
@@ -253,9 +154,8 @@ def rasterize_image_indexed8(
 
     if valid_count:
         map_low, map_high = color_limits
-        # Own exactly one float64 workspace.  np.interp would allocate a second
-        # full float64 input conversion for uint16/float32 camera planes,
-        # invalidating the pre-arm peak-memory bound.
+        # Own one float64 workspace.  np.interp would allocate another full
+        # conversion for uint16/float32 camera planes without improving output.
         scaled = np.empty(values.shape, dtype=np.float64)
         np.copyto(scaled, values, casting="unsafe")
         span = map_high - map_low
@@ -319,9 +219,6 @@ def _automatic_range(values: np.ndarray, valid: np.ndarray) -> tuple[float, floa
 
 __all__ = [
     "evaluated_image_data_range",
-    "estimate_encoded_png_front_peak_nbytes",
-    "estimate_evaluated_image_retained_nbytes",
-    "estimate_indexed8_raster_peak_nbytes",
     "indexed8_code_for_value",
     "png_raster_size",
     "rasterize_image_indexed8",

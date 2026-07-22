@@ -21,13 +21,11 @@ from zlc_frontend.figure import (
     DatasetDescriptor,
     DatasetId,
     FigureDocument,
-    FigureEvaluationPolicy,
     FigureLayer,
     FixedIndex,
     SuggestionStatus,
     ViewIntent,
     ViewSpec,
-    estimate_view_evaluation_peak_nbytes,
     suggest_view,
     validate_view_spec,
 )
@@ -41,7 +39,6 @@ from zlc_frontend.curve_display import (
 from zlc_frontend.display_range import RelimMode
 from zlc_frontend.histogram_display import (
     DEFAULT_HISTOGRAM_BINS,
-    MAX_HISTOGRAM_BINS,
     HistogramDisplayState,
     histogram_display_form_spec,
     histogram_display_form_values,
@@ -56,9 +53,7 @@ from zlc_frontend.image_display import (
     image_display_from_form,
     image_viewport_for_display_state,
 )
-from zlc_frontend.image_raster import estimate_indexed8_raster_peak_nbytes
 from zlc_frontend.image_view import ImageViewportTransform
-from zlc_frontend.matplotlib_render import estimate_live_panel_raster_peak_nbytes
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentComboBox,
@@ -196,52 +191,6 @@ def _roi_scalar_views(schema, binding):
     return views, summary
 
 
-def _scalar_presentation_peak(
-    schema,
-) -> tuple[int, tuple[int, ...], int]:
-    """Return the full three-panel live reserve for one possible scalar schema."""
-
-    views = _roi_scalar_view_specs(schema)
-    default_policy = FigureEvaluationPolicy()
-    history = tuple(axis for axis in schema.point_axes if axis.role == MONITOR_HISTORY)
-    if len(history) != 1 or history[0].size > default_policy.max_histogram_samples:
-        raise ValueError(
-            "ROI scalar history exceeds the live histogram sample limit "
-            f"{default_policy.max_histogram_samples}"
-        )
-    evaluation_peaks = tuple(
-        estimate_view_evaluation_peak_nbytes(schema, view) for view in views
-    )
-    total = 0
-    numeric_hold_extras: list[int] = []
-    for view, evaluation_peak in zip(views, evaluation_peaks, strict=True):
-        histogram_bins = (
-            MAX_HISTOGRAM_BINS
-            if view.intent is ViewIntent.HISTOGRAM
-            else None
-        )
-        raster_peak = estimate_live_panel_raster_peak_nbytes(
-            *_SCALAR_RASTER_SIZE,
-            evaluated_data_upper_bound_bytes=evaluation_peak,
-            histogram_bins=histogram_bins,
-        )
-        total += evaluation_peak + raster_peak
-        if view.intent in (ViewIntent.CURVE, ViewIntent.HISTOGRAM):
-            held_peak = estimate_live_panel_raster_peak_nbytes(
-                *_SCALAR_RASTER_SIZE,
-                evaluated_data_upper_bound_bytes=evaluation_peak,
-                histogram_bins=histogram_bins,
-                extra_retained_fronts=1,
-                extra_retained_evaluated_data_bytes=evaluation_peak,
-            )
-            numeric_hold_extras.append(held_peak - raster_peak)
-    if not numeric_hold_extras or any(value <= 0 for value in numeric_hold_extras):
-        raise RuntimeError("scalar presentation has no numeric-panel hold reserve")
-    # QtRasterBoard permits one pointer hold across the entire board.  Reserve
-    # the larger exact CURVE/HISTOGRAM hold, never their impossible sum.
-    return total, evaluation_peaks, max(numeric_hold_extras)
-
-
 def _scalar_documents(
     schema,
     binding,
@@ -279,8 +228,6 @@ class _PreparedMonitorView:
     scalar_dataset_id: DatasetId | None
     image_document: FigureDocument
     scalar_documents: tuple[FigureDocument, ...]
-    evaluation_policy: FigureEvaluationPolicy
-    downstream_peak_bytes: int
     viewport: ImageViewportTransform
     projection_text: str
 
@@ -337,56 +284,16 @@ def _prepare_monitor_view(
     if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
         raise ValueError("camera monitor IMAGE view needs an explicit axis choice")
     image_view = suggestion.spec
-    image_evaluation_peak = estimate_view_evaluation_peak_nbytes(schema, image_view)
-    image_base_raster_peak = estimate_indexed8_raster_peak_nbytes(
-        y_axes[0].size,
-        x_axes[0].size,
-        value_itemsize=schema.cell_schema.dtype.itemsize,
-        retained_fronts=1,
-        retained_sample_fronts=1,
-    )
-    image_held_raster_peak = estimate_indexed8_raster_peak_nbytes(
-        y_axes[0].size,
-        x_axes[0].size,
-        value_itemsize=schema.cell_schema.dtype.itemsize,
-        retained_fronts=2,
-        retained_sample_fronts=2,
-    )
-    image_hold_extra = image_held_raster_peak - image_base_raster_peak
-    downstream_peak = image_evaluation_peak + image_base_raster_peak
-
     scalar_views: tuple[ViewSpec, ...] = ()
     projection_text = _RAW_PROJECTION_TEXT
     viewport = ImageViewportTransform(
         (y_axes[0], x_axes[0]),
         viewport_revision=0,
     )
-    possible_scalar_reserves = tuple(
-        _scalar_presentation_peak(possible_schema)
-        for possible_schema in command.roi_control_schemas
-    )
-    if not possible_scalar_reserves:
-        raise RuntimeError("camera monitor exposes no admitted ROI control schema")
-    # Runtime ROI create/retarget must not acquire memory after the source was
-    # armed.  Reserve the largest possible scalar board even for a raw-only
-    # initial request; worker-affine renderer replacement is serialized, so
-    # mutually exclusive scalar schemas contribute a maximum rather than a sum.
-    downstream_peak += max(
-        total for total, _peaks, _hold_extra in possible_scalar_reserves
-    )
-    # QtRasterBoard owns at most one pointer hold across the whole board.  The
-    # reserve therefore admits the larger exact IMAGE/CURVE/HISTOGRAM hold
-    # once, rather than summing mutually exclusive pointer captures or
-    # undercounting retained evaluated samples and histogram counts/edges.
-    downstream_peak += max(
-        image_hold_extra,
-        *(hold_extra for _total, _peaks, hold_extra in possible_scalar_reserves),
-    )
-    possible_scalar_evaluation_peaks = tuple(
-        peak
-        for _total, peaks, _hold_extra in possible_scalar_reserves
-        for peak in peaks
-    )
+    if not command.roi_control_schemas:
+        raise RuntimeError("camera monitor exposes no ROI control schema")
+    for possible_schema in command.roi_control_schemas:
+        _roi_scalar_view_specs(possible_schema)
     if scalar_schema is None:
         if roi_binding is not None or command.request.roi is not None:
             raise RuntimeError("ROI request has no scalar view product")
@@ -402,18 +309,6 @@ def _prepare_monitor_view(
         # Resolve once during preparation so binding the GUI overlay after the
         # source starts cannot discover a coordinate/selection mismatch.
         viewport.normalized_bounds_for_selection(roi_binding.selection)
-
-    policy = FigureEvaluationPolicy(
-        max_live_nbytes=max(
-            (image_evaluation_peak, *possible_scalar_evaluation_peaks)
-        )
-    )
-    required_peak = command.descriptor.base_peak_bytes + downstream_peak
-    if required_peak > command.request.memory_limit_bytes:
-        raise MemoryError(
-            f"camera monitor peak budget {required_peak} exceeds limit "
-            f"{command.request.memory_limit_bytes}"
-        )
 
     dataset_id = DatasetId(f"camera-monitor-{generation}")
     scalar_dataset_id = (
@@ -452,8 +347,6 @@ def _prepare_monitor_view(
         scalar_dataset_id,
         image_document,
         scalar_documents,
-        policy,
-        downstream_peak,
         viewport,
         projection_text,
     )
@@ -679,7 +572,6 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(40)
         self._timer.timeout.connect(self._poll_run_snapshot)
-        self._timer.start()
         self._start_button.clicked.connect(self._start_monitor)
         self._stop_button.clicked.connect(self._cancel_monitor)
         self._selector_switch.toggled.connect(self._set_selector_enabled)
@@ -1849,7 +1741,6 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 spec,
                 dataset_id=dataset_id,
                 scalar_dataset_id=scalar_dataset_id,
-                evaluation_policy=prepared_view.evaluation_policy,
                 retain_on_terminal=False,
             )
             attached = threading.Event()
@@ -1878,7 +1769,6 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
         self._run_owner.submit(
             "start",
             lambda: command.start_with_view(
-                downstream_peak_bytes=prepared_view.downstream_peak_bytes,
                 factory=factory,
             ),
             generation=generation,
@@ -1903,6 +1793,20 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             return
         if self._run_owner.poll_snapshot(self._last_snapshot) or self._closing:
             self._wake.request_owner_wake()
+
+    def _sync_runtime_timer(self) -> None:
+        """Poll only while a Run is live or close cleanup needs retrying."""
+
+        handle = self._handle
+        run_active = (
+            handle is not None and not handle.snapshot().state.terminal
+        )
+        should_poll = run_active or (self._closing and not self._allow_close)
+        if should_poll:
+            if not self._timer.isActive():
+                self._timer.start()
+        elif self._timer.isActive():
+            self._timer.stop()
 
     def _owner_cycle(self) -> None:
         try:
@@ -1944,6 +1848,8 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
             # source Run or its raw stream as an error-propagation shortcut.
             self._record_local_failure(message)
             self._maybe_finish_close()
+        finally:
+            self._sync_runtime_timer()
 
     def _drain_results(self) -> None:
         for completion in self._run_owner.drain_completions():

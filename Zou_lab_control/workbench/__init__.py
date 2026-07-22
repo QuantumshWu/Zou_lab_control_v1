@@ -22,20 +22,12 @@ def open_capture_workbench(experiment, request):
 def open_calibration_report_workbench(
     computation_loader,
     reference,
-    *,
-    memory_limit_bytes=None,
 ):
     """Open one committed calibration report without eager Qt imports."""
 
     from ._calibration import open_calibration_report_workbench as _open
 
-    if memory_limit_bytes is None:
-        return _open(computation_loader, reference)
-    return _open(
-        computation_loader,
-        reference,
-        memory_limit_bytes=memory_limit_bytes,
-    )
+    return _open(computation_loader, reference)
 
 
 def open_calibration_workbench(
@@ -44,7 +36,6 @@ def open_calibration_workbench(
     *,
     seed=None,
     reference=None,
-    memory_limit_bytes=None,
     timeout_seconds=None,
 ):
     """Open formal calibration creation/editing without eager Qt imports."""
@@ -52,8 +43,6 @@ def open_calibration_workbench(
     from ._calibration import open_calibration_workbench as _open
 
     options = {"seed": seed, "reference": reference}
-    if memory_limit_bytes is not None:
-        options["memory_limit_bytes"] = memory_limit_bytes
     if timeout_seconds is not None:
         options["timeout_seconds"] = timeout_seconds
     return _open(
@@ -63,14 +52,12 @@ def open_calibration_workbench(
     )
 
 
-def open_data_figure_workbench(figure, *, memory_limit_bytes=None):
+def open_data_figure_workbench(figure):
     """Open one already-resolved DataFigure without eager Qt imports."""
 
     from ._figure import open_data_figure_workbench as _open
 
-    if memory_limit_bytes is None:
-        return _open(figure)
-    return _open(figure, memory_limit_bytes=memory_limit_bytes)
+    return _open(figure)
 
 
 def open_occupancy_cell_workbench(
@@ -79,16 +66,17 @@ def open_occupancy_cell_workbench(
     reference,
     *,
     selection=None,
-    memory_limit_bytes=None,
 ):
     """Open one exact same-shot occupancy map without eager Qt imports."""
 
     from ._occupancy import open_occupancy_cell_workbench as _open
 
-    options = {"selection": selection}
-    if memory_limit_bytes is not None:
-        options["memory_limit_bytes"] = memory_limit_bytes
-    return _open(navigation_loader, cell_loader, reference, **options)
+    return _open(
+        navigation_loader,
+        cell_loader,
+        reference,
+        selection=selection,
+    )
 
 
 def open_figure_workbench(
@@ -99,7 +87,6 @@ def open_figure_workbench(
     selection=None,
     preferences=None,
     occupancy_output=None,
-    memory_limit_bytes=None,
     fit_preparer=None,
     fit_executor=None,
     fit_saver=None,
@@ -121,8 +108,6 @@ def open_figure_workbench(
     }
     if occupancy_output is not None:
         options["occupancy_output"] = occupancy_output
-    if memory_limit_bytes is not None:
-        options["memory_limit_bytes"] = memory_limit_bytes
     for name, value in (
         ("fit_preparer", fit_preparer),
         ("fit_executor", fit_executor),
@@ -145,21 +130,12 @@ def open_saved_fit_grid_workbench(
     view_loader,
     refit_opener,
     reference,
-    *,
-    memory_limit_bytes=None,
 ):
     """Open one exact saved-fit GridPlot without eager Qt imports."""
 
     from ._fit_grid import open_saved_fit_grid_workbench as _open
 
-    if memory_limit_bytes is None:
-        return _open(view_loader, refit_opener, reference)
-    return _open(
-        view_loader,
-        refit_opener,
-        reference,
-        memory_limit_bytes=memory_limit_bytes,
-    )
+    return _open(view_loader, refit_opener, reference)
 
 
 def open_scan_workbench(experiment, request):

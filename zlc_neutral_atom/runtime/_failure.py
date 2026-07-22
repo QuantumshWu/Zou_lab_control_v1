@@ -1,13 +1,8 @@
-"""Bounded string-only failure evidence for runtime ownership boundaries."""
+"""String-only failure evidence for runtime ownership boundaries."""
 
 from __future__ import annotations
 
 import traceback
-
-
-_MAX_DETAIL = 512
-_MAX_LOCATIONS = 8
-_MAX_NOTES = 8
 
 
 class DetachedFailure(RuntimeError):
@@ -25,8 +20,8 @@ class DetachedFailure(RuntimeError):
     ) -> None:
         self.original_type = original_type
         self.detail = detail
-        self.locations = tuple(locations[-_MAX_LOCATIONS:])
-        self.notes = tuple(notes[:_MAX_NOTES])
+        self.locations = tuple(locations)
+        self.notes = tuple(notes)
         super().__init__(f"{original_type}: {detail}")
 
     @property
@@ -34,16 +29,15 @@ class DetachedFailure(RuntimeError):
         return f"{self.original_type}: {self.detail}"
 
 
-def _bounded_text(value: object, limit: int = _MAX_DETAIL) -> str:
+def _safe_text(value: object) -> str:
     try:
-        text = str(value)
+        return str(value)
     except BaseException:
-        text = "<unprintable>"
-    return text if len(text) <= limit else text[: limit - 3] + "..."
+        return "<unprintable>"
 
 
-def safe_error_summary(error: BaseException, *, max_detail: int = _MAX_DETAIL) -> str:
-    """Return bounded diagnostics without ever raising from formatting."""
+def safe_error_summary(error: BaseException) -> str:
+    """Return complete string diagnostics without raising from formatting."""
 
     if isinstance(error, DetachedFailure):
         return error.summary
@@ -51,7 +45,7 @@ def safe_error_summary(error: BaseException, *, max_detail: int = _MAX_DETAIL) -
         error_type = type(error).__name__
     except BaseException:
         error_type = "BaseException"
-    return f"{error_type}: {_bounded_text(error, max_detail)}"
+    return f"{error_type}: {_safe_text(error)}"
 
 
 def detach_failure(
@@ -59,7 +53,7 @@ def detach_failure(
     *,
     note_prefix: str,
 ) -> DetachedFailure | None:
-    """Replace an exception graph with a new bounded, string-only value."""
+    """Replace an exception graph with a complete string-only value."""
 
     if error is None:
         return None
@@ -71,15 +65,15 @@ def detach_failure(
         extracted = traceback.extract_tb(error.__traceback__)
         locations = tuple(
             f"{frame.filename}:{frame.lineno}:{frame.name}"
-            for frame in extracted[-_MAX_LOCATIONS:]
+            for frame in extracted
         )
     except BaseException:
         locations = ()
     try:
         raw_notes = getattr(error, "__notes__", ())
         notes = tuple(
-            _bounded_text(note)
-            for note in raw_notes[:_MAX_NOTES]
+            _safe_text(note)
+            for note in raw_notes
             if isinstance(note, str)
         )
     except BaseException:
@@ -112,7 +106,7 @@ def record_secondary_failure(
     operation: str,
     secondary: BaseException,
 ) -> None:
-    """Best-effort bounded note attachment; safety cleanup must never be interrupted."""
+    """Best-effort note attachment; safety cleanup must never be interrupted."""
 
     if primary is None:
         return

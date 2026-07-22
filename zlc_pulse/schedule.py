@@ -12,7 +12,6 @@ from zlc_storage import canonical_digest
 from .ir import TargetIR, evaluate_affine_tick
 
 
-MAX_MATERIALIZED_TRIGGER_EDGES = 1_000_000
 MAX_TRIGGER_TICK = (1 << 64) - 1
 _POINT_INDEX_DTYPE = np.dtype("<u4")
 _LOOP_ITERATION_DTYPE = np.dtype("<u4")
@@ -87,11 +86,6 @@ class DigitalTriggerSchedule:
         total = len(point_indices)
         if len(loop_iterations) != total or len(ticks) != total:
             raise ValueError("trigger schedule columns must have equal length")
-        if total > MAX_MATERIALIZED_TRIGGER_EDGES:
-            raise ValueError(
-                "digital trigger schedule exceeds the materialization limit "
-                f"of {MAX_MATERIALIZED_TRIGGER_EDGES} edges"
-            )
         if total > 1 and bool(np.any(point_indices[1:] < point_indices[:-1])):
             raise ValueError("trigger point indices must be monotonic")
         if total > 1 and bool(np.any(ticks[1:] <= ticks[:-1])):
@@ -221,7 +215,6 @@ def build_digital_trigger_schedules(
         return ()
     points = ir.scan_points or ((),)
     schedules = []
-    remaining_budget = MAX_MATERIALIZED_TRIGGER_EDGES
     for channel, bit_index in zip(requested, indices):
         point_indices: list[int] = []
         loop_iterations: list[int] = []
@@ -230,11 +223,6 @@ def build_digital_trigger_schedules(
             ir,
             bit_index,
         ):
-            if len(point_indices) >= remaining_budget:
-                raise ValueError(
-                    "digital trigger schedule exceeds the materialization limit "
-                    f"of {MAX_MATERIALIZED_TRIGGER_EDGES} edges"
-                )
             if tick_from_run_start > MAX_TRIGGER_TICK:
                 raise ValueError(
                     "digital trigger schedule exceeds the uint64 run-tick domain"
@@ -265,7 +253,6 @@ def build_digital_trigger_schedules(
                 _full_point_loop(ir),
             )
         )
-        remaining_budget -= len(point_indices)
     return tuple(schedules)
 
 
@@ -285,7 +272,6 @@ def _same_physical_digital_trigger_schedules(
     requested = tuple(item.channel for item in actual)
     requested, indices = _trigger_channel_indices(ir, requested)
     points = ir.scan_points or ((),)
-    remaining_budget = MAX_MATERIALIZED_TRIGGER_EDGES
     for schedule, channel, bit_index in zip(actual, requested, indices, strict=True):
         if schedule.channel != channel or schedule.point_count != len(points):
             return False
@@ -294,11 +280,6 @@ def _same_physical_digital_trigger_schedules(
             ir,
             bit_index,
         ):
-            if remaining_budget <= 0:
-                raise ValueError(
-                    "digital trigger schedule exceeds the materialization limit "
-                    f"of {MAX_MATERIALIZED_TRIGGER_EDGES} edges"
-                )
             if actual_index >= schedule.total:
                 return False
             if (
@@ -307,7 +288,6 @@ def _same_physical_digital_trigger_schedules(
             ):
                 return False
             actual_index += 1
-            remaining_budget -= 1
         if actual_index != schedule.total:
             return False
     return True
@@ -469,7 +449,6 @@ def digital_trigger_schedule_from_tree(tree: object) -> DigitalTriggerSchedule:
 
 __all__ = [
     "DigitalTriggerSchedule",
-    "MAX_MATERIALIZED_TRIGGER_EDGES",
     "MAX_TRIGGER_TICK",
     "TriggerEdge",
     "build_digital_trigger_schedules",

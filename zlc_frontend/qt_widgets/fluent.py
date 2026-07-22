@@ -2669,7 +2669,7 @@ class FluentSwitch(QtWidgets.QAbstractButton):
 
     def sizeHint(self) -> QtCore.QSize:
         # content = track + the 8 px track-to-label gap + the label + a few px of air; the gap
-        # MUST be budgeted here too (hitButton already counts it) or a labelled switch packed
+        # MUST be accounted for here too (hitButton already counts it) or a labelled switch packed
         # tight in a toolbar paints its last glyph under the next widget (the header "Selectors"
         # clip at 1.5x display scale).
         text_w = fluent_text_width(QtGui.QFontMetrics(self.font()), self.text())

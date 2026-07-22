@@ -20,12 +20,11 @@ def _spec():
         (
             FormFieldProps("text", "text", "Text", default=""),
             FormFieldProps(
-                "budget",
+                "iterations",
                 "int",
-                "Memory budget",
-                default=2**40,
+                "Iterations",
+                default=40,
                 minimum=1,
-                unit="bytes",
             ),
             FormFieldProps(
                 "count", "int", "Count", default=3, minimum=1, maximum=9
@@ -97,7 +96,7 @@ def test_headless_form_contract_is_immutable_exact_and_does_not_load_qt() -> Non
     spec = _spec()
     assert spec.keys == (
         "text",
-        "budget",
+        "iterations",
         "count",
         "timeout",
         "gain",
@@ -105,7 +104,7 @@ def test_headless_form_contract_is_immutable_exact_and_does_not_load_qt() -> Non
         "mode",
         "enabled",
     )
-    assert spec.fields[1].row_label == "Memory budget (bytes)"
+    assert spec.fields[1].row_label == "Iterations"
     with pytest.raises(FrozenInstanceError):
         spec.fields[0].label = "changed"
 
@@ -192,25 +191,25 @@ def test_form_preserves_unbounded_numbers_lossless_float_and_typed_choices() -> 
 
     ensure_qt_app()
     form = FluentParameterForm(_spec())
-    assert isinstance(form.widget_for("budget"), FluentLineEdit)
+    assert isinstance(form.widget_for("iterations"), FluentLineEdit)
     assert isinstance(form.widget_for("count"), FluentSpinBox)
     assert isinstance(form.widget_for("timeout"), FluentLineEdit)
     assert isinstance(form.widget_for("gain"), FluentDoubleSpinBox)
 
     values = form.read_all()
-    assert values["budget"] == 2**40
+    assert values["iterations"] == 40
     assert values["gain"] == 0.12345678901234566
     assert type(values["authored"]) is int
     assert type(values["mode"]) is int
 
     huge = 2**80 + 123
-    values["budget"] = huge
+    values["iterations"] = huge
     values["timeout"] = 1.2345678901234567e100
     values["authored"] = 1.0
     values["mode"] = "1"
     form.write_all(values)
     written = form.read_all()
-    assert written["budget"] == huge
+    assert written["iterations"] == huge
     assert written["timeout"] == 1.2345678901234567e100
     assert type(written["authored"]) is float
     assert type(written["mode"]) is str
@@ -238,8 +237,8 @@ def test_full_state_populate_is_exact_prevalidated_and_signal_blocked() -> None:
     assert form.read_all() == initial
 
     updated = dict(initial)
-    updated.update(text="new", budget=2**70, enabled=False)
-    form.widget_for("budget").setDisabled(True)
+    updated.update(text="new", iterations=2**70, enabled=False)
+    form.widget_for("iterations").setDisabled(True)
     form.widget_for("enabled").hide()
     form.populate(updated)
     assert form.read_all() == updated
@@ -259,7 +258,7 @@ def test_text_is_never_evaluated_and_invalid_numeric_text_fails_closed() -> None
     form.widget_for("text").setText(literal)
     assert form.read_all()["text"] == literal
 
-    form.widget_for("budget").setText("2**63")
+    form.widget_for("iterations").setText("2**63")
     with pytest.raises(ValueError, match="base-10 integer"):
         form.read_all()
 

@@ -16,8 +16,6 @@ from zlc_data import (
 )
 from zlc_storage import (
     canonical_text as _canonical_text,
-    nonnegative_integer as _nonnegative_int,
-    positive_integer as _positive_int,
     sha256_text,
 )
 
@@ -48,8 +46,6 @@ from .dataset import (
     ExactDatasetPreviewReader,
     MonitorDataset,
     SealedDatasetArtifact,
-    dataset_storage_nbytes,
-    mutable_dataset_storage_nbytes,
 )
 from .cleanup import CleanupReport
 from .run import RunContext, RunPlan
@@ -101,7 +97,6 @@ class MinimalPipelineSpec:
     name: str
     measurement: BoundMeasurement
     block_id: BlockId
-    memory_limit_bytes: int
     timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
@@ -110,20 +105,12 @@ class MinimalPipelineSpec:
             raise TypeError("measurement must be BoundMeasurement")
         if not isinstance(self.block_id, BlockId):
             raise TypeError("block_id must be BlockId")
-        object.__setattr__(
-            self,
-            "memory_limit_bytes",
-            _positive_int(self.memory_limit_bytes, "memory_limit_bytes"),
-        )
-
-
 @dataclass(frozen=True)
 class CapturePreviewSpec:
     """Process-local capacity-one live view attached to an exact capture."""
 
     block_id: BlockId
     dataset_edge: FrozenDatasetEdge
-    downstream_peak_bytes: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.block_id, BlockId):
@@ -143,14 +130,6 @@ class CapturePreviewSpec:
             raise ValueError(
                 "capture preview requires capacity-one (R=1, MONITOR_HISTORY=1) storage"
             )
-        object.__setattr__(
-            self,
-            "downstream_peak_bytes",
-            _nonnegative_int(
-                self.downstream_peak_bytes,
-                "downstream_peak_bytes",
-            ),
-        )
 
     @staticmethod
     def dataset_edge_for_capture(
@@ -215,28 +194,12 @@ class CapturePreviewPort(Protocol):
 
 @dataclass(frozen=True)
 class ExactDatasetPreviewSpec:
-    """Bounded display branch over the exact builder's current revision.
-
-    ``downstream_peak_bytes`` is the complete peak beyond DatasetBuilder:
-    one frozen source snapshot, committed-transform scratch/output, view
-    evaluation, worker raster scratch/result, and queued/visible fronts.  The
-    exact source owner independently verifies that the declaration can at
-    least hold one frozen source snapshot.
-    """
+    """Display branch over the exact builder's current revision."""
 
     source_schema_fingerprint: str
-    downstream_peak_bytes: int
 
     def __post_init__(self) -> None:
         sha256_text(self.source_schema_fingerprint, "source_schema_fingerprint")
-        object.__setattr__(
-            self,
-            "downstream_peak_bytes",
-            _positive_int(
-                self.downstream_peak_bytes,
-                "downstream_peak_bytes",
-            ),
-        )
 
 
 class ExactDatasetPreviewPort(Protocol):
@@ -410,76 +373,6 @@ class PipelineResult:
     def is_direct_raw_capture(self) -> bool:
         return self._direct_raw_capture
 
-def _estimate_capture_preview_peak_bytes(spec: CapturePreviewSpec) -> int:
-    """Peak increment owned by the capacity-one monitor/display attachment."""
-
-    if not isinstance(spec, CapturePreviewSpec):
-        raise TypeError("spec must be CapturePreviewSpec")
-    edge = spec.dataset_edge
-    schema = edge.schema
-    return (
-        edge.payload_max_retained_nbytes
-        + mutable_dataset_storage_nbytes(schema)
-        + dataset_storage_nbytes(schema)
-        + edge.metadata_max_retained_nbytes
-        + spec.downstream_peak_bytes
-    )
-
-
-def estimate_pipeline_peak_bytes(
-    spec: MinimalPipelineSpec,
-    *,
-    preview_spec: CapturePreviewSpec | None = None,
-) -> int:
-    """Conservative peak of buffers whose sizes are owned by this pipeline.
-
-    This is not a claim about interpreter or third-party allocator overhead.
-    Every term below comes from a frozen byte contract or ndarray geometry;
-    guessed per-object constants are deliberately excluded.
-    """
-
-    if not isinstance(spec, MinimalPipelineSpec):
-        raise TypeError("spec must be MinimalPipelineSpec")
-    contract = spec.measurement.capture_contract
-    events = contract.total_events
-    dataset_bytes = dataset_storage_nbytes(contract.dataset_schema)
-    mutable_dataset_bytes = mutable_dataset_storage_nbytes(
-        contract.dataset_schema
-    )
-    metadata_bytes = (
-        events * contract.dataset_edge.metadata_max_retained_nbytes
-    )
-    exact_peak = (
-        contract.estimated_transport_bytes
-        + mutable_dataset_bytes
-        + dataset_bytes
-        + metadata_bytes
-    )
-    return (
-        exact_peak
-        if preview_spec is None
-        else exact_peak + _estimate_capture_preview_peak_bytes(preview_spec)
-    )
-
-
-def _require_pipeline_memory_budget(
-    spec: MinimalPipelineSpec,
-    preview_spec: CapturePreviewSpec | None = None,
-    *,
-    retained_overhead_bytes: int = 0,
-) -> None:
-    """Compute the owner-derived peak and reject it before any allocation."""
-
-    overhead = _nonnegative_int(
-        retained_overhead_bytes,
-        "retained_overhead_bytes",
-    )
-    peak = estimate_pipeline_peak_bytes(spec, preview_spec=preview_spec) + overhead
-    limit = spec.memory_limit_bytes
-    if peak > limit:
-        raise MemoryError(f"pipeline peak budget {peak} exceeds limit {limit}")
-
-
 def _release_preflight_software(
     session: CaptureSession,
     reservation: ExactReservation | None,
@@ -533,7 +426,7 @@ class ExactCaptureTransaction:
         self.session.start(context)
 
     def capture_next(self, context: RunContext) -> None:
-        """Consume exactly one already-budgeted physical capture event."""
+        """Consume exactly one reserved physical capture event."""
 
         context.checkpoint()
         self.session.capture_next(context)
@@ -710,19 +603,11 @@ def _settle_unbound_preview(
 def _admit_capture_preview(
     spec: MinimalPipelineSpec,
     preview: CapturePreviewPort | None,
-    *,
-    retained_overhead_bytes: int = 0,
 ) -> CapturePreviewSpec | None:
-    """Validate one attached preview and its static memory budget exactly once."""
+    """Validate one attached preview exactly once."""
 
     try:
-        preview_spec = _capture_preview_spec(preview, spec)
-        _require_pipeline_memory_budget(
-            spec,
-            preview_spec,
-            retained_overhead_bytes=retained_overhead_bytes,
-        )
-        return preview_spec
+        return _capture_preview_spec(preview, spec)
     except BaseException as error:
         _notify_preview_failure(preview, error)
         raise
@@ -779,7 +664,6 @@ def _allocate_exact_capture(
             try:
                 tap = session.stream.monitor(
                     max_events=1,
-                    max_bytes=preview_spec.dataset_edge.payload_max_retained_nbytes,
                 )
                 preview_dataset = MonitorDataset.append_window(
                     preview_spec.block_id,
@@ -926,7 +810,6 @@ __all__ = [
     "ExactDatasetPreviewSpec",
     "compile_pipeline",
     "ExactCaptureTransaction",
-    "estimate_pipeline_peak_bytes",
     "finalize_pipeline_result",
     "MinimalPipelineSpec",
     "PipelineResult",

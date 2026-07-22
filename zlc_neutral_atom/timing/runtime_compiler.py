@@ -619,7 +619,7 @@ def compile_pulse_table_runtime_program(
     has_delays = _pulse_table_has_delays(state, slots=slot_values, time_step_ns=clock_step_ns)
     if has_delays and has_bracket:
         unrolled = state.unrolled_bracket()
-        _check_unrolled_edge_budget(unrolled, slots=slot_values, time_step_ns=clock_step_ns)
+        _check_unrolled_edge_capacity(unrolled, slots=slot_values, time_step_ns=clock_step_ns)
         return compile_pulse_table_runtime_program(
             unrolled,
             clock_hz=clock_hz,
@@ -767,7 +767,7 @@ def compile_pulse_table_scan_runtime_program(
     has_bracket = state.repeat_start is not None and state.repeat_end is not None
     if has_bracket and _pulse_table_has_any_delay(state):
         unrolled = state.unrolled_bracket()
-        _check_unrolled_edge_budget(unrolled, slots=unrolled._reference_slots(), time_step_ns=clock_step_ns)
+        _check_unrolled_edge_capacity(unrolled, slots=unrolled._reference_slots(), time_step_ns=clock_step_ns)
         return compile_pulse_table_scan_runtime_program(
             unrolled,
             scan_table=scan_table,
@@ -1828,15 +1828,16 @@ def _is_plain_number(value: object) -> bool:
     except (TypeError, ValueError):
         return False
 
-def _check_unrolled_edge_budget(
+def _check_unrolled_edge_capacity(
     state: PulseTableState,
     *,
     slots: Mapping[str, float] | None = None,
     time_step_ns: float,
 ) -> None:
-    """Raise a clear, actionable error if unrolling the bracket would overflow the edge
-    budget (a large ``repeat_count`` makes a flat edge table that the streamer cannot
-    hold).  ``validate_pulse_streamer_program`` is the authoritative gate; this just
+    """Raise a clear, actionable error if unrolling the bracket would exceed edge capacity.
+
+    A large ``repeat_count`` makes a flat edge table that the streamer cannot
+    hold.  ``validate_pulse_streamer_program`` is the authoritative gate; this just
     front-loads a friendlier message that names the inner repeat as the cause."""
 
     from .streamer_geometry import DEFAULT_MAX_EDGES
@@ -1848,7 +1849,7 @@ def _check_unrolled_edge_budget(
     if upper_bound_edges > DEFAULT_MAX_EDGES:
         raise ValueError(
             f"unrolling the inner repeat bracket would make up to {upper_bound_edges} edges, "
-            f"above the FPGA streamer budget of {DEFAULT_MAX_EDGES}.  Use repeat_forever for the "
+            f"above the FPGA streamer's {DEFAULT_MAX_EDGES}-edge capacity.  Use repeat_forever for the "
             "OUTER loop, fewer inner iterations, or remove the channel delay so the bracket can "
             "stay a compact hardware loop instead of being unrolled."
         )

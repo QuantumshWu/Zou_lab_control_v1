@@ -19,7 +19,6 @@ from zlc_pulse import (
     load_pulse_document,
     pack_target_ir,
 )
-from zlc_pulse.schedule import MAX_MATERIALIZED_TRIGGER_EDGES
 
 
 ROOT = Path(__file__).parents[1]
@@ -159,7 +158,7 @@ def _large_compact_ir(*, loop_count, rising_each_loop):
     )
 
 
-def test_compact_trigger_projection_is_bounded_without_expanding_loop_count():
+def test_compact_trigger_projection_does_not_expand_a_loop_without_rises():
     no_rises = _large_compact_ir(
         loop_count=(1 << 32) - 1,
         rising_each_loop=False,
@@ -176,10 +175,3 @@ def test_compact_trigger_projection_is_bounded_without_expanding_loop_count():
         (),
     )
     assert artifact.trigger_schedules == ()
-
-    too_many = _large_compact_ir(
-        loop_count=MAX_MATERIALIZED_TRIGGER_EDGES + 1,
-        rising_each_loop=True,
-    )
-    with pytest.raises(ValueError, match="materialization limit"):
-        build_digital_trigger_schedules(too_many, ("trigger",))

@@ -155,7 +155,7 @@ class _Application:
         self.handle = handle
         self.prepare_calls = 0
         self.start_calls = 0
-        self.project_calls: list[tuple[ScanArtifactRef, int]] = []
+        self.project_calls: list[ScanArtifactRef] = []
         self.project_error: BaseException | None = None
         self.presentation_ref: ScanArtifactRef | None = None
         self.png_bytes = _PNG
@@ -169,8 +169,8 @@ class _Application:
         self.start_calls += 1
         return self.handle
 
-    def project_final(self, source_ref, *, memory_limit_bytes):
-        self.project_calls.append((source_ref, memory_limit_bytes))
+    def project_final(self, source_ref):
+        self.project_calls.append(source_ref)
         if self.project_error is not None:
             raise self.project_error
         return FinalScanPresentation(
@@ -189,7 +189,6 @@ def _controller(*, digest: str = "a"):
     controller = ScanPanelController(
         application,
         lambda: wakes.append(None),
-        projection_memory_limit_bytes=123_456,
         executor=executor,
     )
     return controller, application, handle, executor, wakes
@@ -240,7 +239,7 @@ def test_final_only_controller_reaps_terminal_before_projecting() -> None:
     assert final.presentation is not None
     assert final.presentation.source_ref == handle.reference
     assert final.presentation.png_bytes == _PNG
-    assert application.project_calls == [(handle.reference, 123_456)]
+    assert application.project_calls == [handle.reference]
     assert final.can_start is True
     assert final.can_stop is False
     assert wakes
@@ -350,25 +349,6 @@ def test_projection_artifact_identity_is_gated() -> None:
     assert model.presentation is None
     assert model.status == "FINAL · DISPLAY FAILED"
     assert "another artifact" in (model.diagnostic or "")
-
-
-def test_projection_rejects_png_decode_above_shared_memory_limit() -> None:
-    controller, application, handle, executor, _ = _controller(digest="f")
-    application.png_bytes = (
-        b"\x89PNG\r\n\x1a\n"
-        b"\x00\x00\x00\rIHDR"
-        + (10_000).to_bytes(4, "big")
-        + (10_000).to_bytes(4, "big")
-    )
-
-    _reach_committed_reference(controller, handle, executor)
-    executor.run_next()
-    model = controller.owner_cycle()
-
-    assert model.artifact_ref == handle.reference
-    assert model.presentation is None
-    assert model.status == "FINAL · DISPLAY FAILED"
-    assert "PNG decode exceeds" in (model.diagnostic or "")
 
 
 def test_close_during_start_revokes_generation_cancels_and_reaps_stale_handle() -> None:

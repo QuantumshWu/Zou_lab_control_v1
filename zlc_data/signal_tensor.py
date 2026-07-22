@@ -398,11 +398,6 @@ class _StoreUpdate:
     version: int
     provenance: int
 
-    @property
-    def payload_nbytes(self) -> int:
-        return int(self.after.nbytes + self.valid_after.nbytes)
-
-
 class TensorStore:
     """One schema-bound current tensor plus a forward delta journal.
 
@@ -693,9 +688,8 @@ class TensorStore:
         data = self._base_data.copy()
         valid = self._base_valid.copy()
         # Allocate the returned history once and fill it while walking the
-        # forward journal.  Appending per-version copies and then np.stack-ing
-        # them retained both representations simultaneously (about 103 MiB peak
-        # for a 50 MiB P4096,D=(2,3),N=256 history read).
+        # forward journal.  Appending per-version copies and then stacking them
+        # would retain two complete representations at once.
         states = np.empty((take, *data.shape), dtype=data.dtype)
         masks = np.empty((take, *valid.shape), dtype=bool)
         versions = [0] * take
@@ -727,26 +721,12 @@ class TensorStore:
         return SignalTensor(data, self.schema, valid=valid, version=match.version,
                             provenance=match.provenance, schema_version=self.schema_version)
 
-    @property
-    def journal_payload_nbytes(self) -> int:
-        return sum(update.payload_nbytes for update in self._updates.values())
-
-    @property
-    def storage_nbytes(self) -> int:
-        current = 0 if self._data is None else int(self._data.nbytes)
-        current_mask = 0 if self._valid is None else int(self._valid.nbytes)
-        base = 0 if self._base_data is None else int(self._base_data.nbytes)
-        base_mask = 0 if self._base_valid is None else int(self._base_valid.nbytes)
-        return current + current_mask + base + base_mask + self.journal_payload_nbytes
-
     def stats(self) -> dict[str, int]:
         return {
             "version": int(self.version),
             "full_updates": int(self.full_updates),
             "patch_updates": int(self.patch_updates),
             "bytes_copied_in": int(self.bytes_copied_in),
-            "journal_payload_nbytes": int(self.journal_payload_nbytes),
-            "storage_nbytes": int(self.storage_nbytes),
         }
 
 

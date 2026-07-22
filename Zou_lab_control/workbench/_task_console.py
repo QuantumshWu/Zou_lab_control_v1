@@ -65,7 +65,7 @@ from zlc_workbench.task_console import (
     save_task_console_scan_intent,
     task_console_catalog_items,
     task_console_scan_binding_form_spec,
-    task_console_scan_budget_form_spec,
+    task_console_scan_runtime_form_spec,
 )
 
 from ._scan import ScanWorkbenchWindow
@@ -142,8 +142,6 @@ def _intent_request(experiment: Experiment, intent: TaskConsoleScanIntent):
         sequencer_role=intent.sequencer_role,
         trigger_channel=intent.trigger_channel,
         output_transform_spec=intent.output_transform_spec,
-        transport_memory_limit_bytes=intent.transport_memory_limit_bytes,
-        memory_limit_bytes=intent.memory_limit_bytes,
         timeout_seconds=intent.timeout_seconds,
     )
     program = intent.program
@@ -364,23 +362,17 @@ class ScanIntentForm(QtWidgets.QWidget):
         )
         binding_box = _form_card("Device binding", self._binding_form, self)
 
-        self._budget_form = FluentParameterForm(
-            task_console_scan_budget_form_spec(),
+        self._runtime_form = FluentParameterForm(
+            task_console_scan_runtime_form_spec(),
             parent=self,
         )
-        self._budget_form.setObjectName(f"{object_prefix}RunBudgetForm")
-        self._budget_form.widget_for(
-            "transport_memory_limit_bytes"
-        ).setObjectName(f"{object_prefix}TransportBudgetBytes")
-        self._budget_form.widget_for("memory_limit_bytes").setObjectName(
-            f"{object_prefix}MemoryBudgetBytes"
-        )
-        self._budget_form.widget_for("timeout_seconds").setObjectName(
+        self._runtime_form.setObjectName(f"{object_prefix}RunRuntimeForm")
+        self._runtime_form.widget_for("timeout_seconds").setObjectName(
             f"{object_prefix}DeadlineSeconds"
         )
-        budget_box = _form_card(
-            "Budgets and deadline",
-            self._budget_form,
+        runtime_box = _form_card(
+            "Run deadline",
+            self._runtime_form,
             self,
         )
 
@@ -416,7 +408,7 @@ class ScanIntentForm(QtWidgets.QWidget):
         left.addWidget(source_box)
         left.addWidget(binding_box)
         right = QtWidgets.QVBoxLayout()
-        right.addWidget(budget_box)
+        right.addWidget(runtime_box)
         right.addWidget(display_box)
         columns.addLayout(left, 1)
         columns.addLayout(right, 1)
@@ -565,7 +557,7 @@ class ScanIntentForm(QtWidgets.QWidget):
         else:
             raise ValueError("select SCAN_SLOT or API_SLOT segmented execution")
         binding = self._binding_form.read_all()
-        budgets = self._budget_form.read_all()
+        runtime = self._runtime_form.read_all()
         occupancy = self._source.currentData() == _OCCUPANCY_SOURCE
         calibration_ref = None
         model_kind = None
@@ -594,11 +586,7 @@ class ScanIntentForm(QtWidgets.QWidget):
             model_kind=model_kind,
             output_transform_spec=self._output_transform_spec,
             display_intent=display,
-            transport_memory_limit_bytes=budgets[
-                "transport_memory_limit_bytes"
-            ],
-            memory_limit_bytes=budgets["memory_limit_bytes"],
-            timeout_seconds=budgets["timeout_seconds"],
+            timeout_seconds=runtime["timeout_seconds"],
         )
 
     def _populate(self, intent: TaskConsoleScanIntent) -> None:
@@ -625,15 +613,7 @@ class ScanIntentForm(QtWidgets.QWidget):
                 "trigger_channel": intent.trigger_channel or "",
             }
         )
-        self._budget_form.populate(
-            {
-                "transport_memory_limit_bytes": (
-                    intent.transport_memory_limit_bytes
-                ),
-                "memory_limit_bytes": intent.memory_limit_bytes,
-                "timeout_seconds": intent.timeout_seconds,
-            }
-        )
+        self._runtime_form.populate({"timeout_seconds": intent.timeout_seconds})
         if occupancy:
             assert intent.calibration_ref is not None
             self._calibration_repository.setText(intent.calibration_ref.repository_id)
@@ -901,7 +881,7 @@ class ScanIntentForm(QtWidgets.QWidget):
         self._calibration_digest.clear()
         self._model_kind.setCurrentIndex(0)
         self._binding_form.populate(self._binding_form.spec.default_values())
-        self._budget_form.populate(self._budget_form.spec.default_values())
+        self._runtime_form.populate(self._runtime_form.spec.default_values())
         self._site_mode.setCurrentIndex(0)
         self._site_index.setValue(0)
         self._update_enabled_state()
@@ -1036,10 +1016,6 @@ class TaskScanCard(QtWidgets.QWidget):
         self._settings.clicked.connect(self._open_settings)
         self._remove.clicked.connect(self._request_remove)
         self._tabs.currentChanged.connect(self._tab_changed)
-        self._state_timer = QtCore.QTimer(self)
-        self._state_timer.setInterval(100)
-        self._state_timer.timeout.connect(self._refresh_state)
-        self._state_timer.start()
 
         if initial_intent is not None:
             self.load_intent(initial_intent)
@@ -1145,7 +1121,6 @@ class TaskScanCard(QtWidgets.QWidget):
         self._refresh_state()
 
     def shutdown(self) -> None:
-        self._state_timer.stop()
         if self._panel is not None:
             self._panel.shutdown()
 
@@ -1159,6 +1134,7 @@ class TaskScanCard(QtWidgets.QWidget):
             raise RuntimeError("scan card already owns a panel")
         self._panel = panel
         panel.finalReferenceChanged.connect(self._forward_final_reference)
+        panel.stateChanged.connect(self._refresh_state)
         panel.setObjectName("embeddedScanWorkbench")
         self._run_layout.removeWidget(self._placeholder)
         self._placeholder.hide()
@@ -1198,8 +1174,6 @@ class TaskScanCard(QtWidgets.QWidget):
 
     def _refresh_state(self) -> None:
         state = self.run_state
-        # Change-gated: this runs every 100 ms, and an unchanged setText still
-        # costs a Qt relayout pass on every card of the board.
         if state != self._state.text():
             self._state.setText(state)
             self.stateChanged.emit(state)

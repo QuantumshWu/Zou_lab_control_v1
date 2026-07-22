@@ -31,7 +31,6 @@ from .figure import (
     EvaluatedInput,
     EvaluatedMeter,
     FigureDocument,
-    FigureEvaluationPolicy,
     FigureEvaluator,
     FigureLayer,
     ResolvedDataset,
@@ -126,7 +125,6 @@ class PanelComposer:
         size: tuple[int, int] = (800, 520),
         selection=None,
         label: str = "",
-        evaluation_policy: FigureEvaluationPolicy | None = None,
     ) -> None:
         from .figure import dataset_contract_for
 
@@ -140,7 +138,7 @@ class PanelComposer:
         self._selection = selection
         self._label = str(label or panel_id)
         self._dataset_id = DatasetId(self._panel_id)
-        self._evaluator = FigureEvaluator(evaluation_policy or FigureEvaluationPolicy())
+        self._evaluator = FigureEvaluator()
         self._document: FigureDocument | None = None
         self._document_fingerprint = None
         self._renderer = None

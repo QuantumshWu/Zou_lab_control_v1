@@ -157,7 +157,6 @@ def cell_schedule(schema: DatasetSchema) -> DatasetCellSchedule:
 @dataclass(frozen=True)
 class _NoDatasetMetadataContract:
     fingerprint: str = "7" * 64
-    max_retained_nbytes: int = 0
 
     @staticmethod
     def snapshot(_payload):
@@ -167,11 +166,6 @@ class _NoDatasetMetadataContract:
     def validate(metadata):
         if metadata is not None:
             raise TypeError("value event has no metadata")
-
-    @staticmethod
-    def retained_nbytes(metadata):
-        _NoDatasetMetadataContract.validate(metadata)
-        return 0
 
     @staticmethod
     def digest(metadata):
@@ -201,7 +195,6 @@ def source(schema: DatasetSchema, *, events=8):
         contract,
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=events,
-        retention_bytes=events * contract.max_retained_nbytes,
         join_key_contract=DatasetCellKeyContract.from_schema(schema),
     )
 
@@ -336,7 +329,6 @@ def test_metadata_contract_validation_precedes_exact_commit(monkeypatch):
     reservation = stream.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=12,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -422,7 +414,6 @@ def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
     reservation = stream.reserve(
         total_events=3,
         max_inflight_events=3,
-        max_inflight_bytes=36,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -453,7 +444,7 @@ def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
     assert final.block.values.shape == (1, 3, 2, 3)
     assert tuple(final.block.values[0, point, 0, 0] for point in range(3)) == (10, 20, 30)
     reservation.release()
-    assert stream.retained_bytes == 0
+    assert stream.retained_events == 0
 
 
 def test_bound_builder_owns_reservation_completion():
@@ -462,7 +453,6 @@ def test_bound_builder_owns_reservation_completion():
     reservation = stream.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=12,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -488,7 +478,6 @@ def test_builder_context_preserves_body_error_and_releases_zero_event_preflight(
     reservation = stream.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=12,
         trace_binding=TRACE_BINDING,
     )
     reservation.activate()
@@ -502,7 +491,6 @@ def test_builder_context_preserves_body_error_and_releases_zero_event_preflight(
     replacement = stream.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=12,
         trace_binding=TRACE_BINDING,
     )
     replacement.abort()
@@ -515,7 +503,6 @@ def test_exact_wrong_key_and_missing_cells_fail_without_acknowledging_delivery()
     reservation = stream.reserve(
         total_events=2,
         max_inflight_events=2,
-        max_inflight_bytes=24,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -537,7 +524,6 @@ def test_exact_wrong_key_and_missing_cells_fail_without_acknowledging_delivery()
     missing_reservation = missing_stream.reserve(
         total_events=2,
         max_inflight_events=2,
-        max_inflight_bytes=24,
         trace_binding=TRACE_BINDING,
     )
     missing_cursor = missing_reservation.activate()
@@ -565,7 +551,6 @@ def test_component_validity_is_aligned_by_axis_id_not_trailing_shape_guess():
     reservation = stream.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=18,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -589,7 +574,7 @@ def test_component_validity_is_aligned_by_axis_id_not_trailing_shape_guess():
 def test_keyed_monitor_cycle_clears_the_previous_sweep_before_point_zero():
     schema = dataset_schema(points=2)
     stream, producer = source(schema, events=4)
-    tap = stream.monitor(max_events=4, max_bytes=48)
+    tap = stream.monitor(max_events=4)
     builder = MonitorDataset.keyed_cycle(
         BlockId("rolling"),
         tap,
@@ -619,7 +604,7 @@ def test_keyed_monitor_cycle_clears_the_previous_sweep_before_point_zero():
 def test_keyed_monitor_gap_at_nonzero_offset_clears_every_stale_cell():
     schema = dataset_schema(points=3)
     stream, producer = source(schema, events=6)
-    tap = stream.monitor(max_events=1, max_bytes=12)
+    tap = stream.monitor(max_events=1)
     builder = MonitorDataset.keyed_cycle(
         BlockId("gap-cycle"),
         tap,
@@ -656,7 +641,7 @@ def test_append_window_owns_newest_first_order_not_producer_join_keys():
     source_schema = dataset_schema(points=2)
     window_schema = monitor_history_schema(source_schema, 3)
     stream, producer = source(source_schema, events=8)
-    tap = stream.monitor(max_events=4, max_bytes=48)
+    tap = stream.monitor(max_events=4)
     window = MonitorDataset.append_window(
         BlockId("history"),
         tap,
@@ -686,7 +671,7 @@ def test_append_window_gap_recovers_after_loss_rolls_out_of_visible_history():
     source_schema = dataset_schema(points=2)
     window_schema = monitor_history_schema(source_schema, 3)
     stream, producer = source(source_schema, events=8)
-    tap = stream.monitor(max_events=1, max_bytes=12)
+    tap = stream.monitor(max_events=1)
     window = MonitorDataset.append_window(
         BlockId("gap-recovery"),
         tap,
@@ -723,7 +708,7 @@ def test_append_window_preserves_every_data_axis_and_component_validity():
     source_schema = dataset_schema(points=1, component_validity=True)
     window_schema = monitor_history_schema(source_schema, 2)
     stream, producer = source(source_schema, events=3)
-    tap = stream.monitor(max_events=3, max_bytes=39)
+    tap = stream.monitor(max_events=3)
     window = MonitorDataset.append_window(
         BlockId("multidimensional-history"),
         tap,
@@ -765,7 +750,7 @@ def test_append_window_preserves_every_data_axis_and_component_validity():
 def test_append_window_rejects_scan_axes_relabelled_as_history():
     schema = dataset_schema(points=2)
     stream, _producer = source(schema, events=2)
-    tap = stream.monitor(max_events=1, max_bytes=12)
+    tap = stream.monitor(max_events=1)
 
     with pytest.raises(Exception, match="MONITOR_HISTORY"):
         MonitorDataset.append_window(
@@ -784,13 +769,11 @@ def test_exact_delivery_cannot_cross_source_authority_even_when_ids_match():
     reservation_a = stream_a.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=12,
         trace_binding=TRACE_BINDING,
     )
     reservation_b = stream_b.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=12,
         trace_binding=TRACE_BINDING,
     )
     cursor_a = reservation_a.activate()
@@ -824,7 +807,6 @@ def test_exact_join_key_must_match_the_frozen_plan_schedule():
     reservation = stream.reserve(
         total_events=2,
         max_inflight_events=2,
-        max_inflight_bytes=24,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -849,7 +831,6 @@ def test_exact_reservation_rejects_cross_run_trace_mixing():
     reservation = stream.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=12,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -875,7 +856,7 @@ def test_exact_reservation_rejects_cross_run_trace_mixing():
 def test_monitor_materializer_is_the_tap_consumer_and_releases_it_on_close():
     schema = dataset_schema(points=1)
     stream, producer = source(schema, events=1)
-    tap = stream.monitor(max_events=1, max_bytes=12)
+    tap = stream.monitor(max_events=1)
     builder = MonitorDataset.keyed_cycle(
         BlockId("monitor-authority"),
         tap,
@@ -888,7 +869,6 @@ def test_monitor_materializer_is_the_tap_consumer_and_releases_it_on_close():
         tap.next()
     builder.ingest_next()
     builder.close()
-    assert tap.retained_bytes == 0
     with pytest.raises(StreamEndedEarly, match="closed"):
         tap.latest()
 
@@ -896,7 +876,7 @@ def test_monitor_materializer_is_the_tap_consumer_and_releases_it_on_close():
 def test_monitor_constructor_cannot_override_the_edge_cycle_schedule():
     schema = dataset_schema(points=2)
     stream, _producer = source(schema, events=2)
-    tap = stream.monitor(max_events=1, max_bytes=12)
+    tap = stream.monitor(max_events=1)
     edge = dataset_edge(stream, schema)
 
     with pytest.raises(TypeError, match="cycle_cells"):
@@ -913,7 +893,7 @@ def test_monitor_constructor_cannot_override_the_edge_cycle_schedule():
 def test_monitor_claim_wakes_and_revokes_an_already_blocked_raw_reader(monkeypatch):
     schema = dataset_schema(points=1)
     stream, producer = source(schema, events=1)
-    tap = stream.monitor(max_events=1, max_bytes=12)
+    tap = stream.monitor(max_events=1)
     entered_wait = threading.Event()
     failures: list[BaseException] = []
     real_wait = tap._condition.wait
@@ -952,7 +932,7 @@ def test_monitor_claim_wakes_and_revokes_an_already_blocked_raw_reader(monkeypat
 def test_monitor_materializer_must_bind_before_first_publication():
     schema = dataset_schema(points=1)
     stream, producer = source(schema, events=1)
-    tap = stream.monitor(max_events=1, max_bytes=12)
+    tap = stream.monitor(max_events=1)
     emit(producer, value(3), DatasetCellAddress(0, 0), 0)
 
     with pytest.raises(ReservationStateError, match="before the first publication"):
@@ -964,22 +944,6 @@ def test_monitor_materializer_must_bind_before_first_publication():
 
     assert tap.next().envelope.sequence == 0
     tap.close()
-
-
-def test_value_payload_contract_counts_component_validity_bytes():
-    schema = dataset_schema(points=1, component_validity=True)
-    x_axis = schema.cell_schema.data_axes[1]
-    component = ComponentValidity(
-        (x_axis.axis_id,), np.array([True, False, True], dtype=bool)
-    )
-    payload = Value(
-        np.ones((2, 3), dtype=np.uint16),
-        component,
-        schema.cell_schema,
-    )
-    contract = ValuePayloadContract(schema.cell_schema)
-    assert contract.retained_nbytes(payload) == payload.values.nbytes + component.mask.nbytes
-    assert contract.max_retained_nbytes == payload.values.nbytes + 6
 
 
 def test_value_payload_contract_requires_generation_owned_schema_identity():
@@ -1005,7 +969,6 @@ def test_minted_generation_prevents_revision_ref_collision_across_sources():
         reservation = stream.reserve(
             total_events=1,
             max_inflight_events=1,
-            max_inflight_bytes=12,
             trace_binding=TRACE_BINDING,
         )
         cursor = reservation.activate()
@@ -1044,10 +1007,6 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
         schema: ValueSchema
         fingerprint: str = "4" * 64
 
-        @property
-        def max_retained_nbytes(self):
-            return int(np.prod(self.schema.data_shape)) * self.schema.dtype.itemsize + 16
-
         def snapshot(self, payload):
             self.validate(payload)
             return payload
@@ -1055,10 +1014,6 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
         def validate(self, payload):
             if not isinstance(payload, CameraSample) or payload.image.schema is not self.schema:
                 raise TypeError("invalid CameraSample")
-
-        def retained_nbytes(self, payload):
-            self.validate(payload)
-            return payload.image.values.nbytes + 16
 
         def digest(self, payload):
             self.validate(payload)
@@ -1074,7 +1029,6 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
     @dataclass(frozen=True)
     class FrameMetadataContract:
         fingerprint: str = "5" * 64
-        max_retained_nbytes: int = 16
 
         @staticmethod
         def snapshot(payload):
@@ -1084,11 +1038,6 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
         def validate(metadata):
             if not isinstance(metadata, FrameMetadata):
                 raise TypeError("invalid FrameMetadata")
-
-        @staticmethod
-        def retained_nbytes(metadata):
-            FrameMetadataContract.validate(metadata)
-            return 16
 
         @staticmethod
         def digest(metadata):
@@ -1116,13 +1065,11 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
         contract,
         flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
         retention_events=1,
-        retention_bytes=contract.max_retained_nbytes,
         join_key_contract=DatasetCellKeyContract.from_schema(schema),
     )
     reservation = stream.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=contract.max_retained_nbytes,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -1171,7 +1118,6 @@ def test_metadata_rejects_enum_with_mutable_value():
     @dataclass(frozen=True)
     class EnumMetadataContract:
         fingerprint: str = "b" * 64
-        max_retained_nbytes: int = 0
 
         @staticmethod
         def snapshot(_payload):
@@ -1180,10 +1126,6 @@ def test_metadata_rejects_enum_with_mutable_value():
         @staticmethod
         def validate(_metadata):
             return None
-
-        @staticmethod
-        def retained_nbytes(_metadata):
-            return 0
 
         @staticmethod
         def digest(_metadata):
@@ -1208,7 +1150,6 @@ def test_metadata_rejects_enum_with_mutable_value():
     reservation = stream.reserve(
         total_events=1,
         max_inflight_events=1,
-        max_inflight_bytes=12,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()

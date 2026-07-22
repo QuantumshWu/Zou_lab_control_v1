@@ -23,7 +23,7 @@ from .lineage import (
     CameraRunEvidence,
     PulseScanExecution,
 )
-from .repository import MaterializedScanData, ScanArtifactInspection
+from .repository import MaterializedScanData
 
 __all__ = [
     "ApiSegmentTable",
@@ -40,7 +40,6 @@ __all__ = [
     "PulseScanExecution",
     "PulseScanProgram",
     "SCAN_TASK_DEFINITIONS",
-    "ScanArtifactInspection",
     "ScanOutputContract",
     "ScanPointTable",
     "ScanArtifactRef",

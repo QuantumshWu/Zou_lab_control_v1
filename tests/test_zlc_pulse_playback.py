@@ -7,7 +7,6 @@ import pytest
 
 from zlc_pulse import (
     CompiledPulseArtifact,
-    MAX_MATERIALIZED_PLAYBACK_PULSES,
     OutputDelay,
     PORT_DIGITAL,
     PulseExecutionForm,
@@ -188,32 +187,3 @@ def test_virtual_shot_grouping_rejects_multiple_trigger_lines():
 
     with pytest.raises(ValueError, match="exactly one trigger channel"):
         playback.trigger_group_sizes(("ch11", "ch10"))
-
-
-def test_playback_rejects_an_unbounded_materialized_compact_projection():
-    loops = MAX_MATERIALIZED_PLAYBACK_PULSES + 1
-    ir = TargetIR(
-        clock_hz=50e6,
-        target_abi_fingerprint="a" * 64,
-        channels=("trigger",),
-        ticks=(0, 5, 10),
-        masks=(1, 0, 0),
-        duration_seconds=10 * loops / 50e6,
-        repeat_forever=False,
-        loop_start_index=0,
-        loop_end_tick=10,
-        loop_count=loops,
-        tick_slot_coeffs=((), (), ()),
-        channel_delays=(0,),
-        logical_digital_outputs=(("trigger", "trigger"),),
-    )
-    artifact = CompiledPulseArtifact(
-        "b" * 64,
-        "test-compiler",
-        PulseExecutionForm.STATIC_ONCE,
-        ir,
-        pack_target_ir(ir),
-        (),
-    )
-    with pytest.raises(ValueError, match="physical digital playback requires"):
-        build_pulse_playback(artifact)

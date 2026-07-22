@@ -108,139 +108,6 @@ def _validate_site_center_admission(
             )
 
 
-def estimate_calibration_analysis_peak_bytes(
-    schema: DatasetSchema,
-    request: CalibrationAnalysisRequest,
-    *,
-    source_read_scratch_bytes: int = 0,
-) -> int:
-    """Conservatively admit the observed calibration allocation pattern.
-
-    A 2304x2304 qCMOS profile peaked at 146.82 MiB (about 29 bytes per
-    pixel).  The 72-byte pixel allowance below covers the accumulator/count,
-    validity, detector-filter temporaries, immutable report copy, and the
-    worst dense local-maximum coordinate workspace.  Compact site/statistics
-    arrays and the capture owner's bounded read scratch are added separately.
-    This is deliberately a pure deterministic bound, not an OS-memory probe or
-    a second resource scheduler.
-    """
-
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    if not isinstance(request, CalibrationAnalysisRequest):
-        raise TypeError("request must be CalibrationAnalysisRequest")
-    read_scratch = _nonnegative_integer(
-        source_read_scratch_bytes,
-        "source_read_scratch_bytes",
-    )
-    if len(schema.cell_schema.data_shape) != 2:
-        raise CalibrationAnalysisError("calibration source cells must be 2D frames")
-    expected_centers = request.expected_centers_xy
-    if expected_centers is not None:
-        height, width = schema.cell_schema.data_shape
-        if (
-            np.any(expected_centers[:, 0] < 0.0)
-            or np.any(expected_centers[:, 0] >= width)
-            or np.any(expected_centers[:, 1] < 0.0)
-            or np.any(expected_centers[:, 1] >= height)
-        ):
-            raise CalibrationAnalysisError(
-                "expected_centers_xy lies outside the captured output-pixel frame"
-            )
-    group_count, join_build_peak, join_retained = (
-        request.layout._memory_upper_bounds(schema)
-    )
-    reference_shots = len(request.layout.reference_event_indices)
-    pixels = math.prod(schema.cell_schema.data_shape)
-    sites = request.site_count
-    model_count = len(request.model_kinds)
-    rows, columns = request.grid_shape_yx
-    reference_samples = group_count * reference_shots * sites
-    short_samples = group_count * sites
-    psf_extent = 2 * request.psf_half_width + 1
-
-    frame_working_set = pixels * 72
-    reference_working_set = reference_samples * 24
-    # The one-pass extractor holds all model signal/validity arrays while each
-    # immutable report copies those arrays and adds predictions/statistical
-    # masks.  32 bytes per model/group/site covers both representations and
-    # their concurrently live boolean workspaces.
-    short_working_set = short_samples * 32 * model_count
-    histogram_working_set = (
-        model_count * sites * (request.histogram_bins + 1) * 8
-    )
-    # Each retained ablation point owns a site-sized boolean mask plus Python
-    # objects for the ndarray, frozen result, scalar fields, and tuple slot.
-    # 1024 bytes is deliberately conservative for that object graph; the mask
-    # payload remains explicit so larger site arrays scale correctly.
-    ablation_working_set = (
-        model_count * (request.max_drop + 1) * (sites + 1024)
-    )
-    psf_working_set = sites * psf_extent * psf_extent * 24
-    site_admission_working_set = (
-        0
-        if request.expected_centers_xy is None
-        else request.expected_centers_xy.nbytes
-    )
-    # The inherited robust lattice fit retains one Python scalar per unordered
-    # pair on each grid axis while np.median materializes its numeric workspace.
-    # A 1x1000 profile exposed the otherwise-hidden quadratic peak; 64 bytes per
-    # pair covers the measured CPython list/scalar/median overlap.
-    lattice_slope_working_set = 64 * (
-        math.comb(rows, 2) + math.comb(columns, 2)
-    )
-    # The report retains one BimodalFit plus per-model SiteFidelity/diagnostic
-    # object graphs for each site.  Their Python containers dominate the small
-    # ndarray payloads for slender grids and therefore need an explicit bound.
-    site_object_working_set = sites * (1 + model_count) * 1024
-    # CalibrationReport retains one named context tuple per group.  AxisId
-    # values are shared, while tuple/int/container overhead is conservatively
-    # bounded per logical axis rather than inferred from data shape.
-    group_contexts_working_set = group_count * (
-        256 + 128 * len(schema.point_axes)
-    )
-    analysis_peak = int(
-        read_scratch
-        + join_retained
-        + group_contexts_working_set
-        + frame_working_set
-        + reference_working_set
-        + short_working_set
-        + histogram_working_set
-        + ablation_working_set
-        + psf_working_set
-        + site_admission_working_set
-        + lattice_slope_working_set
-        + site_object_working_set
-    )
-    # The authority-bearing result remains live through canonical staging.
-    # Full-resolution diagnostic images are raw CAS blobs, so staging adds one
-    # exact image/mask byte copy rather than base64 amplification.  All other
-    # artifact/report arrays do pass through canonical ndarray normalization,
-    # base64, JSON, and a writer-side decode round-trip; eight times their
-    # retained footprint conservatively covers that overlap without pretending
-    # the raw diagnostic image uses the same path.
-    retained_result = int(
-        group_contexts_working_set
-        + pixels * 16
-        + reference_samples * 8
-        + short_samples * (5 + 10 * model_count)
-        + histogram_working_set
-        + ablation_working_set
-        + psf_working_set
-        + site_admission_working_set
-        + site_object_working_set
-    )
-    non_image_result = max(0, retained_result - pixels * 16)
-    staging_peak = (
-        join_retained
-        + retained_result
-        + pixels * 9
-        + 8 * non_image_result
-    )
-    return max(join_build_peak, analysis_peak, staging_peak)
-
-
 @dataclass(frozen=True)
 class BimodalFit:
     threshold: float
@@ -796,12 +663,6 @@ class CalibrationAnalysisResult:
         repr=False,
         compare=False,
     )
-    _memory_admission_peak_bytes: int = field(repr=False, compare=False)
-    _context_codec_workspace_upper_bound_bytes: int = field(
-        repr=False,
-        compare=False,
-    )
-    _memory_admission_limit_bytes: int = field(repr=False, compare=False)
 
     def __init_subclass__(cls, **_kwargs) -> None:
         raise TypeError("CalibrationAnalysisResult is final and cannot be subclassed")
@@ -828,9 +689,6 @@ class CalibrationAnalysisResult:
         computation: CalibrationComputation,
         source: object,
         resolved: _ResolvedCalibrationSource,
-        memory_admission_peak_bytes: int,
-        context_codec_workspace_upper_bound_bytes: int,
-        memory_admission_limit_bytes: int,
     ) -> "CalibrationAnalysisResult":
         from zlc_neutral_atom.artifacts.capture import AdmittedCapture
 
@@ -844,22 +702,6 @@ class CalibrationAnalysisResult:
             raise TypeError("source must be an exact AdmittedCapture")
         if not isinstance(resolved, _ResolvedCalibrationSource):
             raise TypeError("resolved must be _ResolvedCalibrationSource")
-        memory_peak = _positive_integer(
-            memory_admission_peak_bytes,
-            "memory_admission_peak_bytes",
-        )
-        memory_limit = _positive_integer(
-            memory_admission_limit_bytes,
-            "memory_admission_limit_bytes",
-        )
-        context_workspace = _positive_integer(
-            context_codec_workspace_upper_bound_bytes,
-            "context_codec_workspace_upper_bound_bytes",
-        )
-        if memory_peak > memory_limit:
-            raise MemoryError("calibration result exceeds its memory admission")
-        if context_workspace > memory_peak:
-            raise ValueError("calibration codec proof exceeds its whole-run peak")
         if computation.artifact.source_binding.source_capture_ref != source.reference:
             raise ValueError("calibration result names another admitted capture")
         if computation.artifact.source_binding != resolved.source_binding or (
@@ -877,18 +719,11 @@ class CalibrationAnalysisResult:
         object.__setattr__(result, "_token", token)
         object.__setattr__(result, "_source_admission", source)
         object.__setattr__(result, "_source_resolution", resolved)
-        object.__setattr__(result, "_memory_admission_peak_bytes", memory_peak)
-        object.__setattr__(
-            result,
-            "_context_codec_workspace_upper_bound_bytes",
-            context_workspace,
-        )
-        object.__setattr__(result, "_memory_admission_limit_bytes", memory_limit)
         return result
 
     def _source_for_commit(
         self,
-    ) -> tuple[object, _ResolvedCalibrationSource, int, int, int]:
+    ) -> tuple[object, _ResolvedCalibrationSource]:
         """Return the exact retained input after validating result authority."""
 
         from zlc_neutral_atom.artifacts.capture import AdmittedCapture
@@ -913,23 +748,7 @@ class CalibrationAnalysisResult:
             raise PermissionError(
                 "calibration result source resolution changed after analysis"
             )
-        peak = _positive_integer(
-            self._memory_admission_peak_bytes,
-            "memory_admission_peak_bytes",
-        )
-        limit = _positive_integer(
-            self._memory_admission_limit_bytes,
-            "memory_admission_limit_bytes",
-        )
-        if peak > limit:
-            raise PermissionError("calibration memory admission is inconsistent")
-        context_workspace = _positive_integer(
-            self._context_codec_workspace_upper_bound_bytes,
-            "context_codec_workspace_upper_bound_bytes",
-        )
-        if context_workspace > peak:
-            raise PermissionError("calibration codec admission is inconsistent")
-        return source, resolved, peak, context_workspace, limit
+        return source, resolved
 
 def _gaussian_2d(coords, offset, amplitude, x0, y0, sigma_x, sigma_y):
     x, y = coords
@@ -2100,8 +1919,7 @@ def _calibrate_readout_source(
     average_validity = count > 0
     if not np.any(average_validity):
         raise CalibrationAnalysisError("reference frames contain no valid pixels")
-    # Reuse the float64 accumulator for the average.  Calibration needs memory
-    # proportional to one frame, not another frame-sized temporary per shot.
+    # Reuse the float64 accumulator because no second temporary is needed.
     average = total
     np.divide(total, count, out=average, where=average_validity)
     if np.all(average_validity):
@@ -2423,10 +2241,6 @@ def _analyze_calibration_resolved(
     source: object,
     request: CalibrationAnalysisRequest,
     resolved: _ResolvedCalibrationSource,
-    *,
-    memory_admission_peak_bytes: int,
-    context_codec_workspace_upper_bound_bytes: int,
-    memory_admission_limit_bytes: int,
 ) -> CalibrationAnalysisResult:
     from zlc_neutral_atom.artifacts.capture import AdmittedCapture
 
@@ -2447,9 +2261,6 @@ def _analyze_calibration_resolved(
         computation,
         source,
         resolved,
-        memory_admission_peak_bytes,
-        context_codec_workspace_upper_bound_bytes,
-        memory_admission_limit_bytes,
     )
 
 
@@ -2468,7 +2279,6 @@ __all__ = [
     "characterize_readout",
     "calibration_runtime_threshold_sources",
     "compute_calibration",
-    "estimate_calibration_analysis_peak_bytes",
     "find_site_centers",
     "fit_bimodal",
     "otsu_threshold",

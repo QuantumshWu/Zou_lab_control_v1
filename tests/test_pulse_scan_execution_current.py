@@ -83,14 +83,9 @@ def test_materialize_scan_sweeps_repeats_only_frozen_rows_sweep_major():
     assert materialize_scan_sweeps(document, 1) is document
 
 
-def test_materialize_scan_sweeps_fails_before_unbounded_allocation(monkeypatch):
-    import zlc_pulse.scan_execution as scan_execution
-
+def test_materialize_scan_sweeps_validates_the_requested_repeat_count():
     document = _execution_document()
-    monkeypatch.setattr(scan_execution, "MAX_MATERIALIZED_SCAN_POINTS", 5)
 
-    with pytest.raises(ValueError, match="6 points > 5"):
-        materialize_scan_sweeps(document, 3)
     with pytest.raises(TypeError, match="integer"):
         materialize_scan_sweeps(document, True)
     with pytest.raises(ValueError, match="positive"):

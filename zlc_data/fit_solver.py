@@ -71,7 +71,7 @@ def _fit_analysis(
     """Execute every physically present batch independently.
 
     Hosting cancellation and its absolute deadline abort the whole call.
-    Deterministic evaluation budgets produce typed per-batch failures, preserving
+    Deterministic evaluation limits produce typed per-batch failures, preserving
     all other independently successful grid/site fits.
     """
 
@@ -140,12 +140,12 @@ def _fit_analysis(
             raise
         except _CellFailure as exc:
             statuses.append(exc.status)
-            errors.append(_bounded_error(str(exc)))
+            errors.append(_fit_error_text(str(exc)))
             evaluation_counts[batch_index] = exc.evaluations
             continue
         except (FloatingPointError, OverflowError, np.linalg.LinAlgError) as exc:
             statuses.append(FitBatchStatus.NUMERIC_ERROR)
-            errors.append(_bounded_error(f"numeric failure: {exc}"))
+            errors.append(_fit_error_text(f"numeric failure: {exc}"))
             continue
 
         statuses.append(FitBatchStatus.CONVERGED)
@@ -237,7 +237,7 @@ def _fit_cell(
         if evaluation_count >= bound.spec.numeric_policy.max_evaluations:
             raise _CellFailure(
                 FitBatchStatus.EVALUATION_LIMIT,
-                "per-batch model evaluation budget exceeded",
+                "per-batch model evaluation limit exceeded",
                 evaluations=evaluation_count,
             )
         evaluation_count += 1
@@ -601,6 +601,6 @@ def _check_host_abort(
         raise FitDeadlineExceeded("fit hosting deadline exceeded")
 
 
-def _bounded_error(message: str) -> str:
+def _fit_error_text(message: str) -> str:
     compact = " ".join(str(message).split()) or "unspecified fit failure"
-    return compact[:512]
+    return compact

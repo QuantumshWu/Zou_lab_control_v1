@@ -95,7 +95,6 @@ def _curve_figure(
     coordinates: tuple[object, ...] | None = None,
     site_role: AxisViewRole = AxisViewRole.BATCH,
     with_fit: bool = False,
-    render_memory_limit_bytes: int = 64 << 20,
 ) -> DataFigure:
     if coordinates is None:
         coordinates = tuple(float(value) for value in np.linspace(-2.0, 2.0, 21))
@@ -202,7 +201,6 @@ def _curve_figure(
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
         fit_results=fit_results,
-        render_memory_limit_bytes=render_memory_limit_bytes,
     )
 
 
@@ -213,22 +211,6 @@ def _typed_front(window):
     payload = frame.panels[0].display_payload
     assert isinstance(payload, CurvePanelPayload)
     return board, frame, payload
-
-
-def _initial_session_peak(figure: DataFigure, state: CurveDisplayState) -> int:
-    import Zou_lab_control.workbench._figure as figure_module
-
-    front = figure_module._render_typed_front(
-        figure,
-        state,
-        current_value_limits=None,
-        previous_relim_mode=None,
-        previous_count_scale=None,
-        sequence=0,
-        memory_limit_bytes=1 << 30,
-        cancelled=threading.Event(),
-    )
-    return front.session_peak_bytes
 
 
 def _wheel(board: QtRasterBoard, delta: int):
@@ -380,46 +362,6 @@ def test_unsupported_or_authoritative_curve_content_stays_encoded(
         assert reason_fragment in window._summary.text()
     finally:
         _close(application, window)
-
-
-def test_curve_typed_budget_has_exact_boundary(application) -> None:
-    from Zou_lab_control.workbench import _figure as figure_module
-
-    probe = _curve_figure()
-    render_required = figure_module._typed_front_required_peak_bytes(
-        probe,
-        CurveDisplayState(),
-    )
-    required = _initial_session_peak(probe, CurveDisplayState())
-    assert required > render_required
-    admitted = open_data_figure_workbench(probe, memory_limit_bytes=required)
-    try:
-        _until(application, lambda: admitted.raster_ready)
-        assert admitted._view_family == "curve"
-    finally:
-        _close(application, admitted)
-
-    encoded = open_data_figure_workbench(
-        _curve_figure(),
-        memory_limit_bytes=required - 1,
-    )
-    try:
-        _until(application, lambda: encoded.raster_ready)
-        assert encoded._view_family == "encoded"
-        assert "exceeds the frozen memory budget" in encoded._summary.text()
-    finally:
-        _close(application, encoded)
-
-    frozen = open_data_figure_workbench(
-        _curve_figure(render_memory_limit_bytes=render_required - 1),
-        memory_limit_bytes=required + 1,
-    )
-    try:
-        _until(application, lambda: frozen.raster_ready)
-        assert frozen._view_family == "encoded"
-        assert "exceeds the frozen memory budget" in frozen._summary.text()
-    finally:
-        _close(application, frozen)
 
 
 def test_curve_front_sequence_and_authored_state_are_compare_and_swap(

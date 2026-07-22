@@ -62,7 +62,7 @@ def test_calibration_analysis_owner_is_split_from_commit_authority():
         ResolvedCalibration()
 
 
-def test_compile_plan_requires_explicit_source_binding_memory_and_deadline():
+def test_compile_plan_requires_explicit_source_binding_and_deadline():
     signature = inspect.signature(compile_calibration_artifact_plan)
     assert tuple(signature.parameters) == (
         "source_capture_ref",
@@ -70,12 +70,10 @@ def test_compile_plan_requires_explicit_source_binding_memory_and_deadline():
         "calibration_repository",
         "request",
         "expected_readout_binding",
-        "memory_limit_bytes",
         "timeout_seconds",
     )
     for name in (
         "expected_readout_binding",
-        "memory_limit_bytes",
         "timeout_seconds",
     ):
         assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
@@ -117,7 +115,6 @@ def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_pa
             reopened = calibrations.admit(
                 reference,
                 captures,
-                memory_limit_bytes=512 << 20,
             )
             live_result.update(
                 {

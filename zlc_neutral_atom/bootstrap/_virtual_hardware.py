@@ -754,7 +754,7 @@ class VirtualCamera:
             else _positive_int(max_inflight_frames, "max_inflight_frames")
         )
         if capacity > expected:
-            raise ValueError("max_inflight_frames cannot exceed frame budget")
+            raise ValueError("max_inflight_frames cannot exceed expected_frames")
         if capacity > self.max_pending_records:
             raise ValueError("max_inflight_frames exceeds camera max_pending_records")
         with self._condition:
@@ -787,7 +787,7 @@ class VirtualCamera:
             if not self._accepting:
                 if self._produced >= self._expected:
                     raise RuntimeError(
-                        "virtual camera received FIRE after its arm budget was complete"
+                        "virtual camera received FIRE after its expected frame count was complete"
                     )
                 return
             if self._worker is not None and self._worker.is_alive():
@@ -811,7 +811,7 @@ class VirtualCamera:
             if trigger_count > remaining:
                 error = RuntimeError(
                     f"virtual pulse emitted {trigger_count} camera edges with only "
-                    f"{remaining} remaining in the arm budget"
+                    f"{remaining} expected frames remaining"
                 )
                 self._worker_error = error
                 self._accepting = False
@@ -852,7 +852,7 @@ class VirtualCamera:
                             image = next(frame_iterator)
                         except StopIteration as exc:
                             raise RuntimeError(
-                                "virtual atom source ended before the trigger budget"
+                                "virtual atom source ended before the expected trigger count"
                             ) from exc
                         source_ordinal = start_ordinal + local_ordinal
                         produced_count = source_ordinal + 1
@@ -879,7 +879,7 @@ class VirtualCamera:
                     sentinel = object()
                     if next(frame_iterator, sentinel) is not sentinel:
                         raise RuntimeError(
-                            "virtual atom source exceeded the trigger budget"
+                            "virtual atom source exceeded the expected trigger count"
                         )
                 except BaseException as error:
                     with self._condition:
@@ -936,7 +936,7 @@ class VirtualCamera:
                     # producer has advanced the source once more and proved EOF.
                     # That post-frame probe detects both an extra frame and a
                     # source exception raised after the expected final yield.
-                    # Keep the proof on the caller's original blocking budget:
+                    # Keep the proof within the caller's original deadline:
                     # an ill-behaved iterator must not turn an exact read into an
                     # unbounded join, and cancellation must not return a frame
                     # whose finite-source cardinality was never established.
@@ -1188,7 +1188,7 @@ class VirtualMonitorCamera:
             raise ValueError("virtual monitor camera only accepts a continuous arm")
         capacity = _positive_int(max_inflight_frames, "max_inflight_frames")
         if capacity > self.max_pending_records:
-            raise ValueError("monitor inflight budget exceeds camera capacity")
+            raise ValueError("monitor max_inflight_frames exceeds camera capacity")
         with self._condition:
             if self._armed:
                 raise RuntimeError("virtual monitor camera is already armed")
@@ -1322,20 +1322,12 @@ class VirtualMonitorCamera:
                 + ((yy - center_y) / sigma_y) ** 2
             )
         )
-        frame = np.empty((height, width), dtype=np.uint8)
-        # Keep the noise scratch at or below one retained frame.  A full-frame
-        # float64 normal array would make the adapter exceed the memory peak it
-        # attests before arm, even though the delivered Mono8 frame is small.
-        values_per_chunk = max(1, min(1 << 15, frame.size // 8))
-        for start in range(0, frame.size, values_per_chunk):
-            stop = min(frame.size, start + values_per_chunk)
-            noise = self._rng.normal(
-                self.offset_counts,
-                self.read_noise,
-                size=stop - start,
-            )
-            np.clip(noise, 0, 255, out=noise)
-            frame.flat[start:stop] = noise
+        noise = self._rng.normal(
+            self.offset_counts,
+            self.read_noise,
+            size=(height, width),
+        )
+        frame = np.clip(noise, 0, 255).astype(np.uint8)
         signal = self._rng.poisson(
             self.peak_counts * efficiency * spot
         ).astype(np.int32, copy=False)

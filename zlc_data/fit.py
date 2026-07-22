@@ -7,8 +7,6 @@ from .fit_codec import (
     decode_fit_spec,
     encode_fit_result_batch,
     encode_fit_spec,
-    fit_result_decode_additional_peak_upper_bound_nbytes,
-    fit_result_encode_additional_peak_upper_bound_nbytes,
     fit_spec_from_tree,
     fit_spec_to_tree,
 )
@@ -22,8 +20,6 @@ from .fit_contract import (
     FitParameterConstraint,
     FitResultBatch,
     FitSpec,
-    bound_fit_execution_peak_upper_bound_nbytes,
-    fit_result_retained_upper_bound_nbytes,
 )
 from .fit_model import (
     FitModelDefinition,
@@ -35,10 +31,6 @@ from .fit_model import (
 )
 from .fit_problem import (
     bind_fit,
-    fit_binding_additional_peak_upper_bound_nbytes,
-    fit_binding_retained_upper_bound_nbytes,
-    fit_transform_resolution_additional_peak_upper_bound_nbytes,
-    fit_result_source_validation_additional_peak_upper_bound_nbytes,
     validate_fit_result_source_binding,
 )
 from .schema import DatasetSchema
@@ -150,26 +142,6 @@ def _unbound_fit_spec_for(
     )
 
 
-def _require_binding_budget(
-    spec: FitSpec,
-    schema: DatasetSchema,
-    memory_limit_bytes: int | None,
-) -> None:
-    if memory_limit_bytes is None:
-        return
-    if (
-        isinstance(memory_limit_bytes, bool)
-        or not isinstance(memory_limit_bytes, int)
-        or memory_limit_bytes <= 0
-    ):
-        raise ValueError("binding_memory_limit_bytes must be a positive integer or None")
-    required = fit_binding_additional_peak_upper_bound_nbytes(spec, schema)
-    if required > memory_limit_bytes:
-        raise MemoryError(
-            f"Fit binding requires {required} bytes; limit is {memory_limit_bytes}"
-        )
-
-
 def fit_spec_for(
     schema: DatasetSchema,
     model_id: str,
@@ -178,18 +150,8 @@ def fit_spec_for(
     fit_axis_ids: tuple[AxisId, ...] | None = None,
     constraints: tuple[FitParameterConstraint, ...] = (),
     numeric_policy: FitNumericPolicy = FitNumericPolicy(),
-    binding_memory_limit_bytes: int | None = None,
 ) -> FitSpec:
-    """Build and validate one total named-axis Fit request under an optional gate."""
-
-    if committed_transform is not None and binding_memory_limit_bytes is not None:
-        transform_peak = fit_transform_resolution_additional_peak_upper_bound_nbytes(
-            schema
-        )
-        if transform_peak > binding_memory_limit_bytes:
-            raise MemoryError(
-                "Fit transformed-schema resolution exceeds binding memory limit"
-            )
+    """Build and validate one total named-axis Fit request."""
     spec = _unbound_fit_spec_for(
         schema,
         model_id,
@@ -198,7 +160,6 @@ def fit_spec_for(
         constraints=constraints,
         numeric_policy=numeric_policy,
     )
-    _require_binding_budget(spec, schema, binding_memory_limit_bytes)
     return bind_fit(spec, schema).spec
 
 
@@ -210,7 +171,6 @@ def suggest_fit_draft(
     selection: Selection | None = None,
     constraints: tuple[FitParameterConstraint, ...] = (),
     numeric_policy: FitNumericPolicy = FitNumericPolicy(),
-    binding_memory_limit_bytes: int | None = None,
 ) -> BoundFit:
     """Build one authoritative Fit draft from named axes and an optional ROI.
 
@@ -238,11 +198,6 @@ def suggest_fit_draft(
         constraints=constraints,
         numeric_policy=numeric_policy,
     )
-    _require_binding_budget(
-        preliminary_spec,
-        schema,
-        binding_memory_limit_bytes,
-    )
     # Reject an incompatible model before constructing selection-derived
     # transformed metadata.  The temporary binding is released immediately.
     bind_fit(preliminary_spec, schema)
@@ -263,20 +218,6 @@ def suggest_fit_draft(
             raise ValueError(
                 "Fit draft selection may name only explicit fit axes"
             )
-        if binding_memory_limit_bytes is not None:
-            transform_construction = (
-                fit_binding_additional_peak_upper_bound_nbytes(
-                    preliminary_spec,
-                    schema,
-                )
-                + fit_transform_resolution_additional_peak_upper_bound_nbytes(
-                    schema
-                )
-            )
-            if transform_construction > binding_memory_limit_bytes:
-                raise MemoryError(
-                    "Fit selection transform exceeds binding memory limit"
-                )
         committed_transform = commit_transform(
             schema,
             DataTransformSpec((selection,)),
@@ -290,7 +231,6 @@ def suggest_fit_draft(
         constraints=constraints,
         numeric_policy=numeric_policy,
     )
-    _require_binding_budget(spec, schema, binding_memory_limit_bytes)
     return bind_fit(spec, schema)
 
 
@@ -309,20 +249,12 @@ __all__ = [
     "FitSpec",
     "ParameterUnitRelation",
     "bind_fit",
-    "bound_fit_execution_peak_upper_bound_nbytes",
     "decode_fit_result_batch",
     "decode_fit_spec",
     "encode_fit_result_batch",
     "encode_fit_spec",
-    "fit_result_decode_additional_peak_upper_bound_nbytes",
-    "fit_result_encode_additional_peak_upper_bound_nbytes",
     "fit_model_catalog",
-    "fit_binding_additional_peak_upper_bound_nbytes",
-    "fit_binding_retained_upper_bound_nbytes",
-    "fit_transform_resolution_additional_peak_upper_bound_nbytes",
     "fit_model_definition",
-    "fit_result_retained_upper_bound_nbytes",
-    "fit_result_source_validation_additional_peak_upper_bound_nbytes",
     "fit_spec_from_tree",
     "fit_spec_for",
     "suggest_fit_draft",

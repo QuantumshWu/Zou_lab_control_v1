@@ -1,7 +1,7 @@
 """Headless fitting shared by DataFigure and live FitProcessor.
 
-This module owns model definitions, selection, seeds/bounds, deterministic
-sampling, the solver, and fit quality.  Frontends only adapt plot data into
+This module owns model definitions, selection, seeds/bounds, the solver, and
+fit quality.  Frontends only adapt plot data into
 ``SelectedData`` and draw ``FitResult``; processors only adapt signal tensors
 and publish the same result.  There is no Qt/Matplotlib dependency here.
 """
@@ -77,7 +77,6 @@ class FitRequest:
     selection: Selection = Selection()
     initial: tuple[float, ...] | None = None
     fixed: Mapping[str, float] = field(default_factory=dict)
-    sample_budget: int = 12_000
     max_evaluations: int = 4_000
     coordinate_frame: str = "data"
     solve: bool = True
@@ -87,11 +86,8 @@ class FitRequest:
         object.__setattr__(self, "fixed", {str(k): float(v) for k, v in dict(self.fixed).items()})
         if self.initial is not None:
             object.__setattr__(self, "initial", tuple(float(v) for v in self.initial))
-        if int(self.sample_budget) < 8:
-            raise ValueError("fit sample_budget must be at least 8")
         if int(self.max_evaluations) < 1:
             raise ValueError("fit max_evaluations must be positive")
-        object.__setattr__(self, "sample_budget", int(self.sample_budget))
         object.__setattr__(self, "max_evaluations", int(self.max_evaluations))
         object.__setattr__(self, "coordinate_frame", str(self.coordinate_frame or "data"))
         object.__setattr__(self, "solve", bool(self.solve))
@@ -102,7 +98,6 @@ class FitRequest:
             "selection": self.selection.to_dict(),
             "initial": None if self.initial is None else list(self.initial),
             "fixed": dict(self.fixed),
-            "sample_budget": self.sample_budget,
             "max_evaluations": self.max_evaluations,
             "coordinate_frame": self.coordinate_frame,
             "solve": self.solve,
@@ -117,7 +112,6 @@ class FitRequest:
             initial=(None if data.get("initial") is None
                      else tuple(float(value) for value in data["initial"])),
             fixed={str(key): float(value) for key, value in dict(data.get("fixed", {})).items()},
-            sample_budget=int(data.get("sample_budget", 12_000)),
             max_evaluations=int(data.get("max_evaluations", 4_000)),
             coordinate_frame=str(data.get("coordinate_frame", "data")),
             solve=bool(data.get("solve", True)),
@@ -464,17 +458,6 @@ def fit_models(*, family: str | None = None) -> tuple[FitModel, ...]:
     return tuple(model for model in models if model.family.lower() == wanted)
 
 
-def _sample(selected: SelectedData, budget: int) -> SelectedData:
-    """Deterministic even sampling; selection is applied before the budget."""
-
-    if selected.count <= budget:
-        return selected
-    take = np.linspace(0, selected.count - 1, budget, dtype=np.int64)
-    return SelectedData(
-        {key: value[take] for key, value in selected.coordinates.items()},
-        selected.values[take], selected.indices[take], selected.selection, selected.value_shape)
-
-
 def _apply_request_overrides(model: FitModel, request: FitRequest, seeds, bounds):
     low, high = (np.array(v, dtype=float, copy=True) for v in bounds)
     if request.initial is not None:
@@ -545,8 +528,7 @@ def fit_selected(selected: SelectedData, request: FitRequest) -> FitResult:
     """Fit already-selected rows and always return a validity-bearing result."""
 
     model = fit_model(request.model)
-    sampled = _sample(selected, request.sample_budget)
-    values = np.asarray(sampled.values)
+    values = np.asarray(selected.values)
     if values.ndim != 2 or values.shape[1] != 1:
         return _invalid(
             model,
@@ -554,28 +536,28 @@ def fit_selected(selected: SelectedData, request: FitRequest) -> FitResult:
             "fit requires exactly one scalar value per selected row; "
             f"got value shape {values.shape}. Select a data component or reduce "
             "the complete data_shape explicitly before fitting.",
-            sampled.count,
+            selected.count,
         )
-    if sampled.count < model.min_points:
+    if selected.count < model.min_points:
         return _invalid(
             model, request,
-            f"selection contains {sampled.count} finite points; {model.key} needs at least {model.min_points}",
-            sampled.count)
+            f"selection contains {selected.count} finite points; {model.key} needs at least {model.min_points}",
+            selected.count)
     y = np.asarray(values[:, 0], dtype=float)
     try:
         if model.family == "1d":
-            if "x" not in sampled.coordinates:
+            if "x" not in selected.coordinates:
                 raise KeyError("1D fit requires x coordinates")
-            xdata = np.asarray(sampled.coordinates["x"], dtype=float)
+            xdata = np.asarray(selected.coordinates["x"], dtype=float)
         else:
-            if "x" not in sampled.coordinates or "y" not in sampled.coordinates:
+            if "x" not in selected.coordinates or "y" not in selected.coordinates:
                 raise KeyError("2D fit requires x and y coordinates")
-            xdata = (np.asarray(sampled.coordinates["x"], dtype=float),
-                     np.asarray(sampled.coordinates["y"], dtype=float))
+            xdata = (np.asarray(selected.coordinates["x"], dtype=float),
+                     np.asarray(selected.coordinates["y"], dtype=float))
         seeds, bounds = model.initialize(xdata, y)
         seeds, bounds = _apply_request_overrides(model, request, seeds, bounds)
     except Exception as exc:
-        return _invalid(model, request, f"fit initialization failed: {exc}", sampled.count)
+        return _invalid(model, request, f"fit initialization failed: {exc}", selected.count)
 
     if not request.solve:
         popt = np.asarray(seeds[0], dtype=float)
@@ -587,7 +569,7 @@ def fit_selected(selected: SelectedData, request: FitRequest) -> FitResult:
         r2 = float(1.0 - loss / total) if total > 0 else float("nan")
         return FitResult(
             model.key, model.names, popt, None, True, "initial values",
-            {"rmse": rmse, "r2": r2}, sampled.count, request.coordinate_frame)
+            {"rmse": rmse, "r2": r2}, selected.count, request.coordinate_frame)
 
     # Only a REAL solve is gated: the ``solve=False`` reconstruction above (draw a curve from
     # already-known params, e.g. a grid cell redrawing published node params) never runs curve_fit,
@@ -604,14 +586,14 @@ def fit_selected(selected: SelectedData, request: FitRequest) -> FitResult:
     )
     if best is None:
         detail = failures[-1] if failures else "no converged seed"
-        return _invalid(model, request, f"fit failed: {detail}", sampled.count)
+        return _invalid(model, request, f"fit failed: {detail}", selected.count)
 
     popt, pcov, residual = best
     rmse = float(np.sqrt(np.mean(residual**2)))
     total = float(np.sum((y - np.mean(y)) ** 2))
     r2 = float(1.0 - best_loss / total) if total > 0 else float("nan")
     return FitResult(model.key, model.names, popt, pcov, True, "ok",
-                     {"rmse": rmse, "r2": r2}, sampled.count, request.coordinate_frame)
+                     {"rmse": rmse, "r2": r2}, selected.count, request.coordinate_frame)
 
 
 def fit_histogram(edges, counts, mode: str) -> HistogramFitResult:
@@ -776,10 +758,8 @@ def fit_image(
 ) -> FitResult:
     """Fit a regular 2-D image without materialising full-frame float coordinate grids.
 
-    Selection and finite filtering happen before deterministic sampling, exactly as
-    in :func:`fit_data`.  Only the sampled coordinates are allocated as floats; a
-    multi-megapixel frame therefore costs one boolean mask rather than two equally
-    large ``x``/``y`` arrays.  ``origin`` maps local array indices into the request's
+    Selection and finite filtering happen before coordinate construction, exactly as
+    in :func:`fit_data`. ``origin`` maps local array indices into the request's
     coordinate frame and defaults to ``selection.metadata['origin']`` when present.  ``grid`` is
     the authoritative compact geometry when coordinates have non-default origin or spacing.
     """
@@ -830,44 +810,18 @@ def fit_image(
     if x_start >= x_stop or y_start >= y_stop:
         return _invalid(model, request, "selection contains 0 finite points")
 
-    # Rectangle selections on a regular raster are contiguous.  Keep this as a
-    # view: ``np.ix_`` advanced indexing copied the entire selected frame before
-    # the sample budget was applied (18.4 MiB for a 1920x1200 float64 image).
+    # Rectangle selections on a regular raster are contiguous, so keep a view.
     selected_image = array[y_start:y_stop, x_start:x_stop]
     finite = np.isfinite(selected_image)
     if value_bounds is not None:
-        # Compare in the source dtype.  AxisRange.mask intentionally coerces
-        # arbitrary coordinate inputs to float, but doing so here would copy a
-        # whole uint8/uint16 camera frame before the sample budget.
+        # Compare in the source dtype; coordinate construction happens only for
+        # the finite selected pixels below.
         finite &= (selected_image >= value_bounds.low) & (selected_image <= value_bounds.high)
-    all_finite = bool(np.all(finite))
-    row_counts = None if all_finite else np.count_nonzero(finite, axis=1)
-    candidate_count = int(finite.size if all_finite else np.sum(row_counts, dtype=np.int64))
+    candidate_count = int(np.count_nonzero(finite))
     if candidate_count == 0:
         return _invalid(model, request, "selection contains 0 finite points")
 
-    # Select evenly spaced *valid ranks* without first materialising every valid
-    # flat index.  ``flatnonzero`` used an additional int64 array as large as the
-    # frame even though at most ``sample_budget`` rows reach the solver.
-    take_count = min(candidate_count, request.sample_budget)
-    if candidate_count > take_count:
-        ranks = np.linspace(0, candidate_count - 1, take_count, dtype=np.int64)
-    else:
-        ranks = np.arange(candidate_count, dtype=np.int64)
-    if all_finite:
-        local_y, local_x = np.divmod(ranks, selected_image.shape[1])
-    else:
-        cumulative = np.cumsum(row_counts, dtype=np.int64)
-        local_y = np.searchsorted(cumulative, ranks, side="right")
-        previous = np.where(local_y == 0, 0, cumulative[local_y - 1])
-        offsets = ranks - previous
-        local_x = np.empty(take_count, dtype=np.int64)
-        unique_rows, output_starts = np.unique(local_y, return_index=True)
-        output_stops = np.r_[output_starts[1:], take_count]
-        for row, output_start, output_stop in zip(unique_rows, output_starts, output_stops):
-            valid_columns = np.flatnonzero(finite[row])
-            output = slice(output_start, output_stop)
-            local_x[output] = valid_columns[offsets[output]]
+    local_y, local_x = np.nonzero(finite)
 
     rows = local_y + y_start
     cols = local_x + x_start

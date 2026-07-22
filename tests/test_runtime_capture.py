@@ -157,7 +157,6 @@ class _RuntimeFixture:
         tmp_path,
         *,
         camera: _Camera | None = None,
-        transport_memory_limit_bytes: int = 8 << 20,
     ) -> None:
         self.camera = _Camera() if camera is None else camera
         self.broker = DeviceBroker()
@@ -254,7 +253,6 @@ class _RuntimeFixture:
                 AxisId("scan-ordinal"),
                 readout_events_per_repeat=3,
             ),
-            transport_memory_limit_bytes=transport_memory_limit_bytes,
         )
         self.measurement = binding_result.measurement
         self.spec = MinimalPipelineSpec(
@@ -322,7 +320,6 @@ def test_capture_contract_has_one_capability_owner_and_result_has_no_mirrors(
         assert completion._session is None
         assert completion._terminal_reservation is None
         assert not hasattr(capture, "camera")
-        assert not hasattr(capture, "aggregate_peak_bytes")
     finally:
         fixture.close()
 
@@ -342,17 +339,6 @@ def test_terminal_count_mismatch_fails_the_run_without_a_dataset(tmp_path) -> No
         assert fixture.camera.capture_state() == (False, 0)
     finally:
         fixture.close()
-
-
-def test_transport_budget_is_rejected_before_hardware_arm(tmp_path) -> None:
-    camera = _Camera()
-    with pytest.raises(MemoryError, match="transport budget"):
-        _RuntimeFixture(
-            tmp_path,
-            camera=camera,
-            transport_memory_limit_bytes=1,
-        )
-    assert camera.capture_state() == (False, 0)
 
 
 def test_cancel_interrupts_blocked_capture_and_releases_hardware(tmp_path) -> None:

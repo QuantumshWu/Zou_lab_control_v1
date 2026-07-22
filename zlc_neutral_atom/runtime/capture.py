@@ -12,8 +12,6 @@ from typing import Protocol, TypeVar
 
 import numpy as np
 from zlc_storage import (
-    CanonicalDecodeLimits,
-    CanonicalEncodingError,
     canonical_digest,
     canonical_text as _canonical_text,
     encode,
@@ -41,29 +39,6 @@ from zlc_neutral_atom.readout.contracts import (
 )
 
 
-MAX_CAPTURE_TERMINAL_ACK_CANONICAL_BYTES = 4 << 10
-MAX_CAPTURE_TERMINAL_ACK_CANONICAL_NODES = 128
-_CAPTURE_TERMINAL_ACK_LIMITS = CanonicalDecodeLimits(
-    max_depth=16,
-    max_nodes=MAX_CAPTURE_TERMINAL_ACK_CANONICAL_NODES,
-    max_container_entries=MAX_CAPTURE_TERMINAL_ACK_CANONICAL_NODES,
-    max_arrays=0,
-    max_total_array_bytes=0,
-)
-
-
-def _require_capture_terminal_ack_canonical_budget(
-    value: "CaptureTerminalAck",
-) -> None:
-    try:
-        payload = encode(
-            capture_terminal_ack_to_tree(value),
-            limits=_CAPTURE_TERMINAL_ACK_LIMITS,
-        )
-    except CanonicalEncodingError as exc:
-        raise ValueError("capture terminal acknowledgement exceeds its schema budget") from exc
-    if len(payload) > MAX_CAPTURE_TERMINAL_ACK_CANONICAL_BYTES:
-        raise ValueError("capture terminal acknowledgement exceeds its byte budget")
 from zlc_neutral_atom.readout.codec import (
     camera_capture_descriptor_from_tree,
     camera_capture_descriptor_to_tree,
@@ -431,10 +406,7 @@ class CameraCapabilityEvidence:
     capture_spec_owner_fingerprint: str
     flow_control: ProducerFlowControl
     max_source_burst_events: int
-    driver_ring_bytes: int
-    adapter_record_retention_bytes: int
     max_blocking_call_seconds: float
-    max_capture_spec_bytes: int
     physical_facts: CameraPhysicalFacts
     exact_external_trigger_qualification_digest: str | None = None
 
@@ -455,29 +427,11 @@ class CameraCapabilityEvidence:
         )
         object.__setattr__(
             self,
-            "driver_ring_bytes",
-            _positive_int(self.driver_ring_bytes, "driver_ring_bytes"),
-        )
-        object.__setattr__(
-            self,
-            "adapter_record_retention_bytes",
-            _nonnegative_int(
-                self.adapter_record_retention_bytes,
-                "adapter_record_retention_bytes",
-            ),
-        )
-        object.__setattr__(
-            self,
             "max_blocking_call_seconds",
             _positive_finite(
                 self.max_blocking_call_seconds,
                 "max_blocking_call_seconds",
             ),
-        )
-        object.__setattr__(
-            self,
-            "max_capture_spec_bytes",
-            _positive_int(self.max_capture_spec_bytes, "max_capture_spec_bytes"),
         )
         if not isinstance(self.physical_facts, CameraPhysicalFacts):
             raise TypeError("physical_facts must be CameraPhysicalFacts")
@@ -521,10 +475,7 @@ def camera_capability_evidence_to_tree(
         "capture_spec_owner_fingerprint": value.capture_spec_owner_fingerprint,
         "flow_control": value.flow_control.value,
         "max_source_burst_events": value.max_source_burst_events,
-        "driver_ring_bytes": value.driver_ring_bytes,
-        "adapter_record_retention_bytes": value.adapter_record_retention_bytes,
         "max_blocking_call_seconds": value.max_blocking_call_seconds,
-        "max_capture_spec_bytes": value.max_capture_spec_bytes,
         "physical_facts": _camera_physical_facts_to_tree(value.physical_facts),
         "exact_external_trigger_qualification_digest": (
             value.exact_external_trigger_qualification_digest
@@ -541,10 +492,7 @@ def camera_capability_evidence_from_tree(tree: object) -> CameraCapabilityEviden
         "capture_spec_owner_fingerprint",
         "flow_control",
         "max_source_burst_events",
-        "driver_ring_bytes",
-        "adapter_record_retention_bytes",
         "max_blocking_call_seconds",
-        "max_capture_spec_bytes",
         "physical_facts",
         "exact_external_trigger_qualification_digest",
     }
@@ -557,10 +505,7 @@ def camera_capability_evidence_from_tree(tree: object) -> CameraCapabilityEviden
         capture_spec_owner_fingerprint=data["capture_spec_owner_fingerprint"],
         flow_control=ProducerFlowControl(data["flow_control"]),
         max_source_burst_events=data["max_source_burst_events"],
-        driver_ring_bytes=data["driver_ring_bytes"],
-        adapter_record_retention_bytes=data["adapter_record_retention_bytes"],
         max_blocking_call_seconds=data["max_blocking_call_seconds"],
-        max_capture_spec_bytes=data["max_capture_spec_bytes"],
         physical_facts=facts,
         exact_external_trigger_qualification_digest=data[
             "exact_external_trigger_qualification_digest"
@@ -663,20 +608,8 @@ class CaptureCapabilitySnapshot:
         return self.camera_capability_evidence.max_source_burst_events
 
     @property
-    def driver_ring_bytes(self) -> int:
-        return self.camera_capability_evidence.driver_ring_bytes
-
-    @property
-    def adapter_record_retention_bytes(self) -> int:
-        return self.camera_capability_evidence.adapter_record_retention_bytes
-
-    @property
     def max_blocking_call_seconds(self) -> float:
         return self.camera_capability_evidence.max_blocking_call_seconds
-
-    @property
-    def max_capture_spec_bytes(self) -> int:
-        return self.camera_capability_evidence.max_capture_spec_bytes
 
     @property
     def camera_physical_facts(self) -> CameraPhysicalFacts:
@@ -781,7 +714,6 @@ class CameraCaptureContract:
     dataset_edge: FrozenDatasetEdge
     capability: CaptureCapabilitySnapshot
     required_consumer_lag_events: int
-    transport_memory_limit_bytes: int
     camera_provenance: CameraCaptureProvenance
 
     def __post_init__(self) -> None:
@@ -797,14 +729,6 @@ class CameraCaptureContract:
             _nonnegative_int(
                 self.required_consumer_lag_events,
                 "required_consumer_lag_events",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "transport_memory_limit_bytes",
-            _positive_int(
-                self.transport_memory_limit_bytes,
-                "transport_memory_limit_bytes",
             ),
         )
         edge = self.dataset_edge
@@ -847,11 +771,6 @@ class CameraCaptureContract:
         self.capability.camera_physical_facts.validate_descriptor(
             self.camera_provenance.descriptor
         )
-        if self.estimated_transport_bytes > self.transport_memory_limit_bytes:
-            raise MemoryError(
-                f"capture transport budget {self.estimated_transport_bytes} exceeds "
-                f"limit {self.transport_memory_limit_bytes}"
-            )
 
     @property
     def source_id(self) -> str:
@@ -889,27 +808,6 @@ class CameraCaptureContract:
             self.total_events,
             self.capability.max_source_burst_events
             + self.required_consumer_lag_events,
-        )
-
-    @property
-    def max_inflight_bytes(self) -> int:
-        return self.max_inflight_events * self.dataset_edge.payload_max_retained_nbytes
-
-    @property
-    def exact_frame_budget_bytes(self) -> int:
-        """Worst-case resident frames when hardware can outrun host draining."""
-
-        return self.total_events * self.dataset_edge.payload_max_retained_nbytes
-
-    @property
-    def estimated_transport_bytes(self) -> int:
-        return (
-            max(self.capability.driver_ring_bytes, self.exact_frame_budget_bytes)
-            + self.capability.adapter_record_retention_bytes
-            + self.max_inflight_bytes
-            + self.dataset_edge.payload_max_retained_nbytes
-            + self.dataset_edge.metadata_max_retained_nbytes
-            + self.capability.max_capture_spec_bytes
         )
 
 
@@ -1068,7 +966,6 @@ class CaptureTerminalAck:
         _sha256(self.settings_fingerprint, "settings_fingerprint")
         _sha256(self.capability_fingerprint, "capability_fingerprint")
         _sha256(self.capture_spec_fingerprint, "capture_spec_fingerprint")
-        _require_capture_terminal_ack_canonical_budget(self)
 
 
 def capture_terminal_ack_to_tree(value: CaptureTerminalAck) -> dict[str, object]:
@@ -1505,8 +1402,6 @@ class CaptureSession:
             raise TypeError("capture_spec must be FrozenCaptureSpec")
         if capture_spec.owner_fingerprint != contract.capture_spec_owner_fingerprint:
             raise ValueError("capture spec owner differs from CameraCaptureContract")
-        if len(capture_spec.payload) > contract.capability.max_capture_spec_bytes:
-            raise MemoryError("capture spec exceeds device capability byte bound")
         self._port = port
         self._contract = contract
         self._trace_binding = trace_binding
@@ -1518,7 +1413,6 @@ class CaptureSession:
             contract.payload_contract,
             flow_control=contract.capability.flow_control,
             retention_events=contract.max_inflight_events,
-            retention_bytes=contract.max_inflight_bytes,
             join_key_contract=DatasetCellKeyContract.from_schema(
                 contract.dataset_schema
             ),
@@ -1581,7 +1475,6 @@ class CaptureSession:
             reservation = self._stream.reserve(
                 total_events=self._contract.total_events,
                 max_inflight_events=self._contract.max_inflight_events,
-                max_inflight_bytes=self._contract.max_inflight_bytes,
                 trace_binding=self._trace_binding,
             )
             source_event_span_hasher = OrderedEventSpanHasher(
@@ -1741,7 +1634,7 @@ class CaptureSession:
                     raise RuntimeError("capture session is not started")
                 expected_ordinal = self._delivered
                 if expected_ordinal >= self._contract.total_events:
-                    raise RuntimeError("capture already delivered its frozen event budget")
+                    raise RuntimeError("capture already delivered its expected event count")
                 join_key = self._contract.cell_schedule.cell_at(expected_ordinal)
             try:
                 ack = context.device(self._port.device.key).execute(
@@ -2041,8 +1934,6 @@ __all__ = [
     "CapturePreparedAck",
     "CaptureProcessorInputBinding",
     "FrozenCaptureSpec",
-    "MAX_CAPTURE_TERMINAL_ACK_CANONICAL_BYTES",
-    "MAX_CAPTURE_TERMINAL_ACK_CANONICAL_NODES",
     "frozen_capture_spec_from_tree",
     "frozen_capture_spec_to_tree",
     "CaptureSession",

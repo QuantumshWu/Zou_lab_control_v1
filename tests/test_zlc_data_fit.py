@@ -1,4 +1,4 @@
-"""Named-axis fit contracts, packing, models, budgets, and artifact codecs."""
+"""Named-axis fit contracts, packing, models, and artifact codecs."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import hashlib
 import subprocess
 import sys
 import time
-import tracemalloc
 
 import numpy as np
 import pytest
@@ -57,8 +56,6 @@ from zlc_data import (
     decode_fit_spec,
     encode_fit_result_batch,
     encode_fit_spec,
-    fit_result_decode_additional_peak_upper_bound_nbytes,
-    fit_result_encode_additional_peak_upper_bound_nbytes,
     fit_model_catalog,
     fit_model_definition,
     fit_spec_from_tree,
@@ -475,7 +472,7 @@ def test_implicit_fit_coordinates_require_consecutive_float64_identity():
         bind_fit(spec, snapshot.block.schema)
 
 
-def test_sparse_implicit_fit_cost_tracks_present_rows_and_preserves_axis_unit():
+def test_sparse_implicit_fit_tracks_present_rows_and_preserves_axis_unit():
     logical_size = 5_000_000
     scan = AxisSpec(
         AxisId("scan"),
@@ -501,18 +498,13 @@ def test_sparse_implicit_fit_cost_tracks_present_rows_and_preserves_axis_unit():
         "gaussian_offset",
     )
     bound = bind_fit(spec, snapshot.block.schema)
-    tracemalloc.start()
-    tracemalloc.clear_traces()
     problem = build_fit_problem(bound, snapshot)
-    _, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
 
     np.testing.assert_array_equal(
         problem.independent_values[0],
         (0.0, float(logical_size - 1)),
     )
     assert bound.parameter_units == ("count", "count", "MHz", "MHz")
-    assert peak < 2_000_000
 
 
 def test_sparse_declared_fit_validates_coordinates_only_when_binding(monkeypatch):
@@ -948,7 +940,7 @@ def test_nonfactor_sparse_mapping_stays_explicit_after_authoritative_repeat_sele
     assert problem.batch_layout.storage_to_multi == pairs
 
 
-def test_large_radial_image_is_sampled_before_coordinate_packing_and_fits_2d():
+def test_large_radial_image_uses_every_valid_observation_and_fits_2d():
     x_values = np.linspace(-3.0, 3.0, 160)
     y_values = np.linspace(-2.0, 2.0, 120)
     x = axis("x", SPATIAL_X, x_values.size, coordinates=x_values, unit="mm", frame="camera")
@@ -963,22 +955,23 @@ def test_large_radial_image_is_sampled_before_coordinate_packing_and_fits_2d():
         data_axes=(x, y),
         values=image.reshape(1, 1, *image.shape),
     )
-    policy = FitNumericPolicy(sample_budget_per_batch=1_000)
     spec = FitSpec(
         snapshot.block.schema.fingerprint,
         None,
         (x.axis_id, y.axis_id),
         (snapshot.block.schema.repeat_axis.axis_id,),
         "radial_gaussian_center",
-        numeric_policy=policy,
     )
     bound = bind_fit(spec, snapshot.block.schema)
     problem = build_fit_problem(bound, snapshot)
     assert problem.present_observation_counts[0] == image.size
     assert problem.valid_observation_counts[0] == image.size
-    assert problem.used_observation_counts[0] == 1_000
-    assert problem.observations.size == 1_000
-    assert tuple(values.size for values in problem.independent_values) == (1_000, 1_000)
+    assert problem.used_observation_counts[0] == image.size
+    assert problem.observations.size == image.size
+    assert tuple(values.size for values in problem.independent_values) == (
+        image.size,
+        image.size,
+    )
     result = bound.run(snapshot)
     assert result.statuses == (FitBatchStatus.CONVERGED,)
     np.testing.assert_allclose(result.parameter_values[0], expected, rtol=2e-3, atol=2e-3)
@@ -1056,7 +1049,7 @@ def test_radial_roi_keeps_absolute_coordinate_less_centers_and_index_units():
     )
 
 
-def test_value_aware_2d_sampling_keeps_a_narrow_feature_between_grid_points():
+def test_full_2d_fit_keeps_a_narrow_feature():
     x = axis("x", SPATIAL_X, 600)
     y = axis("y", SPATIAL_Y, 600)
     xx, yy = np.meshgrid(np.arange(x.size), np.arange(y.size), indexing="ij")
@@ -1085,18 +1078,17 @@ def test_value_aware_2d_sampling_keeps_a_narrow_feature_between_grid_points():
         (x.axis_id, y.axis_id),
         (snapshot.block.schema.repeat_axis.axis_id,),
         "radial_gaussian_center",
-        numeric_policy=FitNumericPolicy(sample_budget_per_batch=12_000),
     )
 
     problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
-    assert problem.used_observation_counts[0] == 12_000
+    assert problem.used_observation_counts[0] == image.size
     assert np.max(problem.observations) == pytest.approx(5_100.0)
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
     assert result.statuses == (FitBatchStatus.CONVERGED,)
     np.testing.assert_allclose(result.parameter_values[0], expected, rtol=2e-3, atol=2e-3)
 
 
-def test_value_aware_sampling_does_not_turn_one_outlier_into_the_only_feature():
+def test_full_2d_fit_does_not_turn_one_outlier_into_the_only_feature():
     x = axis("x", SPATIAL_X, 240)
     y = axis("y", SPATIAL_Y, 240)
     xx, yy = np.meshgrid(np.arange(x.size), np.arange(y.size), indexing="ij")
@@ -1126,7 +1118,6 @@ def test_value_aware_sampling_does_not_turn_one_outlier_into_the_only_feature():
         (x.axis_id, y.axis_id),
         (snapshot.block.schema.repeat_axis.axis_id,),
         "radial_gaussian_center",
-        numeric_policy=FitNumericPolicy(sample_budget_per_batch=12_000),
     )
 
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
@@ -1139,7 +1130,7 @@ def test_value_aware_sampling_does_not_turn_one_outlier_into_the_only_feature():
     )
 
 
-def test_valid_nonfinite_is_sampled_fail_closed_while_invalid_nonfinite_is_absent():
+def test_valid_nonfinite_is_included_fail_closed_while_invalid_nonfinite_is_absent():
     coordinate_values = np.linspace(-5.0, 5.0, 100)
     scan = axis(
         "nonfinite_scan",
@@ -1164,7 +1155,6 @@ def test_valid_nonfinite_is_sampled_fail_closed_while_invalid_nonfinite_is_absen
         (scan.axis_id,),
         (snapshot.block.schema.repeat_axis.axis_id,),
         "gaussian_offset",
-        numeric_policy=FitNumericPolicy(sample_budget_per_batch=5),
     )
 
     problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
@@ -1173,57 +1163,6 @@ def test_valid_nonfinite_is_sampled_fail_closed_while_invalid_nonfinite_is_absen
     assert coordinate_values[91] not in problem.independent_values[0]
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
     assert result.statuses == (FitBatchStatus.NUMERIC_ERROR,)
-
-
-def test_total_packed_observation_budget_rejects_before_concatenation(monkeypatch):
-    import zlc_data.fit_problem as problem_module
-
-    coordinates = np.linspace(-2.0, 2.0, 5)
-    scan = axis("scan", SCAN_POINT, coordinates.size, coordinates=coordinates)
-    snapshot = snapshot_for(
-        repeat=3,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
-        values=np.ones((3, scan.size)),
-    )
-    allowed_policy = FitNumericPolicy(
-        sample_budget_per_batch=5,
-        max_packed_observations=15,
-    )
-    allowed_spec = gaussian_spec(
-        snapshot,
-        scan,
-        numeric_policy=allowed_policy,
-    )
-    problem = build_fit_problem(
-        bind_fit(allowed_spec, snapshot.block.schema),
-        snapshot,
-    )
-    assert problem.observations.size == 15
-    result = bind_fit(allowed_spec, snapshot.block.schema).run(snapshot)
-
-    restricted_spec = replace(
-        allowed_spec,
-        numeric_policy=replace(allowed_policy, max_packed_observations=10),
-    )
-    with pytest.raises(ValueError, match="packed-observation budget"):
-        replace(problem, spec=restricted_spec)
-    with pytest.raises(ValueError, match="packed-observation budget"):
-        replace(result, spec=restricted_spec)
-
-    def unexpected_concatenation(_parts):
-        raise AssertionError("packed arrays must not be materialized after the total cap")
-
-    monkeypatch.setattr(
-        problem_module,
-        "_concatenate_float64",
-        unexpected_concatenation,
-    )
-    with pytest.raises(ValueError, match="max_packed_observations=10"):
-        build_fit_problem(
-            bind_fit(restricted_spec, snapshot.block.schema),
-            snapshot,
-        )
 
 
 def test_observation_order_is_derived_once_per_cell_batch_group(monkeypatch):
@@ -1244,7 +1183,6 @@ def test_observation_order_is_derived_once_per_cell_batch_group(monkeypatch):
         (scan.axis_id,),
         (snapshot.block.schema.repeat_axis.axis_id, site.axis_id),
         "gaussian_offset",
-        numeric_policy=FitNumericPolicy(sample_budget_per_batch=5),
     )
     derive = problem_module._canonical_observation_order
     calls = 0
@@ -1260,7 +1198,7 @@ def test_observation_order_is_derived_once_per_cell_batch_group(monkeypatch):
     assert calls == 3
 
 
-def test_2d_sampling_is_cartesian_not_a_rank_deficient_flattened_diagonal():
+def test_2d_observation_coordinates_are_cartesian_not_a_flattened_diagonal():
     x_values = np.linspace(-3.0, 3.0, 100)
     y_values = np.linspace(-2.0, 2.0, 100)
     x = axis("x", SPATIAL_X, 100, coordinates=x_values, unit="mm", frame="camera")
@@ -1281,7 +1219,6 @@ def test_2d_sampling_is_cartesian_not_a_rank_deficient_flattened_diagonal():
         (x.axis_id, y.axis_id),
         (snapshot.block.schema.repeat_axis.axis_id,),
         "radial_gaussian_center",
-        numeric_policy=FitNumericPolicy(sample_budget_per_batch=100),
     )
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
     assert result.statuses == (FitBatchStatus.CONVERGED,)
@@ -1289,7 +1226,7 @@ def test_2d_sampling_is_cartesian_not_a_rank_deficient_flattened_diagonal():
     np.testing.assert_allclose(result.parameter_values[0], expected, rtol=2e-4, atol=2e-4)
 
 
-def test_2d_point_axes_sampling_recovers_center_and_ignores_storage_permutation():
+def test_2d_point_axes_fit_recovers_center_and_ignores_storage_permutation():
     x_values = np.linspace(-3.0, 3.0, 100)
     y_values = np.linspace(-2.0, 2.0, 100)
     x = axis("x", SPATIAL_X, 100, coordinates=x_values, unit="mm", frame="camera")
@@ -1316,7 +1253,6 @@ def test_2d_point_axes_sampling_recovers_center_and_ignores_storage_permutation(
             (x.axis_id, y.axis_id),
             (snapshot.block.schema.repeat_axis.axis_id,),
             "radial_gaussian_center",
-            numeric_policy=FitNumericPolicy(sample_budget_per_batch=100),
         )
         return bind_fit(spec, snapshot.block.schema).run(snapshot)
 
@@ -1329,7 +1265,7 @@ def test_2d_point_axes_sampling_recovers_center_and_ignores_storage_permutation(
     np.testing.assert_array_equal(ordered.parameter_values, permuted.parameter_values)
 
 
-def test_sampling_is_invariant_to_explicit_physical_row_permutation():
+def test_fit_packing_is_invariant_to_explicit_physical_row_permutation():
     coordinate_values = np.linspace(-5.0, 5.0, 1_000)
     scan = axis("scan", SCAN_POINT, 1_000, coordinates=coordinate_values, unit="MHz")
     logical_signal = evaluate_fit_model(
@@ -1355,7 +1291,6 @@ def test_sampling_is_invariant_to_explicit_physical_row_permutation():
             (scan.axis_id,),
             (snapshot.block.schema.repeat_axis.axis_id,),
             "gaussian_offset",
-            numeric_policy=FitNumericPolicy(sample_budget_per_batch=50),
         )
         return bind_fit(spec, snapshot.block.schema).run(snapshot)
 
@@ -1385,7 +1320,6 @@ def test_sampling_is_invariant_to_explicit_physical_row_permutation():
         (randomized_scan.axis_id,),
         (randomized_snapshot.block.schema.repeat_axis.axis_id,),
         "gaussian_offset",
-        numeric_policy=FitNumericPolicy(sample_budget_per_batch=50),
     )
     randomized = bind_fit(
         randomized_spec,
@@ -1429,7 +1363,6 @@ def test_duplicate_coordinates_use_logical_index_not_storage_order_as_tie_break(
             (scan.axis_id,),
             (snapshot.block.schema.repeat_axis.axis_id,),
             "gaussian_offset",
-            numeric_policy=FitNumericPolicy(sample_budget_per_batch=8),
         )
         return build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
 
@@ -1646,7 +1579,6 @@ def test_minimum_observations_follow_the_free_parameters_not_a_catalog_constant(
                 (1.0, 0.0, 1.0, 0.0),
             )
         ),
-        numeric_policy=FitNumericPolicy(sample_budget_per_batch=2),
     )
 
     bound = bind_fit(spec, snapshot.block.schema)
@@ -1916,7 +1848,7 @@ def test_solver_uses_explicit_scipy_options(monkeypatch):
         assert options["tr_options"] is None
 
 
-def test_fixed_bounded_initial_constraints_and_numeric_budgets_fail_closed():
+def test_fixed_bounded_initial_constraints_and_solver_limits_fail_closed():
     snapshot, scan = gaussian_snapshot(repeat=1)
     fixed_spec = gaussian_spec(
         snapshot,
@@ -1926,22 +1858,6 @@ def test_fixed_bounded_initial_constraints_and_numeric_budgets_fail_closed():
     fixed = bind_fit(fixed_spec, snapshot.block.schema).run(snapshot)
     assert fixed.statuses == (FitBatchStatus.CONVERGED,)
     assert fixed.parameter_values[0, 1] == 1.2
-
-    impossible = gaussian_spec(
-        snapshot,
-        scan,
-        numeric_policy=FitNumericPolicy(sample_budget_per_batch=4),
-    )
-    with pytest.raises(ValueError, match="below.*minimum observation count"):
-        bind_fit(impossible, snapshot.block.schema)
-
-    impossible_total = gaussian_spec(
-        snapshot,
-        scan,
-        numeric_policy=FitNumericPolicy(max_packed_observations=4),
-    )
-    with pytest.raises(ValueError, match="max_packed_observations.*below.*minimum"):
-        bind_fit(impossible_total, snapshot.block.schema)
 
     bad_initial = gaussian_spec(
         snapshot,
@@ -2054,7 +1970,6 @@ def test_complex_observations_are_rejected_before_float_conversion():
     ordered_spec = replace(
         spec,
         input_schema_fingerprint=ordered_snapshot.block.schema.fingerprint,
-        numeric_policy=FitNumericPolicy(sample_budget_per_batch=5),
     )
     with pytest.raises(ValueError, match="not exactly float64-representable"):
         build_fit_problem(
@@ -2081,8 +1996,10 @@ def test_fit_result_strict_codec_embeds_the_current_fit_spec():
     assert encode_fit_result_batch(restored) == payload
 
     result_tree = decode(payload)
-    assert result_tree["fit_spec"]["numeric_policy"]["max_packed_observations"] \
-        == 2_000_000
+    assert result_tree["fit_spec"]["numeric_policy"] == {
+        "covariance_rcond": 1e-12,
+        "max_evaluations": 4_000,
+    }
     result_tree["parameter_values"] = result.parameter_values.astype(np.float32)
     with pytest.raises(TypeError, match="dtype float32.*float64"):
         decode_fit_result_batch(encode(result_tree))
@@ -2137,31 +2054,10 @@ def test_fit_result_wire_format_has_one_frozen_current_golden():
     )
 
     payload = encode_fit_result_batch(result)
-    assert len(payload) == 2735
+    assert len(payload) == 2608
     assert hashlib.sha256(payload).hexdigest() == (
-        "615906e94861e9e74fa84904f0bcfed183532b1cbd15febe472f25a6aa26e9a5"
+        "4d027f2b8ae14dd098cf0eed405fb58910cca94fd0d802977ca6941367dc6339"
     )
-
-    tracemalloc.start()
-    try:
-        encode_fit_result_batch(result)
-        _current, encode_peak = tracemalloc.get_traced_memory()
-    finally:
-        tracemalloc.stop()
-    assert encode_peak <= (
-        fit_result_encode_additional_peak_upper_bound_nbytes(result)
-    )
-
-    tracemalloc.start()
-    try:
-        decode_fit_result_batch(payload)
-        _current, decode_peak = tracemalloc.get_traced_memory()
-    finally:
-        tracemalloc.stop()
-    assert decode_peak <= (
-        fit_result_decode_additional_peak_upper_bound_nbytes(len(payload))
-    )
-
 
 def test_result_constructor_rejects_impossible_success_and_noncanonical_payloads():
     snapshot, scan = gaussian_snapshot(repeat=1)

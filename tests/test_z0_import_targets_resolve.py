@@ -71,7 +71,7 @@ def _import_targets(relative_path: Path):
 
 
 def test_every_first_party_import_resolves():
-    """Zero, with no ledger and no budget.
+    """Zero, with no migration exception list.
 
     There is deliberately no "the parent package exists, close enough" fallback:
     an import's module part must itself resolve.  ``from pkg import name`` puts

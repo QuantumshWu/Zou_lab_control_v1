@@ -34,7 +34,6 @@ from zlc_frontend.selector import (
     ImageColorLimitsCommit, ImageInteractionCommit, ImageViewportCommit,
 )
 from zlc_neutral_atom.readout.occupancy_reference import OccupancyArtifactRef
-from zlc_storage import positive_integer
 
 from ._window_runtime import (
     RASTER_WORK_EXECUTOR,
@@ -44,7 +43,6 @@ from ._window_runtime import (
 )
 
 
-_DEFAULT_MEMORY_LIMIT = 512 << 20
 _PANEL_ID = "sites"
 _BOARD_ID = "occupancy-cell"
 def _cancel_point(cancelled: threading.Event) -> None:
@@ -52,34 +50,23 @@ def _cancel_point(cancelled: threading.Event) -> None:
         raise CancelledError()
 
 
-def _load_navigation(loader, reference, limit, cancelled):
+def _load_navigation(loader, reference, cancelled):
     _cancel_point(cancelled)
-    result = loader(reference, memory_limit_bytes=limit)
+    result = loader(reference)
     if not isinstance(result, OccupancyCellNavigation):
         raise TypeError("navigation loader must return OccupancyCellNavigation")
     if result.artifact_identity != reference.target_ref:
         raise ValueError("occupancy navigation names a different artifact")
-    if (
-        result.retained_upper_bound_bytes + result.cell_peak_upper_bound_bytes
-        > limit
-    ):
-        raise MemoryError("occupancy navigation leaves no exact-cell display budget")
     _cancel_point(cancelled)
     return result
 
 
 def _build_front(
-    view, source_bound, display, color_limits, previous_relim, cell_revision,
-    sequence, limit, cancelled,
+    view, display, color_limits, previous_relim, cell_revision, sequence,
+    cancelled,
 ):
     if not isinstance(view, OccupancyCellView):
         raise TypeError("cell loader must return OccupancyCellView")
-    source_bound = positive_integer(source_bound, "source retained bound")
-    if view.array_nbytes > source_bound:
-        raise ValueError("source retained bound is smaller than the exact-cell view")
-    limit = positive_integer(limit, "interactive cell peak bound")
-    if source_bound > limit:
-        raise MemoryError("source retained bound exceeds the interactive cell peak bound")
     _cancel_point(cancelled)
     viewport = image_viewport_for_display_state(display, view.home_viewport)
     raster, data_range, histogram, effective_limits = rasterize_image_indexed8(
@@ -121,18 +108,15 @@ def _build_front(
 
 
 def _cell_job(
-    loader, reference, selection, navigation, loaded_view, loaded_bound, display,
-    color_limits, previous_relim, limit, cell_revision, sequence, cancelled,
+    loader, reference, selection, navigation, loaded_view, display, color_limits,
+    previous_relim, cell_revision, sequence, cancelled,
 ):
     _cancel_point(cancelled)
     if loaded_view is None:
-        loaded = loader(
-            reference, selection, memory_limit_bytes=limit,
+        loaded_view = loader(
+            reference, selection,
             expected_navigation=navigation,
         )
-        if not isinstance(loaded, tuple) or len(loaded) != 2:
-            raise TypeError("cell loader must return (OccupancyCellView, retained_bound)")
-        loaded_view, loaded_bound = loaded
     repeat, _storage, logical, _label = navigation.resolve_selection(selection)
     expected_selection = navigation.selection_for_indices(repeat, logical)
     if (
@@ -141,13 +125,12 @@ def _cell_job(
     ):
         raise ValueError("cell loader returned a different exact selection")
     frame = _build_front(
-        loaded_view, loaded_bound, display, color_limits, previous_relim,
-        cell_revision, sequence, limit, cancelled,
+        loaded_view, display, color_limits, previous_relim, cell_revision,
+        sequence, cancelled,
     )
     return (
         navigation.identity, selection, cell_revision, display.revision,
-        loaded_view, positive_integer(loaded_bound, "source retained bound"),
-        frame, display.relim_mode,
+        loaded_view, frame, display.relim_mode,
     )
 
 
@@ -162,7 +145,7 @@ class OccupancyCellWindow(QtWidgets.QWidget):
     """Navigate exact cells and interact with one worker-rasterized SiteMap."""
 
     def __init__(
-        self, navigation_loader, cell_loader, reference, *, selection, memory_limit_bytes,
+        self, navigation_loader, cell_loader, reference, *, selection,
     ) -> None:
         super().__init__()
         if not callable(navigation_loader) or not callable(cell_loader):
@@ -171,14 +154,11 @@ class OccupancyCellWindow(QtWidgets.QWidget):
             raise TypeError("reference must be OccupancyArtifactRef")
         if selection is not None and not isinstance(selection, Selection):
             raise TypeError("selection must be Selection or None")
-        self._memory_limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-        self._cell_limit = 0
         self._cell_loader = cell_loader
         self._reference, self._initial_selection = reference, selection
         self._navigation = self._navigator = None
         self._display = ImageDisplayState()
         self._loaded_view = self._loaded_selection = None
-        self._loaded_bound = 0
         self._requested_selection = self._presented_selection = None
         self._presented_key = self._presented_relim = None
         self._rectangle_candidate = None
@@ -257,10 +237,6 @@ class OccupancyCellWindow(QtWidgets.QWidget):
 
         self._wake = QtOwnerWake(self)
         self._wake.bind(self._owner_cycle)
-        self._timer = QtCore.QTimer(self)
-        self._timer.setInterval(40)
-        self._timer.timeout.connect(self._owner_cycle)
-        self._timer.start()
         self._close_button.clicked.connect(self.shutdown)
         self._setting_button.clicked.connect(self._open_display_settings)
         self._selector_switch.toggled.connect(self._set_selector_enabled)
@@ -276,7 +252,7 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         self._update_controls()
         self._submit(
             "navigation", 0, _load_navigation, navigation_loader, reference,
-            self._memory_limit, self._cancelled,
+            self._cancelled,
         )
 
     @property
@@ -365,7 +341,6 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         self._pending_cell = (self._request_revision, selection)
         self._render_requested = False
         self._loaded_view = self._loaded_selection = None
-        self._loaded_bound = 0
         self._set_controls(selection)
         self._discard_front()
         self._status.setText("BUILDING OCCUPANCY CELL")
@@ -382,10 +357,10 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         if load:
             revision, selection = self._pending_cell
             self._pending_cell = None
-            view, bound, color_limits, previous_relim = None, 0, None, None
+            view, color_limits, previous_relim = None, None, None
         elif self._render_requested:
             revision, selection = self._request_revision, self._loaded_selection
-            view, bound = self._loaded_view, self._loaded_bound
+            view = self._loaded_view
             if view is None or selection != self._requested_selection:
                 return
             self._render_requested = False
@@ -397,13 +372,12 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         self._submit(
             "cell", (revision, selection), _cell_job,
             self._cell_loader if load else None, self._reference, selection,
-            self._navigation, view, bound, display, color_limits, previous_relim,
-            self._cell_limit, revision, self._sequence, self._cancelled,
+            self._navigation, view, display, color_limits, previous_relim,
+            revision, self._sequence, self._cancelled,
         )
 
     def _accept_navigation(self, navigation):
         self._navigation = navigation
-        self._cell_limit = navigation.cell_peak_upper_bound_bytes
         self._build_navigator()
         initial, self._initial_selection = self._initial_selection, None
         if initial is None and all(axis.size == 1 for axis in navigation.axes):
@@ -419,13 +393,13 @@ class OccupancyCellWindow(QtWidgets.QWidget):
             self._diagnostic.setText(error_summary(error))
 
     def _accept_cell(self, result):
-        nav_id, selection, revision, display_revision, view, bound, frame, relim = result
+        nav_id, selection, revision, display_revision, view, frame, relim = result
         if (
             self._navigation.identity != nav_id or revision != self._request_revision
             or selection != self._requested_selection
         ):
             return
-        self._loaded_view, self._loaded_bound = view, bound
+        self._loaded_view = view
         self._loaded_selection = selection
         if display_revision == self._display.revision:
             self._present(revision, selection, display_revision, frame, relim)
@@ -692,7 +666,6 @@ class OccupancyCellWindow(QtWidgets.QWidget):
             return
         self._cell_loader = self._navigation = None
         self._navigator = self._loaded_view = None
-        self._timer.stop()
         self._wake.detach()
         self._closed = self._allow_close = True
         QtCore.QTimer.singleShot(0, self.close)
@@ -708,7 +681,6 @@ class OccupancyCellWindow(QtWidgets.QWidget):
 
 def open_occupancy_cell_workbench(
     navigation_loader, cell_loader, reference, *, selection=None,
-    memory_limit_bytes=_DEFAULT_MEMORY_LIMIT,
 ):
     return open_workbench_window(
         lambda: OccupancyCellWindow(
@@ -716,7 +688,6 @@ def open_occupancy_cell_workbench(
             cell_loader,
             reference,
             selection=selection,
-            memory_limit_bytes=memory_limit_bytes,
         )
     )
 

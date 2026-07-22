@@ -90,7 +90,6 @@ def _close(application, window) -> None:
 def _histogram_figure(
     *,
     site_role: AxisViewRole = AxisViewRole.BATCH,
-    render_memory_limit_bytes: int = 64 << 20,
 ) -> DataFigure:
     repeat = AxisSpec(AxisId("u03a.repeat"), "Repeat", REPEAT, 3)
     point = AxisSpec(AxisId("u03a.point"), "Point", SCAN_POINT, 1)
@@ -163,7 +162,6 @@ def _histogram_figure(
     return DataFigure(
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
-        render_memory_limit_bytes=render_memory_limit_bytes,
     )
 
 
@@ -174,22 +172,6 @@ def _typed_front(window):
     payload = frame.panels[0].display_payload
     assert isinstance(payload, HistogramPanelPayload)
     return board, frame, payload
-
-
-def _initial_session_peak(figure: DataFigure, state: HistogramDisplayState) -> int:
-    import Zou_lab_control.workbench._figure as figure_module
-
-    front = figure_module._render_typed_front(
-        figure,
-        state,
-        current_value_limits=None,
-        previous_relim_mode=None,
-        previous_count_scale=None,
-        sequence=0,
-        memory_limit_bytes=1 << 30,
-        cancelled=threading.Event(),
-    )
-    return front.session_peak_bytes
 
 
 def _wheel(board: QtRasterBoard, delta: int):
@@ -433,44 +415,6 @@ def test_failed_histogram_rerender_preserves_exact_old_front(
         _close(application, window)
 
 
-def test_histogram_budget_rejects_before_agg_or_qt_front(
-    application,
-    monkeypatch,
-) -> None:
-    figure = _histogram_figure()
-
-    from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
-
-    monkeypatch.setattr(
-        SinglePanelAggRenderer,
-        "__init__",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("rejected histogram reached Agg construction")
-        ),
-    )
-    window = open_data_figure_workbench(figure, memory_limit_bytes=1)
-    try:
-        _until(application, lambda: window.worker_idle)
-        board = window.findChild(QtRasterBoard, "figureViewerTypedBoard")
-        assert board is not None and board.front_frame is None
-        assert not window.raster_ready
-        assert window.findChild(QtWidgets.QLabel, "figureViewerStatus").text() == (
-            "FIGURE FAILED"
-        )
-        assert "MemoryError" in window.findChild(
-            QtWidgets.QLabel,
-            "figureViewerDiagnostic",
-        ).text()
-        assert tuple(
-            window._tabs.tabText(index) for index in range(window._tabs.count())
-        ) == ("Loading",)
-        assert window._interaction_switch.isHidden()
-        assert window._settings_button.isHidden()
-        assert window._export_button.isHidden()
-    finally:
-        _close(application, window)
-
-
 def _assert_encoded_fallback(application, window) -> None:
     _until(application, lambda: window.worker_idle and window.raster_ready)
     assert window._view_family == "encoded"
@@ -490,10 +434,7 @@ def _assert_encoded_fallback(application, window) -> None:
 
 def test_multi_cell_histogram_uses_typed_grid_overview(application) -> None:
     figure = _histogram_figure(site_role=AxisViewRole.FACET)
-    window = open_data_figure_workbench(
-        figure,
-        memory_limit_bytes=64 << 20,
-    )
+    window = open_data_figure_workbench(figure)
     try:
         _until(application, lambda: window.worker_idle and window.raster_ready)
         assert window._view_family == "histogram-overview"
@@ -504,125 +445,6 @@ def test_multi_cell_histogram_uses_typed_grid_overview(application) -> None:
         assert window.findChild(QtWidgets.QLabel, "figureViewerMode").text() == (
             "EXACT HISTOGRAM GRID · DISPLAY ONLY"
         )
-    finally:
-        _close(application, window)
-
-
-def test_histogram_typed_budget_has_exact_derived_boundary(application) -> None:
-    import Zou_lab_control.workbench._figure as figure_module
-    from zlc_frontend.matplotlib_render import evaluated_figure_array_nbytes
-
-    figure = _histogram_figure()
-    assert evaluated_figure_array_nbytes(figure.evaluated) == 88
-    render_required = figure_module._typed_front_required_peak_bytes(
-        figure,
-        HistogramDisplayState(),
-    )
-    required = _initial_session_peak(figure, HistogramDisplayState())
-    assert required > render_required
-
-    rejected = open_data_figure_workbench(
-        figure,
-        memory_limit_bytes=required - 1,
-    )
-    try:
-        _assert_encoded_fallback(application, rejected)
-    finally:
-        _close(application, rejected)
-
-    admitted = open_data_figure_workbench(
-        figure,
-        memory_limit_bytes=required,
-    )
-    try:
-        _until(application, lambda: admitted.worker_idle and admitted.raster_ready)
-        assert admitted._view_family == "histogram"
-        _typed_front(admitted)
-    finally:
-        _close(application, admitted)
-
-
-def test_frozen_data_figure_budget_cannot_be_widened_by_window(application) -> None:
-    import Zou_lab_control.workbench._figure as figure_module
-
-    probe = _histogram_figure()
-    render_required = figure_module._typed_front_required_peak_bytes(
-        probe,
-        HistogramDisplayState(),
-    )
-    aggregate_required = _initial_session_peak(probe, HistogramDisplayState())
-    figure = _histogram_figure(render_memory_limit_bytes=render_required - 1)
-    assert figure_module._typed_front_required_peak_bytes(
-        figure,
-        HistogramDisplayState(),
-    ) == render_required
-    window = open_data_figure_workbench(
-        figure,
-        memory_limit_bytes=aggregate_required + (8 << 20),
-    )
-    try:
-        _assert_encoded_fallback(application, window)
-    finally:
-        _close(application, window)
-
-
-@pytest.mark.parametrize("limit_owner", ("window", "data-figure"))
-def test_larger_histogram_rerender_is_rejected_before_agg_and_keeps_old_front(
-    application,
-    monkeypatch,
-    limit_owner,
-) -> None:
-    import Zou_lab_control.workbench._figure as figure_module
-    from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
-
-    probe = _histogram_figure()
-    initial_state = HistogramDisplayState()
-    render_required = figure_module._typed_front_required_peak_bytes(
-        probe,
-        initial_state,
-    )
-    aggregate_required = _initial_session_peak(probe, initial_state)
-    larger_state = replace(initial_state, revision=1, bin_count=500)
-    assert figure_module._typed_front_required_peak_bytes(
-        probe,
-        larger_state,
-    ) > render_required
-    figure = _histogram_figure(
-        render_memory_limit_bytes=(
-            render_required if limit_owner == "data-figure" else 64 << 20
-        )
-    )
-    window = open_data_figure_workbench(
-        figure,
-        memory_limit_bytes=(
-            aggregate_required + (8 << 20)
-            if limit_owner == "data-figure"
-            else aggregate_required
-        ),
-    )
-    try:
-        _until(application, lambda: window.worker_idle and window.raster_ready)
-        board, old_frame, _old_payload = _typed_front(window)
-        monkeypatch.setattr(
-            SinglePanelAggRenderer,
-            "__init__",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError("over-budget rerender reached Agg construction")
-            ),
-        )
-        values = histogram_display_form_values(window._display)
-        values["bin_count"] = 500
-        window._apply_display_form(window._edit_display, 0, values)
-        _until(application, lambda: window.worker_idle)
-        assert board.front_frame is old_frame
-        assert window._display.revision == 0
-        assert window.raster_ready
-        diagnostic = window.findChild(
-            QtWidgets.QLabel,
-            "figureViewerDiagnostic",
-        ).text()
-        assert "MemoryError" in diagnostic
-        assert "interactive histogram requires" in diagnostic
     finally:
         _close(application, window)
 

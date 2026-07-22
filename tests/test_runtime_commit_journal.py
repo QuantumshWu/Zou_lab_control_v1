@@ -49,8 +49,8 @@ class _ManifestFaultAuthority:
             raise self.publish_error
         return self.publish_result
 
-    def read_manifest(self, namespace, digest, *, max_bytes=None):
-        self.read_calls.append((namespace, digest, max_bytes))
+    def read_manifest(self, namespace, digest):
+        self.read_calls.append((namespace, digest))
         if self.read_error is not None:
             raise self.read_error
         return self.visible
@@ -62,7 +62,6 @@ def _publish_with_reconciliation(authority):
         MANIFEST_NAMESPACE,
         MANIFEST_PAYLOAD,
         expected_digest=MANIFEST_DIGEST,
-        max_bytes=4096,
     )
 
 
@@ -151,7 +150,7 @@ def test_verified_absence_preserves_the_original_publish_failure():
         _publish_with_reconciliation(authority)
 
     assert failure.value is publish_error
-    assert authority.read_calls == [(MANIFEST_NAMESPACE, MANIFEST_DIGEST, 4096)]
+    assert authority.read_calls == [(MANIFEST_NAMESPACE, MANIFEST_DIGEST)]
 
 
 @pytest.mark.parametrize(
@@ -190,7 +189,6 @@ def test_public_commit_surface_is_final_only():
         "CommitKind",
         "CommitRecovery",
         "CommitSubject",
-        "MemoryCommitJournal",
     ):
         assert not hasattr(commit_api, removed)
 

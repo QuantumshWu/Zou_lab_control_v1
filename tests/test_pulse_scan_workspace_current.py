@@ -41,7 +41,7 @@ def _controller_with_duration_columns(count: int = 2) -> PulseEditorController:
     first = controller.snapshot().document.periods[0].period_id
     controller.cycle_binding(PulseFieldRef(FIELD_DURATION, first))
     for _ in range(1, count):
-        period_id = controller.add_period(duration=1, unit="us")
+        period_id = controller.add_period(duration=1, unit="us").period_ids[0]
         controller.cycle_binding(PulseFieldRef(FIELD_DURATION, period_id))
     return controller
 

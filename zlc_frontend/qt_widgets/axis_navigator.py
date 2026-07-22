@@ -7,10 +7,7 @@ from PyQt5 import QtCore, QtWidgets
 from zlc_data import AxisLayout, AxisSpec
 from zlc_storage import canonical_text
 
-from ..fit_grid import (
-    FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS,
-    bounded_coordinate_label,
-)
+from ..fit_grid import coordinate_label
 
 from .fluent import (
     FluentButton,
@@ -23,11 +20,11 @@ from .fluent import (
 )
 
 
-_QT_SPINBOX_MAXIMUM = (1 << 31) - 1
+_QT_INT_MAXIMUM = (1 << 31) - 1
 
 
 class _ExactIndexEdit(FluentLineEdit):
-    """A bounded text editor whose committed value remains a Python integer."""
+    """A text editor whose committed value remains an exact Python integer."""
 
     valueChanged = QtCore.pyqtSignal(object)
 
@@ -37,7 +34,10 @@ class _ExactIndexEdit(FluentLineEdit):
         super().__init__("", parent)
         self._maximum = maximum
         self._committed_value: int | None = None
-        self.setMaxLength(FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS)
+        # QLineEdit defaults to 32767 characters.  That silent presentation
+        # truncation contradicts this control's exact-index contract; use the
+        # Qt property type's real limit instead of inventing an application cap.
+        self.setMaxLength(_QT_INT_MAXIMUM)
         self.setPlaceholderText("Select…")
         self.textEdited.connect(self._edited)
         self.editingFinished.connect(self._canonicalize_display)
@@ -46,20 +46,12 @@ class _ExactIndexEdit(FluentLineEdit):
     def _parse(text: str) -> int | None:
         if not text:
             return None
-        if len(text) > FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS:
-            return None
         if text.startswith(("0x", "0X")):
             digits = text[2:]
             if not digits or any(character not in "0123456789abcdefABCDEF" for character in digits):
                 return None
             return int(digits, 16)
         if not text.isascii() or not text.isdecimal():
-            return None
-        # Python deliberately rejects extremely long decimal conversions.
-        # Direct decimal entry is capped below that interpreter limit; hex is
-        # available for larger exact values and physical navigation is always
-        # available without textifying the logical index.
-        if len(text) > min(4096, FIT_GRID_EXACT_INDEX_INPUT_MAX_CHARACTERS):
             return None
         try:
             return int(text, 10)
@@ -79,7 +71,7 @@ class _ExactIndexEdit(FluentLineEdit):
         value = self._committed_value
         if value is None:
             return
-        self.setText(bounded_coordinate_label(value))
+        self.setText(coordinate_label(value))
 
     def value(self) -> int | None:
         return self._committed_value
@@ -92,7 +84,7 @@ class _ExactIndexEdit(FluentLineEdit):
         ):
             raise ValueError("exact index value is outside its axis")
         self._committed_value = value
-        self.setText(bounded_coordinate_label(value))
+        self.setText(coordinate_label(value))
         self.valueChanged.emit(value)
 
 
@@ -138,7 +130,7 @@ class AxisLayoutNavigator(QtWidgets.QWidget):
         form.setObjectName(f"{self._prefix}AxisForm")
         controls = []
         for position, axis in enumerate(prepared_axes):
-            if axis.size - 1 <= _QT_SPINBOX_MAXIMUM:
+            if axis.size - 1 <= _QT_INT_MAXIMUM:
                 control = FluentSpinBox(form)
             else:
                 control = _ExactIndexEdit(axis.size - 1, form)
@@ -157,7 +149,7 @@ class AxisLayoutNavigator(QtWidgets.QWidget):
                 control.setValue(-1)
             else:
                 control.setText("")
-            form.add_row(bounded_coordinate_label(axis.name), control, coordinate)
+            form.add_row(coordinate_label(axis.name), control, coordinate)
             controls.append((axis, control, coordinate))
         self._controls = tuple(controls)
         outer.addWidget(form)
@@ -237,11 +229,11 @@ class AxisLayoutNavigator(QtWidgets.QWidget):
                 unit = (
                     ""
                     if axis.unit is None
-                    else f" {bounded_coordinate_label(axis.unit)}"
+                    else f" {coordinate_label(axis.unit)}"
                 )
                 label.setText(
-                    f"{bounded_coordinate_label(axis.coordinate_at(index))}{unit}"
-                    f" · index {bounded_coordinate_label(index)}"
+                    f"{coordinate_label(axis.coordinate_at(index))}{unit}"
+                    f" · index {coordinate_label(index)}"
                 )
             control.setEnabled(self._interaction_enabled and axis.size > 1)
 

@@ -165,13 +165,6 @@ def test_meter_unit_validity_and_exact_focus_are_preserved():
         expected_selection=regions[1].selection,
         expected_intent=ViewIntent.METER,
     )
-    assert (
-        focused.retained_upper_bound_nbytes
-        <= figure.focused_typed_panel_retained_upper_bound_nbytes(
-            1,
-            expected_intent=ViewIntent.METER,
-        )
-    )
     assert focused.document.document_id != figure.document.document_id
     assert len(focused.document.layers) == len(focused.evaluated.layers) == 1
     assert len(focused.evaluated.layers[0].cells) == 1
@@ -405,89 +398,6 @@ def test_meter_grid_overview_focus_back_escape_and_atomic_exports(
         application.processEvents()
         assert window._view_family == "meter-overview"
         assert window._bundle.pages[0].png_bytes is original_png
-    finally:
-        window.shutdown()
-        _until(application, lambda: window.closed)
-
-
-def test_meter_focus_required_minus_one_rejects_before_renderer_allocation(
-    monkeypatch,
-):
-    figure = _meter_figure()
-    _png, regions = figure.to_png_bytes_with_panel_regions()
-    focused = figure.focused_typed_panel(
-        0,
-        expected_selection=regions[0].selection,
-        expected_intent=ViewIntent.METER,
-    )
-    state = MeterDisplayState(0, regions[0].selection)
-    required = figure_workbench._typed_front_required_peak_bytes(focused, state)
-
-    class ForbiddenRenderer:
-        def __init__(self, *_args, **_kwargs):
-            raise AssertionError("renderer allocation occurred before admission")
-
-    import zlc_frontend.matplotlib_render as matplotlib_render
-
-    monkeypatch.setattr(matplotlib_render, "SinglePanelAggRenderer", ForbiddenRenderer)
-    with pytest.raises(MemoryError):
-        figure_workbench._render_typed_front(
-            focused,
-            state,
-            current_value_limits=None,
-            previous_relim_mode=None,
-            previous_count_scale=None,
-            sequence=1,
-            memory_limit_bytes=required - 1,
-            cancelled=threading.Event(),
-        )
-
-
-def test_meter_focus_budget_rejects_before_deriving_panel(
-    application,
-    monkeypatch,
-):
-    figure = _meter_figure()
-    window = figure_workbench.open_data_figure_workbench(figure)
-    try:
-        _until(application, lambda: window.raster_ready and window.worker_idle)
-        overview = window._grid_overview
-        assert overview is not None
-        external = (
-            overview.external_retained_upper_bound_bytes
-            + window._grid_overview_presentation_bytes
-        )
-        _focused, _render, aggregate = (
-            figure_workbench._typed_focus_preflight_nbytes(
-                figure,
-                0,
-                expected_intent=ViewIntent.METER,
-                display=MeterDisplayState(
-                    0,
-                    overview.regions[0].selection,
-                ),
-                external_session_retained_bytes=external,
-            )
-        )
-        calls = 0
-
-        def forbidden(*_args, **_kwargs):
-            nonlocal calls
-            calls += 1
-            raise AssertionError("focused panel was derived before aggregate admission")
-
-        monkeypatch.setattr(DataFigure, "focused_typed_panel", forbidden)
-        window._memory_limit_bytes = aggregate - 1
-        region = overview.regions[0]
-        window._focus_grid_region(
-            (region.left + region.right) / 2.0,
-            (region.top + region.bottom) / 2.0,
-        )
-        _until(application, lambda: window.worker_idle)
-        assert calls == 0
-        assert window._view_family == "meter-overview"
-        assert window._status.text() == "METER FOCUS FAILED"
-        assert "aggregate peak" in window._diagnostic.text()
     finally:
         window.shutdown()
         _until(application, lambda: window.closed)

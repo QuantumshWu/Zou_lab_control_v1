@@ -16,7 +16,6 @@ import numpy as np
 import pytest
 
 import Zou_lab_control.notebook as zlc
-import zlc_neutral_atom.scan.repository as scan_repository_module
 from fpga.pulse_streamer.host.image import DEFAULT_CLOCK_HZ
 from zlc_data import ComponentValidity
 from zlc_neutral_atom.bootstrap._sequencer_endpoint import (
@@ -47,11 +46,7 @@ from zlc_neutral_atom.scan import (
     pulse_scan_program_from_tree,
     pulse_scan_program_to_tree,
 )
-from zlc_neutral_atom.scan.repository import (
-    ScanRepository,
-    ScanRepositoryResourcePolicy,
-    ScanResourceExceeded,
-)
+from zlc_neutral_atom.scan.repository import ScanRepository
 from zlc_neutral_atom.scan.lineage import (
     api_segmented_cell_schedule,
     execution_compiled_artifacts,
@@ -289,7 +284,7 @@ def test_virtual_camera_rejects_extra_frame_after_expected_final_frame():
         with pytest.raises(RuntimeError, match="virtual camera source failed") as caught:
             camera.read_frame_records(1, timeout=0.5, exact=True)
         assert isinstance(caught.value.__cause__, RuntimeError)
-        assert "exceeded the trigger budget" in str(caught.value.__cause__)
+        assert "exceeded the expected trigger count" in str(caught.value.__cause__)
     finally:
         camera.close()
         sequencer.close()
@@ -400,16 +395,7 @@ def test_endpoint_allows_completed_same_run_successor_but_fences_cross_run():
     sequencer.close()
 
 
-def test_api_metadata_and_camera_boundary_are_admitted_before_fire(tmp_path):
-    small_policy = ScanRepositoryResourcePolicy(max_metadata_blob_bytes=1 << 20)
-    with ScanRepository(tmp_path / "small", resource_policy=small_policy) as repository:
-        with pytest.raises(ScanResourceExceeded, match="admitted bytes"):
-            repository.admit_api_execution_cardinality(1, 1)
-
-    with ScanRepository(tmp_path / "nodes") as repository:
-        with pytest.raises(ScanResourceExceeded, match="canonical nodes"):
-            repository.admit_api_execution_cardinality(600, 1)
-
+def test_camera_boundary_delay_is_derived_before_fire():
     _sequencer, _endpoint, broker, _binding, _capability, request = _bind_endpoint(
         _program(points=2)
     )
@@ -458,12 +444,7 @@ def test_api_metadata_and_camera_boundary_are_admitted_before_fire(tmp_path):
         _sequencer.close()
 
 
-def _run_api_segmented_virtual_product(
-    workspace: Path,
-    *,
-    metadata_limit_bytes: int = 2 << 20,
-    exercise_large_identifier: bool = True,
-) -> None:
+def _run_api_segmented_virtual_product(workspace: Path) -> None:
     from zlc_neutral_atom.bootstrap._installation import _InstallationRuntime
 
     program = _program()
@@ -505,11 +486,6 @@ def _run_api_segmented_virtual_product(
         scan_repositories: list[ScanRepository] = []
 
         def recording_repository_init(repository, root, **kwargs):
-            if "resource_policy" in kwargs:
-                raise AssertionError("virtual installation unexpectedly supplied scan policy")
-            kwargs["resource_policy"] = ScanRepositoryResourcePolicy(
-                max_metadata_blob_bytes=metadata_limit_bytes
-            )
             real_repository_init(repository, root, **kwargs)
             scan_repositories.append(repository)
 
@@ -517,96 +493,12 @@ def _run_api_segmented_virtual_product(
             exp = zlc.connect("virtual", repository=workspace)
         try:
             assert len(scan_repositories) == 1
-            scan_repository = scan_repositories[0]
-            assert (
-                scan_repository.resource_policy.max_metadata_blob_bytes
-                == metadata_limit_bytes
-            )
-            with pytest.raises(AttributeError):
-                scan_repository.resource_policy = ScanRepositoryResourcePolicy()
-            if exercise_large_identifier:
-                large_document = _api_document()
-                large_parameters = list(large_document.api_parameters)
-                large_parameters[0] = replace(
-                    large_parameters[0],
-                    parameter_id="x" * 600_000,
-                )
-                large_document = replace(
-                    large_document,
-                    api_parameters=tuple(large_parameters),
-                )
-                large_request = exp.readout.api_scan_request(
-                    large_document,
-                    api_table=_api_table(large_document, points=1),
-                    segmentation_rationale=_SEGMENTATION_RATIONALE,
-                    timeout_seconds=20.0,
-                )
-                with pytest.raises(
-                    ScanResourceExceeded,
-                    match="after static binding",
-                ):
-                    exp.scan(large_request)
-                assert run_names == []
-                assert fires == []
-
-            tiny_request = exp.readout.api_scan_request(
-                program.document,
-                api_table=program.table,
-                segmentation_rationale=program.segmentation_rationale,
-                memory_limit_bytes=1,
-                timeout_seconds=20.0,
-            )
-            with (
-                patch(
-                    "zlc_neutral_atom.scan.contracts.resolve_api_segment_document"
-                ) as resolve_point,
-                patch(
-                    "zlc_neutral_atom.scan.contracts."
-                    "ScanPointTable.from_api_segment_table"
-                ) as derive_point_table,
-                patch(
-                    "zlc_neutral_atom.bootstrap._triggered_capture."
-                    "compile_pulse_artifact"
-                ) as compile_point,
-            ):
-                with pytest.raises(
-                    MemoryError,
-                    match="API segmented control schedule",
-                ):
-                    exp.scan(tiny_request)
-                resolve_point.assert_not_called()
-                derive_point_table.assert_not_called()
-                compile_point.assert_not_called()
-
             request = exp.readout.api_scan_request(
                 program.document,
                 api_table=program.table,
                 segmentation_rationale=program.segmentation_rationale,
                 timeout_seconds=20.0,
             )
-            with (
-                patch.object(
-                    ScanRepository,
-                    "admit_api_execution_cardinality",
-                    side_effect=ScanResourceExceeded("injected metadata admission"),
-                ) as admit_metadata,
-                patch(
-                    "zlc_neutral_atom.scan.contracts.resolve_api_segment_document"
-                ) as resolve_point,
-                patch(
-                    "zlc_neutral_atom.bootstrap._triggered_capture."
-                    "compile_pulse_artifact"
-                ) as compile_point,
-            ):
-                with pytest.raises(ScanResourceExceeded, match="metadata admission"):
-                    exp.scan(request)
-                admit_metadata.assert_called_once_with(
-                    program.point_count,
-                    program.repeat_count,
-                )
-                resolve_point.assert_not_called()
-                compile_point.assert_not_called()
-
             reference = exp.scan(request)
             artifact = exp.readout.load_scan(reference)
             data = exp.readout.materialize_scan(reference)
@@ -722,27 +614,6 @@ def _run_api_segmented_virtual_product(
                     camera_schema,
                 )
 
-            real_metadata_tree = scan_repository_module._metadata_tree
-
-            def drifted_metadata_tree(value):
-                tree = real_metadata_tree(value)
-                return {**tree, "receipt_drift_probe": [None] * 20_000}
-
-            fires_before_drift = len(fires)
-            with patch.object(
-                scan_repository_module,
-                "_metadata_tree",
-                drifted_metadata_tree,
-            ):
-                with pytest.raises(RunFailed) as drifted:
-                    exp.scan(request)
-            assert len(fires) - fires_before_drift == expected_cells
-            assert drifted.value.snapshot.primary_error.startswith("RuntimeError:")
-            assert "pre-FIRE admission invariant" in (
-                drifted.value.snapshot.primary_error
-            )
-            assert "ScanResourceExceeded" not in drifted.value.snapshot.primary_error
-
             run_names.clear()
             armed_frames.clear()
             prepared_forms.clear()
@@ -784,7 +655,6 @@ def _run_api_segmented_virtual_product(
             preview = ExactDatasetLiveSlot(
                 ExactDatasetPreviewSpec(
                     rejected.source_schema.fingerprint,
-                    512 << 20,
                 )
             )
             with pytest.raises(ValueError, match="FINAL-only"):
@@ -863,36 +733,4 @@ def test_api_segmented_virtual_direct_occupancy_failure_and_autonomous_product(
     assert completed.returncode == 0, (
         f"API segmented product subprocess failed ({completed.returncode})\n"
         f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
-    )
-
-
-def test_api_metadata_admission_charges_frozen_stream_topology(tmp_path):
-    code = (
-        "from pathlib import Path; import runpy, sys; "
-        "ns=runpy.run_path(sys.argv[1]); "
-        "import zlc_neutral_atom.bootstrap._camera_endpoint as endpoint; "
-        "import Zou_lab_control.notebook.facade as facade; "
-        "from zlc_neutral_atom.runtime.streams import StreamId; "
-        "real_processor=facade.OccupancyStreamProcessorSpec; "
-        "endpoint.StreamId=lambda _value: StreamId('s' * 600_000); "
-        "facade.OccupancyStreamProcessorSpec="
-        "lambda calibration,_stream,_source,kind: real_processor("
-        "calibration,StreamId('o' * 600_000),'u' * 600_000,kind); "
-        "ns['_run_api_segmented_virtual_product']("
-        "Path(sys.argv[2]),metadata_limit_bytes=16 << 20,"
-        "exercise_large_identifier=False)"
-    )
-    completed = subprocess.run(
-        [sys.executable, "-c", code, str(Path(__file__).resolve()), str(tmp_path)],
-        cwd=ROOT,
-        env=dict(os.environ),
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    assert completed.returncode == 0, (
-        "API stream-topology admission subprocess failed "
-        f"({completed.returncode})\nstdout:\n{completed.stdout}\n"
-        f"stderr:\n{completed.stderr}"
     )

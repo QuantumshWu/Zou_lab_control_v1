@@ -14,6 +14,7 @@ from zlc_pulse import (
     ApiParameter,
     DestructivePulseEditError,
     OutputDelay,
+    PulseDocument,
     PulseFieldRef,
     ScanParameter,
     attach_scan_recipe,
@@ -66,6 +67,57 @@ def test_new_document_exposes_only_editable_outputs_and_digital_command_is_logic
 
     with pytest.raises(ValueError, match="not a digital output"):
         set_digital_output(document, "p1", dac, True)
+
+
+def test_unrelated_edit_reuses_validated_scan_table_and_cached_indexes(monkeypatch):
+    """A scalar editor commit must not walk an unchanged large scan table."""
+
+    document = _blank()
+    field = PulseFieldRef("duration", "p1", None)
+    document = replace_field_binding(
+        document,
+        field,
+        ScanParameter("duration_p1", field, "Duration", "ns"),
+    ).document
+    document = replace(
+        document,
+        periods=(replace(document.periods[0], duration=60),),
+    )
+    table, _report = freeze_scan_table(
+        document,
+        ("duration_p1",),
+        tuple((20 + 20 * index,) for index in range(64)),
+    )
+    document = replace(document, scan_table=table)
+    document = attach_scan_recipe(
+        document,
+        source="scan_table = [(20,)]\n",
+        generated_columns={
+            "duration_p1": tuple(row[0] for row in table.rows),
+        },
+    )
+
+    calls = 0
+    original = PulseDocument._validate_frozen_scan_value
+
+    def counted(self, parameter, value, *, field):
+        nonlocal calls
+        calls += 1
+        return original(self, parameter, value, field=field)
+
+    monkeypatch.setattr(PulseDocument, "_validate_frozen_scan_value", counted)
+    changed = replace(document, name="renamed")
+
+    assert calls == 0
+    assert changed.scan_table is table
+    assert changed.target.by_key is document.target.by_key
+    assert changed.period_by_id is changed.period_by_id
+    assert changed.scan_parameter_by_id is changed.scan_parameter_by_id
+    assert changed.scan_definition_digest == document.scan_definition_digest
+
+    with pytest.raises(ValueError, match="clock grid"):
+        replace(changed, time_step_ns=30)
+    assert calls > 0
 
 
 def test_bound_dac_action_removal_requires_and_applies_the_whole_cascade():

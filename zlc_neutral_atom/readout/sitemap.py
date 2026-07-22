@@ -20,7 +20,6 @@ from zlc_data import AxisId, CoordinateFrameId, immutable_array
 from zlc_neutral_atom.runtime.capture import CameraPhysicalFacts
 from zlc_pulse import (
     FIELD_DURATION,
-    MAX_MATERIALIZED_TRIGGER_EDGES,
     PORT_DIGITAL,
     PulseDocument,
     RepeatRegion,
@@ -254,13 +253,7 @@ class SitemapAcquisitionProfile:
         )
 
     def _repeat_count(self, value: int) -> int:
-        repeats = positive_integer(value, "repeat_count")
-        if repeats > MAX_MATERIALIZED_TRIGGER_EDGES // self.event_count:
-            raise ValueError(
-                "sitemap repeat groups require more than "
-                f"{MAX_MATERIALIZED_TRIGGER_EDGES} materialized trigger edges"
-            )
-        return repeats
+        return positive_integer(value, "repeat_count")
 
     def analysis_request(
         self,

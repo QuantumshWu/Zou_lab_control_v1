@@ -224,7 +224,6 @@ class CameraCaptureBindingRequest:
     cell_schedule: DatasetCellSchedule
     mode: CameraAcquisitionMode
     required_consumer_lag_events: int
-    transport_memory_limit_bytes: int
     event_settings: tuple[CameraEventReadoutSetting, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -247,14 +246,6 @@ class CameraCaptureBindingRequest:
         if isinstance(lag, bool) or not isinstance(lag, Integral) or lag < 0:
             raise ValueError("required_consumer_lag_events must be non-negative int")
         object.__setattr__(self, "required_consumer_lag_events", int(lag))
-        object.__setattr__(
-            self,
-            "transport_memory_limit_bytes",
-            _positive_int(
-                self.transport_memory_limit_bytes,
-                "transport_memory_limit_bytes",
-            ),
-        )
         if self.event_settings is not None:
             settings = tuple(self.event_settings)
             if any(
@@ -280,7 +271,6 @@ class CameraCaptureEndpoint:
         *,
         max_source_burst_events: int | None = None,
         max_blocking_call_seconds: float | None = None,
-        max_capture_spec_bytes: int = 4096,
         exact_external_trigger_qualification_digest: str | None = None,
         acquisition_mode: CameraAcquisitionMode = CameraAcquisitionMode.EXTERNAL_TRIGGERED,
     ) -> None:
@@ -311,10 +301,6 @@ class CameraCaptureEndpoint:
         if not np.isfinite(timeout) or timeout <= 0:
             raise ValueError("max_blocking_call_seconds must be finite and positive")
         self._max_blocking_call_seconds = timeout
-        self._max_capture_spec_bytes = _positive_int(
-            max_capture_spec_bytes,
-            "max_capture_spec_bytes",
-        )
         if exact_external_trigger_qualification_digest is not None:
             _sha256(
                 exact_external_trigger_qualification_digest,
@@ -362,13 +348,6 @@ class CameraCaptureEndpoint:
             settings = working_point.settings_fingerprint
             payload_contract = working_point.payload_contract
             physical_facts = working_point.physical_facts
-            retained_frame_bytes = payload_contract.max_retained_nbytes
-            driver_ring_bytes = (
-                self._max_source_burst_events * retained_frame_bytes
-            )
-            adapter_record_retention_bytes = (
-                self._adapter_record_capacity * retained_frame_bytes
-            )
             capability_evidence = CameraCapabilityEvidence(
                 adapter_type=(
                     f"{type(self._camera).__module__}."
@@ -381,12 +360,7 @@ class CameraCaptureEndpoint:
                 ),
                 flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
                 max_source_burst_events=self._max_source_burst_events,
-                driver_ring_bytes=driver_ring_bytes,
-                adapter_record_retention_bytes=(
-                    adapter_record_retention_bytes
-                ),
                 max_blocking_call_seconds=self._max_blocking_call_seconds,
-                max_capture_spec_bytes=self._max_capture_spec_bytes,
                 physical_facts=physical_facts,
                 exact_external_trigger_qualification_digest=(
                     self._exact_external_trigger_qualification_digest
@@ -502,10 +476,8 @@ class CameraCaptureEndpoint:
             try:
                 self._camera.arm(
                     expected,
-                    # The camera ring retains only the capability-qualified
-                    # maximum outstanding burst.  The host exact stream/dataset
-                    # retention owns the complete run; allocating that cardinality
-                    # again in the driver would violate the preflight byte budget.
+                    # The camera ring follows the device-qualified maximum
+                    # outstanding burst; the exact host stream owns the run.
                     max_inflight_frames=max_inflight,
                     timeout=command.timeout_seconds,
                 )
@@ -563,7 +535,7 @@ class CameraCaptureEndpoint:
                 raise RuntimeError("camera session is not readable")
             expected_ordinal = session.drained_count
             if expected_ordinal >= session.expected_frames:
-                raise RuntimeError("camera session exhausted its finite frame budget")
+                raise RuntimeError("camera session exhausted its expected frame count")
             payload_contract = session.payload_contract
             operation_epoch = self._operation_epoch
             operation_token = self._begin_command_operation()
@@ -721,14 +693,14 @@ class CameraCaptureEndpoint:
             # session.  An out-of-band interrupt may already have stopped the
             # source from another thread, but only this run-owner thread can
             # release the RLock acquired by arm().
-            terminal_budget = deadline - time.monotonic()
-            if terminal_budget <= 0.0:
+            terminal_seconds = deadline - time.monotonic()
+            if terminal_seconds <= 0.0:
                 raise TimeoutError(
                     "camera session exhausted cleanup timeout before terminal readback"
                 )
         terminal = self._terminalize_with_deadline(
             session,
-            terminal_budget,
+            terminal_seconds,
             require_owner_join=True,
         )
         with self._lock:
@@ -862,7 +834,7 @@ class CameraCaptureEndpoint:
         try:
             if not attempt.done.wait(float(timeout_seconds)):
                 raise TimeoutError(
-                    "camera backend terminalization exceeded its blocking-call budget"
+                    "camera backend terminalization exceeded its blocking-call deadline"
                 )
             error = attempt.outcome.get("error")
             if isinstance(error, BaseException):
@@ -1035,14 +1007,12 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         *,
         max_source_burst_events: int | None = None,
         max_blocking_call_seconds: float | None = None,
-        max_capture_spec_bytes: int = 4096,
     ) -> None:
         super().__init__(
             camera,
             source_id,
             max_source_burst_events=max_source_burst_events,
             max_blocking_call_seconds=max_blocking_call_seconds,
-            max_capture_spec_bytes=max_capture_spec_bytes,
             acquisition_mode=CameraAcquisitionMode.FREE_RUNNING,
         )
 
@@ -1090,7 +1060,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             if command.capability_fingerprint != capability.capability_fingerprint:
                 raise ValueError("camera monitor capability fingerprint differs")
             if command.max_inflight_frames > capability.max_source_burst_events:
-                raise ValueError("camera monitor inflight budget exceeds capability")
+                raise ValueError("camera monitor max_inflight_frames exceeds capability")
             payload_contract = self.payload_contract(binding)
             self._operation_epoch += 1
             self._session = _EndpointSession(
@@ -1123,7 +1093,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 raise RuntimeError("camera monitor session already started")
             max_inflight = session.max_inflight_frames
             if max_inflight is None:
-                raise RuntimeError("camera monitor has no inflight budget")
+                raise RuntimeError("camera monitor has no max_inflight_frames capacity")
             operation_epoch = self._operation_epoch
             operation_token = self._begin_command_operation()
         armed = False
@@ -1338,7 +1308,6 @@ def bind_camera_measurement(
         ),
         capability=capability,
         required_consumer_lag_events=request.required_consumer_lag_events,
-        transport_memory_limit_bytes=request.transport_memory_limit_bytes,
         camera_provenance=camera_provenance,
     )
     return BoundMeasurement(

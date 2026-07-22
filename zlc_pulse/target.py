@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import json
 from importlib.resources import files
 from pathlib import Path
+from types import MappingProxyType
 
 from zlc_storage import (
     canonical_digest,
@@ -95,6 +97,11 @@ class PulseTarget:
     raw_lanes: tuple[str, ...]
     ports: tuple[PulsePortSpec, ...]
     _abi_fingerprint: str = field(init=False, repr=False, compare=False)
+    _by_key: Mapping[str, PulsePortSpec] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         raw = tuple(_text(lane, "target raw lane") for lane in self.raw_lanes)
@@ -135,6 +142,7 @@ class PulseTarget:
             raise ValueError("DAC bus indices must be contiguous from zero")
         object.__setattr__(self, "raw_lanes", raw)
         object.__setattr__(self, "ports", ports)
+        object.__setattr__(self, "_by_key", MappingProxyType(by_key))
         # Labels are presentation-only and intentionally excluded from the ABI.
         object.__setattr__(
             self,
@@ -156,8 +164,8 @@ class PulseTarget:
         )
 
     @property
-    def by_key(self) -> dict[str, PulsePortSpec]:
-        return {port.key: port for port in self.ports}
+    def by_key(self) -> Mapping[str, PulsePortSpec]:
+        return self._by_key
 
     @property
     def abi_fingerprint(self) -> str:

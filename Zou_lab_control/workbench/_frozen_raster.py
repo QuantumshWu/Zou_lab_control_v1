@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, Executor, Future
-import math
 import threading
 from typing import Callable
 
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_frontend.encoded_raster import EncodedRasterDocument
-from zlc_frontend.image_raster import estimate_encoded_png_front_peak_nbytes
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentLabel,
@@ -19,7 +17,7 @@ from zlc_frontend.qt_widgets import (
     FrozenRasterView,
     QtOwnerWake,
 )
-from zlc_storage import canonical_text, positive_integer
+from zlc_storage import canonical_text
 
 from ._window_runtime import (
     RASTER_WORK_EXECUTOR,
@@ -42,7 +40,6 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         loading_summary: str,
         object_prefix: str,
         subject: str,
-        memory_limit_bytes: int,
         executor: Executor | None = None,
     ) -> None:
         super().__init__()
@@ -50,10 +47,6 @@ class FrozenRasterWindow(QtWidgets.QWidget):
             raise TypeError("loader must be callable or None")
         if executor is not None and not isinstance(executor, Executor):
             raise TypeError("executor must implement concurrent.futures.Executor")
-        self._memory_limit_bytes = positive_integer(
-            memory_limit_bytes,
-            "memory_limit_bytes",
-        )
         self._executor = RASTER_WORK_EXECUTOR if executor is None else executor
         self._prefix = canonical_text(object_prefix, "object_prefix")
         self._subject = canonical_text(subject, "subject").upper()
@@ -111,7 +104,6 @@ class FrozenRasterWindow(QtWidgets.QWidget):
             self._submit_future(
                 load_raster_bundle,
                 loader,
-                self._memory_limit_bytes,
                 self._cancelled,
             )
 
@@ -183,39 +175,11 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         if self._placeholder is not None:
             self._placeholder = None
 
-    def _presentation_peak(
-        self,
-        bundle: EncodedRasterDocument,
-        boards: tuple[FrozenRasterView, ...],
-    ) -> int:
-        total = 0
-        for page, board in zip(bundle.pages, boards, strict=True):
-            ratio = float(board.devicePixelRatioF())
-            size = (
-                max(1, math.ceil(board.width() * ratio)),
-                max(1, math.ceil(board.height() * ratio)),
-            )
-            total += estimate_encoded_png_front_peak_nbytes(
-                page.png_bytes,
-                presentation_size=size,
-            )
-        return total
-
-    def _presentation_memory_limit(self) -> int:
-        return self._memory_limit_bytes
-
     def _present_bundle(self, bundle: EncodedRasterDocument) -> bool:
         boards: tuple[FrozenRasterView, ...] = ()
         try:
             boards = self._build_boards(bundle)
             self._boards = boards
-            required = self._presentation_peak(bundle, boards)
-            limit = self._presentation_memory_limit()
-            if required > limit:
-                raise MemoryError(
-                    f"Qt {self._subject.lower()} presentation requires "
-                    f"{required} bytes; limit is {limit}"
-                )
             for page, board in zip(bundle.pages, boards, strict=True):
                 board.present_encoded(page.png_bytes, image_format="PNG")
         except BaseException as error:

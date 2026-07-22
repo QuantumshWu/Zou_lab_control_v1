@@ -30,7 +30,6 @@ from .form import FormChoice, FormFieldProps, FormSpec
 
 DEFAULT_HISTOGRAM_BINS = 60
 MIN_HISTOGRAM_BINS = 5
-MAX_HISTOGRAM_BINS = 500
 _COUNT_SHRINK_DEADBAND = 0.60
 
 
@@ -45,10 +44,9 @@ def _histogram_bin_count(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
         raise TypeError("histogram bin_count must be an integer")
     result = int(value)
-    if not MIN_HISTOGRAM_BINS <= result <= MAX_HISTOGRAM_BINS:
+    if result < MIN_HISTOGRAM_BINS:
         raise ValueError(
-            "histogram bin_count must be between "
-            f"{MIN_HISTOGRAM_BINS} and {MAX_HISTOGRAM_BINS}"
+            f"histogram bin_count must be at least {MIN_HISTOGRAM_BINS}"
         )
     return result
 
@@ -150,7 +148,6 @@ _HISTOGRAM_DISPLAY_FORM = FormSpec(
             "Bins",
             default=DEFAULT_HISTOGRAM_BINS,
             minimum=MIN_HISTOGRAM_BINS,
-            maximum=MAX_HISTOGRAM_BINS,
         ),
         FormFieldProps("x_min", "float", "X minimum", default=None),
         FormFieldProps("x_max", "float", "X maximum", default=None),
@@ -698,7 +695,6 @@ __all__ = [
     "HistogramBinProjection",
     "HistogramDisplayState",
     "HistogramViewportTransform",
-    "MAX_HISTOGRAM_BINS",
     "MIN_HISTOGRAM_BINS",
     "histogram_count_limits",
     "histogram_display_form_spec",

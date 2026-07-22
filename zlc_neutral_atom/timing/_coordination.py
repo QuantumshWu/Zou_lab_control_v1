@@ -116,7 +116,7 @@ def validate_single_trigger_capture_binding(
     expected = contract.total_events
     if pulse_binding.expected_trigger_count != expected:
         raise ValueError(
-            f"pulse capture binding count differs from camera event budget {expected}"
+            f"pulse capture binding count differs from expected camera event count {expected}"
         )
     return schedule
 

@@ -7,13 +7,12 @@ from decimal import Decimal
 from io import BytesIO
 import math
 import threading
-from dataclasses import fields, is_dataclass
 from numbers import Integral, Number
 
 import numpy as np
 
 from zlc_data import FitBatchStatus, FitResultBatch
-from zlc_storage import nonnegative_integer, positive_integer
+from zlc_storage import positive_integer
 
 from .figure import (
     EvaluatedAxis,
@@ -85,11 +84,6 @@ from .render_style import (
 )
 
 
-_RASTER_FIXED_BYTES = 8 << 20
-_RASTER_BUFFER_MULTIPLIER = 8
-_ARTIST_ARRAY_MULTIPLIER = 8
-
-
 def _render_dpi(value: float) -> float:
     if (
         isinstance(value, bool)
@@ -99,165 +93,6 @@ def _render_dpi(value: float) -> float:
     ):
         raise ValueError("dpi must be a finite positive number")
     return float(value)
-
-
-def _array_nbytes(value: object) -> int:
-    if isinstance(value, np.ndarray):
-        return int(value.nbytes)
-    if is_dataclass(value) and not isinstance(value, type):
-        return sum(_array_nbytes(getattr(value, item.name)) for item in fields(value))
-    if isinstance(value, dict):
-        return sum(_array_nbytes(item) for item in value.values())
-    if isinstance(value, (tuple, list)):
-        return sum(_array_nbytes(item) for item in value)
-    return 0
-
-
-def evaluated_figure_array_nbytes(evaluated: EvaluatedFigureData) -> int:
-    """Return the exact ndarray bytes retained by one frozen evaluation.
-
-    The value is intentionally narrower than a render-peak estimate: product
-    composition uses it as the data term of
-    :func:`estimate_live_panel_raster_peak_nbytes`, so the same immutable
-    arrays are not guessed again from rank or dtype at the Workbench boundary.
-    """
-
-    if not isinstance(evaluated, EvaluatedFigureData):
-        raise TypeError("evaluated must be EvaluatedFigureData")
-    return _array_nbytes(evaluated)
-
-
-def _histogram_render_geometry_nbytes(
-    evaluated: EvaluatedFigureData,
-    *,
-    bins: int = DEFAULT_HISTOGRAM_BINS,
-) -> int:
-    """Conservatively charge bounded histogram counts/edges/step vertices."""
-
-    total = 0
-    for _layer, _cell, series_group in _panels(evaluated):
-        if not isinstance(series_group[0].data, EvaluatedHistogram):
-            continue
-        series_count = len(series_group)
-        counts_bytes = series_count * bins * np.dtype("<i8").itemsize
-        edges_bytes = (bins + 1) * np.dtype(np.float64).itemsize
-        vertices_bytes = (
-            series_count
-            * 2
-            * (2 * bins + 2)
-            * np.dtype(np.float64).itemsize
-        )
-        total += counts_bytes + edges_bytes + vertices_bytes
-    return int(total)
-
-
-def estimate_render_peak_nbytes(
-    evaluated: EvaluatedFigureData,
-    *,
-    dpi: float,
-) -> int:
-    """Conservative Agg/PNG peak from immutable evaluated data and canvas size."""
-
-    if not isinstance(evaluated, EvaluatedFigureData):
-        raise TypeError("evaluated must be EvaluatedFigureData")
-    dpi = _render_dpi(dpi)
-    panels = _panels(evaluated)
-    columns = min(3, max(1, len(panels)))
-    rows = math.ceil(len(panels) / columns)
-    width = math.ceil(5.0 * columns * dpi)
-    height = math.ceil(4.0 * rows * dpi)
-    rgba_bytes = width * height * 4
-    return int(
-        _RASTER_FIXED_BYTES
-        + _RASTER_BUFFER_MULTIPLIER * rgba_bytes
-        + _ARTIST_ARRAY_MULTIPLIER
-        * (
-            _array_nbytes(evaluated)
-            + _histogram_render_geometry_nbytes(evaluated)
-        )
-    )
-
-
-def estimate_live_panel_raster_peak_nbytes(
-    width: int,
-    height: int,
-    *,
-    evaluated_data_upper_bound_bytes: int = 0,
-    histogram_bins: int | None = None,
-    histogram_series_count: int = 1,
-    extra_retained_fronts: int = 0,
-    extra_retained_evaluated_data_bytes: int = 0,
-    fit_overlay_retained_upper_bound_bytes: int = 0,
-    fit_prediction_upper_bound_bytes: int = 0,
-) -> int:
-    """Static preflight bound for one coalesced single-panel Agg front.
-
-    The caller supplies a schema-derived upper bound for evaluator-owned data;
-    A live renderer retains the previous artist arrays while Matplotlib copies
-    the next evaluated revision into those artists.  The bound also covers the
-    persistent Agg canvas plus queued/visible immutable raster fronts.  A live
-    histogram additionally admits its bounded counts, edges, and filled-step
-    vertices; ``None`` means that the panel is a curve or meter.  Pointer-hold
-    retention is explicit: every extra immutable RGBA front, bin payload, and
-    older exact evaluated payload is added directly rather than hidden in a
-    multiplier.  A curve fit front separately charges its already-owned DTO
-    retention and the prediction bytes copied through Matplotlib's artist
-    workspace; callers must not hide either term in a second render budget.
-    """
-
-    width = positive_integer(width, "width")
-    height = positive_integer(height, "height")
-    data_bytes = nonnegative_integer(
-        evaluated_data_upper_bound_bytes,
-        "evaluated_data_upper_bound_bytes",
-    )
-    extra_fronts = nonnegative_integer(
-        extra_retained_fronts,
-        "extra_retained_fronts",
-    )
-    extra_data_bytes = nonnegative_integer(
-        extra_retained_evaluated_data_bytes,
-        "extra_retained_evaluated_data_bytes",
-    )
-    fit_overlay_bytes = nonnegative_integer(
-        fit_overlay_retained_upper_bound_bytes,
-        "fit_overlay_retained_upper_bound_bytes",
-    )
-    fit_prediction_bytes = nonnegative_integer(
-        fit_prediction_upper_bound_bytes,
-        "fit_prediction_upper_bound_bytes",
-    )
-    histogram_geometry_bytes = 0
-    histogram_payload_bytes = 0
-    if histogram_bins is not None:
-        bins = positive_integer(histogram_bins, "histogram_bins")
-        series_count = positive_integer(
-            histogram_series_count,
-            "histogram_series_count",
-        )
-        counts_bytes = series_count * bins * np.dtype("<i8").itemsize
-        edges_bytes = (bins + 1) * np.dtype(np.float64).itemsize
-        vertices_bytes = (
-            series_count
-            * 2
-            * (2 * bins + 2)
-            * np.dtype(np.float64).itemsize
-        )
-        histogram_geometry_bytes = (
-            counts_bytes + edges_bytes + vertices_bytes
-        )
-        histogram_payload_bytes = counts_bytes + edges_bytes
-    return (
-        _RASTER_FIXED_BYTES
-        + _RASTER_BUFFER_MULTIPLIER * width * height * 4
-        + _ARTIST_ARRAY_MULTIPLIER
-        * (data_bytes + histogram_geometry_bytes)
-        + extra_fronts * width * height * 4
-        + extra_fronts * histogram_payload_bytes
-        + extra_data_bytes
-        + fit_overlay_bytes
-        + _ARTIST_ARRAY_MULTIPLIER * fit_prediction_bytes
-    )
 
 
 def _series_label(series, *, include_reductions: bool) -> str | None:
@@ -497,7 +332,7 @@ def _draw_projected_image(
     if regular_pixel_contract:
         # Typed IMAGE and saved-fit panels have already crossed the strict
         # regular-pixel viewport boundary.  Revalidate that declared contract
-        # here before taking the low-memory path; never infer it from shape.
+        # here before projection; never infer it from shape.
         image_viewport_for_evaluated_image(data)
         if x_labels is not None or y_labels is not None:
             raise ValueError("projected IMAGE export requires numeric pixel axes")
@@ -746,8 +581,6 @@ def _validated_radial_panels(
         not isinstance(panel, RadialGaussianImageFitPanel) for panel in panels
     ):
         raise TypeError("panels must be a non-empty radial panel tuple")
-    if len(panels) > 36:
-        raise ValueError("radial saved-fit export exceeded 36 panels")
     first = panels[0].fit_overlay
     if any(
         panel.fit_overlay.artifact_identity != first.artifact_identity
@@ -763,64 +596,6 @@ def _validated_radial_grid_columns(columns: int, panel_count: int) -> int:
     if columns > panel_count:
         raise ValueError("columns cannot exceed the radial panel count")
     return columns
-
-
-def _estimate_projected_image_agg_peak_nbytes(
-    images: tuple[EvaluatedImage, ...],
-    *,
-    dpi: float,
-    columns: int,
-) -> int:
-    """Shared conservative Agg/encoder peak after exact images are retained."""
-
-    images = tuple(images)
-    if not images or any(not isinstance(image, EvaluatedImage) for image in images):
-        raise TypeError("images must be a non-empty EvaluatedImage tuple")
-    dpi = _render_dpi(dpi)
-    columns = positive_integer(columns, "columns")
-    if columns > len(images):
-        raise ValueError("columns cannot exceed the image count")
-    rows = math.ceil(len(images) / columns)
-    width = math.ceil(5.0 * columns * dpi)
-    height = math.ceil(4.0 * rows * dpi)
-    rgba_bytes = width * height * 4
-    # The exact values/validity planes are retained by the caller and are not
-    # charged again here.  The strict regular-pixel ``imshow`` path still owns
-    # dtype-independent per-cell mask, normalization/resampling, RGBA and
-    # backend workspaces.  Keep that measured term separate from the Agg/PNG
-    # canvas fronts and the small one-dimensional edge arrays.  A 2304-square
-    # uint16 witness peaked at 373,728,906 incremental bytes; this formula
-    # admits it below the 512 MiB product limit with a conservative margin.
-    cell_count = sum(image.values.size for image in images)
-    axis_coordinate_count = sum(
-        len(image.x_axis.coordinates) + len(image.y_axis.coordinates)
-        for image in images
-    )
-    return int(
-        _RASTER_FIXED_BYTES
-        + _RASTER_BUFFER_MULTIPLIER * rgba_bytes
-        + 88 * cell_count
-        + 16 * axis_coordinate_count
-    )
-
-
-def estimate_image_png_export_peak_nbytes(
-    image: EvaluatedImage,
-    *,
-    dpi: float = 100.0,
-) -> int:
-    """Bound incremental PNG export memory after one exact IMAGE is retained."""
-
-    if not isinstance(image, EvaluatedImage):
-        raise TypeError("image must be EvaluatedImage")
-    image_viewport_for_evaluated_image(image)
-    if np.iscomplexobj(image.values):
-        raise ValueError("complex images require an explicit real-valued display transform")
-    return _estimate_projected_image_agg_peak_nbytes(
-        (image,),
-        dpi=dpi,
-        columns=1,
-    )
 
 
 def _validated_image_panel_export(
@@ -926,7 +701,6 @@ def save_image_panel_png(
     destination,
     *,
     dpi: float = 100.0,
-    memory_limit_bytes: int | None = None,
 ) -> None:
     """Save one exact current IMAGE front without re-evaluation or fit authority.
 
@@ -940,13 +714,6 @@ def save_image_panel_png(
     _validated_image_panel_export(payload, display)
     center, radius, diagnostic, title = _image_panel_fit_annotation(payload)
     dpi = _render_dpi(dpi)
-    required = estimate_image_png_export_peak_nbytes(payload.image, dpi=dpi)
-    if memory_limit_bytes is not None:
-        limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-        if required > limit:
-            raise MemoryError(
-                f"image panel PNG export peak {required} exceeds limit {limit}"
-            )
 
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
@@ -1487,29 +1254,6 @@ def render_pulse_timeline_panel(
 
 
 
-def estimate_projected_radial_fit_render_peak_nbytes(
-    panels: tuple[RadialGaussianImageFitPanel, ...],
-    *,
-    dpi: float,
-    columns: int,
-) -> int:
-    """Bound incremental Agg export memory after source panels are retained.
-
-    The caller already owns the immutable image samples.  This estimate charges
-    the Agg canvas/encoder fronts and conservative artist/mask/coordinate copies
-    created specifically by the export.
-    """
-
-    prepared = _validated_radial_panels(panels)
-    dpi = _render_dpi(dpi)
-    columns = _validated_radial_grid_columns(columns, len(prepared))
-    return _estimate_projected_image_agg_peak_nbytes(
-        tuple(panel.image for panel in prepared),
-        dpi=dpi,
-        columns=columns,
-    )
-
-
 def render_radial_gaussian_image_fit_panels(
     panels: tuple[RadialGaussianImageFitPanel, ...],
     display: ImageDisplayState,
@@ -1517,7 +1261,6 @@ def render_radial_gaussian_image_fit_panels(
     *,
     columns: int,
     dpi: float = 100.0,
-    memory_limit_bytes: int | None = None,
 ):
     """Render the current typed saved-fit IMAGE view from immutable projections.
 
@@ -1535,17 +1278,6 @@ def render_radial_gaussian_image_fit_panels(
     )
     dpi = _render_dpi(dpi)
     columns = _validated_radial_grid_columns(columns, len(prepared))
-    if memory_limit_bytes is not None:
-        limit = positive_integer(memory_limit_bytes, "memory_limit_bytes")
-        required = estimate_projected_radial_fit_render_peak_nbytes(
-            prepared,
-            dpi=dpi,
-            columns=columns,
-        )
-        if required > limit:
-            raise MemoryError(
-                f"projected radial render peak {required} exceeds limit {limit}"
-            )
 
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
@@ -1582,7 +1314,6 @@ def save_radial_gaussian_image_fit_panels(
     image_format: str,
     columns: int,
     dpi: float = 100.0,
-    memory_limit_bytes: int | None = None,
 ) -> None:
     """Save the exact committed typed page/focus display.
 
@@ -1604,7 +1335,6 @@ def save_radial_gaussian_image_fit_panels(
             current_color_limits,
             columns=columns,
             dpi=dpi,
-            memory_limit_bytes=memory_limit_bytes,
         )
         with render_style_context():
             figure.savefig(destination, format=image_format, dpi=dpi)
@@ -2754,11 +2484,6 @@ class SinglePanelAggRenderer:
 
 __all__ = [
     "encode_evaluated_figure_with_panel_regions",
-    "evaluated_figure_array_nbytes",
-    "estimate_image_png_export_peak_nbytes",
-    "estimate_live_panel_raster_peak_nbytes",
-    "estimate_projected_radial_fit_render_peak_nbytes",
-    "estimate_render_peak_nbytes",
     "render_radial_gaussian_image_fit_panels",
     "render_evaluated_figure",
     "release_agg_figure",

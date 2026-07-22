@@ -87,14 +87,12 @@ from .deployment import (
 )
 from .schedule import (
     DigitalTriggerSchedule,
-    MAX_MATERIALIZED_TRIGGER_EDGES,
     TriggerEdge,
     build_digital_trigger_schedules,
     digital_trigger_schedule_from_tree,
     digital_trigger_schedule_to_tree,
 )
 from .simulation import (
-    MAX_MATERIALIZED_PLAYBACK_PULSES,
     PlaybackPulse,
     PlaybackTriggerGroup,
     PulsePlayback,
@@ -109,8 +107,6 @@ from .physical import (
     PhysicalWaveformIndex,
     PhysicalWindowProjection,
     build_physical_waveform_index,
-    estimate_physical_waveform_index_peak_bytes,
-    estimate_physical_window_projection_peak_bytes,
     iter_physical_digital_high_intervals,
     physical_digital_playback_terminal_tick,
 )
@@ -135,18 +131,10 @@ from .server import (
 )
 from .artifact import (
     COMPILED_PULSE_ARTIFACT_SCHEMA,
-    MAX_COMPILED_PULSE_ARTIFACT_BYTES,
     CompiledPulseArtifact,
-    CompiledPulseRuntimeSummary,
     PulseExecutionForm,
-    admit_compiled_pulse_payload_size,
     compiled_pulse_artifact_from_tree,
     compiled_pulse_artifact_to_tree,
-    compiled_pulse_decode_peak_upper_bound_bytes,
-    compiled_pulse_retained_upper_bound_bytes,
-    compiled_pulse_runtime_summary,
-    compiled_pulse_runtime_summary_from_tree,
-    compiled_pulse_runtime_summary_to_tree,
     decode_compiled_pulse_artifact,
     encode_compiled_pulse_artifact,
 )
@@ -220,16 +208,12 @@ from .timeline import (
 
 __all__ = [
     "COMPILED_PULSE_ARTIFACT_SCHEMA",
-    "MAX_COMPILED_PULSE_ARTIFACT_BYTES",
-    "MAX_MATERIALIZED_TRIGGER_EDGES",
-    "MAX_MATERIALIZED_PLAYBACK_PULSES",
     "APPROVED_DEPLOYED_TARGET_ABI",
     "AUTONOMOUS_REFILLED_UNAVAILABLE_REASON",
     "FormalScanCapacityExceeded",
     "AUTONOMOUS_TABLE_READ_RECIPE",
     "COMPILER_ID",
     "CompiledPulseArtifact",
-    "CompiledPulseRuntimeSummary",
     "AutonomousTableTerminalEvidence",
     "DAC_OFFSET_BINARY",
     "DestructivePulseEditError",
@@ -303,7 +287,6 @@ __all__ = [
     "TargetBusSegment",
     "TargetIR",
     "TriggerEdge",
-    "admit_compiled_pulse_payload_size",
     "build_digital_trigger_schedules",
     "build_pulse_playback",
     "build_pulse_target_manifest",
@@ -311,8 +294,6 @@ __all__ = [
     "sample_compiled_bus_codes",
     "build_pulse_timeline",
     "build_physical_waveform_index",
-    "estimate_physical_waveform_index_peak_bytes",
-    "estimate_physical_window_projection_peak_bytes",
     "iter_physical_digital_high_intervals",
     "physical_digital_playback_terminal_tick",
     "pulse_port_manifest_from_tree",
@@ -331,11 +312,6 @@ __all__ = [
     "bind_pulse_document_target",
     "compiled_pulse_artifact_from_tree",
     "compiled_pulse_artifact_to_tree",
-    "compiled_pulse_decode_peak_upper_bound_bytes",
-    "compiled_pulse_retained_upper_bound_bytes",
-    "compiled_pulse_runtime_summary",
-    "compiled_pulse_runtime_summary_from_tree",
-    "compiled_pulse_runtime_summary_to_tree",
     "decode_compiled_pulse_artifact",
     "encode_compiled_pulse_artifact",
     "compile_pulse_artifact",

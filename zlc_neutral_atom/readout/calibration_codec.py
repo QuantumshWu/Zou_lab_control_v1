@@ -20,7 +20,6 @@ from zlc_neutral_atom.capture_reference import (
     capture_artifact_ref_to_tree,
 )
 from zlc_storage import (
-    CanonicalDecodeLimits,
     ContentRef,
     canonical_text as _text,
     content_ref_from_tree,
@@ -66,85 +65,12 @@ from .codec import (
 from .physical_context import (
     ReadoutPhysicalContext,
     readout_physical_context_from_tree,
-    readout_physical_context_retained_upper_bound_bytes,
     readout_physical_context_to_tree,
 )
 
 
 CALIBRATION_ARTIFACT_FORMAT = "zlc_neutral_atom.calibration-artifact"
 CALIBRATION_REPORT_FORMAT = "zlc_neutral_atom.calibration-report"
-
-_ARTIFACT_DECODE_LIMITS = CanonicalDecodeLimits(
-    max_depth=48,
-    max_nodes=100_000,
-    max_container_entries=50_000,
-    max_arrays=256,
-    max_total_array_bytes=256 * 1024 * 1024,
-)
-_CONTEXT_ROUNDTRIP_FIXED_WORKSPACE_BYTES = 1 << 20
-_CONTEXT_ROUNDTRIP_WORKSPACE_MULTIPLIER = 8
-_REPORT_DECODE_LIMITS = CanonicalDecodeLimits(
-    max_depth=64,
-    max_nodes=500_000,
-    max_container_entries=250_000,
-    max_arrays=4_096,
-    max_total_array_bytes=256 * 1024 * 1024,
-)
-
-
-def _json_string_payload_upper_bound(value: str) -> int:
-    """Bound UTF-8 JSON payload bytes for one already-validated text value."""
-
-    total = 0
-    for character in value:
-        if ord(character) < 0x20:
-            total += 6
-        elif character in {'"', "\\"}:
-            total += 2
-        else:
-            total += len(character.encode("utf-8"))
-    return total
-
-
-def estimate_calibration_context_roundtrip_workspace(
-    context: ReadoutPhysicalContext,
-) -> int:
-    """Return the exact-cardinality context workspace bound for final staging."""
-
-    if not isinstance(context, ReadoutPhysicalContext):
-        raise TypeError("context must be ReadoutPhysicalContext")
-    traces = len(context.digital) + len(context.buses)
-    transitions = sum(len(item.transitions) for item in context.digital) + sum(
-        len(item.changes) for item in context.buses
-    )
-    # Primitive context shape before the generic canonical tag expansion.  This
-    # only rejects a context that by itself exhausts the artifact domain; the
-    # complete artifact still receives the codec's normal structural admission.
-    context_nodes = 7 + 4 * traces + 3 * transitions
-    context_entries = 6 + 4 * traces + 3 * transitions
-    if context_nodes >= _ARTIFACT_DECODE_LIMITS.max_nodes or (
-        context_entries >= _ARTIFACT_DECODE_LIMITS.max_container_entries
-    ):
-        raise MemoryError(
-            "readout physical context cannot fit the calibration artifact "
-            "canonical structure domain"
-        )
-    escaped_name_bytes = sum(
-        _json_string_payload_upper_bound(item.output_key)
-        for item in context.digital
-    ) + sum(
-        _json_string_payload_upper_bound(item.bus_name) for item in context.buses
-    )
-    # Names are shared by the semantic pulse/context graph, but tree/JSON/decode
-    # representations duplicate their UTF-8 content.  Keep that duplication in
-    # the codec workspace rather than inflating physical semantic retention.
-    return (
-        _CONTEXT_ROUNDTRIP_FIXED_WORKSPACE_BYTES
-        + _CONTEXT_ROUNDTRIP_WORKSPACE_MULTIPLIER
-        * readout_physical_context_retained_upper_bound_bytes(context)
-        + 8 * escaped_name_bytes
-    )
-
 
 def _analysis_types():
     """Load report-only scientific values only on a report code path."""
@@ -233,14 +159,12 @@ def _decode_typed(
     parser,
     projector,
     name: str,
-    *,
-    limits: CanonicalDecodeLimits,
 ):
     if not isinstance(payload, (bytes, bytearray, memoryview)):
         raise TypeError(f"{name} payload must be bytes-like")
     raw = bytes(payload)
-    value = parser(decode(raw, limits=limits))
-    if encode(projector(value), limits=limits) != raw:
+    value = parser(decode(raw))
+    if encode(projector(value)) != raw:
         raise ValueError(f"{name} payload is typed but non-canonical")
     return value
 
@@ -938,7 +862,7 @@ def _report_from_tree(
 
 
 def encode_calibration_artifact(value: CalibrationArtifact) -> bytes:
-    return encode(_artifact_to_tree(value), limits=_ARTIFACT_DECODE_LIMITS)
+    return encode(_artifact_to_tree(value))
 
 
 def decode_calibration_artifact(
@@ -949,7 +873,6 @@ def decode_calibration_artifact(
         _artifact_from_tree,
         _artifact_to_tree,
         CALIBRATION_ARTIFACT_FORMAT,
-        limits=_ARTIFACT_DECODE_LIMITS,
     )
 
 
@@ -964,8 +887,7 @@ def encode_calibration_report_metadata(
             value,
             reference_average_blob,
             reference_average_validity_blob,
-        ),
-        limits=_REPORT_DECODE_LIMITS,
+        )
     )
 
 
@@ -974,7 +896,7 @@ def calibration_report_blob_refs(
 ) -> tuple[ContentRef, ContentRef]:
     if not isinstance(payload, (bytes, bytearray, memoryview)):
         raise TypeError("calibration report payload must be bytes-like")
-    data = _report_data(decode(payload, limits=_REPORT_DECODE_LIMITS))
+    data = _report_data(decode(payload))
     return (
         content_ref_from_tree(data["reference_average_blob"]),
         content_ref_from_tree(data["reference_average_validity_blob"]),
@@ -1061,7 +983,7 @@ def decode_calibration_report(
     if not isinstance(payload, (bytes, bytearray, memoryview)):
         raise TypeError("calibration report payload must be bytes-like")
     raw = bytes(payload)
-    tree = decode(raw, limits=_REPORT_DECODE_LIMITS)
+    tree = decode(raw)
     data = _report_data(tree)
     average_blob = content_ref_from_tree(data["reference_average_blob"])
     validity_blob = content_ref_from_tree(data["reference_average_validity_blob"])
@@ -1070,10 +992,7 @@ def decode_calibration_report(
         reference_average=reference_average,
         reference_average_validity=reference_average_validity,
     )
-    if encode(
-        _report_to_tree(report, average_blob, validity_blob),
-        limits=_REPORT_DECODE_LIMITS,
-    ) != raw:
+    if encode(_report_to_tree(report, average_blob, validity_blob)) != raw:
         raise ValueError("calibration report payload is typed but non-canonical")
     return report
 
@@ -1088,6 +1007,5 @@ __all__ = [
     "encode_calibration_reference_average",
     "encode_calibration_reference_average_validity",
     "encode_calibration_report_metadata",
-    "estimate_calibration_context_roundtrip_workspace",
     "calibration_report_blob_refs",
 ]

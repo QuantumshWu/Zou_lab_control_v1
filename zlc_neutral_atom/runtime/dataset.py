@@ -40,7 +40,6 @@ from zlc_data import (
     Valid,
     ValidityMode,
     Value,
-    ValuePayloadContract,
     ValueSchema,
     axis_to_tree,
     expand_component_validity,
@@ -82,36 +81,6 @@ _DATASET_DERIVATION_PROVENANCE_SCHEMA = (
 _DATASET_SEAL_PROVENANCE_SCHEMA = "zlc_neutral_atom.DatasetSealProvenance"
 
 
-def dataset_storage_nbytes(schema: DatasetSchema) -> int:
-    """Exact value-plus-validity bytes of one immutable materialization."""
-
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    value_bytes = math.prod(schema.physical_shape) * int(
-        schema.cell_schema.dtype.itemsize
-    )
-    cells = schema.repeat_axis.size * schema.point_layout.storage_size
-    validity = schema.cell_schema.validity_contract
-    if validity.mode is ValidityMode.VALUE:
-        validity_bytes = cells
-    else:
-        component_shape = tuple(
-            schema.cell_schema.axis(axis_id).size
-            for axis_id in validity.component_axis_ids
-        )
-        validity_bytes = math.prod((cells, *component_shape))
-    return value_bytes + validity_bytes
-
-
-def mutable_dataset_storage_nbytes(schema: DatasetSchema) -> int:
-    """Bytes owned by a mutable materializer, including its written-cell mask."""
-
-    return (
-        dataset_storage_nbytes(schema)
-        + schema.repeat_axis.size * schema.point_layout.storage_size
-    )
-
-
 class DatasetEventAdapter(Protocol[PayloadT]):
     """Typed projection from one immutable stream payload into one dataset cell."""
 
@@ -126,13 +95,10 @@ class DatasetEventAdapter(Protocol[PayloadT]):
 
 class DatasetMetadataContract(Protocol[PayloadT]):
     fingerprint: str
-    max_retained_nbytes: int
 
     def snapshot(self, payload: PayloadT) -> object | None: ...
 
     def validate(self, metadata: object | None) -> None: ...
-
-    def retained_nbytes(self, metadata: object | None) -> int: ...
 
     def digest(self, metadata: object | None) -> str: ...
 
@@ -619,18 +585,12 @@ class FrozenDatasetEdge(Generic[PayloadT]):
     consumer_contract_digest: str | None = field(init=False)
     _payload_contract: object = field(init=False, repr=False, compare=False)
     _payload_contract_fingerprint: str = field(init=False, repr=False, compare=False)
-    _payload_max_retained_nbytes: int = field(init=False, repr=False, compare=False)
     _metadata_contract: DatasetMetadataContract = field(
         init=False,
         repr=False,
         compare=False,
     )
     _metadata_contract_fingerprint: str = field(
-        init=False,
-        repr=False,
-        compare=False,
-    )
-    _metadata_max_retained_nbytes: int = field(
         init=False,
         repr=False,
         compare=False,
@@ -697,56 +657,27 @@ class FrozenDatasetEdge(Generic[PayloadT]):
             operator_fingerprint,
             "event adapter operator fingerprint",
         )
-        for member in ("snapshot", "retained_nbytes", "digest"):
+        for member in ("snapshot", "digest"):
             if not callable(getattr(payload_contract, member, None)):
                 raise TypeError(f"event_adapter.payload_contract.{member} must be callable")
         metadata_fingerprint = _sha256_digest(
             metadata.fingerprint,
             "metadata contract fingerprint",
         )
-        payload_max_bytes = payload_contract.max_retained_nbytes
-        if (
-            isinstance(payload_max_bytes, bool)
-            or not isinstance(payload_max_bytes, Integral)
-            or payload_max_bytes <= 0
-        ):
-            raise ValueError("payload contract max_retained_nbytes must be positive")
-        payload_max_bytes = int(payload_max_bytes)
-        metadata_max_bytes = metadata.max_retained_nbytes
-        if (
-            isinstance(metadata_max_bytes, bool)
-            or not isinstance(metadata_max_bytes, Integral)
-            or metadata_max_bytes < 0
-        ):
-            raise ValueError(
-                "metadata contract max_retained_nbytes must be non-negative"
-            )
-        metadata_max_bytes = int(metadata_max_bytes)
-        for member in ("snapshot", "validate", "retained_nbytes", "digest"):
+        for member in ("snapshot", "validate", "digest"):
             if not callable(getattr(metadata, member, None)):
                 raise TypeError(f"metadata_contract.{member} must be callable")
-        value_max_bytes = ValuePayloadContract(schema.cell_schema).max_retained_nbytes
-        if value_max_bytes + metadata_max_bytes > payload_max_bytes:
-            raise DatasetError(
-                "Value plus metadata worst-case bytes exceed the PayloadContract"
-            )
         object.__setattr__(self, "_payload_contract", payload_contract)
         object.__setattr__(
             self,
             "_payload_contract_fingerprint",
             payload_fingerprint,
         )
-        object.__setattr__(self, "_payload_max_retained_nbytes", payload_max_bytes)
         object.__setattr__(self, "_metadata_contract", metadata)
         object.__setattr__(
             self,
             "_metadata_contract_fingerprint",
             metadata_fingerprint,
-        )
-        object.__setattr__(
-            self,
-            "_metadata_max_retained_nbytes",
-            metadata_max_bytes,
         )
         object.__setattr__(self, "_value_schema", value_schema)
         object.__setattr__(self, "_operator_fingerprint", operator_fingerprint)
@@ -789,20 +720,12 @@ class FrozenDatasetEdge(Generic[PayloadT]):
         return self._payload_contract_fingerprint
 
     @property
-    def payload_max_retained_nbytes(self) -> int:
-        return self._payload_max_retained_nbytes
-
-    @property
     def metadata_contract(self) -> DatasetMetadataContract:
         return self._metadata_contract
 
     @property
     def metadata_contract_fingerprint(self) -> str:
         return self._metadata_contract_fingerprint
-
-    @property
-    def metadata_max_retained_nbytes(self) -> int:
-        return self._metadata_max_retained_nbytes
 
     @property
     def value_schema(self) -> ValueSchema:
@@ -832,8 +755,6 @@ class FrozenDatasetEdge(Generic[PayloadT]):
             raise DatasetError("dataset edge must share the stream PayloadContract owner")
         if stream.payload_contract_fingerprint != self.payload_contract_fingerprint:
             raise DatasetError("dataset edge payload fingerprint differs from stream")
-        if stream.max_payload_bytes != self.payload_max_retained_nbytes:
-            raise DatasetError("dataset edge payload byte bound differs from stream")
 
     def validate_stream(self, stream: AcquisitionStream[PayloadT]) -> None:
         self.validate_payload_stream(stream)
@@ -1382,14 +1303,6 @@ def _project_payload(
     contract.validate(metadata)
     if not _is_deeply_immutable(metadata):
         raise TypeError("metadata contract must return a deeply immutable snapshot")
-    retained = contract.retained_nbytes(metadata)
-    if (
-        isinstance(retained, bool)
-        or not isinstance(retained, Integral)
-        or retained < 0
-        or retained > edge.metadata_max_retained_nbytes
-    ):
-        raise ValueError("metadata retained bytes exceed the declared metadata bound")
     digest = (
         _sha256_digest(contract.digest(metadata), "metadata digest")
         if include_metadata_digest
@@ -1587,9 +1500,9 @@ class DatasetBuilder(Generic[PayloadT]):
             self._ensure_writable_locked()
             missing = np.argwhere(~self._written)
             if missing.size:
-                cells = tuple(tuple(int(index) for index in row) for row in missing[:8])
+                cells = tuple(tuple(int(index) for index in row) for row in missing)
                 raise MissingDatasetCells(
-                    f"dataset is missing {len(missing)} cells; first missing cells: {cells}"
+                    f"dataset is missing {len(missing)} cells: {cells}"
                 )
             if not self._coverage_locked().complete:
                 raise DatasetError("formal dataset coverage is incomplete")
@@ -1955,16 +1868,6 @@ class MonitorDataset(Generic[PayloadT]):
                 contract = self.edge.payload_contract
                 owned_payload = contract.snapshot(payload)
                 contract.validate(owned_payload)
-                retained = contract.retained_nbytes(owned_payload)
-                if (
-                    isinstance(retained, bool)
-                    or not isinstance(retained, Integral)
-                    or retained <= 0
-                    or retained > self.edge.payload_max_retained_nbytes
-                ):
-                    raise ValueError(
-                        "append replacement payload exceeds its retained-byte contract"
-                    )
                 payload_digest = _sha256_digest(
                     contract.digest(owned_payload),
                     "append replacement payload digest",
@@ -2348,8 +2251,6 @@ __all__ = [
     "dataset_derivation_provenance_to_tree",
     "dataset_seal_provenance_from_tree",
     "dataset_seal_provenance_to_tree",
-    "dataset_storage_nbytes",
-    "mutable_dataset_storage_nbytes",
     "raw_dataset_seal_provenance_from_tree",
     "raw_dataset_seal_provenance_to_tree",
 ]

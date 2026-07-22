@@ -43,12 +43,6 @@ from zlc_data import (
     commit_transform,
     expand_value_validity,
     fit_model_catalog,
-    fit_binding_additional_peak_upper_bound_nbytes,
-    fit_binding_retained_upper_bound_nbytes,
-    fit_transform_resolution_additional_peak_upper_bound_nbytes,
-    fit_result_source_validation_additional_peak_upper_bound_nbytes,
-    fit_result_retained_upper_bound_nbytes,
-    dataset_schema_retained_upper_bound_nbytes,
     fit_spec_for,
     suggest_fit_draft,
     validate_fit_result_source_binding,
@@ -128,11 +122,7 @@ from zlc_neutral_atom.readout.occupancy import (
 )
 from zlc_neutral_atom.readout.occupancy_pipeline import OccupancyPipelineSpec
 from zlc_neutral_atom.runtime.streams import StreamId
-from zlc_neutral_atom.runtime.dataset import dataset_storage_nbytes
-from zlc_neutral_atom.runtime.pipeline import (
-    MinimalPipelineSpec,
-    estimate_pipeline_peak_bytes,
-)
+from zlc_neutral_atom.runtime.pipeline import MinimalPipelineSpec
 from zlc_neutral_atom.timing.occupancy import TriggeredOccupancySpec
 from zlc_neutral_atom.timing.pulse import PulseScanProgress
 from zlc_neutral_atom.timing.segmented import (
@@ -168,14 +158,9 @@ if TYPE_CHECKING:
     from zlc_neutral_atom.scan.repository import ScanArtifact, ScanRepository
 
 
-_DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_CALIBRATION_TIMEOUT_SECONDS = 300.0
-_DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_OCCUPANCY_TIMEOUT_SECONDS = 300.0
-_DEFAULT_SCAN_MATERIALIZATION_MEMORY_LIMIT_BYTES = 512 << 20
-_DEFAULT_FIGURE_MEMORY_LIMIT_BYTES = 512 << 20
 _DEFAULT_FIT_GUI_TIMEOUT_SECONDS = 30.0
-_SAVED_FIT_GRID_FIXED_BYTES = 64 << 10
 _SCAN_REPEAT_AXIS_ID = AxisId("scan.repeat")
 _SCAN_READOUT_EVENT_AXIS_ID = AxisId("scan.readout_event")
 
@@ -220,10 +205,8 @@ def _validate_scan_request_fields(
     sequencer_ref: DeviceRef,
     trigger_channel: str | None,
     output_transform_spec: DataTransformSpec | None,
-    transport_memory_limit_bytes: int,
-    memory_limit_bytes: int,
     timeout_seconds: float,
-) -> tuple[int, int, float]:
+) -> float:
     if not isinstance(
         program,
         (AutonomousScanSlotProgram, ApiSlotSegmentedProgram),
@@ -240,14 +223,7 @@ def _validate_scan_request_fields(
             raise TypeError("output_transform_spec must be DataTransformSpec or None")
         if not output_transform_spec.operations:
             raise ValueError("empty output_transform_spec must be None")
-    return (
-        _positive_int(
-            transport_memory_limit_bytes,
-            "transport_memory_limit_bytes",
-        ),
-        _positive_int(memory_limit_bytes, "memory_limit_bytes"),
-        _positive_real(timeout_seconds, "timeout_seconds"),
-    )
+    return _positive_real(timeout_seconds, "timeout_seconds")
 
 
 def _resolve_scan_fixed_api(
@@ -287,23 +263,17 @@ class ScanRequest:
     sequencer_ref: DeviceRef
     trigger_channel: str | None = None
     output_transform_spec: DataTransformSpec | None = None
-    transport_memory_limit_bytes: int = 64 << 20
-    memory_limit_bytes: int = 512 << 20
     timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
-        transport, memory, timeout = _validate_scan_request_fields(
+        timeout = _validate_scan_request_fields(
             self.program,
             self.camera_ref,
             self.sequencer_ref,
             self.trigger_channel,
             self.output_transform_spec,
-            self.transport_memory_limit_bytes,
-            self.memory_limit_bytes,
             self.timeout_seconds,
         )
-        object.__setattr__(self, "transport_memory_limit_bytes", transport)
-        object.__setattr__(self, "memory_limit_bytes", memory)
         object.__setattr__(self, "timeout_seconds", timeout)
 
 
@@ -318,8 +288,6 @@ class OccupancyScanRequest:
     model_kind: ReadoutModelKind | None = None
     trigger_channel: str | None = None
     output_transform_spec: DataTransformSpec | None = None
-    transport_memory_limit_bytes: int = 64 << 20
-    memory_limit_bytes: int = 512 << 20
     timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
@@ -330,18 +298,14 @@ class OccupancyScanRequest:
             ReadoutModelKind,
         ):
             raise TypeError("model_kind must be ReadoutModelKind or None")
-        transport, memory, timeout = _validate_scan_request_fields(
+        timeout = _validate_scan_request_fields(
             self.program,
             self.camera_ref,
             self.sequencer_ref,
             self.trigger_channel,
             self.output_transform_spec,
-            self.transport_memory_limit_bytes,
-            self.memory_limit_bytes,
             self.timeout_seconds,
         )
-        object.__setattr__(self, "transport_memory_limit_bytes", transport)
-        object.__setattr__(self, "memory_limit_bytes", memory)
         object.__setattr__(self, "timeout_seconds", timeout)
 
 @dataclass(frozen=True)
@@ -351,7 +315,6 @@ class CalibrationArtifactRequest:
     source_capture_ref: CaptureArtifactRef
     readout_binding: ReadoutBindingKey
     analysis: CalibrationAnalysisRequest
-    memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES
     timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
@@ -361,11 +324,6 @@ class CalibrationArtifactRequest:
             raise TypeError("readout_binding must be ReadoutBindingKey")
         if not isinstance(self.analysis, CalibrationAnalysisRequest):
             raise TypeError("analysis must be CalibrationAnalysisRequest")
-        object.__setattr__(
-            self,
-            "memory_limit_bytes",
-            _positive_int(self.memory_limit_bytes, "memory_limit_bytes"),
-        )
         object.__setattr__(
             self,
             "timeout_seconds",
@@ -412,7 +370,6 @@ class DetectionRequest:
     readout_binding: ReadoutBindingKey
     readout_event_axis_id: AxisId
     model_kind: ReadoutModelKind
-    memory_limit_bytes: int = _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES
     timeout_seconds: float = _DEFAULT_OCCUPANCY_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
@@ -426,11 +383,6 @@ class DetectionRequest:
             raise TypeError("readout_event_axis_id must be AxisId")
         if not isinstance(self.model_kind, ReadoutModelKind):
             raise TypeError("model_kind must be a concrete ReadoutModelKind")
-        object.__setattr__(
-            self,
-            "memory_limit_bytes",
-            _positive_int(self.memory_limit_bytes, "memory_limit_bytes"),
-        )
         object.__setattr__(
             self,
             "timeout_seconds",
@@ -557,18 +509,12 @@ def _occupancy_repository(
 def _occupancy_cell_navigation(
     reference,
     inspected,
-    *,
-    cell_peak_upper_bound_bytes: int,
 ):
     """Project neutral FINAL metadata into the frontend-owned navigation value."""
 
-    from zlc_frontend.occupancy_render import (
-        OccupancyCellNavigation,
-        estimate_occupancy_navigation_retained_nbytes,
-    )
+    from zlc_frontend.occupancy_render import OccupancyCellNavigation
 
     schema = inspected.occupied_schema
-    axes = (schema.repeat_axis, *schema.point_axes)
     return OccupancyCellNavigation(
         artifact_identity=reference.target_ref,
         schema_fingerprint=schema.fingerprint,
@@ -577,37 +523,7 @@ def _occupancy_cell_navigation(
         point_axes=schema.point_axes,
         point_layout=schema.point_layout,
         cell_layout=schema.cell_layout,
-        retained_upper_bound_bytes=estimate_occupancy_navigation_retained_nbytes(
-            inspected.inspection_retained_upper_bound_bytes,
-            len(axes),
-        ),
-        cell_peak_upper_bound_bytes=cell_peak_upper_bound_bytes,
     )
-
-
-def _occupancy_cell_source_projection_peak(
-    inspected,
-    source_inspection,
-    calibration_inspection,
-    *,
-    view_peak_upper_bound_bytes: int,
-    occupancy_admission_peak_upper_bound_bytes: int,
-) -> int:
-    """Compose sequential repository phases without reimplementing their peaks."""
-
-    inspection_retained = (
-        inspected.inspection_retained_upper_bound_bytes
-        + source_inspection.inspection_retained_upper_bound_bytes
-        + calibration_inspection.inspection_retained_upper_bound_bytes
-    )
-    repository_phase = max(
-        occupancy_admission_peak_upper_bound_bytes,
-        calibration_inspection.artifact_decode_peak_upper_bound_bytes,
-        source_inspection.admission_decode_peak_upper_bound_bytes,
-        source_inspection.admission_retained_upper_bound_bytes
-        + source_inspection.max_read_scratch_bytes,
-    )
-    return inspection_retained + view_peak_upper_bound_bytes + repository_phase
 
 
 class PulseFacade:
@@ -797,7 +713,6 @@ class ReadoutFacade:
         self,
         *,
         camera_role: str | None = None,
-        memory_limit_bytes: int = 256 << 20,
         io_timeout_seconds: float = 2.0,
         history_capacity: int = 8,
         roi: Selection | None = None,
@@ -811,7 +726,6 @@ class ReadoutFacade:
             role = self._resolve_monitor_camera_role(services, camera_role)
             return CameraMonitorRequest(
                 camera_ref=services.catalog.require(role).ref,
-                memory_limit_bytes=memory_limit_bytes,
                 io_timeout_seconds=io_timeout_seconds,
                 history_capacity=history_capacity,
                 roi=roi,
@@ -868,8 +782,6 @@ class ReadoutFacade:
         repeat_count: int = 1,
         readout_events_per_repeat: int | None = None,
         within_point_grouping: tuple[tuple[int, int], ...] | None = None,
-        transport_memory_limit_bytes: int = 64 << 20,
-        pipeline_memory_limit_bytes: int = 256 << 20,
         timeout_seconds: float = 30.0,
     ) -> CaptureRequest:
         with _service_guard(self._token) as services:
@@ -897,8 +809,6 @@ class ReadoutFacade:
                 repeat_count,
                 readout_events_per_repeat,
                 within_point_grouping,
-                transport_memory_limit_bytes,
-                pipeline_memory_limit_bytes,
                 timeout_seconds,
             )
 
@@ -921,8 +831,6 @@ class ReadoutFacade:
         trigger_channel: str | None = None,
         api_values: Mapping[str, int | float] | None = None,
         output_transform_spec: DataTransformSpec | None = None,
-        transport_memory_limit_bytes: int = 64 << 20,
-        memory_limit_bytes: int = 512 << 20,
         timeout_seconds: float = 30.0,
     ) -> ScanRequest:
         """Build one direct-camera autonomous SCAN_SLOT request.
@@ -953,8 +861,6 @@ class ReadoutFacade:
                 ).ref,
                 trigger_channel=trigger_channel,
                 output_transform_spec=output_transform_spec,
-                transport_memory_limit_bytes=transport_memory_limit_bytes,
-                memory_limit_bytes=memory_limit_bytes,
                 timeout_seconds=timeout_seconds,
             )
 
@@ -974,8 +880,6 @@ class ReadoutFacade:
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
         output_transform_spec: DataTransformSpec | None = None,
-        transport_memory_limit_bytes: int = 64 << 20,
-        memory_limit_bytes: int = 512 << 20,
         timeout_seconds: float = 30.0,
     ) -> ScanRequest:
         """Build the accepted finite API_SLOT segmented exception explicitly."""
@@ -1004,8 +908,6 @@ class ReadoutFacade:
                 sequencer_ref=services.catalog.require(sequencer_role).ref,
                 trigger_channel=trigger_channel,
                 output_transform_spec=output_transform_spec,
-                transport_memory_limit_bytes=transport_memory_limit_bytes,
-                memory_limit_bytes=memory_limit_bytes,
                 timeout_seconds=timeout_seconds,
             )
 
@@ -1030,8 +932,6 @@ class ReadoutFacade:
         trigger_channel: str | None = None,
         api_values: Mapping[str, int | float] | None = None,
         output_transform_spec: DataTransformSpec | None = None,
-        transport_memory_limit_bytes: int = 64 << 20,
-        memory_limit_bytes: int = 512 << 20,
         timeout_seconds: float = 30.0,
     ) -> OccupancyScanRequest:
         """Build the first external Measurement→Processor SCAN_SLOT request."""
@@ -1058,8 +958,6 @@ class ReadoutFacade:
                 model_kind=model_kind,
                 trigger_channel=trigger_channel,
                 output_transform_spec=output_transform_spec,
-                transport_memory_limit_bytes=transport_memory_limit_bytes,
-                memory_limit_bytes=memory_limit_bytes,
                 timeout_seconds=timeout_seconds,
             )
 
@@ -1095,8 +993,6 @@ class ReadoutFacade:
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
         output_transform_spec: DataTransformSpec | None = None,
-        transport_memory_limit_bytes: int = 64 << 20,
-        memory_limit_bytes: int = 512 << 20,
         timeout_seconds: float = 30.0,
     ) -> OccupancyScanRequest:
         with _service_guard(self._token) as services:
@@ -1125,8 +1021,6 @@ class ReadoutFacade:
                 model_kind=model_kind,
                 trigger_channel=trigger_channel,
                 output_transform_spec=output_transform_spec,
-                transport_memory_limit_bytes=transport_memory_limit_bytes,
-                memory_limit_bytes=memory_limit_bytes,
                 timeout_seconds=timeout_seconds,
             )
 
@@ -1157,30 +1051,17 @@ class ReadoutFacade:
     def materialize_scan(
         self,
         reference: ScanArtifactRef,
-        *,
-        memory_limit_bytes: int = (
-            _DEFAULT_SCAN_MATERIALIZATION_MEMORY_LIMIT_BYTES
-        ),
     ) -> MaterializedScanData:
-        """Load the canonical scan dataset under one source/transform peak cap."""
+        """Load the canonical scan dataset."""
 
         with _service_guard(self._token) as services:
-            return services.scan_repository.materialize(
-                reference,
-                memory_limit_bytes=_positive_int(
-                    memory_limit_bytes,
-                    "memory_limit_bytes",
-                ),
-            )
+            return services.scan_repository.materialize(reference)
 
     def sitemap(
         self,
         *,
         frames: int = 20,
         camera_role: str | None = None,
-        transport_memory_limit_bytes: int = 64 << 20,
-        capture_pipeline_memory_limit_bytes: int = 256 << 20,
-        calibration_memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
         capture_timeout_seconds: float = 30.0,
         calibration_timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS,
     ) -> CalibrationArtifactRef:
@@ -1194,18 +1075,6 @@ class ReadoutFacade:
         """
 
         repeat_groups = _positive_int(frames, "frames")
-        transport_memory = _positive_int(
-            transport_memory_limit_bytes,
-            "transport_memory_limit_bytes",
-        )
-        capture_pipeline_memory = _positive_int(
-            capture_pipeline_memory_limit_bytes,
-            "capture_pipeline_memory_limit_bytes",
-        )
-        calibration_memory = _positive_int(
-            calibration_memory_limit_bytes,
-            "calibration_memory_limit_bytes",
-        )
         capture_timeout = _positive_real(
             capture_timeout_seconds,
             "capture_timeout_seconds",
@@ -1236,8 +1105,6 @@ class ReadoutFacade:
             repeat_count=repeat_groups,
             readout_events_per_repeat=profile.event_count,
             within_point_grouping=grouping,
-            transport_memory_limit_bytes=transport_memory,
-            pipeline_memory_limit_bytes=capture_pipeline_memory,
             timeout_seconds=capture_timeout,
         )
         source = _run(self._token, capture_request)
@@ -1245,7 +1112,6 @@ class ReadoutFacade:
             request = self.calibration_request(
                 source,
                 analysis,
-                memory_limit_bytes=calibration_memory,
                 timeout_seconds=calibration_timeout,
             )
             return self.calibrate(request)
@@ -1259,7 +1125,6 @@ class ReadoutFacade:
         source: CaptureArtifactRef,
         analysis: CalibrationAnalysisRequest,
         *,
-        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
         timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS,
     ) -> CalibrationArtifactRequest:
         """Freeze explicit calibration intent from one FINAL capture inspection."""
@@ -1268,20 +1133,15 @@ class ReadoutFacade:
             raise TypeError("source must be CaptureArtifactRef")
         if not isinstance(analysis, CalibrationAnalysisRequest):
             raise TypeError("analysis must be CalibrationAnalysisRequest")
-        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         timeout = _positive_real(timeout_seconds, "timeout_seconds")
         with _service_guard(self._token) as services:
-            inspected = services.capture_repository.inspect_final(
-                source,
-                memory_limit_bytes=memory_limit,
-            )
+            inspected = services.capture_repository.inspect_final(source)
             binding = inspected.readout_binding
             self._require_binding(binding)
             return CalibrationArtifactRequest(
                 source,
                 binding,
                 analysis,
-                memory_limit,
                 timeout,
             )
 
@@ -1308,7 +1168,6 @@ class ReadoutFacade:
         source_capture_ref: CaptureArtifactRef,
         readout_binding: ReadoutBindingKey,
         analysis: CalibrationAnalysisRequest,
-        memory_limit_bytes: int,
         timeout_seconds: float,
     ) -> RunHandle:
         """Narrow Workbench command; request construction stays in this owner."""
@@ -1318,7 +1177,6 @@ class ReadoutFacade:
                 source_capture_ref,
                 readout_binding,
                 analysis,
-                memory_limit_bytes,
                 timeout_seconds,
             )
         )
@@ -1336,7 +1194,6 @@ class ReadoutFacade:
             request.source_capture_ref,
             request.readout_binding,
             request.analysis,
-            request.memory_limit_bytes,
             request.timeout_seconds,
         )
         return open_calibration_workbench(
@@ -1349,14 +1206,12 @@ class ReadoutFacade:
         self,
         reference: CalibrationArtifactRef,
         *,
-        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
         timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS,
     ):
         """Reopen an exact calibration and create a new immutable revision."""
 
         if not isinstance(reference, CalibrationArtifactRef):
             raise TypeError("reference must be CalibrationArtifactRef")
-        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         timeout = _positive_real(timeout_seconds, "timeout_seconds")
         from Zou_lab_control.workbench import open_calibration_workbench
 
@@ -1364,22 +1219,17 @@ class ReadoutFacade:
             self._load_calibration_report_source,
             self._start_calibration_from_editor,
             reference=reference,
-            memory_limit_bytes=limit,
             timeout_seconds=timeout,
         )
 
     def load_calibration(
         self,
         reference: CalibrationArtifactRef,
-        *,
-        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
     ) -> ResolvedCalibration:
-        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         with _service_guard(self._token) as services:
             resolved = _calibration_repository(services).admit(
                 reference,
                 services.capture_repository,
-                memory_limit_bytes=memory_limit,
             )
             self._require_binding(resolved.artifact.frame_contract.binding)
             return resolved
@@ -1387,69 +1237,40 @@ class ReadoutFacade:
     def load_calibration_computation(
         self,
         reference: CalibrationArtifactRef,
-        *,
-        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
     ) -> "CalibrationComputation":
-        computation, _retained_upper_bound = self._load_calibration_report_source(
-            reference,
-            memory_limit_bytes=memory_limit_bytes,
-        )
-        return computation
+        return self._load_calibration_report_source(reference)
 
     def _load_calibration_report_source(
         self,
         reference: CalibrationArtifactRef,
-        *,
-        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
-    ) -> tuple["CalibrationComputation", int]:
-        """Load diagnostics plus the repository-owned retained-memory bound."""
+    ) -> "CalibrationComputation":
+        """Load committed calibration diagnostics."""
 
-        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         with _service_guard(self._token) as services:
             repository = _calibration_repository(services)
-            summary = repository.inspect_final(
-                reference,
-                memory_limit_bytes=memory_limit,
-            )
+            summary = repository.inspect_final(reference)
             self._require_binding(summary.readout_binding)
-            computation = repository.load_computation(
-                reference,
-                memory_limit_bytes=memory_limit,
-            )
-            retained_upper_bound = (
-                summary.artifact_retained_upper_bound_bytes
-                + summary.report_materialization_peak_upper_bound_bytes
-            )
-            return computation, retained_upper_bound
+            return repository.load_computation(reference)
 
     def load_calibration_report(
         self,
         reference: CalibrationArtifactRef,
-        *,
-        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
     ) -> "CalibrationReport":
-        return self.load_calibration_computation(
-            reference,
-            memory_limit_bytes=memory_limit_bytes,
-        ).report
+        return self.load_calibration_computation(reference).report
 
     def calibration_report_gui(
         self,
         reference: CalibrationArtifactRef,
-        *,
-        memory_limit_bytes: int = _DEFAULT_CALIBRATION_MEMORY_LIMIT_BYTES,
     ):
         """Open one committed calibration report without blocking the Qt owner."""
 
         if not isinstance(reference, CalibrationArtifactRef):
             raise TypeError("reference must be CalibrationArtifactRef")
-        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         from Zou_lab_control.workbench import open_calibration_report_workbench
 
         return open_calibration_report_workbench(
             self._load_calibration_report_source,
             reference,
-            memory_limit_bytes=limit,
         )
 
     def detection_request(
@@ -1458,7 +1279,6 @@ class ReadoutFacade:
         calibration: CalibrationArtifactRef,
         *,
         model_kind: ReadoutModelKind | None = None,
-        memory_limit_bytes: int = _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES,
         timeout_seconds: float = _DEFAULT_OCCUPANCY_TIMEOUT_SECONDS,
     ) -> DetectionRequest:
         """Freeze one committed single-event capture for occupancy analysis."""
@@ -1469,18 +1289,11 @@ class ReadoutFacade:
             raise TypeError("calibration must be CalibrationArtifactRef")
         if model_kind is not None and not isinstance(model_kind, ReadoutModelKind):
             raise TypeError("model_kind must be ReadoutModelKind or None")
-        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         timeout = _positive_real(timeout_seconds, "timeout_seconds")
         with _service_guard(self._token) as services:
-            inspected_source = services.capture_repository.inspect_final(
-                source,
-                memory_limit_bytes=memory_limit,
-            )
-            inspected_calibration = _calibration_repository(
-                services
-            ).inspect_final(
-                calibration,
-                memory_limit_bytes=memory_limit,
+            inspected_source = services.capture_repository.inspect_final(source)
+            inspected_calibration = _calibration_repository(services).inspect_final(
+                calibration
             )
             binding = inspected_source.readout_binding
             if inspected_calibration.readout_binding != binding:
@@ -1508,7 +1321,6 @@ class ReadoutFacade:
                 binding,
                 event_axes[0].axis_id,
                 selected_model,
-                memory_limit,
                 timeout,
             )
 
@@ -1527,18 +1339,14 @@ class ReadoutFacade:
     def load_occupancy(
         self,
         reference: OccupancyArtifactRef,
-        *,
-        memory_limit_bytes: int = _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES,
     ) -> "ResolvedOccupancy":
         if not isinstance(reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
-        memory_limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         with _service_guard(self._token) as services:
             resolved = _occupancy_repository(services).admit(
                 reference,
                 services.capture_repository,
                 _calibration_repository(services),
-                memory_limit_bytes=memory_limit,
             )
             self._require_binding(resolved.readout_binding)
             return resolved
@@ -1546,28 +1354,20 @@ class ReadoutFacade:
     def _inspect_occupancy_cell_navigation(
         self,
         reference: OccupancyArtifactRef,
-        *,
-        memory_limit_bytes: int,
     ):
         """Read only the committed outer-axis metadata needed by the navigator."""
 
         if not isinstance(reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
-        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         with _service_guard(self._token) as services:
             occupancy_repository = _occupancy_repository(services)
             calibration_repository = _calibration_repository(services)
-            inspected = occupancy_repository.inspect_final(
-                reference,
-                memory_limit_bytes=limit,
-            )
+            inspected = occupancy_repository.inspect_final(reference)
             source_info = services.capture_repository.inspect_final(
-                inspected.source_capture_ref,
-                memory_limit_bytes=limit,
+                inspected.source_capture_ref
             )
             calibration_info = calibration_repository.inspect_final(
-                inspected.calibration_reference,
-                memory_limit_bytes=limit,
+                inspected.calibration_reference
             )
             self._require_binding(source_info.readout_binding)
             if calibration_info.readout_binding != source_info.readout_binding:
@@ -1597,78 +1397,24 @@ class ReadoutFacade:
             site_count = inspected.occupied_schema.cell_schema.data_axes[0].size
             if calibration_info.site_count != site_count:
                 raise ValueError("occupancy SITE cardinality differs from calibration")
-            from zlc_frontend.occupancy_render import (
-                estimate_interactive_site_map_peak_nbytes,
-                estimate_occupancy_cell_view_retained_nbytes,
-            )
-
-            view_peak = estimate_occupancy_cell_view_retained_nbytes(
-                frame_schema.data_shape,
-                frame_schema.dtype,
-                site_count,
-            )
-            inspection_retained = (
-                inspected.inspection_retained_upper_bound_bytes
-                + source_info.inspection_retained_upper_bound_bytes
-                + calibration_info.inspection_retained_upper_bound_bytes
-            )
-            repository_limit = limit - inspection_retained - view_peak
-            if repository_limit <= 0:
-                raise MemoryError(
-                    "occupancy navigation inspections leave no exact-cell display budget"
-                )
-            admission_peak = occupancy_repository.admission_peak_upper_bound_bytes(
-                reference,
-                services.capture_repository,
-                calibration_repository,
-                memory_limit_bytes=repository_limit,
-            )
-            source_projection_peak = _occupancy_cell_source_projection_peak(
-                inspected,
-                source_info,
-                calibration_info,
-                view_peak_upper_bound_bytes=view_peak,
-                occupancy_admission_peak_upper_bound_bytes=admission_peak,
-            )
-            cell_peak = estimate_interactive_site_map_peak_nbytes(
-                (y_axes[0].size, x_axes[0].size),
-                frame_schema.dtype,
-                site_count,
-                source_projection_peak_upper_bound_bytes=source_projection_peak,
-            )
-            navigation = _occupancy_cell_navigation(
-                reference,
-                inspected,
-                cell_peak_upper_bound_bytes=cell_peak,
-            )
-            required = navigation.retained_upper_bound_bytes + cell_peak
-            if required > limit:
-                raise MemoryError(
-                    f"interactive occupancy cell requires {required} bytes; "
-                    f"limit is {limit}"
-                )
-            return navigation
+            return _occupancy_cell_navigation(reference, inspected)
 
     def _load_occupancy_cell_source(
         self,
         reference: OccupancyArtifactRef,
         selection: Selection | None,
         *,
-        memory_limit_bytes: int,
         expected_navigation=None,
     ):
-        """Compose one self-contained exact-cell view under one aggregate cap."""
+        """Compose one self-contained exact-cell view."""
 
         if not isinstance(reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
         if selection is not None and not isinstance(selection, Selection):
             raise TypeError("selection must be Selection or None")
-        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         from zlc_frontend.occupancy_render import (
             OccupancyCellNavigation,
             OccupancyCellView,
-            estimate_interactive_site_map_peak_nbytes,
-            estimate_occupancy_cell_view_retained_nbytes,
         )
         from zlc_frontend.figure import (
             DatasetId,
@@ -1688,35 +1434,13 @@ class ReadoutFacade:
         with _service_guard(self._token) as services:
             occupancy_repository = _occupancy_repository(services)
             calibration_repository = _calibration_repository(services)
-            inspected = occupancy_repository.inspect_final(
-                reference,
-                memory_limit_bytes=limit,
-            )
-            inspection_headroom = inspected.inspection_retained_upper_bound_bytes
-            if inspection_headroom >= limit:
-                raise MemoryError(
-                    "occupancy inspection leaves no display budget"
-                )
+            inspected = occupancy_repository.inspect_final(reference)
             source_info = services.capture_repository.inspect_final(
-                inspected.source_capture_ref,
-                memory_limit_bytes=limit - inspection_headroom,
+                inspected.source_capture_ref
             )
-            inspection_headroom += source_info.inspection_retained_upper_bound_bytes
-            if inspection_headroom >= limit:
-                raise MemoryError(
-                    "occupancy and capture inspections leave no display budget"
-                )
             calibration_info = calibration_repository.inspect_final(
-                inspected.calibration_reference,
-                memory_limit_bytes=limit - inspection_headroom,
+                inspected.calibration_reference
             )
-            inspection_headroom += (
-                calibration_info.inspection_retained_upper_bound_bytes
-            )
-            if inspection_headroom >= limit:
-                raise MemoryError(
-                    "occupancy dependency inspections leave no display budget"
-                )
             self._require_binding(source_info.readout_binding)
             if calibration_info.readout_binding != source_info.readout_binding:
                 raise ValueError("occupancy source and calibration bindings differ")
@@ -1740,50 +1464,10 @@ class ReadoutFacade:
                 raise ValueError("physical occupancy frame axes are not distinct")
             x_axis, y_axis = frame_axes[x_position], frame_axes[y_position]
             site_axis = inspected.occupied_schema.cell_schema.data_axes[0]
-            view_bound = estimate_occupancy_cell_view_retained_nbytes(
-                frame_schema.data_shape,
-                frame_schema.dtype,
-                site_axis.size,
-            )
-            available = limit - inspection_headroom - view_bound
-            if available <= 0:
-                raise MemoryError(
-                    "occupancy inspections, exact-cell projection, and materialization "
-                    "exceed the display budget"
-                )
-            admission_peak = occupancy_repository.admission_peak_upper_bound_bytes(
-                reference,
-                services.capture_repository,
-                calibration_repository,
-                memory_limit_bytes=available,
-            )
-            if admission_peak > available:
-                raise MemoryError(
-                    "occupancy dependency admission, exact-cell projection, and "
-                    "inspections exceed the display budget"
-                )
-            source_projection_peak = _occupancy_cell_source_projection_peak(
-                inspected,
-                source_info,
-                calibration_info,
-                view_peak_upper_bound_bytes=view_bound,
-                occupancy_admission_peak_upper_bound_bytes=admission_peak,
-            )
-            cell_peak = estimate_interactive_site_map_peak_nbytes(
-                (y_axis.size, x_axis.size),
-                frame_schema.dtype,
-                site_axis.size,
-                source_projection_peak_upper_bound_bytes=source_projection_peak,
-            )
-            current_navigation = _occupancy_cell_navigation(
-                reference,
-                inspected,
-                cell_peak_upper_bound_bytes=cell_peak,
-            )
-            if expected_navigation is not None and (
-                current_navigation.identity != expected_navigation.identity
-                or current_navigation.cell_peak_upper_bound_bytes
-                != expected_navigation.cell_peak_upper_bound_bytes
+            current_navigation = _occupancy_cell_navigation(reference, inspected)
+            if (
+                expected_navigation is not None
+                and current_navigation.identity != expected_navigation.identity
             ):
                 raise ValueError("occupancy artifact changed after navigation inspection")
             navigation = (
@@ -1791,11 +1475,6 @@ class ReadoutFacade:
                 if expected_navigation is None
                 else expected_navigation
             )
-            if cell_peak > limit:
-                raise MemoryError(
-                    f"interactive occupancy cell requires {cell_peak} bytes; "
-                    f"limit is {limit}"
-                )
             repeat_index, point_storage_index, logical_point, _cell_label = (
                 navigation.resolve_selection(selection)
             )
@@ -1808,7 +1487,6 @@ class ReadoutFacade:
                 reference,
                 services.capture_repository,
                 calibration_repository,
-                memory_limit_bytes=available,
             )
             artifact = resolved.artifact
             if (
@@ -1843,15 +1521,7 @@ class ReadoutFacade:
             calibration_ref = artifact.calibration_reference
             del artifact, resolved, validity
 
-            if calibration_info.artifact_decode_peak_upper_bound_bytes > available:
-                raise MemoryError(
-                    "dependency inspections, calibration artifact, and occupancy cell "
-                    "view exceed the display budget"
-                )
-            calibration = calibration_repository.load(
-                calibration_ref,
-                memory_limit_bytes=available,
-            )
+            calibration = calibration_repository.load(calibration_ref)
             calibration_site_axis = calibration.site_map.site_axis
             if calibration_site_axis != site_axis:
                 raise ValueError("occupancy SITE axis differs from its calibration")
@@ -1879,20 +1549,6 @@ class ReadoutFacade:
                 != inspected.occupied_schema.point_layout
             ):
                 raise ValueError("occupancy outer axes differ from the source capture")
-            if source_info.admission_decode_peak_upper_bound_bytes > available:
-                raise MemoryError(
-                    "dependency inspections, capture admission, and occupancy cell view "
-                    "exceed the display budget"
-                )
-            if (
-                source_info.admission_retained_upper_bound_bytes
-                + source_info.max_read_scratch_bytes
-                > available
-            ):
-                raise MemoryError(
-                    "dependency inspections, exact source-frame read, and occupancy cell "
-                    "view exceed the display budget"
-                )
             source = services.capture_repository.admit(source_ref)
             source_artifact = source.artifact
             frame_source = source_artifact.frame_source
@@ -1977,17 +1633,14 @@ class ReadoutFacade:
                 provenance_epoch_id=source_generation.value,
                 summary=summary,
             )
-            if view.array_nbytes > view_bound:
-                raise MemoryError("occupancy cell projection exceeded its owner bound")
             del source, source_artifact, frame_source, sample, frame_validity
-            return view, view_bound
+            return view
 
     def occupancy_cell_gui(
         self,
         reference: OccupancyArtifactRef,
         *,
         selection: Selection | None = None,
-        memory_limit_bytes: int = _DEFAULT_OCCUPANCY_MEMORY_LIMIT_BYTES,
     ):
         """Open one exact same-shot camera/occupancy physical map."""
 
@@ -1995,7 +1648,6 @@ class ReadoutFacade:
             raise TypeError("reference must be OccupancyArtifactRef")
         if selection is not None and not isinstance(selection, Selection):
             raise TypeError("selection must be Selection or None")
-        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         from Zou_lab_control.workbench import open_occupancy_cell_workbench
 
         return open_occupancy_cell_workbench(
@@ -2003,7 +1655,6 @@ class ReadoutFacade:
             self._load_occupancy_cell_source,
             reference,
             selection=selection,
-            memory_limit_bytes=limit,
         )
 
 
@@ -2015,7 +1666,7 @@ def _project_notebook_figure(
     selection,
     preferences,
     occupancy_output,
-    memory_limit_bytes: int | None,
+    materialize: bool,
     draft_fit_result: FitResultBatch | None = None,
     preloaded_snapshot: OwnedSnapshot | None = None,
     preinspected_schema=None,
@@ -2034,7 +1685,6 @@ def _project_notebook_figure(
         SuggestionStatus,
         ViewIntent,
         ViewPreferences,
-        estimate_view_evaluation_peak_nbytes,
         suggest_fit_view,
         suggest_view,
     )
@@ -2076,7 +1726,7 @@ def _project_notebook_figure(
             "preinspected_schema and preinspected_dataset_ref must be supplied together"
         )
     if preinspected_schema is not None:
-        if memory_limit_bytes is not None or preloaded_snapshot is not None:
+        if materialize or preloaded_snapshot is not None:
             raise ValueError(
                 "preinspected metadata is valid only for document-only projection"
             )
@@ -2106,7 +1756,7 @@ def _project_notebook_figure(
             "occupied" if occupancy_output is None else occupancy_output
         )
         repository = _occupancy_repository(services)
-        if memory_limit_bytes is None:
+        if not materialize:
             inspected = repository.inspect_final(source)
             schema = (
                 inspected.occupied_schema
@@ -2119,7 +1769,6 @@ def _project_notebook_figure(
                 source,
                 services.capture_repository,
                 _calibration_repository(services),
-                memory_limit_bytes=memory_limit_bytes,
             )
             artifact = resolved.artifact
             snapshot = (
@@ -2144,7 +1793,6 @@ def _project_notebook_figure(
             source,
             capture_repository=services.capture_repository,
             scan_repository=services.scan_repository,
-            memory_limit_bytes=memory_limit_bytes,
         )
         source_ref = admitted_fit.source_artifact_ref
         fit_result = admitted_fit.result
@@ -2159,26 +1807,11 @@ def _project_notebook_figure(
         )
 
     if source_ref is not None:
-        inspection_limit = memory_limit_bytes
-        fit_retained = (
-            0
-            if fit_result is None
-            else fit_result_retained_upper_bound_nbytes(fit_result)
-        )
-        if inspection_limit is None and fit_result is not None:
-            inspection_limit = (
-                services.fit_repository.materialization_memory_limit_bytes
-            )
-        if inspection_limit is not None and snapshot is None:
-            inspection_limit -= fit_retained
-            if inspection_limit <= 0:
-                raise MemoryError("fit overlay leaves no source inspection budget")
         if isinstance(source_ref, CaptureArtifactRef):
             if snapshot is None:
                 if preinspected_schema is None:
                     source_inspection = services.capture_repository.inspect_final(
-                        source_ref,
-                        memory_limit_bytes=inspection_limit,
+                        source_ref
                     )
                     schema = source_inspection.dataset_schema
                     source_dataset_ref = source_inspection.dataset_revision_ref
@@ -2192,8 +1825,7 @@ def _project_notebook_figure(
             if snapshot is None:
                 if preinspected_schema is None:
                     source_inspection = services.scan_repository.inspect_final(
-                        source_ref,
-                        memory_limit_bytes=inspection_limit,
+                        source_ref
                     )
                     schema = source_inspection.output_schema
                     source_dataset_ref = source_inspection.output_dataset_ref
@@ -2206,26 +1838,6 @@ def _project_notebook_figure(
         else:
             raise TypeError("fit source artifact kind is not current")
     if fit_result is not None:
-        validation_peak = (
-            fit_result_source_validation_additional_peak_upper_bound_nbytes(
-                fit_result,
-                schema,
-            )
-        )
-        validation_limit = memory_limit_bytes
-        if validation_limit is None:
-            validation_limit = services.fit_repository.materialization_memory_limit_bytes
-        validation_required = validation_peak
-        if snapshot is None:
-            validation_required += fit_result_retained_upper_bound_nbytes(fit_result)
-            if source_inspection is not None:
-                validation_required += (
-                    source_inspection.inspection_retained_upper_bound_bytes
-                )
-        if validation_required > validation_limit:
-            raise MemoryError(
-                "Fit source validation exceeds the aggregate planning budget"
-            )
         validate_fit_result_source_binding(
             fit_result,
             source_dataset_ref,
@@ -2272,38 +1884,6 @@ def _project_notebook_figure(
         )
         label = source_label
     else:
-        if fit_result.spec.committed_transform is not None:
-            transform_peak = (
-                fit_transform_resolution_additional_peak_upper_bound_nbytes(
-                    schema
-                )
-            )
-            if snapshot is None:
-                planning_limit = memory_limit_bytes
-                if planning_limit is None:
-                    planning_limit = (
-                        services.fit_repository.materialization_memory_limit_bytes
-                    )
-                inspection_retained = (
-                    0
-                    if source_inspection is None
-                    else source_inspection.inspection_retained_upper_bound_bytes
-                )
-                planning_required = (
-                    fit_result_retained_upper_bound_nbytes(fit_result)
-                    + inspection_retained
-                    + transform_peak
-                )
-            else:
-                planning_limit = memory_limit_bytes
-                planning_required = transform_peak
-            if (
-                planning_limit is not None
-                and planning_required > planning_limit
-            ):
-                raise MemoryError(
-                    "transformed Fit view planning exceeds the aggregate budget"
-                )
         suggestion = suggest_fit_view(
             schema,
             fit_result,
@@ -2325,67 +1905,20 @@ def _project_notebook_figure(
         datasets=(DatasetDescriptor(dataset_id, label, schema.fingerprint),),
         layers=(FigureLayer("data", dataset_id, suggestion.spec),),
     )
-    if memory_limit_bytes is None:
+    if not materialize:
         return document, None, fit_result
     if snapshot is None and source_ref is not None:
         if source_inspection is None:
-            raise RuntimeError("figure source inspection was not retained for admission")
-        from zlc_frontend import figure_document_retained_upper_bound_nbytes
-
-        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
-        result_retained = (
-            0
-            if fit_result is None
-            else fit_result_retained_upper_bound_nbytes(fit_result)
-        )
-        schema_retained = dataset_schema_retained_upper_bound_nbytes(schema)
-        source_arrays = dataset_storage_nbytes(schema)
-        document_retained = figure_document_retained_upper_bound_nbytes(document)
-        validation_peak = (
-            0
-            if fit_result is None
-            else fit_result_source_validation_additional_peak_upper_bound_nbytes(
-                fit_result,
-                schema,
-            )
-        )
-        evaluation_peak = estimate_view_evaluation_peak_nbytes(
-            schema,
-            suggestion.spec,
-        )
-        source_peak = source_inspection.materialization_peak_upper_bound_bytes
-        required = (
-            result_retained
-            + document_retained
-            + max(
-                source_peak,
-                source_arrays
-                + schema_retained
-                + max(validation_peak, evaluation_peak),
-            )
-        )
-        if required > limit:
-            raise MemoryError(
-                f"figure aggregate construction peak {required} exceeds limit {limit}"
-            )
-        materialization_limit = limit - result_retained - document_retained
-        if materialization_limit <= 0:
-            raise MemoryError("figure metadata leaves no source materialization budget")
+            raise RuntimeError("figure source inspection is unavailable")
         del source_inspection, schema, suggestion
         if isinstance(source_ref, CaptureArtifactRef):
-            snapshot = services.capture_repository.materialize_final(
-                source_ref,
-                memory_limit_bytes=materialization_limit,
-            )
+            snapshot = services.capture_repository.materialize_final(source_ref)
         elif isinstance(source_ref, ScanArtifactRef):
-            snapshot = services.scan_repository.materialize(
-                source_ref,
-                memory_limit_bytes=materialization_limit,
-            ).snapshot
+            snapshot = services.scan_repository.materialize(source_ref).snapshot
         else:  # pragma: no cover - source kind is closed above
             raise TypeError("fit source artifact kind is not current")
     if snapshot is None:
-        raise RuntimeError("figure source was not materialized under its budget")
+        raise RuntimeError("figure source was not materialized")
     return (
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
@@ -2401,10 +1934,8 @@ def _data_figure_for_services(
     selection,
     preferences,
     occupancy_output,
-    memory_limit_bytes: int,
     draft_fit_result: FitResultBatch | None = None,
     preloaded_snapshot: OwnedSnapshot | None = None,
-    retained_inputs_prebudgeted: bool = False,
 ) -> "DataFigure":
     """Build one frozen DataFigure while repository authority stays private."""
 
@@ -2415,76 +1946,17 @@ def _data_figure_for_services(
         selection=selection,
         preferences=preferences,
         occupancy_output=occupancy_output,
-        memory_limit_bytes=memory_limit_bytes,
+        materialize=True,
         draft_fit_result=draft_fit_result,
         preloaded_snapshot=preloaded_snapshot,
     )
     assert datasets is not None
-    from zlc_frontend import (
-        DataFigure,
-        figure_document_retained_upper_bound_nbytes,
-    )
+    from zlc_frontend import DataFigure
 
-    document_retained = figure_document_retained_upper_bound_nbytes(document)
-
-    if retained_inputs_prebudgeted:
-        if preloaded_snapshot is None:
-            raise ValueError(
-                "prebudgeted figure inputs require an explicit preloaded snapshot"
-            )
-        evaluation_limit = memory_limit_bytes - document_retained
-        if evaluation_limit <= 0:
-            raise MemoryError(
-                "prebudgeted Figure session leaves no document/evaluation budget"
-            )
-        # The caller already owns the source arrays/schema/result.  The
-        # newly-created document remains live while render validation builds
-        # its candidate, so it must still be reserved from this residual.
-        render_limit = memory_limit_bytes - document_retained
-    else:
-        retained_source_bytes = sum(
-            dataset_storage_nbytes(entry.snapshot.block.schema)
-            for entry in datasets.entries
-        )
-        retained_schema_bytes = sum(
-            dataset_schema_retained_upper_bound_nbytes(
-                entry.snapshot.block.schema
-            )
-            for entry in datasets.entries
-        )
-        retained_fit_bytes = (
-            0
-            if fit_result is None
-            else fit_result_retained_upper_bound_nbytes(fit_result)
-        )
-        evaluation_limit = (
-            memory_limit_bytes
-            - retained_source_bytes
-            - retained_schema_bytes
-            - retained_fit_bytes
-            - document_retained
-        )
-        if evaluation_limit <= 0:
-            raise MemoryError(
-                "figure source and fit overlay leave no memory for view evaluation"
-            )
-        # Render validation accounts its evaluated arrays, but not the frozen
-        # FigureDocument, source schema metadata, or fit result which remain
-        # live after source-array evaluation ownership has been released.
-        render_limit = (
-            memory_limit_bytes
-            - retained_schema_bytes
-            - retained_fit_bytes
-            - document_retained
-        )
-        if render_limit <= 0:
-            raise MemoryError("fit overlay leaves no memory for figure rendering")
     return DataFigure(
         document,
         datasets,
         fit_results=({"data": fit_result} if fit_result is not None else None),
-        evaluation_memory_limit_bytes=evaluation_limit,
-        render_memory_limit_bytes=render_limit,
     )
 
 
@@ -2592,7 +2064,6 @@ class Experiment:
         fit_axis_ids: tuple[AxisId, ...] | None = None,
         constraints: tuple[FitParameterConstraint, ...] = (),
         numeric_policy: FitNumericPolicy | None = None,
-        memory_limit_bytes: int | None = None,
     ) -> FitExecution:
         """Fit one committed capture or FINAL scan without hidden reduction."""
 
@@ -2600,58 +2071,19 @@ class Experiment:
             raise TypeError("source must be CaptureArtifactRef or ScanArtifactRef")
         if (spec is None) == (model is None):
             raise ValueError("provide exactly one of spec or model")
-        limit = (
-            None
-            if memory_limit_bytes is None
-            else _positive_int(memory_limit_bytes, "memory_limit_bytes")
-        )
         with _fit_service_guard(self._authority_token) as services:
             def closing_cancel_check() -> bool:
                 with services.operation_lock:
                     return services.state != "OPEN"
 
-            effective_limit = (
-                services.fit_repository.materialization_memory_limit_bytes
-                if limit is None
-                else min(
-                    limit,
-                    services.fit_repository.materialization_memory_limit_bytes,
-                )
-            )
             if spec is None:
                 assert model is not None
-                source_materialization_limit = (
-                    services.fit_repository.source_materialization_memory_limit_bytes(
-                        effective_limit
-                    )
-                )
                 if isinstance(source, CaptureArtifactRef):
-                    inspection = services.capture_repository.inspect_final(
-                        source,
-                        memory_limit_bytes=source_materialization_limit,
-                    )
+                    inspection = services.capture_repository.inspect_final(source)
                     schema = inspection.dataset_schema
                 else:
-                    inspection = services.scan_repository.inspect_final(
-                        source,
-                        memory_limit_bytes=source_materialization_limit,
-                    )
+                    inspection = services.scan_repository.inspect_final(source)
                     schema = inspection.output_schema
-                if (
-                    inspection.materialization_peak_upper_bound_bytes
-                    > source_materialization_limit
-                ):
-                    raise MemoryError(
-                        "source cannot materialize inside the aggregate Fit budget"
-                    )
-                binding_limit = (
-                    source_materialization_limit
-                    - inspection.inspection_retained_upper_bound_bytes
-                )
-                if binding_limit <= 0:
-                    raise MemoryError(
-                        "source inspection leaves no Fit request binding budget"
-                    )
                 spec = fit_spec_for(
                     schema,
                     model,
@@ -2663,7 +2095,6 @@ class Experiment:
                         if numeric_policy is None
                         else numeric_policy
                     ),
-                    binding_memory_limit_bytes=binding_limit,
                 )
                 del schema, inspection
             elif any(
@@ -2682,14 +2113,12 @@ class Experiment:
                     services.capture_repository,
                     source,
                     spec,
-                    memory_limit_bytes=effective_limit,
                     cancel_check=closing_cancel_check,
                 )
             return services.fit_repository.execute_scan(
                 services.scan_repository,
                 source,
                 spec,
-                memory_limit_bytes=effective_limit,
                 cancel_check=closing_cancel_check,
             )
 
@@ -2713,7 +2142,6 @@ class Experiment:
         selection: Selection | None,
         preferences,
         occupancy_output: str | None,
-        memory_limit_bytes: int,
         selected_model: str | None = None,
         initial_fit_spec: FitSpec | None = None,
         initial_selection: Selection | None = None,
@@ -2726,7 +2154,6 @@ class Experiment:
 
         if not isinstance(fit_source, (CaptureArtifactRef, ScanArtifactRef)):
             raise TypeError("fit_source must be CaptureArtifactRef or ScanArtifactRef")
-        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         timeout = _positive_real(timeout_seconds, "timeout_seconds")
         chosen_model = (
             None if selected_model is None else _text(selected_model, "model")
@@ -2742,23 +2169,13 @@ class Experiment:
             elif chosen_model != initial_fit_spec.model_id:
                 raise ValueError("selected model differs from the initial FitSpec")
 
-        def inspect_source(services, operation_memory_limit_bytes: int):
-            operation_limit = _positive_int(
-                operation_memory_limit_bytes,
-                "operation_memory_limit_bytes",
-            )
+        def inspect_source(services):
             if isinstance(fit_source, CaptureArtifactRef):
-                return services.capture_repository.inspect_final(
-                    fit_source,
-                    memory_limit_bytes=operation_limit,
-                )
-            return services.scan_repository.inspect_final(
-                fit_source,
-                memory_limit_bytes=operation_limit,
-            )
+                return services.capture_repository.inspect_final(fit_source)
+            return services.scan_repository.inspect_final(fit_source)
 
-        def source_schema(services, operation_memory_limit_bytes: int):
-            inspected = inspect_source(services, operation_memory_limit_bytes)
+        def source_schema(services):
+            inspected = inspect_source(services)
             if isinstance(fit_source, CaptureArtifactRef):
                 return inspected.dataset_schema
             return inspected.output_schema
@@ -2766,7 +2183,6 @@ class Experiment:
         def prepare_fit(
             fit_axis_ids: tuple[AxisId, ...],
             authority_selection: Selection | None,
-            operation_memory_limit_bytes: int,
         ):
             if not fit_axis_ids or any(
                 not isinstance(axis_id, AxisId) for axis_id in fit_axis_ids
@@ -2778,7 +2194,7 @@ class Experiment:
             ):
                 raise TypeError("Figure Fit selection must be Selection or None")
             with _service_guard(self._authority_token) as services:
-                schema = source_schema(services, operation_memory_limit_bytes)
+                schema = source_schema(services)
             seed_spec = initial_fit_spec
             if seed_spec is not None:
                 if seed_spec.input_schema_fingerprint != schema.fingerprint:
@@ -2787,20 +2203,11 @@ class Experiment:
                     raise ValueError(
                         "displayed named Fit axes differ from the initial FitSpec"
                     )
-            from zlc_frontend import (
-                fit_authoring_option,
-                fit_authoring_option_additional_peak_upper_bound_nbytes,
-            )
+            from zlc_frontend import fit_authoring_option
 
             options = []
-            retained_options = 0
             for definition in fit_model_catalog():
                 try:
-                    remaining = operation_memory_limit_bytes - retained_options
-                    if remaining <= 0:
-                        raise MemoryError(
-                            "Fit authoring options exceed the operation memory limit"
-                        )
                     bound = suggest_fit_draft(
                         schema,
                         definition.model_id,
@@ -2818,7 +2225,6 @@ class Experiment:
                             and definition.model_id == seed_spec.model_id
                             else FitNumericPolicy()
                         ),
-                        binding_memory_limit_bytes=remaining,
                     )
                     if (
                         seed_spec is not None
@@ -2826,46 +2232,11 @@ class Experiment:
                         and bound.spec.committed_transform
                         == seed_spec.committed_transform
                     ):
-                        required = fit_binding_additional_peak_upper_bound_nbytes(
-                            seed_spec,
-                            schema,
-                        )
-                        incumbent_retained = (
-                            fit_binding_retained_upper_bound_nbytes(
-                                bound.spec,
-                                bound.expected_schema,
-                            )
-                        )
-                        if incumbent_retained + required > remaining:
-                            raise MemoryError(
-                                "initial FitSpec binding exceeds the operation memory limit"
-                            )
                         del bound
                         bound = bind_fit(seed_spec, schema)
                 except ValueError:
                     continue
-                bound_retained = fit_binding_retained_upper_bound_nbytes(
-                    bound.spec,
-                    bound.expected_schema,
-                )
-                option_peak = (
-                    fit_authoring_option_additional_peak_upper_bound_nbytes(
-                        bound
-                    )
-                )
-                if (
-                    retained_options + bound_retained + option_peak
-                    > operation_memory_limit_bytes
-                ):
-                    raise MemoryError(
-                        "Fit authoring projection exceeds the operation memory limit"
-                    )
                 option = fit_authoring_option(bound)
-                retained_options += option.retained_upper_bound_bytes
-                if retained_options > operation_memory_limit_bytes:
-                    raise MemoryError(
-                        "Fit authoring options exceed the operation memory limit"
-                    )
                 options.append(option)
                 del bound
             if not options:
@@ -2884,14 +2255,9 @@ class Experiment:
             spec: FitSpec,
             cancel_check,
             deadline_monotonic: float,
-            operation_memory_limit_bytes: int,
         ) -> FitExecution:
             if not isinstance(spec, FitSpec):
                 raise TypeError("Figure Fit execution requires FitSpec")
-            operation_limit = _positive_int(
-                operation_memory_limit_bytes,
-                "operation_memory_limit_bytes",
-            )
             with _fit_service_guard(self._authority_token) as services:
                 def combined_cancel_check() -> bool:
                     with services.operation_lock:
@@ -2903,7 +2269,6 @@ class Experiment:
                         services.capture_repository,
                         fit_source,
                         spec,
-                        memory_limit_bytes=operation_limit,
                         cancel_check=combined_cancel_check,
                         deadline_monotonic=deadline_monotonic,
                     )
@@ -2911,42 +2276,28 @@ class Experiment:
                     services.scan_repository,
                     fit_source,
                     spec,
-                    memory_limit_bytes=operation_limit,
                     cancel_check=combined_cancel_check,
                     deadline_monotonic=deadline_monotonic,
                 )
 
         def save_fit_execution(
             execution: FitExecution,
-            operation_memory_limit_bytes: int,
         ) -> FitResultArtifactRef:
             if not isinstance(execution, FitExecution):
                 raise TypeError("Fit save requires FitExecution")
             if execution.source_artifact_ref != fit_source:
                 raise ValueError("Fit execution belongs to another source artifact")
-            save_limit = _positive_int(
-                operation_memory_limit_bytes,
-                "operation_memory_limit_bytes",
-            )
             with _service_guard(self._authority_token):
-                return execution.save(
-                    operation_memory_limit_bytes=save_limit,
-                )
+                return execution.save()
 
         def reload_fit_result(
             reference: FitResultArtifactRef,
-            operation_memory_limit_bytes: int,
         ) -> FitResultBatch:
-            reload_limit = _positive_int(
-                operation_memory_limit_bytes,
-                "operation_memory_limit_bytes",
-            )
             with _service_guard(self._authority_token) as services:
                 admitted = services.fit_repository.load(
                     reference,
                     capture_repository=services.capture_repository,
                     scan_repository=services.scan_repository,
-                    memory_limit_bytes=reload_limit,
                 )
             if admitted.source_artifact_ref != fit_source:
                 raise ValueError("saved Fit reopened against another source artifact")
@@ -2966,18 +2317,13 @@ class Experiment:
                 selection,
                 preferences,
                 occupancy_output=None,
-                memory_limit_bytes,
             ):
                 """Resolve the labelled display cell on the Figure worker."""
 
                 if source != fit_source:
                     raise ValueError("direct Fit Figure loader received another source")
-                figure_limit = _positive_int(
-                    memory_limit_bytes,
-                    "memory_limit_bytes",
-                )
                 with _service_guard(self._authority_token) as services:
-                    inspected = inspect_source(services, figure_limit)
+                    inspected = inspect_source(services)
                     if isinstance(fit_source, CaptureArtifactRef):
                         schema = inspected.dataset_schema
                         dataset_ref = inspected.dataset_revision_ref
@@ -2993,7 +2339,7 @@ class Experiment:
                             selection=selection,
                             preferences=preferences,
                             occupancy_output=occupancy_output,
-                            memory_limit_bytes=None,
+                            materialize=False,
                             preinspected_schema=schema,
                             preinspected_dataset_ref=dataset_ref,
                         )
@@ -3001,18 +2347,6 @@ class Experiment:
                     from zlc_frontend.figure import (
                         fit_single_panel_presentation,
                     )
-                    from zlc_frontend import (
-                        figure_document_retained_upper_bound_nbytes,
-                    )
-
-                    metadata_required = (
-                        dataset_schema_retained_upper_bound_nbytes(schema)
-                        + figure_document_retained_upper_bound_nbytes(seed_document)
-                    )
-                    if metadata_required > figure_limit:
-                        raise MemoryError(
-                            "direct Fit display metadata exceeds the Figure budget"
-                        )
 
                     display_selection, display_preferences = (
                         fit_single_panel_presentation(
@@ -3029,7 +2363,6 @@ class Experiment:
                         selection=display_selection,
                         preferences=display_preferences,
                         occupancy_output=occupancy_output,
-                        memory_limit_bytes=figure_limit,
                     )
 
         from Zou_lab_control.workbench import open_figure_workbench
@@ -3041,7 +2374,6 @@ class Experiment:
             selection=selection,
             preferences=preferences,
             occupancy_output=occupancy_output,
-            memory_limit_bytes=limit,
             fit_preparer=prepare_fit,
             fit_executor=execute_fit,
             fit_saver=save_fit_execution,
@@ -3059,7 +2391,6 @@ class Experiment:
         *,
         model: str | None = None,
         committed_transform: CommittedTransform | None = None,
-        memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
         timeout_seconds: float = _DEFAULT_FIT_GUI_TIMEOUT_SECONDS,
     ):
         """Open the same DataFigure host with its Analysis tab selected."""
@@ -3085,7 +2416,6 @@ class Experiment:
             selection=None,
             preferences=None,
             occupancy_output=None,
-            memory_limit_bytes=memory_limit_bytes,
             selected_model=model,
             initial_selection=initial_selection,
             open_analysis=True,
@@ -3123,7 +2453,7 @@ class Experiment:
                 selection=selection,
                 preferences=preferences,
                 occupancy_output=occupancy_output,
-                memory_limit_bytes=None,
+                materialize=False,
             )
         return document
 
@@ -3142,11 +2472,9 @@ class Experiment:
         selection: Selection | None = None,
         preferences: "ViewPreferences | None" = None,
         occupancy_output: str | None = None,
-        memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
     ) -> "DataFigure":
         """Resolve one frozen source and return its optional-render DataFigure."""
 
-        limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
         with _service_guard(self._authority_token) as services:
             return _data_figure_for_services(
                 services,
@@ -3155,7 +2483,6 @@ class Experiment:
                 selection=selection,
                 preferences=preferences,
                 occupancy_output=occupancy_output,
-                memory_limit_bytes=limit,
             )
 
     def figure_gui(
@@ -3173,7 +2500,6 @@ class Experiment:
         selection: Selection | None = None,
         preferences: "ViewPreferences | None" = None,
         occupancy_output: str | None = None,
-        memory_limit_bytes: int = _DEFAULT_FIGURE_MEMORY_LIMIT_BYTES,
     ):
         """Resolve and show one frozen figure without blocking the notebook GUI."""
 
@@ -3184,32 +2510,24 @@ class Experiment:
             and preferences is None
             and occupancy_output is None
         ):
-            limit = _positive_int(memory_limit_bytes, "memory_limit_bytes")
             authority_token = self._authority_token
             session_thread_id = None
             session_admitted = None
             session_snapshot = None
             session_model = None
-            session_retained_bytes = 0
 
             def load_saved_fit_grid_view(
                 reference,
                 *,
                 page_address,
                 cell_selection,
-                memory_limit_bytes,
             ):
                 nonlocal session_thread_id
                 nonlocal session_admitted
                 nonlocal session_snapshot
                 nonlocal session_model
-                nonlocal session_retained_bytes
                 if reference != source:
                     raise ValueError("saved-fit loader received another artifact ref")
-                view_limit = _positive_int(
-                    memory_limit_bytes,
-                    "memory_limit_bytes",
-                )
                 worker_thread_id = threading.get_ident()
                 if session_thread_id is None:
                     session_thread_id = worker_thread_id
@@ -3218,281 +2536,55 @@ class Experiment:
                         "saved-fit view session changed worker thread"
                     )
                 with _service_guard(authority_token) as services:
-                    from zlc_frontend import (
-                        FitGridModel,
-                        figure_document_retained_upper_bound_nbytes,
-                        fit_grid_model_retained_upper_bound_nbytes,
-                        fit_grid_navigation_retained_upper_bound_nbytes,
-                    )
-                    from zlc_frontend.figure import (
-                        estimate_view_evaluation_peak_nbytes,
-                    )
+                    from zlc_frontend import FitGridModel
 
                     if session_admitted is None:
-                        if view_limit <= _SAVED_FIT_GRID_FIXED_BYTES:
-                            raise MemoryError(
-                                "saved-fit fixed session state exceeds the total budget"
-                            )
                         admitted = services.fit_repository.load(
                             reference,
                             capture_repository=services.capture_repository,
                             scan_repository=services.scan_repository,
-                            memory_limit_bytes=(
-                                view_limit - _SAVED_FIT_GRID_FIXED_BYTES
-                            ),
                         )
-                        fit_bytes = fit_result_retained_upper_bound_nbytes(
-                            admitted.result
-                        )
-                        model_bound = fit_grid_model_retained_upper_bound_nbytes(
-                            reference.target_ref,
-                            admitted.result,
-                        )
-                        navigation_bound = (
-                            fit_grid_navigation_retained_upper_bound_nbytes(
-                                admitted.result
-                            )
-                        )
-                        if (
-                            _SAVED_FIT_GRID_FIXED_BYTES
-                            + fit_bytes
-                            + model_bound
-                            + navigation_bound
-                            > view_limit
-                        ):
-                            raise MemoryError(
-                                "saved-fit result and compact model exceed the total budget"
-                            )
                         model = FitGridModel.from_result(
                             reference.target_ref,
                             admitted.result,
                         )
-                        if model.retained_upper_bound_bytes > model_bound:
-                            raise RuntimeError(
-                                "saved-fit compact model exceeded its preflight bound"
-                            )
                         source_ref = admitted.source_artifact_ref
-                        if cell_selection is None:
-                            page = model.page(page_address)
-                            resolved_selection = page.selection
-                            resolved_preferences = page.preferences
-                            cell_summary = None
-                        else:
-                            if page_address is not None:
-                                raise ValueError(
-                                    "saved-fit view cannot request a page and cell together"
-                                )
-                            model.resolve_selection(cell_selection)
-                            page = None
-                            resolved_selection = cell_selection
-                            resolved_preferences = model.focus_preferences()
-                            cell_summary = model.cell_summary(
-                                admitted.result,
-                                cell_selection,
-                            )
-
-                        source_planning_limit = (
-                            view_limit
-                            - _SAVED_FIT_GRID_FIXED_BYTES
-                            - fit_bytes
-                            - model_bound
-                            - navigation_bound
-                        )
-                        if source_planning_limit <= 0:
-                            raise MemoryError(
-                                "saved-fit session leaves no source budget"
-                            )
-                        if isinstance(source_ref, CaptureArtifactRef):
-                            inspection = services.capture_repository.inspect_final(
-                                source_ref,
-                                memory_limit_bytes=source_planning_limit,
-                            )
-                            schema = inspection.dataset_schema
-                            dataset_ref = inspection.dataset_revision_ref
-                        elif isinstance(source_ref, ScanArtifactRef):
-                            inspection = services.scan_repository.inspect_final(
-                                source_ref,
-                                memory_limit_bytes=source_planning_limit,
-                            )
-                            schema = inspection.output_schema
-                            dataset_ref = inspection.output_dataset_ref
-                        else:
-                            raise TypeError("fit source artifact kind is not current")
-
-                        transform_peak = (
-                            0
-                            if admitted.result.spec.committed_transform is None
-                            else fit_transform_resolution_additional_peak_upper_bound_nbytes(
-                                schema
-                            )
-                        )
-                        validation_peak = (
-                            fit_result_source_validation_additional_peak_upper_bound_nbytes(
-                                admitted.result,
-                                schema,
-                            )
-                        )
-                        planning_required = (
-                            _SAVED_FIT_GRID_FIXED_BYTES
-                            + fit_bytes
-                            + model_bound
-                            + navigation_bound
-                            + inspection.inspection_retained_upper_bound_bytes
-                            + max(transform_peak, validation_peak)
-                        )
-                        if planning_required > view_limit:
-                            raise MemoryError(
-                                "saved-fit source/view planning exceeds the total budget"
-                            )
-                        provisional_document, _unused_datasets, _unused_fit = (
-                            _project_notebook_figure(
-                                services,
-                                source_ref,
-                                intent=None,
-                                selection=resolved_selection,
-                                preferences=resolved_preferences,
-                                occupancy_output=None,
-                                memory_limit_bytes=None,
-                                draft_fit_result=admitted.result,
-                                preinspected_schema=schema,
-                                preinspected_dataset_ref=dataset_ref,
-                            )
-                        )
-                        document_bytes = (
-                            figure_document_retained_upper_bound_nbytes(
-                                provisional_document
-                            )
-                        )
-                        document_planning_required = (
-                            _SAVED_FIT_GRID_FIXED_BYTES
-                            + fit_bytes
-                            + model_bound
-                            + navigation_bound
-                            + inspection.inspection_retained_upper_bound_bytes
-                            + document_bytes
-                        )
-                        if document_planning_required > view_limit:
-                            raise MemoryError(
-                                "saved-fit provisional Figure metadata exceeds the total budget"
-                            )
-                        evaluation_peak = estimate_view_evaluation_peak_nbytes(
-                            schema,
-                            provisional_document.layers[0].view,
-                        )
-                        source_bytes = dataset_storage_nbytes(schema)
-                        schema_bytes = dataset_schema_retained_upper_bound_nbytes(
-                            schema
-                        )
-                        figure_residual = (
-                            view_limit
-                            - _SAVED_FIT_GRID_FIXED_BYTES
-                            - fit_bytes
-                            - model_bound
-                            - navigation_bound
-                            - source_bytes
-                            - schema_bytes
-                        )
-                        figure_planning_peak = max(
-                            transform_peak,
-                            document_bytes
-                            + max(validation_peak, evaluation_peak),
-                        )
-                        if figure_residual < figure_planning_peak:
-                            raise MemoryError(
-                                "saved-fit source and metadata leave no bounded Figure view"
-                            )
-                        materialization_peak = (
-                            _SAVED_FIT_GRID_FIXED_BYTES
-                            + fit_bytes
-                            + model_bound
-                            + navigation_bound
-                            + inspection.materialization_peak_upper_bound_bytes
-                        )
-                        if materialization_peak > view_limit:
-                            raise MemoryError(
-                                "saved-fit source materialization exceeds the total budget"
-                            )
-                        del (
-                            provisional_document,
-                            inspection,
-                            schema,
-                            dataset_ref,
-                            _unused_datasets,
-                            _unused_fit,
-                        )
-                        materialize_limit = (
-                            view_limit
-                            - _SAVED_FIT_GRID_FIXED_BYTES
-                            - fit_bytes
-                            - model_bound
-                            - navigation_bound
-                        )
                         if isinstance(source_ref, CaptureArtifactRef):
                             snapshot = services.capture_repository.materialize_final(
-                                source_ref,
-                                memory_limit_bytes=materialize_limit,
+                                source_ref
                             )
-                        else:
+                        elif isinstance(source_ref, ScanArtifactRef):
                             snapshot = services.scan_repository.materialize(
-                                source_ref,
-                                memory_limit_bytes=materialize_limit,
+                                source_ref
                             ).snapshot
-                        actual_source_bytes = dataset_storage_nbytes(
-                            snapshot.block.schema
-                        )
-                        actual_schema_bytes = (
-                            dataset_schema_retained_upper_bound_nbytes(
-                                snapshot.block.schema
-                            )
-                        )
-                        if (
-                            actual_source_bytes > source_bytes
-                            or actual_schema_bytes > schema_bytes
-                        ):
-                            raise RuntimeError(
-                                "saved-fit materialized source exceeded inspected bounds"
-                            )
-                        retained_bytes = (
-                            _SAVED_FIT_GRID_FIXED_BYTES
-                            + fit_bytes
-                            + source_bytes
-                            + schema_bytes
-                            + navigation_bound
-                        )
-                        figure_limit = (
-                            view_limit
-                            - retained_bytes
-                            - model_bound
-                        )
-                        if figure_limit <= 0:
-                            raise MemoryError(
-                                "saved-fit session leaves no view budget"
-                            )
+                        else:
+                            raise TypeError("fit source artifact kind is not current")
+                        session_admitted = admitted
+                        session_snapshot = snapshot
+                        session_model = model
                     else:
                         admitted = session_admitted
                         snapshot = session_snapshot
                         model = session_model
-                        retained_bytes = session_retained_bytes
-                        figure_limit = view_limit
                         assert snapshot is not None and model is not None
-                        if cell_selection is None:
-                            page = model.page(page_address)
-                            resolved_selection = page.selection
-                            resolved_preferences = page.preferences
-                            cell_summary = None
-                        else:
-                            if page_address is not None:
-                                raise ValueError(
-                                    "saved-fit view cannot request a page and cell together"
-                                )
-                            model.resolve_selection(cell_selection)
-                            page = None
-                            resolved_selection = cell_selection
-                            resolved_preferences = model.focus_preferences()
-                            cell_summary = model.cell_summary(
-                                admitted.result,
-                                cell_selection,
+                    if cell_selection is None:
+                        page = model.page(page_address)
+                        resolved_selection = page.selection
+                        resolved_preferences = page.preferences
+                        cell_summary = None
+                    else:
+                        if page_address is not None:
+                            raise ValueError(
+                                "saved-fit view cannot request a page and cell together"
                             )
+                        model.resolve_selection(cell_selection)
+                        page = None
+                        resolved_selection = cell_selection
+                        resolved_preferences = model.focus_preferences()
+                        cell_summary = model.cell_summary(
+                            admitted.result,
+                            cell_selection,
+                        )
                     figure = _data_figure_for_services(
                         services,
                         admitted,
@@ -3500,16 +2592,9 @@ class Experiment:
                         selection=resolved_selection,
                         preferences=resolved_preferences,
                         occupancy_output=None,
-                        memory_limit_bytes=figure_limit,
                         preloaded_snapshot=snapshot,
-                        retained_inputs_prebudgeted=True,
                     )
-                    if session_admitted is None:
-                        session_admitted = admitted
-                        session_snapshot = snapshot
-                        session_model = model
-                        session_retained_bytes = retained_bytes
-                return figure, model, page, cell_summary, retained_bytes
+                return figure, model, page, cell_summary
 
             def open_saved_fit_refit(reference, cell_selection):
                 if reference != source:
@@ -3541,7 +2626,6 @@ class Experiment:
                     selection=cell_selection,
                     preferences=model.focus_preferences(),
                     occupancy_output=None,
-                    memory_limit_bytes=limit,
                     selected_model=result.spec.model_id,
                     initial_fit_spec=result.spec,
                     initial_selection=authority_selection,
@@ -3554,7 +2638,6 @@ class Experiment:
                 load_saved_fit_grid_view,
                 open_saved_fit_refit,
                 source,
-                memory_limit_bytes=limit,
             )
 
         if isinstance(source, (CaptureArtifactRef, ScanArtifactRef)):
@@ -3565,7 +2648,6 @@ class Experiment:
                 selection=selection,
                 preferences=preferences,
                 occupancy_output=occupancy_output,
-                memory_limit_bytes=memory_limit_bytes,
             )
 
         if isinstance(source, (FitExecution, AdmittedFitResult)):
@@ -3598,7 +2680,6 @@ class Experiment:
                 selection=selection,
                 preferences=preferences,
                 occupancy_output=occupancy_output,
-                memory_limit_bytes=memory_limit_bytes,
                 selected_model=result.spec.model_id,
                 initial_fit_spec=result.spec,
                 initial_selection=initial_authority_selection,
@@ -3619,7 +2700,6 @@ class Experiment:
             selection=selection,
             preferences=preferences,
             occupancy_output=occupancy_output,
-            memory_limit_bytes=memory_limit_bytes,
             initial_fit_result_identity=initial_identity,
         )
 
@@ -3865,7 +2945,6 @@ def _bind_autonomous_scan_camera(
             scan_axes=scan_axes,
             scan_point_layout=point_table.point_layout,
         ),
-        transport_memory_limit_bytes=request.transport_memory_limit_bytes,
     )
     if (
         binding.compiled_artifact.source_document_digest
@@ -3900,8 +2979,6 @@ def _bind_api_scan_camera(
         trigger_channel=request.trigger_channel,
         repeat_axis_id=_SCAN_REPEAT_AXIS_ID,
         readout_event_axis_id=_SCAN_READOUT_EVENT_AXIS_ID,
-        transport_memory_limit_bytes=request.transport_memory_limit_bytes,
-        memory_limit_bytes=request.memory_limit_bytes,
     )
     return binding.program, binding.point_table, binding
 
@@ -3961,7 +3038,6 @@ def _compile_direct_scan_for_services(
             camera_ref=request.camera_ref,
             sequencer_ref=request.sequencer_ref,
             execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
-            pipeline_memory_limit_bytes=request.memory_limit_bytes,
             timeout_seconds=request.timeout_seconds,
             name_prefix="Direct scan",
         )
@@ -3970,7 +3046,6 @@ def _compile_direct_scan_for_services(
             services.scan_repository,
             program=program,
             output_contract=output_contract,
-            memory_limit_bytes=request.memory_limit_bytes,
         )
         descriptor = replace(
             descriptor,
@@ -3984,7 +3059,6 @@ def _compile_direct_scan_for_services(
         f"API segmented scan {program.document.name}",
         binding.measurement,
         BlockId(f"api-scan-camera-{compiled_digest[:20]}"),
-        request.memory_limit_bytes,
         timeout_seconds=request.timeout_seconds,
     )
     segmented = ApiSlotSegmentedSpec(
@@ -3998,7 +3072,6 @@ def _compile_direct_scan_for_services(
         services.scan_repository,
         program=program,
         output_contract=output_contract,
-        memory_limit_bytes=request.memory_limit_bytes,
     )
     descriptor = PlanDescriptor(
         capture.name,
@@ -4014,7 +3087,6 @@ def _compile_direct_scan_for_services(
             str(binding.pulse_port.resource_claim.key),
             str(binding.measurement.capture_port.resource_claim.key),
         ),
-        estimate_pipeline_peak_bytes(capture),
     )
     return plan, descriptor
 
@@ -4039,7 +3111,6 @@ def _bind_occupancy_scan_for_services(
     calibration = _calibration_repository(services).admit(
         request.calibration_ref,
         services.capture_repository,
-        memory_limit_bytes=request.memory_limit_bytes,
     )
     selected_kind = calibration.artifact.select_model(request.model_kind).kind
     identity = canonical_digest(
@@ -4074,7 +3145,6 @@ def _bind_occupancy_scan_for_services(
         processor,
         BlockId(f"scan-counts-{identity}"),
         BlockId(f"scan-occupied-{identity}"),
-        request.memory_limit_bytes,
         request.timeout_seconds,
     )
     if isinstance(program, AutonomousScanSlotProgram):
@@ -4108,14 +3178,12 @@ def _compile_occupancy_scan_for_services(
             services.scan_repository,
             program=program,
             output_contract=output_contract,
-            memory_limit_bytes=request.memory_limit_bytes,
         )
     return compile_api_occupancy_scan_artifact_plan(
         scan_spec,
         services.scan_repository,
         program=program,
         output_contract=output_contract,
-        memory_limit_bytes=request.memory_limit_bytes,
     )
 
 
@@ -4142,7 +3210,6 @@ def _prepare_occupancy_scan_for_workbench(
                     services.scan_repository,
                     program=program,
                     output_contract=output_contract,
-                    memory_limit_bytes=request.memory_limit_bytes,
                     preview=preview,
                 )
             else:
@@ -4155,7 +3222,6 @@ def _prepare_occupancy_scan_for_workbench(
                     services.scan_repository,
                     program=program,
                     output_contract=output_contract,
-                    memory_limit_bytes=request.memory_limit_bytes,
                 )
             return services.runtime.start(plan)
 
@@ -4214,7 +3280,6 @@ def _compile_calibration_for_services(
         _calibration_repository(services),
         request.analysis,
         expected_readout_binding=request.readout_binding,
-        memory_limit_bytes=request.memory_limit_bytes,
         timeout_seconds=request.timeout_seconds,
     )
 
@@ -4258,7 +3323,6 @@ def _compile_detection_for_services(
         expected_readout_binding=request.readout_binding,
         readout_event_axis_id=request.readout_event_axis_id,
         model_kind=request.model_kind,
-        memory_limit_bytes=request.memory_limit_bytes,
         timeout_seconds=request.timeout_seconds,
     )
 

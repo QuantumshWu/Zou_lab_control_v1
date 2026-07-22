@@ -20,7 +20,6 @@ from zlc_storage import (
 TARGET_IR_SCHEMA = "zlc_pulse.TargetIR"
 BUS_MODES = frozenset(("edge", "ramp"))
 SLOT_KINDS = frozenset(("duration", "dac"))
-MAX_MATERIALIZED_SCAN_POINTS = 1_000_000
 _SCAN_POINT_DTYPE = np.dtype("<i4")
 _SCAN_DURATION_DTYPE = np.dtype("<f8")
 
@@ -166,11 +165,6 @@ class TargetIR:
             raise ValueError("scan point width differs from slot count")
         if bool(points) != bool(slot_count):
             raise ValueError("scan points and slot schema must appear together")
-        if len(points) > MAX_MATERIALIZED_SCAN_POINTS:
-            raise ValueError(
-                "scan point table exceeds the materialization limit of "
-                f"{MAX_MATERIALIZED_SCAN_POINTS} rows"
-            )
         object.__setattr__(self, "scan_points", points)
         if not points and any(right <= left for left, right in zip(ticks, ticks[1:])):
             raise ValueError("static TargetIR edge ticks must strictly increase")
@@ -652,7 +646,6 @@ def _row(value: object, field: str) -> tuple[object, ...]:
 
 __all__ = [
     "BUS_MODES",
-    "MAX_MATERIALIZED_SCAN_POINTS",
     "SLOT_KINDS",
     "TARGET_IR_SCHEMA",
     "TargetBusDelay",

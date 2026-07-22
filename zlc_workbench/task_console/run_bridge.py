@@ -107,7 +107,7 @@ class ConsoleRunNode:
 
         ``start`` receives the prepared command and returns its RunHandle.  How a
         command starts is the command's own business -- a camera monitor only
-        starts WITH a live view and its byte budget, a finite capture just starts
+        starts with its live view, while a finite capture just starts
         -- so this seam sequences the call rather than knowing the shapes.
 
         One submission does both prepare and start: a prepared command that is

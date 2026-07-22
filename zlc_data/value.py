@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -118,8 +117,8 @@ def canonical_value_array(
         if not np.all(expanded):
             # Build the canonical array from zero rather than copying and then
             # indexing with ``~expanded``.  The latter materializes another
-            # dense boolean frame for component validity, which breaks the
-            # capture source's bounded read-scratch contract on large images.
+            # dense boolean frame for component validity and doubles that
+            # normalization step's large-image scratch work.
             normalized = np.zeros(schema.data_shape, dtype=schema.dtype, order="C")
             np.copyto(normalized, array, where=expanded)
             owns_normalized = True
@@ -148,7 +147,7 @@ def canonical_value_array(
 
 @dataclass(frozen=True)
 class ValuePayloadContract:
-    """Single owner for Value snapshot, schema validation, and retained-byte accounting."""
+    """Single owner for Value snapshot and schema validation."""
 
     schema: ValueSchema
 
@@ -161,15 +160,6 @@ class ValuePayloadContract:
         source = f"zlc.value-payload:{self.schema.fingerprint}".encode("ascii")
         return hashlib.sha256(source).hexdigest()
 
-    @property
-    def max_retained_nbytes(self) -> int:
-        value_bytes = math.prod(self.schema.data_shape) * self.schema.dtype.itemsize
-        validity = self.schema.validity_contract
-        if validity.mode is not ValidityMode.COMPONENTS:
-            return value_bytes
-        component_shape = tuple(self.schema.axis(axis_id).size for axis_id in validity.component_axis_ids)
-        return value_bytes + math.prod(component_shape)
-
     def snapshot(self, payload: Value) -> Value:
         self.validate(payload)
         return payload
@@ -181,15 +171,6 @@ class ValuePayloadContract:
             raise TypeError(
                 "Value payload must share the generation-owned ValueSchema instance"
             )
-
-    def retained_nbytes(self, payload: Value) -> int:
-        self.validate(payload)
-        validity_bytes = (
-            payload.validity.mask.nbytes
-            if isinstance(payload.validity, ComponentValidity)
-            else 0
-        )
-        return int(payload.values.nbytes + validity_bytes)
 
     def digest(self, payload: Value) -> str:
         """Canonical content identity including schema, values, and validity."""

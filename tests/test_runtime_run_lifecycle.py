@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from zlc_neutral_atom.runtime._failure import detach_failure, safe_error_summary
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.commit import (
     CommitTarget,
@@ -43,6 +44,7 @@ from zlc_neutral_atom.runtime.run import (
     RunSnapshot,
     RunStartRejected,
     RunState,
+    _diagnostics,
 )
 from zlc_storage import RepositoryRootLease
 
@@ -339,7 +341,7 @@ def test_interrupt_lane_unblocks_execution_before_cleanup(tmp_path):
     close_runtime(runtime, arbiter, item)
 
 
-def test_interrupt_failure_is_bounded_and_cannot_hide_cleanup(tmp_path):
+def test_interrupt_failure_preserves_diagnostics_and_cannot_hide_cleanup(tmp_path):
     release = threading.Event()
 
     def interrupt():
@@ -361,8 +363,37 @@ def test_interrupt_failure_is_bounded_and_cannot_hide_cleanup(tmp_path):
         handle.result(2.0)
     snapshot = handle.snapshot()
     assert any("abort transport failed" in value for value in snapshot.cleanup_errors)
-    assert len(snapshot.cleanup_errors) <= 2
+    assert all(snapshot.cleanup_errors)
     close_runtime(runtime, arbiter, item)
+
+
+def test_failure_detachment_preserves_complete_string_evidence():
+    detail = "detail-" + "x" * 4096
+
+    def fail(depth: int) -> None:
+        if depth:
+            fail(depth - 1)
+        raise RuntimeError(detail)
+
+    caught = None
+    try:
+        fail(12)
+    except RuntimeError as error:
+        for index in range(12):
+            error.add_note(f"note-{index}-" + "y" * 600)
+        caught = detach_failure(error, note_prefix="detached traceback")
+    assert caught is not None
+    assert detail in safe_error_summary(caught)
+    assert len(caught.locations) >= 13
+    assert len(caught.notes) == 13  # traceback note plus every original note
+    assert all(
+        caught.notes[index + 1].startswith(f"note-{index}-")
+        for index in range(12)
+    )
+    diagnostics = tuple(
+        f"diagnostic-{index}-" + "z" * 1500 for index in range(6)
+    )
+    assert _diagnostics(diagnostics) == diagnostics
 
 
 def test_cleanup_failure_fails_only_the_current_run(tmp_path):

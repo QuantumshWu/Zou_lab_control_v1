@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from zlc_data import BlockId, ComponentValidity, DataBlock, DatasetSchema, OwnedSnapshot
-from zlc_storage import canonical_text, nonnegative_integer, positive_real
+from zlc_storage import canonical_text, positive_real
 
 from zlc_neutral_atom.acquisition.camera import (
     CameraFrameMetadata,
@@ -25,7 +25,6 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
     DatasetCellSchedule,
     OrderedDatasetMetadataHasher,
-    dataset_storage_nbytes,
 )
 from zlc_neutral_atom.runtime.pipeline import (
     BoundMeasurement,
@@ -46,11 +45,7 @@ from zlc_neutral_atom.runtime.streams import (
     TraceBinding,
 )
 
-from .calibration import (
-    ReadoutModelKind,
-    calibration_retained_array_nbytes,
-    readout_runtime_scratch_nbytes,
-)
+from .calibration import ReadoutModelKind
 from .calibration_reference import CalibrationArtifactRef
 from .occupancy import (
     BoundOccupancyStreamProcessor,
@@ -68,7 +63,6 @@ class OccupancyPipelineSpec:
     processor: OccupancyStreamProcessorSpec
     counts_block_id: BlockId
     occupied_block_id: BlockId
-    memory_limit_bytes: int
     timeout_seconds: float
 
     def __post_init__(self) -> None:
@@ -81,12 +75,6 @@ class OccupancyPipelineSpec:
             raise TypeError("counts_block_id and occupied_block_id must be BlockId")
         if self.counts_block_id == self.occupied_block_id:
             raise ValueError("counts and occupied require distinct BlockId values")
-        if (
-            isinstance(self.memory_limit_bytes, bool)
-            or not isinstance(self.memory_limit_bytes, int)
-            or self.memory_limit_bytes <= 0
-        ):
-            raise ValueError("memory_limit_bytes must be a positive integer")
         object.__setattr__(self, "timeout_seconds", positive_real(self.timeout_seconds, "timeout_seconds"))
 
 
@@ -291,34 +279,6 @@ def _occupied_schema(bound: BoundOccupancyStreamProcessor) -> DatasetSchema:
     )
 
 
-def _estimate_peak_bytes(
-    spec: OccupancyPipelineSpec,
-    bound: BoundOccupancyStreamProcessor,
-    preview_spec: ExactDatasetPreviewSpec | None = None,
-    *,
-    retained_overhead_bytes: int = 0,
-) -> int:
-    contract, output = spec.measurement.capture_contract, bound.output_payload_contract
-    events = contract.total_events
-    counts_bytes, occupied_bytes = dataset_storage_nbytes(bound.output_schema), dataset_storage_nbytes(_occupied_schema(bound))
-    metadata_bytes = events * bound.output_edge.metadata_max_retained_nbytes
-    artifact = spec.processor.calibration.artifact
-    calibration_bytes = calibration_retained_array_nbytes(artifact)
-    preview_bytes = 0 if preview_spec is None else preview_spec.downstream_peak_bytes
-    common = (
-        contract.estimated_transport_bytes
-        + metadata_bytes
-        + calibration_bytes
-        + nonnegative_integer(
-            retained_overhead_bytes,
-            "retained_overhead_bytes",
-        )
-    )
-    execution = common + output.max_retained_nbytes + 2 * counts_bytes + preview_bytes + readout_runtime_scratch_nbytes(artifact, bound.model_kind)
-    finalization = common + output.max_retained_nbytes + 2 * counts_bytes + 2 * occupied_bytes + preview_bytes + output.finalization_scratch_nbytes
-    return max(execution, finalization)
-
-
 def _occupancy_preview_spec(
     spec: OccupancyPipelineSpec,
     preview: ExactDatasetPreviewPort | None,
@@ -341,13 +301,6 @@ def _occupancy_preview_spec(
         if preview_spec.source_schema_fingerprint != source_schema.fingerprint:
             raise ValueError(
                 "occupancy preview schema differs from exact counts output"
-            )
-        minimum = dataset_storage_nbytes(source_schema)
-        if preview_spec.downstream_peak_bytes < minimum:
-            raise MemoryError(
-                "occupancy preview downstream peak cannot hold one frozen "
-                f"source snapshot: required {minimum}, declared "
-                f"{preview_spec.downstream_peak_bytes}"
             )
         return preview_spec
     except BaseException as error:
@@ -424,7 +377,6 @@ def _open_exact_occupancy(
     *,
     preview: ExactDatasetPreviewPort | None = None,
     preview_spec: ExactDatasetPreviewSpec | None = None,
-    retained_overhead_bytes: int = 0,
 ) -> ExactOccupancyTransaction:
     """Allocate the complete software chain without touching hardware."""
 
@@ -448,53 +400,17 @@ def _open_exact_occupancy(
             raise ValueError(
                 "occupancy preview schema differs from bound counts output"
             )
-        peak = _estimate_peak_bytes(
-            spec,
-            bound,
-            preview_spec,
-            retained_overhead_bytes=retained_overhead_bytes,
-        )
-        if peak > spec.memory_limit_bytes:
-            if preview is None:
-                raise MemoryError(
-                    f"occupancy pipeline owned-buffer peak {peak} exceeds "
-                    f"limit {spec.memory_limit_bytes}"
-                )
-            preview_error = MemoryError(
-                "occupancy pipeline owned-buffer peak with optional preview "
-                f"{peak} exceeds limit {spec.memory_limit_bytes}"
-            )
-            baseline_peak = _estimate_peak_bytes(
-                spec,
-                bound,
-                None,
-                retained_overhead_bytes=retained_overhead_bytes,
-            )
-            if baseline_peak > spec.memory_limit_bytes:
-                raise MemoryError(
-                    "occupancy pipeline science baseline owned-buffer peak "
-                    f"{baseline_peak} exceeds limit {spec.memory_limit_bytes}"
-                )
-            _notify_preview_failure(preview, preview_error)
-            if preview.terminal is not True:
-                raise RuntimeError(
-                    "capacity-rejected occupancy preview did not reach a "
-                    "terminal state"
-                ) from preview_error
-            preview = None
-            preview_spec = None
         source = session.reserve_exact()
         source_cursor = source.activate()
         payload = bound.output_payload_contract
         output_stream, producer = AcquisitionStream.create(
             bound.output_stream_id, payload,
             flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-            retention_events=1, retention_bytes=payload.max_retained_nbytes,
+            retention_events=1,
             join_key_contract=capture_input.join_key_contract,
         )
         output_reservation = output_stream.reserve(
             total_events=contract.total_events, max_inflight_events=1,
-            max_inflight_bytes=payload.max_retained_nbytes,
             trace_binding=TraceBinding(context.run_id.value, bound.output_source_id),
         )
         output_cursor = output_reservation.activate()

@@ -54,7 +54,7 @@ def choose_mode(body, mode: str) -> None:
     if combo.currentData() != mode:
         raise AssertionError(f"connection combo did not select {mode!r}")
 
-    # The 40-ms owner snapshot must not overwrite a human's draft selection.
+    # Any active-run watcher must not overwrite a human's draft selection.
     deadline = time.monotonic() + 0.15
     while time.monotonic() < deadline:
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)

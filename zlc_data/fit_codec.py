@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from numbers import Integral
 from typing import Any
 
 import numpy as np
@@ -29,18 +28,12 @@ from .fit_contract import (
     FitParameterConstraint,
     FitResultBatch,
     FitSpec,
-    fit_result_retained_upper_bound_nbytes,
 )
-from .selection import Selection
 from .transform_codec import committed_transform_from_tree, committed_transform_to_tree
 
 
 FIT_SPEC_SCHEMA = "zlc_data.FitSpec"
 FIT_RESULT_BATCH_SCHEMA = "zlc_data.FitResultBatch"
-
-_FIT_CODEC_ENCODE_FIXED_WORKSPACE_BYTES = 8 * 1024 * 1024
-_FIT_CODEC_DECODE_FIXED_WORKSPACE_BYTES = 16 * 1024 * 1024
-
 
 def fit_spec_to_tree(spec: FitSpec) -> dict[str, Any]:
     if not isinstance(spec, FitSpec):
@@ -203,148 +196,6 @@ def encode_fit_result_batch(result: FitResultBatch) -> bytes:
     return encode(_fit_result_batch_to_tree(result))
 
 
-def _fit_result_codec_text_upper_bound_nbytes(result: FitResultBatch) -> int:
-    """Inventory all unbounded owner text without allocating encoded copies."""
-
-    characters = (
-        len(result.source_ref.block_id.value)
-        + len(result.source_ref.stream_generation.value)
-        + len(result.source_ref.schema_fingerprint)
-        + len(result.spec.input_schema_fingerprint)
-        + len(result.spec.model_id)
-        + len(result.scipy_version)
-        + sum(len(axis_id.value) for axis_id in result.spec.fit_axis_ids)
-        + sum(len(axis_id.value) for axis_id in result.spec.batch_axis_ids)
-        + sum(
-            len(constraint.parameter_name)
-            for constraint in result.spec.constraints
-        )
-        + sum(len(status.value) for status in result.statuses)
-        + sum(len(error) for error in result.errors if error is not None)
-    )
-    if result.value_unit is not None:
-        characters += len(result.value_unit)
-    for axis_group in (result.fit_axis_specs, result.batch_axis_specs):
-        for axis in axis_group:
-            characters += (
-                len(axis.axis_id.value) + len(axis.name) + len(axis.role.value)
-            )
-            if axis.unit is not None:
-                characters += len(axis.unit)
-            if axis.coordinate_frame is not None:
-                characters += len(axis.coordinate_frame.value)
-            if axis.coordinates is not None:
-                characters += sum(
-                    len(value)
-                    for value in axis.coordinates
-                    if isinstance(value, str)
-                )
-    transform = result.spec.committed_transform
-    if transform is not None:
-        characters += len(transform.input_schema_fingerprint) + len(
-            transform.output_schema_fingerprint
-        )
-        for operation in transform.spec.operations:
-            if isinstance(operation, Selection):
-                for term in operation.terms:
-                    characters += len(term.axis_id.value)
-                    frame = getattr(term, "coordinate_frame", None)
-                    if frame is not None:
-                        characters += len(frame.value)
-            else:
-                characters += sum(
-                    len(axis_id.value) for axis_id in operation.axis_ids
-                )
-    # UTF-8 uses at most four bytes per Unicode code point.  No encoded strings
-    # are built here, so a tiny rejected budget cannot itself trigger a copy of
-    # an unbounded identifier or coordinate label.
-    return 4 * characters
-
-
-def fit_result_encode_additional_peak_upper_bound_nbytes(
-    result: FitResultBatch,
-) -> int:
-    """Bound additional workspace for encoding an already-resident result.
-
-    The returned value deliberately excludes the :class:`FitResultBatch`
-    itself.  A composition root may therefore subtract a Figure front which
-    already retains that result, then pass the remaining operation budget to
-    the artifact owner without counting the result twice.
-
-    The canonical encoder can simultaneously retain accumulated base64 text,
-    its tagged Python tree, a JSON unicode string, UTF-8 bytes, framed bytes,
-    and one ndarray normalization/conversion scratch set.  The retained-result
-    estimator supplies a conservative inventory of rows, axes, coordinates,
-    and text; here it sizes only those *new codec copies*.
-    """
-
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("result must be FitResultBatch")
-    arrays = (
-        result.parameter_values,
-        result.covariance,
-        result.covariance_valid,
-        result.present_observation_counts,
-        result.valid_observation_counts,
-        result.used_observation_counts,
-        result.evaluation_counts,
-        result.residual_sum_squares,
-        result.r_squared,
-        result.r_squared_valid,
-    )
-    array_nbytes = tuple(int(value.nbytes) for value in arrays)
-    base64_nbytes = tuple(4 * ((size + 2) // 3) for size in array_nbytes)
-    total_arrays = sum(array_nbytes)
-    total_base64 = sum(base64_nbytes)
-    largest_array = max(array_nbytes, default=0)
-    largest_base64 = max(base64_nbytes, default=0)
-    retained = fit_result_retained_upper_bound_nbytes(result)
-    structured_inventory = max(0, retained - total_arrays)
-    owner_text = _fit_result_codec_text_upper_bound_nbytes(result)
-
-    # The structured inventory covers canonical tags/keys; six copies of the
-    # complete owner-text inventory cover JSON's worst control-character escape
-    # expansion.  Six concurrent payload-sized copies then cover the widest
-    # Python unicode representation, UTF-8 bytes, and final framed bytes.
-    payload_upper_bound = (
-        total_base64 + 2 * structured_inventory + 6 * owner_text
-    )
-    tagged_tree_upper_bound = total_base64 + 2 * structured_inventory
-    active_array_scratch = 2 * largest_array + 2 * largest_base64
-    return int(
-        _FIT_CODEC_ENCODE_FIXED_WORKSPACE_BYTES
-        + tagged_tree_upper_bound
-        + 6 * payload_upper_bound
-        + active_array_scratch
-    )
-
-
-def fit_result_decode_additional_peak_upper_bound_nbytes(
-    encoded_payload_nbytes: int,
-) -> int:
-    """Bound load-time codec allocations from one not-yet-read result blob.
-
-    This includes the newly read payload and decoded result because neither is
-    resident when repository admission begins.  It also covers canonical JSON
-    parsing, structure inspection, ndarray base64 decode/copy, the generic
-    canonical rebuild, and the typed result rebuild.  Caller-owned Figure/front
-    memory and later source-artifact admission are intentionally excluded.
-    """
-
-    if isinstance(encoded_payload_nbytes, bool) or not isinstance(
-        encoded_payload_nbytes,
-        Integral,
-    ):
-        raise TypeError("encoded_payload_nbytes must be an integer")
-    if encoded_payload_nbytes <= 0:
-        raise ValueError("encoded_payload_nbytes must be a positive integer")
-    payload = int(encoded_payload_nbytes)
-    # The fit payload has a closed field set and bounded canonical node model.
-    # This factor is intentionally above both canonical validation passes'
-    # simultaneous UTF-8/tagged/tree/array/re-encode allocation sets.
-    return _FIT_CODEC_DECODE_FIXED_WORKSPACE_BYTES + 64 * payload
-
-
 def decode_fit_result_batch(payload: bytes) -> FitResultBatch:
     result = _fit_result_batch_from_tree(decode(payload))
     _require_typed_canonical(
@@ -384,9 +235,6 @@ def _constraint_from_tree(tree: Any) -> FitParameterConstraint:
 def _numeric_policy_to_tree(value: FitNumericPolicy) -> dict[str, Any]:
     return {
         "max_evaluations": value.max_evaluations,
-        "max_batch_cells": value.max_batch_cells,
-        "sample_budget_per_batch": value.sample_budget_per_batch,
-        "max_packed_observations": value.max_packed_observations,
         "covariance_rcond": value.covariance_rcond,
     }
 
@@ -394,9 +242,6 @@ def _numeric_policy_to_tree(value: FitNumericPolicy) -> dict[str, Any]:
 def _numeric_policy_from_tree(tree: Any) -> FitNumericPolicy:
     fields = {
         "max_evaluations",
-        "max_batch_cells",
-        "sample_budget_per_batch",
-        "max_packed_observations",
         "covariance_rcond",
     }
     data = _exact_map(
@@ -407,9 +252,6 @@ def _numeric_policy_from_tree(tree: Any) -> FitNumericPolicy:
     )
     return FitNumericPolicy(
         max_evaluations=data["max_evaluations"],
-        max_batch_cells=data["max_batch_cells"],
-        sample_budget_per_batch=data["sample_budget_per_batch"],
-        max_packed_observations=data["max_packed_observations"],
         covariance_rcond=data["covariance_rcond"],
     )
 
@@ -419,8 +261,6 @@ __all__ = [
     "decode_fit_result_batch",
     "encode_fit_spec",
     "encode_fit_result_batch",
-    "fit_result_decode_additional_peak_upper_bound_nbytes",
-    "fit_result_encode_additional_peak_upper_bound_nbytes",
     "fit_spec_from_tree",
     "fit_spec_to_tree",
 ]

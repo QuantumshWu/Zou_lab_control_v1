@@ -20,7 +20,6 @@ from zlc_neutral_atom.runtime.pipeline import (
     CapturePreviewSpec,
     MinimalPipelineSpec,
     _notify_preview_failure,
-    estimate_pipeline_peak_bytes,
 )
 from zlc_neutral_atom.runtime.run import RunHandle, RunPlan
 from zlc_neutral_atom.timing.capture import TriggeredCaptureSpec
@@ -44,8 +43,6 @@ class CaptureRequest:
     repeat_count: int = 1
     readout_events_per_repeat: int | None = None
     within_point_grouping: tuple[tuple[int, int], ...] | None = None
-    transport_memory_limit_bytes: int = 64 << 20
-    pipeline_memory_limit_bytes: int = 256 << 20
     timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
@@ -85,22 +82,6 @@ class CaptureRequest:
             object.__setattr__(self, "within_point_grouping", grouping)
         object.__setattr__(
             self,
-            "transport_memory_limit_bytes",
-            positive_integer(
-                self.transport_memory_limit_bytes,
-                "transport_memory_limit_bytes",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "pipeline_memory_limit_bytes",
-            positive_integer(
-                self.pipeline_memory_limit_bytes,
-                "pipeline_memory_limit_bytes",
-            ),
-        )
-        object.__setattr__(
-            self,
             "timeout_seconds",
             positive_real(self.timeout_seconds, "timeout_seconds"),
         )
@@ -118,7 +99,6 @@ class PlanDescriptor:
     output_schema_fingerprint: str
     compiled_pulse_digest: str
     resource_claims: tuple[str, ...]
-    estimated_peak_bytes: int
 
 
 class PreparedFiniteCapture:
@@ -198,7 +178,6 @@ class PreparedFiniteCapture:
         self,
         *,
         block_id: BlockId,
-        downstream_peak_bytes: int,
         factory: Callable[[CapturePreviewSpec], CapturePreviewPort],
     ) -> RunHandle:
         if not isinstance(block_id, BlockId):
@@ -210,7 +189,6 @@ class PreparedFiniteCapture:
         preview_spec = CapturePreviewSpec(
             block_id,
             self._preview_edge,
-            downstream_peak_bytes,
         )
         preview = factory(preview_spec)
         plan = compile_capture_artifact_pipeline(
@@ -238,7 +216,6 @@ def bind_finite_capture_spec(
     camera_ref: DeviceRef,
     sequencer_ref: DeviceRef,
     execution_form: PulseExecutionForm,
-    pipeline_memory_limit_bytes: int,
     timeout_seconds: float,
     name_prefix: str,
 ) -> tuple[TriggeredCaptureSpec, PlanDescriptor]:
@@ -248,7 +225,6 @@ def bind_finite_capture_spec(
         f"{name_prefix} {binding.pulse_request.document.name}",
         binding.measurement,
         block_id,
-        pipeline_memory_limit_bytes,
         timeout_seconds=timeout_seconds,
     )
     triggered = TriggeredCaptureSpec(
@@ -272,7 +248,6 @@ def bind_finite_capture_spec(
             str(binding.pulse_port.resource_claim.key),
             str(binding.measurement.capture_port.resource_claim.key),
         ),
-        estimate_pipeline_peak_bytes(pipeline),
     )
     return triggered, descriptor
 
@@ -308,7 +283,6 @@ def prepare_finite_capture(
             readout_events_per_repeat=request.readout_events_per_repeat,
             within_point_grouping=request.within_point_grouping,
         ),
-        transport_memory_limit_bytes=request.transport_memory_limit_bytes,
     )
     triggered, descriptor = bind_finite_capture_spec(
         binding=binding,
@@ -316,7 +290,6 @@ def prepare_finite_capture(
         camera_ref=request.camera_ref,
         sequencer_ref=request.sequencer_ref,
         execution_form=request.execution_form,
-        pipeline_memory_limit_bytes=request.pipeline_memory_limit_bytes,
         timeout_seconds=request.timeout_seconds,
         name_prefix="Capture",
     )

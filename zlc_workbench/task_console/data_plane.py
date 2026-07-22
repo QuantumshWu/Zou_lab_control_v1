@@ -1,15 +1,15 @@
-"""MONITOR seam: the console's per-tick view of what its runs are producing.
+"""MONITOR seam: a coherent, change-driven view of current run outputs.
 
 Seam 3 of the composition root's rewiring contract (``app.py``).  A run node
-publishes into a ``LiveDatasetSlot``; this module turns those slots into ONE
-frozen snapshot per tick, which every panel, picker and legend then reads.
+publishes into a ``LiveDatasetSlot``; this module freezes only slots that
+reported a new revision, then composes ONE board snapshot which every panel,
+picker and legend reads.
 
 Freeze-latest, not a bus.  The old console read a mutable signal hub whenever it
 felt like it, so two widgets in the same tick could disagree about which shot
-they were showing.  Here the tick freezes once -- each slot materialises its own
-atomic transaction -- and the resulting :class:`ConsoleTickSnapshot` is
-immutable.  Two readers of one snapshot cannot disagree, and a slow consumer
-holds a consistent past instead of a torn present.
+they were showing.  Each changed slot materialises its own atomic transaction
+exactly once; unchanged slots reuse their immutable fronts.  The resulting
+:class:`ConsoleTickSnapshot` is immutable, so two readers cannot disagree.
 
 What replaced the shot clock: a monitor tap overwrites when the display falls
 behind rather than back-pressuring acquisition, and it says so per signal
@@ -22,6 +22,7 @@ from different runs advance independently.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 from typing import Mapping
 
 __all__ = ["ConsoleDataPlane", "ConsoleSignalValue", "ConsoleTickSnapshot"]
@@ -129,7 +130,7 @@ class ConsoleTickSnapshot:
 
 
 class ConsoleDataPlane:
-    """Owns the live slots and freezes them together, once per tick.
+    """Own live slots and coalesce their revision notifications.
 
     Slots arrive from the RUN seam: a node's start closure builds one and
     registers it here, so this plane never talks to the domain itself -- it
@@ -137,19 +138,42 @@ class ConsoleDataPlane:
     """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._slots: dict[int, tuple[object, object]] = {}   # id(node) -> (node, slot)
+        self._dirty: set[int] = set()
+        self._cache: dict[int, dict[str, ConsoleSignalValue]] = {}
+        self._failures: dict[int, str] = {}
 
     # ------------------------------------------------------------ membership
     def attach(self, node, slot) -> None:
         if slot is None:
             raise ValueError("a monitor slot is required")
-        self._slots[id(node)] = (node, slot)
+        key = id(node)
+        with self._lock:
+            self._slots[key] = (node, slot)
+            self._dirty.add(key)
+            self._cache.pop(key, None)
+            self._failures.pop(key, None)
+
+    def mark_changed(self, node) -> None:
+        """Mark one producer dirty from its worker-safe change listener."""
+
+        key = id(node)
+        with self._lock:
+            if key in self._slots:
+                self._dirty.add(key)
 
     def detach(self, node) -> None:
-        self._slots.pop(id(node), None)
+        key = id(node)
+        with self._lock:
+            self._slots.pop(key, None)
+            self._dirty.discard(key)
+            self._cache.pop(key, None)
+            self._failures.pop(key, None)
 
     def __len__(self) -> int:
-        return len(self._slots)
+        with self._lock:
+            return len(self._slots)
 
     # ---------------------------------------------------------------- freeze
     def freeze(self) -> ConsoleTickSnapshot:
@@ -161,16 +185,38 @@ class ConsoleDataPlane:
         see why that one row stopped moving.
         """
 
-        signals: dict[str, ConsoleSignalValue] = {}
-        failures: dict[str, str] = {}
-        for node, slot in list(self._slots.values()):
+        with self._lock:
+            slots = dict(self._slots)
+            dirty = self._dirty.intersection(slots)
+            self._dirty.difference_update(dirty)
+        for key in dirty:
+            node, slot = slots[key]
             title = str(getattr(node, "name", "") or type(node).__name__)
             try:
                 frozen = self._freeze_one(node, slot, title)
             except Exception as error:
-                failures[title] = f"{type(error).__name__}: {error}"
+                failure = f"{type(error).__name__}: {error}"
+                with self._lock:
+                    if self._slots.get(key) == (node, slot):
+                        self._cache.pop(key, None)
+                        self._failures[key] = failure
                 continue
-            signals.update(frozen)
+            with self._lock:
+                if self._slots.get(key) == (node, slot):
+                    self._cache[key] = frozen
+                    self._failures.pop(key, None)
+        signals: dict[str, ConsoleSignalValue] = {}
+        failures: dict[str, str] = {}
+        with self._lock:
+            current = dict(self._slots)
+            cached = {key: dict(value) for key, value in self._cache.items()}
+            failed = dict(self._failures)
+        for key, (node, _slot) in current.items():
+            signals.update(cached.get(key, {}))
+            failure = failed.get(key)
+            if failure is not None:
+                title = str(getattr(node, "name", "") or type(node).__name__)
+                failures[title] = failure
         return ConsoleTickSnapshot(signals=signals, failures=failures)
 
     def _freeze_one(self, node, slot, title: str) -> dict[str, ConsoleSignalValue]:

@@ -9,10 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
 from zlc_storage import (
-    CanonicalDecodeLimits,
-    CanonicalEncodingError,
     canonical_text as _text,
-    encode,
     positive_real as _positive_float,
     sha256_text as _sha256,
 )
@@ -50,15 +47,6 @@ from zlc_neutral_atom.runtime.run import RunContext
 
 
 _PULSE_TERMINAL_ACK_SCHEMA = "zlc_neutral_atom.PulseTerminalAck"
-MAX_PULSE_TERMINAL_ACK_CANONICAL_BYTES = 8 << 10
-MAX_PULSE_TERMINAL_ACK_CANONICAL_NODES = 256
-_PULSE_TERMINAL_ACK_LIMITS = CanonicalDecodeLimits(
-    max_depth=32,
-    max_nodes=MAX_PULSE_TERMINAL_ACK_CANONICAL_NODES,
-    max_container_entries=MAX_PULSE_TERMINAL_ACK_CANONICAL_NODES,
-    max_arrays=0,
-    max_total_array_bytes=0,
-)
 
 _CONTINUOUS_EXECUTION_FORMS = frozenset(
     {
@@ -133,18 +121,6 @@ class PulseScanProgress:
             backend_state,
             reason,
         )
-
-
-def _require_terminal_ack_canonical_budget(value: "PulseTerminalAck") -> None:
-    try:
-        payload = encode(
-            pulse_terminal_ack_to_tree(value),
-            limits=_PULSE_TERMINAL_ACK_LIMITS,
-        )
-    except CanonicalEncodingError as exc:
-        raise ValueError("pulse terminal acknowledgement exceeds its schema budget") from exc
-    if len(payload) > MAX_PULSE_TERMINAL_ACK_CANONICAL_BYTES:
-        raise ValueError("pulse terminal acknowledgement exceeds its byte budget")
 
 
 @dataclass(frozen=True)
@@ -402,7 +378,6 @@ class PulseTerminalAck:
             _text(getattr(self, field), field)
         if not isinstance(self.receipt, (PulseCompletion, SimulatedPulseReceipt)):
             raise TypeError("receipt must be PulseCompletion or SimulatedPulseReceipt")
-        _require_terminal_ack_canonical_budget(self)
 
     @property
     def artifact_digest(self) -> str:
@@ -842,8 +817,6 @@ __all__ = [
     "CompletePulseCommand",
     "ContinuousPulseExecutionRequest",
     "FinitePulseExecutionRequest",
-    "MAX_PULSE_TERMINAL_ACK_CANONICAL_BYTES",
-    "MAX_PULSE_TERMINAL_ACK_CANONICAL_NODES",
     "FirePulseCommand",
     "PreparePulseCommand",
     "PulseFiredAck",
