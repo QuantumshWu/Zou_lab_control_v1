@@ -25,6 +25,8 @@ from zlc_neutral_atom.timing.pulse_table import (
     ScanSlot,
     default_pulse_name,
     is_slot_ref,
+    bus_signed_range,
+    bus_zero_code,
     load_scan_table,
     slot_ref_index,
     slot_var,
@@ -359,14 +361,15 @@ def _unit_resolution(step_ns: float, unit: str) -> float:
     return float(step_ns) / factor
 
 
-def _normalize_bus_value_text(text: object, *, max_value: int) -> str:
-    """A typed DAC value, coerced to something the bus can actually carry.
+def _normalize_bus_value_text(text: object, *, lo: int, hi: int) -> str:
+    """A typed DAC value, coerced to the bus's SIGNED user range.
 
-    The field accepts free text, but a bus only has as many lanes as it has, so
-    anything outside ``0..max_value`` is clamped rather than rejected: the number
-    shown is then exactly the number that will be applied.  Unparseable text
-    reads as 0 for the same reason -- a blank field must not leave the previous
-    value silently in effect.
+    ALL user-layer DAC values are signed LSB counts around true 0 V
+    (``bus_signed_range``, the model's one source -- the wire carries
+    offset-binary ``signed + bus_zero_code``).  Anything outside ``lo..hi`` is
+    clamped rather than rejected: the number shown is then exactly the number
+    that will be applied.  Unparseable text reads as 0 (true 0 V) for the same
+    reason -- a blank field must not leave the previous value silently in effect.
     """
 
     raw = str(text or "").strip()
@@ -374,7 +377,7 @@ def _normalize_bus_value_text(text: object, *, max_value: int) -> str:
         value = int(float(raw)) if raw else 0
     except ValueError:
         value = 0
-    return str(max(0, min(int(max_value), value)))
+    return str(max(int(lo), min(int(hi), value)))
 
 
 def _bus_key(name: str) -> str:
@@ -665,7 +668,13 @@ class PeriodCard(FluentGroupBox):
         self.bus_members: dict[str, list[str]] = {}
         self.bus_mode_combos: dict[str, QtWidgets.QComboBox] = {}
         self.bus_value_edits: dict[str, FluentLineEdit] = {}
-        self.bus_max_values: dict[str, int] = {}
+        # Each DAC value edit's embedded scan dot, keyed by bus name -- the registry
+        # _refresh_bus_displays reads to skip scan-bound fields when refreshing the
+        # carried HOLD value (a bound field shows its slot, never a number).
+        self.bus_dots: dict[str, QtWidgets.QAbstractButton] = {}
+        # SIGNED user range per bus, straight from the model's one source
+        # (bus_signed_range): every clamp/validator on a DAC field reads this.
+        self.bus_bounds: dict[str, tuple[int, int]] = {}
 
         # A period is one COLUMN in a row of periods, so the card is exactly as wide as
         # its content needs and never stretches: a card that filled the editor would push
@@ -785,16 +794,21 @@ class PeriodCard(FluentGroupBox):
         """
 
         self.bus_members[bus_name] = list(members)
-        self.bus_max_values[bus_name] = (1 << len(members)) - 1
+        lo, hi = bus_signed_range(len(members))
+        self.bus_bounds[bus_name] = (lo, hi)
 
-        value = 0
+        # The lane bits carry the OFFSET-BINARY wire code (signed + bus_zero_code);
+        # everything the operator sees is the SIGNED value around true 0 V.
+        code = 0
         for bit, lane in enumerate(members):
             position = channel_index.get(lane)
             if position is not None and period.states[position]:
-                value |= 1 << bit
+                code |= 1 << bit
         plan = list((state.analog_bus_modes or {}).get(bus_name, ()))
         entry = plan[index] if 0 <= index < len(plan) else {}
-        mode = str((entry or {}).get("mode", "edge"))
+        # An untouched bus HOLDS (the model's default): defaulting to "edge" here made
+        # the first read_state stamp every visible bus edge@0, poisoning the state.
+        mode = str((entry or {}).get("mode", "hold"))
         stored = (entry or {}).get("value")
 
         row = QtWidgets.QWidget()
@@ -810,26 +824,46 @@ class PeriodCard(FluentGroupBox):
         self.bus_mode_combos[bus_name] = combo
         layout.addWidget(combo, 0)
 
-        # A scan-bound value is stored as its slot expression, so show that rather
-        # than the lane bits (which still hold the last previewed number).
-        text = str(stored) if _is_slot_expr(stored) else str(value)
-        edit_field = FluentScanLineEdit(text, tooltip="Click the dot to scan this DAC value")
-        edit_field.setToolTip(f"{label} value, 0..{self.bus_max_values[bus_name]}")
+        # Displayed value, three-state exactly like the reference: a scan-bound value shows
+        # its slot expression; a HOLD shows the (read-only) value carried in from the
+        # preceding edge/ramp; otherwise the SIGNED stored value (falling back to decoding
+        # the lane code minus bus_zero_code -- the lanes carry offset-binary, the user
+        # never sees the +2^(B-1) offset).
+        if _is_slot_expr(stored):
+            text = str(stored)
+        elif stored is None and mode == "hold":
+            try:
+                text = str(int(state.analog_bus_value_at_period_start(index, bus_name)))
+            except Exception:
+                text = str(code - bus_zero_code(len(members)))
+        elif stored is not None:
+            text = _normalize_bus_value_text(stored, lo=lo, hi=hi)
+        else:
+            text = str(code - bus_zero_code(len(members)))
+        edit_field = FluentScanLineEdit(
+            text,
+            tooltip=f"{label}: signed integer {lo}..{hi} (0 = 0 V); "
+                    "click the dot to cycle scan (sN) -> API (aN) -> off")
+        edit_field.set_numeric_validator("int", bottom=lo, top=hi)
         edit_field.scanClicked.connect(lambda name=bus_name: self.busScanRequested.emit(name))
         self.bus_value_edits[bus_name] = edit_field
+        self.bus_dots[bus_name] = edit_field.dot
         layout.addWidget(edit_field, 1)
 
         def commit(*_args, name=bus_name, widget=edit_field):
             if not _is_slot_expr(widget.text()):
-                self._normalize_bus_value_edit(widget, self.bus_max_values.get(name, 0))
+                self._normalize_bus_value_edit(widget, *self.bus_bounds.get(name, (0, 0)))
             self.busChanged.emit()
             self.changed.emit()
 
         edit_field.editingFinished.connect(commit)
         combo.currentTextChanged.connect(lambda *_: (self.busChanged.emit(), self.changed.emit()))
+        # HOLD keeps the field VISIBLE but read-only, showing the carried value (the
+        # reference's behaviour; set_editable, not setEnabled -- disabling would take
+        # the scan dot down with it and the binding could never be cleared).
         combo.currentTextChanged.connect(
-            lambda title, w=edit_field: w.setVisible(_bus_mode_value(title) != "hold"))
-        edit_field.setVisible(_bus_mode_value(combo.currentText()) != "hold")
+            lambda title, w=edit_field: w.set_editable(_bus_mode_value(title) != "hold"))
+        edit_field.set_editable(_bus_mode_value(combo.currentText()) != "hold")
         # Same scan/API marker the duration field shows: a DAC value bound to a scan slot
         # goes orange + read-only with its sN number; an API-bound value keeps its number
         # with a violet border.  Without this the DAC dot cycle leaves no visible trace.
@@ -879,22 +913,24 @@ class PeriodCard(FluentGroupBox):
         for bus_name in self.bus_value_edits:
             members = self.bus_members.get(bus_name, [])
             mode_combo = self.bus_mode_combos.get(bus_name)
-            mode = _bus_mode_value(mode_combo.currentText()) if mode_combo is not None else "edge"
+            mode = _bus_mode_value(mode_combo.currentText()) if mode_combo is not None else "hold"
             if mode == "hold":
                 continue
             value_edit = self.bus_value_edits[bus_name]
             if _is_slot_expr(value_edit.text()):
                 continue  # scanned DAC value; underlying bits stay as previewed
-            value_text = _normalize_bus_value_text(value_edit.text(), max_value=self.bus_max_values.get(bus_name, 0))
+            lo, hi = self.bus_bounds.get(bus_name, (0, 0))
+            value_text = _normalize_bus_value_text(value_edit.text(), lo=lo, hi=hi)
             if value_edit.text() != value_text:
                 # read_state() must not itself mark the editor dirty: block the textChanged
                 # that this normalization setText would otherwise fire (-> changed -> _mark_dirty).
                 with _signals_blocked(value_edit):
                     value_edit.setText(value_text)
-            value = int(value_text)
+            # The lanes carry the OFFSET-BINARY wire code; the field holds the SIGNED value.
+            code = int(value_text) + bus_zero_code(len(members))
             for bit, channel in enumerate(members):
                 if channel in channel_index:
-                    states[channel_index[channel]] = 1 if (value >> bit) & 1 else 0
+                    states[channel_index[channel]] = 1 if (code >> bit) & 1 else 0
         period = PulsePeriod(
             self.duration_edit.text().strip(),
             tuple(states),
@@ -915,16 +951,17 @@ class PeriodCard(FluentGroupBox):
                 if _is_slot_expr(edit.text()):
                     value = edit.text().strip()  # scanned DAC value -> keep slot reference
                 else:
-                    value_text = _normalize_bus_value_text(edit.text(), max_value=self.bus_max_values.get(bus_name, 0))
+                    lo, hi = self.bus_bounds.get(bus_name, (0, 0))
+                    value_text = _normalize_bus_value_text(edit.text(), lo=lo, hi=hi)
                     if edit.text() != value_text:
                         edit.setText(value_text)
                     value = int(value_text)
             out[bus_name] = {"mode": mode, "value": value}
         return out
 
-    def _normalize_bus_value_edit(self, edit: FluentLineEdit, max_value: int) -> None:
+    def _normalize_bus_value_edit(self, edit: FluentLineEdit, lo: int, hi: int) -> None:
         try:
-            edit.setText(_normalize_bus_value_text(edit.text(), max_value=max_value))
+            edit.setText(_normalize_bus_value_text(edit.text(), lo=lo, hi=hi))
         except Exception:
             edit.setText("0")
 

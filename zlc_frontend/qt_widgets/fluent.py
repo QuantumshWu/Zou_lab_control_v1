@@ -3625,10 +3625,6 @@ class FluentScanLineEdit(FluentLineEdit):
         super().showEvent(event)
         self._place_dot()
 
-    @property
-    def dot(self) -> "FluentScanDot":
-        return self._dot
-
     def set_scan_bound(self, bound: bool, number: int | None = None) -> None:
         bound = bool(bound)
         # no-op guard: re-applying the (expensive) stylesheet/dot/readonly when neither the
