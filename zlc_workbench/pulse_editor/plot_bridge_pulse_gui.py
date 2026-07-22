@@ -3982,6 +3982,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             if index + 1 < len(times):
                 samples.append(times[index + 1])
 
+        # The compiler addresses lanes by their raw key (``ch00``); the operator reads them
+        # by the board name (``cooling``).  Translate for DISPLAY only -- the dataset the run
+        # path uploads still speaks raw keys, so the axis labels are the one place this maps.
+        labels = dict(getattr(state.port_catalog, "channel_labels", {}) or {})
+        display_names = [labels.get(name, name) for name in channels]
+
         index_of = {name: position for position, name in enumerate(channels)}
         values = np.zeros((1, len(samples), len(channels)), dtype=np.float64)
         for pulse in pulses:
@@ -4005,7 +4011,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             tuple(value * 1e6 for value in samples), "us")
         channel_axis = AxisSpec(
             AxisId("pulse.preview.channel"), "Channel", COMPONENT,
-            len(channels), tuple(channels))
+            len(channels), tuple(display_names))
         schema = DatasetSchema(
             repeat,
             (time_axis,),
@@ -4102,10 +4108,19 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         if getattr(self, "preview_image", None) is None:
             self.preview_image = QtWidgets.QLabel()
             self.preview_image.setAlignment(QtCore.Qt.AlignCenter)
-            self.preview_body_layout.addWidget(self.preview_image)
+            self.preview_body_layout.addWidget(self.preview_image, 1)
         self.preview_placeholder.hide()
         self.preview_image.setPixmap(pixmap)
         self.preview_image.show()
+        # The scroll area holds the body at its OWN size hint (setWidgetResizable(False)),
+        # so a layout stretch cannot grow it: without this the QLabel keeps its ~13 px
+        # minimum and the 500x400 plot shows as a sliver.  Size the body to the pixmap
+        # (plus the layout margins) so the whole plot is visible and the scroll bars only
+        # appear when it genuinely overflows the viewport.
+        margins = self.preview_body_layout.contentsMargins()
+        self.preview_body.resize(
+            pixmap.width() + margins.left() + margins.right(),
+            pixmap.height() + margins.top() + margins.bottom())
         self._preview_dirty = False
         self.preview_status.setText(
             f"{state.total_duration_ns() / 1000.0:.4g} us, {len(state.periods)} periods")
