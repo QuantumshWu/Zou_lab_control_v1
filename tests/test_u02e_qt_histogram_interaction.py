@@ -138,6 +138,7 @@ def _histogram_panel(
     bin_count: int = 5,
     labels: tuple[str, str] = ("ROI A", "ROI B"),
     variant: int = 0,
+    thresholds: tuple[float, ...] = (),
 ):
     from zlc_frontend.figure import EvaluatedHistogram, EvaluatedSeries
     from zlc_frontend.histogram_display import (
@@ -193,6 +194,7 @@ def _histogram_panel(
         tuple(EvaluatedSeries((), value) for value in histograms),
         labels,
         projection,
+        thresholds=thresholds,
     )
     presentation = PanelPresentationIdentity(
         "histogram",
@@ -740,6 +742,73 @@ def test_histogram_hold_releases_on_escape_hide_semantics_and_unbind() -> None:
         assert "histogram" not in board._numeric_bindings
         assert "curve" in board._numeric_bindings
         assert board.visible_curve_payload() is not None
+    finally:
+        board.close()
+        application.processEvents()
+
+
+def test_histogram_threshold_line_drag_is_live_exclusive_and_near_line_only() -> None:
+    """The design's frozen histogram selector row: a left press within 2% of
+    the x span of an authored threshold line grabs THAT line (the area
+    machinery never starts), every motion commits the authored set live,
+    release only ends the drag, and a press away from any line falls through
+    to the ordinary area pull."""
+
+    from PyQt5 import QtCore, QtGui, QtTest
+    from zlc_frontend.render import BoardFrame
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+    from zlc_frontend.selector import HistogramThresholdCommit
+
+    application = ensure_qt_app()
+    commands: list[object] = []
+    board = QtRasterBoard(("histogram",), columns=1)
+    board.resize(640, 420)
+    board.show()
+    board.present(BoardFrame(
+        "numeric-board", 0, 0,
+        (_histogram_panel(1, thresholds=(1.0,)),),
+    ))
+    board.bind_histogram_interaction("histogram", commands.append)
+    application.processEvents()
+    try:
+        binding = board._numeric_bindings["histogram"]
+        target = _numeric_target(board, "histogram")
+        assert target is not None
+        x_low, x_high = target.payload.viewport.x_limits
+        line_fraction = (1.0 - x_low) / (x_high - x_low)
+        on_line = _point(target.plot, line_fraction, 0.5)
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=on_line)
+        assert binding.threshold_drag == 0
+        # EXCLUSIVE with the area selector: no span machinery started.
+        assert binding.span_anchor is None and binding.span_rect is None
+
+        drag_fraction = line_fraction + 0.2
+        expected = x_low + drag_fraction * (x_high - x_low)
+        board.mouseMoveEvent(QtGui.QMouseEvent(
+            QtCore.QEvent.MouseMove,
+            QtCore.QPointF(_point(target.plot, drag_fraction, 0.5)),
+            QtCore.Qt.NoButton, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
+        application.processEvents()
+        command = commands[-1]
+        assert isinstance(command, HistogramThresholdCommit)
+        assert command.thresholds == pytest.approx((expected,), abs=0.05)
+        issued = len(commands)
+
+        QtTest.QTest.mouseRelease(
+            board, QtCore.Qt.LeftButton,
+            pos=_point(target.plot, drag_fraction, 0.5))
+        # Release only ends the drag; the last step is not re-issued.
+        assert len(commands) == issued
+        assert binding.threshold_drag is None
+        assert board._selector_hold is None
+
+        # A press AWAY from any line (far past the 2% tolerance) starts the
+        # ordinary area pull instead.
+        away = _point(target.plot, line_fraction - 0.4, 0.5)
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=away)
+        assert binding.threshold_drag is None
+        assert binding.span_anchor is not None
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=away)
     finally:
         board.close()
         application.processEvents()

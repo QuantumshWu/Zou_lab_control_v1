@@ -9,6 +9,7 @@ analysis authority.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import TypeAlias
 
 from zlc_storage import canonical_text, nonnegative_integer
@@ -207,8 +208,29 @@ class HistogramRangeGesture:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class HistogramThresholdCommit:
+    """Author the display threshold cut lines from a live drag step.
+
+    The reference's DragVLine calls back on EVERY motion and the value is
+    pure display state on the histogram figure -- never an analysis
+    authority.  ``thresholds`` is the COMPLETE authored set after this step.
+    """
+
+    origin: PanelInteractionOrigin
+    thresholds: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
+        values = tuple(float(value) for value in self.thresholds)
+        if any(not math.isfinite(value) for value in values):
+            raise ValueError("threshold commit values must be finite")
+        object.__setattr__(self, "thresholds", values)
+
+
 HistogramInteractionIntent: TypeAlias = (
-    HistogramViewportCommit | HistogramRangeGesture
+    HistogramViewportCommit | HistogramRangeGesture | HistogramThresholdCommit
 )
 
 
@@ -218,6 +240,7 @@ __all__ = [
     "CurveViewportCommit",
     "HistogramInteractionIntent",
     "HistogramRangeGesture",
+    "HistogramThresholdCommit",
     "HistogramViewportCommit",
     "ImageColorLimitsCommit",
     "ImageInteractionCommit",

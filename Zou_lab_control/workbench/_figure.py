@@ -79,6 +79,7 @@ from zlc_frontend.histogram_display import (
     histogram_display_form_spec,
     histogram_display_form_values,
     histogram_display_from_form,
+    histogram_display_with_thresholds,
     histogram_display_with_x_view,
     histogram_projection_home_x_limits,
 )
@@ -117,6 +118,7 @@ from zlc_frontend.selector import (
     CurveViewportCommit,
     HistogramInteractionIntent,
     HistogramRangeGesture,
+    HistogramThresholdCommit,
     HistogramViewportCommit,
     ImageColorLimitsCommit,
     ImageInteractionCommit,
@@ -3222,7 +3224,11 @@ class DataFigureWindow(FrozenRasterWindow):
         is_curve = isinstance(command, (CurveViewportCommit, CurveRangeGesture))
         is_histogram = isinstance(
             command,
-            (HistogramViewportCommit, HistogramRangeGesture),
+            (
+                HistogramViewportCommit,
+                HistogramRangeGesture,
+                HistogramThresholdCommit,
+            ),
         )
         if not (is_curve or is_histogram):
             raise TypeError("unknown numeric interaction command")
@@ -3267,6 +3273,14 @@ class DataFigureWindow(FrozenRasterWindow):
                     "DISPLAY ONLY x span "
                     f"{command.x_span[0]:.6g}..{command.x_span[1]:.6g}"
                 )
+            )
+            return
+        if isinstance(command, HistogramThresholdCommit):
+            # A live threshold drag step (the reference's per-motion
+            # DragVLine callback): author the new cut set and re-render.
+            self._start_typed_render(
+                histogram_display_with_thresholds(display, command.thresholds),
+                origin=origin,
             )
             return
         if command.viewport.display_revision != display.revision + 1:

@@ -50,6 +50,7 @@ from ..selector import (
     CurveViewportCommit,
     HistogramInteractionIntent,
     HistogramRangeGesture,
+    HistogramThresholdCommit,
     HistogramViewportCommit,
     ImageColorLimitsCommit,
     ImageInteractionCommit,
@@ -512,6 +513,14 @@ class _NumericPanelBinding:
     # whole box.  Both are None during a plain corner drag / fresh pull.
     span_resize_lock: str | None = None
     span_move_grab: tuple[float, float] | None = None
+    # A live threshold-line drag (histogram only): the grabbed index into the
+    # payload's authored thresholds, the in-flight authored set, and the
+    # display revision the last commit expects back -- present() absorbs the
+    # answer into the hold when it arrives (the reference's DragVLine redraws
+    # per motion).
+    threshold_drag: int | None = None
+    threshold_candidate: tuple[float, ...] | None = None
+    threshold_pending_revision: int | None = None
     pan_anchor: float | None = None
     pan_origin: _NumericViewport | None = None
     pan_candidate: tuple[float, float] | None = None
@@ -1160,12 +1169,23 @@ class QtRasterBoard(QtWidgets.QWidget):
         for panel_id, binding in self._numeric_bindings.items():
             pending = binding.pending_viewport
             candidate = target_numeric_viewports.get(panel_id)
+            answered = False
             if (
                 pending is not None
                 and candidate is not None
                 and candidate.display_revision >= pending.display_revision
             ):
                 binding.pending_viewport = None
+                answered = True
+            if (
+                binding.threshold_pending_revision is not None
+                and candidate is not None
+                and candidate.display_revision
+                >= binding.threshold_pending_revision
+            ):
+                binding.threshold_pending_revision = None
+                answered = True
+            if answered:
                 hold = self._selector_hold
                 if hold is not None and hold.panel_id == panel_id:
                     # This present answers the running gesture's OWN view
@@ -2147,6 +2167,23 @@ class QtRasterBoard(QtWidgets.QWidget):
                 event.accept()
                 return
             if event.button() == QtCore.Qt.LeftButton:
+                # The reference's DragVLine takes PRIORITY over the area
+                # selector: a left press within 2% of the x span of an
+                # authored threshold line grabs THAT line, and the area
+                # machinery stays untouched for the whole drag (the exclusive
+                # arrangement the design's histogram row freezes).
+                grabbed = self._threshold_line_hit(
+                    numeric_target, event.localPos())
+                if grabbed is not None:
+                    self._selector_hold = (
+                        self._held_panel_from_numeric_target(numeric_target))
+                    binding.threshold_drag = grabbed
+                    binding.threshold_candidate = tuple(
+                        numeric_target.payload.thresholds)
+                    self._set_numeric_hover(binding, None)
+                    self.update()
+                    event.accept()
+                    return
                 # The reference's RectangleSelector on a STANDING box: grab the
                 # centre to move it, a corner/edge handle to resize it, and a
                 # press anywhere else discards it and pulls a fresh box.  The
@@ -2291,6 +2328,38 @@ class QtRasterBoard(QtWidgets.QWidget):
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         numeric_binding = self._active_numeric_binding()
+        if (
+            numeric_binding is not None
+            and numeric_binding.threshold_drag is not None
+        ):
+            target = self._numeric_target(numeric_binding)
+            if target is not None:
+                viewport = target.payload.viewport
+                point = self._numeric_normalized_point(
+                    target,
+                    event.localPos(),
+                    clamp_to_plot=True,
+                )
+                moved = viewport.widget_normalized_to_data(*point)
+                base = list(
+                    numeric_binding.threshold_candidate
+                    or target.payload.thresholds
+                )
+                index = numeric_binding.threshold_drag
+                if 0 <= index < len(base) and math.isfinite(moved[0]):
+                    base[index] = float(moved[0])
+                    candidate = tuple(base)
+                    # The reference's DragVLine calls back on EVERY motion.
+                    if candidate != numeric_binding.threshold_candidate:
+                        numeric_binding.threshold_candidate = candidate
+                        self._commit_histogram_thresholds(
+                            numeric_binding,
+                            candidate,
+                            hold=self._selector_hold,
+                        )
+                self.update()
+            event.accept()
+            return
         if numeric_binding is not None and (
             numeric_binding.span_anchor is not None
             or numeric_binding.span_move_grab is not None
@@ -2494,6 +2563,20 @@ class QtRasterBoard(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         numeric_binding = self._active_numeric_binding()
+        if (
+            numeric_binding is not None
+            and numeric_binding.threshold_drag is not None
+            and event.button() == QtCore.Qt.LeftButton
+        ):
+            # Every motion already committed its step; release only ends the
+            # drag (the reference's DragVLine on_release re-arms and stops).
+            self._cancel_active_gesture(
+                clear_image_draft=False,
+                clear_numeric_spans=False,
+            )
+            self.update()
+            event.accept()
+            return
         if (
             numeric_binding is not None
             and numeric_binding.pan_anchor is not None
@@ -3285,6 +3368,42 @@ class QtRasterBoard(QtWidgets.QWidget):
         return None
 
     @staticmethod
+    def _threshold_line_hit(
+        target: _NumericTarget,
+        pos: QtCore.QPointF,
+    ) -> int | None:
+        """Index of the authored threshold line a left press grabs, or None.
+
+        The reference's DragVLine tolerance verbatim: within 2% of the
+        current x span of the line's position (measured here as 2% of the
+        plot's pixel width, the same quantity in widget space)."""
+
+        payload = target.payload
+        if not isinstance(payload, HistogramPanelPayload):
+            return None
+        thresholds = payload.thresholds
+        if not thresholds:
+            return None
+        viewport = payload.viewport
+        bounds = target.bounds
+        counts_mid = 0.5 * (
+            viewport.count_limits[0] + viewport.count_limits[1])
+        tolerance = 0.02 * target.plot.width()
+        pressed_x = float(pos.x())
+        best_index: int | None = None
+        best_distance: float | None = None
+        for index, threshold in enumerate(thresholds):
+            normalized = viewport.data_to_widget_normalized(
+                float(threshold), counts_mid)
+            line_x = bounds.x() + normalized[0] * bounds.width()
+            distance = abs(pressed_x - line_x)
+            if distance <= tolerance and (
+                best_distance is None or distance < best_distance
+            ):
+                best_index, best_distance = index, distance
+        return best_index
+
+    @staticmethod
     def _span_rect_widget_extents(
         target: _NumericTarget,
         rect: tuple[float, float, float, float],
@@ -3635,6 +3754,58 @@ class QtRasterBoard(QtWidgets.QWidget):
                 binding.fault = detached_render_fault(error)
             binding.binding_enabled = False
             self._set_hover_sample(binding, None)
+            return False
+        return True
+
+    def _commit_histogram_thresholds(
+        self,
+        binding: _NumericPanelBinding,
+        thresholds: tuple[float, ...],
+        *,
+        hold: _HeldPanelFront | None = None,
+    ) -> bool:
+        """Author the threshold set from a live drag step (per motion).
+
+        The commit records the display revision it expects back so present()
+        can absorb the answer into the held front -- the same live-follow
+        arrangement the pan/zoom commits use, with an int expectation instead
+        of a pending viewport."""
+
+        payload = (
+            _numeric_payload(hold, binding.kind)
+            if hold is not None
+            else self._visible_display(
+                binding.panel_id,
+                _NUMERIC_PAYLOAD_TYPES[binding.kind],
+            )[0]
+        )
+        if payload is None or tuple(thresholds) == tuple(payload.thresholds):
+            return False
+        front = self._front
+        if front is None:
+            return False
+        if hold is not None and not self._hold_matches_frame(
+            hold,
+            front[0],
+            panel_ids=self._panel_ids,
+        ):
+            return False
+        origin = self._numeric_interaction_origin(binding, hold=hold)
+        command = HistogramThresholdCommit(origin, tuple(thresholds))
+        expected = payload.viewport.display_revision
+        if binding.viewport is not None:
+            expected = max(expected, binding.viewport.display_revision)
+        if binding.threshold_pending_revision is not None:
+            expected = max(expected, binding.threshold_pending_revision)
+        binding.threshold_pending_revision = expected + 1
+        try:
+            binding.callback(command)
+        except BaseException as error:
+            binding.threshold_pending_revision = None
+            if binding.fault is None:
+                binding.fault = detached_render_fault(error)
+            binding.binding_enabled = False
+            self._set_numeric_hover(binding, None)
             return False
         return True
 
@@ -5000,6 +5171,9 @@ class QtRasterBoard(QtWidgets.QWidget):
         binding.span_anchor = None
         binding.span_move_grab = None
         binding.span_resize_lock = None
+        binding.threshold_drag = None
+        binding.threshold_candidate = None
+        binding.threshold_pending_revision = None
         binding.pan_anchor = None
         binding.pan_origin = None
         binding.pan_candidate = None

@@ -25,7 +25,7 @@ from ..render import (
     SourceIdentity)
 from ..selector import (
     CurveRangeGesture, CurveViewportCommit, HistogramRangeGesture,
-    HistogramViewportCommit)
+    HistogramThresholdCommit, HistogramViewportCommit)
 from .board import QtRasterBoard
 
 
@@ -50,6 +50,7 @@ class SinglePanelHost(QtWidgets.QWidget):
 
     rangeSelected = QtCore.pyqtSignal(object)
     viewCommitted = QtCore.pyqtSignal(object)
+    thresholdsCommitted = QtCore.pyqtSignal(object)
 
     def __init__(self, panel_id: str = "panel", *,
                  group: str | None = None,
@@ -176,3 +177,6 @@ class SinglePanelHost(QtWidgets.QWidget):
             return
         if isinstance(intent, (CurveViewportCommit, HistogramViewportCommit)):
             self.viewCommitted.emit(intent.viewport)
+            return
+        if isinstance(intent, HistogramThresholdCommit):
+            self.thresholdsCommitted.emit(intent.thresholds)
