@@ -25,6 +25,7 @@ tests/test_notebook_experiment_facade.py
 tests/test_operator_flows_on_virtual.py
 tests/test_public_hardware_boundary.py
 tests/test_pulse_command_port.py
+tests/test_pulse_edit_alignment.py
 tests/test_pulse_preview_render.py
 tests/test_pulse_scan_slot_cycle.py
 tests/test_pulse_target_binding.py

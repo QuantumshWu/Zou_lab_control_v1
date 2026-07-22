@@ -683,34 +683,52 @@ class PeriodCard(FluentGroupBox):
         column.setSpacing(_px(2, minimum=1) if compact else _px(4, minimum=2))
         self.set_period_position(index, total_periods)
 
-        # --- name: free text, and the only thing telling two identical periods apart
-        self.name_edit = FluentLineEdit(str(period.name or ""))
-        self.name_edit.setPlaceholderText("name")
-        self.name_edit.setFixedWidth(control_width)
-        self.name_edit.setToolTip("This period's name (shown in the preview and the summary)")
-        self.name_edit.textChanged.connect(lambda *_: self.changed.emit())
-        column.addWidget(self.name_edit)
+        # --- period parameters, in a FIXED-HEIGHT header (Duration label, duration,
+        # unit, name), the reference's order.  Every card wraps its header in a top
+        # widget of _panel_top_height() so its per-channel rows begin at the SAME Y as
+        # every other card's; a period card that added these straight to the column had
+        # a shorter header and pushed its checkboxes ~93 px above the matching delay row
+        # (the "period / delay / name alignment is wrong" complaint).
+        top = QtWidgets.QWidget()
+        top.setStyleSheet("background: transparent;")
+        top.setFixedHeight(_panel_top_height())
+        top_layout = QtWidgets.QVBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(_px(6, minimum=4))
 
-        # --- duration + unit.  The dot binds the field to a scan slot; the HOST owns
-        # the slot table, so the card only exposes the button for it to wire.
+        duration_label = FluentLabel("Duration")
+        duration_label.setAlignment(QtCore.Qt.AlignCenter)
+        duration_label.setToolTip("Duration")
+        top_layout.addWidget(_set_fixed_height(duration_label))
+
+        # The dot binds the field to a scan slot; the HOST owns the slot table, so
+        # the card only exposes the button for it to wire.
         self.duration_edit = FluentScanLineEdit(
-            _period_duration_text(period), tooltip="Click the dot to scan this duration")
+            _period_duration_text(period),
+            tooltip="Duration value; click the dot to cycle scan (sN) -> API (aN) -> off")
+        self.duration_edit.setFixedWidth(control_width)
         self.duration_dot = self.duration_edit.dot
-        self.duration_edit.setToolTip("How long this period lasts, in the unit beside it")
+        self.duration_edit.setToolTip("How long this period lasts, in the unit below")
+        top_layout.addWidget(_set_fixed_height(self.duration_edit))
+
         self.unit_combo = FluentComboBox()
         _set_duration_unit_combo(
             self.unit_combo,
             scanned=_is_slot_expr(self.duration_edit.text()),
             unit=str(period.unit or "ns"),
         )
-        self.unit_combo.setFixedWidth(measure_text_width(["str (ns)"], padding=_px(24, minimum=12)))
-        duration_row = QtWidgets.QWidget()
-        duration_layout = QtWidgets.QHBoxLayout(duration_row)
-        duration_layout.setContentsMargins(0, 0, 0, 0)
-        duration_layout.setSpacing(_px(3, minimum=2))
-        duration_layout.addWidget(self.duration_edit, 1)
-        duration_layout.addWidget(self.unit_combo, 0)
-        column.addWidget(duration_row)
+        self.unit_combo.setFixedWidth(control_width)
+        top_layout.addWidget(_set_fixed_height(self.unit_combo))
+
+        # name: free text, and the only thing telling two identical periods apart.
+        self.name_edit = FluentLineEdit(str(period.name or ""))
+        self.name_edit.setPlaceholderText("name")
+        self.name_edit.setFixedWidth(control_width)
+        self.name_edit.setToolTip("This period's name (shown in the preview and the summary)")
+        self.name_edit.textChanged.connect(lambda *_: self.changed.emit())
+        top_layout.addWidget(_set_fixed_height(self.name_edit))
+        top_layout.addStretch()
+        column.addWidget(top)
         # Seed resolution + validator from the value just loaded, so a freshly built
         # card enforces exactly what an edited one does.
         self._handle_duration_text(self.duration_edit.text())
