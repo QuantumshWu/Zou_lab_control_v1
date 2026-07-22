@@ -38,7 +38,11 @@ def test_present_frame_binds_the_image_family_and_forwards_typed_intents() -> No
     zoom commit's candidate viewport, and the clim commit's fixed limits."""
 
     from PyQt5 import QtCore, QtTest
-    from zlc_frontend.selector import ImageColorLimitsCommit, RectangleGesture
+    from zlc_frontend.selector import (
+        ImageColorLimitsCommit,
+        ImageViewportCommit,
+        RectangleGesture,
+    )
 
     application, host = _host_with_image_front()
     try:
@@ -70,11 +74,15 @@ def test_present_frame_binds_the_image_family_and_forwards_typed_intents() -> No
         image_fixtures._wheel(
             board, image_fixtures._point(target, 0.5, 0.5), -120)
         assert views, "wheel zoom did not forward a viewport commit"
-        assert views[-1].viewport_revision > before.viewport_revision
+        assert isinstance(views[-1], ImageViewportCommit)
+        assert views[-1].origin == board.visible_image_origin()
+        assert views[-1].viewport.viewport_revision > before.viewport_revision
 
         origin = board.visible_image_origin()
-        host._on_intent(ImageColorLimitsCommit(origin, (1200.0, 2800.0)))
-        assert limits and limits[-1] == (1200.0, 2800.0)
+        color_commit = ImageColorLimitsCommit(origin, (1200.0, 2800.0))
+        host._on_intent(color_commit)
+        assert limits and limits[-1] is color_commit
+        assert limits[-1].color_limits == (1200.0, 2800.0)
     finally:
         host.close()
         application.processEvents()

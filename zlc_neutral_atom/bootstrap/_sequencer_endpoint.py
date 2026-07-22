@@ -22,6 +22,7 @@ from zlc_neutral_atom.timing.pulse import (
     PreparePulseCommand,
     PulseFiredAck,
     PulsePreparedAck,
+    PulseScanProgress,
     PulseTerminalAck,
     PulseTerminalEvidenceKind,
     PulseTerminalReceipt,
@@ -29,6 +30,7 @@ from zlc_neutral_atom.timing.pulse import (
     SimulatedPulseReceipt,
 )
 from zlc_pulse import (
+    PulseExecutionForm,
     PreparedPulseRef,
     RemotePulseExecutionClient,
     build_pulse_playback,
@@ -109,6 +111,113 @@ class _SequencerSessionOwner:
         if isinstance(command, CompletePulseCommand):
             return self._complete(binding, command)
         raise TypeError(f"sequencer endpoint rejects command {type(command).__name__}")
+
+    def observe_scan_progress(
+        self,
+        binding: BoundDevice,
+        session_id: str,
+        run_id: str,
+        artifact_digest: str,
+        point_count: int,
+    ) -> PulseScanProgress:
+        """Read one exact continuous-scan cursor without owning its timing."""
+
+        def unavailable(state: str, reason: str) -> PulseScanProgress:
+            return PulseScanProgress.unavailable(
+                run_id=run_id,
+                artifact_digest=artifact_digest,
+                point_count=point_count,
+                backend_state=state,
+                reason=reason,
+            )
+
+        with self._condition:
+            self._validate_binding(binding)
+            session = self._session
+            if (
+                session is None
+                or session.session_id != session_id
+                or session.run_id != run_id
+                or session.artifact_digest != artifact_digest
+            ):
+                return unavailable("SUPERSEDED", "pulse session is no longer current")
+            if len(session.request.artifact.target_ir.scan_points) != point_count:
+                return unavailable("MISMATCH", "scan table cardinality differs")
+            if (
+                session.request.artifact.execution_form
+                is not PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS
+            ):
+                return unavailable(
+                    "UNAVAILABLE",
+                    "progress observation is defined only for continuous scan tables",
+                )
+            if session.closed or session.completed:
+                return unavailable("TERMINAL", "pulse session is no longer active")
+            if not session.fired:
+                return unavailable("PREPARED", "pulse scan has not fired")
+            operation_epoch = session.operation_epoch
+        try:
+            progress = self._backend._backend_observe_scan_progress(session)
+        except Exception as error:
+            return unavailable(
+                "UNAVAILABLE",
+                f"scan-progress observation failed: {type(error).__name__}",
+            )
+        if not isinstance(progress, PulseScanProgress):
+            raise TypeError("sequencer backend returned another progress type")
+        with self._condition:
+            if self._superseded(session, operation_epoch):
+                return unavailable("SUPERSEDED", "pulse session changed during observation")
+        if (
+            progress.run_id != run_id
+            or progress.artifact_digest != artifact_digest
+            or progress.point_count != point_count
+        ):
+            raise RuntimeError("sequencer backend observed another pulse execution")
+        return progress
+
+    def wait_continuous_failure(
+        self,
+        binding: BoundDevice,
+        session_id: str,
+        run_id: str,
+        artifact_digest: str,
+        timeout: float,
+    ) -> str | None:
+        """Wait on backend failure evidence without issuing a timing command."""
+
+        with self._condition:
+            self._validate_binding(binding)
+            session = self._session
+            if (
+                session is None
+                or session.session_id != session_id
+                or session.run_id != run_id
+                or session.artifact_digest != artifact_digest
+                or session.closed
+            ):
+                return None
+            if not session.request.artifact.target_ir.repeat_forever:
+                raise RuntimeError("failure wait requires a continuous pulse session")
+            if not session.fired:
+                raise RuntimeError("continuous pulse session has not fired")
+            operation_epoch = session.operation_epoch
+        try:
+            failure = self._backend._backend_wait_continuous_failure(
+                session,
+                timeout,
+            )
+        except Exception as error:
+            failure = (
+                "continuous failure notification failed: "
+                f"{type(error).__name__}: {error}"
+            )
+        with self._condition:
+            if self._superseded(session, operation_epoch):
+                return None
+        if failure is not None:
+            _text(failure, "continuous pulse failure")
+        return failure
 
     def _prepare(
         self,
@@ -397,6 +506,38 @@ class _OwnedSequencerEndpoint:
     def execute_command(self, binding: BoundDevice, command: object) -> object:
         return self._owner.execute_command(binding, command)
 
+    def observe_scan_progress(
+        self,
+        binding: BoundDevice,
+        session_id: str,
+        run_id: str,
+        artifact_digest: str,
+        point_count: int,
+    ) -> PulseScanProgress:
+        return self._owner.observe_scan_progress(
+            binding,
+            session_id,
+            run_id,
+            artifact_digest,
+            point_count,
+        )
+
+    def wait_continuous_failure(
+        self,
+        binding: BoundDevice,
+        session_id: str,
+        run_id: str,
+        artifact_digest: str,
+        timeout: float,
+    ) -> str | None:
+        return self._owner.wait_continuous_failure(
+            binding,
+            session_id,
+            run_id,
+            artifact_digest,
+            timeout,
+        )
+
     def close_session(
         self,
         binding: BoundDevice,
@@ -496,6 +637,46 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
 
     def _backend_fire(self, session: _EndpointSession) -> None:
         self._sequencer.fire_compiled_playback(session.artifact_digest)
+
+    def _backend_observe_scan_progress(
+        self,
+        session: _EndpointSession,
+    ) -> PulseScanProgress:
+        point_index, backend_state, reason = self._sequencer.observe_scan_cursor(
+            session.artifact_digest
+        )
+        if point_index is None:
+            assert reason is not None
+            return PulseScanProgress.unavailable(
+                run_id=session.run_id,
+                artifact_digest=session.artifact_digest,
+                point_count=len(session.request.artifact.target_ir.scan_points),
+                backend_state=backend_state,
+                reason=reason,
+            )
+        return PulseScanProgress(
+            session.run_id,
+            session.artifact_digest,
+            len(session.request.artifact.target_ir.scan_points),
+            point_index,
+            backend_state,
+        )
+
+    def _backend_wait_continuous_failure(
+        self,
+        session: _EndpointSession,
+        timeout: float,
+    ) -> str | None:
+        time.sleep(timeout)
+        snapshot = self._sequencer.snapshot()
+        output = self._sequencer.output_artifact
+        if (
+            snapshot.get("state") == "running"
+            and output is not None
+            and output.fingerprint == session.artifact_digest
+        ):
+            return None
+        return "virtual continuous sequencer stopped outside its session owner"
 
     def _backend_complete(
         self,
@@ -668,6 +849,67 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
         if reference is None:
             raise RuntimeError("remote sequencer session has no prepared reference")
         self._client.fire(reference)
+
+    def _backend_observe_scan_progress(
+        self,
+        session: _EndpointSession,
+    ) -> PulseScanProgress:
+        snapshot = self._validate_server_connection_generation()
+        point_count = len(session.request.artifact.target_ir.scan_points)
+
+        def unavailable(reason: str) -> PulseScanProgress:
+            backend_state = snapshot.backend.get("state")
+            return PulseScanProgress.unavailable(
+                run_id=session.run_id,
+                artifact_digest=session.artifact_digest,
+                point_count=point_count,
+                backend_state=(
+                    backend_state if isinstance(backend_state, str) else snapshot.state
+                ),
+                reason=reason,
+            )
+
+        reference = session.prepared_ref
+        if reference is None or snapshot.prepared_ref != reference:
+            return unavailable("remote server no longer owns the prepared artifact")
+        backend = snapshot.backend
+        if snapshot.state != "RUNNING" or backend.get("state") != "RUNNING":
+            return unavailable("remote sequencer is not reporting an active scan")
+        if backend.get("prepared_artifact_digest") != session.artifact_digest:
+            return unavailable("remote backend artifact identity differs")
+        if backend.get("scan_points") != point_count:
+            return unavailable("remote backend scan table cardinality differs")
+        sample_count = backend.get("cursor_sample_count")
+        if (
+            isinstance(sample_count, bool)
+            or not isinstance(sample_count, int)
+            or sample_count < 1
+        ):
+            return unavailable("remote backend has not sampled a scan cursor yet")
+        point_index = backend.get("last_confirmed_cursor")
+        if (
+            isinstance(point_index, bool)
+            or not isinstance(point_index, int)
+            or not 0 <= point_index < point_count
+        ):
+            return unavailable("remote backend cursor is outside the scan table")
+        return PulseScanProgress(
+            session.run_id,
+            session.artifact_digest,
+            point_count,
+            point_index,
+            "RUNNING",
+        )
+
+    def _backend_wait_continuous_failure(
+        self,
+        session: _EndpointSession,
+        timeout: float,
+    ) -> str | None:
+        reference = session.prepared_ref
+        if reference is None:
+            return "remote continuous sequencer lost its prepared reference"
+        return self._client.wait_continuous_failure(reference, timeout=timeout)
 
     def _backend_complete(
         self,

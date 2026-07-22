@@ -77,8 +77,11 @@ from zlc_neutral_atom.monitor_application import (
     prepare_camera_monitor,
 )
 from zlc_neutral_atom.pulse_application import (
+    AppliedPulseSnapshot,
     PreparedPulseExecution,
+    PulseApplicationOwner,
     PulseRunDescriptor,
+    PulseRunObservation,
     PulseRunRequest,
     PulseRunResult,
     PulseTargetDescriptor,
@@ -131,10 +134,11 @@ from zlc_neutral_atom.runtime.pipeline import (
     estimate_pipeline_peak_bytes,
 )
 from zlc_neutral_atom.timing.occupancy import TriggeredOccupancySpec
+from zlc_neutral_atom.timing.pulse import PulseScanProgress
 from zlc_neutral_atom.timing.segmented import (
     ApiSlotSegmentedSpec,
 )
-from zlc_neutral_atom.runtime.run import RunHandle
+from zlc_neutral_atom.runtime.run import CancelOutcome, RunHandle
 from zlc_pulse import (
     PulseDocument,
     PulseExecutionForm,
@@ -445,9 +449,11 @@ class _ExperimentServices:
     occupancy_repository: "OccupancyRepository | None"
     fit_repository: FitResultRepository
     catalog: DeviceCatalogView
+    pulse_application: PulseApplicationOwner
     operation_lock: threading.RLock
     fit_operations_drained: threading.Event
     fit_operation_thread_counts: dict[int, int]
+    gui_handles: dict[str, object]
     active_fit_operations: int = 0
     state: str = "OPEN"
 
@@ -635,9 +641,13 @@ class PulseFacade:
         document: PulseDocument,
         execution_form: PulseExecutionForm = PulseExecutionForm.STATIC_ONCE,
         *,
+        api_values: Mapping[str, int | float] | None = None,
+        scan_sweep_count: int = 1,
         sequencer_role: str | None = None,
         timeout_seconds: float | None = None,
     ) -> PulseRunRequest:
+        if not isinstance(document, PulseDocument):
+            raise TypeError("document must be PulseDocument")
         with _service_guard(self._token) as services:
             role = _resolve_role(
                 services.catalog,
@@ -646,17 +656,58 @@ class PulseFacade:
                 ("sequencer",),
             )
             reference = services.catalog.require(role).ref
-        timeout = (
-            None
-            if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR
-            else 30.0 if timeout_seconds is None else timeout_seconds
+        if api_values is not None and not isinstance(api_values, Mapping):
+            raise TypeError("api_values must be a mapping or None")
+        requested_api_values = {} if api_values is None else dict(api_values)
+        expected_api_ids = tuple(
+            parameter.parameter_id for parameter in document.api_parameters
         )
-        if (
-            execution_form is PulseExecutionForm.CONTINUOUS_MONITOR
-            and timeout_seconds is not None
-        ):
-            raise ValueError("continuous pulse execution does not accept a timeout")
-        return PulseRunRequest(document, execution_form, reference, timeout)
+        expected_api_id_set = set(expected_api_ids)
+        if set(requested_api_values) != expected_api_id_set:
+            missing = tuple(
+                parameter_id
+                for parameter_id in expected_api_ids
+                if parameter_id not in requested_api_values
+            )
+            unknown = tuple(
+                parameter_id
+                for parameter_id in requested_api_values
+                if parameter_id not in expected_api_id_set
+            )
+            raise ValueError(
+                "Pulse Run API values must exactly cover declared parameters; "
+                f"missing={missing}, unknown={unknown}"
+            )
+        return PulseRunRequest(
+            document=document,
+            execution_form=execution_form,
+            sequencer_ref=reference,
+            timeout_seconds=timeout_seconds,
+            api_values=tuple(
+                (parameter_id, requested_api_values[parameter_id])
+                for parameter_id in expected_api_ids
+            ),
+            scan_sweep_count=scan_sweep_count,
+        )
+
+    def snapshot(self) -> AppliedPulseSnapshot | None:
+        with _service_guard(self._token) as services:
+            return services.pulse_application.snapshot()
+
+    def observe_active(self) -> PulseRunObservation | None:
+        with _service_guard(self._token) as services:
+            return services.pulse_application.observe_active()
+
+    def observe_scan_progress(self) -> PulseScanProgress | None:
+        with _service_guard(self._token) as services:
+            return services.pulse_application.observe_scan_progress()
+
+    def cancel_active(
+        self,
+        reason: str = "user requested pulse stop",
+    ) -> CancelOutcome | None:
+        with _service_guard(self._token) as services:
+            return services.pulse_application.cancel_active(reason)
 
     def inspect(self, request: PulseRunRequest) -> PulseRunDescriptor:
         with _service_guard(self._token) as services:
@@ -666,7 +717,7 @@ class PulseFacade:
         return _start_pulse(self._token, request)
 
     def run(self, request: PulseRunRequest) -> PulseRunResult:
-        if request.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
+        if request.requires_cancellation:
             raise ValueError("continuous pulse execution must be started and cancelled")
         return _run_pulse(self._token, request)
 
@@ -2457,16 +2508,32 @@ class Experiment:
         self.readout = ReadoutFacade(authority_token)
         self.pulse = PulseFacade(authority_token)
 
-    def pulse_gui(self, *, state=None, **kwargs):
-        """Lazily open the pulse-sequence editor through the ONE composition root.
-
-        The narrow PulseWorkbench this used to return is still reachable as a component:
-        ``Zou_lab_control.workbench.open_pulse_workbench(experiment, document)``.
-        """
+    def pulse_gui(
+        self,
+        *,
+        document: PulseDocument | None = None,
+        path: str | Path | None = None,
+    ):
+        """Open the current PulseDocument editor on this exact installation."""
 
         from zlc_workbench.pulse_editor.app import open_pulse_editor
 
-        return open_pulse_editor(self, state=state, **kwargs)
+        key = "pulse-editor"
+        with _service_guard(self._authority_token) as services:
+            existing = services.gui_handles.get(key)
+            if existing is not None:
+                if document is not None or path is not None:
+                    raise RuntimeError(
+                        "this Experiment already owns a Pulse editor; use its Open "
+                        "control instead of replacing unsaved state"
+                    )
+                if bool(getattr(existing, "permanently_closed", False)):
+                    raise RuntimeError("this Experiment's Pulse editor is closing")
+                existing.restore_window()
+                return existing
+            body = open_pulse_editor(self, document=document, path=path)
+            services.gui_handles[key] = body
+            return body
 
     def scan_gui(self, request: ScanRequest | OccupancyScanRequest):
         """Open the current typed SCAN_SLOT panel for a frozen request."""
@@ -3568,6 +3635,12 @@ class Experiment:
                 raise RuntimeError(
                     "Experiment cannot close reentrantly from its active Fit operation"
                 )
+            gui_handles = tuple(services.gui_handles.values())
+            services.gui_handles.clear()
+            for handle in gui_handles:
+                retire = getattr(handle, "request_owner_close", None)
+                if callable(retire):
+                    retire()
             services.state = "CLOSING"
             fit_operations_drained = services.fit_operations_drained
         # A Figure Fit owns repository borrows outside the short composition
@@ -3706,17 +3779,20 @@ def _prepare_pulse_for_services(
         request,
         pulse_port=services.runtime.pulse_port(request.sequencer_ref),
         start_run=services.runtime.start,
+        on_applied=services.pulse_application._record_applied,
     )
 
 
 def _start_pulse(token: object, request: PulseRunRequest) -> RunHandle:
     with _service_guard(token) as services:
-        return _prepare_pulse_for_services(services, request).start()
+        prepared = _prepare_pulse_for_services(services, request)
+        return services.pulse_application.start(prepared)
 
 
 def _run_pulse(token: object, request: PulseRunRequest) -> PulseRunResult:
     with _service_guard(token) as services:
-        handle = _prepare_pulse_for_services(services, request).start()
+        prepared = _prepare_pulse_for_services(services, request)
+        handle = services.pulse_application.start(prepared)
         runtime = services.runtime
     result = runtime.wait(handle)
     if not isinstance(result, PulseRunResult):
@@ -4210,15 +4286,32 @@ def connect(
     repository: str | Path,
     name: str = "neutral_atom",
     seed: int | None = 7,
+    sequencer_host: str | None = None,
+    sequencer_port: int = 18861,
+    transport_timeout_seconds: float = 120.0,
+    required_pulse_document: PulseDocument | None = None,
 ) -> Experiment:
     """Compose one notebook Experiment; raw devices remain authority-private."""
 
     if not isinstance(config, str):
         raise TypeError("config must name an explicit target backend")
-    if config != "virtual":
+    if config not in {"virtual", "remote"}:
         raise ValueError(
-            "the target composition currently accepts only the explicit "
-            "'virtual' backend"
+            "target composition accepts only the explicit 'virtual' or "
+            "'remote' backend"
+        )
+    if config == "remote" and sequencer_host is None:
+        raise ValueError("the remote backend requires sequencer_host")
+    if config == "virtual" and sequencer_host is not None:
+        raise ValueError("sequencer_host is valid only for the remote backend")
+    if required_pulse_document is not None and not isinstance(
+        required_pulse_document,
+        PulseDocument,
+    ):
+        raise TypeError("required_pulse_document must be PulseDocument or None")
+    if config == "virtual" and required_pulse_document is not None:
+        raise ValueError(
+            "required_pulse_document is valid only for the remote backend"
         )
     if not isinstance(repository, (str, Path)):
         raise TypeError("repository must be an explicit experiment workspace root")
@@ -4237,16 +4330,29 @@ def connect(
 
         scan_repository = ScanRepository(repository_root / "scans")
         fit_repository = FitResultRepository(repository_root / "fits")
-        from zlc_neutral_atom.bootstrap._installation import (
-            create_virtual_installation,
-        )
+        safety_journal_path = repository_root / ".runtime" / "safety.journal"
+        if config == "virtual":
+            from zlc_neutral_atom.bootstrap._installation import (
+                create_virtual_installation,
+            )
 
-        runtime = create_virtual_installation(
-            safety_journal_path=(
-                repository_root / ".runtime" / "safety.journal"
-            ),
-            seed=seed,
-        )
+            runtime = create_virtual_installation(
+                safety_journal_path=safety_journal_path,
+                seed=seed,
+            )
+        else:
+            from zlc_neutral_atom.bootstrap._installation import (
+                create_remote_pulse_installation,
+            )
+
+            assert sequencer_host is not None
+            runtime = create_remote_pulse_installation(
+                safety_journal_path=safety_journal_path,
+                host=sequencer_host,
+                port=sequencer_port,
+                transport_timeout_seconds=transport_timeout_seconds,
+                required_pulse_document=required_pulse_document,
+            )
         catalog = runtime.device_catalog
         fit_operations_drained = threading.Event()
         fit_operations_drained.set()
@@ -4260,9 +4366,11 @@ def connect(
             occupancy_repository=None,
             fit_repository=fit_repository,
             catalog=catalog,
+            pulse_application=PulseApplicationOwner(),
             operation_lock=threading.RLock(),
             fit_operations_drained=fit_operations_drained,
             fit_operation_thread_counts={},
+            gui_handles={},
         )
         token = object()
         experiment = Experiment(token, name=canonical_name, device_catalog=catalog)
@@ -4289,6 +4397,7 @@ def connect(
 
 __all__ = [
     "AdmittedFitResult",
+    "AppliedPulseSnapshot",
     "BackgroundMode",
     "BoxReducer",
     "CalibrationAnalysisRequest",
@@ -4312,6 +4421,7 @@ __all__ = [
     "PreparedPulseExecution",
     "PulseFacade",
     "PulseRunDescriptor",
+    "PulseRunObservation",
     "PulseRunRequest",
     "PulseRunResult",
     "PulseTargetDescriptor",

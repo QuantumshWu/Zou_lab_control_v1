@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 import threading
 
 from zlc_pulse import (
+    PORT_DAC,
+    PORT_DIGITAL,
     PulseDocument,
     PulseExecutionForm,
+    PulsePeriod,
     PulseTarget,
     PulseTimelineDocument,
     bind_pulse_document_target,
@@ -18,6 +22,7 @@ from zlc_pulse import (
     new_pulse_document,
     pulse_document_path,
     save_pulse_document,
+    set_digital_output,
 )
 
 
@@ -27,6 +32,7 @@ class PulseEditorSession:
     __slots__ = (
         "_base_fingerprint",
         "_document",
+        "_file_state",
         "_lock",
         "_path",
         "_revision",
@@ -42,6 +48,7 @@ class PulseEditorSession:
         self._document = document
         self._path: Path | None = None
         self._base_fingerprint: str | None = None
+        self._file_state = "new"
         self._revision = 0
         self._lock = threading.RLock()
         self._save_lock = threading.Lock()
@@ -52,15 +59,48 @@ class PulseEditorSession:
         target: PulseTarget,
         *,
         time_step_ns: int | float,
-        name: str = "Untitled pulse",
+        name: str | None = None,
     ) -> "PulseEditorSession":
-        return cls(
-            new_pulse_document(
-                target,
-                time_step_ns=time_step_ns,
-                name=name,
+        # Preserve the established PulseGUI's familiar initial schedule while
+        # keeping ``zlc_pulse.new_pulse_document`` as the neutral one-safe-period
+        # domain primitive.  A new editor opens with two 1 us period cards: the
+        # first programmable digital output high in P1, then an all-safe P2.
+        # Clear All remains the distinct one-blank-period operation.
+        document = new_pulse_document(
+            target,
+            time_step_ns=time_step_ns,
+            name=(
+                str(name)
+                if name is not None
+                else "pulse_" + datetime.now().strftime("%Y%m%d_%H%M%S")
             ),
         )
+        familiar_visible = tuple(
+            port.key
+            for port in target.ports
+            if port.kind in (PORT_DIGITAL, PORT_DAC)
+        )[:4]
+        document = replace(document, visible_ports=familiar_visible)
+        first_digital = next(
+            (port.key for port in target.ports if port.kind == PORT_DIGITAL),
+            None,
+        )
+        if first_digital is not None:
+            document = set_digital_output(
+                document,
+                document.periods[0].period_id,
+                first_digital,
+                True,
+            )
+        blank_states = tuple(0 for _ in target.raw_lanes)
+        document = replace(
+            document,
+            periods=(
+                document.periods[0],
+                PulsePeriod("p2", 1000, "ns", "", blank_states),
+            ),
+        )
+        return cls(document)
 
     @classmethod
     def load(
@@ -72,6 +112,7 @@ class PulseEditorSession:
         session = cls(document)
         session._path = resolved
         session._base_fingerprint = document.fingerprint
+        session._file_state = "loaded"
         return session
 
     @property
@@ -88,6 +129,13 @@ class PulseEditorSession:
     def revision(self) -> int:
         with self._lock:
             return self._revision
+
+    @property
+    def file_state(self) -> str:
+        """Return the formal title state: new, loaded, or saved."""
+
+        with self._lock:
+            return self._file_state
 
     @property
     def dirty(self) -> bool:
@@ -134,16 +182,9 @@ class PulseEditorSession:
             scan_recipe=None,
         )
 
-    def preview(
-        self,
-        *,
-        max_timeline_items: int = 50_000,
-    ) -> tuple[int, PulseTimelineDocument]:
+    def preview(self) -> tuple[int, PulseTimelineDocument]:
         revision, document = self.snapshot()
-        timeline = project_pulse_preview(
-            document,
-            max_timeline_items=max_timeline_items,
-        )
+        timeline = project_pulse_preview(document)
         return revision, timeline
 
     def save(
@@ -177,13 +218,12 @@ class PulseEditorSession:
             with self._lock:
                 self._path = saved
                 self._base_fingerprint = document.fingerprint
+                self._file_state = "saved"
             return saved
 
 
 def project_pulse_preview(
     document: PulseDocument,
-    *,
-    max_timeline_items: int = 50_000,
 ) -> PulseTimelineDocument:
     """Compile the current static or nominal-reference view, never a scan row."""
 
@@ -210,7 +250,6 @@ def project_pulse_preview(
         document,
         artifact,
         reference_label=label,
-        max_timeline_items=max_timeline_items,
     )
 
 

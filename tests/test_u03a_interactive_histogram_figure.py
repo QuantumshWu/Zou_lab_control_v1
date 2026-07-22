@@ -58,7 +58,7 @@ from zlc_frontend.histogram_display import (  # noqa: E402
 )
 from zlc_frontend.qt_widgets import (  # noqa: E402
     FluentRevisionedFormEditor,
-    QtImageBoard,
+    FrozenRasterView,
     QtRasterBoard,
     ensure_qt_app,
 )
@@ -475,7 +475,7 @@ def _assert_encoded_fallback(application, window) -> None:
     _until(application, lambda: window.worker_idle and window.raster_ready)
     assert window._view_family == "encoded"
     assert len(window._boards) == 1
-    assert isinstance(window._boards[0], QtImageBoard)
+    assert isinstance(window._boards[0], FrozenRasterView)
     assert window._boards[0].has_front
     assert window.findChild(QtWidgets.QLabel, "figureViewerMode").text() == (
         "FROZEN DATA FIGURE · DISPLAY ONLY"

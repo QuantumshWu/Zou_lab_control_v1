@@ -447,6 +447,7 @@ class VirtualSequencer:
         self._last_fired: PulsePlayback | None = None
         self._firing_artifact: CompiledPulseArtifact | None = None
         self._last_fired_artifact: CompiledPulseArtifact | None = None
+        self._fire_started_monotonic: float | None = None
         self._logical_deadline: float | None = None
         self._state = "safe"
         self._open = True
@@ -505,6 +506,7 @@ class VirtualSequencer:
             self._last_fired = None
             self._firing_artifact = None
             self._last_fired_artifact = None
+            self._fire_started_monotonic = None
             self._logical_deadline = None
             self._state = "prepared"
         return artifact.target_ir
@@ -521,10 +523,12 @@ class VirtualSequencer:
             self._firing = playback if playback.repeat_forever else None
             self._last_fired_artifact = artifact
             self._firing_artifact = artifact if playback.repeat_forever else None
+            self._fire_started_monotonic = time.monotonic()
             self._logical_deadline = (
                 None
                 if playback.repeat_forever
-                else time.monotonic() + playback.logical_duration * self.sleep_scale
+                else self._fire_started_monotonic
+                + playback.logical_duration * self.sleep_scale
             )
             self._state = "running"
             listeners = tuple(self._listeners)
@@ -549,6 +553,44 @@ class VirtualSequencer:
             self._state = "done"
         return True
 
+    def observe_scan_cursor(
+        self,
+        artifact_digest: str,
+    ) -> tuple[int | None, str, str | None]:
+        """Return the simulated hardware cursor, or an explicit unavailability."""
+
+        with self._lock:
+            state = self._state.upper()
+            artifact = self._last_fired_artifact
+            started = self._fire_started_monotonic
+            if artifact_digest != self._artifact_digest or artifact is None:
+                return None, state, "virtual sequencer does not own this artifact"
+            if self._state != "running":
+                return None, state, "virtual sequencer is not running"
+            durations = tuple(artifact.target_ir.scan_point_durations)
+            if not durations:
+                return None, state, "compiled pulse has no scan table"
+            if started is None:
+                return None, state, "virtual FIRE timestamp is unavailable"
+            scale = self.sleep_scale
+        if scale <= 0.0:
+            return (
+                None,
+                state,
+                "zero-time virtual playback has no meaningful realtime cursor",
+            )
+        cycle_seconds = sum(durations)
+        if not math.isfinite(cycle_seconds) or cycle_seconds <= 0.0:
+            return None, state, "compiled scan duration is invalid"
+        elapsed_logical = max(0.0, (time.monotonic() - started) / scale)
+        phase = elapsed_logical % cycle_seconds
+        boundary = 0.0
+        for point_index, duration in enumerate(durations):
+            boundary += duration
+            if phase < boundary:
+                return point_index, state, None
+        return len(durations) - 1, state, None
+
     def set_safe_state(self) -> None:
         with self._lock:
             self._prepared = None
@@ -558,6 +600,7 @@ class VirtualSequencer:
             self._last_fired = None
             self._firing_artifact = None
             self._last_fired_artifact = None
+            self._fire_started_monotonic = None
             self._logical_deadline = None
             self._state = "safe"
 

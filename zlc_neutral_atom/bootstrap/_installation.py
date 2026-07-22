@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 import uuid
@@ -9,8 +10,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from fpga.pulse_streamer.host.image import DEFAULT_CONFIG_PATH, default_clock_hz
-from zlc_neutral_atom.installation import DeviceCatalogView, DeviceInfo, DeviceRef
+from fpga.pulse_streamer.host.image import (
+    DEFAULT_CONFIG_PATH,
+    StreamerParams,
+    build_fingerprint,
+    default_clock_hz,
+)
+from zlc_neutral_atom.installation import (
+    DeviceCatalogView,
+    DeviceInfo,
+    DeviceRef,
+    InstallationRestartRequiredError,
+)
 from zlc_neutral_atom.readout.calibration import GridOrder
 from zlc_neutral_atom.readout.contracts import (
     ReadoutBindingKey,
@@ -21,7 +32,6 @@ from zlc_neutral_atom.readout.sitemap import (
     SitemapAcquisitionProfile,
     load_packaged_sitemap_pulse,
 )
-from zlc_pulse import bind_pulse_document_target
 from zlc_neutral_atom.runtime.capture import BoundCapturePort
 from zlc_neutral_atom.runtime.monitor import BoundCameraMonitorPort
 from zlc_neutral_atom.runtime.ports import BoundDevice, DeviceBroker, SafetyOperation
@@ -29,16 +39,28 @@ from zlc_neutral_atom.runtime.resources import (
     DeviceIdentityEvidenceKind,
     PhysicalDeviceIdentity,
     ResourceArbiter,
+    ResourceKey,
 )
 from zlc_neutral_atom.runtime.run import RunController, RunHandle, RunPlan
 from zlc_neutral_atom.runtime.safety_journal import PersistentSafetyJournal
 from zlc_neutral_atom.timing.pulse import BoundPulsePort
-from zlc_pulse import PORT_DIGITAL, PulseTarget, load_deployed_pulse_target
-from zlc_storage import canonical_digest, durable_mkdir
+from zlc_pulse import (
+    PORT_DIGITAL,
+    PulseDocument,
+    PulseTarget,
+    RemotePulseExecutionClient,
+    bind_pulse_document_target,
+    load_deployed_pulse_target,
+    validate_pulse_document_clock_grid,
+)
+from zlc_storage import canonical_digest, durable_mkdir, normalized_text
 
-from ._asset_map import InstallationAsset, InstallationAssetMap
+from ._asset_map import InstallationAsset, InstallationAssetMap, adapter_kind
 from ._camera_endpoint import CameraCaptureEndpoint, CameraMonitorEndpoint
-from ._sequencer_endpoint import VirtualSequencerExecutionEndpoint
+from ._sequencer_endpoint import (
+    RemotePulseExecutionEndpoint,
+    VirtualSequencerExecutionEndpoint,
+)
 from ._virtual_hardware import (
     VirtualAtomArray,
     VirtualCamera,
@@ -84,7 +106,7 @@ def _virtual_readout_geometry() -> ReadoutGridGeometry:
 
 
 @dataclass(frozen=True)
-class _FailedVirtualStartupAuthority:
+class _FailedStartupAuthority:
     """Strongly retain an unsafe partial startup until process replacement.
 
     This value has one deliberately narrow purpose: without it, an exceptional
@@ -101,33 +123,61 @@ class _FailedVirtualStartupAuthority:
 
 
 _FAILED_STARTUP_LOCK = threading.Lock()
-_FAILED_STARTUPS: list[_FailedVirtualStartupAuthority] = []
+_FAILED_STARTUPS: list[_FailedStartupAuthority] = []
 _COMPOSITION_LOCK = threading.Lock()
-_COMPOSITION_CLAIMED = False
-_PROCESS_RUNTIME: _VirtualInstallationRuntime | None = None
+_COMPOSITION_STATE = "AVAILABLE"
+_PROCESS_RUNTIME: _InstallationRuntime | None = None
 
 
 def _require_no_failed_startup() -> None:
     with _FAILED_STARTUP_LOCK:
         if _FAILED_STARTUPS:
             raise RuntimeError(
-                "a previous virtual installation startup failed to close cleanly; "
+                "a previous installation startup failed to close cleanly; "
                 "replace this process before composing another installation"
             )
 
 
 def _claim_process_composition() -> None:
-    global _COMPOSITION_CLAIMED
+    global _COMPOSITION_STATE
     with _COMPOSITION_LOCK:
-        if _COMPOSITION_CLAIMED:
+        if _COMPOSITION_STATE != "AVAILABLE":
             raise RuntimeError(
                 "this process already created an installation runtime; "
                 "replace the process instead of rebuilding or hot-swapping it"
             )
-        _COMPOSITION_CLAIMED = True
+        _COMPOSITION_STATE = "CLAIMED"
 
 
-def _retain_process_runtime(runtime: "_VirtualInstallationRuntime") -> None:
+def _reserve_remote_composition() -> None:
+    """Serialize a retryable network probe before hardware authority exists."""
+
+    global _COMPOSITION_STATE
+    with _COMPOSITION_LOCK:
+        if _COMPOSITION_STATE != "AVAILABLE":
+            raise RuntimeError(
+                "this process already created or is creating an installation runtime"
+            )
+        _COMPOSITION_STATE = "PROBING_REMOTE"
+
+
+def _release_remote_probe() -> None:
+    global _COMPOSITION_STATE
+    with _COMPOSITION_LOCK:
+        if _COMPOSITION_STATE != "PROBING_REMOTE":
+            raise RuntimeError("remote composition probe state is inconsistent")
+        _COMPOSITION_STATE = "AVAILABLE"
+
+
+def _claim_remote_probe() -> None:
+    global _COMPOSITION_STATE
+    with _COMPOSITION_LOCK:
+        if _COMPOSITION_STATE != "PROBING_REMOTE":
+            raise RuntimeError("remote composition probe state is inconsistent")
+        _COMPOSITION_STATE = "CLAIMED"
+
+
+def _retain_process_runtime(runtime: "_InstallationRuntime") -> None:
     global _PROCESS_RUNTIME
     with _COMPOSITION_LOCK:
         if _PROCESS_RUNTIME is not None:
@@ -144,7 +194,7 @@ def _retain_failed_startup(
 ) -> None:
     with _FAILED_STARTUP_LOCK:
         _FAILED_STARTUPS.append(
-            _FailedVirtualStartupAuthority(
+            _FailedStartupAuthority(
                 dict(raw_graph),
                 broker,
                 resources,
@@ -185,7 +235,7 @@ def _identity_for(
         asset.evidence_kind
         is not DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT
     ):
-        raise ValueError("virtual assets require installation-asserted identity")
+        raise ValueError("this asset requires installation-asserted identity")
     return PhysicalDeviceIdentity(
         stable_device_identity=asset.expected_identity,
         evidence_kind=asset.evidence_kind,
@@ -319,11 +369,99 @@ def _bind_sequencer(
     return BoundPulsePort(
         broker.verify_capability(binding),
         (),
+        lambda session_id, run_id, artifact_digest, point_count: (
+            endpoint.observe_scan_progress(
+                current_binding(),
+                session_id,
+                run_id,
+                artifact_digest,
+                point_count,
+            )
+        ),
+        lambda session_id, run_id, artifact_digest, timeout: (
+            endpoint.wait_continuous_failure(
+                current_binding(),
+                session_id,
+                run_id,
+                artifact_digest,
+                timeout,
+            )
+        ),
     )
 
 
-class _VirtualInstallationRuntime:
-    """Virtual-only owner of the raw graph, admission, and terminal shutdown."""
+def _bind_remote_sequencer(
+    broker: DeviceBroker,
+    asset: InstallationAsset,
+    asset_map_revision: str,
+    client: RemotePulseExecutionClient,
+    *,
+    endpoint_label: str,
+    max_blocking_call_seconds: float | None,
+) -> BoundPulsePort:
+    """Bind the current remote protocol behind the same typed pulse Port.
+
+    The GUI and notebook never receive ``client`` or the endpoint.  They submit a
+    declarative PulseRunRequest through the ordinary RunController, so remote use
+    cannot grow a second prepare/fire/safe authority.
+    """
+
+    endpoint = RemotePulseExecutionEndpoint(
+        client,
+        endpoint_label=endpoint_label,
+        max_blocking_call_seconds=max_blocking_call_seconds,
+    )
+    binding: BoundDevice | None = None
+
+    def current_binding() -> BoundDevice:
+        if binding is None:
+            raise RuntimeError("remote sequencer endpoint binding is not installed")
+        return binding
+
+    identity = _identity_for(asset, asset_map_revision)
+    proof = broker.verify_identity(lambda: identity)
+    binding = broker.bind(
+        key=asset.resource_key,
+        identity=proof,
+        execute_command=lambda command: endpoint.execute_command(
+            current_binding(),
+            command,
+        ),
+        cleanup_operations={SafetyOperation.SAFE_STATE: endpoint.cleanup},
+        verify_safe_state=endpoint.verify_safe_state,
+        capability_probe=lambda: endpoint.capability_probe(current_binding()),
+        close_session=lambda command: endpoint.close_session(
+            current_binding(),
+            command,
+        ),
+        interrupt_operations={SafetyOperation.SAFE_STATE: endpoint.interrupt},
+    )
+    return BoundPulsePort(
+        broker.verify_capability(binding),
+        (),
+        lambda session_id, run_id, artifact_digest, point_count: (
+            endpoint.observe_scan_progress(
+                current_binding(),
+                session_id,
+                run_id,
+                artifact_digest,
+                point_count,
+            )
+        ),
+        lambda session_id, run_id, artifact_digest, timeout: (
+            endpoint.wait_continuous_failure(
+                current_binding(),
+                session_id,
+                run_id,
+                artifact_digest,
+                timeout,
+            )
+        ),
+    )
+
+
+class _InstallationRuntime:
+    """Process-lifetime owner of one immutable installation graph."""
 
     __slots__ = (
         "_lock",
@@ -586,7 +724,7 @@ def create_virtual_installation(
     *,
     safety_journal_path: str | Path,
     seed: int | None = 7,
-) -> _VirtualInstallationRuntime:
+) -> _InstallationRuntime:
     """Build and publish one immutable virtual graph or fail without a partial runtime."""
 
     if seed is not None:
@@ -689,7 +827,7 @@ def create_virtual_installation(
         journal = PersistentSafetyJournal(journal_path)
         resources = ResourceArbiter(journal)
         controller = RunController(resources)
-        runtime = _VirtualInstallationRuntime(
+        runtime = _InstallationRuntime(
             installation_id=installation_id,
             runtime_instance_id=runtime_instance_id,
             catalog=catalog,
@@ -750,4 +888,244 @@ def create_virtual_installation(
         raise
 
 
-__all__: list[str] = []
+def create_remote_pulse_installation(
+    *,
+    safety_journal_path: str | Path,
+    host: str,
+    port: int = 18861,
+    transport_timeout_seconds: float = 120.0,
+    max_blocking_call_seconds: float | None = None,
+    required_pulse_document: PulseDocument | None = None,
+) -> _InstallationRuntime:
+    """Compose one sequencer-only installation over the current pulse RPC.
+
+    Network reachability is proven before the process-lifetime composition claim.
+    A typo or an unavailable server therefore remains retryable.  Once the remote
+    generation has entered SAFE and is bound, all later failures are treated like
+    any other partial hardware startup and fail closed.
+    """
+
+    endpoint_host = normalized_text(host, "remote pulse host")
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise TypeError("remote pulse port must be an integer")
+    if not 1 <= port <= 65535:
+        raise ValueError("remote pulse port must be between 1 and 65535")
+    if isinstance(transport_timeout_seconds, bool) or not isinstance(
+        transport_timeout_seconds,
+        (int, float),
+    ):
+        raise TypeError("transport_timeout_seconds must be a number")
+    transport_timeout = float(transport_timeout_seconds)
+    if not math.isfinite(transport_timeout) or transport_timeout <= 0:
+        raise ValueError("transport_timeout_seconds must be finite and positive")
+    if max_blocking_call_seconds is None:
+        blocking_limit = None
+    else:
+        if isinstance(max_blocking_call_seconds, bool) or not isinstance(
+            max_blocking_call_seconds,
+            (int, float),
+        ):
+            raise TypeError("max_blocking_call_seconds must be a number or None")
+        blocking_limit = float(max_blocking_call_seconds)
+        if not math.isfinite(blocking_limit) or blocking_limit <= 0:
+            raise ValueError("max_blocking_call_seconds must be finite and positive")
+        if blocking_limit >= transport_timeout:
+            raise ValueError(
+                "max_blocking_call_seconds must be shorter than the transport timeout"
+            )
+    if required_pulse_document is not None and not isinstance(
+        required_pulse_document,
+        PulseDocument,
+    ):
+        raise TypeError("required_pulse_document must be PulseDocument or None")
+    journal_path = Path(safety_journal_path).expanduser().resolve()
+    _require_no_failed_startup()
+
+    # Do not consume the one-installation process claim until both RPC channels
+    # exist and the current server schema/capability snapshot has decoded.
+    _reserve_remote_composition()
+    try:
+        client = RemotePulseExecutionClient.connect(
+            endpoint_host,
+            port,
+            transport_timeout_seconds=transport_timeout,
+        )
+    except BaseException:
+        _release_remote_probe()
+        raise
+    try:
+        snapshot = client.snapshot()
+        host_geometry = build_fingerprint(StreamerParams())
+        if snapshot.geometry_fingerprint != host_geometry:
+            raise ValueError(
+                "remote pulse geometry differs from the current host compiler "
+                f"geometry: remote=0x{snapshot.geometry_fingerprint:08x}, "
+                f"host=0x{host_geometry:08x}"
+            )
+        if required_pulse_document is not None:
+            bind_pulse_document_target(
+                required_pulse_document,
+                snapshot.target,
+            )
+            validate_pulse_document_clock_grid(
+                required_pulse_document,
+                snapshot.clock_hz,
+            )
+    except BaseException as primary:
+        try:
+            client.close()
+        except BaseException as close_error:
+            _claim_remote_probe()
+            _retain_failed_startup(
+                raw_graph={"sequencer": client},
+                broker=None,
+                resources=None,
+                journal=None,
+            )
+            failure = InstallationRestartRequiredError(
+                "remote target preflight failed and SAFE close was not confirmed; "
+                "replace this process"
+            )
+            try:
+                failure.add_note(
+                    "preflight error: "
+                    f"{type(primary).__name__}: {primary}"
+                )
+                failure.add_note(
+                    "close error: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+            raise failure from primary
+        _release_remote_probe()
+        raise
+    _claim_remote_probe()
+    endpoint_label = f"{endpoint_host}:{port}"
+    claimed = False
+    devices: dict[str, object] = {"sequencer": client}
+    journal: PersistentSafetyJournal | None = None
+    resources: ResourceArbiter | None = None
+    broker: DeviceBroker | None = None
+    try:
+        claimed = True
+        safe_timeout = (
+            client.transport_timeout_seconds * 0.9
+            if max_blocking_call_seconds is None
+            else blocking_limit
+        )
+        client.safe_state(timeout=safe_timeout)
+        endpoint_identity = canonical_digest(
+            {
+                "protocol": "zlc.current-pulse-rpc",
+                "host": endpoint_host,
+                "port": port,
+            }
+        )
+        assets = InstallationAssetMap(
+            (
+                InstallationAsset(
+                    asset_id="remote-sequencer",
+                    role="sequencer",
+                    resource_key=ResourceKey.parse("device/sequencer"),
+                    adapter_kind=adapter_kind(client),
+                    evidence_kind=(
+                        DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT
+                    ),
+                    expected_identity=f"remote-pulse-endpoint:{endpoint_identity}",
+                ),
+            )
+        )
+        installation_id = f"installation-{assets.revision[:20]}"
+        runtime_instance_id = uuid.uuid4().hex
+        broker = DeviceBroker()
+        pulse_port = _bind_remote_sequencer(
+            broker,
+            assets.require("sequencer", client),
+            assets.revision,
+            client,
+            endpoint_label=endpoint_label,
+            max_blocking_call_seconds=blocking_limit,
+        )
+        catalog = _catalog(
+            installation_id,
+            runtime_instance_id,
+            assets,
+            devices,
+        )
+        durable_mkdir(journal_path.parent)
+        journal = PersistentSafetyJournal(journal_path)
+        resources = ResourceArbiter(journal)
+        controller = RunController(resources)
+        runtime = _InstallationRuntime(
+            installation_id=installation_id,
+            runtime_instance_id=runtime_instance_id,
+            catalog=catalog,
+            resources=resources,
+            broker=broker,
+            controller=controller,
+            camera_ports={},
+            camera_monitor_ports={},
+            pulse_ports={"sequencer": pulse_port},
+            sitemap_profiles={},
+            raw_graph=devices,
+            close_order=("sequencer",),
+        )
+        _retain_process_runtime(runtime)
+        return runtime
+    except BaseException as primary:
+        cleanup_errors: list[BaseException] = []
+        for action in (
+            None if broker is None else broker.shutdown,
+            client.close,
+        ):
+            if action is None:
+                continue
+            try:
+                action()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if not cleanup_errors:
+            final_action = (
+                resources.shutdown
+                if resources is not None
+                else (None if journal is None else journal.close)
+            )
+            if final_action is not None:
+                try:
+                    final_action()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+        if cleanup_errors and claimed:
+            _retain_failed_startup(
+                raw_graph=devices,
+                broker=broker,
+                resources=resources,
+                journal=journal,
+            )
+        for error in cleanup_errors:
+            try:
+                primary.add_note(
+                    "remote pulse installation startup cleanup also failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+            except BaseException:
+                pass
+        failure = InstallationRestartRequiredError(
+            "remote installation composition failed after the process-lifetime "
+            "claim; replace this process"
+        )
+        try:
+            failure.add_note(
+                "composition error: "
+                f"{type(primary).__name__}: {primary}"
+            )
+        except BaseException:
+            pass
+        raise failure from primary
+
+
+__all__ = [
+    "create_remote_pulse_installation",
+    "create_virtual_installation",
+]

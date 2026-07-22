@@ -106,7 +106,7 @@ from zlc_frontend.qt_widgets import (
     GREY,
     ORANGE,
     QtRasterBoard,
-    QtImageBoard,
+    FrozenRasterView,
     runtime_range_placeholders,
     FluentSettingsPopupAnchor,
     sync_revisioned_form_editors,
@@ -2086,7 +2086,7 @@ class DataFigureWindow(FrozenRasterWindow):
                 raise RuntimeError("Qt rejected the immutable typed grid overview")
         finally:
             self._grid_overview_admission_retained_bytes = 0
-        if len(self._boards) != 1 or not isinstance(self._boards[0], QtImageBoard):
+        if len(self._boards) != 1 or not isinstance(self._boards[0], FrozenRasterView):
             raise RuntimeError("typed grid overview did not admit one encoded board")
         presentation_bytes = self._presentation_peak(overview.bundle, self._boards)
         if retained + presentation_bytes > self._memory_limit_bytes:

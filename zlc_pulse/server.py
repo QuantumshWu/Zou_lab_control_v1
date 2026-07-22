@@ -18,7 +18,6 @@ from zlc_storage import (
 
 from .artifact import (
     CompiledPulseArtifact,
-    PulseExecutionForm,
     admit_compiled_pulse_payload_size,
     decode_compiled_pulse_artifact,
     encode_compiled_pulse_artifact,
@@ -46,6 +45,7 @@ from .validation import validate_target_ir_for_target
 
 PREPARED_PULSE_REF_SCHEMA = "zlc_pulse.PreparedPulseRef"
 PULSE_COMPLETION_SCHEMA = "zlc_pulse.PulseCompletion"
+PULSE_CONTINUOUS_FAILURE_SCHEMA = "zlc_pulse.ContinuousFailure"
 
 
 class PulseExecutionBackend(Protocol):
@@ -60,6 +60,12 @@ class PulseExecutionBackend(Protocol):
         artifact: CompiledPulseArtifact,
         timeout: float | None,
     ) -> PulseBackendCompletion | None: ...
+
+    def wait_continuous_failure(
+        self,
+        artifact: CompiledPulseArtifact,
+        timeout: float,
+    ) -> str | None: ...
 
     def safe_state(self) -> None: ...
 
@@ -331,7 +337,7 @@ class PulseExecutionService:
                 reference,
                 expected_state=self._state,
             )
-            if artifact.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
+            if artifact.target_ir.repeat_forever:
                 raise RuntimeError("continuous pulse execution has no logical completion; use safe_state")
             self._state = "COMPLETING"
             operation_epoch = self._operation_epoch
@@ -390,6 +396,52 @@ class PulseExecutionService:
         if backend_completion is None:
             raise TimeoutError("pulse backend did not reach a validated terminal before timeout")
         return completion
+
+    def wait_continuous_failure(
+        self,
+        reference: PreparedPulseRef,
+        *,
+        timeout: float,
+    ) -> str | None:
+        """Wait briefly for a backend-owned continuous execution failure."""
+
+        wait_seconds = float(timeout)
+        if not math.isfinite(wait_seconds) or wait_seconds <= 0.0:
+            raise ValueError("continuous failure wait timeout must be positive")
+        with self._lock:
+            artifact = self._require_prepared(reference, expected_state="RUNNING")
+            if not artifact.target_ir.repeat_forever:
+                raise RuntimeError(
+                    "continuous failure wait requires a cyclic prepared artifact"
+                )
+            operation_epoch = self._operation_epoch
+        waiter = getattr(self._backend, "wait_continuous_failure", None)
+        if not callable(waiter):
+            raise RuntimeError(
+                "pulse backend lacks continuous failure notification"
+            )
+        try:
+            failure = waiter(artifact, wait_seconds)
+        except BaseException as error:
+            with self._lock:
+                superseded = operation_epoch != self._operation_epoch
+                if not superseded:
+                    self._state = "FAILED"
+            if not superseded:
+                self._best_effort_safe_after_failure(error)
+            raise
+        with self._lock:
+            if operation_epoch != self._operation_epoch:
+                return None
+            if self._state != "RUNNING":
+                raise RuntimeError(
+                    f"continuous failure wait resumed while service is {self._state}"
+                )
+            if failure is None:
+                return None
+            _text(failure, "continuous pulse failure")
+            self._state = "FAILED"
+            return failure
 
     def safe_state(self) -> None:
         self._safe_state(expected_generation=None)
@@ -600,6 +652,29 @@ def decode_completion_message(payload: bytes) -> PulseCompletion:
     return pulse_completion_from_tree(decode(payload))
 
 
+def encode_continuous_failure_message(value: str | None) -> bytes:
+    if value is not None:
+        _text(value, "continuous pulse failure")
+    return encode(
+        {
+            "schema": PULSE_CONTINUOUS_FAILURE_SCHEMA,
+            "failure": value,
+        }
+    )
+
+
+def decode_continuous_failure_message(payload: bytes) -> str | None:
+    tree = decode(payload)
+    if not isinstance(tree, dict) or set(tree) != {"schema", "failure"}:
+        raise ValueError("ContinuousFailure has an unknown field set")
+    if tree["schema"] != PULSE_CONTINUOUS_FAILURE_SCHEMA:
+        raise ValueError("ContinuousFailure schema differs")
+    failure = tree["failure"]
+    if failure is not None:
+        _text(failure, "continuous pulse failure")
+    return failure
+
+
 def serve_pulse_execution_service(
     service: PulseExecutionService,
     *,
@@ -682,6 +757,19 @@ def serve_pulse_execution_service(
                 )
             )
 
+        def exposed_current_wait_continuous_failure(
+            self,
+            reference_bytes,
+            timeout,
+        ):
+            self._require_owner()
+            return encode_continuous_failure_message(
+                service.wait_continuous_failure(
+                    decode_prepared_ref_message(bytes(reference_bytes)),
+                    timeout=float(timeout),
+                )
+            )
+
         def exposed_current_interrupt_safe_state(self, connection_generation):
             return encode(
                 service.safe_state_for_generation(str(connection_generation))
@@ -701,15 +789,18 @@ def serve_pulse_execution_service(
 __all__ = [
     "PREPARED_PULSE_REF_SCHEMA",
     "PULSE_COMPLETION_SCHEMA",
+    "PULSE_CONTINUOUS_FAILURE_SCHEMA",
     "PreparedPulseRef",
     "PulseCompletion",
     "PulseExecutionBackend",
     "PulseExecutionService",
     "decode_artifact_message",
     "decode_completion_message",
+    "decode_continuous_failure_message",
     "decode_prepared_ref_message",
     "encode_artifact_message",
     "encode_completion_message",
+    "encode_continuous_failure_message",
     "encode_prepared_ref_message",
     "prepared_pulse_ref_from_tree",
     "prepared_pulse_ref_to_tree",

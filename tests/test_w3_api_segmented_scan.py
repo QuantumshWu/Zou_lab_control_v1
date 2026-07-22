@@ -466,7 +466,7 @@ def _run_api_segmented_virtual_product(
     metadata_limit_bytes: int = 2 << 20,
     exercise_large_identifier: bool = True,
 ) -> None:
-    from zlc_neutral_atom.bootstrap._installation import _VirtualInstallationRuntime
+    from zlc_neutral_atom.bootstrap._installation import _InstallationRuntime
 
     program = _program()
     run_names: list[str] = []
@@ -475,7 +475,7 @@ def _run_api_segmented_virtual_product(
     prepared_sources: list[str] = []
     fires: list[str] = []
 
-    real_start = _VirtualInstallationRuntime.start
+    real_start = _InstallationRuntime.start
     real_arm = VirtualCamera.arm
     real_prepare = VirtualSequencer.prepare_compiled_playback
     real_fire = VirtualSequencer.fire_compiled_playback
@@ -498,7 +498,7 @@ def _run_api_segmented_virtual_product(
         return real_fire(sequencer, artifact_digest)
 
     with (
-        patch.object(_VirtualInstallationRuntime, "start", record_start),
+        patch.object(_InstallationRuntime, "start", record_start),
         patch.object(VirtualCamera, "arm", record_arm),
         patch.object(VirtualSequencer, "prepare_compiled_playback", record_prepare),
         patch.object(VirtualSequencer, "fire_compiled_playback", record_fire),

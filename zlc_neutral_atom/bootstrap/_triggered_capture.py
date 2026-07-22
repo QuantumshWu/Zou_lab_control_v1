@@ -460,7 +460,10 @@ def bind_triggered_camera_acquisition(
         raise TypeError("pulse_document must be PulseDocument")
     if not isinstance(execution_form, PulseExecutionForm):
         raise TypeError("execution_form must be PulseExecutionForm")
-    if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
+    if execution_form in (
+        PulseExecutionForm.CONTINUOUS_MONITOR,
+        PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
+    ):
         raise ValueError("triggered camera acquisition requires a finite pulse form")
     if not isinstance(layout, TriggeredCameraLayout):
         raise TypeError("layout must be TriggeredCameraLayout")

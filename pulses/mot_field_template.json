@@ -733,5 +733,6 @@
     "da_bias_z"
   ],
   "delays": [],
-  "repeat": null
+  "repeat": null,
+  "scan_sweep_count": 0
 }

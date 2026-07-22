@@ -30,7 +30,6 @@ from zlc_pulse import (
     ScanParameter,
     build_pulse_timeline,
     compile_pulse_artifact,
-    resolve_api_parameters,
     save_pulse_document,
 )
 from zlc_workbench.pulse import PulseEditorSession
@@ -200,7 +199,7 @@ def test_timeline_rejects_labels_from_another_source_document():
         )
 
 
-def test_hardware_run_requires_api_values_to_be_explicitly_resolved():
+def test_hardware_run_retains_authored_api_intent_and_explicit_values():
     document = _document()
     duration = PulseFieldRef(FIELD_DURATION, "on")
     unresolved = replace(
@@ -209,7 +208,7 @@ def test_hardware_run_requires_api_values_to_be_explicitly_resolved():
     )
     reference = DeviceRef("installation", "runtime", "sequencer")
 
-    with pytest.raises(ValueError, match="unresolved API parameters"):
+    with pytest.raises(ValueError, match="exactly cover"):
         PulseRunRequest(
             unresolved,
             PulseExecutionForm.STATIC_ONCE,
@@ -217,15 +216,16 @@ def test_hardware_run_requires_api_values_to_be_explicitly_resolved():
             1.0,
         )
 
-    resolved = resolve_api_parameters(unresolved, {"on_duration": 150})
-    assert resolved.api_parameters == ()
-    assert resolved.field_value(duration) == (150, "ns")
-    PulseRunRequest(
-        resolved,
+    request = PulseRunRequest(
+        unresolved,
         PulseExecutionForm.STATIC_ONCE,
         reference,
         1.0,
+        (("on_duration", 150),),
     )
+    assert request.document is unresolved
+    assert request.document.api_parameters == unresolved.api_parameters
+    assert request.api_values == (("on_duration", 150),)
 
 
 def test_editor_save_detects_an_external_current_document_change(tmp_path):
@@ -380,7 +380,9 @@ def test_notebook_pulse_run_and_cancelled_hold_share_the_runtime_safe_path(tmp_p
         )
 
         finite = experiment.pulse.request(document)
+        assert finite.timeout_seconds is None
         descriptor = experiment.pulse.inspect(finite)
+        assert descriptor.timeout_seconds == 30.0
         result = experiment.pulse.run(finite)
         assert isinstance(result, PulseRunResult)
         assert result.artifact_digest == descriptor.artifact_digest

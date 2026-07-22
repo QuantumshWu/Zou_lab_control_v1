@@ -16,7 +16,7 @@ from zlc_frontend.qt_widgets import (
     FluentLabel,
     FluentTabWidget,
     GREY,
-    QtImageBoard,
+    FrozenRasterView,
     QtOwnerWake,
 )
 from zlc_storage import canonical_text, positive_integer
@@ -60,7 +60,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         self._future: Future[EncodedRasterDocument] | None = None
         self._cancelled = threading.Event()
         self._bundle: EncodedRasterDocument | None = None
-        self._boards: tuple[QtImageBoard, ...] = ()
+        self._boards: tuple[FrozenRasterView, ...] = ()
         self._closing = False
         self._closed = False
         self._allow_close = False
@@ -78,7 +78,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         self._summary.setWordWrap(True)
         self._tabs = FluentTabWidget(self)
         self._tabs.setObjectName(f"{self._prefix}Tabs")
-        self._placeholder = QtImageBoard(
+        self._placeholder = FrozenRasterView(
             f"{self._prefix}-loading",
             self._tabs,
             empty_text=f"Building frozen {self._subject.lower()}…",
@@ -142,12 +142,12 @@ class FrozenRasterWindow(QtWidgets.QWidget):
     def closed(self) -> bool:
         return self._closed
 
-    def _build_boards(self, bundle: EncodedRasterDocument) -> tuple[QtImageBoard, ...]:
+    def _build_boards(self, bundle: EncodedRasterDocument) -> tuple[FrozenRasterView, ...]:
         self._retire_tab_pages()
         boards = []
         one_page = len(bundle.pages) == 1
         for page in bundle.pages:
-            board = QtImageBoard(
+            board = FrozenRasterView(
                 f"{self._prefix}-{page.key}",
                 self._tabs,
                 empty_text="Raster unavailable",
@@ -176,7 +176,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         while self._tabs.count():
             widget = self._tabs.widget(0)
             self._tabs.removeTab(0)
-            if isinstance(widget, QtImageBoard):
+            if isinstance(widget, FrozenRasterView):
                 widget.clear()
             widget.setParent(None)
             widget.deleteLater()
@@ -186,7 +186,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
     def _presentation_peak(
         self,
         bundle: EncodedRasterDocument,
-        boards: tuple[QtImageBoard, ...],
+        boards: tuple[FrozenRasterView, ...],
     ) -> int:
         total = 0
         for page, board in zip(bundle.pages, boards, strict=True):
@@ -205,7 +205,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         return self._memory_limit_bytes
 
     def _present_bundle(self, bundle: EncodedRasterDocument) -> bool:
-        boards: tuple[QtImageBoard, ...] = ()
+        boards: tuple[FrozenRasterView, ...] = ()
         try:
             boards = self._build_boards(bundle)
             self._boards = boards

@@ -60,7 +60,7 @@ from zlc_frontend.figure import (  # noqa: E402
 )
 from zlc_frontend.image_display import ImageColormap  # noqa: E402
 from zlc_frontend.qt_widgets import (  # noqa: E402
-    QtImageBoard,
+    FrozenRasterView,
     QtRasterBoard,
     ensure_qt_app,
 )
@@ -418,7 +418,7 @@ def test_image_authority_or_geometry_gaps_fail_to_whole_figure_encoded(
     assert window.raster_ready
     assert window._view_family == "encoded"
     assert reason in window._summary.text()
-    assert window.findChild(QtImageBoard) is not None
+    assert window.findChild(FrozenRasterView) is not None
     assert window.findChild(QtRasterBoard, "figureViewerTypedBoard").front_frame is None
     _close(application, window)
 

@@ -416,7 +416,7 @@ def test_radial_fit_board_target_preserves_physical_circle_aspect() -> None:
     from PyQt5 import QtCore, QtGui
     from zlc_data import FitBatchStatus
     from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
-    from zlc_frontend.qt_widgets.board import _panel_image_geometry
+    from zlc_frontend.qt_widgets._raster_board_support import _panel_image_geometry
 
     _application = ensure_qt_app()
     payload = _with_radial_fit_overlay(
@@ -1066,7 +1066,7 @@ def test_middle_pan_uses_press_pixels_holds_only_exact_payload_and_commits_live(
         assert not isinstance(hold.display_payload, type(first))
         held_origin = board.visible_image_origin()
         assert held_origin is not None and held_origin.sequence == 1
-        assert held_origin.evaluated_input is first.panels[0].display_payload.evaluated_input
+        assert held_origin.input_identity is first.panels[0].display_payload.evaluated_input
 
         # The complete board advances, while the interacting panel retains the
         # exact press front and transform only.
@@ -1262,7 +1262,7 @@ def test_terminal_fault_discards_only_the_exact_pending_origin() -> None:
     try:
         _wheel(board, _point(_target(board), 0.5, 0.5), -120)
         origin = committed[0].origin
-        assert origin.evaluated_input is board.visible_image_payload().evaluated_input
+        assert origin.input_identity is board.visible_image_payload().evaluated_input
         assert board._image_interaction_is_pending(_binding(board))
         with pytest.raises(ValueError, match="pending image viewport revision"):
             board.present(

@@ -7,14 +7,12 @@ expressions or position-parsed targets.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, replace
 from typing import Mapping, Sequence
 
 import numpy as np
 
 from fpga.pulse_streamer.host.image import StreamerParams
-from zlc_storage import positive_real as _positive_float
 
 from .artifact import CompiledPulseArtifact, PulseExecutionForm
 from .document import (
@@ -33,7 +31,10 @@ from .fpga import pack_target_ir
 from .ir import TargetBusDelay, TargetBusSegment, TargetIR, evaluate_affine_tick
 from .schedule import DigitalTriggerSchedule, build_digital_trigger_schedules
 from .target import PORT_CLOCK, PORT_DAC, PORT_DIGITAL, PulseTarget
-from .validation import validate_target_ir_for_target
+from .validation import (
+    validate_pulse_document_clock_grid,
+    validate_target_ir_for_target,
+)
 
 
 COMPILER_ID = "zlc-pulse-native"
@@ -88,10 +89,7 @@ def compile_pulse_document(
         raise TypeError("document must be PulseDocument")
     if not isinstance(execution_form, PulseExecutionForm):
         raise TypeError("execution_form must be PulseExecutionForm")
-    frequency = _positive_float(clock_hz, "clock_hz")
-    step_ns = 1e9 / frequency
-    if not math.isclose(document.time_step_ns, step_ns, rel_tol=1e-12, abs_tol=1e-12):
-        raise ValueError("pulse document clock grid differs from compile clock")
+    frequency = validate_pulse_document_clock_grid(document, clock_hz)
     geometry = params or StreamerParams()
     if live_target is not None:
         if not isinstance(live_target, PulseTarget):
@@ -100,13 +98,21 @@ def compile_pulse_document(
             raise ValueError("pulse document target ABI differs from live target")
     _validate_target_geometry(document.target, geometry)
 
-    if execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
+    if execution_form in (
+        PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
+        PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
+    ):
         if document.scan_table is None or not document.scan_table.rows:
-            raise ValueError("AUTONOMOUS_SCAN_ONCE requires a frozen scan table with rows")
+            raise ValueError(
+                f"{execution_form.value} requires a frozen scan table with rows"
+            )
         return _compile_scan(
             _program_view(document),
             clock_hz=frequency,
             coeff_frac_bits=int(geometry.coeff_frac_bits),
+            repeat_forever=(
+                execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS
+            ),
         )
 
     reference = execution_form is PulseExecutionForm.STATIC_REFERENCE_POINT
@@ -135,8 +141,19 @@ def compile_pulse_artifact(
     channels = tuple(trigger_channels)
     if len(channels) != len(set(channels)):
         raise ValueError("trigger_channels must be unique")
-    if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR and channels:
-        raise ValueError("continuous monitor cannot publish a finite trigger schedule")
+    continuous_execution = execution_form in (
+        PulseExecutionForm.CONTINUOUS_MONITOR,
+        PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
+    )
+    if continuous_execution and channels:
+        continuous_label = (
+            "continuous monitor"
+            if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR
+            else "continuous scan"
+        )
+        raise ValueError(
+            f"{continuous_label} cannot publish a finite trigger schedule"
+        )
     lane_owners = {
         lane: port for port in document.target.ports for lane in port.lanes
     }
@@ -159,7 +176,7 @@ def compile_pulse_artifact(
     validate_target_ir_for_target(target_ir, document.target)
     schedules = (
         ()
-        if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR or not channels
+        if continuous_execution or not channels
         else build_digital_trigger_schedules(target_ir, channels)
     )
     source_loop_count = 1 if document.repeat is None else document.repeat.count
@@ -317,6 +334,7 @@ def _compile_scan(
     *,
     clock_hz: float,
     coeff_frac_bits: int,
+    repeat_forever: bool,
 ) -> TargetIR:
     step_ns = 1e9 / clock_hz
     work = view
@@ -438,7 +456,7 @@ def _compile_scan(
         ticks=tuple(ticks),
         masks=tuple(masks),
         duration_seconds=sum(point_durations),
-        repeat_forever=False,
+        repeat_forever=repeat_forever,
         loop_start_index=loop_start_index,
         loop_end_tick=loop_end_tick,
         loop_count=loop_count,

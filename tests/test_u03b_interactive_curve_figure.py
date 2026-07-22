@@ -61,7 +61,7 @@ from zlc_frontend.figure import (  # noqa: E402
     suggest_fit_view,
 )
 from zlc_frontend.qt_widgets import (  # noqa: E402
-    QtImageBoard,
+    FrozenRasterView,
     QtRasterBoard,
     ensure_qt_app,
 )
@@ -374,7 +374,7 @@ def test_unsupported_or_authoritative_curve_content_stays_encoded(
     try:
         _until(application, lambda: window.raster_ready)
         assert window._view_family == "encoded"
-        assert window.findChild(QtImageBoard, "figureViewerBoard") is not None
+        assert window.findChild(FrozenRasterView, "figureViewerBoard") is not None
         assert window.findChild(QtRasterBoard, "figureViewerTypedBoard").front_frame is None
         assert "interaction unavailable:" in window._summary.text()
         assert reason_fragment in window._summary.text()

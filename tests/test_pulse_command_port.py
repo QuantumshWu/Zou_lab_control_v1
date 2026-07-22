@@ -18,7 +18,6 @@ from zlc_neutral_atom.pulse_application import (
 from zlc_pulse import (
     PulseExecutionForm,
     load_pulse_document,
-    resolve_api_parameters,
 )
 
 
@@ -61,21 +60,24 @@ def test_pulse_target_descriptor_is_capability_free() -> None:
 def test_pulse_run_request_freezes_intent_without_a_hardware_callback() -> None:
     descriptor = _descriptor()
     document = load_pulse_document(IMAGING_TEMPLATE)
-    document = resolve_api_parameters(
-        document,
-        {
-            parameter.parameter_id: document.field_value(parameter.field)[0]
-            for parameter in document.api_parameters
-        },
+    api_values = tuple(
+        (
+            parameter.parameter_id,
+            document.field_value(parameter.field)[0],
+        )
+        for parameter in document.api_parameters
     )
     request = PulseRunRequest(
         document,
         PulseExecutionForm.STATIC_ONCE,
         descriptor.sequencer_ref,
         3.0,
+        api_values,
     )
 
     assert request.document is document
+    assert request.api_values == api_values
+    assert request.scan_sweep_count == 1
     assert request.sequencer_ref == descriptor.sequencer_ref
     assert request.execution_form is PulseExecutionForm.STATIC_ONCE
     assert {field.name for field in fields(PulseRunRequest)} == {
@@ -83,6 +85,8 @@ def test_pulse_run_request_freezes_intent_without_a_hardware_callback() -> None:
         "execution_form",
         "sequencer_ref",
         "timeout_seconds",
+        "api_values",
+        "scan_sweep_count",
     }
     assert not hasattr(request, "port")
     assert not hasattr(request, "device")
@@ -99,13 +103,14 @@ def test_current_workbench_entry_points_never_accept_a_raw_sequencer() -> None:
 
 
 def test_standalone_launcher_composes_the_current_product_surface() -> None:
-    # The launcher opens the OFFLINE legacy editor through the ONE composition root
-    # (behaviour authority = main, C22); it constructs no device and no experiment.
-    # The workbench windows remain components behind Zou_lab_control.workbench.
+    # The launcher opens the current PulseDocument surface through one composition
+    # root.  Remote selection is declarative; no raw device/client enters the script.
     source = (ROOT / "pulse_gui.py").read_text(encoding="utf-8")
 
     assert "from zlc_workbench.pulse_editor.app import open_pulse_editor" in source
-    assert "open_pulse_editor(state=args.state" in source
+    assert "remote_endpoint=remote_endpoint" in source
+    assert '"--remote-host"' in source
+    assert '"--document"' in source
     assert "connect(" not in source
     assert "managed_pulse_command_port" not in source
     assert "RemoteSequencer" not in source

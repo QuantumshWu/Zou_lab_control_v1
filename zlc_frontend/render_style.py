@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from functools import lru_cache
+import math
 from pathlib import Path
 import threading
 from types import MappingProxyType
@@ -68,9 +69,42 @@ PANEL_UNIT_PX = (180, 240)                # (height, width) of one half-unit
 # L = STOCK_MARGINS_PX[0] (110): the MINIMUM that holds a 4-5 digit y-tick label (a qCMOS
 # ROI pixel value) PLUS the rotated y-title -- narrower clipped the title off the figure.
 PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 96, 80, TITLE_SLOT_PX)   # (L, R, B, T)
+PULSE_LEFT_MARGIN_PX = 122                # board-name y labels need the formal wider left slot
 
 
-def panel_figure_size_inches(size: str = "2x2") -> tuple[float, float]:
+def panel_margins_px(kind: str = "default") -> tuple[int, int, int, int]:
+    """The one fixed outer-margin source for a panel plot kind."""
+
+    left, right, bottom, top = PANEL_MARGINS_PX
+    if str(kind).strip().lower() == "pulse":
+        left = PULSE_LEFT_MARGIN_PX
+    return (left, right, bottom, top)
+
+
+def _panel_geometry_px(
+    size: str,
+    *,
+    kind: str,
+) -> tuple[int, int, int, int, int, int]:
+    from zlc_data.panel_size import panel_size_cells
+
+    rows, cols = panel_size_cells(size)
+    left, right, bottom, top = panel_margins_px(kind)
+    return (
+        cols * PANEL_UNIT_PX[1],
+        rows * PANEL_UNIT_PX[0],
+        left,
+        right,
+        bottom,
+        top,
+    )
+
+
+def panel_figure_size_inches(
+    size: str = "2x2",
+    *,
+    kind: str = "default",
+) -> tuple[float, float]:
     """Figure size in INCHES for a panel of ``size`` -- the ONE source a renderer builds its
     ``Figure(figsize=...)`` from (data region + margins over :data:`DESIGN_DPI`).
 
@@ -78,16 +112,20 @@ def panel_figure_size_inches(size: str = "2x2") -> tuple[float, float]:
     figure and the card box a host reserves for it describe the SAME geometry and can never drift.
     """
 
-    from zlc_data.panel_size import panel_size_cells
-
-    rows, cols = panel_size_cells(size)
-    left, right, bottom, top = PANEL_MARGINS_PX
-    width = cols * PANEL_UNIT_PX[1] + left + right
-    height = rows * PANEL_UNIT_PX[0] + bottom + top
+    data_width, data_height, left, right, bottom, top = _panel_geometry_px(
+        size,
+        kind=kind,
+    )
+    width = data_width + left + right
+    height = data_height + bottom + top
     return (width / DESIGN_DPI, height / DESIGN_DPI)
 
 
-def panel_display_size(size: str = "2x2") -> tuple[int, int]:
+def panel_display_size(
+    size: str = "2x2",
+    *,
+    kind: str = "default",
+) -> tuple[int, int]:
     """On-screen (logical px) size of a panel of ``size`` -- the card's canvas box.
 
     Pure geometry over the owned tokens: no figure, no renderer, no Qt.  A host
@@ -96,9 +134,35 @@ def panel_display_size(size: str = "2x2") -> tuple[int, int]:
     :func:`panel_figure_size_inches` so the reserved box and the rastered figure share one source.
     """
 
-    width_in, height_in = panel_figure_size_inches(size)
+    width_in, height_in = panel_figure_size_inches(size, kind=kind)
     return (round(width_in * DESIGN_DPI * PANEL_DISPLAY_SCALE),
             round(height_in * DESIGN_DPI * PANEL_DISPLAY_SCALE))
+
+
+def panel_axes_bounds(
+    size: str = "2x2",
+    *,
+    kind: str = "default",
+) -> tuple[float, float, float, float]:
+    """Fixed Matplotlib axes box ``(left, bottom, width, height)``.
+
+    Viewport limits never participate in this geometry.  It is the headless
+    equivalent of the formal ``FigureSpec + Divider`` layout: data box and
+    margins are derived once from the same size/kind tokens as the figure.
+    """
+
+    data_width, data_height, left, right, bottom, top = _panel_geometry_px(
+        size,
+        kind=kind,
+    )
+    figure_width = left + data_width + right
+    figure_height = bottom + data_height + top
+    return (
+        left / figure_width,
+        bottom / figure_height,
+        data_width / figure_width,
+        data_height / figure_height,
+    )
 
 
 # The readability floor a pulse timeline needs in the size-preset DATA region: enough px PER ROW that a
@@ -454,8 +518,15 @@ __all__ = [
     "PANEL_DISPLAY_SCALE",
     "PANEL_MARGINS_PX",
     "PANEL_UNIT_PX",
+    "PULSE_LEFT_MARGIN_PX",
+    "PULSE_X_TICK_LINE_METRIC_TEXT",
+    "PULSE_X_TICK_PAD_PT",
     "TITLE_SLOT_PX",
+    "panel_axes_bounds",
     "panel_display_size",
+    "panel_figure_size_inches",
+    "panel_margins_px",
+    "pulse_xlabel_figure_coords",
     "PULSE_SCAN_ANNOTATION_COLOR",
     "PULSE_SCAN_ANNOTATION_FONT_SIZE",
     "PULSE_SCAN_REGION_COLOR",

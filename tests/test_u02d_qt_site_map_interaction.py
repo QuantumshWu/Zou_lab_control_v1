@@ -345,12 +345,12 @@ def test_site_map_reuses_image_gestures_but_keeps_area_display_only():
             board._image_bindings["sites"].applied_bounds
             == gesture.normalized_bounds
         )
-        assert board.visible_image_origin().evaluated_input == payload.occupancy_input
+        assert board.visible_image_origin().input_identity == payload.occupancy_input
 
         _wheel(board, _point(target, 0.5, 0.5), -120)
         assert len(commands) == 1
         assert isinstance(commands[0], ImageViewportCommit)
-        assert commands[0].origin.evaluated_input == payload.occupancy_input
+        assert commands[0].origin.input_identity == payload.occupancy_input
         assert commands[0].viewport.axes == payload.background.viewport.axes
     finally:
         board.close()

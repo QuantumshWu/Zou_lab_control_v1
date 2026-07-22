@@ -1,57 +1,157 @@
-"""The pulse editor's composition root -- the one place that opens the editor window.
+"""Composition root for the one formal Pulse GUI.
 
-Every entry goes through :func:`open_pulse_editor`: the double-clickable
-``pulse_gui.bat``, the root ``pulse_gui.py`` launcher, and
-``Experiment.pulse_gui()`` from a notebook.
-
-The window is the ORIGINAL pulse editor UI -- the edit/preview/scan tabs, period
-cards, channel rows, Fluent chrome -- hosted in :mod:`.plot_bridge_pulse_gui`
-(the UI skeleton is kept BY DIRECTIVE 2026-07-21; it is never redesigned).  Its
-DATA plane is the current domain stack: the authoring model and the
-machine-verified runtime compiler live in ``zlc_neutral_atom.timing``, and
-importing this window loads ZERO legacy-tree modules
-(guard: ``tests/test_workbench_zero_legacy.py``).
+The visible Edit/Preview/Scan product is fixed.  This module only supplies its
+current document/application authorities: an existing Experiment is borrowed;
+a standalone editor starts offline and may compose one owned virtual or remote
+Experiment from the existing Connection controls.
 """
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
+from zlc_pulse import (
+    PulseDocument,
+    load_deployed_pulse_target,
+    validate_pulse_document_clock_grid,
+)
+from zlc_workbench.pulse import PulseEditorSession
+
+from .controller import OwnedPulseConnection, PulseEditorController
+from .window import launch_pulse_editor_window
+
 __all__ = ["open_pulse_editor"]
 
-#: How many ports a freshly opened editor shows before the operator adds more.  The rest
-#: are reachable from the Ports card; opening with all 22 would bury the ones in use.
-INITIAL_VISIBLE_PORTS = 4
+
+def _standalone_workspace(value: str | Path | None) -> Path:
+    if value is not None:
+        return Path(value).expanduser().resolve()
+    configured = os.environ.get("ZLC_PULSE_WORKSPACE", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (Path.home() / ".zlc" / "pulse-workbench").resolve()
 
 
-def open_pulse_editor(experiment=None, *, state=None, scale=None, **kwargs):
-    """Open the pulse editor and return the editor widget.
+def _editor_session(
+    *,
+    document: PulseDocument | None,
+    path: str | Path | None,
+    target,
+    time_step_ns: float,
+) -> PulseEditorSession:
+    if document is not None and path is not None:
+        raise ValueError("provide document or path, not both")
+    if document is not None:
+        if not isinstance(document, PulseDocument):
+            raise TypeError("document must be PulseDocument or None")
+        return PulseEditorSession(document)
+    if path is not None:
+        return PulseEditorSession.load(path)
+    return PulseEditorSession.new(target, time_step_ns=time_step_ns)
 
-    ``state`` may be a ``PulseTableState`` or a path to a saved program JSON.
-    ``experiment=None`` opens the OFFLINE editor (each call its own window; no
-    device is created or discovered).
 
-    This is where lanes acquire their identity.  The board's constraints file is the
-    only place that knows a lane is ``cooling`` on pin ``F15`` and that ten more form
-    the ``da_bias_x`` DAC bus, so the catalog is built HERE, once, and handed to the
-    window -- a catalog built without it shows raw ``ch00`` keys and cannot group a bus.
-    A saved program carries its own catalog and keeps it; only the pin numbers, which
-    are hardware and never travel inside a document, are supplied from the board.
-    """
-
-    from zlc_neutral_atom.timing.board_config import load_board_config
-    from zlc_neutral_atom.timing.pulse_table import PulseTableState
-
-    from .plot_bridge_pulse_gui import show_pulse_gui
+def _managed_connection_mode(experiment, descriptor) -> str:
+    """Project an immutable installation fact into the existing combo choice."""
 
     try:
-        board = load_board_config()
-    except (OSError, ValueError):
-        board = None          # no board file: the editor still opens, on bare lanes
+        info = experiment.device_catalog[descriptor.sequencer_ref.role]
+        adapter = str(info.adapter_kind).lower()
+    except (AttributeError, KeyError, TypeError):
+        adapter = ""
+    return "virtual" if "virtualsequencer" in adapter else "remote"
 
-    if state is not None and not isinstance(state, PulseTableState):
-        state = PulseTableState.load(state)
-    if state is None and board is not None:
-        catalog = board.port_catalog()
-        visible = [p.key for p in catalog.ports if p.kind != "clock"][:INITIAL_VISIBLE_PORTS]
-        state = PulseTableState(port_catalog=catalog, visible_ports=visible)
-    kwargs.setdefault("channel_pins", dict(board.pins) if board is not None else None)
-    return show_pulse_gui(state=state, scale=scale, **kwargs)
+
+def _standalone_connection_factory(workspace: Path):
+    def compose(
+        mode: str,
+        host: str | None,
+        port: int | None,
+        required_document: PulseDocument,
+    ) -> OwnedPulseConnection:
+        # Import lazily so offline authoring does not construct or import a
+        # runtime installation.  Qt receives only the narrow facade below.
+        from Zou_lab_control.notebook.facade import connect
+
+        if mode == "virtual":
+            experiment = connect("virtual", repository=workspace)
+        elif mode == "remote":
+            if host is None or port is None:
+                raise ValueError("remote Pulse connection requires host and port")
+            experiment = connect(
+                "remote",
+                repository=workspace,
+                sequencer_host=host,
+                sequencer_port=port,
+                required_pulse_document=required_document,
+            )
+        else:
+            raise ValueError("Pulse connection mode must be virtual or remote")
+        try:
+            pulse = experiment.pulse
+            descriptor = pulse.target
+            return OwnedPulseConnection(pulse, descriptor, experiment.close)
+        except BaseException:
+            experiment.close()
+            raise
+
+    return compose
+
+
+def open_pulse_editor(
+    experiment=None,
+    *,
+    document: PulseDocument | None = None,
+    path: str | Path | None = None,
+    remote_endpoint: str | None = None,
+    repository: str | Path | None = None,
+):
+    """Open the unchanged formal surface on current Pulse authorities."""
+
+    if document is not None and not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument or None")
+    if document is not None and path is not None:
+        raise ValueError("provide document or path, not both")
+    if experiment is not None and remote_endpoint is not None:
+        raise ValueError("an existing Experiment already owns its Pulse connection")
+
+    if experiment is not None:
+        pulse = getattr(experiment, "pulse", None)
+        if pulse is None:
+            raise TypeError("experiment must expose its current Pulse facade")
+        descriptor = pulse.target
+        session = _editor_session(
+            document=document,
+            path=path,
+            target=descriptor.target,
+            time_step_ns=descriptor.time_step_ns,
+        )
+        session.bind_target(descriptor.target)
+        validate_pulse_document_clock_grid(session.document, descriptor.clock_hz)
+        controller = PulseEditorController(
+            session,
+            pulse=pulse,
+            descriptor=descriptor,
+            initial_connection_mode=_managed_connection_mode(experiment, descriptor),
+        )
+        return launch_pulse_editor_window(controller, hide_on_close=True)
+
+    target = load_deployed_pulse_target()
+    from zlc_neutral_atom.timing.clock import default_time_step_ns
+
+    session = _editor_session(
+        document=document,
+        path=path,
+        target=target,
+        time_step_ns=default_time_step_ns(),
+    )
+    workspace = _standalone_workspace(repository)
+    controller = PulseEditorController(
+        session,
+        connection_factory=_standalone_connection_factory(workspace),
+        initial_connection_mode="offline",
+    )
+    body = launch_pulse_editor_window(controller)
+    if remote_endpoint is not None:
+        controller.connect("remote", remote_endpoint)
+    return body

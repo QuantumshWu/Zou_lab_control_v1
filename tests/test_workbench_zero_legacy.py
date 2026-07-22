@@ -25,7 +25,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 ROOTS = (
     "zlc_workbench.task_console.plot_bridge_console",
     "zlc_workbench.figure_viewer.plot_bridge_figure_viewer",
-    "zlc_workbench.pulse_editor.plot_bridge_pulse_gui",
+    "zlc_workbench.pulse_editor.window",
     "zlc_workbench.task_console.app",
     "zlc_workbench.pulse_editor.app",
     "Zou_lab_control.workbench",

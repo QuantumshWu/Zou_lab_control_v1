@@ -611,5 +611,6 @@
     "ch11"
   ],
   "delays": [],
-  "repeat": null
+  "repeat": null,
+  "scan_sweep_count": 0
 }

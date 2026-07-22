@@ -254,19 +254,30 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges(tmp_pat
         )
         scan_document = replace(scan_document, scan_table=table)
         scan_axis = _axis("capture.scan", SCAN_POINT, 3)
+        scan_layout = TriggeredCameraLayout(
+            repeat_axis,
+            AxisId("scan.event"),
+            scan_axes=(scan_axis,),
+            scan_point_layout=PointLayout.rect_c((3,)),
+            readout_events_per_repeat=1,
+        )
+        with pytest.raises(ValueError, match="requires a finite pulse form"):
+            bind_triggered_camera_acquisition(
+                pulse_port,
+                camera_port,
+                pulse_document=scan_document,
+                execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
+                trigger_channel="ch11",
+                layout=scan_layout,
+                transport_memory_limit_bytes=16 << 20,
+            )
         scanned = bind_triggered_camera_acquisition(
             pulse_port,
             camera_port,
             pulse_document=scan_document,
             execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
             trigger_channel="ch11",
-            layout=TriggeredCameraLayout(
-                repeat_axis,
-                AxisId("scan.event"),
-                scan_axes=(scan_axis,),
-                scan_point_layout=PointLayout.rect_c((3,)),
-                readout_events_per_repeat=1,
-            ),
+            layout=scan_layout,
             transport_memory_limit_bytes=16 << 20,
         )
         scan_schedule = scanned.compiled_artifact.trigger_schedules[0]

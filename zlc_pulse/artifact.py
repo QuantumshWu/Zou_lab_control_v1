@@ -41,6 +41,7 @@ class PulseExecutionForm(str, Enum):
     STATIC_REFERENCE_POINT = "STATIC_REFERENCE_POINT"
     CONTINUOUS_MONITOR = "CONTINUOUS_MONITOR"
     AUTONOMOUS_SCAN_ONCE = "AUTONOMOUS_SCAN_ONCE"
+    AUTONOMOUS_SCAN_CONTINUOUS = "AUTONOMOUS_SCAN_CONTINUOUS"
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,11 +163,21 @@ class CompiledPulseArtifact:
         if self.execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
             if not scan or self.target_ir.repeat_forever:
                 raise ValueError("AUTONOMOUS_SCAN_ONCE requires finite scan TargetIR")
+        elif self.execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS:
+            if not scan or not self.target_ir.repeat_forever:
+                raise ValueError(
+                    "AUTONOMOUS_SCAN_CONTINUOUS requires cyclic scan TargetIR"
+                )
         elif scan:
-            raise ValueError("only AUTONOMOUS_SCAN_ONCE may carry scan points")
-        if self.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
+            raise ValueError("only autonomous scan forms may carry scan points")
+        if self.execution_form in (
+            PulseExecutionForm.CONTINUOUS_MONITOR,
+            PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
+        ):
             if not self.target_ir.repeat_forever or schedules:
-                raise ValueError("continuous monitor must be cyclic and has no finite trigger schedule")
+                raise ValueError(
+                    "continuous execution must be cyclic and has no finite trigger schedule"
+                )
         elif self.target_ir.repeat_forever:
             raise ValueError("finite execution form cannot carry cyclic TargetIR")
         expected_points = len(self.target_ir.scan_points) if scan else 1

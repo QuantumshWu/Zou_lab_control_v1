@@ -427,7 +427,7 @@ def test_curve_and_histogram_bind_simultaneously_with_exact_log_bin_hover() -> N
         histogram_zoom = histogram_commands[-1]
         assert isinstance(histogram_zoom, HistogramViewportCommit)
         assert histogram_zoom.origin == exact_origin
-        assert histogram_zoom.origin.evaluated_input is target.payload.evaluated_input
+        assert histogram_zoom.origin.input_identity is target.payload.evaluated_input
         assert histogram_zoom.viewport.count_limits == target.payload.viewport.count_limits
         assert histogram_zoom.viewport.count_scale is HistogramCountScale.LOG
         assert curve_commands == []
@@ -792,6 +792,10 @@ def test_histogram_threshold_line_drag_is_live_exclusive_and_near_line_only() ->
         command = commands[-1]
         assert isinstance(command, HistogramThresholdCommit)
         assert command.thresholds == pytest.approx((expected,), abs=0.05)
+        assert binding.threshold_pending_origin == command.origin
+        assert board.discard_pending_histogram_interaction(command.origin)
+        assert binding.threshold_pending_origin is None
+        assert binding.threshold_pending_revision is None
         issued = len(commands)
 
         QtTest.QTest.mouseRelease(

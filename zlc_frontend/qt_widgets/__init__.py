@@ -19,7 +19,9 @@ from ..selector import (
     RectangleGesture,
 )
 from .axis_navigator import AxisLayoutNavigator
-from .board import QtImageBoard, QtOwnerWake, QtRasterBoard
+from .board import QtRasterBoard
+from .frozen_raster import FrozenRasterView
+from .owner_wake import QtOwnerWake
 from .panel_host import SinglePanelHost
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
 from .fit_authoring import FitAuthoringPane
@@ -244,7 +246,7 @@ __all__ = [
     "PADDING_H",
     "PADDING_V",
     "PLACEHOLDER",
-    "QtImageBoard",
+    "FrozenRasterView",
     "QtOwnerWake",
     "QtRasterBoard",
     "SinglePanelHost",

@@ -3021,7 +3021,7 @@ def show_task_console(
     on_close=None,
     hide_on_close: bool = False,
 ):
-    """Open the console in a Fluent window (mirrors ``show_pulse_gui``: the body
+    """Open the console in a Fluent window (mirrors ``launch_pulse_editor_window``: the body
     sizes itself from the primary screen; the window wraps it exactly).
 
     ``task`` loads a layout YOU saved (``tasks/<name>.json``) or a JSON path;

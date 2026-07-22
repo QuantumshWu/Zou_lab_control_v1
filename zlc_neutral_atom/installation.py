@@ -9,6 +9,10 @@ from types import MappingProxyType
 from zlc_storage import canonical_text, nonnegative_integer
 
 
+class InstallationRestartRequiredError(RuntimeError):
+    """Composition crossed its process-lifetime claim and cannot be retried here."""
+
+
 @dataclass(frozen=True, slots=True)
 class DeviceRef:
     """Opaque public identity pinned to one non-reusable runtime instance."""
@@ -170,4 +174,9 @@ class DeviceCatalogView(Mapping[str, DeviceInfo]):
         }
 
 
-__all__ = ["DeviceCatalogView", "DeviceInfo", "DeviceRef"]
+__all__ = [
+    "DeviceCatalogView",
+    "DeviceInfo",
+    "DeviceRef",
+    "InstallationRestartRequiredError",
+]

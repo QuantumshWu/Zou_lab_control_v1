@@ -24,6 +24,7 @@ from zlc_neutral_atom.runtime.resources import (
 )
 from zlc_neutral_atom.timing.pulse import (
     CompletePulseCommand,
+    ContinuousPulseExecutionRequest,
     FinitePulseExecutionRequest,
     FirePulseCommand,
     PreparePulseCommand,
@@ -34,6 +35,7 @@ from zlc_neutral_atom.timing.pulse import (
 from zlc_pulse import (
     PulseExecutionForm,
     compile_pulse_artifact,
+    freeze_scan_table,
     load_pulse_document,
 )
 
@@ -203,6 +205,50 @@ def test_reference_and_scan_forms_execute_the_exact_compiled_ir(
         (trigger_channel, artifact.trigger_schedules[0].total),
     )
     assert sequencer.snapshot()["state"] == "safe"
+    _shutdown(broker, sequencer)
+
+
+def test_zero_time_virtual_continuous_scan_cursor_is_explicitly_unavailable() -> None:
+    document = load_pulse_document(ROOT / "pulses" / "mot_field_template.json")
+    table, _report = freeze_scan_table(
+        document,
+        ("da_x", "da_y", "da_z"),
+        ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+    )
+    document = replace(document, scan_table=table)
+    sequencer, endpoint, broker, binding, capability = _bound_virtual_sequencer(
+        document
+    )
+    artifact = compile_pulse_artifact(
+        document,
+        clock_hz=sequencer.clock_hz,
+        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
+        live_target=document.target,
+    )
+    request = ContinuousPulseExecutionRequest(document, artifact)
+    prepare, fire, _complete = _commands(
+        request,
+        capability,
+        session_id="continuous-scan",
+        run_id="continuous-run",
+    )
+    endpoint.execute_command(binding, prepare)
+    endpoint.execute_command(binding, fire)
+
+    progress = endpoint.observe_scan_progress(
+        binding,
+        "continuous-scan",
+        "continuous-run",
+        artifact.fingerprint,
+        2,
+    )
+
+    assert not progress.available
+    assert "zero-time" in progress.unavailable_reason
+    endpoint.close_session(
+        binding,
+        SessionCloseCommand("continuous-scan", 2.0),
+    )
     _shutdown(broker, sequencer)
 
 

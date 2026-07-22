@@ -1912,7 +1912,7 @@ def _assert_occupancy_scan_window(exp, request, monkeypatch):
 def _assert_scan_window(exp, document, monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
-    from zlc_frontend.qt_widgets import QtImageBoard
+    from zlc_frontend.qt_widgets import FrozenRasterView
 
     request = exp.readout.scan_request(document, timeout_seconds=15.0)
     window = exp.scan_gui(request)
@@ -1929,7 +1929,7 @@ def _assert_scan_window(exp, document, monkeypatch):
     assert start is not None and start.isEnabled()
     start.click()
 
-    raster = window.findChild(QtImageBoard, "scanRaster")
+    raster = window.findChild(FrozenRasterView, "scanRaster")
     assert raster is not None
     deadline = time.monotonic() + 15.0
     while (
@@ -1955,7 +1955,7 @@ def _assert_scan_window(exp, document, monkeypatch):
         raise ValueError("injected Qt PNG decode rejection")
 
     with monkeypatch.context() as patch:
-        patch.setattr(QtImageBoard, "present_encoded", reject_final_png)
+        patch.setattr(FrozenRasterView, "present_encoded", reject_final_png)
         start.click()
         assert not raster.has_front
         diagnostics = window.findChild(QtWidgets.QLabel, "scanDiagnostics")

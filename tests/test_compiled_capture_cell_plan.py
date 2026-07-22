@@ -65,7 +65,12 @@ def image_schema(*, component_count: int | None = None):
     )
 
 
-def scanned_artifact(*, points: int, four_edges: bool = False):
+def scanned_artifact(
+    *,
+    points: int,
+    four_edges: bool = False,
+    execution_form: PulseExecutionForm = PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
+):
     document = load_pulse_document(IMAGING_TEMPLATE)
     periods = document.periods[:5]
     if four_edges:
@@ -96,12 +101,40 @@ def scanned_artifact(*, points: int, four_edges: bool = False):
         tuple((first.duration,) for _ in range(points)),
     )
     document = replace(document, scan_table=table)
+    trigger_channels = (
+        ()
+        if execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS
+        else ("ch11",)
+    )
     return compile_pulse_artifact(
         document,
         clock_hz=50e6,
-        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
-        trigger_channels=("ch11",),
+        execution_form=execution_form,
+        trigger_channels=trigger_channels,
     )
+
+
+def test_continuous_scan_has_no_finite_capture_cell_plan():
+    artifact = scanned_artifact(
+        points=2,
+        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
+    )
+    event = axis("capture.event", READOUT_EVENT, 1)
+    schema = DatasetSchema(
+        axis("capture.repeat", REPEAT, 1),
+        (axis("capture.scan", SCAN_POINT, 2), event),
+        PointLayout.rect_c((2, 1)),
+        image_schema(),
+    )
+
+    with pytest.raises(ValueError, match="no finite capture cell plan"):
+        compile_capture_cell_plan(
+            artifact,
+            "ch11",
+            schema,
+            readout_event_axis_id=event.axis_id,
+            scan_point_layout=PointLayout.rect_c((2,)),
+        )
 
 
 def test_static_three_frame_capture_uses_readout_event_not_fake_scan_axis():

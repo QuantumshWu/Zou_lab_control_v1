@@ -38,7 +38,7 @@ from zlc_storage import (
     sha256_text,
 )
 
-from .curve_display import CurveViewportTransform
+from .curve_display import CurveViewportTransform, NumericViewportTransform
 from .display_range import validated_display_range
 from .histogram_display import HistogramBinProjection, HistogramViewportTransform
 from .figure import (
@@ -128,6 +128,37 @@ class SourceIdentity:
             self,
             "schema_fingerprint",
             sha256_text(self.schema_fingerprint, "schema_fingerprint"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentInputIdentity:
+    """Exact immutable document revision rendered by a presentation surface.
+
+    A document is not a dataset producer.  Its identity therefore contains no
+    run, join, block, stream-generation, or schema fields.  ``content_digest``
+    binds the revision label to the exact content that was rasterized.
+    """
+
+    document_id: str
+    document_revision: int
+    content_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "document_id",
+            _text(self.document_id, "document_id"),
+        )
+        object.__setattr__(
+            self,
+            "document_revision",
+            _nonnegative(self.document_revision, "document_revision"),
+        )
+        object.__setattr__(
+            self,
+            "content_digest",
+            sha256_text(self.content_digest, "content_digest"),
         )
 
 
@@ -229,6 +260,43 @@ class PanelPresentationIdentity:
                 field,
                 _nonnegative(getattr(self, field), field),
             )
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentPresentationStamp:
+    """One document input plus the exact panel presentations derived from it."""
+
+    document_input: DocumentInputIdentity
+    presentations: tuple[PanelPresentationIdentity, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.document_input, DocumentInputIdentity):
+            raise TypeError("document_input must be DocumentInputIdentity")
+        presentations = tuple(self.presentations)
+        if not presentations or any(
+            not isinstance(value, PanelPresentationIdentity)
+            for value in presentations
+        ):
+            raise ValueError(
+                "presentations must contain at least one PanelPresentationIdentity"
+            )
+        panel_ids = tuple(value.panel_id for value in presentations)
+        if len(set(panel_ids)) != len(panel_ids):
+            raise ValueError("presentation panel ids must be unique")
+        if any(
+            value.document_id != self.document_input.document_id
+            or value.document_revision
+            != self.document_input.document_revision
+            for value in presentations
+        ):
+            raise ValueError(
+                "document presentation identity differs from its document input"
+            )
+        object.__setattr__(
+            self,
+            "presentations",
+            tuple(sorted(presentations, key=lambda value: value.panel_id)),
+        )
 
 
 @dataclass(frozen=True)
@@ -670,16 +738,16 @@ class PulsePanelPayload:
     with their display labels for hover text.
     """
 
-    evaluated_input: EvaluatedInput
-    viewport: CurveViewportTransform
+    document_input: DocumentInputIdentity
+    viewport: NumericViewportTransform
     row_keys: tuple[str, ...]
     row_labels: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.evaluated_input, EvaluatedInput):
-            raise TypeError("pulse payload requires one EvaluatedInput")
-        if not isinstance(self.viewport, CurveViewportTransform):
-            raise TypeError("pulse payload requires CurveViewportTransform")
+        if not isinstance(self.document_input, DocumentInputIdentity):
+            raise TypeError("pulse payload requires one DocumentInputIdentity")
+        if type(self.viewport) is not NumericViewportTransform:
+            raise TypeError("pulse payload requires NumericViewportTransform")
         keys = tuple(_text(key, "pulse row key") for key in self.row_keys)
         labels = tuple(
             _text(label, "pulse row label") for label in self.row_labels)
@@ -1023,8 +1091,8 @@ DisplayPayload = (
 class PanelFrame:
     panel_id: str
     coherence_group: str
-    source_identity: SourceIdentity
-    coherence_stamp: CoherenceStamp
+    source_identity: SourceIdentity | DocumentInputIdentity
+    coherence_stamp: CoherenceStamp | DocumentPresentationStamp
     raster: RasterBuffer
     display_payload: DisplayPayload | None = None
 
@@ -1035,13 +1103,65 @@ class PanelFrame:
             "coherence_group",
             _text(self.coherence_group, "coherence_group"),
         )
-        if not isinstance(self.source_identity, SourceIdentity):
-            raise TypeError("source_identity must be SourceIdentity")
-        if not isinstance(self.coherence_stamp, CoherenceStamp):
-            raise TypeError("coherence_stamp must be CoherenceStamp")
+        source_is_document = isinstance(
+            self.source_identity, DocumentInputIdentity
+        )
+        stamp_is_document = isinstance(
+            self.coherence_stamp, DocumentPresentationStamp
+        )
+        if not isinstance(
+            self.source_identity, (SourceIdentity, DocumentInputIdentity)
+        ):
+            raise TypeError(
+                "source_identity must be SourceIdentity or DocumentInputIdentity"
+            )
+        if not isinstance(
+            self.coherence_stamp, (CoherenceStamp, DocumentPresentationStamp)
+        ):
+            raise TypeError(
+                "coherence_stamp must be CoherenceStamp or "
+                "DocumentPresentationStamp"
+            )
+        if source_is_document != stamp_is_document:
+            raise TypeError("panel source and presentation stamp families differ")
         if not isinstance(self.raster, RasterBuffer):
             raise TypeError("raster must be RasterBuffer")
         payload = self.display_payload
+        if source_is_document:
+            if not isinstance(payload, PulsePanelPayload):
+                raise TypeError(
+                    "document-backed panels require PulsePanelPayload"
+                )
+            if self.raster.pixel_format is not PixelFormat.RGBA8888:
+                raise ValueError("pulse payload requires an RGBA8888 raster")
+            if payload.document_input != self.source_identity:
+                raise ValueError(
+                    "pulse payload differs from its document source identity"
+                )
+            stamp = self.coherence_stamp
+            assert isinstance(stamp, DocumentPresentationStamp)
+            if stamp.document_input != self.source_identity:
+                raise ValueError(
+                    "document stamp differs from its panel source identity"
+                )
+            presentations = tuple(
+                presentation
+                for presentation in stamp.presentations
+                if presentation.panel_id == self.panel_id
+            )
+            if len(presentations) != 1:
+                raise ValueError(
+                    "payload panel has no unique presentation identity"
+                )
+            if presentations[0].panel_revision != payload.viewport.display_revision:
+                raise ValueError(
+                    "display payload revision differs from panel presentation"
+                )
+            return
+        if isinstance(payload, PulsePanelPayload):
+            raise TypeError(
+                "PulsePanelPayload requires the document presentation family"
+            )
         if payload is not None:
             if not isinstance(
                 payload,
@@ -1090,11 +1210,6 @@ class PanelFrame:
                 if self.raster.pixel_format is not PixelFormat.RGBA8888:
                     raise ValueError("meter payload requires an RGBA8888 raster")
                 payload_revision = payload.display_revision
-                source_input = payload.evaluated_input
-            elif isinstance(payload, PulsePanelPayload):
-                if self.raster.pixel_format is not PixelFormat.RGBA8888:
-                    raise ValueError("pulse payload requires an RGBA8888 raster")
-                payload_revision = payload.viewport.display_revision
                 source_input = payload.evaluated_input
             else:
                 background = payload.background
@@ -1192,7 +1307,8 @@ class BoardFrame:
             stamp = group_panels[0].coherence_stamp
             if any(panel.coherence_stamp != stamp for panel in group_panels[1:]):
                 raise ValueError(
-                    "panels in one coherence group must carry one exact CoherenceStamp"
+                    "panels in one coherence group must carry one exact "
+                    "CoherenceStamp or DocumentPresentationStamp"
                 )
             expected_panel_ids = tuple(sorted(panel.panel_id for panel in group_panels))
             if (
@@ -1200,10 +1316,28 @@ class BoardFrame:
                 != expected_panel_ids
             ):
                 raise ValueError(
-                    "CoherenceStamp presentations must cover its coherence group exactly"
+                    "presentation stamp must cover its coherence group exactly"
                 )
+            if isinstance(stamp, DocumentPresentationStamp):
+                for panel in group_panels:
+                    if (
+                        not isinstance(panel.source_identity, DocumentInputIdentity)
+                        or panel.source_identity != stamp.document_input
+                        or not isinstance(panel.display_payload, PulsePanelPayload)
+                    ):
+                        raise ValueError(
+                            "document presentation group mixes dataset and document "
+                            "panel families"
+                        )
+                continue
+            if not isinstance(stamp, CoherenceStamp):
+                raise TypeError("unsupported panel presentation stamp")
             inputs = {value.dataset_id: value.ref for value in stamp.inputs}
             for panel in group_panels:
+                if not isinstance(panel.source_identity, SourceIdentity):
+                    raise ValueError(
+                        "dataset coherence group contains a document source"
+                    )
                 try:
                     source_ref = inputs[panel.source_identity.dataset_id]
                 except KeyError as exc:
@@ -1266,6 +1400,8 @@ __all__ = [
     "CoherenceStamp",
     "CurveFitOverlay",
     "CurvePanelPayload",
+    "DocumentInputIdentity",
+    "DocumentPresentationStamp",
     "HistogramPanelPayload",
     "MeterPanelPayload",
     "detached_render_fault",
@@ -1277,6 +1413,7 @@ __all__ = [
     "RadialGaussianImageFitOverlay",
     "SiteMapPanelPayload",
     "PixelFormat",
+    "PulsePanelPayload",
     "RasterBuffer",
     "RenderSurface",
     "SITE_MAP_JOIN_SCHEMA_DIGEST",

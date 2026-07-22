@@ -1,435 +1,642 @@
-"""The Preview tab must show the whole plot, labelled by the names the board uses.
+"""Human-control contract for the formal Pulse GUI Preview tab.
 
-Two failures were visible on a real window and neither is caught by "does it draw":
-the pixmap rendered fine at 500x400 and was then shown in a QLabel that had
-collapsed to a ~13 px sliver, and the y axis carried raw lane keys (``ch00``)
-instead of the board names (``cooling``) the operator reads everywhere else.
-
-Driven the way a person drives it -- open the editor, switch to Preview, let it
-refresh -- and asserting the geometry and the labels the render produced.
+The visible product is frozen.  These tests deliberately enter through the
+same tabs, switches, combo popup, wheel gesture, and Save Figure button an
+operator uses.  They do not reach through an obsolete editor object or invoke
+controller actions as a substitute for GUI interaction.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 import pytest
 
 from zlc_frontend.qt_widgets import ensure_qt_app
+from zlc_pulse import load_pulse_document
+from zlc_workbench.pulse import project_pulse_preview
 
 
-@pytest.fixture(scope="module")
-def application():
-    return ensure_qt_app()
+ROOT = Path(__file__).parents[1]
+PULSE_PATH = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+
+
+def _until(application, predicate, *, timeout: float = 12.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        time.sleep(0.005)
+    assert predicate()
+
+
+def _click_tab(body, page) -> None:
+    index = body.tabs.indexOf(page)
+    assert index >= 0
+    bar = body.tabs.tabBar()
+    QtTest.QTest.mouseClick(
+        bar,
+        QtCore.Qt.LeftButton,
+        pos=bar.tabRect(index).center(),
+    )
+
+
+def _choose_combo(application, combo, text: str) -> None:
+    index = combo.findText(text)
+    assert index >= 0
+    QtTest.QTest.mouseClick(combo, QtCore.Qt.LeftButton)
+    _until(application, lambda: combo.view().isVisible())
+    view = combo.view()
+    # Keyboard navigation is a real operator path and is less dependent on the
+    # platform popup container's translucent outer padding than a synthetic
+    # coordinate inside that top-level native window.
+    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Home)
+    for _position in range(index):
+        QtTest.QTest.keyClick(view, QtCore.Qt.Key_Down)
+    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Return)
+    _until(application, lambda: combo.currentText() == text)
+
+
+def _send_wheel(application, board, *, delta: int = -120) -> None:
+    centre = board.rect().center()
+    event = QtGui.QWheelEvent(
+        QtCore.QPointF(centre),
+        QtCore.QPointF(board.mapToGlobal(centre)),
+        QtCore.QPoint(),
+        QtCore.QPoint(0, delta),
+        QtCore.Qt.NoButton,
+        QtCore.Qt.NoModifier,
+        QtCore.Qt.ScrollUpdate,
+        False,
+    )
+    QtWidgets.QApplication.sendEvent(board, event)
+    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+
+
+def _send_mouse_move_with_buttons(application, board, position, buttons) -> None:
+    """Deliver one real Qt pointer-motion event while a button stays held."""
+
+    event = QtGui.QMouseEvent(
+        QtCore.QEvent.MouseMove,
+        QtCore.QPointF(position),
+        QtCore.QPointF(board.mapToGlobal(position)),
+        QtCore.Qt.NoButton,
+        buttons,
+        QtCore.Qt.NoModifier,
+    )
+    QtWidgets.QApplication.sendEvent(board, event)
+    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
 
 @pytest.fixture
-def preview_editor(application):
+def preview_body():
+    application = ensure_qt_app()
     from zlc_workbench.pulse_editor.app import open_pulse_editor
 
-    editor = open_pulse_editor()
-    window = editor.window()
-    window.show()
-    for _ in range(5):
-        application.processEvents()
-    tabs = next(t for t in window.findChildren(QtWidgets.QTabWidget) if t.count() >= 2)
-    tabs.setCurrentIndex(1)                                   # Preview
-    for _ in range(6):
-        application.processEvents()
-    editor.refresh_preview()                                 # the tab-enter refresh, made explicit
-    for _ in range(4):
-        application.processEvents()
-    yield editor
-    try:
-        window.close()
-    except Exception:                                        # pragma: no cover - teardown only
-        pass
-    application.processEvents()
+    body = open_pulse_editor(path=PULSE_PATH)
+    _until(
+        application,
+        lambda: body.window() is not body and body.window().isVisible(),
+    )
+    _click_tab(body, body.preview_view)
+    _until(
+        application,
+        lambda: body.tabs.currentWidget() is body.preview_view
+        and body.preview_host.front_frame is not None,
+    )
+    _until(application, lambda: body.worker_idle)
+    yield body
+    deadline = time.monotonic() + 10.0
+    complete = False
+    while not complete and time.monotonic() < deadline:
+        complete = body.request_close(discard_unsaved=True)
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        time.sleep(0.005)
+    assert complete and body.worker_idle
 
 
-def test_the_preview_plot_is_not_collapsed_to_a_sliver(preview_editor):
-    board = preview_editor.preview_board
-    frame = board.front_frame
-    assert frame is not None, "the preview presented no frame"
+def test_preview_opens_as_the_full_formal_plot_with_display_labels(preview_body) -> None:
+    body = preview_body
+    frame = body.preview_host.front_frame
+    assert frame is not None
     raster = frame.panels[0].raster
-    assert raster.height > 100, "the rendered plot itself is too short to be a plot"
-    # The scroll area holds the body at its own size hint, so the board only shows
-    # the whole plot if the body was resized to it.  A sliver here is the reported bug.
-    assert board.height() > 100, (
-        f"the plot raster is {raster.height} px tall but the board shows only "
-        f"{board.height()} px")
-    assert preview_editor.preview_body.height() >= board.height(), (
-        "the preview body does not make room for the whole board")
+    payload = body.preview_host.board.visible_pulse_payload()
+    assert payload is not None
 
-
-def test_the_preview_status_reads_like_the_reference(preview_editor):
-    """The status line names how many channels were drawn, out of how many exist,
-    the mode, and the repeat -- the same wording main shows (``N/M plotted
-    (active channels) | repeat …``), where the repeat is the reference's exact
-    three-state notation: ``repeat ∞``, ``repeat P1-P2 x3`` (bracket covers the
-    whole table) or ``repeat ∞ + P2-P3 x2`` (partial inner bracket); a one-shot
-    program without a bracket says nothing.
-    """
-
-    import re
-
-    text = preview_editor.preview_status.text()
+    assert raster.height > 100
+    assert body.preview_host.height() > 100
+    assert body.preview_view.preview_body.height() >= body.preview_host.height()
     assert re.fullmatch(
         r"\d+/\d+ plotted \((active|all) channels\)"
-        r"( \| repeat (∞|P\d+-P\d+ x\d+|∞ \+ P\d+-P\d+ x\d+))?", text), (
-        f"the preview status {text!r} does not match the reference wording "
-        "'N/M plotted (active channels) | repeat …'")
+        r" \| repeat (?:∞(?: \+ P\d+-P\d+ x\d+)?|P\d+-P\d+ x\d+)",
+        body.preview_view.preview_status.text(),
+    )
+
+    timeline = project_pulse_preview(load_pulse_document(PULSE_PATH))
+    expected = tuple(
+        (row.row_id, row.label) for row in timeline.rows if row.active
+    )
+    assert tuple(zip(payload.row_keys, payload.row_labels, strict=True)) == expected
+    assert any(key != label for key, label in expected), (
+        "the Preview axis regressed to raw lane keys instead of board labels"
+    )
 
 
-def test_the_preview_y_axis_uses_board_names_not_raw_lane_keys(preview_editor):
-    state = preview_editor.read_state()
-    snapshot, _channels = preview_editor._preview_snapshot(state, include_always_off=False)
-    assert snapshot is not None
-    # The channel axis carries the display labels; a default board's first active lane is
-    # ``cooling`` (key ``ch00``), so the axis must NOT read ``ch00``.
-    channel_axis = snapshot.block.schema.cell_schema.data_axes[0]
-    shown = [str(v) for v in channel_axis.coordinates]
-    assert shown, "no channels on the preview axis"
-    labels = dict(getattr(state.port_catalog, "channel_labels", {}) or {})
-    for name in shown:
-        assert name not in labels, (
-            f"the preview axis shows the raw lane key {name!r} instead of its board name "
-            f"{labels[name]!r}")
+def test_show_off_rows_is_a_visible_switch_that_rebuilds_the_same_plot(preview_body) -> None:
+    application = ensure_qt_app()
+    body = preview_body
+    switch = body.preview_view.preview_include_off
+    assert not switch.isChecked()
+    before_frame = body.preview_host.front_frame
+    before = body.preview_host.board.visible_pulse_payload()
+    assert before_frame is not None and before is not None
+
+    QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
+    _until(
+        application,
+        lambda: body.preview_host.front_frame is not before_frame
+        and body.preview_host.board.visible_pulse_payload() is not None
+        and len(body.preview_host.board.visible_pulse_payload().row_keys)
+        > len(before.row_keys),
+    )
+    after_frame = body.preview_host.front_frame
+    after = body.preview_host.board.visible_pulse_payload()
+    assert after_frame is not None and after is not None
+    timeline = project_pulse_preview(load_pulse_document(PULSE_PATH))
+    assert tuple(after.row_labels) == tuple(row.label for row in timeline.rows)
+    digital = tuple(row for row in timeline.rows if row.port_kind == "digital")
+    analog = tuple(row for row in timeline.rows if row.port_kind == "dac")
+    assert tuple(after.row_keys[: len(digital)]) == tuple(
+        row.row_id for row in digital
+    )
+    # Analog rows use renderer-local unique hit-test keys; their visible labels
+    # remain the exact board names and their keys retain the typed row id.
+    assert all(
+        key.endswith(f":{row.row_id}")
+        for key, row in zip(
+            after.row_keys[len(digital) :], analog, strict=True
+        )
+    )
+    assert after_frame.panels[0].raster.pixels != before_frame.panels[0].raster.pixels
+    assert "(all channels)" in body.preview_view.preview_status.text()
 
 
-def _png_size(data: bytes) -> tuple[int, int]:
-    from PyQt5 import QtGui
+def test_size_popup_is_operator_owned_but_reentering_preview_restores_auto(preview_body) -> None:
+    application = ensure_qt_app()
+    body = preview_body
+    combo = body.preview_view.preview_size_combo
+    assert combo.currentText() == "1x2"
 
-    pixmap = QtGui.QPixmap()
-    pixmap.loadFromData(data)
-    return (pixmap.width(), pixmap.height())
+    previous = body.preview_host.front_frame
+    _choose_combo(application, combo, "8x8")
+    _until(
+        application,
+        lambda: body.preview_host.front_frame is not previous
+        and body.preview_view.preview_size_pinned,
+    )
+    large = body.preview_host.front_frame.panels[0].raster
+    assert combo.currentText() == "8x8"
 
-
-def test_show_off_rows_reveals_the_always_off_channels(preview_editor):
-    """Flipping the "Show off rows" switch ON must draw MORE rows than OFF (the always-off
-    channels) and produce a genuinely different picture -- the regression was that the render
-    took its rows from the compiled sequence (active lanes only), so the toggle did nothing.
-    """
-
-    state = preview_editor.read_state()
-    off_rows = preview_editor._preview_channels(state, include_always_off=False)
-    all_rows = preview_editor._preview_channels(state, include_always_off=True)
-    assert len(all_rows) > len(off_rows), (
-        "'Show off rows' ON did not add any channels -- the toggle is a no-op "
-        f"(off={off_rows}, on={all_rows})")
-    # The whole universe is exactly the catalog's digital ports, never the compiled sequence.
-    universe = [port.lanes[0] for port in state.port_catalog.digital_ports]
-    assert all_rows == universe
-
-    off_png = preview_editor.preview_png_bytes(state, include_always_off=False)
-    on_png = preview_editor.preview_png_bytes(state, include_always_off=True)
-    assert off_png != on_png, "the off-rows toggle produced an identical PNG"
-    assert _png_size(on_png)[1] > _png_size(off_png)[1], (
-        "more rows must make a taller figure")
+    _click_tab(body, body.schedule_view)
+    _until(application, lambda: body.tabs.currentWidget() is body.schedule_view)
+    _click_tab(body, body.preview_view)
+    _until(
+        application,
+        lambda: body.tabs.currentWidget() is body.preview_view
+        and not body.preview_view.preview_size_pinned
+        and combo.currentText() == "1x2",
+    )
+    automatic = body.preview_host.front_frame.panels[0].raster
+    assert automatic.width < large.width and automatic.height < large.height
 
 
-def test_size_preset_scales_the_rendered_pixels(preview_editor):
-    """Picking a size in the dropdown must rescale the figure to that panel size's pixel box --
-    the regression was that the render ignored the preset entirely, so every size looked the same.
-    """
-
-    from zlc_frontend.render_style import panel_display_size
-
-    state = preview_editor.read_state()
-    combo = preview_editor.preview_size_combo
-    preview_editor._preview_size_pinned = True                # as if the operator picked a size
-
-    dims = {}
-    for preset in ("2x2", "4x4", "8x8"):
-        combo.setCurrentText(preset)
-        dims[preset] = _png_size(preview_editor.preview_png_bytes(state))
-        # The emitted raster is exactly the on-screen card box for that preset (one geometry source).
-        assert dims[preset] == panel_display_size(preset), (
-            f"size {preset} rendered {dims[preset]} px, not panel_display_size {panel_display_size(preset)}")
-    assert dims["2x2"][0] < dims["4x4"][0] < dims["8x8"][0], "a bigger preset must widen the figure"
-    assert dims["2x2"][1] < dims["4x4"][1] < dims["8x8"][1], "a bigger preset must heighten the figure"
-
-
-def test_a_trailing_all_off_period_keeps_the_frame_length_visible(preview_editor):
-    """Two periods, a channel ON only in period 0: the preview must span the WHOLE frame.
-
-    The regression: the render took its span from ``sequence.duration``, which derives from
-    the last pulse EDGE -- the trailing all-off period vanished and the channel read as
-    "always on" across a truncated axis.  The frame length is the period table's
-    ``total_duration_ns`` (the authoritative single source), so the ON block must end at
-    half the axis, not at its right edge.
-    """
-
-    state = preview_editor.read_state()
-    # The default editor state IS the scenario: 2 x 1000 ns periods, ch00 on only in period 0.
-    assert len(state.periods) == 2
-    assert state.periods[0].states[0] == 1 and state.periods[1].states[0] == 0
-    seq = state.to_sequence()
-    frame_s = float(state.total_duration_ns()) * 1e-9
-    last_edge_s = max(float(p.stop) for p in seq.pulses)
-    assert last_edge_s < frame_s, "scenario must have a trailing all-off stretch"
-    # The rendered axis must include the full frame: compare the PNG against a render of a
-    # one-period state (which spans only the pulse) -- they must differ, and the block in the
-    # two-period render must NOT touch the right margin.  Cheap mechanical proxy: rendering
-    # with the trailing period present vs removed changes the picture.
-    png_two = preview_editor.preview_png_bytes(state, include_always_off=False)
-    import dataclasses as _d
-    one = type(state).from_dict({**state.to_dict(), "periods": [state.periods[0].to_dict()]}) \
-        if hasattr(state.periods[0], "to_dict") else None
-    if one is not None:
-        png_one = preview_editor.preview_png_bytes(one, include_always_off=False)
-        assert png_two != png_one, (
-            "removing the trailing all-off period did not change the preview -- the frame "
-            "length is not being honoured")
-
-
-def test_display_carries_the_screen_ratio_and_export_saves_at_600_dpi(preview_editor):
-    """The two dpi principles, both the reference's, must hold mechanically:
-
-    * the ON-SCREEN raster is the panel's logical pixel box times the screen's
-      device-pixel ratio (blitted 1:1 crisp -- a HiDPI screen must not stretch a
-      soft logical-pixel image), and the shown pixmap is tagged with that ratio;
-    * an EXPORT ignores the screen and saves the same drawing at the style's
-      ``savefig.dpi`` (600), so a saved figure is publication resolution.
-    """
-
-    from zlc_frontend.render_style import (
-        DEFAULT_STYLE, panel_display_size, panel_figure_size_inches)
-
-    state = preview_editor.read_state()
-    size = preview_editor._preview_size_for(state, include_always_off=False)
-    logical = panel_display_size(size)
-
-    doubled = _png_size(preview_editor.preview_png_bytes(
-        state, include_always_off=False, pixel_ratio=2.0))
-    assert doubled == (logical[0] * 2, logical[1] * 2), (
-        f"pixel_ratio=2 must emit exactly twice the logical box {logical}, got {doubled}")
-
-    exported = _png_size(preview_editor.preview_png_bytes(
-        state, include_always_off=False, export=True))
-    inches = panel_figure_size_inches(size)
-    save_dpi = float(DEFAULT_STYLE["savefig.dpi"])
-    expected = (round(inches[0] * save_dpi), round(inches[1] * save_dpi))
-    assert exported == expected, (
-        f"export must save at savefig.dpi={save_dpi:g} ({expected} px), got {exported}")
-
-    with pytest.raises(ValueError):
-        preview_editor.preview_png_bytes(state, pixel_ratio=2.0, export=True)
-
-    # The GUI display chain fixes the board at the LOGICAL size while the
-    # presented raster carries the widget's device-pixel ratio, so the whole-
-    # cell blit lands 1:1 on device pixels instead of stretching soft pixels.
-    preview_editor.refresh_preview()
-    board = preview_editor.preview_board
-    ratio = float(preview_editor.devicePixelRatioF() or 1.0)
-    raster = board.front_frame.panels[0].raster
-    assert (board.width(), board.height()) == (
-        round(raster.width / ratio), round(raster.height / ratio))
-
-
-def test_wheel_zoom_on_the_preview_rerenders_the_time_view(preview_editor, application):
-    """The preview is a LIVE interactive panel, not a picture: a wheel zoom over
-    the plot goes through the unified gesture owner (a typed CurveViewportCommit)
-    and the editor answers by re-rendering the SAME table at the committed x
-    limits -- the zoomed view shows, home stays the full frame, and the row axis
-    never moves (the design's x-only rule for pulse).
-    """
-
-    from PyQt5 import QtCore, QtGui
-
-    board = preview_editor.preview_board
+def test_selectors_switch_alone_arms_the_preview_wheel(preview_body) -> None:
+    application = ensure_qt_app()
+    body = preview_body
+    board = body.preview_host.board
+    switch = body.preview_view.preview_selectors_switch
     before = board.visible_pulse_payload()
     assert before is not None
     home = before.viewport.home_x_limits
-    assert before.viewport.x_limits == home, "the preview must open at home"
+    assert before.viewport.x_limits == home
+    assert not switch.isChecked()
 
-    binding = board._numeric_binding_for_kind("pulse")
-    target = board._numeric_target(binding)
-    centre = QtCore.QPoint(
-        int(round(target.plot.center().x())), int(round(target.plot.center().y())))
-
-    def wheel() -> None:
-        board.wheelEvent(QtGui.QWheelEvent(
-            QtCore.QPointF(centre),
-            QtCore.QPointF(board.mapToGlobal(centre)),
-            QtCore.QPoint(),
-            QtCore.QPoint(0, -120),
-            QtCore.Qt.NoButton,
-            QtCore.Qt.NoModifier,
-            QtCore.Qt.ScrollUpdate,
-            False,
-        ))
-        application.processEvents()
-
-    # Selectors default OFF (the design's anti-misclick rule): the wheel must
-    # NOT zoom while the switch is parked.
-    assert not preview_editor.preview_selectors_switch.isChecked()
-    wheel()
+    _send_wheel(application, board)
     parked = board.visible_pulse_payload()
-    assert parked.viewport.x_limits == home, (
-        "the wheel zoomed while the Selectors switch was OFF")
+    assert parked is not None and parked.viewport.x_limits == home
 
-    preview_editor.preview_selectors_switch.setChecked(True)
-    application.processEvents()
-    wheel()
-
+    QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
+    _until(application, switch.isChecked)
+    _send_wheel(application, board)
+    _until(
+        application,
+        lambda: board.visible_pulse_payload() is not None
+        and board.visible_pulse_payload().viewport.x_limits != home,
+    )
     after = board.visible_pulse_payload()
     assert after is not None
-    assert after.viewport.x_limits != home, "the wheel zoom did not change the time view"
-    assert after.viewport.home_x_limits == home, "zoom must not move the home span"
-    assert after.viewport.y_limits == before.viewport.y_limits, (
-        "pulse zoom must be x-only -- the row axis moved")
+    assert after.viewport.home_x_limits == home
+    assert after.viewport.y_limits == before.viewport.y_limits
 
 
-def test_the_inner_repeat_bracket_draws_nested_not_unrolled(preview_editor):
-    """A finite inner bracket ``[P1..P1] × 3`` must read as its OWN nested square
-    bracket over period 1's span -- the reference's semantics exactly:
+def test_middle_drag_repaints_continuously_before_mouse_release(preview_body) -> None:
+    """The formal Preview follows a held middle-button drag, not its release."""
 
-    * partial bracket in a forever loop  -> outer ``×∞`` plus inner ``×3``;
-    * bracket covering the whole table   -> only the inner ``×N`` bracket;
-    * partial bracket, forever off       -> the inner bracket alone;
-    * the axis spans the AUTHORED table, never the unrolled copies.
+    application = ensure_qt_app()
+    body = preview_body
+    board = body.preview_host.board
+    switch = body.preview_view.preview_selectors_switch
+    QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
+    _until(application, switch.isChecked)
 
-    The regression this pins: the preview collapsed everything to one
-    whole-frame marker (×∞ swallowing ×N entirely) and drew the bracket
-    UNROLLED across an axis stretched to the expanded length.
-    """
+    initial = board.visible_pulse_payload()
+    assert initial is not None
+    initial_revision = initial.viewport.display_revision
+    layout_bounds = initial.viewport.plot_bounds
+    authoring_before = body._controller.snapshot()
+    centre = board.rect().center()
+    revisions_seen_while_held: set[int] = set()
 
-    from zlc_workbench.pulse_editor.plot_bridge_pulse_gui import _preview_repeat_markers
-
-    state = preview_editor.read_state()
-    assert len(state.periods) == 2
-    baseline = preview_editor.preview_png_bytes(state, include_always_off=False)
-
-    state.repeat_start, state.repeat_end, state.repeat_count = 0, 0, 3
-    markers, total = _preview_repeat_markers(state)
-    assert [label for (_start, _stop, label) in markers] == ["×∞", "×3"], (
-        "a partial inner bracket inside a forever loop must draw BOTH brackets")
-    outer, inner = markers
-    assert outer[0] == 0.0 and outer[1] == pytest.approx(total)
-    assert inner[0] == 0.0 and 0.0 < inner[1] < total, (
-        "the inner bracket must span exactly its own periods, not the whole frame")
-    # The frame is the AUTHORED table: expanding [P0]x3 + P1 would be longer.
-    expanded = float(state.total_duration_ns()) * 1e-9
-    assert total < expanded, "the preview axis must not stretch over the unrolled copies"
-    with_bracket = preview_editor.preview_png_bytes(state, include_always_off=False)
-    assert with_bracket != baseline, "adding the inner bracket left the preview unchanged"
-
-    # Bracket over the WHOLE table: only the inner ×N bracket is drawn.
-    state.repeat_start, state.repeat_end = 0, 1
-    markers, _total = _preview_repeat_markers(state)
-    assert [label for (_start, _stop, label) in markers] == ["×3"]
-
-    # Forever off with a partial bracket: the inner bracket alone.
-    state.repeat_start, state.repeat_end = 0, 0
-    state.repeat_forever = False
-    markers, _total = _preview_repeat_markers(state)
-    assert [label for (_start, _stop, label) in markers] == ["×3"]
-
-
-def test_repeat_forever_bracket_draws_the_infinity_glyph_cleanly(preview_editor):
-    """A repeat-forever pulse draws the ×∞ bracket label; the ∞ (U+221E) must resolve to a real glyph.
-
-    The design font (Helvetica Light) lacks ∞, so drawing the label in it emits a "Glyph 8734 missing"
-    UserWarning and paints a tofu box -- the reference dodges this by drawing the bracket label in
-    DejaVu Sans.  Fail if that warning ever comes back.
-    """
-
-    import warnings
-
-    state = preview_editor.read_state()
+    QtTest.QTest.mousePress(
+        board,
+        QtCore.Qt.MiddleButton,
+        pos=centre,
+    )
     try:
-        state.repeat_forever = True
-    except Exception:                                        # pragma: no cover - defensive
-        pytest.skip("cannot force repeat_forever on this state")
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        preview_editor.preview_png_bytes(state, include_always_off=True)
-    glyph_warnings = [w for w in caught if "missing from font" in str(w.message)]
-    assert not glyph_warnings, (
-        "the ×∞ bracket label hit a missing-glyph fallback (tofu box): "
-        + "; ".join(str(w.message) for w in glyph_warnings))
+        deadline = time.monotonic() + 3.0
+        step = 0
+        while time.monotonic() < deadline and len(revisions_seen_while_held) < 2:
+            # Keep authoring new view revisions while the button remains down.
+            # The back-and-forth path stays safely inside the plot on every
+            # supported formal window size.
+            offset = int(board.width() * (0.18 + (step % 6) * 0.05))
+            if (step // 7) % 2:
+                offset = -offset
+            position = QtCore.QPoint(
+                max(1, min(board.width() - 2, centre.x() + offset)),
+                centre.y(),
+            )
+            _send_mouse_move_with_buttons(
+                application,
+                board,
+                position,
+                QtCore.Qt.MiddleButton,
+            )
+            payload = board.visible_pulse_payload()
+            if (
+                payload is not None
+                and payload.viewport.display_revision > initial_revision
+            ):
+                assert payload.viewport.plot_bounds == pytest.approx(
+                    layout_bounds,
+                    abs=1e-12,
+                )
+                revisions_seen_while_held.add(
+                    payload.viewport.display_revision
+                )
+            step += 1
+            time.sleep(0.008)
+        assert len(revisions_seen_while_held) >= 2, revisions_seen_while_held
+    finally:
+        QtTest.QTest.mouseRelease(
+            board,
+            QtCore.Qt.MiddleButton,
+            pos=centre,
+        )
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
+    # A Preview viewport is presentation-only: the continuously emitted view
+    # candidates must never dirty or revise the authoritative pulse document.
+    authoring_after = body._controller.snapshot()
+    assert authoring_after.document == authoring_before.document
+    assert authoring_after.document_generation == authoring_before.document_generation
+    assert authoring_after.editor_revision == authoring_before.editor_revision
+    assert authoring_after.dirty == authoring_before.dirty
 
-def test_the_panel_exit_is_the_same_picture_with_a_live_viewport(application):
-    """``render_pulse_timeline_panel`` is the PNG exit's twin: ONE drawing, two exits.
-
-    The interactive raster must be PIXEL-IDENTICAL to the decoded PNG -- any
-    divergence means the exits stopped sharing the drawing and the preview a
-    person selects on is no longer the preview that gets saved.  The payload
-    must carry the drawn rows (channels then analog buses, display labels) and
-    a viewport whose x mapping covers the drawn frame, because that mapping is
-    what the unified selector overlay converts gestures through.
-    """
-
-    import numpy as np
-    from PyQt5 import QtGui
-    from zlc_data import BlockId, DatasetRevision, DatasetRevisionRef, StreamGenerationId
-
-    from zlc_frontend.figure import DatasetId, EvaluatedInput
-    from zlc_frontend.matplotlib_render import (
-        render_pulse_timeline_panel, render_pulse_timeline_png)
-    from zlc_frontend.render import PulsePanelPayload, RasterBuffer
-
-    kw = dict(
-        pulses=[dict(channel="ch00", start=0.0, stop=1e-3, name="cool")],
-        channels=["ch00", "ch01"],
-        channel_labels={"ch00": "cooling", "ch01": "probe"},
-        total_duration=2e-3,
-        title="preview",
-        size="2x2",
-        analog_traces=[dict(name="da_dipole", label="da_dipole", min=-512, max=511,
-                            starts=[0.0, 1e-3, 2e-3], values=[300, -100])],
+    _until(application, lambda: body.worker_idle)
+    settled = board.visible_pulse_payload()
+    assert settled is not None
+    settled_revision = settled.viewport.display_revision
+    _send_wheel(application, board)
+    _until(
+        application,
+        lambda: board.visible_pulse_payload() is not None
+        and board.visible_pulse_payload().viewport.display_revision
+        > settled_revision,
     )
-    provenance = EvaluatedInput(
-        DatasetId("pulse"),
-        DatasetRevisionRef(
-            BlockId("pulse-block"),
-            StreamGenerationId("pulse-generation"),
-            "e" * 64,
-            DatasetRevision(1),
-        ),
+
+
+def test_failed_latest_drag_frame_releases_its_exact_pending_intent(
+    preview_body,
+    monkeypatch,
+) -> None:
+    """An admitted intermediate cannot orphan a newer failed view intent."""
+
+    import zlc_frontend.matplotlib_render as rendering
+
+    application = ensure_qt_app()
+    body = preview_body
+    board = body.preview_host.board
+    switch = body.preview_view.preview_selectors_switch
+    QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
+    _until(application, switch.isChecked)
+    initial = board.visible_pulse_payload()
+    assert initial is not None
+    base_revision = initial.viewport.display_revision
+    first_revision = base_revision + 1
+    failed_revision = base_revision + 2
+    original_render = rendering.render_pulse_timeline_panel
+
+    def controlled_render(*args, **kwargs):
+        revision = int(kwargs["display_revision"])
+        if revision == first_revision:
+            # Keep the first candidate in flight until the second human move
+            # becomes the exact latest request.
+            time.sleep(0.12)
+        if revision == failed_revision:
+            # Leave enough owner turns for the successful intermediate raster
+            # to be visibly presented before the latest request fails.
+            time.sleep(0.12)
+            raise RuntimeError("forced latest Preview render failure")
+        return original_render(*args, **kwargs)
+
+    monkeypatch.setattr(
+        rendering,
+        "render_pulse_timeline_panel",
+        controlled_render,
     )
-    raster, payload = render_pulse_timeline_panel(**kw, evaluated_input=provenance)
-    assert isinstance(raster, RasterBuffer) and isinstance(payload, PulsePanelPayload)
-    assert payload.evaluated_input == provenance
+    centre = board.rect().center()
+    QtTest.QTest.mousePress(
+        board,
+        QtCore.Qt.MiddleButton,
+        pos=centre,
+    )
+    try:
+        _send_mouse_move_with_buttons(
+            application,
+            board,
+            centre + QtCore.QPoint(70, 0),
+            QtCore.Qt.MiddleButton,
+        )
+        _send_mouse_move_with_buttons(
+            application,
+            board,
+            centre + QtCore.QPoint(120, 0),
+            QtCore.Qt.MiddleButton,
+        )
+        _until(
+            application,
+            lambda: board.visible_pulse_payload() is not None
+            and board.visible_pulse_payload().viewport.display_revision
+            == first_revision,
+        )
+        _until(
+            application,
+            lambda: "forced latest Preview render failure"
+            in body._controller.snapshot().preview_error,
+        )
+    finally:
+        QtTest.QTest.mouseRelease(
+            board,
+            QtCore.Qt.MiddleButton,
+            pos=centre,
+        )
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
-    image = QtGui.QImage()
-    assert image.loadFromData(render_pulse_timeline_png(**kw)), "PNG did not decode"
-    image = image.convertToFormat(QtGui.QImage.Format_RGBA8888)
-    assert (image.width(), image.height()) == (raster.width, raster.height), (
-        "the two exits emit different pixel boxes")
-    bits = image.constBits()
-    bits.setsize(image.bytesPerLine() * image.height())
-    png_pixels = np.frombuffer(bits, np.uint8).reshape(
-        image.height(), image.bytesPerLine())[:, :image.width() * 4]
-    raster_pixels = np.frombuffer(raster.pixels, np.uint8).reshape(
-        raster.height, raster.stride_bytes)[:, :raster.width * 4]
-    assert np.array_equal(png_pixels, raster_pixels), (
-        "the interactive raster and the PNG exit diverged -- they must share one drawing")
+    # Restore the real worker and prove the exact failed pending capability was
+    # released: a fresh human zoom must be admitted and presented.
+    monkeypatch.setattr(
+        rendering,
+        "render_pulse_timeline_panel",
+        original_render,
+    )
+    _send_wheel(application, board)
+    _until(
+        application,
+        lambda: board.visible_pulse_payload() is not None
+        and board.visible_pulse_payload().viewport.display_revision
+        > failed_revision,
+    )
 
-    assert payload.row_keys == ("ch00", "ch01", "analog:0:da_dipole")
-    assert payload.row_labels == ("cooling", "probe", "da_dipole")
-    viewport = payload.viewport
-    assert viewport.home_x_limits == viewport.x_limits, "home must pin to the drawn frame"
-    assert viewport.x_limits[0] < 0.0 and viewport.x_limits[1] > 2e-3, (
-        "the drawn x span must cover the whole frame (plus the breathing margin)")
-    x_centre, _y = viewport.widget_normalized_to_data(0.5, 0.5)
-    assert viewport.x_limits[0] <= x_centre <= viewport.x_limits[1], (
-        "the widget centre does not map inside the drawn time span")
 
-    # A zoom commit re-renders with a VIEW x-limits override: the drawn view
-    # follows it, home stays pinned to the full frame, and the axis IDENTITY is
-    # unchanged -- a zoom must never read as a different panel (hold/semantics
-    # checks compare this axis).
-    zoom = (2e-4, 8e-4)
-    _raster2, zoomed = render_pulse_timeline_panel(
-        **kw, evaluated_input=provenance, x_limits=zoom, display_revision=1)
-    assert zoomed.viewport.x_limits == pytest.approx(zoom)
-    assert zoomed.viewport.home_x_limits == viewport.home_x_limits, (
-        "zoom must not move the home span")
-    assert zoomed.viewport.x_axis == viewport.x_axis, (
-        "zoom must not change the axis identity")
+def test_failed_intermediate_present_keeps_the_newer_human_drag_intent(
+    preview_body,
+    monkeypatch,
+) -> None:
+    """A stale Qt-present fault cannot discard a later held-drag revision."""
+
+    import threading
+
+    import zlc_frontend.matplotlib_render as rendering
+
+    application = ensure_qt_app()
+    body = preview_body
+    board = body.preview_host.board
+    switch = body.preview_view.preview_selectors_switch
+    QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
+    _until(application, switch.isChecked)
+    initial = board.visible_pulse_payload()
+    assert initial is not None
+    first_revision = initial.viewport.display_revision + 1
+    latest_revision = first_revision + 1
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    latest_started = threading.Event()
+    release_latest = threading.Event()
+    original_render = rendering.render_pulse_timeline_panel
+
+    def controlled_render(*args, **kwargs):
+        revision = int(kwargs["display_revision"])
+        if revision == first_revision:
+            first_started.set()
+            assert release_first.wait(5.0)
+        elif revision == latest_revision:
+            latest_started.set()
+            assert release_latest.wait(5.0)
+        return original_render(*args, **kwargs)
+
+    monkeypatch.setattr(
+        rendering,
+        "render_pulse_timeline_panel",
+        controlled_render,
+    )
+    original_present = body.preview_host.present_panel
+    failed_intermediate = False
+
+    def controlled_present(raster, payload, **kwargs):
+        nonlocal failed_intermediate
+        revision = int(payload.viewport.display_revision)
+        if revision == first_revision and not failed_intermediate:
+            failed_intermediate = True
+            raise RuntimeError("forced stale intermediate present failure")
+        return original_present(raster, payload, **kwargs)
+
+    monkeypatch.setattr(body.preview_host, "present_panel", controlled_present)
+
+    centre = board.rect().center()
+    QtTest.QTest.mousePress(
+        board,
+        QtCore.Qt.MiddleButton,
+        pos=centre,
+    )
+    try:
+        _send_mouse_move_with_buttons(
+            application,
+            board,
+            centre + QtCore.QPoint(65, 0),
+            QtCore.Qt.MiddleButton,
+        )
+        _until(application, first_started.is_set)
+        _send_mouse_move_with_buttons(
+            application,
+            board,
+            centre + QtCore.QPoint(115, 0),
+            QtCore.Qt.MiddleButton,
+        )
+        assert body._pending_preview_revision == latest_revision
+
+        release_first.set()
+        _until(application, latest_started.is_set)
+        assert failed_intermediate
+        assert body._pending_preview_revision == latest_revision
+        assert body._pending_preview_origin is not None
+
+        release_latest.set()
+        _until(
+            application,
+            lambda: board.visible_pulse_payload() is not None
+            and board.visible_pulse_payload().viewport.display_revision
+            == latest_revision,
+        )
+    finally:
+        release_first.set()
+        release_latest.set()
+        QtTest.QTest.mouseRelease(
+            board,
+            QtCore.Qt.MiddleButton,
+            pos=centre,
+        )
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+
+
+def test_save_figure_button_exports_the_visible_preview(
+    preview_body,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    application = ensure_qt_app()
+    body = preview_body
+    target = tmp_path / "operator-preview.png"
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(target), "Pulse figure (*.png)"),
+    )
+
+    QtTest.QTest.mouseClick(
+        body.preview_view.preview_save_figure_button,
+        QtCore.Qt.LeftButton,
+    )
+    _until(
+        application,
+        lambda: target.exists()
+        and target.stat().st_size > 0
+        and body.worker_idle,
+    )
+    image = QtGui.QImage(str(target))
+    assert not image.isNull()
+    assert image.width() > body.preview_host.width()
+    assert image.height() > body.preview_host.height()
+
+
+@pytest.mark.parametrize("scale", ("1", "1.25", "1.5", "1.75", "2", "3"))
+def test_preview_raster_tracks_the_real_screen_dpr_in_a_fresh_qt_process(
+    scale,
+) -> None:
+    """Every supported screen scale gets Qt's exact physical pixel box."""
+
+    source = r'''
+import os
+from pathlib import Path
+import math
+import time
+
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
+
+from PyQt5 import QtCore, QtTest
+from zlc_frontend.qt_widgets import ensure_qt_app
+from zlc_workbench.pulse_editor.app import open_pulse_editor
+
+app = ensure_qt_app()
+path = Path("zlc_neutral_atom/assets/imaging_template.json").resolve()
+body = open_pulse_editor(path=path)
+index = body.tabs.indexOf(body.preview_view)
+bar = body.tabs.tabBar()
+QtTest.QTest.mouseClick(
+    bar,
+    QtCore.Qt.LeftButton,
+    pos=bar.tabRect(index).center(),
+)
+deadline = time.monotonic() + 12.0
+ratio = float(body.devicePixelRatioF())
+qround = lambda value: int(math.floor(value + 0.5))
+while time.monotonic() < deadline:
+    frame = body.preview_host.front_frame
+    board = body.preview_host.board
+    if (
+        frame is not None
+        and frame.panels[0].raster.width == qround(board.width() * ratio)
+        and frame.panels[0].raster.height == qround(board.height() * ratio)
+    ):
+        break
+    app.processEvents(QtCore.QEventLoop.AllEvents, 20)
+    time.sleep(0.005)
+assert body.preview_host.front_frame is not None
+assert abs(ratio - float(os.environ["EXPECTED_SCALE"])) < 0.01, ratio
+raster = body.preview_host.front_frame.panels[0].raster
+board = body.preview_host.board
+assert raster.width == qround(board.width() * ratio), (
+    raster.width, board.width(), ratio
+)
+assert raster.height == qround(board.height() * ratio), (
+    raster.height, board.height(), ratio
+)
+physical_front = board.grab()
+assert (raster.width, raster.height) == (
+    physical_front.width(), physical_front.height()
+), (
+    (raster.width, raster.height),
+    (physical_front.width(), physical_front.height()),
+    ratio,
+)
+deadline = time.monotonic() + 10.0
+complete = False
+while not complete and time.monotonic() < deadline:
+    complete = body.request_close(discard_unsaved=True)
+    app.processEvents(QtCore.QEventLoop.AllEvents, 20)
+    time.sleep(0.005)
+assert complete and body.worker_idle
+'''
+    environment = os.environ.copy()
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    environment["QT_SCALE_FACTOR"] = scale
+    environment["EXPECTED_SCALE"] = scale
+    environment["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -149,6 +149,7 @@ class DeployedStreamerSession:
         self._terminal: PulseHardwareTerminalEvidence | None = None
         self._terminal_observed_monotonic_ns: int | None = None
         self._status_sample_count = 0
+        self._cursor_sample_count = 0
         self._underflow_observed = False
         self._operation_stop = threading.Event()
 
@@ -361,6 +362,7 @@ class DeployedStreamerSession:
             self._terminal = None
             self._terminal_observed_monotonic_ns = None
             self._status_sample_count = 0
+            self._cursor_sample_count = 0
             self._underflow_observed = False
             self._state = "PREPARING"
 
@@ -402,7 +404,6 @@ class DeployedStreamerSession:
                 raise RuntimeError(
                     "FIRE artifact is not the exact immutable prepared artifact"
                 )
-            finite = not artifact.target_ir.repeat_forever
             operation_epoch = self._operation_epoch
             self._state = "FIRING"
             self._terminal_event.clear()
@@ -410,14 +411,14 @@ class DeployedStreamerSession:
             self._terminal = None
             self._terminal_observed_monotonic_ns = None
             self._status_sample_count = 0
+            self._cursor_sample_count = 0
             self._underflow_observed = False
         operation_stop = self._operation_stop
         self.transport.write_words(
             ((CtrlWords.BANK_READY, 0b11),),
             stop=operation_stop,
         )
-        if finite:
-            self._start_worker(operation_epoch)
+        self._start_worker(operation_epoch)
         try:
             self._command(CMD_FIRE, stop=operation_stop)
         except BaseException:
@@ -508,6 +509,38 @@ class DeployedStreamerSession:
         )
         return PulseBackendCompletion(terminal, tail)
 
+    def wait_continuous_failure(
+        self,
+        artifact: CompiledPulseArtifact,
+        timeout: float,
+    ) -> str | None:
+        """Wait for the existing observer to report a continuous-run failure."""
+
+        wait_seconds = float(timeout)
+        if not math.isfinite(wait_seconds) or wait_seconds <= 0.0:
+            raise ValueError("continuous failure wait timeout must be positive")
+        self._require_started()
+        with self._lock:
+            if artifact is not self._artifact:
+                raise RuntimeError("continuous failure wait artifact differs")
+            if not artifact.target_ir.repeat_forever:
+                raise RuntimeError("continuous failure wait requires cyclic execution")
+            if self._state not in {"FIRING", "RUNNING", "FAILED"}:
+                raise RuntimeError(
+                    f"continuous failure wait is invalid while session is {self._state}"
+                )
+            operation_epoch = self._operation_epoch
+            terminal_event = self._terminal_event
+        if not terminal_event.wait(wait_seconds):
+            return None
+        with self._lock:
+            if operation_epoch != self._operation_epoch:
+                return None
+            error = self._terminal_error
+            if error is None:
+                return "continuous pulse observer stopped without a failure record"
+            return f"{type(error).__name__}: {error}"
+
     def safe_state(self) -> None:
         """Abort immediately, invalidate the capability, and join the only I/O worker."""
 
@@ -592,6 +625,8 @@ class DeployedStreamerSession:
                 "prepared_artifact_digest": self._artifact_digest,
                 "scan_points": self._total_points,
                 "last_confirmed_cursor": self._last_cursor,
+                "cursor_sample_count": self._cursor_sample_count,
+                "underflow_observed": self._underflow_observed,
                 "terminal": (
                     None
                     if terminal is None
@@ -713,9 +748,9 @@ class DeployedStreamerSession:
         self._worker_stop = threading.Event()
         self._fire_gate = threading.Event()
         self._worker = threading.Thread(
-            target=self._finite_worker,
+            target=self._observer_worker,
             args=(operation_epoch,),
-            name="zlc-pulse-terminal-observer",
+            name="zlc-pulse-state-observer",
             daemon=True,
         )
         self._worker.start()
@@ -727,7 +762,7 @@ class DeployedStreamerSession:
             self._fire_gate.set()
         self._stop_worker()
 
-    def _finite_worker(self, operation_epoch: int) -> None:
+    def _observer_worker(self, operation_epoch: int) -> None:
         stop = self._worker_stop
         gate = self._fire_gate
         if stop is None or gate is None:
@@ -770,7 +805,15 @@ class DeployedStreamerSession:
 
                 if self._total_points:
                     cursor = self.transport.read_word(CtrlWords.CURSOR, stop=stop)
-                    self._last_cursor = cursor
+                    if not 0 <= cursor < self._total_points:
+                        raise RuntimeError(
+                            "pulse streamer cursor is outside the active scan table"
+                        )
+                    with self._lock:
+                        if operation_epoch != self._operation_epoch or stop.is_set():
+                            return
+                        self._last_cursor = cursor
+                        self._cursor_sample_count += 1
                 time.sleep(self.terminal_poll_interval)
         except TransportAborted:
             return
@@ -804,7 +847,9 @@ class DeployedStreamerSession:
             second_status = self.transport.read_word(CtrlWords.STATUS, stop=stop)
             self._status_sample_count += 1
             cursor_second = self.transport.read_word(CtrlWords.CURSOR, stop=stop)
-            self._last_cursor = cursor_second
+            with self._lock:
+                self._last_cursor = cursor_second
+                self._cursor_sample_count += 2
             return AutonomousTableTerminalEvidence(
                 AUTONOMOUS_TABLE_READ_RECIPE,
                 self.transport.transport_id,

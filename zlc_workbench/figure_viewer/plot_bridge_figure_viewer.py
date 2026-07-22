@@ -22,7 +22,7 @@ where it stands instead of quietly doing nothing -- which would read as "this
 file is empty".
 
 The window chrome (Fluent frameless shell, one shared display-scale rule, centred
-on the primary screen) mirrors ``show_pulse_gui`` / ``show_task_console``.
+on the primary screen) mirrors ``launch_pulse_editor_window`` / ``show_task_console``.
 """
 
 from __future__ import annotations
@@ -437,7 +437,7 @@ def show_figure_viewer(path: str | Path | None = None, *, scale: float | None = 
                        hide_on_close: bool = False) -> FigureViewer:
     """Open the figure viewer in a Fluent window.
 
-    Mirrors ``show_pulse_gui`` / ``show_task_console``: the body sizes from the primary screen, the
+    Mirrors ``launch_pulse_editor_window`` / ``show_task_console``: the body sizes from the primary screen, the
     window wraps it, and the shared auto-scale rule owns the on-screen control size.  ``path``
     prefills the File field on launch; opening a stored figure is not connected on the current data
     plane, so the window reports that rather than loading (see the module docstring).  Closing the

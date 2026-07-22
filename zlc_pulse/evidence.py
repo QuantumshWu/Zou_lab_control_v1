@@ -197,8 +197,8 @@ def validate_terminal_for_artifact(
 
     if not isinstance(artifact, CompiledPulseArtifact):
         raise TypeError("artifact must be CompiledPulseArtifact")
-    if artifact.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
-        raise ValueError("continuous monitor has no finite terminal evidence")
+    if artifact.target_ir.repeat_forever:
+        raise ValueError("continuous execution has no finite terminal evidence")
     if artifact.execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
         if not isinstance(evidence, AutonomousTableTerminalEvidence):
             raise ValueError("autonomous table execution requires cursor evidence")

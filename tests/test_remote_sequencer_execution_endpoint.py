@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import threading
+import time
 
 import pytest
 
@@ -24,6 +26,7 @@ from zlc_neutral_atom.runtime.resources import (
 )
 from zlc_neutral_atom.timing.pulse import (
     CompletePulseCommand,
+    ContinuousPulseExecutionRequest,
     FinitePulseExecutionRequest,
     FirePulseCommand,
     PreparePulseCommand,
@@ -36,6 +39,7 @@ from zlc_pulse import (
     PulseExecutionService,
     RemotePulseExecutionClient,
     compile_pulse_artifact,
+    freeze_scan_table,
     load_pulse_document,
     pulse_server_snapshot_from_tree,
 )
@@ -43,6 +47,7 @@ from zlc_pulse.server import (
     decode_artifact_message,
     decode_prepared_ref_message,
     encode_completion_message,
+    encode_continuous_failure_message,
     encode_prepared_ref_message,
 )
 from zlc_storage import decode, encode
@@ -58,6 +63,7 @@ class Backend:
         self.prepared = None
         self.safe = True
         self.completion = None
+        self.continuous_failure = None
 
     def prepare(self, artifact):
         self.actions.append("prepare")
@@ -76,6 +82,11 @@ class Backend:
             transport_id="remote-test",
         )
         return self.completion
+
+    def wait_continuous_failure(self, artifact, timeout):
+        assert artifact is self.prepared
+        time.sleep(min(float(timeout), 0.001))
+        return self.continuous_failure
 
     def safe_state(self):
         self.actions.append("safe")
@@ -108,6 +119,14 @@ class Root:
     def current_complete(self, payload, timeout):
         return encode_completion_message(
             self.service.complete(
+                decode_prepared_ref_message(bytes(payload)),
+                timeout=timeout,
+            )
+        )
+
+    def current_wait_continuous_failure(self, payload, timeout):
+        return encode_continuous_failure_message(
+            self.service.wait_continuous_failure(
                 decode_prepared_ref_message(bytes(payload)),
                 timeout=timeout,
             )
@@ -250,6 +269,122 @@ def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe() -> None:
     broker.shutdown()
     client.close()
     assert control.closed and interrupt.closed
+
+
+def test_remote_continuous_scan_progress_requires_a_real_cursor_sample() -> None:
+    document = load_pulse_document(ROOT / "pulses" / "mot_field_template.json")
+    table, _report = freeze_scan_table(
+        document,
+        ("da_x", "da_y", "da_z"),
+        ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+    )
+    document = replace(document, scan_table=table)
+    artifact = compile_pulse_artifact(
+        document,
+        clock_hz=50e6,
+        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
+    )
+
+    class ProgressBackend(Backend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fired = False
+            self.cursor = 0
+            self.cursor_sample_count = 0
+
+        def fire(self, current):
+            super().fire(current)
+            self.fired = True
+
+        def safe_state(self):
+            super().safe_state()
+            self.fired = False
+
+        def snapshot(self):
+            return {
+                "schema": "zlc_pulse.DeployedStreamerSessionSnapshot",
+                "state": "RUNNING" if self.fired else "PREPARED",
+                "prepared_artifact_digest": (
+                    None if self.prepared is None else self.prepared.fingerprint
+                ),
+                "scan_points": (
+                    0 if self.prepared is None else len(self.prepared.target_ir.scan_points)
+                ),
+                "last_confirmed_cursor": self.cursor,
+                "cursor_sample_count": self.cursor_sample_count,
+                "underflow_observed": False,
+            }
+
+    backend = ProgressBackend()
+    service = PulseExecutionService(document.target, clock_hz=50e6, backend=backend)
+    control = Connection(service)
+    interrupt = Connection(service)
+    client = InProcessRemotePulseExecutionClient(
+        control,
+        interrupt,
+        transport_timeout_seconds=10.0,
+    )
+    endpoint = RemotePulseExecutionEndpoint(
+        client,
+        endpoint_label="test-progress-fpga",
+        max_blocking_call_seconds=5.0,
+    )
+    broker, binding, capability = _bound_remote(
+        client,
+        endpoint,
+        suffix="progress",
+    )
+    request = ContinuousPulseExecutionRequest(document, artifact)
+    prepare = PreparePulseCommand(
+        "progress-session",
+        "progress-run",
+        request,
+        capability.capability_fingerprint,
+        5.0,
+    )
+    fire = FirePulseCommand("progress-session", artifact.fingerprint)
+    endpoint.execute_command(binding, prepare)
+    endpoint.execute_command(binding, fire)
+
+    unavailable = endpoint.observe_scan_progress(
+        binding,
+        "progress-session",
+        "progress-run",
+        artifact.fingerprint,
+        2,
+    )
+    assert not unavailable.available
+    assert "not sampled" in unavailable.unavailable_reason
+
+    backend.cursor = 1
+    backend.cursor_sample_count = 1
+    progress = endpoint.observe_scan_progress(
+        binding,
+        "progress-session",
+        "progress-run",
+        artifact.fingerprint,
+        2,
+    )
+    assert progress.available
+    assert progress.current_point_index == 1
+
+    backend.continuous_failure = "forced deployed observer failure"
+    failure = endpoint.wait_continuous_failure(
+        binding,
+        "progress-session",
+        "progress-run",
+        artifact.fingerprint,
+        0.1,
+    )
+    assert failure == "forced deployed observer failure"
+    assert service.snapshot()["state"] == "FAILED"
+
+    endpoint.close_session(
+        binding,
+        SessionCloseCommand("progress-session", 5.0),
+    )
+    broker.shutdown()
+    client.close()
 
 
 def test_interrupt_fences_a_provisional_remote_prepare_before_it_can_fire() -> None:

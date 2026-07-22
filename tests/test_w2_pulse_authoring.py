@@ -25,6 +25,7 @@ from zlc_pulse import (
     set_digital_output,
     set_output_delay,
 )
+from zlc_pulse.authoring import clear_port, clear_pulse_schedule, rename_port_label
 
 
 def _blank():
@@ -126,6 +127,103 @@ def test_bound_output_delay_removal_cannot_leave_an_api_reference():
     removed = set_output_delay(document, digital, None, cascade=True)
     assert removed.document.delays == ()
     assert removed.document.api_parameters == ()
+
+
+def test_clear_logical_row_preserves_its_separate_delay_and_cascades_dac_binding():
+    document = _blank()
+    digital = _port(document, PORT_DIGITAL)
+    dac = _port(document, PORT_DAC)
+    document = set_digital_output(document, "p1", digital, True)
+    document = set_analog_action(
+        document,
+        "p1",
+        dac,
+        AnalogStep(dac, "edge", 7),
+    ).document
+    dac_field = PulseFieldRef("dac", "p1", dac)
+    document = replace_field_binding(
+        document,
+        dac_field,
+        ScanParameter("bias", dac_field, "Bias", "value"),
+    ).document
+    table, _report = freeze_scan_table(document, ("bias",), ((3,), (5,)))
+    document = replace(document, scan_table=table)
+    document = set_output_delay(
+        document,
+        dac,
+        OutputDelay(dac, 40, "ns"),
+    ).document
+    delay_field = PulseFieldRef("delay", None, dac)
+    document = replace_field_binding(
+        document,
+        delay_field,
+        ApiParameter("dac_delay", delay_field, "ns"),
+    ).document
+
+    with pytest.raises(DestructivePulseEditError):
+        clear_port(document, dac)
+
+    cleared_dac = clear_port(document, dac, cascade=True).document
+    assert cleared_dac.periods[0].analog_steps == ()
+    assert cleared_dac.scan_parameters == ()
+    assert cleared_dac.scan_table is None
+    assert cleared_dac.delays == (OutputDelay(dac, 40, "ns"),)
+    assert cleared_dac.api_parameters == (
+        ApiParameter("dac_delay", delay_field, "ns"),
+    )
+
+    cleared_digital = clear_port(document, digital, cascade=True).document
+    lane = document.target.by_key[digital].lanes[0]
+    lane_index = document.target.raw_lanes.index(lane)
+    assert cleared_digital.periods[0].states[lane_index] == 0
+    assert cleared_digital.scan_table == document.scan_table
+
+
+def test_clear_all_resets_only_schedule_authority_and_keeps_editor_presentation():
+    document = _blank()
+    digital = _port(document, PORT_DIGITAL)
+    dac = _port(document, PORT_DAC)
+    document = rename_port_label(document, digital, "Camera trigger")
+    document = replace(document, visible_ports=(digital,), name="Readout pulse")
+    document = set_digital_output(document, "p1", digital, True)
+    document = set_analog_action(
+        document,
+        "p1",
+        dac,
+        AnalogStep(dac, "ramp", 13),
+    ).document
+    document = set_output_delay(
+        document,
+        digital,
+        OutputDelay(digital, 40, "ns"),
+    ).document
+    duration = PulseFieldRef("duration", "p1")
+    document = replace_field_binding(
+        document,
+        duration,
+        ScanParameter("duration", duration, "Duration", "ns"),
+    ).document
+    table, _report = freeze_scan_table(document, ("duration",), ((1000,), (1020,)))
+    document = replace(document, scan_table=table)
+
+    cleared = clear_pulse_schedule(document, cascade=True).document
+
+    assert cleared.name == "Readout pulse"
+    assert cleared.target == document.target
+    assert cleared.target.by_key[digital].label == "Camera trigger"
+    assert cleared.visible_ports == (digital,)
+    assert cleared.time_step_ns == document.time_step_ns
+    assert len(cleared.periods) == 1
+    assert cleared.periods[0].duration == 1
+    assert cleared.periods[0].unit == "us"
+    assert not any(cleared.periods[0].states)
+    assert cleared.periods[0].analog_steps == ()
+    assert cleared.delays == ()
+    assert cleared.scan_parameters == ()
+    assert cleared.scan_table is None
+    assert cleared.scan_recipe is None
+    assert cleared.api_parameters == ()
+    assert cleared.repeat is None
 
 
 def test_binding_switch_preserves_other_scan_columns_and_invalidates_recipe():

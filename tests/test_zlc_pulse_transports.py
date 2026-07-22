@@ -193,6 +193,42 @@ def test_resident_finite_terminal_owner_starts_at_fire_before_await():
     )
 
 
+def test_continuous_scan_observer_publishes_only_sampled_hardware_cursor():
+    params = replace(StreamerParams(), bank_size=2)
+    document, _finite = _scan_artifact(params, count=4)
+    artifact = compile_pulse_artifact(
+        document,
+        clock_hz=50e6,
+        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
+        params=params,
+    )
+    transport = TraceRegisterTransport(params)
+    session = _session(document, params, transport)
+    session.prepare(artifact)
+
+    before_fire = session.snapshot()
+    assert before_fire["cursor_sample_count"] == 0
+    session.fire(artifact)
+    transport.cursor = 2
+
+    deadline = time.monotonic() + 1.0
+    while True:
+        observed = session.snapshot()
+        if (
+            observed["cursor_sample_count"] > 0
+            and observed["last_confirmed_cursor"] == 2
+        ):
+            break
+        if time.monotonic() >= deadline:
+            raise AssertionError("continuous scan cursor was not sampled")
+        time.sleep(0.001)
+
+    assert observed["state"] == "RUNNING"
+    assert observed["terminal"] is None
+    assert observed["underflow_observed"] is False
+    session.safe_state()
+
+
 def test_static_terminal_evidence_never_reads_semantically_empty_cursor():
     params = StreamerParams()
     document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")

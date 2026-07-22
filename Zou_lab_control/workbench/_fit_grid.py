@@ -56,7 +56,7 @@ from zlc_frontend.qt_widgets import (
     FluentSwitch,
     GREY,
     ORANGE,
-    QtImageBoard,
+    FrozenRasterView,
     QtRasterBoard,
     RectangleGesture,
     runtime_range_placeholders,
@@ -903,7 +903,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._board_widget.setObjectName("savedFitGridBoard")
         self._board_widget.setMinimumSize(480, 320)
         live_layout.addWidget(self._board_widget, 1)
-        self._encoded_board = QtImageBoard(
+        self._encoded_board = FrozenRasterView(
             "saved-fit-generic",
             self._live_page,
             empty_text="Saved fit raster unavailable",

@@ -18,6 +18,7 @@ from zlc_pulse.server import (
     decode_artifact_message,
     decode_prepared_ref_message,
     encode_completion_message,
+    encode_continuous_failure_message,
     encode_prepared_ref_message,
 )
 from zlc_storage import encode
@@ -70,6 +71,10 @@ class Backend:
         assert artifact is self.prepared
         return pulse_backend_completion_for(artifact, transport_id="client-test")
 
+    def wait_continuous_failure(self, artifact, timeout):
+        assert artifact is self.prepared
+        return None
+
     def safe_state(self):
         self.prepared = None
         self.safe = True
@@ -100,6 +105,14 @@ class Root:
     def current_complete(self, payload, timeout):
         return encode_completion_message(
             self.service.complete(
+                decode_prepared_ref_message(bytes(payload)),
+                timeout=timeout,
+            )
+        )
+
+    def current_wait_continuous_failure(self, payload, timeout):
+        return encode_continuous_failure_message(
+            self.service.wait_continuous_failure(
                 decode_prepared_ref_message(bytes(payload)),
                 timeout=timeout,
             )
@@ -179,6 +192,7 @@ def test_remote_client_rejects_non_current_snapshot_schema():
             return encode({"schema": "old-server"})
 
         current_prepare = current_fire = current_complete = lambda *args: True
+        current_wait_continuous_failure = lambda *args: True
 
         def current_interrupt_safe_state(self, generation):
             return encode({"schema": "old-server"})
@@ -238,5 +252,30 @@ def test_remote_client_serializes_concurrent_close_to_one_safe_request(monkeypat
 
     assert not first.is_alive() and not second.is_alive()
     assert errors == []
+    assert calls == 1
+    assert connection.closed and interrupt_connection.closed
+
+
+def test_remote_client_never_turns_unconfirmed_safe_close_into_later_success(
+    monkeypatch,
+):
+    _install_in_process_rpyc_timed(monkeypatch)
+    _artifact, service, connection = _fixture()
+    interrupt_connection = Connection(service)
+    client = RemotePulseExecutionClient(connection, interrupt_connection)
+    calls = 0
+
+    def fail_safe(_generation):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("SAFE unconfirmed")
+
+    interrupt_connection.root.current_interrupt_safe_state = fail_safe
+
+    with pytest.raises(RuntimeError, match="SAFE unconfirmed"):
+        client.close()
+    with pytest.raises(RuntimeError, match="remains fail-closed"):
+        client.close()
+
     assert calls == 1
     assert connection.closed and interrupt_connection.closed

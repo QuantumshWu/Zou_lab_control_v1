@@ -8,7 +8,12 @@ from numbers import Real
 
 import numpy as np
 
-from zlc_storage import exact_mapping, finite_real, nonnegative_integer
+from zlc_storage import (
+    canonical_text,
+    exact_mapping,
+    finite_real,
+    nonnegative_integer,
+)
 
 from .display_range import (
     DisplayRange,
@@ -245,16 +250,39 @@ def curve_home_x_limits(axis: EvaluatedAxis) -> DisplayRange:
 
 
 @dataclass(frozen=True, slots=True)
-class CurveViewportTransform:
-    """Exact draw-frozen mapping for one interactive curve raster.
+class NumericDisplayAxis:
+    """Presentation-only identity for one numeric display axis.
+
+    Unlike :class:`EvaluatedAxis`, this value carries no data-domain role,
+    storage indices, coordinate frame, or authority axis id.  Document-backed
+    surfaces such as the pulse preview can therefore share the exact numeric
+    viewport math without fabricating a dataset axis that does not exist.
+    """
+
+    key: str
+    label: str
+    unit: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "key", canonical_text(self.key, "axis key"))
+        object.__setattr__(self, "label", canonical_text(self.label, "axis label"))
+        unit = self.unit
+        if unit is not None:
+            unit = canonical_text(unit, "axis unit")
+        object.__setattr__(self, "unit", unit)
+
+
+@dataclass(frozen=True, slots=True)
+class NumericViewportTransform:
+    """Exact draw-frozen mapping shared by numeric raster surfaces.
 
     ``plot_bounds`` is normalized to the complete raster with a top-left
     origin, matching Qt pointer coordinates.  ``x_limits`` and ``y_limits``
-    are the actual limits read back after Agg draw; ``home_x_limits`` is the
-    current dataset-domain home independent of an authored x pin.
+    are the actual limits read back after drawing; ``home_x_limits`` is the
+    surface-domain home independent of an authored x pin.
     """
 
-    x_axis: EvaluatedAxis
+    x_axis: NumericDisplayAxis
     display_revision: int
     plot_bounds: tuple[float, float, float, float]
     x_limits: DisplayRange
@@ -262,9 +290,11 @@ class CurveViewportTransform:
     home_x_limits: DisplayRange
 
     def __post_init__(self) -> None:
-        if not isinstance(self.x_axis, EvaluatedAxis):
-            raise TypeError("x_axis must be EvaluatedAxis")
-        numeric_curve_coordinates(self.x_axis)
+        if not isinstance(self.x_axis, NumericDisplayAxis):
+            raise TypeError("x_axis must be NumericDisplayAxis")
+        self._validate_common()
+
+    def _validate_common(self) -> None:
         object.__setattr__(
             self,
             "display_revision",
@@ -382,12 +412,27 @@ class CurveViewportTransform:
         )[0]
         return validated_display_range(
             (min(first, second), max(first, second)),
-            "curve selection x span",
+            "numeric selection x span",
         )
+
+
+@dataclass(frozen=True, slots=True)
+class CurveViewportTransform(NumericViewportTransform):
+    """Dataset-backed numeric viewport retaining the authority curve axis."""
+
+    x_axis: EvaluatedAxis
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.x_axis, EvaluatedAxis):
+            raise TypeError("x_axis must be EvaluatedAxis")
+        numeric_curve_coordinates(self.x_axis)
+        self._validate_common()
 
 __all__ = [
     "CurveDisplayState",
     "CurveViewportTransform",
+    "NumericDisplayAxis",
+    "NumericViewportTransform",
     "curve_display_form_spec",
     "curve_display_form_values",
     "curve_display_from_form",

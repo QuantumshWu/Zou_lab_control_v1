@@ -428,7 +428,7 @@ def test_frontend_and_workbench_roots_remain_headless() -> None:
         "assert not any(k == 'matplotlib' or k.startswith('matplotlib.') for k in sys.modules)\n"
         "assert not any(k == 'IPython' or k.startswith('IPython.') for k in sys.modules)\n"
         "assert qt.FluentSettingRow.__module__ == 'zlc_frontend.qt_widgets.fluent'\n"
-        "assert qt.QtImageBoard.__module__ == 'zlc_frontend.qt_widgets.board'\n"
+        "assert qt.FrozenRasterView.__module__ == 'zlc_frontend.qt_widgets.frozen_raster'\n"
     )
     assert qt_result.returncode == 0, qt_result.stderr
 

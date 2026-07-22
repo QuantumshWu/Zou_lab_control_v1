@@ -1,10 +1,10 @@
-"""Qt widgets for one immutable live-image board front."""
+"""Interactive Qt presenter for immutable semantic board fronts."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 import math
-from typing import Callable, Literal, TypeAlias
+from typing import Callable
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -12,7 +12,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from zlc_data import FitBatchStatus, Selection
 from zlc_storage import canonical_text, nonnegative_integer
 
-from ..curve_display import CurveViewportTransform
+from ..curve_display import CurveViewportTransform, NumericViewportTransform
 from ..display_range import RelimMode, validated_display_range
 from ..histogram_display import HistogramViewportTransform
 from ..image_raster import indexed8_code_for_value
@@ -25,12 +25,9 @@ from ..render import (
     ImagePanelPayload,
     MeterPanelPayload,
     PanelFrame,
-    PanelPresentationIdentity,
-    PixelFormat,
     PulsePanelPayload,
     RadialGaussianImageFitOverlay,
     SiteMapPanelPayload,
-    SourceIdentity,
     detached_render_fault,
 )
 from ..site_map import (
@@ -60,805 +57,45 @@ from ..selector import (
     PanelInteractionOrigin,
     RectangleGesture,
 )
+from ._raster_board_support import (
+    _CurveSample,
+    _HeldPanelFront,
+    _HistogramBinSample,
+    _ImagePanelBinding,
+    _ImageSample,
+    _NUMERIC_PAYLOAD_TYPES,
+    _NumericCross,
+    _NumericIntent,
+    _NumericKind,
+    _NumericPanelBinding,
+    _NumericTarget,
+    _NumericViewport,
+    _advance_held_front,
+    _image_payload,
+    _input_structure,
+    _numeric_payload,
+    _numeric_plot_geometry,
+    _panel_bounds,
+    _panel_image_geometry,
+    _panel_presentation,
+    _payload_input,
+    _prepared_qimage,
+    _presented_revision_state,
+    _raster_geometry,
+    _selector_pen_color,
+    _selector_precision,
+    _site_map_payload,
+    _validated_panel_layout,
+)
 from .style import (
     BG,
     GREEN,
     ORANGE,
-    SELECTOR_ALPHA,
-    SELECTOR_COLOR,
     SELECTOR_DOT_PX,
     SELECTOR_FONT_PX,
     SELECTOR_HANDLE_PX,
     SELECTOR_LINE_PX,
 )
-
-
-def _selector_pen_color() -> QtGui.QColor:
-    color = QtGui.QColor(SELECTOR_COLOR)
-    color.setAlpha(SELECTOR_ALPHA)
-    return color
-
-
-def _selector_precision(span: float) -> int:
-    """Decimal places for a selector coordinate label, the reference's rule
-    exactly: enough digits to resolve 1/1000 of the visible span."""
-
-    gap = abs(span) / 1000 if span else 0.01
-    return max(0, -int(math.ceil(math.log10(gap))))
-
-
-def _prepared_qimage(panel_or_raster) -> tuple[bytes, QtGui.QImage]:
-    """Prepare one owned Qt front, applying an IMAGE payload's exact LUT.
-
-    Accepting a bare ``RasterBuffer`` preserves the small legacy presenter
-    surface.  Interactive IMAGE panels pass ``PanelFrame`` so INDEXED8 colour
-    limits are resolved from its paired immutable payload rather than guessed
-    from display codes.
-    """
-
-    if isinstance(panel_or_raster, PanelFrame):
-        raster = panel_or_raster.raster
-        payload = panel_or_raster.display_payload
-        if isinstance(payload, SiteMapPanelPayload):
-            payload = payload.background
-        elif not isinstance(payload, ImagePanelPayload):
-            payload = None
-    else:
-        raster = panel_or_raster
-        payload = None
-    formats = {
-        PixelFormat.GRAY8: QtGui.QImage.Format_Grayscale8,
-        PixelFormat.INDEXED8: QtGui.QImage.Format_Indexed8,
-        PixelFormat.RGB888: QtGui.QImage.Format_RGB888,
-        PixelFormat.RGBA8888: QtGui.QImage.Format_RGBA8888,
-    }
-    image = QtGui.QImage(
-        raster.pixels,
-        raster.width,
-        raster.height,
-        raster.stride_bytes,
-        formats[raster.pixel_format],
-    )
-    if image.isNull():
-        raise RuntimeError("Qt rejected the prepared immutable raster front")
-    if raster.pixel_format is PixelFormat.INDEXED8:
-        if payload is None:
-            raise ValueError(
-                "INDEXED8 has no intrinsic colours and requires ImagePanelPayload"
-            )
-        # Worker quantization already spans the committed clim, so the one
-        # sampled palette is installed directly.  A second LUT remap would
-        # reintroduce the narrow-window precision loss this path avoids.
-        image.setColorTable(list(payload.base_palette))
-    return raster.pixels, image
-
-
-def _image_source_rect(
-    image: QtGui.QImage,
-    viewport: ImageViewportTransform | None,
-) -> QtCore.QRectF:
-    if viewport is None:
-        return QtCore.QRectF(0.0, 0.0, float(image.width()), float(image.height()))
-    left, top, right, bottom = viewport.visible_bounds
-    return QtCore.QRectF(
-        left * image.width(),
-        top * image.height(),
-        (right - left) * image.width(),
-        (bottom - top) * image.height(),
-    )
-
-
-def _aspect_target_for_source(
-    bounds: QtCore.QRect,
-    source: QtCore.QRectF,
-    *,
-    aspect_ratio: float | None = None,
-    anchor_west: bool = False,
-) -> QtCore.QRect:
-    if source.width() <= 0.0 or source.height() <= 0.0:
-        raise ValueError("image source viewport must have positive geometry")
-    source_ratio = (
-        source.width() / source.height()
-        if aspect_ratio is None
-        else float(aspect_ratio)
-    )
-    if not math.isfinite(source_ratio) or source_ratio <= 0.0:
-        raise ValueError("image aspect ratio must be finite and positive")
-    bounds_ratio = bounds.width() / max(1, bounds.height())
-    if bounds_ratio > source_ratio:
-        height = bounds.height()
-        width = max(1, int(round(height * source_ratio)))
-    else:
-        width = bounds.width()
-        height = max(1, int(round(width / source_ratio)))
-    return QtCore.QRect(
-        bounds.x()
-        if anchor_west
-        else bounds.x() + (bounds.width() - width) // 2,
-        bounds.y() + (bounds.height() - height) // 2,
-        width,
-        height,
-    )
-
-
-def _panel_image_geometry(
-    bounds: QtCore.QRect,
-    image: QtGui.QImage,
-    payload: ImagePanelPayload | None,
-    *,
-    site_map_payload: SiteMapPanelPayload | None = None,
-) -> tuple[QtCore.QRect, QtCore.QRectF, QtCore.QRect | None]:
-    source = _image_source_rect(
-        image,
-        None if payload is None else payload.viewport,
-    )
-    if payload is None:
-        return _aspect_target_for_source(bounds, source), source, None
-    rail_width = min(34, max(20, bounds.width() // 10))
-    gap = 5
-    image_bounds = QtCore.QRect(
-        bounds.x(),
-        bounds.y(),
-        max(1, bounds.width() - rail_width - gap),
-        bounds.height(),
-    )
-    fit_aspect = None
-    if payload.fit_overlay is not None:
-        unit_span = payload.viewport.visible_span_for_coordinate_span(
-            (1.0, 1.0),
-            coordinate_frame=payload.fit_overlay.coordinate_frame,
-        )
-        fit_aspect = unit_span[1] / unit_span[0]
-    target = _aspect_target_for_source(
-        image_bounds,
-        source,
-        aspect_ratio=(
-            site_map_payload.visible_coordinate_aspect_ratio
-            if site_map_payload is not None
-            else fit_aspect
-        ),
-        anchor_west=site_map_payload is not None,
-    )
-    rail = QtCore.QRect(
-        bounds.right() - rail_width + 1,
-        target.top(),
-        rail_width,
-        target.height(),
-    )
-    return target, source, rail
-
-
-def _panel_bounds(
-    bounds: QtCore.QRect,
-    *,
-    index: int,
-    count: int,
-    columns: int,
-) -> QtCore.QRect:
-    """Return the one grid cell used by both raster paint and hit testing."""
-
-    rows = math.ceil(count / columns)
-    cell_width = bounds.width() // columns
-    cell_height = bounds.height() // rows
-    row, column = divmod(index, columns)
-    right = (
-        bounds.right() + 1
-        if column == columns - 1
-        else bounds.x() + (column + 1) * cell_width
-    )
-    bottom = (
-        bounds.bottom() + 1
-        if row == rows - 1
-        else bounds.y() + (row + 1) * cell_height
-    )
-    return QtCore.QRect(
-        bounds.x() + column * cell_width,
-        bounds.y() + row * cell_height,
-        right - (bounds.x() + column * cell_width),
-        bottom - (bounds.y() + row * cell_height),
-    )
-
-
-def _validated_panel_layout(
-    panel_ids: tuple[str, ...],
-    columns: int,
-) -> tuple[tuple[str, ...], int]:
-    ids = tuple(canonical_text(value, "panel_id") for value in panel_ids)
-    if not ids or len(set(ids)) != len(ids):
-        raise ValueError("QtRasterBoard requires unique panel ids")
-    if isinstance(columns, bool) or not isinstance(columns, int) or columns <= 0:
-        raise ValueError("columns must be a positive integer")
-    return ids, min(columns, len(ids))
-
-
-def _panel_presentation(panel: PanelFrame) -> PanelPresentationIdentity:
-    matches = tuple(
-        value
-        for value in panel.coherence_stamp.presentations
-        if value.panel_id == panel.panel_id
-    )
-    if len(matches) != 1:
-        raise RuntimeError("panel coherence stamp has no unique presentation identity")
-    return matches[0]
-
-
-def _raster_geometry(panel: PanelFrame) -> tuple[int, int, int, PixelFormat]:
-    raster = panel.raster
-    return (
-        raster.width,
-        raster.height,
-        raster.stride_bytes,
-        raster.pixel_format,
-    )
-
-
-def _image_payload(
-    panel_or_hold: PanelFrame | _HeldPanelFront,
-) -> ImagePanelPayload | None:
-    payload = panel_or_hold.display_payload
-    if isinstance(payload, SiteMapPanelPayload):
-        return payload.background
-    return payload if isinstance(payload, ImagePanelPayload) else None
-
-
-def _site_map_payload(
-    panel_or_hold: PanelFrame | _HeldPanelFront,
-) -> SiteMapPanelPayload | None:
-    payload = panel_or_hold.display_payload
-    return payload if isinstance(payload, SiteMapPanelPayload) else None
-
-
-def _payload_input(
-    payload: (
-        ImagePanelPayload
-        | CurvePanelPayload
-        | HistogramPanelPayload
-        | MeterPanelPayload
-        | SiteMapPanelPayload
-    ),
-):
-    return (
-        payload.occupancy_input
-        if isinstance(payload, SiteMapPanelPayload)
-        else payload.evaluated_input
-    )
-
-
-def _input_structure(evaluated_input) -> tuple[object, object, object, str]:
-    """Return producer structure while deliberately excluding normal revisions."""
-
-    ref = evaluated_input.ref
-    return (
-        evaluated_input.dataset_id,
-        ref.block_id,
-        ref.stream_generation,
-        ref.schema_fingerprint,
-    )
-
-
-_NumericKind: TypeAlias = Literal["curve", "histogram", "pulse"]
-_NumericPayload: TypeAlias = (
-    CurvePanelPayload | HistogramPanelPayload | PulsePanelPayload
-)
-_NumericViewport: TypeAlias = CurveViewportTransform | HistogramViewportTransform
-_NumericIntent: TypeAlias = CurveInteractionIntent | HistogramInteractionIntent
-
-#: The ONE kind->payload map for the numeric interaction family.  PULSE is a
-#: member because the pulse timeline is an x-only interactive surface: it
-#: reuses the CURVE viewport transform and the CURVE intent vocabulary, so the
-#: only fact that distinguishes it here is which payload type its front carries.
-_NUMERIC_PAYLOAD_TYPES: dict[_NumericKind, type] = {
-    "curve": CurvePanelPayload,
-    "histogram": HistogramPanelPayload,
-    "pulse": PulsePanelPayload,
-}
-
-
-def _numeric_payload(
-    panel_or_hold: PanelFrame | _HeldPanelFront,
-    kind: _NumericKind,
-) -> _NumericPayload | None:
-    payload = panel_or_hold.display_payload
-    return payload if isinstance(payload, _NUMERIC_PAYLOAD_TYPES[kind]) else None
-
-
-def _numeric_plot_geometry(
-    panel_bounds: QtCore.QRect,
-    viewport: _NumericViewport,
-) -> QtCore.QRectF:
-    """Map the worker's exact top-origin Agg axes bbox into this Qt cell."""
-
-    left, top, right, bottom = viewport.plot_bounds
-    return QtCore.QRectF(
-        panel_bounds.x() + left * panel_bounds.width(),
-        panel_bounds.y() + top * panel_bounds.height(),
-        (right - left) * panel_bounds.width(),
-        (bottom - top) * panel_bounds.height(),
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _ImageSample:
-    """Exact painted sample used only by this board's visual overlays."""
-
-    x_index: int
-    y_index: int
-    x_coordinate: object
-    y_coordinate: object
-    value: object
-    valid: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _NumericCross:
-    """One arbitrary continuous numeric cursor, never a snapped sample."""
-
-    x: float
-    y: float
-
-
-@dataclass(frozen=True, slots=True)
-class _CurveSample:
-    """Nearest valid sample borrowed from one exact immutable curve payload."""
-
-    series_label: str
-    x: float
-    y: float
-
-
-@dataclass(frozen=True, slots=True)
-class _HistogramBinSample:
-    """One bin borrowed from a frozen HistogramPanelPayload projection."""
-
-    series_label: str
-    left: float
-    right: float
-    count: int
-    right_closed: bool
-
-    @property
-    def x(self) -> float:
-        return 0.5 * (self.left + self.right)
-
-    @property
-    def y(self) -> float:
-        return float(self.count)
-
-
-@dataclass(frozen=True, slots=True)
-class _HeldPanelFront:
-    """One GUI-owned display overlay; it is never an authoritative BoardFrame."""
-
-    panel_id: str
-    board_id: str
-    layout_generation: int
-    sequence: int
-    coherence_group: str
-    source_identity: SourceIdentity
-    presentation: PanelPresentationIdentity
-    raster_geometry: tuple[int, int, int, PixelFormat]
-    prepared: tuple[bytes, QtGui.QImage]
-    display_payload: (
-        ImagePanelPayload
-        | CurvePanelPayload
-        | HistogramPanelPayload
-        | SiteMapPanelPayload
-        | None
-    )
-
-    @property
-    def gesture_identity(self) -> tuple[str, int, int, SourceIdentity]:
-        return (
-            self.board_id,
-            self.layout_generation,
-            self.sequence,
-            self.source_identity,
-        )
-
-
-@dataclass(slots=True)
-class _ImagePanelBinding:
-    """The sole mutable owner for one bound image-family panel."""
-
-    panel_id: str
-    viewport: ImageViewportTransform
-    selection_callback: Callable[[RectangleGesture], object]
-    interaction_callback: Callable[[ImageInteractionCommit], object] | None = None
-    binding_enabled: bool = True
-    interaction_ready: bool = False
-    applied_bounds: NormalizedRectangle | None = None
-    draft_bounds: NormalizedRectangle | None = None
-    drag_anchor: tuple[float, float] | None = None
-    drag_prior_draft: NormalizedRectangle | None = None
-    pan_anchor: QtCore.QPointF | None = None
-    pan_origin: ImageViewportTransform | None = None
-    pan_target_size: tuple[int, int] | None = None
-    pan_candidate: ImageViewportTransform | None = None
-    pending_viewport: ImageViewportTransform | None = None
-    pending_color_limits: tuple[float, float] | None = None
-    pending_origin: PanelInteractionOrigin | None = None
-    clim_drag: str | None = None
-    clim_origin_limits: tuple[float, float] | None = None
-    clim_candidate: tuple[float, float] | None = None
-    clim_domain: tuple[float, float] | None = None
-    cross: _ImageSample | None = None
-    hover: _ImageSample | None = None
-    hover_position: QtCore.QPointF | None = None
-    fault: RuntimeError | None = None
-
-
-@dataclass(slots=True)
-class _NumericPanelBinding:
-    """The sole mutable owner for one bound numeric panel."""
-
-    kind: _NumericKind
-    panel_id: str
-    callback: Callable[[_NumericIntent], object]
-    viewport: _NumericViewport | None = None
-    binding_enabled: bool = True
-    interaction_ready: bool = False
-    pending_viewport: _NumericViewport | None = None
-    pending_origin: PanelInteractionOrigin | None = None
-    applied_span: tuple[float, float] | None = None
-    span_anchor: float | None = None
-    span_candidate: tuple[float, float] | None = None
-    # The DRAWN selection rectangle in normalized plot coordinates
-    # (x0, y0, x1, y1): live during the drag, kept after release (the
-    # reference's RectangleSelector leaves its box + label standing).
-    span_rect: tuple[float, float, float, float] | None = None
-    # Interactive-handle modes on a STANDING box, the reference's
-    # RectangleSelector semantics: an edge grab resizes one dimension only
-    # ('x' keeps the y ends frozen, 'y' keeps the x span frozen) and a center
-    # grab ('span_move_grab' = pointer offset from the box origin) moves the
-    # whole box.  Both are None during a plain corner drag / fresh pull.
-    span_resize_lock: str | None = None
-    span_move_grab: tuple[float, float] | None = None
-    # A live threshold-line drag (histogram only): the grabbed index into the
-    # payload's authored thresholds, the in-flight authored set, and the
-    # display revision the last commit expects back -- present() absorbs the
-    # answer into the hold when it arrives (the reference's DragVLine redraws
-    # per motion).
-    threshold_drag: int | None = None
-    threshold_candidate: tuple[float, ...] | None = None
-    threshold_pending_revision: int | None = None
-    pan_anchor: float | None = None
-    pan_origin: _NumericViewport | None = None
-    pan_candidate: tuple[float, float] | None = None
-    cross: _NumericCross | None = None
-    hover: _CurveSample | _HistogramBinSample | None = None
-    hover_position: QtCore.QPointF | None = None
-    fault: RuntimeError | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _NumericTarget:
-    plot: QtCore.QRectF
-    frame: BoardFrame
-    panel: PanelFrame
-    prepared: tuple[bytes, QtGui.QImage]
-    payload: _NumericPayload
-    bounds: QtCore.QRect
-    binding: _NumericPanelBinding
-
-
-class QtOwnerWake(QtCore.QObject):
-    """No-payload queued wake bound once to a GUI-owner callback."""
-
-    requested = QtCore.pyqtSignal()
-
-    def __init__(self, parent: QtCore.QObject | None = None) -> None:
-        super().__init__(parent)
-        self._callback: Callable[[], object] | None = None
-        self._fault: BaseException | None = None
-        self.requested.connect(self._dispatch, QtCore.Qt.QueuedConnection)
-
-    @property
-    def fault(self) -> BaseException | None:
-        return self._fault
-
-    def bind(self, callback: Callable[[], object]) -> None:
-        self._require_owner()
-        if not callable(callback):
-            raise TypeError("callback must be callable")
-        if self._callback is not None:
-            raise RuntimeError("QtOwnerWake is already bound")
-        self._callback = callback
-        self._fault = None
-
-    def request_owner_wake(self) -> None:
-        self.requested.emit()
-
-    def detach(self) -> None:
-        self._require_owner()
-        self._callback = None
-
-    @QtCore.pyqtSlot()
-    def _dispatch(self) -> None:
-        callback = self._callback
-        if callback is None:
-            return
-        try:
-            callback()
-        except BaseException as error:
-            self._fault = detached_render_fault(error)
-
-    def _require_owner(self) -> None:
-        if QtCore.QThread.currentThread() != self.thread():
-            raise RuntimeError("QtOwnerWake binding is GUI-thread affine")
-
-
-class QtImageBoard(QtWidgets.QWidget):
-    """Single-panel BoardPresenter that paints directly from immutable bytes."""
-
-    normalizedDoubleClicked = QtCore.pyqtSignal(float, float)
-
-    def __init__(
-        self,
-        panel_id: str,
-        parent: QtWidgets.QWidget | None = None,
-        *,
-        empty_text: str = "",
-        zoomable: bool = False,
-    ) -> None:
-        super().__init__(parent)
-        self._panel_id = canonical_text(panel_id, "panel_id")
-        self._empty_text = str(empty_text)
-        self._front: tuple[bytes, QtGui.QImage] | None = None
-        self._front_frame: BoardFrame | None = None
-        if not isinstance(zoomable, bool):
-            raise TypeError("zoomable must be bool")
-        self._zoomable = zoomable
-        # Normalised view of the source rect: centre plus a magnification.  A
-        # frozen report page is the one raster the operator cannot re-render at
-        # a larger size, so being unable to magnify it is the difference between
-        # reading a per-site fit and guessing at it.  Off by default: a live
-        # board's zoom belongs to its ViewportTransform, not to the presenter.
-        self._view_center = (0.5, 0.5)
-        self._view_scale = 1.0
-        self._pan_from: QtCore.QPoint | None = None
-        self._front_size: tuple[int, int] | None = None
-        self.setMinimumSize(64, 64)
-
-    def present(self, frame: BoardFrame) -> None:
-        self._require_owner()
-        if not isinstance(frame, BoardFrame):
-            raise TypeError("frame must be BoardFrame")
-        if len(frame.panels) != 1 or frame.panels[0].panel_id != self._panel_id:
-            raise ValueError("QtImageBoard requires its one configured panel")
-        self._front = _prepared_qimage(frame.panels[0])
-        self._front_frame = frame
-        self._note_front_geometry(self._front[1])
-        self.update()
-
-    def present_encoded(self, payload: bytes, *, image_format: str = "PNG") -> None:
-        """Decode one owned display artifact without changing board geometry."""
-        self._require_owner()
-        if not isinstance(payload, bytes):
-            raise TypeError("payload must be owned immutable bytes")
-        image_format = canonical_text(image_format, "image_format")
-        image = QtGui.QImage.fromData(payload, image_format.encode("ascii"))
-        if image.isNull():
-            raise RuntimeError("Qt rejected the encoded immutable raster")
-        self._front = (payload, image)
-        self._front_frame = None
-        self._note_front_geometry(image)
-        self.update()
-
-    def clear(self) -> None:
-        self._require_owner()
-        self._front = None
-        self._front_frame = None
-        self._front_size = None
-        self._reset_view()
-        self.update()
-
-    @property
-    def has_front(self) -> bool:
-        return self._front is not None
-
-    @property
-    def front_frame(self) -> BoardFrame | None:
-        return self._front_frame
-
-    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        del event
-        painter = QtGui.QPainter(self)
-        painter.fillRect(self.rect(), QtCore.Qt.black)
-        front = self._front
-        if front is None:
-            if self._empty_text:
-                painter.setPen(QtGui.QColor(BG))
-                painter.drawText(self.rect(), QtCore.Qt.AlignCenter, self._empty_text)
-            return
-        image = front[1]
-        payload = (
-            None
-            if self._front_frame is None
-            else _image_payload(self._front_frame.panels[0])
-        )
-        source = _image_source_rect(
-            image,
-            None if payload is None else payload.viewport,
-        )
-        painter.drawImage(
-            QtCore.QRectF(_aspect_target_for_source(self.rect(), source)),
-            image,
-            self._magnified_source(source),
-        )
-
-    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
-        if self._zoomable and self._view_scale > 1.0:
-            # Zoomed in, double-click means "show me the whole page again".
-            # Un-zoomed it keeps the meaning every existing consumer relies on.
-            self._reset_view()
-            event.accept()
-            self.update()
-            return
-        front = self._front
-        if front is not None:
-            payload = (
-                None
-                if self._front_frame is None
-                else _image_payload(self._front_frame.panels[0])
-            )
-            source = _image_source_rect(
-                front[1],
-                None if payload is None else payload.viewport,
-            )
-            target = _aspect_target_for_source(self.rect(), source)
-            position = event.pos()
-            if target.contains(position) and target.width() > 0 and target.height() > 0:
-                self.normalizedDoubleClicked.emit(
-                    (position.x() - target.x()) / target.width(),
-                    (position.y() - target.y()) / target.height(),
-                )
-                event.accept()
-                return
-        super().mouseDoubleClickEvent(event)
-
-    # ------------------------------------------------------------ zoom / pan
-    #: A report page is worth magnifying, not resampling; 16x is already past
-    #: the point where one source pixel fills a screen tile.
-    MAX_VIEW_SCALE = 16.0
-
-    @property
-    def view_scale(self) -> float:
-        """Current magnification; 1.0 means the whole page is shown."""
-
-        return self._view_scale
-
-    @property
-    def view_center(self) -> tuple[float, float]:
-        """Normalised centre of the visible sub-rect within the source raster."""
-
-        return self._view_center
-
-    def _reset_view(self) -> None:
-        self._view_center = (0.5, 0.5)
-        self._view_scale = 1.0
-        self._pan_from = None
-
-    def _note_front_geometry(self, image: QtGui.QImage) -> None:
-        size = (int(image.width()), int(image.height()))
-        # A refreshed page of the same geometry keeps the operator's zoom; a
-        # different raster is a different picture, so the view starts over.
-        if size != self._front_size:
-            self._front_size = size
-            self._reset_view()
-
-    def _magnified_source(self, source: QtCore.QRect) -> QtCore.QRectF:
-        base = QtCore.QRectF(source)
-        if not self._zoomable or self._view_scale <= 1.0:
-            return base
-        span = 1.0 / self._view_scale
-        cx, cy = self._view_center
-        return QtCore.QRectF(
-            base.x() + (cx - span / 2.0) * base.width(),
-            base.y() + (cy - span / 2.0) * base.height(),
-            span * base.width(),
-            span * base.height(),
-        )
-
-    def _clamped_center(
-        self,
-        cx: float,
-        cy: float,
-        scale: float,
-    ) -> tuple[float, float]:
-        """Keep the visible sub-rect inside the page: no empty margins."""
-
-        half = 0.5 / scale
-        low, high = half, 1.0 - half
-        if low > high:
-            return (0.5, 0.5)
-        return (min(max(cx, low), high), min(max(cy, low), high))
-
-    def _target_rect(self):
-        front = self._front
-        if front is None:
-            return None
-        payload = (
-            None
-            if self._front_frame is None
-            else _image_payload(self._front_frame.panels[0])
-        )
-        source = _image_source_rect(
-            front[1],
-            None if payload is None else payload.viewport,
-        )
-        target = _aspect_target_for_source(self.rect(), source)
-        if target.width() <= 0 or target.height() <= 0:
-            return None
-        return target
-
-    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
-        target = self._target_rect() if self._zoomable else None
-        if target is None or not target.contains(event.pos()):
-            super().wheelEvent(event)
-            return
-        steps = event.angleDelta().y() / 120.0
-        if steps == 0:
-            super().wheelEvent(event)
-            return
-        scale = min(
-            max(self._view_scale * (1.25 ** steps), 1.0),
-            self.MAX_VIEW_SCALE,
-        )
-        # Hold the page point under the cursor still, so magnifying reads as
-        # "look closer HERE" rather than "jump to the middle".
-        u = (event.pos().x() - target.x()) / target.width()
-        v = (event.pos().y() - target.y()) / target.height()
-        cx, cy = self._view_center
-        px = cx - 0.5 / self._view_scale + u / self._view_scale
-        py = cy - 0.5 / self._view_scale + v / self._view_scale
-        self._view_scale = scale
-        self._view_center = self._clamped_center(
-            px + 0.5 / scale - u / scale,
-            py + 0.5 / scale - v / scale,
-            scale,
-        )
-        event.accept()
-        self.update()
-
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if (
-            self._zoomable
-            and event.button() == QtCore.Qt.LeftButton
-            and self._view_scale > 1.0
-        ):
-            self._pan_from = event.pos()
-            self.setCursor(QtCore.Qt.ClosedHandCursor)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        target = None if self._pan_from is None else self._target_rect()
-        if target is None:
-            super().mouseMoveEvent(event)
-            return
-        delta = event.pos() - self._pan_from
-        self._pan_from = event.pos()
-        cx, cy = self._view_center
-        self._view_center = self._clamped_center(
-            cx - (delta.x() / target.width()) / self._view_scale,
-            cy - (delta.y() / target.height()) / self._view_scale,
-            self._view_scale,
-        )
-        event.accept()
-        self.update()
-
-    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
-        if self._pan_from is not None:
-            self._pan_from = None
-            self.unsetCursor()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def _require_owner(self) -> None:
-        if QtCore.QThread.currentThread() != self.thread():
-            raise RuntimeError("QtImageBoard presentation is GUI-thread affine")
 
 
 class QtRasterBoard(QtWidgets.QWidget):
@@ -1085,6 +322,11 @@ class QtRasterBoard(QtWidgets.QWidget):
                         clear_applied_bounds=True,
                         clear_pending=True,
                     )
+                    target_viewport = target_image_viewports.get(panel_id)
+                    if target_viewport is not None:
+                        binding.revision_floor = (
+                            target_viewport.viewport_revision
+                        )
                     cancel_interaction = cancel_interaction or (
                         interaction_was_active
                         and self._selector_hold is not None
@@ -1102,6 +344,11 @@ class QtRasterBoard(QtWidgets.QWidget):
                         clear_applied_span=True,
                         clear_pending=True,
                     )
+                    target_viewport = target_numeric_viewports.get(panel_id)
+                    if target_viewport is not None:
+                        binding.revision_floor = (
+                            target_viewport.display_revision
+                        )
                     cancel_interaction = cancel_interaction or (
                         interaction_was_active
                         and self._selector_hold is not None
@@ -1121,21 +368,29 @@ class QtRasterBoard(QtWidgets.QWidget):
             binding = self._image_bindings.get(panel_id)
             if binding is not None:
                 binding.viewport = viewport
+                binding.revision_floor = max(
+                    binding.revision_floor, viewport.viewport_revision)
         for panel_id, viewport in target_numeric_viewports.items():
             binding = self._numeric_bindings.get(panel_id)
             if binding is not None:
                 binding.viewport = viewport
+                binding.revision_floor = max(
+                    binding.revision_floor, viewport.display_revision)
         for panel_id, binding in self._image_bindings.items():
             target_viewport = target_image_viewports.get(panel_id)
             pending = binding.pending_viewport
-            answered = False
-            if pending is not None and target_viewport is not None:
-                if (
-                    target_viewport == pending
-                    or target_viewport.viewport_revision > pending.viewport_revision
-                ):
-                    binding.pending_viewport = None
-                    answered = True
+            hold = self._selector_hold
+            answered, intermediate_answer = _presented_revision_state(
+                None if pending is None else pending.viewport_revision,
+                None if target_viewport is None else target_viewport.viewport_revision,
+                (
+                    hold.presentation.panel_revision
+                    if hold is not None and hold.panel_id == panel_id
+                    else None
+                ),
+            )
+            if answered:
+                binding.pending_viewport = None
             pending_origin = binding.pending_origin
             if (
                 binding.pending_color_limits is not None
@@ -1148,35 +403,31 @@ class QtRasterBoard(QtWidgets.QWidget):
                 answered = True
             if not self._image_interaction_is_pending(binding):
                 binding.pending_origin = None
-            hold = self._selector_hold
-            if answered and hold is not None and hold.panel_id == panel_id:
-                # This present answers the running gesture's OWN intent (a
-                # live pan/zoom/clim step): the frozen front absorbs it so the
-                # picture follows the pointer, while EXTERNAL data frames keep
-                # landing underneath unseen -- same as the numeric absorption
-                # below and the reference's per-motion redraw during a drag.
+            if (
+                (answered or intermediate_answer)
+                and hold is not None
+                and hold.panel_id == panel_id
+            ):
                 index = target_panel_ids.index(panel_id)
                 panel = frame.panels[index]
-                self._selector_hold = replace(
-                    hold,
-                    sequence=frame.sequence,
-                    source_identity=panel.source_identity,
-                    presentation=_panel_presentation(panel),
-                    raster_geometry=_raster_geometry(panel),
-                    prepared=prepared[index],
-                    display_payload=panel.display_payload,
+                self._selector_hold = _advance_held_front(
+                    hold, frame, panel, prepared[index]
                 )
         for panel_id, binding in self._numeric_bindings.items():
             pending = binding.pending_viewport
             candidate = target_numeric_viewports.get(panel_id)
-            answered = False
-            if (
-                pending is not None
-                and candidate is not None
-                and candidate.display_revision >= pending.display_revision
-            ):
+            hold = self._selector_hold
+            answered, intermediate_answer = _presented_revision_state(
+                None if pending is None else pending.display_revision,
+                None if candidate is None else candidate.display_revision,
+                (
+                    hold.presentation.panel_revision
+                    if hold is not None and hold.panel_id == panel_id
+                    else None
+                ),
+            )
+            if answered:
                 binding.pending_viewport = None
-                answered = True
             if (
                 binding.threshold_pending_revision is not None
                 and candidate is not None
@@ -1184,25 +435,14 @@ class QtRasterBoard(QtWidgets.QWidget):
                 >= binding.threshold_pending_revision
             ):
                 binding.threshold_pending_revision = None
+                binding.threshold_pending_origin = None
                 answered = True
-            if answered:
-                hold = self._selector_hold
+            if answered or intermediate_answer:
                 if hold is not None and hold.panel_id == panel_id:
-                    # This present answers the running gesture's OWN view
-                    # intent (a live pan/zoom step): the frozen front absorbs
-                    # it so the view follows the pointer, exactly like the
-                    # reference's set_xlim redraw during a drag -- while
-                    # EXTERNAL data frames keep landing underneath unseen.
                     index = target_panel_ids.index(panel_id)
                     panel = frame.panels[index]
-                    self._selector_hold = replace(
-                        hold,
-                        sequence=frame.sequence,
-                        source_identity=panel.source_identity,
-                        presentation=_panel_presentation(panel),
-                        raster_geometry=_raster_geometry(panel),
-                        prepared=prepared[index],
-                        display_payload=panel.display_payload,
+                    self._selector_hold = _advance_held_front(
+                        hold, frame, panel, prepared[index]
                     )
             if binding.pending_viewport is None:
                 binding.pending_origin = None
@@ -1569,15 +809,22 @@ class QtRasterBoard(QtWidgets.QWidget):
         if not isinstance(origin, PanelInteractionOrigin):
             raise TypeError("origin must be PanelInteractionOrigin")
         binding = self._numeric_bindings.get(origin.panel_id)
-        if (
-            binding is None
-            or binding.kind != "histogram"
-            or binding.pending_viewport is None
-            or origin != binding.pending_origin
-        ):
+        if binding is None or binding.kind != "histogram":
             return False
-        binding.pending_viewport = None
-        binding.pending_origin = None
+        discarded = False
+        if binding.pending_viewport is not None and origin == binding.pending_origin:
+            binding.pending_viewport = None
+            binding.pending_origin = None
+            discarded = True
+        if (
+            binding.threshold_pending_revision is not None
+            and origin == binding.threshold_pending_origin
+        ):
+            binding.threshold_pending_revision = None
+            binding.threshold_pending_origin = None
+            discarded = True
+        if not discarded:
+            return False
         self.update()
         return True
 
@@ -1661,21 +908,23 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise ValueError("a cleared curve span has no fit Selection")
         hold = self._selector_hold
         binding = self._numeric_bindings.get(gesture.origin.panel_id)
-        # PULSE emits the same CurveRangeGesture (x-only time span), so its
-        # area selection resolves through this one exit as well.
         if (
             hold is None
             or binding is None
-            or binding.kind not in ("curve", "pulse")
+            or binding.kind != "curve"
             or binding.span_anchor is not None
             or binding.pan_anchor is not None
         ):
+            if binding is not None and binding.kind == "pulse":
+                raise RuntimeError(
+                    "pulse ranges are display-only and cannot become Selection"
+                )
             raise RuntimeError("curve range gesture has no completed held origin")
         origin = self._numeric_interaction_origin(binding, hold=hold)
         if gesture.origin != origin:
             raise RuntimeError("curve range gesture differs from its held panel origin")
         payload = hold.display_payload
-        if not isinstance(payload, (CurvePanelPayload, PulsePanelPayload)):
+        if not isinstance(payload, CurvePanelPayload):
             raise RuntimeError("curve range gesture lost its exact curve payload")
         axis = payload.viewport.x_axis
         return Selection.coordinate_range(
@@ -1736,6 +985,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             viewport,
             callback,
             interaction_callback=interaction_callback,
+            revision_floor=viewport.viewport_revision,
             interaction_ready=enabled,
         )
         if not has_other_binding:
@@ -3129,6 +2379,9 @@ class QtRasterBoard(QtWidgets.QWidget):
             panel_id,
             callback,
             viewport=viewport,
+            revision_floor=(
+                0 if viewport is None else viewport.display_revision
+            ),
             interaction_ready=enabled,
         )
         if not has_other_family:
@@ -3166,8 +2419,8 @@ class QtRasterBoard(QtWidgets.QWidget):
         if type(candidate) is not type(current):
             raise ValueError("numeric viewport type changed without panel structure change")
         if (
-            isinstance(candidate, CurveViewportTransform)
-            and isinstance(current, CurveViewportTransform)
+            isinstance(candidate, NumericViewportTransform)
+            and isinstance(current, NumericViewportTransform)
             and candidate.x_axis != current.x_axis
         ):
             raise ValueError("curve x axis changed without panel structure change")
@@ -3203,7 +2456,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 "pending histogram viewport returned conflicting authored state"
             )
         if candidate.display_revision == current.display_revision:
-            if isinstance(candidate, CurveViewportTransform) and (
+            if isinstance(candidate, NumericViewportTransform) and (
                 candidate.x_limits != current.x_limits
                 or candidate.home_x_limits != current.home_x_limits
             ):
@@ -3710,15 +2963,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             return False
         if candidate.axes != current.axes:
             raise ValueError("viewport commit cannot change image axes")
-        # A live pan/zoom commits once per motion while the hold keeps the
-        # press frame's viewport: the revision base is the LATEST of the
-        # current (possibly frozen) viewport, the last presented one and any
-        # still-pending candidate, and a newer candidate REPLACES an
-        # in-flight one instead of being refused (the reference redraws on
-        # every single motion).
+        # Failed/pending motion revisions stay consumed and never alias.
         base_revision = current.viewport_revision
         if binding.viewport is not None:
             base_revision = max(base_revision, binding.viewport.viewport_revision)
+        base_revision = max(base_revision, binding.revision_floor)
         if binding.pending_viewport is not None:
             base_revision = max(
                 base_revision, binding.pending_viewport.viewport_revision)
@@ -3743,6 +2992,10 @@ class QtRasterBoard(QtWidgets.QWidget):
             return False
         origin = self._interaction_origin(binding, hold=hold)
         command = ImageViewportCommit(origin, candidate)
+        binding.revision_floor = max(
+            binding.revision_floor,
+            candidate.viewport_revision,
+        )
         binding.pending_viewport = candidate
         binding.pending_origin = origin
         try:
@@ -3764,12 +3017,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         *,
         hold: _HeldPanelFront | None = None,
     ) -> bool:
-        """Author the threshold set from a live drag step (per motion).
-
-        The commit records the display revision it expects back so present()
-        can absorb the answer into the held front -- the same live-follow
-        arrangement the pan/zoom commits use, with an int expectation instead
-        of a pending viewport."""
+        """Author one threshold motion and reserve its display revision."""
 
         payload = (
             _numeric_payload(hold, binding.kind)
@@ -3795,13 +3043,17 @@ class QtRasterBoard(QtWidgets.QWidget):
         expected = payload.viewport.display_revision
         if binding.viewport is not None:
             expected = max(expected, binding.viewport.display_revision)
+        expected = max(expected, binding.revision_floor)
         if binding.threshold_pending_revision is not None:
             expected = max(expected, binding.threshold_pending_revision)
         binding.threshold_pending_revision = expected + 1
+        binding.revision_floor = binding.threshold_pending_revision
+        binding.threshold_pending_origin = origin
         try:
             binding.callback(command)
         except BaseException as error:
             binding.threshold_pending_revision = None
+            binding.threshold_pending_origin = None
             if binding.fault is None:
                 binding.fault = detached_render_fault(error)
             binding.binding_enabled = False
@@ -3827,20 +3079,12 @@ class QtRasterBoard(QtWidgets.QWidget):
         if payload is None or x_limits == payload.viewport.x_limits:
             return False
         assert isinstance(payload, _NUMERIC_PAYLOAD_TYPES[binding.kind])
-        # A LIVE pan commits once per motion while the hold keeps the press
-        # frame's payload, so the revision must advance past any still-pending
-        # candidate rather than re-issuing the press revision + 1 every time.
-        # The revision base is the LATEST of the (possibly held/frozen)
-        # payload, the last PRESENTED viewport and any still-pending
-        # candidate: a live pan commits once per motion while the hold keeps
-        # the press frame's payload, so a fresh candidate must REPLACE an
-        # in-flight one with a strictly newer revision -- never re-issue an
-        # already-presented revision with different bounds, and never refuse
-        # (refusing would move the view one step per round-trip).
+        # Allocate beyond visible, pending and failed motion revisions.
         base_revision = payload.viewport.display_revision
         if binding.viewport is not None:
             base_revision = max(
                 base_revision, binding.viewport.display_revision)
+        base_revision = max(base_revision, binding.revision_floor)
         if binding.pending_viewport is not None:
             base_revision = max(
                 base_revision, binding.pending_viewport.display_revision)
@@ -3869,6 +3113,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             if binding.kind == "histogram"
             else CurveViewportCommit(origin, candidate)
         )
+        binding.revision_floor = candidate.display_revision
         binding.pending_viewport = candidate
         binding.pending_origin = origin
         try:
@@ -4657,7 +3902,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         viewport = payload.viewport
         x_unit_value = (
             viewport.x_axis.unit
-            if isinstance(viewport, CurveViewportTransform)
+            if isinstance(viewport, NumericViewportTransform)
             else payload.value_unit
         )
         x_unit = "" if x_unit_value is None else f" {x_unit_value}"
@@ -4728,7 +3973,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                         viewport.x_limits[1] - viewport.x_limits[0])
                     y_span = (
                         viewport.y_limits
-                        if isinstance(viewport, CurveViewportTransform)
+                        if isinstance(viewport, NumericViewportTransform)
                         else viewport.count_limits
                     )
                     dy = _selector_precision(y_span[1] - y_span[0])
@@ -4759,7 +4004,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                     viewport.x_limits[1] - viewport.x_limits[0])
                 y_span = (
                     viewport.y_limits
-                    if isinstance(viewport, CurveViewportTransform)
+                    if isinstance(viewport, NumericViewportTransform)
                     else viewport.count_limits
                 )
                 dy = _selector_precision(y_span[1] - y_span[0])
@@ -5174,6 +4419,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         binding.threshold_drag = None
         binding.threshold_candidate = None
         binding.threshold_pending_revision = None
+        binding.threshold_pending_origin = None
         binding.pan_anchor = None
         binding.pan_origin = None
         binding.pan_candidate = None
@@ -5266,4 +4512,4 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise RuntimeError("QtRasterBoard is closed")
 
 
-__all__ = ["QtImageBoard", "QtOwnerWake", "QtRasterBoard"]
+__all__ = ["QtRasterBoard"]

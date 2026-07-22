@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from numbers import Real
@@ -107,6 +108,180 @@ class DestructivePulseEditError(ValueError):
     def __init__(self, impact: PulseEditImpact) -> None:
         self.impact = impact
         super().__init__("pulse edit has cascading authoritative effects; pass cascade=True")
+
+
+def rename_port_label(
+    document: PulseDocument,
+    port_key: str,
+    label: str,
+) -> PulseDocument:
+    """Replace one presentation label without changing the target ABI.
+
+    A blank edit restores the stable port key, matching the formal editor's
+    established display fallback while keeping ``PulseTarget`` canonical.
+    """
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    key = str(port_key)
+    if key not in document.target.by_key:
+        raise KeyError(f"unknown pulse port {key!r}")
+    normalized = str(label).strip() or key
+    ports = tuple(
+        replace(port, label=normalized) if port.key == key else port
+        for port in document.target.ports
+    )
+    target = PulseTarget(document.target.raw_lanes, ports)
+    if target.abi_fingerprint != document.target.abi_fingerprint:
+        raise RuntimeError("a port label edit changed the target ABI")
+    return replace(document, target=target)
+
+
+def allocate_field_parameter_id(
+    document: PulseDocument,
+    field: PulseFieldRef,
+) -> str:
+    """Allocate one readable stable ParameterId from physical field identity."""
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    if not isinstance(field, PulseFieldRef):
+        raise TypeError("field must be PulseFieldRef")
+    parts = (field.kind, field.period_id or "", field.port or "")
+    stem = "_".join(part for part in parts if part)
+    stem = re.sub(r"[^A-Za-z0-9_]+", "_", stem).strip("_") or "pulse_parameter"
+    if stem[0].isdigit():
+        stem = f"pulse_{stem}"
+    used = {
+        parameter.parameter_id
+        for parameter in (*document.scan_parameters, *document.api_parameters)
+    }
+    candidate = stem
+    suffix = 2
+    while candidate in used:
+        candidate = f"{stem}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def cycle_field_binding(
+    document: PulseDocument,
+    field: PulseFieldRef,
+    *,
+    cascade: bool = False,
+) -> PulseEditResult:
+    """Apply the formal dot cycle using current typed field identities.
+
+    Duration/DAC fields cycle literal -> SCAN -> API -> literal.  Output
+    delays are not scannable and cycle literal -> API -> literal.  A DAC Hold
+    becomes an explicit Edge at its carried value when first parameterized,
+    matching the hardware meaning of changing that period's DAC endpoint.
+    """
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    if not isinstance(field, PulseFieldRef):
+        raise TypeError("field must be PulseFieldRef")
+    working = document
+    old_scan = next(
+        (item for item in working.scan_parameters if item.field == field),
+        None,
+    )
+    old_api = next(
+        (item for item in working.api_parameters if item.field == field),
+        None,
+    )
+    if old_api is not None:
+        return replace_field_binding(
+            working,
+            field,
+            None,
+            cascade=cascade,
+        )
+
+    if old_scan is not None:
+        _value, unit = working.field_value(field)
+        return replace_field_binding(
+            working,
+            field,
+            ApiParameter(old_scan.parameter_id, field, unit),
+            cascade=cascade,
+        )
+
+    if field.kind == FIELD_DELAY:
+        if field.port not in {item.port for item in working.delays}:
+            created = set_output_delay(
+                working,
+                field.port,
+                OutputDelay(field.port, 0, "ns"),
+            )
+            working = created.document
+        _value, unit = working.field_value(field)
+        binding = ApiParameter(
+            allocate_field_parameter_id(working, field),
+            field,
+            unit,
+        )
+        return replace_field_binding(
+            working,
+            field,
+            binding,
+            cascade=cascade,
+        )
+
+    if field.kind == FIELD_DAC:
+        period = working.period_by_id[field.period_id]
+        if field.port not in {step.port for step in period.analog_steps}:
+            carried = _dac_value_at_period_start(
+                working,
+                field.period_id,
+                field.port,
+            )
+            materialized = set_analog_action(
+                working,
+                field.period_id,
+                field.port,
+                AnalogStep(field.port, "edge", carried),
+            )
+            working = materialized.document
+
+    _value, field_unit = working.field_value(field)
+    scan_unit = "ns" if field.kind == FIELD_DURATION else field_unit
+    label = (
+        ""
+        if field.port is None
+        else working.target.by_key[field.port].label
+    )
+    binding = ScanParameter(
+        allocate_field_parameter_id(working, field),
+        field,
+        label,
+        scan_unit,
+    )
+    return replace_field_binding(
+        working,
+        field,
+        binding,
+        cascade=cascade,
+    )
+
+
+def _dac_value_at_period_start(
+    document: PulseDocument,
+    period_id: str,
+    port: str,
+) -> int:
+    current = 0
+    for period in document.periods:
+        if period.period_id == period_id:
+            return current
+        action = next(
+            (step for step in period.analog_steps if step.port == port),
+            None,
+        )
+        if action is not None:
+            current = action.value
+    raise KeyError(f"unknown period {period_id!r}")
 
 
 def new_pulse_document(
@@ -250,6 +425,139 @@ def set_output_delay(
     )
     delays = tuple(item for item in unbound.document.delays if item.port != port)
     return PulseEditResult(replace(unbound.document, delays=delays), unbound.impact)
+
+
+def clear_port(
+    document: PulseDocument,
+    port: str,
+    *,
+    cascade: bool = False,
+) -> PulseEditResult:
+    """Clear one logical editor row as one immutable authoring operation.
+
+    Digital rows become low in every period.  DAC rows lose every authored
+    edge/ramp.  The row's output delay is deliberately left alone: the formal
+    editor presents delay as a separate field and its established ``Clear``
+    action clears the schedule row, not that field.  Any scan/API declarations
+    owned by removed DAC actions are reported and removed atomically.
+    """
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    target_port = document.target.by_key.get(str(port))
+    if target_port is None or target_port.kind not in (PORT_DIGITAL, PORT_DAC):
+        raise ValueError(f"port {port!r} is not a programmable pulse output")
+
+    working = document
+    impacts: list[PulseEditImpact] = []
+    if target_port.kind == PORT_DIGITAL:
+        for period in working.periods:
+            working = set_digital_output(working, period.period_id, target_port.key, False)
+    else:
+        for period in tuple(working.periods):
+            result = set_analog_action(
+                working,
+                period.period_id,
+                target_port.key,
+                None,
+                cascade=True,
+            )
+            working = result.document
+            impacts.append(result.impact)
+
+    impact = _combine_impacts(impacts)
+    if impact.destructive and not cascade:
+        raise DestructivePulseEditError(impact)
+    return PulseEditResult(working, impact)
+
+
+def clear_pulse_schedule(
+    document: PulseDocument,
+    *,
+    cascade: bool = False,
+) -> PulseEditResult:
+    """Reset the schedule to the formal editor's single blank 1 us period.
+
+    Hardware identity, authored presentation labels, visible-row selection,
+    document name, and clock stay intact.  Periods, delays, bindings, frozen
+    scan data/provenance, and repeat are one authoritative destructive edit.
+    """
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    impact = PulseEditImpact(
+        removed_period_ids=tuple(period.period_id for period in document.periods),
+        removed_scan_parameters=tuple(
+            parameter.parameter_id for parameter in document.scan_parameters
+        ),
+        removed_scan_columns=(
+            () if document.scan_table is None else tuple(document.scan_table.columns)
+        ),
+        removed_api_parameters=tuple(
+            parameter.parameter_id for parameter in document.api_parameters
+        ),
+        repeat_before=document.repeat,
+        repeat_after=None,
+        repeat_members_before=_repeat_members(document.periods, document.repeat),
+        repeat_members_after=(),
+        scan_provenance_removed=document.scan_recipe is not None,
+    )
+    if impact.destructive and not cascade:
+        raise DestructivePulseEditError(impact)
+    blank = new_pulse_document(
+        document.target,
+        time_step_ns=document.time_step_ns,
+        name=document.name,
+        duration=1,
+        unit="us",
+    )
+    return PulseEditResult(
+        replace(blank, visible_ports=document.visible_ports),
+        impact,
+    )
+
+
+def _combine_impacts(impacts: Sequence[PulseEditImpact]) -> PulseEditImpact:
+    """Combine disjoint field-edit reports without inventing a second command model."""
+
+    values = tuple(impacts)
+    return PulseEditImpact(
+        removed_period_ids=tuple(
+            item for impact in values for item in impact.removed_period_ids
+        ),
+        removed_scan_parameters=tuple(
+            item for impact in values for item in impact.removed_scan_parameters
+        ),
+        removed_scan_columns=tuple(
+            item for impact in values for item in impact.removed_scan_columns
+        ),
+        removed_api_parameters=tuple(
+            item for impact in values for item in impact.removed_api_parameters
+        ),
+        repeat_before=next(
+            (impact.repeat_before for impact in values if impact.repeat_before is not None),
+            None,
+        ),
+        repeat_after=next(
+            (impact.repeat_after for impact in reversed(values) if impact.repeat_after is not None),
+            None,
+        ),
+        repeat_members_before=next(
+            (impact.repeat_members_before for impact in values if impact.repeat_members_before),
+            (),
+        ),
+        repeat_members_after=next(
+            (
+                impact.repeat_members_after
+                for impact in reversed(values)
+                if impact.repeat_members_after
+            ),
+            (),
+        ),
+        scan_provenance_removed=any(
+            impact.scan_provenance_removed for impact in values
+        ),
+    )
 
 
 def replace_field_binding(
@@ -1025,12 +1333,17 @@ __all__ = [
     "ScanParameterNormalization",
     "ScanNormalizationReport",
     "attach_scan_recipe",
+    "allocate_field_parameter_id",
+    "clear_port",
+    "clear_pulse_schedule",
+    "cycle_field_binding",
     "freeze_scan_table",
     "insert_period",
     "inspect_remove_period",
     "move_period",
     "new_pulse_document",
     "new_period",
+    "rename_port_label",
     "replace_field_binding",
     "remove_period",
     "replace_pulse_field",

@@ -401,7 +401,7 @@ class PanelEditor(QtWidgets.QWidget):
         """
 
         from zlc_frontend.panel_render import PanelComposer, PanelProvenance, PanelRenderError
-        from zlc_frontend.qt_widgets import QtImageBoard
+        from zlc_frontend.qt_widgets import FrozenRasterView
 
         card = self.card
         value = None if card is None else getattr(card, "_last_value", None)
@@ -409,7 +409,7 @@ class PanelEditor(QtWidgets.QWidget):
             self.status.setText("open the panel with data first")
             return
         if self._board is None:
-            self._board = QtImageBoard("edit-%x" % id(self), empty_text="no snapshot yet",
+            self._board = FrozenRasterView("edit-%x" % id(self), empty_text="no snapshot yet",
                                        zoomable=True)
             self.canvas_holder.addWidget(self._board)
         if self._composer is None:

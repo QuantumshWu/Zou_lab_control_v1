@@ -280,7 +280,7 @@ flat card border a sealed construction detail; do not replace the editor with pl
 
 ### Pulse GUI Layout Contract
 
-`PulseSequenceEditor` has **Edit / Preview / Scan** tabs.
+`PulseEditorWindowBody` has **Edit / Preview / Scan** tabs.
 
 - Edit: `Channel Names and Duration`, `Delay & Scan`, horizontal period-card
   timeline (not a grid), bottom `Control Buttons`, `Channel View`. The

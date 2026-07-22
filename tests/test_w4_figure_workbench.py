@@ -57,7 +57,7 @@ from zlc_frontend.figure import (
     suggest_view,
 )
 from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
-from zlc_frontend.qt_widgets import QtImageBoard, QtRasterBoard
+from zlc_frontend.qt_widgets import FrozenRasterView, QtRasterBoard
 from zlc_frontend.matplotlib_render import release_agg_figure
 from zlc_neutral_atom.readout.calibration import (
     GridOrder,
@@ -296,18 +296,18 @@ def test_shared_viewer_presents_one_coherent_multi_panel_front(
     figure = _faceted_curve_figure()
     assert len(figure.evaluated.layers[0].cells) == 2
     calls = []
-    original = QtImageBoard.present_encoded
+    original = FrozenRasterView.present_encoded
 
     def traced_present(self, payload, *, image_format="PNG"):
         calls.append((payload, image_format))
         return original(self, payload, image_format=image_format)
 
-    monkeypatch.setattr(QtImageBoard, "present_encoded", traced_present)
+    monkeypatch.setattr(FrozenRasterView, "present_encoded", traced_present)
     window = open_data_figure_workbench(figure)
     try:
         _until(application, lambda: window.raster_ready)
         summary = window.findChild(QtWidgets.QLabel, "figureViewerSummary").text()
-        board = window.findChild(QtImageBoard, "figureViewerBoard")
+        board = window.findChild(FrozenRasterView, "figureViewerBoard")
         assert "curve" in summary
         assert "2 panel(s)" in summary
         assert board.has_front
@@ -335,7 +335,7 @@ def test_memory_rejection_never_reaches_qt_decode(application, monkeypatch):
     def forbidden_decode(self, payload, *, image_format="PNG"):
         calls.append((self, payload, image_format))
 
-    monkeypatch.setattr(QtImageBoard, "present_encoded", forbidden_decode)
+    monkeypatch.setattr(FrozenRasterView, "present_encoded", forbidden_decode)
     monkeypatch.setattr(DataFigure, "to_png_bytes", lambda self, **kwargs: payload)
     window = open_data_figure_workbench(
         figure,
@@ -371,7 +371,7 @@ def test_physical_board_budget_is_checked_before_qt_decode(
         lambda self, **kwargs: one_pixel_png,
     )
     monkeypatch.setattr(
-        QtImageBoard,
+        FrozenRasterView,
         "present_encoded",
         lambda self, payload, *, image_format="PNG": calls.append(payload),
     )
@@ -404,7 +404,7 @@ def test_close_does_not_wait_for_an_inflight_render(
     # A faceted CURVE figure renders its multi-panel overview through the typed
     # grid entry point, so gate that renderer rather than the single-panel one.
     original = DataFigure.to_png_bytes_with_panel_regions
-    original_present = QtImageBoard.present_encoded
+    original_present = FrozenRasterView.present_encoded
 
     def gated_render(self, *args, **kwargs):
         render_calls.append(self)
@@ -423,7 +423,7 @@ def test_close_does_not_wait_for_an_inflight_render(
         present_calls.append((payload, image_format))
         return original_present(self, payload, image_format=image_format)
 
-    monkeypatch.setattr(QtImageBoard, "present_encoded", traced_present)
+    monkeypatch.setattr(FrozenRasterView, "present_encoded", traced_present)
     window = open_data_figure_workbench(_faceted_curve_figure())
     queued_window = None
     try:
@@ -717,7 +717,7 @@ def test_public_calibration_report_gui_loads_and_renders_off_qt_owner(
     owner_thread = threading.get_ident()
     loader_calls = []
     present_calls = []
-    original_present = QtImageBoard.present_encoded
+    original_present = FrozenRasterView.present_encoded
 
     def traced_load(self, candidate, *, memory_limit_bytes):
         loader_calls.append((threading.get_ident(), candidate, memory_limit_bytes))
@@ -732,7 +732,7 @@ def test_public_calibration_report_gui_loads_and_renders_off_qt_owner(
         "_load_calibration_report_source",
         traced_load,
     )
-    monkeypatch.setattr(QtImageBoard, "present_encoded", traced_present)
+    monkeypatch.setattr(FrozenRasterView, "present_encoded", traced_present)
     window = readout.calibration_report_gui(reference)
     try:
         _until(application, lambda: window.raster_ready, timeout=45.0)
@@ -768,7 +768,7 @@ def test_public_calibration_report_gui_loads_and_renders_off_qt_owner(
         assert all(payload.startswith(b"\x89PNG\r\n\x1a\n") for _thread, _name, payload in present_calls)
         assert all(
             board.has_front
-            for board in window.findChildren(QtImageBoard)
+            for board in window.findChildren(FrozenRasterView)
             if board.objectName().startswith("calibrationReportBoard_")
         )
         _close(application, window)

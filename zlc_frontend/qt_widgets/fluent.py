@@ -312,7 +312,7 @@ def _enable_ipython_qt_loop() -> None:
     """Under IPython/Jupyter, install the Qt event-loop hook (the ``%gui qt`` integration) so a
     Qt window opened from a cell keeps PROCESSING events -- it paints and stays responsive
     instead of appearing frozen -- because the kernel pumps Qt between cells.  Without this a
-    ``show_pulse_gui()`` / ``show_task_console()`` / ``exp.pulse_gui()`` window just hangs blank
+    ``launch_pulse_editor_window()`` / ``show_task_console()`` / ``exp.pulse_gui()`` window just hangs blank
     in a notebook.  No-op outside IPython (a script or pytest runs its own loop / is headless),
     and done once per process.  ``%matplotlib widget`` is independent of this -- they coexist."""
 

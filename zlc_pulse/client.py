@@ -12,6 +12,7 @@ from .artifact import CompiledPulseArtifact
 from .server import (
     PreparedPulseRef,
     PulseCompletion,
+    decode_continuous_failure_message,
     decode_completion_message,
     decode_prepared_ref_message,
     encode_artifact_message,
@@ -110,6 +111,7 @@ class RemotePulseExecutionClient:
             "current_prepare",
             "current_fire",
             "current_complete",
+            "current_wait_continuous_failure",
         ):
             if not callable(getattr(root, method, None)):
                 raise TypeError(f"pulse server connection is missing {method}()")
@@ -132,6 +134,7 @@ class RemotePulseExecutionClient:
         self._safe_state_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._closed = False
+        self._close_failure_summary: str | None = None
         snapshot = self.snapshot()
         self._generation = snapshot.connection_generation
 
@@ -148,10 +151,12 @@ class RemotePulseExecutionClient:
         except ImportError as exc:  # pragma: no cover - deployment dependency
             raise RuntimeError("remote pulse execution requires rpyc") from exc
         timeout = float(transport_timeout_seconds)
+        use_ipv6 = ":" in str(host)
         connection = rpyc.connect(
             host,
             int(port),
             config={"allow_public_attrs": True, "sync_request_timeout": timeout},
+            ipv6=use_ipv6,
         )
         interrupt_connection = None
         try:
@@ -159,6 +164,7 @@ class RemotePulseExecutionClient:
                 host,
                 int(port),
                 config={"allow_public_attrs": True, "sync_request_timeout": timeout},
+                ipv6=use_ipv6,
             )
             return cls(
                 connection,
@@ -230,6 +236,31 @@ class RemotePulseExecutionClient:
             raise RuntimeError("pulse completion belongs to another prepared reference")
         return completion
 
+    def wait_continuous_failure(
+        self,
+        reference: PreparedPulseRef,
+        *,
+        timeout: float,
+    ) -> str | None:
+        """Long-poll one backend-owned failure notification on the control lane."""
+
+        self._validate_reference(reference)
+        logical_timeout = float(timeout)
+        if not math.isfinite(logical_timeout) or logical_timeout <= 0.0:
+            raise ValueError("continuous failure wait timeout must be positive")
+        if logical_timeout >= self._transport_timeout:
+            raise ValueError(
+                "continuous failure wait must be shorter than the transport backstop"
+            )
+        return decode_continuous_failure_message(
+            bytes(
+                self._root.current_wait_continuous_failure(
+                    encode_prepared_ref_message(reference),
+                    logical_timeout,
+                )
+            )
+        )
+
     def safe_state(self, *, timeout: float | None = None) -> PulseServerSnapshot:
         """Enter SAFE through the interrupt connection within a logical deadline.
 
@@ -283,11 +314,35 @@ class RemotePulseExecutionClient:
         with self._safe_state_lock:
             with self._close_lock:
                 if self._closed:
+                    if self._close_failure_summary is not None:
+                        raise RuntimeError(
+                            "remote pulse client remains fail-closed after an "
+                            "unconfirmed shutdown: " + self._close_failure_summary
+                        )
                     return
+            failure: BaseException | None = None
             try:
                 self._safe_state_owned(self._transport_timeout * 0.9)
-            finally:
+            except BaseException as error:
+                failure = error
+            try:
                 self._close_connections()
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+                else:
+                    try:
+                        failure.add_note(
+                            "closing the remote pulse transports also failed: "
+                            f"{type(error).__name__}: {error}"
+                        )
+                    except BaseException:
+                        pass
+            if failure is not None:
+                summary = f"{type(failure).__name__}: {failure}"
+                with self._close_lock:
+                    self._close_failure_summary = summary
+                raise failure
 
     def _abort_connections(self) -> None:
         """Revoke both local transports without waiting for remote replies."""

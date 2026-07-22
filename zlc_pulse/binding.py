@@ -20,7 +20,22 @@ def bind_pulse_document_target(
     if not isinstance(target, PulseTarget):
         raise TypeError("target must be PulseTarget")
     if document.target.abi_fingerprint == target.abi_fingerprint:
-        return document if document.target is target else replace(document, target=target)
+        labels = {
+            port.key: port.label for port in document.target.ports
+        }
+        ports = tuple(
+            replace(port, label=labels[port.key]) for port in target.ports
+        )
+        bound_target = (
+            target
+            if ports == target.ports
+            else PulseTarget(target.raw_lanes, ports)
+        )
+        return (
+            document
+            if document.target is bound_target
+            else replace(document, target=bound_target)
+        )
     if document.target.raw_lanes != target.raw_lanes:
         raise ValueError("PulseDocument raw lane order differs from live target")
 
@@ -38,6 +53,24 @@ def bind_pulse_document_target(
     by_physical: dict[tuple[object, ...], list[PulsePortSpec]] = {}
     for port in target.ports:
         by_physical.setdefault(_physical_signature(target, port), []).append(port)
+
+    authored_labels: dict[str, str] = {}
+    for source in document.target.ports:
+        candidates = by_physical.get(
+            _physical_signature(document.target, source),
+            (),
+        )
+        if len(candidates) == 1:
+            authored_labels[candidates[0].key] = source.label
+    bound_ports = tuple(
+        replace(port, label=authored_labels.get(port.key, port.label))
+        for port in target.ports
+    )
+    bound_target = (
+        target
+        if bound_ports == target.ports
+        else PulseTarget(target.raw_lanes, bound_ports)
+    )
 
     referenced = set(document.visible_ports)
     referenced.update(
@@ -79,7 +112,7 @@ def bind_pulse_document_target(
         raise ValueError("two visible authoring ports collapse onto one live port")
     return replace(
         document,
-        target=target,
+        target=bound_target,
         visible_ports=rebound_visible,
         periods=tuple(
             replace(

@@ -3,7 +3,7 @@
 The pulse preview presents on the SAME QtRasterBoard as every other panel kind
 and its gestures run through the SAME numeric interaction owner: area select,
 wheel zoom and pan speak the CURVE intent vocabulary over a PulsePanelPayload
-whose viewport is the shared CurveViewportTransform.  This is the design's
+whose viewport is the shared NumericViewportTransform.  This is the design's
 "one selector owner, no second family" rule made mechanical: the payload rides
 the real ``render_pulse_timeline_panel`` output, the gestures are driven the
 way a person drives them, and every intent must come back typed and x-only.
@@ -18,24 +18,16 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
-def _pulse_panel():
-    from zlc_data import BlockId, DatasetRevision, DatasetRevisionRef, StreamGenerationId
-    from zlc_frontend.figure import DatasetId, EvaluatedInput
+def _pulse_panel(*, digest: str = "e" * 64):
     from zlc_frontend.matplotlib_render import render_pulse_timeline_panel
     from zlc_frontend.render import (
-        CoherenceStamp,
+        DocumentInputIdentity,
+        DocumentPresentationStamp,
         PanelFrame,
         PanelPresentationIdentity,
-        SourceIdentity,
     )
 
-    ref = DatasetRevisionRef(
-        BlockId("pulse-block"),
-        StreamGenerationId("pulse-generation"),
-        "e" * 64,
-        DatasetRevision(1),
-    )
-    evaluated_input = EvaluatedInput(DatasetId("pulse"), ref)
+    document_input = DocumentInputIdentity("pulse-document", 1, digest)
     raster, payload = render_pulse_timeline_panel(
         pulses=[dict(channel="ch00", start=0.0, stop=1e-3, name="cool"),
                 dict(channel="ch01", start=2e-4, stop=8e-4, name="probe")],
@@ -44,30 +36,18 @@ def _pulse_panel():
         total_duration=2e-3,
         title="preview",
         size="2x2",
-        evaluated_input=evaluated_input,
+        document_input=document_input,
     )
     presentation = PanelPresentationIdentity(
-        "pulse", "pulse-document", 0, 0, payload.viewport.display_revision
+        "pulse", "pulse-document", 1, 0, payload.viewport.display_revision
     )
-    stamp = CoherenceStamp(
-        "run",
-        "pulse-epoch-0",
-        "pulse-frame",
-        ref.schema_fingerprint,
-        "f" * 64,
-        (evaluated_input,),
-        (presentation,),
+    stamp = DocumentPresentationStamp(document_input, (presentation,))
+    return PanelFrame(
+        "pulse", "pulse", document_input, stamp, raster, payload
     )
-    source = SourceIdentity(
-        evaluated_input.dataset_id,
-        ref.block_id,
-        ref.stream_generation,
-        ref.schema_fingerprint,
-    )
-    return PanelFrame("pulse", "pulse", source, stamp, raster, payload)
 
 
-def _board(commands):
+def _board(commands, *, panel=None):
     from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
     from zlc_frontend.render import BoardFrame
 
@@ -75,7 +55,9 @@ def _board(commands):
     board = QtRasterBoard(("pulse",), columns=1)
     board.resize(600, 450)
     board.show()
-    board.present(BoardFrame("pulse-board", 0, 0, (_pulse_panel(),)))
+    board.present(BoardFrame(
+        "pulse-board", 0, 0, (_pulse_panel() if panel is None else panel,)
+    ))
     board.bind_pulse_interaction("pulse", commands.append)
     application.processEvents()
     return application, board
@@ -129,24 +111,24 @@ def _wheel(board, position, delta: int):
     return event
 
 
-def test_pulse_area_select_is_a_time_span_and_resolves_a_selection() -> None:
+def test_pulse_area_select_is_display_only_and_cannot_resolve_a_selection() -> None:
     """Left drag on the pulse preview emits a CurveRangeGesture whose x_span is
-    a real TIME span inside the drawn frame, resolvable to a Selection on the
-    time axis while the hold is alive; a degenerate click clears the span.
+    a real TIME span inside the drawn frame.  It remains display-only: pulse
+    documents have no dataset axis on which an authority Selection can exist.
+    A degenerate click clears the span.
     """
 
     from PyQt5 import QtCore, QtTest
-    from zlc_data import Selection
     from zlc_frontend.selector import CurveRangeGesture
 
     commands: list[object] = []
-    selections: list[Selection] = []
     application, board = _board(commands)
 
     def resolve(gesture):
         commands.append(gesture)
         if isinstance(gesture, CurveRangeGesture) and gesture.x_span is not None:
-            selections.append(board.selection_for_curve_range_gesture(gesture))
+            with pytest.raises(RuntimeError, match="display-only"):
+                board.selection_for_curve_range_gesture(gesture)
 
     board.unbind_pulse_interaction()
     board.bind_pulse_interaction("pulse", resolve)
@@ -169,7 +151,7 @@ def test_pulse_area_select_is_a_time_span_and_resolves_a_selection() -> None:
         assert x_low < span_low < span_high < x_high, (
             f"the selected span {gesture.x_span} must be a time range inside "
             f"the drawn frame {payload.viewport.x_limits}")
-        assert selections, "the completed span did not resolve to a Selection"
+        assert not hasattr(payload.viewport.x_axis, "axis_id")
         board.set_pulse_range_candidate(gesture.x_span)
         assert board._numeric_bindings["pulse"].applied_span == pytest.approx(
             gesture.x_span)
@@ -311,6 +293,214 @@ def test_pulse_area_box_is_data_anchored_and_double_middle_zooms_to_it() -> None
         rect_after = binding.span_rect
         assert rect_after is not None
         assert tuple(sorted((rect_after[0], rect_after[2]))) == pytest.approx(span)
+    finally:
+        board.close()
+        application.processEvents()
+
+
+def test_pulse_panel_is_strictly_document_backed_and_rejects_mixed_identity() -> None:
+    """No dataset/run/join identity may leak into a pulse document front."""
+
+    from dataclasses import replace
+
+    from zlc_data import (
+        BlockId,
+        DatasetRevision,
+        DatasetRevisionRef,
+        StreamGenerationId,
+    )
+    from zlc_frontend.figure import DatasetId, EvaluatedInput
+    from zlc_frontend.render import (
+        BoardFrame,
+        CoherenceStamp,
+        DocumentInputIdentity,
+        DocumentPresentationStamp,
+        PanelFrame,
+        PanelPresentationIdentity,
+        PulsePanelPayload,
+        SourceIdentity,
+    )
+    from zlc_frontend.selector import PanelInteractionOrigin
+
+    panel = _pulse_panel()
+    document = panel.source_identity
+    assert isinstance(document, DocumentInputIdentity)
+    assert isinstance(panel.coherence_stamp, DocumentPresentationStamp)
+    assert isinstance(panel.display_payload, PulsePanelPayload)
+    for forbidden in (
+        "dataset_id", "block_id", "stream_generation", "run_id",
+        "join_key_digest", "inputs",
+    ):
+        assert not hasattr(document, forbidden)
+        assert not hasattr(panel.coherence_stamp, forbidden)
+    assert not hasattr(panel.display_payload.viewport.x_axis, "axis_id")
+
+    changed = DocumentInputIdentity(
+        document.document_id, document.document_revision, "f" * 64
+    )
+    with pytest.raises(ValueError, match="payload differs"):
+        PanelFrame(
+            panel.panel_id,
+            panel.coherence_group,
+            document,
+            panel.coherence_stamp,
+            panel.raster,
+            replace(panel.display_payload, document_input=changed),
+        )
+    changed_stamp = DocumentPresentationStamp(
+        changed,
+        (
+            PanelPresentationIdentity(
+                panel.panel_id,
+                changed.document_id,
+                changed.document_revision,
+                0,
+                panel.display_payload.viewport.display_revision,
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="stamp differs"):
+        PanelFrame(
+            panel.panel_id,
+            panel.coherence_group,
+            document,
+            changed_stamp,
+            panel.raster,
+            panel.display_payload,
+        )
+    with pytest.raises(ValueError, match="document presentation identity"):
+        DocumentPresentationStamp(
+            document,
+            (
+                PanelPresentationIdentity(
+                    panel.panel_id,
+                    document.document_id,
+                    document.document_revision + 1,
+                    0,
+                    panel.display_payload.viewport.display_revision,
+                ),
+            ),
+        )
+    dataset_source = SourceIdentity(
+        DatasetId("not-a-pulse-document"),
+        BlockId("block"),
+        StreamGenerationId("generation"),
+        "b" * 64,
+    )
+    with pytest.raises(TypeError, match="families differ"):
+        PanelFrame(
+            panel.panel_id,
+            panel.coherence_group,
+            dataset_source,
+            panel.coherence_stamp,
+            panel.raster,
+            panel.display_payload,
+        )
+
+    dataset_ref = DatasetRevisionRef(
+        dataset_source.block_id,
+        dataset_source.stream_generation,
+        dataset_source.schema_fingerprint,
+        DatasetRevision(1),
+    )
+    dataset_input = EvaluatedInput(dataset_source.dataset_id, dataset_ref)
+    with pytest.raises(TypeError, match="document interaction"):
+        PanelInteractionOrigin(
+            panel.panel_id,
+            "board",
+            0,
+            0,
+            document,
+            panel.coherence_stamp.presentations[0],
+            dataset_input,
+        )
+    dataset_presentation = PanelPresentationIdentity(
+        "dataset", "figure-document", 1, 0, 0
+    )
+    dataset_stamp = CoherenceStamp(
+        "run", "epoch", "join", "c" * 64, "d" * 64,
+        (dataset_input,), (dataset_presentation,),
+    )
+    dataset_panel = PanelFrame(
+        "dataset", "mixed", dataset_source, dataset_stamp, panel.raster
+    )
+    with pytest.raises(ValueError, match="one exact"):
+        BoardFrame(
+            "board",
+            0,
+            0,
+            (dataset_panel, replace(panel, coherence_group="mixed")),
+        )
+
+
+def test_same_document_revision_with_changed_digest_makes_old_gesture_stale() -> None:
+    """The CAS includes content digest, not only a reusable revision label."""
+
+    from dataclasses import replace
+
+    from zlc_frontend.qt_widgets import SinglePanelHost, ensure_qt_app
+    from zlc_frontend.render import DocumentInputIdentity, DocumentPresentationStamp
+    from zlc_frontend.selector import CurveViewportCommit
+
+    application = ensure_qt_app()
+    host = SinglePanelHost("pulse")
+    first = _pulse_panel()
+    host.present_panel(first.raster, first.display_payload)
+    stale = host.visible_interaction_origin()
+    assert stale is not None
+    assert isinstance(
+        host.front_frame.panels[0].coherence_stamp,
+        DocumentPresentationStamp,
+    )
+
+    current_document = DocumentInputIdentity(
+        first.source_identity.document_id,
+        first.source_identity.document_revision,
+        "f" * 64,
+    )
+    current_payload = replace(
+        first.display_payload,
+        document_input=current_document,
+    )
+    host.present_panel(first.raster, current_payload)
+    current = host.visible_interaction_origin()
+    assert current is not None and current != stale
+    commit = CurveViewportCommit(
+        stale,
+        replace(
+            first.display_payload.viewport,
+            display_revision=first.display_payload.viewport.display_revision + 1,
+            x_limits=(2e-4, 8e-4),
+        ),
+    )
+    assert commit.origin != current
+    assert commit.origin.input_identity.content_digest == "e" * 64
+    assert current.input_identity.content_digest == "f" * 64
+    host.close()
+    application.processEvents()
+
+
+def test_document_digest_change_cancels_a_real_inflight_pulse_gesture() -> None:
+    """A drag cannot commit against a newer document with a reused revision."""
+
+    from PyQt5 import QtCore, QtTest
+    from zlc_frontend.render import BoardFrame
+
+    commands: list[object] = []
+    application, board = _board(commands)
+    try:
+        plot = _target(board).plot
+        start = _point(plot, 0.25, 0.5)
+        end = _point(plot, 0.75, 0.5)
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
+        _drag_move(board, end, QtCore.Qt.LeftButton)
+        assert board._selector_hold is not None
+
+        changed = _pulse_panel(digest="f" * 64)
+        board.present(BoardFrame("pulse-board", 0, 1, (changed,)))
+        assert board._selector_hold is None
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
+        assert commands == []
     finally:
         board.close()
         application.processEvents()

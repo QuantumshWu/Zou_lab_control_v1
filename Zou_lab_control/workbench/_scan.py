@@ -22,7 +22,7 @@ from zlc_frontend.qt_widgets import (
     GREEN,
     GREY,
     ORANGE,
-    QtImageBoard,
+    FrozenRasterView,
     QtOwnerWake,
     QtRasterBoard,
     WINDOW_SCREEN_FRACTION,
@@ -238,7 +238,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._projection = FluentLabel("Display: waiting for FINAL artifact", self)
         self._projection.setObjectName("projectionSummary")
         self._projection.setWordWrap(True)
-        self._raster = QtImageBoard(
+        self._raster = FrozenRasterView(
             "scan-final",
             self,
             empty_text="No FINAL result",

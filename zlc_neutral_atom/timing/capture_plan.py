@@ -247,7 +247,10 @@ def compile_capture_cell_plan(
 
     if not isinstance(artifact, CompiledPulseArtifact):
         raise TypeError("artifact must be CompiledPulseArtifact")
-    if artifact.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
+    if artifact.execution_form in (
+        PulseExecutionForm.CONTINUOUS_MONITOR,
+        PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
+    ):
         raise ValueError("continuous pulse execution has no finite capture cell plan")
     _text(trigger_channel, "trigger_channel")
     if not isinstance(dataset_schema, DatasetSchema):

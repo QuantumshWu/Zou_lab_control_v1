@@ -75,14 +75,14 @@ generated `impl_1\zlc_pulse_streamer_top.{bit,ltx}`.
 
 ## GUI Screenshot Checks
 
-When pulse GUI layout changes, verify the inner `PulseSequenceEditor` and the
+When Pulse GUI internals are split, verify the formal `PulseEditorWindowBody` and the
 outer `FluentWindow`.  Let Qt render before grabbing screenshots:
 
 ```python
 app.processEvents()
 QtTest.QTest.qWait(1000)
 app.processEvents()
-editor.grab_screenshot(path)
+body.window().grab().save(str(path))
 ```
 
 Object-level checks for button text, visible channels, labels, and geometry are

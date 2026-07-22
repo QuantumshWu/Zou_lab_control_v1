@@ -15,7 +15,7 @@ from typing import TypeAlias
 from zlc_storage import canonical_text, nonnegative_integer
 
 from .figure import EvaluatedInput
-from .curve_display import CurveViewportTransform
+from .curve_display import CurveViewportTransform, NumericViewportTransform
 from .display_range import optional_display_range, validated_display_range
 from .histogram_display import HistogramViewportTransform
 from .image_view import (
@@ -23,7 +23,11 @@ from .image_view import (
     NormalizedRectangle,
     validate_normalized_rectangle,
 )
-from .render import PanelPresentationIdentity, SourceIdentity
+from .render import (
+    DocumentInputIdentity,
+    PanelPresentationIdentity,
+    SourceIdentity,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,15 +62,20 @@ class RectangleGesture:
 
 @dataclass(frozen=True, slots=True)
 class PanelInteractionOrigin:
-    """The exact painted front against which one display intent was authored."""
+    """The exact painted front against which one display intent was authored.
+
+    Dataset and document identity are a closed, matched pair.  There is no
+    optional dataset provenance slot for document-backed surfaces to fake or
+    leave half-populated.
+    """
 
     panel_id: str
     board_id: str
     layout_generation: int
     sequence: int
-    source_identity: SourceIdentity
+    source_identity: SourceIdentity | DocumentInputIdentity
     presentation: PanelPresentationIdentity
-    evaluated_input: EvaluatedInput
+    input_identity: EvaluatedInput | DocumentInputIdentity
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "panel_id", canonical_text(self.panel_id, "panel_id"))
@@ -77,23 +86,46 @@ class PanelInteractionOrigin:
                 field,
                 nonnegative_integer(getattr(self, field), field),
             )
-        if not isinstance(self.source_identity, SourceIdentity):
-            raise TypeError("source_identity must be zlc_frontend.render.SourceIdentity")
+        if not isinstance(
+            self.source_identity, (SourceIdentity, DocumentInputIdentity)
+        ):
+            raise TypeError(
+                "source_identity must be SourceIdentity or DocumentInputIdentity"
+            )
         if not isinstance(self.presentation, PanelPresentationIdentity):
             raise TypeError(
                 "presentation must be zlc_frontend.render.PanelPresentationIdentity"
             )
         if self.presentation.panel_id != self.panel_id:
             raise ValueError("interaction presentation belongs to another panel")
-        if not isinstance(self.evaluated_input, EvaluatedInput):
-            raise TypeError("evaluated_input must be zlc_frontend.figure.EvaluatedInput")
-        if self.evaluated_input.dataset_id != self.source_identity.dataset_id:
+        if isinstance(self.source_identity, DocumentInputIdentity):
+            if not isinstance(self.input_identity, DocumentInputIdentity):
+                raise TypeError(
+                    "document interaction requires DocumentInputIdentity"
+                )
+            if self.input_identity != self.source_identity:
+                raise ValueError(
+                    "interaction document differs from its source identity"
+                )
+            if (
+                self.presentation.document_id
+                != self.source_identity.document_id
+                or self.presentation.document_revision
+                != self.source_identity.document_revision
+            ):
+                raise ValueError(
+                    "interaction presentation differs from its document identity"
+                )
+            return
+        if not isinstance(self.input_identity, EvaluatedInput):
+            raise TypeError("dataset interaction requires EvaluatedInput")
+        if self.input_identity.dataset_id != self.source_identity.dataset_id:
             raise ValueError("interaction input belongs to another dataset")
         if (
-            self.evaluated_input.ref.block_id != self.source_identity.block_id
-            or self.evaluated_input.ref.stream_generation
+            self.input_identity.ref.block_id != self.source_identity.block_id
+            or self.input_identity.ref.stream_generation
             != self.source_identity.stream_generation
-            or self.evaluated_input.ref.schema_fingerprint
+            or self.input_identity.ref.schema_fingerprint
             != self.source_identity.schema_fingerprint
         ):
             raise ValueError("interaction input differs from its source identity")
@@ -137,23 +169,38 @@ ImageInteractionCommit: TypeAlias = ImageViewportCommit | ImageColorLimitsCommit
 
 @dataclass(frozen=True, slots=True)
 class CurveViewportCommit:
-    """Request one display-only CURVE x viewport from an exact painted front."""
+    """Request one display-only numeric x viewport from an exact painted front.
+
+    Dataset curves retain their :class:`CurveViewportTransform`; a pulse
+    document uses the authority-free :class:`NumericViewportTransform`.
+    """
 
     origin: PanelInteractionOrigin
-    viewport: CurveViewportTransform
+    viewport: NumericViewportTransform
 
     def __post_init__(self) -> None:
         if not isinstance(self.origin, PanelInteractionOrigin):
             raise TypeError("origin must be PanelInteractionOrigin")
-        if not isinstance(self.viewport, CurveViewportTransform):
-            raise TypeError("viewport must be CurveViewportTransform")
+        if not isinstance(self.viewport, NumericViewportTransform):
+            raise TypeError("viewport must be NumericViewportTransform")
+        if isinstance(self.origin.source_identity, DocumentInputIdentity):
+            if type(self.viewport) is not NumericViewportTransform:
+                raise TypeError(
+                    "document viewport commit requires NumericViewportTransform"
+                )
+        elif not isinstance(self.viewport, CurveViewportTransform):
+            raise TypeError(
+                "dataset curve viewport commit requires CurveViewportTransform"
+            )
         if self.viewport.display_revision <= self.origin.presentation.panel_revision:
-            raise ValueError("curve viewport commit revision must exceed its painted origin")
+            raise ValueError(
+                "numeric viewport commit revision must exceed its painted origin"
+            )
 
 
 @dataclass(frozen=True, slots=True)
 class CurveRangeGesture:
-    """Set or clear one display-only x span; never an authority Selection."""
+    """Set or clear one display-only numeric x span; never an authority Selection."""
 
     origin: PanelInteractionOrigin
     x_span: tuple[float, float] | None

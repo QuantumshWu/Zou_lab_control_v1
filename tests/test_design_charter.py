@@ -27,7 +27,7 @@ QT_WIDGETS_LINE_CAP = 600
 #: fluent.py went 3736 -> 3748 in 1e0695a: its ``launch_fluent_window`` docstring claimed four
 #: ``show_*`` entry points including a device manager that cannot be built yet, and saying what
 #: the four actually are took twelve lines.  C6 wants that spelled out rather than absorbed.
-GRANDFATHERED = {"board.py": 4624, "fluent.py": 3748, "param_widgets.py": 774}
+GRANDFATHERED = {"board.py": 4515, "fluent.py": 3748, "param_widgets.py": 774}
 
 
 def test_the_charter_stays_short_enough_to_actually_read_every_round():

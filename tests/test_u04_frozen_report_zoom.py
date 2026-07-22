@@ -2,7 +2,7 @@
 
 The design allows exactly one frozen-raster exception - the multi-page
 calibration report - and it attaches a condition: `报告类多页至少补 zoom`
-(UX-003 and UX-006 both carry it).  `QtImageBoard` had no zoom at all, so a
+(UX-003 and UX-006 both carry it).  `FrozenRasterView` had no zoom at all, so a
 report page could only ever be read at whatever size the window happened to be.
 That is the one raster an operator cannot ask the system to re-render larger,
 which is what makes the omission a real loss rather than a cosmetic one.
@@ -21,7 +21,7 @@ import pytest
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
-from zlc_frontend.qt_widgets import QtImageBoard
+from zlc_frontend.qt_widgets import FrozenRasterView
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,14 +41,14 @@ def _png_bytes(width: int = 40, height: int = 20) -> bytes:
     return bytes(buffer.data())
 
 
-def _board(app, *, zoomable: bool) -> QtImageBoard:
-    board = QtImageBoard("page", zoomable=zoomable)
+def _board(app, *, zoomable: bool) -> FrozenRasterView:
+    board = FrozenRasterView("page", zoomable=zoomable)
     board.resize(400, 200)
     board.present_encoded(_png_bytes())
     return board
 
 
-def _wheel(board: QtImageBoard, steps: int, pos=None):
+def _wheel(board: FrozenRasterView, steps: int, pos=None):
     point = pos if pos is not None else board.rect().center()
     board.wheelEvent(
         QtGui.QWheelEvent(
@@ -104,7 +104,7 @@ def test_magnification_is_bounded(app):
     board = _board(app, zoomable=True)
     try:
         _wheel(board, 200)
-        assert board.view_scale == QtImageBoard.MAX_VIEW_SCALE
+        assert board.view_scale == FrozenRasterView.MAX_VIEW_SCALE
     finally:
         board.deleteLater()
 

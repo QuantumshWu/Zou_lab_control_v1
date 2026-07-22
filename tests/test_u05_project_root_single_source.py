@@ -49,9 +49,9 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 #: deleted along with the shell that used to hold it.
 SHELLS = [
     ("zlc_frontend/console_state.py", "task_files_dir", "TASK_FILES_ENV", "tasks"),
-    # The pulse editor moved whole into the plot_bridge zone; the claim is unchanged --
-    # ask the seam, never count your own parents -- so the entry follows the function.
-    ("zlc_workbench/pulse_editor/plot_bridge_pulse_gui.py", "_pulse_files_dir", "PULSE_FILES_ENV", "pulses"),
+    # The formal Pulse editor owns this one filesystem-facing helper; split
+    # views/controllers never derive a second project root.
+    ("zlc_workbench/pulse_editor/window.py", "_pulse_files_dir", "_PULSE_FILES_ENV", "pulses"),
 ]
 
 

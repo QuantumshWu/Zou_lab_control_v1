@@ -9,13 +9,16 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import deque
+import math
 from typing import Sequence
 
 from fpga.pulse_streamer.host.image import (
     StreamerParams,
     check_rtl_assumptions,
 )
+from zlc_storage import positive_real
 
+from .document import PulseDocument
 from .ir import TargetIR, evaluate_affine_tick
 from .target import PORT_CLOCK, PORT_DAC, PORT_DIGITAL, PulseTarget
 
@@ -23,6 +26,26 @@ from .target import PORT_CLOCK, PORT_DAC, PORT_DIGITAL, PulseTarget
 SCAN_READ_LATENCY_TICKS = 2
 SLOT_MULTIPLIER_WIDTH = 25
 COUNTER_LIMIT = (1 << 32) - 1
+
+
+def validate_pulse_document_clock_grid(
+    document: PulseDocument,
+    clock_hz: int | float,
+) -> float:
+    """Return the validated clock shared by preflight and the sole compiler."""
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    frequency = positive_real(clock_hz, "clock_hz")
+    step_ns = 1e9 / frequency
+    if not math.isclose(
+        document.time_step_ns,
+        step_ns,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("pulse document clock grid differs from compile clock")
+    return frequency
 
 
 def validate_target_ir_for_geometry(
@@ -689,5 +712,6 @@ def _effective_ticks(ir: TargetIR, point: Sequence[int]) -> tuple[int, ...]:
 __all__ = [
     "SCAN_READ_LATENCY_TICKS",
     "SLOT_MULTIPLIER_WIDTH",
+    "validate_pulse_document_clock_grid",
     "validate_target_ir_for_geometry",
 ]

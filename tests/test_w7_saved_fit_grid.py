@@ -71,7 +71,7 @@ from zlc_frontend.figure import (
     suggest_fit_view,
 )
 from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
-from zlc_frontend.qt_widgets import AxisLayoutNavigator, QtImageBoard, QtRasterBoard
+from zlc_frontend.qt_widgets import AxisLayoutNavigator, FrozenRasterView, QtRasterBoard
 from zlc_neutral_atom.artifacts import AdmittedCapture, FitResultRepository
 from zlc_neutral_atom.fit_reference import FitResultArtifactRef
 
@@ -1047,7 +1047,7 @@ def test_every_saved_1d_catalog_model_reopens_focuses_and_exports_without_refit(
         assert type(window).__name__ == "SavedFitGridWindow"
         assert window._model.model_id == model_id
         assert window._view_family == "encoded"
-        assert isinstance(window._encoded_board, QtImageBoard)
+        assert isinstance(window._encoded_board, FrozenRasterView)
         assert window._encoded_board.has_front
         assert window._current_encoded_bundle is not None
         assert window._page_encoded_bundle is window._current_encoded_bundle

@@ -325,6 +325,7 @@ class PulseDocument:
     visible_ports: tuple[str, ...] = ()
     delays: tuple[OutputDelay, ...] = ()
     repeat: RepeatRegion | None = None
+    scan_sweep_count: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _text(self.name, "pulse document name"))
@@ -418,6 +419,16 @@ class PulseDocument:
                 raise ValueError("repeat region references a missing period_id") from exc
             if end < start:
                 raise ValueError("repeat region end precedes its start")
+
+        object.__setattr__(
+            self,
+            "scan_sweep_count",
+            _integer(
+                self.scan_sweep_count,
+                "scan_sweep_count",
+                minimum=0,
+            ),
+        )
 
         scan_parameters = tuple(self.scan_parameters)
         if any(not isinstance(item, ScanParameter) for item in scan_parameters):
@@ -642,6 +653,7 @@ def pulse_document_to_tree(document: PulseDocument) -> dict[str, object]:
         "visible_ports": list(document.visible_ports),
         "delays": [_delay_to_tree(item) for item in document.delays],
         "repeat": None if document.repeat is None else _repeat_to_tree(document.repeat),
+        "scan_sweep_count": document.scan_sweep_count,
     }
 
 
@@ -659,6 +671,7 @@ def pulse_document_from_tree(tree: object) -> PulseDocument:
         "visible_ports",
         "delays",
         "repeat",
+        "scan_sweep_count",
     }
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("PulseDocument has an unknown field set")
@@ -692,6 +705,7 @@ def pulse_document_from_tree(tree: object) -> PulseDocument:
         visible_ports=tuple(tree["visible_ports"]),
         delays=tuple(_delay_from_tree(item) for item in tree["delays"]),
         repeat=None if repeat is None else _repeat_from_tree(repeat),
+        scan_sweep_count=tree["scan_sweep_count"],
     )
 
 

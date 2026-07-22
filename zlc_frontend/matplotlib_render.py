@@ -12,7 +12,7 @@ from numbers import Integral, Number
 
 import numpy as np
 
-from zlc_data import SCAN_POINT, AxisId, FitBatchStatus, FitResultBatch
+from zlc_data import FitBatchStatus, FitResultBatch
 from zlc_storage import nonnegative_integer, positive_integer
 
 from .figure import (
@@ -39,6 +39,8 @@ from .image_view import image_viewport_for_evaluated_image
 from .curve_display import (
     CurveDisplayState,
     CurveViewportTransform,
+    NumericDisplayAxis,
+    NumericViewportTransform,
     curve_home_x_limits,
     numeric_curve_coordinates,
 )
@@ -1067,6 +1069,7 @@ def _draw_pulse_timeline(
     scan_dac_segments=(),
     pixel_ratio: float = 1.0,
     x_limits=None,
+    screen_pixel_exact: bool = True,
 ):
     """Draw the pulse-timeline figure once -- the reference's faithful preview.
 
@@ -1111,19 +1114,33 @@ def _draw_pulse_timeline(
     from .render_style import (
         DESIGN_DPI, PALETTE, PANEL_DISPLAY_SCALE, PULSE_SCAN_ANNOTATION_COLOR,
         PULSE_SCAN_ANNOTATION_FONT_SIZE, PULSE_SCAN_REGION_COLOR, apply_title,
-        panel_figure_size_inches, smaller_fontsize,
+        panel_axes_bounds, panel_display_size, panel_figure_size_inches,
+        smaller_fontsize,
     )
 
     # The size PRESET is the one geometry knob: inches come from the frontend's single size source and
     # the raster dpi matches a panel's on-screen scale, so the emitted PNG is exactly the pixel box a
     # card of this size reserves (panel_display_size(size)) -- preview, Save Figure and a seeded panel
     # all agree, and a bigger preset yields a bigger picture.
-    size_inches = panel_figure_size_inches(size)
+    size_inches = panel_figure_size_inches(size, kind="pulse")
     # ``pixel_ratio`` is the caller's SCREEN device-pixel ratio: the reference
     # renders every on-screen Agg buffer at exactly the widget's device pixels
     # (design dpi x display scale x real screen ratio) so the blit is 1:1
     # crisp, never rendered at logical pixels and stretched up by Qt.
-    dpi = _render_dpi(DESIGN_DPI * PANEL_DISPLAY_SCALE * _render_dpi(pixel_ratio))
+    ratio = _render_dpi(pixel_ratio)
+    dpi = _render_dpi(DESIGN_DPI * PANEL_DISPLAY_SCALE * ratio)
+    if screen_pixel_exact:
+        # Qt scales a positive logical extent with qRound semantics (half up),
+        # while Matplotlib otherwise rounds each ``figsize * dpi`` edge by its
+        # own floating-point path.  At fractional DPR (notably 125/150/175%)
+        # those paths can differ by one physical pixel, forcing Qt to resample
+        # the entire preview and making text/lines look soft.  Freeze the
+        # existing logical panel size and make Agg's device raster exactly the
+        # physical box Qt will paint.  This changes no layout token or UI size.
+        logical_width, logical_height = panel_display_size(size, kind="pulse")
+        physical_width = max(1, math.floor(logical_width * ratio + 0.5))
+        physical_height = max(1, math.floor(logical_height * ratio + 0.5))
+        size_inches = (physical_width / dpi, physical_height / dpi)
     pulses = [dict(row) for row in pulses]
     channels = [str(channel) for channel in channels]
     labels = dict(channel_labels or {})
@@ -1165,9 +1182,13 @@ def _draw_pulse_timeline(
     if bracket_bounds:
         right_limit += span * 0.05
 
-    figure = Figure(figsize=size_inches, dpi=dpi, constrained_layout=True)
+    # The formal plot geometry is a pure function of size/kind tokens.  A
+    # viewport changes only xlim; it can never feed a layout solver.  This is
+    # the headless equivalent of the reference FigureSpec + Divider path and
+    # keeps axes, title and labels immobile through every live drag revision.
+    figure = Figure(figsize=size_inches, dpi=dpi, constrained_layout=False)
     FigureCanvasAgg(figure)
-    axis = figure.subplots()
+    axis = figure.add_axes(panel_axes_bounds(size, kind="pulse"))
     axis.set_ylabel("")
     baseline_offset = row_height / 2
     pulse_zorder = 3
@@ -1354,6 +1375,7 @@ def render_pulse_timeline_png(
                 scan_regions=scan_regions,
                 scan_dac_segments=scan_dac_segments,
                 pixel_ratio=pixel_ratio,
+                screen_pixel_exact=not export,
             )
             buffer = BytesIO()
             if export:
@@ -1381,7 +1403,7 @@ def render_pulse_timeline_panel(
     analog_traces=(),
     scan_regions=(),
     scan_dac_segments=(),
-    evaluated_input,
+    document_input,
     display_revision: int = 0,
     pixel_ratio: float = 1.0,
     x_limits=None,
@@ -1395,9 +1417,9 @@ def render_pulse_timeline_panel(
     as every other panel kind instead of a bespoke picture label.  Gestures are
     x-only (time), so the home limits pin to the drawn frame span.
 
-    ``evaluated_input`` is the caller-owned provenance (the pulse document /
-    editor state identity this picture was drawn from); the renderer only
-    forwards it into the payload, exactly like every other panel renderer.
+    ``document_input`` is the caller-owned exact pulse-document revision this
+    picture was drawn from.  It is forwarded without inventing dataset/run/
+    join/schema provenance.
     """
 
     figure = None
@@ -1446,15 +1468,8 @@ def render_pulse_timeline_panel(
             # The axis IDENTITY pins to the HOME (full-frame) span, never the
             # current zoomed view: hold matching and semantics checks compare
             # this axis, and a zoom must not read as a different panel.
-            time_axis = EvaluatedAxis(
-                AxisId("pulse.preview.time"),
-                "Time",
-                SCAN_POINT,
-                "s",
-                (0, 1),
-                (home_x_limits[0], home_x_limits[1]),
-            )
-            viewport = CurveViewportTransform(
+            time_axis = NumericDisplayAxis("pulse.preview.time", "Time", "s")
+            viewport = NumericViewportTransform(
                 time_axis,
                 int(display_revision),
                 plot_bounds,
@@ -1463,7 +1478,7 @@ def render_pulse_timeline_panel(
                 home_x_limits,
             )
             return raster, PulsePanelPayload(
-                evaluated_input, viewport, tuple(row_keys), tuple(row_labels))
+                document_input, viewport, tuple(row_keys), tuple(row_labels))
     finally:
         if figure is not None:
             release_agg_figure(figure)

@@ -5,8 +5,9 @@ from __future__ import annotations
 import math
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 from zlc_storage import (
     CanonicalDecodeLimits,
     CanonicalEncodingError,
@@ -59,6 +60,80 @@ _PULSE_TERMINAL_ACK_LIMITS = CanonicalDecodeLimits(
     max_total_array_bytes=0,
 )
 
+_CONTINUOUS_EXECUTION_FORMS = frozenset(
+    {
+        PulseExecutionForm.CONTINUOUS_MONITOR,
+        PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PulseScanProgress:
+    """One evidence-backed, read-only observation of an active scan table.
+
+    ``current_point_index`` is the row currently owned by the sequencer.  It is
+    deliberately not a completed-point or completed-sweep counter: the frozen
+    RTL does not expose either fact for a continuously wrapping table.
+    """
+
+    run_id: str
+    artifact_digest: str
+    point_count: int
+    current_point_index: int | None
+    backend_state: str
+    unavailable_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        _text(self.run_id, "pulse scan progress run_id")
+        _sha256(self.artifact_digest, "pulse scan progress artifact_digest")
+        if (
+            isinstance(self.point_count, bool)
+            or not isinstance(self.point_count, int)
+            or self.point_count < 0
+        ):
+            raise ValueError("pulse scan progress point_count must be non-negative")
+        _text(self.backend_state, "pulse scan progress backend_state")
+        if self.current_point_index is None:
+            if self.unavailable_reason is None:
+                raise ValueError("unavailable pulse scan progress requires a reason")
+            _text(
+                self.unavailable_reason,
+                "pulse scan progress unavailable_reason",
+            )
+            return
+        if self.unavailable_reason is not None:
+            raise ValueError("available pulse scan progress cannot carry a reason")
+        if (
+            isinstance(self.current_point_index, bool)
+            or not isinstance(self.current_point_index, int)
+            or not 0 <= self.current_point_index < self.point_count
+        ):
+            raise ValueError("pulse scan progress point index is outside the scan table")
+
+    @property
+    def available(self) -> bool:
+        return self.current_point_index is not None
+
+    @classmethod
+    def unavailable(
+        cls,
+        *,
+        run_id: str,
+        artifact_digest: str,
+        point_count: int,
+        backend_state: str,
+        reason: str,
+    ) -> "PulseScanProgress":
+        return cls(
+            run_id,
+            artifact_digest,
+            point_count,
+            None,
+            backend_state,
+            reason,
+        )
+
 
 def _require_terminal_ack_canonical_budget(value: "PulseTerminalAck") -> None:
     try:
@@ -79,7 +154,7 @@ class FinitePulseExecutionRequest:
 
     def __post_init__(self) -> None:
         _validate_execution_request(self.document, self.artifact)
-        if self.artifact.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
+        if self.artifact.execution_form in _CONTINUOUS_EXECUTION_FORMS:
             raise ValueError("finite pulse execution cannot use a continuous artifact")
         repeat = self.document.repeat
         expected_loop_count = 1 if repeat is None else repeat.count
@@ -103,16 +178,16 @@ class FinitePulseExecutionRequest:
 
 @dataclass(frozen=True)
 class ContinuousPulseExecutionRequest:
-    """One cyclic pulse that remains active until its Run is cancelled."""
+    """One cyclic pulse program that remains active until its Run is cancelled."""
 
     document: PulseDocument
     artifact: CompiledPulseArtifact
 
     def __post_init__(self) -> None:
         _validate_execution_request(self.document, self.artifact)
-        if self.artifact.execution_form is not PulseExecutionForm.CONTINUOUS_MONITOR:
+        if self.artifact.execution_form not in _CONTINUOUS_EXECUTION_FORMS:
             raise ValueError(
-                "continuous pulse execution requires a CONTINUOUS_MONITOR artifact"
+                "continuous pulse execution requires a cyclic continuous artifact"
             )
 
     @property
@@ -356,8 +431,8 @@ def validate_pulse_terminal_for_artifact(
         raise TypeError("acknowledgement must be PulseTerminalAck")
     if not isinstance(artifact, CompiledPulseArtifact):
         raise TypeError("artifact must be CompiledPulseArtifact")
-    if artifact.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
-        raise ValueError("continuous monitor cannot have a finite terminal receipt")
+    if artifact.execution_form in _CONTINUOUS_EXECUTION_FORMS:
+        raise ValueError("continuous pulse execution cannot have a finite terminal receipt")
     if acknowledgement.artifact_digest != artifact.fingerprint:
         raise ValueError("pulse terminal belongs to another compiled artifact")
     expected_counts = tuple(
@@ -485,6 +560,12 @@ def pulse_terminal_ack_from_tree(tree: object) -> PulseTerminalAck:
 class BoundPulsePort:
     capability_attestation: VerifiedDeviceCapability
     cleanup_operations: tuple[SafetyOperation, ...]
+    _scan_progress_reader: (
+        Callable[[str, str, str, int], PulseScanProgress] | None
+    ) = field(default=None, repr=False, compare=False)
+    _continuous_failure_waiter: (
+        Callable[[str, str, str, float], str | None] | None
+    ) = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         admit_bound_capability(
@@ -544,6 +625,69 @@ class BoundPulsePort:
         if request.artifact.wire_image.geometry_fingerprint != self.capability.geometry_fingerprint:
             raise ValueError("pulse request wire geometry differs from live sequencer")
         return PulseSession(self, request)
+
+    def observe_scan_progress(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        artifact_digest: str,
+        point_count: int,
+    ) -> PulseScanProgress:
+        """Observe only cached/backend-owned scan state; never drive timing."""
+
+        _text(session_id, "pulse session_id")
+        _text(run_id, "pulse run_id")
+        _sha256(artifact_digest, "pulse artifact_digest")
+        if (
+            isinstance(point_count, bool)
+            or not isinstance(point_count, int)
+            or point_count < 0
+        ):
+            raise ValueError("pulse scan point_count must be non-negative")
+        reader = self._scan_progress_reader
+        if reader is None:
+            return PulseScanProgress.unavailable(
+                run_id=run_id,
+                artifact_digest=artifact_digest,
+                point_count=point_count,
+                backend_state="UNAVAILABLE",
+                reason="bound sequencer has no scan-progress observation capability",
+            )
+        progress = reader(session_id, run_id, artifact_digest, point_count)
+        if not isinstance(progress, PulseScanProgress):
+            raise TypeError("scan-progress reader returned another value type")
+        if (
+            progress.run_id != run_id
+            or progress.artifact_digest != artifact_digest
+            or progress.point_count != point_count
+        ):
+            raise RuntimeError("scan-progress observation belongs to another execution")
+        return progress
+
+    def wait_continuous_failure(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        artifact_digest: str,
+        timeout: float,
+    ) -> str | None:
+        """Wait for failure notification only; this method never drives timing."""
+
+        _text(session_id, "pulse session_id")
+        _text(run_id, "pulse run_id")
+        _sha256(artifact_digest, "pulse artifact_digest")
+        wait_seconds = float(timeout)
+        if not math.isfinite(wait_seconds) or wait_seconds <= 0.0:
+            raise ValueError("continuous failure wait timeout must be positive")
+        waiter = self._continuous_failure_waiter
+        if waiter is None:
+            return "bound sequencer has no continuous failure notification capability"
+        failure = waiter(session_id, run_id, artifact_digest, wait_seconds)
+        if failure is not None:
+            _text(failure, "continuous pulse failure")
+        return failure
 
     def cleanup(self, context: RunContext, session_id: str) -> CleanupReport:
         device = context.cleanup_device(self.device.key)
@@ -727,6 +871,7 @@ __all__ = [
     "PreparePulseCommand",
     "PulseFiredAck",
     "PulsePreparedAck",
+    "PulseScanProgress",
     "PulseSession",
     "PulseTerminalAck",
     "PulseTerminalEvidenceKind",

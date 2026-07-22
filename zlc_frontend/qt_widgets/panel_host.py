@@ -21,12 +21,13 @@ from PyQt5 import QtCore, QtWidgets
 
 from ..render import (
     BoardFrame, CoherenceStamp, CurvePanelPayload, HistogramPanelPayload,
-    ImagePanelPayload, PanelFrame, PanelPresentationIdentity,
+    DocumentPresentationStamp, ImagePanelPayload, PanelFrame,
+    PanelPresentationIdentity,
     PulsePanelPayload, RasterBuffer, SourceIdentity)
 from ..selector import (
     CurveRangeGesture, CurveViewportCommit, HistogramRangeGesture,
     HistogramThresholdCommit, HistogramViewportCommit, ImageColorLimitsCommit,
-    ImageViewportCommit)
+    ImageViewportCommit, PanelInteractionOrigin)
 from .board import QtRasterBoard
 
 
@@ -40,13 +41,15 @@ class SinglePanelHost(QtWidgets.QWidget):
     CURVE intent vocabulary, histogram its own -- and completed gestures come
     back as signals:
 
-    * ``rangeSelected(object)``  -- an area drag's x-span (or ``None`` for a
-      degenerate click).  The host already echoed the display-only candidate
-      onto the board; the window decides what the selection MEANS.
-    * ``viewCommitted(object)``  -- a wheel-zoom / pan commit's candidate
-      viewport.  The window re-renders at ``candidate.x_limits`` and calls
+    * ``rangeSelected(object)``  -- the complete range gesture, including the
+      exact painted origin.  The host already echoed its display-only span onto
+      the board; the window decides what the selection MEANS.
+    * ``viewCommitted(object)``  -- the complete wheel-zoom / pan commit.  The
+      window first CAS-checks ``commit.origin``, re-renders at
+      ``commit.viewport.x_limits``, and calls
       :meth:`present_panel` again with ``display_revision =
-      candidate.display_revision`` so the accepted front matches the intent.
+      commit.viewport.display_revision`` so the accepted front matches the
+      intent.  No signal strips provenance down to a tuple or transform.
     """
 
     rangeSelected = QtCore.pyqtSignal(object)
@@ -101,23 +104,54 @@ class SinglePanelHost(QtWidgets.QWidget):
         if self._bound_kind is not None:
             self._board.set_selectors_enabled(self._selectors_on)
 
+    def visible_interaction_origin(self) -> PanelInteractionOrigin | None:
+        """Return the exact painted origin for this host's bound family.
+
+        Family dispatch belongs here because the host owns the binding kind.
+        Callers therefore perform one origin CAS without reaching into four
+        separate board APIs or guessing the payload family from a transform.
+        """
+
+        if self._bound_kind == "image":
+            return self._board.visible_image_origin(self._panel_id)
+        if self._bound_kind == "curve":
+            return self._board.visible_curve_origin(self._panel_id)
+        if self._bound_kind == "histogram":
+            return self._board.visible_histogram_origin(self._panel_id)
+        if self._bound_kind == "pulse":
+            return self._board.visible_pulse_origin(self._panel_id)
+        return None
+
+    def discard_pending_interaction(self, origin: PanelInteractionOrigin) -> bool:
+        """Release only the exact failed display commit for this host."""
+
+        if not isinstance(origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
+        if self._bound_kind == "image":
+            return self._board.discard_pending_image_interaction(origin)
+        if self._bound_kind == "curve":
+            return self._board.discard_pending_curve_interaction(origin)
+        if self._bound_kind == "histogram":
+            return self._board.discard_pending_histogram_interaction(origin)
+        if self._bound_kind == "pulse":
+            return self._board.discard_pending_pulse_interaction(origin)
+        return False
+
     def present_panel(self, raster: RasterBuffer, payload, *,
                       pixel_ratio: float = 1.0) -> tuple[int, int]:
         """Present one rendered panel as a coherent frame; returns the LOGICAL size.
 
-        Every identity fact is DERIVED from the payload itself -- the
-        provenance is ``payload.evaluated_input`` (its revision is the content
-        revision, its schema fingerprint the stamp fingerprint) and the panel
-        revision is the viewport's display revision -- so a window cannot hand
-        the board a frame whose identity disagrees with its own payload.
+        Every identity fact is DERIVED from the payload itself.  Dataset panels
+        mint a :class:`CoherenceStamp`; a pulse-document panel mints a
+        :class:`DocumentPresentationStamp` and never fabricates dataset/run/
+        join/schema identity.  In both families the panel revision is the
+        viewport's display revision, so a window cannot hand the board a frame
+        whose identity disagrees with its payload.
         ``pixel_ratio`` is the screen ratio the raster was rendered at: the
         widget pins to the LOGICAL size so the whole-cell blit lands 1:1 on
         device pixels.
         """
 
-        provenance = payload.evaluated_input
-        fingerprint = provenance.ref.schema_fingerprint
-        content_revision = int(provenance.ref.revision.value)
         if isinstance(payload, ImagePanelPayload):
             display_revision = int(payload.viewport.viewport_revision)
         elif isinstance(
@@ -129,23 +163,42 @@ class SinglePanelHost(QtWidgets.QWidget):
                 "SinglePanelHost requires an interactive image, curve, "
                 "histogram, or pulse payload"
             )
-        presentation = PanelPresentationIdentity(
-            self._panel_id, self._group, content_revision, 0, display_revision)
-        stamp = CoherenceStamp(
-            self._group,
-            f"{self._panel_id}-epoch-{display_revision}",
-            f"{self._panel_id}-frame-{display_revision}",
-            fingerprint,
-            fingerprint,
-            (provenance,),
-            (presentation,),
-        )
-        source = SourceIdentity(
-            provenance.dataset_id,
-            provenance.ref.block_id,
-            provenance.ref.stream_generation,
-            fingerprint,
-        )
+        if isinstance(payload, PulsePanelPayload):
+            source = payload.document_input
+            presentation = PanelPresentationIdentity(
+                self._panel_id,
+                source.document_id,
+                source.document_revision,
+                0,
+                display_revision,
+            )
+            stamp = DocumentPresentationStamp(source, (presentation,))
+        else:
+            provenance = payload.evaluated_input
+            fingerprint = provenance.ref.schema_fingerprint
+            content_revision = int(provenance.ref.revision.value)
+            presentation = PanelPresentationIdentity(
+                self._panel_id,
+                self._group,
+                content_revision,
+                0,
+                display_revision,
+            )
+            stamp = CoherenceStamp(
+                self._group,
+                f"{self._panel_id}-epoch-{display_revision}",
+                f"{self._panel_id}-frame-{display_revision}",
+                fingerprint,
+                fingerprint,
+                (provenance,),
+                (presentation,),
+            )
+            source = SourceIdentity(
+                provenance.dataset_id,
+                provenance.ref.block_id,
+                provenance.ref.stream_generation,
+                fingerprint,
+            )
         panel = PanelFrame(
             self._panel_id, self._group, source, stamp, raster, payload)
         self._sequence += 1
@@ -230,16 +283,16 @@ class SinglePanelHost(QtWidgets.QWidget):
     def _on_intent(self, intent) -> None:
         if isinstance(intent, (CurveRangeGesture, HistogramRangeGesture)):
             self._echo_range_candidate(intent.x_span)
-            self.rangeSelected.emit(intent.x_span)
+            self.rangeSelected.emit(intent)
             return
         if isinstance(intent, (CurveViewportCommit, HistogramViewportCommit)):
-            self.viewCommitted.emit(intent.viewport)
+            self.viewCommitted.emit(intent)
             return
         if isinstance(intent, HistogramThresholdCommit):
-            self.thresholdsCommitted.emit(intent.thresholds)
+            self.thresholdsCommitted.emit(intent)
             return
         if isinstance(intent, ImageViewportCommit):
-            self.viewCommitted.emit(intent.viewport)
+            self.viewCommitted.emit(intent)
             return
         if isinstance(intent, ImageColorLimitsCommit):
-            self.colorLimitsCommitted.emit(intent.color_limits)
+            self.colorLimitsCommitted.emit(intent)
