@@ -4,8 +4,9 @@ Put the files that change **per board / per wiring / per machine** here. They ar
 intentionally separate from the RTL and the host code so you can reconfigure for a
 different FPGA board or cabling without touching anything else.
 
-This is the sole in-repository default. `ZLC_PS_XDC` may explicitly override it
-with an external board file.
+This is the sole in-repository default. `ZLC_PS_XDC` may explicitly select an
+external board file for the FPGA build; it is not a client-side Remote-GUI
+override.
 
 ## What goes in here
 
@@ -16,7 +17,8 @@ on your board, plus the input clock. The shipped default is the 62-output addres
 board map. It defines, by port name:
 
 - the **62 TTL outputs** (named: `trap`, `cooling`, `probe`, `repump`, `trig`,
-  `emCCD`, the shutters, etc. — these names become the GUI/API channel labels),
+  `emCCD`, the shutters, etc. — these names are projected into the deployed
+  `PulseTarget` used by the GUI/API),
 - the **DAC clock(s)** (`da_clk[...]`) and any analog-bus pins,
 - the input **`clk`** and the `GND`/unused pins.
 
@@ -74,7 +76,11 @@ Two options:
    - PowerShell: `$env:ZLC_PS_XDC = "C:\path\to\your_board.xdc"`
    - cmd: `set ZLC_PS_XDC=C:\path\to\your_board.xdc`
 
-`ZLC_PS_XDC`, when set, overrides this folder everywhere.
+After changing boards, produce a canonical `PulseTarget` from that exact XDC and
+start the server with `ZLC_PS_TARGET` pointing at it.  The Remote GUI deliberately
+does not read its local XDC: it accepts the target published by the server, because
+the client and the physical board may be on different machines.  Package pins stay
+deployment/bitstream facts; pulse execution addresses the target's ordered raw lanes.
 
 ## Environment overrides (so a moved board / Vivado / part never hard-breaks)
 
@@ -82,7 +88,8 @@ All optional — set only what differs from the defaults:
 
 | variable | overrides | used by |
 |---|---|---|
-| `ZLC_PS_XDC` | the board pin map path | build, server, GUI, host inference |
+| `ZLC_PS_XDC` | the board pin map path | FPGA build and build-time inference |
+| `ZLC_PS_TARGET` | canonical target paired with the deployed bitstream/XDC | `fpga/run_server.bat`; published to Remote clients in the server snapshot |
 | `ZLC_PS_CONFIG` | the `streamer_config.json` path | host validation/estimate, `estimate_resources.bat` |
 | `ZLC_PS_FPGA_PART` | the synthesis part (else read from `streamer_config.json`) | `create_project.tcl`, capacity estimate |
 | `ZLC_PS_VIVADO_BIN` | the `vivado.bat` path | build + server |
@@ -94,13 +101,17 @@ different Artix-7 retargets the build without editing the `.tcl`.
 
 ## Who reads this folder
 
-`board.xdc` (search order: `ZLC_PS_XDC` env → this file):
+`board.xdc`:
 
 - `fpga/pulse_streamer/create_project.tcl` (the Vivado build)
 - `fpga/build_and_program.bat` (build + program)
-- `fpga/run_server.bat` (channel-count inference for the server)
-- `Zou_lab_control/neutral_atom/devices/fpga_pulse_streamer.py` (`_resolve_xdc_path`)
-- `pulse_gui.py` (standalone GUI default channel map)
+- `zlc_neutral_atom.timing.board_config.load_board_config` (explicit projection and
+  checked-in topology contract; its default is this in-repository file)
+
+`fpga/run_server.bat` instead loads `ZLC_PS_TARGET` (default:
+`zlc_pulse/assets/deployed_target.json`) and publishes that exact target to Remote
+clients.  The checked-in architecture test requires the default target to equal the
+default XDC's lane/name/bus projection as a whole.
 
 `streamer_config.json` (search order: `ZLC_PS_CONFIG` env → cwd → this file):
 
