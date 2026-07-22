@@ -165,6 +165,19 @@ def _row_spacing() -> int:
     return _px(CHANNEL_ROW_SPACING, minimum=3)
 
 
+def _row_region_vmetrics() -> tuple[int, int]:
+    """(top margin, inter-row spacing) of the channel-row column -- ONE vertical geometry.
+
+    Port Catalog, Delay/Scan and every Period card stack the SAME row list under the same
+    fixed-height header, and the operator reads those rows ACROSS -- so all three layouts
+    must advance by the same pitch.  A card that wrote its own (compact) margins/spacing
+    literals shaved 2 px per row against the panels and was 47 px off by the last of 22
+    rows; deriving all three from here makes that drift structurally impossible.
+    """
+
+    return _px(8), _row_spacing()
+
+
 def _channel_label_width() -> int:
     return _px(CHANNEL_LABEL_WIDTH, minimum=84)
 
@@ -687,9 +700,15 @@ class PeriodCard(FluentGroupBox):
         control_width = _period_control_width(card_width)
 
         column = QtWidgets.QVBoxLayout(self)
+        # The horizontal pad may tighten in compact mode (width is the card's own
+        # business), but the VERTICAL geometry -- top margin and inter-row spacing --
+        # is the shared row-region metric (_row_region_vmetrics), the same one the
+        # Port Catalog and Delay/Scan panels read: rows are read ACROSS the three
+        # columns, so all three must advance by the same pitch.
         pad = _px(4, minimum=2) if compact else _px(6, minimum=3)
-        column.setContentsMargins(pad, pad, pad, pad)
-        column.setSpacing(_px(2, minimum=1) if compact else _px(4, minimum=2))
+        row_top, row_gap = _row_region_vmetrics()
+        column.setContentsMargins(pad, row_top, pad, pad)
+        column.setSpacing(row_gap)
         self.set_period_position(index, total_periods)
 
         # --- period parameters, in a FIXED-HEIGHT header (Duration label, duration,
@@ -759,8 +778,13 @@ class PeriodCard(FluentGroupBox):
         self.unit_combo.currentTextChanged.connect(self._handle_unit)
         self.unit_combo.currentTextChanged.connect(lambda *_: self.changed.emit())
 
-        # --- one row per visible logical port, in catalog order
+        # --- one row per visible logical port, in catalog order.  EVERY row is pinned to
+        # the shared _channel_row_height: the row pitch (height + spacing) must equal the
+        # Name/Delay panels' exactly, or the columns drift apart row by row.  A natural
+        # (unpinned) widget height only happens to match today and would drift with any
+        # style change.
         channel_index = {channel: position for position, channel in enumerate(channels)}
+        row_height = _channel_row_height(len(rows))
         for row in rows:
             key = str(row["key"])
             label = str(labels.get(key, row.get("label") or row.get("name") or key))
@@ -768,11 +792,12 @@ class PeriodCard(FluentGroupBox):
             if str(row.get("kind")) == "bus":
                 column.addWidget(self._build_bus_row(
                     str(row["name"]), label, members, period, channel_index,
-                    state, index, compact))
+                    state, index, compact, row_height))
                 continue
             lane = members[0] if members else key
             check = FluentCheckBox(label)
             check.setToolTip(label if compact else f"{label}: high for this whole period")
+            check.setFixedHeight(row_height)
             position = channel_index.get(lane)
             check.setChecked(bool(position is not None and period.states[position]))
             check.toggled.connect(lambda *_: self.changed.emit())
@@ -782,7 +807,8 @@ class PeriodCard(FluentGroupBox):
 
     def _build_bus_row(self, bus_name: str, label: str, members: Sequence[str],
                        period: PulsePeriod, channel_index: Mapping[str, int],
-                       state: PulseTableState, index: int, compact: bool) -> QtWidgets.QWidget:
+                       state: PulseTableState, index: int, compact: bool,
+                       row_height: int) -> QtWidgets.QWidget:
         """A DAC bus as ONE row: a mode and a value, not its individual lanes.
 
         The operator sets an integer; the lanes are how the compiler carries it.
@@ -811,7 +837,11 @@ class PeriodCard(FluentGroupBox):
         mode = str((entry or {}).get("mode", "hold"))
         stored = (entry or {}).get("value")
 
+        # The bus row is pinned to the SAME row height as every channel row (the combo and
+        # value edit override their taller natural minimums), so the DAC rows keep the
+        # Name/Delay panels' pitch and the columns stay aligned past them.
         row = QtWidgets.QWidget()
+        row.setFixedHeight(row_height)
         layout = QtWidgets.QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(_px(3, minimum=2))
@@ -821,6 +851,7 @@ class PeriodCard(FluentGroupBox):
         combo.addItems([_bus_mode_title(name) for name in ("edge", "ramp", "hold")])
         combo.setCurrentText(_bus_mode_title(mode))
         combo.setToolTip("Edge / Ramp apply this period's value; Hold carries the previous one")
+        combo.setFixedHeight(row_height)
         self.bus_mode_combos[bus_name] = combo
         layout.addWidget(combo, 0)
 
@@ -845,6 +876,7 @@ class PeriodCard(FluentGroupBox):
             tooltip=f"{label}: signed integer {lo}..{hi} (0 = 0 V); "
                     "click the dot to cycle scan (sN) -> API (aN) -> off")
         edit_field.set_numeric_validator("int", bottom=lo, top=hi)
+        edit_field.setFixedHeight(row_height)
         edit_field.scanClicked.connect(lambda name=bus_name: self.busScanRequested.emit(name))
         self.bus_value_edits[bus_name] = edit_field
         self.bus_dots[bus_name] = edit_field.dot
@@ -1282,8 +1314,9 @@ class ChannelNamesPanel(FluentGroupBox):
         self.setMaximumWidth(panel_w)
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(_px(8), _px(8), _px(8), _px(8))
-        layout.setSpacing(_row_spacing())
+        row_top, row_gap = _row_region_vmetrics()
+        layout.setContentsMargins(_px(8), row_top, _px(8), _px(8))
+        layout.setSpacing(row_gap)
 
         top = QtWidgets.QWidget()
         top.setStyleSheet("background: transparent;")
@@ -1379,8 +1412,9 @@ class ChannelPanel(FluentGroupBox):
         self.setMaximumWidth(content_w)
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(_px(8), _px(8), _px(8), _px(8))
-        layout.setSpacing(_row_spacing())
+        row_top, row_gap = _row_region_vmetrics()
+        layout.setContentsMargins(_px(8), row_top, _px(8), _px(8))
+        layout.setSpacing(row_gap)
 
         top = QtWidgets.QWidget()
         top.setStyleSheet("background: transparent;")

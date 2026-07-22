@@ -67,3 +67,46 @@ def test_period_checkboxes_line_up_with_the_channel_delay_rows(editor):
     assert not skewed, (
         "the Period checkboxes do not line up with the channel delay rows:\n"
         + "\n".join(skewed))
+
+
+def _row_centre_y(widget) -> float:
+    return _top_y(widget) + widget.height() / 2.0
+
+
+def test_every_row_stays_aligned_in_the_show_all_compact_view(editor, application):
+    """ALL 22 rows -- 18 digital channels AND the 4 DAC bus rows -- line up in Show All.
+
+    The regression this pins: the panels advanced 25 px per row while the (compact)
+    period card advanced 23 -- its own margins/spacing literals -- so the columns
+    drifted 2 px per row and the LAST row was 47 px off.  The row-region vertical
+    geometry is now one source (``_row_region_vmetrics``) and every card row is pinned
+    to the shared row height, so the skew must stay within rounding for every row.
+    """
+
+    from zlc_neutral_atom.timing.ports import PORT_CLOCK
+
+    state = editor.read_state()
+    state.visible_ports = [
+        port.key for port in state.port_catalog.ports if port.kind != PORT_CLOCK]
+    editor.load_state(state)
+    for _ in range(10):
+        application.processEvents()
+
+    names = editor.names_panel.raw_label_widgets
+    card = editor.drag_container.pulse_cards()[0]
+    rows_checked = 0
+    skewed = []
+    for key, name_widget in names.items():
+        if key in card.checks:
+            other = card.checks[key]
+        elif key.startswith("bus:") and key[4:] in card.bus_mode_combos:
+            other = card.bus_mode_combos[key[4:]].parentWidget()
+        else:
+            continue
+        rows_checked += 1
+        dy = _row_centre_y(other) - _row_centre_y(name_widget)
+        if abs(dy) > 2.5:
+            skewed.append(f"{key}: {dy:+.1f} px")
+    assert rows_checked >= 20, f"only {rows_checked} rows were compared -- the probe is broken"
+    assert not skewed, (
+        "rows drift apart in the Show All (compact) view:\n" + "\n".join(skewed))
