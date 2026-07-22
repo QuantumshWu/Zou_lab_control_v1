@@ -61,6 +61,21 @@ def test_the_preview_plot_is_not_collapsed_to_a_sliver(preview_editor):
         f"the plot is {pixmap.height()} px tall but the label shows only {label.height()} px")
 
 
+def test_the_preview_status_reads_like_the_reference(preview_editor):
+    """The status line names how many channels were drawn, out of how many exist,
+    the mode, and the repeat -- the same wording main shows (``N/M plotted
+    (active channels) | repeat …``), NOT a bare ``us, periods`` blurb.
+    """
+
+    import re
+
+    text = preview_editor.preview_status.text()
+    assert re.fullmatch(
+        r"\d+/\d+ plotted \((active|all) channels\) \| repeat (∞|\d+)", text), (
+        f"the preview status {text!r} does not match the reference wording "
+        "'N/M plotted (active channels) | repeat …'")
+
+
 def test_the_preview_y_axis_uses_board_names_not_raw_lane_keys(preview_editor):
     state = preview_editor.read_state()
     snapshot, _channels = preview_editor._preview_snapshot(state, include_always_off=False)

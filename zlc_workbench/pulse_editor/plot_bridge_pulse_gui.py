@@ -446,6 +446,16 @@ def _display_row_label(row: Mapping[str, object], labels: Mapping[str, str] | No
     return str((labels or {}).get(key) or row.get("label") or key)
 
 
+def _repeat_summary_text(state: "PulseTableState") -> str:
+    """How the program's repeat is phrased everywhere it is shown.
+
+    ``repeat ∞`` for a forever program, ``repeat N`` for a finite one -- the header
+    summary and the Preview status must not word this differently, so both read it here.
+    """
+
+    return "repeat ∞" if state.repeat_forever else f"repeat {int(state.repeat_count)}"
+
+
 def _summary_time_text(value_ns: float) -> str:
     value_ns = float(value_ns)
     # Largest-unit-first table derived from the single source UNITS_TO_NS, skipping the
@@ -3851,7 +3861,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 f"step {state.time_step_ns:g} ns",
                 f"{total_ns:.3g} ns",
                 f"{pulse_count} pulses",
-                "repeat ∞" if state.repeat_forever else "single",
+                _repeat_summary_text(state),
             ]
             if state.scan_slots:
                 parts.append(f"scan {len(state.scan_slots)} slots × {len(state.scan_table)} pts")
@@ -4122,8 +4132,16 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             pixmap.width() + margins.left() + margins.right(),
             pixmap.height() + margins.top() + margins.bottom())
         self._preview_dirty = False
+        # Match the reference wording exactly (C22): "N/M plotted (active channels) | repeat …".
+        # N = channels the render drew, M = programmable (non-clock) ports, and the mode names
+        # whether off rows were included -- so the operator reads the same status main shows.
+        include_off = bool(getattr(self, "preview_include_off", None)
+                           and self.preview_include_off.isChecked())
+        _snapshot, drawn = self._preview_snapshot(state, include_always_off=include_off)
+        total = sum(1 for port in state.port_catalog.ports if port.kind != PORT_CLOCK)
+        mode = "all channels" if include_off else "active channels"
         self.preview_status.setText(
-            f"{state.total_duration_ns() / 1000.0:.4g} us, {len(state.periods)} periods")
+            f"{len(drawn)}/{total} plotted ({mode}) | {_repeat_summary_text(state)}")
 
     def _apply_scan_state_in_place(self, state: PulseTableState) -> bool:
         """Whether a scan toggle can be absorbed without rebuilding the cards.
