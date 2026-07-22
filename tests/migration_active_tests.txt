@@ -77,6 +77,7 @@ tests/test_u04_scan_capacity_refusal.py
 tests/test_u04_settings_popup_anchor.py
 tests/test_u04_signal_picker_owner.py
 tests/test_u04_status_strip_priority.py
+tests/test_u04_task_console_panel_host.py
 tests/test_u04_task_console_multi_card.py
 tests/test_u04_workspace_bootstrap.py
 tests/test_u05_board_layout.py

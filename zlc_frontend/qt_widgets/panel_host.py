@@ -118,7 +118,17 @@ class SinglePanelHost(QtWidgets.QWidget):
         provenance = payload.evaluated_input
         fingerprint = provenance.ref.schema_fingerprint
         content_revision = int(provenance.ref.revision.value)
-        display_revision = int(payload.viewport.display_revision)
+        if isinstance(payload, ImagePanelPayload):
+            display_revision = int(payload.viewport.viewport_revision)
+        elif isinstance(
+            payload, (CurvePanelPayload, HistogramPanelPayload, PulsePanelPayload)
+        ):
+            display_revision = int(payload.viewport.display_revision)
+        else:
+            raise TypeError(
+                "SinglePanelHost requires an interactive image, curve, "
+                "histogram, or pulse payload"
+            )
         presentation = PanelPresentationIdentity(
             self._panel_id, self._group, content_revision, 0, display_revision)
         stamp = CoherenceStamp(

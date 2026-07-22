@@ -366,6 +366,11 @@ class PanelCard(FluentGroupBox):
         # Bumped by every display-knob edit.  The renderer reads it to tell a
         # genuinely new display from a repeat of the same one.
         self._display_revision = 0
+        # The board gestures' authored viewport pin (x_view, y_view) in DATA
+        # coordinates, or None for home.  Display-only continuity like the
+        # colour window -- deliberately NOT in config.params: a saved layout
+        # reopens at home, exactly like the pulse preview.
+        self._view_pin = None
         # The console header's "Selectors" switch state for THIS card (set via
         # ``set_selectors_enabled``; default OFF = the historical display-only Monitor board).
         # Every plotter (re)build parks its selector layer to this flag (``_apply_selectors_state``),
@@ -645,6 +650,17 @@ class PanelCard(FluentGroupBox):
             return
         self.board = SinglePanelHost(
             self.panel_id, empty_text="waiting for data")
+        # The pulse-preview answer protocol, verbatim: a wheel-zoom / pan /
+        # double-middle commit is answered by re-composing THIS card at the
+        # candidate's view under the candidate's revision; a clim-rail commit
+        # routes through the ONE fixed-limits writer the Setting inputs use.
+        self.board.viewCommitted.connect(self._on_view_committed)
+        self.board.colorLimitsCommitted.connect(self._on_color_limits_committed)
+        # The console switch may have been armed before this card received its
+        # first frame.  Replay the card-owned state onto the newly-created host;
+        # otherwise the visible switch says ON while this first surface stays
+        # inert until the operator toggles it twice.
+        self._apply_selectors_state()
         self.canvas_holder.addWidget(self.board)
 
     def _composer(self, value):
@@ -736,22 +752,27 @@ class PanelCard(FluentGroupBox):
         if mode is RelimMode.FIXED:
             fixed = (float(params.get("fixed_lo", 0.0)),
                      float(params.get("fixed_hi", 1.0)))
+        pin_x, pin_y = self._view_pin or (None, None)
         intent = self.view_intent()
         if intent is ViewIntent.CURVE:
             return CurveDisplayState(
                 revision=self._display_revision, relim_mode=mode, fixed_y_limits=fixed,
+                x_view=pin_x,
             )
         if intent is ViewIntent.HISTOGRAM:
             return HistogramDisplayState(
                 revision=self._display_revision, relim_mode=mode,
                 bin_count=int(params.get("bins", 60) or 60),
                 fixed_count_limits=fixed,
+                x_view=pin_x,
             )
         return ImageDisplayState(
             revision=self._display_revision,
             relim_mode=mode,
             colormap=ImageColormap(str(params.get("colormap", "gray") or "gray")),
             fixed_color_limits=fixed,
+            x_view=pin_x,
+            y_view=pin_y,
         )
 
     def present(self) -> None:
@@ -1072,6 +1093,37 @@ class PanelCard(FluentGroupBox):
         """
 
         self.unit_label.setText(self._current_unit_text()) if hasattr(self, "unit_label") else None
+
+    def _on_view_committed(self, candidate) -> None:
+        """Answer a board zoom/pan commit: re-compose this card at the
+        candidate's view under the candidate's revision (the pulse preview's
+        answer-by-re-render, with the card's worker-composer as the renderer).
+        Landing back on home clears the pin so later ticks track the frame.
+        """
+
+        viewport_revision = getattr(candidate, "viewport_revision", None)
+        if viewport_revision is not None:      # image-family transform
+            views = candidate.optional_coordinate_views_for_normalized_bounds()
+            pin = views if any(view is not None for view in views) else None
+            revision = int(viewport_revision)
+        else:                                  # curve/histogram transform
+            span = tuple(float(value) for value in candidate.x_limits)
+            home = tuple(float(value) for value in candidate.home_x_limits)
+            pin = None if span == home else (span, None)
+            revision = int(candidate.display_revision)
+        self._view_pin = pin
+        self._display_revision = revision
+        if self._last_value is not None and self.compose_signal_value(
+                self._last_value):
+            self.present()
+
+    def _on_color_limits_committed(self, limits) -> None:
+        """Answer a clim-rail commit: the dragged window IS a fixed colour
+        window, so it lands in the SAME persisted fact the Setting's fixed
+        inputs write (relim=fixed + lo/hi through the one writer)."""
+
+        self.config.params["relim"] = "fixed"
+        self.apply_fixed_lims(float(limits[0]), float(limits[1]))
 
     def apply_fixed_lims(self, lo: float, hi: float) -> None:
         """Persist the fixed lo/hi and re-compose with them NOW.
