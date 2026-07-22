@@ -700,14 +700,14 @@ class PeriodCard(FluentGroupBox):
         control_width = _period_control_width(card_width)
 
         column = QtWidgets.QVBoxLayout(self)
-        # The horizontal pad may tighten in compact mode (width is the card's own
-        # business), but the VERTICAL geometry -- top margin and inter-row spacing --
-        # is the shared row-region metric (_row_region_vmetrics), the same one the
-        # Port Catalog and Delay/Scan panels read: rows are read ACROSS the three
-        # columns, so all three must advance by the same pitch.
-        pad = _px(4, minimum=2) if compact else _px(6, minimum=3)
+        # The reference's EXACT card geometry: a uniform _px(7) margin on all four
+        # sides (no compact variant) with the shared row spacing.  The panels use a
+        # _px(8) margin; the missing sliver is added as a spacer right after the
+        # fixed-height header (below), so the first channel row starts at the same Y
+        # as the Name/Delay rows and every later row advances by the same pitch.
         row_top, row_gap = _row_region_vmetrics()
-        column.setContentsMargins(pad, row_top, pad, pad)
+        card_pad = _px(7)
+        column.setContentsMargins(card_pad, card_pad, card_pad, card_pad)
         column.setSpacing(row_gap)
         self.set_period_position(index, total_periods)
 
@@ -757,6 +757,10 @@ class PeriodCard(FluentGroupBox):
         top_layout.addWidget(_set_fixed_height(self.name_edit))
         top_layout.addStretch()
         column.addWidget(top)
+        # The panels carry a _px(8) top margin against the card's _px(7): this spacer
+        # makes up exactly the difference (the reference's post-header sliver), so the
+        # first channel row lands on the same Y as the Name/Delay rows.
+        column.addSpacing(max(0, row_top - card_pad))
         # Seed resolution + validator from the value just loaded, so a freshly built
         # card enforces exactly what an edited one does.
         self._handle_duration_text(self.duration_edit.text())
