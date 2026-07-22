@@ -200,3 +200,59 @@ def test_repeat_forever_bracket_draws_the_infinity_glyph_cleanly(preview_editor)
     assert not glyph_warnings, (
         "the ×∞ bracket label hit a missing-glyph fallback (tofu box): "
         + "; ".join(str(w.message) for w in glyph_warnings))
+
+
+def test_the_panel_exit_is_the_same_picture_with_a_live_viewport(application):
+    """``render_pulse_timeline_panel`` is the PNG exit's twin: ONE drawing, two exits.
+
+    The interactive raster must be PIXEL-IDENTICAL to the decoded PNG -- any
+    divergence means the exits stopped sharing the drawing and the preview a
+    person selects on is no longer the preview that gets saved.  The payload
+    must carry the drawn rows (channels then analog buses, display labels) and
+    a viewport whose x mapping covers the drawn frame, because that mapping is
+    what the unified selector overlay converts gestures through.
+    """
+
+    import numpy as np
+    from PyQt5 import QtGui
+
+    from zlc_frontend.matplotlib_render import (
+        render_pulse_timeline_panel, render_pulse_timeline_png)
+    from zlc_frontend.render import PulsePanelPayload, RasterBuffer
+
+    kw = dict(
+        pulses=[dict(channel="ch00", start=0.0, stop=1e-3, name="cool")],
+        channels=["ch00", "ch01"],
+        channel_labels={"ch00": "cooling", "ch01": "probe"},
+        total_duration=2e-3,
+        title="preview",
+        size="2x2",
+        analog_traces=[dict(name="da_dipole", label="da_dipole", min=-512, max=511,
+                            starts=[0.0, 1e-3, 2e-3], values=[300, -100])],
+    )
+    raster, payload = render_pulse_timeline_panel(**kw)
+    assert isinstance(raster, RasterBuffer) and isinstance(payload, PulsePanelPayload)
+
+    image = QtGui.QImage()
+    assert image.loadFromData(render_pulse_timeline_png(**kw)), "PNG did not decode"
+    image = image.convertToFormat(QtGui.QImage.Format_RGBA8888)
+    assert (image.width(), image.height()) == (raster.width, raster.height), (
+        "the two exits emit different pixel boxes")
+    bits = image.constBits()
+    bits.setsize(image.bytesPerLine() * image.height())
+    png_pixels = np.frombuffer(bits, np.uint8).reshape(
+        image.height(), image.bytesPerLine())[:, :image.width() * 4]
+    raster_pixels = np.frombuffer(raster.pixels, np.uint8).reshape(
+        raster.height, raster.stride_bytes)[:, :raster.width * 4]
+    assert np.array_equal(png_pixels, raster_pixels), (
+        "the interactive raster and the PNG exit diverged -- they must share one drawing")
+
+    assert payload.row_keys == ("ch00", "ch01", "analog:0:da_dipole")
+    assert payload.row_labels == ("cooling", "probe", "da_dipole")
+    viewport = payload.viewport
+    assert viewport.home_x_limits == viewport.x_limits, "home must pin to the drawn frame"
+    assert viewport.x_limits[0] < 0.0 and viewport.x_limits[1] > 2e-3, (
+        "the drawn x span must cover the whole frame (plus the breathing margin)")
+    x_centre, _y = viewport.widget_normalized_to_data(0.5, 0.5)
+    assert viewport.x_limits[0] <= x_centre <= viewport.x_limits[1], (
+        "the widget centre does not map inside the drawn time span")

@@ -659,6 +659,33 @@ def _validated_curve_fit_overlays(
 
 
 @dataclass(frozen=True, slots=True)
+class PulsePanelPayload:
+    """Draw-frozen mapping for one PULSE timeline raster front.
+
+    The pulse preview is an x-only interactive surface: gestures select or zoom
+    along TIME while the row axis stays pinned, so the payload reuses the curve
+    family's viewport transform for its widget<->data mapping and adds only the
+    drawn row identities (digital channels then analog bus keys, top to bottom)
+    with their display labels for hover text.
+    """
+
+    viewport: CurveViewportTransform
+    row_keys: tuple[str, ...]
+    row_labels: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.viewport, CurveViewportTransform):
+            raise TypeError("pulse payload requires CurveViewportTransform")
+        keys = tuple(_text(key, "pulse row key") for key in self.row_keys)
+        labels = tuple(
+            _text(label, "pulse row label") for label in self.row_labels)
+        if len(keys) != len(labels):
+            raise ValueError("pulse row keys and labels must align")
+        object.__setattr__(self, "row_keys", keys)
+        object.__setattr__(self, "row_labels", labels)
+
+
+@dataclass(frozen=True, slots=True)
 class HistogramPanelPayload:
     """Exact samples plus one shared, immutable display bin projection.
 
