@@ -141,6 +141,18 @@ exit /b 0
 if defined ZLC_PS_VIVADO_BIN goto zlc_vivado_found
 if defined ZLC_VIVADO_BIN set "ZLC_PS_VIVADO_BIN=%ZLC_VIVADO_BIN%"
 if defined ZLC_PS_VIVADO_BIN goto zlc_vivado_found
+for %%V in (2019.1 2019.2 2020.1 2020.2 2021.1 2021.2 2022.1 2022.2 2023.1 2023.2 2024.1 2024.2 2025.1 2025.2 2026.1 2026.2) do (
+  if exist "C:\Xilinx\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\%%V\bin\vivado.bat"
+  if exist "D:\Xilinx\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=D:\Xilinx\Vivado\%%V\bin\vivado.bat"
+  if exist "C:\AMD\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=C:\AMD\Vivado\%%V\bin\vivado.bat"
+  if exist "D:\AMD\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=D:\AMD\Vivado\%%V\bin\vivado.bat"
+)
+rem Preserve the established default-install discovery for versions not listed above.
+rem The last matching version wins, matching the pre-migration launcher behaviour.
+for /d %%V in ("C:\Xilinx\Vivado\*" "D:\Xilinx\Vivado\*" "C:\AMD\Vivado\*" "D:\AMD\Vivado\*") do (
+  if exist "%%~V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=%%~V\bin\vivado.bat"
+)
+if defined ZLC_PS_VIVADO_BIN goto zlc_vivado_found
 for /f "delims=" %%I in ('where vivado.bat 2^>nul') do if not defined ZLC_PS_VIVADO_BIN set "ZLC_PS_VIVADO_BIN=%%I"
 if defined ZLC_PS_VIVADO_BIN goto zlc_vivado_found
 where vivado >nul 2>nul
