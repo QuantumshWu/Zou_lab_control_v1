@@ -51,14 +51,18 @@ def preview_editor(application):
 
 
 def test_the_preview_plot_is_not_collapsed_to_a_sliver(preview_editor):
-    label = preview_editor.preview_image
-    pixmap = label.pixmap()
-    assert pixmap is not None and not pixmap.isNull(), "preview produced no pixmap"
-    assert pixmap.height() > 100, "the rendered plot itself is too short to be a plot"
-    # The scroll area holds the body at its own size hint, so the QLabel only shows the
-    # whole plot if the body was resized to it.  A sliver here is the reported bug.
-    assert label.height() >= pixmap.height(), (
-        f"the plot is {pixmap.height()} px tall but the label shows only {label.height()} px")
+    board = preview_editor.preview_board
+    frame = board.front_frame
+    assert frame is not None, "the preview presented no frame"
+    raster = frame.panels[0].raster
+    assert raster.height > 100, "the rendered plot itself is too short to be a plot"
+    # The scroll area holds the body at its own size hint, so the board only shows
+    # the whole plot if the body was resized to it.  A sliver here is the reported bug.
+    assert board.height() > 100, (
+        f"the plot raster is {raster.height} px tall but the board shows only "
+        f"{board.height()} px")
+    assert preview_editor.preview_body.height() >= board.height(), (
+        "the preview body does not make room for the whole board")
 
 
 def test_the_preview_status_reads_like_the_reference(preview_editor):
@@ -215,13 +219,56 @@ def test_display_carries_the_screen_ratio_and_export_saves_at_600_dpi(preview_ed
     with pytest.raises(ValueError):
         preview_editor.preview_png_bytes(state, pixel_ratio=2.0, export=True)
 
-    # The GUI display chain tags the pixmap with the widget's ratio so Qt shows
-    # it at the logical size instead of stretching device pixels.
+    # The GUI display chain fixes the board at the LOGICAL size while the
+    # presented raster carries the widget's device-pixel ratio, so the whole-
+    # cell blit lands 1:1 on device pixels instead of stretching soft pixels.
     preview_editor.refresh_preview()
-    pixmap = preview_editor.preview_image.pixmap()
-    assert pixmap is not None and not pixmap.isNull()
-    assert pixmap.devicePixelRatio() == pytest.approx(
-        float(preview_editor.devicePixelRatioF() or 1.0))
+    board = preview_editor.preview_board
+    ratio = float(preview_editor.devicePixelRatioF() or 1.0)
+    raster = board.front_frame.panels[0].raster
+    assert (board.width(), board.height()) == (
+        round(raster.width / ratio), round(raster.height / ratio))
+
+
+def test_wheel_zoom_on_the_preview_rerenders_the_time_view(preview_editor, application):
+    """The preview is a LIVE interactive panel, not a picture: a wheel zoom over
+    the plot goes through the unified gesture owner (a typed CurveViewportCommit)
+    and the editor answers by re-rendering the SAME table at the committed x
+    limits -- the zoomed view shows, home stays the full frame, and the row axis
+    never moves (the design's x-only rule for pulse).
+    """
+
+    from PyQt5 import QtCore, QtGui
+
+    board = preview_editor.preview_board
+    before = board.visible_pulse_payload()
+    assert before is not None
+    home = before.viewport.home_x_limits
+    assert before.viewport.x_limits == home, "the preview must open at home"
+
+    binding = board._numeric_binding_for_kind("pulse")
+    target = board._numeric_target(binding)
+    centre = QtCore.QPoint(
+        int(round(target.plot.center().x())), int(round(target.plot.center().y())))
+    event = QtGui.QWheelEvent(
+        QtCore.QPointF(centre),
+        QtCore.QPointF(board.mapToGlobal(centre)),
+        QtCore.QPoint(),
+        QtCore.QPoint(0, -120),
+        QtCore.Qt.NoButton,
+        QtCore.Qt.NoModifier,
+        QtCore.Qt.ScrollUpdate,
+        False,
+    )
+    board.wheelEvent(event)
+    application.processEvents()
+
+    after = board.visible_pulse_payload()
+    assert after is not None
+    assert after.viewport.x_limits != home, "the wheel zoom did not change the time view"
+    assert after.viewport.home_x_limits == home, "zoom must not move the home span"
+    assert after.viewport.y_limits == before.viewport.y_limits, (
+        "pulse zoom must be x-only -- the row axis moved")
 
 
 def test_the_inner_repeat_bracket_draws_nested_not_unrolled(preview_editor):

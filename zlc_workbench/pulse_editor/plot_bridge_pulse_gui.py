@@ -4269,13 +4269,26 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             include_always_off = bool(
                 getattr(self, "preview_include_off", None)
                 and self.preview_include_off.isChecked())
-        # The plot layer owns the faithful pulse-timeline render (filled step blocks +
-        # coloured baselines + repeat brackets); this window is a PURE data source, so
-        # the preview, Save Figure and Save Image all draw the identical figure and the
-        # frontend never imports the pulse/neutral packages.  The table is drawn AS
-        # AUTHORED (expand_repeat=False, the reference's preview call): an inner
-        # bracket reads as a nested square bracket over its own span, never as the
-        # unrolled copies the hardware plays.
+        return render_pulse_timeline_png(
+            **self._preview_render_kwargs(state, include_always_off=include_always_off),
+            pixel_ratio=pixel_ratio,
+            export=export,
+        )
+
+    def _preview_render_kwargs(self, state: PulseTableState, *,
+                               include_always_off: bool) -> dict:
+        """ONE extraction feeding BOTH preview exits (PNG bytes and the
+        interactive raster front), so the picture a person selects on can never
+        differ from the picture that is saved.
+
+        The plot layer owns the faithful pulse-timeline render (filled step blocks +
+        coloured baselines + repeat brackets); this window is a PURE data source, so
+        the frontend never imports the pulse/neutral packages.  The table is drawn AS
+        AUTHORED (expand_repeat=False, the reference's preview call): an inner
+        bracket reads as a nested square bracket over its own span, never as the
+        unrolled copies the hardware plays.
+        """
+
         sequence = state.to_sequence(expand_repeat=False)
         raw_pulses = list(getattr(sequence, "pulses", ()) or ())
         # Rows come from the ONE channel source (the digital-port universe, filtered by "Show off
@@ -4306,7 +4319,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             ]
         traces = self._preview_analog_traces(state, include_always_off=include_always_off)
         regions, segments = self._preview_scan_annotations(state)
-        return render_pulse_timeline_png(
+        return dict(
             pulses=pulses,
             channels=channels,
             channel_labels=labels,
@@ -4318,8 +4331,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             analog_traces=traces,
             scan_regions=regions,
             scan_dac_segments=segments,
-            pixel_ratio=pixel_ratio,
-            export=export,
         )
 
     def _preview_analog_traces(self, state: PulseTableState, *,
@@ -4437,37 +4448,21 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 effective = self._preview_size_for(state, include_always_off=include_off_now)
                 if self.preview_size_combo.currentText() != effective:
                     self.preview_size_combo.setCurrentText(effective)
-            # The screen's device-pixel ratio rides into the render so the Agg
-            # buffer holds exactly the widget's DEVICE pixels; tagging the pixmap
-            # with the same ratio keeps its logical size unchanged while Qt blits
-            # 1:1 -- the reference's "never rendered small and stretched up" rule.
-            ratio = float(self.devicePixelRatioF() or 1.0)
-            png = self.preview_png_bytes(state, pixel_ratio=ratio)
+            logical = self._present_preview(state, include_always_off=include_off_now)
         except Exception as exc:
             self.preview_status.setText(
                 f"Preview unavailable: {str(exc).splitlines()[0][:120]}")
             return
-        self._preview_png = png
-        pixmap = QtGui.QPixmap()
-        pixmap.loadFromData(png)
-        pixmap.setDevicePixelRatio(ratio)
-        if getattr(self, "preview_image", None) is None:
-            self.preview_image = QtWidgets.QLabel()
-            self.preview_image.setAlignment(QtCore.Qt.AlignCenter)
-            self.preview_body_layout.addWidget(self.preview_image, 1)
         self.preview_placeholder.hide()
-        self.preview_image.setPixmap(pixmap)
-        self.preview_image.show()
         # The scroll area holds the body at its OWN size hint (setWidgetResizable(False)),
-        # so a layout stretch cannot grow it: without this the QLabel keeps its ~13 px
-        # minimum and the 500x400 plot shows as a sliver.  Size the body to the pixmap's
-        # LOGICAL size (device pixels over the ratio, plus the layout margins) so the
-        # whole plot is visible and the scroll bars only appear when it genuinely
-        # overflows the viewport.
+        # so a layout stretch cannot grow it: without this the board keeps its minimum
+        # and the plot shows as a sliver.  Size the body to the board's LOGICAL size
+        # (plus the layout margins) so the whole plot is visible and the scroll bars
+        # only appear when it genuinely overflows the viewport.
         margins = self.preview_body_layout.contentsMargins()
         self.preview_body.resize(
-            int(round(pixmap.width() / ratio)) + margins.left() + margins.right(),
-            int(round(pixmap.height() / ratio)) + margins.top() + margins.bottom())
+            logical[0] + margins.left() + margins.right(),
+            logical[1] + margins.top() + margins.bottom())
         self._preview_dirty = False
         # Match the reference wording exactly (C22): "N/M plotted (active channels) | repeat …".
         # N = channels the render drew, M = the DIGITAL-port universe those rows are drawn from (the
@@ -4482,6 +4477,135 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.preview_status.setText(
             f"{len(drawn)}/{total} plotted ({mode})"
             + (f" | {notation}" if notation else ""))
+
+    def _ensure_preview_board(self):
+        """The ONE interactive preview surface: a QtRasterBoard hosting the
+        single PULSE panel, bound once to the unified gesture owner."""
+
+        board = getattr(self, "preview_board", None)
+        if board is None:
+            from zlc_frontend.qt_widgets import QtRasterBoard
+
+            board = QtRasterBoard(("pulse",), columns=1)
+            self.preview_board = board
+            self.preview_body_layout.addWidget(
+                board, 0, QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+            board.bind_pulse_interaction("pulse", self._on_preview_intent)
+        return board
+
+    def _present_preview(self, state: PulseTableState, *,
+                         include_always_off: bool,
+                         display_revision: int | None = None) -> tuple[int, int]:
+        """Render the CURRENT table and present it as one coherent BoardFrame.
+
+        The pulse preview is a first-class panel: the same drawing as the PNG
+        exit, read back as a raster + draw-frozen viewport, presented on the
+        unified QtRasterBoard so area/cross/zoom/pan run through the one
+        selector owner.  Returns the board's LOGICAL pixel size.
+
+        Identity: the provenance revision advances when the CONTENT changes
+        (state fingerprint), the display revision on every present (a zoom
+        commit passes its own candidate revision back so the pending intent
+        matches its accepted front).  The zoomed view survives an edit -- x is
+        pinned; only the picture underneath updates.
+        """
+
+        import hashlib
+
+        from zlc_data import (
+            BlockId, DatasetRevision, DatasetRevisionRef, StreamGenerationId)
+        from zlc_frontend.figure import DatasetId, EvaluatedInput
+        from zlc_frontend.matplotlib_render import render_pulse_timeline_panel
+        from zlc_frontend.render import (
+            BoardFrame, CoherenceStamp, PanelFrame, PanelPresentationIdentity,
+            SourceIdentity)
+
+        kwargs = self._preview_render_kwargs(
+            state, include_always_off=include_always_off)
+        ratio = float(self.devicePixelRatioF() or 1.0)
+        fingerprint = hashlib.sha256(
+            str(self._state_key(state)).encode("utf-8")).hexdigest()
+        if fingerprint != getattr(self, "_preview_content_fp", None):
+            self._preview_content_fp = fingerprint
+            self._preview_content_rev = int(
+                getattr(self, "_preview_content_rev", 0)) + 1
+        if display_revision is None:
+            display_revision = int(getattr(self, "_preview_display_rev", 0)) + 1
+        self._preview_display_rev = int(display_revision)
+        provenance = EvaluatedInput(
+            DatasetId("pulse.preview"),
+            DatasetRevisionRef(
+                BlockId("pulse-preview"),
+                StreamGenerationId("pulse-editor"),
+                fingerprint,
+                DatasetRevision(self._preview_content_rev),
+            ),
+        )
+        raster, payload = render_pulse_timeline_panel(
+            **kwargs,
+            pixel_ratio=ratio,
+            evaluated_input=provenance,
+            display_revision=self._preview_display_rev,
+            x_limits=getattr(self, "_preview_view_x_limits", None),
+        )
+        presentation = PanelPresentationIdentity(
+            "pulse", "pulse-preview", self._preview_content_rev, 0,
+            self._preview_display_rev)
+        stamp = CoherenceStamp(
+            "pulse-editor",
+            f"pulse-epoch-{self._preview_display_rev}",
+            f"pulse-frame-{self._preview_display_rev}",
+            fingerprint,
+            fingerprint,
+            (provenance,),
+            (presentation,),
+        )
+        source = SourceIdentity(
+            provenance.dataset_id,
+            provenance.ref.block_id,
+            provenance.ref.stream_generation,
+            fingerprint,
+        )
+        panel = PanelFrame("pulse", "pulse-preview", source, stamp, raster, payload)
+        board = self._ensure_preview_board()
+        self._preview_board_seq = int(getattr(self, "_preview_board_seq", -1)) + 1
+        board.present(BoardFrame(
+            "pulse-preview-board", 0, self._preview_board_seq, (panel,)))
+        # The board cell stretch-blits the raster over its whole rect, so fixing
+        # the widget at the LOGICAL size makes the device-pixel raster land 1:1
+        # on a HiDPI screen -- same crispness rule as the pixmap path it replaces.
+        logical = (int(round(raster.width / ratio)),
+                   int(round(raster.height / ratio)))
+        board.setFixedSize(logical[0], logical[1])
+        return logical
+
+    def _on_preview_intent(self, intent) -> None:
+        """Answer the unified owner's typed pulse intents.
+
+        Area (CurveRangeGesture) projects the display-only candidate back onto
+        the board; a wheel-zoom/pan commit (CurveViewportCommit) re-renders the
+        SAME table at the candidate's x limits and presents the accepted front
+        under the candidate's display revision.  Landing back on the home span
+        clears the pin so later refreshes track the full frame again.
+        """
+
+        from zlc_frontend.selector import CurveRangeGesture, CurveViewportCommit
+
+        if isinstance(intent, CurveRangeGesture):
+            self.preview_board.set_pulse_range_candidate(intent.x_span)
+            return
+        if isinstance(intent, CurveViewportCommit):
+            candidate = intent.viewport
+            limits = tuple(float(value) for value in candidate.x_limits)
+            home = tuple(float(value) for value in candidate.home_x_limits)
+            self._preview_view_x_limits = None if limits == home else limits
+            include_off = bool(getattr(self, "preview_include_off", None)
+                               and self.preview_include_off.isChecked())
+            self._present_preview(
+                self.read_state(),
+                include_always_off=include_off,
+                display_revision=int(candidate.display_revision),
+            )
 
     def _apply_scan_state_in_place(self, state: PulseTableState) -> bool:
         """Whether a scan toggle can be absorbed without rebuilding the cards.
