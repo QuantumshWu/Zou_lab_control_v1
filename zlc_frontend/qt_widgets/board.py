@@ -27,6 +27,7 @@ from ..render import (
     PanelFrame,
     PanelPresentationIdentity,
     PixelFormat,
+    PulsePanelPayload,
     RadialGaussianImageFitOverlay,
     SiteMapPanelPayload,
     SourceIdentity,
@@ -314,33 +315,30 @@ def _input_structure(evaluated_input) -> tuple[object, object, object, str]:
     )
 
 
-def _curve_payload(
-    panel_or_hold: PanelFrame | _HeldPanelFront,
-) -> CurvePanelPayload | None:
-    payload = panel_or_hold.display_payload
-    return payload if isinstance(payload, CurvePanelPayload) else None
-
-
-def _histogram_payload(
-    panel_or_hold: PanelFrame | _HeldPanelFront,
-) -> HistogramPanelPayload | None:
-    payload = panel_or_hold.display_payload
-    return payload if isinstance(payload, HistogramPanelPayload) else None
-
-
-_NumericKind: TypeAlias = Literal["curve", "histogram"]
-_NumericPayload: TypeAlias = CurvePanelPayload | HistogramPanelPayload
+_NumericKind: TypeAlias = Literal["curve", "histogram", "pulse"]
+_NumericPayload: TypeAlias = (
+    CurvePanelPayload | HistogramPanelPayload | PulsePanelPayload
+)
 _NumericViewport: TypeAlias = CurveViewportTransform | HistogramViewportTransform
 _NumericIntent: TypeAlias = CurveInteractionIntent | HistogramInteractionIntent
+
+#: The ONE kind->payload map for the numeric interaction family.  PULSE is a
+#: member because the pulse timeline is an x-only interactive surface: it
+#: reuses the CURVE viewport transform and the CURVE intent vocabulary, so the
+#: only fact that distinguishes it here is which payload type its front carries.
+_NUMERIC_PAYLOAD_TYPES: dict[_NumericKind, type] = {
+    "curve": CurvePanelPayload,
+    "histogram": HistogramPanelPayload,
+    "pulse": PulsePanelPayload,
+}
 
 
 def _numeric_payload(
     panel_or_hold: PanelFrame | _HeldPanelFront,
     kind: _NumericKind,
 ) -> _NumericPayload | None:
-    if kind == "curve":
-        return _curve_payload(panel_or_hold)
-    return _histogram_payload(panel_or_hold)
+    payload = panel_or_hold.display_payload
+    return payload if isinstance(payload, _NUMERIC_PAYLOAD_TYPES[kind]) else None
 
 
 def _numeric_plot_geometry(
@@ -1219,6 +1217,12 @@ class QtRasterBoard(QtWidgets.QWidget):
         return None if binding is None else binding.fault
 
     @property
+    def pulse_selector_fault(self) -> RuntimeError | None:
+        self._require_owner()
+        binding = self._numeric_binding_for_kind("pulse")
+        return None if binding is None else binding.fault
+
+    @property
     def selectors_enabled(self) -> bool:
         """Return the effective board-wide interaction intent."""
 
@@ -1417,6 +1421,32 @@ class QtRasterBoard(QtWidgets.QWidget):
         )
         return origin
 
+    def visible_pulse_payload(
+        self,
+        panel_id: str | None = None,
+    ) -> PulsePanelPayload | None:
+        """Return the exact held/current PULSE payload currently painted."""
+
+        self._require_owner()
+        binding = self._numeric_binding_for_kind("pulse", panel_id=panel_id)
+        payload, _origin = self._visible_display(
+            None if binding is None else binding.panel_id, PulsePanelPayload
+        )
+        return payload if isinstance(payload, PulsePanelPayload) else None
+
+    def visible_pulse_origin(
+        self,
+        panel_id: str | None = None,
+    ) -> PanelInteractionOrigin | None:
+        """Return provenance for the exact held/current PULSE front."""
+
+        self._require_owner()
+        binding = self._numeric_binding_for_kind("pulse", panel_id=panel_id)
+        _payload, origin = self._visible_display(
+            None if binding is None else binding.panel_id, PulsePanelPayload
+        )
+        return origin
+
     def discard_pending_curve_interaction(
         self,
         origin: PanelInteractionOrigin,
@@ -1452,6 +1482,28 @@ class QtRasterBoard(QtWidgets.QWidget):
         if (
             binding is None
             or binding.kind != "histogram"
+            or binding.pending_viewport is None
+            or origin != binding.pending_origin
+        ):
+            return False
+        binding.pending_viewport = None
+        binding.pending_origin = None
+        self.update()
+        return True
+
+    def discard_pending_pulse_interaction(
+        self,
+        origin: PanelInteractionOrigin,
+    ) -> bool:
+        """Discard only the exact failed PULSE display intent."""
+
+        self._require_owner()
+        if not isinstance(origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
+        binding = self._numeric_bindings.get(origin.panel_id)
+        if (
+            binding is None
+            or binding.kind != "pulse"
             or binding.pending_viewport is None
             or origin != binding.pending_origin
         ):
@@ -1519,10 +1571,12 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise ValueError("a cleared curve span has no fit Selection")
         hold = self._selector_hold
         binding = self._numeric_bindings.get(gesture.origin.panel_id)
+        # PULSE emits the same CurveRangeGesture (x-only time span), so its
+        # area selection resolves through this one exit as well.
         if (
             hold is None
             or binding is None
-            or binding.kind != "curve"
+            or binding.kind not in ("curve", "pulse")
             or binding.span_anchor is not None
             or binding.pan_anchor is not None
         ):
@@ -1531,7 +1585,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         if gesture.origin != origin:
             raise RuntimeError("curve range gesture differs from its held panel origin")
         payload = hold.display_payload
-        if not isinstance(payload, CurvePanelPayload):
+        if not isinstance(payload, (CurvePanelPayload, PulsePanelPayload)):
             raise RuntimeError("curve range gesture lost its exact curve payload")
         axis = payload.viewport.x_axis
         return Selection.coordinate_range(
@@ -1604,6 +1658,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         image: bool,
         curve: bool,
         histogram: bool = False,
+        pulse: bool = False,
     ) -> None:
         """Arm only panel families whose painted provenance is current.
 
@@ -1619,6 +1674,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             not isinstance(image, bool)
             or not isinstance(curve, bool)
             or not isinstance(histogram, bool)
+            or not isinstance(pulse, bool)
         ):
             raise TypeError("interaction readiness values must be bool")
         for binding in self._image_bindings.values():
@@ -1626,7 +1682,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 self._cancel_image_gesture(binding, clear_draft=True)
                 self._set_hover_sample(binding, None)
             binding.interaction_ready = image
-        readiness = {"curve": curve, "histogram": histogram}
+        readiness = {"curve": curve, "histogram": histogram, "pulse": pulse}
         for binding in self._numeric_bindings.values():
             ready = readiness[binding.kind]
             if not ready and binding.interaction_ready:
@@ -1726,6 +1782,26 @@ class QtRasterBoard(QtWidgets.QWidget):
 
         self._bind_numeric_interaction(
             "histogram", panel_id, callback, enabled=enabled
+        )
+
+    def bind_pulse_interaction(
+        self,
+        panel_id: str,
+        callback: Callable[[CurveInteractionIntent], object],
+        *,
+        enabled: bool = True,
+    ) -> None:
+        """Bind one PULSE timeline panel to display-only typed intents.
+
+        The pulse timeline is an x-only interactive surface, so it speaks the
+        CURVE intent vocabulary (``CurveRangeGesture`` for area,
+        ``CurveViewportCommit`` for wheel zoom / middle-drag pan) over its
+        :class:`PulsePanelPayload` front -- one gesture owner, no second
+        selector family.
+        """
+
+        self._bind_numeric_interaction(
+            "pulse", panel_id, callback, enabled=enabled
         )
 
     def set_selector_applied_selection(
@@ -1830,6 +1906,27 @@ class QtRasterBoard(QtWidgets.QWidget):
         )
         self.update()
 
+    def set_pulse_range_candidate(
+        self,
+        x_span: tuple[float, float] | None,
+        *,
+        panel_id: str | None = None,
+    ) -> None:
+        """Project the owner-applied display-only PULSE time-range candidate."""
+
+        self._require_owner()
+        binding = self._numeric_binding_for_kind("pulse", panel_id=panel_id)
+        if binding is None:
+            if x_span is None:
+                return
+            raise RuntimeError("no pulse panel is bound")
+        binding.applied_span = (
+            None
+            if x_span is None
+            else validated_display_range(x_span, "pulse range candidate")
+        )
+        self.update()
+
     def unbind_rectangle_selector(self, panel_id: str | None = None) -> None:
         self._require_owner()
         binding = self._image_binding(panel_id)
@@ -1847,6 +1944,13 @@ class QtRasterBoard(QtWidgets.QWidget):
     def unbind_histogram_interaction(self, panel_id: str | None = None) -> None:
         self._require_owner()
         binding = self._numeric_binding_for_kind("histogram", panel_id=panel_id)
+        if binding is not None:
+            self._reset_numeric_binding(binding.panel_id)
+        self.update()
+
+    def unbind_pulse_interaction(self, panel_id: str | None = None) -> None:
+        self._require_owner()
+        binding = self._numeric_binding_for_kind("pulse", panel_id=panel_id)
         if binding is not None:
             self._reset_numeric_binding(binding.panel_id)
         self.update()
@@ -2267,10 +2371,11 @@ class QtRasterBoard(QtWidgets.QWidget):
                         numeric_binding,
                         hold=hold,
                     )
+                    # PULSE speaks the CURVE intent vocabulary (x-only surface).
                     gesture: _NumericIntent = (
-                        CurveRangeGesture(origin, candidate)
-                        if numeric_binding.kind == "curve"
-                        else HistogramRangeGesture(origin, candidate)
+                        HistogramRangeGesture(origin, candidate)
+                        if numeric_binding.kind == "histogram"
+                        else CurveRangeGesture(origin, candidate)
                     )
                     numeric_binding.callback(gesture)
             except BaseException as error:
@@ -3027,6 +3132,10 @@ class QtRasterBoard(QtWidgets.QWidget):
     ) -> _CurveSample | _HistogramBinSample | None:
         if isinstance(target.payload, HistogramPanelPayload):
             return self._histogram_sample_for_target(target, point)
+        if isinstance(target.payload, PulsePanelPayload):
+            # A pulse timeline has rows, not sampled series -- there is nothing
+            # to snap a hover to.  Cross/area/zoom stay live via the viewport.
+            return None
         return self._curve_sample_for_numeric_target(target, point)
 
     def _curve_sample_for_numeric_target(
@@ -3285,14 +3394,12 @@ class QtRasterBoard(QtWidgets.QWidget):
             if hold is not None
             else self._visible_display(
                 binding.panel_id,
-                CurvePanelPayload
-                if binding.kind == "curve"
-                else HistogramPanelPayload,
+                _NUMERIC_PAYLOAD_TYPES[binding.kind],
             )[0]
         )
         if payload is None or x_limits == payload.viewport.x_limits:
             return False
-        assert isinstance(payload, (CurvePanelPayload, HistogramPanelPayload))
+        assert isinstance(payload, _NUMERIC_PAYLOAD_TYPES[binding.kind])
         if binding.pending_viewport is not None:
             return False
         front = self._front
@@ -3316,9 +3423,9 @@ class QtRasterBoard(QtWidgets.QWidget):
             ),
         )
         command: _NumericIntent = (
-            CurveViewportCommit(origin, candidate)
-            if binding.kind == "curve"
-            else HistogramViewportCommit(origin, candidate)
+            HistogramViewportCommit(origin, candidate)
+            if binding.kind == "histogram"
+            else CurveViewportCommit(origin, candidate)
         )
         binding.pending_viewport = candidate
         binding.pending_origin = origin
@@ -3414,11 +3521,7 @@ class QtRasterBoard(QtWidgets.QWidget):
     ) -> PanelInteractionOrigin:
         return self._require_interaction_origin(
             panel_id=binding.panel_id,
-            payload_type=(
-                CurvePanelPayload
-                if binding.kind == "curve"
-                else HistogramPanelPayload
-            ),
+            payload_type=_NUMERIC_PAYLOAD_TYPES[binding.kind],
             hold=hold,
             kind=binding.kind,
         )
@@ -3539,6 +3642,12 @@ class QtRasterBoard(QtWidgets.QWidget):
                     payload.value_unit,
                     payload.series_labels,
                 )
+            if isinstance(payload, PulsePanelPayload):
+                return (
+                    PulsePanelPayload,
+                    payload.viewport.x_axis,
+                    payload.row_keys,
+                )
             if isinstance(payload, SiteMapPanelPayload):
                 return (
                     SiteMapPanelPayload,
@@ -3595,6 +3704,12 @@ class QtRasterBoard(QtWidgets.QWidget):
                 isinstance(current_payload, HistogramPanelPayload)
                 and current_payload.value_unit == held_payload.value_unit
                 and current_payload.series_labels == held_payload.series_labels
+            )
+        elif isinstance(held_payload, PulsePanelPayload):
+            payload_matches = (
+                isinstance(current_payload, PulsePanelPayload)
+                and current_payload.viewport.x_axis == held_payload.viewport.x_axis
+                and current_payload.row_keys == held_payload.row_keys
             )
         elif isinstance(held_payload, SiteMapPanelPayload):
             payload_matches = (
@@ -4111,9 +4226,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             else payload.value_unit
         )
         x_unit = "" if x_unit_value is None else f" {x_unit_value}"
+        # A pulse timeline's y is the unit-less row position; histogram y is a
+        # bare count.  Only the curve family carries a value unit to print.
         y_unit = (
             ""
-            if isinstance(payload, HistogramPanelPayload)
+            if isinstance(payload, (HistogramPanelPayload, PulsePanelPayload))
             else "" if payload.value_unit is None else f" {payload.value_unit}"
         )
 

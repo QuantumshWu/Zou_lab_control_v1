@@ -56,6 +56,7 @@ tests/test_u02d_site_map_budget.py
 tests/test_u02d_site_map_payload.py
 tests/test_u02d_site_map_viewport.py
 tests/test_u02e_qt_histogram_interaction.py
+tests/test_u02f_qt_pulse_interaction.py
 tests/test_u03a_interactive_histogram_figure.py
 tests/test_u03b_interactive_curve_figure.py
 tests/test_u03c_image_export.py

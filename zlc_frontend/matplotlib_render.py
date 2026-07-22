@@ -1336,6 +1336,7 @@ def render_pulse_timeline_panel(
     analog_traces=(),
     scan_regions=(),
     scan_dac_segments=(),
+    evaluated_input,
     display_revision: int = 0,
 ) -> "tuple[RasterBuffer, PulsePanelPayload]":
     """The SAME pulse-timeline picture as an interactive raster front.
@@ -1346,6 +1347,10 @@ def render_pulse_timeline_panel(
     pulse preview presents on the same board, with the same selector overlay,
     as every other panel kind instead of a bespoke picture label.  Gestures are
     x-only (time), so the home limits pin to the drawn frame span.
+
+    ``evaluated_input`` is the caller-owned provenance (the pulse document /
+    editor state identity this picture was drawn from); the renderer only
+    forwards it into the payload, exactly like every other panel renderer.
     """
 
     figure = None
@@ -1402,7 +1407,7 @@ def render_pulse_timeline_panel(
                 x_limits,
             )
             return raster, PulsePanelPayload(
-                viewport, tuple(row_keys), tuple(row_labels))
+                evaluated_input, viewport, tuple(row_keys), tuple(row_labels))
     finally:
         if figure is not None:
             release_agg_figure(figure)

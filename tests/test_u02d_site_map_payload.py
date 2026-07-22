@@ -37,6 +37,7 @@ from zlc_frontend.render import (
     PanelFrame,
     PanelPresentationIdentity,
     PixelFormat,
+    PulsePanelPayload,
     RasterBuffer,
     SiteMapPanelPayload,
     SourceIdentity,
@@ -204,6 +205,7 @@ def test_site_map_remains_a_closed_payload_and_owns_exact_site_arrays() -> None:
         CurvePanelPayload,
         HistogramPanelPayload,
         MeterPanelPayload,
+        PulsePanelPayload,
         SiteMapPanelPayload,
     )
     assert payload.centers_xy.dtype == np.dtype("<f8")

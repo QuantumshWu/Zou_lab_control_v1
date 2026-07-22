@@ -215,7 +215,9 @@ def test_the_panel_exit_is_the_same_picture_with_a_live_viewport(application):
 
     import numpy as np
     from PyQt5 import QtGui
+    from zlc_data import BlockId, DatasetRevision, DatasetRevisionRef, StreamGenerationId
 
+    from zlc_frontend.figure import DatasetId, EvaluatedInput
     from zlc_frontend.matplotlib_render import (
         render_pulse_timeline_panel, render_pulse_timeline_png)
     from zlc_frontend.render import PulsePanelPayload, RasterBuffer
@@ -230,8 +232,18 @@ def test_the_panel_exit_is_the_same_picture_with_a_live_viewport(application):
         analog_traces=[dict(name="da_dipole", label="da_dipole", min=-512, max=511,
                             starts=[0.0, 1e-3, 2e-3], values=[300, -100])],
     )
-    raster, payload = render_pulse_timeline_panel(**kw)
+    provenance = EvaluatedInput(
+        DatasetId("pulse"),
+        DatasetRevisionRef(
+            BlockId("pulse-block"),
+            StreamGenerationId("pulse-generation"),
+            "e" * 64,
+            DatasetRevision(1),
+        ),
+    )
+    raster, payload = render_pulse_timeline_panel(**kw, evaluated_input=provenance)
     assert isinstance(raster, RasterBuffer) and isinstance(payload, PulsePanelPayload)
+    assert payload.evaluated_input == provenance
 
     image = QtGui.QImage()
     assert image.loadFromData(render_pulse_timeline_png(**kw)), "PNG did not decode"

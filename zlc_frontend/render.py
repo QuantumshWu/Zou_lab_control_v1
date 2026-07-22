@@ -669,11 +669,14 @@ class PulsePanelPayload:
     with their display labels for hover text.
     """
 
+    evaluated_input: EvaluatedInput
     viewport: CurveViewportTransform
     row_keys: tuple[str, ...]
     row_labels: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.evaluated_input, EvaluatedInput):
+            raise TypeError("pulse payload requires one EvaluatedInput")
         if not isinstance(self.viewport, CurveViewportTransform):
             raise TypeError("pulse payload requires CurveViewportTransform")
         keys = tuple(_text(key, "pulse row key") for key in self.row_keys)
@@ -1000,6 +1003,7 @@ DisplayPayload = (
     | CurvePanelPayload
     | HistogramPanelPayload
     | MeterPanelPayload
+    | PulsePanelPayload
     | SiteMapPanelPayload
 )
 
@@ -1035,13 +1039,14 @@ class PanelFrame:
                     CurvePanelPayload,
                     HistogramPanelPayload,
                     MeterPanelPayload,
+                    PulsePanelPayload,
                     SiteMapPanelPayload,
                 ),
             ):
                 raise TypeError(
                     "display_payload must be ImagePanelPayload, "
                     "CurvePanelPayload, HistogramPanelPayload, MeterPanelPayload, "
-                    "SiteMapPanelPayload, or None"
+                    "PulsePanelPayload, SiteMapPanelPayload, or None"
                 )
             presentations = tuple(
                 presentation
@@ -1074,6 +1079,11 @@ class PanelFrame:
                 if self.raster.pixel_format is not PixelFormat.RGBA8888:
                     raise ValueError("meter payload requires an RGBA8888 raster")
                 payload_revision = payload.display_revision
+                source_input = payload.evaluated_input
+            elif isinstance(payload, PulsePanelPayload):
+                if self.raster.pixel_format is not PixelFormat.RGBA8888:
+                    raise ValueError("pulse payload requires an RGBA8888 raster")
+                payload_revision = payload.viewport.display_revision
                 source_input = payload.evaluated_input
             else:
                 background = payload.background
