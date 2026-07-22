@@ -40,7 +40,6 @@ from zlc_neutral_atom.runtime.resources import (
     ResourceKey,
 )
 from zlc_neutral_atom.runtime.run import RunCancelled, RunController, RunFailed
-from zlc_neutral_atom.runtime.safety_journal import PersistentSafetyJournal
 from zlc_neutral_atom.timing.capture import (
     TriggeredCaptureSpec,
     compile_triggered_pipeline,
@@ -189,8 +188,6 @@ class _RuntimeFixture:
                 current(),
                 command,
             ),
-            cleanup_operations={SafetyOperation.DISARM: self.endpoint.cleanup},
-            verify_safe_state=self.endpoint.verify_safe_state,
             capability_probe=lambda: self.endpoint.capability_probe(current()),
             close_session=lambda command: self.endpoint.close_session(
                 current(),
@@ -229,8 +226,6 @@ class _RuntimeFixture:
                 current_pulse(),
                 command,
             ),
-            cleanup_operations={SafetyOperation.SAFE_STATE: pulse_endpoint.cleanup},
-            verify_safe_state=pulse_endpoint.verify_safe_state,
             capability_probe=lambda: pulse_endpoint.capability_probe(current_pulse()),
             close_session=lambda command: pulse_endpoint.close_session(
                 current_pulse(),
@@ -276,8 +271,7 @@ class _RuntimeFixture:
             binding_result.trigger_channel,
             binding_result.cell_plan,
         )
-        self.journal = PersistentSafetyJournal(tmp_path / "safety.zlcj")
-        self.resources = ResourceArbiter(self.journal)
+        self.resources = ResourceArbiter()
         self.controller = RunController(self.resources)
 
     def close(self) -> None:

@@ -76,9 +76,6 @@ from zlc_neutral_atom.runtime.monitor import (
 )
 from zlc_neutral_atom.runtime.ports import (
     BoundDevice,
-    CleanupStepAck,
-    SafeStateAck,
-    SafetyOperation,
     SessionClosedAck,
     SessionCloseCommand,
 )
@@ -803,29 +800,6 @@ class CameraCaptureEndpoint:
             with self._condition:
                 self._physical_operations_inflight -= 1
                 self._condition.notify_all()
-
-    def cleanup(self) -> CleanupStepAck:
-        """Stop the physical source and acknowledge the declared DISARM step."""
-
-        return CleanupStepAck(SafetyOperation.DISARM, self.interrupt())
-
-    def verify_safe_state(self) -> SafeStateAck:
-        """Read the adapter-owned armed/pending state without changing it."""
-
-        armed, pending = self._camera.capture_state()
-        if armed:
-            raise RuntimeError(
-                f"camera {self._source_id!r} still owns an armed acquisition"
-            )
-        if pending:
-            raise RuntimeError(
-                f"camera {self._source_id!r} still retains pending frames"
-            )
-        return SafeStateAck(
-            canonical_digest(
-                {"source_id": self._source_id, "armed": False, "pending": 0}
-            )
-        )
 
     def _terminalize_with_deadline(
         self,

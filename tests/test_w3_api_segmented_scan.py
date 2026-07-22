@@ -211,8 +211,6 @@ def _bind_endpoint(program: ApiSlotSegmentedProgram):
         execute_command=lambda command: endpoint.execute_command(
             current_binding(), command
         ),
-        cleanup_operations={SafetyOperation.SAFE_STATE: endpoint.cleanup},
-        verify_safe_state=endpoint.verify_safe_state,
         capability_probe=lambda: endpoint.capability_probe(current_binding()),
         close_session=lambda command: endpoint.close_session(
             current_binding(), command

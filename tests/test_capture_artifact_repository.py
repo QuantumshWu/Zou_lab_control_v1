@@ -45,7 +45,6 @@ from zlc_neutral_atom.runtime.resources import (
     ResourceKey,
 )
 from zlc_neutral_atom.runtime.run import RunController, RunFailed
-from zlc_neutral_atom.runtime.safety_journal import PersistentSafetyJournal
 from zlc_neutral_atom.timing.capture import TriggeredCaptureSpec
 from zlc_neutral_atom.timing.pulse import BoundPulsePort
 from zlc_pulse import PulseExecutionForm, load_deployed_pulse_target, load_pulse_document
@@ -172,8 +171,6 @@ def _bind_endpoint(
         key=ResourceKey.parse(key),
         identity=proof,
         execute_command=lambda command: endpoint.execute_command(current(), command),
-        cleanup_operations={cleanup_operation: endpoint.cleanup},
-        verify_safe_state=endpoint.verify_safe_state,
         capability_probe=lambda: endpoint.capability_probe(current()),
         close_session=lambda command: endpoint.close_session(current(), command),
         interrupt_operations={cleanup_operation: endpoint.interrupt},
@@ -258,8 +255,7 @@ class _CaptureCase:
         )
         kwargs = {} if resource_policy is None else {"resource_policy": resource_policy}
         self.repository = CaptureRepository(tmp_path / "captures", **kwargs)
-        self.journal = PersistentSafetyJournal(tmp_path / "safety.zlcj")
-        self.resources = ResourceArbiter(self.journal)
+        self.resources = ResourceArbiter()
         self.controller = RunController(self.resources)
         self.handle = None
 
@@ -328,7 +324,6 @@ def test_manifest_contains_current_owner_values_without_mirror_truths(tmp_path) 
             "camera_provenance",
             "camera_capability_evidence",
             "camera_arm_spec",
-            "safety_bundle_id",
             "pulse_evidence",
         }
         assert "aggregate_peak_bytes" not in manifest

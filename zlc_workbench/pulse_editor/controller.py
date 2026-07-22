@@ -17,7 +17,6 @@ import threading
 from typing import Callable, Protocol
 from uuid import uuid4
 
-from zlc_neutral_atom.installation import InstallationRestartRequiredError
 from zlc_neutral_atom.pulse_application import (
     AppliedPulseSnapshot,
     PulseRunObservation,
@@ -81,6 +80,7 @@ from .scan_workspace import (
     load_scan_array as read_scan_array,
     load_scan_program_source,
     save_scan_array as write_scan_array,
+    scan_column_specs,
     scan_slot_schema,
 )
 
@@ -275,6 +275,26 @@ class PulseEditorControllerSnapshot:
     close_complete: bool
 
 
+@dataclass(frozen=True)
+class PulseEditorProjection:
+    """Only the editor revision and facts derived from that revision.
+
+    This is the synchronous Qt edit boundary.  It deliberately excludes Run,
+    connection, worker, preview-front, and close state so an ordinary unit or
+    value commit cannot manufacture an application-wide snapshot.
+    """
+
+    document: PulseDocument
+    document_generation: int
+    editor_revision: int
+    path: Path | None
+    file_state: str
+    dirty: bool
+    target_manifest: PulseTargetManifest
+    display_visible_ports: tuple[str, ...]
+    scan_workspace: ScanWorkspaceSnapshot
+
+
 class PulseEditorController:
     """Single mutable application owner behind the frozen formal Pulse UI."""
 
@@ -359,6 +379,11 @@ class PulseEditorController:
         self._scan_source_text = ""
         self._scan_source_baseline: str | None = None
         self._scan_auto_template = ""
+        self._scan_source_revision = 0
+        self._scan_workspace_cache_key: tuple[object, ...] | None = None
+        self._scan_workspace_cache: ScanWorkspaceSnapshot | None = None
+        self._scan_workspace_cache_generated: object | None = None
+        self._scan_workspace_cache_loaded: object | None = None
         self._scan_progress: PulseScanProgress | None = None
         self._scan_progress_inflight = False
         self._held_scan_source: PulseDocument | None = None
@@ -385,7 +410,6 @@ class PulseEditorController:
         self._owner_reaped = True
         self._reap_inflight = False
         self._owned_close_inflight = False
-        self._owned_close_failed = False
         self._close_requested = False
         self._close_complete = False
         self._borrowed_authority_retire = threading.Event()
@@ -410,7 +434,6 @@ class PulseEditorController:
             str,
         ] | None = None
         self._reset_scan_workspace(editor.document)
-        self.request_preview()
 
     def set_notify(self, notify: Callable[[], None]) -> None:
         if not callable(notify):
@@ -422,7 +445,9 @@ class PulseEditorController:
         with self._lock:
             return not self._tracked and not self._results
 
-    def snapshot(self) -> PulseEditorControllerSnapshot:
+    def editor_projection(self) -> PulseEditorProjection:
+        """Project one committed editor revision, without runtime state."""
+
         revision, document = self._editor.snapshot()
         source_manifest = (
             self._descriptor.manifest
@@ -435,19 +460,33 @@ class PulseEditorController:
             target_manifest,
             document=document,
         )
-        return PulseEditorControllerSnapshot(
+        return PulseEditorProjection(
             document=document,
             document_generation=self._editor_generation,
             editor_revision=revision,
             path=self._editor.path,
             file_state=self._editor.file_state,
             dirty=self._editor.dirty,
+            target_manifest=target_manifest,
+            display_visible_ports=display_visible_ports,
+            scan_workspace=self._scan_workspace_snapshot(document),
+        )
+
+    def snapshot(self) -> PulseEditorControllerSnapshot:
+        editor = self.editor_projection()
+        return PulseEditorControllerSnapshot(
+            document=editor.document,
+            document_generation=editor.document_generation,
+            editor_revision=editor.editor_revision,
+            path=editor.path,
+            file_state=editor.file_state,
+            dirty=editor.dirty,
             connection_state=self._connection_state,
             connection_mode=self._connection_mode,
             connection_endpoint=self._connection_endpoint,
             target_descriptor=self._descriptor,
-            target_manifest=target_manifest,
-            display_visible_ports=display_visible_ports,
+            target_manifest=editor.target_manifest,
+            display_visible_ports=editor.display_visible_ports,
             run_snapshot=self._run_snapshot,
             run_generation=self._run_generation,
             run_revision=self._run_revision,
@@ -457,7 +496,7 @@ class PulseEditorController:
             rendered_preview=self._rendered_preview,
             preview_error=self._preview_error,
             preview_notice=self._preview_notice,
-            scan_workspace=self._scan_workspace_snapshot(document),
+            scan_workspace=editor.scan_workspace,
             applied_snapshot=self._applied_snapshot,
             scan_progress=self._scan_progress,
             held_scan_point=self._held_scan_snapshot(),
@@ -495,6 +534,8 @@ class PulseEditorController:
     def replace_document(self, document: PulseDocument) -> int:
         self._require_authoring_available()
         previous = self._editor.document
+        if document == previous:
+            return self._editor.revision
         if self._descriptor is not None:
             document = bind_pulse_document_target(document, self._descriptor.target)
             document = restrict_pulse_document_to_manifest(
@@ -514,8 +555,22 @@ class PulseEditorController:
         if self._active_manifest_mode == "offline":
             self._display_ports_by_mode["offline"] = document.visible_ports
         self._observe_document_schema_change(previous, document)
-        self.request_preview()
+        self._invalidate_document_preview()
         return revision
+
+    def _invalidate_document_preview(self) -> None:
+        """Retire a stale front without rendering a hidden Preview tab.
+
+        The Preview tab explicitly requests the current revision when opened.
+        An already-running older render is allowed to finish and be discarded;
+        it must not chain a render for every intermediate editor revision.
+        """
+
+        self._preview = None
+        self._rendered_preview = None
+        self._preview_error = ""
+        self._preview_revision = None
+        self._preview_generation = None
 
     def apply_target_manifest(
         self,
@@ -539,13 +594,17 @@ class PulseEditorController:
         self._authoring_manifest = result.manifest.with_target(document.target)
         self._display_ports_by_mode["offline"] = document.visible_ports
         self._observe_document_schema_change(previous, document)
-        self.request_preview()
+        self._invalidate_document_preview()
         return PulseTargetEditResult(document, self._authoring_manifest, result.impact)
 
     def rename_document(self, name: str) -> int:
         """Commit the visible pulse name without making the view an authority."""
 
-        return self.replace_document(replace(self._editor.document, name=str(name)))
+        document = self._editor.document
+        normalized = str(name)
+        if normalized == document.name:
+            return self._editor.revision
+        return self.replace_document(replace(document, name=normalized))
 
     def set_scan_sweep_count(self, count: int) -> int:
         """Commit the saved operator default; runtime remains request-explicit."""
@@ -554,6 +613,8 @@ class PulseEditorController:
             raise TypeError("scan sweep count must be an integer")
         if count < 0:
             raise ValueError("scan sweep count must be non-negative")
+        if count == self._editor.document.scan_sweep_count:
+            return self._editor.revision
         return self.replace_document(
             replace(self._editor.document, scan_sweep_count=count)
         )
@@ -562,15 +623,22 @@ class PulseEditorController:
         document = self._editor.document
         if period_id not in document.period_by_id:
             raise KeyError(f"unknown period {period_id!r}")
+        normalized = str(name)
+        if document.period_by_id[period_id].name == normalized:
+            return self._editor.revision
         periods = tuple(
-            replace(period, name=str(name)) if period.period_id == period_id else period
+            replace(period, name=normalized) if period.period_id == period_id else period
             for period in document.periods
         )
         return self.replace_document(replace(document, periods=periods))
 
     def rename_port(self, port: str, label: str) -> int:
+        document = self._editor.document
+        normalized = str(label).strip() or str(port)
+        if document.target.by_key[str(port)].label == normalized:
+            return self._editor.revision
         return self.replace_document(
-            rename_port_label(self._editor.document, port, label)
+            rename_port_label(document, port, normalized)
         )
 
     def set_period_duration(
@@ -579,14 +647,23 @@ class PulseEditorController:
         value: int | float,
         unit: str,
     ) -> int:
+        document = self._editor.document
         field = PulseFieldRef(FIELD_DURATION, period_id)
+        current_value, current_unit = document.field_value(field)
+        if current_value == value and current_unit == str(unit):
+            return self._editor.revision
         return self.replace_document(
-            replace_pulse_field(self._editor.document, field, value, unit=unit)
+            replace_pulse_field(document, field, value, unit=unit)
         )
 
     def set_digital(self, period_id: str, port: str, high: bool) -> int:
+        document = self._editor.document
+        target_port = document.target.by_key[str(port)]
+        lane_index = document.target.raw_lanes.index(target_port.lanes[0])
+        if bool(document.period_by_id[period_id].states[lane_index]) == bool(high):
+            return self._editor.revision
         return self.replace_document(
-            set_digital_output(self._editor.document, period_id, port, high)
+            set_digital_output(document, period_id, port, high)
         )
 
     def set_analog(
@@ -650,10 +727,15 @@ class PulseEditorController:
         ordered = tuple(
             key for key in manifest.available_port_keys if key in selected
         )
+        if ordered == self._display_ports_for(
+            self._active_manifest_mode,
+            manifest,
+            document=document,
+        ):
+            return self._editor.revision
         self._display_ports_by_mode[self._active_manifest_mode] = ordered
         if self._active_manifest_mode == "offline":
             return self.replace_document(replace(document, visible_ports=ordered))
-        self._notify()
         return self._editor.revision
 
     def clear_port(self, port: str) -> int:
@@ -776,18 +858,13 @@ class PulseEditorController:
         )
         return self.replace_document(result.document)
 
-    def update_scan_source(self, source: str) -> None:
-        """Accept the existing code editor's buffer without executing on Qt."""
-
-        self._require_not_closing()
-        self._scan_source_text = str(source)
-
     def set_scan_template(self, kind: str) -> str:
         """Replace the code buffer with the current typed slot template."""
 
         self._require_not_closing()
         source = default_scan_program(self._editor.document, kind)
         self._scan_source_text = source
+        self._scan_source_revision += 1
         return source
 
     def generate_scan_source(self, source: str | None = None) -> None:
@@ -795,7 +872,10 @@ class PulseEditorController:
 
         self._require_scan_operation_available()
         if source is not None:
-            self._scan_source_text = str(source)
+            submitted = str(source)
+            if submitted != self._scan_source_text:
+                self._scan_source_text = submitted
+                self._scan_source_revision += 1
         document = self._editor.document
         if not document.scan_parameters:
             raise ValueError("bind at least one field to a scan parameter first")
@@ -907,7 +987,7 @@ class PulseEditorController:
         )
         self._editor_generation += 1
         self._reset_scan_workspace(self._editor.document)
-        self.request_preview()
+        self._invalidate_document_preview()
 
     def open_path(self, path: str | Path) -> None:
         self._require_not_closing()
@@ -1139,8 +1219,6 @@ class PulseEditorController:
             raise RuntimeError("this Pulse editor cannot change its installation")
         if self._connect_inflight or self._close_requested:
             return
-        if self._owned_close_failed:
-            raise RuntimeError("the current Pulse installation did not close safely")
         if self._load_inflight or self._save_inflight or self._run_busy():
             raise RuntimeError("connection requires an idle Pulse editor")
         normalized_mode = str(mode).strip().lower()
@@ -1179,6 +1257,7 @@ class PulseEditorController:
             self._connection_mode = normalized_mode
             self._connection_endpoint = endpoint_label
             connection = self._owned_connection
+            self._detach_pulse_authority()
             self._submit("switch-close", connection, connection.close)
             return
 
@@ -1225,14 +1304,19 @@ class PulseEditorController:
         )
 
     def _activate_offline(self) -> None:
-        self._owned_connection = None
-        self._pulse = None
-        self._descriptor = None
+        self._detach_pulse_authority()
         self._active_manifest_mode = "offline"
         self._connection_state = "offline"
         self._connection_mode = "offline"
         self._connection_endpoint = ""
         self._diagnostic = ""
+
+    def _detach_pulse_authority(self) -> None:
+        """Stop all reads through an authority before its asynchronous close starts."""
+
+        self._owned_connection = None
+        self._pulse = None
+        self._descriptor = None
         self._run_snapshot = None
         self._applied_snapshot = None
         self._run_generation = None
@@ -1516,8 +1600,6 @@ class PulseEditorController:
     def request_close(self) -> None:
         if self._close_complete:
             return
-        if self._owned_close_failed:
-            self._owned_close_failed = False
         self._close_requested = True
         self.cancel("PulseGUI is closing")
         self._advance_close()
@@ -1536,11 +1618,92 @@ class PulseEditorController:
         self._notify()
 
     def pump(self) -> PulseEditorControllerSnapshot:
+        """Consume a real owner event and publish its resulting state once."""
+
         self._apply_borrowed_authority_retirement()
         self._drain_results()
         self._poll_run()
         self._advance_close()
         return self.snapshot()
+
+    def poll_runtime_change(self) -> PulseEditorControllerSnapshot | None:
+        """Poll an active Run without manufacturing unchanged GUI snapshots.
+
+        This is the narrow compatibility seam for ``RunHandle``, whose current
+        API is observed rather than pushed.  Idle editors do no work.  Active
+        editors publish only when a runtime fact changes; the 40 ms Qt timer is
+        therefore no longer an application-wide snapshot clock.
+        """
+
+        # The Experiment owner can retire the borrowed facade from another
+        # thread.  Detach it before even deciding whether the compatibility
+        # timer has Run work; otherwise a timer already queued in Qt can call
+        # observe_active() after Experiment.close().
+        self._apply_borrowed_authority_retirement()
+        if not self._runtime_poll_required():
+            return None
+        before = self._runtime_presentation_key()
+        self._poll_run()
+        self._advance_close()
+        if self._runtime_presentation_key() == before:
+            return None
+        return self.snapshot()
+
+    def _runtime_poll_required(self) -> bool:
+        snapshot = self._run_snapshot
+        return bool(
+            self._run_starting
+            or self._pending_start is not None
+            or self._handle is not None
+            or self._reap_inflight
+            or (snapshot is not None and not snapshot.state.terminal)
+            or (self._close_requested and not self._close_complete)
+        )
+
+    @property
+    def runtime_poll_required(self) -> bool:
+        """Return whether the compatibility RunHandle watcher has work.
+
+        Reading this flag does not poll hardware and does not build a GUI
+        snapshot.  The Qt owner uses it to keep its timer stopped while idle.
+        """
+
+        return self._runtime_poll_required()
+
+    @property
+    def scan_progress_poll_required(self) -> bool:
+        """Whether a non-terminal applied scan can produce progress facts."""
+
+        run = self._run_snapshot
+        applied = self._applied_snapshot
+        return bool(
+            self._pulse is not None
+            and run is not None
+            and not run.state.terminal
+            and applied is not None
+            and applied.source_document.scan_table is not None
+        )
+
+    def _runtime_presentation_key(self) -> tuple[object, ...]:
+        return (
+            self._run_snapshot,
+            self._applied_snapshot,
+            self._run_generation,
+            self._run_revision,
+            self._scan_progress,
+            self._held_scan_index,
+            None
+            if self._held_scan_source is None
+            else self._held_scan_source.fingerprint,
+            self._run_starting,
+            self._pending_start is not None,
+            self._owner_reaped,
+            self._reap_inflight,
+            self._connection_state,
+            self._diagnostic,
+            self._close_requested,
+            self._close_complete,
+        )
 
     def _apply_borrowed_authority_retirement(self) -> None:
         if (
@@ -1704,6 +1867,7 @@ class PulseEditorController:
                 if operation == self._scan_operation_generation and not self._close_requested:
                     self._scan_source_text = source
                     self._scan_source_baseline = None
+                    self._scan_source_revision += 1
                     self._scan_diagnostic = f"Loaded scan program: {loaded_path.name}"
                 continue
             if kind == "scan-save-array":
@@ -1816,7 +1980,7 @@ class PulseEditorController:
                         self._editor_generation += 1
                         self._reset_scan_workspace(loaded.document)
                         self._diagnostic = f"Opened {loaded.path}"
-                        self.request_preview()
+                        self._invalidate_document_preview()
                 continue
             if kind == "save":
                 self._save_inflight = False
@@ -1843,10 +2007,6 @@ class PulseEditorController:
                 self._connect_inflight = False
                 try:
                     connection = future.result()
-                except InstallationRestartRequiredError as error:
-                    self._connection_state = "restart_required"
-                    self._diagnostic = str(error)
-                    continue
                 except BaseException as error:
                     self._connection_state = "offline"
                     self._diagnostic = (
@@ -1894,20 +2054,17 @@ class PulseEditorController:
                     )
                 self._connection_state = "ready"
                 self._diagnostic = ""
-                self.request_preview()
+                self._invalidate_document_preview()
                 continue
             if kind == "switch-close":
                 self._owned_close_inflight = False
                 request = self._pending_connection_request
                 self._pending_connection_request = None
+                close_error: BaseException | None = None
                 try:
                     future.result()
                 except BaseException as error:
-                    self._connect_inflight = False
-                    self._owned_close_failed = True
-                    self._connection_state = "close_blocked"
-                    self._diagnostic = f"Pulse installation SAFE close failed: {error}"
-                    continue
+                    close_error = error
                 self._activate_offline()
                 self._connect_inflight = False
                 if (
@@ -1916,19 +2073,17 @@ class PulseEditorController:
                     and not self._close_requested
                 ):
                     self._begin_connection(request)
+                elif close_error is not None:
+                    self._diagnostic = (
+                        "Previous Pulse connection close failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
                 continue
             if kind == "discard-connection":
                 try:
                     future.result()
                 except BaseException as error:
-                    if self._owned_connection is None and isinstance(
-                        token,
-                        OwnedPulseConnection,
-                    ):
-                        self._owned_connection = token
-                    self._owned_close_failed = True
-                    self._connection_state = "close_blocked"
-                    self._diagnostic = f"Remote SAFE close failed: {error}"
+                    self._diagnostic = f"Discarded connection close failed: {error}"
                 continue
             if kind == "start":
                 generation, revision = token
@@ -1984,13 +2139,7 @@ class PulseEditorController:
                 try:
                     future.result()
                 except BaseException as error:
-                    self._owned_close_failed = True
-                    self._connection_state = "close_blocked"
                     self._diagnostic = f"Remote installation close failed: {error}"
-                else:
-                    self._owned_connection = None
-                    self._pulse = None
-                    self._descriptor = None
                 continue
 
     def _reset_scan_workspace(self, document: PulseDocument) -> None:
@@ -2006,6 +2155,7 @@ class PulseEditorController:
         else:
             self._scan_source_text = self._scan_auto_template
             self._scan_source_baseline = self._scan_auto_template
+        self._scan_source_revision += 1
         self._scan_busy_operation = None
         self._scan_diagnostic = ""
 
@@ -2013,13 +2163,41 @@ class PulseEditorController:
         self,
         document: PulseDocument,
     ) -> ScanWorkspaceSnapshot:
+        scan_field_state = tuple(
+            (parameter, document.field_value(parameter.field))
+            for parameter in document.scan_parameters
+        )
+        api_field_state = tuple(
+            (parameter, document.field_value(parameter.field))
+            for parameter in document.api_parameters
+        )
+        cache_key = (
+            self._scan_source_revision,
+            self._scan_source_baseline == self._scan_source_text,
+            self._scan_selected,
+            scan_field_state,
+            api_field_state,
+            tuple(period.period_id for period in document.periods),
+            document.time_step_ns,
+            self._scan_busy_operation,
+            self._scan_diagnostic,
+        )
+        if (
+            cache_key == self._scan_workspace_cache_key
+            and self._scan_workspace_cache is not None
+            and self._scan_workspace_cache_generated is self._scan_generated
+            and self._scan_workspace_cache_loaded is self._scan_loaded
+        ):
+            return self._scan_workspace_cache
         generated = candidate_snapshot(self._scan_generated, document)
         loaded = candidate_snapshot(self._scan_loaded, document)
         selected = generated if self._scan_selected == "generated" else loaded
         selected_table = None if selected is None else selected.table
         compatible = selected is not None and selected.compatible
-        return ScanWorkspaceSnapshot(
+        table_stale = selected is not None and not compatible
+        snapshot = ScanWorkspaceSnapshot(
             source_text=self._scan_source_text,
+            source_revision=self._scan_source_revision,
             default_template=self._scan_auto_template,
             source_dirty=(
                 self._scan_source_baseline is None
@@ -2033,12 +2211,24 @@ class PulseEditorController:
             loaded_path=(None if loaded is None else loaded.origin_path),
             table_text=format_scan_table(
                 selected_table,
-                stale=selected is not None and not compatible,
+                column_names=(
+                    None
+                    if table_stale
+                    else tuple(
+                        spec.name for spec in scan_column_specs(document)
+                    )
+                ),
+                stale=table_stale,
             ),
             slots_text=format_scan_slots(document),
             busy_operation=self._scan_busy_operation,
             diagnostic=self._scan_diagnostic,
         )
+        self._scan_workspace_cache_key = cache_key
+        self._scan_workspace_cache = snapshot
+        self._scan_workspace_cache_generated = self._scan_generated
+        self._scan_workspace_cache_loaded = self._scan_loaded
+        return snapshot
 
     def _held_scan_snapshot(
         self,
@@ -2050,10 +2240,11 @@ class PulseEditorController:
         table = source.scan_table
         if not 0 <= index < len(table.rows):
             return None
+        display_names = tuple(spec.name for spec in scan_column_specs(source))
         return (
             index,
             len(table.rows),
-            tuple(zip(table.columns, table.rows[index], strict=True)),
+            tuple(zip(display_names, table.rows[index], strict=True)),
         )
 
     def _invalidate_changed_scan_schema(
@@ -2082,6 +2273,7 @@ class PulseEditorController:
         self._scan_auto_template = default_scan_program(document)
         if source_was_auto:
             self._scan_source_text = self._scan_auto_template
+            self._scan_source_revision += 1
         self._scan_source_baseline = (
             self._scan_auto_template
             if source_was_auto and self._scan_generated is None
@@ -2128,8 +2320,11 @@ class PulseEditorController:
         connection: OwnedPulseConnection,
         diagnostic: str,
     ) -> None:
-        self._owned_connection = connection
-        self._connection_state = "restart_required"
+        # A rejected connection is already unusable.  Remove it from every
+        # read path before its asynchronous close begins; a failed close is a
+        # fact about that connection, not process-global state.
+        self._detach_pulse_authority()
+        self._connection_state = "offline"
         self._diagnostic = diagnostic
         self._owned_close_inflight = True
         self._submit("close-owned", connection, connection.close)
@@ -2250,12 +2445,11 @@ class PulseEditorController:
         with self._lock:
             if self._tracked or self._results:
                 return
-        if self._owned_close_failed:
-            return
         if self._owned_connection is not None:
             if not self._owned_close_inflight:
                 self._owned_close_inflight = True
                 connection = self._owned_connection
+                self._detach_pulse_authority()
                 self._submit("close-owned", connection, connection.close)
             return
         if not self._pool_closed:
@@ -2274,6 +2468,7 @@ __all__ = [
     "OwnedPulseConnection",
     "PulseEditorController",
     "PulseEditorControllerSnapshot",
+    "PulseEditorProjection",
     "PulseRunFacade",
     "RenderedPulsePreview",
     "parse_remote_endpoint",

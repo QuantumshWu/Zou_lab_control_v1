@@ -104,6 +104,26 @@ class SinglePanelHost(QtWidgets.QWidget):
         if self._bound_kind is not None:
             self._board.set_selectors_enabled(self._selectors_on)
 
+    def clear(self) -> None:
+        """Forget the current front/binding while keeping this host alive.
+
+        The host is a stable piece of window chrome.  Callers that change the
+        presented signal or payload family need to retire the old interaction
+        binding before the next immutable frame arrives; they do not need to
+        delete and recreate this QWidget subtree.
+        """
+
+        if self._bound_kind == "pulse":
+            self._board.unbind_pulse_interaction(self._panel_id)
+        elif self._bound_kind == "curve":
+            self._board.unbind_curve_interaction(self._panel_id)
+        elif self._bound_kind == "histogram":
+            self._board.unbind_histogram_interaction(self._panel_id)
+        elif self._bound_kind == "image":
+            self._board.unbind_rectangle_selector(self._panel_id)
+        self._bound_kind = None
+        self._board.clear()
+
     def visible_interaction_origin(self) -> PanelInteractionOrigin | None:
         """Return the exact painted origin for this host's bound family.
 
@@ -235,7 +255,7 @@ class SinglePanelHost(QtWidgets.QWidget):
     # ------------------------------------------------------------------ #
 
     def _ensure_binding(self, payload) -> None:
-        """Bind the gesture family matching the FIRST payload's kind, once.
+        """Bind the gesture family matching the first payload since ``clear``.
 
         The binding is created READY (the panel was just presented, so its
         provenance is current) and the board-wide arm state is then set from

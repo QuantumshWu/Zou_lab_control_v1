@@ -609,9 +609,7 @@ class ExactCaptureTransaction:
         report = self.session.cleanup(context)
         if not software_errors:
             return report
-        return CleanupReport(
-            safety_proofs=report.safety_proofs,
-            decisions=report.decisions,
+        return CleanupReport.complete(
             errors=(*report.errors, *software_errors),
         )
 
@@ -654,14 +652,6 @@ class ExactCaptureTransaction:
             self._detach_preview(primary)
         elif report.errors:
             self._detach_preview(report.errors[0])
-        elif report.decisions:
-            decision = report.decisions[0]
-            self._detach_preview(
-                RuntimeError(
-                    "capture cleanup reported an unsafe terminal state: "
-                    f"{decision.reason}"
-                )
-            )
         else:
             self._finish_preview_source()
 
@@ -712,11 +702,6 @@ def _settle_unbound_preview(
     failure: BaseException | None = primary
     if failure is None and report.errors:
         failure = report.errors[0]
-    if failure is None and report.decisions:
-        failure = RuntimeError(
-            "capture cleanup reported an unsafe terminal state: "
-            f"{report.decisions[0].reason}"
-        )
     if failure is not None:
         _notify_preview_failure(preview, failure)
     return report

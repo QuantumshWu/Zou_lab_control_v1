@@ -201,6 +201,44 @@ class VivadoAxiRegisterTransport:
         )
         return self._parse_read(output, marker)
 
+    def read_words(
+        self,
+        word_offsets: Sequence[int],
+        *,
+        stop: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> tuple[int, ...]:
+        """Read several proof words in one persistent-Vivado action.
+
+        Each address remains an independent AXI read transaction; only the costly
+        Python/Vivado stdin-marker round trip is shared.  External executors retain
+        the older one-read contract used by hardware models and therefore fall back
+        to ``read_word``.
+        """
+
+        offsets = tuple(int(value) for value in word_offsets)
+        if not offsets:
+            return ()
+        if self._external_executor is not None:
+            return tuple(
+                self.read_word(address, stop=stop, deadline=deadline)
+                for address in offsets
+            )
+        absolute_deadline = self._effective_deadline(deadline)
+        lines: list[str] = []
+        markers: list[str] = []
+        for index, address in enumerate(offsets):
+            marker = f"ZLCBATCH_{index:04d}"
+            markers.append(marker)
+            lines.extend(self._read_txn_tcl(address * 4, marker))
+        output = self._run_tcl(
+            lines,
+            action="axi_read_batch",
+            deadline=absolute_deadline,
+            stop=stop,
+        )
+        return tuple(self._parse_read(output, marker) for marker in markers)
+
     def record_diagnostic(self, name: str, text: str) -> None:
         try:
             (self.state_dir / f"{name}.log").write_text(
@@ -291,7 +329,7 @@ class VivadoAxiRegisterTransport:
             f"{int(value) & 0xFFFFFFFF:08X}" for value in reversed(values)
         )
         return [
-            f"create_hw_axi_txn zlc_w [get_hw_axis] -address {address} -data {data} -len {len(values)} -type write -burst INCR",
+            f"create_hw_axi_txn zlc_w [get_hw_axis] -address {address} -data {data} -len {len(values)} -type write -burst INCR -force",
             "run_hw_axi zlc_w",
             "delete_hw_axi_txn zlc_w",
         ]
@@ -300,7 +338,7 @@ class VivadoAxiRegisterTransport:
     def _read_txn_tcl(byte_address: int, marker: str) -> list[str]:
         address = f"{byte_address & 0xFFFFFFFF:08X}"
         return [
-            f"create_hw_axi_txn zlc_r [get_hw_axis] -address {address} -len 1 -type read",
+            f"create_hw_axi_txn zlc_r [get_hw_axis] -address {address} -len 1 -type read -force",
             "run_hw_axi zlc_r",
             f'puts "{marker} [get_property DATA [get_hw_axi_txns zlc_r]]"',
             "delete_hw_axi_txn zlc_r",
@@ -377,7 +415,17 @@ class VivadoAxiRegisterTransport:
         output = self._read_until_marker(marker, deadline=deadline, stop=stop)
         self.record_diagnostic(action, output)
         if f"{marker}_ERROR" in output:
-            raise RuntimeError(f"persistent Vivado {action} failed")
+            detail = next(
+                (
+                    line.strip()
+                    for line in output.splitlines()
+                    if line.strip().startswith("ERROR:")
+                ),
+                "Vivado Tcl action returned an error",
+            )
+            raise RuntimeError(
+                f"persistent Vivado {action} failed: {detail[:1000]}"
+            )
         return output
 
     def _kill_process(self) -> None:
@@ -394,9 +442,17 @@ class VivadoAxiRegisterTransport:
         body = "\n".join(lines)
         return (
             f'puts "{marker}_BEGIN"\n'
-            "if {[catch {\n"
+            # A failed run_hw_axi skips the transaction helper's normal delete.
+            # Clear only our private fixed names before and after every action so
+            # one Xicom fault cannot poison the later physical-SAFE attempt.
+            "catch {delete_hw_axi_txn -quiet [get_hw_axi_txns -quiet zlc_w]}\n"
+            "catch {delete_hw_axi_txn -quiet [get_hw_axi_txns -quiet zlc_r]}\n"
+            "set zlc_axi_code [catch {\n"
             f"{body}\n"
-            "} zlc_axi_result zlc_axi_options]} {\n"
+            "} zlc_axi_result zlc_axi_options]\n"
+            "catch {delete_hw_axi_txn -quiet [get_hw_axi_txns -quiet zlc_w]}\n"
+            "catch {delete_hw_axi_txn -quiet [get_hw_axi_txns -quiet zlc_r]}\n"
+            "if {$zlc_axi_code} {\n"
             f'    puts "{marker}_ERROR $zlc_axi_result"\n'
             "    if {[dict exists $zlc_axi_options -errorinfo]} { puts [dict get $zlc_axi_options -errorinfo] }\n"
             "} else {\n"

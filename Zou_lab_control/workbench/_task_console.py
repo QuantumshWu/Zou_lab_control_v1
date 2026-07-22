@@ -691,7 +691,6 @@ class ScanIntentForm(QtWidgets.QWidget):
         document = self._document
         if document is None:
             return
-        self._clear_api_rows()
         api_values = (
             dict(program.api_values)
             if isinstance(program, AutonomousScanSlotProgram)
@@ -700,31 +699,10 @@ class ScanIntentForm(QtWidgets.QWidget):
                 for parameter in document.api_parameters
             }
         )
-        if not document.api_parameters:
-            self._api_empty = FluentLabel(
-                "No whole-run API constants declared",
-                self._fixed_api_page,
-            )
-            self._api_empty.setObjectName(f"{self._prefix}ApiConstantsState")
-            self._api_layout.addWidget(self._api_empty)
-        else:
-            self._api_form = FluentParameterForm(
-                _api_constant_form_spec(document),
-                api_values,
-                parent=self._fixed_api_page,
-            )
-            self._api_form.setObjectName(f"{self._prefix}ApiConstantForm")
-            for parameter in document.api_parameters:
-                self._api_form.widget_for(parameter.parameter_id).setObjectName(
-                    f"{self._prefix}ApiValue_{parameter.parameter_id}"
-                )
-            self._api_layout.addWidget(self._api_form)
+        self._reconcile_api_constants(document, api_values)
         columns = tuple(
             parameter.parameter_id for parameter in document.api_parameters
         )
-        self._api_table.clear()
-        self._api_table.setColumnCount(len(columns))
-        self._api_table.setHorizontalHeaderLabels(list(columns))
         rows = (
             program.table.rows
             if isinstance(program, ApiSlotSegmentedProgram)
@@ -732,9 +710,7 @@ class ScanIntentForm(QtWidgets.QWidget):
             if columns
             else ()
         )
-        self._api_table.setRowCount(0)
-        for row in rows:
-            self._append_api_row(row)
+        self._reconcile_api_table(columns, tuple(rows))
         self._allow_host_gaps.setChecked(
             isinstance(program, ApiSlotSegmentedProgram)
         )
@@ -800,6 +776,41 @@ class ScanIntentForm(QtWidgets.QWidget):
             )
         self._refresh_slot_summary()
 
+    def _reconcile_api_table(
+        self,
+        columns: tuple[str, ...],
+        rows: tuple[tuple[object, ...], ...],
+    ) -> None:
+        """Update stable table items; add/remove only the changed rows."""
+
+        current_columns = tuple(
+            "" if self._api_table.horizontalHeaderItem(index) is None else
+            self._api_table.horizontalHeaderItem(index).text()
+            for index in range(self._api_table.columnCount())
+        )
+        if current_columns != columns:
+            self._api_table.setColumnCount(len(columns))
+            self._api_table.setHorizontalHeaderLabels(list(columns))
+        while self._api_table.rowCount() > len(rows):
+            self._api_table.removeRow(self._api_table.rowCount() - 1)
+        while self._api_table.rowCount() < len(rows):
+            self._api_table.insertRow(self._api_table.rowCount())
+        for row_index, row in enumerate(rows):
+            if len(row) != len(columns):
+                raise ValueError("API row width differs from declared parameters")
+            for column_index, value in enumerate(row):
+                text = str(value)
+                item = self._api_table.item(row_index, column_index)
+                if item is None:
+                    self._api_table.setItem(
+                        row_index,
+                        column_index,
+                        QtWidgets.QTableWidgetItem(text),
+                    )
+                elif item.text() != text:
+                    item.setText(text)
+        self._refresh_slot_summary()
+
     def _remove_selected_api_rows(self) -> None:
         selected = sorted(
             {index.row() for index in self._api_table.selectedIndexes()},
@@ -811,13 +822,57 @@ class ScanIntentForm(QtWidgets.QWidget):
             self._api_table.removeRow(row)
         self._refresh_slot_summary()
 
-    def _clear_api_rows(self) -> None:
-        while self._api_layout.count():
-            item = self._api_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+    def _retire_api_constants_widget(self) -> None:
+        widget = self._api_form if self._api_form is not None else self._api_empty
+        if widget is not None:
+            self._api_layout.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
         self._api_form = None
+        self._api_empty = None
+
+    def _install_api_constants_widget(self, widget: QtWidgets.QWidget) -> None:
+        self._retire_api_constants_widget()
+        self._api_layout.addWidget(widget)
+
+    def _reconcile_api_constants(
+        self,
+        document: PulseDocument,
+        values: dict[str, object],
+    ) -> None:
+        """Reconcile API constants without replacing controls for value edits."""
+
+        if not document.api_parameters:
+            if self._api_form is None and self._api_empty is not None:
+                self._api_empty.setText("No whole-run API constants declared")
+                return
+            empty = FluentLabel(
+                "No whole-run API constants declared",
+                self._fixed_api_page,
+            )
+            empty.setObjectName(f"{self._prefix}ApiConstantsState")
+            self._install_api_constants_widget(empty)
+            self._api_empty = empty
+            return
+
+        spec = _api_constant_form_spec(document)
+        form = self._api_form
+        if form is not None:
+            form.reconcile(spec, values)
+            for parameter in document.api_parameters:
+                form.widget_for(parameter.parameter_id).setObjectName(
+                    f"{self._prefix}ApiValue_{parameter.parameter_id}"
+                )
+            return
+
+        form = FluentParameterForm(spec, values, parent=self._fixed_api_page)
+        form.setObjectName(f"{self._prefix}ApiConstantForm")
+        for parameter in document.api_parameters:
+            form.widget_for(parameter.parameter_id).setObjectName(
+                f"{self._prefix}ApiValue_{parameter.parameter_id}"
+            )
+        self._install_api_constants_widget(form)
+        self._api_form = form
 
     def _clear_unapplied(self) -> None:
         self._document = None
@@ -831,8 +886,9 @@ class ScanIntentForm(QtWidgets.QWidget):
         self._slot_mode.blockSignals(True)
         self._slot_mode.clear()
         self._slot_mode.blockSignals(False)
-        self._clear_api_rows()
+        self._retire_api_constants_widget()
         self._api_empty = FluentLabel("Load a PulseDocument", self._fixed_api_page)
+        self._api_empty.setObjectName(f"{self._prefix}ApiConstantsState")
         self._api_layout.addWidget(self._api_empty)
         self._api_table.clear()
         self._api_table.setRowCount(0)

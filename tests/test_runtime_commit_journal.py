@@ -80,7 +80,6 @@ def _intent(commit_id: str) -> CommitIntent:
     return CommitIntent(
         commit_id=commit_id,
         run_id="test-run",
-        safety_bundle_id="test-safety-bundle",
         target=_target(commit_id),
         created_at=1.0,
     )
@@ -107,7 +106,6 @@ def _prepare(coordinator, commit_id: str) -> FinalCommit[str]:
     return coordinator.prepare(
         commit_id,
         "test-run",
-        "test-safety-bundle",
         target,
         lambda: PublishedManifest(
             target.target_ref,
@@ -203,7 +201,6 @@ def test_coordinator_mints_one_immutable_final_authority(tmp_path):
     try:
         assert authority.commit_id == "immutable"
         assert authority.run_id == "test-run"
-        assert authority.safety_bundle_id == "test-safety-bundle"
         assert authority.target == _target("immutable")
         with pytest.raises(AttributeError, match="immutable"):
             authority.commit_id = "changed"

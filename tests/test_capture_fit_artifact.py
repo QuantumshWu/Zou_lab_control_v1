@@ -55,7 +55,6 @@ from zlc_neutral_atom.runtime.resources import (
     ResourceKey,
 )
 from zlc_neutral_atom.runtime.run import RunController
-from zlc_neutral_atom.runtime.safety_journal import PersistentSafetyJournal
 from zlc_neutral_atom.timing.capture import TriggeredCaptureSpec
 from zlc_neutral_atom.timing.pulse import BoundPulsePort
 from zlc_pulse import PulseExecutionForm, load_deployed_pulse_target, load_pulse_document
@@ -163,8 +162,6 @@ def _bind_endpoint(broker, key, identity, endpoint, cleanup_operation):
         key=ResourceKey.parse(key),
         identity=broker.verify_identity(lambda: _identity(identity)),
         execute_command=lambda command: endpoint.execute_command(current(), command),
-        cleanup_operations={cleanup_operation: endpoint.cleanup},
-        verify_safe_state=endpoint.verify_safe_state,
         capability_probe=lambda: endpoint.capability_probe(current()),
         close_session=lambda command: endpoint.close_session(current(), command),
         interrupt_operations={cleanup_operation: endpoint.interrupt},
@@ -242,8 +239,7 @@ class _CaptureCase:
             binding.cell_plan,
         )
         self.capture_repository = CaptureRepository(tmp_path / "captures")
-        self.safety = PersistentSafetyJournal(tmp_path / "safety.zlcj")
-        self.resources = ResourceArbiter(self.safety)
+        self.resources = ResourceArbiter()
         self.controller = RunController(self.resources)
         self.capture_reference = self.controller.start(
             compile_capture_artifact_pipeline(

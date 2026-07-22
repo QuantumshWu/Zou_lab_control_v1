@@ -5,7 +5,7 @@ import pytest
 from zlc_neutral_atom.bootstrap._endpoint_binding import (
     require_current_endpoint_binding,
 )
-from zlc_neutral_atom.runtime.ports import BoundDevice, DeviceBroker, SafeStateAck
+from zlc_neutral_atom.runtime.ports import BoundDevice, DeviceBroker
 from zlc_neutral_atom.runtime.resources import (
     DeviceIdentityEvidenceKind,
     PhysicalDeviceIdentity,
@@ -28,8 +28,6 @@ def binding() -> BoundDevice:
         key=ResourceKey.parse("device/test/endpoint-binding"),
         identity=identity,
         execute_command=lambda _command: None,
-        cleanup_operations={},
-        verify_safe_state=lambda: SafeStateAck("test-device-safe"),
     )
     yield value
     broker.shutdown()

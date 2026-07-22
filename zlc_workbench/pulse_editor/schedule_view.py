@@ -284,9 +284,53 @@ def _analog_values(
 
 def _set_duration_units(combo: FluentComboBox, binding: _Binding | None, unit: str) -> None:
     scanned = binding is not None and binding.kind == "scan"
-    combo.addItems(list(DURATION_UNITS) + (["str (ns)"] if scanned else []))
-    combo.setCurrentText("str (ns)" if scanned else unit)
+    desired = tuple(DURATION_UNITS) + (("str (ns)",) if scanned else ())
+    current = tuple(combo.itemText(index) for index in range(combo.count()))
+    if current != desired:
+        combo.clear()
+        combo.addItems(list(desired))
+    selected = "str (ns)" if scanned else unit
+    if combo.currentText() != selected:
+        combo.setCurrentText(selected)
     combo.setEnabled(not scanned)
+
+
+def _set_widget_text(widget, value: object) -> None:
+    """Set textual state only when authority actually changed it."""
+
+    text = str(value)
+    if widget.text() != text:
+        widget.setText(text)
+
+
+def _reconcile_widget_order(
+    layout: QtWidgets.QBoxLayout,
+    previous: Sequence[str],
+    desired: Sequence[str],
+    widgets: Mapping[str, QtWidgets.QWidget],
+    *,
+    offset: int,
+) -> None:
+    """Insert or move only rows whose stable-key position actually changed."""
+
+    desired = tuple(desired)
+    desired_set = set(desired)
+    current = [
+        key
+        for key in previous
+        if key in desired_set
+        and key in widgets
+        and layout.indexOf(widgets[key]) >= 0
+    ]
+    for index, key in enumerate(desired):
+        if index < len(current) and current[index] == key:
+            continue
+        widget = widgets[key]
+        if key in current:
+            current.remove(key)
+            layout.removeWidget(widget)
+        layout.insertWidget(offset + index, widget)
+        current.insert(index, key)
 
 
 class PeriodCard(FluentGroupBox):
@@ -312,10 +356,12 @@ class PeriodCard(FluentGroupBox):
     ) -> None:
         super().__init__("", parent)
         self.period_id = period.period_id
-        self._rows = tuple(rows)
+        self._rows: tuple[_PortRow, ...] = ()
         self.checks: dict[str, FluentCheckBox] = {}
         self.bus_mode_combos: dict[str, FluentComboBox] = {}
         self.bus_value_edits: dict[str, FluentScanLineEdit] = {}
+        self.port_rows: dict[str, QtWidgets.QWidget] = {}
+        self._projection_state: tuple[object, ...] | None = None
 
         card_width = _period_card_width()
         self.setMinimumWidth(card_width)
@@ -324,6 +370,7 @@ class PeriodCard(FluentGroupBox):
         control_width = _period_control_width(card_width)
 
         column = QtWidgets.QVBoxLayout(self)
+        self._column = column
         row_top, row_gap = _row_region_vmetrics()
         card_pad = _px(7)
         column.setContentsMargins(card_pad, card_pad, card_pad, card_pad)
@@ -387,39 +434,105 @@ class PeriodCard(FluentGroupBox):
         self.duration_edit.set_numeric_validator("float", bottom=0.0)
         if duration_binding is not None and duration_binding.kind == "scan":
             self.duration_edit.setValidator(None)
-        self.name_edit.textEdited.connect(
-            lambda text: self.periodNameEdited.emit(self.period_id, text)
-        )
+        self.name_edit.editingFinished.connect(self._commit_name)
         self.duration_dot.clicked.connect(
             lambda _checked=False, ref=duration_ref: self.bindingCycleRequested.emit(ref)
         )
         self.duration_edit.editingFinished.connect(self._commit_duration)
         self.unit_combo.currentTextChanged.connect(lambda _text: self._commit_duration())
 
+        column.addStretch(1)
+        self.reconcile(
+            index,
+            period,
+            total_periods=total_periods,
+            rows=rows,
+            digital_values=digital_values,
+            analog_values=analog_values,
+            bindings=bindings,
+        )
+
+    def _create_port_row(
+        self,
+        row: _PortRow,
+        *,
+        digital_value: bool,
+        analog_value: tuple[str, int | None],
+        binding: _Binding | None,
+    ) -> QtWidgets.QWidget:
         row_height = _channel_row_height()
-        for row in rows:
-            if row.kind == PORT_DAC:
-                column.addWidget(
-                    self._build_bus_row(
-                        row,
-                        analog_values.get(row.key, ("hold", 0)),
-                        bindings.get(PulseFieldRef(FIELD_DAC, self.period_id, row.key)),
-                        row_height,
-                    )
-                )
-                continue
+        if row.kind == PORT_DAC:
+            widget = self._build_bus_row(
+                row,
+                analog_value,
+                binding,
+                row_height,
+            )
+        else:
             check = FluentCheckBox(row.label)
             check.setToolTip(f"{row.label}: high for this whole period")
             check.setFixedHeight(row_height)
-            check.setChecked(bool(digital_values.get(row.key, False)))
+            check.setChecked(bool(digital_value))
             check.toggled.connect(
                 lambda checked, key=row.key: self.digitalEdited.emit(
                     self.period_id, key, bool(checked)
                 )
             )
             self.checks[row.key] = check
-            column.addWidget(check)
-        column.addStretch(1)
+            widget = check
+        self.port_rows[row.key] = widget
+        return widget
+
+    def _remove_port_row(self, key: str) -> None:
+        widget = self.port_rows.pop(key)
+        self._column.removeWidget(widget)
+        widget.setParent(None)
+        widget.deleteLater()
+        self.checks.pop(key, None)
+        self.bus_mode_combos.pop(key, None)
+        self.bus_value_edits.pop(key, None)
+
+    def _reconcile_port_rows(
+        self,
+        rows: Sequence[_PortRow],
+        *,
+        digital_values: Mapping[str, bool],
+        analog_values: Mapping[str, tuple[str, int | None]],
+        bindings: Mapping[PulseFieldRef, _Binding],
+    ) -> None:
+        rows = tuple(rows)
+        desired = tuple(row.key for row in rows)
+        desired_by_key = {row.key: row for row in rows}
+        if len(desired) != len(desired_by_key):
+            raise ValueError("period rows must have unique keys")
+        previous_kind = {row.key: row.kind for row in self._rows}
+        topology_changed = desired != tuple(row.key for row in self._rows)
+        for key in tuple(self.port_rows):
+            replacement = desired_by_key.get(key)
+            if replacement is None or replacement.kind != previous_kind.get(key):
+                self._remove_port_row(key)
+                topology_changed = True
+        for row in rows:
+            if row.key in self.port_rows:
+                continue
+            self._create_port_row(
+                row,
+                digital_value=bool(digital_values.get(row.key, False)),
+                analog_value=analog_values.get(row.key, ("hold", 0)),
+                binding=bindings.get(
+                    PulseFieldRef(FIELD_DAC, self.period_id, row.key)
+                ),
+            )
+            topology_changed = True
+        if topology_changed:
+            _reconcile_widget_order(
+                self._column,
+                tuple(row.key for row in self._rows),
+                desired,
+                self.port_rows,
+                offset=2,
+            )
+        self._rows = rows
 
     def _build_bus_row(
         self,
@@ -490,7 +603,16 @@ class PeriodCard(FluentGroupBox):
             value = _number(self.duration_edit.text())
         except (TypeError, ValueError):
             return
-        self.durationEdited.emit(self.period_id, value, self.unit_combo.currentText())
+        unit = self.unit_combo.currentText()
+        if value == self._committed_duration and unit == self._committed_unit:
+            return
+        self.durationEdited.emit(self.period_id, value, unit)
+
+    def _commit_name(self) -> None:
+        name = self.name_edit.text()
+        if name == self._committed_name:
+            return
+        self.periodNameEdited.emit(self.period_id, name)
 
     def _commit_analog(self, port: str) -> None:
         combo = self.bus_mode_combos[port]
@@ -515,6 +637,126 @@ class PeriodCard(FluentGroupBox):
             check.setText(label)
             check.setToolTip(f"{label}: high for this whole period")
 
+    def reconcile(
+        self,
+        index: int,
+        period,
+        *,
+        total_periods: int,
+        rows: Sequence[_PortRow],
+        digital_values: Mapping[str, bool],
+        analog_values: Mapping[str, tuple[str, int | None]],
+        bindings: Mapping[PulseFieldRef, _Binding],
+    ) -> None:
+        """Project scalar changes onto this stable card without recreating it."""
+
+        if period.period_id != self.period_id:
+            raise ValueError("cannot reconcile a PeriodCard to another period_id")
+        projection_state = (
+            int(index),
+            int(total_periods),
+            period,
+            tuple(rows),
+            tuple((row.key, bool(digital_values.get(row.key, False))) for row in rows),
+            tuple(
+                (row.key, analog_values.get(row.key, ("hold", 0))) for row in rows
+            ),
+            tuple(
+                (field, binding)
+                for field, binding in bindings.items()
+                if field.period_id == self.period_id
+            ),
+        )
+        if projection_state == self._projection_state:
+            return
+        self._reconcile_port_rows(
+            rows,
+            digital_values=digital_values,
+            analog_values=analog_values,
+            bindings=bindings,
+        )
+        self.set_period_position(index, total_periods)
+
+        duration_ref = PulseFieldRef(FIELD_DURATION, self.period_id)
+        duration_binding = bindings.get(duration_ref)
+        duration_text = (
+            f"s{duration_binding.position}"
+            if duration_binding is not None and duration_binding.kind == "scan"
+            else str(period.duration)
+        )
+        with signals_blocked(self.duration_edit, self.unit_combo, self.name_edit):
+            self.duration_edit.set_scan_bound(False, None)
+            self.duration_edit.set_api_bound(False, None)
+            self.duration_edit.set_numeric_validator("float", bottom=0.0)
+            _set_widget_text(self.duration_edit, duration_text)
+            base_tooltip = "How long this period lasts, in the unit below"
+            self.duration_edit.setToolTip(base_tooltip)
+            if duration_binding is not None:
+                if duration_binding.kind == "scan":
+                    self.duration_edit.set_scan_bound(
+                        True, duration_binding.position + 1
+                    )
+                    self.duration_edit.setValidator(None)
+                else:
+                    self.duration_edit.set_api_bound(
+                        True, duration_binding.position + 1
+                    )
+                self.duration_edit.setToolTip(
+                    f"{base_tooltip}\nParameter: {duration_binding.parameter_id}"
+                )
+            _set_duration_units(self.unit_combo, duration_binding, period.unit)
+            _set_widget_text(self.name_edit, period.name or "")
+        self._committed_duration = period.duration
+        self._committed_unit = period.unit
+        self._committed_name = str(period.name or "")
+
+        rows_by_key = {row.key: row for row in rows}
+        for key, check in self.checks.items():
+            row = rows_by_key[key]
+            with signals_blocked(check):
+                _set_widget_text(check, row.label)
+                check.setToolTip(f"{row.label}: high for this whole period")
+                check.setChecked(bool(digital_values.get(key, False)))
+        for key, combo in self.bus_mode_combos.items():
+            row = rows_by_key[key]
+            mode, number = analog_values.get(key, ("hold", 0))
+            binding = bindings.get(PulseFieldRef(FIELD_DAC, self.period_id, key))
+            edit = self.bus_value_edits[key]
+            lo, hi = row.signed_range or (0, 0)
+            text = (
+                f"s{binding.position}"
+                if binding is not None and binding.kind == "scan"
+                else str(0 if number is None else number)
+            )
+            with signals_blocked(combo, edit):
+                combo.setEnabled(True)
+                mode_title = _bus_mode_title(mode)
+                if combo.currentText() != mode_title:
+                    combo.setCurrentText(mode_title)
+                edit.set_scan_bound(False, None)
+                edit.set_api_bound(False, None)
+                edit.set_numeric_validator("int", bottom=lo, top=hi)
+                _set_widget_text(edit, text)
+                edit.set_editable(mode != "hold")
+                tooltip = (
+                    f"{row.label}: signed integer {lo}..{hi} (0 = 0 V); "
+                    "click the dot to cycle scan (sN) -> API (aN) -> off"
+                )
+                if binding is not None:
+                    if binding.kind == "scan":
+                        edit.set_scan_bound(True, binding.position + 1)
+                        edit.setValidator(None)
+                        combo.setEnabled(False)
+                    else:
+                        edit.set_api_bound(True, binding.position + 1)
+                    tooltip = f"{tooltip}\nParameter: {binding.parameter_id}"
+                edit.setToolTip(tooltip)
+        self._projection_state = projection_state
+
+    def set_visible_ports(self, ports: frozenset[str]) -> None:
+        for key, widget in self.port_rows.items():
+            widget.setVisible(key in ports)
+
 
 class ChannelNamesPanel(FluentGroupBox):
     """Operator channel catalog projected from the active target manifest."""
@@ -533,9 +775,10 @@ class ChannelNamesPanel(FluentGroupBox):
         parent=None,
     ) -> None:
         super().__init__("Port Catalog", parent)
-        self.rows = tuple(rows)
+        self.rows: tuple[_PortRow, ...] = ()
         self.port_labels: dict[str, FluentLineEdit] = {}
         self.hardware_labels: dict[str, FluentLabel] = {}
+        self.row_widgets: dict[str, QtWidgets.QWidget] = {}
         self.top_labels: dict[str, FluentLabel] = {}
         label_w = _channel_label_width()
         edit_w = _channel_name_edit_width()
@@ -544,6 +787,7 @@ class ChannelNamesPanel(FluentGroupBox):
         self.setMaximumWidth(panel_w)
 
         layout = QtWidgets.QVBoxLayout(self)
+        self._column = layout
         row_top, row_gap = _row_region_vmetrics()
         layout.setContentsMargins(_px(8), row_top, _px(8), _px(8))
         layout.setSpacing(row_gap)
@@ -557,7 +801,9 @@ class ChannelNamesPanel(FluentGroupBox):
 
         self.name_edit = FluentLineEdit(document_name)
         self.name_edit.setPlaceholderText("pulse name")
-        self.name_edit.textEdited.connect(self.documentNameEdited)
+        self.name_edit.editingFinished.connect(
+            lambda: self.documentNameEdited.emit(self.name_edit.text())
+        )
         self.top_labels["name"] = _add_labeled_widget(
             top_layout, "Name:", self.name_edit
         )
@@ -579,44 +825,110 @@ class ChannelNamesPanel(FluentGroupBox):
         )
         top_layout.addStretch()
         layout.addWidget(top)
-
-        row_height = _channel_row_height()
-        for row_info in rows:
-            row = QtWidgets.QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(_px(5, minimum=3))
-            endpoint_text = (
-                row_info.endpoints[0]
-                if len(row_info.endpoints) == 1
-                else f"{row_info.endpoints[0]}…{row_info.endpoints[-1]}"
-            )
-            hardware = FluentLabel(endpoint_text)
-            hardware.setToolTip(
-                f"endpoint {row_info.endpoints[0]}"
-                if row_info.kind == PORT_DIGITAL
-                else (
-                    f"{row_info.width}-bit DAC endpoints: "
-                    f"{', '.join(row_info.endpoints)}"
-                )
-            )
-            hardware.setAlignment(QtCore.Qt.AlignCenter)
-            hardware.setFixedSize(label_w, row_height)
-            self.hardware_labels[row_info.key] = hardware
-            label = FluentLineEdit(row_info.label)
-            label.setToolTip(
-                "The channel's display NAME (editable). Renaming changes only the "
-                "human label; the PulseTarget topology and ABI stay fixed."
-            )
-            label.setFixedWidth(edit_w)
-            label.setFixedHeight(row_height)
-            label.textEdited.connect(
-                lambda text, key=row_info.key: self.portLabelEdited.emit(key, text)
-            )
-            self.port_labels[row_info.key] = label
-            row.addWidget(hardware)
-            row.addWidget(label, 1)
-            layout.addLayout(row)
         layout.addStretch()
+        self._label_width = label_w
+        self._edit_width = edit_w
+        self.reconcile_rows(rows)
+
+    def _create_row(self, row_info: _PortRow) -> QtWidgets.QWidget:
+        row_height = _channel_row_height()
+        row_widget = QtWidgets.QWidget()
+        row_widget.setStyleSheet("background: transparent;")
+        row_widget.setFixedHeight(row_height)
+        row = QtWidgets.QHBoxLayout(row_widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(_px(5, minimum=3))
+        hardware = FluentLabel("")
+        hardware.setAlignment(QtCore.Qt.AlignCenter)
+        hardware.setFixedSize(self._label_width, row_height)
+        label = FluentLineEdit("")
+        label.setToolTip(
+            "The channel's display NAME (editable). Renaming changes only the "
+            "human label; the PulseTarget topology and ABI stay fixed."
+        )
+        label.setFixedWidth(self._edit_width)
+        label.setFixedHeight(row_height)
+        label.editingFinished.connect(
+            lambda key=row_info.key, editor=label: self.portLabelEdited.emit(
+                key, editor.text()
+            )
+        )
+        self.hardware_labels[row_info.key] = hardware
+        self.port_labels[row_info.key] = label
+        self.row_widgets[row_info.key] = row_widget
+        row.addWidget(hardware)
+        row.addWidget(label, 1)
+        return row_widget
+
+    def reconcile_rows(self, rows: Sequence[_PortRow]) -> None:
+        rows = tuple(rows)
+        if rows == self.rows:
+            return
+        desired = tuple(row.key for row in rows)
+        if len(desired) != len(set(desired)):
+            raise ValueError("channel rows must have unique keys")
+        topology_changed = desired != tuple(row.key for row in self.rows)
+        desired_set = set(desired)
+        for key in tuple(self.row_widgets):
+            if key in desired_set:
+                continue
+            widget = self.row_widgets.pop(key)
+            self._column.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
+            self.hardware_labels.pop(key)
+            self.port_labels.pop(key)
+        for row in rows:
+            if row.key not in self.row_widgets:
+                self._create_row(row)
+                topology_changed = True
+        if topology_changed:
+            _reconcile_widget_order(
+                self._column,
+                tuple(row.key for row in self.rows),
+                desired,
+                self.row_widgets,
+                offset=1,
+            )
+        self.rows = rows
+        for row in rows:
+            endpoint_text = (
+                row.endpoints[0]
+                if len(row.endpoints) == 1
+                else f"{row.endpoints[0]}…{row.endpoints[-1]}"
+            )
+            hardware = self.hardware_labels[row.key]
+            _set_widget_text(hardware, endpoint_text)
+            hardware.setToolTip(
+                f"endpoint {row.endpoints[0]}"
+                if row.kind == PORT_DIGITAL
+                else f"{row.width}-bit DAC endpoints: {', '.join(row.endpoints)}"
+            )
+            with signals_blocked(self.port_labels[row.key]):
+                _set_widget_text(self.port_labels[row.key], row.label)
+
+    def reconcile_header(
+        self,
+        *,
+        document_name: str,
+        total_text: str,
+        period_count: int,
+        visible_text: str,
+    ) -> None:
+        with signals_blocked(
+            self.name_edit,
+            self.total_label,
+            self.periods_label,
+            self.visible_label,
+        ):
+            _set_widget_text(self.name_edit, document_name)
+            _set_widget_text(self.total_label, total_text)
+            _set_widget_text(self.periods_label, period_count)
+            _set_widget_text(self.visible_label, visible_text)
+
+    def set_visible_ports(self, ports: frozenset[str]) -> None:
+        for key, widget in self.row_widgets.items():
+            widget.setVisible(key in ports)
 
 
 class ChannelPanel(FluentGroupBox):
@@ -640,11 +952,12 @@ class ChannelPanel(FluentGroupBox):
         parent=None,
     ) -> None:
         super().__init__("Delay / Scan", parent)
-        self.rows = tuple(rows)
+        self.rows: tuple[_PortRow, ...] = ()
         self.delay_edits: dict[str, FluentScanLineEdit] = {}
         self.delay_units: dict[str, FluentComboBox] = {}
         self.clear_buttons: dict[str, FluentButton] = {}
         self.channel_labels: dict[str, ElidedLabel] = {}
+        self.row_widgets: dict[str, QtWidgets.QWidget] = {}
         self.top_labels: dict[str, FluentLabel] = {}
         label_w = _channel_label_width()
         delay_w = _px(70, minimum=60)
@@ -656,6 +969,7 @@ class ChannelPanel(FluentGroupBox):
         self.setMaximumWidth(content_w)
 
         layout = QtWidgets.QVBoxLayout(self)
+        self._column = layout
         row_top, row_gap = _row_region_vmetrics()
         layout.setContentsMargins(_px(8), row_top, _px(8), _px(8))
         layout.setSpacing(row_gap)
@@ -716,67 +1030,154 @@ class ChannelPanel(FluentGroupBox):
         top_layout.addWidget(self.scan_source_toggle)
         top_layout.addStretch()
         layout.addWidget(top)
-
-        row_height = _channel_row_height()
-        for row_info in rows:
-            row = QtWidgets.QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(gap)
-            label = ElidedLabel(row_info.label)
-            label.setToolTip(row_info.key)
-            label.setFixedSize(label_w, row_height)
-            self.channel_labels[row_info.key] = label
-
-            value, unit_text = delays.get(row_info.key, (0, "ns"))
-            delay_edit = FluentScanLineEdit(str(value))
-            field = PulseFieldRef(FIELD_DELAY, None, row_info.key)
-            delay_edit.scanClicked.connect(
-                lambda key=row_info.key, ref=field: self.bindingCycleRequested.emit(ref)
-            )
-            binding = bindings.get(field)
-            if binding is not None:
-                delay_edit.set_api_bound(True, binding.position + 1)
-                delay_edit.setToolTip(f"API parameter: {binding.parameter_id}")
-            elif row_info.kind == PORT_DAC:
-                delay_edit.setToolTip(
-                    "Physical DAC-bus output delay (may be negative): the whole bus "
-                    "value shifts by d, out[t] = in[t-d]."
-                )
-            else:
-                delay_edit.setToolTip(
-                    "Physical per-channel output delay (may be negative): the whole "
-                    "channel waveform shifts by d, out[t] = in[t-d]."
-                )
-            delay_edit.setFixedSize(delay_w, row_height)
-            delay_edit.set_numeric_validator("float")
-            delay_edit.editingFinished.connect(
-                lambda key=row_info.key: self._commit_delay(key)
-            )
-
-            unit = FluentComboBox()
-            unit.addItems(DELAY_UNITS)
-            unit.setCurrentText(unit_text if unit_text in DELAY_UNITS else "ns")
-            unit.setFixedSize(unit_w, row_height)
-            unit.currentTextChanged.connect(
-                lambda _text, key=row_info.key: self._commit_delay(key)
-            )
-
-            clear_btn = FluentButton("X", color=ORANGE)
-            clear_btn.setFixedSize(hide_w, row_height)
-            clear_btn.setToolTip("Set this row fully off.")
-            clear_btn.clicked.connect(
-                lambda _checked=False, key=row_info.key: self.clearPortRequested.emit(key)
-            )
-
-            self.delay_edits[row_info.key] = delay_edit
-            self.delay_units[row_info.key] = unit
-            self.clear_buttons[row_info.key] = clear_btn
-            row.addWidget(label)
-            row.addWidget(delay_edit, 1)
-            row.addWidget(unit)
-            row.addWidget(clear_btn)
-            layout.addLayout(row)
         layout.addStretch()
+        self._label_width = label_w
+        self._delay_width = delay_w
+        self._unit_width = unit_w
+        self._hide_width = hide_w
+        self._row_gap = gap
+        self._projection_state: tuple[object, ...] | None = None
+        self.reconcile_rows(
+            rows,
+            time_step_ns=time_step_ns,
+            delays=delays,
+            bindings=bindings,
+            scan_parameter_count=scan_parameter_count,
+            scan_point_count=scan_point_count,
+        )
+
+    def _create_row(self, row_info: _PortRow) -> QtWidgets.QWidget:
+        row_height = _channel_row_height()
+        row_widget = QtWidgets.QWidget()
+        row_widget.setStyleSheet("background: transparent;")
+        row_widget.setFixedHeight(row_height)
+        row = QtWidgets.QHBoxLayout(row_widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(self._row_gap)
+        label = ElidedLabel("")
+        label.setFixedSize(self._label_width, row_height)
+        delay_edit = FluentScanLineEdit("")
+        field = PulseFieldRef(FIELD_DELAY, None, row_info.key)
+        delay_edit.scanClicked.connect(
+            lambda key=row_info.key, ref=field: self.bindingCycleRequested.emit(ref)
+        )
+        delay_edit.setFixedSize(self._delay_width, row_height)
+        delay_edit.editingFinished.connect(
+            lambda key=row_info.key: self._commit_delay(key)
+        )
+        unit = FluentComboBox()
+        unit.addItems(DELAY_UNITS)
+        unit.setFixedSize(self._unit_width, row_height)
+        unit.currentTextChanged.connect(
+            lambda _text, key=row_info.key: self._commit_delay(key)
+        )
+        clear_btn = FluentButton("X", color=ORANGE)
+        clear_btn.setFixedSize(self._hide_width, row_height)
+        clear_btn.setToolTip("Set this row fully off.")
+        clear_btn.clicked.connect(
+            lambda _checked=False, key=row_info.key: self.clearPortRequested.emit(key)
+        )
+        self.channel_labels[row_info.key] = label
+        self.delay_edits[row_info.key] = delay_edit
+        self.delay_units[row_info.key] = unit
+        self.clear_buttons[row_info.key] = clear_btn
+        self.row_widgets[row_info.key] = row_widget
+        row.addWidget(label)
+        row.addWidget(delay_edit, 1)
+        row.addWidget(unit)
+        row.addWidget(clear_btn)
+        return row_widget
+
+    def reconcile_rows(
+        self,
+        rows: Sequence[_PortRow],
+        *,
+        time_step_ns: float,
+        delays: Mapping[str, tuple[int | float, str]],
+        bindings: Mapping[PulseFieldRef, _Binding],
+        scan_parameter_count: int,
+        scan_point_count: int,
+    ) -> None:
+        rows = tuple(rows)
+        projection_state = (
+            rows,
+            float(time_step_ns),
+            tuple((row.key, delays.get(row.key, (0, "ns"))) for row in rows),
+            tuple(
+                (
+                    row.key,
+                    bindings.get(PulseFieldRef(FIELD_DELAY, None, row.key)),
+                )
+                for row in rows
+            ),
+            int(scan_parameter_count),
+            int(scan_point_count),
+        )
+        if projection_state == self._projection_state:
+            return
+        desired = tuple(row.key for row in rows)
+        if len(desired) != len(set(desired)):
+            raise ValueError("channel rows must have unique keys")
+        topology_changed = desired != tuple(row.key for row in self.rows)
+        desired_set = set(desired)
+        for key in tuple(self.row_widgets):
+            if key in desired_set:
+                continue
+            widget = self.row_widgets.pop(key)
+            self._column.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
+            self.channel_labels.pop(key)
+            self.delay_edits.pop(key)
+            self.delay_units.pop(key)
+            self.clear_buttons.pop(key)
+        for row in rows:
+            if row.key not in self.row_widgets:
+                self._create_row(row)
+                topology_changed = True
+        if topology_changed:
+            _reconcile_widget_order(
+                self._column,
+                tuple(row.key for row in self.rows),
+                desired,
+                self.row_widgets,
+                offset=1,
+            )
+        self.rows = rows
+        with signals_blocked(self.step_display, self.scan_summary):
+            _set_widget_text(self.step_display, _format_clock_text(time_step_ns))
+            self.set_scan_summary(scan_parameter_count, scan_point_count)
+        for row in rows:
+            key = row.key
+            label = self.channel_labels[key]
+            _set_widget_text(label, row.label)
+            label.setToolTip(key)
+            value, unit_text = delays.get(key, (0, "ns"))
+            edit = self.delay_edits[key]
+            unit = self.delay_units[key]
+            binding = bindings.get(PulseFieldRef(FIELD_DELAY, None, key))
+            with signals_blocked(edit, unit):
+                edit.set_scan_bound(False, None)
+                edit.set_api_bound(False, None)
+                edit.set_numeric_validator("float")
+                _set_widget_text(edit, value)
+                if binding is not None:
+                    edit.set_api_bound(True, binding.position + 1)
+                    edit.setToolTip(f"API parameter: {binding.parameter_id}")
+                elif row.kind == PORT_DAC:
+                    edit.setToolTip(
+                        "Physical DAC-bus output delay (may be negative): the whole "
+                        "bus value shifts by d, out[t] = in[t-d]."
+                    )
+                else:
+                    edit.setToolTip(
+                        "Physical per-channel output delay (may be negative): the "
+                        "whole channel waveform shifts by d, out[t] = in[t-d]."
+                    )
+                selected_unit = unit_text if unit_text in DELAY_UNITS else "ns"
+                if unit.currentText() != selected_unit:
+                    unit.setCurrentText(selected_unit)
+        self._projection_state = projection_state
 
     def _commit_delay(self, port: str) -> None:
         edit = self.delay_edits[port]
@@ -792,17 +1193,24 @@ class ChannelPanel(FluentGroupBox):
             text = "no scan slots"
         else:
             text = f"{slots} slot{'s' if slots != 1 else ''} · {points} pt{'s' if points != 1 else ''}"
-        self.scan_summary.setText(text)
+        _set_widget_text(self.scan_summary, text)
 
     def set_scan_source(self, *, use_loaded: bool, path: str) -> None:
         with signals_blocked(self.scan_source_toggle):
-            self.scan_source_toggle.setChecked(bool(use_loaded))
-        self.scan_file_label.setText(str(path) if path else "(no file)")
+            checked = bool(use_loaded)
+            if self.scan_source_toggle.isChecked() != checked:
+                self.scan_source_toggle.setChecked(checked)
+        display_path = str(path) if path else "(no file)"
+        _set_widget_text(self.scan_file_label, display_path)
 
     def set_port_label(self, port: str, label: str) -> None:
         widget = self.channel_labels.get(port)
         if widget is not None:
             widget.setText(label)
+
+    def set_visible_ports(self, ports: frozenset[str]) -> None:
+        for key, widget in self.row_widgets.items():
+            widget.setVisible(key in ports)
 
 
 class RepeatBracket(FluentGroupBox):
@@ -811,6 +1219,7 @@ class RepeatBracket(FluentGroupBox):
     def __init__(self, kind: str, repeat_count: int = 2, parent=None) -> None:
         super().__init__("", parent)
         self.kind = kind
+        self._committed_count = int(repeat_count)
         self.setFixedWidth(_px(78, minimum=60))
         self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
         layout = QtWidgets.QVBoxLayout(self)
@@ -831,7 +1240,7 @@ class RepeatBracket(FluentGroupBox):
             self.repeat_spin.setRange(1, 999)
             self.repeat_spin.setValue(repeat_count)
             self.repeat_spin.setFixedHeight(_row_height())
-            self.repeat_spin.valueChanged.connect(self.changed)
+            self.repeat_spin.editingFinished.connect(self._commit_count)
             top_layout.addWidget(self.repeat_spin)
         else:
             spacer = QtWidgets.QWidget()
@@ -845,6 +1254,22 @@ class RepeatBracket(FluentGroupBox):
         top_layout.addStretch()
         layout.addWidget(top)
         layout.addStretch()
+
+    def _commit_count(self) -> None:
+        if self.repeat_spin is None:
+            return
+        if int(self.repeat_spin.value()) == self._committed_count:
+            return
+        self.changed.emit()
+
+    def set_repeat_count(self, count: int) -> None:
+        if self.repeat_spin is None:
+            return
+        normalized = int(count)
+        with signals_blocked(self.repeat_spin):
+            if int(self.repeat_spin.value()) != normalized:
+                self.repeat_spin.setValue(normalized)
+        self._committed_count = normalized
 
 
 @dataclass(frozen=True)
@@ -882,45 +1307,50 @@ class PulseDragContainer(QtWidgets.QWidget):
         self._selected_period_id: str | None = None
         self._selected_gap: int | None = None
 
-    def add_item(
-        self,
-        widget: QtWidgets.QWidget,
-        item_type: str,
-        period_id: str | None = None,
-    ) -> None:
-        self.items.append(_DragItem(widget, item_type, period_id))
-        self.layout_main.addWidget(widget)
+    def reconcile_items(self, desired: Sequence[_DragItem]) -> None:
+        """Insert, remove, or move only the structural items that changed."""
 
-    def insert_item(
-        self,
-        index: int,
-        widget: QtWidgets.QWidget,
-        item_type: str,
-        period_id: str | None = None,
-    ) -> None:
-        self.items.insert(
-            max(0, min(index, len(self.items))),
-            _DragItem(widget, item_type, period_id),
+        desired = list(desired)
+        current_identity = tuple(
+            (id(item.widget), item.item_type, item.period_id) for item in self.items
         )
-        self.refresh_layout()
+        desired_identity = tuple(
+            (id(item.widget), item.item_type, item.period_id) for item in desired
+        )
+        if desired_identity == current_identity:
+            return
+        desired_ids = {id(item.widget) for item in desired}
+        if len(desired_ids) != len(desired):
+            raise ValueError("drag items must have unique widgets")
 
-    def clear_items(self) -> None:
-        while self.layout_main.count():
-            item = self.layout_main.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        self.items = []
-        self.insert_indicator.hide()
+        current = list(self.items)
+        for item in tuple(current):
+            if id(item.widget) in desired_ids:
+                continue
+            self.layout_main.removeWidget(item.widget)
+            current.remove(item)
 
-    def refresh_layout(self) -> None:
-        while self.layout_main.count():
-            item = self.layout_main.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-        for item in self.items:
-            self.layout_main.addWidget(item.widget)
+        for index, wanted in enumerate(desired):
+            current_index = next(
+                (
+                    position
+                    for position, item in enumerate(current)
+                    if item.widget is wanted.widget
+                ),
+                None,
+            )
+            if current_index is None:
+                self.layout_main.insertWidget(index, wanted.widget)
+                current.insert(index, wanted)
+                continue
+            current[current_index] = wanted
+            if current_index == index:
+                continue
+            self.layout_main.removeWidget(wanted.widget)
+            self.layout_main.insertWidget(index, wanted.widget)
+            current.insert(index, current.pop(current_index))
+
+        self.items = desired
         self.insert_indicator.hide()
         self.update_period_titles()
 
@@ -1238,11 +1668,12 @@ class PulseScheduleView(QtWidgets.QWidget):
         super().__init__(parent)
         self._document_generation = -1
         self._revision = -1
-        self._document_fingerprint = ""
+        self._document_identity = 0
         self._manifest_fingerprint = ""
         self._period_ids: tuple[str, ...] = ()
         self._visible_ports: tuple[str, ...] = ()
         self._programmable_ports: tuple[str, ...] = ()
+        self._all_rows: tuple[_PortRow, ...] = ()
         self._active_ports: frozenset[str] = frozenset()
         self._repeat: tuple[str, str, int] | None = None
         self._selected_period_id: str | None = None
@@ -1266,10 +1697,6 @@ class PulseScheduleView(QtWidgets.QWidget):
     @property
     def revision(self) -> int:
         return self._revision
-
-    @property
-    def document_fingerprint(self) -> str:
-        return self._document_fingerprint
 
     def _build_ui(self) -> None:
         self.setStyleSheet("background: transparent;")
@@ -1644,11 +2071,134 @@ class PulseScheduleView(QtWidgets.QWidget):
                                 max(0, len(widget.text()) - start),
                             ),
                         )
-        # Focusing a rebuilt child may ask its scroll area to reveal it.  The
-        # saved bars are restored last so the operator sees exactly the same
-        # viewport that contained that focus before the immutable refresh.
+        # A structural add/remove/reorder may ask a scroll area to reveal the
+        # focused child.  Restore the saved bars last so the operator keeps the
+        # same viewport; scalar reconciliation normally retains the child too.
         self.scroll.horizontalScrollBar().setValue(snapshot.horizontal_scroll)
         self.dataset_scroll.verticalScrollBar().setValue(snapshot.vertical_scroll)
+
+    def _connect_period_card(self, card: PeriodCard) -> None:
+        card.periodNameEdited.connect(self.periodNameEdited)
+        card.durationEdited.connect(self.durationEdited)
+        card.digitalEdited.connect(self.digitalEdited)
+        card.analogEdited.connect(self.analogEdited)
+        card.bindingCycleRequested.connect(self.bindingCycleRequested)
+
+    def _reconcile_period_items(
+        self,
+        document: PulseDocument,
+        rows: Sequence[_PortRow],
+        *,
+        digital_values: Mapping[tuple[str, str], bool],
+        analog_values: Mapping[tuple[str, str], tuple[str, int | None]],
+        bindings: Mapping[PulseFieldRef, _Binding],
+    ) -> None:
+        """Incrementally add/remove/move cards and repeat markers by stable id."""
+
+        existing_cards = {
+            card.period_id: card for card in self.drag_container.pulse_cards()
+        }
+        cards: list[PeriodCard] = []
+        total = len(document.periods)
+        for index, period in enumerate(document.periods):
+            card = existing_cards.pop(period.period_id, None)
+            if card is None:
+                card = PeriodCard(
+                    index,
+                    period,
+                    total_periods=total,
+                    rows=rows,
+                    digital_values={
+                        row.key: digital_values.get(
+                            (period.period_id, row.key), False
+                        )
+                        for row in rows
+                        if row.kind == PORT_DIGITAL
+                    },
+                    analog_values={
+                        row.key: analog_values.get(
+                            (period.period_id, row.key), ("hold", 0)
+                        )
+                        for row in rows
+                        if row.kind == PORT_DAC
+                    },
+                    bindings=bindings,
+                )
+                self._connect_period_card(card)
+            else:
+                card.reconcile(
+                    index,
+                    period,
+                    total_periods=total,
+                    rows=rows,
+                    digital_values={
+                        row.key: digital_values.get(
+                            (period.period_id, row.key), False
+                        )
+                        for row in rows
+                        if row.kind == PORT_DIGITAL
+                    },
+                    analog_values={
+                        row.key: analog_values.get(
+                            (period.period_id, row.key), ("hold", 0)
+                        )
+                        for row in rows
+                        if row.kind == PORT_DAC
+                    },
+                    bindings=bindings,
+                )
+            cards.append(card)
+
+        existing_start = next(
+            (
+                item.widget
+                for item in self.drag_container.items
+                if item.item_type == "bracket_start"
+            ),
+            None,
+        )
+        existing_end = next(
+            (
+                item.widget
+                for item in self.drag_container.items
+                if item.item_type == "bracket_end"
+            ),
+            None,
+        )
+        desired_items = [
+            _DragItem(card, "pulse", card.period_id) for card in cards
+        ]
+        repeat = document.repeat
+        if repeat is not None:
+            if existing_start is None:
+                existing_start = RepeatBracket("start")
+            if existing_end is None:
+                existing_end = RepeatBracket("end", repeat.count)
+                existing_end.changed.connect(self._request_repeat_count)
+            existing_end.set_repeat_count(repeat.count)
+            period_ids = tuple(period.period_id for period in document.periods)
+            start_index = period_ids.index(repeat.start_period_id)
+            end_index = period_ids.index(repeat.end_period_id)
+            desired_items.insert(
+                start_index,
+                _DragItem(existing_start, "bracket_start"),
+            )
+            desired_items.insert(
+                end_index + 2,
+                _DragItem(existing_end, "bracket_end"),
+            )
+            self.bracket_button.setText("Del Bracket")
+        else:
+            self.bracket_button.setText("Add Bracket")
+
+        desired_widget_ids = {id(item.widget) for item in desired_items}
+        for item in self.drag_container.items:
+            if id(item.widget) in desired_widget_ids:
+                continue
+            self.drag_container.layout_main.removeWidget(item.widget)
+            item.widget.setParent(None)
+            item.widget.deleteLater()
+        self.drag_container.reconcile_items(desired_items)
 
     def set_document(
         self,
@@ -1691,22 +2241,20 @@ class PulseScheduleView(QtWidgets.QWidget):
             raise ValueError("document_generation must be a non-negative integer")
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
             raise ValueError("revision must be a non-negative integer")
-        fingerprint = document.fingerprint
+        document_identity = id(document)
         manifest_fingerprint = manifest.fingerprint
         incoming_version = (document_generation, revision)
         current_version = (self._document_generation, self._revision)
         if incoming_version < current_version:
             return False
         if incoming_version == current_version:
-            if fingerprint != self._document_fingerprint:
+            if document_identity != self._document_identity:
                 raise ValueError("one editor revision cannot identify two PulseDocuments")
             if (
                 manifest_fingerprint == self._manifest_fingerprint
                 and display_visible_ports == self._visible_ports
             ):
                 return False
-
-        interaction = self._capture_interaction()
 
         rows = _port_rows(
             document,
@@ -1754,6 +2302,22 @@ class PulseScheduleView(QtWidgets.QWidget):
             total_ns += (document.repeat.count - 1) * sum(
                 base_ns_by_id[item] for item in inner_ids
             )
+        row_structure = tuple((row.key, row.kind) for row in all_rows)
+        previous_row_structure = tuple(
+            (row.key, row.kind) for row in self._all_rows
+        )
+        repeat_bounds = None if repeat is None else repeat[:2]
+        previous_repeat_bounds = (
+            None if self._repeat is None else self._repeat[:2]
+        )
+        structure_changed = bool(
+            period_ids != self._period_ids
+            or row_structure != previous_row_structure
+            or repeat_bounds != previous_repeat_bounds
+        )
+        visible_changed = visible != self._visible_ports
+        layout_changed = structure_changed or visible_changed
+        interaction = self._capture_interaction() if layout_changed else None
         repeat_text = _repeat_summary_text(document)
         visible_set = set(visible)
         hidden_active = tuple(
@@ -1790,15 +2354,53 @@ class PulseScheduleView(QtWidgets.QWidget):
                 f"{_summary_time_text(total_ns)}: {', '.join(labels)}{suffix}"
             )
 
-        self.setUpdatesEnabled(False)
+        if layout_changed:
+            self.setUpdatesEnabled(False)
         try:
-            self._clear_layout(self.names_panel_layout)
-            self._clear_layout(self.channel_panel_layout)
-            self.drag_container.clear_items()
+            if not hasattr(self, "names_panel"):
+                self.names_panel = ChannelNamesPanel(
+                    document.name,
+                    all_rows,
+                    total_text=_summary_time_text(total_ns),
+                    period_count=len(period_ids),
+                    visible_text=f"{len(visible)}/{len(programmable)}",
+                )
+                self.names_panel.documentNameEdited.connect(self.documentNameEdited)
+                self.names_panel.portLabelEdited.connect(self._port_label_edited)
+                self.names_panel_layout.addWidget(self.names_panel)
+                self.name_edit = self.names_panel.name_edit
 
-            self.names_panel = ChannelNamesPanel(
-                document.name,
-                rows,
+                self.channel_panel = ChannelPanel(
+                    all_rows,
+                    time_step_ns=document.time_step_ns,
+                    delays=delays,
+                    bindings=bindings,
+                    scan_parameter_count=len(document.scan_parameters),
+                    scan_point_count=point_count,
+                )
+                self.channel_panel.delayEdited.connect(self.delayEdited)
+                self.channel_panel.bindingCycleRequested.connect(
+                    self.bindingCycleRequested
+                )
+                self.channel_panel.clearPortRequested.connect(self.clearPortRequested)
+                self.channel_panel.scanArrayLoadRequested.connect(
+                    self.scanArrayLoadRequested
+                )
+                self.channel_panel.scanSourceEdited.connect(self.scanSourceEdited)
+                self.channel_panel_layout.addWidget(self.channel_panel)
+            else:
+                self.names_panel.reconcile_rows(all_rows)
+                self.channel_panel.reconcile_rows(
+                    all_rows,
+                    time_step_ns=document.time_step_ns,
+                    delays=delays,
+                    bindings=bindings,
+                    scan_parameter_count=len(document.scan_parameters),
+                    scan_point_count=point_count,
+                )
+
+            self.names_panel.reconcile_header(
+                document_name=document.name,
                 total_text=_summary_time_text(total_ns),
                 period_count=len(period_ids),
                 visible_text=f"{len(visible)}/{len(programmable)}",
@@ -1806,101 +2408,48 @@ class PulseScheduleView(QtWidgets.QWidget):
             self.names_panel.total_label.setToolTip(
                 f"{total_ns:.9g} ns total (one frame)"
             )
-            self.names_panel.documentNameEdited.connect(self.documentNameEdited)
-            self.names_panel.portLabelEdited.connect(self._port_label_edited)
-            self.names_panel_layout.addWidget(self.names_panel)
-            self.name_edit = self.names_panel.name_edit
-
-            self.channel_panel = ChannelPanel(
-                rows,
-                time_step_ns=document.time_step_ns,
-                delays=delays,
-                bindings=bindings,
-                scan_parameter_count=len(document.scan_parameters),
-                scan_point_count=point_count,
-            )
-            self.channel_panel.delayEdited.connect(self.delayEdited)
-            self.channel_panel.bindingCycleRequested.connect(
-                self.bindingCycleRequested
-            )
-            self.channel_panel.clearPortRequested.connect(self.clearPortRequested)
-            self.channel_panel.scanArrayLoadRequested.connect(
-                self.scanArrayLoadRequested
-            )
-            self.channel_panel.scanSourceEdited.connect(self.scanSourceEdited)
             self.channel_panel.set_scan_source(
                 use_loaded=self._scan_source_loaded, path=self._scan_source_path
             )
-            self.channel_panel_layout.addWidget(self.channel_panel)
-
-            for index, period in enumerate(document.periods):
-                card = PeriodCard(
-                    index,
-                    period,
-                    total_periods=len(period_ids),
-                    rows=rows,
-                    digital_values={
-                        row.key: digital_values.get(
-                            (period.period_id, row.key), False
-                        )
-                        for row in rows
-                        if row.kind == PORT_DIGITAL
-                    },
-                    analog_values={
-                        row.key: analog_values.get(
-                            (period.period_id, row.key), ("hold", 0)
-                        )
-                        for row in rows
-                        if row.kind == PORT_DAC
-                    },
-                    bindings=bindings,
-                )
-                card.periodNameEdited.connect(self.periodNameEdited)
-                card.durationEdited.connect(self.durationEdited)
-                card.digitalEdited.connect(self.digitalEdited)
-                card.analogEdited.connect(self.analogEdited)
-                card.bindingCycleRequested.connect(self.bindingCycleRequested)
-                self.drag_container.add_item(card, "pulse", period.period_id)
-
-            if repeat is not None:
-                start_id, end_id, count = repeat
-                start_index = period_ids.index(start_id)
-                end_index = period_ids.index(end_id)
-                start_bracket = RepeatBracket("start")
-                end_bracket = RepeatBracket("end", count)
-                end_bracket.changed.connect(self._request_repeat_count)
-                self.drag_container.insert_item(
-                    start_index, start_bracket, "bracket_start"
-                )
-                self.drag_container.insert_item(
-                    end_index + 2, end_bracket, "bracket_end"
-                )
-                self.bracket_button.setText("Del Bracket")
-            else:
-                self.bracket_button.setText("Add Bracket")
-            self.drag_container.refresh_layout()
+            self._reconcile_period_items(
+                document,
+                all_rows,
+                digital_values=digital_values,
+                analog_values=analog_values,
+                bindings=bindings,
+            )
 
             self._period_ids = period_ids
             self._programmable_ports = programmable
+            self._all_rows = tuple(all_rows)
             self._visible_ports = visible
             self._active_ports = frozenset(active)
             self._repeat = repeat
+            selected_period_id = (
+                self._selected_period_id
+                if interaction is None
+                else interaction.selected_period_id
+            )
+            selected_gap = (
+                self._selected_gap if interaction is None else interaction.selected_gap
+            )
             self._selected_period_id = (
-                interaction.selected_period_id
-                if interaction.selected_period_id in period_ids
-                else None
+                selected_period_id if selected_period_id in period_ids else None
             )
             self._selected_gap = (
-                interaction.selected_gap
+                selected_gap
                 if self._selected_period_id is None
-                and interaction.selected_gap is not None
-                and 0 <= interaction.selected_gap <= len(period_ids)
+                and selected_gap is not None
+                and 0 <= selected_gap <= len(period_ids)
                 else None
             )
-            self.drag_container.show_selection(
-                period_id=self._selected_period_id,
-                gap=self._selected_gap,
-            )
+            if layout_changed:
+                self.drag_container.show_selection(
+                    period_id=self._selected_period_id,
+                    gap=self._selected_gap,
+                )
+            if row_structure != previous_row_structure or visible_changed:
+                self._apply_visible_port_projection(frozenset(visible))
             self.remove_button.setEnabled(len(period_ids) > 1)
             self._refresh_hidden_combo(all_rows)
             self.visible_label.setText(
@@ -1910,32 +2459,42 @@ class PulseScheduleView(QtWidgets.QWidget):
             self._summary_text = " | ".join(summary_parts)
             self._document_generation = document_generation
             self._revision = revision
-            self._document_fingerprint = fingerprint
+            self._document_identity = document_identity
             self._manifest_fingerprint = manifest_fingerprint
-            self._sync_dataset_geometry()
-            self._restore_interaction(interaction, version=incoming_version)
-            QtCore.QTimer.singleShot(
-                0,
-                lambda saved=interaction, version=incoming_version: self._restore_interaction(
-                    saved,
-                    version=version,
-                ),
-            )
+            if layout_changed:
+                self._sync_dataset_geometry()
+            if interaction is not None:
+                self._restore_interaction(interaction, version=incoming_version)
+                QtCore.QTimer.singleShot(
+                    0,
+                    lambda saved=interaction, version=incoming_version: self._restore_interaction(
+                        saved,
+                        version=version,
+                    ),
+                )
         finally:
-            self.setUpdatesEnabled(True)
-            self.update()
+            if layout_changed:
+                self.setUpdatesEnabled(True)
+                self.update()
         return True
 
-    @staticmethod
-    def _clear_layout(layout: QtWidgets.QLayout) -> None:
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            child_layout = item.layout()
-            if widget is not None:
-                widget.deleteLater()
-            elif child_layout is not None:
-                PulseScheduleView._clear_layout(child_layout)
+    def _apply_visible_port_projection(self, visible: frozenset[str]) -> None:
+        """Reveal existing aligned rows without rebuilding any editor widget."""
+
+        self.names_panel.set_visible_ports(visible)
+        self.channel_panel.set_visible_ports(visible)
+        for card in self.drag_container.pulse_cards():
+            card.set_visible_ports(visible)
+        for widget in (
+            self.names_panel,
+            self.channel_panel,
+            *self.drag_container.pulse_cards(),
+        ):
+            layout = widget.layout()
+            if layout is not None:
+                layout.invalidate()
+                layout.activate()
+            widget.updateGeometry()
 
     def period_cards(self) -> tuple[PeriodCard, ...]:
         return tuple(self.drag_container.pulse_cards())
@@ -2099,8 +2658,8 @@ class PulseScheduleView(QtWidgets.QWidget):
         self.visiblePortsEdited.emit(self._programmable_ports)
 
     def _refresh_hidden_combo(self, rows: Sequence[_PortRow]) -> None:
-        self.add_channel_combo.clear()
         visible = set(self._visible_ports)
+        desired: list[tuple[str, str]] = []
         for row in rows:
             if row.key in visible:
                 continue
@@ -2109,7 +2668,30 @@ class PulseScheduleView(QtWidgets.QWidget):
                 if row.kind == PORT_DAC
                 else row.label
             )
-            self.add_channel_combo.addItem(display, row.key)
+            desired.append((row.key, display))
+
+        selected = self.add_channel_combo.currentData()
+        with signals_blocked(self.add_channel_combo):
+            for index, (key, display) in enumerate(desired):
+                if (
+                    index < self.add_channel_combo.count()
+                    and self.add_channel_combo.itemData(index) == key
+                ):
+                    if self.add_channel_combo.itemText(index) != display:
+                        self.add_channel_combo.setItemText(index, display)
+                    continue
+                previous = self.add_channel_combo.findData(key)
+                if previous >= 0:
+                    self.add_channel_combo.removeItem(previous)
+                self.add_channel_combo.insertItem(index, display, key)
+            while self.add_channel_combo.count() > len(desired):
+                self.add_channel_combo.removeItem(
+                    self.add_channel_combo.count() - 1
+                )
+            if selected is not None:
+                selected_index = self.add_channel_combo.findData(selected)
+                if selected_index >= 0:
+                    self.add_channel_combo.setCurrentIndex(selected_index)
         has_hidden = self.add_channel_combo.count() > 0
         self.add_channel_combo.setEnabled(has_hidden)
         self.add_channel_button.setEnabled(has_hidden)

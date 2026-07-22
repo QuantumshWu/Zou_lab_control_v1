@@ -110,7 +110,15 @@ def test_template_defaults_come_from_nominal_clock_units_and_real_dac_range():
     assert duration.hi >= 4000.0
     assert (analog.lo, analog.hi) == tuple(float(v) for v in dac.signed_range)
     source = default_scan_program(document)
-    assert all(item.parameter_id in source for item in document.scan_parameters)
+    assert duration.name == "duration_p2"
+    assert duration.name in source
+    assert analog.name.endswith("_p1")
+    assert analog.name in source
+    assert "Period 1" in source and "Period 2" in source
+    assert all(
+        item.parameter_id == spec.name
+        for item, spec in zip(document.scan_parameters, specs, strict=True)
+    )
 
 
 def test_controller_worker_commits_generated_recipe_in_stable_parameter_order():
@@ -118,6 +126,7 @@ def test_controller_worker_commits_generated_recipe_in_stable_parameter_order():
     try:
         document = controller.snapshot().document
         columns = tuple(item.parameter_id for item in document.scan_parameters)
+        display_names = tuple(spec.name for spec in scan_column_specs(document))
         source = "import numpy as np\nscan_table = np.array([[20, 40], [60, 80]])\n"
         controller.generate_scan_source(source)
         snapshot = _pump_until(
@@ -131,7 +140,14 @@ def test_controller_worker_commits_generated_recipe_in_stable_parameter_order():
         assert snapshot.scan_workspace.selected_source == "generated"
         assert snapshot.scan_workspace.selected_compatible
         assert not snapshot.scan_workspace.source_dirty
-        assert snapshot.scan_workspace.table_text.splitlines()[0] == "   ".join(columns)
+        assert snapshot.scan_workspace.table_text.splitlines()[0] == "   ".join(
+            display_names
+        )
+        assert not any(
+            parameter_id in snapshot.scan_workspace.table_text
+            for parameter_id in columns
+            if parameter_id not in display_names
+        )
 
         controller.generate_scan_source("scan_table = [1, 2]\n")
         failed = _pump_until(

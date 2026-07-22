@@ -341,9 +341,7 @@ def _compile_scan_artifact_plan(
             if borrow is not None:
                 borrow.close()
             raise
-        if borrow is not None and (
-            primary is not None or report.errors or report.decisions
-        ):
+        if borrow is not None and (primary is not None or report.errors):
             borrow.close()
         return report
 

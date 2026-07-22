@@ -5,7 +5,14 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from zlc_pulse import PORT_DIGITAL, load_deployed_pulse_target
+from zlc_neutral_atom.installation import DeviceRef
+from zlc_neutral_atom.pulse_application import PulseTargetDescriptor
+from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
+from zlc_pulse import (
+    PORT_DIGITAL,
+    load_deployed_pulse_target,
+    pulse_target_manifest_from_lanes,
+)
 from zlc_workbench.pulse import PulseEditorSession
 from zlc_workbench.pulse_editor.controller import PulseEditorController
 
@@ -29,6 +36,7 @@ def _controller() -> PulseEditorController:
 def test_preview_worker_uses_document_identity_and_latest_presentation_revision():
     controller = _controller()
     try:
+        controller.request_preview()
         first = _pump_until(
             controller,
             lambda value: value.rendered_preview is not None,
@@ -137,3 +145,58 @@ def test_preview_manual_size_is_transient_and_reset_on_reentry():
     finally:
         controller.request_close()
         _pump_until(controller, lambda value: value.close_complete)
+
+
+def test_borrowed_experiment_retirement_detaches_before_runtime_timer_poll():
+    target = load_deployed_pulse_target()
+
+    class ClosedExperimentPulse:
+        observe_calls = 0
+
+        def observe_active(self):
+            self.observe_calls += 1
+            raise RuntimeError("Experiment is closed")
+
+        def cancel_active(self, _reason=""):
+            return None
+
+        def request(self, *_args, **_kwargs):
+            raise AssertionError("request is not part of this close-race reproduction")
+
+        def start(self, *_args, **_kwargs):
+            raise AssertionError("start is not part of this close-race reproduction")
+
+        def snapshot(self):
+            return None
+
+    pulse = ClosedExperimentPulse()
+    descriptor = PulseTargetDescriptor(
+        DeviceRef("test-installation", "test-runtime", "sequencer"),
+        pulse_target_manifest_from_lanes(target),
+        50_000_000.0,
+        0,
+        1,
+    )
+    controller = PulseEditorController(
+        PulseEditorSession.new(target, time_step_ns=20),
+        pulse=pulse,
+        descriptor=descriptor,
+        initial_connection_mode="virtual",
+    )
+    controller._run_snapshot = RunSnapshot(
+        RunId("active-before-owner-close"),
+        RunState.RUNNING,
+        "execute",
+        False,
+        None,
+        None,
+        (),
+        None,
+    )
+
+    controller.retire_borrowed_authority()
+    controller.poll_runtime_change()
+
+    assert pulse.observe_calls == 0
+    assert controller._pulse is None
+    _pump_until(controller, lambda value: value.close_complete)

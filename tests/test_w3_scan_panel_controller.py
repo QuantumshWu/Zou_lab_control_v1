@@ -47,7 +47,6 @@ def _snapshot(
         state=state,
         phase=phase,
         final_committed=final_committed,
-        safety_bundle_id=None,
         commit_recovery_warning=None,
         primary_error=None,
         cleanup_errors=(),

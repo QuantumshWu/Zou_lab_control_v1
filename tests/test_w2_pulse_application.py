@@ -425,5 +425,4 @@ def test_notebook_pulse_run_and_cancelled_hold_share_the_runtime_safe_path(tmp_p
         terminal = hold.wait(5.0)
 
     assert terminal.state is RunState.CANCELLED
-    assert terminal.safety_bundle_id is not None
     assert not terminal.final_committed

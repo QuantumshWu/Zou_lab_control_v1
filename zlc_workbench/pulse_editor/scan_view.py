@@ -117,7 +117,6 @@ class PulseScanView(QtWidgets.QWidget):
     stepRequested = QtCore.pyqtSignal(int)
     loadProgramRequested = QtCore.pyqtSignal()
     templateRequested = QtCore.pyqtSignal(str)
-    codeChanged = QtCore.pyqtSignal()
     runRequested = QtCore.pyqtSignal(str)
     saveArrayRequested = QtCore.pyqtSignal()
     progressRefreshRequested = QtCore.pyqtSignal()
@@ -150,15 +149,14 @@ class PulseScanView(QtWidgets.QWidget):
         self.scan_repeats_spin.setDecimals(0)
         self.scan_repeats_spin.setRange(0, 999)
         self.scan_repeats_spin.setValue(0)
+        self._committed_repeats = 0
         self.scan_repeats_spin.setFixedHeight(row_height())
         self.scan_repeats_spin.setToolTip(
             "How many WHOLE scan sweeps to play before stopping.  0 = sweep "
             "forever (the default); K ≥ 1 = K full sweeps then stop.  The "
             "device performs the finite stop."
         )
-        self.scan_repeats_spin.valueChanged.connect(
-            lambda value: self.repeatsChanged.emit(int(value))
-        )
+        self.scan_repeats_spin.editingFinished.connect(self._commit_repeats)
         run_row.addWidget(self.scan_repeats_spin)
 
         self.scan_hold_button = FluentButton("Stop ▸ hold point", color=RED)
@@ -210,6 +208,8 @@ class PulseScanView(QtWidgets.QWidget):
         )
         editor_layout.setSpacing(px(6, minimum=4))
         self.scan_code = FluentCodeEdit()
+        self._code_dirty = False
+        self._source_revision = -1
 
         template_buttons = QtWidgets.QHBoxLayout()
         template_buttons.setSpacing(px(6, minimum=4))
@@ -304,19 +304,36 @@ class PulseScanView(QtWidgets.QWidget):
         self._scan_progress_timer = QtCore.QTimer(self)
         self._scan_progress_timer.setInterval(200)
         self._scan_progress_timer.timeout.connect(self._request_visible_progress)
-        self._scan_progress_timer.start()
 
     def _on_code_changed(self) -> None:
+        self._code_dirty = True
         self.scan_run_button.set_dirty(True)
-        self.codeChanged.emit()
 
     def _request_visible_progress(self) -> None:
         if self.isVisible():
             self.progressRefreshRequested.emit()
 
+    def set_progress_polling(self, enabled: bool) -> None:
+        """Run the narrow progress watcher only for a visible active scan."""
+
+        should_run = bool(enabled)
+        if should_run and not self._scan_progress_timer.isActive():
+            self._scan_progress_timer.start()
+        elif not should_run and self._scan_progress_timer.isActive():
+            self._scan_progress_timer.stop()
+
     def set_repeats(self, repeats: int) -> None:
+        normalized = int(repeats)
         with signals_blocked(self.scan_repeats_spin):
-            self.scan_repeats_spin.setValue(int(repeats))
+            if int(self.scan_repeats_spin.value()) != normalized:
+                self.scan_repeats_spin.setValue(normalized)
+        self._committed_repeats = normalized
+
+    def _commit_repeats(self) -> None:
+        value = int(self.scan_repeats_spin.value())
+        if value == self._committed_repeats:
+            return
+        self.repeatsChanged.emit(value)
 
     def set_slots_text(self, text: str) -> None:
         self.scan_slots_label.setText(str(text))
@@ -324,16 +341,32 @@ class PulseScanView(QtWidgets.QWidget):
     def set_progress_text(self, text: str) -> None:
         self.scan_progress_label.setText(str(text))
 
-    def set_scan_code(self, source: str, *, dirty: bool = False) -> None:
+    @property
+    def code_dirty(self) -> bool:
+        return self._code_dirty
+
+    @property
+    def source_revision(self) -> int:
+        return self._source_revision
+
+    def set_scan_code(
+        self,
+        source: str,
+        *,
+        dirty: bool = False,
+        source_revision: int,
+    ) -> None:
         with signals_blocked(self.scan_code):
             self.scan_code.setPlainText(str(source))
-        self.scan_run_button.set_dirty(bool(dirty))
+        self._source_revision = int(source_revision)
+        self.set_run_dirty(dirty)
 
     def set_scan_table_text(self, text: str) -> None:
         self.scan_table_view.setPlainText(str(text))
 
     def set_run_dirty(self, dirty: bool) -> None:
-        self.scan_run_button.set_dirty(bool(dirty))
+        self._code_dirty = bool(dirty)
+        self.scan_run_button.set_dirty(self._code_dirty)
 
     def set_workspace_busy(self, busy: bool) -> None:
         """Disable only workspace admissions while its worker owns one intent."""

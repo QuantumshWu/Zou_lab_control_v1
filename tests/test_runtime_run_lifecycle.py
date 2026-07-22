@@ -1,10 +1,10 @@
-"""Current flat Run lifecycle, safety boundary, and FINAL commit contracts."""
+"""Current flat Run lifecycle and FINAL commit contracts."""
 
 from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 
 import pytest
 
@@ -17,11 +17,11 @@ from zlc_neutral_atom.runtime.commit import (
 )
 from zlc_neutral_atom.runtime.ports import (
     BoundDevice,
-    CleanupStepAck,
     DeviceBroker,
-    SafeStateAck,
+    SessionClosedAck,
     SafetyInterrupt,
     SafetyOperation,
+    cleanup_device_session,
 )
 from zlc_neutral_atom.runtime.resources import (
     DeviceIdentityEvidenceKind,
@@ -30,9 +30,6 @@ from zlc_neutral_atom.runtime.resources import (
     ResourceBusy,
     ResourceClaim,
     ResourceKey,
-    ResourceLease,
-    ResourceQuarantined,
-    SafetyJournalWriteError,
 )
 from zlc_neutral_atom.runtime.run import (
     CancelOutcome,
@@ -42,13 +39,11 @@ from zlc_neutral_atom.runtime.run import (
     RunContext,
     RunController,
     RunFailed,
-    RunHandle,
     RunPlan,
     RunSnapshot,
     RunStartRejected,
     RunState,
 )
-from zlc_neutral_atom.runtime.safety_journal import PersistentSafetyJournal
 from zlc_storage import RepositoryRootLease
 
 
@@ -84,17 +79,23 @@ def device_fixture(
     probe = identity_probe or (lambda: physical)
     broker = DeviceBroker()
     verified = broker.verify_identity(probe)
+    binding_instance_id = verified.binding_instance_id
+
+    def close_session(command):
+        return SessionClosedAck(
+            session_id=command.session_id,
+            binding_instance_id=binding_instance_id,
+            source_stopped=True,
+            no_more_work=True,
+            joined=True,
+            acknowledgement_digest="test-session-closed",
+        )
+
     device = broker.bind(
         key=resource,
         identity=verified,
         execute_command=execute_command,
-        cleanup_operations={
-            SafetyOperation.SAFE_STATE: lambda: CleanupStepAck(
-                SafetyOperation.SAFE_STATE,
-                "safe-operation-ack",
-            )
-        },
-        verify_safe_state=lambda: SafeStateAck("safe-state-readback"),
+        close_session=close_session,
         interrupt_operations=(
             {}
             if interrupt is None
@@ -105,9 +106,11 @@ def device_fixture(
 
 
 def safe_cleanup(context: RunContext, resource: ResourceKey) -> CleanupReport:
-    device = context.cleanup_device(resource)
-    device.perform(SafetyOperation.SAFE_STATE)
-    return CleanupReport.safe((device.verify_safe_state(),))
+    return cleanup_device_session(
+        context.cleanup_device(resource),
+        "test-session",
+        1.0,
+    )
 
 
 def plan(
@@ -142,9 +145,8 @@ def plan(
     )
 
 
-def controller(tmp_path, journal=None) -> tuple[RunController, ResourceArbiter]:
-    journal = journal or PersistentSafetyJournal(tmp_path / "safety.journal")
-    arbiter = ResourceArbiter(journal)
+def controller(_tmp_path) -> tuple[RunController, ResourceArbiter]:
+    arbiter = ResourceArbiter()
     return RunController(arbiter), arbiter
 
 
@@ -168,37 +170,6 @@ def wait_snapshot(handle, predicate, timeout: float = 2.0) -> RunSnapshot:
         if time.monotonic() >= deadline:
             raise TimeoutError(f"Run did not reach requested state: {snapshot}")
         time.sleep(0.002)
-
-
-class _FaultInjectingSafetyJournal:
-    """Current SafetyJournal wrapper used only to inject lost acknowledgements."""
-
-    def __init__(self, path, *, failures: int) -> None:
-        self._persistent = PersistentSafetyJournal(path)
-        self.failures = failures
-
-    def _bind_authority(self, token):
-        self._persistent._bind_authority(token)
-
-    def _close_from_authority(self, token):
-        self._persistent._close_from_authority(token)
-
-    def snapshot(self):
-        return self._persistent.snapshot()
-
-    def append_hazards(self, records):
-        return self._persistent.append_hazards(records)
-
-    def append_safety_bundle(self, bundle):
-        if self.failures:
-            self.failures -= 1
-            raise SafetyJournalWriteError(
-                "synthetic safety journal acknowledgement loss"
-            )
-        return self._persistent.append_safety_bundle(bundle)
-
-    def append_recovery_bundle(self, bundle):
-        return self._persistent.append_recovery_bundle(bundle)
 
 
 def open_commit_coordinator(root):
@@ -230,11 +201,10 @@ def commit_final(
         target_ref=f"artifacts/{commit_id}",
         expected_manifest_digest="0" * 64,
     )
-    run_id, safety_bundle_id = context.authorize_commit_preparation()
+    run_id = context.authorize_commit_preparation()
     operation = coordinator.prepare(
         commit_id,
         run_id,
-        safety_bundle_id,
         target,
         lambda: PublishedManifest(
             target.target_ref,
@@ -272,8 +242,6 @@ def test_run_plan_has_distinct_prepared_executed_and_final_values(tmp_path):
     assert observations == ["preflight", "execute", "finalize"]
     assert not arbiter.active_claims()
     close_runtime(runtime, arbiter, item)
-
-
 def test_resource_claim_is_held_through_cleanup_until_terminal_publication(tmp_path):
     item = device_fixture("claim")
     runtime, arbiter = controller(tmp_path)
@@ -295,8 +263,6 @@ def test_resource_claim_is_held_through_cleanup_until_terminal_publication(tmp_p
     assert handle.result(2.0) == "prepared"
     assert not arbiter.active_claims()
     close_runtime(runtime, arbiter, item)
-
-
 def test_child_code_gets_read_only_cancellation_and_handle_owns_transition(tmp_path):
     item = device_fixture("readonly-cancel")
     runtime, arbiter = controller(tmp_path)
@@ -319,34 +285,6 @@ def test_child_code_gets_read_only_cancellation_and_handle_owns_transition(tmp_p
         handle.result(2.0)
     assert handle.snapshot().state is RunState.CANCELLED
     close_runtime(runtime, arbiter, item)
-
-
-def test_cancelled_run_never_regresses_during_safety_journal_retry(tmp_path):
-    item = device_fixture("retry-monotonic")
-    journal = _FaultInjectingSafetyJournal(
-        tmp_path / "safety.journal",
-        failures=1,
-    )
-    runtime, arbiter = controller(tmp_path, journal)
-    handle = runtime.start(plan(item))
-    wait_snapshot(handle, lambda value: value.phase == "safety-journal-failed")
-    assert handle.cancel("cancel while safety journal is stalled") is CancelOutcome.REQUESTED
-    before = handle.snapshot()
-    assert before.state is RunState.CANCELLING
-    assert handle.retry_recovery()
-
-    observed = [before.state]
-    while True:
-        snapshot = handle.snapshot()
-        observed.append(snapshot.state)
-        if snapshot.state.terminal:
-            break
-        time.sleep(0.001)
-    assert RunState.RUNNING not in observed
-    assert snapshot.state is RunState.CANCELLED
-    close_runtime(runtime, arbiter, item)
-
-
 def test_start_returns_before_blocking_identity_probe_and_can_cancel(tmp_path):
     entered = threading.Event()
     release = threading.Event()
@@ -376,7 +314,6 @@ def test_start_returns_before_blocking_identity_probe_and_can_cancel(tmp_path):
         handle.result(2.0)
     assert executed == []
     close_runtime(runtime, arbiter, item)
-
 
 def test_interrupt_lane_unblocks_execution_before_cleanup(tmp_path):
     release = threading.Event()
@@ -428,18 +365,20 @@ def test_interrupt_failure_is_bounded_and_cannot_hide_cleanup(tmp_path):
     close_runtime(runtime, arbiter, item)
 
 
-def test_cleanup_omission_fails_and_quarantines_exact_device(tmp_path):
-    item = device_fixture("omitted-safety")
+def test_cleanup_failure_fails_only_the_current_run(tmp_path):
+    item = device_fixture("cleanup-failure")
     runtime, arbiter = controller(tmp_path)
     handle = runtime.start(
-        plan(item, cleanup=lambda _context, _prepared, _primary: CleanupReport())
+        plan(
+            item,
+            cleanup=lambda _context, _prepared, _primary: CleanupReport(
+                errors=(RuntimeError("synthetic cleanup failure"),)
+            ),
+        )
     )
-    with pytest.raises(RunFailed):
+    with pytest.raises(RunFailed, match="synthetic cleanup failure"):
         handle.result(2.0)
-    assert "omitted safety disposition" in " ".join(handle.snapshot().cleanup_errors)
-    with pytest.raises(RunStartRejected) as caught:
-        runtime.start(plan(item))
-    assert isinstance(caught.value.outcome, ResourceQuarantined)
+    assert runtime.start(plan(item)).result(2.0) == "prepared"
     close_runtime(runtime, arbiter, item)
 
 
@@ -538,23 +477,3 @@ def test_owner_thread_start_failure_releases_unarmed_claim(tmp_path, monkeypatch
         runtime.start(plan(item))
     assert not arbiter.active_claims()
     close_runtime(runtime, arbiter, item)
-
-
-def test_obsolete_lifecycle_surface_is_physically_absent():
-    assert "mode" not in {field.name for field in fields(RunPlan)}
-    assert "hazard_claims" not in {field.name for field in fields(RunPlan)}
-    assert "revision" not in {field.name for field in fields(RunSnapshot)}
-    assert "committed_checkpoint" not in {field.name for field in fields(RunSnapshot)}
-    assert not hasattr(PostSafetyContext, "commit_checkpoint")
-    assert not hasattr(RunHandle, "wait_for")
-    assert not hasattr(RunController, "lookup")
-
-    import zlc_neutral_atom.runtime.run as run_module
-
-    for name in (
-        "RunMode",
-        "RunRevision",
-        "CheckpointReconciliationRequired",
-        "CheckpointDisposition",
-    ):
-        assert not hasattr(run_module, name)

@@ -126,14 +126,11 @@ def run_cleanup_steps(
 ) -> CleanupReport:
     """Run every cleanup step in order, even when an earlier step fails.
 
-    A thrown cleanup exception is evidence, not permission to skip the next
-    physical resource.  Converting it into ``CleanupReport.errors`` lets the
-    Run safety gate retain proofs from the other steps while still failing
-    closed for the resource whose cleanup could not be proved.
+    A thrown cleanup exception does not permit skipping the next physical
+    resource.  The controller performs the authoritative safe-state readback;
+    this helper only aggregates cleanup execution errors.
     """
 
-    safety_proofs = []
-    decisions = []
     errors: list[BaseException] = []
     for step in steps:
         try:
@@ -143,14 +140,8 @@ def run_cleanup_steps(
         except BaseException as error:
             errors.append(error)
             continue
-        safety_proofs.extend(report.safety_proofs)
-        decisions.extend(report.decisions)
         errors.extend(report.errors)
-    return CleanupReport(
-        safety_proofs=tuple(safety_proofs),
-        decisions=tuple(decisions),
-        errors=tuple(errors),
-    )
+    return CleanupReport.complete(errors=tuple(errors))
 
 
 __all__: list[str] = []

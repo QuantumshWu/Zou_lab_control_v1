@@ -1,4 +1,4 @@
-"""One process-lifetime neutral-atom installation composition authority."""
+"""One owned neutral-atom installation composition."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Mapping
 
 from fpga.pulse_streamer.host.image import (
@@ -20,7 +19,6 @@ from zlc_neutral_atom.installation import (
     DeviceCatalogView,
     DeviceInfo,
     DeviceRef,
-    InstallationRestartRequiredError,
 )
 from zlc_neutral_atom.readout.calibration import GridOrder
 from zlc_neutral_atom.readout.contracts import (
@@ -34,7 +32,11 @@ from zlc_neutral_atom.readout.sitemap import (
 )
 from zlc_neutral_atom.runtime.capture import BoundCapturePort
 from zlc_neutral_atom.runtime.monitor import BoundCameraMonitorPort
-from zlc_neutral_atom.runtime.ports import BoundDevice, DeviceBroker, SafetyOperation
+from zlc_neutral_atom.runtime.ports import (
+    BoundDevice,
+    DeviceBroker,
+    SafetyOperation,
+)
 from zlc_neutral_atom.runtime.resources import (
     DeviceIdentityEvidenceKind,
     PhysicalDeviceIdentity,
@@ -42,7 +44,6 @@ from zlc_neutral_atom.runtime.resources import (
     ResourceKey,
 )
 from zlc_neutral_atom.runtime.run import RunController, RunHandle, RunPlan
-from zlc_neutral_atom.runtime.safety_journal import PersistentSafetyJournal
 from zlc_neutral_atom.timing.pulse import BoundPulsePort
 from zlc_pulse import (
     PORT_DAC,
@@ -56,7 +57,7 @@ from zlc_pulse import (
     pulse_target_manifest,
     validate_pulse_document_clock_grid,
 )
-from zlc_storage import canonical_digest, durable_mkdir, normalized_text
+from zlc_storage import canonical_digest, normalized_text
 
 from ._asset_map import InstallationAsset, InstallationAssetMap, adapter_kind
 from ._camera_endpoint import CameraCaptureEndpoint, CameraMonitorEndpoint
@@ -111,104 +112,6 @@ def _virtual_readout_geometry() -> ReadoutGridGeometry:
             for column in range(columns)
         ),
     )
-
-
-@dataclass(frozen=True)
-class _FailedStartupAuthority:
-    """Strongly retain an unsafe partial startup until process replacement.
-
-    This value has one deliberately narrow purpose: without it, an exceptional
-    virtual adapter close could let Python garbage collection release the last
-    journal/graph owner while startup is reporting failure.  It is never exposed
-    as a recovery API; a later composition attempt fails closed and the process
-    must be replaced.
-    """
-
-    raw_graph: Mapping[str, object]
-    broker: DeviceBroker | None
-    resources: ResourceArbiter | None
-    journal: PersistentSafetyJournal | None
-
-
-_FAILED_STARTUP_LOCK = threading.Lock()
-_FAILED_STARTUPS: list[_FailedStartupAuthority] = []
-_COMPOSITION_LOCK = threading.Lock()
-_COMPOSITION_STATE = "AVAILABLE"
-_PROCESS_RUNTIME: _InstallationRuntime | None = None
-
-
-def _require_no_failed_startup() -> None:
-    with _FAILED_STARTUP_LOCK:
-        if _FAILED_STARTUPS:
-            raise RuntimeError(
-                "a previous installation startup failed to close cleanly; "
-                "replace this process before composing another installation"
-            )
-
-
-def _claim_process_composition() -> None:
-    global _COMPOSITION_STATE
-    with _COMPOSITION_LOCK:
-        if _COMPOSITION_STATE != "AVAILABLE":
-            raise RuntimeError(
-                "this process already created an installation runtime; "
-                "replace the process instead of rebuilding or hot-swapping it"
-            )
-        _COMPOSITION_STATE = "CLAIMED"
-
-
-def _reserve_remote_composition() -> None:
-    """Serialize a retryable network probe before hardware authority exists."""
-
-    global _COMPOSITION_STATE
-    with _COMPOSITION_LOCK:
-        if _COMPOSITION_STATE != "AVAILABLE":
-            raise RuntimeError(
-                "this process already created or is creating an installation runtime"
-            )
-        _COMPOSITION_STATE = "PROBING_REMOTE"
-
-
-def _release_remote_probe() -> None:
-    global _COMPOSITION_STATE
-    with _COMPOSITION_LOCK:
-        if _COMPOSITION_STATE != "PROBING_REMOTE":
-            raise RuntimeError("remote composition probe state is inconsistent")
-        _COMPOSITION_STATE = "AVAILABLE"
-
-
-def _claim_remote_probe() -> None:
-    global _COMPOSITION_STATE
-    with _COMPOSITION_LOCK:
-        if _COMPOSITION_STATE != "PROBING_REMOTE":
-            raise RuntimeError("remote composition probe state is inconsistent")
-        _COMPOSITION_STATE = "CLAIMED"
-
-
-def _retain_process_runtime(runtime: "_InstallationRuntime") -> None:
-    global _PROCESS_RUNTIME
-    with _COMPOSITION_LOCK:
-        if _PROCESS_RUNTIME is not None:
-            raise RuntimeError("process installation runtime was already published")
-        _PROCESS_RUNTIME = runtime
-
-
-def _retain_failed_startup(
-    *,
-    raw_graph: Mapping[str, object],
-    broker: DeviceBroker | None,
-    resources: ResourceArbiter | None,
-    journal: PersistentSafetyJournal | None,
-) -> None:
-    with _FAILED_STARTUP_LOCK:
-        _FAILED_STARTUPS.append(
-            _FailedStartupAuthority(
-                dict(raw_graph),
-                broker,
-                resources,
-                journal,
-            )
-        )
 
 
 def _deployed_target() -> PulseTarget:
@@ -313,8 +216,7 @@ def _bind_camera(
             asset,
             asset_map_revision,
             endpoint,
-        ),
-        (SafetyOperation.DISARM,),
+        )
     )
 
 
@@ -342,8 +244,6 @@ def _bind_camera_endpoint(
             current_binding(),
             command,
         ),
-        cleanup_operations={SafetyOperation.DISARM: endpoint.cleanup},
-        verify_safe_state=endpoint.verify_safe_state,
         capability_probe=lambda: endpoint.capability_probe(current_binding()),
         close_session=lambda command: endpoint.close_session(
             current_binding(),
@@ -367,8 +267,7 @@ def _bind_monitor_camera(
             asset,
             asset_map_revision,
             endpoint,
-        ),
-        (SafetyOperation.DISARM,),
+        )
     )
 
 
@@ -396,8 +295,6 @@ def _bind_sequencer(
             current_binding(),
             command,
         ),
-        cleanup_operations={SafetyOperation.SAFE_STATE: endpoint.cleanup},
-        verify_safe_state=endpoint.verify_safe_state,
         capability_probe=lambda: endpoint.capability_probe(current_binding()),
         close_session=lambda command: endpoint.close_session(
             current_binding(),
@@ -407,7 +304,6 @@ def _bind_sequencer(
     )
     return BoundPulsePort(
         broker.verify_capability(binding),
-        (),
         lambda session_id, run_id, artifact_digest, point_count: (
             endpoint.observe_scan_progress(
                 current_binding(),
@@ -466,8 +362,6 @@ def _bind_remote_sequencer(
             current_binding(),
             command,
         ),
-        cleanup_operations={SafetyOperation.SAFE_STATE: endpoint.cleanup},
-        verify_safe_state=endpoint.verify_safe_state,
         capability_probe=lambda: endpoint.capability_probe(current_binding()),
         close_session=lambda command: endpoint.close_session(
             current_binding(),
@@ -477,7 +371,6 @@ def _bind_remote_sequencer(
     )
     return BoundPulsePort(
         broker.verify_capability(binding),
-        (),
         lambda session_id, run_id, artifact_digest, point_count: (
             endpoint.observe_scan_progress(
                 current_binding(),
@@ -703,7 +596,7 @@ class _InstallationRuntime:
                 return True
             self._state = "CLOSING"
         # Never hold the lifecycle lock across controller joins, adapter/SDK
-        # close, broker invalidation, or journal release.
+        # close, or broker invalidation.
         if not self._controller.shutdown(
             max(0.0, deadline - time.monotonic())
         ):
@@ -716,8 +609,7 @@ class _InstallationRuntime:
             if callable(close):
                 close()
             self._closed_roles.add(role)
-        # The journal/arbiter authority is released only after every raw close
-        # has acknowledged.  An exception above leaves this runtime retryable.
+        # Release process-local ownership only after every raw close acknowledges.
         self._resources.shutdown()
         with self._lock:
             self._state = "CLOSED"
@@ -761,7 +653,6 @@ def _catalog(
 
 def create_virtual_installation(
     *,
-    safety_journal_path: str | Path,
     seed: int | None = 7,
 ) -> _InstallationRuntime:
     """Build and publish one immutable virtual graph or fail without a partial runtime."""
@@ -771,15 +662,11 @@ def create_virtual_installation(
             raise TypeError("virtual installation seed must be an integer or None")
         if seed < 0:
             raise ValueError("virtual installation seed must be non-negative")
-    journal_path = Path(safety_journal_path).expanduser().resolve()
-    _require_no_failed_startup()
-    _claim_process_composition()
     trap: VirtualAtomArray | None = None
     sequencer: VirtualSequencer | None = None
     camera: VirtualCamera | None = None
     monitor_camera: VirtualMonitorCamera | None = None
     devices: dict[str, object] = {}
-    journal: PersistentSafetyJournal | None = None
     resources: ResourceArbiter | None = None
     broker: DeviceBroker | None = None
     try:
@@ -824,7 +711,6 @@ def create_virtual_installation(
         )
         installation_id = f"installation-{assets.revision[:20]}"
         runtime_instance_id = uuid.uuid4().hex
-        durable_mkdir(journal_path.parent)
         for role in ("sequencer", "camera", "monitor_camera"):
             devices[role].ensure_open()
         sequencer.set_safe_state()
@@ -866,10 +752,7 @@ def create_virtual_installation(
             assets,
             devices,
         )
-        # Acquire durable authority last, after all fallible adapter construction,
-        # open, identity, binding, and capability probes have succeeded.
-        journal = PersistentSafetyJournal(journal_path)
-        resources = ResourceArbiter(journal)
+        resources = ResourceArbiter()
         controller = RunController(resources)
         runtime = _InstallationRuntime(
             installation_id=installation_id,
@@ -885,7 +768,6 @@ def create_virtual_installation(
             raw_graph=devices,
             close_order=("monitor_camera", "camera", "sequencer", "trap"),
         )
-        _retain_process_runtime(runtime)
         return runtime
     except BaseException as primary:
         cleanup_errors: list[BaseException] = []
@@ -904,23 +786,12 @@ def create_virtual_installation(
             except BaseException as error:
                 cleanup_errors.append(error)
         if not cleanup_errors:
-            final_action = (
-                resources.shutdown
-                if resources is not None
-                else (None if journal is None else journal.close)
-            )
+            final_action = None if resources is None else resources.shutdown
             if final_action is not None:
                 try:
                     final_action()
                 except BaseException as error:
                     cleanup_errors.append(error)
-        if cleanup_errors:
-            _retain_failed_startup(
-                raw_graph=devices,
-                broker=broker,
-                resources=resources,
-                journal=journal,
-            )
         for error in cleanup_errors:
             try:
                 primary.add_note(
@@ -934,7 +805,6 @@ def create_virtual_installation(
 
 def create_remote_pulse_installation(
     *,
-    safety_journal_path: str | Path,
     host: str,
     port: int = 18861,
     transport_timeout_seconds: float = 120.0,
@@ -943,7 +813,7 @@ def create_remote_pulse_installation(
 ) -> _InstallationRuntime:
     """Compose one sequencer-only installation over the current pulse RPC.
 
-    Network reachability is proven before the process-lifetime composition claim.
+    Network reachability is proven before publishing the owned installation.
     A typo or an unavailable server therefore remains retryable.  Once the remote
     generation has entered SAFE and is bound, all later failures are treated like
     any other partial hardware startup and fail closed.
@@ -982,21 +852,11 @@ def create_remote_pulse_installation(
         PulseDocument,
     ):
         raise TypeError("required_pulse_document must be PulseDocument or None")
-    journal_path = Path(safety_journal_path).expanduser().resolve()
-    _require_no_failed_startup()
-
-    # Do not consume the one-installation process claim until both RPC channels
-    # exist and the current server schema/capability snapshot has decoded.
-    _reserve_remote_composition()
-    try:
-        client = RemotePulseExecutionClient.connect(
-            endpoint_host,
-            port,
-            transport_timeout_seconds=transport_timeout,
-        )
-    except BaseException:
-        _release_remote_probe()
-        raise
+    client = RemotePulseExecutionClient.connect(
+        endpoint_host,
+        port,
+        transport_timeout_seconds=transport_timeout,
+    )
     try:
         snapshot = client.snapshot()
         host_geometry = build_fingerprint(StreamerParams())
@@ -1019,40 +879,19 @@ def create_remote_pulse_installation(
         try:
             client.close()
         except BaseException as close_error:
-            _claim_remote_probe()
-            _retain_failed_startup(
-                raw_graph={"sequencer": client},
-                broker=None,
-                resources=None,
-                journal=None,
-            )
-            failure = InstallationRestartRequiredError(
-                "remote target preflight failed and SAFE close was not confirmed; "
-                "replace this process"
-            )
             try:
-                failure.add_note(
-                    "preflight error: "
-                    f"{type(primary).__name__}: {primary}"
-                )
-                failure.add_note(
+                primary.add_note(
                     "close error: "
                     f"{type(close_error).__name__}: {close_error}"
                 )
             except BaseException:
                 pass
-            raise failure from primary
-        _release_remote_probe()
         raise
-    _claim_remote_probe()
     endpoint_label = f"{endpoint_host}:{port}"
-    claimed = False
     devices: dict[str, object] = {"sequencer": client}
-    journal: PersistentSafetyJournal | None = None
     resources: ResourceArbiter | None = None
     broker: DeviceBroker | None = None
     try:
-        claimed = True
         safe_timeout = (
             client.transport_timeout_seconds * 0.9
             if max_blocking_call_seconds is None
@@ -1097,9 +936,7 @@ def create_remote_pulse_installation(
             assets,
             devices,
         )
-        durable_mkdir(journal_path.parent)
-        journal = PersistentSafetyJournal(journal_path)
-        resources = ResourceArbiter(journal)
+        resources = ResourceArbiter()
         controller = RunController(resources)
         runtime = _InstallationRuntime(
             installation_id=installation_id,
@@ -1115,7 +952,6 @@ def create_remote_pulse_installation(
             raw_graph=devices,
             close_order=("sequencer",),
         )
-        _retain_process_runtime(runtime)
         return runtime
     except BaseException as primary:
         cleanup_errors: list[BaseException] = []
@@ -1130,23 +966,12 @@ def create_remote_pulse_installation(
             except BaseException as error:
                 cleanup_errors.append(error)
         if not cleanup_errors:
-            final_action = (
-                resources.shutdown
-                if resources is not None
-                else (None if journal is None else journal.close)
-            )
+            final_action = None if resources is None else resources.shutdown
             if final_action is not None:
                 try:
                     final_action()
                 except BaseException as error:
                     cleanup_errors.append(error)
-        if cleanup_errors and claimed:
-            _retain_failed_startup(
-                raw_graph=devices,
-                broker=broker,
-                resources=resources,
-                journal=journal,
-            )
         for error in cleanup_errors:
             try:
                 primary.add_note(
@@ -1155,18 +980,7 @@ def create_remote_pulse_installation(
                 )
             except BaseException:
                 pass
-        failure = InstallationRestartRequiredError(
-            "remote installation composition failed after the process-lifetime "
-            "claim; replace this process"
-        )
-        try:
-            failure.add_note(
-                "composition error: "
-                f"{type(primary).__name__}: {primary}"
-            )
-        except BaseException:
-            pass
-        raise failure from primary
+        raise
 
 
 __all__ = [

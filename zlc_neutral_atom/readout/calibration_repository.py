@@ -1090,7 +1090,7 @@ class CalibrationRepository:
             raise ValueError(
                 "calibration report group contexts differ from the admitted source"
             )
-        run_id, safety_bundle_id = context.authorize_commit_preparation()
+        run_id = context.authorize_commit_preparation()
         # Staging writes CAS blobs, so repository lifetime begins before the
         # first write and overlaps prepare() minting the commit-lifetime hold.
         with self._root_lease.borrow() as staging_borrow:
@@ -1104,7 +1104,7 @@ class CalibrationRepository:
                 memory_admission_limit_bytes=memory_admission_limit,
             )
             confirmed = context.authorize_commit_preparation()
-            if confirmed != (run_id, safety_bundle_id):
+            if confirmed != run_id:
                 raise RuntimeError("calibration commit subject changed while staging")
             target = _target(self.repository_id, reference)
 
@@ -1128,7 +1128,6 @@ class CalibrationRepository:
                 operation = self._coordinator.prepare(
                     _commit_id(run_id, reference.manifest_digest),
                     run_id,
-                    safety_bundle_id,
                     target,
                     publish,
                 )

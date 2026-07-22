@@ -42,15 +42,12 @@ class CommitTarget:
 class CommitIntent:
     commit_id: str
     run_id: str
-    safety_bundle_id: str | None
     target: CommitTarget
     created_at: float
 
     def __post_init__(self) -> None:
         _canonical(self.commit_id, "commit_id")
         _canonical(self.run_id, "run_id")
-        if self.safety_bundle_id is not None:
-            _canonical(self.safety_bundle_id, "safety_bundle_id")
         if not isinstance(self.target, CommitTarget):
             raise TypeError("target must be CommitTarget")
         if isinstance(self.created_at, bool) or not isinstance(
@@ -152,7 +149,6 @@ _JOURNAL_MUTATION_TOKEN = object()
 class _CommitPreparation:
     commit_id: str
     run_id: str
-    safety_bundle_id: str | None
     target: CommitTarget
 
 
@@ -196,10 +192,6 @@ class FinalCommit(Generic[CommitT]):
     def run_id(self) -> str:
         return self._preparation.run_id
 
-    @property
-    def safety_bundle_id(self) -> str | None:
-        return self._preparation.safety_bundle_id
-
     def abandon(self) -> None:
         """Explicitly abandon this authority if RunController has not consumed it."""
 
@@ -234,7 +226,6 @@ class _CommitAuthoritySnapshot(Generic[CommitT]):
         if (
             intent.commit_id != preparation.commit_id
             or intent.run_id != preparation.run_id
-            or intent.safety_bundle_id != preparation.safety_bundle_id
             or intent.target != preparation.target
         ):
             raise ValueError("CommitIntent differs from authority preparation")
@@ -388,18 +379,12 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
         self,
         commit_id: str,
         run_id: str,
-        safety_bundle_id: str | None,
         target: CommitTarget,
         publish: Callable[[], PublishedManifest[CommitT]],
     ) -> FinalCommit[CommitT]:
         preparation = _CommitPreparation(
             _canonical(commit_id, "commit_id"),
             _canonical(run_id, "run_id"),
-            (
-                None
-                if safety_bundle_id is None
-                else _canonical(safety_bundle_id, "safety_bundle_id")
-            ),
             target,
         )
         if not isinstance(target, CommitTarget):
@@ -538,7 +523,6 @@ class PersistentCommitJournal:
             "kind": "INTENT",
             "commit_id": intent.commit_id,
             "run_id": intent.run_id,
-            "safety_bundle_id": intent.safety_bundle_id,
             "target": {
                 "repository_id": intent.target.repository_id,
                 "artifact_kind": intent.target.artifact_kind,
@@ -701,7 +685,6 @@ class PersistentCommitJournal:
                     "kind",
                     "commit_id",
                     "run_id",
-                    "safety_bundle_id",
                     "target",
                     "created_at",
                 }:
@@ -718,7 +701,6 @@ class PersistentCommitJournal:
                 intent = CommitIntent(
                     commit_id=value["commit_id"],
                     run_id=value["run_id"],
-                    safety_bundle_id=value["safety_bundle_id"],
                     target=CommitTarget(**target),
                     created_at=value["created_at"],
                 )

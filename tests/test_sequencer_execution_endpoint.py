@@ -72,8 +72,6 @@ def _bound_virtual_sequencer(document):
         execute_command=lambda command: endpoint.execute_command(
             current_binding(), command
         ),
-        cleanup_operations={SafetyOperation.SAFE_STATE: endpoint.cleanup},
-        verify_safe_state=endpoint.verify_safe_state,
         capability_probe=lambda: endpoint.capability_probe(current_binding()),
         close_session=lambda command: endpoint.close_session(
             current_binding(), command
@@ -146,7 +144,6 @@ def test_finite_pulse_runs_prepare_fire_terminal_then_verified_safe() -> None:
     assert terminal.evidence_kind is PulseTerminalEvidenceKind.SIMULATED
     assert terminal.expected_trigger_counts_from_completed_schedule == (("ch11", 3),)
     assert terminal.artifact_digest == artifact.fingerprint
-    assert endpoint.verify_safe_state().acknowledgement_digest
     assert sequencer.snapshot()["state"] == "safe"
     _shutdown(broker, sequencer)
 

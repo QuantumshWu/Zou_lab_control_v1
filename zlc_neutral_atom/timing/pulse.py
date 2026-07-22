@@ -39,7 +39,6 @@ from zlc_neutral_atom.runtime.ports import (
     VerifiedDeviceCapability,
     admit_bound_capability,
     cleanup_device_session,
-    verify_cleanup_device_safe_state,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.resources import (
@@ -564,7 +563,6 @@ def pulse_terminal_ack_from_tree(tree: object) -> PulseTerminalAck:
 @dataclass(frozen=True)
 class BoundPulsePort:
     capability_attestation: VerifiedDeviceCapability
-    cleanup_operations: tuple[SafetyOperation, ...]
     _scan_progress_reader: (
         Callable[[str, str, str, int], PulseScanProgress] | None
     ) = field(default=None, repr=False, compare=False)
@@ -584,17 +582,6 @@ class BoundPulsePort:
             for operation in (SafetyOperation.ABORT, SafetyOperation.SAFE_STATE)
         ):
             raise ValueError("pulse port requires a thread-safe ABORT or SAFE_STATE interrupt")
-        operations = tuple(self.cleanup_operations)
-        if len(set(operations)) != len(operations):
-            raise ValueError("pulse cleanup operations cannot contain duplicates")
-        if any(
-            operation not in (SafetyOperation.ABORT, SafetyOperation.SAFE_STATE)
-            for operation in operations
-        ):
-            raise ValueError("pulse cleanup may only ABORT or enter SAFE_STATE")
-        if any(operation not in self.device.safety_capabilities for operation in operations):
-            raise ValueError("pulse cleanup operation is absent from BoundDevice")
-        object.__setattr__(self, "cleanup_operations", operations)
 
     @property
     def device(self) -> BoundDevice:
@@ -698,27 +685,12 @@ class BoundPulsePort:
         device = context.cleanup_device(self.device.key)
         return cleanup_device_session(
             device,
-            self.cleanup_operations,
             session_id,
             self.capability.max_blocking_call_seconds,
-            termination_failure_reason=(
-                "sequencer cleanup did not reach a verified safe terminal"
-            ),
-            termination_recovery_action=(
-                "verify sequencer output state and recover the connection"
-            ),
-            verification_failure_reason="sequencer safe-state verification failed",
-            verification_recovery_action=(
-                "inspect outputs and recover the sequencer before reuse"
-            ),
         )
 
-    def verify_idle(self, context: RunContext) -> CleanupReport:
-        return verify_cleanup_device_safe_state(
-            context.cleanup_device(self.device.key),
-            failure_reason="unopened sequencer safe-state verification failed",
-            recovery_action="inspect and recover the sequencer before reuse",
-        )
+    def verify_idle(self, _context: RunContext) -> CleanupReport:
+        return CleanupReport.complete()
 
 
 class _PulseSessionState(str, Enum):

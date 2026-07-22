@@ -15,7 +15,6 @@ from zlc_neutral_atom.runtime.commit import (
 )
 from zlc_neutral_atom.runtime.resources import ResourceArbiter
 from zlc_neutral_atom.runtime.run import RunController, RunFailed, RunPlan
-from zlc_neutral_atom.runtime.safety_journal import PersistentSafetyJournal
 from zlc_storage import RepositoryRootLease
 
 
@@ -48,18 +47,14 @@ class _CommitHarness:
             self.recover,
             root_lease=self.root_lease,
         )
-        self.safety = PersistentSafetyJournal(tmp_path / "safety.zlcj")
-        self.resources = ResourceArbiter(self.safety)
+        self.resources = ResourceArbiter()
         self.controller = RunController(self.resources)
 
-    def operation(self, context, *, run_id=None, safety_bundle_id=None):
-        subject = context.authorize_commit_preparation()
-        selected_run = subject[0] if run_id is None else run_id
-        selected_safety = subject[1] if safety_bundle_id is None else safety_bundle_id
+    def operation(self, context, *, run_id=None):
+        selected_run = context.authorize_commit_preparation() if run_id is None else run_id
         return self.coordinator.prepare(
             f"capture-final-{selected_run}-{_DIGEST}",
             selected_run,
-            selected_safety,
             self.target,
             self.publish,
         )
@@ -71,7 +66,7 @@ class _CommitHarness:
             bound_devices=(),
             preflight=lambda _context: "prepared",
             execute=lambda _context, prepared: prepared,
-            cleanup=lambda _context, _prepared, _primary: CleanupReport.safe(()),
+            cleanup=lambda _context, _prepared, _primary: CleanupReport.complete(),
             finalize=finalize,
             requires_final_commit=True,
         )
@@ -215,7 +210,6 @@ def test_repository_root_cannot_close_while_authority_is_live(tmp_path) -> None:
     operation = harness.coordinator.prepare(
         "capture-final-detached-" + _DIGEST,
         "detached",
-        None,
         harness.target,
         harness.publish,
     )

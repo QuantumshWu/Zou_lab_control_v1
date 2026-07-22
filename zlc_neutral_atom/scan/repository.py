@@ -128,7 +128,6 @@ _ARTIFACT_FIELDS = frozenset(
         "dataset_provenance",
         "output_values_blob",
         "output_validity_blob",
-        "safety_bundle_id",
     }
 )
 _METADATA_LIMITS = CanonicalDecodeLimits(
@@ -209,7 +208,6 @@ class _StoredScan:
     provenance: DatasetSealProvenance
     values_blob: ContentRef
     validity_blob: ContentRef
-    safety_bundle_id: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.pulse_program_blob, ContentRef):
@@ -250,7 +248,6 @@ class _StoredScan:
             self.validity_blob, ContentRef
         ):
             raise TypeError("scan data blobs must be ContentRef")
-        canonical_text(self.safety_bundle_id, "safety_bundle_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +265,6 @@ class _StoredScanIndex:
     provenance: DatasetSealProvenance
     values_blob: ContentRef
     validity_blob: ContentRef
-    safety_bundle_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -470,7 +466,6 @@ class ScanArtifact:
     output_contract: ScanOutputContract
     output_dataset_ref: DatasetRevisionRef
     provenance: DatasetSealProvenance
-    safety_bundle_id: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.ref, ScanArtifactRef):
@@ -490,7 +485,6 @@ class ScanArtifact:
             raise TypeError("output_contract must be ScanOutputContract")
         if not isinstance(self.provenance, DatasetSealProvenance):
             raise TypeError("provenance must be DatasetSealProvenance")
-        canonical_text(self.safety_bundle_id, "safety_bundle_id")
 
     @property
     def output_schema(self) -> DatasetSchema:
@@ -508,7 +502,6 @@ class ScanArtifactInspection:
     output_dataset_ref: DatasetRevisionRef
     provenance: DatasetSealProvenance
     pulse_runtime_summaries: tuple[CompiledPulseRuntimeSummary, ...]
-    safety_bundle_id: str
     inspection_retained_upper_bound_bytes: int
     inspection_decode_peak_upper_bound_bytes: int
     materialization_peak_upper_bound_bytes: int
@@ -535,7 +528,6 @@ class ScanArtifactInspection:
                 "pulse_runtime_summaries must contain CompiledPulseRuntimeSummary values"
             )
         object.__setattr__(self, "pulse_runtime_summaries", summaries)
-        canonical_text(self.safety_bundle_id, "safety_bundle_id")
         positive_integer(
             self.inspection_retained_upper_bound_bytes,
             "inspection_retained_upper_bound_bytes",
@@ -976,7 +968,6 @@ def _metadata_tree(
         "dataset_provenance": dataset_seal_provenance_to_tree(value.provenance),
         "output_values_blob": content_ref_to_tree(value.values_blob),
         "output_validity_blob": content_ref_to_tree(value.validity_blob),
-        "safety_bundle_id": value.safety_bundle_id,
     }
 
 
@@ -1023,7 +1014,6 @@ def _decode_metadata_index(payload: bytes) -> _StoredScanIndex:
         dataset_seal_provenance_from_tree(data["dataset_provenance"]),
         content_ref_from_tree(data["output_values_blob"]),
         content_ref_from_tree(data["output_validity_blob"]),
-        canonical_text(data["safety_bundle_id"], "safety_bundle_id"),
     )
     if _encode_metadata(value) != payload:
         raise ValueError("scan metadata is typed but non-canonical")
@@ -1046,7 +1036,6 @@ def _stored_scan_from_index(
         index.provenance,
         index.values_blob,
         index.validity_blob,
-        index.safety_bundle_id,
     )
 
 
@@ -1634,9 +1623,7 @@ class ScanRepository:
         metadata_size: int,
         inspection_peak: int,
     ) -> ScanArtifactInspection:
-        if index.provenance.trace_binding.run_id != intent.run_id or (
-            index.safety_bundle_id != intent.safety_bundle_id
-        ):
+        if index.provenance.trace_binding.run_id != intent.run_id:
             raise ValueError("scan index differs from its FINAL commit intent")
         data_peak = (
             _FIXED_MATERIALIZATION_BYTES
@@ -1652,7 +1639,6 @@ class ScanRepository:
             index.output_dataset_ref,
             index.provenance,
             index.compiled_pulse_runtime_summaries,
-            index.safety_bundle_id,
             inspection_peak,
             inspection_peak,
             max(inspection_peak, data_peak),
@@ -1698,9 +1684,7 @@ class ScanRepository:
         stored: _StoredScan,
         intent: CommitIntent,
     ) -> ScanArtifact:
-        if stored.provenance.trace_binding.run_id != intent.run_id or (
-            stored.safety_bundle_id != intent.safety_bundle_id
-        ):
+        if stored.provenance.trace_binding.run_id != intent.run_id:
             raise ValueError("scan artifact differs from its FINAL commit intent")
         return ScanArtifact(
             reference,
@@ -1710,7 +1694,6 @@ class ScanRepository:
             stored.output_contract,
             stored.output_dataset_ref,
             stored.provenance,
-            stored.safety_bundle_id,
         )
 
     def materialize(
@@ -1802,8 +1785,6 @@ class ScanRepository:
     def _stage_result(
         self,
         prepared: _PreparedScanDataset,
-        *,
-        safety_bundle_id: str,
     ) -> tuple[ScanArtifactRef, bytes]:
         if type(prepared) is not _PreparedScanDataset:
             raise TypeError("prepared must be scan application output")
@@ -1834,7 +1815,6 @@ class ScanRepository:
             prepared.provenance,
             values_ref,
             validity_ref,
-            safety_bundle_id,
         )
         admission = prepared.api_metadata_admission
         if isinstance(prepared.execution, ApiSegmentedScanExecution):
@@ -1914,21 +1894,13 @@ class ScanRepository:
             raise TypeError("scan commit requires PostSafetyContext")
         if type(prepared) is not _PreparedScanDataset:
             raise TypeError("prepared must be scan application output")
-        run_id, safety_bundle_id = context.authorize_commit_preparation()
-        if safety_bundle_id is None:
-            raise ValueError("hardware scan commit requires a safety bundle")
+        run_id = context.authorize_commit_preparation()
         if prepared.run_id != run_id:
             raise ValueError("prepared scan belongs to another Run")
         with self._root_lease.borrow() as staging_borrow:
             staging_borrow.require_active()
-            reference, payload = self._stage_result(
-                prepared,
-                safety_bundle_id=safety_bundle_id,
-            )
-            if context.authorize_commit_preparation() != (
-                run_id,
-                safety_bundle_id,
-            ):
+            reference, payload = self._stage_result(prepared)
+            if context.authorize_commit_preparation() != run_id:
                 raise RuntimeError("scan commit subject changed while staging")
             target = _target(self.repository_id, reference)
 
@@ -1951,7 +1923,6 @@ class ScanRepository:
                 operation = self._coordinator.prepare(
                     _commit_id(run_id, reference.manifest_digest),
                     run_id,
-                    safety_bundle_id,
                     target,
                     publish,
                 )
@@ -1995,9 +1966,7 @@ class ScanRepository:
             reference,
             manifest_payload=payload,
         )
-        if stored.provenance.trace_binding.run_id != intent.run_id or (
-            stored.safety_bundle_id != intent.safety_bundle_id
-        ):
+        if stored.provenance.trace_binding.run_id != intent.run_id:
             raise ValueError("visible scan differs from pending commit intent")
         for blob in (
             stored.pulse_program_blob,

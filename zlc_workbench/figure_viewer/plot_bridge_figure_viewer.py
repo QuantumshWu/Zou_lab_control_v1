@@ -28,9 +28,7 @@ on the primary screen) mirrors ``launch_pulse_editor_window`` / ``show_task_cons
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping
 
-import numpy as np
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_storage.paths import display_path
@@ -43,10 +41,8 @@ from zlc_frontend.qt_widgets import (
     FluentCodeEdit,
     FluentFrame,
     FluentPathEdit,
-    FluentReadoutMultiline,
     FluentScrollArea,
     FluentSectionLabel,
-    FluentSettingRow,
     FluentStatusStrip,
     FluentTabWidget,
     WINDOW_SCREEN_FRACTION,
@@ -311,88 +307,6 @@ class FigureViewer(QtWidgets.QWidget):
             return
         self._open_stored_figure(p)
 
-
-    def _clear_layout(self, layout: QtWidgets.QVBoxLayout) -> None:
-        while layout.count():
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-
-    def _clear_info(self) -> None:
-        for layout in (self.plot_layout, self.meas_layout, self.info_layout):
-            self._clear_layout(layout)
-        self.flow_view.set_graph(None)
-        self.raw_info.clear()
-        self.raw_info.setToolTip("")
-
-
-    def _fill_rows(self, layout: QtWidgets.QVBoxLayout, rows: list[tuple[str, object]]) -> None:
-        for key, value in rows:
-            if value is None:
-                continue
-            layout.addWidget(FluentSettingRow(key, self._readout_field(value),
-                                              label_width=self._label_w))
-
-    def _add_info_row(self, key: str, value: object) -> None:
-        """One read-only ``key | value`` row in the DEVICE tab (the shared row primitive)."""
-        self.info_layout.addWidget(FluentSettingRow(key, self._readout_field(value),
-                                                    label_width=self._label_w))
-
-    @staticmethod
-    def _readout_field(value: object) -> FluentReadoutMultiline:
-        """The ONE read-only value control for an Info row: a :class:`FluentReadoutMultiline` that SOFT-
-        WRAPS a long value (a resolved path, a device-metadata blob, a data shape) over as many lines as
-        it needs instead of a single-line edit clipping it.  Ignored horizontal policy so the row/column
-        drives the width; the field auto-sizes its OWN height to the wrapped content (up to its cap).
-
-        A collection is rendered HUMAN-readably here (the ONE place, so no row can leak a Python repr): a
-        list -> comma-joined items, a dict -> ``k=v`` pairs, an ndarray -> ``array(shape) dtype`` -- NOT
-        ``['a', 'b']`` / ``{'a': 1}`` with quotes and braces.  A plain TUPLE stays as-is because a shape
-        (``(1920, 1080)``) already reads cleanly; a scalar is just ``str``."""
-        if isinstance(value, Mapping):
-            text = ", ".join(f"{k}={v}" for k, v in value.items())
-        elif isinstance(value, list):
-            text = ", ".join(str(v) for v in value)
-        elif isinstance(value, np.ndarray):
-            text = f"array{tuple(value.shape)} {value.dtype}"
-        else:
-            text = str(value)
-        field = FluentReadoutMultiline(text)
-        field.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
-        return field
-
-    def _fill_provenance(self, provenance: object) -> None:
-        """Expand the saved ``info['provenance']`` (the producing node's device snapshot) into the
-        Info column, easy to read: a 'Provenance' section header, then the top-level scalar facts
-        (node / layer / captured_at / calibration fingerprint) as rows, then ONE sub-section per held
-        device (``camera`` / ``sequencer``) listing its snapshot keys one per row.  ``provenance`` may
-        be ``None`` (nothing was recorded) -> nothing is added; a non-dict is shown verbatim."""
-        if not provenance:
-            return
-        self.info_layout.addWidget(FluentSectionLabel("Provenance"))
-        if not isinstance(provenance, Mapping):
-            self._add_info_row("provenance", provenance)
-            return
-        devices = provenance.get("devices") if isinstance(provenance.get("devices"), Mapping) else {}
-        # Top-level scalar facts first (skip the nested ``devices`` -- it gets its own sub-sections).
-        for key, value in provenance.items():
-            if key == "devices":
-                continue
-            if isinstance(value, Mapping):       # e.g. acquisition_parameters / calibration_fingerprint
-                self.info_layout.addWidget(FluentSectionLabel(str(key)))
-                for sub_key, sub_val in value.items():
-                    self._add_info_row(str(sub_key), sub_val)
-            else:
-                self._add_info_row(str(key), value)
-        # One sub-section per device, its snapshot keys one row each.
-        for role, snap in devices.items():
-            self.info_layout.addWidget(FluentSectionLabel(str(role)))
-            if isinstance(snap, Mapping):
-                for sub_key, sub_val in snap.items():
-                    self._add_info_row(str(sub_key), sub_val)
-            else:
-                self._add_info_row(str(role), snap)
 
     # -------------------------------------------------------------- console
 

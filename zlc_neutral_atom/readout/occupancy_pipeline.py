@@ -223,7 +223,7 @@ class ExactOccupancyTransaction:
         self.worker = None
         if not errors:
             return report
-        return CleanupReport(report.safety_proofs, report.decisions, (*report.errors, *errors))
+        return CleanupReport.complete(errors=(*report.errors, *errors))
 
     def _fail_preview(self, error: BaseException) -> None:
         preview, self.preview = self.preview, None
@@ -240,14 +240,6 @@ class ExactOccupancyTransaction:
             self._fail_preview(primary)
         elif report.errors:
             self._fail_preview(report.errors[0])
-        elif report.decisions:
-            decision = report.decisions[0]
-            self._fail_preview(
-                RuntimeError(
-                    "occupancy cleanup reported an unsafe terminal state: "
-                    f"{decision.reason}"
-                )
-            )
 
 
 
@@ -371,11 +363,6 @@ def _settle_unbound_preview(
     failure = primary
     if failure is None and report.errors:
         failure = report.errors[0]
-    if failure is None and report.decisions:
-        failure = RuntimeError(
-            "occupancy cleanup reported an unsafe terminal state: "
-            f"{report.decisions[0].reason}"
-        )
     if failure is None:
         failure = RuntimeError("occupancy preview never reached an exact source")
     if failure is not None:

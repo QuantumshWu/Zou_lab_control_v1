@@ -43,6 +43,9 @@ from ..target import PulseTarget
 from .lease import DeviceLease
 
 
+_CONTINUOUS_OBSERVER_INTERVAL_SECONDS = 0.2
+
+
 class TransportAborted(RuntimeError):
     """An in-flight register transaction was cancelled during safe-state."""
 
@@ -312,6 +315,7 @@ class DeployedStreamerSession:
                     f"pulse session state {self._state} requires verified safe_state "
                     "before prepare"
                 )
+            prior_state = self._state
             self._operation_epoch += 1
             operation_epoch = self._operation_epoch
             self._operation_stop = threading.Event()
@@ -336,7 +340,11 @@ class DeployedStreamerSession:
                     "pulse prepare was superseded during deployment validation"
                 )
         self._stop_worker()
-        self._check_register_layout(stop=operation_stop)
+        # This server owns a frozen bitstream for the transport lifetime.  Bring-up
+        # verifies its layout before RPC admission, so the same JTAG read need not be
+        # repeated for every On Pulse.
+        if not self._layout_verified:
+            self._check_register_layout(stop=operation_stop)
         remaining_tail = self._drain_until - time.monotonic()
         if remaining_tail > 0 and operation_stop.wait(remaining_tail):
             raise TransportAborted("prepare interrupted while draining the prior output tail")
@@ -366,14 +374,24 @@ class DeployedStreamerSession:
             self._underflow_observed = False
             self._state = "PREPARING"
 
-        self._drive_physical_safe(
-            deadline=time.monotonic() + self.action_timeout
-        )
+        # Replacement cancellation and session close have already proved SAFE.
+        # Repeating the full physical transition here added no new safety fact.
+        if prior_state != "SAFE":
+            self._drive_physical_safe(
+                deadline=time.monotonic() + self.action_timeout
+            )
         rows = list(artifact.wire_image.words)
         rows.append((CtrlWords.BANK_READY, 0b11))
+        # Ordered BRAM writes and LOAD can share one transport batch.  Vivado still
+        # executes each AXI transaction in order; only the host round trip is merged.
+        rows.extend(
+            (
+                (CtrlWords.COMMAND, 0),
+                (CtrlWords.COMMAND, CMD_LOAD),
+            )
+        )
         self.transport.write_words(tuple(rows), stop=operation_stop)
-        if not self._command(
-            CMD_LOAD,
+        if not self._wait_status(
             wait_mask=STATUS_LOADED,
             timeout=self.load_timeout,
             stop=operation_stop,
@@ -414,13 +432,18 @@ class DeployedStreamerSession:
             self._cursor_sample_count = 0
             self._underflow_observed = False
         operation_stop = self._operation_stop
-        self.transport.write_words(
-            ((CtrlWords.BANK_READY, 0b11),),
-            stop=operation_stop,
-        )
         self._start_worker(operation_epoch)
         try:
-            self._command(CMD_FIRE, stop=operation_stop)
+            # BANK_READY precedes FIRE in the same ordered batch.  This preserves
+            # the hardware protocol and removes a redundant Vivado round trip.
+            self.transport.write_words(
+                (
+                    (CtrlWords.BANK_READY, 0b11),
+                    (CtrlWords.COMMAND, 0),
+                    (CtrlWords.COMMAND, CMD_FIRE),
+                ),
+                stop=operation_stop,
+            )
         except BaseException:
             self._cancel_worker_before_fire()
             with self._lock:
@@ -654,6 +677,20 @@ class DeployedStreamerSession:
         )
         if wait_mask is None:
             return True
+        return self._wait_status(
+            wait_mask=wait_mask,
+            timeout=self._remaining_budget(deadline),
+            stop=stop,
+        )
+
+    def _wait_status(
+        self,
+        *,
+        wait_mask: int,
+        timeout: float,
+        stop: threading.Event | None,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
         while True:
             status = self.transport.read_word(
                 CtrlWords.STATUS,
@@ -726,9 +763,31 @@ class DeployedStreamerSession:
         self._verify_clock_muxes_disabled(deadline=deadline)
 
     def _drive_physical_safe(self, *, deadline: float) -> None:
+        """Execute the frozen streamer's proven three-phase SAFE protocol.
+
+        These are hardware state transitions, not independent host writes that may
+        be coalesced.  The first SAFE resets the engine, clock muxes are then
+        disabled and read back, and the final SAFE proves the post-disable state.
+        """
+
         self._enter_safe(deadline=deadline)
         self._disable_clock_muxes(deadline=deadline)
         self._enter_safe(deadline=deadline)
+
+    def _read_words(
+        self,
+        word_offsets: Sequence[int],
+        *,
+        stop: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> tuple[int, ...]:
+        reader = getattr(self.transport, "read_words", None)
+        if callable(reader):
+            return tuple(reader(tuple(word_offsets), stop=stop, deadline=deadline))
+        return tuple(
+            self.transport.read_word(address, stop=stop, deadline=deadline)
+            for address in word_offsets
+        )
 
     def _verify_clock_muxes_disabled(self, *, deadline: float) -> None:
         base = region_bases(self.params)["ctrl"] + CtrlWords.CLK_ENABLE
@@ -770,9 +829,26 @@ class DeployedStreamerSession:
         gate.wait()
         if stop.is_set():
             return
+        artifact = self._artifact
+        continuous = bool(artifact is not None and artifact.target_ir.repeat_forever)
+        poll_interval = (
+            max(
+                self.terminal_poll_interval,
+                _CONTINUOUS_OBSERVER_INTERVAL_SECONDS,
+            )
+            if continuous
+            else self.terminal_poll_interval
+        )
         try:
             while not stop.is_set():
-                status = self.transport.read_word(CtrlWords.STATUS, stop=stop)
+                sampled_cursor: int | None = None
+                if continuous and self._total_points:
+                    status, sampled_cursor = self._read_words(
+                        (CtrlWords.STATUS, CtrlWords.CURSOR),
+                        stop=stop,
+                    )
+                else:
+                    status = self.transport.read_word(CtrlWords.STATUS, stop=stop)
                 self._status_sample_count += 1
                 if status & STATUS_ERROR:
                     raise RuntimeError("pulse streamer reported STATUS_ERROR")
@@ -804,7 +880,11 @@ class DeployedStreamerSession:
                     return
 
                 if self._total_points:
-                    cursor = self.transport.read_word(CtrlWords.CURSOR, stop=stop)
+                    cursor = (
+                        sampled_cursor
+                        if sampled_cursor is not None
+                        else self.transport.read_word(CtrlWords.CURSOR, stop=stop)
+                    )
                     if not 0 <= cursor < self._total_points:
                         raise RuntimeError(
                             "pulse streamer cursor is outside the active scan table"
@@ -814,7 +894,14 @@ class DeployedStreamerSession:
                             return
                         self._last_cursor = cursor
                         self._cursor_sample_count += 1
-                time.sleep(self.terminal_poll_interval)
+                # Continuous Pulse is observed for diagnostics/progress only; FPGA
+                # timing is autonomous.  Polling JTAG at a 1 ms target saturated the
+                # transport (real hardware managed only ~9 reads/s) and delayed the
+                # next SAFE/upload.  A cancellable ~3 Hz hardware sample is ample
+                # for progress UI and detects fail-closed underflow without owning
+                # the autonomous timing path.
+                if stop.wait(poll_interval):
+                    return
         except TransportAborted:
             return
         except BaseException as error:

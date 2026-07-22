@@ -69,6 +69,7 @@ class SignalExprWidget(QtWidgets.QWidget):
         self._slot_box.setSpacing(scaled_px(4, minimum=3))
         root.addLayout(self._slot_box)
         self.slot_combos: list = []
+        self._slot_rows: list[FluentSettingRow] = []
         # +/- buttons sit UNDER the label column (an empty label), so they line up with the
         # control column of the rows above instead of floating full-width.
         btn_inner = QtWidgets.QWidget()
@@ -103,7 +104,7 @@ class SignalExprWidget(QtWidgets.QWidget):
         # the expression on its OWN labelled "value" row, aligned to the same label column as the
         # signal slots above -- so the whole source control reads as one tidy grid (#4)
         root.addWidget(FluentSettingRow("value", expr_inner, label_width=self._label_w))
-        self._rebuild_slots()
+        self._reconcile_slots()
 
     def _names(self) -> list:
         try:
@@ -126,25 +127,40 @@ class SignalExprWidget(QtWidgets.QWidget):
     def _labels(self) -> dict:
         return coerce_short_labels(self._labels_provider)
 
-    def _rebuild_slots(self) -> None:
-        for combo in self.slot_combos:
-            combo.setParent(None); combo.deleteLater()
-        self.slot_combos = []
-        while self._slot_box.count():
-            item = self._slot_box.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None); w.deleteLater()
+    def _reconcile_slots(self) -> None:
+        """Keyed-by-index slot delta; retained pickers never get recreated."""
+
         n = max(1, len(self._inputs))
-        for i in range(n):
+        while len(self.slot_combos) > n:
+            row = self._slot_rows.pop()
+            self.slot_combos.pop()
+            self._slot_box.removeWidget(row)
+            row.setParent(None)
+            row.deleteLater()
+        while len(self.slot_combos) < n:
+            i = len(self.slot_combos)
             combo = FluentTreeComboBox()             # collapsible-tree signal picker (G2)
-            label = f"signal[{i}]" if n > 1 else "signal"
-            cur = self._inputs[i] if i < len(self._inputs) else ""
-            fill_grouped_signal_combo(combo, names=self._names(), sources=self._sources(),
-                                      formats=self._formats(), labels=self._labels(), current=cur)
             combo.activated.connect(lambda *_a, idx=i: self._on_pick(idx))
             self.slot_combos.append(combo)
-            self._slot_box.addWidget(FluentSettingRow(label, combo, label_width=self._label_w))
+            row = FluentSettingRow("", combo, label_width=self._label_w)
+            self._slot_rows.append(row)
+            self._slot_box.addWidget(row)
+        for i, (combo, row) in enumerate(
+            zip(self.slot_combos, self._slot_rows, strict=True)
+        ):
+            row.set_label(
+                f"signal[{i}]" if n > 1 else "signal",
+                width=self._label_w,
+            )
+            current = self._inputs[i] if i < len(self._inputs) else ""
+            fill_grouped_signal_combo(
+                combo,
+                names=self._names(),
+                sources=self._sources(),
+                formats=self._formats(),
+                labels=self._labels(),
+                current=current,
+            )
         self._rm_btn.setEnabled(n > 1)
 
     def _collect_inputs(self) -> None:
@@ -168,7 +184,7 @@ class SignalExprWidget(QtWidgets.QWidget):
         self._source_edit.blockSignals(True)
         self._source_edit.setText(seed_source_for_slots(len(self._inputs), self._source_edit.text()))
         self._source_edit.blockSignals(False)
-        self._rebuild_slots()
+        self._reconcile_slots()
         self.changed.emit()
 
     def _remove_slot(self) -> None:
@@ -180,7 +196,7 @@ class SignalExprWidget(QtWidgets.QWidget):
         self._source_edit.blockSignals(True)
         self._source_edit.setText(seed_source_for_slots(len(self._inputs), self._source_edit.text()))
         self._source_edit.blockSignals(False)
-        self._rebuild_slots()
+        self._reconcile_slots()
         self.changed.emit()
 
     def _open_editor(self) -> None:
@@ -217,4 +233,4 @@ class SignalExprWidget(QtWidgets.QWidget):
         self._source_edit.blockSignals(True)
         self._source_edit.setText(expr.source)
         self._source_edit.blockSignals(False)
-        self._rebuild_slots()
+        self._reconcile_slots()

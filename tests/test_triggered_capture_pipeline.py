@@ -136,11 +136,8 @@ def test_single_fire_failure_poisons_both_finite_owners():
     assert any("capture poison also failed" in note for note in primary.__notes__)
 
 
-def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges(tmp_path):
-    runtime = create_virtual_installation(
-        safety_journal_path=tmp_path / "trigger-interval-safety.zlcj",
-        seed=7,
-    )
+def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
+    runtime = create_virtual_installation(seed=7)
     try:
         catalog = runtime.device_catalog
         camera_port = runtime.camera_port(catalog.require("camera").ref)

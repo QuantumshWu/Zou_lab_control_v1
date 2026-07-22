@@ -427,6 +427,64 @@ FORM_WIDGET_HANDLERS: Mapping[str, FormWidgetHandler] = MappingProxyType(
 )
 
 
+def _widget_family(field: FormFieldProps) -> str:
+    """Concrete control family required by one declaration."""
+
+    if field.kind == "int" and _IntHandler._uses_spin(field):
+        return "int-spin"
+    if field.kind == "float" and _FloatHandler._uses_spin(field):
+        return "float-spin"
+    if field.kind in {"text", "int", "float", "number"}:
+        return "line-edit"
+    if field.kind == "choice":
+        return "choice"
+    if field.kind == "bool":
+        return "bool"
+    raise ValueError(f"unsupported form field kind: {field.kind!r}")
+
+
+def _same_typed_value(left: object, right: object) -> bool:
+    return type(left) is type(right) and left == right
+
+
+def _widget_has_value(
+    handler: FormWidgetHandler,
+    field: FormFieldProps,
+    widget: QtWidgets.QWidget,
+    value: object,
+) -> bool:
+    try:
+        current = handler.read(field, widget)
+    except (TypeError, ValueError):
+        return False
+    return _same_typed_value(current, value)
+
+
+def _reconfigure_widget(
+    old_field: FormFieldProps,
+    field: FormFieldProps,
+    widget: QtWidgets.QWidget,
+) -> None:
+    """Apply changed presentation constraints to one compatible control."""
+
+    widget.setToolTip(field.description)
+    if isinstance(widget, FluentLineEdit):
+        if field.kind == "text":
+            widget.setPlaceholderText(field.description[:48])
+        elif field.kind in {"int", "float", "number"}:
+            widget.setPlaceholderText(
+                "(optional)" if field.default is None else ""
+            )
+    elif isinstance(widget, FluentSpinBox):
+        assert field.minimum is not None and field.maximum is not None
+        widget.setRange(int(field.minimum), int(field.maximum))
+    elif isinstance(widget, _LosslessFloatSpinBox):
+        assert field.minimum is not None and field.maximum is not None
+        widget.setRange(float(field.minimum), float(field.maximum))
+    elif isinstance(widget, FluentComboBox) and old_field.choices != field.choices:
+        _ChoiceHandler._fill(widget, field.choices)
+
+
 class FluentParameterForm(QtWidgets.QWidget):
     """Thin exact-key form built from one ordered :class:`FormSpec`."""
 
@@ -445,10 +503,11 @@ class FluentParameterForm(QtWidgets.QWidget):
         self._fields = {field.key: field for field in spec.fields}
         self._widgets: dict[str, QtWidgets.QWidget] = {}
         self._handlers: dict[str, FormWidgetHandler] = {}
+        self._rows: dict[str, FluentSettingRow] = {}
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(scaled_px(6, minimum=4))
+        self._layout = QtWidgets.QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(scaled_px(6, minimum=4))
         label_width = setting_label_width(field.row_label for field in spec.fields)
         for field in spec.fields:
             handler = FORM_WIDGET_HANDLERS[field.kind]
@@ -459,9 +518,14 @@ class FluentParameterForm(QtWidgets.QWidget):
             )
             self._widgets[field.key] = widget
             self._handlers[field.key] = handler
-            layout.addWidget(
-                FluentSettingRow(field.row_label, widget, label_width=label_width)
+            row = FluentSettingRow(
+                field.row_label,
+                widget,
+                label_width=label_width,
+                parent=self,
             )
+            self._rows[field.key] = row
+            self._layout.addWidget(row)
 
         if values is not None:
             self.populate(values)
@@ -522,6 +586,117 @@ class FluentParameterForm(QtWidgets.QWidget):
 
     def write_all(self, values: Mapping[str, object]) -> None:
         self.populate(values)
+
+    def reconcile(
+        self,
+        spec: FormSpec,
+        values: Mapping[str, object],
+    ) -> None:
+        """Keyed-diff a new declaration into this stable form owner.
+
+        Same-key controls with a compatible concrete widget family are updated
+        in place.  New keys create one row, removed keys destroy one row,
+        reordering only moves existing rows, and a true widget-family change
+        replaces only that key's row.  All values are normalized before the
+        first QWidget mutation.
+        """
+
+        if not isinstance(spec, FormSpec):
+            raise TypeError("spec must be FormSpec")
+        if not isinstance(values, Mapping):
+            raise TypeError("form values must be a mapping")
+        incoming = {key: values[key] for key in values}
+        supplied = set(incoming)
+        expected = set(spec.keys)
+        if supplied != expected:
+            missing = sorted(repr(key) for key in expected - supplied)
+            extra = sorted(repr(key) for key in supplied - expected)
+            raise ValueError(
+                f"form values must have exact keys; missing={missing}, extra={extra}"
+            )
+        new_handlers = {
+            field.key: FORM_WIDGET_HANDLERS[field.kind]
+            for field in spec.fields
+        }
+        prepared = {
+            field.key: new_handlers[field.key].normalize(
+                field, incoming[field.key]
+            )
+            for field in spec.fields
+        }
+
+        old_fields = self._fields
+        replacements: dict[
+            str, tuple[QtWidgets.QWidget, FluentSettingRow]
+        ] = {}
+        label_width = setting_label_width(field.row_label for field in spec.fields)
+        for field in spec.fields:
+            old_field = old_fields.get(field.key)
+            if (
+                old_field is not None
+                and _widget_family(old_field) == _widget_family(field)
+            ):
+                continue
+            handler = new_handlers[field.key]
+            widget = handler.build(
+                field,
+                prepared[field.key],
+                lambda key=field.key: self.changed.emit(key),
+            )
+            row = FluentSettingRow(
+                field.row_label,
+                widget,
+                label_width=label_width,
+                parent=self,
+            )
+            replacements[field.key] = widget, row
+
+        retained_widgets = tuple(
+            self._widgets[field.key]
+            for field in spec.fields
+            if field.key not in replacements and field.key in self._widgets
+        )
+        self.setUpdatesEnabled(False)
+        try:
+            with signals_blocked(*retained_widgets):
+                for field in spec.fields:
+                    if field.key in replacements:
+                        continue
+                    old_field = old_fields[field.key]
+                    widget = self._widgets[field.key]
+                    handler = new_handlers[field.key]
+                    _reconfigure_widget(old_field, field, widget)
+                    if not _widget_has_value(
+                        handler, field, widget, prepared[field.key]
+                    ):
+                        handler.write(field, widget, prepared[field.key])
+
+            desired_keys = set(spec.keys)
+            replaced_keys = set(replacements)
+            for key, row in tuple(self._rows.items()):
+                if key in desired_keys and key not in replaced_keys:
+                    continue
+                self._layout.removeWidget(row)
+                row.setParent(None)
+                row.deleteLater()
+                self._rows.pop(key, None)
+                self._widgets.pop(key, None)
+
+            for key, (widget, row) in replacements.items():
+                self._widgets[key] = widget
+                self._rows[key] = row
+
+            for index, field in enumerate(spec.fields):
+                row = self._rows[field.key]
+                row.set_label(field.row_label, width=label_width)
+                self._layout.removeWidget(row)
+                self._layout.insertWidget(index, row)
+
+            self._spec = spec
+            self._fields = {field.key: field for field in spec.fields}
+            self._handlers = new_handlers
+        finally:
+            self.setUpdatesEnabled(True)
 
     def refresh(self) -> None:
         """Refresh every handler, preserving legal selections and edit silence."""

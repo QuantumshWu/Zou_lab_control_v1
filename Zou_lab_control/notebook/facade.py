@@ -4330,16 +4330,12 @@ def connect(
 
         scan_repository = ScanRepository(repository_root / "scans")
         fit_repository = FitResultRepository(repository_root / "fits")
-        safety_journal_path = repository_root / ".runtime" / "safety.journal"
         if config == "virtual":
             from zlc_neutral_atom.bootstrap._installation import (
                 create_virtual_installation,
             )
 
-            runtime = create_virtual_installation(
-                safety_journal_path=safety_journal_path,
-                seed=seed,
-            )
+            runtime = create_virtual_installation(seed=seed)
         else:
             from zlc_neutral_atom.bootstrap._installation import (
                 create_remote_pulse_installation,
@@ -4347,7 +4343,6 @@ def connect(
 
             assert sequencer_host is not None
             runtime = create_remote_pulse_installation(
-                safety_journal_path=safety_journal_path,
                 host=sequencer_host,
                 port=sequencer_port,
                 transport_timeout_seconds=transport_timeout_seconds,

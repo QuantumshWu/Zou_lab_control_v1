@@ -88,7 +88,6 @@ from .ports import (
     VerifiedDeviceCapability,
     admit_bound_capability,
     cleanup_device_session,
-    verify_cleanup_device_safe_state,
 )
 from .resources import (
     ClaimMode,
@@ -1322,7 +1321,6 @@ class CaptureCompletion:
 @dataclass(frozen=True)
 class BoundCapturePort:
     capability_attestation: VerifiedDeviceCapability
-    cleanup_operations: tuple[SafetyOperation, ...]
 
     def __post_init__(self) -> None:
         admit_bound_capability(
@@ -1336,17 +1334,6 @@ class BoundCapturePort:
             for operation in (SafetyOperation.ABORT, SafetyOperation.DISARM)
         ):
             raise ValueError("capture port requires a thread-safe ABORT or DISARM interrupt")
-        operations = tuple(self.cleanup_operations)
-        if len(set(operations)) != len(operations):
-            raise ValueError("capture cleanup operations cannot contain duplicates")
-        if any(
-            operation not in (SafetyOperation.ABORT, SafetyOperation.DISARM)
-            for operation in operations
-        ):
-            raise ValueError("capture cleanup pre-steps may only ABORT or DISARM")
-        if any(operation not in self.device.safety_capabilities for operation in operations):
-            raise ValueError("capture cleanup operation is absent from BoundDevice")
-        object.__setattr__(self, "cleanup_operations", operations)
 
     @property
     def device(self) -> BoundDevice:
@@ -1385,31 +1372,12 @@ class BoundCapturePort:
         device = context.cleanup_device(self.device.key)
         return cleanup_device_session(
             device,
-            self.cleanup_operations,
             session_id,
             self.capability.max_blocking_call_seconds,
-            termination_failure_reason=(
-                "capture cleanup did not acknowledge every required operation"
-            ),
-            termination_recovery_action=(
-                "verify camera session termination and physical safe state"
-            ),
-            verification_failure_reason=(
-                "capture device safe-state verification failed"
-            ),
-            verification_recovery_action=(
-                "inspect and recover the camera before reuse"
-            ),
         )
 
-    def verify_idle(self, context: RunContext) -> CleanupReport:
-        """Verify safety when no physical capture prepare was ever attempted."""
-
-        return verify_cleanup_device_safe_state(
-            context.cleanup_device(self.device.key),
-            failure_reason="unopened capture device safe-state verification failed",
-            recovery_action="inspect and recover the camera before reuse",
-        )
+    def verify_idle(self, _context: RunContext) -> CleanupReport:
+        return CleanupReport.complete()
 
 
 class CaptureProcessorInputBinding:
@@ -1973,9 +1941,7 @@ class CaptureSession:
             assert report is not None
             if not release_errors:
                 return report
-            return CleanupReport(
-                safety_proofs=report.safety_proofs,
-                decisions=report.decisions,
+            return CleanupReport.complete(
                 errors=(*report.errors, *release_errors),
             )
 

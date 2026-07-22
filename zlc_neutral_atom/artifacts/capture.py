@@ -241,7 +241,6 @@ _CAPTURE_MANIFEST_FIELDS = {
     "camera_provenance",
     "camera_capability_evidence",
     "camera_arm_spec",
-    "safety_bundle_id",
     "pulse_evidence",
 }
 
@@ -395,7 +394,6 @@ def _validate_capture_metadata_contract(
     camera_provenance: CameraCaptureProvenance,
     camera_capability_evidence: CameraCapabilityEvidence,
     camera_arm_spec: FrozenCaptureSpec,
-    safety_bundle_id: str,
 ) -> None:
     """Validate the typed cross-facts shared by inspection and full admission."""
 
@@ -470,7 +468,6 @@ def _validate_capture_metadata_contract(
         != terminal.binding_instance_id
     ):
         raise ValueError("camera binding lineage is inconsistent")
-    _canonical_text(safety_bundle_id, "safety_bundle_id")
     if len(
         {
             camera_provenance.binding.value,
@@ -522,7 +519,6 @@ class CaptureArtifact:
     camera_provenance: CameraCaptureProvenance
     camera_capability_evidence: CameraCapabilityEvidence
     camera_arm_spec: FrozenCaptureSpec
-    safety_bundle_id: str
     pulse_evidence: PulseCaptureEvidence | None = None
 
     @property
@@ -546,7 +542,6 @@ class CaptureArtifact:
             camera_provenance=self.camera_provenance,
             camera_capability_evidence=self.camera_capability_evidence,
             camera_arm_spec=self.camera_arm_spec,
-            safety_bundle_id=self.safety_bundle_id,
         )
         if self.pulse_evidence is not None and not isinstance(
             self.pulse_evidence,
@@ -879,14 +874,11 @@ class CaptureRepository:
                 camera_provenance=camera_provenance,
                 camera_capability_evidence=capability_evidence,
                 camera_arm_spec=arm_spec,
-                safety_bundle_id=data["safety_bundle_id"],
             )
             persisted_run_id = dataset_provenance.trace_binding.run_id
-            persisted_safety_bundle_id = data["safety_bundle_id"]
             for intent in matching:
                 if (
                     intent.run_id != persisted_run_id
-                    or intent.safety_bundle_id != persisted_safety_bundle_id
                     or intent.commit_id
                     != (
                         f"capture-final-{persisted_run_id}-"
@@ -1069,7 +1061,6 @@ class CaptureRepository:
                 data["camera_capability_evidence"]
             ),
             camera_arm_spec=frozen_capture_spec_from_tree(data["camera_arm_spec"]),
-            safety_bundle_id=data["safety_bundle_id"],
             pulse_evidence=pulse_capture_evidence_from_tree(
                 data["pulse_evidence"],
                 compiled_pulse,
@@ -1086,7 +1077,6 @@ class CaptureRepository:
             camera_provenance=artifact.camera_provenance,
             camera_capability_evidence=artifact.camera_capability_evidence,
             camera_arm_spec=artifact.camera_arm_spec,
-            safety_bundle_id=artifact.safety_bundle_id,
             pulse_evidence=artifact.pulse_evidence,
         )
         if (
@@ -1121,7 +1111,6 @@ class CaptureRepository:
                 )
                 if (
                     intent.run_id != artifact.run_id
-                    or intent.safety_bundle_id != artifact.safety_bundle_id
                     or intent.commit_id != expected_commit_id
                 ):
                     raise ValueError(
@@ -1206,7 +1195,7 @@ class CaptureRepository:
             raise TypeError("capture commit requires PostSafetyContext")
         if not isinstance(result, (PipelineResult, TriggeredPipelineResult)):
             raise TypeError("capture commit requires an exact pipeline result")
-        run_id, safety_bundle_id = context.authorize_commit_preparation()
+        run_id = context.authorize_commit_preparation()
         # Hold the root before the first CAS write.  prepare() synchronously
         # mints the long-lived commit borrow before this temporary hold exits.
         with self._root_lease.borrow() as staging_borrow:
@@ -1217,7 +1206,7 @@ class CaptureRepository:
                 compiled_pulse_ref=compiled_pulse_ref,
             )
             confirmed_subject = context.authorize_commit_preparation()
-            if confirmed_subject != (run_id, safety_bundle_id):
+            if confirmed_subject != run_id:
                 raise RuntimeError("capture commit subject changed while staging")
             target = CommitTarget(
                 self.repository_id,
@@ -1251,7 +1240,6 @@ class CaptureRepository:
             operation = self._coordinator.prepare(
                 commit_id,
                 run_id,
-                safety_bundle_id,
                 target,
                 publish,
             )
@@ -1313,10 +1301,6 @@ class CaptureRepository:
         artifact.frame_source._verify_all_frame_chunks()
         if artifact.run_id != intent.run_id:
             raise ValueError("capture manifest run_id differs from commit intent")
-        if artifact.safety_bundle_id != intent.safety_bundle_id:
-            raise ValueError(
-                "capture manifest safety bundle differs from commit intent"
-            )
         # A readable target may be the visible residue of a replace whose
         # parent-directory flush acknowledgement failed.  This storage-owned
         # barrier verifies/fsyncs only an existing immutable target and never
@@ -1364,8 +1348,6 @@ class CaptureRepository:
                 raise ValueError("untriggered capture cannot name a compiled-pulse ref")
         if base.run_id != context.run_id.value:
             raise ValueError("PostSafetyContext run_id differs from pipeline result")
-        if context.safety_bundle_id is None:
-            raise ValueError("CaptureArtifact requires a durable safety bundle id")
         if not base.is_direct_raw_capture:
             raise ValueError(
                 "CaptureArtifact only accepts direct raw camera datasets"
@@ -1421,7 +1403,6 @@ class CaptureRepository:
             camera_provenance=base.camera_provenance,
             camera_capability_evidence=base.camera_capability_evidence,
             camera_arm_spec=base.camera_arm_spec,
-            safety_bundle_id=context.safety_bundle_id,
             pulse_evidence=evidence,
         )
         if len(manifest_payload) > policy.max_manifest_bytes:
@@ -1440,7 +1421,6 @@ class CaptureRepository:
             camera_provenance=base.camera_provenance,
             camera_capability_evidence=base.camera_capability_evidence,
             camera_arm_spec=base.camera_arm_spec,
-            safety_bundle_id=context.safety_bundle_id,
             pulse_evidence=evidence,
         )
         return reference, manifest_payload
@@ -1562,9 +1542,7 @@ def compile_capture_artifact_pipeline(
             if borrow is not None:
                 borrow.close()
             raise
-        if borrow is not None and (
-            primary is not None or report.errors or report.decisions
-        ):
+        if borrow is not None and (primary is not None or report.errors):
             borrow.close()
         return report
 
@@ -1652,7 +1630,6 @@ def _manifest_payload(
     camera_provenance: CameraCaptureProvenance,
     camera_capability_evidence: CameraCapabilityEvidence,
     camera_arm_spec: FrozenCaptureSpec,
-    safety_bundle_id: str,
     pulse_evidence: PulseCaptureEvidence | None,
 ) -> bytes:
     absent = pulse_evidence is None
@@ -1689,10 +1666,6 @@ def _manifest_payload(
             ),
             "camera_arm_spec": frozen_capture_spec_to_tree(
                 camera_arm_spec
-            ),
-            "safety_bundle_id": _canonical_text(
-                safety_bundle_id,
-                "safety_bundle_id",
             ),
             "pulse_evidence": pulse_capture_evidence_to_tree(
                 pulse_evidence

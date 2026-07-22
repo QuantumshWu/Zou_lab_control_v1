@@ -15,18 +15,11 @@ from types import MappingProxyType
 from typing import Callable, Mapping, TypeVar
 from zlc_storage import canonical_text as _canonical_text
 
-from .cleanup import CleanupReport, SafetyProof
+from .cleanup import CleanupReport
 from .resources import (
     DeviceBindingStamp,
     PhysicalDeviceIdentity,
-    RecoveryAcquireResult,
-    RecoveryClaim,
-    RecoveryEvidence,
-    RecoveryLease,
-    ResourceArbiter,
-    ResourceBusy,
     ResourceKey,
-    SafeReceipt,
 )
 
 
@@ -38,30 +31,6 @@ class SafetyOperation(str, Enum):
     ABORT = "ABORT"
     SAFE_STATE = "SAFE_STATE"
     DISARM = "DISARM"
-    READ_STATUS = "READ_STATUS"
-
-
-@dataclass(frozen=True)
-class CleanupStepAck:
-    """Adapter acknowledgement for one declared cleanup operation."""
-
-    operation: SafetyOperation
-    acknowledgement_digest: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.operation, SafetyOperation):
-            raise TypeError("CleanupStepAck.operation must be SafetyOperation")
-        _canonical_text(self.acknowledgement_digest, "acknowledgement_digest")
-
-
-@dataclass(frozen=True)
-class SafeStateAck:
-    """Adapter readback proving the device is in its declared physical safe state."""
-
-    acknowledgement_digest: str
-
-    def __post_init__(self) -> None:
-        _canonical_text(self.acknowledgement_digest, "acknowledgement_digest")
 
 
 @dataclass(frozen=True)
@@ -208,9 +177,7 @@ class _DeviceEndpoint:
     identity_probe: Callable[[], PhysicalDeviceIdentity]
     execute_command: Callable[[object], object]
     capability_probe: Callable[[], object] | None
-    cleanup_operations: Mapping[SafetyOperation, Callable[[], CleanupStepAck]]
     close_session: Callable[[SessionCloseCommand], SessionClosedAck] | None
-    verify_safe_state: Callable[[], SafeStateAck]
     interrupt_operations: Mapping[SafetyOperation, Callable[[], object]]
 
 
@@ -234,7 +201,6 @@ class BoundDevice:
     __slots__ = (
         "_key",
         "_binding_stamp",
-        "_safety_capabilities",
         "_interrupt_capabilities",
         "_session_cleanup_capable",
         "_broker",
@@ -251,9 +217,6 @@ class BoundDevice:
             raise PermissionError("BoundDevice references are created by DeviceBroker.bind")
         object.__setattr__(self, "_key", endpoint.key)
         object.__setattr__(self, "_binding_stamp", endpoint.binding_stamp)
-        object.__setattr__(
-            self, "_safety_capabilities", frozenset(endpoint.cleanup_operations)
-        )
         object.__setattr__(
             self, "_interrupt_capabilities", frozenset(endpoint.interrupt_operations)
         )
@@ -278,10 +241,6 @@ class BoundDevice:
     @property
     def binding_instance_id(self) -> str:
         return self._binding_stamp.binding_instance_id
-
-    @property
-    def safety_capabilities(self) -> frozenset[SafetyOperation]:
-        return self._safety_capabilities
 
     @property
     def interrupt_capabilities(self) -> frozenset[SafetyOperation]:
@@ -350,7 +309,6 @@ class DeviceBroker:
         self._identity_probe_inflight: set[str] = set()
         self._identity_handshakes = 0
         self._active: dict[str, str] = {}
-        self._recovering: dict[ResourceKey, object] = {}
         self._shutdown = False
 
     def shutdown(self) -> None:
@@ -361,7 +319,6 @@ class DeviceBroker:
                 return
             if (
                 self._active
-                or self._recovering
                 or self._capability_probe_inflight
                 or self._identity_probe_inflight
                 or self._identity_handshakes
@@ -428,8 +385,6 @@ class DeviceBroker:
         key: ResourceKey,
         identity: VerifiedPhysicalDeviceIdentity,
         execute_command: Callable[[object], object],
-        cleanup_operations: Mapping[SafetyOperation, Callable[[], CleanupStepAck]],
-        verify_safe_state: Callable[[], SafeStateAck],
         capability_probe: Callable[[], object] | None = None,
         close_session: Callable[[SessionCloseCommand], SessionClosedAck] | None = None,
         interrupt_operations: Mapping[SafetyOperation, Callable[[], object]] = MappingProxyType({}),
@@ -444,13 +399,6 @@ class DeviceBroker:
             raise TypeError("capability_probe must be callable")
         if close_session is not None and not callable(close_session):
             raise TypeError("close_session must be callable")
-        normalized_cleanup: dict[SafetyOperation, Callable[[], CleanupStepAck]] = {}
-        for operation, callback in dict(cleanup_operations).items():
-            if not isinstance(operation, SafetyOperation):
-                raise TypeError("cleanup operation keys must be SafetyOperation")
-            if not callable(callback):
-                raise TypeError("cleanup operation values must be callable")
-            normalized_cleanup[operation] = callback
         normalized_interrupt: dict[SafetyOperation, Callable[[], object]] = {}
         for operation, callback in dict(interrupt_operations).items():
             if operation not in _INTERRUPT_OPERATIONS:
@@ -458,8 +406,6 @@ class DeviceBroker:
             if not callable(callback):
                 raise TypeError("interrupt operation values must be callable")
             normalized_interrupt[operation] = callback
-        if not callable(verify_safe_state):
-            raise TypeError("verify_safe_state must be callable")
         with self._condition:
             self._ensure_open()
             pending = self._verified_identities.get(identity._nonce)
@@ -486,9 +432,7 @@ class DeviceBroker:
                 identity_probe=identity_probe,
                 execute_command=execute_command,
                 capability_probe=capability_probe,
-                cleanup_operations=MappingProxyType(normalized_cleanup),
                 close_session=close_session,
-                verify_safe_state=verify_safe_state,
                 interrupt_operations=MappingProxyType(normalized_interrupt),
             )
             reference = BoundDevice(
@@ -514,8 +458,6 @@ class DeviceBroker:
             raise TypeError("capability verification requires this broker's BoundDevice")
         with self._condition:
             self._ensure_open()
-            if device.key in self._recovering:
-                raise RuntimeError("cannot probe capability during device recovery")
             if device.binding_instance_id in self._active:
                 raise RuntimeError("cannot probe capability while the device is active")
             if device.binding_instance_id in self._capability_probe_inflight:
@@ -598,8 +540,6 @@ class DeviceBroker:
                     raise RuntimeError(
                         f"device {binding.key} identity probe is already in progress"
                     )
-                if binding.key in self._recovering:
-                    raise RuntimeError(f"device {binding.key} is undergoing recovery")
                 if binding._broker is not self:
                     raise ValueError("all BoundDevice references must belong to one broker")
                 if binding.binding_instance_id in self._active:
@@ -618,8 +558,7 @@ class DeviceBroker:
             with self._condition:
                 for binding, _endpoint in endpoints:
                     if (
-                        binding.key in self._recovering
-                        or binding.binding_instance_id in self._active
+                        binding.binding_instance_id in self._active
                     ):
                         raise RuntimeError(
                             f"device {binding.key} became unavailable during identity probe"
@@ -645,100 +584,6 @@ class DeviceBroker:
                 if self._active.get(binding.binding_instance_id) == run_id:
                     self._active.pop(binding.binding_instance_id, None)
             self._condition.notify_all()
-
-    def _open_recovery(
-        self,
-        claim: RecoveryClaim,
-        binding: BoundDevice,
-    ) -> "_DeviceRecoveryLease":
-        if not isinstance(claim, RecoveryClaim):
-            raise TypeError("recovery verification requires RecoveryClaim")
-        if not isinstance(binding, BoundDevice) or binding._broker is not self:
-            raise TypeError("recovery binding must belong to this DeviceBroker")
-        with self._condition:
-            self._ensure_open()
-            if binding.key != claim.key:
-                raise ValueError("recovery claim and binding identify different resources")
-            if binding.binding_instance_id in self._active:
-                raise RuntimeError(f"device {claim.key} is active and cannot be recovered")
-            if binding.binding_instance_id in self._capability_probe_inflight:
-                raise RuntimeError(
-                    f"device {claim.key} capability probe blocks recovery"
-                )
-            if binding.binding_instance_id in self._identity_probe_inflight:
-                raise RuntimeError(
-                    f"device {claim.key} identity probe blocks recovery"
-                )
-            if claim.key in self._recovering:
-                raise RuntimeError(f"device {claim.key} already has a recovery owner")
-            endpoint = self._endpoints[binding.binding_instance_id]
-            if endpoint.binding_stamp.physical_identity != claim.physical_identity:
-                raise ValueError("recovery binding does not match hazardous physical identity")
-            token = object()
-            self._recovering[claim.key] = token
-            return _DeviceRecoveryLease(self, token, claim, binding, endpoint)
-
-    def _validate_recovery_owner(
-        self,
-        token: object,
-        binding: BoundDevice,
-    ) -> None:
-        with self._lock:
-            if self._recovering.get(binding.key) is not token:
-                raise RuntimeError("device recovery ownership is no longer active")
-
-    def _release_recovery(self, token: object, key: ResourceKey) -> None:
-        with self._condition:
-            if self._recovering.get(key) is not token:
-                raise RuntimeError("device recovery ownership is no longer active")
-            self._recovering.pop(key)
-            self._condition.notify_all()
-
-
-class _DeviceRecoveryLease:
-    __slots__ = ("_broker", "_token", "_claim", "_binding", "_endpoint", "_released")
-
-    def __init__(
-        self,
-        broker: DeviceBroker,
-        token: object,
-        claim: RecoveryClaim,
-        binding: BoundDevice,
-        endpoint: _DeviceEndpoint,
-    ) -> None:
-        self._broker = broker
-        self._token = token
-        self._claim = claim
-        self._binding = binding
-        self._endpoint = endpoint
-        self._released = False
-
-    def verify(self) -> RecoveryEvidence:
-        self._broker._validate_recovery_owner(
-            self._token,
-            self._binding,
-        )
-        _verify_live_identity(self._binding, self._endpoint)
-        acknowledgement = self._endpoint.verify_safe_state()
-        if not isinstance(acknowledgement, SafeStateAck):
-            raise TypeError("device recovery safe-state verifier must return SafeStateAck")
-        _verify_live_identity(self._binding, self._endpoint)
-        self._broker._validate_recovery_owner(
-            self._token,
-            self._binding,
-        )
-        evidence = RecoveryEvidence(
-            binding_stamp=self._binding.binding_stamp,
-            safe_state_digest=acknowledgement.acknowledgement_digest,
-        )
-        return evidence
-
-    def release(self) -> None:
-        if self._released:
-            return
-        self._broker._release_recovery(self._token, self._claim.key)
-        self._released = True
-
 
 class _DeviceRunLease:
     __slots__ = ("_broker", "_run_id", "_bindings", "_revoked", "_lock")
@@ -767,28 +612,6 @@ class _DeviceRunLease:
     def execute(self, binding: BoundDevice, command: object) -> object:
         return self._endpoint(binding).execute_command(command)
 
-    def cleanup_step(
-        self, binding: BoundDevice, operation: SafetyOperation
-    ) -> CleanupStepAck:
-        endpoint = self._endpoint(binding)
-        try:
-            callback = endpoint.cleanup_operations[operation]
-        except KeyError as exc:
-            raise RuntimeError(
-                f"device {binding.key} does not provide safety operation {operation.value}"
-            ) from exc
-        acknowledgement = callback()
-        if not isinstance(acknowledgement, CleanupStepAck):
-            raise TypeError(
-                f"device {binding.key} cleanup operation {operation.value} must return CleanupStepAck"
-            )
-        if acknowledgement.operation is not operation:
-            raise ValueError(
-                f"device {binding.key} returned acknowledgement for "
-                f"{acknowledgement.operation.value}, expected {operation.value}"
-            )
-        return acknowledgement
-
     def close_session(
         self,
         binding: BoundDevice,
@@ -812,22 +635,6 @@ class _DeviceRunLease:
                 f"device {binding.key} session cleanup did not prove stop/drain/join"
             )
         return acknowledgement
-
-    def verify_safe_state(self, binding: BoundDevice) -> SafeReceipt:
-        endpoint = self._endpoint(binding)
-        _verify_live_identity(binding, endpoint)
-        acknowledgement = endpoint.verify_safe_state()
-        if not isinstance(acknowledgement, SafeStateAck):
-            raise TypeError(
-                f"device {binding.key} safe-state verifier must return SafeStateAck"
-            )
-        _verify_live_identity(binding, endpoint)
-        return SafeReceipt(
-            key=binding.key,
-            binding_stamp=binding.binding_stamp,
-            operation_id="VERIFY_SAFE_STATE",
-            acknowledgement_digest=acknowledgement.acknowledgement_digest,
-        )
 
     def interrupt(self, binding: BoundDevice, operation: SafetyOperation) -> object:
         endpoint = self._endpoint(binding)
@@ -868,23 +675,13 @@ class RunDevice:
 
 
 class CleanupDevice:
-    """Cleanup-phase proxy restricted to the declared safety operation set."""
+    """Cleanup-phase proxy that closes one domain-owned device session."""
 
     __slots__ = ("_context", "_binding")
 
     def __init__(self, context: object, binding: BoundDevice) -> None:
         self._context = context
         self._binding = binding
-
-    @property
-    def capabilities(self) -> frozenset[SafetyOperation]:
-        return self._binding.safety_capabilities
-
-    def perform(self, operation: SafetyOperation) -> CleanupStepAck:
-        return self._context._execute_cleanup_step(  # type: ignore[attr-defined, no-any-return]
-            self._binding,
-            operation,
-        )
 
     def close_session(
         self,
@@ -896,67 +693,18 @@ class CleanupDevice:
             SessionCloseCommand(session_id, timeout_seconds),
         )
 
-    def verify_safe_state(self) -> SafetyProof:
-        return self._context._verify_bound_safe_state(  # type: ignore[attr-defined, no-any-return]
-            self._binding,
-        )
-
-
-def verify_cleanup_device_safe_state(
-    device: CleanupDevice,
-    *,
-    failure_reason: str,
-    recovery_action: str,
-) -> CleanupReport:
-    """Read back one device's safe state and retain failure as cleanup evidence."""
-
-    try:
-        proof = device.verify_safe_state()
-    except BaseException as error:
-        return CleanupReport.unsafe(
-            (device._binding.key,),
-            reason=failure_reason,
-            recovery_action=recovery_action,
-            errors=(error,),
-        )
-    return CleanupReport.safe((proof,))
-
-
 def cleanup_device_session(
     device: CleanupDevice,
-    operations: tuple[SafetyOperation, ...],
     session_id: str,
     timeout_seconds: float,
-    *,
-    termination_failure_reason: str,
-    termination_recovery_action: str,
-    verification_failure_reason: str,
-    verification_recovery_action: str,
 ) -> CleanupReport:
-    """Execute interrupt-safe pre-steps, close one session, then prove safety."""
+    """Close one device session at its domain-owned terminal boundary."""
 
-    errors: list[BaseException] = []
-    for operation in operations:
-        try:
-            device.perform(operation)
-        except BaseException as error:
-            errors.append(error)
     try:
         device.close_session(session_id, timeout_seconds)
     except BaseException as error:
-        errors.append(error)
-    if errors:
-        return CleanupReport.unsafe(
-            (device._binding.key,),
-            reason=termination_failure_reason,
-            recovery_action=termination_recovery_action,
-            errors=tuple(errors),
-        )
-    return verify_cleanup_device_safe_state(
-        device,
-        failure_reason=verification_failure_reason,
-        recovery_action=verification_recovery_action,
-    )
+        return CleanupReport(errors=(error,))
+    return CleanupReport.complete()
 
 
 def _open_device_run(
@@ -970,86 +718,3 @@ def _open_device_run(
     if any(binding._broker is not broker for binding in bindings):
         raise ValueError("one RunPlan cannot mix DeviceBroker authorities")
     return broker._open(_BROKER_OPEN_TOKEN, run_id, bindings)
-
-
-class RecoveryAttempt:
-    """Exclusive recovery claim; live binding proof is acquired only on complete."""
-
-    __slots__ = (
-        "_lease",
-        "_devices",
-        "_device_lease",
-        "_binding",
-        "_proof",
-        "_durable_result",
-        "_result",
-        "_lock",
-    )
-
-    def __init__(
-        self,
-        lease: RecoveryLease,
-        devices: DeviceBroker,
-    ) -> None:
-        self._lease = lease
-        self._devices = devices
-        self._device_lease: _DeviceRecoveryLease | None = None
-        self._binding: BoundDevice | None = None
-        self._proof: RecoveryEvidence | None = None
-        self._durable_result = None
-        self._result = None
-        self._lock = threading.Lock()
-
-    def complete(self, binding: BoundDevice):
-        with self._lock:
-            if self._result is not None:
-                if binding is not self._binding:
-                    raise ValueError("completed recovery cannot be rebound")
-                return self._result
-            if self._binding is not None and binding is not self._binding:
-                raise ValueError("recovery retry must reuse the original binding")
-            if self._proof is None:
-                device_lease = self._devices._open_recovery(
-                    self._lease.claim,
-                    binding,
-                )
-                try:
-                    proof = device_lease.verify()
-                except BaseException:
-                    device_lease.release()
-                    raise
-                self._device_lease = device_lease
-                self._binding = binding
-                self._proof = proof
-            assert self._proof is not None
-            if self._durable_result is None:
-                self._durable_result = self._lease._complete(self._proof)
-            assert self._device_lease is not None
-            self._device_lease.release()
-            self._result = self._durable_result
-            return self._result
-
-    def abort(self) -> bool:
-        with self._lock:
-            result = self._lease.abort()
-            if self._device_lease is not None:
-                self._device_lease.release()
-            return result
-
-class RecoveryController:
-    """Only path that turns a device recovery probe into quarantine resolution."""
-
-    def __init__(self, resources: ResourceArbiter, devices: DeviceBroker) -> None:
-        if not isinstance(resources, ResourceArbiter):
-            raise TypeError("resources must be ResourceArbiter")
-        if not isinstance(devices, DeviceBroker):
-            raise TypeError("devices must be DeviceBroker")
-        self._resources = resources
-        self._devices = devices
-
-    def begin(self, key: ResourceKey) -> RecoveryAttempt | ResourceBusy | None:
-        acquired: RecoveryAcquireResult = self._resources._begin_recovery(key)
-        if acquired is None or isinstance(acquired, ResourceBusy):
-            return acquired
-        assert isinstance(acquired, RecoveryLease)
-        return RecoveryAttempt(acquired, self._devices)

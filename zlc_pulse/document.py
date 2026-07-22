@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -233,6 +233,12 @@ class FrozenScanTable:
 
     columns: tuple[str, ...]
     rows: tuple[tuple[int | float, ...], ...]
+    _fingerprint: str | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
 
     def __post_init__(self) -> None:
         columns = tuple(_identifier(item, "scan table column") for item in self.columns)
@@ -251,7 +257,11 @@ class FrozenScanTable:
 
     @property
     def fingerprint(self) -> str:
-        return canonical_digest(frozen_scan_table_to_tree(self))
+        cached = self._fingerprint
+        if cached is None:
+            cached = canonical_digest(frozen_scan_table_to_tree(self))
+            object.__setattr__(self, "_fingerprint", cached)
+        return cached
 
 
 @dataclass(frozen=True)
@@ -326,6 +336,12 @@ class PulseDocument:
     delays: tuple[OutputDelay, ...] = ()
     repeat: RepeatRegion | None = None
     scan_sweep_count: int = 0
+    _fingerprint: str | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _text(self.name, "pulse document name"))
@@ -529,7 +545,11 @@ class PulseDocument:
 
     @property
     def fingerprint(self) -> str:
-        return canonical_digest(pulse_document_to_tree(self))
+        cached = self._fingerprint
+        if cached is None:
+            cached = canonical_digest(pulse_document_to_tree(self))
+            object.__setattr__(self, "_fingerprint", cached)
+        return cached
 
     @property
     def period_by_id(self) -> dict[str, PulsePeriod]:

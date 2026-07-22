@@ -9,9 +9,6 @@ from dataclasses import dataclass
 from fpga.pulse_streamer.host.image import StreamerParams, build_fingerprint
 from zlc_neutral_atom.runtime.ports import (
     BoundDevice,
-    CleanupStepAck,
-    SafeStateAck,
-    SafetyOperation,
     SessionClosedAck,
     SessionCloseCommand,
 )
@@ -549,12 +546,6 @@ class _OwnedSequencerEndpoint:
     def interrupt(self) -> str:
         return self._owner.interrupt()
 
-    def cleanup(self) -> CleanupStepAck:
-        return CleanupStepAck(SafetyOperation.SAFE_STATE, self.interrupt())
-
-    def verify_safe_state(self) -> SafeStateAck:
-        return self._backend_verify_safe_state()
-
 
 class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
     """Typed finite execution endpoint for the in-process hardware simulator."""
@@ -733,9 +724,20 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
     ) -> tuple[bool, str]:
         if not isinstance(snapshot, dict):
             raise TypeError("virtual sequencer safe-state snapshot must be a mapping")
-        safe = snapshot.get("state") == "safe"
+        safe = (
+            snapshot.get("state") == "safe"
+            and snapshot.get("prepared_program") is None
+            and self._sequencer.firing is None
+            and self._sequencer.last_fired is None
+        )
         return safe, canonical_digest(
-            {"session_id": session_id, "state": snapshot.get("state")}
+            {
+                "session_id": session_id,
+                "state": snapshot.get("state"),
+                "prepared_program": snapshot.get("prepared_program"),
+                "firing": self._sequencer.firing is not None,
+                "last_fired": self._sequencer.last_fired is not None,
+            }
         )
 
     def _backend_interrupt_digest(self, snapshot: object) -> str:
@@ -743,18 +745,6 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
             raise TypeError("virtual sequencer safe-state snapshot must be a mapping")
         return canonical_digest(
             {"operation": "SAFE_STATE", "state": snapshot.get("state")}
-        )
-
-    def _backend_verify_safe_state(self) -> SafeStateAck:
-        snapshot = dict(self._sequencer.snapshot())
-        if snapshot.get("state") != "safe":
-            raise RuntimeError("virtual sequencer is not in its safe state")
-        if self._sequencer.firing is not None or self._sequencer.last_fired is not None:
-            raise RuntimeError("virtual sequencer still retains an active output")
-        if snapshot.get("prepared_program") is not None:
-            raise RuntimeError("virtual sequencer still retains a prepared program")
-        return SafeStateAck(
-            canonical_digest({"state": "safe", "firing": None})
         )
 
 
@@ -941,14 +931,18 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
         session_id: str,
         snapshot: object,
     ) -> tuple[bool, str]:
-        return True, canonical_digest(
+        state = getattr(snapshot, "state", None)
+        prepared_ref = getattr(snapshot, "prepared_ref", None)
+        safe = state == "SAFE" and prepared_ref is None
+        return safe, canonical_digest(
             {
                 "session_id": session_id,
                 "server_connection_generation": (
                     self._server_connection_generation
                 ),
-                "state": snapshot.state,
-                "backend": snapshot.backend,
+                "state": state,
+                "prepared_ref": None if prepared_ref is None else "present",
+                "backend": getattr(snapshot, "backend", None),
             }
         )
 
@@ -961,22 +955,6 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
                 ),
                 "state": snapshot.state,
             }
-        )
-
-    def _backend_verify_safe_state(self) -> SafeStateAck:
-        snapshot = self._validate_server_connection_generation()
-        if snapshot.state != "SAFE" or snapshot.prepared_ref is not None:
-            raise RuntimeError("remote pulse server has not published SAFE")
-        return SafeStateAck(
-            canonical_digest(
-                {
-                    "server_connection_generation": (
-                        self._server_connection_generation
-                    ),
-                    "state": snapshot.state,
-                    "prepared_ref": None,
-                }
-            )
         )
 
     def _validate_server_connection_generation(self):

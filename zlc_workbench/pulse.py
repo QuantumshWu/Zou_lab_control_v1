@@ -31,6 +31,7 @@ class PulseEditorSession:
 
     __slots__ = (
         "_base_fingerprint",
+        "_dirty",
         "_document",
         "_file_state",
         "_lock",
@@ -48,6 +49,7 @@ class PulseEditorSession:
         self._document = document
         self._path: Path | None = None
         self._base_fingerprint: str | None = None
+        self._dirty = True
         self._file_state = "new"
         self._revision = 0
         self._lock = threading.RLock()
@@ -112,6 +114,7 @@ class PulseEditorSession:
         session = cls(document)
         session._path = resolved
         session._base_fingerprint = document.fingerprint
+        session._dirty = False
         session._file_state = "loaded"
         return session
 
@@ -140,10 +143,7 @@ class PulseEditorSession:
     @property
     def dirty(self) -> bool:
         with self._lock:
-            return (
-                self._base_fingerprint is None
-                or self._document.fingerprint != self._base_fingerprint
-            )
+            return self._dirty
 
     def snapshot(self) -> tuple[int, PulseDocument]:
         with self._lock:
@@ -156,6 +156,7 @@ class PulseEditorSession:
             if document == self._document:
                 return self._revision
             self._document = document
+            self._dirty = True
             self._revision += 1
             return self._revision
 
@@ -219,6 +220,7 @@ class PulseEditorSession:
                 self._path = saved
                 self._base_fingerprint = document.fingerprint
                 self._file_state = "saved"
+                self._dirty = False
             return saved
 
 

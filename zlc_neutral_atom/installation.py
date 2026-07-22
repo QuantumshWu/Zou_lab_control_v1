@@ -1,4 +1,4 @@
-"""Capability-free observations of one process-lifetime installation runtime."""
+"""Capability-free observations of one composed installation runtime."""
 
 from __future__ import annotations
 
@@ -7,10 +7,6 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from zlc_storage import canonical_text, nonnegative_integer
-
-
-class InstallationRestartRequiredError(RuntimeError):
-    """Composition crossed its process-lifetime claim and cannot be retried here."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,5 +174,4 @@ __all__ = [
     "DeviceCatalogView",
     "DeviceInfo",
     "DeviceRef",
-    "InstallationRestartRequiredError",
 ]

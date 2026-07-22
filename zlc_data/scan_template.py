@@ -35,6 +35,7 @@ class ScanColumnSpec:
     hi: float
     is_dac: bool = False
     unit: str = "ns"
+    label: str = ""
 
 
 def scan_table_template(kind: str, columns: Sequence[ScanColumnSpec]) -> str:
@@ -60,8 +61,11 @@ def scan_table_template(kind: str, columns: Sequence[ScanColumnSpec]) -> str:
         return f"{base}.round().astype(int)" if spec.is_dac else base
 
     def note(spec: ScanColumnSpec) -> str:
-        return (f"{spec.name}: DAC code [{spec.lo:g}..{spec.hi:g}], 0 = 0 V"
-                if spec.is_dac else f"{spec.name}: duration [{spec.unit}], >= 1 tick")
+        subject = spec.name
+        if str(spec.label).strip():
+            subject = f"{subject} ({str(spec.label).strip()})"
+        return (f"{subject}: DAC code [{spec.lo:g}..{spec.hi:g}], 0 = 0 V"
+                if spec.is_dac else f"{subject}: duration [{spec.unit}], >= 1 tick")
 
     if str(kind) == "grid":
         # A real N-D grid: ONE axis per slot, every combination (outer product).  Each axis is seeded

@@ -42,7 +42,6 @@ tests/test_remote_sequencer_execution_endpoint.py
 tests/test_runtime_capture.py
 tests/test_runtime_commit_journal.py
 tests/test_runtime_dataset_builder.py
-tests/test_runtime_persistent_safety_journal.py
 tests/test_runtime_resource_arbiter.py
 tests/test_runtime_run_lifecycle.py
 tests/test_runtime_streams.py

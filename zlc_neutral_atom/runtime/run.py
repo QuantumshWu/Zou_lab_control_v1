@@ -13,7 +13,7 @@ from zlc_storage import canonical_text as _canonical_text, finite_real
 
 from ._failure import detach_failure, record_secondary_failure, safe_error_summary
 from .cancellation import CancellationRequested, CancellationToken, _CancellationSource
-from .cleanup import CleanupReport, SafetyProof, _mint_safety_proof
+from .cleanup import CleanupReport
 from .commit import (
     CommitIntent,
     FinalCommit,
@@ -25,28 +25,18 @@ from .commit import (
 from .ports import (
     BoundDevice,
     CleanupDevice,
-    CleanupStepAck,
     RunDevice,
     SafetyInterrupt,
-    SafetyOperation,
     SessionClosedAck,
     _open_device_run,
 )
 from .resources import (
     ClaimMode,
-    HazardClaim,
-    HazardEpochExpired,
-    SafetyJournalWriteError,
     ResourceArbiter,
     ResourceBusy,
     ResourceClaim,
     ResourceKey,
     ResourceLease,
-    ResourceQuarantined,
-    SafeReceipt,
-    SafetyDecision,
-    SafetyDispositionBundle,
-    SafetyOutcome,
     TerminalPublication,
     _mint_terminal_publication,
 )
@@ -97,7 +87,6 @@ class RunSnapshot:
     state: RunState
     phase: str
     final_committed: bool
-    safety_bundle_id: str | None
     commit_recovery_warning: str | None
     primary_error: str | None
     cleanup_errors: tuple[str, ...]
@@ -187,14 +176,17 @@ class _PermanentCommitRejection(CapabilityRevoked):
 
 
 class RunStartRejected(RuntimeError):
-    def __init__(self, outcome: ResourceBusy | ResourceQuarantined) -> None:
+    def __init__(self, outcome: ResourceBusy) -> None:
         super().__init__(f"run start rejected: {outcome}")
         self.outcome = outcome
 
 
 class RunFailed(RuntimeError):
     def __init__(self, snapshot: RunSnapshot) -> None:
-        super().__init__(snapshot.primary_error or "run failed during cleanup")
+        message = snapshot.primary_error
+        if message is None and snapshot.cleanup_errors:
+            message = "; ".join(snapshot.cleanup_errors)
+        super().__init__(message or "run failed")
         self.snapshot = snapshot
 
 
@@ -314,7 +306,6 @@ class RunContext:
         self._hardware_revoked = False
         self._hardware_inflight = 0
         self._interrupt_enabled = False
-        self._issued_safety_proofs: dict[object, tuple[SafetyProof, SafeReceipt]] = {}
 
     @property
     def run_id(self) -> RunId:
@@ -388,24 +379,6 @@ class RunContext:
                 self._hardware_inflight -= 1
                 self._hardware_condition.notify_all()
 
-    def _execute_cleanup_step(
-        self,
-        binding: BoundDevice,
-        operation: SafetyOperation,
-    ) -> CleanupStepAck:
-        with self._hardware_condition:
-            if not self._cleanup_enabled or self._hardware_revoked:
-                raise CapabilityRevoked("Run has no active cleanup hardware capability")
-            if self._devices.get(binding.key) is not binding:
-                raise CapabilityRevoked("device binding does not belong to this Run")
-            self._hardware_inflight += 1
-        try:
-            return self._lease().cleanup_step(binding, operation)
-        finally:
-            with self._hardware_condition:
-                self._hardware_inflight -= 1
-                self._hardware_condition.notify_all()
-
     def _close_bound_device_session(
         self,
         binding: BoundDevice,
@@ -423,42 +396,6 @@ class RunContext:
             with self._hardware_condition:
                 self._hardware_inflight -= 1
                 self._hardware_condition.notify_all()
-
-    def _verify_bound_safe_state(self, binding: BoundDevice) -> SafetyProof:
-        with self._hardware_condition:
-            if not self._cleanup_enabled or self._hardware_revoked:
-                raise CapabilityRevoked("Run has no active cleanup hardware capability")
-            if self._devices.get(binding.key) is not binding:
-                raise CapabilityRevoked("device binding does not belong to this Run")
-            self._hardware_inflight += 1
-        try:
-            receipt = self._lease().verify_safe_state(binding)
-            nonce = object()
-            proof = _mint_safety_proof(run_id=self.run_id.value, receipt=receipt, nonce=nonce)
-            with self._hardware_condition:
-                self._issued_safety_proofs[nonce] = (proof, receipt)
-            return proof
-        finally:
-            with self._hardware_condition:
-                self._hardware_inflight -= 1
-                self._hardware_condition.notify_all()
-
-    def _consume_safety_proofs(
-        self,
-        proofs: tuple[SafetyProof, ...],
-    ) -> tuple[SafeReceipt, ...]:
-        with self._hardware_condition:
-            receipts: list[SafeReceipt] = []
-            for proof in tuple(proofs):
-                if not isinstance(proof, SafetyProof) or proof.run_id != self.run_id.value:
-                    raise ValueError("cleanup safety proof belongs to another Run")
-                issued = self._issued_safety_proofs.get(proof._nonce)
-                if issued is None or issued[0] is not proof:
-                    raise ValueError("cleanup safety proof was not issued or was already consumed")
-                receipts.append(issued[1])
-            for proof in tuple(proofs):
-                self._issued_safety_proofs.pop(proof._nonce)
-            return tuple(receipts)
 
     def _enable_hardware(self) -> bool:
         with self._hardware_condition:
@@ -529,7 +466,6 @@ class RunContext:
             self._device_lease = None
             self._devices.clear()
             self._pending_devices = ()
-            self._issued_safety_proofs.clear()
         if lease is not None:
             lease.revoke()
 
@@ -551,14 +487,13 @@ class _PostSafetySeed:
     cancellation: CancellationToken
     deadline: float | None
 
-    def mint(self, bundle: SafetyDispositionBundle | None) -> "PostSafetyContext":
-        self.handle._mark_post_safety(bundle)
+    def mint(self) -> "PostSafetyContext":
+        self.handle._mark_post_safety()
         return PostSafetyContext(
             _POST_SAFETY_CONTEXT_TOKEN,
             run_id=self.handle.run_id,
             cancellation=self.cancellation,
             deadline=self.deadline,
-            safety_bundle_id=None if bundle is None else bundle.bundle_id,
             handle=self.handle,
         )
 
@@ -573,7 +508,6 @@ class PostSafetyContext:
         "_run_id",
         "_cancellation",
         "_deadline",
-        "_safety_bundle_id",
         "_handle",
         "_prepared_commits",
         "_active",
@@ -586,7 +520,6 @@ class PostSafetyContext:
         run_id: RunId,
         cancellation: CancellationToken,
         deadline: float | None,
-        safety_bundle_id: str | None,
         handle: "RunHandle",
     ) -> None:
         if token is not _POST_SAFETY_CONTEXT_TOKEN:
@@ -594,7 +527,6 @@ class PostSafetyContext:
         object.__setattr__(self, "_run_id", run_id)
         object.__setattr__(self, "_cancellation", cancellation)
         object.__setattr__(self, "_deadline", deadline)
-        object.__setattr__(self, "_safety_bundle_id", safety_bundle_id)
         object.__setattr__(self, "_handle", handle)
         object.__setattr__(self, "_prepared_commits", [])
         object.__setattr__(self, "_active", True)
@@ -620,19 +552,15 @@ class PostSafetyContext:
     def deadline(self) -> float | None:
         return self._deadline
 
-    @property
-    def safety_bundle_id(self) -> str | None:
-        return self._safety_bundle_id
-
     def checkpoint(self) -> None:
         self._require_active()
         self.cancellation.checkpoint()
         if self.deadline is not None and time.monotonic() >= self.deadline:
             raise TimeoutError(f"run {self.run_id} exceeded its monotonic deadline")
 
-    def authorize_commit_preparation(self) -> tuple[str, str | None]:
+    def authorize_commit_preparation(self) -> str:
         self._require_active()._validate_commit_preparation(self.deadline)
-        return self.run_id.value, self.safety_bundle_id
+        return self.run_id.value
 
     def _track_prepared_commit(
         self,
@@ -643,8 +571,6 @@ class PostSafetyContext:
             raise TypeError("prepared commit tracking requires FinalCommit")
         if operation.run_id != self.run_id.value:
             raise ValueError("prepared commit belongs to another Run")
-        if operation.safety_bundle_id != self.safety_bundle_id:
-            raise ValueError("prepared commit safety bundle differs from this Run")
         if any(existing is operation for existing in self._prepared_commits):
             raise ValueError("prepared commit operation is already tracked")
         self._prepared_commits.append(operation)
@@ -717,7 +643,6 @@ class RunHandle(Generic[FinalT]):
         self._commit_inflight = False
         self._commit_recovery_warning: str | None = None
         self._pending_commit: _PendingCommit | None = None
-        self._safety_bundle_id: str | None = None
         self._primary_error: str | None = None
         self._cleanup_errors: tuple[str, ...] = ()
         self._result: object = _MISSING
@@ -733,7 +658,7 @@ class RunHandle(Generic[FinalT]):
         self._owner_reaped = False
         self._recovery_instruction: str | None = None
         self._retry_disposition: Callable[[], None] | None = None
-        self._retry_phase = "safety-journal-failed"
+        self._retry_phase = "commit-reconciliation-failed"
         self._recovery_lock = threading.Lock()
 
     def snapshot(self) -> RunSnapshot:
@@ -871,7 +796,7 @@ class RunHandle(Generic[FinalT]):
                     launch_claimed = True
                 try:
                     retry()
-                except (SafetyJournalWriteError, _CommitRetryRequired) as error:
+                except _CommitRetryRequired as error:
                     self._install_retry(
                         retry,
                         instruction,
@@ -928,7 +853,6 @@ class RunHandle(Generic[FinalT]):
             state=self._state,
             phase=self._phase,
             final_committed=self._final_committed,
-            safety_bundle_id=self._safety_bundle_id,
             commit_recovery_warning=self._commit_recovery_warning,
             primary_error=self._primary_error,
             cleanup_errors=self._cleanup_errors,
@@ -981,12 +905,11 @@ class RunHandle(Generic[FinalT]):
         with self._condition:
             return self._interrupt_errors
 
-    def _mark_post_safety(self, bundle: SafetyDispositionBundle | None) -> None:
+    def _mark_post_safety(self) -> None:
         with self._condition:
             self._interrupt_enabled = False
             while self._interrupt_inflight:
                 self._condition.wait()
-            self._safety_bundle_id = None if bundle is None else bundle.bundle_id
             self._interrupt = None
             self._cancel_sealer = None
             self._condition.notify_all()
@@ -997,7 +920,7 @@ class RunHandle(Generic[FinalT]):
         instruction: str,
         errors: tuple[str, ...],
         *,
-        phase: str = "safety-journal-failed",
+        phase: str = "commit-reconciliation-failed",
     ) -> None:
         with self._condition:
             if self._state.terminal:
@@ -1084,11 +1007,6 @@ class RunHandle(Generic[FinalT]):
             rejection, discard = self._commit_gate_rejection_locked(deadline)
             if rejection is None and operation.run_id != self.run_id.value:
                 rejection = _PermanentCommitRejection("commit belongs to another Run")
-            if (
-                rejection is None
-                and operation.safety_bundle_id != self._safety_bundle_id
-            ):
-                rejection = _PermanentCommitRejection("commit safety bundle differs")
             if rejection is None:
                 try:
                     authority = _consume_commit_authority(operation)
@@ -1155,7 +1073,6 @@ class RunHandle(Generic[FinalT]):
         intent = CommitIntent(
             commit_id=preparation.commit_id,
             run_id=preparation.run_id,
-            safety_bundle_id=preparation.safety_bundle_id,
             target=preparation.target,
             created_at=time.time(),
         )
@@ -1434,7 +1351,7 @@ class RunController:
             if not self._accepting:
                 raise RuntimeError("RunController is shutting down and rejects new Runs")
             acquired = self._resources.acquire_all(run_id.value, plan.resource_claims)
-            if isinstance(acquired, (ResourceBusy, ResourceQuarantined)):
+            if isinstance(acquired, ResourceBusy):
                 raise RunStartRejected(acquired)
             source = _CancellationSource()
             handle: RunHandle[FinalT] = RunHandle(run_id, source, self._on_thread_joined)
@@ -1535,13 +1452,6 @@ class RunController:
             self._handles.pop(finished.run_id, None)
 
     @staticmethod
-    def _hazards(plan: RunPlan) -> tuple[HazardClaim, ...]:
-        return tuple(
-            HazardClaim(device.key, device.binding_stamp)
-            for device in plan.bound_devices
-        )
-
-    @staticmethod
     def _run_owner(
         ownership: _ExecutionOwnership,
         lease: ResourceLease,
@@ -1555,56 +1465,19 @@ class RunController:
             owned_context.checkpoint()
         except BaseException as error:
             ownership.clear()
-            RunController._finish_before_hazards(
+            RunController._finish_before_execution(
                 lease,
                 handle,
                 owned_context,
                 error,
-            )
-            return
-        hazards = RunController._hazards(owned_plan)
-        try:
-            owned_context.set_phase("hazard-journal")
-            lease.activate_hazards(hazards)
-        except HazardEpochExpired as error:
-            ownership.clear()
-            RunController._finish_before_hazards(
-                lease,
-                handle,
-                owned_context,
-                error,
-            )
-            return
-        except SafetyJournalWriteError as error:
-            summary = safe_error_summary(error)
-            detach_failure(error, note_prefix="detached hazard journal traceback")
-
-            def retry_hazards() -> None:
-                try:
-                    lease.activate_hazards(hazards)
-                except HazardEpochExpired as expired:
-                    RunController._finish_before_hazards(
-                        lease,
-                        handle,
-                        ownership.take()[1],
-                        expired,
-                    )
-                    ownership.clear()
-                    return
-                RunController._run_after_hazards_guarded(ownership, lease, handle)
-
-            handle._install_retry(
-                retry_hazards,
-                "repair the safety journal, then retry hazard activation",
-                (summary,),
             )
             return
         owned_plan = None  # type: ignore[assignment]
         owned_context = None  # type: ignore[assignment]
-        RunController._run_after_hazards_guarded(ownership, lease, handle)
+        RunController._run_execution_guarded(ownership, lease, handle)
 
     @staticmethod
-    def _finish_before_hazards(
+    def _finish_before_execution(
         lease: ResourceLease,
         handle: RunHandle,
         context: RunContext,
@@ -1612,7 +1485,7 @@ class RunController:
     ) -> None:
         cancelled = isinstance(error, CancellationRequested)
         summary = safe_error_summary(error)
-        detach_failure(error, note_prefix="detached pre-hazard traceback")
+        detach_failure(error, note_prefix="detached pre-execution traceback")
         try:
             context._revoke_hardware()
             seed = context._detach_for_post_safety()
@@ -1621,43 +1494,25 @@ class RunController:
             detach_failure(revoke_error, note_prefix="detached revoke traceback")
             seed = _PostSafetySeed(handle, handle._token, None)
 
-        def finish(bundle: SafetyDispositionBundle | None) -> None:
-            post = seed.mint(bundle)
-            post._revoke()
-            state = RunState.CANCELLED if cancelled else RunState.FAILED
-            publication = handle._terminal_publication(
-                state=state,
-                result=_MISSING,
-                primary_error=summary,
-                cleanup_errors=(),
-            )
-            lease.release_terminal(publication, disposition=state.value)
-
-        try:
-            bundle = lease._commit_safety(())
-        except SafetyJournalWriteError as journal_error:
-            journal_summary = safe_error_summary(journal_error)
-            detach_failure(journal_error, note_prefix="detached safety journal traceback")
-
-            def retry() -> None:
-                finish(lease._commit_safety(()))
-
-            handle._install_retry(
-                retry,
-                "repair the safety journal, then release the unarmed Run",
-                (summary, journal_summary),
-            )
-            return
-        finish(bundle)
+        post = seed.mint()
+        post._revoke()
+        state = RunState.CANCELLED if cancelled else RunState.FAILED
+        publication = handle._terminal_publication(
+            state=state,
+            result=_MISSING,
+            primary_error=summary,
+            cleanup_errors=(),
+        )
+        lease.release_terminal(publication, disposition=state.value)
 
     @staticmethod
-    def _run_after_hazards_guarded(
+    def _run_execution_guarded(
         ownership: _ExecutionOwnership,
         lease: ResourceLease,
         handle: RunHandle[FinalT],
     ) -> None:
         try:
-            RunController._run_after_hazards(ownership, lease, handle)
+            RunController._run_execution(ownership, lease, handle)
         except BaseException as error:
             RunController._fail_closed(ownership, lease, handle, error)
 
@@ -1674,45 +1529,8 @@ class RunController:
             plan, context = ownership.take()
         except RuntimeError:
             summary = safe_error_summary(error)
-            detach_failure(error, note_prefix="detached post-safety lifecycle traceback")
-            if lease.safety_committed:
-                handle._mark_post_safety(lease.safety_bundle)
-                publication = handle._terminal_publication(
-                    state=RunState.FAILED,
-                    result=_MISSING,
-                    primary_error=summary,
-                    cleanup_errors=(),
-                )
-                lease.release_terminal(publication, disposition=RunState.FAILED.value)
-            else:
-                handle._block_non_retryable_recovery((summary,))
-            return
-        summary = safe_error_summary(error)
-        try:
-            handle._begin_cleanup_after_interrupt()
-            context._revoke_hardware()
-        except BaseException as revoke_error:
-            summary += "; " + safe_error_summary(revoke_error)
-            detach_failure(revoke_error, note_prefix="detached fail-closed revoke traceback")
-        try:
-            seed = context._detach_for_post_safety()
-        except BaseException:
-            seed = _PostSafetySeed(handle, handle._token, None)
-        decisions = tuple(
-            SafetyDecision.unsafe(
-                device.key,
-                reason="runtime lifecycle failed before safe-state proof completed",
-                recovery_action="verify physical safe state before clearing quarantine",
-            )
-            for device in plan.bound_devices
-        )
-        ownership.clear()
-        plan = None  # type: ignore[assignment]
-        context = None  # type: ignore[assignment]
-
-        def finish(bundle: SafetyDispositionBundle | None) -> None:
-            post = seed.mint(bundle)
-            post._revoke()
+            detach_failure(error, note_prefix="detached terminal lifecycle traceback")
+            handle._mark_post_safety()
             publication = handle._terminal_publication(
                 state=RunState.FAILED,
                 result=_MISSING,
@@ -1720,34 +1538,45 @@ class RunController:
                 cleanup_errors=(),
             )
             lease.release_terminal(publication, disposition=RunState.FAILED.value)
-
-        try:
-            bundle = lease._commit_safety(decisions)
-        except SafetyJournalWriteError as journal_error:
-            journal_summary = safe_error_summary(journal_error)
-            detach_failure(journal_error, note_prefix="detached fail-closed journal traceback")
-
-            def retry() -> None:
-                finish(lease._commit_safety(decisions))
-
-            handle._install_retry(
-                retry,
-                "repair the safety journal, then finish fail-closed termination",
-                (summary, journal_summary),
-            )
             return
+        summary = safe_error_summary(error)
+        cleanup_summaries: list[str] = []
+        try:
+            handle._begin_cleanup_after_interrupt()
+            context._enter_cleanup_hardware()
+            try:
+                context._run_interrupts(plan.interrupt_operations)
+            except BaseException as interrupt_error:
+                cleanup_summaries.append(safe_error_summary(interrupt_error))
+            context._revoke_hardware()
+        except BaseException as revoke_error:
+            cleanup_summaries.append(safe_error_summary(revoke_error))
+            detach_failure(revoke_error, note_prefix="detached fail-closed revoke traceback")
+        try:
+            seed = context._detach_for_post_safety()
+        except BaseException:
+            seed = _PostSafetySeed(handle, handle._token, None)
+        ownership.clear()
+        plan = None  # type: ignore[assignment]
+        context = None  # type: ignore[assignment]
         detach_failure(error, note_prefix="detached lifecycle traceback")
-        finish(bundle)
+        post = seed.mint()
+        post._revoke()
+        publication = handle._terminal_publication(
+            state=RunState.FAILED,
+            result=_MISSING,
+            primary_error=summary,
+            cleanup_errors=_bounded_diagnostics(tuple(cleanup_summaries)),
+        )
+        lease.release_terminal(publication, disposition=RunState.FAILED.value)
 
     @staticmethod
-    def _run_after_hazards(
+    def _run_execution(
         ownership: _ExecutionOwnership,
         lease: ResourceLease,
         handle: RunHandle[FinalT],
     ) -> None:
         plan, context = ownership.take()
-        hazards = RunController._hazards(plan)
-        hazard_keys = tuple(hazard.key for hazard in hazards)
         finalize = plan.finalize
         requires_final_commit = plan.requires_final_commit
         dispose_unfinalized = plan.dispose_unfinalized
@@ -1779,28 +1608,13 @@ class RunController:
                 if not isinstance(report, CleanupReport):
                     raise TypeError("RunPlan.cleanup must return CleanupReport")
             except BaseException as cleanup_error:
-                report = CleanupReport.unsafe(
-                    hazard_keys,
-                    reason="cleanup raised before safety could be confirmed",
-                    recovery_action="verify physical safe state before clearing quarantine",
-                    errors=(cleanup_error,),
-                )
-            decisions, coverage_errors = _resolve_cleanup_decisions(
-                context,
-                report,
-                hazard_keys,
-            )
+                report = CleanupReport(errors=(cleanup_error,))
             interrupt_errors = handle._interrupt_error_snapshot()
             cleanup_errors = tuple(
                 safe_error_summary(error)
-                for error in (*report.errors, *coverage_errors)
+                for error in report.errors
             )
             cleanup_errors = _bounded_diagnostics((*cleanup_errors, *interrupt_errors))
-            unsafe = tuple(
-                decision.key
-                for decision in decisions
-                if decision.outcome is SafetyOutcome.UNSAFE
-            )
             if (
                 primary is None
                 and handle._token.is_cancelled
@@ -1811,7 +1625,7 @@ class RunController:
             primary_summary = None if primary is None else safe_error_summary(primary)
             if primary is not None:
                 detach_failure(primary, note_prefix="detached Run traceback")
-            for error in (*report.errors, *coverage_errors):
+            for error in report.errors:
                 detach_failure(error, note_prefix="detached cleanup traceback")
             prepared = None
             report = None  # type: ignore[assignment]
@@ -1821,48 +1635,18 @@ class RunController:
             seed = context._detach_for_post_safety()
             context = None  # type: ignore[assignment]
             ownership.clear()
-
-            def after_safety(bundle: SafetyDispositionBundle | None) -> None:
-                RunController._finalize_and_publish(
-                    lease=lease,
-                    handle=handle,
-                    seed=seed,
-                    bundle=bundle,
-                    finalize=finalize,
-                    finalization_input=finalization_input,
-                    requires_final_commit=requires_final_commit,
-                    primary_error=primary_summary,
-                    cancelled=cancelled,
-                    cleanup_errors=cleanup_errors,
-                    unsafe=unsafe,
-                )
-
-            try:
-                handle._set_phase("finalizing-safety")
-                bundle = lease._commit_safety(decisions)
-            except SafetyJournalWriteError as journal_error:
-                journal_summary = safe_error_summary(journal_error)
-                detach_failure(
-                    journal_error,
-                    note_prefix="detached safety journal traceback",
-                )
-
-                def retry() -> None:
-                    try:
-                        after_safety(lease._commit_safety(decisions))
-                    except SafetyJournalWriteError:
-                        raise
-                    except BaseException as retry_error:
-                        _dispose_finalization_input(finalization_input, retry_error)
-                        raise
-
-                handle._install_retry(
-                    retry,
-                    "repair the safety journal, then retry the frozen safety bundle",
-                    _bounded_diagnostics((*cleanup_errors, journal_summary)),
-                )
-                return
-            after_safety(bundle)
+            handle._set_phase("post-cleanup")
+            RunController._finalize_and_publish(
+                lease=lease,
+                handle=handle,
+                seed=seed,
+                finalize=finalize,
+                finalization_input=finalization_input,
+                requires_final_commit=requires_final_commit,
+                primary_error=primary_summary,
+                cancelled=cancelled,
+                cleanup_errors=cleanup_errors,
+            )
         except BaseException as lifecycle_error:
             _dispose_finalization_input(finalization_input, lifecycle_error)
             raise
@@ -1873,19 +1657,17 @@ class RunController:
         lease: ResourceLease,
         handle: RunHandle,
         seed: _PostSafetySeed,
-        bundle: SafetyDispositionBundle | None,
         finalize: Callable[[PostSafetyContext, object], object],
         finalization_input: _FinalizationInput,
         requires_final_commit: bool,
         primary_error: str | None,
         cancelled: bool,
         cleanup_errors: tuple[str, ...],
-        unsafe: tuple[ResourceKey, ...],
     ) -> None:
-        post = seed.mint(bundle)
+        post = seed.mint()
         result = _MISSING
         pending_control = False
-        if primary_error is None and not cleanup_errors and not unsafe:
+        if primary_error is None and not cleanup_errors:
             try:
                 handle._set_phase("finalize")
                 post.checkpoint()
@@ -1961,7 +1743,7 @@ class RunController:
         if primary_error is None and requires_final_commit and not handle.snapshot().final_committed:
             primary_error = "RuntimeError: RunPlan requires a final commit but finalize published none"
             result = _MISSING
-        if cleanup_errors or unsafe:
+        if cleanup_errors:
             state = RunState.FAILED
         elif primary_error is None:
             state = RunState.SUCCEEDED
@@ -1984,39 +1766,6 @@ def _dispose_finalization_input(
             "unfinalized execute-result disposal also failed",
             error,
         )
-
-
-def _resolve_cleanup_decisions(
-    context: RunContext,
-    report: CleanupReport,
-    hazard_keys: tuple[ResourceKey, ...],
-) -> tuple[tuple[SafetyDecision, ...], tuple[BaseException, ...]]:
-    expected = set(hazard_keys)
-    try:
-        receipts = context._consume_safety_proofs(report.safety_proofs)
-    except BaseException as error:
-        receipts = ()
-        errors: list[BaseException] = [error]
-    else:
-        errors = []
-    safe = tuple(SafetyDecision.safe(receipt) for receipt in receipts)
-    decisions = {decision.key: decision for decision in report.decisions}
-    for decision in safe:
-        if decision.key in decisions:
-            errors.append(ValueError(f"cleanup returned two decisions for {decision.key}"))
-        else:
-            decisions[decision.key] = decision
-    for key in set(decisions) - expected:
-        decisions.pop(key, None)
-        errors.append(ValueError(f"cleanup reported undeclared hazard resource {key}"))
-    for key in expected - set(decisions):
-        errors.append(RuntimeError(f"cleanup omitted safety disposition for {key}"))
-        decisions[key] = SafetyDecision.unsafe(
-            key,
-            reason="hardware safety acknowledgement was omitted",
-            recovery_action="verify physical safe state before clearing quarantine",
-        )
-    return tuple(decisions[key] for key in sorted(decisions)), tuple(errors)
 
 
 def _bounded_diagnostics(values: tuple[str, ...]) -> tuple[str, ...]:

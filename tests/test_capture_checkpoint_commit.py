@@ -64,7 +64,6 @@ def test_commit_intent_rejects_legacy_kind_field() -> None:
     values = {
         "commit_id": "capture-final-run-" + "a" * 64,
         "run_id": "run",
-        "safety_bundle_id": "safety",
         "target": _target(),
         "created_at": 1.0,
     }

@@ -1635,6 +1635,13 @@ class FluentSettingRow(QtWidgets.QWidget):
         else:
             h.addWidget(control, 1)
 
+    def set_label(self, text: str, *, width: int | None = None) -> None:
+        """Update this stable row's label without replacing either control."""
+
+        self._label.setText(str(text))
+        if width is not None:
+            self._label.setFixedWidth(int(width))
+
 
 class _RoundedPopupCard(QtCore.QObject):
     """Paints a FluentPopup-style rounded card (white fill + 1 px border) onto the

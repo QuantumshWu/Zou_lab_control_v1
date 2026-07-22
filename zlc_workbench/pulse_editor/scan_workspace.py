@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Literal, Sequence
 
@@ -79,6 +80,7 @@ class ScanWorkspaceSnapshot:
     """Immutable state consumed by the existing Scan/Edit widgets."""
 
     source_text: str
+    source_revision: int
     default_template: str
     source_dirty: bool
     selected_source: ScanCandidateSource
@@ -127,18 +129,46 @@ def scan_column_specs(document: PulseDocument) -> tuple[ScanColumnSpec, ...]:
     if not isinstance(document, PulseDocument):
         raise TypeError("document must be PulseDocument")
     specs: list[ScanColumnSpec] = []
+    period_positions = {
+        period.period_id: index for index, period in enumerate(document.periods)
+    }
+    used_names: set[str] = set()
     for parameter in document.scan_parameters:
+        field = parameter.field
+        period_index = period_positions[field.period_id]
+        period = document.periods[period_index]
+        period_title = f"Period {period_index + 1}"
+        if period.name:
+            period_title += f" {period.name!r}"
+        if field.kind == FIELD_DAC:
+            port_title = document.target.by_key[field.port].label
+            display_label = f"{period_title} · {port_title}"
+            raw_name = f"{port_title}_p{period_index + 1}"
+        elif field.kind == FIELD_DURATION:
+            display_label = f"{period_title} · duration"
+            raw_name = f"duration_p{period_index + 1}"
+        stem = re.sub(r"[^A-Za-z0-9_]+", "_", raw_name).strip("_").lower()
+        stem = stem or "scan_value"
+        if stem[0].isdigit():
+            stem = f"scan_{stem}"
+        template_name = stem
+        suffix = 2
+        while template_name in used_names:
+            template_name = f"{stem}_{suffix}"
+            suffix += 1
+        used_names.add(template_name)
         if parameter.field.kind == FIELD_DAC:
             port = document.target.by_key[parameter.field.port]
             assert port.signed_range is not None
             lo, hi = port.signed_range
             specs.append(
                 ScanColumnSpec(
-                    parameter.parameter_id,
+                    template_name,
                     float(lo),
                     float(hi),
                     is_dac=True,
                     unit="value",
+                    label=display_label,
                 )
             )
             continue
@@ -154,11 +184,12 @@ def scan_column_specs(document: PulseDocument) -> tuple[ScanColumnSpec, ...]:
         tick = float(document.time_step_ns) / unit_scale_ns
         specs.append(
             ScanColumnSpec(
-                parameter.parameter_id,
+                template_name,
                 tick,
                 max(nominal * 2.0, 100.0 * tick),
                 is_dac=False,
                 unit=parameter.unit,
+                label=display_label,
             )
         )
     return tuple(specs)
@@ -395,13 +426,20 @@ def candidate_snapshot(
 def format_scan_table(
     table: FrozenScanTable | None,
     *,
+    column_names: Sequence[str] | None = None,
     stale: bool = False,
 ) -> str:
     """Format the existing read-only table surface without changing its geometry."""
 
     if table is None:
         return "(empty — Run code, or Load Array in the Delay/Scan panel)"
-    header = "   ".join(table.columns)
+    if column_names is None:
+        names = tuple(f"column_{index + 1}" for index in range(len(table.columns)))
+    else:
+        names = tuple(str(name) for name in column_names)
+        if len(names) != len(table.columns) or any(not name.strip() for name in names):
+            raise ValueError("scan table display names must match its non-empty columns")
+    header = "   ".join(names)
     shown = [
         "   ".join(_format_number(value) for value in row)
         for row in table.rows[:40]
@@ -434,10 +472,13 @@ def format_scan_slots(document: PulseDocument) -> str:
     sections: list[str] = []
     if document.scan_parameters:
         lines = ["Columns of the scan table (one row = one scan point):"]
+        display_specs = scan_column_specs(document)
         period_indices = {
             period.period_id: index for index, period in enumerate(document.periods)
         }
-        for index, parameter in enumerate(document.scan_parameters):
+        for index, (parameter, display) in enumerate(
+            zip(document.scan_parameters, display_specs, strict=True)
+        ):
             nominal, nominal_unit = document.field_value(parameter.field)
             if parameter.field.kind == FIELD_DURATION:
                 nominal = (
@@ -464,7 +505,7 @@ def format_scan_slots(document: PulseDocument) -> str:
                 else f"{field.port} (Period {period_indices[field.period_id] + 1})"
             )
             lines.append(
-                f"  {parameter.parameter_id} (compiler s{index}): {where}  "
+                f"  {display.name} (compiler s{index}): {where}  "
                 f"[{parameter.unit}]  (nominal {_format_number(nominal)}) → {allowed}"
             )
         lines.extend(

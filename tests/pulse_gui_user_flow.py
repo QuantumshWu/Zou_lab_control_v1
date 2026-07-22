@@ -73,11 +73,17 @@ def exercise_offline_dac_round_trip(
 
     original_abi = body.current_document.target.abi_fingerprint
     click_tab(body, body.target_view)
+    original_rows = {row.key: row for row in body.target_view._rows}
     QtTest.QTest.mouseClick(
         body.target_view.add_dac_button,
         QtCore.Qt.LeftButton,
     )
     added_key = body.target_view._rows[-1].key
+    draft_added_row = body.target_view._rows[-1]
+    assert all(
+        next(row for row in body.target_view._rows if row.key == key) is widget
+        for key, widget in original_rows.items()
+    )
     scrollbar = body.target_view.cards_scroll.verticalScrollBar()
 
     def remove_button_is_visible() -> bool:
@@ -103,11 +109,17 @@ def exercise_offline_dac_round_trip(
         QtCore.Qt.LeftButton,
     )
     until(application, lambda: added_key in body.current_document.target.by_key)
+    assert next(
+        row for row in body.target_view._rows if row.key == added_key
+    ) is draft_added_row
+    assert all(
+        next(row for row in body.target_view._rows if row.key == key) is widget
+        for key, widget in original_rows.items()
+    )
 
-    # Apply rebuilds the manifest projection at scroll top.  Reach the new row
-    # through a real scrollbar key event before clicking it; sending QTest input
-    # straight to an off-viewport child is not a human flow and leaves invalid
-    # native events behind when that row is deleted.
+    # Reach the bottom row through a real scrollbar key event before clicking
+    # it; sending QTest input straight to an off-viewport child is not a human
+    # flow.  Apply itself keeps every keyed row and the scroll position stable.
     QtTest.QTest.keyClick(scrollbar, QtCore.Qt.Key_End)
     until(application, remove_button_is_visible)
     added_row = next(row for row in body.target_view._rows if row.key == added_key)
@@ -122,6 +134,10 @@ def exercise_offline_dac_round_trip(
             added_key not in body.current_document.target.by_key
             and body.current_document.target.abi_fingerprint == original_abi
         ),
+    )
+    assert all(
+        next(row for row in body.target_view._rows if row.key == key) is widget
+        for key, widget in original_rows.items()
     )
     return added_key
 

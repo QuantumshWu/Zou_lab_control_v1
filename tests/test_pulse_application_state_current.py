@@ -182,7 +182,6 @@ def test_two_facades_share_run_observation_applied_identity_and_safe_cancel(
         lambda observation: observation.run.state.terminal,
     )
     assert terminal.run.state is RunState.CANCELLED
-    assert terminal.run.safety_bundle_id is not None
     assert terminal.run.final_committed is False
     assert peer.observe_active() == terminal
     assert peer.cancel_active() is CancelOutcome.ALREADY_TERMINAL
@@ -254,7 +253,6 @@ def test_run_rejects_both_continuous_forms_and_outer_k_is_finite_scan_only(
         lambda observation: observation.run.state.terminal,
     )
     assert cancelled.run.state is RunState.CANCELLED
-    assert cancelled.run.safety_bundle_id is not None
 
 
 def test_continuous_backend_failure_terminates_run_without_user_cancel(
@@ -291,5 +289,4 @@ def test_continuous_backend_failure_terminates_run_without_user_cancel(
         time.sleep(0.005)
     terminal = handle.snapshot()
     assert terminal.state is RunState.FAILED
-    assert terminal.safety_bundle_id is not None
     assert terminal.final_committed is False

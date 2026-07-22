@@ -1331,7 +1331,7 @@ class PanelCard(FluentGroupBox):
         value = str(self.sub_kind_combo.itemData(int(index)) or "")
         if value == str(self.config.params.get("sub_plot_kind") or ""):
             return
-        self._wait_render_idle()   # the teardown+rebuild below must own the figure (ownership protocol)
+        self._wait_render_idle()   # reset/re-compose must own the render state
         if value:
             self.config.params["sub_plot_kind"] = value
         else:
@@ -1447,10 +1447,10 @@ class PanelCard(FluentGroupBox):
         self.changed.emit()
 
     def _on_size(self, size: str) -> None:
-        self._wait_render_idle()   # the worker must not be composing into the surface being replaced
+        self._wait_render_idle()   # the worker must not compose while semantics/size change
         self.config.size = str(size)
-        # ATOMIC relayout transaction.  A size change is three synchronous steps: drop the surface,
-        # grow the card to the new preset, re-compose.  If any event-loop slice runs between the grow
+        # ATOMIC relayout transaction.  A size change is three synchronous steps: clear the old front,
+        # grow the card to the new preset, re-compose on the same host.  If any event-loop slice runs between the grow
         # and the re-compose -- a closing size-combo popup, a deferred paint -- the operator sees one
         # frame of a BIG EMPTY card before the picture lands, which is what the "resize jump" was.
         # Freezing this card's repaints for the whole mutation makes the paint system composite ONE
@@ -1931,7 +1931,7 @@ class PanelCard(FluentGroupBox):
 
     def set_selectors_enabled(self, on: bool) -> None:
         """The console header's "Selectors" switch for THIS card: remember the desired state and
-        gate the CURRENT plotter now (in place -- no rebuild, no flash).  Every later (re)build /
+        gate the CURRENT plotter now (in place -- no rebuild, no flash).  Every later rebind /
         focus swap re-applies it through ``_apply_selectors_state``, so a fresh figure always
         inherits the switch."""
         self._wait_render_idle()
@@ -1954,7 +1954,7 @@ class PanelCard(FluentGroupBox):
         """Carry the board header's Selectors switch onto this card's surface.
 
         The switch is the card's state, not the surface's: it is stored here so
-        a surface built (or rebuilt) later comes up matching the switch instead
+        a surface bound later comes up matching the switch instead
         of coming up live behind the operator's back.
         """
 
@@ -2021,9 +2021,24 @@ class PanelCard(FluentGroupBox):
 
 
     def _reset_plot(self) -> None:
-        """Drop the plot so the next refresh rebuilds it (size/params/source changed)."""
-        self._teardown_plot()
+        """Reset render semantics without replacing the stable Qt surface.
+
+        ``SinglePanelHost`` is the card-owned presenter.  A source expression,
+        display kind, size, or data shape change requires a fresh composer, not
+        a fresh QWidget: the next immutable frame carries the new semantics and
+        the host reconciles them when it presents that frame.  Destroying the
+        host here used to rebuild the card subtree for ordinary edits, dropping
+        interaction state and making a scalar Setting change visibly stall.
+        Widget destruction belongs only to :meth:`shutdown`.
+        """
+
+        self._pending_frame = None
+        self._composer_obj = None
+        self._compose_key = None
         self._value_shape = None
+        board = self.board
+        if board is not None:
+            board.clear()
 
     def _teardown_plot(self) -> None:
         """Drop this card's surface, leaving nothing painted behind it.

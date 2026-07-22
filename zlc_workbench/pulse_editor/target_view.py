@@ -17,6 +17,7 @@ from zlc_frontend.qt_widgets import (
     FluentLineEdit,
     FluentScrollArea,
     FluentSpinBox,
+    signals_blocked,
 )
 from zlc_pulse import (
     PORT_DAC,
@@ -106,6 +107,8 @@ class PulseTargetView(QtWidgets.QWidget):
         self.digital_layout.setVerticalSpacing(px(6, minimum=4))
         self.digital_layout.setColumnStretch(0, 1)
         self.digital_layout.setColumnStretch(1, 1)
+        for column, text in enumerate(("signal name", "endpoint", "")):
+            self.digital_layout.addWidget(self._header_label(text), 0, column)
         self.cards_layout.addWidget(self.digital_card)
 
         self.dac_card = FluentGroupBox("DAC outputs")
@@ -116,6 +119,16 @@ class PulseTargetView(QtWidgets.QWidget):
         self.dac_layout.setColumnStretch(0, 1)
         self.dac_layout.setColumnStretch(2, 2)
         self.dac_layout.setColumnStretch(3, 1)
+        for column, text in enumerate(
+            (
+                "signal name",
+                "width",
+                "data endpoints (bit order)",
+                "latch endpoint",
+                "",
+            )
+        ):
+            self.dac_layout.addWidget(self._header_label(text), 0, column)
         self.cards_layout.addWidget(self.dac_card)
         self.cards_layout.addStretch(1)
         self.cards_scroll.setWidget(self.cards_body)
@@ -137,14 +150,10 @@ class PulseTargetView(QtWidgets.QWidget):
         editable = bool(editable)
         mode = str(mode).strip().lower()
         fingerprint = manifest.fingerprint
-        if fingerprint != self._manifest_fingerprint:
-            self._populate(pulse_target_port_drafts(manifest))
-            self._manifest_fingerprint = fingerprint
-            QtCore.QTimer.singleShot(
-                0,
-                lambda: self.cards_scroll.verticalScrollBar().setValue(0),
-            )
         self._editable = editable
+        if fingerprint != self._manifest_fingerprint:
+            self._reconcile_drafts(pulse_target_port_drafts(manifest))
+            self._manifest_fingerprint = fingerprint
         self._set_editable(editable)
         if editable:
             self.status_label.setText(
@@ -157,51 +166,171 @@ class PulseTargetView(QtWidgets.QWidget):
                 "the connected backend."
             )
 
-    @staticmethod
-    def _clear_grid(layout: QtWidgets.QGridLayout) -> None:
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-
-    def _populate(self, drafts: tuple[PulseTargetPortDraft, ...]) -> None:
-        self._clear_grid(self.digital_layout)
-        self._clear_grid(self.dac_layout)
-        self._rows.clear()
+    def _reconcile_drafts(
+        self,
+        drafts: tuple[PulseTargetPortDraft, ...],
+    ) -> None:
         ordered = tuple(row for row in drafts if row.kind == PORT_DIGITAL) + tuple(
             row for row in drafts if row.kind == PORT_DAC
         )
-        digital_headers = ("signal name", "endpoint", "")
-        dac_headers = (
-            "signal name",
-            "width",
-            "data endpoints (bit order)",
-            "latch endpoint",
-            "",
-        )
-        for column, text in enumerate(digital_headers):
-            self.digital_layout.addWidget(self._header_label(text), 0, column)
-        for column, text in enumerate(dac_headers):
-            self.dac_layout.addWidget(self._header_label(text), 0, column)
-        positions = {PORT_DIGITAL: 1, PORT_DAC: 1}
+        if len({draft.key for draft in ordered}) != len(ordered):
+            raise ValueError("Pulse target draft keys must be unique")
+
+        previous_rows = tuple(self._rows)
+        existing = {row.key: row for row in previous_rows}
+        reconciled: list[_TargetRowWidgets] = []
         for draft in ordered:
-            row = self._make_row(draft)
-            self._rows.append(row)
-            position = positions[draft.kind]
-            if draft.kind == PORT_DIGITAL:
-                self.digital_layout.addWidget(row.signal, position, 0)
-                self.digital_layout.addWidget(row.endpoints, position, 1)
-                self.digital_layout.addWidget(row.remove_button, position, 2)
+            row = existing.pop(draft.key, None)
+            if row is None:
+                row = self._make_row(draft)
+            elif row.kind != draft.kind:
+                self._destroy_row(row)
+                row = self._make_row(draft)
             else:
-                self.dac_layout.addWidget(row.signal, position, 0)
-                self.dac_layout.addWidget(row.width, position, 1)
-                self.dac_layout.addWidget(row.endpoints, position, 2)
-                self.dac_layout.addWidget(row.clock_endpoint, position, 3)
-                self.dac_layout.addWidget(row.remove_button, position, 4)
-            positions[draft.kind] += 1
-        self.digital_card.setTitle(f"Digital outputs · {positions[PORT_DIGITAL] - 1}")
-        self.dac_card.setTitle(f"DAC outputs · {positions[PORT_DAC] - 1}")
+                self._reconcile_row(row, draft)
+            reconciled.append(row)
+
+        for removed in existing.values():
+            self._destroy_row(removed)
+
+        structure_changed = len(previous_rows) != len(reconciled) or any(
+            before is not after
+            for before, after in zip(previous_rows, reconciled)
+        )
+        self._rows = reconciled
+        if structure_changed:
+            self._place_rows()
+
+        digital_count = sum(row.kind == PORT_DIGITAL for row in self._rows)
+        dac_count = sum(row.kind == PORT_DAC for row in self._rows)
+        digital_title = f"Digital outputs · {digital_count}"
+        dac_title = f"DAC outputs · {dac_count}"
+        if self.digital_card.title() != digital_title:
+            self.digital_card.setTitle(digital_title)
+        if self.dac_card.title() != dac_title:
+            self.dac_card.setTitle(dac_title)
+        self._set_editable(self._editable)
+
+    def _reconcile_row(
+        self,
+        row: _TargetRowWidgets,
+        draft: PulseTargetPortDraft,
+    ) -> None:
+        if row.key != draft.key or row.kind != draft.kind:
+            raise ValueError("Only an identical target-row identity can be reconciled")
+        endpoint_text = ", ".join(draft.endpoints)
+        clock_text = draft.clock_endpoint or ""
+        with signals_blocked(
+            row.signal,
+            row.endpoints,
+            row.width,
+            row.clock_endpoint,
+        ):
+            self._set_line_text(row.signal, draft.signal)
+            self._set_line_text(row.endpoints, endpoint_text)
+            if row.width.value() != draft.width:
+                row.width.setValue(draft.width)
+            self._set_line_text(row.clock_endpoint, clock_text)
+        row.endpoints.setToolTip(endpoint_text)
+        row.clock_endpoint.setToolTip(clock_text)
+        row.clock_key = draft.clock_key
+        row.lane_order = draft.lane_order
+
+    @staticmethod
+    def _set_line_text(field: FluentLineEdit, text: str) -> None:
+        """Update authoritative text without disturbing an unchanged editor."""
+
+        text = str(text)
+        if field.text() == text:
+            return
+        cursor = field.cursorPosition()
+        selection_start = field.selectionStart()
+        selection_length = len(field.selectedText())
+        had_focus = field.hasFocus()
+        field.setText(text)
+        if not had_focus:
+            field.setCursorPosition(0)
+            return
+        if selection_start >= 0 and selection_length:
+            start = min(selection_start, len(text))
+            field.setSelection(start, min(selection_length, len(text) - start))
+        else:
+            field.setCursorPosition(min(cursor, len(text)))
+
+    @staticmethod
+    def _placed_widgets(row: _TargetRowWidgets) -> tuple[QtWidgets.QWidget, ...]:
+        if row.kind == PORT_DIGITAL:
+            return row.signal, row.endpoints, row.remove_button
+        return (
+            row.signal,
+            row.width,
+            row.endpoints,
+            row.clock_endpoint,
+            row.remove_button,
+        )
+
+    def _destroy_row(self, row: _TargetRowWidgets) -> None:
+        layout = self.digital_layout if row.kind == PORT_DIGITAL else self.dac_layout
+        for widget in self._placed_widgets(row):
+            layout.removeWidget(widget)
+        for widget in (
+            row.signal,
+            row.endpoints,
+            row.width,
+            row.clock_endpoint,
+            row.remove_button,
+        ):
+            widget.setParent(None)
+            widget.deleteLater()
+
+    def _place_rows(self) -> None:
+        """Move stable row widgets to their desired grid positions."""
+
+        positions = {PORT_DIGITAL: 1, PORT_DAC: 1}
+        desired: list[
+            tuple[QtWidgets.QGridLayout, QtWidgets.QWidget, int, int]
+        ] = []
+        for row in self._rows:
+            position = positions[row.kind]
+            if row.kind == PORT_DIGITAL:
+                desired.extend(
+                    (
+                        (self.digital_layout, row.signal, position, 0),
+                        (self.digital_layout, row.endpoints, position, 1),
+                        (self.digital_layout, row.remove_button, position, 2),
+                    )
+                )
+            else:
+                desired.extend(
+                    (
+                        (self.dac_layout, row.signal, position, 0),
+                        (self.dac_layout, row.width, position, 1),
+                        (self.dac_layout, row.endpoints, position, 2),
+                        (self.dac_layout, row.clock_endpoint, position, 3),
+                        (self.dac_layout, row.remove_button, position, 4),
+                    )
+                )
+            positions[row.kind] += 1
+
+        moved: list[tuple[QtWidgets.QGridLayout, QtWidgets.QWidget, int, int]] = []
+        for layout, widget, row_index, column_index in desired:
+            item_index = layout.indexOf(widget)
+            if item_index >= 0:
+                current_row, current_column, row_span, column_span = (
+                    layout.getItemPosition(item_index)
+                )
+                if (
+                    current_row == row_index
+                    and current_column == column_index
+                    and row_span == 1
+                    and column_span == 1
+                ):
+                    continue
+                layout.removeWidget(widget)
+            moved.append((layout, widget, row_index, column_index))
+
+        for layout, widget, row_index, column_index in moved:
+            layout.addWidget(widget, row_index, column_index)
 
     @staticmethod
     def _header_label(text: str) -> FluentLabel:
@@ -275,21 +404,26 @@ class PulseTargetView(QtWidgets.QWidget):
     def _set_editable(self, editable: bool) -> None:
         for row in self._rows:
             row.signal.setReadOnly(not editable)
+            row.signal.setEnabled(editable)
             row.endpoints.setReadOnly(not editable)
+            row.endpoints.setEnabled(editable)
             row.width.setReadOnly(not editable)
+            row.width.setEnabled(editable)
             row.width.setButtonSymbols(
                 QtWidgets.QAbstractSpinBox.UpDownArrows
                 if editable
                 else QtWidgets.QAbstractSpinBox.NoButtons
             )
             row.clock_endpoint.setReadOnly(not editable)
-            row.remove_button.setVisible(editable)
+            row.clock_endpoint.setEnabled(editable)
+            row.remove_button.setVisible(True)
+            row.remove_button.setEnabled(editable)
         for button in (
             self.add_digital_button,
             self.add_dac_button,
             self.apply_button,
         ):
-            button.setVisible(editable)
+            button.setVisible(True)
             button.setEnabled(editable)
 
     def _used_keys(self) -> set[str]:
@@ -327,22 +461,14 @@ class PulseTargetView(QtWidgets.QWidget):
         field.setText(", ".join(endpoints))
 
     def _queue_reveal_row(self, key: str) -> None:
-        """Reveal a newly rebuilt row after Qt publishes its final scroll range."""
+        """Reveal one newly inserted row after Qt publishes the new scroll range."""
 
         def reveal() -> None:
             row = next((item for item in self._rows if item.key == key), None)
             if row is not None:
                 self.cards_scroll.ensureWidgetVisible(row.signal)
 
-        # ``_populate`` replaces every grid item with deleteLater-owned widgets.
-        # One owner turn polishes the new Fluent controls; the following layout
-        # request publishes the final content height to QScrollArea.  Scrolling
-        # in the first turn uses the old maximum and leaves the new bottom row
-        # below the viewport, so reveal only after both ordered Qt phases.
-        QtCore.QTimer.singleShot(
-            0,
-            lambda: QtCore.QTimer.singleShot(0, reveal),
-        )
+        QtCore.QTimer.singleShot(0, reveal)
 
     def _current_drafts(self) -> tuple[PulseTargetPortDraft, ...]:
         drafts = []
@@ -391,8 +517,7 @@ class PulseTargetView(QtWidgets.QWidget):
             (index for index, row in enumerate(current) if row.kind == PORT_DAC),
             len(current),
         )
-        self._populate((*current[:split], draft, *current[split:]))
-        self._set_editable(True)
+        self._reconcile_drafts((*current[:split], draft, *current[split:]))
         self._queue_reveal_row(key)
 
     def _add_dac(self) -> None:
@@ -412,8 +537,7 @@ class PulseTargetView(QtWidgets.QWidget):
             clock_key,
             f"endpoint:{clock_key}",
         )
-        self._populate((*current, draft))
-        self._set_editable(True)
+        self._reconcile_drafts((*current, draft))
         self._queue_reveal_row(key)
 
     def _remove_key(self, key: str) -> None:
@@ -423,8 +547,7 @@ class PulseTargetView(QtWidgets.QWidget):
             self.feedbackRequested.emit(str(error))
             return
         drafts = tuple(row for row in current if row.key != key)
-        self._populate(drafts)
-        self._set_editable(True)
+        self._reconcile_drafts(drafts)
 
     def draft_manifest(self) -> PulseTargetManifest:
         drafts = self._current_drafts()

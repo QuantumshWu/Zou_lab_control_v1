@@ -1106,11 +1106,6 @@ class _CameraMonitorTransaction:
         terminal_error: BaseException | None
         if report.errors:
             terminal_error = report.errors[0]
-        elif report.decisions:
-            terminal_error = RuntimeError(
-                "camera monitor cleanup reported an unsafe terminal state: "
-                f"{report.decisions[0].reason}"
-            )
         elif software_errors:
             terminal_error = software_errors[0]
         elif cancelled:
@@ -1130,9 +1125,7 @@ class _CameraMonitorTransaction:
                 software_errors.append(close_error)
         if not software_errors:
             return report
-        return CleanupReport(
-            safety_proofs=report.safety_proofs,
-            decisions=report.decisions,
+        return CleanupReport.complete(
             errors=(*report.errors, *software_errors),
         )
 

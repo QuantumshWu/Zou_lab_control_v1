@@ -141,15 +141,30 @@ def allocate_field_parameter_id(
     document: PulseDocument,
     field: PulseFieldRef,
 ) -> str:
-    """Allocate one readable stable ParameterId from physical field identity."""
+    """Allocate one readable handle, then keep that handle stable."""
 
     if not isinstance(document, PulseDocument):
         raise TypeError("document must be PulseDocument")
     if not isinstance(field, PulseFieldRef):
         raise TypeError("field must be PulseFieldRef")
-    parts = (field.kind, field.period_id or "", field.port or "")
-    stem = "_".join(part for part in parts if part)
-    stem = re.sub(r"[^A-Za-z0-9_]+", "_", stem).strip("_") or "pulse_parameter"
+    period_suffix = ""
+    if field.period_id is not None:
+        period_suffix = f"_p{tuple(document.period_by_id).index(field.period_id) + 1}"
+    if field.kind == FIELD_DURATION:
+        stem = f"duration{period_suffix}"
+    elif field.port is not None:
+        label = document.target.by_key[field.port].label
+        stem = (
+            f"{label}{period_suffix}"
+            if field.kind == FIELD_DAC
+            else f"{label}_delay"
+        )
+    else:
+        stem = "pulse_parameter"
+    stem = (
+        re.sub(r"[^A-Za-z0-9_]+", "_", stem).strip("_").lower()
+        or "pulse_parameter"
+    )
     if stem[0].isdigit():
         stem = f"pulse_{stem}"
     used = {

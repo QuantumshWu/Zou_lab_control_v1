@@ -27,7 +27,6 @@ from .ports import (
     VerifiedDeviceCapability,
     admit_bound_capability,
     cleanup_device_session,
-    verify_cleanup_device_safe_state,
 )
 from .resources import ClaimMode, ResourceClaim
 from .run import RunContext
@@ -143,7 +142,6 @@ class BoundCameraMonitorPort:
     """Drive authority restricted to one continuous display-only monitor."""
 
     capability_attestation: VerifiedDeviceCapability
-    cleanup_operations: tuple[SafetyOperation, ...]
 
     def __post_init__(self) -> None:
         admit_bound_capability(
@@ -157,17 +155,6 @@ class BoundCameraMonitorPort:
             for operation in (SafetyOperation.ABORT, SafetyOperation.DISARM)
         ):
             raise ValueError("camera monitor requires a thread-safe stop interrupt")
-        operations = tuple(self.cleanup_operations)
-        if len(set(operations)) != len(operations):
-            raise ValueError("camera monitor cleanup operations cannot repeat")
-        if any(
-            operation not in (SafetyOperation.ABORT, SafetyOperation.DISARM)
-            for operation in operations
-        ):
-            raise ValueError("camera monitor cleanup may only ABORT or DISARM")
-        if any(operation not in self.device.safety_capabilities for operation in operations):
-            raise ValueError("camera monitor cleanup operation is absent from the device")
-        object.__setattr__(self, "cleanup_operations", operations)
 
     @property
     def device(self) -> BoundDevice:
@@ -194,21 +181,12 @@ class BoundCameraMonitorPort:
     def cleanup(self, context: RunContext, session_id: str) -> CleanupReport:
         return cleanup_device_session(
             context.cleanup_device(self.device.key),
-            self.cleanup_operations,
             session_id,
             self.capability.max_blocking_call_seconds,
-            termination_failure_reason="camera monitor did not stop and join",
-            termination_recovery_action="recover the monitor camera before reuse",
-            verification_failure_reason="camera monitor safe-state verification failed",
-            verification_recovery_action="inspect and recover the monitor camera",
         )
 
-    def verify_idle(self, context: RunContext) -> CleanupReport:
-        return verify_cleanup_device_safe_state(
-            context.cleanup_device(self.device.key),
-            failure_reason="unopened camera monitor is not in a safe state",
-            recovery_action="inspect and recover the monitor camera before reuse",
-        )
+    def verify_idle(self, _context: RunContext) -> CleanupReport:
+        return CleanupReport.complete()
 
 
 __all__ = [

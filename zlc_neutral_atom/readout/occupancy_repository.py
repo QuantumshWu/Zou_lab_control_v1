@@ -1054,7 +1054,7 @@ class OccupancyRepository:
             raise TypeError("occupancy commit requires PostSafetyContext")
         if type(result) is not OccupancyAnalysisResult:
             raise TypeError("result must be OccupancyAnalysisResult")
-        run_id, safety_bundle_id = context.authorize_commit_preparation()
+        run_id = context.authorize_commit_preparation()
         resolved = result._admissions_for_commit(run_id)
         source, _calibration, _binding = resolved._require_authority()
         if result.artifact.counts.revision != source.artifact.frame_source.revision:
@@ -1062,10 +1062,7 @@ class OccupancyRepository:
         with self._root_lease.borrow() as staging_borrow:
             staging_borrow.require_active()
             reference, payload = self._stage_result(result)
-            if context.authorize_commit_preparation() != (
-                run_id,
-                safety_bundle_id,
-            ):
+            if context.authorize_commit_preparation() != run_id:
                 raise RuntimeError("occupancy commit subject changed while staging")
             target = _target(self.repository_id, reference)
 
@@ -1088,7 +1085,6 @@ class OccupancyRepository:
                 operation = self._coordinator.prepare(
                     _commit_id(run_id, reference.manifest_digest),
                     run_id,
-                    safety_bundle_id,
                     target,
                     publish,
                 )
