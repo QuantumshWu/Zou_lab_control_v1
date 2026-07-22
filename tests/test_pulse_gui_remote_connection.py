@@ -468,6 +468,35 @@ def _run_c47_input_projection_gui(workspace: Path) -> None:
         application.processEvents()
         assert controller.snapshot().editor_revision == revision
         assert set_document_calls == []
+
+        # A real semantic edit advances the displayed editor ledger.  When the
+        # asynchronous Preview completion later publishes runtime state, it
+        # must not replay that already-presented revision through a full Edit
+        # tree reconcile.
+        prior_unit = card.unit_combo.currentText()
+        QtTest.QTest.mouseClick(card.unit_combo, QtCore.Qt.LeftButton)
+        QtTest.QTest.keyClick(card.unit_combo, QtCore.Qt.Key_Down)
+        QtTest.QTest.keyClick(card.unit_combo, QtCore.Qt.Key_Return)
+        _until(
+            application,
+            lambda: (
+                controller.current_document.periods[0].unit != prior_unit
+            ),
+        )
+        edited_document = controller.current_document
+        _click_tab(body, body.preview_view)
+        _until(
+            application,
+            lambda: (
+                controller.snapshot().rendered_preview is not None
+                and controller.snapshot().rendered_preview.editor_revision
+                == controller.snapshot().editor_revision
+            ),
+        )
+        application.processEvents()
+        assert controller.current_document is edited_document
+        assert set_document_calls == []
+        _click_tab(body, body.schedule_view)
         assert all(
             before_widget is after_widget
             for before_widget, after_widget in zip(

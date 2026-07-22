@@ -445,6 +445,30 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             editor_revision=delta.editor_revision,
             runtime=runtime,
         )
+        # The keyed delta has already brought the stable editor widgets to this
+        # exact immutable document revision.  Advance the presentation ledger
+        # now; otherwise the next unrelated Preview/Run completion compares its
+        # current revision with the stale pre-edit projection and needlessly
+        # walks the complete Edit tree through ``set_document()``.
+        self._last_editor_projection = PulseEditorProjection(
+            document=delta.document,
+            document_generation=delta.document_generation,
+            editor_revision=delta.editor_revision,
+            path=previous_editor.path,
+            file_state=previous_editor.file_state,
+            dirty=self._controller.dirty,
+            target_manifest=previous_editor.target_manifest,
+            display_visible_ports=(
+                previous_editor.display_visible_ports
+                if delta.display_visible_ports is None
+                else delta.display_visible_ports
+            ),
+            scan_workspace=(
+                previous_editor.scan_workspace
+                if delta.scan_workspace is None
+                else delta.scan_workspace
+            ),
+        )
         if (
             delta.editor_revision != delta.base_revision
             and self.tabs.currentWidget() is self.preview_view

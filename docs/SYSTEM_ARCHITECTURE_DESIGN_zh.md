@@ -421,7 +421,7 @@ Remote server启动时同时读取canonical target与**server-side** XDC，逐la
 
 PulseGUI的同一个Target tab投影该manifest：Remote/Virtual全部只读；只有明确Offline模式可编辑草稿。正式界面复用`FluentScrollArea + FluentGroupBox`，Digital/DAC各是一张紧凑分区卡，内部用共享Fluent输入控件组成对齐行，不显示stable internal key，也不得另造原生`QTableWidget/QScrollArea`视觉体系。Offline可增删Digital，也可增删完整DAC port；一个DAC草稿原子包含signal、width、逐bit data endpoints与配对latch-clock endpoint，不能拆成多条TTL。任何字段变化在Apply前不触碰文档；Apply一次构造candidate `PulseTarget+PulseTargetManifest`，按stable port key重映射全部period states/DAC actions/delay/scan/API引用并发布一个新revision。删除或改宽已被权威内容使用的port先列出精确引用并要求一次显式“Apply and clear”；确认后才清除受影响引用与失效scan provenance。Qt控件树不是第二owner，在线模式也不存在可编辑client signal config。standalone PulseGUI从Virtual/Remote选择Offline并按Connect时，先在worker调用旧installation的领域`close_session`；无论关闭成功还是失败，旧facade都立即从GUI权威中摘除，避免Qt timer继续轮询已关闭Experiment。成功时原子恢复Offline manifest与Offline显示集合；失败只显示该次关闭诊断，不安装进程永久门禁。后续Remote/Virtual连接必须在worker上从零做live identity与当前SAFE初始化，不继承旧连接的软件判定。窗口关闭只有在全部tracked future/result已归零并且idle executor已经`shutdown(wait=True)`完成后才发布`close_complete`；不能让Qt/font资源先销毁而worker线程仍在Python退出路径中解栈。
 
-PulseGUI的编辑态与运行态必须物理分开。scan code键入、尚未Apply的Target字段和其它临时输入只属于稳定Qt editor draft，不调用controller、不render、不读取硬件。unit/name/value/delay/binding/visibility等语义提交返回持有当前immutable document引用、revision与实际changed stable ids的typed local delta；窗口只原位reconcile这些字段及明确dependent。Scan workspace是Scan tab自己的component front，只在scan schema、candidate或source事实改变时投影；不能因无关编辑重建，也不能与Run/connection/preview/worker/close拼成application snapshot。完整`PulseEditorControllerSnapshot`只在首次composition，以及worker result、连接、Run/cancel/close等异步owner边界产生；idle时timer关闭，active timer观察不到变化就返回`None`。保留的snapshot必须冻结真实ownership/consistency boundary（immutable dataset revision、Run/ack/capability跨线程观察或同一次board coherent front），不得拿普通Qt编辑事件或周期全应用投影冒充。Preview只在打开tab或显式view intent时请求，编辑隐藏页面不会后台compile/render。Period/port控件按stable id长期存活：标量变化只写现有widget，Add只insert，Remove只delete，Reorder只move，visibility只hide/show；任何路径都不得清空layout再重建整棵Edit树。dirty标志由editor session在提交/保存边界维护，普通编辑不得为标题状态重新序列化整个PulseDocument；view也以owner revision而非全document digest判断是否更新。
+PulseGUI的编辑态与运行态必须物理分开。scan code键入、尚未Apply的Target字段和其它临时输入只属于稳定Qt editor draft，不调用controller、不render、不读取硬件。unit/name/value/delay/binding/visibility等语义提交返回持有当前immutable document引用、revision与实际changed stable ids的typed local delta；窗口只原位reconcile这些字段及明确dependent，并在同一owner turn推进“已展示editor revision”账本。后到的Preview/Run/connection completion若携带同一document generation/revision，只能更新自己的runtime区域，不能因账本仍停在编辑前revision而补做一次全树`set_document()`。Scan workspace是Scan tab自己的component front，只在scan schema、candidate或source事实改变时投影；不能因无关编辑重建，也不能与Run/connection/preview/worker/close拼成application snapshot。完整`PulseEditorControllerSnapshot`只在首次composition，以及worker result、连接、Run/cancel/close等异步owner边界产生；idle时timer关闭，active timer观察不到变化就返回`None`。保留的snapshot必须冻结真实ownership/consistency boundary（immutable dataset revision、Run/ack/capability跨线程观察或同一次board coherent front），不得拿普通Qt编辑事件或周期全应用投影冒充。Preview只在打开tab或显式view intent时请求，编辑隐藏页面不会后台compile/render。Period/port控件按stable id长期存活：标量变化只写现有widget，Add只insert，Remove只delete，Reorder只move，visibility只hide/show；任何路径都不得清空layout再重建整棵Edit树。dirty标志由editor session在提交/保存边界维护，普通编辑不得为标题状态重新序列化整个PulseDocument；view也以owner revision而非全document digest判断是否更新。
 
 `InstallationDeviceGraph` 只在 composition/runtime owner lane 内可达，也不能通过 debug property、generic resolver、callback closure 或 frontend ViewModel 泄漏。这里的 typed facades 是 runtime-instance-pinned、immutable binding surface/descriptor，不包含用户可变的 calibration convenience pointer或UI state。public `Experiment`只发布`device_catalog`与稳定的领域 convenience facade；每个 facade 操作在一个 composition 临界区恰好取得一次当前 RUNNING runtime snapshot，据此构造并冻结 request/binding stamp，不能分别读取 descriptor 和 runtime 指针。所有依赖标定的请求都显式接收 `CalibrationArtifactRef` 并在构造时与 binding/model 一起冻结；headless domain session 本身不是普通用户的硬件 service locator。
 
@@ -532,7 +532,7 @@ neutral_atom 只依赖 `zlc_data`，不依赖 frontend 的任何层。
 
 首轮库存不是只有基础控件，后续纵切至少要逐项核验以下已挣得结构：Pulse侧的`PulseStateUIManager/PeriodCard/PulseDragContainer/RepeatBracket/ChannelNamesPanel/ChannelPanel`；TaskConsole侧的`MeasurementPanel` form loop、`LogicNodeEditor`的Setting/Edit同源、`AnalysisControls/_FitFixSeedEditor`、grouped signal tree helpers、`PanelConfig + pack/drop_index + _PanelBoard`以及`PanelCard/PanelEditor`的单writer同步；figure侧的`BaseLivePlot/GridPlot/GridCell`增量artist与grid focus、`selectors.py`的ROI/cross/zoom/disconnect、`DataFigure/SavedFigure`交互与重放、`calibration_report.py`的site histogram/PSF/site-map布局、`figure_viewer.py`的artifact浏览壳，以及DeviceManager的统一handler/readback/限流。这个清单是salvage入口，不是要求整类照搬：纯presentation或纯layout算法优先MOVE；携带旧Hub、LogicNode、mutable config、raw hardware或旧artifact状态的类必须拆出已验证的view/interaction算法，再接到current typed owner与EditorSession。每个未来monitor/rolling/calibration/fit/selector窗口在写新widget前都要先给这张库存追加真实consumer和裁决，不能等窗口写完再做“复用清理”。
 
-**W-UI1声明式表单抢救是后续窗口按consumer分段通过的硬前置，不是末尾清理，也不是一次预造旧全集。** W-UI0只完成Fluent primitive、style、render与window lifecycle owner；它没有完成旧树早已存在的“字段声明 -> 单一handler registry -> Setting/Edit共用”机制。W-UI1a先交付W3已经消费的static scalar/typed choice/exact populate；W-UI1b必须在monitor/Measurement/Processor出现动态stream/device选项前交付typed option snapshot + revision + stale-draft拒绝；W-UI1c必须在DeviceManager或明确live-control出现前原源码迁入`RateLimitedApply`与teardown flush。某一段没有真实current consumer时不得为“完整”提前搬JSON、Hub expression或万能schema，但对应产品纵切也不得先写一份临时控件绕过门。
+**W-UI1声明式表单抢救是后续窗口按consumer分段通过的硬前置，不是末尾清理，也不是一次预造旧全集。** W-UI0只完成Fluent primitive、style、render与window lifecycle owner；它没有完成旧树早已存在的“字段声明 -> 单一handler registry -> Setting/Edit共用”机制。W-UI1a先交付W3已经消费的static scalar/typed choice/exact populate；W-UI1b必须在monitor/Measurement/Processor出现动态stream/device选项前交付typed option snapshot + revision + stale-draft拒绝；W-UI1c必须在DeviceViewer、DeviceManager runtime-control页或其它明确live-control出现前迁入`RateLimitedApply`与teardown flush，纯config/admin DeviceManager不构成该consumer。某一段没有真实current consumer时不得为“完整”提前搬JSON、Hub expression或万能schema，但对应产品纵切也不得先写一份临时控件绕过门。
 
 旧`frontend/param_widgets.py`中已经由多个真consumer挣得的通用内核必须以现有源码和行为oracle为迁移输入：`ParamWidgetHandler`的`build/read/write/is_empty/refresh`五操作封闭合同、统一change wiring、no-`eval` coercion、label/unit/required组合、choice/path/scalar读写、selection-preserving refresh、exception-safe signal blocking，以及`RateLimitedApply`的per-key leading+trailing与teardown flush。current为了保证full-state populate真正原子，在这五项上只允许增加一个公开且abstract的`normalize(field,value)`预变更操作；所有字段先normalize成功才可开始写Qt，不能把它藏成可忘记override的私有helper。禁止在W窗口里重新建立按字段类型分支、独立number parser、第二套populate/reset或逐字段Setting/Edit接线。
 
@@ -2014,6 +2014,37 @@ Workbench 拥有 UI Command/ViewModel；neutral_atom 拥有领域 Request、RunP
 - Workbench DeviceViewer controller接收`DeviceCatalogReader`和只读status DTO；需要操作者控制时只注入具名、审计化的`DeviceControlPort`，不存在`editable=True`后直接调用raw setter。
 - Workbench DeviceManager controller接收config document reader、catalog reader与`DeviceAdminPort`；它可以校验候选config、显示reconnect-required差异并请求safe shutdown，但不能在进程内Apply/Open/Swap physical graph，也不返回或缓存旧`DeviceSet`。
 
+**DeviceManager current 产品闭包（2026-07-22）：** 配置模型只描述当前 composition root
+真正能够建立的两个 closed variant：完整的 `virtual(seed)` installation，以及
+sequencer-only 的 `remote_pulse(host, port, transport_timeout_seconds)`。它不是旧
+`{role: {type, params}}` 动态类注册表，也不保存 FQCN、`$device:` 字符串引用、constructor
+reflection、raw topology 或运行期 exposure/ROI。真实 qCMOS + remote sequencer composition
+尚未存在时，界面不得把它画成可初始化组合；等该真实 composition 及 AssetMap 落地后，
+由 config owner 增加一个明确 typed variant，而不是预造万能 device graph。
+
+current-only config codec 使用 exact key set 与 canonical bytes；Load/New 是明确整份 generation
+替换，Save 是磁盘提交，二者都不接触硬件。普通 host/port/seed/timeout 输入只更新
+`DeviceConfigEditorSession` 的单 key 本地 draft；不会 serialize 整份 config、创建全窗
+snapshot、调用全量 reconcile 或重建其它卡。`FluentParameterForm.read_value(key)` 是该局部
+路径，`read_all/candidate()` 只在 Save/Init 边界运行。backend 切换才是 topology 变化，
+只允许 keyed form reconcile 与 configured-device rows 的结构替换。
+
+`DeviceAdminPort` 只有四个已挣得动作：读取当前 capability-free state、纯比较 candidate、
+尚未发布 runtime 的 standalone process 中 initialize once、以及按
+`runtime_instance_id` 请求 shutdown-for-restart。只要本进程曾成功发布 runtime，关闭后也
+不构造 replacement graph；新配置由新进程重新加载。shutdown 复用唯一
+`InstallationRuntime.shutdown`，尽量反向关闭全部 adapter 并返回本次 detached diagnostics；
+不增加 persistent journal、quarantine、七态机或 reconnect coordinator。Qt 不执行连接/
+关闭：controller 只在明确按钮后启动一个非 Qt worker，并在真实完成时投递一次窄 lifecycle
+delta；idle 零轮询。
+
+可见面继续以 main DeviceManager 的永久 Config tab、Devices header/status dot、3:2 双
+FluentScrollArea、New/Load/Save/Save-as/Init、Loaded 紧凑行与常驻 status strip 为 oracle。
+旧 `Open devices/Control/Snapshot` 依赖 raw device 的部分不伪造：runtime 在 Experiment 发布前
+已经 open，运行期 readback/write 是另一个具名 `DeviceControlPort/DeviceViewer` 产品闭包。
+因此纯 config/admin DeviceManager 不消费 `RateLimitedApply`；只有真实 live-control consumer
+落地时才迁入 leading+trailing 与 teardown flush。
+
 这些ports不是跨包万能Service。每个port的方法集合必须由单一UI use case挣得；它们接受/返回owner定义的immutable request/result。Workbench controller负责把neutral/pulse/installation对象投影成frontend ViewModel；frontend不复制领域DTO。Selection到neutral `ControlTopic`的转换由Workbench PanelController完成，frontend不导入neutral stream原语；设备role到BoundDevice的解析也只在composition/bind发生，GUI不保存resolver。
 
 Workbench 大图像 ViewModel 使用 app-local LiveDataBlockRef/ReadOnlyArrayView 和 revision，不默认在每个 UI hop 再深拷贝。默认发布边界产生拥有自己内存的 immutable snapshot；若 driver 会复用 buffer，必须在该边界 copy，发布后 producer 不得再修改。该 live ref 经 LiveFigureBinding 解析，不泄漏进 frontend FigureDocument/codec。
@@ -3028,8 +3059,8 @@ Architecture：
 - 同一PhysicalDeviceIdentity在Workbench/notebook/standalone/remote入口间只有一个installation authority和一份backend可验证physical-owner proof；两个进程各自的ResourceArbiter不能同时把本地EXCLUSIVE冒充成同一物理设备的跨进程所有权；
 - TaskConsole、PulseGUI、Experiment/session与standalone real入口均拿不到raw device drive verb；其它owner持有重叠claim时，从每个公开入口尝试camera acquire或sequencer prepare/fire都被同一authority拒绝；
 - S0.5 legacy start 必须经过 LegacyRuntimeFence并登记`LegacyRunFootprint(claims, reference_keys)`；claims与实际host读写一致，reference_keys覆盖全部raw connection/lifecycle依赖；旧 thread 未真实退出/safe 前shutdown不能越过对应reference，新 Run只被真实冲突claim阻塞，所有 direct LogicNode.start 入口被机械禁止或限定为无硬件测试；
-- 改变device/config/virtual-real只产生reconnect-required并请求同一个InstallationRuntime shutdown；与并发start线性化后新start为零adapter调用拒绝，console外handle和target Run同样被authority发现、cancel、join并完成durable safety，旧connection关闭前claims归零；原进程内不得构造或发布replacement graph；
-- console打开时从非Qt notebook/kernel线程请求safe shutdown，硬件quiescence、safety disposition与close仍完全由InstallationRuntime完成；GUI只在Qt owner thread queued reconcile，event loop阻塞、QWidget callback失败或窗口已销毁都不改变硬件正确性，也不存在跨线程QWidget调用；
+- 改变device/config/virtual-real只产生reconnect-required并请求同一个InstallationRuntime shutdown；与并发start线性化后新start为零adapter调用拒绝，console外handle和target Run同样由唯一RunController cancel/join并走各领域既有close_session，旧connection关闭前claims归零；原进程内不得构造或发布replacement graph；
+- DeviceManager从非Qt worker请求shutdown-for-restart，Run终止、领域session收口与adapter close仍完全由InstallationRuntime完成；GUI只在Qt owner thread消费一次完成delta，event loop阻塞、QWidget callback失败或窗口已销毁都不产生跨线程QWidget调用；
 - 对startup的journal lock、physical-owner proof、adapter open、identity、AssetMap、broker bind、capability probe与graph freeze逐点故障注入：Run admission始终未开放，已打开的exact owned subset按reverse close order关闭，绝不发布partial Experiment/catalog/drive facade；
 - 对shutdown的run join、每个领域`close_session`、broker invalidation、每个adapter close、lane stop与physical-owner release逐点故障注入；旧facade先摘除，失败只形成本次close诊断，下一次连接重新做live SAFE初始化；
 - StreamProcessor/Analysis callable 不读 global RNG/time/config，显式 seed/config 可重放；
@@ -3109,7 +3140,7 @@ Thread/UI：
 - synchronous run 的 RunStillCancelling 保留可查询 RunHandle/claims；
 - active Run内不透明reconnect；旧runtime关闭并摘除后，新runtime必须重新验证live identity、physical owner与当前SAFE，旧close结果不能代替或阻止该验证；
 - 新 connection generation 在 UNVERIFIED handshake 完成前不可 acquire，应用重启不洗白 sticky fatal；
-- active Run内transport断开不透明reconnect；普通重连要求safe shutdown与新进程，durable blocker下的recovery-only重连产生新generation；旧run cleanup不能用新generation readback生成旧generation的SAFE receipt；
+- active Run内transport断开不透明reconnect；普通重连要求当前runtime完成shutdown并由新进程产生新generation；旧run cleanup不能借新generation readback冒充旧generation已终止，也不写persistent blocker/quarantine；
 - startup open/identity/AssetMap verification/broker bind在Run admission开放前完成，不创建ResourceArbiter connection lease；任一步失败时普通硬件调用次数为零、partial graph不发布且已开子集被安全关闭；
 - `VerifiedPhysicalDeviceIdentity`不可变且只能由DeviceBroker握手mint并在bind时一次消费；成功后唯一长期事实是`DeviceBindingStamp(PhysicalDeviceIdentity, binding_instance_id)`。同一握手结果复用、同一PhysicalDeviceIdentity绑定两个ResourceKey、同key二次bind或静默换physical identity全部拒绝；
 - identity evidence明确区分HARDWARE_IDENTITY_READBACK与INSTALLATION_ASSERTED_ENDPOINT；后者保存endpoint/AssetMap revision与剩余换板风险，不能在Q0/artifact/UI中显示成硬件serial readback；

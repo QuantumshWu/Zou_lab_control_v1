@@ -80,11 +80,16 @@ def _standalone_connection_factory(workspace: Path):
         elif mode == "remote":
             if host is None or port is None:
                 raise ValueError("remote Pulse connection requires host and port")
+            from zlc_neutral_atom.installation_config import (
+                InstallationConfigDocument,
+            )
+
             experiment = connect(
-                "remote",
+                InstallationConfigDocument.remote_pulse(
+                    host=host,
+                    port=port,
+                ),
                 repository=workspace,
-                sequencer_host=host,
-                sequencer_port=port,
                 required_pulse_document=required_document,
             )
         else:

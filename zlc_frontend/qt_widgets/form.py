@@ -548,20 +548,20 @@ class FluentParameterForm(QtWidgets.QWidget):
         field = self._field_for(key)
         return self._handlers[key].is_empty(field, self._widgets[key])
 
+    def read_value(self, key: str) -> object:
+        """Read one edited leaf without promoting it to a whole-form snapshot."""
+        field = self._field_for(key)
+        handler, widget = self._handlers[key], self._widgets[key]
+        if field.required and handler.is_empty(field, widget):
+            raise _value_error(field, "required value is empty")
+        try:
+            return handler.read(field, widget)
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith("field "):
+                raise
+            raise _value_error(field, str(exc)) from exc
     def read_all(self) -> dict[str, object]:
-        values: dict[str, object] = {}
-        for field in self._spec.fields:
-            handler = self._handlers[field.key]
-            widget = self._widgets[field.key]
-            if field.required and handler.is_empty(field, widget):
-                raise _value_error(field, "required value is empty")
-            try:
-                values[field.key] = handler.read(field, widget)
-            except (TypeError, ValueError) as exc:
-                if isinstance(exc, ValueError) and str(exc).startswith("field "):
-                    raise
-                raise _value_error(field, str(exc)) from exc
-        return values
+        return {field.key: self.read_value(field.key) for field in self._spec.fields}
 
     def populate(self, values: Mapping[str, object]) -> None:
         """Atomically populate every exact key without emitting edit signals.

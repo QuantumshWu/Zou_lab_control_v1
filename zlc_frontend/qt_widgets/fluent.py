@@ -3329,11 +3329,10 @@ def launch_fluent_window(
     teardown, title propagation), size it, centre it on the primary screen, show it, and retain it
     on the ONE app registry (:func:`retain_window`).
 
-    EVERY ``show_*`` entry point (pulse editor / task console / figure viewer) routes through
-    here.  It exists because hand-copied launchers drift: one of them had silently dropped
+    EVERY formal window entry (pulse editor / task console / figure viewer / device manager)
+    routes through here.  It exists because hand-copied launchers drift: one had silently dropped
     ensure_qt_app / the shared scale / centring / retention, the same failure family as the
-    duplicated scale rule (commit 57a1d25).  A device-manager window is not built on the current
-    data plane; when it is, it joins this sequence rather than growing a fourth copy.
+    duplicated scale rule (commit 57a1d25).
 
     ``fixed_size=True`` locks the window to its content hint (these GUIs size their own body from
     the screen, so the window must not be user-resizable past it); ``size=(w, h)`` (with

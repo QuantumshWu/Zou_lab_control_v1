@@ -20,6 +20,11 @@ from zlc_neutral_atom.installation import (
     DeviceInfo,
     DeviceRef,
 )
+from zlc_neutral_atom.installation_config import (
+    InstallationConfigDocument,
+    RemotePulseInstallationConfig,
+    VirtualInstallationConfig,
+)
 from zlc_neutral_atom.readout.calibration import GridOrder
 from zlc_neutral_atom.readout.contracts import (
     ReadoutBindingKey,
@@ -412,6 +417,9 @@ class _InstallationRuntime:
         "_raw_graph",
         "_close_order",
         "_closed_roles",
+        "_broker_closed",
+        "_resources_closed",
+        "_shutdown_diagnostics",
     )
 
     def __init__(
@@ -494,6 +502,9 @@ class _InstallationRuntime:
         self._raw_graph = raw_graph
         self._close_order = close_order
         self._closed_roles: set[str] = set()
+        self._broker_closed = False
+        self._resources_closed = False
+        self._shutdown_diagnostics: tuple[str, ...] = ()
 
     @property
     def device_catalog(self) -> DeviceCatalogView:
@@ -502,6 +513,13 @@ class _InstallationRuntime:
     @property
     def runtime_instance_id(self) -> str:
         return self._runtime_instance_id
+
+    @property
+    def shutdown_diagnostics(self) -> tuple[str, ...]:
+        """Detached failures from the most recent close attempt."""
+
+        with self._lock:
+            return self._shutdown_diagnostics
 
     def camera_port(self, reference: DeviceRef) -> BoundCapturePort:
         with self._lock:
@@ -600,25 +618,87 @@ class _InstallationRuntime:
         if not self._controller.shutdown(
             max(0.0, deadline - time.monotonic())
         ):
+            with self._lock:
+                self._shutdown_diagnostics = (
+                    "active Run did not terminate before the shutdown deadline",
+                )
             return False
-        self._broker.shutdown()
+        failures: list[str] = []
+        if not self._broker_closed:
+            try:
+                self._broker.shutdown()
+            except BaseException as error:
+                failures.append(
+                    f"device broker: {type(error).__name__}: {error}"
+                )
+            else:
+                self._broker_closed = True
         for role in self._close_order:
             if role in self._closed_roles:
                 continue
             close = getattr(self._raw_graph[role], "close", None)
-            if callable(close):
-                close()
-            self._closed_roles.add(role)
+            try:
+                if callable(close):
+                    close()
+            except BaseException as error:
+                failures.append(
+                    f"{role}: {type(error).__name__}: {error}"
+                )
+            else:
+                self._closed_roles.add(role)
+        if failures:
+            with self._lock:
+                self._shutdown_diagnostics = tuple(failures)
+            return False
         # Release process-local ownership only after every raw close acknowledges.
-        self._resources.shutdown()
+        if not self._resources_closed:
+            try:
+                self._resources.shutdown()
+            except BaseException as error:
+                failures.append(
+                    f"resource arbiter: {type(error).__name__}: {error}"
+                )
+            else:
+                self._resources_closed = True
+        if failures:
+            with self._lock:
+                self._shutdown_diagnostics = tuple(failures)
+            return False
         with self._lock:
             self._state = "CLOSED"
+            self._shutdown_diagnostics = ()
             self._raw_graph.clear()
             self._camera_ports.clear()
             self._camera_monitor_ports.clear()
             self._pulse_ports.clear()
             self._sitemap_profiles.clear()
             return True
+
+
+def create_installation(
+    document: InstallationConfigDocument,
+    *,
+    required_pulse_document: PulseDocument | None = None,
+) -> _InstallationRuntime:
+    """Compose exactly one of the current typed installation variants."""
+
+    if not isinstance(document, InstallationConfigDocument):
+        raise TypeError("document must be InstallationConfigDocument")
+    config = document.config
+    if isinstance(config, VirtualInstallationConfig):
+        if required_pulse_document is not None:
+            raise ValueError(
+                "required_pulse_document is valid only for remote_pulse"
+            )
+        return create_virtual_installation(seed=config.seed)
+    if isinstance(config, RemotePulseInstallationConfig):
+        return create_remote_pulse_installation(
+            host=config.host,
+            port=config.port,
+            transport_timeout_seconds=config.transport_timeout_seconds,
+            required_pulse_document=required_pulse_document,
+        )
+    raise TypeError("document contains an unknown installation config")
 
 
 def _catalog(
@@ -984,6 +1064,7 @@ def create_remote_pulse_installation(
 
 
 __all__ = [
+    "create_installation",
     "create_remote_pulse_installation",
     "create_virtual_installation",
 ]

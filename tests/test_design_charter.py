@@ -30,7 +30,7 @@ QT_WIDGETS_LINE_CAP = 600
 #: still obey the cap.
 GRANDFATHERED = {
     "board.py": 4515,
-    "fluent.py": 3821,
+    "fluent.py": 3820,
     "form.py": 735,
     "param_widgets.py": 774,
 }

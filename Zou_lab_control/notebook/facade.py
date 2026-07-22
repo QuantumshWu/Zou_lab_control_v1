@@ -16,6 +16,10 @@ from zlc_neutral_atom.installation import (
     DeviceRef,
     DeviceCatalogView,
 )
+from zlc_neutral_atom.installation_config import (
+    InstallationConfigDocument,
+    load_installation_config,
+)
 from zlc_data import (
     READOUT_EVENT,
     REPEAT,
@@ -196,7 +200,11 @@ def _cleanup_failures(*actions) -> list[Exception]:
 
 def _require_runtime_shutdown(runtime, *, timeout: float) -> None:
     if not runtime.shutdown(timeout=timeout):
-        raise RuntimeError("runtime did not terminate within the cleanup deadline")
+        diagnostics = tuple(getattr(runtime, "shutdown_diagnostics", ()))
+        suffix = "" if not diagnostics else ": " + "; ".join(diagnostics)
+        raise RuntimeError(
+            "runtime did not terminate within the cleanup deadline" + suffix
+        )
 
 
 def _validate_scan_request_fields(
@@ -401,6 +409,7 @@ class _ExperimentServices:
     occupancy_repository: "OccupancyRepository | None"
     fit_repository: FitResultRepository
     catalog: DeviceCatalogView
+    installation_config: InstallationConfigDocument
     pulse_application: PulseApplicationOwner
     operation_lock: threading.RLock
     fit_operations_drained: threading.Event
@@ -1963,7 +1972,14 @@ def _data_figure_for_services(
 class Experiment:
     """Public notebook root containing values, requests, and narrow facades only."""
 
-    __slots__ = ("_authority_token", "name", "device_catalog", "pulse", "readout")
+    __slots__ = (
+        "_authority_token",
+        "name",
+        "device_catalog",
+        "installation_config",
+        "pulse",
+        "readout",
+    )
 
     def __init__(
         self,
@@ -1971,12 +1987,18 @@ class Experiment:
         *,
         name: str,
         device_catalog: DeviceCatalogView,
+        installation_config: InstallationConfigDocument,
     ) -> None:
         self._authority_token = authority_token
         self.name = _text(name, "experiment name")
         if not isinstance(device_catalog, DeviceCatalogView):
             raise TypeError("device_catalog must be DeviceCatalogView")
+        if not isinstance(installation_config, InstallationConfigDocument):
+            raise TypeError(
+                "installation_config must be InstallationConfigDocument"
+            )
         self.device_catalog = device_catalog
+        self.installation_config = installation_config
         self.readout = ReadoutFacade(authority_token)
         self.pulse = PulseFacade(authority_token)
 
@@ -2026,6 +2048,23 @@ class Experiment:
         from zlc_workbench.task_console.app import open_task_console
 
         return open_task_console(self, task=task, state=state, **kwargs)
+
+    def device_manager(self):
+        """Open the one config/admin window bound to this installation."""
+
+        from zlc_workbench.device_manager.app import open_device_manager
+
+        key = "device-manager"
+        with _service_guard(self._authority_token) as services:
+            existing = services.gui_handles.get(key)
+            if existing is not None:
+                if bool(getattr(existing, "permanently_closed", False)):
+                    raise RuntimeError("this Experiment's Device manager is closing")
+                existing.restore_window()
+                return existing
+            body = open_device_manager(experiment=self)
+            services.gui_handles[key] = body
+            return body
 
     def start(self, request: CaptureRequest) -> RunHandle:
         return _start(self._authority_token, request)
@@ -2764,8 +2803,16 @@ class Experiment:
                 raise RuntimeError("Fit drain event disagrees with operation count")
             shutdown = services.runtime.shutdown(timeout=2.0)
             if not shutdown:
+                diagnostics = tuple(
+                    getattr(services.runtime, "shutdown_diagnostics", ())
+                )
+                suffix = (
+                    ""
+                    if not diagnostics
+                    else ": " + "; ".join(diagnostics)
+                )
                 raise RuntimeError(
-                    "Experiment close is waiting for an active Run to terminate"
+                    "Experiment close did not complete" + suffix
                 )
             failures = _cleanup_failures(
                 services.fit_repository.close,
@@ -3372,39 +3419,57 @@ def _run_detection(
     return runtime.wait(handle)
 
 
+_CONNECT_SEED_UNSET = object()
+
+
+def _resolve_installation_document(
+    config: str | Path | InstallationConfigDocument,
+    seed: int | None | object,
+) -> InstallationConfigDocument:
+    if isinstance(config, InstallationConfigDocument):
+        if seed is not _CONNECT_SEED_UNSET:
+            raise ValueError(
+                "seed belongs inside an InstallationConfigDocument"
+            )
+        return config
+    if isinstance(config, Path):
+        if seed is not _CONNECT_SEED_UNSET:
+            raise ValueError("seed cannot override a saved installation config")
+        return load_installation_config(config)
+    if not isinstance(config, str):
+        raise TypeError(
+            "config must be 'virtual', a config path, or "
+            "InstallationConfigDocument"
+        )
+    if config == "virtual":
+        resolved_seed = 7 if seed is _CONNECT_SEED_UNSET else seed
+        return InstallationConfigDocument.virtual(seed=resolved_seed)
+    if config == "remote_pulse":
+        raise ValueError(
+            "remote_pulse requires InstallationConfigDocument.remote_pulse(...) "
+            "or a saved installation config"
+        )
+    if seed is not _CONNECT_SEED_UNSET:
+        raise ValueError("seed cannot override a saved installation config")
+    return load_installation_config(config)
+
+
 def connect(
-    config: str = "virtual",
+    config: str | Path | InstallationConfigDocument = "virtual",
     *,
     repository: str | Path,
     name: str = "neutral_atom",
-    seed: int | None = 7,
-    sequencer_host: str | None = None,
-    sequencer_port: int = 18861,
-    transport_timeout_seconds: float = 120.0,
+    seed: int | None | object = _CONNECT_SEED_UNSET,
     required_pulse_document: PulseDocument | None = None,
 ) -> Experiment:
     """Compose one notebook Experiment; raw devices remain authority-private."""
 
-    if not isinstance(config, str):
-        raise TypeError("config must name an explicit target backend")
-    if config not in {"virtual", "remote"}:
-        raise ValueError(
-            "target composition accepts only the explicit 'virtual' or "
-            "'remote' backend"
-        )
-    if config == "remote" and sequencer_host is None:
-        raise ValueError("the remote backend requires sequencer_host")
-    if config == "virtual" and sequencer_host is not None:
-        raise ValueError("sequencer_host is valid only for the remote backend")
+    installation_document = _resolve_installation_document(config, seed)
     if required_pulse_document is not None and not isinstance(
         required_pulse_document,
         PulseDocument,
     ):
         raise TypeError("required_pulse_document must be PulseDocument or None")
-    if config == "virtual" and required_pulse_document is not None:
-        raise ValueError(
-            "required_pulse_document is valid only for the remote backend"
-        )
     if not isinstance(repository, (str, Path)):
         raise TypeError("repository must be an explicit experiment workspace root")
     canonical_name = _text(name, "experiment name")
@@ -3422,24 +3487,12 @@ def connect(
 
         scan_repository = ScanRepository(repository_root / "scans")
         fit_repository = FitResultRepository(repository_root / "fits")
-        if config == "virtual":
-            from zlc_neutral_atom.bootstrap._installation import (
-                create_virtual_installation,
-            )
+        from zlc_neutral_atom.bootstrap._installation import create_installation
 
-            runtime = create_virtual_installation(seed=seed)
-        else:
-            from zlc_neutral_atom.bootstrap._installation import (
-                create_remote_pulse_installation,
-            )
-
-            assert sequencer_host is not None
-            runtime = create_remote_pulse_installation(
-                host=sequencer_host,
-                port=sequencer_port,
-                transport_timeout_seconds=transport_timeout_seconds,
-                required_pulse_document=required_pulse_document,
-            )
+        runtime = create_installation(
+            installation_document,
+            required_pulse_document=required_pulse_document,
+        )
         catalog = runtime.device_catalog
         fit_operations_drained = threading.Event()
         fit_operations_drained.set()
@@ -3453,6 +3506,7 @@ def connect(
             occupancy_repository=None,
             fit_repository=fit_repository,
             catalog=catalog,
+            installation_config=installation_document,
             pulse_application=PulseApplicationOwner(),
             operation_lock=threading.RLock(),
             fit_operations_drained=fit_operations_drained,
@@ -3460,7 +3514,12 @@ def connect(
             gui_handles={},
         )
         token = object()
-        experiment = Experiment(token, name=canonical_name, device_catalog=catalog)
+        experiment = Experiment(
+            token,
+            name=canonical_name,
+            device_catalog=catalog,
+            installation_config=installation_document,
+        )
         _register(token, services)
         return experiment
     except BaseException as error:
@@ -3482,6 +3541,25 @@ def connect(
         raise
 
 
+def device_manager(
+    config: str | Path | InstallationConfigDocument = "virtual",
+    *,
+    repository: str | Path | None = None,
+    name: str = "neutral_atom",
+    seed: int | None | object = _CONNECT_SEED_UNSET,
+):
+    """Open the standalone config editor before any installation is composed."""
+
+    document = _resolve_installation_document(config, seed)
+    from zlc_workbench.device_manager.app import open_device_manager
+
+    return open_device_manager(
+        document=document,
+        repository=repository,
+        name=name,
+    )
+
+
 __all__ = [
     "AdmittedFitResult",
     "AppliedPulseSnapshot",
@@ -3497,10 +3575,12 @@ __all__ = [
     "FitResultArtifactRef",
     "CaptureRequest",
     "connect",
+    "device_manager",
     "DetectionRequest",
     "Experiment",
     "FitExecution",
     "GridOrder",
+    "InstallationConfigDocument",
     "MaterializedScanData",
     "OccupancyScanRequest",
     "OccupancyArtifactRef",
