@@ -2149,54 +2149,56 @@ class QtRasterBoard(QtWidgets.QWidget):
             if event.button() == QtCore.Qt.LeftButton:
                 # The reference's RectangleSelector on a STANDING box: grab the
                 # centre to move it, a corner/edge handle to resize it, and a
-                # press anywhere else discards it and pulls a fresh box.
+                # press anywhere else discards it and pulls a fresh box.  The
+                # box lives in DATA coordinates (the reference's artists do),
+                # so it follows the data through any zoom/pan between
+                # gestures; hit-testing maps it to widget pixels on demand.
                 standing = (
                     binding.span_rect if binding.span_anchor is None else None
                 )
-                handle = (
-                    self._span_handle_hit(
-                        numeric_target.bounds, standing, event.localPos())
-                    if standing is not None
-                    else None
-                )
+                handle = None
+                if standing is not None:
+                    xs_px, ys_px = self._span_rect_widget_extents(
+                        numeric_target, standing)
+                    handle = self._span_handle_hit(
+                        xs_px, ys_px, event.localPos())
                 self._selector_hold = self._held_panel_from_numeric_target(
                     numeric_target
                 )
+                pressed = viewport.widget_normalized_to_data(*point)
                 if handle is not None:
                     xs = sorted((standing[0], standing[2]))
                     ys = sorted((standing[1], standing[3]))
                     if handle == "C":
                         binding.span_rect = (xs[0], ys[0], xs[1], ys[1])
                         binding.span_move_grab = (
-                            point[0] - xs[0], point[1] - ys[0])
+                            pressed[0] - xs[0], pressed[1] - ys[0])
                     elif handle in ("N", "S"):
                         # A y-edge resize never changes the x span.
                         fixed_y = ys[1] if handle == "N" else ys[0]
-                        binding.span_rect = (xs[0], fixed_y, xs[1], point[1])
+                        binding.span_rect = (
+                            xs[0], fixed_y, xs[1], pressed[1])
                         binding.span_anchor = xs[0]
                         binding.span_resize_lock = "y"
                     else:
                         anchor_x = xs[1] if "W" in handle else xs[0]
                         if handle in ("W", "E"):
                             binding.span_rect = (
-                                anchor_x, ys[0], point[0], ys[1])
+                                anchor_x, ys[0], pressed[0], ys[1])
                             binding.span_resize_lock = "x"
                         else:
                             anchor_y = (
                                 ys[1] if handle in ("NW", "NE") else ys[0])
                             binding.span_rect = (
-                                anchor_x, anchor_y, point[0], point[1])
+                                anchor_x, anchor_y, pressed[0], pressed[1])
                         binding.span_anchor = anchor_x
-                    try:
-                        binding.span_candidate = viewport.selection_x_span(
-                            binding.span_rect[0], binding.span_rect[2])
-                    except ValueError:
-                        binding.span_candidate = None
+                    binding.span_candidate = self._span_data_candidate(
+                        binding.span_rect[0], binding.span_rect[2])
                 else:
-                    binding.span_anchor = point[0]
+                    binding.span_anchor = pressed[0]
                     binding.span_candidate = None
                     binding.span_rect = (
-                        point[0], point[1], point[0], point[1])
+                        pressed[0], pressed[1], pressed[0], pressed[1])
                 self._set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
@@ -2301,43 +2303,35 @@ class QtRasterBoard(QtWidgets.QWidget):
                     event.localPos(),
                     clamp_to_plot=True,
                 )
+                moved = viewport.widget_normalized_to_data(*point)
                 rect = numeric_binding.span_rect
                 grab = numeric_binding.span_move_grab
                 if grab is not None and rect is not None:
                     # Centre-handle grab: the whole box follows the pointer.
                     width = rect[2] - rect[0]
                     height = rect[3] - rect[1]
-                    x0 = point[0] - grab[0]
-                    y0 = point[1] - grab[1]
+                    x0 = moved[0] - grab[0]
+                    y0 = moved[1] - grab[1]
                     numeric_binding.span_rect = (
                         x0, y0, x0 + width, y0 + height)
-                    try:
-                        numeric_binding.span_candidate = (
-                            viewport.selection_x_span(x0, x0 + width))
-                    except ValueError:
-                        numeric_binding.span_candidate = None
+                    numeric_binding.span_candidate = (
+                        self._span_data_candidate(x0, x0 + width))
                 elif numeric_binding.span_resize_lock == "y":
                     # A y-edge resize reshapes the box only -- the x span (and
                     # so the candidate fixed at press) never changes.
                     if rect is not None:
                         numeric_binding.span_rect = (
-                            rect[0], rect[1], rect[2], point[1])
+                            rect[0], rect[1], rect[2], moved[1])
                 else:
-                    if point[0] == numeric_binding.span_anchor:
-                        numeric_binding.span_candidate = None
-                    else:
-                        try:
-                            numeric_binding.span_candidate = viewport.selection_x_span(
-                                numeric_binding.span_anchor,
-                                point[0],
-                            )
-                        except ValueError:
-                            numeric_binding.span_candidate = None
+                    numeric_binding.span_candidate = self._span_data_candidate(
+                        numeric_binding.span_anchor,
+                        moved[0],
+                    )
                     if rect is not None:
                         numeric_binding.span_rect = (
-                            (rect[0], rect[1], point[0], rect[3])
+                            (rect[0], rect[1], moved[0], rect[3])
                             if numeric_binding.span_resize_lock == "x"
-                            else (rect[0], rect[1], point[0], point[1])
+                            else (rect[0], rect[1], moved[0], moved[1])
                         )
                 self.update()
             event.accept()
@@ -3291,9 +3285,42 @@ class QtRasterBoard(QtWidgets.QWidget):
         return None
 
     @staticmethod
+    def _span_rect_widget_extents(
+        target: _NumericTarget,
+        rect: tuple[float, float, float, float],
+    ) -> tuple[list[float], list[float]]:
+        """A DATA-coordinate span box as sorted widget-pixel x/y extents,
+        mapped through the panel's CURRENT viewport."""
+
+        viewport = target.payload.viewport
+        bounds = target.bounds
+        first = viewport.data_to_widget_normalized(rect[0], rect[1])
+        second = viewport.data_to_widget_normalized(rect[2], rect[3])
+        xs = sorted((bounds.x() + first[0] * bounds.width(),
+                     bounds.x() + second[0] * bounds.width()))
+        ys = sorted((bounds.y() + first[1] * bounds.height(),
+                     bounds.y() + second[1] * bounds.height()))
+        return xs, ys
+
+    @staticmethod
+    def _span_data_candidate(
+        first: float | None,
+        second: float | None,
+    ) -> tuple[float, float] | None:
+        """Sorted DATA-coordinate x span; None for a degenerate pull (the
+        reference's empty-extents onselect)."""
+
+        if first is None or second is None or first == second:
+            return None
+        low, high = sorted((float(first), float(second)))
+        if not (math.isfinite(low) and math.isfinite(high)):
+            return None
+        return (low, high)
+
+    @staticmethod
     def _span_handle_hit(
-        bounds: QtCore.QRect,
-        rect_norm: tuple[float, float, float, float],
+        xs: list[float],
+        ys: list[float],
         pos: QtCore.QPointF,
     ) -> str | None:
         """Which handle of a STANDING selection box a press grabs.
@@ -3302,13 +3329,10 @@ class QtRasterBoard(QtWidgets.QWidget):
         within twice the grab range moves the whole box (``"C"``, priority);
         otherwise the nearest of the eight corner/edge handles within the
         grab range resizes; anything else returns None (press elsewhere
-        discards the box and pulls a fresh one)."""
+        discards the box and pulls a fresh one).  ``xs``/``ys`` are the box's
+        sorted widget-pixel extents."""
 
         grab = 10.0
-        xs = sorted((bounds.x() + rect_norm[0] * bounds.width(),
-                     bounds.x() + rect_norm[2] * bounds.width()))
-        ys = sorted((bounds.y() + rect_norm[1] * bounds.height(),
-                     bounds.y() + rect_norm[3] * bounds.height()))
         centre_x = (xs[0] + xs[1]) / 2.0
         centre_y = (ys[0] + ys[1]) / 2.0
         px, py = float(pos.x()), float(pos.y())
@@ -4489,18 +4513,15 @@ class QtRasterBoard(QtWidgets.QWidget):
             # unboxed two-line coordinate label in the top-left corner.
             rect_norm = binding.span_rect
             if rect_norm is not None:
-                # rect_norm is BOUNDS-normalized (the same vocabulary the press/
-                # move handlers store via _numeric_normalized_point), so it maps
-                # through the panel bounds -- mapping it through the plot rect
-                # would draw the rubber band offset from the pointer.
+                # The box is stored in DATA coordinates (the reference keeps
+                # its selector artists in data space), so it follows the data
+                # through zoom/pan; map it through the CURRENT viewport here.
                 selector_color = _selector_pen_color()
-                x0 = bounds.x() + rect_norm[0] * bounds.width()
-                y0 = bounds.y() + rect_norm[1] * bounds.height()
-                x1 = bounds.x() + rect_norm[2] * bounds.width()
-                y1 = bounds.y() + rect_norm[3] * bounds.height()
+                xs_px, ys_px = self._span_rect_widget_extents(
+                    target, rect_norm)
                 rectangle = QtCore.QRectF(
-                    QtCore.QPointF(min(x0, x1), min(y0, y1)),
-                    QtCore.QPointF(max(x0, x1), max(y0, y1)),
+                    QtCore.QPointF(xs_px[0], ys_px[0]),
+                    QtCore.QPointF(xs_px[1], ys_px[1]),
                 )
                 painter.setPen(QtGui.QPen(selector_color, SELECTOR_LINE_PX))
                 painter.setBrush(QtCore.Qt.NoBrush)
@@ -4528,13 +4549,10 @@ class QtRasterBoard(QtWidgets.QWidget):
                     # Selection complete: the reference prints the SORTED extents
                     # "(xmin, ymin)\n(xmax, ymax)" top-left (its selector's
                     # ``extents`` order, whatever the drag direction), precision
-                    # 1/1000 of the visible span, no box.
-                    ax0, ay0 = viewport.widget_normalized_to_data(
-                        rect_norm[0], rect_norm[1])
-                    ax1, ay1 = viewport.widget_normalized_to_data(
-                        rect_norm[2], rect_norm[3])
-                    lo_x, hi_x = sorted((ax0, ax1))
-                    lo_y, hi_y = sorted((ay0, ay1))
+                    # 1/1000 of the visible span, no box.  The box IS data
+                    # coordinates -- print it directly.
+                    lo_x, hi_x = sorted((rect_norm[0], rect_norm[2]))
+                    lo_y, hi_y = sorted((rect_norm[1], rect_norm[3]))
                     dx = _selector_precision(
                         viewport.x_limits[1] - viewport.x_limits[0])
                     y_span = (

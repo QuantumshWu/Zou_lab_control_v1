@@ -257,3 +257,60 @@ def test_pulse_cross_pins_and_clears_and_hover_never_snaps() -> None:
     finally:
         board.close()
         application.processEvents()
+
+
+def test_pulse_area_box_is_data_anchored_and_double_middle_zooms_to_it() -> None:
+    """The reference keeps its selector artists in DATA coordinates: after an
+    area select, a double-middle re-xlims the view to EXACTLY the selection,
+    and the standing box (still the same data span) now covers the whole
+    zoomed view instead of clinging to stale screen fractions."""
+
+    from PyQt5 import QtCore, QtGui, QtTest
+    from zlc_frontend.selector import CurveRangeGesture, CurveViewportCommit
+
+    commands: list[object] = []
+    application, board = _board(commands)
+    try:
+        plot = _target(board).plot
+        start, end = _point(plot, 0.30, 0.30), _point(plot, 0.60, 0.70)
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
+        _drag_move(board, end, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
+        gesture = commands[-1]
+        assert isinstance(gesture, CurveRangeGesture)
+        span = gesture.x_span
+        assert span is not None
+        board.set_pulse_range_candidate(span)
+        binding = board._numeric_bindings["pulse"]
+        rect = binding.span_rect
+        assert rect is not None
+        # The standing box IS the selection, stored in data coordinates.
+        assert tuple(sorted((rect[0], rect[2]))) == pytest.approx(span)
+
+        # A REAL double-click arrives as press, release, press, dblclick,
+        # release -- the first press starts a pan the dblclick must shrug off.
+        centre = _point(_target(board).plot, 0.5, 0.5)
+        QtTest.QTest.mousePress(board, QtCore.Qt.MiddleButton, pos=centre)
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.MiddleButton, pos=centre)
+        board.mousePressEvent(QtGui.QMouseEvent(
+            QtCore.QEvent.MouseButtonPress, QtCore.QPointF(centre),
+            QtCore.Qt.MiddleButton, QtCore.Qt.MiddleButton,
+            QtCore.Qt.NoModifier))
+        board.mouseDoubleClickEvent(QtGui.QMouseEvent(
+            QtCore.QEvent.MouseButtonDblClick, QtCore.QPointF(centre),
+            QtCore.Qt.MiddleButton, QtCore.Qt.MiddleButton,
+            QtCore.Qt.NoModifier))
+        board.mouseReleaseEvent(QtGui.QMouseEvent(
+            QtCore.QEvent.MouseButtonRelease, QtCore.QPointF(centre),
+            QtCore.Qt.MiddleButton, QtCore.Qt.NoButton, QtCore.Qt.NoModifier))
+        command = commands[-1]
+        assert isinstance(command, CurveViewportCommit)
+        assert command.viewport.x_limits == pytest.approx(span)
+        # The box did not move: still the same data span, regardless of the
+        # viewport it will next be painted through.
+        rect_after = binding.span_rect
+        assert rect_after is not None
+        assert tuple(sorted((rect_after[0], rect_after[2]))) == pytest.approx(span)
+    finally:
+        board.close()
+        application.processEvents()
