@@ -1051,6 +1051,7 @@ def _draw_pulse_timeline(
     scan_regions=(),
     scan_dac_segments=(),
     pixel_ratio: float = 1.0,
+    x_limits=None,
 ):
     """Draw the pulse-timeline figure once -- the reference's faithful preview.
 
@@ -1244,7 +1245,12 @@ def _draw_pulse_timeline(
             axis.text((s_start + s_stop) / 2.0, y_base + row_height / 2.0,
                       str(number), **badge_kwargs)
 
-    axis.set_xlim(left_limit, right_limit)
+    # ``x_limits`` is a display-only VIEW override (the unified zoom/pan owner's
+    # commit); the drawn geometry and the home span stay the full frame either way.
+    if x_limits is not None:
+        axis.set_xlim(float(x_limits[0]), float(x_limits[1]))
+    else:
+        axis.set_xlim(left_limit, right_limit)
     ylim_top = n_rows - 0.38
     if bracket_bounds:
         ylim_top = n_rows + 0.78 + 0.26 * max(0, len(bracket_bounds) - 1)
@@ -1284,7 +1290,7 @@ def _draw_pulse_timeline(
         # axis.set_title(), whose default 'large' titlesize dwarfs the compact preview and
         # crowds the repeat bracket right below it.
         apply_title(axis, str(title))
-    return figure, axis, row_keys, row_labels
+    return figure, axis, row_keys, row_labels, (left_limit, right_limit)
 
 
 def render_pulse_timeline_png(
@@ -1318,7 +1324,7 @@ def render_pulse_timeline_png(
     figure = None
     try:
         with render_style_context():
-            figure, _axis, _row_keys, _row_labels = _draw_pulse_timeline(
+            figure, _axis, _row_keys, _row_labels, _home = _draw_pulse_timeline(
                 pulses=pulses,
                 channels=channels,
                 channel_labels=channel_labels,
@@ -1361,6 +1367,7 @@ def render_pulse_timeline_panel(
     evaluated_input,
     display_revision: int = 0,
     pixel_ratio: float = 1.0,
+    x_limits=None,
 ) -> "tuple[RasterBuffer, PulsePanelPayload]":
     """The SAME pulse-timeline picture as an interactive raster front.
 
@@ -1379,7 +1386,7 @@ def render_pulse_timeline_panel(
     figure = None
     try:
         with render_style_context():
-            figure, axis, row_keys, row_labels = _draw_pulse_timeline(
+            figure, axis, row_keys, row_labels, home = _draw_pulse_timeline(
                 pulses=pulses,
                 channels=channels,
                 channel_labels=channel_labels,
@@ -1392,18 +1399,23 @@ def render_pulse_timeline_panel(
                 scan_regions=scan_regions,
                 scan_dac_segments=scan_dac_segments,
                 pixel_ratio=pixel_ratio,
+                x_limits=x_limits,
             )
             figure.canvas.draw()
             width, height = figure.canvas.get_width_height()
             raster = RasterBuffer.from_agg_rgba(
                 width, height, figure.canvas.buffer_rgba())
-            x_limits = validated_display_range(
+            drawn_x_limits = validated_display_range(
                 tuple(float(value) for value in axis.get_xlim()),
                 "drawn pulse x limits",
             )
             y_limits = validated_display_range(
                 tuple(float(value) for value in axis.get_ylim()),
                 "drawn pulse y limits",
+            )
+            home_x_limits = validated_display_range(
+                tuple(float(value) for value in home),
+                "pulse home x limits",
             )
             x0, y0, box_width, box_height = (
                 float(value) for value in axis.bbox.bounds
@@ -1414,21 +1426,24 @@ def render_pulse_timeline_panel(
                 (x0 + box_width) / raster.width,
                 1.0 - y0 / raster.height,
             )
+            # The axis IDENTITY pins to the HOME (full-frame) span, never the
+            # current zoomed view: hold matching and semantics checks compare
+            # this axis, and a zoom must not read as a different panel.
             time_axis = EvaluatedAxis(
                 AxisId("pulse.preview.time"),
                 "Time",
                 SCAN_POINT,
                 "s",
                 (0, 1),
-                (x_limits[0], x_limits[1]),
+                (home_x_limits[0], home_x_limits[1]),
             )
             viewport = CurveViewportTransform(
                 time_axis,
                 int(display_revision),
                 plot_bounds,
-                x_limits,
+                drawn_x_limits,
                 y_limits,
-                x_limits,
+                home_x_limits,
             )
             return raster, PulsePanelPayload(
                 evaluated_input, viewport, tuple(row_keys), tuple(row_labels))

@@ -360,3 +360,16 @@ def test_the_panel_exit_is_the_same_picture_with_a_live_viewport(application):
     x_centre, _y = viewport.widget_normalized_to_data(0.5, 0.5)
     assert viewport.x_limits[0] <= x_centre <= viewport.x_limits[1], (
         "the widget centre does not map inside the drawn time span")
+
+    # A zoom commit re-renders with a VIEW x-limits override: the drawn view
+    # follows it, home stays pinned to the full frame, and the axis IDENTITY is
+    # unchanged -- a zoom must never read as a different panel (hold/semantics
+    # checks compare this axis).
+    zoom = (2e-4, 8e-4)
+    _raster2, zoomed = render_pulse_timeline_panel(
+        **kw, evaluated_input=provenance, x_limits=zoom, display_revision=1)
+    assert zoomed.viewport.x_limits == pytest.approx(zoom)
+    assert zoomed.viewport.home_x_limits == viewport.home_x_limits, (
+        "zoom must not move the home span")
+    assert zoomed.viewport.x_axis == viewport.x_axis, (
+        "zoom must not change the axis identity")
