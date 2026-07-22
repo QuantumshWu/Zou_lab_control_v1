@@ -144,6 +144,7 @@ tests/test_zlc_pulse_transports.py
 tests/test_zlc_pulse_trigger_schedule.py
 tests/test_zlc_pulse_validation_math.py
 tests/test_zlc_qt_image_interaction.py
+tests/test_zlc_single_panel_host.py
 tests/test_zlc_readout_contracts.py
 tests/test_zlc_readout_main_oracle.py
 tests/test_zlc_readout_physical_context.py

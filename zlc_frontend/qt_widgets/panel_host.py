@@ -21,11 +21,12 @@ from PyQt5 import QtCore, QtWidgets
 
 from ..render import (
     BoardFrame, CoherenceStamp, CurvePanelPayload, HistogramPanelPayload,
-    PanelFrame, PanelPresentationIdentity, PulsePanelPayload, RasterBuffer,
-    SourceIdentity)
+    ImagePanelPayload, PanelFrame, PanelPresentationIdentity,
+    PulsePanelPayload, RasterBuffer, SourceIdentity)
 from ..selector import (
     CurveRangeGesture, CurveViewportCommit, HistogramRangeGesture,
-    HistogramThresholdCommit, HistogramViewportCommit)
+    HistogramThresholdCommit, HistogramViewportCommit, ImageColorLimitsCommit,
+    ImageViewportCommit)
 from .board import QtRasterBoard
 
 
@@ -51,6 +52,11 @@ class SinglePanelHost(QtWidgets.QWidget):
     rangeSelected = QtCore.pyqtSignal(object)
     viewCommitted = QtCore.pyqtSignal(object)
     thresholdsCommitted = QtCore.pyqtSignal(object)
+    # image family only: a completed DISPLAY ONLY rectangle (RectangleGesture)
+    # and a clim-rail commit's fixed colour limits.  The window echoes a
+    # rectangle candidate through ``board.set_image_rectangle_candidate``.
+    rectangleSelected = QtCore.pyqtSignal(object)
+    colorLimitsCommitted = QtCore.pyqtSignal(object)
 
     def __init__(self, panel_id: str = "panel", *,
                  group: str | None = None,
@@ -134,6 +140,25 @@ class SinglePanelHost(QtWidgets.QWidget):
         self._board.setFixedSize(logical[0], logical[1])
         return logical
 
+    def present_frame(self, frame: BoardFrame) -> None:
+        """Present one ALREADY-COHERENT frame (e.g. a worker compose product).
+
+        ``present_panel`` derives the identity boilerplate for windows that
+        render their own picture; a console card's worker hands over a complete
+        :class:`BoardFrame` whose identity the composer already minted.  Both
+        entrances funnel into the SAME board and the SAME gesture binding, so
+        the selector family stays owned once regardless of who built the frame.
+        """
+
+        if not isinstance(frame, BoardFrame):
+            raise TypeError("frame must be BoardFrame")
+        if len(frame.panels) != 1 or frame.panels[0].panel_id != self._panel_id:
+            raise ValueError(
+                "SinglePanelHost requires its one configured panel"
+            )
+        self._board.present(frame)
+        self._ensure_binding(frame.panels[0].display_payload)
+
     # ------------------------------------------------------------------ #
     # gesture plumbing
     # ------------------------------------------------------------------ #
@@ -159,6 +184,20 @@ class SinglePanelHost(QtWidgets.QWidget):
             self._board.bind_histogram_interaction(
                 self._panel_id, self._on_intent)
             self._bound_kind = "histogram"
+        elif isinstance(payload, ImagePanelPayload):
+            # The image family separates the operator's switch from readiness:
+            # bind unarmed, then declare the just-presented provenance current
+            # (the host's one source IS the frame the caller handed over).
+            self._board.bind_rectangle_selector(
+                self._panel_id,
+                payload.viewport,
+                self.rectangleSelected.emit,
+                enabled=False,
+                interaction_callback=self._on_intent,
+            )
+            self._board.set_interaction_readiness(
+                image=True, curve=False, histogram=False, pulse=False)
+            self._bound_kind = "image"
         if self._bound_kind is not None:
             self._board.set_selectors_enabled(self._selectors_on)
 
@@ -180,3 +219,9 @@ class SinglePanelHost(QtWidgets.QWidget):
             return
         if isinstance(intent, HistogramThresholdCommit):
             self.thresholdsCommitted.emit(intent.thresholds)
+            return
+        if isinstance(intent, ImageViewportCommit):
+            self.viewCommitted.emit(intent.viewport)
+            return
+        if isinstance(intent, ImageColorLimitsCommit):
+            self.colorLimitsCommitted.emit(intent.color_limits)
